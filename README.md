@@ -6,13 +6,13 @@ This project is a subproject from a bigger and older project called [CAI](https:
 
 ## Why Pascal?
 * Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
-* Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code.
+* Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code and at the same time have a readable code.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers.
 
 ## Installation
-Clone this project and add the **neural** folder to your Lazarus unit search path and you are ready to go!
+Clone this project, add the **neural** folder to your Lazarus unit search path and you'll be ready to go!
 
 ## How does The Code Look Like for a CIFAR-10 Classification Example?
 ```
@@ -46,7 +46,7 @@ The documentation is currently under construction. There are some available vide
 * [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
 * [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
 
-There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at. Introductory examples to look at first are:
+There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at. Introductory examples are:
 * [Training a neural network to learn boolean functions AND, OR and XOR](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
 * [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
 
