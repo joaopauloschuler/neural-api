@@ -6,7 +6,7 @@ This project is a subproject from a bigger and older project called [CAI](https:
 
 ## Why Pascal?
 * Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
-* Pascal is easy to learn and easy to make a bug free code. You'll be able to make super fast **native** code.
+* Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers.
@@ -47,8 +47,8 @@ The documentation is currently under construction. There are some available vide
 * [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
 
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at. Introductory examples to look at first are:
-* [Training a neural network to learn boolean functions AND, OR and XOR.](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
-* [Many neural network architectures for CIFAR-10 image classification.](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
+* [Training a neural network to learn boolean functions AND, OR and XOR](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+* [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
 
 ## Quick View about the API
 This API is really big. The following list gives a general idea about this API but it doesn't contain everything.
@@ -65,8 +65,8 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetDepthwiseConv` (input/output: 1D, 2D or 3D).
 * `TNNetDepthwiseConvReLU` (input/output: 1D, 2D or 3D).
 * `TNNetDepthwiseConvLinear` (input/output: 1D, 2D or 3D).
-* `TNNet.AddSeparableConvReLU` (input/output: 1D, 2D or 3D - separable convolution).
-* `TNNet.AddSeparableConvLinear` (input/output: 1D, 2D or 3D - separable convolution).
+* `TNNet.AddSeparableConvReLU` (input/output: 1D, 2D or 3D). Adds a separable convolution.
+* `TNNet.AddSeparableConvLinear` (input/output: 1D, 2D or 3D). Adds a separable convolution
 * `TNNet.AddConvOrSeparableConv` (input/output: 1D, 2D or 3D). Adds a convolution or a separable convolutions with/without ReLU and normalization.
 
 ### Fully Connected Layers
@@ -76,22 +76,22 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetFullConnectSigmoid` (input/output: 1D, 2D or 3D).
 
 ### Locally Connected Layers
-* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). Similar to full connect with individual neurons.
+* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetLocalConnectReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 
-### Min / Max / Avg pools
+### Min / Max / Avg Pools
 * `TNNetAvgPool` (input/output: 1D, 2D or 3D).
 * `TNNetMaxPool` (input/output: 1D, 2D or 3D).
 * `TNNetMinPool` (input/output: 1D, 2D or 3D).
-* `TNNet.AddMinMaxPool` (input/output: 1D, 2D or 3D - min and max pools and then concatenates results).
-* `TNNet.AddAvgMaxPool` (input/output: 1D, 2D or 3D - average and max pools and then concatenates results).
+* `TNNet.AddMinMaxPool` (input/output: 1D, 2D or 3D). Does both min and max pools and then concatenates results.
+* `TNNet.AddAvgMaxPool` (input/output: 1D, 2D or 3D ). Does both average and max pools and then concatenates results.
 
 ### Min / Max / Avg layers that Operate an Entire Channel and Produce Only One Result per Channel
 * `TNNetAvgChannel` (input: 2D or 3D - output: 1D). Calculates the channel average.
 * `TNNetMaxChannel` (input: 2D or 3D - output: 1D). Calculates the channel max.
 * `TNNetMinChannel` (input: 2D or 3D - output: 1D). Calculates the channel min.
-* `TNNet.AddMinMaxChannel` (input/output: 1D, 2D or 3D - min and max channel and then concatenates results).
-* `TNNet.AddAvgMaxChannel` (input/output: 1D, 2D or 3D - average and max channel and then concatenates results).
+* `TNNet.AddMinMaxChannel` (input/output: 1D, 2D or 3D). Does both min and max channel and then concatenates results.
+* `TNNet.AddAvgMaxChannel` (input/output: 1D, 2D or 3D). Does both average and max channel and then concatenates results.
 
 ### Trainable Normalization Layers Allowing Faster Learning/Convergence
 * `TNNetChannelZeroCenter` (input/output: 1D, 2D or 3D). Trainable zero centering.
@@ -105,16 +105,16 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetLayerStdNormalization` (input/output: 1D, 2D or 3D).
 * `TNNetLocalResponseNorm2D` (input/output: 2D or 3D).
 * `TNNetLocalResponseNormDepth` (input/output: 2D or 3D).
-* `TNNetRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication and random bias (shift).
-* `TNNetChannelRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication and random bias (shift) per channel.
+* `TNNetRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication (scale) and a random bias (shift).
+* `TNNetChannelRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication (scale) and random bias (shift) per channel.
 
 ### Concatenation, Summation and Reshaping Layers
-* `TNNetConcat` (input/output: 1D, 2D or 3D). Allows concatenating the result from previous layers.
-* `TNNetDeepConcat` (input/output: 1D, 2D or 3D). Concatenates into the Depth axis. This is useful with DenseNet like architectures.
+* `TNNetConcat` (input/output: 1D, 2D or 3D). Allows concatenating results from previous layers.
+* `TNNetDeepConcat` (input/output: 1D, 2D or 3D). Concatenates into the depth axis. This is useful with DenseNet like architectures.
 * `TNNetIdentity` (input/output: 1D, 2D or 3D).
 * `TNNetIdentityWithoutBackprop` (input/output: 1D, 2D or 3D). Allows the forward pass to proceed but prevents backpropagation.
 * `TNNetReshape` (input/output: 1D, 2D or 3D).
-* `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits layers/channels from input.
+* `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits layers/channels from the input.
 * `TNNetSum` (input/output: 1D, 2D or 3D). Sums outputs from parallel layers allowing ResNet style networks.
 
 ### Layers with Activation Functions and no Trainable Parameter
@@ -129,7 +129,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetChannelMul` (input/output: 1D, 2D or 3D).
 
 ### Opposing Operations
-* `TNNetDeLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). Similar to full connect with individual neurons.
+* `TNNetDeLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetDeLocalConnectReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetDeconvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetDeconvolutionReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
