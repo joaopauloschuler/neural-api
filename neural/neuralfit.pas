@@ -41,6 +41,7 @@ type
       FL2Decay: TNeuralFloat;
       FFileNameBase: string;
       FClipDelta: single;
+      FTargetAccuracy: single;
       procedure CheckLearningRate(iEpochCount: integer);
     public
       constructor Create();
@@ -58,6 +59,7 @@ type
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
+      property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
   end;
 
   { TNeuralImageFit }
@@ -110,6 +112,7 @@ begin
   FClipDelta := 0.0;
   FFileNameBase := 'autosave';
   FL2Decay := 0.0000001;
+  FTargetAccuracy := 1;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -192,9 +195,18 @@ begin
   FThreadNum := FMaxThreadNum;
   FBatchSize := pBatchSize;
   FMaxEpochs := Epochs;
-  if FBatchSize > FThreadNum then
+  if FBatchSize >= FThreadNum then
   begin
     FBatchSize := (FBatchSize div FThreadNum) * FThreadNum;
+  end
+  else if FBatchSize > 0 then
+  begin
+    FThreadNum := FBatchSize;
+  end
+  else
+  begin
+    FErrorProc('Batch size has to be bigger than zero.');
+    exit;
   end;
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
@@ -380,6 +392,12 @@ begin
             ' Total time: ', (((Now() - globalStartTime)) * 24 * 60): 6: 2, 'min'
           );
         end;
+
+        if (ValidationRate >= FTargetAccuracy) then
+        begin
+          FRunning := false;
+          break;
+        end;
       end;// Assigned(FImgValidationVolumes)
 
       if (iEpochCount mod FThreadNN.Count = 0) and (FVerbose) then
@@ -416,6 +434,11 @@ begin
               ' Total time: ', (((Now() - globalStartTime)) * 24 * 60): 6: 2, 'min'
             );
           end;
+        end;
+        if (TestRate >= FTargetAccuracy) then
+        begin
+          FRunning := false;
+          break;
         end;
       end;
 
