@@ -16,29 +16,28 @@ Clone this project and add the **neural** folder to your Lazarus unit search pat
 
 ## How does The Code Look Like for a CIFAR-10 Classification Example?
 ```
-    NN := TNNet.Create();
-    NN.AddLayer(TNNetInput.Create(32, 32, 3));
-    NN.AddLayer(TNNetConvolutionReLU.Create(16, 5, 0, 0));
-    NN.AddLayer(TNNetMaxPool.Create(2));
-    NN.AddLayer(TNNetConvolutionReLU.Create(32, 5, 0, 0));
-    NN.AddLayer(TNNetMaxPool.Create(2));
-    NN.AddLayer(TNNetConvolutionReLU.Create(32, 5, 0, 0));
-    NN.AddLayer(TNNetLayerFullConnectReLU.Create(32));
-    NN.AddLayer(TNNetFullConnectLinear.Create(NumClasses));
-    NN.AddLayer(TNNetSoftMax.Create());
-    CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
+NN := TNNet.Create();
+NN.AddLayer(TNNetInput.Create(32, 32, 3));
+NN.AddLayer(TNNetConvolutionReLU.Create(16, 5, 0, 0));
+NN.AddLayer(TNNetMaxPool.Create(2));
+NN.AddLayer(TNNetConvolutionReLU.Create(32, 5, 0, 0));
+NN.AddLayer(TNNetMaxPool.Create(2));
+NN.AddLayer(TNNetConvolutionReLU.Create(32, 5, 0, 0));
+NN.AddLayer(TNNetLayerFullConnectReLU.Create(32));
+NN.AddLayer(TNNetFullConnectLinear.Create(NumClasses));
+NN.AddLayer(TNNetSoftMax.Create());
 
-    WriteLn('Neural Network will minimize error with:');
-    WriteLn(' Layers: ', NN.CountLayers());
-    WriteLn(' Neurons:', NN.CountNeurons());
-    WriteLn(' Weights:' ,NN.CountWeights());
-    NN.DebugWeights();
-    NN.DebugStructure();
+CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
-    NeuralFit := TNeuralImageFit.Create;
-    NeuralFit.InitialLearningRate := fLearningRate;
-    NeuralFit.Inertia := fInertia;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize}128, {epochs}100);
+WriteLn('Neural Network will minimize error with:');
+WriteLn(' Layers: ', NN.CountLayers());
+WriteLn(' Neurons:', NN.CountNeurons());
+WriteLn(' Weights:' ,NN.CountWeights());
+
+NeuralFit := TNeuralImageFit.Create;
+NeuralFit.InitialLearningRate := fLearningRate;
+NeuralFit.Inertia := fInertia;
+NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize}128, {epochs}100);
  ```
  
 ## Documentation
