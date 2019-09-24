@@ -9,7 +9,10 @@ uses
   Classes, SysUtils, neuralnetwork, neuralvolume, MTProcs;
 
 type
-  // This is a base class. Do not use it directly.
+  TCustomLearningRateScheduleFn = function(Epoch: integer): single;
+  TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
+
+  /// This is a base class. Do not use it directly.
   TNeuralFitBase = class(TMObject)
     protected
       FBatchSize: integer;
@@ -42,6 +45,9 @@ type
       FFileNameBase: string;
       FClipDelta: single;
       FTargetAccuracy: single;
+      FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
+      FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
+      FOnAfterStep, FOnAfterEpoch: TNotifyEvent;
       procedure CheckLearningRate(iEpochCount: integer);
     public
       constructor Create();
@@ -50,6 +56,8 @@ type
       property AvgWeightEpochCount: integer read FAvgWeightEpochCount write FAvgWeightEpochCount;
       property ClipDelta: single read FClipDelta write FClipDelta;
       property CurrentLearningRate: single read FCurrentLearningRate;
+      property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
+      property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
       property FileNameBase: string read FFileNameBase write FFileNameBase;
       property Inertia: single read FInertia write FInertia;
       property InitialEpoch: integer read FInitialEpoch write FInitialEpoch;
@@ -113,6 +121,10 @@ begin
   FFileNameBase := 'autosave';
   FL2Decay := 0.0000001;
   FTargetAccuracy := 1;
+  FCustomLearningRateScheduleFn := nil;
+  FCustomLearningRateScheduleObjFn := nil;
+  FOnAfterStep := nil;
+  FOnAfterEpoch := nil;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -127,7 +139,17 @@ var
   iStairCount: integer;
   fNewLearningRate: single;
 begin
-  if FStaircaseEpochs > 1 then
+  FCustomLearningRateScheduleFn := nil;
+  FCustomLearningRateScheduleObjFn := nil;
+  if Assigned(FCustomLearningRateScheduleFn) then
+  begin
+    fNewLearningRate := FCustomLearningRateScheduleFn(iEpochCount);
+  end
+  else if Assigned(FCustomLearningRateScheduleObjFn) then
+  begin
+    fNewLearningRate := FCustomLearningRateScheduleObjFn(iEpochCount);
+  end
+  else if FStaircaseEpochs > 1 then
   begin
     iStairCount := iEpochCount div FStaircaseEpochs;
     fNewLearningRate := (fInitialLearningRate * power(fLearningRateDecay, iStairCount));
@@ -335,6 +357,7 @@ begin
 
         startTime := Now();
       end;
+      if Assigned(FOnAfterStep) then FOnAfterStep(Self);
     end;
 
     Inc(iEpochCount);
@@ -477,6 +500,8 @@ begin
           Round( (Now() - globalStartTime) * 24 * 60 * 60)
         );
       end;
+      if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
+
       CloseFile(CSVFile);
       AssignFile(CSVFile, FileNameCSV);
       Append(CSVFile);
