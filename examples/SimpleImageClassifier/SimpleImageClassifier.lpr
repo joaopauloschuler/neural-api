@@ -28,10 +28,10 @@ type
       TNNetInput.Create(32, 32, 3),
       TNNetConvolutionLinear.Create(64, 5, 2, 1, 1).InitBasicPatterns(),
       TNNetMaxPool.Create(4),
-      TNNetConvolutionLinear.Create(64, 3, 0, 1, 1),
-      TNNetConvolutionLinear.Create(64, 3, 0, 1, 1),
-      TNNetConvolutionLinear.Create(64, 3, 0, 1, 1),
-      TNNetConvolutionLinear.Create(64, 3, 0, 1, 1),
+      TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
+      TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
+      TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
+      TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
