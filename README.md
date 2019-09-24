@@ -45,6 +45,7 @@ NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumC
 The documentation is currently under construction. There are some available videos:
 * [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
 * [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
+* [AVX and AVX2 Code Optimization](https://www.youtube.com/watch?v=Pnv174V_emw)
 
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at. Introductory examples are:
 * [Training a neural network to learn boolean functions AND, OR and XOR](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
