@@ -40,6 +40,8 @@ type
     if HasOption('h', 'help') then
     begin
       WriteHelp;
+      Terminate;
+      Exit;
     end;
 
     fLearningRate := 0.001;
@@ -66,7 +68,6 @@ type
     Train();
 
     Terminate;
-    Exit;
   end;
 
   procedure TTestCNNAlgo.Train();
@@ -92,7 +93,7 @@ type
     NN.AddDenseNetBlock(6, 12, 48);
     NN.AddMovingNorm(false, 0, 0);
     NN.AddLayer( TNNetReLU.Create() );
-    NN.AddLayer( TNNetAvgChannel.Create() );
+    NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
     NN.AddLayer( TNNetSoftMax.Create() );
 
