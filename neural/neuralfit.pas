@@ -152,7 +152,7 @@ begin
   else if FStaircaseEpochs > 1 then
   begin
     iStairCount := iEpochCount div FStaircaseEpochs;
-    fNewLearningRate := (fInitialLearningRate * power(fLearningRateDecay, iStairCount));
+    fNewLearningRate := (fInitialLearningRate * power(fLearningRateDecay, iStairCount * FStaircaseEpochs));
   end
   else
   begin
@@ -188,7 +188,6 @@ destructor TNeuralImageFit.Destroy();
 begin
   inherited Destroy;
 end;
-
 
 procedure TNeuralImageFit.Fit(pNN: TNNet;
   pImgVolumes, pImgValidationVolumes, pImgTestVolumes: TNNetVolumeList;
@@ -513,7 +512,6 @@ begin
       MessageProc(
         'Epochs: '+IntToStr(iEpochCount)+
         '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffGeneral,4,2)+' hours.');
-
     end;
   end;
 

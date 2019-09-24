@@ -32,6 +32,8 @@ type
       TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
       TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
       TNNetConvolutionReLU.Create(64, 3, 0, 1, 1),
+      TNNetDropout.Create(0.5),
+      TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
