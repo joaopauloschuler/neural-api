@@ -42,14 +42,17 @@ NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumC
  
 ## Documentation
 
-The documentation is currently under construction. There are some available videos:
+The documentation is currently under construction. Some recommended introductory source code examples are:
+* [Simple Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier)
+* [Training a neural network to learn boolean functions AND, OR and XOR](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+* [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
+
+There are some available videos:
 * [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
 * [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
 * [AVX and AVX2 Code Optimization](https://www.youtube.com/watch?v=Pnv174V_emw)
 
-There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at. Introductory examples are:
-* [Training a neural network to learn boolean functions AND, OR and XOR](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
-* [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
+There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at.
 
 ## Quick View about the API
 This API is really big. The following list gives a general idea about this API but it doesn't contain everything.
