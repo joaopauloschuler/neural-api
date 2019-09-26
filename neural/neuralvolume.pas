@@ -332,6 +332,23 @@ type
       DataPtr: TNeuralFloatArrPtr read FDataPtr;
   end;
 
+  /// Implements a pair of volumes
+  TNNetVolumePair = class(TObject)
+    protected
+      FA: TNNetVolume;
+      FB: TNNetVolume;
+    public
+      constructor Create(); overload;
+      constructor Create(pA, pB: TNNetVolume); overload;
+
+      destructor Destroy(); override;
+
+      property A:TNNetVolume read FA;
+      property B:TNNetVolume read FB;
+      property I:TNNetVolume read FA;
+      property O:TNNetVolume read FB;
+  end;
+
   /// Class with string message events
   TMObject = class(TObject)
     protected
@@ -352,7 +369,7 @@ type
       property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
   end;
 
-  { TNNetVolumeList }
+  /// TNNetVolume list
   {$IFDEF FPC}
   TNNetVolumeList = class (specialize TFPGObjectList<TNNetVolume>)
   {$ELSE}
@@ -381,6 +398,19 @@ type
       property Items[Index: Integer]: TNNetVolume read GetItem write SetItem; default;
      {$ENDIF}
   end;
+
+  /// A list of TNNetVolume pairs.
+  {$IFDEF FPC}
+  TNNetVolumePairList = class (specialize TFPGObjectList<TNNetVolumePair>);
+  {$ELSE}
+  TNNetVolumePairList = class (TNNetList)
+    private
+      function GetItem(Index: Integer): TNNetVolumePair; inline;
+      procedure SetItem(Index: Integer; AObject: TNNetVolumePair); inline;
+    public
+      property Items[Index: Integer]: TNNetVolumePair read GetItem write SetItem; default;
+  end;
+  {$ENDIF}
 
   { TNNetKMeans }
   TNNetKMeans = class(TMObject)
@@ -1332,6 +1362,27 @@ begin
   if x>0
     then Result := 1
     else Result := 0;
+end;
+
+constructor TNNetVolumePair.Create();
+begin
+  inherited Create();
+  FA := TNNetVolume.Create();
+  FB := TNNetVolume.Create();
+end;
+
+constructor TNNetVolumePair.Create(pA, pB: TNNetVolume);
+begin
+  inherited Create();
+  FA := pA;
+  FB := pB;
+end;
+
+destructor TNNetVolumePair.Destroy();
+begin
+  FA.Free;
+  FB.Free;
+  inherited Destroy();
 end;
 
 { TNNetStringList }
@@ -7939,9 +7990,19 @@ begin
     for I := 0 to Count - 1 do
     begin
       TObject(Self[I]).Free;
-    end;  
-  end;      
+    end;
+  end;
   inherited;
+end;
+
+function TNNetVolumePairList.GetItem(Index: Integer): TNNetVolumePair;
+begin
+  Result := TNNetVolumePair(Get(Index));
+end;
+
+procedure TNNetVolumePairList.SetItem(Index: Integer; AObject: TNNetVolumePair);
+begin
+  Put(Index,AObject);
 end;
 {$ENDIF}
 
