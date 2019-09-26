@@ -1,16 +1,26 @@
 // This unit is under development - do not use it.
 unit neuralfit;
 
-{$mode objfpc}{$H+}
+{$IFDEF FPC}
+{$mode objfpc}
+{$H+}
+{$DEFINE HASTHREADS}
+{$ENDIF}
 
 interface
 
 uses
-  Classes, SysUtils, neuralnetwork, neuralvolume, MTProcs;
+  Classes, SysUtils, neuralnetwork, neuralvolume
+  {$IFDEF HASTHREADS}, MTProcs{$ENDIF}
+  ;
 
 type
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
+
+  {$IFNDEF HASTHREADS}
+  TMultiThreadProcItem = TObject;
+  {$ENDIF}
 
   /// This is a base class. Do not use it directly.
   TNeuralFitBase = class(TMObject)
@@ -28,7 +38,7 @@ type
       FGlobalTotalLoss: single;
       FGlobalErrorSum: single;
       FFinishedThread: TNNetVolume;
-      FCritSec: TRTLCriticalSection;
+      {$IFDEF HASTHREADS}FCritSec: TRTLCriticalSection;{$ENDIF}
       FMultipleSamplesAtValidation: boolean;
       FDataAugmentation: boolean;
       FVerbose: boolean;
@@ -205,6 +215,9 @@ var
   ValidationRecord: TNeuralFloat;
   iEpochCount: integer;
 begin
+  {$IFNDEF HASTHREADS}
+  FMaxThreadNum := 1;
+  {$ENDIF}
   iEpochCount := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
   FTrainingVolumes := pTrainingVolumes;
@@ -296,7 +309,11 @@ begin
       FGlobalErrorSum  := 0;
       FFinishedThread.Fill(0);
       FNN.ClearTime();
+      {$IFDEF HASTHREADS}
       ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+      {$ELSE}
+      RunNNThread(0, nil, Self);
+      {$ENDIF}
       if FClipDelta > 0 then
       begin
         MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
@@ -382,7 +399,11 @@ begin
         FGlobalTotalLoss := 0;
         FGlobalErrorSum  := 0;
         FMessageProc('Starting Validation.');
+        {$IFDEF HASTHREADS}
         ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+        {$ELSE}
+        TestNNThread(0, nil, Self);
+        {$ENDIF}
 
         FGlobalTotal := (FGlobalHit + FGlobalMiss);
         if FGlobalTotal > 0 then
@@ -433,7 +454,11 @@ begin
           FGlobalTotalLoss := 0;
           FGlobalErrorSum  := 0;
           FMessageProc('Starting Testing.');
+          {$IFDEF HASTHREADS}
           ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+          {$ELSE}
+          TestNNThread(0, nil, Self);
+          {$ENDIF}
 
           FGlobalTotal := (FGlobalHit + FGlobalMiss);
           if FGlobalTotal > 0 then
@@ -564,11 +589,11 @@ begin
     LocalNN.GetOutput( pOutput );
     LocalNN.Backpropagate( FTrainingVolumes[ElementIdx].O );
 
-    LocalErrorSum += vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
 
     //TODO: calculate loss here!
     CurrentLoss := 0;
-    LocalTotalLoss += CurrentLoss;
+    LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
     if Assigned(FInferHitFn) then
     begin
@@ -589,25 +614,35 @@ begin
     begin
       while FFinishedThread.FData[Index + 1] = 0 do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
+      {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
+      {$ELSE}
+      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
+        FFinishedThread.FData[Index + 1];
+      {$ENDIF}
     end;
   end;
-  FFinishedThread.FData[Index] += 1;
+  FFinishedThread.FData[Index] := FFinishedThread.FData[Index] + 1;
   if Index and 3 = 0 then
   begin
     if Index + 2 < FThreadNum then
     begin
       while FFinishedThread.FData[Index + 2] = 0 do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
+      {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
+      {$ELSE}
+      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
+        FFinishedThread.FData[Index + 2];
+      {$ENDIF}
     end;
   end;
 
-  EnterCriticalSection(FCritSec);
-  FGlobalHit       += LocalHit;
-  FGlobalMiss      += LocalMiss;
-  FGlobalTotalLoss += LocalTotalLoss;
-  FGlobalErrorSum  += LocalErrorSum;
+  {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
+  FGlobalHit       := FGlobalHit + LocalHit;
+  FGlobalMiss      := FGlobalMiss + LocalMiss;
+  FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
+  FGlobalErrorSum  := FGlobalErrorSum + LocalErrorSum;
 
   FNN.ForwardTime := FNN.ForwardTime + LocalNN.ForwardTime;
   FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
@@ -616,7 +651,7 @@ begin
   {$ELSE}
   if Index and 3 = 0 then FNN.SumDeltasNoChecks(LocalNN);
   {$ENDIF}
-  LeaveCriticalSection(FCritSec);
+  {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   vInput.Free;
   vOutput.Free;
   pOutput.Free;
@@ -660,7 +695,7 @@ begin
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
 
-    LocalErrorSum += FWorkingVolumes[ElementIdx].O.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + FWorkingVolumes[ElementIdx].O.SumDiff( pOutput );
 
     if Assigned(FInferHitFn) then
     begin
@@ -675,16 +710,16 @@ begin
     end;
 
     if Assigned(FLossFn)
-      then LocalTotalLoss += FLossFn(FWorkingVolumes[ElementIdx].O);
+      then LocalTotalLoss := LocalTotalLoss + FLossFn(FWorkingVolumes[ElementIdx].O);
   end; // of for
   LocalNN.EnableDropouts(true);
 
-  EnterCriticalSection(FCritSec);
-  FGlobalHit       += LocalHit;
-  FGlobalMiss      += LocalMiss;
-  FGlobalTotalLoss += LocalTotalLoss;
-  FGlobalErrorSum  += LocalErrorSum;
-  LeaveCriticalSection(FCritSec);
+  {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
+  FGlobalHit       := FGlobalHit + LocalHit;
+  FGlobalMiss      := FGlobalMiss + LocalMiss;
+  FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
+  FGlobalErrorSum  := FGlobalErrorSum + LocalErrorSum;
+  {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
 
   LocalFrequency.Free;
   vInput.Free;
@@ -708,9 +743,13 @@ constructor TNeuralFitBase.Create();
 begin
   inherited Create();
   FFinishedThread := TNNetVolume.Create();
+  {$IFDEF HASTHREADS}
   FMaxThreadNum := ProcThreadPool.MaxThreadCount;
-  FDataAugmentation := true;
   InitCriticalSection(FCritSec);
+  {$ELSE}
+  FMaxThreadNum := 1;
+  {$ENDIF}
+  FDataAugmentation := true;
   FMultipleSamplesAtValidation := true;
   FVerbose := true;
   FStaircaseEpochs := 1;
@@ -733,7 +772,9 @@ end;
 
 destructor TNeuralFitBase.Destroy();
 begin
+  {$IFDEF HASTHREADS}
   DoneCriticalSection(FCritSec);
+  {$ENDIF}
   FFinishedThread.Free;
   inherited Destroy();
 end;
@@ -810,6 +851,9 @@ var
   ValidationRecord: TNeuralFloat;
   iEpochCount: integer;
 begin
+  {$IFNDEF HASTHREADS}
+  FMaxThreadNum := 1;
+  {$ENDIF}
   iEpochCount := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
   FImgVolumes := pImgVolumes;
@@ -902,7 +946,11 @@ begin
       FGlobalErrorSum  := 0;
       FFinishedThread.Fill(0);
       FNN.ClearTime();
+      {$IFDEF HASTHREADS}
       ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+      {$ELSE}
+      RunNNThread(0, nil, Self);
+      {$ENDIF}
       if FClipDelta > 0 then
       begin
         MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
@@ -988,7 +1036,11 @@ begin
         FGlobalTotalLoss := 0;
         FGlobalErrorSum  := 0;
         FMessageProc('Starting Validation.');
+        {$IFDEF HASTHREADS}
         ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+        {$ELSE}
+        TestNNThread(0, nil, Self);
+        {$ENDIF}
 
         FGlobalTotal := (FGlobalHit + FGlobalMiss);
         if (FGlobalTotal > 0) then
@@ -1039,7 +1091,11 @@ begin
           FGlobalTotalLoss := 0;
           FGlobalErrorSum  := 0;
           FMessageProc('Starting Testing.');
+          {$IFDEF HASTHREADS}
           ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+          {$ELSE}
+          TestNNThread(0, nil, Self);
+          {$ENDIF}
 
           FGlobalTotal := (FGlobalHit + FGlobalMiss);
           if (FGlobalTotal > 0) then
@@ -1203,7 +1259,7 @@ begin
       then vOutput.SetClassForSoftMax( ImgInput.Tag )
       else vOutput.SetClass( ImgInput.Tag, +0.9, -0.1);
 
-    LocalErrorSum += vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
     OutputValue := pOutput.FData[ ImgInput.Tag ];
     if Not(FIsSoftmax) then
     begin
@@ -1224,7 +1280,7 @@ begin
       WriteLn('Error - invalid output value:',OutputValue);
       CurrentLoss := 1;
     end;
-    LocalTotalLoss += CurrentLoss;
+    LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
     if pOutput.GetClass() = FImgVolumes[ImgIdx].Tag then
     begin
@@ -1242,26 +1298,35 @@ begin
     begin
       while FFinishedThread.FData[Index + 1] = 0 do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
+      {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
+      {$ELSE}
+      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
+        FFinishedThread.FData[Index + 1];
+      {$ENDIF}
     end;
   end;
-  FFinishedThread.FData[Index] += 1;
+  FFinishedThread.FData[Index] := FFinishedThread.FData[Index] + 1;
   if Index and 3 = 0 then
   begin
     if Index + 2 < FThreadNum then
     begin
       while FFinishedThread.FData[Index + 2] = 0 do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
+      {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
+      {$ELSE}
+      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
+        FFinishedThread.FData[Index + 2];
+      {$ENDIF}
     end;
   end;
-//  WriteLn('Index:',Index,' [',FFinishedThread.FData[Index],']');
 
-  EnterCriticalSection(FCritSec);
-  FGlobalHit       += LocalHit;
-  FGlobalMiss      += LocalMiss;
-  FGlobalTotalLoss += LocalTotalLoss;
-  FGlobalErrorSum  += LocalErrorSum;
+  {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
+  FGlobalHit       := FGlobalHit + LocalHit;
+  FGlobalMiss      := FGlobalMiss + LocalMiss;
+  FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
+  FGlobalErrorSum  := FGlobalErrorSum + LocalErrorSum;
 
   FNN.ForwardTime := FNN.ForwardTime + LocalNN.ForwardTime;
   FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
@@ -1270,7 +1335,7 @@ begin
   {$ELSE}
   if Index and 3 = 0 then FNN.SumDeltasNoChecks(LocalNN);
   {$ENDIF}
-  LeaveCriticalSection(FCritSec);
+  {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   ImgInputCp.Free;
   ImgInput.Free;
   vOutput.Free;
@@ -1356,10 +1421,10 @@ begin
     end;
 
     vOutput.SetClassForSoftMax( ImgInput.Tag );
-    LocalErrorSum += vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
 
     OutputValue := pOutput.FData[ ImgInput.Tag ];
-    if Not(FIsSoftmax) then OutputValue += 0.5001;
+    if Not(FIsSoftmax) then OutputValue := OutputValue + 0.5001;
 
     if (OutputValue > 0) then
     begin
@@ -1370,7 +1435,7 @@ begin
       WriteLn('Error - invalid output value:',OutputValue);
       CurrentLoss := 1;
     end;
-    LocalTotalLoss += CurrentLoss;
+    LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
     PredictedClass := pOutput.GetClass();
     if PredictedClass = ImgInput.Tag then
@@ -1384,12 +1449,12 @@ begin
   end; // of for
   LocalNN.EnableDropouts(true);
 
-  EnterCriticalSection(FCritSec);
-  FGlobalHit       += LocalHit;
-  FGlobalMiss      += LocalMiss;
-  FGlobalTotalLoss += LocalTotalLoss;
-  FGlobalErrorSum  += LocalErrorSum;
-  LeaveCriticalSection(FCritSec);
+  {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
+  FGlobalHit       := FGlobalHit + LocalHit;
+  FGlobalMiss      := FGlobalMiss + LocalMiss;
+  FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
+  FGlobalErrorSum  := FGlobalErrorSum + LocalErrorSum;
+  {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
 
   sumOutput.Free;
   ImgInputCp.Free;
@@ -1444,4 +1509,3 @@ begin
 end;
 
 end.
-
