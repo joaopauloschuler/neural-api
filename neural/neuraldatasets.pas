@@ -165,12 +165,12 @@ procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList);
 
 // loads a CIFAR10 into TNNetVolumeList
-procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB);
-procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB);
+procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
+procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
 
 // loads a CIFAR100 into TNNetVolumeList
-procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB);
-procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB);
+procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
+procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
 
 // This function returns TRUE if data_batch_1.bin and error message otherwise
 function CheckCIFARFile():boolean;
@@ -187,7 +187,7 @@ procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 
 implementation
 
-uses SysUtils, math, FileUtil{, uvolumelcl, Graphics};
+uses SysUtils, math;
 
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 var
@@ -664,7 +664,7 @@ begin
       vOutput.SetClassForReLU( ImgVolumes[ImgIdx].Tag );
     end;
 
-    ErrorSum += vOutput.SumDiff(pOutput);
+    ErrorSum := ErrorSum + vOutput.SumDiff(pOutput);
 
     if (bIsSoftmax) then
     begin
@@ -679,7 +679,7 @@ begin
         CurrentLoss := 1;
       end;
 
-      Loss += CurrentLoss;
+      Loss := Loss + CurrentLoss;
     end;
   end;
 

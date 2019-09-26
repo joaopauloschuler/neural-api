@@ -18,7 +18,11 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 *)
 unit neuralgeneric;
 
-{$mode objfpc}{$H+}
+{$IFDEF FPC}
+{$mode objfpc}
+{$ENDIF}
+
+{$H+}
 
 interface
 

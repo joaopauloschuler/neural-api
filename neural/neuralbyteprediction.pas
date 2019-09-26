@@ -41,7 +41,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 unit neuralbyteprediction; // this unit used to be called UBup3
 
+{$IFDEF FPC}
 {$MODE Delphi}
+{$ENDIF}
 
 interface
 
@@ -1189,7 +1191,9 @@ var
 begin
   NeuronList := TStringList.Create();
   NeuronList.Sorted := True;
+  {$IFDEF FPC}
   NeuronList.SortStyle := sslAuto;
+  {$ENDIF}
   for neuronPos := Low(FNN) to High(FNN) do
   begin
 

@@ -1,4 +1,4 @@
-(*
+﻿(*
 neuralplanbuilder: This unit "builds and optimizea plans" towards success with
 AI techniques. A plan (TPlan) is a sequence of actions and predicted states.
 A composite plan (TCompositePlan) is an array of plans that can work together.
@@ -21,7 +21,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 unit neuralplanbuilder; // this unit used to be called UFway44.
 
+{$IFDEF FPC}
 {$MODE Delphi}
+{$ENDIF}
 
 { Lazarus/Free Pascal Source }
 // made by Joao Paulo Schwarz Schuler

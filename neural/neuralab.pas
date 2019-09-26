@@ -18,8 +18,7 @@ You should have received a copy of the GNU General Public License along
 with this program; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 }
-
-{$MODE Delphi}
+{$IFDEF FPC}{$MODE Delphi}{$ENDIF}
 
 interface
 
@@ -126,8 +125,11 @@ var
   SumKey: longint;
 begin
   SumKey := 203;
+{$IFDEF FPC}
 {$PUSH}
+{$ENDIF}
 {$OVERFLOWCHECKS OFF}
+
   for I := Low(S) to High(S) do
   begin
     SumKey :=
@@ -136,7 +138,9 @@ begin
   end;
   ABKey := abs(SumKey) mod Divisor;
 {$OVERFLOWCHECKS ON}
+{$IFDEF FPC}
 {$POP}
+{$ENDIF}
 end;
 
 function ABCmp(var X, Y: array of byte): boolean;
