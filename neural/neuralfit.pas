@@ -24,6 +24,7 @@ type
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
+      FGlobalTotal: integer;
       FGlobalTotalLoss: single;
       FGlobalErrorSum: single;
       FFinishedThread: TNNetVolume;
@@ -71,9 +72,9 @@ type
       property Verbose: boolean read FVerbose write FVerbose;
   end;
 
-  TNNetDefineHitFn = function(vPair: TNNetVolumePair): boolean of object;
   TNNetDataAugmentationFn = function(vPair: TNNetVolume): TNeuralFloat of object;
   TNNetLossFn = function(vPair: TNNetVolume): TNeuralFloat of object;
+  TNNetInferHitFn = function(A, B: TNNetVolume): boolean;
 
   /// Generic Neural Network Fitting Algorithm
   TNeuralFit = class(TNeuralFitBase)
@@ -81,8 +82,8 @@ type
       FTrainingVolumes, FValidationVolumes, FTestVolumes: TNNetVolumePairList;
       FWorkingVolumes: TNNetVolumePairList;
 
-      FInferHitFn: TNNetDefineHitFn;
       FDataAugmentationFn: TNNetDataAugmentationFn;
+      FInferHitFn: TNNetInferHitFn;
       FLossFn: TNNetLossFn;
     public
       constructor Create();
@@ -95,6 +96,12 @@ type
         Item: TMultiThreadProcItem);
       procedure TestNNThread(Index: PtrInt; Data: Pointer;
         Item: TMultiThreadProcItem);
+      procedure EnableMonopolarHitComparison();
+      procedure EnableBipolarHitComparison();
+
+      property DataAugmentationFn: TNNetDataAugmentationFn read FDataAugmentationFn write FDataAugmentationFn;
+      property InferHitFn: TNNetInferHitFn read FInferHitFn write FInferHitFn;
+      property LossFn: TNNetLossFn read FLossFn write FLossFn;
   end;
 
   /// Image Classification Fitting Algorithm
@@ -121,9 +128,51 @@ type
       procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
   end;
 
+
+  function MonopolarCompare(A, B: TNNetVolume): boolean;
+  function BipolarCompare(A, B: TNNetVolume): boolean;
+
 implementation
 uses
   math;
+
+function MonopolarCompare(A, B: TNNetVolume): boolean;
+var
+  Pos: integer;
+  ACount, BCount: integer;
+begin
+  ACount := A.Size;
+  BCount := B.Size;
+  Result := (ACount>0) and (ACount = BCount);
+  Pos := 0;
+  while Result and (Pos < ACount) do
+  begin
+    Result := Result and (
+      ( (A.FData[Pos]>0.5) and (B.FData[Pos]>0.5) ) or
+      ( (A.FData[Pos]<0.5) and (B.FData[Pos]<0.5) )
+    );
+    Inc(Pos);
+  end;
+end;
+
+function BipolarCompare(A, B: TNNetVolume): boolean;
+var
+  Pos: integer;
+  ACount, BCount: integer;
+begin
+  ACount := A.Size;
+  BCount := B.Size;
+  Result := (ACount>0) and (ACount = BCount);
+  Pos := 0;
+  while Result and (Pos < ACount) do
+  begin
+    Result := Result and (
+      ( (A.FData[Pos]>0) and (B.FData[Pos]>0) ) or
+      ( (A.FData[Pos]<0) and (B.FData[Pos]<0) )
+    );
+    Inc(Pos);
+  end;
+end;
 
 constructor TNeuralFit.Create();
 begin
@@ -263,11 +312,12 @@ begin
       FNN.UpdateWeights();
       FNN.ComputeL2Decay();
 
-      if (FGlobalHit > 0) then
+      FGlobalTotal := (FGlobalHit + FGlobalMiss);
+      if (FGlobalTotal > 0) then
       begin
-        TrainingError := FGlobalErrorSum / (FGlobalHit + FGlobalMiss);
-        TrainingLoss  := FGlobalTotalLoss / (FGlobalHit + FGlobalMiss);
-        CurrentAccuracy := (FGlobalHit*100) div (FGlobalHit+FGlobalMiss);
+        TrainingError := FGlobalErrorSum / FGlobalTotal;
+        TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
+        CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
         if (FStepSize < 100) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.99 + CurrentAccuracy*0.01;
@@ -282,7 +332,7 @@ begin
         end;
       end;
 
-      if ( (FGlobalHit > 0) and (I mod 10 = 0) ) then
+      if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
 
@@ -334,11 +384,12 @@ begin
         FMessageProc('Starting Validation.');
         ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
 
-        if FGlobalHit + FGlobalMiss > 0 then
+        FGlobalTotal := (FGlobalHit + FGlobalMiss);
+        if FGlobalTotal > 0 then
         begin
-          ValidationRate  := FGlobalHit / (FGlobalHit + FGlobalMiss);
-          ValidationLoss  := FGlobalTotalLoss / (FGlobalHit + FGlobalMiss);
-          ValidationError := FGlobalErrorSum / (FGlobalHit + FGlobalMiss);
+          ValidationRate  := FGlobalHit / FGlobalTotal;
+          ValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
+          ValidationError := FGlobalErrorSum / FGlobalTotal;
         end;
 
         if (ValidationRate > ValidationRecord) then
@@ -384,13 +435,14 @@ begin
           FMessageProc('Starting Testing.');
           ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
 
-          if FGlobalHit + FGlobalMiss > 0 then
+          FGlobalTotal := (FGlobalHit + FGlobalMiss);
+          if FGlobalTotal > 0 then
           begin
-            TestRate  := FGlobalHit / (FGlobalHit + FGlobalMiss);
-            TestLoss  := FGlobalTotalLoss / (FGlobalHit + FGlobalMiss);
-            TestError := FGlobalErrorSum / (FGlobalHit + FGlobalMiss);
+            TestRate  := FGlobalHit / FGlobalTotal;
+            TestLoss  := FGlobalTotalLoss / FGlobalTotal;
+            TestError := FGlobalErrorSum / FGlobalTotal;
           end;
-          if (FGlobalHit > 0) and (FVerbose) then
+          if (FGlobalTotal > 0) and (FVerbose) then
           begin
             WriteLn(
               'Epochs: ', iEpochCount,
@@ -520,7 +572,7 @@ begin
 
     if Assigned(FInferHitFn) then
     begin
-      if FInferHitFn(FTrainingVolumes[ElementIdx]) then
+      if FInferHitFn(FTrainingVolumes[ElementIdx].O, pOutput) then
       begin
         Inc(LocalHit);
       end
@@ -612,7 +664,7 @@ begin
 
     if Assigned(FInferHitFn) then
     begin
-      if FInferHitFn(FTrainingVolumes[ElementIdx]) then
+      if FInferHitFn(FTrainingVolumes[ElementIdx].O, pOutput) then
       begin
         Inc(LocalHit);
       end
@@ -638,6 +690,16 @@ begin
   vInput.Free;
   vOutput.Free;
   pOutput.Free;
+end;
+
+procedure TNeuralFit.EnableMonopolarHitComparison();
+begin
+  FInferHitFn := @MonopolarCompare;
+end;
+
+procedure TNeuralFit.EnableBipolarHitComparison();
+begin
+  FInferHitFn := @BipolarCompare;
 end;
 
 { TNeuralFitBase }
@@ -809,8 +871,8 @@ begin
       ' Step size:', FStepSize,
       ' Staircase ephocs:',FStaircaseEpochs);
     if Assigned(FImgVolumes) then WriteLn('Training images:', FImgVolumes.Count);
-    if Assigned(FImgValidationVolumes) then WriteLn('Training images:', FImgValidationVolumes.Count);
-    if Assigned(FImgTestVolumes) then WriteLn('Training images:', FImgTestVolumes.Count);
+    if Assigned(FImgValidationVolumes) then WriteLn('Validation images:', FImgValidationVolumes.Count);
+    if Assigned(FImgTestVolumes) then WriteLn('Test images:', FImgTestVolumes.Count);
   end;
 
   FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
@@ -856,11 +918,12 @@ begin
       FNN.UpdateWeights();
       FNN.ComputeL2Decay();
 
-      if (FGlobalHit > 0) then
+      FGlobalTotal := (FGlobalHit + FGlobalMiss);
+      if (FGlobalTotal > 0) then
       begin
-        TrainingError := FGlobalErrorSum / (FGlobalHit + FGlobalMiss);
-        TrainingLoss  := FGlobalTotalLoss / (FGlobalHit + FGlobalMiss);
-        CurrentAccuracy := (FGlobalHit*100) div (FGlobalHit+FGlobalMiss);
+        TrainingError := FGlobalErrorSum / FGlobalTotal;
+        TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
+        CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
         if (FStepSize < 100) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.99 + CurrentAccuracy*0.01;
@@ -875,7 +938,7 @@ begin
         end;
       end;
 
-      if ( (FGlobalHit > 0) and (I mod 10 = 0) ) then
+      if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
 
@@ -927,11 +990,12 @@ begin
         FMessageProc('Starting Validation.');
         ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
 
-        if FGlobalHit + FGlobalMiss > 0 then
+        FGlobalTotal := (FGlobalHit + FGlobalMiss);
+        if (FGlobalTotal > 0) then
         begin
-          ValidationRate  := FGlobalHit / (FGlobalHit + FGlobalMiss);
-          ValidationLoss  := FGlobalTotalLoss / (FGlobalHit + FGlobalMiss);
-          ValidationError := FGlobalErrorSum / (FGlobalHit + FGlobalMiss);
+          ValidationRate  := FGlobalHit / FGlobalTotal;
+          ValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
+          ValidationError := FGlobalErrorSum / FGlobalTotal;
         end;
 
         if (ValidationRate > ValidationRecord) then
@@ -940,7 +1004,8 @@ begin
           FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
           FAvgWeight.SaveToFile(fileName);
         end;
-        if (FGlobalHit > 0) and (FVerbose) then
+
+        if (FGlobalTotal > 0) and (FVerbose) then
         begin
           WriteLn(
             'Epochs: ',iEpochCount,
@@ -976,13 +1041,15 @@ begin
           FMessageProc('Starting Testing.');
           ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
 
-          if FGlobalHit + FGlobalMiss > 0 then
+          FGlobalTotal := (FGlobalHit + FGlobalMiss);
+          if (FGlobalTotal > 0) then
           begin
-            TestRate  := FGlobalHit / (FGlobalHit + FGlobalMiss);
-            TestLoss  := FGlobalTotalLoss / (FGlobalHit + FGlobalMiss);
-            TestError := FGlobalErrorSum / (FGlobalHit + FGlobalMiss);
+            TestRate  := FGlobalHit / FGlobalTotal;
+            TestLoss  := FGlobalTotalLoss / FGlobalTotal;
+            TestError := FGlobalErrorSum / FGlobalTotal;
           end;
-          if (FGlobalHit > 0) and (FVerbose) then
+
+          if (FGlobalTotal > 0) and (FVerbose) then
           begin
             WriteLn(
               'Epochs: ',iEpochCount,

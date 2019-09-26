@@ -2,10 +2,10 @@ CAI NEURAL API.
 Copyright (C) 2019 Joao Paulo Schwarz Schuler
 
 This folder contains libraries/APIs built under the CAI Project. Please have a look at these links for more information:
-https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/readme.txt
+https://github.com/joaopauloschuler/neural-api
 https://sourceforge.net/projects/cai/
 
-The most updated release is located here:
+The most recent development revision/commit is located here:
 https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/neural/
 
 This program is free software; you can redistribute it and/or modify
