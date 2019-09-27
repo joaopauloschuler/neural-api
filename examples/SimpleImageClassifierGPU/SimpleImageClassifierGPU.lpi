@@ -53,11 +53,13 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dDebug
--dAVX"/>
-            <OtherDefines Count="3">
+-dAVX
+-dOpenCL"/>
+            <OtherDefines Count="4">
               <Define0 Value="Debug"/>
               <Define1 Value="AVX"/>
               <Define2 Value="MakeQuick"/>
+              <Define3 Value="OpenCL"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -153,10 +155,12 @@
     </Linking>
     <Other>
       <CustomOptions Value="-dAVX
--dRelease"/>
-      <OtherDefines Count="2">
+-dRelease
+-dOpenCL"/>
+      <OtherDefines Count="3">
         <Define0 Value="AVX"/>
         <Define1 Value="Release"/>
+        <Define2 Value="OpenCL"/>
       </OtherDefines>
     </Other>
   </CompilerOptions>
