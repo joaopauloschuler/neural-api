@@ -12,6 +12,7 @@ interface
 uses
   Classes, SysUtils, neuralnetwork, neuralvolume
   {$IFDEF HASTHREADS}, MTProcs{$ENDIF}
+  {$IFDEF OpenCL}, cl{$ENDIF}
   ;
 
 type
@@ -59,10 +60,18 @@ type
       FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
       FOnAfterStep, FOnAfterEpoch: TNotifyEvent;
       FRunning: boolean;
+      {$IFDEF OpenCL}
+      FPlatformId: cl_platform_id;
+      FDeviceId: cl_device_id;
+      {$ENDIF}
       procedure CheckLearningRate(iEpochCount: integer);
     public
       constructor Create();
       destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      procedure DisableOpenCL();
+      procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+      {$ENDIF}
 
       property AvgWeightEpochCount: integer read FAvgWeightEpochCount write FAvgWeightEpochCount;
       property ClipDelta: single read FClipDelta write FClipDelta;
@@ -243,6 +252,10 @@ begin
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
   FThreadNN := TNNetDataParallelism.Create(pNN, FThreadNum);
+  {$IFDEF OpenCL}
+  if (FPlatformId <> nil) and (FDeviceId <> nil) then
+    FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
+  {$ENDIF}
   FFinishedThread.Resize(1, 1, FThreadNum);
   FNN := pNN;
   AccuracyWithInertia := 0;
@@ -742,6 +755,9 @@ end;
 constructor TNeuralFitBase.Create();
 begin
   inherited Create();
+  {$IFDEF OpenCL}
+  DisableOpenCL();
+  {$ENDIF}
   FFinishedThread := TNNetVolume.Create();
   {$IFDEF HASTHREADS}
   FMaxThreadNum := ProcThreadPool.MaxThreadCount;
@@ -778,6 +794,21 @@ begin
   FFinishedThread.Free;
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+procedure TNeuralFitBase.DisableOpenCL();
+begin
+  FPlatformId := nil;
+  FDeviceId := nil;
+end;
+
+procedure TNeuralFitBase.EnableOpenCL(platform_id: cl_platform_id;
+  device_id: cl_device_id);
+begin
+  FPlatformId := platform_id;
+  FDeviceId := device_id;
+end;
+{$ENDIF}
 
 procedure TNeuralFitBase.CheckLearningRate(iEpochCount: integer);
 var
@@ -879,6 +910,10 @@ begin
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
   FThreadNN := TNNetDataParallelism.Create(pNN, FThreadNum);
+  {$IFDEF OpenCL}
+  if (FPlatformId <> nil) and (FDeviceId <> nil) then
+    FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
+  {$ENDIF}
   FFinishedThread.Resize(1, 1, FThreadNum);
   FNN := pNN;
   FNumClasses := pNumClasses;
