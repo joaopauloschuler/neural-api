@@ -716,6 +716,8 @@ end;
       FFeatureSizeX, FFeatureSizeY, FFeatureSizeYMinus1: integer;
       FInputCopy: TNNetVolume;
       FSizeXDepth: integer;
+      FSizeXDepthBytes: integer;
+      FPrevSizeXDepthBytes: integer;
       FCalculatePrevLayerError: boolean;
       function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer;
       procedure RefreshNeuronWeightList();
@@ -1800,6 +1802,8 @@ begin
       then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
       else FInputCopy := FPrevLayer.Output;
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
+    FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
+    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
     ComputeCPUFast();
     FForwardTime := FForwardTime + (Now() - StartTime);
   end
@@ -5088,7 +5092,6 @@ begin
 
   {$IFDEF OpenCL}
   FShouldOpenCL := ( (FVectorSize <= csMaxInterleavedSize) or (FOutput.Size*FVectorSize >= 24*24*3 * 3*3*3) );
-
   if (FHasOpenCL and FShouldOpenCL) then
   begin
     EnableOpenCL(FDotProductKernel);
@@ -5363,7 +5366,14 @@ end;
 procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
-
+  (*
+  // good for debugging
+  WriteLn(
+    'Has OpenCL:', FHasOpenCL,
+    ' Should OpenCL:', FShouldOpenCL,
+    ' Current layer:', Self.LayerIdx
+  );
+  *)
   if (FHasOpenCL and FShouldOpenCL) then
   begin
     if not Assigned(FDotCL) then
@@ -5432,6 +5442,8 @@ begin
     end;
 
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
+    FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
+    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
 
     //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
     PrepareInputForConvolutionFast();
@@ -5756,13 +5768,15 @@ begin
                     if CanBackpropOnPos then
                     begin
                       SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                      PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY);
+                      PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
                       begin
                         {$IFNDEF AVX64}
                         LocalPrevError.MulAdd
                         (
-                          LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
-                          LocalWeight.GetRawPtr(0, LocalCntY),
+                          PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
+                          PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
                           SmoothLocalOutputErrorDeriv,
                           FSizeXDepth
                         );
@@ -5771,10 +5785,20 @@ begin
                         if PrevNumElements + PrevMissedElements <> FSizeXDepth
                         then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
                         {$ENDIF}
-                        PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
-                        PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
+                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
+                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
                         asm_avx64_prev_backprop;
                         {$ENDIF}
+                        if LocalCntY < FFeatureSizeYMinus1 then
+                        begin
+                          {$IFDEF FPC}
+                          PrevPtrA := (pointer(PrevPtrA) + FPrevSizeXDepthBytes);
+                          PrevPtrB := (pointer(PrevPtrB) + FSizeXDepthBytes);
+                          {$ELSE}
+                          PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY + 1);
+                          PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY + 1);
+                          {$ENDIF}
+                        end;
                       end;
                     end;
                   end;

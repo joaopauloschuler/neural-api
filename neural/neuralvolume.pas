@@ -138,6 +138,8 @@ type
     procedure Diff(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure InterleaveWithDepthFrom(Original: TVolume; NewDepth: integer);{$IFDEF Release} inline; {$ENDIF}
     procedure InterleaveWithXFrom(Original: TVolume; NewX: integer); {$IFDEF Release} inline; {$ENDIF}
+    function IncYSize(): integer; inline;
+    function IncYSizeBytes(): integer; inline;
     procedure DeInterleaveWithXFrom(Original: TVolume; NewX: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure DeInterleaveWithDepthFrom(Original: TVolume; NewDepth: integer);{$IFDEF Release} inline; {$ENDIF}
     procedure SetMin(Value: TNeuralFloat); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -2443,6 +2445,16 @@ end;
 procedure TVolume.InterleaveWithXFrom(Original: TVolume; NewX: integer);
 begin
   InterleaveWithDepthFrom(Original, Original.FSize div NewX);
+end;
+
+function TVolume.IncYSize(): integer;
+begin
+  Result := GetRawPos(0, 1);
+end;
+
+function TVolume.IncYSizeBytes(): integer;
+begin
+  Result := IncYSize() * SizeOf(TNeuralFloat);
 end;
 
 procedure TVolume.DeInterleaveWithXFrom(Original: TVolume; NewX: integer);
