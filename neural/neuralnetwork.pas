@@ -311,8 +311,8 @@ type
       constructor Create(pSizeX, pSizeY, pDepth: integer); overload;
       constructor Create(pSizeX, pSizeY, pDepth, pError: integer); overload;
 
-      procedure EnableErrorCollection;
-      procedure DisableErrorCollection;
+      function EnableErrorCollection: TNNetInput;
+      function DisableErrorCollection: TNNetInput;
   end;
 
   /// This layer copies the input to the output and can be used as a base class
@@ -6120,18 +6120,20 @@ begin
   end;
 end;
 
-procedure TNNetInput.EnableErrorCollection;
+function TNNetInput.EnableErrorCollection: TNNetInput;
 begin
   FStruct[3] := 1;
   FOutputError.ReSize(FOutPut);
   FOutputErrorDeriv.ReSize(FOutPut);
+  Result := Self;
 end;
 
-procedure TNNetInput.DisableErrorCollection;
+function TNNetInput.DisableErrorCollection: TNNetInput;
 begin
   FStruct[3] := 0;
   FOutputError.ReSize(1,1,1);
   FOutputErrorDeriv.ReSize(1,1,1);
+  Result := Self;
 end;
 
 procedure TNNetInputBase.Compute;
