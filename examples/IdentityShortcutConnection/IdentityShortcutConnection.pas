@@ -24,7 +24,11 @@ type
     GlueLayer: TNNetLayer;
     EasyOpenCL: TEasyOpenCL;
   begin
-    if not CheckCIFARFile() then exit;
+    if not CheckCIFARFile() then
+    begin
+      Terminate;
+      exit;
+    end;
 
     WriteLn('Creating Neural Network...');
     NN := TNNet.Create();
@@ -94,6 +98,7 @@ type
     ImgTestVolumes.Free;
     ImgValidationVolumes.Free;
     ImgTrainingVolumes.Free;
+    Terminate;
   end;
 
 var

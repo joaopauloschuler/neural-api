@@ -23,7 +23,12 @@ type
     ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
     EasyOpenCL: TEasyOpenCL;
   begin
-    if not CheckCIFARFile() then exit;
+    if not CheckCIFARFile() then
+    begin
+      Terminate;
+      exit;
+    end;
+
     EasyOpenCL := TEasyOpenCL.Create();
     if EasyOpenCL.GetPlatformCount() = 0 then
     begin
@@ -72,6 +77,7 @@ type
     ImgTestVolumes.Free;
     ImgValidationVolumes.Free;
     ImgTrainingVolumes.Free;
+    Terminate;
   end;
 
 var

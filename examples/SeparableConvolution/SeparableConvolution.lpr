@@ -21,7 +21,12 @@ type
     NeuralFit: TNeuralImageFit;
     ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
   begin
-    if not CheckCIFARFile() then exit;
+    if not CheckCIFARFile() then
+    begin
+      Terminate;
+      exit;
+    end;
+
     WriteLn('Creating Neural Network...');
     NN := TNNet.Create();
     NN.AddLayer([
@@ -61,6 +66,7 @@ type
     ImgTestVolumes.Free;
     ImgValidationVolumes.Free;
     ImgTrainingVolumes.Free;
+    Terminate;
   end;
 
 var
