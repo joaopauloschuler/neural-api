@@ -12,7 +12,7 @@ This project is a subproject from a bigger and older project called [CAI](https:
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers.
 
 ## Will it Work with Delphi?
-This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of release [v0.9](https://github.com/joaopauloschuler/neural-api/releases/tag/v0.9), a number of units do compile with Delphi and you can create and run neural networks with Delphi: neuralvolume, neuralnetwork, neuralab, neuralabfun, neuralbit, neuralbyteprediction, neuralcache, neuraldatasets, neuralgeneric, neuralplanbuilder.
+This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of release [v0.9](https://github.com/joaopauloschuler/neural-api/releases/tag/v0.9), a number of units do compile with Delphi and you can create and run neural networks with Delphi: neuralvolume, neuralnetwork, neuralab, neuralabfun, neuralbit, neuralbyteprediction, neuralcache, neuraldatasets, neuralgeneric, neuralplanbuilder and neuralfit.
 
 ## Installation
 Clone this project, add the **neural** folder to your Lazarus unit search path and you'll be ready to go!
@@ -45,18 +45,33 @@ NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumC
  ```
  
 ## Documentation
+The documentation is under construction and is currently composed by:
+* Introductory Examples.
+* Youtube Videos.
+* Advanced Examples.
 
-The documentation is currently under construction. Some recommended introductory source code examples are:
+### Introductory Examples
+Some recommended introductory source code examples are:
+* [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
+* [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
 * [Simple Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierCPU.ipynb)
 * [Simple Image Classifier with OpenCL](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifierGPU)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifierGPU/SimpleImageClassifierGPU.ipynb)
-* [Training a neural network to learn boolean functions AND, OR and XOR](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
-* [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
 * [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
 
+### Youtube Videos
 There are some available videos:
 * [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
 * [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
 * [AVX and AVX2 Code Optimization](https://www.youtube.com/watch?v=Pnv174V_emw)
+
+Some videos make referrence to **uvolume** unit. The current **neuralvolume** unit used to be called **uvolume**. This is why
+it's mentioned.
+
+### Advanced Examples
+Although these examples require deeper understanding about neural networks, they are very interesting:
+* [DenseNetBC L40](https://github.com/joaopauloschuler/neural-api/tree/master/examples/DenseNetBCL40)
+* [Separable Convolutions](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SeparableConvolution) - MobileNet building block.
+* [Identity Shortcut Connection](https://github.com/joaopauloschuler/neural-api/tree/master/examples/IdentityShortcutConnection) - ResNet building block.
 
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at.
 
