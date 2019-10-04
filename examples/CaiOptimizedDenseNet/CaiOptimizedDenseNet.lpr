@@ -23,6 +23,8 @@ type
   TTestCNNAlgo = class(TCustomApplication)
   protected
     fLearningRate, fInertia, fTarget: single;
+    bSeparable: boolean;
+    iInnerConvNum: integer;
     procedure DoRun; override;
     procedure Train();
   public
@@ -34,7 +36,7 @@ type
 
   procedure TTestCNNAlgo.DoRun;
   var
-    LearningRate, Inertia, Target: string;
+    ParStr: string;
   begin
     // parse parameters
     if HasOption('h', 'help') then
@@ -47,22 +49,31 @@ type
     fLearningRate := 0.001;
     if HasOption('l', 'learningrate') then
     begin
-      LearningRate := GetOptionValue('l', 'learningrate');
-      fLearningRate := StrToFloat(LearningRate);
+      ParStr := GetOptionValue('l', 'learningrate');
+      fLearningRate := StrToFloat(ParStr);
     end;
 
     fInertia := 0.9;
     if HasOption('i', 'inertia') then
     begin
-      Inertia := GetOptionValue('i', 'inertia');
-      fInertia := StrToFloat(Inertia);
+      ParStr := GetOptionValue('i', 'inertia');
+      fInertia := StrToFloat(ParStr);
     end;
 
     fTarget := 1;
     if HasOption('t', 'target') then
     begin
-      Target := GetOptionValue('t', 'target');
-      fTarget := StrToFloat(Target);
+      ParStr := GetOptionValue('t', 'target');
+      fTarget := StrToFloat(ParStr);
+    end;
+
+    bSeparable := HasOption('s', 'separable');
+
+    iInnerConvNum := 12;
+    if HasOption('c', 'convolutions') then
+    begin
+      ParStr := GetOptionValue('c', 'convolutions');
+      iInnerConvNum := StrToInt(ParStr);
     end;
 
     Train();
@@ -77,28 +88,26 @@ type
     ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
     NumClasses: integer;
     fileNameBase: string;
-    InnerConvNum: integer;
     ConvNeuronCount: integer;
     Bottleneck: integer;
     HasMovingNorm: boolean;
-    Separable: boolean;
   begin
     if not CheckCIFARFile() then exit;
     WriteLn('Creating Neural Network...');
     NumClasses  := 10;
     NN := THistoricalNets.Create();
     fileNameBase := 'CaiOptimizedDenseNet';
-    InnerConvNum := 12;
     ConvNeuronCount := 32;
     Bottleneck := 32;
-    Separable := false;
     HasMovingNorm := true;
     NN.AddLayer( TNNetInput.Create(32, 32, 3).EnableErrorCollection() );
-    NN.AddDenseNetBlockCAI(InnerConvNum div 3, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}Separable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    // First block shouldn't be separable.
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}false, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(InnerConvNum div 3, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}Separable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(InnerConvNum div 3, ConvNeuronCount, {IsSeparable=}0, TNNetConvolutionReLU, {IsSeparable=}Separable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {IsSeparable=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
     NN.AddAvgMaxChannel(0.5, false);
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
     NN.AddLayer( TNNetSoftMax.Create() );
@@ -122,8 +131,6 @@ type
     NeuralFit.InitialLearningRate := fLearningRate;
     NeuralFit.Inertia := fInertia;
     NeuralFit.TargetAccuracy := fTarget;
-    NeuralFit.StaircaseEpochs := 90;
-    NeuralFit.LearningRateDecay := 0.995;
     NeuralFit.CustomLearningRateScheduleObjFn := @Self.DenseNetLearningRateSchedule;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize=}64, {epochs=}300);
     NeuralFit.Free;
@@ -149,7 +156,9 @@ type
       ' -h : displays this help. ', sLineBreak,
       ' -l : defines learing rate. Default is -l 0.001. ', sLineBreak,
       ' -i : defines inertia. Default is -i 0.9.', sLineBreak,
-      ' https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/examples/DenseNetBCL40/',sLineBreak,
+      ' -s : enables separable convolutions (less weights and faster).', sLineBreak,
+      ' -c : defines the number of convolutions. Default is 12.', sLineBreak,
+      ' https://github.com/joaopauloschuler/neural-api/tree/master/examples/CaiOptimizedDenseNet',sLineBreak,
       ' More info at:',sLineBreak,
       '   https://github.com/joaopauloschuler/neural-api'
     );

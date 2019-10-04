@@ -404,8 +404,6 @@ end;
 
 function TClassifier.NeuronGroupFitness(var NG: TNeuronGroup): single;
 var
-  Probability, TotalCount: single;
-  NextState: byte;
   StateCount: integer;
   SuccessCnt, TotalCnt: integer;
   Effect: byte;

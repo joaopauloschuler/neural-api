@@ -789,7 +789,7 @@ begin
   FStaircaseEpochs := 1;
   FStepSize := 1;
   FAvgWeightEpochCount := 10;
-  FLearningRateDecay := 0.99;
+  FLearningRateDecay := 0.01;
   FInitialLearningRate := 0.001;
   FInitialEpoch := 0;
   fMinLearnRate := FInitialLearningRate * 0.01;
@@ -833,8 +833,17 @@ var
   iStairCount: integer;
   fNewLearningRate: single;
 begin
-  FCustomLearningRateScheduleFn := nil;
-  FCustomLearningRateScheduleObjFn := nil;
+  if (FLearningRateDecay >= 0.5) and (FLearningRateDecay <= 1) then
+  begin
+    // This is a hack for backward compatibility. Weight decays should be
+    // expressed with 0.01 and not 0.99
+    FLearningRateDecay := 1 - FLearningRateDecay;
+    if FVerbose then
+    WriteLn
+    (
+      'Learning rate decay set to:',FLearningRateDecay:7:5
+    );
+  end;
   if Assigned(FCustomLearningRateScheduleFn) then
   begin
     fNewLearningRate := FCustomLearningRateScheduleFn(iEpochCount);
@@ -846,11 +855,11 @@ begin
   else if FStaircaseEpochs > 1 then
   begin
     iStairCount := iEpochCount div FStaircaseEpochs;
-    fNewLearningRate := (fInitialLearningRate * power(fLearningRateDecay, iStairCount * FStaircaseEpochs));
+    fNewLearningRate := (fInitialLearningRate * power(1-FLearningRateDecay, iStairCount * FStaircaseEpochs));
   end
   else
   begin
-    fNewLearningRate := (fInitialLearningRate * power(fLearningRateDecay,iEpochCount));
+    fNewLearningRate := (fInitialLearningRate * power(1-FLearningRateDecay,iEpochCount));
   end;
   if ( ( fNewLearningRate >= fMinLearnRate ) and (fNewLearningRate <> FCurrentLearningRate) ) then
   begin
