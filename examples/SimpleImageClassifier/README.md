@@ -28,7 +28,7 @@ Later on, this is how the training/fitting is called:
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'SimpleImageClassifier';
     NeuralFit.InitialLearningRate := 0.001;
-    NeuralFit.LearningRateDecay := 0.995;
+    NeuralFit.LearningRateDecay := 0.005;
     NeuralFit.StaircaseEpochs := 17;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
