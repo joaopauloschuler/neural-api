@@ -105,7 +105,7 @@ var
   Application: TTestCNNAlgo;
 begin
   Application := TTestCNNAlgo.Create(nil);
-  Application.Title:='CIFAR-10 Separable Convolutions Example';
+  Application.Title:='CIFAR-10 Identity Shortcut Connection';
   Application.Run;
   Application.Free;
 end.

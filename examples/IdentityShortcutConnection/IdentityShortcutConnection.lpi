@@ -9,7 +9,7 @@
       </Flags>
       <SessionStorage Value="InProjectDir"/>
       <MainUnit Value="0"/>
-      <Title Value="CIFAR-10 Separable Convolutions Example"/>
+      <Title Value="CIFAR-10 Identity Shortcut Connection"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
     </General>
