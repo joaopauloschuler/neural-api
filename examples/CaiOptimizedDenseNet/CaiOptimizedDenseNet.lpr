@@ -108,7 +108,8 @@ type
     NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
     NN.AddLayer( TNNetMaxPool.Create(2) );
     NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {IsSeparable=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
-    NN.AddAvgMaxChannel(0.5, false);
+    NN.AddLayer( TNNetDropout.Create(0.5) );
+    NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
     NN.AddLayer( TNNetSoftMax.Create() );
     NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
