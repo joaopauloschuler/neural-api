@@ -145,9 +145,12 @@ type
   TNeuralImageFit = class(TNeuralFitBase)
     protected
       FNumClasses: integer;
-      FMaxCrop: integer;
       FImgVolumes, FImgValidationVolumes, FImgTestVolumes: TNNetVolumeList;
-      FImgCrop: boolean;
+      FMaxCropSize: integer;
+      FHasImgCrop: boolean;
+      FHasMakeGray: boolean;
+      FHasFlipX: boolean;
+      FHasFlipY: boolean;
       FIsSoftmax: boolean;
       FColorEncoding: integer;
       FWorkingVolumes: TNNetVolumeList;
@@ -163,6 +166,12 @@ type
       procedure TestNNThread(Index: PtrInt; Data: Pointer;
         Item: TMultiThreadProcItem);
       procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
+
+      property HasImgCrop: boolean read FHasImgCrop write FHasImgCrop;
+      property HasMakeGray: boolean read FHasMakeGray write FHasMakeGray;
+      property HasFlipX: boolean read FHasFlipX write FHasFlipX;
+      property HasFlipY: boolean read FHasFlipY write FHasFlipY;
+      property MaxCropSize: integer read FMaxCropSize write FMaxCropSize;
   end;
 
 
@@ -779,6 +788,10 @@ begin
   FFinishedThread := TNNetVolume.Create();
   {$IFDEF HASTHREADS}
   FMaxThreadNum := ProcThreadPool.MaxThreadCount;
+    {$IFDEF OpenCL}
+    if FMaxThreadNum <=8 then
+    FMaxThreadNum := ProcThreadPool.MaxThreadCount * 2;
+    {$ENDIF}
   InitCriticalSection(FCritSec);
   {$ELSE}
   FMaxThreadNum := 1;
@@ -880,8 +893,11 @@ end;
 constructor TNeuralImageFit.Create();
 begin
   inherited Create();
-  FMaxCrop := 8;
-  FImgCrop := false;
+  FMaxCropSize := 8;
+  FHasImgCrop := false;
+  FHasFlipX := true;
+  FHasFlipY := false;
+  FHasMakeGray := true;
   FIsSoftmax := true;
   FColorEncoding := 0;
   FMultipleSamplesAtValidation := true;
@@ -1283,30 +1299,34 @@ begin
 
     if FDataAugmentation then
     begin
-      if FImgCrop then
+      if FHasImgCrop then
       begin
-        ImgInput.CopyCropping(FImgVolumes[ImgIdx], random(8), random(8), 24, 24);
+        ImgInput.CopyCropping(FImgVolumes[ImgIdx], random(FMaxCropSize), random(FMaxCropSize), FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
       end
       else
       begin
-        CropSizeX := random(FMaxCrop + 1);
-        CropSizeY := random(FMaxCrop + 1);
+        CropSizeX := random(FMaxCropSize + 1);
+        CropSizeY := random(FMaxCropSize + 1);
         ImgInputCp.CopyCropping(FImgVolumes[ImgIdx], random(CropSizeX), random(CropSizeY),FImgVolumes[ImgIdx].SizeX-CropSizeX, FImgVolumes[ImgIdx].SizeY-CropSizeY);
         ImgInput.CopyResizing(ImgInputCp, FImgVolumes[ImgIdx].SizeX, FImgVolumes[ImgIdx].SizeY);
       end;
 
       if (ImgInput.Depth = 3) then
       begin
-        if (Random(1000) > 750) then
+        if FHasMakeGray and (Random(1000) > 750) then
         begin
           ImgInput.MakeGray(FColorEncoding);
         end;
       end;
 
-      // flip is always used in training
-      if Random(1000) > 500 then
+      if FHasFlipX and (Random(1000) > 500) then
       begin
         ImgInput.FlipX();
+      end;
+
+      if FHasFlipY and (Random(1000) > 500) then
+      begin
+        ImgInput.FlipY();
       end;
     end
     else begin
@@ -1442,9 +1462,9 @@ begin
     sumOutput.Fill(0);
     ImgIdx := I;
 
-    if FImgCrop then
+    if FHasImgCrop then
     begin
-      ImgInput.CopyCropping(FWorkingVolumes[ImgIdx], 4, 4, 24, 24);
+      ImgInput.CopyCropping(FWorkingVolumes[ImgIdx], FMaxCropSize div 2, FMaxCropSize div 2, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
     end
     else
     begin
@@ -1467,7 +1487,7 @@ begin
 
       if ImgInput.SizeX >= 32 then
       begin
-        ImgInputCp.CopyCropping(ImgInput, FMaxCrop div 2, FMaxCrop div 2, ImgInput.SizeX - FMaxCrop, ImgInput.SizeY - FMaxCrop);
+        ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
         ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
         LocalNN.Compute( ImgInput );
         LocalNN.GetOutput( pOutput );
@@ -1550,7 +1570,7 @@ begin
 
     if ImgInput.SizeX >= 32 then
     begin
-      ImgInputCp.CopyCropping(ImgInput, FMaxCrop div 2, FMaxCrop div 2, ImgInput.SizeX - FMaxCrop, ImgInput.SizeY - FMaxCrop);
+      ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
       ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
       pNN.Compute( ImgInput );
       pNN.GetOutput( pOutput );
