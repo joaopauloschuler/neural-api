@@ -159,7 +159,7 @@ type
       FThreadCount: longint;
       /// OpenCL Group Sizes;
       FGroupSizeA, FGroupSizeB: longint;
-      ///
+      /// Average Previous Computing Time
       FPreviousComputeTime: TDateTime;
 
       FDotProductKernel: TDotProductKernel;
@@ -172,7 +172,7 @@ type
       procedure UnprepareForCompute();
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint);
-      procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: integer = 0); overload;
+      procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
 
   /// Class that does dot products via OpenCL
@@ -186,7 +186,7 @@ type
       FActFun: longint;
       /// Kernel parameter: number of OpenCL threads.
       FThreadCount: longint;
-      ///
+      /// Average Previous Computing Time
       FPreviousComputeTime: TDateTime;
 
       FInputBufferAs: cl_mem;
@@ -203,7 +203,7 @@ type
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; kernelname: string = 'cai_dot_product'; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
 
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint);
-      procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: integer = 0); overload;
+      procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
 
 implementation
@@ -390,7 +390,7 @@ begin
 end;
 
 procedure TDotProductSharedKernel.FinishAndLoadResult(Results: TNNetVolume;
-  SaveCPU: integer);
+  SaveCPU: TNeuralFloat);
 var
   ResultSize: integer;
   err: integer; // error code returned from api calls
@@ -409,14 +409,23 @@ begin
 
   if SaveCPU > 0 then
   begin
-    if FPreviousComputeTime > 1 then // 1 ms
+    //if Random(100)=0 then WriteLn(FPreviousComputeTime:6:4);
+    // Time Collection
+    if (Random(10)=0) then
     begin
-      Sleep(Ceil(FPreviousComputeTime)*SaveCPU);
+      startTime := now();
+      err := FDotProductKernel.ReadBuffer(FResultBuffer, Results);
+      finishTime := now();
+      FPreviousComputeTime := FPreviousComputeTime * 0.99 + (finishTime - startTime)* 24 * 60 * 60 * 1000 * 0.01;
+    end
+    else
+    begin
+      if FPreviousComputeTime*SaveCPU > 1 then // 1 ms
+      begin
+        Sleep(Floor(FPreviousComputeTime*SaveCPU));
+      end;
+      err := FDotProductKernel.ReadBuffer(FResultBuffer, Results);
     end;
-    startTime := now();
-    err := FDotProductKernel.ReadBuffer(FResultBuffer, Results);
-    finishTime := now();
-    FPreviousComputeTime := FPreviousComputeTime * 0.99 + (finishTime - startTime)* 24 * 60 * 60 * 1000 * 0.01;
   end
   else
   begin
@@ -611,7 +620,7 @@ begin
   end;
 end;
 
-procedure TDotProductCL.FinishAndLoadResult(Results: TNNetVolume; SaveCPU: integer);
+procedure TDotProductCL.FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat);
 var
   ResultSize: integer;
   err: integer; // error code returned from api calls
@@ -630,14 +639,21 @@ begin
 
   if SaveCPU > 0 then
   begin
-    if FPreviousComputeTime > 1 then // 1 ms
+    if (Random(10)=0) then
     begin
-      Sleep(Ceil(FPreviousComputeTime)*SaveCPU);
+      startTime := now();
+      err := ReadBuffer(FResultBuffer, Results);
+      finishTime := now();
+      FPreviousComputeTime := FPreviousComputeTime * 0.99 + (finishTime - startTime)* 24 * 60 * 60 * 1000 * 0.01;
+    end
+    else
+    begin
+      if FPreviousComputeTime*SaveCPU > 1 then // 1 ms
+      begin
+        Sleep(Floor(FPreviousComputeTime*SaveCPU));
+      end;
+      err := ReadBuffer(FResultBuffer, Results);
     end;
-    startTime := now();
-    err := ReadBuffer(FResultBuffer, Results);
-    finishTime := now();
-    FPreviousComputeTime := FPreviousComputeTime * 0.99 + (finishTime - startTime)* 24 * 60 * 60 * 1000 * 0.01;
   end
   else
   begin
