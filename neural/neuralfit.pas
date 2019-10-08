@@ -788,10 +788,12 @@ begin
   FFinishedThread := TNNetVolume.Create();
   {$IFDEF HASTHREADS}
   FMaxThreadNum := ProcThreadPool.MaxThreadCount;
-    {$IFDEF OpenCL}
-    if FMaxThreadNum <=8 then
-    FMaxThreadNum := ProcThreadPool.MaxThreadCount * 2;
-    {$ENDIF}
+    //{$IFDEF OpenCL}
+    // This optimization works very well on some systems but not all :-(
+    // This optimization fails on google colab.
+    //if FMaxThreadNum <=8 then
+    //FMaxThreadNum := ProcThreadPool.MaxThreadCount * 2;
+    //{$ENDIF}
   InitCriticalSection(FCritSec);
   {$ELSE}
   FMaxThreadNum := 1;

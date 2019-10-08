@@ -5272,13 +5272,11 @@ begin
   end;
   FDotCL.Compute(InputAVolume, FInputPrepared, 0);
 
-  //{$IFDEF Linux}
-  // This optimization works very well on some systems but not all :-(
-  // This optimization fails on google colab.
-  //FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
-  //{$ELSE}
+  {$IFDEF Linux}
+  FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
+  {$ELSE}
   FDotCL.FinishAndLoadResult(FOutputRaw, 0.0);
-  //{$ENDIF}
+  {$ENDIF}
 
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
