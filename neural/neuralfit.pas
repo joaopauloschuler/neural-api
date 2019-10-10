@@ -64,6 +64,7 @@ type
       FStepSize: integer;
       FLearningRateDecay: single;
       FInitialLearningRate: single;
+      FCyclicalLearningRateLen: integer;
       FInitialEpoch: integer;
       FMaxEpochs: integer;
       FMinLearnRate: single;
@@ -95,6 +96,7 @@ type
       property CurrentLearningRate: single read FCurrentLearningRate;
       property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
       property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
+      property CyclicalLearningRateLen: integer read FCyclicalLearningRateLen write FCyclicalLearningRateLen;
       property FileNameBase: string read FFileNameBase write FFileNameBase;
       property Inertia: single read FInertia write FInertia;
       property InitialEpoch: integer read FInitialEpoch write FInitialEpoch;
@@ -349,6 +351,7 @@ begin
       FGlobalErrorSum  := 0;
       FFinishedThread.Fill(0);
       FNN.ClearTime();
+      FNN.RefreshDropoutMask();
       {$IFDEF HASTHREADS}
       ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
       {$ELSE}
@@ -806,6 +809,7 @@ begin
   FAvgWeightEpochCount := 10;
   FLearningRateDecay := 0.01;
   FInitialLearningRate := 0.001;
+  FCyclicalLearningRateLen := 0; // not cyclical by default.
   FInitialEpoch := 0;
   fMinLearnRate := FInitialLearningRate * 0.01;
   FInertia := 0.9;
@@ -848,6 +852,10 @@ var
   iStairCount: integer;
   fNewLearningRate: single;
 begin
+  if FCyclicalLearningRateLen > 0 then
+  begin
+    iEpochCount := iEpochCount mod FCyclicalLearningRateLen;
+  end;
   if (FLearningRateDecay >= 0.5) and (FLearningRateDecay <= 1) then
   begin
     // This is a hack for backward compatibility. Weight decays should be
@@ -1026,6 +1034,7 @@ begin
       FGlobalErrorSum  := 0;
       FFinishedThread.Fill(0);
       FNN.ClearTime();
+      FNN.RefreshDropoutMask();
       {$IFDEF HASTHREADS}
       ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
       {$ELSE}

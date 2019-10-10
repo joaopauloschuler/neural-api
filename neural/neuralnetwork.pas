@@ -223,7 +223,7 @@ type
       procedure SumWeights(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltas(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
-      procedure CopyWeights(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      procedure CopyWeights(Origin: TNNetLayer); virtual;
       procedure ForceRangeWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeWeights(VMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function SaveDataToString(): string; virtual;
@@ -387,11 +387,13 @@ end;
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(Rate: double);
+      constructor Create(Rate: double; OneMaskPerbatch: integer = 1);
       destructor Destroy(); override;
-
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      procedure CopyWeights(Origin: TNNetLayer); override;
+      procedure RefreshDropoutMask();
+      property DropoutMask: TNNetVolume read FDropoutMask;
   end;
 
   /// This layer adds a random addition (or bias) and amplifies (multiplies)
@@ -1043,6 +1045,7 @@ end;
       procedure Clear();
       procedure IdxsToLayers(aIdx: array of integer; var aL: array of TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure EnableDropouts(pFlag: boolean); {$IFDEF Release} inline; {$ENDIF}
+      procedure RefreshDropoutMask(); {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure MulAddWeights(Value: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure MulWeights(V: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -4054,16 +4057,17 @@ begin
   inherited Backpropagate;
 end;
 
+{ TNNetDropout }
 procedure TNNetDropout.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FDropoutMask.ReSize(FOutput);
 end;
 
-{ TNNetDropout }
-constructor TNNetDropout.Create(Rate: double);
+constructor TNNetDropout.Create(Rate: double; OneMaskPerbatch: integer = 1);
 begin
   inherited Create();
+  FStruct[1] := OneMaskPerbatch;
   if (Rate > 0) then
   begin
     FRate := Round(1/Rate);
@@ -4085,6 +4089,12 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetDropout.CopyWeights(Origin: TNNetLayer);
+begin
+  inherited CopyWeights(Origin);
+  if FBatchUpdate then FDropoutMask.Copy(TNNetDropout(Origin).DropoutMask);
+end;
+
 procedure TNNetDropout.Compute();
 var
   CntOut, MaxOutput: integer;
@@ -4095,14 +4105,21 @@ begin
 
   if ( FEnabled and (FRate>0) ) then
   begin
-    FDropoutMask.Fill(1);
-    MaxOutput := FOutput.Size - 1;
-    for CntOut := 0 to MaxOutput do
+    if FBatchUpdate and ({OneMaskPerbatch}FStruct[1]>0) then
     begin
-      if (Random(FRate) = 0) then
+      FOutput.Mul(FDropoutMask);
+    end
+    else
+    begin
+      FDropoutMask.Fill(1);
+      MaxOutput := FOutput.Size - 1;
+      for CntOut := 0 to MaxOutput do
       begin
-        FOutput.FData[CntOut] := 0;
-        FDropoutMask.FData[CntOut] := 0;
+        if (Random(FRate) = 0) then
+        begin
+          FOutput.FData[CntOut] := 0;
+          FDropoutMask.FData[CntOut] := 0;
+        end;
       end;
     end;
   end;
@@ -4119,6 +4136,21 @@ begin
   if ( FEnabled and (FOutputError.Size = FOutput.Size) ) then FOutputError.Mul(FDropoutMask);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited Backpropagate();
+end;
+
+procedure TNNetDropout.RefreshDropoutMask();
+var
+  CntOut, MaxOutput: integer;
+begin
+  FDropoutMask.Fill(1);
+  MaxOutput := FOutput.Size - 1;
+  for CntOut := 0 to MaxOutput do
+  begin
+    if (Random(FRate) = 0) then
+    begin
+      FDropoutMask.FData[CntOut] := 0;
+    end;
+  end;
 end;
 
 procedure TNNetAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -6476,7 +6508,7 @@ begin
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
-      'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0]);
+      'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnect' :          Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
@@ -6538,7 +6570,7 @@ begin
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
-      if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0]) else
+      if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
@@ -7586,6 +7618,22 @@ begin
       if (FLayers[LayerCnt] is TNNetAddNoiseBase) then
       begin
         TNNetAddNoiseBase(FLayers[LayerCnt]).Enabled := pFlag;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNet.RefreshDropoutMask();
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      if (FLayers[LayerCnt] is TNNetDropout) then
+      begin
+        TNNetDropout(FLayers[LayerCnt]).RefreshDropoutMask();
       end;
     end;
   end;
