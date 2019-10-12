@@ -22,7 +22,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
 type
   TTestCNNAlgo = class(TCustomApplication)
   protected
-    fLearningRate, fInertia, fTarget: single;
+    fLearningRate, fInertia, fTarget, fDropout: single;
     procedure DoRun; override;
     procedure Train();
   public
@@ -65,6 +65,13 @@ type
       fTarget := StrToFloat(Target);
     end;
 
+    fDropout := 0.0;
+    if HasOption('d', 'dropout') then
+    begin
+      Target := GetOptionValue('d', 'dropout');
+      fDropout := StrToFloat(Target);
+    end;
+
     Train();
 
     Terminate;
@@ -86,11 +93,11 @@ type
 
     NN.AddLayer( TNNetInput.Create(32, 32, 3) );
     NN.AddLayer( TNNetConvolutionLinear.Create(64, 3, 1, 1, 1) ).InitBasicPatterns();
-    NN.AddDenseNetBlock(6, 12, 48);
-    NN.AddDenseNetTransition(0.5, 1, true);
-    NN.AddDenseNetBlock(6, 12, 48);
-    NN.AddDenseNetTransition(0.5, 1, true);
-    NN.AddDenseNetBlock(6, 12, 48);
+    NN.AddDenseNetBlock(6, 12, 48, 0, fDropout);
+    NN.AddDenseNetTransition(0.5, 1, false);
+    NN.AddDenseNetBlock(6, 12, 48, 0, fDropout);
+    NN.AddDenseNetTransition(0.5, 1, false);
+    NN.AddDenseNetBlock(6, 12, 48, 0, fDropout);
     NN.AddMovingNorm(false, 0, 0);
     NN.AddLayer( TNNetReLU.Create() );
     NN.AddLayer( TNNetMaxChannel.Create() );
@@ -136,10 +143,11 @@ type
     WriteLn
     (
       'CIFAR-10 DenseNetBC L40 Classification Example by Joao Paulo Schwarz Schuler',sLineBreak,
-      'Command Line Example: DenseNetBC L40 -i 0.8', sLineBreak,
+      'Command Line Example: DenseNetBCL40 -i 0.8', sLineBreak,
       ' -h : displays this help. ', sLineBreak,
-      ' -l : defines learing rate. Default is -l 0.001. ', sLineBreak,
       ' -i : defines inertia. Default is -i 0.9.', sLineBreak,
+      ' -l : defines learing rate. Default is -l 0.001. ', sLineBreak,
+      ' -d : defines dropout rate. Default is -d 0.0. ', sLineBreak,
       ' https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/examples/DenseNetBCL40/',sLineBreak,
       ' More info at:',sLineBreak,
       '   https://github.com/joaopauloschuler/neural-api'
