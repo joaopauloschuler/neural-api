@@ -30,8 +30,6 @@ type
   public
     constructor Create(TheOwner: TComponent); override;
     procedure WriteHelp; virtual;
-
-    function DenseNetLearningRateSchedule(Epoch: integer): single;
   end;
 
   procedure TTestCNNAlgo.DoRun;
@@ -130,9 +128,11 @@ type
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := fileNameBase;
     NeuralFit.InitialLearningRate := fLearningRate;
+    NeuralFit.LearningRateDecay := 0.02;
+    NeuralFit.CyclicalLearningRateLen := 100;
+    NeuralFit.StaircaseEpochs := 15;
     NeuralFit.Inertia := fInertia;
     NeuralFit.TargetAccuracy := fTarget;
-    NeuralFit.CustomLearningRateScheduleObjFn := @Self.DenseNetLearningRateSchedule;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize=}64, {epochs=}300);
     NeuralFit.Free;
 
@@ -163,16 +163,6 @@ type
       ' More info at:',sLineBreak,
       '   https://github.com/joaopauloschuler/neural-api'
     );
-  end;
-
-  function TTestCNNAlgo.DenseNetLearningRateSchedule(Epoch: integer): single;
-  begin
-    if Epoch < 150
-      then Result := fLearningRate
-    else if epoch < 225
-      then Result :=  fLearningRate * 0.1
-    else
-      Result := fLearningRate * 0.01;
   end;
 
 var
