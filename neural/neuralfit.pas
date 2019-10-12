@@ -561,7 +561,7 @@ begin
           ValidationLoss:6:4,',',
           ValidationError:6:4,',',
           FCurrentLearningRate:9:7,',',
-          Round( (Now() - globalStartTime) * 24 * 60 * 60)
+          Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
       end;
       if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
@@ -1245,7 +1245,7 @@ begin
           ValidationLoss:6:4,',',
           ValidationError:6:4,',',
           FCurrentLearningRate:9:7,',',
-          Round( (Now() - globalStartTime) * 24 * 60 * 60)
+          Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
       end;
       if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
