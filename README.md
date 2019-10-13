@@ -177,5 +177,9 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
 
+## Paid Support
+In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
+to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
+
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
