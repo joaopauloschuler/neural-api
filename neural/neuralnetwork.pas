@@ -4143,7 +4143,7 @@ var
   CntOut, MaxOutput: integer;
 begin
   FDropoutMask.Fill(1);
-  MaxOutput := FOutput.Size - 1;
+  MaxOutput := FDropoutMask.Size - 1;
   for CntOut := 0 to MaxOutput do
   begin
     if (Random(FRate) = 0) then
@@ -4151,6 +4151,7 @@ begin
       FDropoutMask.FData[CntOut] := 0;
     end;
   end;
+  // Dropout mask debug: WriteLn('Dropoutmask sum is:', FDropoutMask.GetSum():6:2, ' Size:', MaxOutput + 1);
 end;
 
 procedure TNNetAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -6757,7 +6758,7 @@ begin
 
   if (HasNorm) then
   begin
-    AddConvOrSeparableConv := AddChannelMovingNorm(PerCell, RandomBias, RandomAmplifier);
+    AddConvOrSeparableConv := AddMovingNorm(PerCell, RandomBias, RandomAmplifier);
   end;
 end;
 
