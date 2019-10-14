@@ -53,7 +53,7 @@ type
     NeuralFit.HasFlipX := false;
     NeuralFit.HasFlipY := false;
     NeuralFit.MaxCropSize := 4;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}128, {epochs=}50);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}128, {epochs=}20);
     NeuralFit.Free;
 
     NN.Free;
