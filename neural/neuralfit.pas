@@ -1448,6 +1448,7 @@ var
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   PredictedClass: integer;
+  TotalDiv: TNeuralFloat;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
@@ -1488,27 +1489,28 @@ begin
     LocalNN.GetOutput( pOutput );
     if FMultipleSamplesAtValidation then
     begin
+      TotalDiv := 1;
       sumOutput.Add( pOutput );
 
-      ImgInput.FlipX();
+      if FHasFlipX then
+      begin
+        ImgInput.FlipX();
+        TotalDiv := TotalDiv + 1;
+        LocalNN.Compute( ImgInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+      end;
 
-      LocalNN.Compute( ImgInput );
-      LocalNN.GetOutput( pOutput );
-      sumOutput.Add( pOutput );
-
-      if ImgInput.SizeX >= 32 then
+      if FMaxCropSize >= 2 then
       begin
         ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
         ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
         LocalNN.Compute( ImgInput );
         LocalNN.GetOutput( pOutput );
         sumOutput.Add( pOutput );
-        sumOutput.Divi(3);
-      end
-      else
-      begin
-        sumOutput.Divi(2);
+        TotalDiv := TotalDiv + 1;
       end;
+      sumOutput.Divi(TotalDiv);
 
       pOutput.Copy(sumOutput);
     end;
@@ -1560,6 +1562,7 @@ procedure TNeuralImageFit.ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVol
 var
   ImgInput, ImgInputCp: TNNetVolume;
   sumOutput: TNNetVolume;
+  TotalDiv: TNeuralFloat;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
@@ -1571,27 +1574,28 @@ begin
 
   if FMultipleSamplesAtValidation then
   begin
+    TotalDiv := 1;
     sumOutput.Add( pOutput );
 
-    ImgInput.FlipX();
+    if FHasFlipX then
+    begin
+      ImgInput.FlipX();
+      TotalDiv := TotalDiv + 1;
+      pNN.Compute( ImgInput );
+      pNN.GetOutput( pOutput );
+      sumOutput.Add( pOutput );
+    end;
 
-    pNN.Compute( ImgInput );
-    pNN.GetOutput( pOutput );
-    sumOutput.Add( pOutput );
-
-    if ImgInput.SizeX >= 32 then
+    if FMaxCropSize >= 2 then
     begin
       ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
       ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
       pNN.Compute( ImgInput );
       pNN.GetOutput( pOutput );
       sumOutput.Add( pOutput );
-      sumOutput.Divi(3);
-    end
-    else
-    begin
-      sumOutput.Divi(2);
+      TotalDiv := TotalDiv + 1;
     end;
+    sumOutput.Divi(TotalDiv);
 
     pOutput.Copy(sumOutput);
   end;

@@ -36,7 +36,7 @@ type
       TNNetConvolutionReLU.Create(32, 3, 1, 1, 1),
       TNNetFullConnectReLU.Create(32),
       TNNetFullConnectReLU.Create(32),
-      TNNetDropout.Create(0.20),
+      TNNetDropout.Create(0.2),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
@@ -50,6 +50,9 @@ type
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
+    NeuralFit.HasFlipX := false;
+    NeuralFit.HasFlipY := false;
+    NeuralFit.MaxCropSize := 4;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}128, {epochs=}50);
     NeuralFit.Free;
 
