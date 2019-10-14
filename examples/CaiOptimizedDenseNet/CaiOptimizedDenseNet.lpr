@@ -25,6 +25,7 @@ type
     fLearningRate, fInertia, fTarget: single;
     bSeparable: boolean;
     iInnerConvNum: integer;
+    iBottleneck: integer;
     procedure DoRun; override;
     procedure Train();
   public
@@ -74,6 +75,13 @@ type
       iInnerConvNum := StrToInt(ParStr);
     end;
 
+    iBottleneck := 32;
+    if HasOption('b', 'bottleneck') then
+    begin
+      ParStr := GetOptionValue('b', 'bottleneck');
+      iBottleneck := StrToInt(ParStr);
+    end;
+
     Train();
 
     Terminate;
@@ -87,7 +95,6 @@ type
     NumClasses: integer;
     fileNameBase: string;
     ConvNeuronCount: integer;
-    Bottleneck: integer;
     HasMovingNorm: boolean;
   begin
     if not CheckCIFARFile() then exit;
@@ -96,16 +103,15 @@ type
     NN := THistoricalNets.Create();
     fileNameBase := 'CaiOptimizedDenseNet';
     ConvNeuronCount := 32;
-    Bottleneck := 32;
     HasMovingNorm := true;
     NN.AddLayer( TNNetInput.Create(32, 32, 3).EnableErrorCollection() );
     // First block shouldn't be separable.
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}false, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}false, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {IsSeparable=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}Bottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, ConvNeuronCount, {IsSeparable=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddLayer( TNNetDropout.Create(0.5) );
     NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
@@ -159,6 +165,7 @@ type
       ' -i : defines inertia. Default is -i 0.9.', sLineBreak,
       ' -s : enables separable convolutions (less weights and faster).', sLineBreak,
       ' -c : defines the number of convolutions. Default is 12.', sLineBreak,
+      ' -b : defines the bottleneck. Default is 32.', sLineBreak,
       ' https://github.com/joaopauloschuler/neural-api/tree/master/examples/CaiOptimizedDenseNet',sLineBreak,
       ' More info at:',sLineBreak,
       '   https://github.com/joaopauloschuler/neural-api'
