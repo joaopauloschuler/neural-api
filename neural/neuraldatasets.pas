@@ -164,16 +164,22 @@ function TinyImageTo1D(var TI: TTinySingleChannelImage): TTinySingleChannelImage
 procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList);
 
+// creates CIFAR100 volumes required for training, testing and validation
+procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
+  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
+  Verbose:boolean = true);
+
 // loads a CIFAR10 into TNNetVolumeList
 procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
 procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
 
 // loads a CIFAR100 into TNNetVolumeList
-procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
-procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
+procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string;
+  color_encoding: byte = csEncodeRGB; Verbose:boolean = true); overload;
 
 // This function returns TRUE if data_batch_1.bin and error message otherwise
 function CheckCIFARFile():boolean;
+function CheckCIFAR100File():boolean;
 
 // This function tests a neural network on the passed ImgVolumes
 procedure TestBatch
@@ -228,6 +234,27 @@ begin
   loadCifar10Dataset(ImgTestVolumes, 'test_batch.bin', 0);
 end;
 
+procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
+  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
+  Verbose:boolean = true);
+var
+  I, HalfSize, LastElement: integer;
+begin
+  ImgTrainingVolumes := TNNetVolumeList.Create();
+  ImgValidationVolumes := TNNetVolumeList.Create();
+  ImgTestVolumes := TNNetVolumeList.Create();
+  loadCifar100Dataset(ImgTrainingVolumes, 'train.bin', color_encoding, Verbose);
+  loadCifar100Dataset(ImgValidationVolumes, 'test.bin', color_encoding, Verbose);
+  ImgValidationVolumes.FreeObjects := false;
+  HalfSize := ImgValidationVolumes.Count div 2;
+  LastElement := ImgValidationVolumes.Count - 1;
+  for I := LastElement downto HalfSize do
+  begin
+    ImgTestVolumes.Add(ImgValidationVolumes[I]);
+    ImgValidationVolumes.Delete(I);
+  end;
+  ImgValidationVolumes.FreeObjects := true;
+end;
 
 // loads a CIFAR10 into TNNetVolumeList
 procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB);
@@ -307,47 +334,36 @@ begin
   WriteLn(' Done.');
 end;
 
-procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; idx: integer;
-  base_pos: integer; color_encoding: byte);
-var
-  fileName: string;
-begin
-  fileName := 'data_batch_'+IntToStr(idx)+'.bin';
-  loadCifar100Dataset(ImgVolumes, fileName, base_pos, color_encoding);
-end;
-
 procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName: string;
-  base_pos: integer; color_encoding: byte);
+  color_encoding: byte; Verbose:boolean = true);
 var
-  I, ImgPos: integer;
   Img: TCifar100Image;
   cifarFile: TCifar100File;
   AuxVolume: TNNetVolume;
 begin
-  Write('Loading 10K images from CIFAR-100 file "'+fileName+'" ...');
+  if Verbose then Write('Loading images from CIFAR-100 file "'+fileName+'" ...');
   AssignFile(cifarFile, fileName);
   Reset(cifarFile);
-  AuxVolume := TNNetVolume.Create();
 
   // binary CIFAR 10 file contains 10K images
-  for I := 0 to 9999 do
+  while not(Eof(cifarFile)) do
   begin
+    AuxVolume := TNNetVolume.Create();
     Read(cifarFile, Img);
-    ImgPos := I + base_pos;
-    LoadTinyImageIntoNNetVolume(Img, ImgVolumes[ImgPos]);
+    LoadTinyImageIntoNNetVolume(Img, AuxVolume);
+    AuxVolume.RgbImgToNeuronalInput(color_encoding);
+    ImgVolumes.Add(AuxVolume);
 
-    if (color_encoding = csEncodeGray) then
+    //TODO: add treatment for CIFAR100
+    (*if (color_encoding = csEncodeGray) then
     begin
       AuxVolume.Copy(ImgVolumes[ImgPos]);
       ImgVolumes[ImgPos].GetGrayFromRgb(AuxVolume);
-    end;
-
-    ImgVolumes[ImgPos].RgbImgToNeuronalInput(color_encoding);
+    end;*)
   end;
 
-  AuxVolume.Free;
   CloseFile(cifarFile);
-  WriteLn(' Done.');
+  if Verbose then WriteLn(' ',ImgVolumes.Count, ' images loaded.');
 end;
 
 // This function returns TRUE if data_batch_1.bin and error message otherwise
@@ -358,6 +374,25 @@ begin
   begin
     WriteLn('File Not Fount: data_batch_1.bin');
     WriteLn('Please download it from here: https://www.cs.toronto.edu/~kriz/cifar-10-binary.tar.gz');
+    //TODO: automatically download file
+    Result := false;
+  end;
+end;
+
+function CheckCIFAR100File(): boolean;
+begin
+  Result := true;
+  if not (FileExists('train.bin')) then
+  begin
+    WriteLn('File Not Fount: train.bin');
+    WriteLn('Please download it from here: https://www.cs.toronto.edu/~kriz/cifar-100-binary.tar.gz');
+    //TODO: automatically download file
+    Result := false;
+  end
+  else if not (FileExists('test.bin')) then
+  begin
+    WriteLn('File Not Fount: test.bin');
+    WriteLn('Please download it from here: https://www.cs.toronto.edu/~kriz/cifar-100-binary.tar.gz');
     //TODO: automatically download file
     Result := false;
   end;
@@ -421,8 +456,8 @@ begin
       Vol[J, I, 2] := TI.B[I, J];
     end;
   end;
-  Vol.Tags[0] := TI.bCoarseLabel;
-  Vol.Tags[1] := TI.bFineLabel;
+  Vol.Tags[0] := TI.bFineLabel;
+  Vol.Tags[1] := TI.bCoarseLabel;
 end;
 
 procedure LoadNNetVolumeIntoTinyImage(Vol: TNNetVolume; var TI: TTinyImage);
