@@ -1,3 +1,4 @@
+[![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)
 # CAI NEURAL API
 CAI NEURAL API is a pascal based neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus
 OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux.
@@ -176,6 +177,10 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);`
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
+
+## Paid Support
+In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
+to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
 
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
