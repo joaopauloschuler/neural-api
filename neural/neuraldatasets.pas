@@ -53,6 +53,7 @@ uses
 type
   TTinyImageChannel = packed array [0..31, 0..31] of byte;
   TTinyImageChannel1D = packed array [0..32 * 32 - 1] of byte;
+  TMNistImage = packed array [0..27, 0..27] of byte;
 
   TTinyImage = packed record
     bLabel: byte;
@@ -134,6 +135,7 @@ procedure ConfusionWriteCSV(var CSVConfusion: TextFile; Vol: TNNetVolume; Digits
 // Loads a TinyImage into TNNetVolume.
 procedure LoadTinyImageIntoNNetVolume(var TI: TTinyImage; Vol: TNNetVolume); overload;
 procedure LoadTinyImageIntoNNetVolume(var TI: TCifar100Image; Vol: TNNetVolume); overload;
+procedure LoadTinyImageIntoNNetVolume(var TI: TMNistImage; Vol: TNNetVolume); overload;
 
 // Loads a volume into a tiny image.
 procedure LoadNNetVolumeIntoTinyImage(Vol: TNNetVolume; var TI: TTinyImage); overload;
@@ -169,6 +171,11 @@ procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
   Verbose:boolean = true);
 
+procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
+  ImgTestVolumes: TNNetVolumeList;
+  TrainFileName, TestFileName: string;
+  Verbose:boolean = true);
+
 // loads a CIFAR10 into TNNetVolumeList
 procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
 procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
@@ -177,9 +184,14 @@ procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_
 procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string;
   color_encoding: byte = csEncodeRGB; Verbose:boolean = true); overload;
 
-// This function returns TRUE if data_batch_1.bin and error message otherwise
+// loads MNIST pair of files (image and labels) into ImgVolumes.
+procedure loadMNISTDataset(ImgVolumes: TNNetVolumeList; fileName:string;
+  Verbose:boolean = true); overload;
+
+// These functions return TRUE if the dataset is found or an error message otherwise
 function CheckCIFARFile():boolean;
 function CheckCIFAR100File():boolean;
+function CheckMNISTFile(fileName:string):boolean;
 
 // This function tests a neural network on the passed ImgVolumes
 procedure TestBatch
@@ -245,6 +257,28 @@ begin
   ImgTestVolumes := TNNetVolumeList.Create();
   loadCifar100Dataset(ImgTrainingVolumes, 'train.bin', color_encoding, Verbose);
   loadCifar100Dataset(ImgValidationVolumes, 'test.bin', color_encoding, Verbose);
+  ImgValidationVolumes.FreeObjects := false;
+  HalfSize := ImgValidationVolumes.Count div 2;
+  LastElement := ImgValidationVolumes.Count - 1;
+  for I := LastElement downto HalfSize do
+  begin
+    ImgTestVolumes.Add(ImgValidationVolumes[I]);
+    ImgValidationVolumes.Delete(I);
+  end;
+  ImgValidationVolumes.FreeObjects := true;
+end;
+
+procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
+  ImgTestVolumes: TNNetVolumeList; TrainFileName, TestFileName: string;
+  Verbose: boolean);
+var
+  I, HalfSize, LastElement: integer;
+begin
+  ImgTrainingVolumes := TNNetVolumeList.Create();
+  ImgValidationVolumes := TNNetVolumeList.Create();
+  ImgTestVolumes := TNNetVolumeList.Create();
+  loadMNISTDataset(ImgTrainingVolumes, TrainFileName, Verbose);
+  loadMNISTDataset(ImgValidationVolumes, TestFileName, Verbose);
   ImgValidationVolumes.FreeObjects := false;
   HalfSize := ImgValidationVolumes.Count div 2;
   LastElement := ImgValidationVolumes.Count - 1;
@@ -366,6 +400,75 @@ begin
   if Verbose then WriteLn(' ',ImgVolumes.Count, ' images loaded.');
 end;
 
+procedure loadMNISTDataset(ImgVolumes: TNNetVolumeList; fileName: string;
+  Verbose: boolean);
+var
+  fileNameLabels, fileNameImg: string;
+  fileLabels, fileImg: THandle;
+  LabelItems, LabelMagic: integer;
+  ImgMagic, ImgItems, ImgRows, ImgCols: Integer;
+  MNistImg: TMNistImage;
+  ImgCnt: integer;
+  LabelByte: integer;
+  Vol: TNNetVolume;
+begin
+  fileNameLabels := fileName + '-labels.idx1-ubyte';
+  fileNameImg := fileName + '-images.idx3-ubyte';
+
+  if not FileExists(fileNameLabels) then
+  begin
+    if Verbose then WriteLn('Labels file not found:', fileNameLabels);
+    exit;
+  end;
+
+  if not FileExists(fileNameImg) then
+  begin
+    if Verbose then WriteLn('Image file not found:', fileNameImg);
+    exit;
+  end;
+
+  fileLabels := FileOpen(fileNameLabels, fmOpenRead);
+  fileImg := FileOpen(fileNameImg, fmOpenRead);
+
+  FileRead(fileLabels, LabelMagic, 4);
+  FileRead(fileLabels, LabelItems, 4);
+
+  FileRead(fileImg, ImgMagic, 4);
+  FileRead(fileImg, ImgItems, 4);
+  FileRead(fileImg, ImgRows, 4);
+  FileRead(fileImg, ImgCols, 4);
+
+  LabelItems := SwapEndian(LabelItems);
+  LabelMagic := SwapEndian(LabelMagic);
+  ImgMagic := SwapEndian(ImgMagic);
+  ImgItems := SwapEndian(ImgItems);
+  ImgRows := SwapEndian(ImgRows);
+  ImgCols := SwapEndian(ImgCols);
+
+  if Verbose then
+    WriteLn
+    (
+      'File:', fileName,
+      ' Labels:', LabelItems, ' Images:', ImgItems,
+      ' Rows:', ImgRows, ' Cols:', ImgCols
+    );
+
+  for ImgCnt := 1 to ImgItems do
+  begin
+    FileRead(fileImg, MNistImg, SizeOf(TMNistImage));
+    FileRead(fileLabels, LabelByte, 1);
+    Vol := TNNetVolume.Create();
+    LoadTinyImageIntoNNetVolume(MNistImg, Vol);
+    Vol.Divi(64);
+    Vol.Add(-2);
+    Vol.Tag := LabelByte;
+    ImgVolumes.Add(Vol);
+  end;
+
+  FileClose(fileLabels);
+  FileClose(fileImg);
+end;
+
 // This function returns TRUE if data_batch_1.bin and error message otherwise
 function CheckCIFARFile():boolean;
 begin
@@ -393,6 +496,25 @@ begin
   begin
     WriteLn('File Not Fount: test.bin');
     WriteLn('Please download it from here: https://www.cs.toronto.edu/~kriz/cifar-100-binary.tar.gz');
+    //TODO: automatically download file
+    Result := false;
+  end;
+end;
+
+function CheckMNISTFile(fileName: string): boolean;
+begin
+  Result := true;
+  if not (FileExists(fileName+'-labels.idx1-ubyte')) then
+  begin
+    WriteLn('File Not Fount:', fileName+'-labels.idx1-ubyte');
+    WriteLn('Please download from http://yann.lecun.com/exdb/mnist/ or https://www.kaggle.com/zalando-research/fashionmnist');
+    //TODO: automatically download file
+    Result := false;
+  end
+  else if not (FileExists(fileName+'-images.idx3-ubyte')) then
+  begin
+    WriteLn('File Not Fount:', fileName+'-images.idx3-ubyte');
+    WriteLn('Please download from http://yann.lecun.com/exdb/mnist/ or https://www.kaggle.com/zalando-research/fashionmnist');
     //TODO: automatically download file
     Result := false;
   end;
@@ -458,6 +580,20 @@ begin
   end;
   Vol.Tags[0] := TI.bFineLabel;
   Vol.Tags[1] := TI.bCoarseLabel;
+end;
+
+procedure LoadTinyImageIntoNNetVolume(var TI: TMNistImage; Vol: TNNetVolume);
+var
+  I, J: integer;
+begin
+  Vol.ReSize(28, 28, 1);
+  for I := 0 to 27 do
+  begin
+    for J := 0 to 27 do
+    begin
+      Vol[J, I, 0] := TI[I, J];
+    end;
+  end;
 end;
 
 procedure LoadNNetVolumeIntoTinyImage(Vol: TNNetVolume; var TI: TTinyImage);
