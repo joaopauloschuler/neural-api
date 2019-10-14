@@ -182,7 +182,7 @@ procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; fileName:string; base_
 
 // loads a CIFAR100 into TNNetVolumeList
 procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string;
-  color_encoding: byte = csEncodeRGB; Verbose:boolean = true); overload;
+  color_encoding: byte = csEncodeRGB; Verbose:boolean = true);
 
 // loads MNIST pair of files (image and labels) into ImgVolumes.
 procedure loadMNISTDataset(ImgVolumes: TNNetVolumeList; fileName:string;
@@ -203,9 +203,20 @@ procedure TestBatch
 // This function translates the original CIFAR10 labels to Animal/Machine labels.
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 
+{$IFNDEF FPC}
+function SwapEndian(I:integer):integer;
+{$ENDIF}
+
 implementation
 
 uses SysUtils, math;
+
+{$IFNDEF FPC}
+function SwapEndian(I:integer):integer;
+begin
+  result := Swap(I)
+end;
+{$ENDIF}
 
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 var
@@ -369,7 +380,7 @@ begin
 end;
 
 procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName: string;
-  color_encoding: byte; Verbose:boolean = true);
+  color_encoding: byte = csEncodeRGB; Verbose:boolean = true);
 var
   Img: TCifar100Image;
   cifarFile: TCifar100File;
