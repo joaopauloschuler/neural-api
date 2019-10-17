@@ -2851,7 +2851,7 @@ begin
       PreviousLayer := GetLastLayer();
       if BottleNeck > 0 then
       begin
-        if (PreviousLayer.Output.Depth > BottleNeck) and (PointWiseConv <> nil) then
+        if (PreviousLayer.Output.Depth > BottleNeck * 2) and (PointWiseConv <> nil) then
         begin
           if pBefore <> nil then AddLayer( pBefore.Create() );
           AddLayer( PointWiseConv.Create(BottleNeck, {featuresize}1, {padding}0, {stride}1, supressBias) );
@@ -6763,7 +6763,7 @@ begin
 
   if (HasNorm) then
   begin
-    AddConvOrSeparableConv := AddMovingNorm(PerCell, RandomBias, RandomAmplifier);
+    AddConvOrSeparableConv := AddChannelMovingNorm(PerCell, RandomBias, RandomAmplifier);
   end;
 end;
 
