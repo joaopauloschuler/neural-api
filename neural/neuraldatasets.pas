@@ -283,7 +283,7 @@ end;
 
 procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; TrainFileName, TestFileName: string;
-  Verbose: boolean; IsFashion:boolean = false);
+  Verbose: boolean = true; IsFashion:boolean = false);
 var
   I, HalfSize, LastElement: integer;
 begin
@@ -414,7 +414,7 @@ begin
 end;
 
 procedure loadMNISTDataset(ImgVolumes: TNNetVolumeList; fileName: string;
-  Verbose: boolean; IsFashion:boolean = false;
+  Verbose: boolean = true; IsFashion:boolean = false;
   MaxLabel: integer = 10);
 var
   fileNameLabels, fileNameImg: string;
