@@ -2,7 +2,7 @@ program CaiOptimizedDenseNet;
 (*
  Coded by Joao Paulo Schwarz Schuler.
  https://github.com/joaopauloschuler/neural-api
- This command line tool trains a DenseNetBC L40 with CIFAR-10.
+ This command line tool trains a CAI Optimized DenseNet with CIFAR-10.
  This code is inspired on:
  https://github.com/liuzhuang13/DenseNet
 *)
@@ -164,8 +164,8 @@ type
   begin
     WriteLn
     (
-      'CIFAR-10 DenseNetBC L40 Classification Example by Joao Paulo Schwarz Schuler',sLineBreak,
-      'Command Line Example: DenseNetBC L40 -i 0.8', sLineBreak,
+      'CIFAR-10 CAI Optimized DenseNet Classification Example by Joao Paulo Schwarz Schuler',sLineBreak,
+      'Command Line Example: CaiOptimizedDenseNet -i 0.8', sLineBreak,
       ' -h : displays this help. ', sLineBreak,
       ' -l : defines learing rate. Default is -l 0.001. ', sLineBreak,
       ' -i : defines inertia. Default is -i 0.9.', sLineBreak,
