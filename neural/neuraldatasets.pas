@@ -174,7 +174,8 @@ procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
 procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList;
   TrainFileName, TestFileName: string;
-  Verbose:boolean = true);
+  Verbose:boolean = true;
+  IsFashion:boolean = false);
 
 // loads a CIFAR10 into TNNetVolumeList
 procedure loadCifar10Dataset(ImgVolumes: TNNetVolumeList; idx:integer; base_pos:integer = 0; color_encoding: byte = csEncodeRGB); overload;
@@ -186,12 +187,13 @@ procedure loadCifar100Dataset(ImgVolumes: TNNetVolumeList; fileName:string;
 
 // loads MNIST pair of files (image and labels) into ImgVolumes.
 procedure loadMNISTDataset(ImgVolumes: TNNetVolumeList; fileName:string;
-  Verbose:boolean = true); overload;
+  Verbose:boolean = true; IsFashion:boolean = false;
+  MaxLabel: integer = 10); overload;
 
 // These functions return TRUE if the dataset is found or an error message otherwise
 function CheckCIFARFile():boolean;
 function CheckCIFAR100File():boolean;
-function CheckMNISTFile(fileName:string):boolean;
+function CheckMNISTFile(fileName:string; IsFasion:boolean = false):boolean;
 
 // This function tests a neural network on the passed ImgVolumes
 procedure TestBatch
@@ -281,15 +283,15 @@ end;
 
 procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; TrainFileName, TestFileName: string;
-  Verbose: boolean);
+  Verbose: boolean; IsFashion:boolean = false);
 var
   I, HalfSize, LastElement: integer;
 begin
   ImgTrainingVolumes := TNNetVolumeList.Create();
   ImgValidationVolumes := TNNetVolumeList.Create();
   ImgTestVolumes := TNNetVolumeList.Create();
-  loadMNISTDataset(ImgTrainingVolumes, TrainFileName, Verbose);
-  loadMNISTDataset(ImgValidationVolumes, TestFileName, Verbose);
+  loadMNISTDataset(ImgTrainingVolumes, TrainFileName, Verbose, IsFashion);
+  loadMNISTDataset(ImgValidationVolumes, TestFileName, Verbose, IsFashion);
   ImgValidationVolumes.FreeObjects := false;
   HalfSize := ImgValidationVolumes.Count div 2;
   LastElement := ImgValidationVolumes.Count - 1;
@@ -412,7 +414,8 @@ begin
 end;
 
 procedure loadMNISTDataset(ImgVolumes: TNNetVolumeList; fileName: string;
-  Verbose: boolean);
+  Verbose: boolean; IsFashion:boolean = false;
+  MaxLabel: integer = 10);
 var
   fileNameLabels, fileNameImg: string;
   fileLabels, fileImg: THandle;
@@ -422,9 +425,14 @@ var
   ImgCnt: integer;
   LabelByte: integer;
   Vol: TNNetVolume;
+  Separator: char;
 begin
-  fileNameLabels := fileName + '-labels.idx1-ubyte';
-  fileNameImg := fileName + '-images.idx3-ubyte';
+  if IsFashion
+    then Separator := '-'
+    else Separator := '.';
+
+  fileNameLabels := fileName + '-labels'+Separator+'idx1-ubyte';
+  fileNameImg := fileName + '-images'+Separator+'idx3-ubyte';
 
   if not FileExists(fileNameLabels) then
   begin
@@ -473,7 +481,15 @@ begin
     Vol.Divi(64);
     Vol.Add(-2);
     Vol.Tag := LabelByte;
-    ImgVolumes.Add(Vol);
+    if LabelByte >= MaxLabel then
+    begin
+      WriteLn('Error loading Label:', LabelByte,' at index ', ImgCnt);
+      Vol.Free;
+    end
+    else
+    begin
+      ImgVolumes.Add(Vol);
+    end;
   end;
 
   FileClose(fileLabels);
@@ -512,20 +528,37 @@ begin
   end;
 end;
 
-function CheckMNISTFile(fileName: string): boolean;
+function CheckMNISTFile(fileName: string; IsFasion:boolean = false): boolean;
+var
+  Separator: char;
+  Link: string;
+  FullFileName: string;
 begin
   Result := true;
-  if not (FileExists(fileName+'-labels.idx1-ubyte')) then
+  if IsFasion then
   begin
-    WriteLn('File Not Fount:', fileName+'-labels.idx1-ubyte');
-    WriteLn('Please download from http://yann.lecun.com/exdb/mnist/ or https://www.kaggle.com/zalando-research/fashionmnist');
+    Separator := '-';
+    Link := 'https://www.kaggle.com/zalando-research/fashionmnist';
+  end
+  else
+  begin
+    Separator := '.';
+    Link := 'http://yann.lecun.com/exdb/mnist/';
+  end;
+  FullFileName := fileName+'-labels'+Separator+'idx1-ubyte';
+  if not (FileExists(FullFileName)) then
+  begin
+    WriteLn('File Not Fount:', FullFileName);
+    WriteLn('Please download from ', Link);
     //TODO: automatically download file
     Result := false;
-  end
-  else if not (FileExists(fileName+'-images.idx3-ubyte')) then
+    exit;
+  end;
+  FullFileName := fileName+'-images'+Separator+'idx3-ubyte';
+  if not (FileExists(FullFileName)) then
   begin
-    WriteLn('File Not Fount:', fileName+'-images.idx3-ubyte');
-    WriteLn('Please download from http://yann.lecun.com/exdb/mnist/ or https://www.kaggle.com/zalando-research/fashionmnist');
+    WriteLn('File Not Fount:', FullFileName);
+    WriteLn('Please download from ', Link);
     //TODO: automatically download file
     Result := false;
   end;

@@ -1345,6 +1345,17 @@ begin
     end;
     ImgInput.Tag := FImgVolumes[ImgIdx].Tag;
 
+    if ImgInput.Tag >= FNumClasses then
+    begin
+      FErrorProc
+      (
+        'Invalid image ' + IntToStr(ImgIdx) +
+        ' input class: ' + IntToStr(ImgInput.Tag)
+      );
+      ReadLn;
+      Continue;
+    end;
+
     LocalNN.Compute( ImgInput );
     LocalNN.GetOutput( pOutput );
 
