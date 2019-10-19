@@ -41,7 +41,7 @@ type
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
-    CreateMNistVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, 'train', 't10k');
+    CreateMNISTVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, 'train', 't10k');
 
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'SimpleMNist';

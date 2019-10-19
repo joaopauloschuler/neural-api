@@ -40,7 +40,7 @@ type
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
-    CreateMNistVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
+    CreateMNISTVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
       'train', 't10k', {Verbose=}true, {IsFashion=}true);
 
     NeuralFit := TNeuralImageFit.Create;

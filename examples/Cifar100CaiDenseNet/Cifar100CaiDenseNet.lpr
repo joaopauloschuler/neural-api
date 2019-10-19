@@ -3,9 +3,7 @@ program Cifar100CaiDenseNet;
 (*
  Coded by Joao Paulo Schwarz Schuler.
  https://github.com/joaopauloschuler/neural-api
- This command line tool trains a DenseNetBC L40 with CIFAR-10.
- This code is inspired on:
- https://github.com/liuzhuang13/DenseNet
+ This command line tool trains a CAI Optimized DenseNet with CIFAR-100.
 *)
 {$mode objfpc}{$H+}
 
@@ -90,7 +88,7 @@ type
     ConvNeuronCount: integer;
     Bottleneck: integer;
     HasMovingNorm: boolean;
-    I,Idx: integer;
+    //I,Idx: integer;
   begin
     if not CheckCIFAR100File() then exit;
     WriteLn('Creating Neural Network...');
@@ -166,7 +164,7 @@ type
   begin
     WriteLn
     (
-      'CIFAR-10 DenseNetBC L40 Classification Example by Joao Paulo Schwarz Schuler',sLineBreak,
+      'CIFAR-100 Cai Optimized DenseNet Example by Joao Paulo Schwarz Schuler',sLineBreak,
       'Command Line Example: Cifar100CaiDenseNet -i 0.8', sLineBreak,
       ' -h : displays this help. ', sLineBreak,
       ' -l : defines learing rate. Default is -l 0.001. ', sLineBreak,

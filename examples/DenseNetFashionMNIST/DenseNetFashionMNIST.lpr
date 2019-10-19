@@ -127,7 +127,7 @@ type
     WriteLn('Inertia set to: [',fInertia:7:5,']');
     WriteLn('Target set to: [',fTarget:7:5,']');
 
-    CreateMNistVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
+    CreateMNISTVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
       'train', 't10k', {Verbose=}true, {IsFashion=}true);
 
     WriteLn('Neural Network will minimize error with:');

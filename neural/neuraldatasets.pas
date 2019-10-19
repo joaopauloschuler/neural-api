@@ -171,7 +171,7 @@ procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
   Verbose:boolean = true);
 
-procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
+procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList;
   TrainFileName, TestFileName: string;
   Verbose:boolean = true;
@@ -281,7 +281,7 @@ begin
   ImgValidationVolumes.FreeObjects := true;
 end;
 
-procedure CreateMNistVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
+procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; TrainFileName, TestFileName: string;
   Verbose: boolean = true; IsFashion:boolean = false);
 var
