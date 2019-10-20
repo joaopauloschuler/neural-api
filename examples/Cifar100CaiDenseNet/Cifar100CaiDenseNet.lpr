@@ -1,4 +1,3 @@
-// This example is under development - do not use it.
 program Cifar100CaiDenseNet;
 (*
  Coded by Joao Paulo Schwarz Schuler.
