@@ -538,7 +538,7 @@ begin
   if IsFasion then
   begin
     Separator := '-';
-    Link := 'https://www.kaggle.com/zalando-research/fashionmnist';
+    Link := 'https://github.com/zalandoresearch/fashion-mnist';
   end
   else
   begin
