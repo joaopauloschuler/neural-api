@@ -423,7 +423,7 @@ var
   ImgMagic, ImgItems, ImgRows, ImgCols: Integer;
   MNistImg: TMNistImage;
   ImgCnt: integer;
-  LabelByte: integer;
+  LabelByte: byte;
   Vol: TNNetVolume;
   Separator: char;
 begin

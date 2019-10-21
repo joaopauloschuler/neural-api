@@ -133,7 +133,7 @@ type
     WriteLn('Neural Network will minimize error with:');
     WriteLn(' Layers: ', NN.CountLayers());
     WriteLn(' Neurons:', NN.CountNeurons());
-    WriteLn(' Weights:' ,NN.CountWeights());
+    WriteLn(' Weights:', NN.CountWeights());
     NN.DebugWeights();
     NN.DebugStructure();
 
