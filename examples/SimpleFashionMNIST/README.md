@@ -17,3 +17,9 @@ With CAI, Fashion MNIST dataset is loaded with:
 ```
 CreateMNISTVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, 'train', 't10k', {Verbose=}true, {IsFashion=}true);
 ```
+
+In this example, the presence of required dataset files is tested with
+```
+if Not(CheckMNISTFile('train', {IsFashion=}true)) or
+   Not(CheckMNISTFile('t10k', {IsFashion=}true)) then exit;
+```
