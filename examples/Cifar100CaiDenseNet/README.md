@@ -1,4 +1,4 @@
-# CAI Optimized DenseNet MNIST Image Classifier
+# CAI Optimized DenseNet CIFAR-100 Image Classifier
 
 [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html) is an 100 classes dataset commonly used for testing computer vision algorithms.
 
