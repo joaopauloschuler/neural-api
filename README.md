@@ -178,6 +178,33 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
 
+### Datasets
+These datasets can be easily loaded:
+
+#### CIFAR-10
+```
+procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList);
+```
+Source code example: [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier)
+
+#### CIFAR-100
+```
+procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList);
+```
+Source code example: [CAI Optimized DenseNet CIFAR-100 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Cifar100CaiDenseNet)
+
+#### MNIST and Fashion MNIST
+```
+procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
+  ImgTestVolumes: TNNetVolumeList;
+  TrainFileName, TestFileName: string;
+  Verbose:boolean = true;
+  IsFashion:boolean = false);
+  ```
+Source code examples: 
+* [Simple MNIST Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleMNist)
+* [Simple Fashion MNIST Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleFashionMNIST)
+
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
