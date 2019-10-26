@@ -370,7 +370,7 @@ begin
         end;
       end;
       FNN.UpdateWeights();
-      FNN.ComputeL2Decay();
+      if FL2Decay > 0.0 then FNN.ComputeL2Decay();
 
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
       if (FGlobalTotal > 0) then
@@ -1053,7 +1053,7 @@ begin
         end;
       end;
       FNN.UpdateWeights();
-      FNN.ComputeL2Decay();
+      if FL2Decay > 0.0 then FNN.ComputeL2Decay();
 
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
       if (FGlobalTotal > 0) then
