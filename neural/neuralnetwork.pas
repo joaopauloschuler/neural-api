@@ -347,21 +347,39 @@ type
   end;
 
   /// This is a plain Rectified Linear Unit (ReLU) layer.
+  // https://en.wikipedia.org/wiki/Rectifier_(neural_networks)
   TNNetReLU = class(TNNetReLUBase)
     public
       procedure Compute(); override;
   end;
 
+  /// Scaled Exponential Linear Unit
+  // https://arxiv.org/pdf/1706.02515.pdf
+  // You might need to lower your learning rate with SELU.
+  TNNetSELU = class(TNNetReLUBase)
+    private
+      FAlpha: TNeuralFloat;
+      FScale: TNeuralFloat;
+      FScaleAlpha: TNeuralFloat;
+      FThreshold: TNeuralFloat;
+    public
+      constructor Create();
+      procedure Compute(); override;
+  end;
+
   /// Leaky Rectified Linear Unit (ReLU) layer.
+  // https://en.wikipedia.org/wiki/Rectifier_(neural_networks)
   TNNetLeakyReLU = class(TNNetReLUBase)
     private
-      FNegativeSide: TNeuralFloat;
+      FAlpha: TNeuralFloat;
+      FThreshold: TNeuralFloat;
     public
       constructor Create();
       procedure Compute(); override;
   end;
 
   /// Very Leaky Rectified Linear Unit (ReLU) layer.
+  // https://en.wikipedia.org/wiki/Rectifier_(neural_networks)
   TNNetVeryLeakyReLU = class(TNNetLeakyReLU)
     public
       constructor Create();
@@ -1201,18 +1219,77 @@ type
 
 implementation
 
+{ TNNetSELU }
+
+constructor TNNetSELU.Create();
+begin
+  inherited Create;
+  FAlpha := 1.6733;
+  FScale := 1.0507;
+  FThreshold := 0.0;
+  FScaleAlpha := FAlpha * FScale;
+end;
+
+procedure TNNetSELU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  ScaleAlphaExp: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      if LocalPrevOutput.FData[OutputCnt]>FThreshold then
+      begin
+        FOutput.FData[OutputCnt] := FScale * LocalPrevOutput.FData[OutputCnt];
+        FOutputErrorDeriv.FData[OutputCnt] := FScale;
+      end
+      else
+      begin
+        ScaleAlphaExp := FScaleAlpha * Exp(LocalPrevOutput.FData[OutputCnt]);
+        FOutput.FData[OutputCnt] := ScaleAlphaExp - FScaleAlpha;
+        FOutputErrorDeriv.FData[OutputCnt] := ScaleAlphaExp;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      if LocalPrevOutput.FData[OutputCnt]>FThreshold then
+      begin
+        FOutput.FData[OutputCnt] := FScale * LocalPrevOutput.FData[OutputCnt];
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := FScaleAlpha * Exp(LocalPrevOutput.FData[OutputCnt]) - FScaleAlpha;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetVeryLeakyReLU }
 constructor TNNetVeryLeakyReLU.Create();
 begin
   inherited Create();
-  FNegativeSide := 1/3;
+  FAlpha := 1/3;
 end;
 
 { TNNetLeakyReLU }
 constructor TNNetLeakyReLU.Create();
 begin
   inherited Create();
-  FNegativeSide := 0.001;
+  FAlpha := 0.01;
+  FThreshold := 0.0;
 end;
 
 procedure TNNetLeakyReLU.Compute();
@@ -1230,15 +1307,15 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      if LocalPrevOutput.FData[OutputCnt]>0 then
+      if LocalPrevOutput.FData[OutputCnt]>FThreshold then
       begin
         FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
         FOutputErrorDeriv.FData[OutputCnt] := 1;
       end
       else
       begin
-        FOutput.FData[OutputCnt] := FOutput.FData[OutputCnt] * FNegativeSide;
-        FOutputErrorDeriv.FData[OutputCnt] := FNegativeSide;
+        FOutput.FData[OutputCnt] := FOutput.FData[OutputCnt] * FAlpha;
+        FOutputErrorDeriv.FData[OutputCnt] := FAlpha;
       end;
     end;
   end
@@ -1247,13 +1324,13 @@ begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
     begin
-      if LocalPrevOutput.FData[OutputCnt]>0 then
+      if LocalPrevOutput.FData[OutputCnt]>FThreshold then
       begin
         FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
       end
       else
       begin
-        FOutput.FData[OutputCnt] := FOutput.FData[OutputCnt] * FNegativeSide;
+        FOutput.FData[OutputCnt] := FOutput.FData[OutputCnt] * FAlpha;
       end;
     end;
   end;
@@ -2881,11 +2958,11 @@ begin
       if BottleNeck > 0 then
       begin
         AddMovingNorm(false, 0, 0);
-        AddLayer( TNNetReLU.Create() );
+        AddLayer( TNNetSELU.Create() );
         AddLayer( TNNetPointwiseConvLinear.Create(BottleNeck, supressBias) );
       end;
       AddMovingNorm(false, 0, 0);
-      AddLayer( TNNetReLU.Create() );
+      AddLayer( TNNetSELU.Create() );
       AddLayer( TNNetConvolutionLinear.Create(k, {featuresize}3, {padding}1, {stride}1, supressBias) );
       if (DropoutRate > 0) then AddLayer( TNNetDropout.Create(DropoutRate) );
       AddLayer( TNNetDeepConcat.Create([PreviousLayer, GetLastLayer()]) );
@@ -2900,7 +2977,7 @@ function THistoricalNets.AddDenseNetTransition(
   HasAvgPool: boolean = true): TNNetLayer;
 begin
   AddChannelMovingNorm(false, 0, 0);
-  AddLayer( TNNetReLU.Create() );
+  AddLayer( TNNetSELU.Create() );
   if (Compression <> 1)
       then AddCompression(Compression, supressBias);
   if HasAvgPool
@@ -6592,6 +6669,7 @@ begin
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
+      'TNNetSELU' :                 Result := TNNetSELU.Create();
       'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
@@ -6656,6 +6734,7 @@ begin
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
+      if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
       if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else

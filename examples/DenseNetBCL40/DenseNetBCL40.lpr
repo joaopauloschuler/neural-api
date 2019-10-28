@@ -51,7 +51,7 @@ type
       fLearningRate := StrToFloat(LearningRate);
     end;
 
-    fInertia := 0.9;
+    fInertia := 0.9; //0.75 should also be tested.
     if HasOption('i', 'inertia') then
     begin
       Inertia := GetOptionValue('i', 'inertia');
@@ -99,7 +99,7 @@ type
     NN.AddDenseNetTransition(0.5, 1, false);
     NN.AddDenseNetBlock(6, 12, 48, 0, fDropout);
     NN.AddMovingNorm(false, 0, 0);
-    NN.AddLayer( TNNetReLU.Create() );
+    NN.AddLayer( TNNetSELU.Create() );
     NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
     NN.AddLayer( TNNetSoftMax.Create() );
