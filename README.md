@@ -37,7 +37,7 @@ CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 WriteLn('Neural Network will minimize error with:');
 WriteLn(' Layers: ', NN.CountLayers());
 WriteLn(' Neurons:', NN.CountNeurons());
-WriteLn(' Weights:' ,NN.CountWeights());
+WriteLn(' Weights:', NN.CountWeights());
 
 NeuralFit := TNeuralImageFit.Create;
 NeuralFit.InitialLearningRate := fLearningRate;
@@ -145,6 +145,9 @@ This API is really big. The following list gives a general idea about this API b
 
 ### Layers with Activation Functions and no Trainable Parameter
 * `TNNetReLU` (input/output: 1D, 2D or 3D).
+* `TNNetSELU` (input/output: 1D, 2D or 3D).
+* `TNNetLeakyReLU` (input/output: 1D, 2D or 3D).
+* `TNNetVeryLeakyReLU` (input/output: 1D, 2D or 3D).
 * `TNNetSigmoid` (input/output: 1D, 2D or 3D).
 * `TNNetSoftMax` (input/output: 1D, 2D or 3D).
 

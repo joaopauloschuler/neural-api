@@ -1,4 +1,4 @@
-# CAI Optimized DenseNet MNIST Image Classifier
+# CAI Optimized DenseNet Fashion MNIST Image Classifier
 
 [Fashion MNIST](https://github.com/zalandoresearch/fashion-mnist) is a dataset commonly used for testing computer vision algorithms.
 It contains these classes:
