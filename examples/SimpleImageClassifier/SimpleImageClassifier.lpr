@@ -32,6 +32,7 @@ type
       TNNetInput.Create(32, 32, 3),
       TNNetConvolutionLinear.Create(64, 5, 2, 1, 1).InitBasicPatterns(),
       TNNetMaxPool.Create(4),
+      TNNetMovingStdNormalization.Create(),
       TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
       TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
       TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
@@ -50,7 +51,7 @@ type
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}128, {epochs=}50);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}64, {epochs=}50);
     NeuralFit.Free;
 
     NN.Free;
