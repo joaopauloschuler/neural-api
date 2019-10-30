@@ -502,7 +502,7 @@ begin
 
       if (iEpochCount mod FThreadNN.Count = 0) and (FVerbose) then
       begin
-        FNN.DebugWeights();
+        FThreadNN[0].DebugWeights();
       end;
 
       if TestCnt > 0 then
@@ -1256,7 +1256,7 @@ begin
 
       if (iEpochCount mod FThreadNN.Count = 0) and (FVerbose) then
       begin
-        FNN.DebugWeights();
+        FThreadNN[0].DebugWeights();
       end;
 
       if Assigned(FImgTestVolumes) then
