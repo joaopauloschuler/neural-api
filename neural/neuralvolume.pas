@@ -229,6 +229,7 @@ type
     procedure InitHeUniform(Value: T = 1);
     procedure InitLeCunGaussian(Value: T = 1);
     procedure InitHeGaussian(Value: T = 1);
+    procedure InitSELU(Value: T = 1);
 
     // load and save functions
     function SaveToString(): string;
@@ -4250,6 +4251,11 @@ begin
   InitGaussian();
   MulAux := Value*Sqrt(3/(Size));
   Mul(MulAux);
+end;
+
+procedure TVolume.InitSELU(Value: T);
+begin
+  InitGaussian( Value * Sqrt(1/Size) );
 end;
 
 function TVolume.SaveToString(): string;

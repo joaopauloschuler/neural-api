@@ -114,6 +114,7 @@ type
       procedure InitHeGaussian(Value: TNeuralFloat = 1);
       procedure InitHeUniformDepthwise(Value: TNeuralFloat = 1);
       procedure InitHeGaussianDepthwise(Value: TNeuralFloat = 1);
+      procedure InitSELU(Value: TNeuralFloat = 1);
 
       property Weights: TNNetVolume read FWeights;
       property BackInertia: TNNetVolume read FBackInertia;
@@ -136,8 +137,7 @@ type
     csNNetMaxParameterIdx = 7;
 
   type
-  // neural network layer
-  { TNNetLayer }
+  /// neural network layer
   TNNetLayer = class(TMObject)
     protected
       FActivationFn: TNeuralActivationFunction;
@@ -238,13 +238,14 @@ type
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
 
       // Initializers
-      procedure InitUniform(Value: TNeuralFloat = 1);
-      procedure InitLeCunUniform(Value: TNeuralFloat = 1);
-      procedure InitHeUniform(Value: TNeuralFloat = 1);
-      procedure InitHeUniformDepthwise(Value: TNeuralFloat = 1);
-      procedure InitHeGaussian(Value: TNeuralFloat = 0.5);
-      procedure InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5);
-      procedure InitGlorotBengioUniform(Value: TNeuralFloat = 1);
+      function InitUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      function InitLeCunUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      function InitHeUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      function InitHeUniformDepthwise(Value: TNeuralFloat = 1): TNNetLayer;
+      function InitHeGaussian(Value: TNeuralFloat = 0.5): TNNetLayer;
+      function InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5): TNNetLayer;
+      function InitGlorotBengioUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       procedure InitDefault(); virtual;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
@@ -1246,7 +1247,7 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      if LocalPrevOutput.FData[OutputCnt]>FThreshold then
+      if LocalPrevOutput.FData[OutputCnt] >= FThreshold then
       begin
         FOutput.FData[OutputCnt] := FScale * LocalPrevOutput.FData[OutputCnt];
         FOutputErrorDeriv.FData[OutputCnt] := FScale;
@@ -8298,7 +8299,7 @@ begin
   {$ENDIF}
 end;
 
-procedure TNNetLayer.InitUniform(Value: TNeuralFloat);
+function TNNetLayer.InitUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -8310,9 +8311,10 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
 end;
 
-procedure TNNetLayer.InitLeCunUniform(Value: TNeuralFloat);
+function TNNetLayer.InitLeCunUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -8324,9 +8326,10 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
 end;
 
-procedure TNNetLayer.InitHeUniform(Value: TNeuralFloat);
+function TNNetLayer.InitHeUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -8338,9 +8341,10 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
 end;
 
-procedure TNNetLayer.InitHeUniformDepthwise(Value: TNeuralFloat);
+function TNNetLayer.InitHeUniformDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -8352,9 +8356,10 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
 end;
 
-procedure TNNetLayer.InitHeGaussian(Value: TNeuralFloat);
+function TNNetLayer.InitHeGaussian(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -8366,9 +8371,10 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
 end;
 
-procedure TNNetLayer.InitHeGaussianDepthwise(Value: TNeuralFloat);
+function TNNetLayer.InitHeGaussianDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -8380,9 +8386,10 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
 end;
 
-procedure TNNetLayer.InitGlorotBengioUniform(Value: TNeuralFloat);
+function TNNetLayer.InitGlorotBengioUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
   MulAux: Single;
@@ -8402,6 +8409,22 @@ begin
     end;
     AfterWeightUpdate();
   end;
+  Result := Self;
+end;
+
+function TNNetLayer.InitSELU(Value: TNeuralFloat): TNNetLayer;
+var
+  Cnt: integer;
+begin
+  if (FNeurons.Count > 0) then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].InitSELU(Value);
+    end;
+    AfterWeightUpdate();
+  end;
+  Result := Self;
 end;
 
 procedure TNNetLayer.InitDefault();
@@ -9233,6 +9256,11 @@ begin
   InitGaussian();
   MulAux := Value*Sqrt(3/(FWeights.SizeX * FWeights.SizeY));
   FWeights.Mul(MulAux);
+end;
+
+procedure TNNetNeuron.InitSELU(Value: TNeuralFloat);
+begin
+  InitGaussian( Value * Sqrt(1/FWeights.Size) );
 end;
 
 procedure TNNetNeuron.Fill(Value: TNeuralFloat);
