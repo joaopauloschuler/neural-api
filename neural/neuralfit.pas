@@ -106,6 +106,8 @@ type
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
+      property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
+      property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property Verbose: boolean read FVerbose write FVerbose;
