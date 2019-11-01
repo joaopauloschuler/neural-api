@@ -52,7 +52,7 @@ type
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'ImageClassifierSELU';
     NeuralFit.InitialLearningRate := 0.001;
-    NeuralFit.LearningRateDecay := 0.01;
+    NeuralFit.LearningRateDecay := 0.03;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
