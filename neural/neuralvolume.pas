@@ -212,7 +212,8 @@ type
     // Color and Neuronal Weights Transformations
     procedure RgbImgToNeuronalInput(color_encoding: integer);
     procedure NeuronalInputToRgbImg(color_encoding: integer);
-    procedure NeuronalWeightToImg(MaxW, MinW:TNeuralFloat; color_encoding: integer);
+    procedure NeuronalWeightToImg(color_encoding: integer); overload;
+    procedure NeuronalWeightToImg(MaxW, MinW:TNeuralFloat; color_encoding: integer); overload;
     procedure NeuronalWeightToImg3Channel(MaxW0, MinW0, MaxW1, MinW1, MaxW2, MinW2:TNeuralFloat; color_encoding: integer);
 
     procedure ZeroCenter();
@@ -3671,6 +3672,11 @@ begin
   begin
     WriteLn('Bad color encoding:', color_encoding);
   end;
+end;
+
+procedure TVolume.NeuronalWeightToImg(color_encoding: integer);
+begin
+  NeuronalWeightToImg(Self.GetMax(), Self.GetMin(), color_encoding);
 end;
 
 procedure TVolume.NeuronalWeightToImg(MaxW, MinW: TNeuralFloat; color_encoding: integer);
