@@ -26,19 +26,19 @@ interface
 uses
   Classes, SysUtils, ExtCtrls, Graphics, neuralvolume, LCLType;
 
-// saves a bitmap into a file from a handle HWND
+/// saves a bitmap into a file from a handle HWND
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
 
-// Loads a volume into RGB TImage
+/// Loads a volume into RGB TImage
 procedure LoadVolumeIntoTImage(V:TNNetVolume; Image:TImage; color_encoding: integer = csEncodeRGB);
 
-// Loads a 3 layers RGB volume into RGB TImage
+/// Loads a 3 layers RGB volume into RGB TImage
 procedure LoadRGBVolumeIntoTImage(V:TNNetVolume; Image:TImage);
 
-// Loads a Picture into a Volume
+/// Loads a Picture into a Volume
 procedure LoadPictureIntoVolume(LocalPicture: TPicture; Vol:TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
 
-// Loads a Bitmat into a Volume
+/// Loads a Bitmat into a Volume
 procedure LoadBitmapIntoVolume(LocalBitmap: TBitmap; Vol:TNNetVolume);
 
 implementation

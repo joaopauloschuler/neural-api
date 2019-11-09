@@ -3684,6 +3684,7 @@ var
   MaxAbs: TNeuralFloat;
 begin
   MaxAbs := Max(Abs(MinW), Abs(MaxW));
+  if MaxAbs = 0.0 then exit;
   if ( (color_encoding = csEncodeRGB) or (color_encoding = csEncodeGray) ) then
   begin
     Mul(128/MaxAbs);

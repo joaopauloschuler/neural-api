@@ -122,7 +122,8 @@ type
   end;
 
   {$IFDEF FPC}
-  TNNetNeuronList = specialize TFPGObjectList<TNNetNeuron>;
+  TNNetNeuronList = class (specialize TFPGObjectList<TNNetNeuron>)
+    public
   {$ELSE}
   TNNetNeuronList = class (TNNetList)
     private
@@ -130,8 +131,12 @@ type
       procedure SetItem(Index: Integer; AObject: TNNetNeuron); inline;
     public
       property Items[Index: Integer]: TNNetNeuron read GetItem write SetItem; default;
-  end;
   {$ENDIF}
+      constructor CreateWithElements(ElementCount: integer);
+      function GetMaxWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function GetMinWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      procedure InitForDebug();
+  end;
 
   const
     csNNetMaxParameterIdx = 7;
@@ -762,6 +767,7 @@ type
       FCalculatePrevLayerError: boolean;
       function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer;
       procedure RefreshNeuronWeightList();
+      procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -1066,6 +1072,7 @@ type
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Backpropagate(pOutput: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
+      procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
       procedure Backpropagate(pOutput: array of TNeuralFloat); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure GetOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure AddOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
@@ -1217,8 +1224,206 @@ type
   procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
   {$ENDIF}
 
+  procedure RebuildPatternOnPreviousPatterns
+  (
+    Calculated: TNNetVolume;
+    LocalWeight: TNNetVolume;
+    PrevLayer: TNNetNeuronList;
+    PrevStride: integer;
+    ReLU: boolean
+  );
+
+  procedure RebuildNeuronListOnPreviousPatterns
+  (
+    CalculatedLayer: TNNetNeuronList;
+    CurrentLayer, PrevLayer: TNNetNeuronList;
+    PrevStride: integer;
+    ReLU: boolean
+  );
 
 implementation
+
+procedure RebuildPatternOnPreviousPatterns
+(
+  Calculated: TNNetVolume;
+  LocalWeight: TNNetVolume;
+  PrevLayer: TNNetNeuronList;
+  PrevStride: integer;
+  ReLU: boolean
+);
+var
+  SizeX, SizeY, Depth: integer;
+  LocalMaxX, LocalMaxY, LocalMaxD: integer;
+  LocalCntX, LocalCntY, NeuronIdx: integer;
+  LocalMultiplier: TNeuralFloat;
+  PrevMaxX, PrevMaxY, PrevMaxD: integer;
+  PrevCntX, PrevCntY, PrevCntD: integer;
+  PrevWeight: TNNetVolume;
+  PrevWeightValue: TNeuralFloat;
+begin
+  Depth := PrevLayer[0].Weights.Depth;
+  SizeX :=
+    PrevLayer[0].Weights.SizeX +
+    ((LocalWeight.SizeX - 1) * PrevStride);
+  SizeY :=
+    PrevLayer[0].Weights.SizeY +
+    ((LocalWeight.SizeY - 1) * PrevStride);
+  if PrevLayer.Count <> LocalWeight.Depth then
+  begin
+    exit;
+  end;
+  Calculated.ReSize(SizeX, SizeY, Depth);
+  Calculated.Fill(0);
+  LocalMaxX := LocalWeight.SizeX - 1;
+  LocalMaxY := LocalWeight.SizeY - 1;
+  LocalMaxD := LocalWeight.Depth - 1;
+  // For each current weight
+  for LocalCntX := 0 to LocalMaxX do
+  begin
+    for LocalCntY := 0 to LocalMaxY do
+    begin
+      for NeuronIdx := 0 to LocalMaxD do
+      begin
+        LocalMultiplier := LocalWeight[LocalCntX, LocalCntY, NeuronIdx];
+        begin
+          // Multiply corresponding weight and add to proper position.
+          PrevWeight := PrevLayer[NeuronIdx].Weights;
+          PrevMaxX := PrevWeight.SizeX - 1;
+          PrevMaxY := PrevWeight.SizeY - 1;
+          PrevMaxD := PrevWeight.Depth - 1;
+          for PrevCntX := 0 to PrevMaxX do
+          begin
+            for PrevCntY := 0 to PrevMaxY do
+            begin
+              for PrevCntD := 0 to PrevMaxD do
+              begin
+                PrevWeightValue := PrevWeight[PrevCntX, PrevCntY, PrevCntD];
+                if (PrevWeightValue > 0) or Not(ReLU) then
+                Calculated.Add
+                (
+                  (LocalCntX * PrevStride) + PrevCntX,
+                  (LocalCntY * PrevStride) + PrevCntY,
+                  PrevCntD,
+                  LocalMultiplier * PrevWeightValue
+                );
+              end;
+            end;
+          end; // PrevCntX
+        end; //if LocalMultiplier > 0
+      end;
+    end;
+  end; // LocalCntX
+end;
+
+procedure RebuildNeuronListOnPreviousPatterns
+(
+  CalculatedLayer: TNNetNeuronList;
+  CurrentLayer, PrevLayer: TNNetNeuronList;
+  PrevStride: integer;
+  ReLU: boolean
+);
+var
+  NeuronCnt: integer;
+begin
+  if CurrentLayer.Count <> CalculatedLayer.Count then
+  begin
+    WriteLn(
+      'Sizes differ. Current layer: ', CurrentLayer.Count,
+      ' Calc layer: ', CalculatedLayer.Count
+    );
+    exit;
+  end;
+
+  for NeuronCnt := 0 to CurrentLayer.Count - 1 do
+  begin
+    RebuildPatternOnPreviousPatterns
+    (
+     {Calculated=}CalculatedLayer[NeuronCnt].Weights,
+     {LocalWeight=}CurrentLayer[NeuronCnt].Weights,
+     {PrevLayer=}PrevLayer,
+     {PrevStride=}PrevStride,
+     ReLU
+    );
+  end;
+end;
+
+{ TNNetNeuronList }
+constructor TNNetNeuronList.CreateWithElements(ElementCount: integer);
+var
+  I: integer;
+begin
+  Self.Create();
+  for I := 1 to ElementCount do
+    Self.Add( TNNetNeuron.Create() );
+end;
+
+function TNNetNeuronList.GetMaxWeight(): TNeuralFloat;
+var
+  Cnt: integer;
+  MaxValue: TNeuralFloat;
+begin
+  if Count > 0 then
+  begin
+    Result := Self[0].Weights.GetMax();
+    if Count > 1 then
+    begin
+      for Cnt := 0 to Count-1 do
+      begin
+        MaxValue := Self[Cnt].Weights.GetMax();
+        if MaxValue > Result then Result := MaxValue;
+      end;
+    end;
+  end
+  else
+  begin
+    Result := -1;
+  end;
+end;
+
+function TNNetNeuronList.GetMinWeight(): TNeuralFloat;
+var
+  Cnt: integer;
+  MinValue: TNeuralFloat;
+begin
+  if Count > 0 then
+  begin
+    Result := Self[0].Weights.GetMin();
+    if Count > 1 then
+    begin
+      for Cnt := 0 to Count-1 do
+      begin
+        MinValue := Self[Cnt].Weights.GetMin();
+        if MinValue < Result then Result := MinValue;
+      end;
+    end;
+  end
+  else
+  begin
+    Result := -1;
+  end;
+end;
+
+procedure TNNetNeuronList.InitForDebug();
+begin
+  if (Count >= 3) and (Self[0].Weights.Depth >= 3)then
+  begin
+    Self[0].Weights.Fill(0);
+    Self[1].Weights.Fill(0);
+    Self[2].Weights.Fill(0);
+    Self[0].Weights[0,0,0] := 1;
+    Self[1].Weights[0,0,1] := 1;
+    Self[2].Weights[0,0,2] := 1;
+  end;
+  if (Count >= 6) and (Self[0].Weights.Depth >= 16) and (Self[0].Weights.SizeX >= 3) then
+  begin
+    Self[3].Weights.Fill(0);
+    Self[4].Weights.Fill(0);
+    Self[5].Weights.Fill(0);
+    Self[3].Weights[0,0,4] := -1;
+    Self[4].Weights[1,0,5] := 1;
+    Self[5].Weights[2,0,6] := 1;
+  end;
+end;
 
 { TNNetSELU }
 
@@ -1961,6 +2166,7 @@ begin
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
+    RefreshCalculatePrevLayerError();
     if FPadding > 0
       then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
       else FInputCopy := FPrevLayer.Output;
@@ -5311,6 +5517,14 @@ begin
   end;
 end;
 
+procedure TNNetConvolutionAbstract.RefreshCalculatePrevLayerError();
+begin
+  FCalculatePrevLayerError :=
+    Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+end;
+
 procedure TNNetConvolutionAbstract.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -5318,10 +5532,7 @@ begin
   FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY);
   SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, pPrevLayer.Output.Depth);
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
-  FCalculatePrevLayerError :=
-    Assigned(FPrevLayer) and
-    (FPrevLayer.OutputError.Size > 0) and
-    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  RefreshCalculatePrevLayerError();
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureSizeX, FPadding, FStride);
   FOutputSizeY := CalcOutputSize(pPrevLayer.Output.SizeY, FFeatureSizeY, FPadding, FStride);
 end;
@@ -5632,6 +5843,7 @@ begin
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
+    RefreshCalculatePrevLayerError();
     if FPadding > 0
       then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
       else FInputCopy := FPrevLayer.Output;
@@ -7204,6 +7416,13 @@ begin
   FBackwardTime := FBackwardTime + (Now() - StartTime);
 end;
 
+procedure TNNet.BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
+begin
+  ResetBackpropCallCurrCnt();
+  Layers[LayerIdx].ComputeOutputErrorForOneNeuron(NeuronIdx, Error);
+  Layers[LayerIdx].Backpropagate();
+end;
+
 procedure TNNet.Backpropagate(pOutput: array of TNeuralFloat);
 var
   V: TNNetVolume;
@@ -7699,8 +7918,8 @@ begin
         Write
         (
           'Layer ',LayerCnt:2,
-          ' Max Error: ', FLayers[LayerCnt].OutputError.GetMax():7:3,
-          ' Min Error: ', FLayers[LayerCnt].OutputError.GetMin():7:3,
+          ' Max Error: ', FLayers[LayerCnt].OutputError.GetMax():12:7,
+          ' Min Error: ', FLayers[LayerCnt].OutputError.GetMin():12:7,
           ' Max ErrorD: ',FLayers[LayerCnt].OutputErrorDeriv.GetMax():6:3,
           ' Min ErrorD: ',FLayers[LayerCnt].OutputErrorDeriv.GetMin():6:3,
           ' ' + FLayers[LayerCnt].ClassName + ' ' +
@@ -8196,21 +8415,30 @@ end;
 procedure TNNetLayer.ComputeOutputErrorForOneNeuron(NeuronIdx: integer;
   value: TNeuralFloat);
 begin
-  // generic implementation only works when all sizes are the same.
+  FOutputError.Fill(0);
+  FOutputErrorDeriv.Fill(0);
   if
     (FOutputError.Size = FOutput.Size) and
     (FOutputErrorDeriv.Size = FOutputError.Size)
     then
   begin
-  {$IFDEF FPC}
-    FOutputError.FData[NeuronIdx] += FOutput.FData[NeuronIdx] - value;
-    FOutputErrorDeriv.FData[NeuronIdx] += FOutputError.FData[NeuronIdx] *
-      FActivationFnDerivative(FOutput.FData[NeuronIdx]);
-  {$ELSE}
-    FOutputError.FData[NeuronIdx] := FOutputError.FData[NeuronIdx] + FOutput.FData[NeuronIdx] - value;
-    FOutputErrorDeriv.FData[NeuronIdx] := FOutputErrorDeriv.FData[NeuronIdx] + FOutputError.FData[NeuronIdx] *
-      FActivationFnDerivative(FOutput.FData[NeuronIdx]);
-  {$ENDIF}
+    if Self is TNNetConvolutionAbstract then
+    begin
+      FOutputError.AddAtDepth(NeuronIdx, -value);
+      ComputeErrorDeriv();
+    end
+    else
+    begin
+      {$IFDEF FPC}
+        FOutputError.FData[NeuronIdx] += FOutput.FData[NeuronIdx] - value;
+        FOutputErrorDeriv.FData[NeuronIdx] += FOutputError.FData[NeuronIdx] *
+          FActivationFnDerivative(FOutput.FData[NeuronIdx]);
+      {$ELSE}
+        FOutputError.FData[NeuronIdx] := FOutputError.FData[NeuronIdx] + FOutput.FData[NeuronIdx] - value;
+        FOutputErrorDeriv.FData[NeuronIdx] := FOutputErrorDeriv.FData[NeuronIdx] + FOutputError.FData[NeuronIdx] *
+          FActivationFnDerivative(FOutput.FData[NeuronIdx]);
+      {$ENDIF}
+    end;
   end else
   begin
     FErrorProc
@@ -8227,7 +8455,6 @@ end;
 procedure TNNetLayer.ComputeOutputErrorWith(pOutput: TNNetVolume);
   {$IFDEF CheckRange}var MaxError:TNeuralFloat; {$ENDIF}
 begin
-  // generic implementation only works when all sizes are the same.
   if
     (pOutput.Size = FOutput.Size) and
     (pOutput.Size = FOutputError.Size) then
@@ -8517,49 +8744,13 @@ begin
 end;
 
 function TNNetLayer.GetMaxWeight(): TNeuralFloat;
-var
-  Cnt: integer;
-  MaxValue: TNeuralFloat;
 begin
-  if FNeurons.Count > 0 then
-  begin
-    Result := FNeurons[0].Weights.GetMax();
-    if FNeurons.Count > 1 then
-    begin
-      for Cnt := 0 to FNeurons.Count-1 do
-      begin
-        MaxValue := FNeurons[Cnt].Weights.GetMax();
-        if MaxValue > Result then Result := MaxValue;
-      end;
-    end;
-  end
-  else
-  begin
-    Result := -1;
-  end;
+  Result := FNeurons.GetMaxWeight();
 end;
 
 function TNNetLayer.GetMinWeight(): TNeuralFloat;
-var
-  Cnt: integer;
-  MinValue: TNeuralFloat;
 begin
-  if FNeurons.Count > 0 then
-  begin
-    Result := FNeurons[0].Weights.GetMin();
-    if FNeurons.Count > 1 then
-    begin
-      for Cnt := 0 to FNeurons.Count-1 do
-      begin
-        MinValue := FNeurons[Cnt].Weights.GetMin();
-        if MinValue < Result then Result := MinValue;
-      end;
-    end;
-  end
-  else
-  begin
-    Result := -1;
-  end;
+  Result := FNeurons.GetMinWeight();
 end;
 
 function TNNetLayer.GetMaxDelta(): TNeuralFloat;

@@ -77,7 +77,8 @@ type
       FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
       FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
       FOnAfterStep, FOnAfterEpoch: TNotifyEvent;
-      FRunning: boolean;
+      FRunning, FShouldQuit: boolean;
+      FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
       {$IFDEF OpenCL}
       FPlatformId: cl_platform_id;
       FDeviceId: cl_device_id;
@@ -86,6 +87,7 @@ type
     public
       constructor Create();
       destructor Destroy(); override;
+      procedure WaitUntilFinished;
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
       procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
@@ -111,6 +113,11 @@ type
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property Verbose: boolean read FVerbose write FVerbose;
+      property TrainingAccuracy: TNeuralFloat read FTrainingAccuracy;
+      property ValidationAccuracy: TNeuralFloat read FValidationAccuracy;
+      property TestAccuracy: TNeuralFloat read FTestAccuracy;
+      property Running: boolean read FRunning;
+      property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
 
   TNNetDataAugmentationFn = function(vPair: TNNetVolume): TNeuralFloat of object;
@@ -272,6 +279,8 @@ var
   ValidationRecord: TNeuralFloat;
   iEpochCount: integer;
 begin
+  FRunning := true;
+  FShouldQuit := false;
   FGetTrainingPair := pGetTrainingPair;
   FGetValidationPair := pGetValidationPair;
   FGetTestPair := pGetTestPair;
@@ -280,7 +289,6 @@ begin
   {$ENDIF}
   iEpochCount := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
-  FRunning := true;
   FThreadNum := FMaxThreadNum;
   FBatchSize := pBatchSize;
   FMaxEpochs := Epochs;
@@ -295,6 +303,7 @@ begin
   else
   begin
     FErrorProc('Batch size has to be bigger than zero.');
+    FRunning := false;
     exit;
   end;
   FStepSize := FBatchSize;
@@ -357,13 +366,14 @@ begin
   end;
 
   globalStartTime := Now();
-  while ( FRunning and (FMaxEpochs > iEpochCount) ) do
+  while ( (FMaxEpochs > iEpochCount) and Not(FShouldQuit) ) do
   begin
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(iEpochCount);
     for I := 1 to (TrainingCnt div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
     begin
+      if FShouldQuit then break;
       FGlobalHit       := 0;
       FGlobalMiss      := 0;
       FGlobalTotalLoss := 0;
@@ -414,11 +424,11 @@ begin
       if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
-
+        FTrainingAccuracy := AccuracyWithInertia/100;
         if FVerbose then WriteLn
         (
           (FGlobalHit + FGlobalMiss)*I + iEpochCount*TrainingCnt,
-          ' Examples seen. Accuracy:', (AccuracyWithInertia/100):6:4,
+          ' Examples seen. Accuracy:', (FTrainingAccuracy):6:4,
           ' Error:', TrainingError:10:5,
           ' Loss:', TrainingLoss:7:5,
           ' Threads: ', FThreadNum,
@@ -442,7 +452,7 @@ begin
       else FAvgWeights := TNNetDataParallelism.Create(FNN, 1)
     end;
 
-    if (FRunning) then
+    if Not(FShouldQuit) then
     begin
       if FAvgWeightEpochCount > 1 then
       begin
@@ -453,7 +463,7 @@ begin
         FAvgWeight.CopyWeights(FNN);
       end;
 
-      if ValidationCnt > 0 then
+      if (ValidationCnt > 0) and Not(FShouldQuit) then
       begin
         FGlobalHit       := 0;
         FGlobalMiss      := 0;
@@ -474,6 +484,7 @@ begin
           ValidationRate  := FGlobalHit / FGlobalTotal;
           ValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
           ValidationError := FGlobalErrorSum / FGlobalTotal;
+          FValidationAccuracy := ValidationRate;
         end;
 
         if (ValidationRate > ValidationRecord) then
@@ -497,7 +508,7 @@ begin
 
         if (ValidationRate >= FTargetAccuracy) then
         begin
-          FRunning := false;
+          FShouldQuit := true;
           break;
         end;
       end;// Assigned(FImgValidationVolumes)
@@ -507,7 +518,7 @@ begin
         FThreadNN[0].DebugWeights();
       end;
 
-      if TestCnt > 0 then
+      if (TestCnt > 0) and Not(FShouldQuit) then
       begin
         if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
         begin
@@ -530,6 +541,7 @@ begin
             TestRate  := FGlobalHit / FGlobalTotal;
             TestLoss  := FGlobalTotalLoss / FGlobalTotal;
             TestError := FGlobalErrorSum / FGlobalTotal;
+            FTestAccuracy := TestRate;
           end;
           if (FGlobalTotal > 0) and (FVerbose) then
           begin
@@ -545,7 +557,7 @@ begin
         end;
         if (TestRate >= FTargetAccuracy) then
         begin
-          FRunning := false;
+          FShouldQuit := true;
           break;
         end;
       end;
@@ -605,6 +617,7 @@ begin
   if Assigned(FAvgWeights) then FAvgWeights.Free;
   FThreadNN.Free;
   CloseFile(CSVFile);
+  FMessageProc('Finished.');
   FRunning := false;
 end;
 
@@ -710,7 +723,7 @@ begin
   LocalNN.EnableDropouts(true);
   for I := 1 to BlockSize do
   begin
-    if not(FRunning) then Break;
+    if FShouldQuit then Break;
     LocalTrainingPair := FGetTrainingPair(I);
 
     vInput.Copy( LocalTrainingPair.I );
@@ -741,11 +754,11 @@ begin
     end;
   end; // of for
 
-  if Index and 1 = 0 then
+  if (Index and 1 = 0) and Not(FShouldQuit) then
   begin
     if Index + 1 < FThreadNum then
     begin
-      while FFinishedThread.FData[Index + 1] = 0 do;
+      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
@@ -756,11 +769,11 @@ begin
     end;
   end;
   FFinishedThread.FData[Index] := FFinishedThread.FData[Index] + 1;
-  if Index and 3 = 0 then
+  if (Index and 3 = 0) and Not(FShouldQuit) then
   begin
     if Index + 2 < FThreadNum then
     begin
-      while FFinishedThread.FData[Index + 2] = 0 do;
+      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
@@ -822,7 +835,7 @@ begin
   LocalNN.EnableDropouts(false);
   for I := StartPos to FinishPos - 1 do
   begin
-    if not(FRunning) then Break;
+    if FShouldQuit then Break;
     LocalTestPair := FLocalTestPair(I);
     vInput.Copy(LocalTestPair.I);
 
@@ -912,6 +925,11 @@ begin
   FCustomLearningRateScheduleObjFn := nil;
   FOnAfterStep := nil;
   FOnAfterEpoch := nil;
+  FTrainingAccuracy := 0;
+  FValidationAccuracy := 0;
+  FTestAccuracy := 0;
+  FRunning := false;
+  FShouldQuit := false;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -921,6 +939,15 @@ begin
   {$ENDIF}
   FFinishedThread.Free;
   inherited Destroy();
+end;
+
+procedure TNeuralFitBase.WaitUntilFinished;
+begin
+  FShouldQuit := true;
+  while FRunning do
+  begin
+    Sleep(1);
+  end;
 end;
 
 {$IFDEF OpenCL}
@@ -1026,6 +1053,8 @@ var
   ValidationRecord: TNeuralFloat;
   iEpochCount: integer;
 begin
+  FRunning := true;
+  FShouldQuit := false;
   {$IFNDEF HASTHREADS}
   FMaxThreadNum := 1;
   {$ENDIF}
@@ -1034,7 +1063,6 @@ begin
   FImgVolumes := pImgVolumes;
   FImgValidationVolumes := pImgValidationVolumes;
   FImgTestVolumes := pImgTestVolumes;
-  FRunning := true;
   FThreadNum := FMaxThreadNum;
   FBatchSize := pBatchSize;
   FMaxEpochs := Epochs;
@@ -1049,6 +1077,7 @@ begin
   else
   begin
     FErrorProc('Batch size has to be bigger than zero.');
+    FRunning := false;
     exit;
   end;
   FStepSize := FBatchSize;
@@ -1112,13 +1141,14 @@ begin
   end;
 
   globalStartTime := Now();
-  while ( FRunning and (FMaxEpochs > iEpochCount) ) do
+  while ( (FMaxEpochs > iEpochCount) and Not(FShouldQuit) ) do
   begin
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(iEpochCount);
     for I := 1 to (FImgVolumes.Count div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
     begin
+      if (FShouldQuit) then break;
       FGlobalHit       := 0;
       FGlobalMiss      := 0;
       FGlobalTotalLoss := 0;
@@ -1169,11 +1199,11 @@ begin
       if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
-
+        FTrainingAccuracy := AccuracyWithInertia/100;
         if FVerbose then WriteLn
         (
           (FGlobalHit + FGlobalMiss)*I + iEpochCount*FImgVolumes.Count,
-          ' Examples seen. Accuracy:', (AccuracyWithInertia/100):6:4,
+          ' Examples seen. Accuracy:', (TrainingAccuracy):6:4,
           ' Error:', TrainingError:10:5,
           ' Loss:', TrainingLoss:7:5,
           ' Threads: ', FThreadNum,
@@ -1197,7 +1227,7 @@ begin
       else FAvgWeights := TNNetDataParallelism.Create(FNN, 1)
     end;
 
-    if (FRunning) then
+    if Not(FShouldQuit) then
     begin
       if FAvgWeightEpochCount > 1 then
       begin
@@ -1208,7 +1238,7 @@ begin
         FAvgWeight.CopyWeights(FNN);
       end;
 
-      if Assigned(FImgValidationVolumes) then
+      if Assigned(FImgValidationVolumes) and Not(FShouldQuit) then
       begin
         FWorkingVolumes := FImgValidationVolumes;
         FGlobalHit       := 0;
@@ -1228,6 +1258,7 @@ begin
           ValidationRate  := FGlobalHit / FGlobalTotal;
           ValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
           ValidationError := FGlobalErrorSum / FGlobalTotal;
+          FValidationAccuracy := ValidationRate;
         end;
 
         if (ValidationRate > ValidationRecord) then
@@ -1251,7 +1282,7 @@ begin
 
         if (ValidationRate >= FTargetAccuracy) then
         begin
-          FRunning := false;
+          FShouldQuit := true;
           break;
         end;
       end;// Assigned(FImgValidationVolumes)
@@ -1261,7 +1292,7 @@ begin
         FThreadNN[0].DebugWeights();
       end;
 
-      if Assigned(FImgTestVolumes) then
+      if Assigned(FImgTestVolumes) and Not(FShouldQuit) then
       begin
         if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
         begin
@@ -1283,6 +1314,7 @@ begin
             TestRate  := FGlobalHit / FGlobalTotal;
             TestLoss  := FGlobalTotalLoss / FGlobalTotal;
             TestError := FGlobalErrorSum / FGlobalTotal;
+            FTestAccuracy := TestRate;
           end;
 
           if (FGlobalTotal > 0) and (FVerbose) then
@@ -1299,7 +1331,7 @@ begin
         end;
         if (TestRate >= FTargetAccuracy) then
         begin
-          FRunning := false;
+          FShouldQuit := true;
           break;
         end;
       end;
@@ -1359,6 +1391,7 @@ begin
   if Assigned(FAvgWeights) then FAvgWeights.Free;
   FThreadNN.Free;
   CloseFile(CSVFile);
+  FMessageProc('Finished.');
   FRunning := false;
 end;
 
@@ -1396,7 +1429,7 @@ begin
   LocalNN.EnableDropouts(true);
   for I := 1 to BlockSize do
   begin
-    if not(FRunning) then Break;
+    if (FShouldQuit) then Break;
     ImgIdx := Random(FImgVolumes.Count);
 
     if FDataAugmentation then
@@ -1487,11 +1520,11 @@ begin
     end;
   end; // of for
 
-  if Index and 1 = 0 then
+  if (Index and 1 = 0) and Not(FShouldQuit) then
   begin
     if Index + 1 < FThreadNum then
     begin
-      while FFinishedThread.FData[Index + 1] = 0 do;
+      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
@@ -1502,11 +1535,11 @@ begin
     end;
   end;
   FFinishedThread.FData[Index] := FFinishedThread.FData[Index] + 1;
-  if Index and 3 = 0 then
+  if (Index and 3 = 0) and Not(FShouldQuit) then
   begin
     if Index + 2 < FThreadNum then
     begin
-      while FFinishedThread.FData[Index + 2] = 0 do;
+      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
@@ -1572,7 +1605,7 @@ begin
   LocalNN.EnableDropouts(false);
   for I := StartPos to FinishPos - 1 do
   begin
-    if not(FRunning) then Break;
+    if FShouldQuit then Break;
     sumOutput.Fill(0);
     ImgIdx := I;
 

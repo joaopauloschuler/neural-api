@@ -25,10 +25,13 @@ interface
 
 uses
   neuraldatasets, Classes, SysUtils, ExtCtrls, Graphics,
-  neuralvolume;
+  neuralvolume, neuralnetwork, StdCtrls;
 
 {$IFDEF FPC}
 type
+  TImageDynArr = array of TImage;
+  TLabelDynArr = array of TLabel;
+
   { TClassesAndElements }
   TClassesAndElements = class(TStringStringListVolume)
     private
@@ -45,16 +48,173 @@ type
   end;
 {$ENDIF}
 
-// Loads a TinyImage into FCL TImage.
+/// Loads a TinyImage into FCL TImage.
 procedure LoadTinyImageIntoTImage(var TI: TTinyImage; var Image: TImage);
 
-// Loads a single channel tiny image into image.
+/// Loads a single channel tiny image into image.
 procedure LoadTISingleChannelIntoImage(var TI: TTinySingleChannelImage;
   var Image: TImage);
 
+/// Show Neuronal Patterns (pNeuronList) in an array of images (pImage).
+procedure ShowNeurons(
+  pNeuronList: TNNetNeuronList;
+  var pImage: TImageDynArr;
+  startImage, filterSize, color_encoding: integer;
+  ScalePerImage: boolean);
+
+/// Creates images to display neuronal patterns inside of a group box.
+procedure CreateNeuronImages
+(
+  GrBoxNeurons: TGroupBox;
+  var pImage: TImageDynArr;
+  var pLabelX, pLabelY: TLabelDynArr;
+  pNeuronList: TNNetNeuronList;
+  filterSize, imagesPerRow, NeuronNum: integer
+);
+
+/// Frees images displaying neuronal patterns.
+procedure FreeNeuronImages
+(
+  var pImage: TImageDynArr;
+  var pLabelX, pLabelY: TLabelDynArr
+);
+
 implementation
 
-uses neuralvolumev, fileutil;
+uses neuralvolumev, fileutil, math;
+
+procedure CreateNeuronImages
+(
+  GrBoxNeurons: TGroupBox;
+  var pImage: TImageDynArr;
+  var pLabelX, pLabelY: TLabelDynArr;
+  pNeuronList: TNNetNeuronList;
+  filterSize, imagesPerRow, NeuronNum: integer
+);
+var
+  NeuronCount: integer;
+  RowCount, ColCount: integer;
+  RowNum, ColNum: integer;
+  PosTop, PosLeft: integer;
+  MaxTop, MaxLeft: integer;
+begin
+  PosTop  := 14;
+  PosLeft := 22;
+  MaxTop  := 0;
+  MaxLeft := 0;
+
+  RowNum := NeuronNum div imagesPerRow;
+  ColNum := imagesPerRow;
+
+  if (NeuronNum mod imagesPerRow > 0) then
+  begin
+    Inc(RowNum);
+  end;
+
+  SetLength(pImage,  NeuronNum);
+  SetLength(pLabelY, RowNum);
+  SetLength(pLabelX, ColNum);
+
+  for NeuronCount := 0 to NeuronNum - 1 do
+  begin
+    pImage[NeuronCount] := TImage.Create(GrBoxNeurons.Parent);
+    pImage[NeuronCount].Parent  := GrBoxNeurons;
+    pImage[NeuronCount].Width   := pNeuronList[0].Weights.SizeX;
+    pImage[NeuronCount].Height  := pNeuronList[0].Weights.SizeY;
+    pImage[NeuronCount].Top     := (NeuronCount div imagesPerRow) * (filterSize+4) + PosTop;
+    pImage[NeuronCount].Left    := (NeuronCount mod imagesPerRow) * (filterSize+4) + PosLeft;
+    pImage[NeuronCount].Stretch := true;
+    MaxTop                      := Max(MaxTop, pImage[NeuronCount].Top);
+    MaxLeft                     := Max(MaxLeft, pImage[NeuronCount].Left);
+  end;
+
+  GrBoxNeurons.Height := MaxTop  + filterSize + 24;
+  GrBoxNeurons.Width  := MaxLeft + filterSize + 10;
+
+  for ColCount := 0 to ColNum - 1 do
+  begin
+    pLabelX[ColCount] := TLabel.Create(GrBoxNeurons.Parent);
+    pLabelX[ColCount].Parent  := GrBoxNeurons;
+    pLabelX[ColCount].Top     := (0)        * (filterSize+4) + PosTop - 14;
+    pLabelX[ColCount].Left    := (ColCount) * (filterSize+4) + PosLeft;
+    pLabelX[ColCount].Caption := Chr(Ord('A') + ColCount);
+  end;
+
+  for RowCount := 0 to RowNum - 1 do
+  begin
+    pLabelY[RowCount] := TLabel.Create(GrBoxNeurons.Parent);
+    pLabelY[RowCount].Parent  := GrBoxNeurons;
+    pLabelY[RowCount].Top     := (RowCount) * (filterSize+4) + PosTop;
+    pLabelY[RowCount].Left    := (0)        * (filterSize+4) + PosLeft - 16;
+    pLabelY[RowCount].Caption := IntToStr(RowCount);
+  end;
+end;
+
+procedure FreeNeuronImages
+(
+  var pImage: TImageDynArr;
+  var pLabelX, pLabelY: TLabelDynArr
+);
+var
+  NeuronCount, RowCount, ColCount: integer;
+begin
+  for NeuronCount := Low(pImage) to High(pImage) do
+  begin
+    pImage[NeuronCount].Free;
+  end;
+
+  for RowCount := Low(pLabelX) to High(pLabelX) do
+  begin
+    pLabelX[RowCount].Free;
+  end;
+
+  for ColCount := Low(pLabelY) to High(pLabelY) do
+  begin
+    pLabelY[ColCount].Free;
+  end;
+
+  SetLength(pImage,  0);
+  SetLength(pLabelX, 0);
+  SetLength(pLabelY, 0);
+end;
+
+procedure ShowNeurons(
+  pNeuronList: TNNetNeuronList;
+  var pImage: TImageDynArr;
+  startImage, filterSize, color_encoding: integer;
+  ScalePerImage: boolean);
+var
+  NeuronCount: integer;
+  MaxW, MinW: TNeuralFloat;
+  vDisplay: TNNetVolume;
+begin
+  vDisplay := TNNetVolume.Create();
+  if Not(ScalePerImage) then
+  begin
+    MaxW := pNeuronList.GetMaxWeight();
+    MinW := pNeuronList.GetMinWeight();
+  end;
+
+  for NeuronCount := 0 to pNeuronList.Count - 1 do
+  begin
+    vDisplay.Copy(pNeuronList[NeuronCount].Weights);
+    if (ScalePerImage) then
+    begin
+      MaxW := pNeuronList[NeuronCount].Weights.GetMax();
+      MinW := pNeuronList[NeuronCount].Weights.GetMin();
+    end;
+
+    if MinW < MaxW then
+    begin
+      vDisplay.NeuronalWeightToImg(MaxW, MinW, color_encoding);
+
+      LoadVolumeIntoTImage(vDisplay, pImage[NeuronCount + startImage], color_encoding);
+      pImage[NeuronCount + startImage].Width := filterSize;
+      pImage[NeuronCount + startImage].Height := filterSize;
+    end;
+  end;
+  vDisplay.Free;
+end;
 
 procedure LoadTinyImageIntoTImage(var TI: TTinyImage; var Image: TImage);
 var
