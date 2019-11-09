@@ -28,30 +28,30 @@ type
     end;
     WriteLn('Creating Neural Network...');
     NN := THistoricalNets.Create();
-    NN.AddLayer([
-      TNNetInput.Create(32, 32, 3),
-      TNNetConvolutionLinear.Create(64, 5, 2, 1, 1).InitBasicPatterns(),
-      TNNetMaxPool.Create(4),
-      TNNetSELU.Create(),
-      TNNetMovingStdNormalization.Create(),
-      TNNetConvolutionLinear.Create(64, 3, 1, 1, 1).InitSELU(),
-      TNNetSELU.Create(),
-      TNNetConvolutionLinear.Create(64, 3, 1, 1, 1).InitSELU(),
-      TNNetSELU.Create(),
-      TNNetConvolutionLinear.Create(64, 3, 1, 1, 1).InitSELU(),
-      TNNetSELU.Create(),
-      TNNetConvolutionLinear.Create(64, 3, 1, 1, 1).InitSELU(),
-      TNNetDropout.Create(0.5),
-      TNNetMaxPool.Create(2),
-      TNNetSELU.Create(),
-      TNNetFullConnectLinear.Create(10),
-      TNNetSoftMax.Create()
-    ]);
+
+    NN.AddLayer( TNNetInput.Create(32, 32, 3) );
+    NN.AddLayer( TNNetConvolutionLinear.Create(64, 5, 2, 1, 1) ).InitSELU().InitBasicPatterns();
+    NN.AddLayer( TNNetMaxPool.Create(4) );
+    NN.AddLayer( TNNetSELU.Create() );
+    NN.AddLayer( TNNetMovingStdNormalization.Create() );
+    NN.AddLayer( TNNetConvolutionLinear.Create(64, 3, 1, 1, 1) ).InitSELU();
+    NN.AddLayer( TNNetSELU.Create() );
+    NN.AddLayer( TNNetConvolutionLinear.Create(64, 3, 1, 1, 1) ).InitSELU();
+    NN.AddLayer( TNNetSELU.Create() );
+    NN.AddLayer( TNNetConvolutionLinear.Create(64, 3, 1, 1, 1) ).InitSELU();
+    NN.AddLayer( TNNetSELU.Create() );
+    NN.AddLayer( TNNetConvolutionLinear.Create(64, 3, 1, 1, 1) ).InitSELU();
+    NN.AddLayer( TNNetDropout.Create(0.5) );
+    NN.AddLayer( TNNetMaxPool.Create(2) );
+    NN.AddLayer( TNNetSELU.Create() );
+    NN.AddLayer( TNNetFullConnectLinear.Create(10) );
+    NN.AddLayer( TNNetSoftMax.Create() );
+
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'ImageClassifierSELU';
-    NeuralFit.InitialLearningRate := 0.001;
+    NeuralFit.InitialLearningRate := 0.0004; // SELU seems to work better with smaller learning rates.
     NeuralFit.LearningRateDecay := 0.03;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
