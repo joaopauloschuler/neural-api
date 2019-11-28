@@ -147,6 +147,7 @@ type
         Item: TMultiThreadProcItem);
       procedure EnableMonopolarHitComparison();
       procedure EnableBipolarHitComparison();
+      procedure EnableClassComparison();
 
       property DataAugmentationFn: TNNetDataAugmentationFn read FDataAugmentationFn write FDataAugmentationFn;
       property InferHitFn: TNNetInferHitFn read FInferHitFn write FInferHitFn;
@@ -207,6 +208,7 @@ type
 
   function MonopolarCompare(A, B: TNNetVolume): boolean;
   function BipolarCompare(A, B: TNNetVolume): boolean;
+  function ClassCompare(A, B: TNNetVolume): boolean;
 
 implementation
 uses
@@ -250,6 +252,10 @@ begin
   end;
 end;
 
+function ClassCompare(A, B: TNNetVolume): boolean;
+begin
+  Result := (A.GetClass() = B.GetClass());
+end;
 { TNeuralDataLoadingFit }
 
 constructor TNeuralDataLoadingFit.Create();
@@ -882,6 +888,11 @@ end;
 procedure TNeuralDataLoadingFit.EnableBipolarHitComparison();
 begin
   FInferHitFn := @BipolarCompare;
+end;
+
+procedure TNeuralDataLoadingFit.EnableClassComparison();
+begin
+  FInferHitFn := @ClassCompare;
 end;
 
 { TNeuralFitBase }
