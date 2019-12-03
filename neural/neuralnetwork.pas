@@ -664,6 +664,7 @@ type
     FChannels: TNeuralIntegerArray;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
+    constructor Create(ChannelStart, ChannelLen: integer); overload;
     constructor Create(pChannels: array of integer); overload;
     destructor Destroy(); override;
 
@@ -3831,6 +3832,17 @@ begin
 
   FActivationFn := pPrevLayer.ActivationFn;
   FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
+end;
+
+constructor TNNetSplitChannels.Create(ChannelStart, ChannelLen: integer);
+var
+  pChannels: array of integer;
+  ChannelCnt: integer;
+begin
+  SetLength(pChannels, ChannelLen);
+  for ChannelCnt := 0 to ChannelLen - 1 do
+    pChannels[ChannelCnt] := ChannelStart + ChannelCnt;
+  Create(pChannels);
 end;
 
 constructor TNNetSplitChannels.Create(pChannels: array of integer);
