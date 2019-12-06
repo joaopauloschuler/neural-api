@@ -1,5 +1,5 @@
 # Gradient Ascent Example
-<img src="../docs/gradientascent.jpg" height="192">
+<img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/gradientascent.jpg" height="192">
 
 It's usually very hard to understand neuron by neuron how a neural network dedicated to image classification internally works. 
 One technique used to help with the understanding about what individual neurons represent is called Gradient Ascent.
