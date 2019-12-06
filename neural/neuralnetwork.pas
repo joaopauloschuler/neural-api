@@ -257,6 +257,7 @@ type
       property ActivationFnDerivative: TNeuralActivationFunction read FActivationFnDerivative write FActivationFnDerivative;
       property Neurons: TNNetNeuronList read FNeurons;
       property Output: TNNetVolume read FOutput;
+      property OutputRaw: TNNetVolume read FOutputRaw;
       property PrevLayer: TNNetLayer read FPrevLayer write SetPrevLayer;
       property LearningRate: TNeuralFloat read FLearningRate write FLearningRate;
       property L2Decay: TNeuralFloat read FL2Decay write FL2Decay;
@@ -1231,7 +1232,8 @@ type
     LocalWeight: TNNetVolume;
     PrevLayer: TNNetNeuronList;
     PrevStride: integer;
-    ReLU: boolean
+    ReLU: boolean = false;
+    Threshold: TNeuralFloat = 0.5
   );
 
   procedure RebuildNeuronListOnPreviousPatterns
@@ -1239,7 +1241,8 @@ type
     CalculatedLayer: TNNetNeuronList;
     CurrentLayer, PrevLayer: TNNetNeuronList;
     PrevStride: integer;
-    ReLU: boolean
+    ReLU: boolean = false;
+    Threshold: TNeuralFloat = 0.5
   );
 
 implementation
@@ -1250,7 +1253,8 @@ procedure RebuildPatternOnPreviousPatterns
   LocalWeight: TNNetVolume;
   PrevLayer: TNNetNeuronList;
   PrevStride: integer;
-  ReLU: boolean
+  ReLU: boolean = false;
+  Threshold: TNeuralFloat = 0.5
 );
 var
   SizeX, SizeY, Depth: integer;
@@ -1261,6 +1265,7 @@ var
   PrevCntX, PrevCntY, PrevCntD: integer;
   PrevWeight: TNNetVolume;
   PrevWeightValue: TNeuralFloat;
+  MinWeightAbs: TNeuralFloat;
 begin
   Depth := PrevLayer[0].Weights.Depth;
   SizeX :=
@@ -1278,6 +1283,7 @@ begin
   LocalMaxX := LocalWeight.SizeX - 1;
   LocalMaxY := LocalWeight.SizeY - 1;
   LocalMaxD := LocalWeight.Depth - 1;
+  MinWeightAbs := LocalWeight.GetMaxAbs() * Threshold;
   // For each current weight
   for LocalCntX := 0 to LocalMaxX do
   begin
@@ -1286,6 +1292,7 @@ begin
       for NeuronIdx := 0 to LocalMaxD do
       begin
         LocalMultiplier := LocalWeight[LocalCntX, LocalCntY, NeuronIdx];
+        if MinWeightAbs <= Abs(LocalMultiplier) then
         begin
           // Multiply corresponding weight and add to proper position.
           PrevWeight := PrevLayer[NeuronIdx].Weights;
@@ -1321,7 +1328,8 @@ procedure RebuildNeuronListOnPreviousPatterns
   CalculatedLayer: TNNetNeuronList;
   CurrentLayer, PrevLayer: TNNetNeuronList;
   PrevStride: integer;
-  ReLU: boolean
+  ReLU: boolean = false;
+  Threshold: TNeuralFloat = 0.5
 );
 var
   NeuronCnt: integer;
@@ -1343,7 +1351,8 @@ begin
      {LocalWeight=}CurrentLayer[NeuronCnt].Weights,
      {PrevLayer=}PrevLayer,
      {PrevStride=}PrevStride,
-     ReLU
+     {ReLU=}ReLU,
+     {Threshold=}Threshold
     );
   end;
 end;
@@ -6760,7 +6769,8 @@ end;
 
 procedure TNNetInputBase.Compute;
 begin
-  // Input layer can't compute.
+  FOutputError.Fill(0);
+  FOutputErrorDeriv.Fill(0);
 end;
 
 procedure TNNetInputBase.Backpropagate;
@@ -8434,7 +8444,8 @@ begin
     (FOutputErrorDeriv.Size = FOutputError.Size)
     then
   begin
-    if Self is TNNetConvolutionAbstract then
+    if (Self is TNNetConvolutionAbstract) or
+      (Self is TNNetPoolBase) then
     begin
       FOutputError.AddAtDepth(NeuronIdx, -value);
       ComputeErrorDeriv();

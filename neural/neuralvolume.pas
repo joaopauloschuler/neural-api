@@ -300,6 +300,7 @@ type
       procedure AddToChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure MulChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure Mul(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure NormalizeMax(Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       // Do not use RecurrencePlot as it's still in testing.
       procedure RecurrencePlot(Original: TNNetVolume; Threshold: TNeuralFloat);
       /// This function creates one output channel for each input channel.
@@ -4949,6 +4950,17 @@ end;
 procedure TNNetVolume.Mul(Original: TNNetVolume);
 begin
   Mul(FDataPtr, Original.DataPtr, Size);
+end;
+
+procedure TNNetVolume.NormalizeMax(Value: TNeuralFloat);
+var
+  MaxValue: TNeuralFloat;
+begin
+  MaxValue := GetMaxAbs();
+  if MaxValue > 0 then
+  begin
+    Mul( Value/MaxValue );
+  end;
 end;
 
 // https://en.wikipedia.org/wiki/Recurrence_plot
