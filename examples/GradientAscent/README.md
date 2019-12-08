@@ -18,6 +18,18 @@ This is the API method used for an arbitrary neuron backpropagation (Gradient As
 procedure TNNet.BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
 ```
 
+Errors on the input image aren't enabled by default. In this example, errors regarding the input image are enabled with this:
+```
+TNNetInput(FNN.Layers[0]).EnableErrorCollection();
+```
+
+Then, errors are added to the input with this:
+```
+vInput.MulAdd(-1, FNN.Layers[0].OutputError);
+FNN.ClearDeltas();
+FNN.ClearInertia();
+```
+
 You can find more about Gradient Ascent at:
 * [Lecture 12: Visualizing and Understanding - CS231n - Stanford](http://cs231n.stanford.edu/slides/2017/cs231n_2017_lecture12.pdf)
 * [Understanding Neural Networks Through Deep Visualization](http://yosinski.com/deepvis)
