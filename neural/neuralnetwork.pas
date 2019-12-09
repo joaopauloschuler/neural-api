@@ -8444,8 +8444,7 @@ begin
     (FOutputErrorDeriv.Size = FOutputError.Size)
     then
   begin
-    if (Self is TNNetConvolutionAbstract) or
-      (Self is TNNetPoolBase) then
+    if (FOutputError.Depth > 1) then
     begin
       FOutputError.AddAtDepth(NeuronIdx, -value);
       ComputeErrorDeriv();

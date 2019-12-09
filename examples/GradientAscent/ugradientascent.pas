@@ -1,6 +1,4 @@
-// This is under development - DO NOT USE IT.
 {
-unit
 Copyright (C) 2018 Joao Paulo Schwarz Schuler
 
 This program is free software; you can redistribute it and/or modify
@@ -105,8 +103,6 @@ begin
     if FileExists(OpenDialogNN.FileName) then
     begin
       ButLearn.Enabled := false;
-      //FileName := 'SimpleImageClassifier.nn';
-      //FileName := 'JP16R01.nn';
       FileName := OpenDialogNN.FileName;
       if not(FileExists(FileName)) then
       begin
@@ -164,16 +160,14 @@ end;
 
 procedure TFormVisualLearning.Learn(Sender: TObject);
 var
-  vInput, pOutput, vError, vDisplay: TNNetVolume;
+  vInput, pOutput, vDisplay: TNNetVolume;
   OutputCount, K: integer;
   InputSize: integer;
 begin
   iEpochCount := 0;
   iEpochCountAfterLoading := 0;
   FLastLayerIdx := ComboLayer.ItemIndex;
-  if
-    (FNN.Layers[FLastLayerIdx] is TNNetConvolutionAbstract) or
-    (FNN.Layers[FLastLayerIdx] is TNNetPoolBase)
+  if (FNN.Layers[FLastLayerIdx].OutputError.Depth > 1)
     then FOutputSize := FNN.Layers[FLastLayerIdx].OutputError.Depth
     else FOutputSize := FNN.Layers[FLastLayerIdx].OutputError.Size;
 
@@ -191,7 +185,6 @@ begin
   vInput  := TNNetVolume.Create(FNN.Layers[0].Output);
   vDisplay := TNNetVolume.Create(vInput);
   pOutput := TNNetVolume.Create(FNN.GetLastLayer().Output);
-  vError  := TNNetVolume.Create();
   InputSize := FNN.Layers[0].Output.SizeX;
 
   FreeNeuronImages(aImage,  aLabelX,  aLabelY);
@@ -221,8 +214,7 @@ begin
       FNN.Compute(vInput);
       FNN.GetOutput(pOutput);
       FNN.BackpropagateFromLayerAndNeuron(FLastLayerIdx, OutputCount, 20);
-      vError.Copy(FNN.Layers[0].OutputError);
-      vInput.MulAdd(-1,vError);
+      vInput.MulAdd(-1, FNN.Layers[0].OutputError);
       FNN.ClearDeltas();
       FNN.ClearInertia();
       if K mod 100 = 0 then
@@ -241,7 +233,6 @@ begin
 
   vDisplay.Free;
   vInput.Free;
-  vError.Free;
   pOutput.Free;
 end;
 
@@ -285,4 +276,3 @@ begin
 end;
 
 end.
-
