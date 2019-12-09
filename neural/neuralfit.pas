@@ -458,7 +458,7 @@ begin
       else FAvgWeights := TNNetDataParallelism.Create(FNN, 1)
     end;
 
-    if Not(FShouldQuit) then
+    if Not(FShouldQuit) and Assigned(pGetValidationPair) then
     begin
       if FAvgWeightEpochCount > 1 then
       begin
@@ -524,7 +524,7 @@ begin
         FThreadNN[0].DebugWeights();
       end;
 
-      if (TestCnt > 0) and Not(FShouldQuit) then
+      if (TestCnt > 0) and Not(FShouldQuit) and Assigned(pGetTestPair) then
       begin
         if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
         begin

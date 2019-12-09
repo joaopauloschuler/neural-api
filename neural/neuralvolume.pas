@@ -345,6 +345,7 @@ type
     public
       constructor Create(); overload;
       constructor Create(pA, pB: TNNetVolume); overload;
+      constructor CreateCopying(pA, pB: TNNetVolume); overload;
 
       destructor Destroy(); override;
 
@@ -1381,6 +1382,15 @@ begin
   inherited Create();
   FA := pA;
   FB := pB;
+end;
+
+constructor TNNetVolumePair.CreateCopying(pA, pB: TNNetVolume);
+begin
+  inherited Create();
+  FA := TNNetVolume.Create(pA);
+  FB := TNNetVolume.Create(pB);
+  FA.Copy(pA);
+  FB.Copy(pB);
 end;
 
 destructor TNNetVolumePair.Destroy();
