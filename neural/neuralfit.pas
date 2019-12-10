@@ -108,22 +108,24 @@ type
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
+      property NN: TNNet read FNN;
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
       property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
-      property Verbose: boolean read FVerbose write FVerbose;
-      property TrainingAccuracy: TNeuralFloat read FTrainingAccuracy;
       property ValidationAccuracy: TNeuralFloat read FValidationAccuracy;
+      property Verbose: boolean read FVerbose write FVerbose;
       property TestAccuracy: TNeuralFloat read FTestAccuracy;
+      property ThreadNN: TNNetDataParallelism read FThreadNN;
+      property TrainingAccuracy: TNeuralFloat read FTrainingAccuracy;
       property Running: boolean read FRunning;
       property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
 
-  TNNetDataAugmentationFn = function(vPair: TNNetVolume): TNeuralFloat of object;
-  TNNetLossFn = function(vPair: TNNetVolume): TNeuralFloat of object;
-  TNNetInferHitFn = function(A, B: TNNetVolume): boolean;
-  TNNetGetPairFn = function(Idx: integer): TNNetVolumePair of object;
+  TNNetDataAugmentationFn = function(vPair: TNNetVolume; ThreadId: integer): TNeuralFloat of object;
+  TNNetLossFn = function(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat of object;
+  TNNetInferHitFn = function(A, B: TNNetVolume; ThreadId: integer): boolean;
+  TNNetGetPairFn = function(Idx: integer; ThreadId: integer): TNNetVolumePair of object;
 
   /// Fitting algorithm with data (pairs) loading
   TNeuralDataLoadingFit = class(TNeuralFitBase)
@@ -160,9 +162,9 @@ type
       FTrainingVolumes, FValidationVolumes, FTestVolumes: TNNetVolumePairList;
       FWorkingVolumes: TNNetVolumePairList;
 
-      function FitTrainingPair(Idx: integer): TNNetVolumePair;
-      function FitValidationPair(Idx: integer): TNNetVolumePair;
-      function FitTestPair(Idx: integer): TNNetVolumePair;
+      function FitTrainingPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
+      function FitValidationPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
+      function FitTestPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
     public
       constructor Create();
       destructor Destroy(); override;
@@ -206,15 +208,15 @@ type
   end;
 
 
-  function MonopolarCompare(A, B: TNNetVolume): boolean;
-  function BipolarCompare(A, B: TNNetVolume): boolean;
-  function ClassCompare(A, B: TNNetVolume): boolean;
+  function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+  function BipolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+  function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 
 implementation
 uses
   math;
 
-function MonopolarCompare(A, B: TNNetVolume): boolean;
+function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 var
   Pos: integer;
   ACount, BCount: integer;
@@ -233,7 +235,7 @@ begin
   end;
 end;
 
-function BipolarCompare(A, B: TNNetVolume): boolean;
+function BipolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 var
   Pos: integer;
   ACount, BCount: integer;
@@ -252,7 +254,7 @@ begin
   end;
 end;
 
-function ClassCompare(A, B: TNNetVolume): boolean;
+function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 begin
   Result := (A.GetClass() = B.GetClass());
 end;
@@ -264,6 +266,7 @@ begin
   FGetTrainingPair := nil;
   FGetValidationPair := nil;
   FGetTestPair := nil;
+  FLossFn := nil;
   FTestSize := 0;
 end;
 
@@ -287,6 +290,7 @@ var
 begin
   FRunning := true;
   FShouldQuit := false;
+  FNN := pNN;
   FGetTrainingPair := pGetTrainingPair;
   FGetValidationPair := pGetValidationPair;
   FGetTestPair := pGetTestPair;
@@ -314,13 +318,12 @@ begin
   end;
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
-  FThreadNN := TNNetDataParallelism.Create(pNN, FThreadNum);
+  FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
   {$IFDEF OpenCL}
   if (FPlatformId <> nil) and (FDeviceId <> nil) then
     FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
   {$ENDIF}
   FFinishedThread.Resize(1, 1, FThreadNum);
-  FNN := pNN;
   AccuracyWithInertia := 0;
   TrainingError := 0;
   TrainingLoss := 0;
@@ -413,7 +416,10 @@ begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
-        if (FStepSize < 100) then
+        if (iEpochCount = FInitialEpoch) then
+        begin
+          AccuracyWithInertia := CurrentAccuracy;
+        end else if (FStepSize < 100) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.99 + CurrentAccuracy*0.01;
         end
@@ -603,7 +609,6 @@ begin
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
       end;
-      if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
 
       CloseFile(CSVFile);
       AssignFile(CSVFile, FileNameCSV);
@@ -617,17 +622,18 @@ begin
         'Epochs: '+IntToStr(iEpochCount)+
         '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffGeneral,4,2)+' hours.');
     end;
+    if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
   end;
 
-  FAvgWeight.Free;
-  if Assigned(FAvgWeights) then FAvgWeights.Free;
-  FThreadNN.Free;
+  FreeAndNil(FAvgWeight);
+  if Assigned(FAvgWeights) then FreeAndNil(FAvgWeights);
+  FreeAndNil(FThreadNN);
   CloseFile(CSVFile);
   FMessageProc('Finished.');
   FRunning := false;
 end;
 
-function TNeuralFit.FitTrainingPair(Idx: integer): TNNetVolumePair;
+function TNeuralFit.FitTrainingPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
 var
   ElementIdx: integer;
 begin
@@ -635,12 +641,12 @@ begin
   FitTrainingPair := FTrainingVolumes[ElementIdx];
 end;
 
-function TNeuralFit.FitValidationPair(Idx: integer): TNNetVolumePair;
+function TNeuralFit.FitValidationPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
 begin
   FitValidationPair := FValidationVolumes[Idx];
 end;
 
-function TNeuralFit.FitTestPair(Idx: integer): TNNetVolumePair;
+function TNeuralFit.FitTestPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
 begin
   FitTestPair := FTestVolumes[Idx];
 end;
@@ -708,9 +714,9 @@ var
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTrainingPair: TNNetVolumePair;
 begin
-  vInput  := TNNetVolume.Create( FGetTrainingPair(0).I );
-  pOutput := TNNetVolume.Create( FGetTrainingPair(0).O );
-  vOutput := TNNetVolume.Create( FGetTrainingPair(0).O );
+  vInput  := TNNetVolume.Create( FGetTrainingPair(0, Index).I );
+  pOutput := TNNetVolume.Create( FGetTrainingPair(0, Index).O );
+  vOutput := TNNetVolume.Create( FGetTrainingPair(0, Index).O );
 
   LocalHit := 0;
   LocalMiss := 0;
@@ -730,12 +736,12 @@ begin
   for I := 1 to BlockSize do
   begin
     if FShouldQuit then Break;
-    LocalTrainingPair := FGetTrainingPair(I);
+    LocalTrainingPair := FGetTrainingPair(I, Index);
 
     vInput.Copy( LocalTrainingPair.I );
 
     if Assigned(FDataAugmentationFn)
-      then FDataAugmentationFn(vInput);
+      then FDataAugmentationFn(vInput, Index);
 
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
@@ -743,13 +749,17 @@ begin
 
     LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
 
-    //TODO: calculate loss here!
     CurrentLoss := 0;
+    if Assigned(FLossFn) then
+    begin
+      CurrentLoss := FLossFn(LocalTrainingPair.O, pOutput, Index);
+    end;
+
     LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
     if Assigned(FInferHitFn) then
     begin
-      if FInferHitFn(LocalTrainingPair.O, pOutput) then
+      if FInferHitFn(LocalTrainingPair.O, pOutput, Index) then
       begin
         Inc(LocalHit);
       end
@@ -822,9 +832,9 @@ var
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTestPair: TNNetVolumePair;
 begin
-  vInput  := TNNetVolume.Create(FGetTestPair(0).I);
-  pOutput := TNNetVolume.Create(FGetTestPair(0).O);
-  vOutput := TNNetVolume.Create(FGetTestPair(0).O);
+  vInput  := TNNetVolume.Create(FGetTestPair(0, Index).I);
+  pOutput := TNNetVolume.Create(FGetTestPair(0, Index).O);
+  vOutput := TNNetVolume.Create(FGetTestPair(0, Index).O);
   LocalFrequency := TNNetVolume.Create();
 
   LocalHit := 0;
@@ -842,7 +852,7 @@ begin
   for I := StartPos to FinishPos - 1 do
   begin
     if FShouldQuit then Break;
-    LocalTestPair := FLocalTestPair(I);
+    LocalTestPair := FLocalTestPair(I, Index);
     vInput.Copy(LocalTestPair.I);
 
     LocalNN.Compute( vInput );
@@ -852,7 +862,7 @@ begin
 
     if Assigned(FInferHitFn) then
     begin
-      if FInferHitFn(LocalTestPair.O, pOutput) then
+      if FInferHitFn(LocalTestPair.O, pOutput, Index) then
       begin
         Inc(LocalHit);
       end
@@ -863,7 +873,7 @@ begin
     end;
 
     if Assigned(FLossFn)
-      then LocalTotalLoss := LocalTotalLoss + FLossFn(LocalTestPair.O);
+      then LocalTotalLoss := LocalTotalLoss + FLossFn(LocalTestPair.O, pOutput, Index);
   end; // of for
   LocalNN.EnableDropouts(true);
 
@@ -1066,6 +1076,7 @@ var
 begin
   FRunning := true;
   FShouldQuit := false;
+  FNN := pNN;
   {$IFNDEF HASTHREADS}
   FMaxThreadNum := 1;
   {$ENDIF}
@@ -1093,13 +1104,12 @@ begin
   end;
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
-  FThreadNN := TNNetDataParallelism.Create(pNN, FThreadNum);
+  FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
   {$IFDEF OpenCL}
   if (FPlatformId <> nil) and (FDeviceId <> nil) then
     FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
   {$ENDIF}
   FFinishedThread.Resize(1, 1, FThreadNum);
-  FNN := pNN;
   FNumClasses := pNumClasses;
   AccuracyWithInertia := 100 / FNumClasses;
   TrainingError := 0;
@@ -1193,7 +1203,10 @@ begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
-        if (FStepSize < 100) then
+        if (iEpochCount = FInitialEpoch) then
+        begin
+          AccuracyWithInertia := CurrentAccuracy;
+        end else if (FStepSize < 100) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.99 + CurrentAccuracy*0.01;
         end
@@ -1398,9 +1411,9 @@ begin
     end;
   end;
 
-  FAvgWeight.Free;
-  if Assigned(FAvgWeights) then FAvgWeights.Free;
-  FThreadNN.Free;
+  FreeAndNil(FAvgWeight);
+  if Assigned(FAvgWeights) then FreeAndNil(FAvgWeights);
+  FreeAndNil(FThreadNN);
   CloseFile(CSVFile);
   FMessageProc('Finished.');
   FRunning := false;
