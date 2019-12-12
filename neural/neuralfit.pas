@@ -76,7 +76,7 @@ type
       FTargetAccuracy: single;
       FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
       FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
-      FOnAfterStep, FOnAfterEpoch: TNotifyEvent;
+      FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
       {$IFDEF OpenCL}
@@ -111,6 +111,7 @@ type
       property NN: TNNet read FNN;
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
       property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
+      property OnStart: TNotifyEvent read FOnStart write FOnStart;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property ValidationAccuracy: TNeuralFloat read FValidationAccuracy;
@@ -122,7 +123,7 @@ type
       property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
 
-  TNNetDataAugmentationFn = function(vPair: TNNetVolume; ThreadId: integer): TNeuralFloat of object;
+  TNNetDataAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
   TNNetLossFn = function(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat of object;
   TNNetInferHitFn = function(A, B: TNNetVolume; ThreadId: integer): boolean;
   TNNetGetPairFn = function(Idx: integer; ThreadId: integer): TNNetVolumePair of object;
@@ -373,7 +374,7 @@ begin
   begin
     MessageProc('Computing...');
   end;
-
+  if Assigned(FOnStart) then FOnStart(Self);
   globalStartTime := Now();
   while ( (FMaxEpochs > iEpochCount) and Not(FShouldQuit) ) do
   begin
@@ -416,7 +417,7 @@ begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
-        if (iEpochCount = FInitialEpoch) then
+        if (iEpochCount = FInitialEpoch) and (I = 1) then
         begin
           AccuracyWithInertia := CurrentAccuracy;
         end else if (FStepSize < 100) then
@@ -946,6 +947,7 @@ begin
   FCustomLearningRateScheduleObjFn := nil;
   FOnAfterStep := nil;
   FOnAfterEpoch := nil;
+  FOnStart := nil;
   FTrainingAccuracy := 0;
   FValidationAccuracy := 0;
   FTestAccuracy := 0;
@@ -1160,7 +1162,7 @@ begin
   begin
     MessageProc('Computing...');
   end;
-
+  if Assigned(FOnStart) then FOnStart(Self);
   globalStartTime := Now();
   while ( (FMaxEpochs > iEpochCount) and Not(FShouldQuit) ) do
   begin
@@ -1203,7 +1205,7 @@ begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
-        if (iEpochCount = FInitialEpoch) then
+        if (iEpochCount = FInitialEpoch) and (I = 1) then
         begin
           AccuracyWithInertia := CurrentAccuracy;
         end else if (FStepSize < 100) then
