@@ -392,13 +392,20 @@ type
       constructor Create();
   end;
 
-  /// This is a plain Sigmoid (ReLU) layer.
+  /// This is a plain Sigmoid layer.
   TNNetSigmoid = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
+      constructor Create();
       procedure Compute(); override;
       procedure Backpropagate(); override;
+  end;
+
+  /// This is a plain Hyperbolic Tangent layer.
+  TNNetHyperbolicTangent = class(TNNetSigmoid)
+    public
+      constructor Create();
   end;
 
   /// This layer multiplies the learning in previous layers. It can speed up
@@ -682,7 +689,7 @@ type
     constructor Create(pChannels: array of integer); overload;
   end;
 
-  /// Fully connected layer with hiperbolic tangent.
+  /// Fully connected layer with hyperbolic tangent.
   TNNetFullConnect = class(TNNetLayer)
     private
       FAuxTransposedW: TNNetVolume;
@@ -834,7 +841,7 @@ type
 
   TNNetConvolutionClass = class of TNNetConvolutionBase;
 
-  /// Convolutional layer with hiperbolic tangent activation function.
+  /// Convolutional layer with hyperbolic tangent activation function.
   TNNetConvolution = class(TNNetConvolutionBase)
     protected
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -1355,6 +1362,13 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+constructor TNNetHyperbolicTangent.Create();
+begin
+  inherited Create();
+  FActivationFn := @HiperbolicTangent;
+  FActivationFnDerivative := @HiperbolicTangentDerivative;
 end;
 
 { TNNetNeuronList }
@@ -2355,6 +2369,13 @@ procedure TNNetSigmoid.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutputRaw.Resize(FOutput);
+end;
+
+constructor TNNetSigmoid.Create();
+begin
+  inherited Create();
+  FActivationFn := @Sigmoid;
+  FActivationFnDerivative := @SigmoidDerivative;
 end;
 
 procedure TNNetSigmoid.Compute();
@@ -4866,8 +4887,6 @@ begin
   FOutput.ReSize(pPrevLayer.FOutput);
   FOutputError.ReSize(pPrevLayer.FOutputError);
   FOutputErrorDeriv.ReSize(pPrevLayer.FOutputErrorDeriv);
-  FActivationFn := pPrevLayer.ActivationFn;
-  FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
 end;
 
 procedure TNNetIdentity.Compute;
@@ -5787,6 +5806,8 @@ begin
   FStruct[2] := pInputPadding;
   FStruct[3] := pStride;
   FStruct[4] := FSuppressBias;
+  FActivationFn := @HiperbolicTangent;
+  FActivationFnDerivative := @HiperbolicTangentDerivative;
 end;
 
 destructor TNNetConvolutionBase.Destroy();
@@ -6568,6 +6589,8 @@ begin
 
   AddNeurons(FOutPut.Size);
   FAuxTransposedW := TNNetVolume.Create(FOutPut.Size);
+  FActivationFn := @HiperbolicTangent;
+  FActivationFnDerivative := @HiperbolicTangentDerivative;
 end;
 
 constructor TNNetFullConnect.Create(pSize: integer; pSuppressBias: integer = 0);
@@ -6908,6 +6931,7 @@ begin
       'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
+      'TNNetHyperbolicTangent' :    Result := TNNetHyperbolicTangent.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
@@ -6973,6 +6997,7 @@ begin
       if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
+      if S[0] = 'TNNetHyperbolicTangent' then Result := TNNetHyperbolicTangent.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
@@ -8369,8 +8394,8 @@ begin
   FOutputErrorDeriv := TNNetVolume.Create(1,1,1);
 
   FNeurons := TNNetNeuronList.Create();
-  FActivationFn := @HiperbolicTangent;
-  FActivationFnDerivative := @HiperbolicTangentDerivative;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
   FL2Decay := 0;
   FPrevLayer := nil;
