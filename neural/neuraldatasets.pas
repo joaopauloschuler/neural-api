@@ -164,7 +164,7 @@ function TinyImageTo1D(var TI: TTinySingleChannelImage): TTinySingleChannelImage
 
 // creates CIFAR10 volumes required for training, testing and validation
 procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
-  ImgTestVolumes: TNNetVolumeList);
+  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB);
 
 // creates CIFAR100 volumes required for training, testing and validation
 procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
@@ -231,7 +231,7 @@ begin
 end;
 
 procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
-  ImgTestVolumes: TNNetVolumeList);
+  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB);
 var
   I: integer;
 begin
@@ -251,12 +251,12 @@ begin
     ImgTestVolumes.Add(TNNetVolume.Create());
   end;
 
-  loadCifar10Dataset(ImgTrainingVolumes, 1, 0, 0);
-  loadCifar10Dataset(ImgTrainingVolumes, 2, 10000, 0);
-  loadCifar10Dataset(ImgTrainingVolumes, 3, 20000, 0);
-  loadCifar10Dataset(ImgTrainingVolumes, 4, 30000, 0);
-  loadCifar10Dataset(ImgValidationVolumes, 5, 0, 0);
-  loadCifar10Dataset(ImgTestVolumes, 'test_batch.bin', 0);
+  loadCifar10Dataset(ImgTrainingVolumes, 1, 0, color_encoding);
+  loadCifar10Dataset(ImgTrainingVolumes, 2, 10000, color_encoding);
+  loadCifar10Dataset(ImgTrainingVolumes, 3, 20000, color_encoding);
+  loadCifar10Dataset(ImgTrainingVolumes, 4, 30000, color_encoding);
+  loadCifar10Dataset(ImgValidationVolumes, 5, 0, color_encoding);
+  loadCifar10Dataset(ImgTestVolumes, 'test_batch.bin', 0, color_encoding);
 end;
 
 procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
