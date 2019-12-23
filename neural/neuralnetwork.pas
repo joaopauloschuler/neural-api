@@ -360,6 +360,15 @@ type
       procedure Compute(); override;
   end;
 
+  /// This is an experimental layer - do not use it.
+  TNNetReLUL = class(TNNetReLUBase)
+    private
+      FScale, FLowLimit, FHighLimit: TNeuralFloat;
+    public
+      constructor Create(LowLimit, HighLimit: integer);
+      procedure Compute(); override;
+  end;
+
   /// Scaled Exponential Linear Unit
   // https://arxiv.org/pdf/1706.02515.pdf
   // You might need to lower your learning rate with SELU.
@@ -1021,6 +1030,16 @@ type
       procedure ComputePreviousLayerError(); override;
   end;
 
+  /// This is an experimental layer. Do not use it yet.
+  TNNetUpsample = class(TNNetDeMaxPool)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create();
+      procedure Compute(); override;
+      procedure ComputePreviousLayerError(); override;
+  end;
+
   TNNetDeAvgPool = class(TNNetDeMaxPool);
 
   /// neural network
@@ -1362,6 +1381,143 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetReLUL }
+
+constructor TNNetReLUL.Create(LowLimit, HighLimit: integer);
+begin
+  inherited Create();
+  FScale := 0.001;
+  FHighLimit := HighLimit;
+  FLowLimit := LowLimit;
+  FStruct[0] := LowLimit;
+  FStruct[1] := HighLimit;
+end;
+
+procedure TNNetReLUL.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  CurrValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      CurrValue := LocalPrevOutput.FData[OutputCnt];
+      if (CurrValue > FHighLimit) then
+      begin
+        FOutput.FData[OutputCnt] := FHighLimit + (CurrValue-FHighLimit) * FScale;
+        FOutputErrorDeriv.FData[OutputCnt] := FScale;
+      end
+      else if (CurrValue > FLowLimit) then
+      begin
+        FOutput.FData[OutputCnt] := CurrValue;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := FLowLimit + (CurrValue-FLowLimit) * FScale;
+        FOutputErrorDeriv.FData[OutputCnt] := FScale;
+      end;
+    end;
+  end
+  else
+  begin
+    // not intended for input
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetUpsample }
+
+procedure TNNetUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutputSizeD := pPrevLayer.Output.Depth div (FPoolSize*FPoolSize);
+
+  FOutput.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+constructor TNNetUpsample.Create();
+begin
+  inherited Create(2);
+end;
+
+procedure TNNetUpsample.Compute();
+var
+  CntX, CntY, CntD, OutX, OutY, OutD: integer;
+  MaxX, MaxY, MaxD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Output.Fill(0);
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := Output.Depth - 1;
+
+  for OutD := 0 to MaxD do
+  begin
+    CntD := OutD shl 2;
+    for CntX := 0 to MaxX do
+    begin
+      OutX := CntX shl 1;
+      for CntY := 0 to MaxY do
+      begin
+        OutY := CntY shl 1;
+        //WriteLn(OutX, ' ', OutY, ' ', OutD, ' ', Output.SizeX,' ', Output.SizeY,' ', Output.Depth);
+        Output[OutX  ,OutY  ,OutD] := FPrevLayer.Output[CntX,CntY,CntD];
+        Output[OutX+1,OutY  ,OutD] := FPrevLayer.Output[CntX,CntY,CntD+1];
+        Output[OutX  ,OutY+1,OutD] := FPrevLayer.Output[CntX,CntY,CntD+2];
+        Output[OutX+1,OutY+1,OutD] := FPrevLayer.Output[CntX,CntY,CntD+3];
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetUpsample.ComputePreviousLayerError();
+var
+  CntX, CntY, CntD, OutX, OutY, OutD: integer;
+  MaxX, MaxY, MaxD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := Output.Depth - 1;
+
+  for OutD := 0 to MaxD do
+  begin
+    CntD := OutD shl 2;
+    for CntX := 0 to MaxX do
+    begin
+      OutX := CntX shl 1;
+      for CntY := 0 to MaxY do
+      begin
+        OutY := CntY shl 1;
+        //WriteLn(OutX, ' ', OutY, ' ', OutD, ' ', Output.SizeX,' ', Output.SizeY,' ', Output.Depth);
+        FPrevLayer.OutputError.Add(CntX,CntY,CntD,  OutputError[OutX  ,OutY  ,OutD]);
+        FPrevLayer.OutputError.Add(CntX,CntY,CntD+1,OutputError[OutX+1,OutY  ,OutD]);
+        FPrevLayer.OutputError.Add(CntX,CntY,CntD+2,OutputError[OutX  ,OutY+1,OutD]);
+        FPrevLayer.OutputError.Add(CntX,CntY,CntD+3,OutputError[OutX+1,OutY+1,OutD]);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 constructor TNNetHyperbolicTangent.Create();
@@ -3852,16 +4008,8 @@ begin
   Depth := Length(FChannels);
 
   FOutput.ReSize(SizeX,SizeY,Depth);
-
-  // if previous layer has error data, then we need error data
-  if pPrevLayer.FOutputError.Size = pPrevLayer.FOutput.Size then
-  begin
-    FOutputError.ReSize(SizeX,SizeY,Depth);
-    FOutputErrorDeriv.ReSize(SizeX,SizeY,Depth);
-  end;
-
-  FActivationFn := pPrevLayer.ActivationFn;
-  FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
 end;
 
 constructor TNNetSplitChannels.Create(ChannelStart, ChannelLen: integer);
@@ -3885,6 +4033,8 @@ begin
   begin
     FChannels[I] := pChannels[I];
   end;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
 end;
 
 destructor TNNetSplitChannels.Destroy();
@@ -4719,6 +4869,7 @@ begin
   MaxD := Output.Depth - 1;
 
   floatPoolSize := FPoolSize;
+  FOutputError.Divi(floatPoolSize);
 
   for CntY := 0 to MaxY do
   begin
@@ -4741,8 +4892,6 @@ begin
       end;
     end;
   end;
-
-  FPrevLayer.FOutputError.Divi(floatPoolSize);
 end;
 
 { TNNetDeLocalConnectReLU }
@@ -6927,6 +7076,7 @@ begin
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
+      'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1]);
       'TNNetSELU' :                 Result := TNNetSELU.Create();
       'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
@@ -6971,6 +7121,7 @@ begin
       'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[4]);
       'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
+      'TNNetUpsample' :             Result := TNNetUpsample.Create();
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
@@ -6993,6 +7144,7 @@ begin
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
+      if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1]) else
       if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
       if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
@@ -7037,6 +7189,7 @@ begin
       if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[4]) else
       if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
+      if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
