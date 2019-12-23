@@ -49,6 +49,7 @@ type
       FAvgWeights: TNNetDataParallelism;
       FAvgWeight: TNNet;
       FAvgWeightEpochCount: integer;
+      FCurrentEpoch: integer;
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
@@ -95,6 +96,7 @@ type
 
       property AvgWeightEpochCount: integer read FAvgWeightEpochCount write FAvgWeightEpochCount;
       property ClipDelta: single read FClipDelta write FClipDelta;
+      property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentLearningRate: single read FCurrentLearningRate;
       property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
       property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
@@ -287,7 +289,6 @@ var
   CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
   MaxDelta: TNeuralFloat;
   ValidationRecord: TNeuralFloat;
-  iEpochCount: integer;
 begin
   FRunning := true;
   FShouldQuit := false;
@@ -298,7 +299,7 @@ begin
   {$IFNDEF HASTHREADS}
   FMaxThreadNum := 1;
   {$ENDIF}
-  iEpochCount := FInitialEpoch;
+  FCurrentEpoch := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
   FThreadNum := FMaxThreadNum;
   FBatchSize := pBatchSize;
@@ -376,11 +377,11 @@ begin
   end;
   if Assigned(FOnStart) then FOnStart(Self);
   globalStartTime := Now();
-  while ( (FMaxEpochs > iEpochCount) and Not(FShouldQuit) ) do
+  while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
     FGlobalErrorSum := 0;
     startTime := Now();
-    CheckLearningRate(iEpochCount);
+    CheckLearningRate(FCurrentEpoch);
     for I := 1 to (TrainingCnt div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
     begin
       if FShouldQuit then break;
@@ -417,7 +418,7 @@ begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
-        if (iEpochCount = FInitialEpoch) and (I = 1) then
+        if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
         begin
           AccuracyWithInertia := CurrentAccuracy;
         end else if (FStepSize < 100) then
@@ -440,7 +441,7 @@ begin
         FTrainingAccuracy := AccuracyWithInertia/100;
         if FVerbose then WriteLn
         (
-          (FGlobalHit + FGlobalMiss)*I + iEpochCount*TrainingCnt,
+          (FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*TrainingCnt,
           ' Examples seen. Accuracy:', (FTrainingAccuracy):6:4,
           ' Error:', TrainingError:10:5,
           ' Loss:', TrainingLoss:7:5,
@@ -455,7 +456,7 @@ begin
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
     end;
 
-    Inc(iEpochCount);
+    Inc(FCurrentEpoch);
 
     if not Assigned(FAvgWeights) then
     begin
@@ -469,7 +470,7 @@ begin
     begin
       if FAvgWeightEpochCount > 1 then
       begin
-        FAvgWeights.ReplaceAtIdxAndUpdateWeightAvg(iEpochCount mod FAvgWeightEpochCount, FNN, FAvgWeight);
+        FAvgWeights.ReplaceAtIdxAndUpdateWeightAvg(FCurrentEpoch mod FAvgWeightEpochCount, FNN, FAvgWeight);
       end
       else
       begin
@@ -510,8 +511,8 @@ begin
         if (FGlobalHit > 0) and (FVerbose) then
         begin
           WriteLn(
-            'Epochs: ',iEpochCount,
-            ' Examples seen:', iEpochCount * TrainingCnt,
+            'Epochs: ',FCurrentEpoch,
+            ' Examples seen:', FCurrentEpoch * TrainingCnt,
             ' Validation Accuracy: ', ValidationRate:6:4,
             ' Validation Error: ', ValidationError:6:4,
             ' Validation Loss: ', ValidationLoss:6:4,
@@ -526,14 +527,14 @@ begin
         end;
       end;// Assigned(FImgValidationVolumes)
 
-      if (iEpochCount mod FThreadNN.Count = 0) and (FVerbose) then
+      if (FCurrentEpoch mod FThreadNN.Count = 0) and (FVerbose) then
       begin
         FThreadNN[0].DebugWeights();
       end;
 
       if (TestCnt > 0) and Not(FShouldQuit) and Assigned(pGetTestPair) then
       begin
-        if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
+        if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
         begin
           FGlobalHit       := 0;
           FGlobalMiss      := 0;
@@ -559,8 +560,8 @@ begin
           if (FGlobalTotal > 0) and (FVerbose) then
           begin
             WriteLn(
-              'Epochs: ', iEpochCount,
-              ' Examples seen:', iEpochCount * TrainingCnt,
+              'Epochs: ', FCurrentEpoch,
+              ' Examples seen:', FCurrentEpoch * TrainingCnt,
               ' Test Accuracy: ', TestRate:6:4,
               ' Test Error: ', TestError:6:4,
               ' Test Loss: ', TestLoss:6:4,
@@ -575,12 +576,12 @@ begin
         end;
       end;
 
-      if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
+      if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
       begin
         WriteLn
         (
           CSVFile,
-          iEpochCount,',',
+          FCurrentEpoch,',',
           (AccuracyWithInertia/100):6:4,',',
           TrainingLoss:6:4,',',
           TrainingError:6:4,',',
@@ -599,7 +600,7 @@ begin
         WriteLn
         (
           CSVFile,
-          iEpochCount,',',
+          FCurrentEpoch,',',
           (AccuracyWithInertia/100):6:4,',',
           TrainingLoss:6:4,',',
           TrainingError:6:4,',',
@@ -620,7 +621,7 @@ begin
         ' 100 epochs: ' + FloatToStrF( 100*totalTimeSeconds*(50000/(FStepSize*10))/3600,ffGeneral,1,4)+' hours.');
 
       MessageProc(
-        'Epochs: '+IntToStr(iEpochCount)+
+        'Epochs: '+IntToStr(FCurrentEpoch)+
         '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffGeneral,4,2)+' hours.');
     end;
     if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
@@ -953,6 +954,7 @@ begin
   FTestAccuracy := 0;
   FRunning := false;
   FShouldQuit := false;
+  FCurrentEpoch := 0;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -1074,7 +1076,6 @@ var
   CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
   MaxDelta: TNeuralFloat;
   ValidationRecord: TNeuralFloat;
-  iEpochCount: integer;
 begin
   FRunning := true;
   FShouldQuit := false;
@@ -1082,7 +1083,7 @@ begin
   {$IFNDEF HASTHREADS}
   FMaxThreadNum := 1;
   {$ENDIF}
-  iEpochCount := FInitialEpoch;
+  FCurrentEpoch := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
   FImgVolumes := pImgVolumes;
   FImgValidationVolumes := pImgValidationVolumes;
@@ -1164,11 +1165,11 @@ begin
   end;
   if Assigned(FOnStart) then FOnStart(Self);
   globalStartTime := Now();
-  while ( (FMaxEpochs > iEpochCount) and Not(FShouldQuit) ) do
+  while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
     FGlobalErrorSum := 0;
     startTime := Now();
-    CheckLearningRate(iEpochCount);
+    CheckLearningRate(FCurrentEpoch);
     for I := 1 to (FImgVolumes.Count div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
     begin
       if (FShouldQuit) then break;
@@ -1205,7 +1206,7 @@ begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
-        if (iEpochCount = FInitialEpoch) and (I = 1) then
+        if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
         begin
           AccuracyWithInertia := CurrentAccuracy;
         end else if (FStepSize < 100) then
@@ -1228,7 +1229,7 @@ begin
         FTrainingAccuracy := AccuracyWithInertia/100;
         if FVerbose then WriteLn
         (
-          (FGlobalHit + FGlobalMiss)*I + iEpochCount*FImgVolumes.Count,
+          (FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*FImgVolumes.Count,
           ' Examples seen. Accuracy:', (TrainingAccuracy):6:4,
           ' Error:', TrainingError:10:5,
           ' Loss:', TrainingLoss:7:5,
@@ -1243,7 +1244,7 @@ begin
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
     end;
 
-    Inc(iEpochCount);
+    Inc(FCurrentEpoch);
 
     if not Assigned(FAvgWeights) then
     begin
@@ -1257,7 +1258,7 @@ begin
     begin
       if FAvgWeightEpochCount > 1 then
       begin
-        FAvgWeights.ReplaceAtIdxAndUpdateWeightAvg(iEpochCount mod FAvgWeightEpochCount, FNN, FAvgWeight);
+        FAvgWeights.ReplaceAtIdxAndUpdateWeightAvg(FCurrentEpoch mod FAvgWeightEpochCount, FNN, FAvgWeight);
       end
       else
       begin
@@ -1297,8 +1298,8 @@ begin
         if (FGlobalTotal > 0) and (FVerbose) then
         begin
           WriteLn(
-            'Epochs: ',iEpochCount,
-            ' Examples seen:', iEpochCount * FImgVolumes.Count,
+            'Epochs: ',FCurrentEpoch,
+            ' Examples seen:', FCurrentEpoch * FImgVolumes.Count,
             ' Validation Accuracy: ', ValidationRate:6:4,
             ' Validation Error: ', ValidationError:6:4,
             ' Validation Loss: ', ValidationLoss:6:4,
@@ -1313,14 +1314,14 @@ begin
         end;
       end;// Assigned(FImgValidationVolumes)
 
-      if (iEpochCount mod FThreadNN.Count = 0) and (FVerbose) then
+      if (FCurrentEpoch mod FThreadNN.Count = 0) and (FVerbose) then
       begin
         FThreadNN[0].DebugWeights();
       end;
 
       if Assigned(FImgTestVolumes) and Not(FShouldQuit) then
       begin
-        if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
+        if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
         begin
           FWorkingVolumes := FImgTestVolumes;
           FGlobalHit       := 0;
@@ -1346,8 +1347,8 @@ begin
           if (FGlobalTotal > 0) and (FVerbose) then
           begin
             WriteLn(
-              'Epochs: ',iEpochCount,
-              ' Examples seen:', iEpochCount * FImgVolumes.Count,
+              'Epochs: ',FCurrentEpoch,
+              ' Examples seen:', FCurrentEpoch * FImgVolumes.Count,
               ' Test Accuracy: ', TestRate:6:4,
               ' Test Error: ', TestError:6:4,
               ' Test Loss: ', TestLoss:6:4,
@@ -1362,12 +1363,12 @@ begin
         end;
       end;
 
-      if ( (iEpochCount mod 10 = 0) and (iEpochCount > 0) ) then
+      if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
       begin
         WriteLn
         (
           CSVFile,
-          iEpochCount,',',
+          FCurrentEpoch,',',
           (AccuracyWithInertia/100):6:4,',',
           TrainingLoss:6:4,',',
           TrainingError:6:4,',',
@@ -1386,7 +1387,7 @@ begin
         WriteLn
         (
           CSVFile,
-          iEpochCount,',',
+          FCurrentEpoch,',',
           (AccuracyWithInertia/100):6:4,',',
           TrainingLoss:6:4,',',
           TrainingError:6:4,',',
@@ -1408,7 +1409,7 @@ begin
         ' 100 epochs: ' + FloatToStrF( 100*totalTimeSeconds*(50000/(FStepSize*10))/3600,ffGeneral,1,4)+' hours.');
 
       MessageProc(
-        'Epochs: '+IntToStr(iEpochCount)+
+        'Epochs: '+IntToStr(FCurrentEpoch)+
         '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffGeneral,4,2)+' hours.');
     end;
   end;
