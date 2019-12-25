@@ -13,7 +13,7 @@ object FormVisualLearning: TFormVisualLearning
   Position = poScreenCenter
   LCLVersion = '2.0.2.0'
   object ButLearn: TButton
-    Left = 752
+    Left = 768
     Height = 45
     Top = 8
     Width = 168
@@ -61,7 +61,7 @@ object FormVisualLearning: TFormVisualLearning
     TabOrder = 2
   end
   object RadRGB: TRadioButton
-    Left = 472
+    Left = 688
     Height = 24
     Top = 8
     Width = 52
@@ -71,9 +71,9 @@ object FormVisualLearning: TFormVisualLearning
     TabStop = True
   end
   object RadLAB: TRadioButton
-    Left = 552
+    Left = 688
     Height = 24
-    Top = 8
+    Top = 40
     Width = 50
     Caption = 'LAB'
     TabOrder = 3
@@ -90,7 +90,7 @@ object FormVisualLearning: TFormVisualLearning
     Left = 576
     Height = 28
     Top = 40
-    Width = 65
+    Width = 80
     ItemHeight = 20
     ItemIndex = 2
     Items.Strings = (
@@ -114,5 +114,29 @@ object FormVisualLearning: TFormVisualLearning
     Width = 78
     Caption = 'Complexity:'
     ParentColor = False
+  end
+  object LabLearningRate: TLabel
+    Left = 456
+    Height = 20
+    Top = 8
+    Width = 94
+    Caption = 'Learning Rate:'
+    ParentColor = False
+  end
+  object ComboLearningRate: TComboBox
+    Left = 576
+    Height = 28
+    Top = 8
+    Width = 80
+    ItemHeight = 20
+    ItemIndex = 0
+    Items.Strings = (
+      'High'
+      'Normal'
+      'Low'
+    )
+    Style = csDropDownList
+    TabOrder = 7
+    Text = 'High'
   end
 end

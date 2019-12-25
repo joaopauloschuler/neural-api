@@ -36,6 +36,8 @@ uses
   {$endif}
   ;
 
+const csLearningRates: array[0..2] of TNeuralFloat = (1, 0.1, 0.01);
+
 type
 
   { TFormVisualLearning }
@@ -43,11 +45,13 @@ type
     ButLearn: TButton;
     ChkRunOnGPU: TCheckBox;
     ChkBigNetwork: TCheckBox;
+    ComboLearningRate: TComboBox;
     ComboComplexity: TComboBox;
     GrBoxNeurons: TGroupBox;
     ImgSample: TImage;
     LabClassRate: TLabel;
     LabComplexity: TLabel;
+    LabLearningRate: TLabel;
     RadLAB: TRadioButton;
     RadRGB: TRadioButton;
     procedure ButLearnClick(Sender: TObject);
@@ -57,21 +61,24 @@ type
   private
     { private declarations }
     FRunning: boolean;
-    vDisplay: TNNetVolume;
+    FDisplay: TNNetVolume;
     ImgTrainingVolumes, ImgTestVolumes, ImgValidationVolumes: TNNetVolumeList;
     FRealPairs, FGeneratedPairs: TNNetVolumePairList;
     FImageCnt: integer;
     iEpochCount, iEpochCountAfterLoading: integer;
-    Generative: THistoricalNets;
+    FGenerative: THistoricalNets;
     FGeneratives: TNNetDataParallelism;
-    Discriminator, DiscriminatorClone: TNNet;
+    FDiscriminator, FDiscriminatorClone: TNNet;
     aImage: array of TImage;
     aLabelX, aLabelY: array of TLabel;
     FBaseName: string;
     FColorEncoding: byte;
     FRandomSizeX, FRandomSizeY, FRandomDepth: integer;
-    {$ifdef OpenCL}FEasyOpenCL: TEasyOpenCL;{$endif}
+    FLearningRateProportion: TNeuralFloat;
+    {$ifdef OpenCL}
+    FEasyOpenCL: TEasyOpenCL;
     FHasOpenCL: boolean;
+    {$endif}
 
     FCritSec: TRTLCriticalSection;
     FFit: TNeuralDataLoadingFit;
@@ -137,7 +144,7 @@ begin
   FGeneratives := nil;
   FRealPairs := TNNetVolumePairList.Create();
   FGeneratedPairs := TNNetVolumePairList.Create();
-  vDisplay := TNNetVolume.Create();
+  FDisplay := TNNetVolume.Create();
   FImageCnt := 0;
   CreateAscentImages
   (
@@ -165,7 +172,7 @@ begin
   DoneCriticalSection(FCritSec);
   FRealPairs.Free;
   FGeneratedPairs.Free;
-  vDisplay.Free;
+  FDisplay.Free;
   {$ifdef OpenCL}FEasyOpenCL.Free;{$endif}
   FFit.Free;
 end;
@@ -176,43 +183,43 @@ var
   pMin1, pMax1: TNeuralFloat;
   pMin2, pMax2: TNeuralFloat;
 begin
-  vDisplay := TNNetVolume.Create(ImgInput);
-  vDisplay.Copy(ImgInput);
+  FDisplay.Resize(ImgInput);
+  FDisplay.Copy(ImgInput);
 
   if color_encoding = csEncodeLAB then
   begin
-    vDisplay.GetMinMaxAtDepth(0, pMin0, pMax0);
-    vDisplay.GetMinMaxAtDepth(1, pMin1, pMax1);
-    vDisplay.GetMinMaxAtDepth(2, pMin2, pMax2);
+    FDisplay.GetMinMaxAtDepth(0, pMin0, pMax0);
+    FDisplay.GetMinMaxAtDepth(1, pMin1, pMax1);
+    FDisplay.GetMinMaxAtDepth(2, pMin2, pMax2);
     pMax0 := Max(Abs(pMin0), Abs(pMax0));
     pMax1 := Max(Abs(pMin1), Abs(pMax1));
     pMax2 := Max(Abs(pMin2), Abs(pMax2));
 
     if pMax0 > 2 then
     begin
-      vDisplay.MulAtDepth(0, 2/pMax0);
+      FDisplay.MulAtDepth(0, 2/pMax0);
     end;
 
     if pMax1 > 2 then
     begin
-      vDisplay.MulAtDepth(1, 2/pMax1);
+      FDisplay.MulAtDepth(1, 2/pMax1);
     end;
 
     if pMax2 > 2 then
     begin
-      vDisplay.MulAtDepth(2, 2/pMax2);
+      FDisplay.MulAtDepth(2, 2/pMax2);
     end;
   end
-  else if vDisplay.GetMaxAbs() > 2 then
+  else if FDisplay.GetMaxAbs() > 2 then
   begin
-    vDisplay.NormalizeMax(2);
+    FDisplay.NormalizeMax(2);
   end;
 
-  vDisplay.PrintDebugChannel();
+  //Debug only: FDisplay.PrintDebugChannel();
 
-  vDisplay.NeuronalInputToRgbImg(color_encoding);
+  FDisplay.NeuronalInputToRgbImg(color_encoding);
 
-  LoadVolumeIntoTImage(vDisplay, aImage[FImageCnt]);
+  LoadVolumeIntoTImage(FDisplay, aImage[FImageCnt]);
   aImage[FImageCnt].Width := 64;
   aImage[FImageCnt].Height := 64;
   ProcessMessages();
@@ -221,7 +228,7 @@ end;
 
 procedure TFormVisualLearning.DiscriminatorOnStart(Sender: TObject);
 begin
-  FGeneratives := TNNetDataParallelism.Create(Generative, FFit.MaxThreadNum);
+  FGeneratives := TNNetDataParallelism.Create(FGenerative, FFit.MaxThreadNum);
   {$ifdef OpenCL}
   if FHasOpenCL then
   begin
@@ -283,14 +290,16 @@ begin
   iEpochCount := 0;
   iEpochCountAfterLoading := 0;
 
-  writeln('Creating Neural Network...');
-  Generative := THistoricalNets.Create();
-  Discriminator := TNNet.Create();
+  writeln('Creating Neural Networks...');
+  FGenerative := THistoricalNets.Create();
+  FDiscriminator := TNNet.Create();
+
+  FLearningRateProportion := csLearningRates[ComboLearningRate.ItemIndex];
 
   if Not(FileExists(FBaseName+'generative.nn')) then
   begin
     WriteLn('Creating generative.');
-    Generative.AddLayer([
+    FGenerative.AddLayer([
       TNNetInput.Create(FRandomSizeX, FRandomSizeY, FRandomDepth),
       TNNetConvolutionReLU.Create(128 * NeuronMultiplier,3,1,1,0), //4x4
       TNNetMovingStdNormalization.Create(),
@@ -314,7 +323,7 @@ begin
       TNNetReLUL.Create(-40, +40) // Protection against overflow
     ]);
     (*
-    Generative.AddLayer([
+    FGenerative.AddLayer([
        TNNetInput.Create(40, 40, 3),
        TNNetConvolutionReLU.Create(64 * NeuronMultiplier,3,0,1,0),
        TNNetMovingStdNormalization.Create(),
@@ -326,22 +335,22 @@ begin
        TNNetReLUL.Create(-40, +40) // Protection against overflow
     ]);
     *)
-    Generative.Layers[Generative.GetFirstImageNeuronalLayerIdx()].InitBasicPatterns();
+    FGenerative.Layers[FGenerative.GetFirstImageNeuronalLayerIdx()].InitBasicPatterns();
   end
   else
   begin
     WriteLn('Loading generative.');
-    Generative.LoadFromFile(FBaseName+'generative.nn');
+    FGenerative.LoadFromFile(FBaseName+'generative.nn');
   end;
-  Generative.DebugStructure();
-  Generative.SetLearningRate(0.001,0.9);
-  Generative.SetL2Decay(0.0);
+  FGenerative.DebugStructure();
+  FGenerative.SetLearningRate(0.001,0.9);
+  FGenerative.SetL2Decay(0.0);
 
   if Not(FileExists(FBaseName+'discriminator.nn')) then
   begin
     WriteLn('Creating discriminator.');
     (*
-    Discriminator.AddLayer([
+    FDiscriminator.AddLayer([
       TNNetInput.Create(32,32,3),
       TNNetConvolutionLinear.Create(64 * NeuronMultiplier,3,1,2,0), // downsample to 16x16
       TNNetSELU.Create(),
@@ -353,7 +362,7 @@ begin
       TNNetFullConnectLinear.Create(2),
       TNNetSoftMax.Create()
     ]);*)
-    Discriminator.AddLayer([
+    FDiscriminator.AddLayer([
       TNNetInput.Create(32,32,3),
       TNNetConvolutionReLU.Create(64 * NeuronMultiplier,3,0,1,0), // downsample to 15x15
       TNNetMaxPool.Create(2),
@@ -367,20 +376,20 @@ begin
       TNNetSoftMax.Create()
     ]);
 
-    Discriminator.Layers[Discriminator.GetFirstImageNeuronalLayerIdx()].InitBasicPatterns();
+    FDiscriminator.Layers[FDiscriminator.GetFirstImageNeuronalLayerIdx()].InitBasicPatterns();
   end
   else
   begin
     WriteLn('Loading discriminator.');
-    Discriminator.LoadFromFile(FBaseName+'discriminator.nn');
-    TNNetInput(Discriminator.Layers[0]).EnableErrorCollection;
-    Discriminator.DebugStructure();
-    Discriminator.DebugWeights();
+    FDiscriminator.LoadFromFile(FBaseName+'discriminator.nn');
+    TNNetInput(FDiscriminator.Layers[0]).EnableErrorCollection;
+    FDiscriminator.DebugStructure();
+    FDiscriminator.DebugWeights();
   end;
-  Discriminator.DebugStructure();
+  FDiscriminator.DebugStructure();
 
-  DiscriminatorClone := Discriminator.Clone();
-  TNNetInput(DiscriminatorClone.Layers[0]).EnableErrorCollection;
+  FDiscriminatorClone := FDiscriminator.Clone();
+  TNNetInput(FDiscriminatorClone.Layers[0]).EnableErrorCollection;
 
   FFit.EnableClassComparison();
   FFit.OnAfterEpoch := @Self.DiscriminatorOnAfterEpoch;
@@ -398,18 +407,18 @@ begin
     Generative.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
   end;
   {$endif}
-  FFit.FitLoading(Discriminator, 64*10, 500, 500, 64, 3500, @GetDiscriminatorTrainingPair, nil, nil);
+  //Debug only: FFit.MaxThreadNum := 1;
+  FFit.FitLoading(FDiscriminator, 64*10, 500, 500, 64, 35000, @GetDiscriminatorTrainingPair, nil, nil);
 
   if Assigned(FGeneratives) then FreeAndNil(FGeneratives);
-  vDisplay.Free;
-  Generative.Free;
-  Discriminator.Free;
-  DiscriminatorClone.Free;
+  FGenerative.Free;
+  FDiscriminator.Free;
+  FDiscriminatorClone.Free;
 end;
 
 function TFormVisualLearning.GetDiscriminatorTrainingPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
 var
-  RandomValue: integer;
+  RandomValue, RandomPos: integer;
   LocalPair: TNNetVolumePair;
 begin
   if (FRealPairs.Count = 0) then
@@ -429,8 +438,13 @@ begin
   RandomValue := Random(1000);
   if RandomValue < 500 then
   begin
-    Result := FRealPairs[Random(FRealPairs.Count)];
+    RandomPos := Random(FRealPairs.Count);
+    Result := FRealPairs[RandomPos];
     Result.O.SetClassForSoftMax(1);
+    if Result.I.Size <> 32*32*3 then
+    begin
+      WriteLn('ERROR: Real Pair index ',RandomPos,'has wrong size:', Result.I.Size);
+    end;
     // Debug Only: if (Random(100)=0) then DisplayInputImage(Result.I, FColorEncoding);
   end
   else
@@ -443,71 +457,80 @@ begin
     FGeneratives[ThreadId].GetOutput(LocalPair.I);
     Result := LocalPair;
     Result.O.SetClassForSoftMax(0);
+    if Result.I.Size <> 32*32*3 then
+    begin
+      WriteLn('ERROR: Generated Pair has wrong size:', Result.I.Size);
+    end;
   end;
 end;
 
 procedure TFormVisualLearning.DiscriminatorOnAfterEpoch(Sender: TObject);
 var
-  LoopCnt: integer;
-  RandomIdx: integer;
-  LocalPair: TNNetVolumePair;
-  ExpectedDiscriminatorOutput, Transitory, DiscriminatorFound: TNNetVolume;
+  LoopCnt, MaxLoop: integer;
+  ExpectedDiscriminatorOutput, Transitory, DiscriminatorFound, GenerativeInput: TNNetVolume;
   Error: TNeuralFloat;
 begin
-  if FFit.TrainingAccuracy <= 0.745 //Default is: 0.745
+  if (FFit.TrainingAccuracy <= 0.745) or FFit.ShouldQuit
   then exit;
   WriteLn('Training Generative Start.');
   ExpectedDiscriminatorOutput := TNNetVolume.Create(2, 1, 1);
   ExpectedDiscriminatorOutput.SetClassForSoftMax(1);
   DiscriminatorFound := TNNetVolume.Create(ExpectedDiscriminatorOutput);
-  Transitory := TNNetVolume.Create(DiscriminatorClone.Layers[0].OutputError);
-  DiscriminatorClone.CopyWeights(Discriminator);
-  Generative.SetBatchUpdate(true);
-  Generative.SetLearningRate(FFit.CurrentLearningRate*1, 0); //Also good values are: *0.1, 0.0
-  DiscriminatorClone.SetBatchUpdate(true);
-  DiscriminatorClone.SetL2Decay(0.0);
-  Generative.SetL2Decay(0.00001);
+  Transitory := TNNetVolume.Create(FDiscriminatorClone.Layers[0].OutputError);
+  GenerativeInput := TNNetVolume.Create(FRandomSizeX, FRandomSizeY, FRandomDepth);
+  FDiscriminatorClone.CopyWeights(FDiscriminator);
+  FGenerative.SetBatchUpdate(true);
+  FGenerative.SetLearningRate(FFit.CurrentLearningRate*FLearningRateProportion, 0);
+  FGenerative.SetL2Decay(0.00001);
+  FDiscriminatorClone.SetBatchUpdate(true);
+  FDiscriminatorClone.SetL2Decay(0.0);
+  MaxLoop := Round(100 * (1/FLearningRateProportion));
   begin
     Error := 0;
-    DiscriminatorClone.RefreshDropoutMask();
-    for LoopCnt := 1 to 100 do
+    FDiscriminatorClone.RefreshDropoutMask();
+    for LoopCnt := 1 to MaxLoop do
     begin
-      DiscriminatorClone.ClearDeltas();
-      DiscriminatorClone.ClearInertia();
-      RandomIdx := Random(FGeneratedPairs.Count);
-      LocalPair := FGeneratedPairs[RandomIdx];
-      LocalPair.I.Resize(FRandomSizeX, FRandomSizeY, FRandomDepth);
-      LocalPair.I.Randomize();
-      LocalPair.I.NormalizeMax(2);
-      Generative.Compute(LocalPair.I);
-      Generative.GetOutput(LocalPair.I);
-      DiscriminatorClone.Compute(LocalPair.I);
-      DiscriminatorClone.GetOutput(DiscriminatorFound);
-      DiscriminatorClone.Backpropagate(ExpectedDiscriminatorOutput);
+      if FFit.ShouldQuit then break;
+      FDiscriminatorClone.ClearDeltas();
+      FDiscriminatorClone.ClearInertia();
+      GenerativeInput.Randomize();
+      GenerativeInput.NormalizeMax(2);
+      if FGenerative.Layers[0].Output.Size<>GenerativeInput.Size then
+      begin
+        Write('.');
+        FGenerative.Layers[0].Output.ReSize(GenerativeInput);
+        FGenerative.Layers[0].OutputError.ReSize(GenerativeInput);
+      end;
+      FGenerative.Compute(GenerativeInput);
+      FGenerative.GetOutput(Transitory);
+      FDiscriminatorClone.Compute(Transitory);
+      FDiscriminatorClone.GetOutput(DiscriminatorFound);
+      FDiscriminatorClone.Backpropagate(ExpectedDiscriminatorOutput);
       Error += ExpectedDiscriminatorOutput.SumDiff(DiscriminatorFound);
-      Transitory.Copy(LocalPair.I);
-      Transitory.Sub(DiscriminatorClone.Layers[0].OutputError);
-      Generative.Backpropagate(Transitory);
-      Generative.NormalizeMaxAbsoluteDelta(0.0001);
-      Generative.UpdateWeights();
+      Transitory.Sub(FDiscriminatorClone.Layers[0].OutputError);
+      FGenerative.Backpropagate(Transitory);
+      FGenerative.NormalizeMaxAbsoluteDelta(0.001);
+      FGenerative.UpdateWeights();
       if LoopCnt mod 10 = 0 then ProcessMessages();
+      if LoopCnt mod 100 = 0 then DisplayInputImage(Transitory, FColorEncoding);
     end;
-    DisplayInputImage(LocalPair.I, FColorEncoding);
-    DiscriminatorClone.Layers[0].OutputError.PrintDebug();WriteLn();
+    FDiscriminatorClone.Layers[0].OutputError.PrintDebug();WriteLn();
     WriteLn('Generative error:', Error:6:4);
   end;
-  Generative.DebugErrors();
-  Generative.DebugWeights();
-  FGeneratives.CopyWeights(Generative);
-  DiscriminatorClone.DebugWeights();
+  //Debug:
+  //FGenerative.DebugErrors();
+  //FGenerative.DebugWeights();
+  //FDiscriminatorClone.DebugWeights();
+  FGeneratives.CopyWeights(FGenerative);
+  GenerativeInput.Free;
   ExpectedDiscriminatorOutput.Free;
   Transitory.Free;
   DiscriminatorFound.Free;
   if FFit.CurrentEpoch mod 100 = 0 then
   begin
     WriteLn('Saving ', FBaseName);
-    Generative.SaveToFile(FBaseName+'generative.nn');
-    Discriminator.SaveToFile(FBaseName+'discriminator.nn');
+    FGenerative.SaveToFile(FBaseName+'generative.nn');
+    FDiscriminator.SaveToFile(FBaseName+'discriminator.nn');
     SaveScreenshot(FBaseName+'cai-neural-gan.bmp');
   end;
   WriteLn('Training Generative Finish with:', Error:6:4);
