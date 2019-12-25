@@ -522,10 +522,11 @@ begin
 
         if (ValidationRate >= FTargetAccuracy) then
         begin
+          FMessageProc('ValidationRate passed TargetAccuracy.');
           FShouldQuit := true;
           break;
         end;
-      end;// Assigned(FImgValidationVolumes)
+      end;// Assigned(pGetValidationPair)
 
       if (FCurrentEpoch mod FThreadNN.Count = 0) and (FVerbose) then
       begin
@@ -571,6 +572,7 @@ begin
         end;
         if (TestRate >= FTargetAccuracy) then
         begin
+          FMessageProc('TestRate passed TargetAccuracy.');
           FShouldQuit := true;
           break;
         end;
@@ -1309,6 +1311,7 @@ begin
 
         if (ValidationRate >= FTargetAccuracy) then
         begin
+          FMessageProc('ValidationRate passed TargetAccuracy.');
           FShouldQuit := true;
           break;
         end;
@@ -1358,6 +1361,7 @@ begin
         end;
         if (TestRate >= FTargetAccuracy) then
         begin
+          FMessageProc('TestRate passed TargetAccuracy.');
           FShouldQuit := true;
           break;
         end;
