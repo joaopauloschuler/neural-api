@@ -7538,15 +7538,17 @@ end;
 procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0);
 var
   LayerCnt: integer;
+  LastLayer: integer;
   StartTime: double;
 begin
   StartTime := Now();
   if FLayers.Count > FromLayerIdx + 1 then
   begin
-    if FLayers[FromLayerIdx].Output.Size = pInput.Size then
+    if FLayers[FromLayerIdx].FOutput.Size = pInput.Size then
     begin
-      FLayers[FromLayerIdx].FOutput.Copy(pInput);
-      for LayerCnt := FromLayerIdx to GetLastLayerIdx() do
+      FLayers[FromLayerIdx].FOutput.CopyNoChecks(pInput);
+      LastLayer := GetLastLayerIdx();
+      for LayerCnt := FromLayerIdx to LastLayer do
       begin
         FLayers[LayerCnt].Compute();
       end;
