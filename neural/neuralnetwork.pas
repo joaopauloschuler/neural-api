@@ -966,11 +966,19 @@ type
       procedure Backpropagate(); override;
     end;
 
-  /// Usual maxpool layer.
+  /// DEFAULT CAI maxpool layer.
   TNNetMaxPool = class(TNNetPoolBase)
     private
       procedure ComputeDefaultStride();
       procedure ComputeWithStride();
+    public
+      procedure Compute(); override;
+  end;
+
+  /// PORTABLE maxpool layer (similar to other APIs)
+  TNNetMaxPoolPortable = class(TNNetMaxPool)
+    private
+      function CalcOutputSize(pInputSize: integer): integer; override;
     public
       procedure Compute(); override;
   end;
@@ -1381,6 +1389,26 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+function TNNetMaxPoolPortable.CalcOutputSize(pInputSize: integer): integer;
+begin
+  Result := ( ( pInputSize - FPoolSize + 2*FPadding ) div FStride) + 1;
+end;
+
+procedure TNNetMaxPoolPortable.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Output.Fill(-1000000);
+
+  if FPadding > 0
+    then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
+    else FInputCopy := FPrevLayer.Output;
+
+  ComputeWithStride();
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetReLUL }
@@ -5415,8 +5443,8 @@ end;
 
 function TNNetPoolBase.CalcOutputSize(pInputSize: integer): integer;
 begin
-  Result := (pInputSize + FPadding) div FStride;
-  if ((pInputSize + FPadding) mod FStride > 0) then Inc(Result);
+  Result := (pInputSize + 2*FPadding) div FStride;
+  if ((pInputSize + 2*FPadding) mod FStride > 0) then Inc(Result);
 end;
 
 constructor TNNetPoolBase.Create(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0);
@@ -7105,6 +7133,7 @@ begin
       'TNNetPointwiseConvReLU' :    Result := TNNetPointwiseConvReLU.Create(St[0], St[4]);
       'TNNetPointwiseConvLinear' :  Result := TNNetPointwiseConvLinear.Create(St[0], St[4]);
       'TNNetMaxPool' :              Result := TNNetMaxPool.Create(St[0], St[1], St[2]);
+      'TNNetMaxPoolPortable' :      Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]);
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
@@ -7173,6 +7202,7 @@ begin
       if S[0] = 'TNNetPointwiseConvReLU' then Result := TNNetPointwiseConvReLU.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvLinear' then Result := TNNetPointwiseConvLinear.Create(St[0], St[4]) else
       if S[0] = 'TNNetMaxPool' then Result := TNNetMaxPool.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetMaxPoolPortable' then Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
