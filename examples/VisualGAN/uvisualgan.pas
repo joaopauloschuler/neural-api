@@ -83,6 +83,7 @@ type
     FCritSec: TRTLCriticalSection;
     FFit: TNeuralDataLoadingFit;
     function GetDiscriminatorTrainingPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
+    procedure GetDiscriminatorTrainingProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
     procedure DiscriminatorOnAfterEpoch(Sender: TObject);
     procedure DiscriminatorOnAfterStep(Sender: TObject);
     procedure DiscriminatorAugmentation(pInput: TNNetVolume; ThreadId: integer);
@@ -408,7 +409,8 @@ begin
   end;
   {$endif}
   //Debug only: FFit.MaxThreadNum := 1;
-  FFit.FitLoading(FDiscriminator, 64*10, 500, 500, 64, 35000, @GetDiscriminatorTrainingPair, nil, nil);
+  //FFit.FitLoading(FDiscriminator, 64*10, 500, 500, 64, 35000, @GetDiscriminatorTrainingPair, nil, nil); // This line does the same as below
+  FFit.FitLoading(FDiscriminator, 64*10, 500, 500, 64, 35000, @GetDiscriminatorTrainingProc, nil, nil); // This line does the same as above
 
   if Assigned(FGeneratives) then FreeAndNil(FGeneratives);
   FGenerative.Free;
@@ -462,6 +464,16 @@ begin
       WriteLn('ERROR: Generated Pair has wrong size:', Result.I.Size);
     end;
   end;
+end;
+
+procedure TFormVisualLearning.GetDiscriminatorTrainingProc(Idx: integer;
+  ThreadId: integer; pInput, pOutput: TNNetVolume);
+var
+  LocalPair: TNNetVolumePair;
+begin
+  LocalPair := GetDiscriminatorTrainingPair(Idx, ThreadId);
+  pInput.Copy(LocalPair.I);
+  pOutput.Copy(LocalPair.O);
 end;
 
 procedure TFormVisualLearning.DiscriminatorOnAfterEpoch(Sender: TObject);
