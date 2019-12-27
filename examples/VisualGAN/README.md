@@ -3,6 +3,7 @@
 
 In this example, 2 neural networks will enter an arms race via a [Generative Adversarial Neural Network](https://en.wikipedia.org/wiki/Generative_adversarial_network): `FGenerative` and `FDiscriminator`. The Generative network will learn how to create images while the discriminator will compare these images against the CIFAR-10 dataset.
 
+## The Source Code
 The discriminator `FDiscriminator` is trained via `TNeuralDataLoadingFit`:
 ```
   FFit.OnAfterEpoch := @Self.DiscriminatorOnAfterEpoch;
@@ -26,3 +27,15 @@ From the above code, some events are used and are interesting to note:
 * `FFit.OnAfterEpoch := @Self.DiscriminatorOnAfterEpoch;` calls the generative training. Therefore, the generative training is done after each discriminator epoch.
 
 In order to show how `TNeuralDataLoadingFit` loads training data, above implementation has 2 equivalent calls (the first is commented) with both `GetDiscriminatorTrainingPair` and `GetDiscriminatorTrainingProc`.
+
+## Results
+Can you spot face like characteristics such as eyes and mouths?
+
+<img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/art3.png"></img>
+
+<img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/art4.png"></img>
+
+<img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/art5.png"></img>
+
+
+
