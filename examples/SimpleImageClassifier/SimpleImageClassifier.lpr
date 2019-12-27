@@ -30,7 +30,7 @@ type
     NN := THistoricalNets.Create();
     NN.AddLayer([
       TNNetInput.Create(32, 32, 3),
-      TNNetConvolutionLinear.Create(64, 5, 2, 1, 1).InitBasicPatterns(),
+      TNNetConvolutionLinear.Create(64, 5, 2, 1, 1),
       TNNetMaxPool.Create(4),
       TNNetMovingStdNormalization.Create(),
       TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
@@ -42,6 +42,7 @@ type
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
+    NN.DebugStructure();
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     NeuralFit := TNeuralImageFit.Create;
