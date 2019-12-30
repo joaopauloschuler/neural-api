@@ -19,7 +19,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 unit neuraldatasetsv;
 
-{$mode objfpc}{$H+}
+{$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
 
 interface
 
@@ -27,11 +27,11 @@ uses
   neuraldatasets, Classes, SysUtils, ExtCtrls, Graphics,
   neuralvolume, neuralnetwork, StdCtrls;
 
-{$IFDEF FPC}
 type
   TImageDynArr = array of TImage;
   TLabelDynArr = array of TLabel;
 
+{$IFDEF FPC}
   { TClassesAndElements }
   TClassesAndElements = class(TStringStringListVolume)
     private
@@ -94,7 +94,7 @@ procedure LoadNNLayersIntoCombo(NN: TNNet; Combo: TComboBox);
 
 implementation
 
-uses neuralvolumev, fileutil, math;
+uses neuralvolumev, {$IFDEF FPC}fileutil{$ELSE} Winapi.Windows{$ENDIF}, math;
 
 procedure LoadNNLayersIntoCombo(NN: TNNet; Combo: TComboBox);
 var
@@ -326,7 +326,7 @@ begin
   begin
     for J := 0 to 31 do
     begin
-      Image.Canvas.Pixels[J, I] := RGBToColor(TI.R[I, J], TI.G[I, J], TI.B[I, J]);
+      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(TI.R[I, J], TI.G[I, J], TI.B[I, J]){$ENDIF};
     end;
   end;
 end;
@@ -341,7 +341,7 @@ begin
     for J := 0 to 31 do
     begin
       Image.Canvas.Pixels[J, I] :=
-        RGBToColor(TI.Grey[I, J], TI.Grey[I, J], TI.Grey[I, J]);
+        {$IFDEF FPC}RGBToColor{$ELSE}RGB(TI.Grey[I, J], TI.Grey[I, J], TI.Grey[I, J]){$ENDIF};
     end;
   end;
 end;

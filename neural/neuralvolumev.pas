@@ -19,12 +19,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 unit neuralvolumev;
 
-{$mode objfpc}{$H+}
+{$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
 
 interface
 
 uses
-  Classes, SysUtils, ExtCtrls, Graphics, neuralvolume, LCLType;
+  Classes, SysUtils, ExtCtrls, Graphics, neuralvolume, {$IFDEF FPC}LCLType {$ELSE}Winapi.Windows{$ENDIF} ;
 
 /// saves a bitmap into a file from a handle HWND
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
@@ -39,12 +39,13 @@ procedure LoadRGBVolumeIntoTImage(V:TNNetVolume; Image:TImage);
 procedure LoadPictureIntoVolume(LocalPicture: TPicture; Vol:TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
 
 /// Loads a Bitmat into a Volume
-procedure LoadBitmapIntoVolume(LocalBitmap: TBitmap; Vol:TNNetVolume);
+procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol:TNNetVolume);
 
 implementation
-uses LCLIntf;
+{$IFDEF FPC}uses LCLIntf;{$ENDIF}
 
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
+{$IFDEF FPC}
 var
   MyBitmap: TBitmap;
   MyDC: HDC;
@@ -59,6 +60,39 @@ begin
     FreeAndNil(MyBitmap);
   end;
 end;
+{$ELSE}
+var
+  MyBitmap: Graphics.TBitmap;
+  MyDC    : HDC;
+  pRect   : TRect;
+  w,h     : integer;
+begin
+  MyDC := GetDC(hWnd);
+  MyBitmap := Graphics.TBitmap.Create;
+  try
+    GetWindowRect(HWND,pRect);
+    w  := pRect.Right - pRect.Left;
+    h  := pRect.Bottom - pRect.Top;
+
+    MyBitmap.Width := w;
+    MyBitmap.Height:= h;
+
+    BitBlt(MyBitmap.Canvas.Handle,
+            0,
+            0,
+            MyBitmap.Width,
+            MyBitmap.Height,
+            MyDC,
+            0,
+            0,
+            SRCCOPY) ;
+    MyBitmap.SaveToFile(OutputFileName);
+  finally
+    ReleaseDC(hWnd, MyDC);
+    FreeAndNil(MyBitmap);
+  end;
+end;
+{$ENDIF}
 
 procedure LoadRGBVolumeIntoTImage(V:TNNetVolume; Image:TImage);
 var
@@ -71,7 +105,7 @@ begin
   begin
     for J := 0 to MaxY do
     begin
-      Image.Canvas.Pixels[J, I] := RGBToColor(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]);
+      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]){$ENDIF};
     end;
   end;
 end;
@@ -81,7 +115,7 @@ begin
   LoadBitmapIntoVolume(LocalPicture.Bitmap, Vol);
 end;
 
-procedure LoadBitmapIntoVolume(LocalBitmap: TBitmap; Vol: TNNetVolume);
+procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol: TNNetVolume);
 var
   CountX, CountY, MaxX, MaxY: integer;
   LocalCanvas: TCanvas;
@@ -138,7 +172,7 @@ begin
           // RGB and Gray
           bG := RoundAsByte(V[J,I,0]);
         end;
-        Image.Canvas.Pixels[J, I] := RGBToColor(bG, bG, bG);
+        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(bG, bG, bG){$ENDIF};
       end;
     end;
   end
@@ -172,7 +206,7 @@ begin
           G := 0;
           B := V[J,I,1];
         end;
-        Image.Canvas.Pixels[J, I] := RGBToColor(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
+        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B)){$ENDIF};
       end;
     end;
   end
@@ -201,7 +235,7 @@ begin
           B := V[J,I,2];
         end;
         //WriteLn(V[J,I,0]:10:5, ' ', V[J,I,1]:10:5, ' ', V[J,I,2]:10:5, ' - ', R:10:5, ' ', G:10:5, ' ', B:10:5);
-        Image.Canvas.Pixels[J, I] := RGBToColor(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
+        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B)){$ENDIF};
       end;
     end;
   end;
