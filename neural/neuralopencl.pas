@@ -36,7 +36,7 @@ unit neuralopencl;
 interface
 
 uses
-  Classes, SysUtils, cl, {$IFDEF FPC}ctypes{$ELSE}Winapi.Windows,CL_Platform{$ENDIF}, neuralvolume;
+  Classes, SysUtils, cl, {$IFDEF FPC}ctypes{$ELSE}Winapi.Windows,AnsiStrings,CL_Platform{$ENDIF}, neuralvolume;
 
 type
   {$IFNDEF FPC}
@@ -853,12 +853,12 @@ begin
     FMessageProc('clCreateProgramWithSource OK!');
 
   localCompilerOptions := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(FCompilerOptions)+1);
-  StrPCopy (localCompilerOptions,FCompilerOptions);
+  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy(localCompilerOptions,FCompilerOptions){$ENDIF};
 
   // Build the program executable
   err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
 
-  StrDispose(localCompilerOptions);
+  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
 
   if (err <> CL_SUCCESS) then
   begin
@@ -1064,8 +1064,8 @@ var
   err: integer; // error code returned from api calls
 begin
   err := 0;
-  localKernelName := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc(length(kernelname)+1){$ENDIF};
-  StrPCopy (localKernelName,kernelname);
+  localKernelName := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(kernelname)+1);
+  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localKernelName,kernelname);
 
   // Create the compute kernel in the program we wish to run
   Result := clCreateKernel(prog, localKernelName, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
@@ -1077,7 +1077,7 @@ begin
   begin
     FMessageProc('clCreateKernel '+kernelname+' OK!');
   end;
-  StrDispose(localKernelName);
+  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelName);
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;

@@ -105,7 +105,7 @@ begin
   begin
     for J := 0 to MaxY do
     begin
-      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]){$ENDIF};
+      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]);
     end;
   end;
 end;
@@ -172,7 +172,7 @@ begin
           // RGB and Gray
           bG := RoundAsByte(V[J,I,0]);
         end;
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(bG, bG, bG){$ENDIF};
+        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(bG, bG, bG);
       end;
     end;
   end
@@ -206,7 +206,7 @@ begin
           G := 0;
           B := V[J,I,1];
         end;
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B)){$ENDIF};
+        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
       end;
     end;
   end
@@ -235,7 +235,7 @@ begin
           B := V[J,I,2];
         end;
         //WriteLn(V[J,I,0]:10:5, ' ', V[J,I,1]:10:5, ' ', V[J,I,2]:10:5, ' - ', R:10:5, ' ', G:10:5, ' ', B:10:5);
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B)){$ENDIF};
+        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
       end;
     end;
   end;

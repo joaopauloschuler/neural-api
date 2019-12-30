@@ -291,6 +291,9 @@ var
   vDisplay: TNNetVolume;
 begin
   vDisplay := TNNetVolume.Create();
+  MaxW := 0.0;
+  MinW := 0.0;
+
   if Not(ScalePerImage) then
   begin
     MaxW := pNeuronList.GetMaxWeight();
@@ -326,7 +329,7 @@ begin
   begin
     for J := 0 to 31 do
     begin
-      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB(TI.R[I, J], TI.G[I, J], TI.B[I, J]){$ENDIF};
+      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(TI.R[I, J], TI.G[I, J], TI.B[I, J]);
     end;
   end;
 end;
@@ -341,7 +344,7 @@ begin
     for J := 0 to 31 do
     begin
       Image.Canvas.Pixels[J, I] :=
-        {$IFDEF FPC}RGBToColor{$ELSE}RGB(TI.Grey[I, J], TI.Grey[I, J], TI.Grey[I, J]){$ENDIF};
+        {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(TI.Grey[I, J], TI.Grey[I, J], TI.Grey[I, J]);
     end;
   end;
 end;
