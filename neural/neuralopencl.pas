@@ -27,8 +27,7 @@ unit neuralopencl;
 // This code was also inspired on:
 // https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/opencl/trillion-test/uopencl_trillion_test.pas
 
-
-// For Delphi user Using this Pascal Open CL headers
+// Delphi developers require these OpenCL headers:
 // https://github.com/CWBudde/PasOpenCL
 
 {$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
