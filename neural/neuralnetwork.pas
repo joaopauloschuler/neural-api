@@ -4365,7 +4365,7 @@ begin
     if Abs( Output.Raw[I] - Output2.Raw[I] ) > 0.1 then
     begin
       if ErrorCount < 10 then WriteLn('Error at pos ',I,':',Output.Raw[I]:10:5,' ',Output2.Raw[I]:10:5);
-      ErrorCount += 1;
+      ErrorCount := ErrorCount + 1;
     end;
   end;
   WriteLn(' Error Count:', ErrorCount);

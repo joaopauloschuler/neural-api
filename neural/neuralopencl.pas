@@ -853,7 +853,7 @@ begin
     FMessageProc('clCreateProgramWithSource OK!');
 
   localCompilerOptions := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(FCompilerOptions)+1);
-  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy(localCompilerOptions,FCompilerOptions){$ENDIF};
+  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localCompilerOptions,FCompilerOptions);
 
   // Build the program executable
   err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);

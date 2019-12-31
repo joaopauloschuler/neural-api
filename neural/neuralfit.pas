@@ -30,6 +30,7 @@ uses
   Classes, SysUtils, neuralnetwork, neuralvolume
   {$IFDEF HASTHREADS}, MTProcs{$ENDIF}
   {$IFDEF OpenCL}, cl{$ENDIF}
+  {$IFNDEF FPC}, neuralopencl {$ENDIF}
   ;
 
 type
