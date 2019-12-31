@@ -95,6 +95,7 @@ type
       {$ENDIF}
 
       property AvgWeightEpochCount: integer read FAvgWeightEpochCount write FAvgWeightEpochCount;
+      property AvgNN: TNNet read FAvgWeight;
       property ClipDelta: single read FClipDelta write FClipDelta;
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentLearningRate: single read FCurrentLearningRate;
@@ -152,13 +153,26 @@ type
         TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
         pGetTrainingProc, pGetValidationProc, pGetTestProc: TNNetGet2VolumesProc); overload;
 
+      procedure EnableMonopolarHitComparison();
+      procedure EnableBipolarHitComparison();
+      procedure EnableClassComparison();
+
+      // On most cases, you should never call the following methods directly
       procedure RunNNThread(Index: PtrInt; Data: Pointer;
         Item: TMultiThreadProcItem);
       procedure TestNNThread(Index: PtrInt; Data: Pointer;
         Item: TMultiThreadProcItem);
-      procedure EnableMonopolarHitComparison();
-      procedure EnableBipolarHitComparison();
-      procedure EnableClassComparison();
+
+      procedure AllocateMemory(pNN: TNNet;
+        pBatchSize: integer;
+        pGetTrainingPair, pGetValidationPair, pGetTestPair: TNNetGetPairFn); overload;
+      procedure AllocateMemory(pNN: TNNet;
+        pBatchSize: integer;
+        pGetTrainingProc, pGetValidationProc, pGetTestProc: TNNetGet2VolumesProc); overload;
+      procedure FreeMemory();
+      procedure RunTrainingBatch();
+      procedure RunValidationBatch(ValidationSize: integer);
+      procedure RunTestBatch(TestSize: integer);
 
       property DataAugmentationFn: TNNetDataAugmentationFn read FDataAugmentationFn write FDataAugmentationFn;
       property InferHitFn: TNNetInferHitFn read FInferHitFn write FInferHitFn;
@@ -293,52 +307,11 @@ var
   TestError, TestLoss, TestRate: TNeuralFloat;
   CSVFile: TextFile;
   CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
-  MaxDelta: TNeuralFloat;
   ValidationRecord: TNeuralFloat;
 begin
-  FRunning := true;
-  FShouldQuit := false;
-  FNN := pNN;
-  FGetTrainingPair := pGetTrainingPair;
-  FGetValidationPair := pGetValidationPair;
-  FGetTestPair := pGetTestPair;
-  {$IFNDEF HASTHREADS}
-  FMaxThreadNum := 1;
-  {$ENDIF}
-  FCurrentEpoch := FInitialEpoch;
-  FCurrentLearningRate := FInitialLearningRate;
-  FThreadNum := FMaxThreadNum;
-  FBatchSize := pBatchSize;
+  AllocateMemory(pNN, pBatchSize, pGetTrainingPair,
+    pGetValidationPair, pGetTestPair);
   FMaxEpochs := Epochs;
-  if FBatchSize >= FThreadNum then
-  begin
-    FBatchSize := (FBatchSize div FThreadNum) * FThreadNum;
-  end
-  else if FBatchSize > 0 then
-  begin
-    FThreadNum := FBatchSize;
-  end
-  else
-  begin
-    FErrorProc('Batch size has to be bigger than zero.');
-    FRunning := false;
-    exit;
-  end;
-
-  if Not(Assigned(FGetTrainingPair)) and Not(Assigned(FGetTrainingProc)) then
-  begin
-    FErrorProc('Training function hasn''t been defined.');
-    exit;
-  end;
-
-  FStepSize := FBatchSize;
-  if Assigned(FThreadNN) then FThreadNN.Free;
-  FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
-  {$IFDEF OpenCL}
-  if (FPlatformId <> nil) and (FDeviceId <> nil) then
-    FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
-  {$ENDIF}
-  FFinishedThread.Resize(1, 1, FThreadNum);
   AccuracyWithInertia := 0;
   TrainingError := 0;
   TrainingLoss := 0;
@@ -352,16 +325,12 @@ begin
   totalTimeSeconds := 0;
 
   FMessageProc('File name is: ' + FFileNameBase);
-
   FileNameCSV := FFileNameBase + '.csv';
   FileName := FFileNameBase + '.nn';
 
   AssignFile(CSVFile, FileNameCSV);
   ReWrite(CSVFile);
   WriteLn(CSVFile, 'epoch,training accuracy,training loss,training error,validation accuracy,validation loss,validation error,learning rate,time,test accuracy,test loss,test error');
-
-  FAvgWeights := nil;
-  FAvgWeight := FNN.Clone();
 
   if FVerbose then
   begin
@@ -375,14 +344,6 @@ begin
     if ValidationCnt > 0 then WriteLn('Validation volumes: ', ValidationCnt);
     if TestCnt > 0 then WriteLn('Test volumes: ', TestCnt);
   end;
-
-  FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
-  FThreadNN.SetBatchUpdate(true);
-  // in batch update mode, threaded NN should not apply L2 (L2 is applied in the main thread).
-  FThreadNN.SetL2Decay(0);
-
-  FNN.SetL2Decay(FL2Decay);
-  FNN.SetLearningRate(FCurrentLearningRate, FInertia);
 
   if FVerbose then
   begin
@@ -398,32 +359,7 @@ begin
     for I := 1 to (TrainingCnt div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
     begin
       if FShouldQuit then break;
-      FGlobalHit       := 0;
-      FGlobalMiss      := 0;
-      FGlobalTotalLoss := 0;
-      FGlobalErrorSum  := 0;
-      FFinishedThread.Fill(0);
-      FNN.ClearTime();
-      FNN.RefreshDropoutMask();
-      {$IFDEF HASTHREADS}
-      ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-      {$ELSE}
-      RunNNThread(0, nil, Self);
-      {$ENDIF}
-      if FClipDelta > 0 then
-      begin
-        MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
-      end
-      else
-      begin
-        MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
-        if MaxDelta < 1 then
-        begin
-          MessageProc('Deltas have been multiplied by:'+FloatToStr(MaxDelta) );
-        end;
-      end;
-      FNN.UpdateWeights();
-      if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+      RunTrainingBatch();
 
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
       if (FGlobalTotal > 0) then
@@ -446,12 +382,12 @@ begin
         begin
           AccuracyWithInertia := CurrentAccuracy;
         end;
+        FTrainingAccuracy := AccuracyWithInertia/100;
       end;
 
       if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
-        FTrainingAccuracy := AccuracyWithInertia/100;
         if FVerbose then WriteLn
         (
           (FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*TrainingCnt,
@@ -492,21 +428,8 @@ begin
 
       if (ValidationCnt > 0) and Not(FShouldQuit) then
       begin
-        FGlobalHit       := 0;
-        FGlobalMiss      := 0;
-        FGlobalTotalLoss := 0;
-        FGlobalErrorSum  := 0;
-        FTestSize        := ValidationCnt;
-        FLocalTestPair   := FGetValidationPair;
-        FLocalTestProc   := FGetValidationProc;
-        FMessageProc('Starting Validation.');
-        {$IFDEF HASTHREADS}
-        ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-        {$ELSE}
-        TestNNThread(0, nil, Self);
-        {$ENDIF}
+        RunValidationBatch(ValidationCnt);
 
-        FGlobalTotal := (FGlobalHit + FGlobalMiss);
         if FGlobalTotal > 0 then
         begin
           ValidationRate  := FGlobalHit / FGlobalTotal;
@@ -551,21 +474,7 @@ begin
       begin
         if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
         begin
-          FGlobalHit       := 0;
-          FGlobalMiss      := 0;
-          FGlobalTotalLoss := 0;
-          FGlobalErrorSum  := 0;
-          FTestSize        := TestCnt;
-          FLocalTestPair   := FGetTestPair;
-          FLocalTestProc   := FGetTestProc;
-          FMessageProc('Starting Testing.');
-          {$IFDEF HASTHREADS}
-          ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-          {$ELSE}
-          TestNNThread(0, nil, Self);
-          {$ENDIF}
-
-          FGlobalTotal := (FGlobalHit + FGlobalMiss);
+          RunTestBatch(TestCnt);
           if FGlobalTotal > 0 then
           begin
             TestRate  := FGlobalHit / FGlobalTotal;
@@ -644,15 +553,9 @@ begin
     if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
   end;
 
-  FGetTrainingPair := nil;
-  FGetValidationPair := nil;
-  FGetTestPair := nil;
-  FreeAndNil(FAvgWeight);
-  if Assigned(FAvgWeights) then FreeAndNil(FAvgWeights);
-  FreeAndNil(FThreadNN);
   CloseFile(CSVFile);
   FMessageProc('Finished.');
-  FRunning := false;
+  FreeMemory();
 end;
 
 procedure TNeuralDataLoadingFit.FitLoading(pNN: TNNet; TrainingCnt,
@@ -948,6 +851,157 @@ begin
   vInput.Free;
   vOutput.Free;
   pOutput.Free;
+end;
+
+procedure TNeuralDataLoadingFit.AllocateMemory(pNN: TNNet;
+  pBatchSize: integer; pGetTrainingPair,
+  pGetValidationPair, pGetTestPair: TNNetGetPairFn);
+begin
+  FRunning := true;
+  FShouldQuit := false;
+  FNN := pNN;
+  FGetTrainingPair := pGetTrainingPair;
+  FGetValidationPair := pGetValidationPair;
+  FGetTestPair := pGetTestPair;
+  {$IFNDEF HASTHREADS}
+  FMaxThreadNum := 1;
+  {$ENDIF}
+  FCurrentEpoch := FInitialEpoch;
+  FCurrentLearningRate := FInitialLearningRate;
+  FThreadNum := FMaxThreadNum;
+  FBatchSize := pBatchSize;
+  if FBatchSize >= FThreadNum then
+  begin
+    FBatchSize := (FBatchSize div FThreadNum) * FThreadNum;
+  end
+  else if FBatchSize > 0 then
+  begin
+    FThreadNum := FBatchSize;
+  end
+  else
+  begin
+    FErrorProc('Batch size has to be bigger than zero.');
+    FRunning := false;
+    exit;
+  end;
+
+  if Not(Assigned(FGetTrainingPair)) and Not(Assigned(FGetTrainingProc)) then
+  begin
+    FErrorProc('Training function hasn''t been defined.');
+    exit;
+  end;
+
+  FStepSize := FBatchSize;
+  if Assigned(FThreadNN) then FThreadNN.Free;
+  FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
+  {$IFDEF OpenCL}
+  if (FPlatformId <> nil) and (FDeviceId <> nil) then
+    FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
+  {$ENDIF}
+  FFinishedThread.Resize(1, 1, FThreadNum);
+  FAvgWeights := nil;
+  FAvgWeight := FNN.Clone();
+  FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
+  FThreadNN.SetBatchUpdate(true);
+  // in batch update mode, threaded NN should not apply L2 (L2 is applied in the main thread).
+  FThreadNN.SetL2Decay(0);
+
+  FNN.SetL2Decay(FL2Decay);
+  FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+end;
+
+procedure TNeuralDataLoadingFit.AllocateMemory(pNN: TNNet; pBatchSize: integer;
+  pGetTrainingProc, pGetValidationProc,
+  pGetTestProc: TNNetGet2VolumesProc);
+var
+  vGetTrainingPair, vGetValidationPair, vGetTestPair: TNNetGetPairFn;
+begin
+  vGetTrainingPair := nil;
+  vGetValidationPair := nil;
+  vGetTestPair := nil;
+  FGetTrainingProc := pGetTrainingProc;
+  FGetValidationProc := pGetValidationProc;
+  FGetTestProc := pGetTestProc;
+  AllocateMemory(pNN, pBatchSize, vGetTrainingPair, vGetValidationPair, vGetTestPair);
+end;
+
+procedure TNeuralDataLoadingFit.FreeMemory();
+begin
+  FGetTrainingPair := nil;
+  FGetValidationPair := nil;
+  FGetTestPair := nil;
+  FreeAndNil(FAvgWeight);
+  if Assigned(FAvgWeights) then FreeAndNil(FAvgWeights);
+  FreeAndNil(FThreadNN);
+  FRunning := false;
+end;
+
+procedure TNeuralDataLoadingFit.RunTrainingBatch();
+var
+  MaxDelta: TNeuralFloat;
+begin
+  FGlobalHit       := 0;
+  FGlobalMiss      := 0;
+  FGlobalTotalLoss := 0;
+  FGlobalErrorSum  := 0;
+  FFinishedThread.Fill(0);
+  FNN.ClearTime();
+  FNN.RefreshDropoutMask();
+  {$IFDEF HASTHREADS}
+  ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  {$ELSE}
+  RunNNThread(0, nil, Self);
+  {$ENDIF}
+  if FClipDelta > 0 then
+  begin
+    MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
+  end
+  else
+  begin
+    MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
+    if MaxDelta < 1 then
+    begin
+      MessageProc('Deltas have been multiplied by:'+FloatToStr(MaxDelta) );
+    end;
+  end;
+  FNN.UpdateWeights();
+  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+end;
+
+procedure TNeuralDataLoadingFit.RunValidationBatch(ValidationSize: integer);
+begin
+  FGlobalHit       := 0;
+  FGlobalMiss      := 0;
+  FGlobalTotalLoss := 0;
+  FGlobalErrorSum  := 0;
+  FTestSize        := ValidationSize;
+  FLocalTestPair   := FGetValidationPair;
+  FLocalTestProc   := FGetValidationProc;
+  FMessageProc('Starting Validation.');
+  {$IFDEF HASTHREADS}
+  ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  {$ELSE}
+  TestNNThread(0, nil, Self);
+  {$ENDIF}
+  FGlobalTotal := (FGlobalHit + FGlobalMiss);
+end;
+
+procedure TNeuralDataLoadingFit.RunTestBatch(TestSize: integer);
+begin
+  FGlobalHit       := 0;
+  FGlobalMiss      := 0;
+  FGlobalTotalLoss := 0;
+  FGlobalErrorSum  := 0;
+  FTestSize        := TestSize;
+  FLocalTestPair   := FGetTestPair;
+  FLocalTestProc   := FGetTestProc;
+  FMessageProc('Starting Testing.');
+  {$IFDEF HASTHREADS}
+  ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  {$ELSE}
+  TestNNThread(0, nil, Self);
+  {$ENDIF}
+  FGlobalTotal := (FGlobalHit + FGlobalMiss);
 end;
 
 procedure TNeuralDataLoadingFit.EnableMonopolarHitComparison();
@@ -1279,12 +1333,12 @@ begin
         begin
           AccuracyWithInertia := CurrentAccuracy;
         end;
+        FTrainingAccuracy := AccuracyWithInertia/100;
       end;
 
       if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
-        FTrainingAccuracy := AccuracyWithInertia/100;
         if FVerbose then WriteLn
         (
           (FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*FImgVolumes.Count,
