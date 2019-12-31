@@ -1,12 +1,12 @@
 // Neural Threads
 unit neuralthread;
 
-{$mode objfpc}{$H+}
+{$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
 
 interface
 
 uses
-  Classes, SysUtils, fgl, math, syncobjs;
+  Classes, SysUtils, {$IFDEF FPC}fgl{$ELSE}Generics.Collections{$ENDIF}, math, syncobjs;
 
 type
   TNeuronProc = procedure(index, threadnum: integer) of object;
@@ -19,8 +19,8 @@ type
     FRunning: boolean;
     FProcFinished: boolean;
     FIndex, FThreadNum: integer;
-    FNeuronStart: TEventObject;
-    FNeuronFinish: TEventObject;
+    FNeuronStart:  {$IFDEF FPC}TEventObject{$ELSE}TEvent {$ENDIF};
+    FNeuronFinish: {$IFDEF FPC}TEventObject{$ELSE}TEvent {$ENDIF};
 
     procedure Execute; override;
   public
@@ -36,7 +36,11 @@ type
   end;
 
   { TNeuronThreadList }
+  {$IFDEF FPC}
   TNeuronThreadList = class (specialize TFPGObjectList<TNeuronThread>)
+  {$ELSE}
+  TNeuronThreadList = class (TObjectList<TNeuronThread>)
+  {$ENDIF}
   private
     FStarted: boolean;
   public
@@ -205,8 +209,13 @@ begin
   FThreadNum := 1;
   FShouldStart := false;
   FProcFinished := false;
+  {$IFDEF FPC}
   FNeuronStart := TEventObject.Create(nil, True, False, 'NStart '+IntToStr(pIndex)) ;
   FNeuronFinish := TEventObject.Create(nil, True, False, 'NFinish '+IntToStr(pIndex)) ;
+  {$ELSE}
+  FNeuronStart := TEvent.Create(nil, True, False, 'NStart '+IntToStr(pIndex)) ;
+  FNeuronFinish := TEvent.Create(nil, True, False, 'NFinish '+IntToStr(pIndex)) ;
+  {$ENDIF}
 end;
 
 destructor TNeuronThread.Destroy();

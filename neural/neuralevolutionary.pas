@@ -61,13 +61,18 @@ begin
 end;
 *)
 
-{$mode objfpc}{$H+}
+{$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
+
 interface
 
 type
 
   { TEvolutionary }
+  {$IFDEF FPC}
   generic TEvolutionary<T> = class(TObject)
+  {$ELSE}
+  TEvolutionary<T> = class(TObject)
+  {$ENDIF}
   protected
     FAlwaysGetBest: boolean;
     FKidsPerFather: integer;
@@ -88,13 +93,21 @@ type
 
 implementation
 
+{$IFDEF FPC}
 function TEvolutionary.Clone(var Element: T): T;
+{$ELSE}
+function TEvolutionary<T>.Clone(var Element: T): T;
+{$ENDIF}
 begin
   // This solution works well for records and "objects" declared as "object".
   Result := Element;
 end;
 
+{$IFDEF FPC}
 function TEvolutionary.GetBestKid(var Element: T): double;
+{$ELSE}
+function TEvolutionary<T>.GetBestKid(var Element: T): double;
+{$ENDIF}
 var
   KidsCnt: integer;
   NewElement: T;
@@ -122,7 +135,11 @@ begin
   end; // end of KidsCnt
 end;
 
+{$IFDEF FPC}
 function TEvolutionary.Evolve(Element: T; RunCnt: integer): T;
+{$ELSE}
+function TEvolutionary<T>.Evolve(Element: T; RunCnt: integer): T;
+{$ENDIF}
 var
   GlobalCnt: integer;
   CurrentEval: double;
@@ -146,15 +163,22 @@ begin
   end;
 end;
 
-constructor TEvolutionary.Create(pAlwaysGetBest: boolean = False;
-  pKidsPerFather: integer = 10);
+{$IFDEF FPC}
+constructor TEvolutionary.Create(pAlwaysGetBest: boolean = False; pKidsPerFather: integer = 10);
+{$ELSE}
+constructor TEvolutionary<T>.Create(pAlwaysGetBest: boolean = False; pKidsPerFather: integer = 10);
+{$ENDIF}
 begin
   inherited Create;
   FAlwaysGetBest := pAlwaysGetBest;
   FKidsPerFather := pKidsPerFather;
 end;
 
+{$IFDEF FPC}
 destructor TEvolutionary.Destroy;
+{$ELSE}
+destructor TEvolutionary<T>.Destroy;
+{$ENDIF}
 begin
   inherited Destroy;
 end;

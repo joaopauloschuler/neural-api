@@ -29,7 +29,9 @@ interface
 uses
   Classes, SysUtils, neuralnetwork, neuralvolume
   {$IFDEF HASTHREADS}, MTProcs{$ENDIF}
-  {$IFDEF OpenCL}, cl{$ENDIF}
+  {$IFDEF OpenCL}, cl
+  {$IFNDEF FPC}, neuralopencl{$ENDIF}
+  {$ENDIF}
   ;
 
 type

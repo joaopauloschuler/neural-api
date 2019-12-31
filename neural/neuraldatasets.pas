@@ -48,7 +48,7 @@ end;
 interface
 
 uses
-  neuralvolume, neuralnetwork;
+  {$IFNDEF FPC}System.Classes,{$ENDIF}neuralvolume, neuralnetwork;
 
 type
   TTinyImageChannel = packed array [0..31, 0..31] of byte;

@@ -56,10 +56,18 @@ type
   TNeuralFloatPtr = ^TNeuralFloat;
 
   TNeuralFloat4 = array[0..3] of TNeuralFloat;
-  {$IFDEF CPU32}
-  TNeuralFloatArr = array[0..1024*2048] of TNeuralFloat;
+  {$IFDEF FPC}
+    {$IFDEF CPU32}
+    TNeuralFloatArr = array[0..1024*2048] of TNeuralFloat;
+    {$ELSE}
+    TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat)] of TNeuralFloat;
+    {$ENDIF}
   {$ELSE}
-  TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat)] of TNeuralFloat;
+    {$IFDEF CPUX86}
+    TNeuralFloatArr = array[0..1024*2048] of TNeuralFloat;
+    {$ELSE}
+    TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat) div 8] of TNeuralFloat; // Modified by Max 30/12/2019 [Data type too large: exceeds 2 GB]
+    {$ENDIF}
   {$ENDIF}
 
   TNeuralFloatArrPtr = ^TNeuralFloatArr;
