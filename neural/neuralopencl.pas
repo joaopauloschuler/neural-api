@@ -842,7 +842,11 @@ begin
     FMessageProc('clCreateCommandQueue OK!');
 
   // Create the compute program from the source buffer
-  FProg := clCreateProgramWithSource(context, 1, PPAnsiChar(@localKernelSource), nil,  {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
+  {$IFDEF FPC}
+  FProg := clCreateProgramWithSource(context, 1, PPChar(@localKernelSource), nil,  err);
+  {$ELSE}
+  FProg := clCreateProgramWithSource(context, 1, PPAnsiChar(@localKernelSource), nil,  @err);
+  {$ENDIF}
   if FProg = nil then
   begin
     FMessageProc(localKernelSource);
