@@ -38,7 +38,10 @@ uses
   Classes, SysUtils, cl, {$IFDEF FPC}ctypes{$ELSE}Winapi.Windows,AnsiStrings,CL_Platform{$ENDIF}, neuralvolume;
 
 type
-  {$IFNDEF FPC}
+  {$IFDEF FPC}
+  TNeuralStrBuffer = array[0..999] of Char;
+  {$ELSE}
+  TNeuralStrBuffer = array[0..999] of AnsiChar;
   csize_t          = NativeUInt;
   cl_bool          = TCL_bool;
   cl_uint          = TCL_uint;
@@ -753,10 +756,10 @@ end;
 procedure TEasyOpenCL.LoadPlatforms();
 var
   err: integer; // error code returned from api calls
-  local_platformids: {$IFDEF FPC}pcl_platform_id{$ELSE}ppcl_platform_id{$ENDIF};
+  firstpointer, local_platformids: {$IFDEF FPC}pcl_platform_id{$ELSE}ppcl_platform_id{$ENDIF};
   local_platforms: cl_uint;
   i: integer;
-  buf: array[0..999] of char;
+  buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
   bufwritten := 0;
@@ -767,6 +770,7 @@ begin
     exit;
   end;
   getmem(local_platformids, local_platforms * sizeof(cl_platform_id));
+  firstpointer := local_platformids;
   err := clGetPlatformIDs(local_platforms, local_platformids, nil);
   if (err <> CL_SUCCESS) then
   begin
@@ -790,11 +794,11 @@ begin
       err := clGetPlatformInfo(local_platformids^, CL_PLATFORM_NAME, sizeof(buf), @buf, @bufwritten);
       FPlatformNames[i] := buf;
       FPlatformIds[i]   := local_platformids^;
-      Inc(local_platformids,sizeof(PCL_platform_id));
+      Inc(local_platformids);
       {$ENDIF}
     end;
   end;
-  freemem(local_platformids);
+  freemem(firstpointer);
 end;
 
 procedure TEasyOpenCL.FreeContext();
@@ -879,7 +883,7 @@ var
   local_devices: TDeviceNames;
   local_deviceids: TDevices;
   i, j, k: integer;
-  buf: array[0..999] of char;
+  buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
   bufwritten := 0;
@@ -932,9 +936,9 @@ procedure TEasyOpenCL.GetDevicesFromPlatform(PlatformId: cl_platform_id; out pDe
 var
   err: integer; // error code returned from api calls
   local_devices: cl_uint;
-  local_deviceids: {$IFDEF FPC}pcl_device_id{$ELSE}ppcl_device_id{$ENDIF};
+  firstpointer, local_deviceids: {$IFDEF FPC}pcl_device_id{$ELSE}ppcl_device_id{$ENDIF};
   j: integer;
-  buf: array[0..999] of char;
+  buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
   bufwritten := 0;
@@ -949,7 +953,8 @@ begin
     SetLength(pDevices, local_devices);
 
     getmem(local_deviceids, local_devices * sizeof(cl_device_id));
-    err := clGetDeviceIDs(PlatformId, CL_DEVICE_TYPE_ALL, local_devices,  local_deviceids, nil);
+    firstpointer := local_deviceids;
+    err := clGetDeviceIDs(PlatformId, CL_DEVICE_TYPE_ALL, local_devices, local_deviceids, nil);
 
     if (local_devices > 0) then
     begin
@@ -963,11 +968,11 @@ begin
         err := clGetDeviceInfo(local_deviceids^, CL_DEVICE_NAME, sizeof(buf), @buf, @bufwritten);
         pDeviceNames[j] := buf;
         pDevices[j] := local_deviceids^;
-        inc(local_deviceids,sizeof(PCL_device_id))
+        Inc(local_deviceids);
         {$ENDIF}
       end;
     end;
-    freemem(local_deviceids);
+    freemem(firstpointer);
   end;
 end;
 
