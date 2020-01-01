@@ -40,8 +40,10 @@ uses
 type
   {$IFDEF FPC}
   TNeuralStrBuffer = array[0..999] of Char;
+  TNeuralPChar     = PChar;
   {$ELSE}
   TNeuralStrBuffer = array[0..999] of AnsiChar;
+  TNeuralPChar     = PAnsiChar;
   csize_t          = NativeUInt;
   cl_bool          = TCL_bool;
   cl_uint          = TCL_uint;
@@ -810,17 +812,20 @@ end;
 
 procedure TEasyOpenCL.CompileProgram();
 var
-  localKernelSource: PChar;
-  localCompilerOptions: {$IFDEF FPC}PChar{$ELSE}PAnsiChar{$ENDIF};
+  localKernelSource: TNeuralPChar;
+  errorlog, localCompilerOptions: TNeuralPChar;
   err: integer; // error code returned from api calls
-  errorlog: PChar;
-  errorlogstr: string[255];
+  errorlogstr: TNeuralStrBuffer;
   loglen: csize_t;
 begin
   err := 0;
   FreeContext();
 
+  {$IFDEF FPC}
   localKernelSource := FOpenCLProgramSource.GetText();
+  {$ELSE}
+  localKernelSource := AnsiStrings.StrNew(PAnsiChar(AnsiString(FOpenCLProgramSource.Text)));
+  {$ENDIF}
 
   // Create a compute context
   FContext := clCreateContext(nil, 1, @FCurrentDevice, nil, nil, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
@@ -869,8 +874,8 @@ begin
   if (err <> CL_SUCCESS) then
   begin
     errorlog := @errorlogstr[1];
-    loglen := 255;
-    clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, 255, errorlog,  {$IFDEF FPC}loglen{$ELSE}@loglen{$ENDIF});
+    loglen := SizeOf(errorlogstr);
+    clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, SizeOf(errorlogstr), errorlog, {$IFDEF FPC}loglen{$ELSE}@loglen{$ENDIF});
     FErrorProc('Error: Failed to build program executable:' + IntToStr(err) + ' ' + errorlog);
     exit;
   end
@@ -1067,7 +1072,7 @@ end;
 
 function TEasyOpenCL.CreateKernel(kernelname: string): cl_kernel;
 var
-  localKernelName: {$IFDEF FPC}PChar{$ELSE}PAnsiChar{$ENDIF};
+  localKernelName: TNeuralPChar;
   err: integer; // error code returned from api calls
 begin
   err := 0;
