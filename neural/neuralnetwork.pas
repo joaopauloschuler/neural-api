@@ -73,7 +73,13 @@ interface
 
 uses
   {$IFDEF OpenCL}
-  cl, neuralopencl,
+    {$IFDEF FPC}
+    cl,
+    neuralopencl,
+    {$ELSE} // For Delphi Compiler
+    cl, // https://github.com/CWBudde/PasOpenCL
+    neuralopencl,
+    {$ENDIF}
   {$ENDIF}
   {$IFDEF FPC}
   fgl,

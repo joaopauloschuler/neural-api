@@ -74,7 +74,7 @@ type
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
-    FCompilerOptions:ShortString;
+    FCompilerOptions: ShortString;
     {$ENDIF}
 
     procedure LoadPlatforms();
@@ -794,7 +794,6 @@ begin
       {$ENDIF}
     end;
   end;
-
   freemem(local_platformids);
 end;
 
@@ -1216,6 +1215,7 @@ begin
   LoadPlatforms();
   SetLength(FDeviceNames, 0);
   SetLength(FDevices, 0);
+
   FCompilerOptions := '-cl-fast-relaxed-math -cl-mad-enable';
 
   FContext := nil;        // compute context

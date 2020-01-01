@@ -18,8 +18,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 *)
 unit neuralfit;
 
+{$include neuralnetwork.inc}
+
 {$IFDEF FPC}
-{$mode objfpc}
 {$H+}
 {$DEFINE HASTHREADS}
 {$ENDIF}
