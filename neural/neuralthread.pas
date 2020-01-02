@@ -1,7 +1,6 @@
 // Neural Threads
 unit neuralthread;
-
-{$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
+{$include neuralnetwork.inc}
 
 interface
 

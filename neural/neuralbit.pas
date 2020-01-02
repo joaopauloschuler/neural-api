@@ -17,6 +17,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 }
 
 interface
+{$include neuralnetwork.inc}
 
 type
   TArrOf2Bytes = array[0..1] of byte;
