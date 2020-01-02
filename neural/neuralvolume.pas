@@ -56,10 +56,18 @@ type
   TNeuralFloatPtr = ^TNeuralFloat;
 
   TNeuralFloat4 = array[0..3] of TNeuralFloat;
-  {$IFDEF CPU32}
-  TNeuralFloatArr = array[0..1024*2048] of TNeuralFloat;
+  {$IFDEF FPC}
+    {$IFDEF CPU32}
+    TNeuralFloatArr = array[0..1024*2048] of TNeuralFloat;
+    {$ELSE}
+    TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat)] of TNeuralFloat;
+    {$ENDIF}
   {$ELSE}
-  TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat)] of TNeuralFloat;
+    {$IFDEF CPUX86}
+    TNeuralFloatArr = array[0..1024*2048] of TNeuralFloat;
+    {$ELSE}
+    TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat) div 8] of TNeuralFloat; // Modified by Max 30/12/2019 [Data type too large: exceeds 2 GB]
+    {$ENDIF}
   {$ENDIF}
 
   TNeuralFloatArrPtr = ^TNeuralFloatArr;
@@ -300,6 +308,7 @@ type
       procedure AddToChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure MulChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure Mul(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure NormalizeMax(Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       // Do not use RecurrencePlot as it's still in testing.
       procedure RecurrencePlot(Original: TNNetVolume; Threshold: TNeuralFloat);
       /// This function creates one output channel for each input channel.
@@ -344,6 +353,7 @@ type
     public
       constructor Create(); overload;
       constructor Create(pA, pB: TNNetVolume); overload;
+      constructor CreateCopying(pA, pB: TNNetVolume); overload;
 
       destructor Destroy(); override;
 
@@ -1380,6 +1390,15 @@ begin
   inherited Create();
   FA := pA;
   FB := pB;
+end;
+
+constructor TNNetVolumePair.CreateCopying(pA, pB: TNNetVolume);
+begin
+  inherited Create();
+  FA := TNNetVolume.Create(pA);
+  FB := TNNetVolume.Create(pB);
+  FA.Copy(pA);
+  FB.Copy(pB);
 end;
 
 destructor TNNetVolumePair.Destroy();
@@ -4949,6 +4968,17 @@ end;
 procedure TNNetVolume.Mul(Original: TNNetVolume);
 begin
   Mul(FDataPtr, Original.DataPtr, Size);
+end;
+
+procedure TNNetVolume.NormalizeMax(Value: TNeuralFloat);
+var
+  MaxValue: TNeuralFloat;
+begin
+  MaxValue := GetMaxAbs();
+  if MaxValue > 0 then
+  begin
+    Mul( Value/MaxValue );
+  end;
 end;
 
 // https://en.wikipedia.org/wiki/Recurrence_plot

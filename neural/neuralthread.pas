@@ -1,33 +1,38 @@
 // Neural Threads
 unit neuralthread;
-
-{$mode objfpc}{$H+}
+{$include neuralnetwork.inc}
 
 interface
 
 uses
-  Classes, SysUtils, fgl, math, syncobjs;
+  Classes, SysUtils,
+  {$IFDEF FPC}
+  fgl, MTPCPU
+  {$ELSE}
+  Generics.Collections, Windows
+  {$ENDIF}
+  , syncobjs;
 
 type
-  TNeuronProc = procedure(index, threadnum: integer) of object;
+  TNeuralProc = procedure(index, threadnum: integer) of object;
 
-  { TNeuronThread }
-  TNeuronThread = class(TThread)
+  { TNeuralThread }
+  TNeuralThread = class(TThread)
   protected
-    FProc: TNeuronProc;
+    FProc: TNeuralProc;
     FShouldStart: boolean;
     FRunning: boolean;
     FProcFinished: boolean;
     FIndex, FThreadNum: integer;
-    FNeuronStart: TEventObject;
-    FNeuronFinish: TEventObject;
+    FNeuronStart:  {$IFDEF FPC}TEventObject{$ELSE}TEvent {$ENDIF};
+    FNeuronFinish: {$IFDEF FPC}TEventObject{$ELSE}TEvent {$ENDIF};
 
     procedure Execute; override;
   public
     constructor Create(CreateSuspended : boolean; pIndex: integer);
     destructor Destroy(); override;
 
-    procedure StartProc(pProc: TNeuronProc; pIndex, pThreadNum: integer); {$IFDEF Release} inline; {$ENDIF}
+    procedure StartProc(pProc: TNeuralProc; pIndex, pThreadNum: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure WaitForProc(); {$IFDEF Release} inline; {$ENDIF}
     procedure DoSomething(); {$IFDEF Release} inline; {$ENDIF}
     property ShouldStart: boolean read FShouldStart;
@@ -35,36 +40,62 @@ type
     property ProcFinished: boolean read FProcFinished;
   end;
 
-  { TNeuronThreadList }
-  TNeuronThreadList = class (specialize TFPGObjectList<TNeuronThread>)
+  { TNeuralThreadList }
+  {$IFDEF FPC}
+  TNeuralThreadList = class (specialize TFPGObjectList<TNeuralThread>)
+  {$ELSE}
+  TNeuralThreadList = class (TObjectList<TNeuralThread>)
+  {$ENDIF}
   private
     FStarted: boolean;
   public
     constructor Create(pSize: integer);
+    destructor Destroy; override;
 
     procedure StartEngine();
     procedure StopEngine();
 
-    procedure StartProc(pProc: TNeuronProc; pBlock: boolean = true);
+    procedure StartProc(pProc: TNeuralProc; pBlock: boolean = true);
     procedure WaitForProc(); {$IFDEF Release} inline; {$ENDIF}
   end;
 
-  procedure NeuronThreadListCreate(pSize: integer);
-  procedure NeuronThreadListFree();
-  function fNTL: TNeuronThreadList; {$IFDEF Release} inline; {$ENDIF}
-  procedure CreateNeuronThreadListIfRequired();
+  procedure NeuralThreadListCreate(pSize: integer);
+  procedure NeuralThreadListFree();
+  function fNTL: TNeuralThreadList; {$IFDEF Release} inline; {$ENDIF}
+  procedure CreateNeuralThreadListIfRequired();
+  function NeuralDefaultThreadCount: integer;
+  procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
+  procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
 
 implementation
 
-var
-  vNTL: TNeuronThreadList;
-
-procedure NeuronThreadListCreate(pSize: integer);
+procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
 begin
-  vNTL := TNeuronThreadList.Create(pSize);
+  {$IFDEF FPC}
+  InitCriticalSection(pCritSec);
+  {$ELSE}
+  InitializeCriticalSection(pCritSec);
+  {$ENDIF}
 end;
 
-procedure NeuronThreadListFree();
+procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
+begin
+  {$IFDEF FPC}
+  DoneCriticalsection(pCritSec);
+  {$ELSE}
+  DeleteCriticalSection(pCritSec);
+  {$ENDIF}
+end;
+
+var
+  vNTL: TNeuralThreadList;
+
+procedure NeuralThreadListCreate(pSize: integer);
+begin
+  vNTL := TNeuralThreadList.Create(pSize);
+end;
+
+procedure NeuralThreadListFree();
 begin
   if Assigned(vNTL) then
   begin
@@ -74,21 +105,30 @@ begin
   end;
 end;
 
-procedure CreateNeuronThreadListIfRequired();
+procedure CreateNeuralThreadListIfRequired();
 begin
   if Not(Assigned(vNTL)) then
   begin
-    NeuronThreadListCreate(TThread.ProcessorCount);
+    NeuralThreadListCreate(TThread.ProcessorCount);
   end;
 end;
 
-function fNTL: TNeuronThreadList;
+function NeuralDefaultThreadCount: integer;
+begin
+  {$IFDEF FPC}
+  Result := GetSystemThreadCount;
+  {$ELSE}
+  Result := TThread.ProcessorCount;
+  {$ENDIF}
+end;
+
+function fNTL: TNeuralThreadList;
 begin
   Result := vNTL;
 end;
 
-{ TNeuronThreadList }
-constructor TNeuronThreadList.Create(pSize: integer);
+{ TNeuralThreadList }
+constructor TNeuralThreadList.Create(pSize: integer);
 var
   I: integer;
 begin
@@ -98,11 +138,17 @@ begin
 
   for I := 1 to pSize do
   begin
-    Self.Add( TNeuronThread.Create(true, I));
+    Self.Add( TNeuralThread.Create(true, I));
   end;
 end;
 
-procedure TNeuronThreadList.StartEngine();
+destructor TNeuralThreadList.Destroy;
+begin
+  StopEngine();
+  inherited Destroy;
+end;
+
+procedure TNeuralThreadList.StartEngine();
 var
   I: integer;
   localCount: integer;
@@ -118,7 +164,7 @@ begin
   end;
 end;
 
-procedure TNeuronThreadList.StopEngine();
+procedure TNeuralThreadList.StopEngine();
 var
   I: integer;
   localCount: integer;
@@ -141,7 +187,7 @@ begin
   end;
 end;
 
-procedure TNeuronThreadList.StartProc(pProc: TNeuronProc; pBlock: boolean = true);
+procedure TNeuralThreadList.StartProc(pProc: TNeuralProc; pBlock: boolean = true);
 var
   I: integer;
   localCount: integer;
@@ -164,7 +210,7 @@ begin
   end;
 end;
 
-procedure TNeuronThreadList.WaitForProc();
+procedure TNeuralThreadList.WaitForProc();
 var
   I: integer;
   MaxCount: integer;
@@ -176,8 +222,8 @@ begin
   end;
 end;
 
-{ TNeuronThread }
-procedure TNeuronThread.Execute;
+{ TNeuralThread }
+procedure TNeuralThread.Execute;
 begin
   while (not Terminated) do
   begin
@@ -197,7 +243,7 @@ begin
   end;
 end;
 
-constructor TNeuronThread.Create(CreateSuspended: boolean; pIndex: integer);
+constructor TNeuralThread.Create(CreateSuspended: boolean; pIndex: integer);
 begin
   inherited Create(CreateSuspended);
   FProc := nil;
@@ -205,18 +251,23 @@ begin
   FThreadNum := 1;
   FShouldStart := false;
   FProcFinished := false;
+  {$IFDEF FPC}
   FNeuronStart := TEventObject.Create(nil, True, False, 'NStart '+IntToStr(pIndex)) ;
   FNeuronFinish := TEventObject.Create(nil, True, False, 'NFinish '+IntToStr(pIndex)) ;
+  {$ELSE}
+  FNeuronStart := TEvent.Create(nil, True, False, 'NStart '+IntToStr(pIndex)) ;
+  FNeuronFinish := TEvent.Create(nil, True, False, 'NFinish '+IntToStr(pIndex)) ;
+  {$ENDIF}
 end;
 
-destructor TNeuronThread.Destroy();
+destructor TNeuralThread.Destroy();
 begin
   FNeuronStart.Free;
   FNeuronFinish.Free;
   inherited Destroy();
 end;
 
-procedure TNeuronThread.StartProc(pProc: TNeuronProc; pIndex,
+procedure TNeuralThread.StartProc(pProc: TNeuralProc; pIndex,
   pThreadNum: integer);
 begin
   FNeuronStart.ResetEvent;
@@ -229,13 +280,13 @@ begin
   FNeuronStart.SetEvent;
 end;
 
-procedure TNeuronThread.WaitForProc();
+procedure TNeuralThread.WaitForProc();
 begin
   FNeuronFinish.WaitFor(INFINITE);
   FNeuronFinish.ResetEvent;
 end;
 
-procedure TNeuronThread.DoSomething();
+procedure TNeuralThread.DoSomething();
 begin
   FNeuronStart.SetEvent;
 end;
@@ -244,7 +295,7 @@ initialization
 vNTL := nil;
 
 finalization
-NeuronThreadListFree();
+NeuralThreadListFree();
 
 end.
 

@@ -27,14 +27,36 @@ unit neuralopencl;
 // This code was also inspired on:
 // https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/opencl/trillion-test/uopencl_trillion_test.pas
 
-{$mode objfpc}{$H+}
+// Delphi developers require these OpenCL headers:
+// https://github.com/CWBudde/PasOpenCL
+
+{$IFDEF FPC} {$mode objfpc}{$H+} {$ENDIF}
 
 interface
 
 uses
-  Classes, SysUtils, cl, ctypes, neuralvolume;
+  Classes, SysUtils, cl, {$IFDEF FPC}ctypes{$ELSE}Winapi.Windows,AnsiStrings,CL_Platform{$ENDIF}, neuralvolume;
 
 type
+  {$IFDEF FPC}
+  TNeuralStrBuffer = array[0..999] of Char;
+  TNeuralPChar     = PChar;
+  {$ELSE}
+  TNeuralStrBuffer = array[0..999] of AnsiChar;
+  TNeuralPChar     = PAnsiChar;
+  csize_t          = NativeUInt;
+  cl_bool          = TCL_bool;
+  cl_uint          = TCL_uint;
+  cl_platform_id   = PCL_platform_id;
+  cl_device_id     = PCL_device_id;
+  cl_context       = PCL_context;
+  cl_command_queue = PCL_command_queue;
+  cl_program       = PCL_program;
+  cl_mem_flags     = TCL_mem_flags;
+  cl_mem           = PCL_mem ;
+  cl_kernel        = PCL_kernel;
+  {$ENDIF}
+
   TPlatformNames = array of string;
   TPlatforms = array of cl_platform_id;
   TDeviceNames = array of string;
@@ -54,7 +76,11 @@ type
     FContext: cl_context;        // OpenCL compute context
     FCommands: cl_command_queue; // OpenCL compute command queue
     FProg: cl_program;           // OpenCL compute program
+    {$IFDEF FPC}
     FCompilerOptions: string[255];
+    {$ELSE}
+    FCompilerOptions: ShortString;
+    {$ENDIF}
 
     procedure LoadPlatforms();
     procedure FreeContext();
@@ -242,7 +268,7 @@ const
     end
   =
     (
-    (id: CL_DEVICE_TYPE_INFO; Name: 'DEVICE TYPE'),
+    (id: {$IFDEF FPC}CL_DEVICE_TYPE_INFO{$ELSE}CL_DEVICE_TYPE{$ENDIF}; Name: 'DEVICE TYPE'),
     (id: CL_DEVICE_MAX_WORK_GROUP_SIZE; Name: 'DEVICE MAX WORK GROUP SIZE'),
     (id: CL_DEVICE_MAX_COMPUTE_UNITS; Name: 'DEVICE MAX COMPUTE UNITS'),
     (id: CL_DEVICE_IMAGE3D_MAX_WIDTH; Name: 'DEVICE IMAGE3D MAX WIDTH'),
@@ -732,10 +758,10 @@ end;
 procedure TEasyOpenCL.LoadPlatforms();
 var
   err: integer; // error code returned from api calls
-  local_platformids: pcl_platform_id;
+  firstpointer, local_platformids: {$IFDEF FPC}pcl_platform_id{$ELSE}ppcl_platform_id{$ENDIF};
   local_platforms: cl_uint;
   i: integer;
-  buf: array[0..999] of char;
+  buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
   bufwritten := 0;
@@ -746,6 +772,7 @@ begin
     exit;
   end;
   getmem(local_platformids, local_platforms * sizeof(cl_platform_id));
+  firstpointer := local_platformids;
   err := clGetPlatformIDs(local_platforms, local_platformids, nil);
   if (err <> CL_SUCCESS) then
   begin
@@ -761,14 +788,19 @@ begin
   begin
     for i := 0 to local_platforms - 1 do
     begin
-      err := clGetPlatformInfo(local_platformids[i], CL_PLATFORM_NAME,
-        sizeof(buf), @buf, bufwritten);
+      {$IFDEF FPC}
+      err := clGetPlatformInfo(local_platformids[i], CL_PLATFORM_NAME, sizeof(buf), @buf, bufwritten);
       FPlatformNames[i] := buf;
-      FPlatformIds[i] := local_platformids[i];
+      FPlatformIds[i]   := local_platformids[i];
+      {$ELSE}
+      err := clGetPlatformInfo(local_platformids^, CL_PLATFORM_NAME, sizeof(buf), @buf, @bufwritten);
+      FPlatformNames[i] := buf;
+      FPlatformIds[i]   := local_platformids^;
+      Inc(local_platformids);
+      {$ENDIF}
     end;
   end;
-
-  freemem(local_platformids);
+  freemem(firstpointer);
 end;
 
 procedure TEasyOpenCL.FreeContext();
@@ -780,20 +812,23 @@ end;
 
 procedure TEasyOpenCL.CompileProgram();
 var
-  localKernelSource: PChar;
-  localCompilerOptions: PChar;
+  localKernelSource: TNeuralPChar;
+  errorlog, localCompilerOptions: TNeuralPChar;
   err: integer; // error code returned from api calls
-  errorlog: PChar;
-  errorlogstr: string[255];
+  errorlogstr: TNeuralStrBuffer;
   loglen: csize_t;
 begin
   err := 0;
   FreeContext();
 
+  {$IFDEF FPC}
   localKernelSource := FOpenCLProgramSource.GetText();
+  {$ELSE}
+  localKernelSource := AnsiStrings.StrNew(PAnsiChar(AnsiString(FOpenCLProgramSource.Text)));
+  {$ENDIF}
 
   // Create a compute context
-  FContext := clCreateContext(nil, 1, @FCurrentDevice, nil, nil, err);
+  FContext := clCreateContext(nil, 1, @FCurrentDevice, nil, nil, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
 
   if FContext = nil then
   begin
@@ -804,7 +839,7 @@ begin
     FMessageProc('clCreateContext OK!');
 
   // Create a command commands
-  FCommands := clCreateCommandQueue(context, FCurrentDevice, 0, err);
+  FCommands := clCreateCommandQueue(context, FCurrentDevice, 0,  {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
   if FCommands = nil then
   begin
     FErrorProc('Error: Failed to create a command commands:' + IntToStr(err));
@@ -814,7 +849,11 @@ begin
     FMessageProc('clCreateCommandQueue OK!');
 
   // Create the compute program from the source buffer
-  FProg := clCreateProgramWithSource(context, 1, PPChar(@localKernelSource), nil, err);
+  {$IFDEF FPC}
+  FProg := clCreateProgramWithSource(context, 1, PPChar(@localKernelSource), nil,  err);
+  {$ELSE}
+  FProg := clCreateProgramWithSource(context, 1, PPAnsiChar(@localKernelSource), nil,  @err);
+  {$ENDIF}
   if FProg = nil then
   begin
     FMessageProc(localKernelSource);
@@ -824,19 +863,19 @@ begin
   else
     FMessageProc('clCreateProgramWithSource OK!');
 
-  localCompilerOptions := StrAlloc(length(FCompilerOptions)+1);
-  StrPCopy (localCompilerOptions,FCompilerOptions);
+  localCompilerOptions := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(FCompilerOptions)+1);
+  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localCompilerOptions,FCompilerOptions);
 
   // Build the program executable
   err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
 
-  StrDispose(localCompilerOptions);
+  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
 
   if (err <> CL_SUCCESS) then
   begin
     errorlog := @errorlogstr[1];
-    loglen := 255;
-    clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, 255, errorlog, loglen);
+    loglen := SizeOf(errorlogstr);
+    clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, SizeOf(errorlogstr), errorlog, {$IFDEF FPC}loglen{$ELSE}@loglen{$ENDIF});
     FErrorProc('Error: Failed to build program executable:' + IntToStr(err) + ' ' + errorlog);
     exit;
   end
@@ -849,7 +888,7 @@ var
   local_devices: TDeviceNames;
   local_deviceids: TDevices;
   i, j, k: integer;
-  buf: array[0..999] of char;
+  buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
   bufwritten := 0;
@@ -860,8 +899,7 @@ begin
       FMessageProc('Platform info: ' + IntToStr(i) + ' ---------------------');
       for k := low(platform_str_info) to high(platform_str_info) do
       begin
-        clGetPlatformInfo(FPlatformIds[i], platform_str_info[k].id,
-          sizeof(buf), @buf, bufwritten);
+        clGetPlatformInfo(FPlatformIds[i], platform_str_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
         MessageProc(platform_str_info[k].Name + ': ' + buf);
       end;
 
@@ -874,15 +912,13 @@ begin
           MessageProc('Device info: ' + IntToStr(j) + ' ------------');
           for k := low(device_str_info) to high(device_str_info) do
           begin
-            clGetDeviceInfo(local_deviceids[j], device_str_info[k].id,
-              sizeof(buf), @buf, bufwritten);
+            clGetDeviceInfo(local_deviceids[j], device_str_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
             MessageProc(device_str_info[k].Name + ': ' + buf);
           end;
 
           for k := low(device_word_info) to high(device_word_info) do
           begin
-            clGetDeviceInfo(local_deviceids[j], device_word_info[k].id,
-              sizeof(buf), @buf, bufwritten);
+            clGetDeviceInfo(local_deviceids[j], device_word_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
             MessageProc(device_word_info[k].Name + ': ' + IntToStr(pdword(@buf)^));
           end;
         end;
@@ -901,14 +937,13 @@ begin
   Result := Length(FDeviceNames);
 end;
 
-procedure TEasyOpenCL.GetDevicesFromPlatform(PlatformId: cl_platform_id;
-  out pDeviceNames: TDeviceNames; out pDevices: TDevices);
+procedure TEasyOpenCL.GetDevicesFromPlatform(PlatformId: cl_platform_id; out pDeviceNames: TDeviceNames; out pDevices: TDevices);
 var
   err: integer; // error code returned from api calls
   local_devices: cl_uint;
-  local_deviceids: pcl_device_id;
+  firstpointer, local_deviceids: {$IFDEF FPC}pcl_device_id{$ELSE}ppcl_device_id{$ENDIF};
   j: integer;
-  buf: array[0..999] of char;
+  buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
   bufwritten := 0;
@@ -923,20 +958,26 @@ begin
     SetLength(pDevices, local_devices);
 
     getmem(local_deviceids, local_devices * sizeof(cl_device_id));
-    err := clGetDeviceIDs(PlatformId, CL_DEVICE_TYPE_ALL, local_devices,
-      local_deviceids, nil);
+    firstpointer := local_deviceids;
+    err := clGetDeviceIDs(PlatformId, CL_DEVICE_TYPE_ALL, local_devices, local_deviceids, nil);
 
     if (local_devices > 0) then
     begin
       for j := 0 to local_devices - 1 do
       begin
-        err := clGetDeviceInfo(local_deviceids[j], CL_DEVICE_NAME,
-          sizeof(buf), @buf, bufwritten);
+        {$IFDEF FPC}
+        err := clGetDeviceInfo(local_deviceids[j], CL_DEVICE_NAME, sizeof(buf), @buf, bufwritten);
         pDeviceNames[j] := buf;
         pDevices[j] := local_deviceids[j];
+        {$ELSE}
+        err := clGetDeviceInfo(local_deviceids^, CL_DEVICE_NAME, sizeof(buf), @buf, @bufwritten);
+        pDeviceNames[j] := buf;
+        pDevices[j] := local_deviceids^;
+        Inc(local_deviceids);
+        {$ENDIF}
       end;
     end;
-    freemem(local_deviceids);
+    freemem(firstpointer);
   end;
 end;
 
@@ -981,7 +1022,7 @@ var
   err: integer; // error code returned from api calls
 begin
   err := 0;
-  Result := clCreateBuffer(FContext, flags, size, ptr, err);
+  Result := clCreateBuffer(FContext, flags, size, ptr, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
 
   if (err <> CL_SUCCESS) or (Result = nil) then
   begin
@@ -1031,15 +1072,15 @@ end;
 
 function TEasyOpenCL.CreateKernel(kernelname: string): cl_kernel;
 var
-  localKernelName: PChar;
+  localKernelName: TNeuralPChar;
   err: integer; // error code returned from api calls
 begin
   err := 0;
-  localKernelName := StrAlloc(length(kernelname)+1);
-  StrPCopy (localKernelName,kernelname);
+  localKernelName := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(kernelname)+1);
+  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localKernelName,kernelname);
 
   // Create the compute kernel in the program we wish to run
-  Result := clCreateKernel(prog, localKernelName, err);
+  Result := clCreateKernel(prog, localKernelName, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
   if (Result = nil) or (err <> CL_SUCCESS) then
   begin
     FErrorProc('Error: Failed to create compute kernel:'+kernelname);
@@ -1048,7 +1089,7 @@ begin
   begin
     FMessageProc('clCreateKernel '+kernelname+' OK!');
   end;
-  StrDispose(localKernelName);
+  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelName);
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
@@ -1174,11 +1215,17 @@ constructor TEasyOpenCL.Create();
 begin
   inherited Create();
   FOpenCLProgramSource := TStringList.Create();
+  {$IFDEF FPC}
   MessageProc := @Self.DefaultMessageProc;
   ErrorProc := @Self.DefaultErrorProc;
+  {$ELSE}
+  MessageProc := Self.DefaultMessageProc;
+  ErrorProc := Self.DefaultErrorProc;
+  {$ENDIF}
   LoadPlatforms();
   SetLength(FDeviceNames, 0);
   SetLength(FDevices, 0);
+
   FCompilerOptions := '-cl-fast-relaxed-math -cl-mad-enable';
 
   FContext := nil;        // compute context
@@ -1196,5 +1243,10 @@ begin
   SetLength(FDevices, 0);
   inherited Destroy;
 end;
+
+{$IFNDEF FPC}
+initialization
+InitOpenCL;
+{$ENDIF}
 
 end.

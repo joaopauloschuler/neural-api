@@ -24,6 +24,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 // AVX2 setting depends on your CPU. Enable it if it allows vfmadd231ps only.
 //{$DEFINE AVX2}
 
+// Enable this flag if you intend to use OpenCL
+//{$Define OpenCL}
+
 {$IFDEF FPC}
   {$COPERATORS ON}
   {$mode objfpc}
