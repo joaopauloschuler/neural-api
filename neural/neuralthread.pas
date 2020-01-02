@@ -50,6 +50,7 @@ type
     FStarted: boolean;
   public
     constructor Create(pSize: integer);
+    destructor Destroy; override;
 
     procedure StartEngine();
     procedure StopEngine();
@@ -139,6 +140,12 @@ begin
   begin
     Self.Add( TNeuralThread.Create(true, I));
   end;
+end;
+
+destructor TNeuralThreadList.Destroy;
+begin
+  StopEngine();
+  inherited Destroy;
 end;
 
 procedure TNeuralThreadList.StartEngine();
