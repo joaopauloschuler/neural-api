@@ -6,7 +6,13 @@ unit neuralthread;
 interface
 
 uses
-  Classes, SysUtils, {$IFDEF FPC}fgl{$ELSE}Generics.Collections{$ENDIF}, math, syncobjs;
+  Classes, SysUtils,
+  {$IFDEF FPC}
+  fgl, MTPCPU
+  {$ELSE}
+  Generics.Collections, Windows
+  {$ENDIF}
+  , math, syncobjs;
 
 type
   TNeuronProc = procedure(index, threadnum: integer) of object;
@@ -57,8 +63,29 @@ type
   procedure NeuronThreadListFree();
   function fNTL: TNeuronThreadList; {$IFDEF Release} inline; {$ENDIF}
   procedure CreateNeuronThreadListIfRequired();
+  function NeuralDefaultThreadCount: integer;
+  procedure NeuralInitCritSec(var pCritSec: TRTLCriticalSection);
+  procedure NeuralDoneCritSec(var pCritSec: TRTLCriticalSection);
 
 implementation
+
+procedure NeuralInitCritSec(var pCritSec: TRTLCriticalSection);
+begin
+  {$IFDEF FPC}
+  InitCriticalSection(pCritSec);
+  {$ELSE}
+  InitializeCriticalSection(pCritSec);
+  {$ENDIF}
+end;
+
+procedure NeuralDoneCritSec(var pCritSec: TRTLCriticalSection);
+begin
+  {$IFDEF FPC}
+  DoneCriticalsection(pCritSec);
+  {$ELSE}
+  DeleteCriticalSection(pCritSec);
+  {$ENDIF}
+end;
 
 var
   vNTL: TNeuronThreadList;
@@ -84,6 +111,15 @@ begin
   begin
     NeuronThreadListCreate(TThread.ProcessorCount);
   end;
+end;
+
+function NeuralDefaultThreadCount: integer;
+begin
+  {$IFDEF FPC}
+  Result := GetSystemThreadCount;
+  {$ELSE}
+  Result := TThread.ProcessorCount;
+  {$ENDIF}
 end;
 
 function fNTL: TNeuronThreadList;

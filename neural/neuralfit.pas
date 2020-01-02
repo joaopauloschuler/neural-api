@@ -239,24 +239,6 @@ implementation
 uses
   math;
 
-procedure NeuralInitCritSec(var pCritSec: TRTLCriticalSection);
-begin
-  {$IFDEF FPC}
-  InitCriticalSection(pCritSec);
-  {$ELSE}
-  InitializeCriticalSection(pCritSec);
-  {$ENDIF}
-end;
-
-procedure NeuralDoneCritSec(var pCritSec: TRTLCriticalSection);
-begin
-  {$IFDEF FPC}
-  DoneCriticalsection(pCritSec);
-  {$ELSE}
-  DeleteCriticalSection(pCritSec);
-  {$ENDIF}
-end;
-
 function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 var
   Pos: integer;
@@ -1049,7 +1031,7 @@ begin
   {$ENDIF}
   FFinishedThread := TNNetVolume.Create();
   {$IFDEF HASTHREADS}
-  FMaxThreadNum := TThread.ProcessorCount;
+  FMaxThreadNum := NeuralDefaultThreadCount();
     //{$IFDEF OpenCL}
     // This optimization works very well on some systems but not all :-(
     // This optimization fails on google colab.
