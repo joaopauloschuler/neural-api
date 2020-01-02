@@ -19,20 +19,20 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 unit neuralfit;
 
 {$include neuralnetwork.inc}
+{$DEFINE HASTHREADS}
 
 {$IFDEF FPC}
 {$H+}
-{$DEFINE HASTHREADS}
 {$ENDIF}
 
 interface
 
 uses
-  Classes, SysUtils, neuralnetwork, neuralvolume
-  {$IFDEF HASTHREADS}, MTProcs{$ENDIF}
+  Classes, SysUtils, neuralnetwork, neuralvolume, neuralthread
   {$IFDEF OpenCL}, cl
-  {$IFNDEF FPC}, neuralopencl{$ENDIF}
+  {$IFNDEF FPC}, neuralopencl {$ENDIF}
   {$ENDIF}
+  {$IFNDEF FPC}, Windows {$ENDIF}
   ;
 
 type
@@ -87,6 +87,7 @@ type
       FPlatformId: cl_platform_id;
       FDeviceId: cl_device_id;
       {$ENDIF}
+      Procs: TNeuronThreadList;
       procedure CheckLearningRate(iEpochCount: integer);
     public
       constructor Create();
@@ -161,10 +162,8 @@ type
       procedure EnableClassComparison();
 
       // On most cases, you should never call the following methods directly
-      procedure RunNNThread(Index: PtrInt; Data: Pointer;
-        Item: TMultiThreadProcItem);
-      procedure TestNNThread(Index: PtrInt; Data: Pointer;
-        Item: TMultiThreadProcItem);
+      procedure RunNNThread(index, threadnum: integer);
+      procedure TestNNThread(index, threadnum: integer);
 
       procedure AllocateMemory(pNN: TNNet;
         pBatchSize: integer;
@@ -220,10 +219,8 @@ type
       procedure Fit(pNN: TNNet;
         pImgVolumes, pImgValidationVolumes, pImgTestVolumes: TNNetVolumeList;
         pNumClasses, pBatchSize, Epochs: integer);
-      procedure RunNNThread(Index: PtrInt; Data: Pointer;
-        Item: TMultiThreadProcItem);
-      procedure TestNNThread(Index: PtrInt; Data: Pointer;
-        Item: TMultiThreadProcItem);
+      procedure RunNNThread(index, threadnum: integer);
+      procedure TestNNThread(index, threadnum: integer);
       procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
 
       property HasImgCrop: boolean read FHasImgCrop write FHasImgCrop;
@@ -241,6 +238,24 @@ type
 implementation
 uses
   math;
+
+procedure NeuralInitCritSec(var pCritSec: TRTLCriticalSection);
+begin
+  {$IFDEF FPC}
+  InitCriticalSection(pCritSec);
+  {$ELSE}
+  InitializeCriticalSection(pCritSec);
+  {$ENDIF}
+end;
+
+procedure NeuralDoneCritSec(var pCritSec: TRTLCriticalSection);
+begin
+  {$IFDEF FPC}
+  DoneCriticalsection(pCritSec);
+  {$ELSE}
+  DeleteCriticalSection(pCritSec);
+  {$ENDIF}
+end;
 
 function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 var
@@ -650,8 +665,7 @@ begin
   {$ENDIF}
 end;
 
-procedure TNeuralDataLoadingFit.RunNNThread(Index: PtrInt; Data: Pointer;
-  Item: TMultiThreadProcItem);
+procedure TNeuralDataLoadingFit.RunNNThread(index, threadnum: integer);
 var
   BlockSize, BlockSizeRest: integer;
   LocalNN: TNNet;
@@ -776,8 +790,7 @@ begin
   pOutput.Free;
 end;
 
-procedure TNeuralDataLoadingFit.TestNNThread(Index: PtrInt; Data: Pointer;
-  Item: TMultiThreadProcItem);
+procedure TNeuralDataLoadingFit.TestNNThread(index, threadnum: integer);
 var
   BlockSize: integer;
   LocalNN: TNNet;
@@ -893,7 +906,7 @@ begin
     FErrorProc('Training function hasn''t been defined.');
     exit;
   end;
-
+  Procs := TNeuronThreadList.Create(FThreadNum);
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
   FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
@@ -930,6 +943,7 @@ end;
 
 procedure TNeuralDataLoadingFit.FreeMemory();
 begin
+  Procs.Free;
   FGetTrainingPair := nil;
   FGetValidationPair := nil;
   FGetTestPair := nil;
@@ -951,7 +965,8 @@ begin
   FNN.ClearTime();
   FNN.RefreshDropoutMask();
   {$IFDEF HASTHREADS}
-  ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  Procs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
   {$ELSE}
   RunNNThread(0, nil, Self);
   {$ENDIF}
@@ -982,7 +997,8 @@ begin
   FLocalTestProc   := FGetValidationProc;
   FMessageProc('Starting Validation.');
   {$IFDEF HASTHREADS}
-  ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
   {$ELSE}
   TestNNThread(0, nil, Self);
   {$ENDIF}
@@ -1000,7 +1016,8 @@ begin
   FLocalTestProc   := FGetTestProc;
   FMessageProc('Starting Testing.');
   {$IFDEF HASTHREADS}
-  ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+  Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
   {$ELSE}
   TestNNThread(0, nil, Self);
   {$ENDIF}
@@ -1032,14 +1049,14 @@ begin
   {$ENDIF}
   FFinishedThread := TNNetVolume.Create();
   {$IFDEF HASTHREADS}
-  FMaxThreadNum := ProcThreadPool.MaxThreadCount;
+  FMaxThreadNum := TThread.ProcessorCount;
     //{$IFDEF OpenCL}
     // This optimization works very well on some systems but not all :-(
     // This optimization fails on google colab.
     //if FMaxThreadNum <=8 then
     //FMaxThreadNum := ProcThreadPool.MaxThreadCount * 2;
     //{$ENDIF}
-  InitCriticalSection(FCritSec);
+  NeuralInitCritSec(FCritSec);
   {$ELSE}
   FMaxThreadNum := 1;
   {$ENDIF}
@@ -1075,7 +1092,7 @@ end;
 destructor TNeuralFitBase.Destroy();
 begin
   {$IFDEF HASTHREADS}
-  DoneCriticalSection(FCritSec);
+  NeuralDoneCritSec(FCritSec);
   {$ENDIF}
   FFinishedThread.Free;
   inherited Destroy();
@@ -1220,6 +1237,7 @@ begin
     FRunning := false;
     exit;
   end;
+  Procs := TNeuronThreadList.Create(FThreadNum);
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
   FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
@@ -1296,7 +1314,8 @@ begin
       FNN.ClearTime();
       FNN.RefreshDropoutMask();
       {$IFDEF HASTHREADS}
-      ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+      //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+      Procs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
       {$ELSE}
       RunNNThread(0, nil, Self);
       {$ENDIF}
@@ -1389,7 +1408,8 @@ begin
         FGlobalErrorSum  := 0;
         FMessageProc('Starting Validation.');
         {$IFDEF HASTHREADS}
-        ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+        //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+        Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
         {$ELSE}
         TestNNThread(0, nil, Self);
         {$ENDIF}
@@ -1446,7 +1466,8 @@ begin
           FGlobalErrorSum  := 0;
           FMessageProc('Starting Testing.');
           {$IFDEF HASTHREADS}
-          ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+          //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+          Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
           {$ELSE}
           TestNNThread(0, nil, Self);
           {$ENDIF}
@@ -1531,6 +1552,7 @@ begin
     end;
   end;
 
+  Procs.Free;
   FreeAndNil(FAvgWeight);
   if Assigned(FAvgWeights) then FreeAndNil(FAvgWeights);
   FreeAndNil(FThreadNN);
@@ -1539,8 +1561,7 @@ begin
   FRunning := false;
 end;
 
-procedure TNeuralImageFit.RunNNThread(Index: PtrInt; Data: Pointer;
-  Item: TMultiThreadProcItem);
+procedure TNeuralImageFit.RunNNThread(index, threadnum: integer);
 var
   BlockSize, BlockSizeRest, CropSizeX, CropSizeY: integer;
   LocalNN: TNNet;
@@ -1714,8 +1735,7 @@ begin
   pOutput.Free;
 end;
 
-procedure TNeuralImageFit.TestNNThread(Index: PtrInt; Data: Pointer;
-  Item: TMultiThreadProcItem);
+procedure TNeuralImageFit.TestNNThread(index, threadnum: integer);
 var
   BlockSize: integer;
   LocalNN: TNNet;
