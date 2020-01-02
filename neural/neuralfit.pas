@@ -87,7 +87,7 @@ type
       FPlatformId: cl_platform_id;
       FDeviceId: cl_device_id;
       {$ENDIF}
-      Procs: TNeuronThreadList;
+      FProcs: TNeuralThreadList;
       procedure CheckLearningRate(iEpochCount: integer);
     public
       constructor Create();
@@ -888,7 +888,7 @@ begin
     FErrorProc('Training function hasn''t been defined.');
     exit;
   end;
-  Procs := TNeuronThreadList.Create(FThreadNum);
+  FProcs := TNeuralThreadList.Create(FThreadNum);
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
   FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
@@ -925,7 +925,7 @@ end;
 
 procedure TNeuralDataLoadingFit.FreeMemory();
 begin
-  Procs.Free;
+  FProcs.Free;
   FGetTrainingPair := nil;
   FGetValidationPair := nil;
   FGetTestPair := nil;
@@ -948,9 +948,9 @@ begin
   FNN.RefreshDropoutMask();
   {$IFDEF HASTHREADS}
   //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-  Procs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
+  FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
   {$ELSE}
-  RunNNThread(0, nil, Self);
+  RunNNThread(0, 1);
   {$ENDIF}
   if FClipDelta > 0 then
   begin
@@ -980,9 +980,9 @@ begin
   FMessageProc('Starting Validation.');
   {$IFDEF HASTHREADS}
   //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-  Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
+  FProcs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
   {$ELSE}
-  TestNNThread(0, nil, Self);
+  TestNNThread(0, 1);
   {$ENDIF}
   FGlobalTotal := (FGlobalHit + FGlobalMiss);
 end;
@@ -999,9 +999,9 @@ begin
   FMessageProc('Starting Testing.');
   {$IFDEF HASTHREADS}
   //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-  Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
+  FProcs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
   {$ELSE}
-  TestNNThread(0, nil, Self);
+  TestNNThread(0, 1);
   {$ENDIF}
   FGlobalTotal := (FGlobalHit + FGlobalMiss);
 end;
@@ -1038,7 +1038,7 @@ begin
     //if FMaxThreadNum <=8 then
     //FMaxThreadNum := ProcThreadPool.MaxThreadCount * 2;
     //{$ENDIF}
-  NeuralInitCritSec(FCritSec);
+  NeuralInitCriticalSection(FCritSec);
   {$ELSE}
   FMaxThreadNum := 1;
   {$ENDIF}
@@ -1074,7 +1074,7 @@ end;
 destructor TNeuralFitBase.Destroy();
 begin
   {$IFDEF HASTHREADS}
-  NeuralDoneCritSec(FCritSec);
+  NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
   FFinishedThread.Free;
   inherited Destroy();
@@ -1219,7 +1219,7 @@ begin
     FRunning := false;
     exit;
   end;
-  Procs := TNeuronThreadList.Create(FThreadNum);
+  FProcs := TNeuralThreadList.Create(FThreadNum);
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
   FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
@@ -1297,9 +1297,9 @@ begin
       FNN.RefreshDropoutMask();
       {$IFDEF HASTHREADS}
       //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-      Procs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
+      FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
       {$ELSE}
-      RunNNThread(0, nil, Self);
+      RunNNThread(0, 1);
       {$ENDIF}
       if FClipDelta > 0 then
       begin
@@ -1391,9 +1391,9 @@ begin
         FMessageProc('Starting Validation.');
         {$IFDEF HASTHREADS}
         //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-        Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
+        FProcs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
         {$ELSE}
-        TestNNThread(0, nil, Self);
+        TestNNThread(0, 1);
         {$ENDIF}
 
         FGlobalTotal := (FGlobalHit + FGlobalMiss);
@@ -1449,9 +1449,9 @@ begin
           FMessageProc('Starting Testing.');
           {$IFDEF HASTHREADS}
           //ProcThreadPool.DoParallel(@TestNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-          Procs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
+          FProcs.StartProc({$IFDEF FPC}@TestNNThread{$ELSE}TestNNThread{$ENDIF});
           {$ELSE}
-          TestNNThread(0, nil, Self);
+          TestNNThread(0, 1);
           {$ENDIF}
 
           FGlobalTotal := (FGlobalHit + FGlobalMiss);
@@ -1534,7 +1534,7 @@ begin
     end;
   end;
 
-  Procs.Free;
+  FProcs.Free;
   FreeAndNil(FAvgWeight);
   if Assigned(FAvgWeights) then FreeAndNil(FAvgWeights);
   FreeAndNil(FThreadNN);

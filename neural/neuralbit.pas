@@ -41,13 +41,13 @@ procedure BAClear(var VARS: array of byte);
 { limpa o valor }
 procedure BAMake1(var VARS: array of byte);
 { VARS  <- 1.0 }
-function BARead(var A: array of byte; P: longint): byte; {$IFDEF Release} inline; {$ENDIF}
+function BARead(var A: array of byte; P: longint): byte;
 { Bit Array Read }
-procedure BAFlip(var A: array of byte; P: longint); {$IFDEF Release} inline; {$ENDIF}
+procedure BAFlip(var A: array of byte; P: longint);
 { Flip no bit P }
-procedure BAWrite(var A: array of byte; P: longint; Data: byte); {$IFDEF Release} inline; {$ENDIF}
+procedure BAWrite(var A: array of byte; P: longint; Data: byte);
 { Bit Array Write }
-function BATest(var A: array of byte; P: longint): boolean; {$IFDEF Release} inline; {$ENDIF}
+function BATest(var A: array of byte; P: longint): boolean;
 { Bit Array Test }
 procedure BASum(var x, y: array of byte);
 { soma registradores: x=x+y }

@@ -1111,11 +1111,11 @@ type
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayer(): TNNetLayer; {$IFDEF Release} inline; {$ENDIF}
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
-      procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
       procedure Backpropagate(pOutput: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
       procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
-      procedure Backpropagate(pOutput: array of TNeuralFloat); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
       procedure GetOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure AddOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure SetActivationFn(ActFn, ActFnDeriv: TNeuralActivationFunction);
@@ -1131,7 +1131,7 @@ type
       procedure SetSmoothErrorPropagation(p:boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTime(); {$IFDEF Release} inline; {$ENDIF}
       procedure Clear();
-      procedure IdxsToLayers(aIdx: array of integer; var aL: array of TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      procedure IdxsToLayers(aIdx: array of integer; var aL: array of TNNetLayer);
       procedure EnableDropouts(pFlag: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure RefreshDropoutMask(); {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}

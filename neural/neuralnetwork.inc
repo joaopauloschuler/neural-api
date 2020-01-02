@@ -40,7 +40,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
   {$UNDEF AVX2}
   {$UNDEF AVX512}
   {$UNDEF AVXANY}
-  {$UNDEF Release}
 
   {$IFDEF CPU32BITS}
     {$DEFINE CPU32}

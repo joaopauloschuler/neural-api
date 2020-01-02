@@ -1244,4 +1244,9 @@ begin
   inherited Destroy;
 end;
 
+{$IFNDEF FPC}
+initialization
+InitOpenCL;
+{$ENDIF}
+
 end.
