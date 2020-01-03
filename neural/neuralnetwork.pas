@@ -6692,7 +6692,10 @@ procedure TNNetFullConnect.ComputePreviousLayerError();
 begin
   if Assigned(FPrevLayer) then
   begin
-    ComputePreviousLayerErrorCPU();
+    if (FPrevLayer.FOutput.Size = FPrevLayer.FOutputError.Size) then
+    begin
+      ComputePreviousLayerErrorCPU();
+    end;
   end;
 end;
 
@@ -6838,9 +6841,9 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if (FNeurons.Count = FOutput.Size) and (FPrevLayer.Output.Size>0) then
+  if (FNeurons.Count = FOutput.Size) and (FPrevLayer.FOutput.Size>0) then
   begin
-    // ComputeErrorDeriv() is not required as it's done by BackpropagateNTL
+    // ComputeErrorDeriv() is not required as it's done by BackpropagateCPU
     StartTime := Now();
     if FLearningRate <> 0.0 then
     begin
