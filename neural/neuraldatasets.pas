@@ -216,7 +216,9 @@ uses SysUtils, math;
 {$IFNDEF FPC}
 function SwapEndian(I:integer):integer;
 begin
-  result := Swap(I)
+  // valid for SmallInt
+  // result := Swap(I)
+  Result := ((Swap(Smallint(I)) and $ffff) shl $10) or (Swap(Smallint(I shr $10)) and $ffff)
 end;
 {$ENDIF}
 
