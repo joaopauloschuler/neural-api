@@ -405,7 +405,7 @@ begin
   if FHasOpenCL then
   begin
     FFit.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
-    Generative.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
+    FGenerative.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
   end;
   {$endif}
   //Debug only: FFit.MaxThreadNum := 1;
