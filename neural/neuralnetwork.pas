@@ -3406,8 +3406,7 @@ function THistoricalNets.AddDenseNetTransition(
 begin
   AddChannelMovingNorm(false, 0, 0);
   AddLayer( TNNetSELU.Create() );
-  if (Compression <> 1)
-      then AddCompression(Compression, supressBias);
+  AddCompression(Compression, supressBias);
   if HasAvgPool
     then Result := AddLayer( TNNetAvgPool.Create(2) )
     else Result := AddLayer( TNNetMaxPool.Create(2) );
@@ -3487,10 +3486,7 @@ begin
       if pAfter <> nil then AddLayer( pAfter.Create() );
       AddLayer( TNNetConcat.Create([PreviousLayer, GetLastLayer()]) );
     end;
-    if (Compression <> 1) then
-    begin
-      AddLayer( PointWiseConv.Create(Round(GetLastLayer().Output.Depth * Compression ), {featuresize}1, {padding}0, {stride}1, {suppress bias}1) );
-    end;
+    AddLayer( PointWiseConv.Create(Round(GetLastLayer().Output.Depth * Compression ), {featuresize}1, {padding}0, {stride}1, {suppress bias}1) );
   end;
   Result := GetLastLayer();
 end;
@@ -7383,8 +7379,7 @@ end;
 
 function TNNet.AddCompression(Compression: TNeuralFloat; supressBias: integer): TNNetLayer;
 begin
-  if (Compression <> 1)
-    then AddLayer( TNNetPointwiseConvLinear.Create(Round(GetLastLayer().Output.Depth * Compression ), supressBias) );
+  AddLayer( TNNetPointwiseConvLinear.Create(Round(GetLastLayer().Output.Depth * Compression ), supressBias) );
   Result := GetLastLayer();
 end;
 
