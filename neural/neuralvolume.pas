@@ -216,6 +216,7 @@ type
     procedure FlipY();
     procedure IncTag(); {$IFDEF Release} inline; {$ENDIF}
     procedure ClearTag(); {$IFDEF Release} inline; {$ENDIF}
+    function NeuralToStr(V: TNeuralFloat): string;
 
     // Color and Neuronal Weights Transformations
     procedure RgbImgToNeuronalInput(color_encoding: integer);
@@ -559,6 +560,9 @@ type
 
   function CompareNNetVolumeListAsc(const Item1, Item2: TNNetVolume): Integer;
   function CompareNNetVolumeListDesc(const Item1, Item2: TNNetVolume): Integer;
+
+  function NeuralFloatToStr(V: TNeuralFloat): string;
+  function NeuralStrToFloat(V: String): TNeuralFloat;
 
   procedure TestTNNetVolume();
   procedure TestKMeans();
@@ -1141,6 +1145,24 @@ begin
   Result := Item2.Tag - Item1.Tag;
 end;
 
+function NeuralFloatToStr(V: TNeuralFloat): string;
+var
+  LocalFormatSettings: TFormatSettings;
+begin
+  {$IFDEF FPC} LocalFormatSettings := DefaultFormatSettings; {$ENDIF}
+  LocalFormatSettings.DecimalSeparator := '.';
+  Result := FloatToStr(V,LocalFormatSettings);
+end;
+
+function NeuralStrToFloat(V: string): TNeuralFloat;
+var
+  LocalFormatSettings: TFormatSettings;
+begin
+  {$IFDEF FPC} LocalFormatSettings := DefaultFormatSettings; {$ENDIF}
+  LocalFormatSettings.DecimalSeparator := '.';
+  Result := StrToFloat(V,LocalFormatSettings);
+end;
+
 procedure TestTNNetVolume();
 var
   TestSize: integer;
@@ -1647,7 +1669,7 @@ begin
       begin
         if Volume.FData[I] > Threshold then
         begin
-          FTokenizer.Add(Self[I]+':'+FloatToStr(Volume.FData[I]));
+          FTokenizer.Add(Self[I]+':'+Volume.NeuralToStr(Volume.FData[I]));
         end;
       end;
     end;
@@ -3614,6 +3636,11 @@ var
   I: integer;
 begin
   for I := Low(FTag) to High(FTag) do FTag[I] := 0;
+end;
+
+function TVolume.NeuralToStr(V: TNeuralFloat): string;
+begin
+  Result := FloatToStr(V, FFormatSettings);
 end;
 
 procedure TVolume.RgbImgToNeuronalInput(color_encoding: integer);

@@ -9720,7 +9720,7 @@ end;
 
 function TNNetNeuron.SaveToString(): string;
 begin
-  Result := FloatToStr(FBiasWeight) + ']' + FWeights.SaveToString();
+  Result := NeuralFloatToStr(FBiasWeight) + ']' + FWeights.SaveToString();
 end;
 
 procedure TNNetNeuron.LoadFromString(strData: string);
@@ -9729,7 +9729,7 @@ var
 begin
   S := CreateTokenizedStringList(strData,']');
 
-  FBiasWeight := StrToFloat(S[0]);
+  FBiasWeight := NeuralStrToFloat(S[0]);
   FWeights.LoadFromString(S[1]);
   S.Free;
 end;
