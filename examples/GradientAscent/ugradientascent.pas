@@ -163,11 +163,14 @@ var
   vInput, pOutput, vDisplay: TNNetVolume;
   OutputCount, K: integer;
   InputSize: integer;
+  StatingSum, CurrentSum, InputForce: TNeuralFloat;
+  LayerHasDepth: boolean;
 begin
   iEpochCount := 0;
   iEpochCountAfterLoading := 0;
   FLastLayerIdx := ComboLayer.ItemIndex;
-  if (FNN.Layers[FLastLayerIdx].OutputError.Depth > 1)
+  LayerHasDepth := (FNN.Layers[FLastLayerIdx].OutputError.Depth > 1);
+  if LayerHasDepth
     then FOutputSize := FNN.Layers[FLastLayerIdx].OutputError.Depth
     else FOutputSize := FNN.Layers[FLastLayerIdx].OutputError.Size;
 
@@ -203,13 +206,22 @@ begin
   for OutputCount := 0 to FOutputSize - 1 do
   begin
     //vInput.Randomize(10000, 5000, 5000000);
-    vInput.RandomizeGaussian(2); vInput.Sub(1);
+    if LayerHasDepth then
+    begin
+      vInput.Fill(0.0);
+      vInput.AddSaltAndPepper(4, 2, -2, true);
+    end
+    else
+    begin
+      vInput.RandomizeGaussian(2); vInput.Sub(1);
+    end;
+    StatingSum := vInput.GetSumAbs();
     if ChkStrongInput.Checked
-      then vInput.NormalizeMax(20)
-      else vInput.NormalizeMax(0.002);
+      then InputForce := 2
+      else InputForce := 0.002;
+    vInput.NormalizeMax(InputForce);
     Write('Random Input: '); vInput.PrintDebug(); WriteLn;
-    //vInput.Fill(0.1);
-    for K := 1 to 100 do
+    for K := 1 to 10000 do
     begin
       FNN.Compute(vInput);
       FNN.GetOutput(pOutput);
@@ -224,11 +236,17 @@ begin
         LoadVolumeIntoTImage(vDisplay, aImage[OutputCount], 0);
         aImage[OutputCount].Width   := FFilterSize;
         aImage[OutputCount].Height  := FFilterSize;
+        Application.ProcessMessages();
+        CurrentSum := vInput.GetSumAbs();
+        WriteLn(StatingSum,' - ',CurrentSum,' - ',(CurrentSum/StatingSum));
+        if (CurrentSum > vInput.Size*StatingSum) or Not(LayerHasDepth)
+          then break
+          else vInput.AddSaltAndPepper(4, InputForce/10, -InputForce/10, true);
       end;
       Application.ProcessMessages();
       if Not(FRunning) then break;
     end;
-    FNN.DebugWeights();
+    //FNN.DebugWeights();
   end;
 
   vDisplay.Free;
