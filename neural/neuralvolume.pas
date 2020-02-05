@@ -173,7 +173,7 @@ type
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
     procedure AddGaussianNoise(pMul: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
-    procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2); {$IFDEF Release} inline; {$ENDIF}
+    procedure AddSaltAndPepper(pNum: integer; pSalt: T; pPepper: T; pColor:boolean = false); {$IFDEF Release} inline; {$ENDIF}
     function RandomGaussianValue(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
     procedure Copy(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure CopyRelu(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -207,6 +207,7 @@ type
     function GetMaxAbs(): T; {$IFDEF Release} inline; {$ENDIF}
     procedure GetMinMaxAtDepth(pDepth: integer; out pMin, pMax: T);
     function GetSum(): T; virtual;
+    function GetSumAbs(): T; virtual;
     function GetSumSqr(): T; virtual;
     function GetAvg(): T; {$IFDEF Release} inline; {$ENDIF}
     function GetVariance(): T; {$IFDEF Release} inline; {$ENDIF}
@@ -2242,8 +2243,8 @@ end;
 
 // inspired on
 // https://medium.com/ymedialabs-innovation/data-augmentation-techniques-in-cnn-using-tensorflow-371ae43d5be9
-procedure TVolume.AddSaltAndPepper(pNum: integer; pSalt: integer;
-  pPepper: integer);
+procedure TVolume.AddSaltAndPepper(pNum: integer; pSalt: T;
+  pPepper: T; pColor:boolean = false);
 var
   I: integer;
   CntDepth: integer;
@@ -2258,10 +2259,12 @@ begin
 
     for CntDepth := 0 to FDepth - 1 do
     begin
-     Self.Data[SaltPosX, SaltPosY, CntDepth] := pSalt;
-     Self.Data[PepperPosX, PepperPosY, CntDepth] := pPepper;
+      if (Not(pColor) or (Random(100) < 50) ) then
+      begin
+        Self.Data[SaltPosX, SaltPosY, CntDepth] := pSalt;
+        Self.Data[PepperPosX, PepperPosY, CntDepth] := pPepper;
+      end;
     end;
-
   end;
 end;
 
@@ -3471,6 +3474,31 @@ begin
       for I := 1 to vHigh do
       begin
         Result := Result + FData[I];
+      end;
+    end;
+  end
+  else
+  begin
+    Result := 0;
+  end;
+end;
+
+function TVolume.GetSumAbs(): T;
+var
+  I: integer;
+  vHigh: integer;
+begin
+  if Length(FData) > 0 then
+  begin
+    if FData[0] >0 then Result := FData[0] else Result := -FData[0];
+    vHigh := High(FData);
+    if vHigh > 0 then
+    begin
+      for I := 1 to vHigh do
+      begin
+        if FData[I] > 0
+          then Result := Result + FData[I]
+          else Result := Result - FData[I];
       end;
     end;
   end
