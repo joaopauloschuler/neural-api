@@ -35,6 +35,7 @@ type
   TFormVisualLearning = class(TForm)
     ButLearn: TButton;
     ButLoadFile: TButton;
+    ChkForceInputRange: TCheckBox;
     ChkStrongInput: TCheckBox;
     ComboLayer: TComboBox;
     GrBoxNeurons: TGroupBox;
@@ -122,7 +123,7 @@ begin
       FNN.DebugStructure();
       FNN.DebugWeights();
       FNN.SetBatchUpdate( true );
-      FNN.SetLearningRate(0.001,0.0);
+      FNN.SetLearningRate(0.01,0.0);
       TNNetInput(FNN.Layers[0]).EnableErrorCollection();
       WriteLn('Neural network has: ');
       WriteLn(' Layers: ', FNN.CountLayers()  );
@@ -165,6 +166,7 @@ var
   InputSize: integer;
   StatingSum, CurrentSum, InputForce: TNeuralFloat;
   LayerHasDepth: boolean;
+  StopRatio: TNeuralFloat;
 begin
   iEpochCount := 0;
   iEpochCountAfterLoading := 0;
@@ -203,6 +205,10 @@ begin
   FormVisualLearning.Height := GrBoxNeurons.Top + GrBoxNeurons.Height + 10;
   Application.ProcessMessages;
 
+  if ChkForceInputRange.Checked
+  then StopRatio := 100
+  else StopRatio := vInput.Size;
+
   for OutputCount := 0 to FOutputSize - 1 do
   begin
     //vInput.Randomize(10000, 5000, 5000000);
@@ -227,6 +233,7 @@ begin
       FNN.GetOutput(pOutput);
       FNN.BackpropagateFromLayerAndNeuron(FLastLayerIdx, OutputCount, 20);
       vInput.MulAdd(-1, FNN.Layers[0].OutputError);
+      if ChkForceInputRange.Checked then vInput.ForceMaxRange(2);
       FNN.ClearDeltas();
       FNN.ClearInertia();
       if K mod 100 = 0 then
@@ -239,7 +246,7 @@ begin
         Application.ProcessMessages();
         CurrentSum := vInput.GetSumAbs();
         WriteLn(StatingSum,' - ',CurrentSum,' - ',(CurrentSum/StatingSum));
-        if (CurrentSum > vInput.Size*StatingSum) or Not(LayerHasDepth)
+        if (CurrentSum > StopRatio*StatingSum) or Not(LayerHasDepth)
           then break
           else vInput.AddSaltAndPepper(4, InputForce/10, -InputForce/10, true);
       end;

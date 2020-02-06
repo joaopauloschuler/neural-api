@@ -69,12 +69,20 @@ object FormVisualLearning: TFormVisualLearning
   object ChkStrongInput: TCheckBox
     Left = 768
     Height = 24
-    Top = 16
+    Top = 8
     Width = 106
     Caption = 'Strong Input'
     Checked = True
     State = cbChecked
     TabOrder = 4
+  end
+  object ChkForceInputRange: TCheckBox
+    Left = 768
+    Height = 24
+    Top = 32
+    Width = 144
+    Caption = 'Force Input Range'
+    TabOrder = 5
   end
   object OpenDialogNN: TOpenDialog
     Title = 'Open existing Neural Network File'
