@@ -41,6 +41,7 @@ type
       constructor Create();
       function CountElements(): integer;
       procedure LoadFoldersAsClasses(FolderName: string; pImageSubFolder: string = ''; SkipFirst: integer = 0; SkipLast: integer = 0);
+      procedure LoadFoldersAsClassesProportional(FolderName: string; pImageSubFolder: string; fSkipFirst: TNeuralFloat; fLoadLen: TNeuralFloat);
       procedure LoadImages(color_encoding: integer);
       procedure LoadClass_FilenameFromFolder(FolderName: string);
       function GetRandomClassId(): integer; {$IFDEF Release} inline; {$ENDIF}
@@ -408,6 +409,47 @@ begin
   end;
 end;
 
+procedure TClassesAndElements.LoadFoldersAsClassesProportional(
+  FolderName: string; pImageSubFolder: string; fSkipFirst: TNeuralFloat;
+  fLoadLen: TNeuralFloat);
+var
+  ClassCnt, ElementCnt: integer;
+  MaxClass, SkipFirst, SkipLast: integer;
+  ClassFolder: string;
+begin
+  FBaseFolder := FolderName;
+  FImageSubFolder := pImageSubFolder;
+  FindAllDirectories(Self, FolderName, {SearchSubDirs}false);
+  FixObjects();
+  //WriteLn(FolderName,':',Self.Count);
+  if Self.Count > 0 then
+  begin
+    MaxClass := Self.Count - 1;
+    begin
+      for ClassCnt := 0 to MaxClass do
+      begin
+        ClassFolder := Self[ClassCnt] + DirectorySeparator;
+        if FImageSubFolder <> '' then
+        begin
+          ClassFolder += FImageSubFolder + DirectorySeparator;
+        end;
+        if not Assigned(Self.List[ClassCnt]) then
+        begin
+          WriteLn(ClassFolder,' - error: not assigned list');
+        end;
+        FindAllFiles(Self.List[ClassCnt], ClassFolder, '*.png;*.jpg;*.jpeg;*.bmp', {SearchSubDirs} false);
+        Self.List[ClassCnt].FixObjects();
+        ElementCnt := Self.List[ClassCnt].Count;
+        SkipFirst := Round(ElementCnt * fSkipFirst);
+        SkipLast := ElementCnt - Round(ElementCnt * fLoadLen) - SkipFirst;
+        if SkipFirst > 0 then Self.List[ClassCnt].DeleteFirst(SkipFirst);
+        if SkipLast > 0 then Self.List[ClassCnt].DeleteLast(SkipLast);
+        //WriteLn(ClassFolder,':',Self.List[ClassCnt].Count);
+      end;
+    end;
+  end;
+end;
+
 procedure TClassesAndElements.LoadImages(color_encoding: integer);
 var
   LocalPicture: TPicture;
@@ -422,6 +464,7 @@ begin
     for ClassId := 0 to MaxClass do
     begin
       MaxImage := Self.List[ClassId].Count - 1;
+      //WriteLn(MaxImage, ' ', MaxImage);
       if MaxImage >= 0 then
       begin
         for ImageId := 0 to MaxImage do

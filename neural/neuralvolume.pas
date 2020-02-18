@@ -173,7 +173,7 @@ type
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
     procedure AddGaussianNoise(pMul: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
-    procedure AddSaltAndPepper(pNum: integer; pSalt: T; pPepper: T; pColor:boolean = false); {$IFDEF Release} inline; {$ENDIF}
+    procedure AddSaltAndPepper(pNum: integer; pSalt: T = 1.0; pPepper: T = -1.0; pColor:boolean = false); {$IFDEF Release} inline; {$ENDIF}
     function RandomGaussianValue(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
     procedure Copy(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure CopyRelu(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -2243,8 +2243,8 @@ end;
 
 // inspired on
 // https://medium.com/ymedialabs-innovation/data-augmentation-techniques-in-cnn-using-tensorflow-371ae43d5be9
-procedure TVolume.AddSaltAndPepper(pNum: integer; pSalt: T;
-  pPepper: T; pColor:boolean = false);
+procedure TVolume.AddSaltAndPepper(pNum: integer; pSalt: T = 1.0;
+  pPepper: T = -1.0; pColor:boolean = false);
 var
   I: integer;
   CntDepth: integer;
