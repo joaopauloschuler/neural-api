@@ -17,7 +17,7 @@ type
 
   procedure TTestCNNAlgo.DoRun;
   var
-    NN: THistoricalNets;
+    NN: TNNet;
     NeuralFit: TNeuralImageFit;
     ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
   begin
