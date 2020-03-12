@@ -410,6 +410,7 @@ type
       procedure SortByTagAsc;
       procedure SortByTagDesc;
       procedure GetColumn(V: TNNetVolume; colIdx: integer);
+      procedure ResizeImage(NewSizeX, NewSizeY: integer);
      {$IFNDEF FPC}
       property Items[Index: Integer]: TNNetVolume read GetItem write SetItem; default;
      {$ENDIF}
@@ -2098,6 +2099,23 @@ begin
     begin
       V.FData[I] := Self[I].FData[colIdx];
     end;
+  end;
+end;
+
+procedure TNNetVolumeList.ResizeImage(NewSizeX, NewSizeY: integer);
+var
+  I: integer;
+  AuxVolume: TNNetVolume;
+begin
+  if (Count>0) then
+  begin
+    AuxVolume := TNNetVolume.Create();
+    for I := 0 to Count - 1 do
+    begin
+      AuxVolume.Copy(Self[I]);
+      Self[I].CopyResizing(AuxVolume, NewSizeX, NewSizeY);
+    end;
+    AuxVolume.Free;
   end;
 end;
 
