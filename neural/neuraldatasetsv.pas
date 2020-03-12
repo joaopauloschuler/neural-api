@@ -42,7 +42,8 @@ type
       function CountElements(): integer;
       procedure LoadFoldersAsClasses(FolderName: string; pImageSubFolder: string = ''; SkipFirst: integer = 0; SkipLast: integer = 0);
       procedure LoadFoldersAsClassesProportional(FolderName: string; pImageSubFolder: string; fSkipFirst: TNeuralFloat; fLoadLen: TNeuralFloat);
-      procedure LoadImages(color_encoding: integer);
+      procedure LoadImages(color_encoding: integer); overload;
+      procedure LoadImages(color_encoding, NewSizeX, NewSizeY: integer); overload;
       procedure LoadClass_FilenameFromFolder(FolderName: string);
       function GetRandomClassId(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFileName(ClassId, ElementId: integer): string; {$IFDEF Release} inline; {$ENDIF}
@@ -479,6 +480,45 @@ begin
     end;
   end;
   LocalPicture.Free;
+end;
+
+procedure TClassesAndElements.LoadImages(color_encoding, NewSizeX,
+  NewSizeY: integer);
+var
+  LocalPicture: TPicture;
+  SourceVolume: TNNetVolume;
+  AuxVolume: TNNetVolume;
+  ClassId, ImageId: integer;
+  MaxClass, MaxImage: integer;
+begin
+  AuxVolume := TNNetVolume.Create();
+  LocalPicture := TPicture.Create;
+  if Self.Count > 0 then
+  begin
+    MaxClass := Self.Count - 1;
+    for ClassId := 0 to MaxClass do
+    begin
+      MaxImage := Self.List[ClassId].Count - 1;
+      if MaxImage >= 0 then
+      begin
+        for ImageId := 0 to MaxImage do
+        begin
+          SourceVolume := Self.List[ClassId].List[ImageId];
+          LocalPicture.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
+          LoadPictureIntoVolume(LocalPicture, SourceVolume);
+          if (SourceVolume.SizeX <> NewSizeX) or (SourceVolume.SizeY <> NewSizeY) then
+          begin
+            AuxVolume.Copy(SourceVolume);
+            SourceVolume.CopyResizing(AuxVolume, NewSizeX, NewSizeY);
+          end;
+          SourceVolume.Tag := ClassId;
+          SourceVolume.RgbImgToNeuronalInput(color_encoding);
+        end;
+      end;
+    end;
+  end;
+  LocalPicture.Free;
+  AuxVolume.Free;
 end;
 
 procedure TClassesAndElements.LoadClass_FilenameFromFolder(FolderName: string);
