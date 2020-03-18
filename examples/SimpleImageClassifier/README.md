@@ -6,7 +6,7 @@ This example has interesting aspects to look at:
 
 This is how a sequential array of layers is added:
 ```
-    NN := THistoricalNets.Create();
+    NN := TNNet.Create();
     NN.AddLayer([
       TNNetInput.Create(32, 32, 3),
       TNNetConvolutionLinear.Create(64, 5, 2, 1, 1).InitBasicPatterns(),
