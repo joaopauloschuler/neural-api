@@ -24,25 +24,6 @@ type
     procedure GetTestPair(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
   end;
 
-  function BipolarCompare99(A, B: TNNetVolume; ThreadId: integer): boolean;
-  var
-    Pos, Hits: integer;
-    ACount: integer;
-  begin
-    ACount := Min(A.Size, B.Size);
-    Pos := 0;
-    Hits := 0;
-    while (Pos < ACount) do
-    begin
-      if (
-        ( (A.FData[Pos]>0) and (B.FData[Pos]>0) ) or
-        ( (A.FData[Pos]<0) and (B.FData[Pos]<0) )
-      ) then Inc(Hits);
-      Inc(Pos);
-    end;
-    Result := (Hits > Round(ACount*0.99));
-  end;
-
   procedure TTestCNNAlgo.DoRun;
   var
     NN: THistoricalNets;
@@ -87,7 +68,7 @@ type
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
     NeuralFit.Verbose := true;
-    NeuralFit.InferHitFn := @BipolarCompare99;
+    NeuralFit.EnableBipolar99HitComparison();
     NeuralFit.FitLoading(NN,
       ImgTrainingVolumes.Count, ImgValidationVolumes.Count, ImgTestVolumes.Count,
       {batchsize=}64, {epochs=}50,

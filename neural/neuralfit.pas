@@ -159,6 +159,7 @@ type
 
       procedure EnableMonopolarHitComparison();
       procedure EnableBipolarHitComparison();
+      procedure EnableBipolar99HitComparison();
       procedure EnableClassComparison();
 
       // On most cases, you should never call the following methods directly
@@ -233,6 +234,7 @@ type
 
   function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
   function BipolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+  function BipolarCompare99(A, B: TNNetVolume; ThreadId: integer): boolean;
   function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 
 implementation
@@ -275,6 +277,25 @@ begin
     );
     Inc(Pos);
   end;
+end;
+
+function BipolarCompare99(A, B: TNNetVolume; ThreadId: integer): boolean;
+var
+  Pos, Hits: integer;
+  ACount: integer;
+begin
+  ACount := Min(A.Size, B.Size);
+  Pos := 0;
+  Hits := 0;
+  while (Pos < ACount) do
+  begin
+    if (
+      ( (A.FData[Pos]>0) and (B.FData[Pos]>0) ) or
+      ( (A.FData[Pos]<0) and (B.FData[Pos]<0) )
+    ) then Inc(Hits);
+    Inc(Pos);
+  end;
+  Result := (Hits > Round(ACount*0.99));
 end;
 
 function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
@@ -445,7 +466,7 @@ begin
           FAvgWeight.SaveToFile(fileName);
         end;
 
-        if (FGlobalHit > 0) and (FVerbose) then
+        if (FGlobalTotal > 0) and (FVerbose) then
         begin
           WriteLn(
             'Epochs: ',FCurrentEpoch,
@@ -1014,6 +1035,11 @@ end;
 procedure TNeuralDataLoadingFit.EnableBipolarHitComparison();
 begin
   FInferHitFn := @BipolarCompare;
+end;
+
+procedure TNeuralDataLoadingFit.EnableBipolar99HitComparison();
+begin
+  FInferHitFn := @BipolarCompare99;
 end;
 
 procedure TNeuralDataLoadingFit.EnableClassComparison();
