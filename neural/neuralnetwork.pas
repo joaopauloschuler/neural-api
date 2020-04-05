@@ -1225,6 +1225,7 @@ type
         BottleNeck: integer = 0;
         Compression: TNeuralFloat = 1
         ): TNNetLayer;
+      function AddSuperResolution(pSizeX, pSizeY, pNeurons, pLayerCnt: integer): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -3489,6 +3490,20 @@ begin
     AddLayer( PointWiseConv.Create(Round(GetLastLayer().Output.Depth * Compression ), {featuresize}1, {padding}0, {stride}1, {suppress bias}1) );
   end;
   Result := GetLastLayer();
+end;
+
+function THistoricalNets.AddSuperResolution(pSizeX, pSizeY, pNeurons,
+  pLayerCnt: integer): TNNetLayer;
+var
+  LayerCnt: integer;
+begin
+  AddLayer( TNNetInput.Create(pSizeX, pSizeY,3) );
+  AddLayer( TNNetDeAvgPool.Create(2) );
+  for LayerCnt := 1 to pLayerCnt do
+  begin
+    AddLayer( TNNetConvolutionReLU.Create(pNeurons,3,1,0) );
+  end;
+  Result := AddLayer( TNNetConvolutionLinear.Create(3,1,0,0) );
 end;
 
 { TNNetFullConnectLinear }
