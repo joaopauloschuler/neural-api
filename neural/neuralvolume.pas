@@ -405,7 +405,8 @@ type
       procedure ConcatInto(V: TNNetVolume);
       procedure InterleaveInto(V: TNNetVolume);
       procedure SplitFrom(V: TNNetVolume);
-      procedure AddVolumes(pVolNum, pSizeX, pSizeY, pDepth: integer; c: TNeuralFloat = 0);
+      procedure AddVolumes(pVolNum, pSizeX, pSizeY, pDepth: integer; c: TNeuralFloat = 0); overload;
+      procedure AddVolumes(Origin: TNNetVolumeList); overload;
       procedure AddInto(Original: TNNetVolume);
       procedure SortByTagAsc;
       procedure SortByTagDesc;
@@ -2048,6 +2049,22 @@ begin
   for I := 1 to pVolNum do
   begin
     Self.Add( TNNetVolume.Create(pSizeX, pSizeY, pDepth,c) );
+  end;
+end;
+
+procedure TNNetVolumeList.AddVolumes(Origin: TNNetVolumeList);
+var
+  I: integer;
+  NewVolume: TNNetVolume;
+begin
+  if Origin.Count > 0 then
+  begin
+    for I := 1 to Origin.Count - 1 do
+    begin
+      NewVolume := TNNetVolume.Create();
+      NewVolume.Copy(Origin[I]);
+      Self.Add( NewVolume );
+    end;
   end;
 end;
 
