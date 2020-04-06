@@ -2059,7 +2059,7 @@ var
 begin
   if Origin.Count > 0 then
   begin
-    for I := 1 to Origin.Count - 1 do
+    for I := 0 to Origin.Count - 1 do
     begin
       NewVolume := TNNetVolume.Create();
       NewVolume.Copy(Origin[I]);
