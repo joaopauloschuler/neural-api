@@ -62,7 +62,7 @@ type
 
     NeuralFit := TNeuralDataLoadingFit.Create;
     NeuralFit.FileNameBase := 'super-resolution-cifar10';
-    NeuralFit.InitialLearningRate := 0.01/(32*32);
+    NeuralFit.InitialLearningRate := 0.001/(32*32);
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
