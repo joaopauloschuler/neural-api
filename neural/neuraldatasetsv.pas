@@ -47,7 +47,18 @@ type
       procedure LoadClass_FilenameFromFolder(FolderName: string);
       function GetRandomClassId(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFileName(ClassId, ElementId: integer): string; {$IFDEF Release} inline; {$ENDIF}
+      procedure AddVolumesTo(Volumes: TNNetVolumeList);
   end;
+
+  /// add volumes into ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes
+  // according to percentages found in TrainingPct, ValidationPct, TestPct.
+  // folder names are classes
+  procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
+    ImgTestVolumes: TNNetVolumeList;
+    FolderName, pImageSubFolder: string;
+    color_encoding: integer;
+    TrainingProp, ValidationProp, TestProp: single;
+    NewSizeX: integer = 0; NewSizeY: integer = 0);
 {$ENDIF}
 
 /// Loads a TinyImage into FCL TImage.
@@ -97,6 +108,49 @@ procedure LoadNNLayersIntoCombo(NN: TNNet; Combo: TComboBox);
 implementation
 
 uses neuralvolumev, {$IFDEF FPC}fileutil{$ELSE} Winapi.Windows{$ENDIF}, math;
+
+{$IFDEF FPC}
+procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
+  ImgTestVolumes: TNNetVolumeList;
+  FolderName, pImageSubFolder: string;
+  color_encoding: integer;
+  TrainingProp, ValidationProp, TestProp: single;
+  NewSizeX: integer = 0; NewSizeY: integer = 0);
+var
+  ClassesAndElements: TClassesAndElements;
+begin
+  ImgTrainingVolumes := TNNetVolumeList.Create();
+  ImgValidationVolumes := TNNetVolumeList.Create();
+  ImgTestVolumes := TNNetVolumeList.Create();
+
+  ClassesAndElements := TClassesAndElements.Create();
+
+  if TrainingProp > 0 then
+  begin
+    ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, 0, TrainingProp);
+    ClassesAndElements.LoadImages(color_encoding, NewSizeX, NewSizeY);
+    ClassesAndElements.AddVolumesTo(ImgTrainingVolumes);
+  end;
+
+  if ValidationProp > 0 then
+  begin
+    ClassesAndElements.Clear;
+    ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, TrainingProp, ValidationProp);
+    ClassesAndElements.LoadImages(color_encoding, NewSizeX, NewSizeY);
+    ClassesAndElements.AddVolumesTo(ImgValidationVolumes);
+  end;
+
+  if TestProp > 0 then
+  begin
+    ClassesAndElements.Clear;
+    ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, TrainingProp + ValidationProp, TestProp);
+    ClassesAndElements.LoadImages(color_encoding, NewSizeX, NewSizeY);
+    ClassesAndElements.AddVolumesTo(ImgTestVolumes);
+  end;
+
+  ClassesAndElements.Free;
+end;
+{$ENDIF}
 
 procedure LoadNNLayersIntoCombo(NN: TNNet; Combo: TComboBox);
 var
@@ -506,10 +560,13 @@ begin
           SourceVolume := Self.List[ClassId].List[ImageId];
           LocalPicture.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
           LoadPictureIntoVolume(LocalPicture, SourceVolume);
-          if (SourceVolume.SizeX <> NewSizeX) or (SourceVolume.SizeY <> NewSizeY) then
+          if (NewSizeX > 0) and (NewSizeY > 0) then
           begin
-            AuxVolume.Copy(SourceVolume);
-            SourceVolume.CopyResizing(AuxVolume, NewSizeX, NewSizeY);
+            if (SourceVolume.SizeX <> NewSizeX) or (SourceVolume.SizeY <> NewSizeY) then
+            begin
+              AuxVolume.Copy(SourceVolume);
+              SourceVolume.CopyResizing(AuxVolume, NewSizeX, NewSizeY);
+            end;
           end;
           SourceVolume.Tag := ClassId;
           SourceVolume.RgbImgToNeuronalInput(color_encoding);
@@ -542,6 +599,31 @@ function TClassesAndElements.GetFileName(ClassId, ElementId: integer): string;
 begin
   Result := Self.List[ClassId].Strings[ElementId];
 end;
+
+procedure TClassesAndElements.AddVolumesTo(Volumes: TNNetVolumeList);
+var
+  SourceVolume: TNNetVolume;
+  ClassId, ImageId: integer;
+  MaxClass, MaxImage: integer;
+begin
+  if Self.Count > 0 then
+  begin
+    MaxClass := Self.Count - 1;
+    for ClassId := 0 to MaxClass do
+    begin
+      MaxImage := Self.List[ClassId].Count - 1;
+      if MaxImage >= 0 then
+      begin
+        for ImageId := 0 to MaxImage do
+        begin
+          SourceVolume := Self.List[ClassId].List[ImageId];
+          Volumes.AddCopy(SourceVolume);
+        end;
+      end;
+    end;
+  end;
+end;
+
 {$ENDIF}
 
 

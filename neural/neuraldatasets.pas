@@ -171,6 +171,7 @@ procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
   Verbose:boolean = true);
 
+// creates MNIST volumes required for training, testing and validation
 procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList;
   TrainFileName, TestFileName: string;
