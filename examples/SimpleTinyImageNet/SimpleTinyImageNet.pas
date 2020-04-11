@@ -66,7 +66,7 @@ type
 
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'SimpleTinyImageNet200';
-    NeuralFit.InitialLearningRate := 0.003;
+    NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
