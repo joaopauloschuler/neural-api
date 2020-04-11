@@ -24,7 +24,8 @@ unit neuralvolumev;
 interface
 
 uses
-  Classes, SysUtils, ExtCtrls, Graphics, neuralvolume, {$IFDEF FPC}LCLType {$ELSE}Winapi.Windows{$ENDIF} ;
+  Classes, SysUtils, ExtCtrls, Graphics, neuralvolume,
+  {$IFDEF FPC}LCLType, FPImage {$ELSE}Winapi.Windows{$ENDIF} ;
 
 /// saves a bitmap into a file from a handle HWND
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
@@ -123,7 +124,6 @@ var
   RawPos: integer;
 begin
   LocalCanvas := LocalBitmap.Canvas;
-
   MaxX := LocalBitmap.Width - 1;
   MaxY := LocalBitmap.Height - 1;
 
