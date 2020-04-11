@@ -1,3 +1,5 @@
+///This example trains a super resolution neural network with
+//the TinyImageNet 200 dataset: https://tiny-imagenet.herokuapp.com/ .
 program SuperResolutionTrain;
 (*
  Coded by Joao Paulo Schwarz Schuler.
@@ -28,25 +30,31 @@ type
   var
     NN: THistoricalNets;
     NeuralFit: TNeuralDataLoadingFit;
+    ProportionToLoad: Single;
   begin
-    if not CheckCIFARFile() then
-    begin
-      Terminate;
-      exit;
-    end;
     WriteLn('Creating Neural Network...');
     NN := THistoricalNets.Create();
-    if FileExists('super-resolution-cifar10.nn') then
+    if FileExists('super-resolution-tiny-image-net-200.nn') then
     begin
-      NN.LoadFromFile('super-resolution-cifar10.nn');
+      NN.LoadFromFile('super-resolution-tiny-image-net-200.nn');
     end
     else
     begin
-      NN.AddSuperResolution({pSizeX=}16, {pSizeY=}16, {pNeurons=}64, {pLayerCnt=}7);
+      NN.AddSuperResolution({pSizeX=}32, {pSizeY=}32, {pNeurons=}16, {pLayerCnt=}7);
     end;
     NN.DebugStructure();
 
-    CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
+    ProportionToLoad := 1;
+    WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Tiny ImageNet 200 dataset into memory.');
+    CreateVolumesFromImagesFromFolder
+    (
+      ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
+      {FolderName=}'tiny-imagenet-200/train', {pImageSubFolder=}'images',
+      {color_encoding=}0{RGB},
+      {TrainingProp=}0.9*ProportionToLoad,
+      {ValidationProp=}0.05*ProportionToLoad,
+      {TestProp=}0.05*ProportionToLoad
+    );
 
     ImgTrainingSmall := TNNetVolumeList.Create();
     ImgValidationSmall := TNNetVolumeList.Create();
@@ -56,12 +64,12 @@ type
     ImgValidationSmall.AddVolumes(ImgValidationVolumes);
     ImgTestSmall.AddVolumes(ImgTestVolumes);
 
-    ImgTrainingSmall.ResizeImage(16, 16);
-    ImgValidationSmall.ResizeImage(16, 16);
-    ImgTestSmall.ResizeImage(16, 16);
+    ImgTrainingSmall.ResizeImage(32, 32);
+    ImgValidationSmall.ResizeImage(32, 32);
+    ImgTestSmall.ResizeImage(32, 32);
 
     NeuralFit := TNeuralDataLoadingFit.Create;
-    NeuralFit.FileNameBase := 'super-resolution-cifar10';
+    NeuralFit.FileNameBase := 'super-resolution-tiny-image-net-200';
     NeuralFit.InitialLearningRate := 0.001/(32*32);
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
@@ -69,6 +77,7 @@ type
     NeuralFit.L2Decay := 0.00001;
     NeuralFit.Verbose := true;
     NeuralFit.EnableBipolar99HitComparison();
+    NeuralFit.AvgWeightEpochCount := 1;
     NeuralFit.FitLoading(NN,
       ImgTrainingVolumes.Count, ImgValidationVolumes.Count, ImgTestVolumes.Count,
       {batchsize=}64, {epochs=}50,
