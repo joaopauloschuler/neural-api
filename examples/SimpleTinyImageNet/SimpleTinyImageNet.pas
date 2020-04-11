@@ -36,8 +36,8 @@ type
       TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
       TNNetMaxPool.Create(2),
       TNNetConvolutionReLU.Create({Features=}128, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetConvolutionReLU.Create({Features=}256, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetConvolutionReLU.Create({Features=}512, {FeatureSize=}3, {Padding=}1, {Stride=}2),
+      TNNetConvolutionReLU.Create({Features=}128, {FeatureSize=}3, {Padding=}1, {Stride=}1),
+      TNNetConvolutionReLU.Create({Features=}256, {FeatureSize=}3, {Padding=}1, {Stride=}2),
       TNNetDropout.Create(0.5),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(200),
@@ -66,10 +66,11 @@ type
 
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'SimpleTinyImageNet200';
-    NeuralFit.InitialLearningRate := 0.001;
+    NeuralFit.InitialLearningRate := 0.003;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
+    //NeuralFit.MaxThreadNum := 8;
     NeuralFit.CyclicalLearningRateLen := 100;
     NeuralFit.L2Decay := 0.00001;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}200, {batchsize=}64, {epochs=}400);
