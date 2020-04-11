@@ -127,7 +127,7 @@ type
       procedure LoadClass_FilenameFromFolder(FolderName: string);
       function GetRandomClassId(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFileName(ClassId, ElementId: integer): string; {$IFDEF Release} inline; {$ENDIF}
-      procedure AddVolumesTo(Volumes: TNNetVolumeList);
+      procedure AddVolumesTo(Volumes: TNNetVolumeList; EmptySource:boolean = false);
 
       procedure LoadImages_NTL(index, threadnum: integer);
   end;
@@ -255,7 +255,7 @@ begin
   begin
     ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, TrainingProp, ValidationProp);
     ClassesAndElements.LoadImages(color_encoding, NewSizeX, NewSizeY);
-    ClassesAndElements.AddVolumesTo(ImgValidationVolumes);
+    ClassesAndElements.AddVolumesTo(ImgValidationVolumes, {EmptySource=}true);
     ClassesAndElements.Clear;
   end;
 
@@ -263,7 +263,7 @@ begin
   begin
     ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, TrainingProp + ValidationProp, TestProp);
     ClassesAndElements.LoadImages(color_encoding, NewSizeX, NewSizeY);
-    ClassesAndElements.AddVolumesTo(ImgTestVolumes);
+    ClassesAndElements.AddVolumesTo(ImgTestVolumes, {EmptySource=}true);
     ClassesAndElements.Clear;
   end;
 
@@ -271,7 +271,7 @@ begin
   begin
     ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, 0, TrainingProp);
     ClassesAndElements.LoadImages(color_encoding, NewSizeX, NewSizeY);
-    ClassesAndElements.AddVolumesTo(ImgTrainingVolumes);
+    ClassesAndElements.AddVolumesTo(ImgTrainingVolumes, {EmptySource=}true);
     ClassesAndElements.Clear;
   end;
 
@@ -425,7 +425,7 @@ begin
   Result := Self.List[ClassId].Strings[ElementId];
 end;
 
-procedure TClassesAndElements.AddVolumesTo(Volumes: TNNetVolumeList);
+procedure TClassesAndElements.AddVolumesTo(Volumes: TNNetVolumeList; EmptySource:boolean = false);
 var
   SourceVolume: TNNetVolume;
   ClassId, ImageId: integer;
@@ -443,6 +443,7 @@ begin
         begin
           SourceVolume := Self.List[ClassId].List[ImageId];
           Volumes.AddCopy(SourceVolume);
+          if EmptySource then SourceVolume.ReSize(1,1,1);
         end;
       end;
     end;
