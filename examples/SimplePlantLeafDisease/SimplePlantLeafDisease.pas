@@ -46,7 +46,7 @@ type
       TNNetSoftMax.Create()
     ]);
     NN.DebugStructure();
-    // change ProportionToLoad to a smaller number if you don't have available 20GB of RAM.
+    // change ProportionToLoad to a smaller number if you don't have available 32GB of RAM.
     ProportionToLoad := 1;
     WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease dataset into memory.');
     CreateVolumesFromImagesFromFolder
@@ -74,6 +74,7 @@ type
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
+    //NeuralFit.MaxThreadNum := 8;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}39, {batchsize=}64, {epochs=}50);
     NeuralFit.Free;
 
