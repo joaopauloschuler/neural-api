@@ -232,7 +232,7 @@ The example above shows how to load the dataset with 90% loaded into training an
 
 Source code examples: 
 * [Simple Plant Leaf Disease Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimplePlantLeafDisease)
-* [Tiny ImageNet 200](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleTinyImageNet/SimpleTinyImageNet.pas)
+* [Tiny ImageNet 200](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleTinyImageNet)
 
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
