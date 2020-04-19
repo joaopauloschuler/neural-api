@@ -35,4 +35,15 @@ Later on, this is how the training/fitting is called:
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}128, {epochs=}100);
 ```
 
-Looks pretty simple!
+There is a trick that you can do with this API or any other API when working with image classification: **you can increase the input image size**.
+
+As per the following example, by increasing CIFAR-10 input image sizes from 32x32 to 48x48, you can gain up to 2% in classification accuracy.
+
+You can change image sizes with:
+```
+ImgTrainingVolumes.ResizeImage(48, 48);
+ImgValidationVolumes.ResizeImage(48, 48);
+ImgTestVolumes.ResizeImage(48, 48);
+```
+
+You can find an implementation with this trick at the [SimpleImageClassifierResize48.lpr](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierResize48.lpr) file. There is also another implementation resizing to CIFAR-10 to 64x64 pixels but the gain won't be too big.
