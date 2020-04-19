@@ -31,12 +31,16 @@ type
     NN: THistoricalNets;
     NeuralFit: TNeuralDataLoadingFit;
     ProportionToLoad: Single;
+    BaseFileName: string;
+    FinalFileName: string;
   begin
     WriteLn('Creating Neural Network...');
+    BaseFileName := 'super-resolution-tiny-image-net-200';
+    FinalFileName := BaseFileName+'-final.nn';
     NN := THistoricalNets.Create();
-    if FileExists('super-resolution-tiny-image-net-200.nn') then
+    if FileExists(FinalFileName) then
     begin
-      NN.LoadFromFile('super-resolution-tiny-image-net-200.nn');
+      NN.LoadFromFile(FinalFileName);
     end
     else
     begin
@@ -69,7 +73,7 @@ type
     ImgTestSmall.ResizeImage(32, 32);
 
     NeuralFit := TNeuralDataLoadingFit.Create;
-    NeuralFit.FileNameBase := 'super-resolution-tiny-image-net-200';
+    NeuralFit.FileNameBase := BaseFileName;
     NeuralFit.InitialLearningRate := 0.001/(32*32);
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
@@ -78,13 +82,14 @@ type
     NeuralFit.Verbose := true;
     NeuralFit.EnableBipolar99HitComparison();
     NeuralFit.AvgWeightEpochCount := 1;
+    //NeuralFit.MaxThreadNum := 8;
     NeuralFit.FitLoading(NN,
       ImgTrainingVolumes.Count, ImgValidationVolumes.Count, ImgTestVolumes.Count,
-      {batchsize=}64, {epochs=}50,
+      {batchsize=}64, {epochs=}10,
       @GetTrainingPair, @GetValidationPair, @GetTestPair);
-
     NeuralFit.Free;
 
+    NN.SaveToFile(FinalFileName);
     NN.Free;
     ImgTestVolumes.Free;
     ImgValidationVolumes.Free;
