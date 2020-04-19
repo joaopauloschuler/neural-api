@@ -28,7 +28,7 @@ type
     ProportionToLoad: Single;
   begin
     WriteLn('Creating Neural Network...');
-    NN := THistoricalNets.Create();
+    NN := TNNet.Create();
     NN.AddLayer([
       TNNetInput.Create(128, 128, 3),
       TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}2),
