@@ -211,6 +211,29 @@ Source code examples:
 * [Simple MNIST Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleMNist)
 * [Simple Fashion MNIST Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleFashionMNIST)
 
+#### One Class per Folder with Image Classification
+In the case that your dataset has one class per folder, you can call **CreateVolumesFromImagesFromFolder** for loading your data into RAM:
+```
+// change ProportionToLoad to a smaller number if you don't have enough RAM.
+ProportionToLoad := 1;
+WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease dataset into memory.');
+CreateVolumesFromImagesFromFolder
+(
+  ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
+  {FolderName=}'plant', {pImageSubFolder=}'',
+  {color_encoding=}csRGB{RGB},
+  {TrainingProp=}0.9*ProportionToLoad,
+  {ValidationProp=}0.05*ProportionToLoad,
+  {TestProp=}0.05*ProportionToLoad,
+  {NewSizeX=}128, {NewSizeY=}128
+);
+```
+The example above shows how to load the dataset with 90% loaded into training and 5% loaded for each validation and testing. Images are being resized to 128x128.
+
+Source code examples: 
+* [Simple Plant Leaf Disease Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimplePlantLeafDisease)
+* [Tiny ImageNet 200](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleTinyImageNet)
+
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
