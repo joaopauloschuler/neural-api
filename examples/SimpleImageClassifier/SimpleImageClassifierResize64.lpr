@@ -27,7 +27,7 @@ type
       exit;
     end;
     WriteLn('Creating Neural Network...');
-    NN := THistoricalNets.Create();
+    NN := TNNet.Create();
     NN.AddLayer([
       TNNetInput.Create(64, 64, 3),
       TNNetConvolutionLinear.Create(64, 5, 2, 1, 1),
