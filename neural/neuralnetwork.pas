@@ -1110,6 +1110,7 @@ type
       function GetFirstNeuronalLayerIdxWithChannels(FromLayerIdx, Channels:integer): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayer(): TNNetLayer; {$IFDEF Release} inline; {$ENDIF}
+      procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
       procedure Backpropagate(pOutput: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -1164,19 +1165,29 @@ type
       function GetWeightSum(): TNeuralFloat;
 
       // load and save functions
+      // Save weights to string
       function SaveDataToString(): string;
+      // Load weights from string
       procedure LoadDataFromString(strData: string);
+      // Load weights from file
       procedure LoadDataFromFile(filename: string);
 
+      // Save architecture to string
       function SaveStructureToString(): string;
+      // Load architecture from string
       procedure LoadStructureFromString(strData: string);
 
+      // Save both architecture and weights to string (complete saving).
       function SaveToString(): string;
+      // Save both architecture and weights to file (complete saving).
       procedure SaveToFile(filename: string);
 
+      // Save both architecture and weights from string (complete saving).
       procedure LoadFromString(strData: string);
+      // Load both architecture and weights from file (complete saving).
       procedure LoadFromFile(filename: string);
 
+      // Returns a cloned neural network
       function Clone(): TNNet;
 
       // deprecated
@@ -7624,6 +7635,39 @@ begin
   V := TNNetVolume.Create(pInput);
   Compute(V, FromLayerIdx);
   V.Free;
+end;
+
+procedure TNNet.Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx: integer
+  );
+var
+  AuxOutput: TNNetVolume;
+  MaxIdxInput, IdxInput: integer;
+begin
+  MaxIdxInput := pInput.Count - 1;
+  if MaxIdxInput >=0 then
+  begin
+    AuxOutput := TNNetVolume.Create();
+    for IdxInput := 0 to MaxIdxInput do
+    begin
+      Self.Compute(pInput[IdxInput], FromLayerIdx);
+      Self.GetOutput(AuxOutput);
+      if (pOutput.Count > IdxInput) then
+      begin
+        pOutput[IdxInput].Copy(AuxOutput);
+      end
+      else
+      begin
+        pOutput.AddCopy(AuxOutput);
+      end;
+      pOutput[IdxInput].Tags[0] := pInput[IdxInput].Tags[0];
+      pOutput[IdxInput].Tags[1] := pInput[IdxInput].Tags[1];
+      if (IdxInput mod 1000 = 0) and (IdxInput > 0) then
+      begin
+        MessageProc(IntToStr(IdxInput)+' processed.');
+      end;
+    end;
+    AuxOutput.Free;
+  end;
 end;
 
 procedure TNNet.Backpropagate(pOutput: TNNetVolume);
