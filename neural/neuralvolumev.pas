@@ -42,6 +42,10 @@ procedure LoadPictureIntoVolume(LocalPicture: TPicture; Vol:TNNetVolume); {$IFDE
 /// Loads a Bitmat into a Volume
 procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol:TNNetVolume);
 
+{$IFNDEF FPC}
+procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
+{$ENDIF
+
 implementation
 {$IFDEF FPC}uses LCLIntf;{$ENDIF}
 
@@ -115,6 +119,18 @@ procedure LoadPictureIntoVolume(LocalPicture: TPicture; Vol: TNNetVolume);
 begin
   LoadBitmapIntoVolume(LocalPicture.Bitmap, Vol);
 end;
+
+{$IFNDEF FPC}
+procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
+var
+  LocalPicture: TPicture;
+begin
+  LocalPicture := TPicture.Create;
+  LocalPicture.LoadFromFile( ImageFileName );
+  LoadPictureIntoVolume(LocalPicture, V);
+  LocalPicture.Free;
+end;
+{$ENDIF}
 
 procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol: TNNetVolume);
 var

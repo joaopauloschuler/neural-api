@@ -143,6 +143,9 @@ type
     NewSizeX: integer = 0; NewSizeY: integer = 0);
 
   procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume);
+
+  // Loads an image from a file and stores it into a Volume.
+  procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
 {$ENDIF}
 
 // Writes the header of a confusion matrix into a CSV file
@@ -448,6 +451,16 @@ begin
       end;
     end;
   end;
+end;
+
+procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
+var
+  M: TFPMemoryImage;
+begin
+  M := TFPMemoryImage.Create(1, 1);
+  M.LoadFromFile( ImageFileName );
+  LoadImageIntoVolume(M, V);
+  M.Free;
 end;
 
 procedure TClassesAndElements.LoadImages_NTL(index, threadnum: integer);
