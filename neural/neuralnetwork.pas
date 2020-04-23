@@ -3506,14 +3506,42 @@ end;
 function THistoricalNets.AddSuperResolution(pSizeX, pSizeY, pNeurons,
   pLayerCnt: integer): TNNetLayer;
 var
-  LayerCnt: integer;
+  BeforeDeAvgLayerCnt, AfterDeAvgLayerCnt: integer;
 begin
   AddLayer( TNNetInput.Create(pSizeX, pSizeY,3) );
+  BeforeDeAvgLayerCnt := (pLayerCnt div 2);
+  AfterDeAvgLayerCnt := pLayerCnt - BeforeDeAvgLayerCnt - 1;
+  //AddLayer( TNNetConvolutionReLU.Create(pNeurons,5,2,0) );
+
+  AddDenseNetBlockCAI
+  (
+    BeforeDeAvgLayerCnt, pNeurons, {supressBias=}0,
+    {PointWiseConv=}TNNetConvolutionLinear,
+    {IsSeparable=}false,
+    {HasNorm=}false,
+    {pBefore=}nil,
+    {pAfter=}nil,
+    {BottleNeck=}16,
+    {Compression=}1, // Compression factor. 2 means taking half of channels.
+    {DropoutRate=}0,
+    {RandomBias=}0,
+    {RandomAmplifier=}0
+  );
   AddLayer( TNNetDeAvgPool.Create(2) );
-  for LayerCnt := 1 to pLayerCnt do
-  begin
-    AddLayer( TNNetConvolutionReLU.Create(pNeurons,3,1,0) );
-  end;
+  AddDenseNetBlockCAI
+  (
+    AfterDeAvgLayerCnt, pNeurons, {supressBias=}0,
+    {PointWiseConv=}TNNetConvolutionLinear,
+    {IsSeparable=}false,
+    {HasNorm=}false,
+    {pBefore=}nil,
+    {pAfter=}nil,
+    {BottleNeck=}16,
+    {Compression=}1, // Compression factor. 2 means taking half of channels.
+    {DropoutRate=}0,
+    {RandomBias=}0,
+    {RandomAmplifier=}0
+  );
   Result := AddLayer( TNNetConvolutionLinear.Create(3,1,0,0) );
 end;
 
@@ -3847,6 +3875,10 @@ begin
   else
   for LayerCnt := Low(aL) to High(aL) do
   begin
+    if aL[LayerCnt] is TNNetInput then
+    begin
+      TNNetInput(aL[LayerCnt]).EnableErrorCollection;
+    end;
     if
     (
       (aL[LayerCnt].FOutput.SizeX <> SizeX) or
@@ -4989,6 +5021,10 @@ begin
 
   for LayerCnt := Low(aL) to High(aL) do
   begin
+    if aL[LayerCnt] is TNNetInput then
+    begin
+      TNNetInput(aL[LayerCnt]).EnableErrorCollection;
+    end;
     FPrevOutput.Add(aL[LayerCnt].FOutput);
     FPrevOutputError.Add(aL[LayerCnt].FOutputError);
     FPrevOutputErrorDeriv.Add(aL[LayerCnt].FOutputErrorDeriv);
@@ -6975,7 +7011,6 @@ constructor TNNetInput.Create(pSizeX, pSizeY, pDepth, pError: integer);
 begin
   Create(pSizeX, pSizeY, pDepth);
 
-  FStruct[3] := pError;
   if pError = 1 then
   begin
     EnableErrorCollection();
@@ -6984,9 +7019,12 @@ end;
 
 function TNNetInput.EnableErrorCollection: TNNetInput;
 begin
-  FStruct[3] := 1;
-  FOutputError.ReSize(FOutPut);
-  FOutputErrorDeriv.ReSize(FOutPut);
+  if FStruct[3] <> 1 then
+  begin
+    FStruct[3] := 1;
+    FOutputError.ReSize(FOutPut);
+    FOutputErrorDeriv.ReSize(FOutPut);
+  end;
   Result := Self;
 end;
 
