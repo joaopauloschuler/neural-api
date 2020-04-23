@@ -29,6 +29,7 @@ type
   procedure TTestCNNAlgo.DoRun;
   var
     NN: THistoricalNets;
+    NNMaxPool: TNNet;
     NeuralFit: TNeuralDataLoadingFit;
     BaseFileName: string;
     FinalFileName: string;
@@ -47,19 +48,20 @@ type
     end;
     NN.DebugStructure();
 
+    // Small Neural Network to resize 32x32 images into 16x16 images.
+    NNMaxPool := TNNet.Create();
+    NNMaxPool.AddLayer( TNNetInput.Create(32,32,3) );
+    NNMaxPool.AddLayer( TNNetMaxPool.Create(2) );
+
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     ImgTrainingSmall := TNNetVolumeList.Create();
     ImgValidationSmall := TNNetVolumeList.Create();
     ImgTestSmall := TNNetVolumeList.Create();
 
-    ImgTrainingSmall.AddVolumes(ImgTrainingVolumes);
-    ImgValidationSmall.AddVolumes(ImgValidationVolumes);
-    ImgTestSmall.AddVolumes(ImgTestVolumes);
-
-    ImgTrainingSmall.ResizeImage(16, 16);
-    ImgValidationSmall.ResizeImage(16, 16);
-    ImgTestSmall.ResizeImage(16, 16);
+    NNMaxPool.Compute(ImgTrainingVolumes, ImgTrainingSmall);
+    NNMaxPool.Compute(ImgValidationVolumes, ImgValidationVolumes);
+    NNMaxPool.Compute(ImgTestVolumes, ImgTestVolumes);
 
     NeuralFit := TNeuralDataLoadingFit.Create;
     NeuralFit.FileNameBase := BaseFileName;
@@ -80,6 +82,7 @@ type
 
     NN.SaveToFile(FinalFileName);
     NN.Free;
+    NNMaxPool.Free;
     ImgTestVolumes.Free;
     ImgValidationVolumes.Free;
     ImgTrainingVolumes.Free;
@@ -97,6 +100,17 @@ type
     LocalIdx := Random(ImgTrainingSmall.Count);
     pInput.Copy(ImgTrainingSmall[LocalIdx]);
     pOutput.Copy(ImgTrainingVolumes[LocalIdx]);
+    // insert data augmentation
+    if Random(1000)>500 then
+    begin
+      pInput.FlipX();
+      pOutput.FlipX();
+    end;
+    if Random(1000)>500 then
+    begin
+      pInput.FlipY();
+      pOutput.FlipY();
+    end;
   end;
 
   procedure TTestCNNAlgo.GetValidationPair(Idx: integer; ThreadId: integer;
