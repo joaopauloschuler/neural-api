@@ -60,8 +60,8 @@ type
     ImgTestSmall := TNNetVolumeList.Create();
 
     NNMaxPool.Compute(ImgTrainingVolumes, ImgTrainingSmall);
-    NNMaxPool.Compute(ImgValidationVolumes, ImgValidationVolumes);
-    NNMaxPool.Compute(ImgTestVolumes, ImgTestVolumes);
+    NNMaxPool.Compute(ImgValidationVolumes, ImgValidationSmall);
+    NNMaxPool.Compute(ImgTestVolumes, ImgTestSmall);
 
     NeuralFit := TNeuralDataLoadingFit.Create;
     NeuralFit.FileNameBase := BaseFileName;
