@@ -30,12 +30,11 @@ type
   var
     NN: THistoricalNets;
     NeuralFit: TNeuralDataLoadingFit;
-    ProportionToLoad: Single;
     BaseFileName: string;
     FinalFileName: string;
   begin
     WriteLn('Creating Neural Network...');
-    BaseFileName := 'super-resolution-tiny-image-net-200';
+    BaseFileName := 'super-resolution-cifar-10';
     FinalFileName := BaseFileName+'-final.nn';
     NN := THistoricalNets.Create();
     if FileExists(FinalFileName) then
@@ -44,21 +43,11 @@ type
     end
     else
     begin
-      NN.AddSuperResolution({pSizeX=}32, {pSizeY=}32, {pNeurons=}16, {pLayerCnt=}7);
+      NN.AddSuperResolution({pSizeX=}16, {pSizeY=}16, {pNeurons=}64, {pLayerCnt=}7);
     end;
     NN.DebugStructure();
 
-    ProportionToLoad := 1;
-    WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Tiny ImageNet 200 dataset into memory.');
-    CreateVolumesFromImagesFromFolder
-    (
-      ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
-      {FolderName=}'tiny-imagenet-200/train', {pImageSubFolder=}'images',
-      {color_encoding=}0{RGB},
-      {TrainingProp=}0.9*ProportionToLoad,
-      {ValidationProp=}0.05*ProportionToLoad,
-      {TestProp=}0.05*ProportionToLoad
-    );
+    CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     ImgTrainingSmall := TNNetVolumeList.Create();
     ImgValidationSmall := TNNetVolumeList.Create();
@@ -68,9 +57,9 @@ type
     ImgValidationSmall.AddVolumes(ImgValidationVolumes);
     ImgTestSmall.AddVolumes(ImgTestVolumes);
 
-    ImgTrainingSmall.ResizeImage(32, 32);
-    ImgValidationSmall.ResizeImage(32, 32);
-    ImgTestSmall.ResizeImage(32, 32);
+    ImgTrainingSmall.ResizeImage(16, 16);
+    ImgValidationSmall.ResizeImage(16, 16);
+    ImgTestSmall.ResizeImage(16, 16);
 
     NeuralFit := TNeuralDataLoadingFit.Create;
     NeuralFit.FileNameBase := BaseFileName;
@@ -78,14 +67,14 @@ type
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
-    NeuralFit.L2Decay := 0.00001;
+    NeuralFit.L2Decay := 0;
     NeuralFit.Verbose := true;
     NeuralFit.EnableBipolar99HitComparison();
     NeuralFit.AvgWeightEpochCount := 1;
-    //NeuralFit.MaxThreadNum := 8;
+    //NeuralFit.MaxThreadNum := 16;
     NeuralFit.FitLoading(NN,
       ImgTrainingVolumes.Count, ImgValidationVolumes.Count, ImgTestVolumes.Count,
-      {batchsize=}64, {epochs=}10,
+      {batchsize=}64, {epochs=}50,
       @GetTrainingPair, @GetValidationPair, @GetTestPair);
     NeuralFit.Free;
 
@@ -102,9 +91,12 @@ type
 
   procedure TTestCNNAlgo.GetTrainingPair(Idx: integer; ThreadId: integer;
     pInput, pOutput: TNNetVolume);
+  var
+    LocalIdx: integer;
   begin
-    pInput.Copy(ImgTrainingSmall[Idx]);
-    pOutput.Copy(ImgTrainingVolumes[Idx]);
+    LocalIdx := Random(ImgTrainingSmall.Count);
+    pInput.Copy(ImgTrainingSmall[LocalIdx]);
+    pOutput.Copy(ImgTrainingVolumes[LocalIdx]);
   end;
 
   procedure TTestCNNAlgo.GetValidationPair(Idx: integer; ThreadId: integer;
@@ -125,7 +117,7 @@ var
   Application: TTestCNNAlgo;
 begin
   Application := TTestCNNAlgo.Create(nil);
-  Application.Title:='CIFAR-10 Classification Example';
+  Application.Title:='CIFAR-10 Super Resolution Train';
   Application.Run;
   Application.Free;
 end.

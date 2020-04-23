@@ -32,19 +32,19 @@ type
     end;
     WriteLn('Creating neural network for upscaling the dataset.');
     NN := THistoricalNets.Create();
-    NN.AddSuperResolution({pSizeX=}32, {pSizeY=}32, {pNeurons=}16, {pLayerCnt=}7);
-    if FileExists('super-resolution-tiny-image-net-200-final.nn') then
+    NN.AddSuperResolution({pSizeX=}32, {pSizeY=}32, {pNeurons=}64, {pLayerCnt=}7);
+    if FileExists('super-resolution-cifar-10-final.nn') then
     begin
-      NN.LoadDataFromFile('super-resolution-tiny-image-net-200-final.nn');
+      NN.LoadDataFromFile('super-resolution-cifar-10.nn');
     end
     else
-    if FileExists('../../../examples/SuperResolution/super-resolution-tiny-image-net-200-final.nn') then
+    if FileExists('../../../examples/SuperResolution/super-resolution-cifar-10.nn') then
     begin
-      NN.LoadDataFromFile('../../../examples/SuperResolution/super-resolution-tiny-image-net-200-final.nn');
+      NN.LoadDataFromFile('../../../examples/SuperResolution/super-resolution-cifar-10.nn');
     end
     else
     begin
-      WriteLn('super-resolution-tiny-image-net-200-final.nn can''t be found. Please run SuperResolutionTrain.');
+      WriteLn('super-resolution-cifar-10.nn can''t be found. Please run SuperResolutionTrain.');
       Terminate;
       exit;
     end;

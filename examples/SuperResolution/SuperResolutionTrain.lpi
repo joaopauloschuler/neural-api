@@ -9,7 +9,7 @@
       </Flags>
       <SessionStorage Value="InProjectDir"/>
       <MainUnit Value="0"/>
-      <Title Value="CIFAR-10 Classification Example"/>
+      <Title Value="CIFAR-10 Super Resolution Train"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
     </General>
