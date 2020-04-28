@@ -1236,7 +1236,8 @@ type
         BottleNeck: integer = 0;
         Compression: TNeuralFloat = 1
         ): TNNetLayer;
-      function AddSuperResolution(pSizeX, pSizeY, pNeurons, pLayerCnt: integer): TNNetLayer;
+      function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
+        pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -3503,25 +3504,24 @@ begin
   Result := GetLastLayer();
 end;
 
-function THistoricalNets.AddSuperResolution(pSizeX, pSizeY, pNeurons,
-  pLayerCnt: integer): TNNetLayer;
+function THistoricalNets.AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
+  pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
 var
   BeforeDeAvgLayerCnt, AfterDeAvgLayerCnt: integer;
 begin
   AddLayer( TNNetInput.Create(pSizeX, pSizeY,3) );
   BeforeDeAvgLayerCnt := (pLayerCnt div 2);
   AfterDeAvgLayerCnt := pLayerCnt - BeforeDeAvgLayerCnt - 1;
-  //AddLayer( TNNetConvolutionReLU.Create(pNeurons,5,2,0) );
 
   AddDenseNetBlockCAI
   (
     BeforeDeAvgLayerCnt, pNeurons, {supressBias=}0,
     {PointWiseConv=}TNNetConvolutionLinear,
-    {IsSeparable=}false,
+    {IsSeparable=}IsSeparable,
     {HasNorm=}false,
     {pBefore=}nil,
     {pAfter=}nil,
-    {BottleNeck=}16,
+    {BottleNeck=}BottleNeck,
     {Compression=}1, // Compression factor. 2 means taking half of channels.
     {DropoutRate=}0,
     {RandomBias=}0,
@@ -3532,11 +3532,11 @@ begin
   (
     AfterDeAvgLayerCnt, pNeurons, {supressBias=}0,
     {PointWiseConv=}TNNetConvolutionLinear,
-    {IsSeparable=}false,
+    {IsSeparable=}IsSeparable,
     {HasNorm=}false,
     {pBefore=}nil,
     {pAfter=}nil,
-    {BottleNeck=}16,
+    {BottleNeck=}BottleNeck,
     {Compression=}1, // Compression factor. 2 means taking half of channels.
     {DropoutRate=}0,
     {RandomBias=}0,
