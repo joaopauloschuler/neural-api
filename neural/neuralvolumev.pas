@@ -44,7 +44,7 @@ procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol:TNNetVolume);
 
 {$IFNDEF FPC}
 procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
-{$ENDIF
+{$ENDIF}
 
 implementation
 {$IFDEF FPC}uses LCLIntf;{$ENDIF}
