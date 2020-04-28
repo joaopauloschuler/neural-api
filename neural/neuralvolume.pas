@@ -301,6 +301,7 @@ type
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
+      procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX512: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -4889,6 +4890,25 @@ begin
     end;
   end;
 
+end;
+
+procedure TNNetVolume.AddArea(DestX, DestY, OriginX, OriginY, LenX,
+  LenY: integer; Original: TNNetVolume);
+var
+  CntY: integer;
+  SizeXDepth: integer;
+  PtrA, PtrB: Pointer;
+begin
+  if Self.Depth = Original.Depth then
+  begin
+    SizeXDepth := LenX * Self.Depth;
+    for CntY := 0 to LenY - 1 do
+    begin
+      PtrA := Self.GetRawPtr(DestX, DestY+CntY);
+      PtrB := Original.GetRawPtr(OriginX, OriginY+CntY);
+      Add(PtrA, PtrB, SizeXDepth);
+    end;
+  end;
 end;
 
 function TNNetVolume.HasAVX: boolean;
