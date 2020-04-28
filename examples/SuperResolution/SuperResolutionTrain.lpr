@@ -9,7 +9,8 @@ program SuperResolutionTrain;
 
 uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
-  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets, neuralfit;
+  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets,
+  neuralfit, usuperresolutionexample;
 
 type
 
@@ -31,26 +32,18 @@ type
     NN: THistoricalNets;
     NNMaxPool: TNNet;
     NeuralFit: TNeuralDataLoadingFit;
-    BaseFileName: string;
-    FinalFileName: string;
   begin
     WriteLn('Creating Neural Network...');
-    BaseFileName := 'super-resolution-cifar-10';
-    FinalFileName := BaseFileName+'-final.nn';
     NN := THistoricalNets.Create();
-    if FileExists(FinalFileName) then
-    begin
-      NN.LoadFromFile(FinalFileName);
-    end
-    else
-    begin
-      NN.AddSuperResolution({pSizeX=}16, {pSizeY=}16, {pNeurons=}64, {pLayerCnt=}7);
-    end;
+    NN.AddSuperResolution({pSizeX=}16, {pSizeY=}16,
+      {BottleNeck=}csExampleBottleNeck, {pNeurons=}csExampleNeuronCount,
+      {pLayerCnt=}csExampleLayerCount, {IsSeparable=}csExampleIsSeparable);
+    LoadResizingWeights(NN, csExampleFileName);
     NN.DebugStructure();
 
     // Small Neural Network to resize 32x32 images into 16x16 images.
     NNMaxPool := TNNet.Create();
-    NNMaxPool.AddLayer( TNNetInput.Create(32,32,3) );
+    NNMaxPool.AddLayer( TNNetInput.Create(32, 32, 3) );
     NNMaxPool.AddLayer( TNNetMaxPool.Create(2) );
 
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
@@ -64,7 +57,7 @@ type
     NNMaxPool.Compute(ImgTestVolumes, ImgTestSmall);
 
     NeuralFit := TNeuralDataLoadingFit.Create;
-    NeuralFit.FileNameBase := BaseFileName;
+    NeuralFit.FileNameBase := csExampleBaseFileName;
     NeuralFit.InitialLearningRate := 0.001/(32*32);
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
@@ -80,7 +73,6 @@ type
       @GetTrainingPair, @GetValidationPair, @GetTestPair);
     NeuralFit.Free;
 
-    NN.SaveToFile(FinalFileName);
     NN.Free;
     NNMaxPool.Free;
     ImgTestVolumes.Free;

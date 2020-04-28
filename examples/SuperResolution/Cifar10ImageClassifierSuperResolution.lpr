@@ -7,7 +7,8 @@ program Cifar10ImageClassifierSuperResolution;
 
 uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
-  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets, neuralfit;
+  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets,
+  neuralfit, usuperresolutionexample;
 
 type
   TTestCNNAlgo = class(TCustomApplication)
@@ -31,23 +32,7 @@ type
       exit;
     end;
     WriteLn('Creating neural network for upscaling the dataset.');
-    NN := THistoricalNets.Create();
-    NN.AddSuperResolution({pSizeX=}32, {pSizeY=}32, {pNeurons=}64, {pLayerCnt=}7);
-    if FileExists('super-resolution-cifar-10-final.nn') then
-    begin
-      NN.LoadDataFromFile('super-resolution-cifar-10.nn');
-    end
-    else
-    if FileExists('../../../examples/SuperResolution/super-resolution-cifar-10.nn') then
-    begin
-      NN.LoadDataFromFile('../../../examples/SuperResolution/super-resolution-cifar-10.nn');
-    end
-    else
-    begin
-      WriteLn('super-resolution-cifar-10.nn can''t be found. Please run SuperResolutionTrain.');
-      Terminate;
-      exit;
-    end;
+    NN := CreateResizingNN(32, 32, csExampleFileName);
     NN.DebugStructure();
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
