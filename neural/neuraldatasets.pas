@@ -143,6 +143,7 @@ type
     NewSizeX: integer = 0; NewSizeY: integer = 0);
 
   procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume);
+  procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
 
   // Loads an image from a file and stores it into a Volume.
   procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
@@ -535,7 +536,7 @@ begin
   MaxY := M.Height - 1;
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
-  for CountX := 0 to MaxY do
+  for CountX := 0 to MaxX do
   begin
     for CountY := 0 to MaxY do
     begin
@@ -548,6 +549,29 @@ begin
     end;
   end;
 end;
+
+procedure LoadVolumeIntoImage(Vol: TNNetVolume; M: TFPMemoryImage);
+var
+  CountX, CountY, MaxX, MaxY: integer;
+  LocalColor: TFPColor;
+  RawPos: integer;
+begin
+  MaxX := Vol.SizeX - 1;
+  MaxY := Vol.SizeY - 1;
+  M.SetSize(Vol.SizeX, Vol.SizeY);
+  for CountX := 0 to MaxX do
+  begin
+    for CountY := 0 to MaxY do
+    begin
+      RawPos := Vol.GetRawPos(CountX, CountY, 0);
+      LocalColor.red := Min(Round(Vol.FData[RawPos]),255) shl 8;
+      LocalColor.green := Min(Round(Vol.FData[RawPos + 1]),255) shl 8;
+      LocalColor.blue := Min(Round(Vol.FData[RawPos + 2]),255) shl 8;
+      M.Colors[CountX, CountY] := LocalColor;
+    end;
+  end;
+end;
+
 {$ENDIF}
 
 {$IFNDEF FPC}
