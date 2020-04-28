@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectOptions>
+    <Version Value="11"/>
+    <PathDelim Value="\"/>
+    <General>
+      <SessionStorage Value="InProjectDir"/>
+      <MainUnit Value="0"/>
+      <Title Value="SuperResolutionApp"/>
+      <ResourceType Value="res"/>
+      <UseXPManifest Value="True"/>
+      <Icon Value="0"/>
+    </General>
+    <BuildModes Count="3">
+      <Item1 Name="Default" Default="True"/>
+      <Item2 Name="Debug">
+        <CompilerOptions>
+          <Version Value="11"/>
+          <PathDelim Value="\"/>
+          <Target>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\SuperResolutionApp"/>
+          </Target>
+          <SearchPaths>
+            <IncludeFiles Value="..\..\neural;$(ProjOutDir)"/>
+            <OtherUnitFiles Value="..\..\neural"/>
+            <UnitOutputDirectory Value="..\..\bin\$(TargetCPU)-$(TargetOS)\units"/>
+          </SearchPaths>
+          <Parsing>
+            <SyntaxOptions>
+              <IncludeAssertionCode Value="True"/>
+            </SyntaxOptions>
+          </Parsing>
+          <CodeGeneration>
+            <Checks>
+              <IOChecks Value="True"/>
+              <RangeChecks Value="True"/>
+              <OverflowChecks Value="True"/>
+              <StackChecks Value="True"/>
+            </Checks>
+            <VerifyObjMethodCallValidity Value="True"/>
+            <TargetProcessor Value="pentium4"/>
+          </CodeGeneration>
+          <Linking>
+            <Debugging>
+              <DebugInfoType Value="dsDwarf2Set"/>
+              <UseExternalDbgSyms Value="True"/>
+            </Debugging>
+          </Linking>
+          <Other>
+            <CustomOptions Value="-Sv
+-CpATHLON64
+-OpCOREAVX2
+-dDebug"/>
+            <OtherDefines Count="1">
+              <Define0 Value="Debug"/>
+            </OtherDefines>
+          </Other>
+        </CompilerOptions>
+      </Item2>
+      <Item3 Name="Release">
+        <CompilerOptions>
+          <Version Value="11"/>
+          <PathDelim Value="\"/>
+          <Target>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\SuperResolutionApp"/>
+          </Target>
+          <SearchPaths>
+            <IncludeFiles Value="..\..\neural;$(ProjOutDir)"/>
+            <OtherUnitFiles Value="..\..\neural"/>
+            <UnitOutputDirectory Value="..\..\bin\$(TargetCPU)-$(TargetOS)\units"/>
+          </SearchPaths>
+          <CodeGeneration>
+            <SmartLinkUnit Value="True"/>
+            <Optimizations>
+              <OptimizationLevel Value="3"/>
+            </Optimizations>
+          </CodeGeneration>
+          <Linking>
+            <Debugging>
+              <GenerateDebugInfo Value="False"/>
+            </Debugging>
+            <LinkSmart Value="True"/>
+          </Linking>
+          <Other>
+            <CustomOptions Value="-dRelease
+-dAVX64"/>
+            <OtherDefines Count="6">
+              <Define0 Value="Release"/>
+              <Define1 Value="AVX32"/>
+              <Define2 Value="AVX64"/>
+              <Define3 Value="AVX2"/>
+              <Define4 Value="CheckRange"/>
+              <Define5 Value="Debug"/>
+            </OtherDefines>
+          </Other>
+        </CompilerOptions>
+      </Item3>
+    </BuildModes>
+    <PublishOptions>
+      <Version Value="2"/>
+    </PublishOptions>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes Count="1">
+        <Mode0 Name="default"/>
+      </Modes>
+    </RunParams>
+    <RequiredPackages Count="2">
+      <Item1>
+        <PackageName Value="multithreadprocslaz"/>
+      </Item1>
+      <Item2>
+        <PackageName Value="LCL"/>
+      </Item2>
+    </RequiredPackages>
+    <Units Count="3">
+      <Unit0>
+        <Filename Value="SuperResolutionApp.lpr"/>
+        <IsPartOfProject Value="True"/>
+      </Unit0>
+      <Unit1>
+        <Filename Value="usuperesolutionapp.pas"/>
+        <IsPartOfProject Value="True"/>
+        <ComponentName Value="Form1"/>
+        <HasResources Value="True"/>
+        <ResourceBaseClass Value="Form"/>
+      </Unit1>
+      <Unit2>
+        <Filename Value="usuperresolutionexample.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit2>
+    </Units>
+  </ProjectOptions>
+  <CompilerOptions>
+    <Version Value="11"/>
+    <PathDelim Value="\"/>
+    <Target>
+      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\SuperResolutionApp"/>
+    </Target>
+    <SearchPaths>
+      <IncludeFiles Value="..\..\neural;$(ProjOutDir)"/>
+      <OtherUnitFiles Value="..\..\neural"/>
+      <UnitOutputDirectory Value="..\..\bin\$(TargetCPU)-$(TargetOS)\units"/>
+    </SearchPaths>
+    <Parsing>
+      <SyntaxOptions>
+        <IncludeAssertionCode Value="True"/>
+      </SyntaxOptions>
+    </Parsing>
+    <CodeGeneration>
+      <Checks>
+        <IOChecks Value="True"/>
+        <RangeChecks Value="True"/>
+        <OverflowChecks Value="True"/>
+        <StackChecks Value="True"/>
+      </Checks>
+      <VerifyObjMethodCallValidity Value="True"/>
+    </CodeGeneration>
+    <Other>
+      <CustomOptions Value="-dRelease
+-dAVX"/>
+      <OtherDefines Count="4">
+        <Define0 Value="AVX2"/>
+        <Define1 Value="Release"/>
+        <Define2 Value="CheckRange"/>
+        <Define3 Value="AVX"/>
+      </OtherDefines>
+    </Other>
+  </CompilerOptions>
+  <Debugging>
+    <Exceptions Count="3">
+      <Item1>
+        <Name Value="EAbort"/>
+      </Item1>
+      <Item2>
+        <Name Value="ECodetoolError"/>
+      </Item2>
+      <Item3>
+        <Name Value="EFOpenError"/>
+      </Item3>
+    </Exceptions>
+  </Debugging>
+</CONFIG>
