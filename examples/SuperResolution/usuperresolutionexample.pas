@@ -7,12 +7,12 @@ uses
   neuralnetwork, Classes, SysUtils;
 
 const
-  csExampleBaseFileName: string = 'super-resolution-7-64';
-  csExampleFileName:string = 'super-resolution-7-64.nn';
+  csExampleBaseFileName: string = 'super-resolution-7-64-sep';
+  csExampleFileName:string = 'super-resolution-7-64-sep.nn';
   csExampleBottleNeck:integer = 16;
   csExampleNeuronCount:integer = 64;
   csExampleLayerCount:integer = 7;
-  csExampleIsSeparable:boolean =  false;
+  csExampleIsSeparable:boolean =  true;
 
 function CreateResizingNN(SizeX, SizeY: integer; FileName: string): THistoricalNets;
 procedure LoadResizingWeights(NN: TNNet; FileName: string; FailIfNotFound: boolean = false);

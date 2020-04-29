@@ -101,7 +101,7 @@ type
     WriteLn('Loading input file: ', inputFile);
     Image.LoadFromFile(inputFile);
     LoadImageIntoVolume(Image, InputImgVol);
-    WriteLn('Input image size: ', InputImgVol.SizeX,',', InputImgVol.SizeY,',',InputImgVol.Depth);
+    WriteLn('Input image size: ', InputImgVol.SizeX,' x ', InputImgVol.SizeY,' x ',InputImgVol.Depth);
     InputImgVol.Divi(64);
     InputImgVol.Sub(2);
     WriteLn('Creating Neural Network...');
@@ -131,7 +131,7 @@ type
         AuxInputImgVol.Free;
       end;
       OutputImgVol.Resize((MaxTileX + 1)*csTileSize*2, (MaxTileY + 1)*csTileSize*2, 3);
-      WriteLn('Resizing with tiles to: ', OutputImgVol.SizeX,',', OutputImgVol.SizeY,',',OutputImgVol.Depth);
+      WriteLn('Resizing with tiles to: ', OutputImgVol.SizeX,' x ', OutputImgVol.SizeY,' x ',OutputImgVol.Depth);
       OutputImgVol.Fill(0);
       for TileXCnt := 0 to MaxTileX do
       begin

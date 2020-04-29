@@ -564,9 +564,9 @@ begin
     for CountY := 0 to MaxY do
     begin
       RawPos := Vol.GetRawPos(CountX, CountY, 0);
-      LocalColor.red := Min(Round(Vol.FData[RawPos]),255) shl 8;
-      LocalColor.green := Min(Round(Vol.FData[RawPos + 1]),255) shl 8;
-      LocalColor.blue := Min(Round(Vol.FData[RawPos + 2]),255) shl 8;
+      LocalColor.red := NeuronForceMinMax(Round(Vol.FData[RawPos]),0,255) shl 8;
+      LocalColor.green := NeuronForceMinMax(Round(Vol.FData[RawPos + 1]),0,255) shl 8;
+      LocalColor.blue := NeuronForceMinMax(Round(Vol.FData[RawPos + 2]),0, 255) shl 8;
       M.Colors[CountX, CountY] := LocalColor;
     end;
   end;
