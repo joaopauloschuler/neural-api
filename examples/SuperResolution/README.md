@@ -3,7 +3,8 @@
 At the right, you can find an example. The small image is the original image while the big image is the image processed twice by a neural network trained to increase the resolution.
 This example has been created via the SuperResolution.lpi command line tool with:
 
-```#SuperResolution -i street.png -o street2.png
+```
+#SuperResolution -i street.png -o street2.png
 Loading input file: street.png
 Input image size: 79x107x3
 Creating Neural Network...
