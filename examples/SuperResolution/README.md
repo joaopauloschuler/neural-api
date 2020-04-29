@@ -19,4 +19,6 @@ Resizing with tiles...
 Neural network file found at ../../../examples/SuperResolution : super-resolution-7-64-sep.nn
 Padding input image.
 Resizing with tiles to: 288x416x3
-Saving output file: street3.png```
+Saving output file: street3.png
+```
+
