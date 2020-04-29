@@ -544,7 +544,8 @@ type
   function DiffAct(x: TNeuralFloat): TNeuralFloat;
   function DiffActDerivative(x: TNeuralFloat): TNeuralFloat;
 
-  function NeuronForceMinMax(x, pMin, pMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+  function NeuronForceMinMax(x, pMin, pMax: TNeuralFloat): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
+  function NeuronForceMinMax(x, pMin, pMax: integer): integer; overload; {$IFDEF Release} inline; {$ENDIF}
   function NeuronForceRange(x, range:TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
   function NeuronForceMinRange(x, range:TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
 
@@ -682,6 +683,13 @@ begin
 end;
 
 function NeuronForceMinMax(x, pMin, pMax: TNeuralFloat): TNeuralFloat;
+begin
+  if (x>pMax) then Result := pMax
+  else if (x<pMin) then Result := pMin
+  else Result := x;
+end;
+
+function NeuronForceMinMax(x, pMin, pMax: integer): integer;
 begin
   if (x>pMax) then Result := pMax
   else if (x<pMin) then Result := pMin
