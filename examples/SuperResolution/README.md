@@ -1,7 +1,8 @@
 # Super Resolution Example is Under Construction
-<img align="right" src="results/street_result.png">
+<img align="right" src="results/street_result.png"></img>
+## Introduction
 At the right, you can find an example. The small image is the original image while the big image is the image processed twice by a neural network trained to increase the resolution.
-This example has been created via the SuperResolution.lpi command line tool with:
+This example has been created via the **SuperResolution.lpi** command line tool with:
 
 ```
 #SuperResolution -i street.png -o street2.png
