@@ -25,15 +25,21 @@ Saving output file: street3.png
 ```
 Besides the command line tool above, the **SuperResolution** folder has these main components:
 * **SuperResolutionTrain.lpi**: trains a neural network for increasing image resolution with the CIFAR-10 dataset.
-* **SuperResolutionApp.lpi**: visually tests the trained neural network with CIFAR-10 images upscaling 32x32 images up 256x256 images.
 * **Cifar10ImageClassifierSuperResolution.lpi**: can we better classify 32x32 images if we first upscale to 64x64? This experiment shows it!
 * **super-resolution-7-64-sep.nn**: ready to use already trained neural network.
+* **SuperResolutionApp.lpi**: visually tests the trained neural network with CIFAR-10 images upscaling 32x32 images up 256x256 images.
 
 ## SuperResolutionTrain
-Under construction.
-## SuperResolutionApp
 Under construction.
 ## Cifar10ImageClassifierSuperResolution
 Under construction.
 ## SuperResolution Command Line Tool
 Under construction.
+## SuperResolutionApp
+<p>
+  <img src="results/bird.png"> </img>
+</p>
+Under construction.
+<p>
+  <img src="results/stealth.png"> </img>
+</p>
