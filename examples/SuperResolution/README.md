@@ -80,7 +80,24 @@ The **FitLoading** method above needs to load pairs of images (16x16, 32x32) to 
   end;
 ```
 ## Cifar10ImageClassifierSuperResolution
-Under construction.
+As noted in other experiments, by upscaling the image resolution we can get higher classification accuracy. This is exactly what this example does. Firstly, CIFAR-10 dataset is loaded. Then, its images are upscaled to 64x64 from 32x32 so we can run the image classification with 64x64 Images:
+```
+    CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
+    WriteLn('Upscaling test data.');
+    NN.Compute(ImgTestVolumes, ImgTestVolumes64);
+    ImgTestVolumes.Clear;
+    WriteLn('Upscaling validation data.');
+    NN.Compute(ImgValidationVolumes, ImgValidationVolumes64);
+    ImgValidationVolumes.Clear;
+    WriteLn('Upscaling training data.');
+    NN.Compute(ImgTrainingVolumes, ImgTrainingVolumes64);
+    ImgTrainingVolumes.Clear;
+```
+Then, the training is run with:
+```
+    NeuralFit.Fit(NN, ImgTrainingVolumes64, ImgValidationVolumes64, ImgTestVolumes64, {NumClasses=}10, {batchsize=}64, {epochs=}50);
+```
+Raw results files have been stored in the [results](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution/results) folder.
 ## SuperResolution Command Line Tool
 Under construction.
 ## SuperResolutionApp
