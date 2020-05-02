@@ -148,6 +148,7 @@ This simple application randomly selects images from the CIFAR-10 dataset and up
   <img src="results/bird.png"> </img>
 </p>
 This application is used to verify that the trained NN is upscaling images well. You should give a try!
+
 <p>
   <img src="results/stealth.png"> </img>
 </p>
