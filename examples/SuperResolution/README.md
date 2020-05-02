@@ -99,7 +99,49 @@ Then, the training is run with:
 ```
 Raw results files have been stored in the [results](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution/results) folder.
 ## SuperResolution Command Line Tool
-Under construction.
+This command line tool is super easy to use and doesn’t require any deep learning knowledge. The following code shows how to use it:
+```
+  procedure TSuperResolutionExample.WriteHelp;
+  begin
+    WriteLn
+    (
+      'Increase Image Resolution from an image file',sLineBreak,
+      'Command Line Example: SuperResolution -i myphoto.png -o myphoto-big.png', sLineBreak,
+      ' -h : displays this help. ', sLineBreak,
+      ' -i : defines input file. ', sLineBreak,
+      ' -o : defines output file.', sLineBreak,
+      ' More info at:', sLineBreak,
+      '   https://github.com/joaopauloschuler/neural-api', sLineBreak
+    );
+  end;
+```
+This API requires images to be loaded into volumes before they can be processed. The following code loads the input image into memory and then into a volume with:
+```
+    Image := TFPMemoryImage.Create(1,1);
+    WriteLn('Loading input file: ', inputFile);
+    Image.LoadFromFile(inputFile);
+    LoadImageIntoVolume(Image, InputImgVol);
+    WriteLn('Input image size: ', InputImgVol.SizeX,' x ', InputImgVol.SizeY,' x ',InputImgVol.Depth);
+```
+From 0..255 RGB input numeric range, the range used as input to the neural network is rescaled to -2..+2. This is done with:
+```
+    InputImgVol.Divi(64);
+    InputImgVol.Sub(2);
+```
+Depending on the size of the input image, the image is processed in tiles. The output image is scaled back to 0..255 from -2..+2 with:
+```
+    OutputImgVol.Add(2);
+    OutputImgVol.Mul(64);
+```
+After running the NN, the output image is saved to file with:
+```
+    LoadVolumeIntoImage(OutputImgVol, Image);
+    WriteLn('Saving output file: ', outputFile);
+    if Not(Image.SaveToFile(outputFile)) then
+    begin
+      WriteLn('Saving has failed: ', outputFile);
+    end;
+```
 ## SuperResolutionApp
 <p>
   <img src="results/bird.png"> </img>
