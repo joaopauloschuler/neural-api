@@ -30,7 +30,55 @@ Besides the command line tool above, the **SuperResolution** folder has these ma
 * **SuperResolutionApp.lpi**: visually tests the trained neural network with CIFAR-10 images upscaling 32x32 images up 256x256 images.
 
 ## SuperResolutionTrain
-Under construction.
+There is an already trained neural network (NN) available for use: **super-resolution-7-64-sep.nn**. In the case that you intend to train it by yourself, here we go.
+CIFAR-10 dataset is used for training. Firstly, we'll create a NN to downscale CIFAR-10 32x32 images into 16x16 images with the following:
+```
+    // Small Neural Network to resize 32x32 images into 16x16 images.
+    NNMaxPool := TNNet.Create();
+    NNMaxPool.AddLayer( TNNetInput.Create(32, 32, 3) );
+    NNMaxPool.AddLayer( TNNetMaxPool.Create(2) );
+```
+We load the CIFAR-10 dataset with:
+```
+    CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
+```
+For each image in CIFAR-10 dataset, we’ll run our downscaling NN with:
+```
+    NNMaxPool.Compute(ImgTrainingVolumes, ImgTrainingSmall);
+    NNMaxPool.Compute(ImgValidationVolumes, ImgValidationSmall);
+    NNMaxPool.Compute(ImgTestVolumes, ImgTestSmall); 
+```
+The **Compute** method above will compute the NN for each element in the first parameter (inputs) and will place the output in the second parameter. Therefore, **ImgTrainingSmall**, **ImgValidationSmall**, **ImgTestSmall** will contain lists of 16x16 images.
+We are now ready to train our upscaling NN from 16x16 images to 32x32 images with:
+```
+    NeuralFit.FitLoading(NN,
+      ImgTrainingVolumes.Count, ImgValidationVolumes.Count, ImgTestVolumes.Count,
+      {batchsize=}64, {epochs=}50,
+      @GetTrainingPair, @GetValidationPair, @GetTestPair); 
+```
+The **FitLoading** method above needs to load pairs of images (16x16, 32x32) to be able to train the NN. This is done with the following:
+```
+  procedure TTestCNNAlgo.GetTrainingPair(Idx: integer; ThreadId: integer;
+    pInput, pOutput: TNNetVolume);
+  var
+    LocalIdx: integer;
+  begin
+    LocalIdx := Random(ImgTrainingSmall.Count);
+    pInput.Copy(ImgTrainingSmall[LocalIdx]);
+    pOutput.Copy(ImgTrainingVolumes[LocalIdx]);
+    // insert data augmentation
+    if Random(1000)>500 then
+    begin
+      pInput.FlipX();
+      pOutput.FlipX();
+    end;
+    if Random(1000)>500 then
+    begin
+      pInput.FlipY();
+      pOutput.FlipY();
+    end;
+  end;
+```
 ## Cifar10ImageClassifierSuperResolution
 Under construction.
 ## SuperResolution Command Line Tool
