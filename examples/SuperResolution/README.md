@@ -1,4 +1,4 @@
-# Super Resolution Example is Under Construction
+# Simple Super Resolution Example
 <img align="right" src="results/street_result.png"></img>
 ## Introduction
 The image at the right side shows an example. The smaller image is the original image while the bigger image is the image processed twice by a neural network trained to increase the resolution.
@@ -142,11 +142,12 @@ After running the NN, the output image is saved to file with:
       WriteLn('Saving has failed: ', outputFile);
     end;
 ```
-## SuperResolutionApp
+## SuperResolutionApp (The Testing Application)
+This simple application randomly selects images from the CIFAR-10 dataset and upscale to 64x64, 128x128 and 256x256. Results are sometimes **fantastic** as seen in the following image.
 <p>
   <img src="results/bird.png"> </img>
 </p>
-Under construction.
+This application is used to verify that the trained NN is upscaling images well. You should give a try!
 <p>
   <img src="results/stealth.png"> </img>
 </p>
