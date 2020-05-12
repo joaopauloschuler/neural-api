@@ -193,8 +193,8 @@ type
   begin
     WriteLn
     (
-      'Increase Image Resolution from an Image File',sLineBreak,
-      'Command Line Example: SuperResolution -i myphoto.png', sLineBreak,
+      'Increase Image Resolution from an image file',sLineBreak,
+      'Command Line Example: SuperResolution -i myphoto.png -o myphoto-big.png', sLineBreak,
       ' -h : displays this help. ', sLineBreak,
       ' -i : defines input file. ', sLineBreak,
       ' -o : defines output file.', sLineBreak,
