@@ -312,7 +312,8 @@ type
       procedure MulChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure Mul(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeMax(Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
-      // Do not use RecurrencePlot as it's still in testing.
+      /// Calculates the recurrence plot from the input volume
+      // https://en.wikipedia.org/wiki/Recurrence_plot
       procedure RecurrencePlot(Original: TNNetVolume; Threshold: TNeuralFloat);
       /// This function creates one output channel for each input channel.
       // The recurrence plot is calculated from Original's X axis.
