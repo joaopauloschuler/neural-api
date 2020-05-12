@@ -844,7 +844,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); virtual;
       destructor Destroy(); override;
 
       {$IFDEF OpenCL}
@@ -890,37 +890,37 @@ type
   { TNNetDeconvolution }
   TNNetDeconvolution = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
   /// Convolutional layer with ReLU activation function.
   TNNetConvolutionReLU = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Pointwise convolution with ReLU activation.
   TNNetPointwiseConvReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
   end;
 
   /// Convolutional layer without activation function.
   TNNetConvolutionLinear = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Pointwise convolution with Linear activation.
   TNNetPointwiseConvLinear = class(TNNetConvolutionLinear)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
   end;
 
   { TNNetDeconvolutionReLU }
   TNNetDeconvolutionReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
   { TNNetLocalConnect }
@@ -938,19 +938,19 @@ type
   { TNNetDeLocalConnect }
   TNNetDeLocalConnect = class(TNNetLocalConnect)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
   { TNNetLocalConnectReLU }
   TNNetLocalConnectReLU = class(TNNetLocalConnect)
   public
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   { TNNetDeLocalConnectReLU }
   TNNetDeLocalConnectReLU = class(TNNetLocalConnectReLU)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
   { TNNetPoolBase }
@@ -1163,6 +1163,7 @@ type
       function CountNeurons(): integer;
       function CountWeights(): integer;
       function GetWeightSum(): TNeuralFloat;
+      function GetBiasSum(): TNeuralFloat;
 
       // load and save functions
       // Save weights to string
@@ -3509,7 +3510,7 @@ function THistoricalNets.AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons
 var
   BeforeDeAvgLayerCnt, AfterDeAvgLayerCnt: integer;
 begin
-  AddLayer( TNNetInput.Create(pSizeX, pSizeY,3) );
+  AddLayer( TNNetInput.Create(pSizeX, pSizeY, 3) );
   BeforeDeAvgLayerCnt := (pLayerCnt div 2);
   AfterDeAvgLayerCnt := pLayerCnt - BeforeDeAvgLayerCnt - 1;
 
@@ -7124,6 +7125,20 @@ begin
   end;
 end;
 
+function TNNet.GetBiasSum(): TNeuralFloat;
+var
+  LayerCnt: integer;
+begin
+  Result := 0;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Result := Result + FLayers[LayerCnt].GetBiasSum();
+    end;
+  end;
+end;
+
 function TNNet.CreateLayer(strData: string): TNNetLayer;
 var
   S, S2: TStringList;
@@ -7935,7 +7950,8 @@ begin
   begin
     FErrorProc
     (
-      'TNNet.SumWeights - CopyWeights does not match: ' + IntToStr(Origin.Layers.Count)
+      'TNNet.CopyWeights does not match. Origin: ' + IntToStr(Origin.Layers.Count) +
+      ' Self: ' + IntToStr(FLayers.Count)
     );
   end;
 end;
