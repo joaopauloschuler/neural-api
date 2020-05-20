@@ -1226,7 +1226,8 @@ type
         BottleNeck: integer = 0;
         Compression: integer = 1; // Compression factor. 2 means taking half of channels.
         DropoutRate: TNeuralFloat = 0;
-        RandomBias: integer = 1; RandomAmplifier: integer = 1
+        RandomBias: integer = 1; RandomAmplifier: integer = 1;
+        FeatureSize: integer = 3
         ): TNNetLayer;
       function AddDenseFullyConnected(pUnits, k, supressBias: integer;
         PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
@@ -3435,7 +3436,8 @@ function THistoricalNets.AddDenseNetBlockCAI(pUnits, k, supressBias: integer;
   BottleNeck: integer = 0;
   Compression: integer = 1; // Compression factor. 2 means taking half of channels.
   DropoutRate: TNeuralFloat = 0;
-  RandomBias: integer = 1; RandomAmplifier: integer = 1
+  RandomBias: integer = 1; RandomAmplifier: integer = 1;
+  FeatureSize: integer = 3
   ): TNNetLayer;
 var
   UnitCnt: integer;
@@ -3456,7 +3458,7 @@ begin
         end;
       end;
       if pBefore <> nil then AddLayer( pBefore.Create() );
-      AddConvOrSeparableConv(IsSeparable, {HasReLU=} true, HasNorm, k, 3, 1, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
+      AddConvOrSeparableConv(IsSeparable, {HasReLU=} true, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
       if pAfter <> nil then AddLayer( pAfter.Create() );
       if DropoutRate > 0 then AddLayer( TNNetDropout.Create(DropoutRate) );
       AddLayer( TNNetDeepConcat.Create([PreviousLayer, GetLastLayer()]) );
