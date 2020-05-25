@@ -62,7 +62,7 @@ type
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     NeuralFit := TNeuralImageFit.Create;
-    NeuralFit.FileNameBase := 'SimpleImageClassifier';
+    NeuralFit.FileNameBase := 'SimpleImageClassifierGPU';
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
