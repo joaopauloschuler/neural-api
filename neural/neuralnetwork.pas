@@ -961,6 +961,7 @@ type
       FMaxPosX, FMaxPosY: array of integer;
       FPoolSize, FStride, FPadding: integer;
       FOutputSizeX, FOutputSizeY, FOutputSizeD: integer;
+      FInputDivPool: array of integer;
 
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function CalcOutputSize(pInputSize: integer): integer; virtual;
@@ -2691,10 +2692,10 @@ begin
 
   for CntY := 0 to MaxY do
   begin
-    OutY := CntY div FPoolSize;
+    OutY := FInputDivPool[CntY]; //CntY div FPoolSize;
     for CntX := 0 to MaxX do
     begin
-      OutX := CntX div FPoolSize;
+      OutX := FInputDivPool[CntX]; //CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FInputCopy.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
@@ -5498,6 +5499,8 @@ end;
 
 { TNNetPoolBase }
 procedure TNNetPoolBase.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  MaxInputDivPool, MaxInputDivPoolCnt: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX);
@@ -5509,6 +5512,13 @@ begin
   FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
   SetLength(FMaxPosX, FOutput.Size);
   SetLength(FMaxPosY, FOutput.Size);
+  if ((FStride = FPoolSize) and (FPadding = 0)) then
+  begin
+    MaxInputDivPool := Max(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY);
+    SetLength(FInputDivPool, MaxInputDivPool);
+    for MaxInputDivPoolCnt := 0 to MaxInputDivPool-1
+      do FInputDivPool[MaxInputDivPoolCnt] := MaxInputDivPoolCnt div FPoolSize;
+  end;
 end;
 
 function TNNetPoolBase.CalcOutputSize(pInputSize: integer): integer;
@@ -5541,7 +5551,7 @@ destructor TNNetPoolBase.Destroy();
 begin
   SetLength(FMaxPosX, 0);
   SetLength(FMaxPosY, 0);
-
+  SetLength(FInputDivPool, 0);
   if FPadding > 0
     then FInputCopy.Free;
 
@@ -5584,10 +5594,10 @@ begin
 
   for CntY := 0 to MaxY do
   begin
-    OutY := CntY div FPoolSize;
+    OutY := FInputDivPool[CntY]; //CntY div FPoolSize;
     for CntX := 0 to MaxX do
     begin
-      OutX := CntX div FPoolSize;
+      OutX := FInputDivPool[CntX]; //CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FInputCopy.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
