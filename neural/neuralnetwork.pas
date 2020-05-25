@@ -288,6 +288,7 @@ type
       FBiasOutput: TNNetVolume;
       FShouldConcatWeights: boolean;
       FShouldInterleaveWeights: boolean;
+      FAfterWeightUpdateHasBeenCalled:boolean;
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
     public
@@ -3036,6 +3037,7 @@ begin
       end;
     end;
   end;
+  FAfterWeightUpdateHasBeenCalled := true;
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();
@@ -3076,6 +3078,7 @@ begin
   FBiasOutput := TNNetVolume.Create();
   FShouldConcatWeights := false;
   FShouldInterleaveWeights := false;
+  FAfterWeightUpdateHasBeenCalled := false;
 end;
 
 destructor TNNetLayerConcatedWeights.Destroy();
@@ -5960,8 +5963,8 @@ begin
   begin
     InputAVolume := FConcatedWeights;
   end;
-  FDotCL.Compute(InputAVolume, FInputPrepared, 0);
-
+  FDotCL.Compute(InputAVolume, FInputPrepared, 0, FAfterWeightUpdateHasBeenCalled, true);
+  FAfterWeightUpdateHasBeenCalled := false;
   {$IFDEF Linux}
   FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
   {$ELSE}

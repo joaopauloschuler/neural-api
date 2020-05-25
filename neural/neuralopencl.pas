@@ -197,7 +197,7 @@ type
 
       procedure UnprepareForCompute();
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
-      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint);
+      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
 
@@ -327,8 +327,12 @@ begin
   PrepareForCompute := CL_SUCCESS;
 end;
 
-procedure TDotProductSharedKernel.Compute(VAs, VBs: TNNetVolume; pActFN: longint
-  );
+procedure TDotProductSharedKernel.Compute
+(
+  VAs, VBs: TNNetVolume;
+  pActFN: longint;
+  NewVAs:boolean = true; NewVBs:boolean = true
+);
 var
   err: integer;
 begin
@@ -362,9 +366,9 @@ begin
       err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err :=
-        FDotProductKernel.WriteBuffer(FInputBufferAs, VAs) or
-        FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+      if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+      if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
 
       err := err or clSetKernelArg(Kernel, 4, SizeOf(longint), @FActFun);
