@@ -82,8 +82,18 @@ type
   end;
 
   const
-    csTileSize = 16;
+    //csTileSize = 16;
     csTileBorder = 4;
+
+  function GetMaxDivisor(x, acceptableMax: integer): integer;
+  begin
+    Result := acceptableMax;
+    while (Result > 2) do
+    begin
+      if X mod Result = 0 then break;
+      Dec(Result);
+    end;
+  end;
 
   procedure TSuperResolutionExample.RunAlgo(inputFile, outputFile: string);
   var
@@ -94,6 +104,10 @@ type
     MaxTileX, MaxTileY: integer;
     TileXCnt, TileYCnt: integer;
     TileStartX, TileStartY: integer;
+    LocalDestX, LocalDestY: integer;
+    LocalOriginX, LocalOriginY: integer;
+    LocalLenX, LocalLenY: integer;
+    LocalTileSizeX, LocalTileSizeY: integer;
   begin
     InputImgVol := TNNetVolume.Create();
     OutputImgVol := TNNetVolume.Create();
@@ -114,12 +128,15 @@ type
     end
     else
     begin
-      WriteLn('Resizing with tiles...');
-      NN := CreateResizingNN(csTileSize+csTileBorder*2, csTileSize+csTileBorder*2, csExampleFileName);
-      InputTile := TNNetVolume.Create(csTileSize+csTileBorder*2, csTileSize+csTileBorder*2, 3);
-      OutputTile := TNNetVolume.Create(csTileSize * 2 + csTileBorder*2, csTileSize * 2 + csTileBorder*2, 3);
-      MaxTileX := (InputImgVol.SizeX div csTileSize) - 1;
-      MaxTileY := (InputImgVol.SizeY div csTileSize) - 1;
+      LocalTileSizeX := GetMaxDivisor(InputImgVol.SizeX-csTileBorder*2, 128);
+      LocalTileSizeY := GetMaxDivisor(InputImgVol.SizeY-csTileBorder*2, 128);
+      WriteLn('Resizing with tiles. Tile size is:', LocalTileSizeX, 'x', LocalTileSizeY, ' .');
+      NN := CreateResizingNN(LocalTileSizeX+csTileBorder*2, LocalTileSizeY+csTileBorder*2, csExampleFileName);
+      InputTile := TNNetVolume.Create(LocalTileSizeX+csTileBorder*2, LocalTileSizeY+csTileBorder*2, 3);
+      OutputTile := TNNetVolume.Create(InputTile.SizeX*2, InputTile.SizeY*2, 3);
+      MaxTileX := ( (InputImgVol.SizeX-csTileBorder*2) div LocalTileSizeX) - 1;
+      MaxTileY := ( (InputImgVol.SizeY-csTileBorder*2) div LocalTileSizeY) - 1;
+      (*
       if
         (InputImgVol.SizeX mod csTileSize < csTileBorder*2) or
         (InputImgVol.SizeY mod csTileSize < csTileBorder*2) then
@@ -130,33 +147,61 @@ type
         InputImgVol.Copy(AuxInputImgVol);
         AuxInputImgVol.Free;
       end;
-      OutputImgVol.Resize((MaxTileX + 1)*csTileSize*2, (MaxTileY + 1)*csTileSize*2, 3);
+      *)
+      OutputImgVol.Resize(InputImgVol.SizeX*2, InputImgVol.SizeY*2, 3);
       WriteLn('Resizing with tiles to: ', OutputImgVol.SizeX,' x ', OutputImgVol.SizeY,' x ',OutputImgVol.Depth);
       OutputImgVol.Fill(0);
       for TileXCnt := 0 to MaxTileX do
       begin
         for TileYCnt := 0 to MaxTileY do
         begin
-          TileStartX := TileXCnt*csTileSize;
-          TileStartY := TileYCnt*csTileSize;
+          TileStartX := TileXCnt*LocalTileSizeX;
+          TileStartY := TileYCnt*LocalTileSizeY;
           InputTile.CopyCropping
           (
             InputImgVol,
             TileStartX,
             TileStartY,
-            csTileSize+csTileBorder*2,
-            csTileSize+csTileBorder*2
+            LocalTileSizeX+csTileBorder*2,
+            LocalTileSizeY+csTileBorder*2
           );
           NN.Compute(InputTile);
           NN.GetOutput(OutputTile);
+          LocalDestX := TileXCnt*LocalTileSizeX*2+csTileBorder*2;
+          LocalDestY := TileYCnt*LocalTileSizeY*2+csTileBorder*2;
+          LocalOriginX := csTileBorder*2;
+          LocalOriginY := csTileBorder*2;
+          LocalLenX := LocalTileSizeX*2;
+          LocalLenY := LocalTileSizeY*2;
+
+          if ((TileXCnt = 0) or (TileXCnt = MaxTileX)) then
+          begin
+            LocalLenX := LocalLenX + csTileBorder*2;
+            if (TileXCnt = 0) then
+            begin
+              LocalOriginX := 0;
+              LocalDestX := 0;
+            end;
+          end;
+
+          if ((TileYCnt = 0) or (TileYCnt = MaxTileY)) then
+          begin
+            LocalLenY := LocalLenY + csTileBorder*2;
+            if (TileYCnt = 0) then
+            begin
+              LocalOriginY := 0;
+              LocalDestY := 0;
+            end;
+          end;
+
           OutputImgVol.AddArea
           (
-            {DestX=}TileXCnt*csTileSize*2,
-            {DestY=}TileYCnt*csTileSize*2,
-            {OriginX=}csTileBorder*2,
-            {OriginX=}csTileBorder*2,
-            {LenX=}csTileSize*2,
-            {LenY=}csTileSize*2,
+            {DestX=}LocalDestX,
+            {DestY=}LocalDestY,
+            {OriginX=}LocalOriginX,
+            {OriginY=}LocalOriginY,
+            {LenX=}LocalLenX,
+            {LenY=}LocalLenY,
             OutputTile
           );
         end;
