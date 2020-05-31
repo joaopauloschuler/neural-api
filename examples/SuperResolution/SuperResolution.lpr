@@ -22,6 +22,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   Math,
   neuraldatasets,
   neuralfit,
+  neuralgeneric,
   FPImage,
   usuperresolutionexample,
   FPWriteBMP, FPWritePCX, FPWriteJPEG, FPWritePNG,
@@ -82,24 +83,13 @@ type
   end;
 
   const
-    //csTileSize = 16;
     csTileBorder = 4;
-
-  function GetMaxDivisor(x, acceptableMax: integer): integer;
-  begin
-    Result := acceptableMax;
-    while (Result > 2) do
-    begin
-      if X mod Result = 0 then break;
-      Dec(Result);
-    end;
-  end;
 
   procedure TSuperResolutionExample.RunAlgo(inputFile, outputFile: string);
   var
     Image: TFPMemoryImage;
     NN: TNNet;
-    InputImgVol, AuxInputImgVol, OutputImgVol: TNNetVolume;
+    InputImgVol, OutputImgVol: TNNetVolume;
     InputTile, OutputTile: TNNetVolume;
     MaxTileX, MaxTileY: integer;
     TileXCnt, TileYCnt: integer;
@@ -130,24 +120,12 @@ type
     begin
       LocalTileSizeX := GetMaxDivisor(InputImgVol.SizeX-csTileBorder*2, 128);
       LocalTileSizeY := GetMaxDivisor(InputImgVol.SizeY-csTileBorder*2, 128);
-      WriteLn('Resizing with tiles. Tile size is:', LocalTileSizeX, 'x', LocalTileSizeY, ' .');
+      WriteLn('Resizing with tiles. Tile size is: ', LocalTileSizeX, 'x', LocalTileSizeY, ' .');
       NN := CreateResizingNN(LocalTileSizeX+csTileBorder*2, LocalTileSizeY+csTileBorder*2, csExampleFileName);
       InputTile := TNNetVolume.Create(LocalTileSizeX+csTileBorder*2, LocalTileSizeY+csTileBorder*2, 3);
       OutputTile := TNNetVolume.Create(InputTile.SizeX*2, InputTile.SizeY*2, 3);
       MaxTileX := ( (InputImgVol.SizeX-csTileBorder*2) div LocalTileSizeX) - 1;
       MaxTileY := ( (InputImgVol.SizeY-csTileBorder*2) div LocalTileSizeY) - 1;
-      (*
-      if
-        (InputImgVol.SizeX mod csTileSize < csTileBorder*2) or
-        (InputImgVol.SizeY mod csTileSize < csTileBorder*2) then
-      begin
-        WriteLn('Padding input image.');
-        AuxInputImgVol := TNNetVolume.Create();
-        AuxInputImgVol.CopyPadding(InputImgVol, csTileBorder);
-        InputImgVol.Copy(AuxInputImgVol);
-        AuxInputImgVol.Free;
-      end;
-      *)
       OutputImgVol.Resize(InputImgVol.SizeX*2, InputImgVol.SizeY*2, 3);
       WriteLn('Resizing with tiles to: ', OutputImgVol.SizeX,' x ', OutputImgVol.SizeY,' x ',OutputImgVol.Depth);
       OutputImgVol.Fill(0);
