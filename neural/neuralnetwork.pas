@@ -5514,7 +5514,7 @@ begin
   SetLength(FMaxPosY, FOutput.Size);
   if ((FStride = FPoolSize) and (FPadding = 0)) then
   begin
-    MaxInputDivPool := Max(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY);
+    MaxInputDivPool := Max(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY) + 1;
     SetLength(FInputDivPool, MaxInputDivPool);
     for MaxInputDivPoolCnt := 0 to MaxInputDivPool-1
       do FInputDivPool[MaxInputDivPoolCnt] := MaxInputDivPoolCnt div FPoolSize;
