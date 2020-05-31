@@ -1,14 +1,8 @@
 program SuperResolution;
 (*
  Coded by Joao Paulo Schwarz Schuler.
- // https://sourceforge.net/p/cai
- This command line tool runs the CAI Convolutional Neural Network with
- CIFAR10 files.
-
- In the case that your processor supports AVX instructions, uncomment
- {$DEFINE AVX} or {$DEFINE AVX2} defines. Also have a look at AVX512 define.
-
- Look at TTestCNNAlgo.WriteHelp; for more info.
+ https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution
+ This command line tool increases image resolution from an input image file.
 *)
 {$mode objfpc}{$H+}
 
@@ -222,7 +216,7 @@ type
       ' -i : defines input file. ', sLineBreak,
       ' -o : defines output file.', sLineBreak,
       ' More info at:', sLineBreak,
-      '   https://github.com/joaopauloschuler/neural-api', sLineBreak
+      '   https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution', sLineBreak
     );
   end;
 
