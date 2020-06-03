@@ -80,7 +80,7 @@ Although these examples require deeper understanding about neural networks, they
 
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at.
 
-## Quick View about the API
+## Neural Network Layers
 This API is really big. The following list gives a general idea about this API but it doesn't contain everything.
 
 ### Input Layer
@@ -185,22 +185,22 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
 
-### Datasets
+## Dataset Support
 These datasets can be easily loaded:
 
-#### CIFAR-10
+### CIFAR-10
 ```
 procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList);
 ```
 Source code example: [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier)
 
-#### CIFAR-100
+### CIFAR-100
 ```
 procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList);
 ```
 Source code example: [CAI Optimized DenseNet CIFAR-100 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Cifar100CaiDenseNet)
 
-#### MNIST and Fashion MNIST
+### MNIST and Fashion MNIST
 ```
 procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList;
@@ -212,7 +212,7 @@ Source code examples:
 * [Simple MNIST Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleMNist)
 * [Simple Fashion MNIST Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleFashionMNIST)
 
-#### One Class per Folder with Image Classification
+### One Class per Folder with Image Classification
 In the case that your dataset has one class per folder, you can call **CreateVolumesFromImagesFromFolder** for loading your data into RAM:
 ```
 // change ProportionToLoad to a smaller number if you don't have enough RAM.
@@ -234,6 +234,9 @@ The example above shows how to load the dataset with 90% loaded into training an
 Source code examples: 
 * [Simple Plant Leaf Disease Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimplePlantLeafDisease)
 * [Tiny ImageNet 200](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleTinyImageNet)
+
+### Loading and Saving Images with Volumes
+When loading an image from a file, the easiest and fastest method is calling `LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume)`. When loading from an **TFPMemoryImage**, you can load with `LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume)`. For saving an image, the fastest method is `SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string)`.
 
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
