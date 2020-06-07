@@ -81,7 +81,6 @@ type
 
   procedure TSuperResolutionExample.RunAlgo(inputFile, outputFile: string);
   var
-    Image: TFPMemoryImage;
     NN: TNNet;
     InputImgVol, OutputImgVol: TNNetVolume;
     InputTile, OutputTile: TNNetVolume;
@@ -95,10 +94,8 @@ type
   begin
     InputImgVol := TNNetVolume.Create();
     OutputImgVol := TNNetVolume.Create();
-    Image := TFPMemoryImage.Create(1,1);
     WriteLn('Loading input file: ', inputFile);
-    Image.LoadFromFile(inputFile);
-    LoadImageIntoVolume(Image, InputImgVol);
+    LoadImageFromFileIntoVolume(inputFile, InputImgVol);
     WriteLn('Input image size: ', InputImgVol.SizeX,' x ', InputImgVol.SizeY,' x ',InputImgVol.Depth);
     InputImgVol.Divi(64);
     InputImgVol.Sub(2);
@@ -183,15 +180,13 @@ type
     end;
     OutputImgVol.Add(2);
     OutputImgVol.Mul(64);
-    LoadVolumeIntoImage(OutputImgVol, Image);
     WriteLn('Saving output file: ', outputFile);
-    if Not(Image.SaveToFile(outputFile)) then
+    if Not(SaveImageFromVolumeIntoFile(OutputImgVol, outputFile)) then
     begin
       WriteLn('Saving has failed: ', outputFile);
     end;
     OutputImgVol.Free;
     InputImgVol.Free;
-    Image.Free;
     NN.Free;
   end;
 
