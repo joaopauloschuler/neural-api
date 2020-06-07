@@ -27,9 +27,14 @@ unit neuraldatasets;
 interface
 
 uses
-  {$IFNDEF FPC}System.Classes,{$ENDIF}neuralvolume, neuralnetwork
-  {$IFDEF FPC}, FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
-  FPReadGif, FPReadPNM, FPReadPSD, FPReadTGA, FPReadTiff{$ENDIF}
+  {$IFNDEF FPC}System.Classes,{$ENDIF}
+  neuralvolume, neuralnetwork
+  {$IFDEF FPC},
+  FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
+  FPReadGif, FPReadPNM, FPReadPSD, FPReadTGA, FPReadTiff,
+  FPWriteBMP, FPWritePCX, FPWriteJPEG, FPWritePNG,
+  FPWritePNM, FPWriteTGA, FPWriteTiff
+  {$ENDIF}
   ;
 
 type
@@ -146,7 +151,8 @@ type
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
 
   // Loads an image from a file and stores it into a Volume.
-  procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
+  function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
+  function SaveImageFromVolumeIntoFile(V:TNNetVolume; ImageFileName:string):boolean;
 {$ENDIF}
 
 // Writes the header of a confusion matrix into a CSV file
@@ -454,13 +460,24 @@ begin
   end;
 end;
 
-procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
+function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
 var
   M: TFPMemoryImage;
 begin
   M := TFPMemoryImage.Create(1, 1);
-  M.LoadFromFile( ImageFileName );
-  LoadImageIntoVolume(M, V);
+  Result := M.LoadFromFile( ImageFileName );
+  if Result then LoadImageIntoVolume(M, V);
+  M.Free;
+end;
+
+function SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string
+  ): boolean;
+var
+  M: TFPMemoryImage;
+begin
+  M := TFPMemoryImage.Create(V.SizeX, V.SizeY);
+  LoadVolumeIntoImage(V, M);
+  Result := M.SaveToFile(ImageFileName);
   M.Free;
 end;
 
