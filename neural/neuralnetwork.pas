@@ -294,6 +294,10 @@ type
     public
       constructor Create();
       destructor Destroy(); override;
+      procedure RefreshNeuronWeightList();
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      {$ENDIF}
   end;
 
   {$IFDEF FPC}
@@ -706,7 +710,7 @@ type
   end;
 
   /// Fully connected layer with hyperbolic tangent.
-  TNNetFullConnect = class(TNNetLayer)
+  TNNetFullConnect = class(TNNetLayerConcatedWeights)
     private
       FAuxTransposedW: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -720,6 +724,11 @@ type
       procedure Backpropagate(); override;
       procedure BackpropagateCPU(); virtual;
       destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure ComputeOpenCL(); virtual;
+      procedure BackpropagateOpenCL(); virtual;
+      {$ENDIF}
   end;
 
   /// Fully connected layer without activation function. This layer is useful
@@ -791,7 +800,6 @@ type
       FPrevSizeXDepthBytes: integer;
       FCalculatePrevLayerError: boolean;
       function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer;
-      procedure RefreshNeuronWeightList();
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
@@ -833,7 +841,7 @@ type
   TNNetConvolutionBase = class(TNNetConvolutionAbstract)
     private
       FInputPrepared: TNNetVolume;
-      FDotProductResult: TNNetVolume;
+      //FDotProductResult: TNNetVolume;
       FPointwise: boolean;
       FLearnSmoothener: TNeuralFloat;
 
@@ -847,7 +855,6 @@ type
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); virtual;
       destructor Destroy(); override;
-
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
       {$ENDIF}
@@ -871,7 +878,7 @@ type
       {$IFDEF Debug}
       procedure ComputeNeuronCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddBiasToRawResult(); {$IFDEF Release} inline; {$ENDIF}
-      procedure ComputeNeuronFromResult(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
+      //procedure ComputeNeuronFromResult(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeNeuron(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeNeuronAtOutputPos(NeuronIdx, x, y: integer); {$IFDEF Release} inline; {$ENDIF}
       function ComputeNeuronAtOutputPos3(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -1113,6 +1120,7 @@ type
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayer(): TNNetLayer; {$IFDEF Release} inline; {$ENDIF}
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
+      procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
       procedure Backpropagate(pOutput: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -1281,6 +1289,7 @@ type
 
   {$IFDEF OpenCL}
   procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+  procedure TestFullConnectOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
   {$ENDIF}
 
   procedure RebuildPatternOnPreviousPatterns
@@ -3049,24 +3058,41 @@ var
   MaxNeurons: integer;
   BiasValue: TNeuralFloatPtr;
 begin
-  MaxX := FOutput.SizeX - 1;
-  MaxY := FOutput.SizeY - 1;
   MaxNeurons := FNeurons.Count - 1;
-
   FBiasOutput.ReSize(FOutputRaw);
   if High(FArrNeurons) < MaxNeurons then BuildArrNeurons();
 
-  for OutputCntX := 0 to MaxX do
+  if Self is TNNetConvolution then
   begin
-    for OutputCntY := 0 to MaxY do
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+
+    for OutputCntX := 0 to MaxX do
     begin
-      BiasValue := FBiasOutput.GetRawPtr(OutputCntX, OutputCntY);
-      for NeuronIdx := 0 to MaxNeurons do
+      for OutputCntY := 0 to MaxY do
       begin
-        BiasValue^ := FArrNeurons[NeuronIdx].FBiasWeight;
-        Inc(BiasValue);
+        BiasValue := FBiasOutput.GetRawPtr(OutputCntX, OutputCntY);
+        for NeuronIdx := 0 to MaxNeurons do
+        begin
+          BiasValue^ := FArrNeurons[NeuronIdx].FBiasWeight;
+          Inc(BiasValue);
+        end;
       end;
     end;
+  end
+  else
+  if Self is TNNetFullConnect then
+  begin
+    for NeuronIdx := 0 to MaxNeurons do
+    BiasValue := FBiasOutput.GetRawPtr(0, 0);
+    begin
+      BiasValue^ := FArrNeurons[NeuronIdx].FBiasWeight;
+      Inc(BiasValue);
+    end;
+  end
+  else
+  begin
+    FErrorProc('Error: bias output hasn''t been defined.');
   end;
 end;
 
@@ -3090,6 +3116,61 @@ begin
   FConcatedWInter.Free;
   inherited Destroy();
 end;
+
+procedure TNNetLayerConcatedWeights.RefreshNeuronWeightList();
+var
+  NeuronCnt: integer;
+begin
+  FNeuronWeightList.Clear;
+
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    FNeuronWeightList.Add(FNeurons[NeuronCnt].Weights);
+  end;
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize);
+end;
+
+procedure TNNetLayerConcatedWeights.EnableOpenCL(
+  DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  (*
+  // good for debugging
+  WriteLn(
+    'Has OpenCL:', FHasOpenCL,
+    ' Should OpenCL:', FShouldOpenCL,
+    ' Current layer:', Self.LayerIdx
+  );
+  *)
+  if (FHasOpenCL and FShouldOpenCL) then
+  begin
+    if not Assigned(FDotCL) then
+    begin
+      FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+      FDotCL.HideMessages();
+    end;
+    RefreshNeuronWeightList();
+    AfterWeightUpdate();
+
+    FConcatedWeights.ReSize(FNeuronWeightList.GetTotalSize(),1,1);
+
+    FConcatedWInter.ReSize(FNeuronWeightList.GetTotalSize(),1,1);
+
+    //WriteLn(' Layer:', Self.LayerIdx,' Vector:',FVectorSize,' Neuron count:',FNeuronWeightList.Count,' Output size:',FOutput.Size);
+    FShouldInterleaveWeights := true;
+    FShouldConcatWeights := true;
+
+    //FDotProductResult.ReSize(FOutputSizeX, FOutputSizeY, FNeurons.Count);
+  end;
+  AfterWeightUpdate();
+end;
+{$ENDIF}
 
 { TNNetReLU }
 procedure TNNetReLU.Compute();
@@ -3567,7 +3648,7 @@ begin
   begin
     if (FOutputError.FData[OutputCnt] <> 0.0) then
     begin
-      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FNeurons[OutputCnt].FWeights);
+      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FArrNeurons[OutputCnt].FWeights);
     end;
   end;
 end;
@@ -3610,7 +3691,7 @@ begin
 
       if (FBatchUpdate) then
       begin
-        if localLearErrorDeriv<> 0.0 then
+        if localLearErrorDeriv <> 0.0 then
         begin
           localNeuron.Delta.MulAdd(localLearErrorDeriv, FPrevLayer.Output);
           localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
@@ -4441,6 +4522,36 @@ begin
   Input.Free;
   NN.Free;
 end;
+
+procedure TestFullConnectOpenCL(platform_id: cl_platform_id;
+  device_id: cl_device_id);
+var
+  NN: TNNet;
+  NReLU: TNNetLayer;
+  Input, Output: TNNetVolume;
+begin
+  WriteLn('Test FULL CONNECT Layer with OpenCL');
+  WriteLn(' ---------- Test 1 ----------');
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create([1.0, 2.0, 3.0, 4.0]);
+  NRelu := TNNetFullConnectReLU.Create(1024,0);
+  Output := TNNetVolume.Create(8, 1, 1);
+
+  NN.AddLayer( TNNetInput.Create(2, 2, 1) );
+  NN.AddLayer( NRelu );
+  NN.AddLayer( TNNetFullConnectReLU.Create(8,0) );
+  NN.Compute(Input, Output);
+  Output.Print();
+
+  NN.EnableOpenCL(platform_id, device_id);
+  NN.Compute(Input, Output);
+  Output.Print();
+
+  Output.Free;
+  Input.Free;
+  NN.Free;
+end;
+
 {$ENDIF}
 
 { TNNetDataParallelism }
@@ -5390,7 +5501,7 @@ begin
   begin
     if (FOutputRaw.FData[OutputCnt] > 0.0) and (FOutputError.FData[OutputCnt] <> 0.0) then
     begin
-      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FNeurons[OutputCnt].FWeights);
+      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FArrNeurons[OutputCnt].FWeights);
     end;
   end;
 end;
@@ -5802,18 +5913,6 @@ begin
   InitDefault();
 end;
 
-procedure TNNetConvolutionAbstract.RefreshNeuronWeightList();
-var
-  NeuronCnt: integer;
-begin
-  FNeuronWeightList.Clear;
-
-  for NeuronCnt := 0 to FNeurons.Count - 1 do
-  begin
-    FNeuronWeightList.Add(FNeurons[NeuronCnt].Weights);
-  end;
-end;
-
 procedure TNNetConvolutionAbstract.RefreshCalculatePrevLayerError();
 begin
   FCalculatePrevLayerError :=
@@ -6053,7 +6152,7 @@ begin
   AddNeurons(pNumFeatures);
   FOutputError.ReSize(pNumFeatures, 1, 1);
   FOutputErrorDeriv.ReSize(pNumFeatures, 1, 1);
-  FDotProductResult := TNNetVolume.Create;
+  //FDotProductResult := TNNetVolume.Create;
 
   if not FPointwise
     then FInputPrepared := TNNetVolume.Create;
@@ -6072,56 +6171,9 @@ begin
   if not FPointwise
     then FInputPrepared.Free;
 
-  FDotProductResult.Free;
+  //FDotProductResult.Free;
   inherited Destroy;
 end;
-
-{$IFDEF OpenCL}
-procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TDotProductKernel);
-begin
-  inherited EnableOpenCL(DotProductKernel);
-  (*
-  // good for debugging
-  WriteLn(
-    'Has OpenCL:', FHasOpenCL,
-    ' Should OpenCL:', FShouldOpenCL,
-    ' Current layer:', Self.LayerIdx
-  );
-  *)
-  if (FHasOpenCL and FShouldOpenCL) then
-  begin
-    if not Assigned(FDotCL) then
-    begin
-      FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
-      FDotCL.HideMessages();
-    end;
-
-    FConcatedWeights.ReSize(FNeuronWeightList.GetTotalSize(),1,1);
-
-    FConcatedWInter.ReSize(FNeuronWeightList.GetTotalSize(),1,1);
-
-    //WriteLn(FVectorSize,' ',FNeuronWeightList.Count,' ',FOutputSizeX * FOutputSizeY);
-    (*if
-      {(FVectorSize mod 16 = 0) and
-      (FNeuronWeightList.Count mod 16 = 0) and
-      ((FOutputSizeX * FOutputSizeY) mod 16 = 0)} false then
-    begin
-      FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize, 'simpleGEMM1', 16, 16);
-      FShouldInterleaveWeights := true;
-      FShouldConcatWeights := true;
-    end
-    else*)
-    begin
-      FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize);
-      FShouldInterleaveWeights := true;
-      FShouldConcatWeights := true;
-    end;
-
-    FDotProductResult.ReSize(FOutputSizeX, FOutputSizeY, FNeurons.Count);
-  end;
-  AfterWeightUpdate();
-end;
-{$ENDIF}
 
 procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
@@ -6758,8 +6810,20 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   WeightsNum := pPrevLayer.Output.Size;
   SetNumWeightsForAllNeurons(WeightsNum);
+  FVectorSize := FNeurons[0].Weights.Size;
   InitDefault();
   BuildArrNeurons();
+  {$IFDEF OpenCL}
+  FShouldOpenCL := (FNeurons.Count >= 512) and (pPrevLayer.Output.Size >= 128);
+  if (FHasOpenCL and FShouldOpenCL) then
+  begin
+    FShouldConcatWeights := true;
+    FShouldInterleaveWeights := true;
+    RefreshNeuronWeightList();
+    EnableOpenCL(FDotProductKernel);
+  end;
+  {$ENDIF}
+  AfterWeightUpdate();
 end;
 
 procedure TNNetFullConnect.ComputePreviousLayerError();
@@ -6786,7 +6850,7 @@ begin
   begin
     if (FOutputErrorDeriv.FData[OutputCnt] <> 0.0) then
     begin
-      LocalPrevError.MulAdd(FOutputErrorDeriv.FData[OutputCnt], FNeurons[OutputCnt].FWeights);
+      LocalPrevError.MulAdd(FOutputErrorDeriv.FData[OutputCnt], FArrNeurons[OutputCnt].FWeights);
     end;
   end;
 end;
@@ -6833,7 +6897,8 @@ begin
 end;
 *)
 
-constructor TNNetFullConnect.Create(pSizeX, pSizeY, pDepth, pSuppressBias: integer);
+constructor TNNetFullConnect.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer);
 begin
   inherited Create;
   FOutPut.ReSize(pSizeX, pSizeY, pDepth);
@@ -6866,7 +6931,18 @@ begin
     (FPrevLayer.Output.Size = FNeurons[0].Weights.Size) then
   begin
     StartTime := Now();
+    {$IFDEF OpenCL}
+    if Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL then
+    begin
+      ComputeOpenCL();
+    end
+    else
+    begin
+      ComputeCPU();
+    end;
+    {$ELSE}
     ComputeCPU();
+    {$ENDIF}
     FForwardTime := FForwardTime + (Now() - StartTime);
   end else
   begin
@@ -6891,8 +6967,8 @@ begin
     for Cnt := 0 to MaxCnt do
     begin
       Sum :=
-        FNeurons[Cnt].Weights.DotProduct(FPrevLayer.Output) +
-        FNeurons[Cnt].FBiasWeight;
+        FArrNeurons[Cnt].Weights.DotProduct(FPrevLayer.Output) +
+        FArrNeurons[Cnt].FBiasWeight;
       FOutputRaw.FData[Cnt] := Sum;
       FOutput.FData[Cnt] := FActivationFn(Sum);
     end;
@@ -6902,12 +6978,119 @@ begin
     for Cnt := 0 to MaxCnt do
     begin
       Sum :=
-        FNeurons[Cnt].Weights.DotProduct(FPrevLayer.Output);
+        FArrNeurons[Cnt].Weights.DotProduct(FPrevLayer.Output);
       FOutputRaw.FData[Cnt] := Sum;
       FOutput.FData[Cnt] := FActivationFn(Sum);
     end;
   end;
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetFullConnect.ComputeOpenCL();
+var
+  InputAVolume: TNNetVolume;
+begin
+  if FShouldInterleaveWeights then
+  begin
+    if FConcatedWInter.Size < FNeurons[0].Weights.Size * FNeurons.Count then
+    begin
+      FErrorProc('Error at TNNetFullConnect.ComputeOpenCL: ' + IntToStr(FConcatedWInter.Size));
+      AfterWeightUpdate();
+    end;
+    InputAVolume := FConcatedWInter;
+  end
+  else
+  begin
+    InputAVolume := FConcatedWeights;
+  end;
+  FDotCL.Compute(InputAVolume, FPrevLayer.FOutput, 0, FAfterWeightUpdateHasBeenCalled, true);
+  FAfterWeightUpdateHasBeenCalled := false;
+  {$IFDEF Debug}
+  if FOutputRaw.Size <> FOutput.Size then
+  begin
+    FErrorProc('Error at TNNetFullConnect.ComputeOpenCL. Raw output size is:' + IntToStr(FOutputRaw.Size));
+    FOutputRaw.Resize(FOutput);
+  end;
+  if FBiasOutput.Size <> FOutput.Size then
+  begin
+    FErrorProc('Error at TNNetFullConnect.ComputeOpenCL. Bias size is:' + IntToStr(FOutputRaw.Size));
+    FOutputRaw.Resize(FOutput);
+  end;
+  {$ENDIF}
+  {$IFDEF Linux}
+  FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
+  {$ELSE}
+  FDotCL.FinishAndLoadResult(FOutputRaw, 0.0);
+  {$ENDIF}
+
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+
+procedure TNNetFullConnect.BackpropagateOpenCL();
+var
+  MaxNeurons, NeuronCnt: integer;
+  localLearErrorDeriv: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeurons do
+  begin
+      OutputErrorDeriv.FData[NeuronCnt] :=
+        OutputError.FData[NeuronCnt] *
+        FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+
+      localNeuron := FArrNeurons[NeuronCnt];
+      localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
+
+      {$IFDEF Debug}
+      if localNeuron.FBackInertia.Size <> FPrevLayer.Output.Size then
+      begin
+        FErrorProc
+        (
+          'TNNetLayerFullConnect.Backpropagate should have same sizes.' +
+          'Inertia Size:' + IntToStr(localNeuron.FBackInertia.Size) +
+          ' PrevLayer Output:' + IntToStr(FPrevLayer.Output.Size)
+        );
+      end;
+      {$ENDIF}
+      if (FBatchUpdate) then
+      begin
+        if localLearErrorDeriv <> 0.0 then
+        begin
+          localNeuron.Delta.MulAdd(localLearErrorDeriv, FPrevLayer.Output);
+          localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
+        end;
+      end
+      else
+      begin
+        localNeuron.FBackInertia.MulMulAdd(FInertia, localLearErrorDeriv * (1-FInertia), FPrevLayer.Output);
+
+        localNeuron.FBiasInertia :=
+          (1-FInertia)*localLearErrorDeriv +
+          (  FInertia)*localNeuron.FBiasInertia;
+        {$IFDEF CheckRange}
+        NeuronForceRange(localNeuron.FBiasInertia,FLearningRate);
+        {$ENDIF}
+
+        localNeuron.AddInertia();
+      end;
+  end;
+  if not FBatchUpdate then AfterWeightUpdate();
+end;
+
+procedure TNNetFullConnect.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  FOutputRaw.Resize(FOutput);
+  if Assigned(FPrevLayer) and Assigned(FDotCL) then
+  begin
+    RefreshNeuronWeightList();
+    AfterWeightUpdate();
+    FDotCL.PrepareForCompute(FConcatedWInter, FPrevLayer.FOutput, FVectorSize);
+  end;
+end;
+{$ENDIF}
 
 procedure TNNetFullConnect.Backpropagate();
 var
@@ -6921,7 +7104,18 @@ begin
     StartTime := Now();
     if FLearningRate <> 0.0 then
     begin
+      {$IFDEF OpenCL}
+      if Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL then
+      begin
+        BackpropagateOpenCL();
+      end
+      else
+      begin
+        BackpropagateCPU();
+      end;
+      {$ELSE}
       BackpropagateCPU;
+      {$ENDIF}
     end; // of FLearningRate <> 0.0
     {$IFDEF CheckRange} ForceRangeWeights(1000); {$ENDIF}
     ComputePreviousLayerError();
@@ -6952,7 +7146,7 @@ begin
         OutputError.FData[NeuronCnt] *
         FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
 
-      localNeuron := FNeurons[NeuronCnt];
+      localNeuron := FArrNeurons[NeuronCnt];
       localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
 
       {$IFDEF Debug}
@@ -6968,7 +7162,7 @@ begin
       {$ENDIF}
       if (FBatchUpdate) then
       begin
-        if localLearErrorDeriv<> 0.0 then
+        if localLearErrorDeriv <> 0.0 then
         begin
           localNeuron.Delta.MulAdd(localLearErrorDeriv, FPrevLayer.Output);
           localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
@@ -6994,7 +7188,6 @@ end;
 destructor TNNetFullConnect.Destroy();
 begin
   FAuxTransposedW.Free;
-
   inherited Destroy;
 end;
 
@@ -7736,6 +7929,12 @@ begin
     end;
     AuxOutput.Free;
   end;
+end;
+
+procedure TNNet.Compute(pInput, pOutput: TNNetVolume; FromLayerIdx: integer);
+begin
+  Self.Compute(pInput, FromLayerIdx);
+  Self.GetOutput(pOutput);
 end;
 
 procedure TNNet.Backpropagate(pOutput: TNNetVolume);
@@ -10008,6 +10207,7 @@ begin
   end;
 end;
 
+(*
 procedure TNNetConvolution.ComputeNeuronFromResult(NeuronIdx: integer);
 var
   OutputCntX, OutputCntY: integer;
@@ -10034,7 +10234,7 @@ begin
     Inc(OutputCntX);
   end;
 end;
-
+*)
 (*
 procedure TNNetConvolution.ComputeNeuronFastAVX32(NeuronIdx: integer);
 var
