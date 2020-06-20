@@ -23,11 +23,11 @@ This is an example for image classification:
 ```
 NN := TNNet.Create();
 NN.AddLayer(TNNetInput.Create(32, 32, 3)); //32x32x3 Input Image
-NN.AddLayer(TNNetConvolutionReLU.Create({Features=}16, {FeatureSize=}5, {Padding=}0, {Stride=}0, {SuppressBias=}0));
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}16, {FeatureSize=}5, {Padding=}0, {Stride=}1, {SuppressBias=}0));
 NN.AddLayer(TNNetMaxPool.Create({Size=}2));
-NN.AddLayer(TNNetConvolutionReLU.Create({Features=}32, {FeatureSize=}5, {Padding=}0, {Stride=}0, {SuppressBias=}0));
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}32, {FeatureSize=}5, {Padding=}0, {Stride=}1, {SuppressBias=}0));
 NN.AddLayer(TNNetMaxPool.Create({Size=}2));
-NN.AddLayer(TNNetConvolutionReLU.Create({Features=}32, {FeatureSize=}5, {Padding=}0, {Stride=}0, {SuppressBias=}0));
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}32, {FeatureSize=}5, {Padding=}0, {Stride=}1, {SuppressBias=}0));
 NN.AddLayer(TNNetLayerFullConnectReLU.Create({Neurons=}32));
 NN.AddLayer(TNNetFullConnectLinear.Create(NumClasses));
 NN.AddLayer(TNNetSoftMax.Create());
