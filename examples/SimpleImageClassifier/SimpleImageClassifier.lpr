@@ -30,13 +30,13 @@ type
     NN := TNNet.Create();
     NN.AddLayer([
       TNNetInput.Create(32, 32, 3),
-      TNNetConvolutionLinear.Create(64, 5, 2, 1, 1),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1, {SuppressBias=}1),
       TNNetMaxPool.Create(4),
       TNNetMovingStdNormalization.Create(),
-      TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
-      TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
-      TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
-      TNNetConvolutionReLU.Create(64, 3, 1, 1, 1),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
       TNNetDropout.Create(0.5),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(10),
