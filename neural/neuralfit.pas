@@ -53,6 +53,7 @@ type
       FAvgWeight: TNNet;
       FAvgWeightEpochCount: integer;
       FCurrentEpoch: integer;
+      FCurrentStep: integer;
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
@@ -102,6 +103,7 @@ type
       property AvgNN: TNNet read FAvgWeight;
       property ClipDelta: single read FClipDelta write FClipDelta;
       property CurrentEpoch: integer read FCurrentEpoch;
+      property CurrentStep: integer read FCurrentStep;
       property CurrentLearningRate: single read FCurrentLearningRate;
       property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
       property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
@@ -424,6 +426,7 @@ begin
         startTime := Now();
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
+      Inc(FCurrentStep);
     end;
 
     Inc(FCurrentEpoch);
@@ -1095,6 +1098,7 @@ begin
   FRunning := false;
   FShouldQuit := false;
   FCurrentEpoch := 0;
+  FCurrentStep := 0;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -1224,6 +1228,7 @@ begin
   FMaxThreadNum := 1;
   {$ENDIF}
   FCurrentEpoch := FInitialEpoch;
+  FCurrentStep := 0;
   FCurrentLearningRate := FInitialLearningRate;
   FImgVolumes := pImgVolumes;
   FImgValidationVolumes := pImgValidationVolumes;
@@ -1384,6 +1389,7 @@ begin
         startTime := Now();
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
+      Inc(FCurrentStep);
     end;
 
     Inc(FCurrentEpoch);
