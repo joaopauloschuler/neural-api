@@ -3563,7 +3563,7 @@ function THistoricalNets.AddDenseNetBlockCAI(pUnits, k, supressBias: integer;
   ): TNNetLayer;
 var
   UnitCnt: integer;
-  PreviousLayer: TNNetLayer;
+  PreviousLayer, LastLayer: TNNetLayer;
 begin
   if pUnits > 0 then
   begin
@@ -3583,11 +3583,12 @@ begin
       AddConvOrSeparableConv(IsSeparable, {HasReLU=} true, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
       if pAfter <> nil then AddLayer( pAfter.Create() );
       if DropoutRate > 0 then AddLayer( TNNetDropout.Create(DropoutRate) );
-      AddLayer( TNNetDeepConcat.Create([PreviousLayer, GetLastLayer()]) );
-    end;
-    if (Compression > 1) then
-    begin
-      AddLayer( TNNetSplitChannelEvery.Create(Compression, 0) );
+      LastLayer := GetLastLayer();
+      if (UnitCnt=pUnits) and (Compression > 1) then
+      begin
+        PreviousLayer := AddLayerAfter( TNNetSplitChannelEvery.Create(Compression, 0),PreviousLayer );
+      end;
+      AddLayer( TNNetDeepConcat.Create([PreviousLayer, LastLayer]) );
     end;
   end;
   Result := GetLastLayer();
@@ -3602,7 +3603,7 @@ function THistoricalNets.AddDenseNetBlockCAI(pUnits, k, supressBias: integer;
   ): TNNetLayer;
 var
   UnitCnt: integer;
-  PreviousLayer: TNNetLayer;
+  PreviousLayer, LastLayer: TNNetLayer;
 begin
   if pUnits > 0 then
   begin
@@ -3619,14 +3620,15 @@ begin
         end;
       end;
       if pBeforeConv <> nil then AddLayer( pBeforeConv.Create() );
-      AddConvOrSeparableConv(IsSeparable, {HasReLU=} true, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
+      AddConvOrSeparableConv(IsSeparable, {HasReLU=} false, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
       if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
       if DropoutRate > 0 then AddLayer( TNNetDropout.Create(DropoutRate) );
-      AddLayer( TNNetDeepConcat.Create([PreviousLayer, GetLastLayer()]) );
-    end;
-    if (Compression > 1) then
-    begin
-      AddLayer( TNNetSplitChannelEvery.Create(Compression, 0) );
+      LastLayer := GetLastLayer();
+      if (UnitCnt=pUnits) and (Compression > 1) then
+      begin
+        PreviousLayer := AddLayerAfter( TNNetSplitChannelEvery.Create(Compression, 0),PreviousLayer );
+      end;
+      AddLayer( TNNetDeepConcat.Create([PreviousLayer, LastLayer]) );
     end;
   end;
   Result := GetLastLayer();
