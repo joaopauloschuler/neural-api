@@ -358,6 +358,9 @@ type
       procedure Backpropagate(); override;
   end;
 
+  // Class of activation function layers.
+  TNNetActivationFunctionClass = class of TNNetIdentity;
+
   /// This is a base/abstract class. Do not use it directly.
   TNNetReLUBase = class(TNNetIdentity)
     public
@@ -895,10 +898,10 @@ type
       procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
   end;
 
-  { TNNetDeconvolution }
-  TNNetDeconvolution = class(TNNetConvolution)
+  /// Convolutional layer without activation function.
+  TNNetConvolutionLinear = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Convolutional layer with ReLU activation function.
@@ -907,22 +910,28 @@ type
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
-  /// Pointwise convolution with ReLU activation.
-  TNNetPointwiseConvReLU = class(TNNetConvolutionReLU)
+  /// Pointwise convolution with tanh activation.
+  TNNetPointwiseConv = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
-  end;
-
-  /// Convolutional layer without activation function.
-  TNNetConvolutionLinear = class(TNNetConvolution)
-  public
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Pointwise convolution with Linear activation.
   TNNetPointwiseConvLinear = class(TNNetConvolutionLinear)
   public
     constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+  end;
+
+  /// Pointwise convolution with ReLU activation.
+  TNNetPointwiseConvReLU = class(TNNetConvolutionReLU)
+  public
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+  end;
+
+  { TNNetDeconvolution }
+  TNNetDeconvolution = class(TNNetConvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
   { TNNetDeconvolutionReLU }
@@ -1084,6 +1093,7 @@ type
       function AddLayer(strData: string): TNNetLayer; overload;
       function AddLayer(pLayers: array of TNNetLayer): TNNetLayer; overload;
       // Adds a separable convolution.
+      function AddSeparableConv(pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer; pDepthMultiplier: integer = 1; pSuppressBias: integer = 0; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddSeparableConvReLU(pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer; pDepthMultiplier: integer = 1; pSuppressBias: integer = 0; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddSeparableConvLinear(pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer; pDepthMultiplier: integer = 1; pSuppressBias: integer = 0; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       /// Instead of a batch normalization (or a normalization per batch),
@@ -1102,7 +1112,12 @@ type
         pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer;
         PerCell: boolean = false; pSuppressBias: integer = 0;
         RandomBias: integer = 1; RandomAmplifier: integer = 1;
-        pAfterLayer: TNNetLayer = nil): TNNetLayer;
+        pAfterLayer: TNNetLayer = nil): TNNetLayer; overload;
+      function AddConvOrSeparableConv(IsSeparable: boolean;
+        pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer;
+        pSuppressBias: integer = 0;
+        pActFn: TNNetActivationFunctionClass = nil;
+        pAfterLayer: TNNetLayer = nil): TNNetLayer; overload;
       function AddCompression(Compression: TNeuralFloat = 0.5; supressBias: integer = 1): TNNetLayer;
       /// This function does both max and min pools and then concatenates results.
       function AddMinMaxPool(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0): TNNetLayer;
@@ -1122,6 +1137,8 @@ type
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Compute(pInput: array of TNNetVolume); overload;
+      procedure Compute(pInput: array of TNeuralFloatDynArr); overload;
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
       procedure Backpropagate(pOutput: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
@@ -1238,7 +1255,21 @@ type
         DropoutRate: TNeuralFloat = 0;
         RandomBias: integer = 1; RandomAmplifier: integer = 1;
         FeatureSize: integer = 3
-        ): TNNetLayer;
+        ): TNNetLayer; overload;
+      function AddDenseNetBlockCAI(pUnits, k, supressBias: integer;
+        PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
+        IsSeparable: boolean = false;
+        HasNorm: boolean = true;
+        pBeforeBottleNeck: TNNetLayerClass = nil;
+        pAfterBottleNeck: TNNetLayerClass = nil;
+        pBeforeConv: TNNetLayerClass = nil;
+        pAfterConv: TNNetLayerClass = nil;
+        BottleNeck: integer = 0;
+        Compression: integer = 1; // Compression factor. 2 means taking half of channels.
+        DropoutRate: TNeuralFloat = 0;
+        RandomBias: integer = 1; RandomAmplifier: integer = 1;
+        FeatureSize: integer = 3
+        ): TNNetLayer; overload;
       function AddDenseFullyConnected(pUnits, k, supressBias: integer;
         PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
         HasNorm: boolean = true;
@@ -1421,6 +1452,12 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+constructor TNNetPointwiseConv.Create(pNumFeatures: integer;
+  pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, {pFeatureSize=}1, {pInputPadding=}0, {pStride=}1, pSuppressBias);
 end;
 
 function TNNetMaxPoolPortable.CalcOutputSize(pInputSize: integer): integer;
@@ -3545,6 +3582,45 @@ begin
       if pBefore <> nil then AddLayer( pBefore.Create() );
       AddConvOrSeparableConv(IsSeparable, {HasReLU=} true, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
       if pAfter <> nil then AddLayer( pAfter.Create() );
+      if DropoutRate > 0 then AddLayer( TNNetDropout.Create(DropoutRate) );
+      AddLayer( TNNetDeepConcat.Create([PreviousLayer, GetLastLayer()]) );
+    end;
+    if (Compression > 1) then
+    begin
+      AddLayer( TNNetSplitChannelEvery.Create(Compression, 0) );
+    end;
+  end;
+  Result := GetLastLayer();
+end;
+
+function THistoricalNets.AddDenseNetBlockCAI(pUnits, k, supressBias: integer;
+  PointWiseConv: TNNetConvolutionClass; IsSeparable: boolean; HasNorm: boolean;
+  pBeforeBottleNeck: TNNetLayerClass; pAfterBottleNeck: TNNetLayerClass;
+  pBeforeConv: TNNetLayerClass; pAfterConv: TNNetLayerClass;
+  BottleNeck: integer; Compression: integer; DropoutRate: TNeuralFloat;
+  RandomBias: integer; RandomAmplifier: integer; FeatureSize: integer
+  ): TNNetLayer;
+var
+  UnitCnt: integer;
+  PreviousLayer: TNNetLayer;
+begin
+  if pUnits > 0 then
+  begin
+    for UnitCnt := 1 to pUnits do
+    begin
+      PreviousLayer := GetLastLayer();
+      if BottleNeck > 0 then
+      begin
+        if (PreviousLayer.Output.Depth > BottleNeck * 2) and (PointWiseConv <> nil) then
+        begin
+          if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
+          AddLayer( PointWiseConv.Create(BottleNeck, {featuresize}1, {padding}0, {stride}1, supressBias) );
+          if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
+        end;
+      end;
+      if pBeforeConv <> nil then AddLayer( pBeforeConv.Create() );
+      AddConvOrSeparableConv(IsSeparable, {HasReLU=} true, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
+      if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
       if DropoutRate > 0 then AddLayer( TNNetDropout.Create(DropoutRate) );
       AddLayer( TNNetDeepConcat.Create([PreviousLayer, GetLastLayer()]) );
     end;
@@ -7422,6 +7498,7 @@ begin
       'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvLinear' :  Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetPointwiseConv' :        Result := TNNetPointwiseConv.Create(St[0], St[4]);
       'TNNetPointwiseConvReLU' :    Result := TNNetPointwiseConvReLU.Create(St[0], St[4]);
       'TNNetPointwiseConvLinear' :  Result := TNNetPointwiseConvLinear.Create(St[0], St[4]);
       'TNNetMaxPool' :              Result := TNNetMaxPool.Create(St[0], St[1], St[2]);
@@ -7491,6 +7568,7 @@ begin
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvLinear' then Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetPointwiseConv' then Result := TNNetPointwiseConv.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvReLU' then Result := TNNetPointwiseConvReLU.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvLinear' then Result := TNNetPointwiseConvLinear.Create(St[0], St[4]) else
       if S[0] = 'TNNetMaxPool' then Result := TNNetMaxPool.Create(St[0], St[1], St[2]) else
@@ -7564,6 +7642,14 @@ var
 begin
   for LocalLayer in pLayers do AddLayer(LocalLayer);
   Result := GetLastLayer();
+end;
+
+function TNNet.AddSeparableConv(pNumFeatures, pFeatureSize, pInputPadding,
+  pStride: integer; pDepthMultiplier: integer; pSuppressBias: integer;
+  pAfterLayer: TNNetLayer): TNNetLayer;
+begin
+  AddLayerAfter( TNNetDepthwiseConvLinear.Create(pDepthMultiplier, pFeatureSize, pInputPadding, pStride), pAfterLayer);
+  Result := AddLayer( TNNetPointwiseConv.Create(pNumFeatures, pSuppressBias) );
 end;
 
 function TNNet.AddSeparableConvReLU(pNumFeatures, pFeatureSize, pInputPadding,
@@ -7661,6 +7747,27 @@ begin
   if (HasNorm) then
   begin
     AddConvOrSeparableConv := AddChannelMovingNorm(PerCell, RandomBias, RandomAmplifier);
+  end;
+end;
+
+function TNNet.AddConvOrSeparableConv(IsSeparable: boolean; pNumFeatures,
+  pFeatureSize, pInputPadding, pStride: integer;
+  pSuppressBias: integer; pActFn: TNNetActivationFunctionClass;
+  pAfterLayer: TNNetLayer): TNNetLayer;
+begin
+  if (IsSeparable) then
+  begin
+    AddConvOrSeparableConv := AddSeparableConvLinear(pNumFeatures, pFeatureSize,
+      pInputPadding, pStride, {DepthMultiplier=}1, pSuppressBias,
+      pAfterLayer);
+  end
+  else
+  begin
+    AddConvOrSeparableConv := AddLayerAfter( TNNetConvolutionLinear.Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias), pAfterLayer);
+  end;
+  if pActFn <> nil then
+  begin
+    AddConvOrSeparableConv := AddLayer( pActFn.Create() );
   end;
 end;
 
@@ -7887,6 +7994,70 @@ begin
     FErrorProc('Compute - Neural Network doesn''t have suficcient layers.');
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNet.Compute(pInput: array of TNNetVolume);
+var
+  MaxInputs: integer;
+  InputCnt: integer;
+begin
+  MaxInputs := Length(pInput) - 1;
+  if MaxInputs >= 1 then
+  begin
+    for InputCnt := 1 to MaxInputs do
+    begin
+      if FLayers[InputCnt].FOutput.Size = pInput[InputCnt].Size then
+      begin
+        FLayers[InputCnt].FOutput.CopyNoChecks(pInput[InputCnt]);
+      end
+      else
+      begin
+        FErrorProc
+        (
+          'Compute - Wrong Input Size:'+IntToStr(pInput[InputCnt].Size) + ' on layer '+
+          IntToStr(InputCnt) +
+          ' Expected size is:' + IntToStr(FLayers[InputCnt].Output.Size) +
+          ' Have you missed the TNNetInput layer?'
+        );
+      end;
+    end;
+  end;
+  if MaxInputs >= 0 then
+  begin
+    Compute(pInput[0]);
+  end;
+end;
+
+procedure TNNet.Compute(pInput: array of TNeuralFloatDynArr);
+var
+  MaxInputs: integer;
+  InputCnt: integer;
+begin
+  MaxInputs := Length(pInput) - 1;
+  if MaxInputs >= 1 then
+  begin
+    for InputCnt := 1 to MaxInputs do
+    begin
+      if FLayers[InputCnt].FOutput.Size = Length(pInput[InputCnt]) then
+      begin
+        FLayers[InputCnt].FOutput.Copy(pInput[InputCnt]);
+      end
+      else
+      begin
+        FErrorProc
+        (
+          'Compute - Wrong Input Size:'+IntToStr(Length(pInput[InputCnt])) + ' on layer '+
+          IntToStr(InputCnt) +
+          ' Expected size is:' + IntToStr(FLayers[InputCnt].Output.Size) +
+          ' Have you missed the TNNetInput layer?'
+        );
+      end;
+    end;
+  end;
+  if MaxInputs >= 0 then
+  begin
+    Compute(pInput[0]);
+  end;
 end;
 
 procedure TNNet.Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0);
