@@ -2434,6 +2434,8 @@ begin
   FStruct[1] := pFeatureSize;
   FStruct[2] := pInputPadding;
   FStruct[3] := pStride;
+  FActivationFn := @HiperbolicTangent;
+  FActivationFnDerivative := @HiperbolicTangentDerivative;
 end;
 
 procedure TNNetDepthwiseConv.Compute();
