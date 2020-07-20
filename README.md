@@ -310,9 +310,9 @@ Source code examples:
 When loading an image from a file, the easiest and fastest method is calling `LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume)`. When loading from an **TFPMemoryImage**, you can load with `LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume)`. For saving an image, the fastest method is `SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string)`.
 
 ## Fitting your Neural Network
-
+The easiest way to train your neural network is utilizing unit `neuralfit.pas`. Inside this unit, you’ll find the class `TNeuralImageFit` that is used by many examples.
 ### Image Classification
-The easiest way to train your neural network is utilizing unit `neuralfit.pas`. Inside this unit, you’ll find the class `TNeuralImageFit` that is used by many examples.  `TNeuralImageFit` has been designed for image classification tasks and is declared as follows:
+  `TNeuralImageFit` has been designed for image classification tasks and can be called as follows:
 ```
 procedure Fit(pNN: TNNet;
   pImgVolumes, pImgValidationVolumes, pImgTestVolumes: TNNetVolumeList;
@@ -330,7 +330,27 @@ Once you have a trained neural network, you can use an advanced classification p
 ```
 procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
 ```
-
+### Training with Volume Pairs
+In the case that your training, validation and testing data can be defined as volume pairs from input volume to output volume, the easiest way to train your neural network will be calling `TNeuralFit`. This class has the following fitting method:
+```
+procedure Fit(pNN: TNNet;
+  pTrainingVolumes, pValidationVolumes, pTestVolumes: TNNetVolumePairList;
+  pBatchSize, Epochs: integer);
+```
+The above implementation has a limitation: your dataset needs to be placed into RAM. In the case that your dataset is too large for RAM, you can call ` TNeuralDataLoadingFit`:
+```
+TNNetGetPairFn = function(Idx: integer; ThreadId: integer): TNNetVolumePair of object;
+TNNetGet2VolumesProc = procedure(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume) of object;
+  
+TNeuralDataLoadingFit = class(TNeuralFitBase)
+...
+    procedure FitLoading(pNN: TNNet;
+      TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
+      pGetTrainingPair, pGetValidationPair, pGetTestPair: TNNetGetPairFn); overload;
+    procedure FitLoading(pNN: TNNet;
+      TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
+      pGetTrainingProc, pGetValidationProc, pGetTestProc: TNNetGet2VolumesProc); overload;
+```
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
