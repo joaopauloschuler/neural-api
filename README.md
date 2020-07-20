@@ -238,6 +238,28 @@ Source code examples:
 ### Loading and Saving Images with Volumes
 When loading an image from a file, the easiest and fastest method is calling `LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume)`. When loading from an **TFPMemoryImage**, you can load with `LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume)`. For saving an image, the fastest method is `SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string)`.
 
+## Fitting your Neural Network
+
+### Image Classification
+The easiest way to train your neural network is utilizing unit `neuralfit.pas`. Inside this unit, you’ll find the class `TNeuralImageFit` that is used by many examples.  `TNeuralImageFit` has been designed for image classification tasks and is declared as follows:
+```
+procedure Fit(pNN: TNNet;
+  pImgVolumes, pImgValidationVolumes, pImgTestVolumes: TNNetVolumeList;
+  pNumClasses, pBatchSize, Epochs: integer);
+```
+Each volume should be provided with property `tag` that contains the corresponding class. `TNeuralImageFit` internally implements data augmentation techniques: flipping, making gray, cropping and resizing. These techniques can be controlled with:
+```
+property HasImgCrop: boolean read FHasImgCrop write FHasImgCrop;
+property HasMakeGray: boolean read FHasMakeGray write FHasMakeGray;
+property HasFlipX: boolean read FHasFlipX write FHasFlipX;
+property HasFlipY: boolean read FHasFlipY write FHasFlipY;
+property MaxCropSize: integer read FMaxCropSize write FMaxCropSize; 
+```
+Once you have a trained neural network, you can use an advanced classification procedure that will average the classification probability of the input image with its flipped and cropped versions. This process frequently gives a higher classification accuracy at the expense of internally running the very same neural network a number of times. This is how you can classify images:
+```
+procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
+```
+
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
