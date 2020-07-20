@@ -80,6 +80,50 @@ Although these examples require deeper understanding about neural networks, they
 
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at.
 
+## Volumes
+This API heavily relies on volumes. `TNNetVolume` class allows you to create volumes that can be accessed as 1D, 2D or 3D arrays and be operated with AVX SIMD instruction set. This is the most common way to create a volume:
+```
+constructor Create(pSizeX, pSizeY, pDepth: integer; c: T = 0);
+```
+You can access the data as 1D or 3D with:
+```
+property Data[x, y, d: integer]: T read Get write Store; default;
+property Raw[x: integer]: T read GetRaw write SetRaw;
+```
+As examples, you can add, subtract, multiply and calculate dot products with:
+```
+procedure Add(Original: TNNetVolume); overload;
+procedure Sub(Original: TNNetVolume); overload;
+function DotProduct(Original: TNNetVolume): TNeuralFloat; overload;
+procedure Mul(Value: Single); overload;
+```
+In the case that you need the raw position or raw pointer to an element of the volume, you can get with:
+```
+function GetRawPos(x, y, d: integer): integer; overload;
+function GetRawPos(x, y: integer): integer; overload;
+function GetRawPtr(x, y, d: integer): pointer; overload;
+function GetRawPtr(x, y: integer): pointer; overload;
+function GetRawPtr(x: integer): pointer; overload;
+```
+You can easily operate volumes with OpenCL via `TEasyOpenCLV`:
+```
+  TEasyOpenCLV = class (TEasyOpenCL)
+    public
+      function CreateBuffer(flags: cl_mem_flags; V: TNNetVolume): cl_mem; overload;
+      function CreateInputBuffer(V: TNNetVolume): cl_mem; overload;
+      function CreateHostInputBuffer(V: TNNetVolume): cl_mem; overload;
+      function CreateOutputBuffer(V: TNNetVolume): cl_mem; overload;
+      function CreateBuffer(V: TNNetVolume): cl_mem;  overload;
+
+      function WriteBuffer(buffer: cl_mem; V: TNNetVolume; blocking: cl_bool = CL_FALSE): integer;
+      function ReadBuffer(buffer: cl_mem; V: TNNetVolume; blocking: cl_bool = CL_TRUE): integer;
+
+      function CreateAndWriteBuffer(V: TNNetVolume; var buffer: cl_mem): integer; overload;
+      function CreateAndWriteBuffer(V: TNNetVolume): cl_mem; overload;
+      function CreateWriteSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem;
+      function CreateOutputSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem;
+  end;
+```
 ## Neural Network Layers
 This API is really big. The following list gives a general idea about this API but it doesn't contain everything.
 
