@@ -94,8 +94,8 @@ As examples, you can add, subtract, multiply and calculate dot products with:
 ```
 procedure Add(Original: TNNetVolume); overload;
 procedure Sub(Original: TNNetVolume); overload;
-function DotProduct(Original: TNNetVolume): TNeuralFloat; overload;
 procedure Mul(Value: Single); overload;
+function DotProduct(Original: TNNetVolume): TNeuralFloat; overload;
 ```
 In the case that you need the raw position or raw pointer to an element of the volume, you can get with:
 ```
@@ -123,6 +123,33 @@ You can easily operate volumes with OpenCL via `TEasyOpenCLV`:
       function CreateWriteSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem;
       function CreateOutputSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem;
   end;
+```
+### Volume Pairs, Volume Lists and Volume Pair Lists
+Volumes can be organized in pairs:
+```
+  /// Implements a pair of volumes
+  TNNetVolumePair = class(TObject)
+    protected
+      FA: TNNetVolume;
+      FB: TNNetVolume;
+    public
+      constructor Create(); overload;
+      constructor Create(pA, pB: TNNetVolume); overload;
+      constructor CreateCopying(pA, pB: TNNetVolume); overload;
+
+      destructor Destroy(); override;
+
+      property A:TNNetVolume read FA;
+      property B:TNNetVolume read FB;
+      property I:TNNetVolume read FA;
+      property O:TNNetVolume read FB;
+  end;
+```
+Depending on the problem that you are trying to solve, modelling the training with pairs or pair lists might be helpful. Typically, a pair will be (input, desired output).
+This is how volume lists and volume pair lists have been implemented:
+```
+TNNetVolumeList = class (specialize TFPGObjectList<TNNetVolume>
+TNNetVolumePairList = class (specialize TFPGObjectList<TNNetVolumePair>)
 ```
 ## Neural Network Layers
 This API is really big. The following list gives a general idea about this API but it doesn't contain everything.
