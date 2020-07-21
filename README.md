@@ -330,6 +330,7 @@ Once you have a trained neural network, you can use an advanced classification p
 ```
 procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
 ```
+In the case that you would like to look further, the [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier) example uses `TNeuralImageFit`.
 ### Training with Volume Pairs
 In the case that your training, validation and testing data can be defined as volume pairs from input volume to output volume, the easiest way to train your neural network will be calling `TNeuralFit`. This class has the following fitting method:
 ```
@@ -337,7 +338,7 @@ procedure Fit(pNN: TNNet;
   pTrainingVolumes, pValidationVolumes, pTestVolumes: TNNetVolumePairList;
   pBatchSize, Epochs: integer);
 ```
-The above implementation has a limitation: your dataset needs to be placed into RAM. In the case that your dataset is too large for RAM, you can call ` TNeuralDataLoadingFit`:
+The above implementation has a limitation: your dataset needs to be placed into RAM. In the case that your dataset is too large for RAM, you can call `TNeuralDataLoadingFit`:
 ```
 TNNetGetPairFn = function(Idx: integer; ThreadId: integer): TNNetVolumePair of object;
 TNNetGet2VolumesProc = procedure(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume) of object;
@@ -351,6 +352,7 @@ TNeuralDataLoadingFit = class(TNeuralFitBase)
       TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
       pGetTrainingProc, pGetValidationProc, pGetTestProc: TNNetGet2VolumesProc); overload;
 ```
+The [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr) example uses volume pair list for training as its training data is very small. The [Super Resolution](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) example uses `TNeuralDataLoadingFit` so it creates training pairs on the fly.
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
