@@ -312,7 +312,7 @@ When loading an image from a file, the easiest and fastest method is calling `Lo
 ## Fitting your Neural Network
 The easiest way to train your neural network is utilizing unit `neuralfit.pas`. Inside this unit, you’ll find the class `TNeuralImageFit` that is used by many examples.
 ### Image Classification
-  `TNeuralImageFit` has been designed for image classification tasks and can be called as follows:
+`TNeuralImageFit` has been designed for image classification tasks and can be called as follows:
 ```
 procedure Fit(pNN: TNNet;
   pImgVolumes, pImgValidationVolumes, pImgTestVolumes: TNNetVolumeList;
@@ -353,6 +353,39 @@ TNeuralDataLoadingFit = class(TNeuralFitBase)
       pGetTrainingProc, pGetValidationProc, pGetTestProc: TNNetGet2VolumesProc); overload;
 ```
 The [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr) example uses volume pair list for training as its training data is very small. The [Super Resolution](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) example uses `TNeuralDataLoadingFit` so it creates training pairs on the fly.
+### TNeuralFitBase
+`TNeuralImageFit` and `TNeuralDataLoadingFit` both descend from `TNeuralFitBase`. From `TNeuralFitBase`, you can define training properties:
+```
+property Inertia: single read FInertia write FInertia;
+property InitialEpoch: integer read FInitialEpoch write FInitialEpoch;
+property InitialLearningRate: single read FInitialLearningRate write FInitialLearningRate;
+property LearningRateDecay: single read FLearningRateDecay write FLearningRateDecay;
+property CyclicalLearningRateLen: integer read FCyclicalLearningRateLen write FCyclicalLearningRateLen;
+property Momentum: single read FInertia write FInertia;
+property L2Decay: single read FL2Decay write FL2Decay;
+property FileNameBase: string read FFileNameBase write FFileNameBase;
+```
+You can also collect current statistics:
+```
+property CurrentEpoch: integer read FCurrentEpoch;
+property CurrentStep: integer read FCurrentStep;
+property CurrentLearningRate: single read FCurrentLearningRate;
+property TestAccuracy: TNeuralFloat read FTestAccuracy;
+property TrainingAccuracy: TNeuralFloat read FTrainingAccuracy;
+property Running: boolean read FRunning;
+```
+Some events are available:
+```
+property OnStart: TNotifyEvent read FOnStart write FOnStart;
+property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
+property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
+```
+You can define your own learning rate schedule:
+```
+property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
+property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
+```
+
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
