@@ -61,7 +61,7 @@ type
 
   procedure NeuralThreadListCreate(pSize: integer);
   procedure NeuralThreadListFree();
-  function fNTL: TNeuralThreadList; {$IFDEF Release} inline; {$ENDIF}
+  function fNTL: TNeuralThreadList; {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
   procedure CreateNeuralThreadListIfRequired();
   function NeuralDefaultThreadCount: integer;
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);

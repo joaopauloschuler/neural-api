@@ -205,7 +205,7 @@ type
       procedure ComputeOutputErrorForOneNeuron(NeuronIdx: integer; value: TNeuralFloat);
       procedure ComputeOutputErrorWith(pOutput: TNNetVolume); virtual;
       procedure ComputeOutputErrorForIdx(pOutput: TNNetVolume; const aIdx: array of integer); virtual;
-      procedure ComputeErrorDeriv(); {$IFDEF Release} inline; {$ENDIF}
+      procedure ComputeErrorDeriv(); {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
       procedure Fill(value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddNeurons(NeuronNum: integer);
@@ -8060,7 +8060,7 @@ begin
   end;
   if MaxInputs >= 0 then
   begin
-    Compute(pInput[0]);
+    Compute(pInput[0], 0);
   end;
 end;
 
