@@ -385,6 +385,25 @@ You can define your own learning rate schedule:
 property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
 property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
 ```
+### Got Too Many Console Messages?
+`TNeuralFitBase` descends from `TMObject` that allows you to code your own message treatment:
+```
+property MessageProc: TGetStrProc read FMessageProc write FMessageProc;
+property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
+```
+On your own code, you could something is:
+```
+MyFit.MessageProc := {$IFDEF FPC}@{$ENDIF}Self.MessageProc;
+MyFit.ErrorProc := {$IFDEF FPC}@{$ENDIF}Self.ErrorProc;
+```
+If you don’t need any message at all, you can hide messages by calling:
+```
+procedure HideMessages();
+```
+You can also disable fitting verbosity with:
+```
+property Verbose: boolean read FVerbose write FVerbose;
+```
 
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
