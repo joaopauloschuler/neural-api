@@ -1,0 +1,139 @@
+object FormVisualLearning: TFormVisualLearning
+  Left = 665
+  Height = 605
+  Top = 141
+  Width = 1133
+  Caption = 'Artificial Art - Autoencoder with Tiny ImageNet 200'
+  ClientHeight = 605
+  ClientWidth = 1133
+  DesignTimePPI = 120
+  OnClose = FormClose
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  Position = poScreenCenter
+  LCLVersion = '2.0.2.0'
+  object ButLearn: TButton
+    Left = 768
+    Height = 45
+    Top = 8
+    Width = 168
+    Caption = 'Start'
+    OnClick = ButLearnClick
+    TabOrder = 0
+  end
+  object ImgSample: TImage
+    Left = 1080
+    Height = 32
+    Top = 8
+    Width = 32
+    Stretch = True
+  end
+  object LabClassRate: TLabel
+    Left = 8
+    Height = 46
+    Top = 8
+    Width = 96
+    Caption = '  0%'
+    Color = 15526549
+    Font.CharSet = ANSI_CHARSET
+    Font.Height = -40
+    Font.Name = 'Courier New'
+    Font.Pitch = fpFixed
+    Font.Quality = fqDraft
+    Font.Style = [fsBold]
+    ParentColor = False
+    ParentFont = False
+    Transparent = False
+  end
+  object GrBoxNeurons: TGroupBox
+    Left = 8
+    Height = 504
+    Top = 72
+    Width = 344
+    TabOrder = 1
+  end
+  object ChkBigNetwork: TCheckBox
+    Left = 136
+    Height = 24
+    Top = 8
+    Width = 259
+    Caption = 'Bigger (and slower) neural network.'
+    TabOrder = 2
+  end
+  object RadRGB: TRadioButton
+    Left = 688
+    Height = 24
+    Top = 8
+    Width = 52
+    Caption = 'RGB'
+    Checked = True
+    TabOrder = 4
+    TabStop = True
+  end
+  object RadLAB: TRadioButton
+    Left = 688
+    Height = 24
+    Top = 40
+    Width = 50
+    Caption = 'LAB'
+    TabOrder = 3
+  end
+  object ChkRunOnGPU: TCheckBox
+    Left = 136
+    Height = 24
+    Top = 40
+    Width = 102
+    Caption = 'Run on GPU'
+    TabOrder = 5
+  end
+  object ComboComplexity: TComboBox
+    Left = 576
+    Height = 28
+    Top = 40
+    Width = 80
+    ItemHeight = 20
+    ItemIndex = 0
+    Items.Strings = (
+      '256'
+      '512'
+      '1024'
+      '2048'
+      '4096'
+    )
+    Style = csDropDownList
+    TabOrder = 6
+    Text = '256'
+  end
+  object LabComplexity: TLabel
+    Left = 472
+    Height = 20
+    Top = 40
+    Width = 78
+    Caption = 'Complexity:'
+    ParentColor = False
+  end
+  object LabLearningRate: TLabel
+    Left = 456
+    Height = 20
+    Top = 8
+    Width = 94
+    Caption = 'Learning Rate:'
+    ParentColor = False
+  end
+  object ComboLearningRate: TComboBox
+    Left = 576
+    Height = 28
+    Top = 8
+    Width = 80
+    ItemHeight = 20
+    ItemIndex = 0
+    Items.Strings = (
+      'High'
+      'Normal'
+      'Low'
+    )
+    Style = csDropDownList
+    TabOrder = 7
+    Text = 'High'
+  end
+end
