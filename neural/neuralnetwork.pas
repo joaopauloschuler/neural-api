@@ -1270,6 +1270,22 @@ type
         RandomBias: integer = 1; RandomAmplifier: integer = 1;
         FeatureSize: integer = 3
         ): TNNetLayer; overload;
+      function AddParallelConvs(
+        PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
+        IsSeparable: boolean = false;
+        CopyInput: boolean = false;
+        pBeforeBottleNeck: TNNetLayerClass = nil;
+        pAfterBottleNeck: TNNetLayerClass = nil;
+        pBeforeConv: TNNetLayerClass = nil;
+        pAfterConv: TNNetLayerClass = nil;
+        BottleNeck: integer = 32;
+        p11count: integer = 16;
+        p33count: integer = 16;
+        p55count: integer = 0;
+        p77count: integer = 0;
+        maxPool: integer = 0;
+        minPool: integer = 0
+        ): TNNetLayer;
       function AddDenseFullyConnected(pUnits, k, supressBias: integer;
         PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
         HasNorm: boolean = true;
@@ -3633,6 +3649,96 @@ begin
       AddLayer( TNNetDeepConcat.Create([PreviousLayer, LastLayer]) );
     end;
   end;
+  Result := GetLastLayer();
+end;
+
+function THistoricalNets.AddParallelConvs(PointWiseConv: TNNetConvolutionClass;
+  IsSeparable: boolean;
+  CopyInput: boolean;
+  pBeforeBottleNeck: TNNetLayerClass;
+  pAfterBottleNeck: TNNetLayerClass; pBeforeConv: TNNetLayerClass;
+  pAfterConv: TNNetLayerClass;
+  BottleNeck: integer; p11count: integer;
+  p33count: integer; p55count: integer; p77count: integer;
+  maxPool: integer;
+  minPool: integer): TNNetLayer;
+var
+  UnitCnt: integer;
+  aL: array of TNNetLayer;
+  PreviousLayer, LastLayer: TNNetLayer;
+
+  procedure LocalAddConv(FilterCount, FilterSize: integer; PrevLayer: TNNetLayer);
+  begin
+    if pBeforeConv <> nil then PrevLayer := AddLayerAfter( pBeforeConv.Create(), PrevLayer );
+    AddConvOrSeparableConv(IsSeparable, {HasReLU=} false, {HasNorm=}false, FilterCount, FilterSize, (FilterSize-1) div 2, 1, {PerCell=}false, {supressBias=}1, {RandomBias=}0, {RandomAmplifier=}0, PrevLayer);
+  end;
+
+  function LocalAddBottleNeck(FilterCount: integer; PrevLayer: TNNetLayer): TNNetLayer;
+  begin
+    if pBeforeBottleNeck <> nil then PrevLayer := AddLayerAfter( pBeforeBottleNeck.Create(), PrevLayer);
+    AddLayerAfter( PointWiseConv.Create(FilterCount, {featuresize}1, {padding}0, {stride}1, {supressBias}1), PrevLayer);
+    if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
+    Result := GetLastLayer();
+  end;
+
+begin
+  PreviousLayer := GetLastLayer();
+  UnitCnt := 0;
+  SetLength(aL, 7);
+  if (CopyInput) then
+  begin
+    aL[UnitCnt] := PreviousLayer;
+    UnitCnt += 1;
+  end;
+  if (maxPool>0) then
+  begin
+    LastLayer := AddLayerAfter( TNNetMaxPool.Create(3,1,0), PreviousLayer);
+    aL[UnitCnt] := LocalAddBottleNeck(maxPool, LastLayer);
+    UnitCnt += 1;
+  end;
+  if (minPool>0) then
+  begin
+    LastLayer := AddLayerAfter( TNNetMinPool.Create(3,1,0), PreviousLayer);
+    aL[UnitCnt] := LocalAddBottleNeck(minPool, LastLayer);
+    UnitCnt += 1;
+  end;
+  if (p11count>0) then
+  begin
+    LocalAddConv(p11count, 1, PreviousLayer);
+    aL[UnitCnt] := GetLastLayer();
+    UnitCnt += 1;
+  end;
+  if (p33count>0) then
+  begin
+    LastLayer := PreviousLayer;
+    if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+    LocalAddConv(p33count, 3, LastLayer);
+    aL[UnitCnt] := GetLastLayer();
+    UnitCnt += 1;
+  end;
+  if (p55count>0) then
+  begin
+    LastLayer := PreviousLayer;
+    if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+    LocalAddConv(p55count, 5, LastLayer);
+    aL[UnitCnt] := GetLastLayer();
+    UnitCnt += 1;
+  end;
+  if (p77count>0) then
+  begin
+    LastLayer := PreviousLayer;
+    if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+    LocalAddConv(p77count, 7, LastLayer);
+    aL[UnitCnt] := GetLastLayer();
+    UnitCnt += 1;
+  end;
+  if UnitCnt > 1 then
+  begin
+    SetLength(aL, UnitCnt);
+    AddLayer( TNNetDeepConcat.Create(aL) );
+  end;
+  if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
+  SetLength(aL, 0);
   Result := GetLastLayer();
 end;
 
