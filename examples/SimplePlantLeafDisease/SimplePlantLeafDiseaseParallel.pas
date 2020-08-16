@@ -134,7 +134,7 @@ type
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}39, {batchsize=}64, {epochs=}300);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}39, {batchsize=}64, {epochs=}160);
     NeuralFit.Free;
 
     NN.Free;
