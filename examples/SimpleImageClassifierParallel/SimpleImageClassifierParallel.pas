@@ -29,24 +29,10 @@ type
     WriteLn('Creating Neural Network...');
     NN := THistoricalNets.Create();
     NN.AddLayer( TNNetInput.Create(32, 32, 3) );
-    NN.AddLayer( TNNetConvolutionLinear.Create({Features=}32, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1) );
-    NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddParallelConvs(
-        {PointWiseConv}TNNetConvolutionLinear,
-        {IsSeparable}false,
-        {CopyInput}false,
-        {pBeforeBottleNeck}nil,
-        {pAfterBottleNeck}nil,
-        {pBeforeConv}nil,
-        {pAfterConv}TNNetReLU,
-        {BottleNeck}0,
-        {p11count}16,
-        {p33count}16,
-        {p55count}16,
-        {p77count}16,
-        {maxPool}16
-    );
-    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer([
+      TNNetConvolutionLinear.Create({Features=}32, {FeatureSize=}3, {Padding=}0, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}0, {Stride=}1, {SuppressBias=}1)
+    ]);
     NN.AddParallelConvs(
         {PointWiseConv}TNNetConvolutionLinear,
         {IsSeparable}false,
@@ -62,6 +48,22 @@ type
         {p77count}16,
         {maxPool}16
     );
+    NN.AddParallelConvs(
+        {PointWiseConv}TNNetConvolutionLinear,
+        {IsSeparable}false,
+        {CopyInput}false,
+        {pBeforeBottleNeck}nil,
+        {pAfterBottleNeck}nil,
+        {pBeforeConv}nil,
+        {pAfterConv}TNNetReLU,
+        {BottleNeck}32,
+        {p11count}16,
+        {p33count}16,
+        {p55count}16,
+        {p77count}16,
+        {maxPool}16
+    );
+    NN.AddLayer( TNNetMaxPool.Create(2) );
     NN.AddParallelConvs(
         {PointWiseConv}TNNetConvolutionLinear,
         {IsSeparable}false,
@@ -110,7 +112,7 @@ type
     );
     NN.AddLayer([
       TNNetDropout.Create(0.5),
-      TNNetMaxPool.Create(2),
+      TNNetMaxPool.Create(4),
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
@@ -125,6 +127,7 @@ type
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
+    NeuralFit.MaxThreadNum := 32;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}64, {epochs=}300);
     NeuralFit.Free;
 
