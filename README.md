@@ -98,6 +98,17 @@ vInput := TNNetVolume.Create(32, 32, 3);
 vInput[1, 1, 1] := 1;
 vInput[2, 2, 2] := vInput[1, 1, 1] + 1;
 vInput.Raw[10] := 5;
+
+vInput.RandomizeGaussian();
+WriteLn('Avg: ', vInput.GetAvg());
+WriteLn('Variance: ', vInput.GetVariance());
+WriteLn('Std Dev: ', vInput.GetStdDeviation());
+
+WriteLn('Multiplying by 10');
+vInput.Mul(10);
+WriteLn('Avg: ', vInput.GetAvg());
+WriteLn('Variance: ', vInput.GetVariance());
+WriteLn('Std Dev: ', vInput.GetStdDeviation());
 ```
 As examples, you can add, subtract, multiply and calculate dot products with:
 ```
