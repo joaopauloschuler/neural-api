@@ -405,6 +405,13 @@ You can also disable fitting verbosity with:
 ```
 property Verbose: boolean read FVerbose write FVerbose;
 ```
+Your code will look like this:
+```
+NeuralFit := TNeuralImageFit.Create;
+...
+NeuralFit.Verbose := false;
+NeuralFit.HideMessages();
+```
 
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
