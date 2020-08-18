@@ -88,8 +88,16 @@ constructor Create(pSizeX, pSizeY, pDepth: integer; c: T = 0);
 ```
 You can access the data as 1D or 3D with:
 ```
-property Data[x, y, d: integer]: T read Get write Store; default;
 property Raw[x: integer]: T read GetRaw write SetRaw;
+property Data[x, y, d: integer]: T read Get write Store; default;
+```
+Your code will look like this:
+```
+// Usage Examples
+vInput := TNNetVolume.Create(32, 32, 3);
+vInput[1, 1, 1] := 1;
+vInput[2, 2, 2] := vInput[1, 1, 1] + 1;
+vInput.Raw[10] := 5;
 ```
 As examples, you can add, subtract, multiply and calculate dot products with:
 ```
