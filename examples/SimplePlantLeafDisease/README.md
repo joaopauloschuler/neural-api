@@ -1,4 +1,4 @@
-# Simple Plant Leaf Disease Image Classifier
+# Simple Plant Leaf Disease Image Classifier for the PlantVillage Dataset
 
 This example has interesting aspects to look at:
 * An easy and fast way to load image datasets where each folder represents one class of images: **CreateVolumesFromImagesFromFolder**.
