@@ -350,7 +350,7 @@ Once you have a trained neural network, you can use an advanced classification p
 ```
 procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
 ```
-In the case that you would like to look further, the [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier) example uses `TNeuralImageFit`.
+In the case that you would like to look into `TNeuralImageFit` in more detail, the [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier) example is a good starting point.
 ### Training with Volume Pairs
 In the case that your training, validation and testing data can be defined as volume pairs from input volume to output volume, the easiest way to train your neural network will be calling `TNeuralFit`. This class has the following fitting method:
 ```
