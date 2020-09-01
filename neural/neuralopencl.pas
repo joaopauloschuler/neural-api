@@ -104,6 +104,10 @@ type
     procedure CompileProgram(programsource: string);   overload;
 
     function CreateBuffer(flags: cl_mem_flags; size: csize_t; ptr: Pointer = nil): cl_mem; overload;
+    function MapBuffer(buffer: cl_mem; cb: csize_t; map_flags: cl_map_flags; blocking: cl_bool = CL_TRUE): Pointer; overload;
+    function MapHostInputBuffer(buffer: cl_mem; cb: csize_t): Pointer; overload;
+    function UnmapMemObject(buffer: cl_mem; mapped_ptr: Pointer): cl_int;
+    function RefreshHostInputBufferCache(buffer: cl_mem; cb: csize_t): cl_int;
     function WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer; overload;
     function ReadBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer; overload;
 
@@ -187,6 +191,8 @@ type
       FGroupSizeA, FGroupSizeB: longint;
       /// Average Previous Computing Time
       FPreviousComputeTime: TDateTime;
+      /// Indicates if buffers should be stored on host.
+      FHostInput: boolean;
 
       FDotProductKernel: TDotProductKernel;
 
@@ -214,6 +220,8 @@ type
       FThreadCount: longint;
       /// Average Previous Computing Time
       FPreviousComputeTime: TDateTime;
+      /// Indicates if buffers should be stored on host.
+      FHostInput: boolean;
 
       FInputBufferAs: cl_mem;
       FInputBufferBs: cl_mem;
@@ -289,6 +297,7 @@ constructor TDotProductSharedKernel.Create(DotProductKernel: TDotProductKernel);
 begin
   inherited Create();
   FDotProductKernel := DotProductKernel;
+  FHostInput := False;
 end;
 
 destructor TDotProductSharedKernel.Destroy();
@@ -319,8 +328,17 @@ begin
   FGroupSizeA := GroupSizeA;
   FGroupSizeB := GroupSizeB;
 
-  FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
-  FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+  if (FHostInput) then
+  begin
+    FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
+    FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
+  end
+  else
+  begin
+    FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+  end;
+
   FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
   FPreviousComputeTime := 0;
 
@@ -366,8 +384,19 @@ begin
       err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-      if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+      if (FHostInput) then
+      begin
+        //TODO: Fix this refresh.
+        //if NewVAs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferAs, VAs.GetMemSize());
+        //if NewVBs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferBs, VBs.GetMemSize())
+        if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+        if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+      end
+      else
+      begin
+        if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+        if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+      end;
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
 
@@ -516,6 +545,7 @@ begin
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;
+  FHostInput     := False;
 
   FNumAs := 0;
   FNumBs := 0;
@@ -555,8 +585,16 @@ begin
   FGroupSizeA := GroupSizeA;
   FGroupSizeB := GroupSizeB;
 
-  FInputBufferAs := CreateInputBuffer(VAs);
-  FInputBufferBs := CreateInputBuffer(VBs);
+  if (FHostInput) then
+  begin
+    FInputBufferAs := CreateHostInputBuffer(VAs);
+    FInputBufferBs := CreateHostInputBuffer(VBs);
+  end
+  else
+  begin
+    FInputBufferAs := CreateInputBuffer(VAs);
+    FInputBufferBs := CreateInputBuffer(VBs);
+  end;
   FResultBuffer  := CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
   FPreviousComputeTime := 0;
 
@@ -597,9 +635,22 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      err :=
-        WriteBuffer(FInputBufferAs, VAs) or
-        WriteBuffer(FInputBufferBs, VBs);
+      if (FHostInput) then
+      begin
+        err :=
+          //TODO: Fix this refresh.
+          //RefreshHostInputBufferCache(FInputBufferAs, VAs.GetMemSize()) or
+          //RefreshHostInputBufferCache(FInputBufferBs, VBs.GetMemSize())
+          WriteBuffer(FInputBufferAs, VAs) or
+          WriteBuffer(FInputBufferBs, VBs);
+        ;
+      end
+      else
+      begin
+        err :=
+          WriteBuffer(FInputBufferAs, VAs) or
+          WriteBuffer(FInputBufferBs, VBs);
+      end;
 
       FActFun := pActFN;
 
@@ -1032,6 +1083,44 @@ begin
   begin
     FErrorProc('clCreateBuffer :'+ IntToStr(err)+ ' Size:'+ IntToStr(size)+' bytes.');
   end;
+end;
+
+function TEasyOpenCL.MapBuffer(buffer: cl_mem; cb: csize_t;
+  map_flags: cl_map_flags;
+  blocking: cl_bool): Pointer;
+var
+  err: integer; // error code returned from api calls
+begin
+  err := 0;
+  Result := clEnqueueMapBuffer(FCommands, buffer, blocking, map_flags, {offset=}0, cb,
+    {num_events=}0, {events_list=}nil, {event=}nil, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
+  if (err <> CL_SUCCESS) then
+  begin
+    FErrorProc('clEnqueueMapBuffer :'+ IntToStr(err)+ ' Size:'+ IntToStr(cb)+' bytes.');
+  end;
+end;
+
+function TEasyOpenCL.MapHostInputBuffer(buffer: cl_mem; cb: csize_t): Pointer;
+begin
+  Result := MapBuffer(buffer, cb, {map_flags=}CL_MAP_READ, {blocking=}CL_TRUE);
+end;
+
+function TEasyOpenCL.UnmapMemObject(buffer: cl_mem; mapped_ptr: Pointer): cl_int;
+begin
+  Result := clEnqueueUnmapMemObject(FCommands, buffer, mapped_ptr, {num_events=}0, {events_list=}nil, {event=}nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('UnmapMemObject :'+ IntToStr(Result)+'.');
+  end;
+end;
+
+function TEasyOpenCL.RefreshHostInputBufferCache(buffer: cl_mem; cb: csize_t
+  ): cl_int;
+var
+  mapped_ptr: Pointer;
+begin
+  mapped_ptr := MapHostInputBuffer(buffer, cb);
+  Result := UnmapMemObject(buffer, mapped_ptr);
 end;
 
 function TEasyOpenCL.WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
