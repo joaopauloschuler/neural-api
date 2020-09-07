@@ -26,7 +26,9 @@ interface
 
 uses
   neuraldatasets, Classes, SysUtils, ExtCtrls, Graphics,
-  neuralvolume, neuralnetwork, StdCtrls;
+  neuralvolume, neuralnetwork, StdCtrls
+  {$IFNDEF FPC}, Windows{$ENDIF}
+  ;
 
 type
   TImageDynArr = array of TImage;

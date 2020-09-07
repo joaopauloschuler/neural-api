@@ -3688,25 +3688,25 @@ begin
   if (CopyInput) then
   begin
     aL[UnitCnt] := PreviousLayer;
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if (maxPool>0) then
   begin
     LastLayer := AddLayerAfter( TNNetMaxPool.Create(3,1,0), PreviousLayer);
     aL[UnitCnt] := LocalAddBottleNeck(maxPool, LastLayer);
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if (minPool>0) then
   begin
     LastLayer := AddLayerAfter( TNNetMinPool.Create(3,1,0), PreviousLayer);
     aL[UnitCnt] := LocalAddBottleNeck(minPool, LastLayer);
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if (p11count>0) then
   begin
     LocalAddConv(p11count, 1, PreviousLayer);
     aL[UnitCnt] := GetLastLayer();
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if (p33count>0) then
   begin
@@ -3714,7 +3714,7 @@ begin
     if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
     LocalAddConv(p33count, 3, LastLayer);
     aL[UnitCnt] := GetLastLayer();
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if (p55count>0) then
   begin
@@ -3722,7 +3722,7 @@ begin
     if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
     LocalAddConv(p55count, 5, LastLayer);
     aL[UnitCnt] := GetLastLayer();
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if (p77count>0) then
   begin
@@ -3730,7 +3730,7 @@ begin
     if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
     LocalAddConv(p77count, 7, LastLayer);
     aL[UnitCnt] := GetLastLayer();
-    UnitCnt += 1;
+    Inc(UnitCnt);
   end;
   if UnitCnt > 1 then
   begin

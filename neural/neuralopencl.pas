@@ -46,12 +46,14 @@ type
   TNeuralPChar     = PAnsiChar;
   csize_t          = NativeUInt;
   cl_bool          = TCL_bool;
+  cl_int           = TCL_int;
   cl_uint          = TCL_uint;
   cl_platform_id   = PCL_platform_id;
   cl_device_id     = PCL_device_id;
   cl_context       = PCL_context;
   cl_command_queue = PCL_command_queue;
   cl_program       = PCL_program;
+  cl_map_flags     = TCL_map_flags;
   cl_mem_flags     = TCL_mem_flags;
   cl_mem           = PCL_mem ;
   cl_kernel        = PCL_kernel;
