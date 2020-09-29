@@ -48,6 +48,12 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
     end;
   end;
 
+  // Returns TRUE if difference is smaller than 0.1 .
+  function LocalFloatCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+  begin
+    Result := ( Abs(A.FData[0]-B.FData[0])<0.1 );
+  end;
+
   procedure RunAlgo();
   var
     NN: TNNet;
@@ -71,9 +77,9 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
     NFit.InitialLearningRate := 0.00001;
     NFit.LearningRateDecay := 0;
     NFit.L2Decay := 0;
-    NFit.Fit(NN, TrainingPairs, ValidationPairs, TestPairs, {batchsize=}16, {epochs=}100);
+    NFit.InferHitFn := @LocalFloatCompare;
+    NFit.Fit(NN, TrainingPairs, ValidationPairs, TestPairs, {batchsize=}32, {epochs=}50);
     NN.DebugWeights();
-    NN.DebugErrors();
 
     pOutPut := TNNetVolume.Create(1,1,1,1);
 
@@ -86,7 +92,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
       ( 'Inputs:',
         TestPairs[Cnt].I.FData[0]:5:2,', ',
         TestPairs[Cnt].I.FData[1]:5:2,' - ',
-        ' Output:',
+        'Output:',
         pOutPut.Raw[0]:5:2,' ',
         ' Desired Output:',
         TestPairs[Cnt].O.FData[0]:5:2
