@@ -190,6 +190,7 @@ type
     procedure Define(Original: array of T);
     function DotProduct(Original: TVolume): T; overload; {$IFDEF Release} inline; {$ENDIF}
     class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
+    class function Product(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
     function SumDiff(Original: TVolume): T;  {$IFDEF Release} inline; {$ENDIF}
     procedure SumToPos(Original: TVolume);
     function GetDistanceSqr(Original: TVolume): T;  overload; {$IFDEF Release} inline; {$ENDIF}
@@ -8158,6 +8159,18 @@ begin
   for I := 0 to vHigh do
     //Uncomment for debugging only: WriteLn(PtrA^[I]:8:6,' # ', PtrB^[I]:8:6,' # ', Result:8:6);
     Result := Result + PtrA^[I] * PtrB^[I];
+end;
+
+class function TVolume.Product(PtrA: TNeuralFloatArrPtr;
+  NumElements: integer): Single;
+var
+  I: integer;
+  vHigh: integer;
+begin
+  Result := 1;
+  vHigh := NumElements - 1;
+  for I := 0 to vHigh do
+    Result := Result * PtrA^[I];
 end;
 
 {$IFNDEF FPC}

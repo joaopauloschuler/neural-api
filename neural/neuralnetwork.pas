@@ -947,9 +947,22 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       procedure Compute(); override;
-      procedure ComputeNTL(index, threadnum: integer);
+      procedure ComputeCPU();
       procedure Backpropagate(); override;
       procedure BackpropagateCPU();
+  end;
+
+  { TNNetLocalProduct }
+  // This is an experimental layer. Do not use it yet.
+  TNNetLocalProduct = class(TNNetConvolutionBase)
+  private
+    procedure BackpropagateAtOutputPos(OutputX, OutputY, OutputD: integer); {$IFDEF Release} inline; {$ENDIF}
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    procedure Compute(); override;
+    procedure ComputeCPU();
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU();
   end;
 
   { TNNetDeLocalConnect }
@@ -1467,6 +1480,173 @@ begin
      {ReLU=}ReLU,
      {Threshold=}Threshold
     );
+  end;
+end;
+
+{ TNNetLocalProduct }
+
+procedure TNNetLocalProduct.BackpropagateAtOutputPos(OutputX, OutputY,
+  OutputD: integer);
+var
+  CntX, CntY: integer;
+  MaxX, MaxY: integer;
+  LocalOutputError: TNeuralFloat;
+  LocalPrevError: TNNetVolume;
+  OutputIdx: integer;
+  OutputSize, Derivative: TNeuralFloat;
+  DestPos: integer;
+begin
+  OutputIdx := FOutput.GetRawPos(OutputX, OutputY, OutputD);
+  LocalOutputError := FOutputError.FData[OutputIdx];
+
+  if (LocalOutputError <> 0) and (FOutput.FData[OutputIdx] > 0) then
+  begin
+    MaxY := FFeatureSizeY - 1;
+    MaxX := FFeatureSizeX - 1;
+    LocalPrevError := FPrevLayer.OutputError;
+
+    FSmoothErrorPropagation := true;
+
+    if FSmoothErrorPropagation then
+    begin
+      OutputSize := FFeatureSizeX * FFeatureSizeY * FOutput.Depth;
+    end
+    else
+    begin
+      OutputSize := 1;
+    end;
+
+    if
+      (OutputX >= FPadding) and (OutputY >= FPadding) and
+      (OutputX < OutputError.SizeX - FPadding) and
+      (OutputY < OutputError.SizeY - FPadding) then
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        for CntX := 0 to MaxX do
+        begin
+          DestPos := LocalPrevError.GetRawPos( (OutputX-FPadding)*FStride, (OutputY-FPadding)*FStride + CntY, CntX) ;
+          Derivative := (FOutput.FData[OutputIdx] / FPrevLayer.FOutput.FData[DestPos]);
+          LocalPrevError.FData[DestPos] := LocalPrevError.FData[DestPos] + LocalOutputError*Derivative/OutputSize;
+        end;
+      end;
+    end;
+  end;// of if (LocalOutputErrorDeriv <> 0)
+end;
+
+procedure TNNetLocalProduct.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+end;
+
+procedure TNNetLocalProduct.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  if FNeurons.Count > 0 then
+  begin
+    if FPadding > 0
+      then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
+      else FInputCopy := FPrevLayer.Output;
+
+    FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
+    PrepareInputForConvolutionFast();
+    ComputeCPU();
+  end
+  else
+  begin
+    FErrorProc('Neuronal layer contains no neuron:'+ IntToStr(FNeurons.Count));
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLocalProduct.ComputeCPU();
+var
+  OutputCntX, OutputCntY, OutputCntD: integer;
+  InputCntX, InputCntY: integer;
+  MaxX, MaxY, MaxD: integer;
+  LocalSize: integer;
+  PtrA: TNeuralFloatArrPtr;
+  OutputIdx: integer;
+  Product: TNeuralFloat;
+  CntXYD: integer;
+begin
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+
+  LocalSize := FFeatureSizeX*FFeatureSizeY*FInputCopy.Depth;
+  InputCntX := 0;
+  OutputCntX := 0;
+  CntXYD := 0;
+  while OutputCntX <= MaxX do
+  begin
+    InputCntY := 0;
+    OutputCntY := 0;
+    while OutputCntY <= MaxY do
+    begin
+      OutputCntD := 0;
+      PtrA := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY, 0);
+      while OutputCntD <= MaxD do
+      begin
+        OutputIdx := FOutput.GetRawPos(OutputCntX, OutputCntY, OutputCntD);
+
+        Product := TNNetVolume.Product(PtrA, LocalSize);
+
+        FOutputRaw.FData[OutputIdx] := Product;
+        FOutput.FData[OutputIdx] := Product;
+        Inc(OutputCntD);
+        Inc(CntXYD);
+      end;
+      Inc(InputCntY, FStride);
+      Inc(OutputCntY);
+    end;
+    Inc(InputCntX, FStride);
+    Inc(OutputCntX);
+  end;
+  (*
+  FInputPrepared.Print();WriteLn();
+  FPrevLayer.FOutput.Print();WriteLn();
+  FOutput.Print();WriteLn();
+  WriteLn();
+  *)
+end;
+
+procedure TNNetLocalProduct.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    {$IFDEF CheckRange}ForceRangeWeights(1000);{$ENDIF}
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetLocalProduct.BackpropagateCPU();
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+begin
+  MaxX := OutputError.SizeX - 1;
+  MaxY := OutputError.SizeY - 1;
+  MaxD := OutputError.Depth - 1;
+
+  for CntD := 0 to MaxD do
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      for CntX := 0 to MaxX do
+      begin
+        BackpropagateAtOutputPos(CntX, CntY, CntD);
+      end;
+    end;
   end;
 end;
 
@@ -3146,6 +3326,7 @@ begin
     end;
   end
   else
+  if ( not(Self is TNNetLocalConnect) and not(Self is TNNetLocalProduct) ) then
   begin
     FErrorProc('Error: bias output hasn''t been defined.');
   end;
@@ -5558,7 +5739,7 @@ begin
 
     FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
     PrepareInputForConvolutionFast();
-    ComputeNTL(0,1);
+    ComputeCPU();
   end
   else
   begin
@@ -5567,7 +5748,7 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
-procedure TNNetLocalConnect.ComputeNTL(index, threadnum: integer);
+procedure TNNetLocalConnect.ComputeCPU();
 var
   OutputCntX, OutputCntY, OutputCntD: integer;
   InputCntX, InputCntY: integer;
@@ -5597,18 +5778,15 @@ begin
       PtrA := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY, 0);
       while OutputCntD <= MaxD do
       begin
-        if CntXYD mod threadnum = index then
-        begin
-          NeuronIdx := FOutput.GetRawPos(OutputCntX, OutputCntY, OutputCntD);
-          LocalW := FNeurons[NeuronIdx].Weights;
-          PtrB := LocalW.GetRawPtr(0, 0, 0);
+        NeuronIdx := FOutput.GetRawPos(OutputCntX, OutputCntY, OutputCntD);
+        LocalW := FNeurons[NeuronIdx].Weights;
+        PtrB := LocalW.GetRawPtr(0, 0, 0);
 
-          Sum := LocalW.DotProduct(PtrA, PtrB, LocalSize);
-          if FSuppressBias = 0 then Sum := Sum + FNeurons[NeuronIdx].FBiasWeight;
+        Sum := LocalW.DotProduct(PtrA, PtrB, LocalSize);
+        if FSuppressBias = 0 then Sum := Sum + FNeurons[NeuronIdx].FBiasWeight;
 
-          FOutputRaw.FData[NeuronIdx] := Sum;
-          FOutput.FData[NeuronIdx] := FActivationFn(Sum);
-        end;
+        FOutputRaw.FData[NeuronIdx] := Sum;
+        FOutput.FData[NeuronIdx] := FActivationFn(Sum);
         Inc(OutputCntD);
         Inc(CntXYD);
       end;
@@ -7598,6 +7776,7 @@ begin
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetLocalConnect' :         Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetLocalProduct' :         Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalConnectReLU' :     Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(St[0]);
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
@@ -7668,6 +7847,7 @@ begin
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetLocalConnect' then Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetLocalProduct' then Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalConnectReLU' then Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(St[0]) else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
