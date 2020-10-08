@@ -68,10 +68,12 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
     ValidationPairs := CreateHypotenusePairList(1000);
     TestPairs := CreateHypotenusePairList(1000);
 
-    NN.AddLayer( TNNetInput.Create(2) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(32) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(32) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(1) );
+    NN.AddLayer([
+      TNNetInput.Create(2),
+      TNNetFullConnectReLU.Create(32),
+      TNNetFullConnectReLU.Create(32),
+      TNNetFullConnectReLU.Create(1)
+    ]);
 
     WriteLn('Computing...');
     NFit.InitialLearningRate := 0.00001;
@@ -81,7 +83,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
     NFit.Fit(NN, TrainingPairs, ValidationPairs, TestPairs, {batchsize=}32, {epochs=}50);
     NN.DebugWeights();
 
-    pOutPut := TNNetVolume.Create(1,1,1,1);
+    pOutPut := TNNetVolume.Create({pSizeX=}1, {pSizeY=}1, {pDepth=}1, {FillValue=}1);
 
     // tests the learning
     for Cnt := 0 to 9 do
