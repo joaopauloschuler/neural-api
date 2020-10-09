@@ -240,11 +240,14 @@ This API is really big. The following list gives a general idea about this API b
 
 ### Layers with Activation Functions and no Trainable Parameter
 * `TNNetReLU` (input/output: 1D, 2D or 3D).
-* `TNNetSELU` (input/output: 1D, 2D or 3D).
 * `TNNetLeakyReLU` (input/output: 1D, 2D or 3D).
 * `TNNetVeryLeakyReLU` (input/output: 1D, 2D or 3D).
+* `TNNetReLUSqrt` (input/output: 1D, 2D or 3D).
+* `TNNetSELU` (input/output: 1D, 2D or 3D).
 * `TNNetSigmoid` (input/output: 1D, 2D or 3D).
 * `TNNetSoftMax` (input/output: 1D, 2D or 3D).
+* `TNNetHyperbolicTangent` (input/output: 1D, 2D or 3D).
+* `TNNetPower` (input/output: 1D, 2D or 3D).
 
 ### Trainable Bias (Shift) and Multiplication (Scaling) per Cell or Channel Allowing Faster Learning and Convergence
 * `TNNetCellBias` (input/output: 1D, 2D or 3D).
