@@ -397,6 +397,20 @@ type
       procedure Compute(); override;
   end;
 
+  //Does a ReLU followed by a Square Root
+  TNNetReLUSqrt = class(TNNetReLUBase)
+      procedure Compute(); override;
+  end;
+
+  // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
+  TNNetPower = class(TNNetReLUBase)
+    private
+      FPower: TNeuralFloat;
+    public
+      constructor Create(iPower: integer);
+      procedure Compute(); override;
+  end;
+
   /// Leaky Rectified Linear Unit (ReLU) layer.
   // https://en.wikipedia.org/wiki/Rectifier_(neural_networks)
   TNNetLeakyReLU = class(TNNetReLUBase)
@@ -1483,6 +1497,95 @@ begin
   end;
 end;
 
+{ TNNetPower }
+
+constructor TNNetPower.Create(iPower: integer);
+begin
+  inherited Create();
+  FPower := iPower;
+  FStruct[0] := iPower;
+end;
+
+procedure TNNetPower.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  VSqrt: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      FOutput.FData[OutputCnt] := Power(LocalPrevOutput.FData[OutputCnt], FPower);
+      FOutputErrorDeriv.FData[OutputCnt] := FPower*Power(LocalPrevOutput.FData[OutputCnt], FPower-1);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      FOutput.FData[OutputCnt] := Power(LocalPrevOutput.FData[OutputCnt], FPower);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetReLUSqrt }
+
+procedure TNNetReLUSqrt.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  VSqrt: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      if LocalPrevOutput.FData[OutputCnt] > 0 then
+      begin
+        VSqrt := Sqrt(LocalPrevOutput.FData[OutputCnt]);
+        FOutput.FData[OutputCnt] := VSqrt;
+        FOutputErrorDeriv.FData[OutputCnt] := 1/(2*VSqrt);
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      if LocalPrevOutput.FData[OutputCnt]>0 then
+      begin
+        FOutput.FData[OutputCnt] := Sqrt(LocalPrevOutput.FData[OutputCnt]);
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetLocalProduct }
 
 procedure TNNetLocalProduct.BackpropagateAtOutputPos(OutputX, OutputY,
@@ -1526,7 +1629,7 @@ begin
         for CntX := 0 to MaxX do
         begin
           DestPos := LocalPrevError.GetRawPos( (OutputX-FPadding)*FStride, (OutputY-FPadding)*FStride + CntY, CntX) ;
-          Derivative := (FOutput.FData[OutputIdx] / FPrevLayer.FOutput.FData[DestPos]);
+          Derivative := 1; //(FOutput.FData[OutputIdx] / FPrevLayer.FOutput.FData[DestPos]);
           LocalPrevError.FData[DestPos] := LocalPrevError.FData[DestPos] + LocalOutputError*Derivative/OutputSize;
         end;
       end;
@@ -7760,7 +7863,9 @@ begin
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
+      'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1]);
+      'TNNetPower' :                Result := TNNetPower.Create(St[0]);
       'TNNetSELU' :                 Result := TNNetSELU.Create();
       'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
@@ -7831,7 +7936,9 @@ begin
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
+      if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1]) else
+      if S[0] = 'TNNetPower' then Result := TNNetPower.Create(St[0]) else
       if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
       if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
