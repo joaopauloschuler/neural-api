@@ -1119,6 +1119,10 @@ type
       function AddLayer(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayer(strData: string): TNNetLayer; overload;
       function AddLayer(pLayers: array of TNNetLayer): TNNetLayer; overload;
+      function AddLayerConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
+      function AddLayerConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer; overload;
+      function AddLayerDeepConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
+      function AddLayerDeepConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer; overload;
       // Adds a separable convolution.
       function AddSeparableConv(pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer; pDepthMultiplier: integer = 1; pSuppressBias: integer = 0; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddSeparableConvReLU(pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer; pDepthMultiplier: integer = 1; pSuppressBias: integer = 0; pAfterLayer: TNNetLayer = nil): TNNetLayer;
@@ -8039,6 +8043,36 @@ var
 begin
   for LocalLayer in pLayers do AddLayer(LocalLayer);
   Result := GetLastLayer();
+end;
+
+function TNNet.AddLayerConcatingInputOutput(pLayers: array of TNNetLayer
+  ): TNNetLayer;
+var
+  PrevLayer: TNNetLayer;
+begin
+  PrevLayer := GetLastLayer();
+  AddLayer(pLayers);
+  Result := AddLayer(TNNetConcat.Create([PrevLayer, GetLastLayer()]));
+end;
+
+function TNNet.AddLayerConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer;
+begin
+  Result := AddLayerConcatingInputOutput([pLayer]);
+end;
+
+function TNNet.AddLayerDeepConcatingInputOutput(pLayers: array of TNNetLayer
+  ): TNNetLayer;
+var
+  PrevLayer: TNNetLayer;
+begin
+  PrevLayer := GetLastLayer();
+  AddLayer(pLayers);
+  Result := AddLayer(TNNetDeepConcat.Create([PrevLayer, GetLastLayer()]));
+end;
+
+function TNNet.AddLayerDeepConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer;
+begin
+  Result := AddLayerDeepConcatingInputOutput([pLayer]);
 end;
 
 function TNNet.AddSeparableConv(pNumFeatures, pFeatureSize, pInputPadding,
