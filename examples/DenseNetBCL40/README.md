@@ -47,8 +47,7 @@ function THistoricalNets.AddDenseNetTransition(
 begin
   AddChannelMovingNorm(false, 0, 0);
   AddLayer( TNNetReLU.Create() );
-  if (Compression <> 1)
-      then AddCompression(Compression, supressBias);
+  AddCompression(Compression, supressBias);
   if HasAvgPool
     then Result := AddLayer( TNNetAvgPool.Create(2) )
     else Result := AddLayer( TNNetMaxPool.Create(2) );
