@@ -308,6 +308,10 @@ NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding
 NN.AddLayer(TNNetLayerFullConnectReLU.Create(64));
 NN.AddLayer(TNNetLayerFullConnectReLU.Create(NumClasses));
 ```
+These source code examples show `AddLayerAfter`:
+* [DenseNetBC L40](https://github.com/joaopauloschuler/neural-api/tree/master/examples/DenseNetBCL40)
+* [Identity Shortcut Connection](https://github.com/joaopauloschuler/neural-api/tree/master/examples/IdentityShortcutConnection) - ResNet building block [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/IdentityShortcutConnection/IdentityShortcutConnection.ipynb)
+
 You can find more about multi-path architectures at:
 * [Multi-path Convolutional Neural Networks for Complex Image Classification](https://arxiv.org/abs/1506.04701).
 * [Dual Path Networks](https://arxiv.org/abs/1707.01629).
