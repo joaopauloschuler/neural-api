@@ -230,13 +230,13 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetChannelRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication (scale) and random bias (shift) per channel.
 
 ### Concatenation, Summation and Reshaping Layers
-* `TNNetConcat` (input/output: 1D, 2D or 3D). Allows concatenating results from previous layers.
-* `TNNetDeepConcat` (input/output: 1D, 2D or 3D). Concatenates into the depth axis. This is useful with DenseNet like architectures.
+* `TNNetConcat` (input/output: 1D, 2D or 3D). Allows concatenating previous layers into a single layer.
+* `TNNetDeepConcat` (input/output: 1D, 2D or 3D). Concatenates previous layers into the depth axis. This is useful with DenseNet like architectures. Use `TNNetDeepConcat` instead of `TNNetConcat` if you need to add convolutions after concating layers.
 * `TNNetIdentity` (input/output: 1D, 2D or 3D).
 * `TNNetIdentityWithoutBackprop` (input/output: 1D, 2D or 3D). Allows the forward pass to proceed but prevents backpropagation.
 * `TNNetReshape` (input/output: 1D, 2D or 3D).
 * `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits layers/channels from the input.
-* `TNNetSum` (input/output: 1D, 2D or 3D). Sums outputs from parallel layers allowing ResNet style networks.
+* `TNNetSum` (input/output: 1D, 2D or 3D). Sums outputs from previous layers allowing ResNet style networks.
 
 ### Layers with Activation Functions and no Trainable Parameter
 * `TNNetReLU` (input/output: 1D, 2D or 3D).
@@ -278,6 +278,39 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);`
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
+
+## Multi-path Architectures Support
+Since 2017, this API supports multi-paths architectures. You can create multi-paths with `AddLayerAfter` method. For concatenating (merging) paths, you can call either `TNNetConcat` or `TNNetDeepConcat`. Follows an example:
+```
+// Creates The Neural Network
+NN := TNNet.Create();
+ 
+// This network splits into 2 paths and then is later concatenated
+InputLayer := NN.AddLayer(TNNetInput.Create(32, 32, 3));
+ 
+// First branch starting from InputLayer (5x5 features)
+NN.AddLayerAfter(TNNetConvolutionReLU.Create({Features=}16, {FeatureSize=}5, {Padding=}2, {Stride=}1), InputLayer);
+NN.AddLayer(TNNetMaxPool.Create(2));
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1));
+NN.AddLayer(TNNetMaxPool.Create(2));
+EndOfFirstPath := NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1));
+ 
+// Another branch starting from InputLayer (3x3 features)
+NN.AddLayerAfter(TNNetConvolutionReLU.Create({Features=}16, {FeatureSize=}3, {Padding=}1, {Stride=}1), InputLayer);
+NN.AddLayer(TNNetMaxPool.Create(2));
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1));
+NN.AddLayer(TNNetMaxPool.Create(2));
+EndOfSecondPath := NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1));
+ 
+// Concats both branches into one branch.
+NN.AddLayer(TNNetDeepConcat.Create([EndOfFirstPath, EndOfSecondPath]));
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1));
+NN.AddLayer(TNNetLayerFullConnectReLU.Create(64));
+NN.AddLayer(TNNetLayerFullConnectReLU.Create(NumClasses));
+```
+You can find more about multi-path architectures at:
+* [Multi-path Convolutional Neural Networks for Complex Image Classification](https://arxiv.org/abs/1506.04701).
+* [Dual Path Networks](https://arxiv.org/abs/1707.01629).
 
 ## Dataset Support
 These datasets can be easily loaded:
