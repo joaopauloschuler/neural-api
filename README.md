@@ -282,6 +282,20 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
 
+## Adding Layers
+You can add layers one by one or you can add an array of layers in one go. Follows an example adding layers one by one:
+```
+NN.AddLayer(TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1));
+NN.AddLayer(TNNetMaxPool.Create(2));
+```
+The next example shows how to add an array of layers that is equivalent to the above example:
+```
+NN.AddLayer([
+  TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1),
+  TNNetMaxPool.Create(2)
+]);
+```
+
 ## Multi-path Architectures Support
 Since 2017, this API supports multi-paths architectures. You can create multi-paths with `AddLayerAfter` method. For concatenating (merging) paths, you can call either `TNNetConcat` or `TNNetDeepConcat`. Follows an example:
 ```
