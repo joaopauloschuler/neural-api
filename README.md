@@ -29,7 +29,7 @@ NN.AddLayer([
   TNNetConvolutionReLU.Create({Features=}32, {FeatureSize=}5, {Padding=}0, {Stride=}1, {SuppressBias=}0),
   TNNetMaxPool.Create({Size=}2),
   TNNetConvolutionReLU.Create({Features=}32, {FeatureSize=}5, {Padding=}0, {Stride=}1, {SuppressBias=}0),
-  TNNetLayerFullConnectReLU.Create({Neurons=}32),
+  TNNetFullConnectReLU.Create({Neurons=}32),
   TNNetFullConnectLinear.Create(NumClasses),
   TNNetSoftMax.Create()
 ]);
