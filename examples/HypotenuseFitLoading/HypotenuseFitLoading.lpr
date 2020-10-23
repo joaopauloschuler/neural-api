@@ -88,7 +88,7 @@ type
     // tests the learning
     for Cnt := 0 to 9 do
     begin
-      GetTrainingPair({Idx=}0, {ThreadId=}0, TestInput, TestOutput);
+      GetTestPair({Idx=}0, {ThreadId=}0, TestInput, TestOutput);
       NN.Compute(TestInput);
       NN.GetOutput(pOutPut);
       WriteLn
