@@ -408,14 +408,17 @@ Once you have a trained neural network, you can use an advanced classification p
 procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
 ```
 In the case that you would like to look into `TNeuralImageFit` in more detail, the [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier) example is a good starting point.
-### Training with Volume Pairs
+
+### Training with Volume Pair Lists - TNeuralFit
 In the case that your training, validation and testing data can be defined as volume pairs from input volume to output volume, the easiest way to train your neural network will be calling `TNeuralFit`. This class has the following fitting method:
 ```
 procedure Fit(pNN: TNNet;
   pTrainingVolumes, pValidationVolumes, pTestVolumes: TNNetVolumePairList;
   pBatchSize, Epochs: integer);
 ```
-The above implementation has a limitation: your dataset needs to be placed into RAM. In the case that your dataset is too large for RAM, you can call `TNeuralDataLoadingFit`:
+Both [AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr) and [hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse) examples load volume pair lists for training.
+### Training with Volume Pairs - TNeuralDataLoadingFit
+The `TNeuralFit` implementation has a limitation: your dataset needs to be placed into RAM. In the case that your dataset is too large for RAM, you can call `TNeuralDataLoadingFit`:
 ```
 TNNetGetPairFn = function(Idx: integer; ThreadId: integer): TNNetVolumePair of object;
 TNNetGet2VolumesProc = procedure(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume) of object;
@@ -429,7 +432,7 @@ TNeuralDataLoadingFit = class(TNeuralFitBase)
       TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
       pGetTrainingProc, pGetValidationProc, pGetTestProc: TNNetGet2VolumesProc); overload;
 ```
-Both [AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr) and [hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse) examples load volume pair lists for training. The [Super Resolution](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) example uses `TNeuralDataLoadingFit` so it creates training pairs on the fly.
+ The [Hypotenuse with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading) example uses `TNeuralDataLoadingFit` so it creates training pairs on the fly.
 ### TNeuralFitBase
 `TNeuralImageFit` and `TNeuralDataLoadingFit` both descend from `TNeuralFitBase`. From `TNeuralFitBase`, you can define training properties:
 ```
