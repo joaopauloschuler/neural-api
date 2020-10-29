@@ -1322,11 +1322,16 @@ type
         pAfterBottleNeck: TNNetLayerClass = nil;
         pBeforeConv: TNNetLayerClass = nil;
         pAfterConv: TNNetLayerClass = nil;
-        BottleNeck: integer = 32;
-        p11count: integer = 16;
-        p33count: integer = 16;
-        p55count: integer = 0;
-        p77count: integer = 0;
+        PreviousLayer: TNNetLayer = nil;
+        BottleNeck: integer = 16;
+        p11ConvCount: integer = 4;
+        p11FilterCount: integer = 16;
+        p33ConvCount: integer = 4;
+        p33FilterCount: integer = 16;
+        p55ConvCount: integer = 4;
+        p55FilterCount: integer = 0;
+        p77ConvCount: integer = 4;
+        p77FilterCount: integer = 0;
         maxPool: integer = 0;
         minPool: integer = 0
         ): TNNetLayer;
@@ -1517,8 +1522,6 @@ end;
 { TNNetPad }
 
 procedure TNNetPad.SetPrevLayer(pPrevLayer: TNNetLayer);
-var
-  Padding: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(pPrevLayer.FOutput.SizeX + FPadding*2, pPrevLayer.FOutput.SizeY + FPadding*2, pPrevLayer.FOutput.Depth);
@@ -1584,7 +1587,6 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  VSqrt: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
@@ -3493,8 +3495,8 @@ begin
   else
   if Self is TNNetFullConnect then
   begin
-    for NeuronIdx := 0 to MaxNeurons do
     BiasValue := FBiasOutput.GetRawPtr(0, 0);
+    for NeuronIdx := 0 to MaxNeurons do
     begin
       BiasValue^ := FArrNeurons[NeuronIdx].FBiasWeight;
       Inc(BiasValue);
@@ -4014,14 +4016,23 @@ function THistoricalNets.AddParallelConvs(PointWiseConv: TNNetConvolutionClass;
   pBeforeBottleNeck: TNNetLayerClass;
   pAfterBottleNeck: TNNetLayerClass; pBeforeConv: TNNetLayerClass;
   pAfterConv: TNNetLayerClass;
-  BottleNeck: integer; p11count: integer;
-  p33count: integer; p55count: integer; p77count: integer;
+  PreviousLayer: TNNetLayer;
+  BottleNeck: integer;
+  p11ConvCount: integer;
+  p11FilterCount: integer;
+  p33ConvCount: integer;
+  p33FilterCount: integer;
+  p55ConvCount: integer;
+  p55FilterCount: integer;
+  p77ConvCount: integer;
+  p77FilterCount: integer;
   maxPool: integer;
   minPool: integer): TNNetLayer;
 var
   UnitCnt: integer;
+  ConvCount: integer;
   aL: array of TNNetLayer;
-  PreviousLayer, LastLayer: TNNetLayer;
+  LastLayer: TNNetLayer;
 
   procedure LocalAddConv(FilterCount, FilterSize: integer; PrevLayer: TNNetLayer);
   begin
@@ -4038,9 +4049,9 @@ var
   end;
 
 begin
-  PreviousLayer := GetLastLayer();
+  if Not(Assigned(PreviousLayer)) then PreviousLayer := GetLastLayer();
   UnitCnt := 0;
-  SetLength(aL, 7);
+  SetLength(aL, 3 + p11ConvCount + p33ConvCount + p55ConvCount + p77ConvCount);
   if (CopyInput) then
   begin
     aL[UnitCnt] := PreviousLayer;
@@ -4058,35 +4069,49 @@ begin
     aL[UnitCnt] := LocalAddBottleNeck(minPool, LastLayer);
     Inc(UnitCnt);
   end;
-  if (p11count>0) then
+  if ( (p11FilterCount>0) and (p11ConvCount>0) ) then
   begin
-    LocalAddConv(p11count, 1, PreviousLayer);
-    aL[UnitCnt] := GetLastLayer();
-    Inc(UnitCnt);
+    for ConvCount := 1 to p11ConvCount do
+    begin
+      LastLayer := PreviousLayer;
+      if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+      LocalAddConv(p11FilterCount, 1, LastLayer);
+      aL[UnitCnt] := GetLastLayer();
+      Inc(UnitCnt);
+    end;
   end;
-  if (p33count>0) then
+  if ( (p33FilterCount>0) and (p33ConvCount>0) ) then
   begin
-    LastLayer := PreviousLayer;
-    if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
-    LocalAddConv(p33count, 3, LastLayer);
-    aL[UnitCnt] := GetLastLayer();
-    Inc(UnitCnt);
+    for ConvCount := 1 to p33ConvCount do
+    begin
+      LastLayer := PreviousLayer;
+      if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+      LocalAddConv(p33FilterCount, 3, LastLayer);
+      aL[UnitCnt] := GetLastLayer();
+      Inc(UnitCnt);
+    end;
   end;
-  if (p55count>0) then
+  if ( (p55FilterCount>0) and (p55ConvCount>0) ) then
   begin
-    LastLayer := PreviousLayer;
-    if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
-    LocalAddConv(p55count, 5, LastLayer);
-    aL[UnitCnt] := GetLastLayer();
-    Inc(UnitCnt);
+    for ConvCount := 1 to p55ConvCount do
+    begin
+      LastLayer := PreviousLayer;
+      if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+      LocalAddConv(p55FilterCount, 5, LastLayer);
+      aL[UnitCnt] := GetLastLayer();
+      Inc(UnitCnt);
+    end;
   end;
-  if (p77count>0) then
+  if ( (p77FilterCount>0) and (p77ConvCount>0) ) then
   begin
-    LastLayer := PreviousLayer;
-    if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
-    LocalAddConv(p77count, 7, LastLayer);
-    aL[UnitCnt] := GetLastLayer();
-    Inc(UnitCnt);
+    for ConvCount := 1 to p77ConvCount do
+    begin
+      LastLayer := PreviousLayer;
+      if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
+      LocalAddConv(p77FilterCount, 7, LastLayer);
+      aL[UnitCnt] := GetLastLayer();
+      Inc(UnitCnt);
+    end;
   end;
   if UnitCnt > 1 then
   begin
