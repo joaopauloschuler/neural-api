@@ -47,7 +47,7 @@ type
   TNeuralFitBase = class(TMObject)
     protected
       FBatchSize: integer;
-      FMaxThreadNum, FThreadNum: integer;
+      FMaxThreadNum, FDefaultThreadCount, FThreadNum: integer;
       FThreadNN: TNNetDataParallelism;
       FAvgWeights: TNNetDataParallelism;
       FAvgWeight: TNNet;
@@ -890,7 +890,7 @@ begin
   {$ENDIF}
   FCurrentEpoch := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
-  FThreadNum := FMaxThreadNum;
+  FThreadNum := Min(FMaxThreadNum, FDefaultThreadCount);
   FBatchSize := pBatchSize;
   if FBatchSize >= FThreadNum then
   begin
@@ -1071,6 +1071,7 @@ begin
   {$ELSE}
   FMaxThreadNum := 1;
   {$ENDIF}
+  FDefaultThreadCount := FMaxThreadNum;
   FDataAugmentation := true;
   FMultipleSamplesAtValidation := true;
   FVerbose := true;
@@ -1233,7 +1234,7 @@ begin
   FImgVolumes := pImgVolumes;
   FImgValidationVolumes := pImgValidationVolumes;
   FImgTestVolumes := pImgTestVolumes;
-  FThreadNum := FMaxThreadNum;
+  FThreadNum := Min(FMaxThreadNum, FDefaultThreadCount);
   FBatchSize := pBatchSize;
   FMaxEpochs := Epochs;
   if FBatchSize >= FThreadNum then
