@@ -985,7 +985,9 @@ begin
     MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
     if MaxDelta < 1 then
     begin
-      MessageProc('Deltas have been multiplied by:'+FloatToStr(MaxDelta) );
+      MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
+      ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
+      FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
     end;
   end;
   FNN.UpdateWeights();
@@ -1342,7 +1344,9 @@ begin
         MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
         if MaxDelta < 1 then
         begin
-          MessageProc('Deltas have been multiplied by:'+FloatToStr(MaxDelta) );
+          MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
+          ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
+          FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
         end;
       end;
       FNN.UpdateWeights();
