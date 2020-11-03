@@ -4097,7 +4097,9 @@ begin
     begin
       LastLayer := PreviousLayer;
       if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
-      LocalAddConv(p55FilterCount, 5, LastLayer);
+      LocalAddConv(BottleNeck, 3, LastLayer);
+      if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
+      LocalAddConv(p55FilterCount, 3, GetLastLayer());
       aL[UnitCnt] := GetLastLayer();
       Inc(UnitCnt);
     end;
@@ -4108,7 +4110,11 @@ begin
     begin
       LastLayer := PreviousLayer;
       if BottleNeck > 0 then LastLayer := LocalAddBottleNeck(BottleNeck, PreviousLayer);
-      LocalAddConv(p77FilterCount, 7, LastLayer);
+      LocalAddConv(BottleNeck, 3, LastLayer);
+      if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
+      LocalAddConv(BottleNeck, 3, GetLastLayer());
+      if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
+      LocalAddConv(p77FilterCount, 3, GetLastLayer());
       aL[UnitCnt] := GetLastLayer();
       Inc(UnitCnt);
     end;
