@@ -8895,13 +8895,21 @@ end;
 function TNNet.ForceMaxAbsoluteDelta(vMax: TNeuralFloat): TNeuralFloat;
 var
   LayerCnt: integer;
+  LayerMul: TNeuralFloat;
 begin
   Result := 1;
   if FLayers.Count > 0 then
   begin
     for LayerCnt := 0 to GetLastLayerIdx() do
     begin
-      Result := Min(Result, FLayers[LayerCnt].ForceMaxAbsoluteDelta(vMax));
+      LayerMul := FLayers[LayerCnt].ForceMaxAbsoluteDelta(vMax);
+      if LayerMul < Result then
+      begin
+        Result := LayerMul;
+        MessageProc('Deltas have been multiplied by '+FloatToStr(LayerMul)+
+          ' on layer '+IntToStr(LayerCnt)+' - '+
+          FLayers[LayerCnt].ClassName+'.');
+      end;
     end;
   end;
 end;
