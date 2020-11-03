@@ -6378,6 +6378,7 @@ begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
+  FOutputError.Mul(FStride);
 
   for CntY := 0 to MaxY do
   begin
@@ -6409,6 +6410,7 @@ begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
+  FOutputError.Mul(FStride);
 
   for CntX := 0 to MaxX do
   begin
