@@ -1,4 +1,4 @@
-program SimpleImageClassifierParallel;
+program Cifar10Parallel;
 (*
  Coded by Joao Paulo Schwarz Schuler.
  https://github.com/joaopauloschuler/neural-api
@@ -20,6 +20,7 @@ type
     NN: THistoricalNets;
     NeuralFit: TNeuralImageFit;
     ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
+    I: integer;
   begin
     if not CheckCIFARFile() then
     begin
@@ -28,11 +29,12 @@ type
     end;
     WriteLn('Creating Neural Network...');
     NN := THistoricalNets.Create();
-    NN.AddLayer( TNNetInput.Create(32, 32, 3) );
     NN.AddLayer([
-      TNNetConvolutionLinear.Create({Features=}32, {FeatureSize=}3, {Padding=}0, {Stride=}1, {SuppressBias=}1),
-      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}0, {Stride=}1, {SuppressBias=}1)
+      TNNetInput.Create(32, 32, 3),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}0, {Stride=}2, {SuppressBias=}0)
     ]);
+    NN.AddLayer( TNNetMulLearning.Create(2) );
+    for I := 1 to 2 do
     NN.AddParallelConvs(
         {PointWiseConv}TNNetConvolutionLinear,
         {IsSeparable}false,
@@ -41,29 +43,20 @@ type
         {pAfterBottleNeck}nil,
         {pBeforeConv}nil,
         {pAfterConv}TNNetReLU,
-        {BottleNeck}32,
-        {p11count}16,
-        {p33count}16,
-        {p55count}16,
-        {p77count}16,
-        {maxPool}16
-    );
-    NN.AddParallelConvs(
-        {PointWiseConv}TNNetConvolutionLinear,
-        {IsSeparable}false,
-        {CopyInput}false,
-        {pBeforeBottleNeck}nil,
-        {pAfterBottleNeck}nil,
-        {pBeforeConv}nil,
-        {pAfterConv}TNNetReLU,
-        {BottleNeck}32,
-        {p11count}16,
-        {p33count}16,
-        {p55count}16,
-        {p77count}16,
-        {maxPool}16
+        {PreviousLayer}nil,
+        {BottleNeck}16,
+        {p11ConvCount}2,
+        {p11FilterCount}16,
+        {p33ConvCount}2,
+        {p33FilterCount}16,
+        {p55ConvCount}2,
+        {p55FilterCount}16,
+        {p77ConvCount}2,
+        {p77FilterCount}16,
+        {maxPool}0
     );
     NN.AddLayer( TNNetMaxPool.Create(2) );
+    for I := 1 to 2 do
     NN.AddParallelConvs(
         {PointWiseConv}TNNetConvolutionLinear,
         {IsSeparable}false,
@@ -72,47 +65,21 @@ type
         {pAfterBottleNeck}nil,
         {pBeforeConv}nil,
         {pAfterConv}TNNetReLU,
-        {BottleNeck}32,
-        {p11count}48,
-        {p33count}16,
-        {p55count}16,
-        {p77count}16,
-        {maxPool}8,
-        {minPool}8
-    );
-    NN.AddParallelConvs(
-        {PointWiseConv}TNNetConvolutionLinear,
-        {IsSeparable}false,
-        {CopyInput}true,
-        {pBeforeBottleNeck}nil,
-        {pAfterBottleNeck}nil,
-        {pBeforeConv}nil,
-        {pAfterConv}TNNetReLU,
-        {BottleNeck}32,
-        {p11count}48,
-        {p33count}16,
-        {p55count}16,
-        {p77count}16,
-        {maxPool}8
-    );
-    NN.AddParallelConvs(
-        {PointWiseConv}TNNetConvolutionLinear,
-        {IsSeparable}true,
-        {CopyInput}true,
-        {pBeforeBottleNeck}nil,
-        {pAfterBottleNeck}nil,
-        {pBeforeConv}nil,
-        {pAfterConv}TNNetReLU,
-        {BottleNeck}32,
-        {p11count}0,
-        {p33count}16,
-        {p55count}16,
-        {p77count}16,
-        {maxPool}8
+        {PreviousLayer}nil,
+        {BottleNeck}16,
+        {p11ConvCount}2,
+        {p11FilterCount}16,
+        {p33ConvCount}2,
+        {p33FilterCount}16,
+        {p55ConvCount}2,
+        {p55FilterCount}16,
+        {p77ConvCount}2,
+        {p77FilterCount}16,
+        {maxPool}16
     );
     NN.AddLayer([
       TNNetDropout.Create(0.5),
-      TNNetMaxPool.Create(4),
+      TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
@@ -122,13 +89,12 @@ type
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'SimpleImageClassifierParallel';
     NeuralFit.InitialLearningRate := 0.001;
-    NeuralFit.LearningRateDecay := 0.03;
-    NeuralFit.CyclicalLearningRateLen := 100;
+    NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
     NeuralFit.MaxThreadNum := 32;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}64, {epochs=}300);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}64, {epochs=}50);
     NeuralFit.Free;
 
     NN.Free;
