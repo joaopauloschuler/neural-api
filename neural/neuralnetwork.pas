@@ -218,7 +218,7 @@ type
       function GetMaxDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMinDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function ForceMaxAbsoluteDelta(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
-      function GetMaxAbsoluteDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function GetMaxAbsoluteDelta(): TNeuralFloat; virtual;
       procedure GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function GetWeightSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetBiasSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -552,6 +552,7 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      function GetMaxAbsoluteDelta(): TNeuralFloat; override;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -631,6 +632,7 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      function GetMaxAbsoluteDelta(): TNeuralFloat; override;
   end;
 
   /// This layer has no trainable parameter. It does a spacial (per channel)
@@ -1121,6 +1123,8 @@ type
       FLearningRate: TNeuralFloat;
       FForwardTime: double;
       FBackwardTime: double;
+      //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
+      FMaxDeltaLayer: integer;
       {$IFDEF OpenCL}
       FDotProductKernel: TDotProductKernel;
       {$ENDIF}
@@ -1267,10 +1271,11 @@ type
       procedure MulWeightsHe(V:TNeuralFloat); deprecated;
 
     published
-      property LearningRate: TNeuralFloat read FLearningRate;
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
       property Layers: TNNetLayerList read FLayers;
+      property LearningRate: TNeuralFloat read FLearningRate;
+      property MaxDeltaLayer: integer read FMaxDeltaLayer;
   end;
 
   { THistoricalNets }
@@ -3377,6 +3382,12 @@ begin
   FNeurons[1].FWeights.Fill(1);
 end;
 
+function TNNetChannelStdNormalization.GetMaxAbsoluteDelta(): TNeuralFloat;
+begin
+  // channel standard normalization has lower impact on deltas.
+  Result := inherited GetMaxAbsoluteDelta() * 0.01;
+end;
+
 { TNNetMovingStdNormalization }
 constructor TNNetMovingStdNormalization.Create();
 begin
@@ -3441,6 +3452,12 @@ begin
   SetNumWeightsForAllNeurons(1, 1, 2);
   FNeurons[0].FWeights.FData[0] := 0;
   FNeurons[0].FWeights.FData[1] := 1;
+end;
+
+function TNNetMovingStdNormalization.GetMaxAbsoluteDelta(): TNeuralFloat;
+begin
+  // channel standard normalization has lower impact on deltas.
+  Result := inherited GetMaxAbsoluteDelta() * 0.01;
 end;
 
 { TNNetLayerConcatedWeights }
@@ -6378,7 +6395,7 @@ begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
-  FOutputError.Mul(FStride);
+  if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
 
   for CntY := 0 to MaxY do
   begin
@@ -6410,7 +6427,7 @@ begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
-  FOutputError.Mul(FStride);
+  if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
 
   for CntX := 0 to MaxX do
   begin
@@ -8892,13 +8909,20 @@ end;
 function TNNet.GetMaxAbsoluteDelta(): TNeuralFloat;
 var
   LayerCnt: integer;
+  LayerDelta: TNeuralFloat;
 begin
   Result := 0;
+  FMaxDeltaLayer := 0;
   if FLayers.Count > 0 then
   begin
     for LayerCnt := 0 to GetLastLayerIdx() do
     begin
-      Result := Max(Result, FLayers[LayerCnt].GetMaxAbsoluteDelta());
+      LayerDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
+      if Result < LayerDelta then
+      begin
+        Result := LayerDelta;
+        FMaxDeltaLayer := LayerCnt;
+      end;
     end;
   end;
 end;
