@@ -6395,7 +6395,9 @@ begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
-  if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
+  //Although the below line makes all the sense, it might brake compatibility
+  //with existing code.
+  //if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
 
   for CntY := 0 to MaxY do
   begin
@@ -6427,7 +6429,9 @@ begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
-  if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
+  //Although the below line makes all the sense, it might brake compatibility
+  //with existing code.
+  //if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
 
   for CntX := 0 to MaxX do
   begin
