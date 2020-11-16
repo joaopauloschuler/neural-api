@@ -3618,7 +3618,7 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      if LocalPrevOutput.FData[OutputCnt]>0 then
+      if LocalPrevOutput.FData[OutputCnt] >= 0 then
       begin
         FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
         FOutputErrorDeriv.FData[OutputCnt] := 1;
