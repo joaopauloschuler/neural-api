@@ -6134,7 +6134,7 @@ begin
   begin
       localNeuron := FArrNeurons[NeuronCnt];
 
-      if FOutputRaw.FData[NeuronCnt] > 0 then
+      if FOutputRaw.FData[NeuronCnt] >= 0 then
       begin
         localLearErrorDeriv := -FLearningRate * FOutputError.FData[NeuronCnt];
       end
@@ -6958,7 +6958,7 @@ begin
             {$IFDEF FPC}
             if FActivationFn = @RectifiedLinearUnit then
             begin
-              if FOutput.FData[OutputRawPos] > 0 then
+              if FOutputRaw.FData[OutputRawPos] >= 0 then
               begin
                 LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
               end
