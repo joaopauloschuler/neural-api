@@ -682,6 +682,9 @@ var
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTrainingPair: TNNetVolumePair;
+  {$IFDEF DEBUG}
+  InitialWeightSum, FinalWeightSum: TNeuralFloat;
+  {$ENDIF}
 begin
   vInput  := TNNetVolume.Create();
   pOutput := TNNetVolume.Create();
@@ -702,6 +705,9 @@ begin
   LocalNN.ClearTime();
   LocalNN.ClearDeltas();
   LocalNN.EnableDropouts(true);
+  {$IFDEF DEBUG}
+  InitialWeightSum := LocalNN.GetWeightSum();
+  {$ENDIF}
   for I := 1 to BlockSize do
   begin
     if FShouldQuit then Break;
@@ -776,7 +782,13 @@ begin
       {$ENDIF}
     end;
   end;
-
+  {$IFDEF DEBUG}
+  FinalWeightSum := LocalNN.GetWeightSum();
+  if InitialWeightSum <> FinalWeightSum then
+  begin
+    FErrorProc('Weights changed on thread:'+FloatToStr(FinalWeightSum - InitialWeightSum));
+  end;
+  {$ENDIF}
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
   FGlobalHit       := FGlobalHit + LocalHit;
   FGlobalMiss      := FGlobalMiss + LocalMiss;
