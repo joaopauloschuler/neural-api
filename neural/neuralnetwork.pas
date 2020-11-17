@@ -2234,6 +2234,9 @@ begin
         //Debug only: Write('[',(CurrentChannelCount - 1),':',ChannelCnt,']');
       end;
     end;
+    //FStruct isn't required anymore
+    FStruct[0] := 0;
+    FStruct[1] := 0;
   end;
   inherited SetPrevLayer(pPrevLayer);
 end;
@@ -4890,6 +4893,7 @@ begin
   AuxVolume := TNNetVolume.Create;
 
   NN.AddLayer( TNNetInput.Create(32,32,3) );
+
   NN.AddDenseNetBlockCAI({pUnits=}4, {k=}32, {supressBias=}0,
         {PointWiseConv=} TNNetConvolutionLinear,
         {IsSeparable=}true,
@@ -4908,9 +4912,16 @@ begin
   NN.AddLayer( TNNetMaxPool.Create(2) );
   NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
   NN.AddLayer( TNNetMaxPool.Create(2) );
+  NN.AddLayer( TNNetCellBias.Create() );
   NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
-  NN.AddLayer( TNNetFullConnectReLU.Create(64) );
-  NN.AddLayer( TNNetFullConnectReLU.Create(20) );
+  NN.AddLayer( TNNetConvolutionLinear.Create(32,5,0,0) );
+  NN.AddLayer( TNNetConvolution.Create(32,5,0,0) );
+  NN.AddLayer( TNNetFullConnectReLU.Create(32) );
+  NN.AddLayer( TNNetFullConnectReLU.Create(10) );
+  NN.AddLayer( TNNetFullConnectLinear.Create(10) );
+  NN.AddLayer( TNNetFullConnect.Create(10) );
+  NN.AddLayer( TNNetHyperbolicTangent.Create() );
+  NN.AddLayer( TNNetReLU.Create() );
 
   NN2 := NN.Clone();
 
