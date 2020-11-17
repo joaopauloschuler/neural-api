@@ -4880,15 +4880,30 @@ end;
 
 procedure TestConvolutionAPI();
 var
-  NN, NN2: TNNet;
+  NN: THistoricalNets;
+  NN2: TNNet;
   I: integer;
   Par: TNNetDataParallelism;
   AuxVolume: TNNetVolume;
 begin
-  NN := TNNet.Create();
+  NN := THistoricalNets.Create();
   AuxVolume := TNNetVolume.Create;
 
   NN.AddLayer( TNNetInput.Create(32,32,3) );
+  NN.AddDenseNetBlockCAI({pUnits=}4, {k=}32, {supressBias=}0,
+        {PointWiseConv=} TNNetConvolutionLinear,
+        {IsSeparable=}true,
+        {HasNorm=}true,
+        {pBeforeBottleNeck=}nil,
+        {pAfterBottleNeck=}nil,
+        {pBeforeConv=}nil,
+        {pAfterConv=}TNNetHyperbolicTangent,
+        {BottleNeck=}16,
+        {Compression=}2,
+        {DropoutRate=}0.5,
+        {RandomBias=}1, {RandomAmplifier=}1,
+        {FeatureSize=}3
+        );
   NN.AddLayer( TNNetConvolutionReLU.Create(16,5,0,0) );
   NN.AddLayer( TNNetMaxPool.Create(2) );
   NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
@@ -4901,8 +4916,30 @@ begin
 
   WriteLn('Test Convolution API Start');
 
+  if NN.SaveToString() <> NN2.SaveToString() then
+  begin
+    WriteLn('Error: network save to string differs.');
+  end;
+
   for I := 0 to NN.Layers.Count - 1 do
   begin
+    if NN.Layers[I].SaveDataToString() <> NN2.Layers[I].SaveDataToString() then
+    begin
+      WriteLn('Error: save data to string doesn''t match on layer:',I);
+    end;
+
+    if NN.Layers[I].SaveStructureToString() <> NN2.Layers[I].SaveStructureToString() then
+    begin
+      WriteLn('Error: save structure to string doesn''t match on layer:',I);
+      WriteLn('NN Structure:', NN.Layers[I].SaveStructureToString());
+      WriteLn('NN2 Structure:', NN2.Layers[I].SaveStructureToString());
+    end;
+
+    if NN.Layers[I].ClassName <> NN2.Layers[I].ClassName then
+    begin
+      WriteLn('Error: class name doesn''t match on layer:',I);
+    end;
+
     if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
     begin
       WriteLn('Error: neuron count doesn''t match on layer:',I);
