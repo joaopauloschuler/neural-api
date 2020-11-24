@@ -133,6 +133,7 @@ type
       function GetRandomClassId(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFileName(ClassId, ElementId: integer): string; {$IFDEF Release} inline; {$ENDIF}
       procedure AddVolumesTo(Volumes: TNNetVolumeList; EmptySource:boolean = false);
+      procedure MakeMonopolar();
 
       procedure LoadImages_NTL(index, threadnum: integer);
   end;
@@ -454,6 +455,34 @@ begin
           SourceVolume := Self.List[ClassId].List[ImageId];
           Volumes.AddCopy(SourceVolume);
           if EmptySource then SourceVolume.ReSize(1,1,1);
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TClassesAndElements.MakeMonopolar();
+var
+  SourceVolume: TNNetVolume;
+  ClassId, ImageId: integer;
+  MaxClass, MaxImage: integer;
+begin
+  if Self.Count > 0 then
+  begin
+    MaxClass := Self.Count - 1;
+    for ClassId := 0 to MaxClass do
+    begin
+      MaxImage := Self.List[ClassId].Count - 1;
+      if MaxImage >= 0 then
+      begin
+        for ImageId := 0 to MaxImage do
+        begin
+          SourceVolume := Self.List[ClassId].List[ImageId];
+          if Assigned(SourceVolume) then
+          begin
+            SourceVolume.Add(2);
+            SourceVolume.Divi(2);
+          end;
         end;
       end;
     end;
