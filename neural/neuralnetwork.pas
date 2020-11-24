@@ -1182,6 +1182,7 @@ type
       function GetFirstNeuronalLayerIdxWithChannels(FromLayerIdx, Channels:integer): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayer(): TNNetLayer; {$IFDEF Release} inline; {$ENDIF}
+      function GetRandomLayer(): TNNetLayer;
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -8806,6 +8807,11 @@ end;
 function TNNet.GetLastLayer(): TNNetLayer;
 begin
   Result := FLayers[GetLastLayerIdx()];
+end;
+
+function TNNet.GetRandomLayer(): TNNetLayer;
+begin
+  Result := FLayers[Random(FLayers.Count)];
 end;
 
 procedure TNNet.InitWeights();
