@@ -948,13 +948,13 @@ type
   /// Pointwise convolution with Linear activation.
   TNNetPointwiseConvLinear = class(TNNetConvolutionLinear)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); virtual;
   end;
 
   /// Pointwise convolution with ReLU activation.
   TNNetPointwiseConvReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); virtual;
   end;
 
   { TNNetDeconvolution }
@@ -4974,6 +4974,45 @@ begin
     end;
   end;
 end;
+
+procedure TestBackProp();
+var
+  NN: TNNet;
+  InputVolume, OutputVolume: TNNetVolume;
+begin
+  NN := TNNet.Create;
+  (*
+  NN.AddLayer([
+    TNNetInput.Create(4,4,1),
+    TNNetConvolutionLinear.Create(1,3,1,1,0)
+  ]);
+  *)
+  NN.AddLayer([
+    TNNetInput.Create(4,4,1),
+    TNNetDepthwiseConvLinear.Create(1,3,1,1)
+  ]);
+
+  TNNetInput(NN.Layers[0]).EnableErrorCollection;
+
+  InputVolume := TNNetVolume.Create(NN.Layers[0].Output);
+  OutputVolume := TNNetVolume.Create();
+
+  InputVolume.Fill(10);
+  NN.Layers[1].Neurons[0].Weights.Fill(0.1);
+
+  NN.Compute(InputVolume);
+  NN.GetOutput(OutputVolume);
+  OutputVolume.Print();
+
+  OutputVolume.Fill(0.1);
+  NN.Backpropagate(OutputVolume);
+  NN.Layers[0].OutputError.Print();
+
+  NN.Free;
+  OutputVolume.Free;
+  InputVolume.Free;
+end;
+
 
 procedure CompareComputing(NN1, NN2: TNNet);
 var
