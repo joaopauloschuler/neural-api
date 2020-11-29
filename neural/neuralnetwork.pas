@@ -1553,6 +1553,14 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FOutput.Size <> FOutputError.Size)
+    then
+  begin
+    FOutputError.ReSize(FOutput);
+    FOutputErrorDeriv.ReSize(FOutput);
+  end;
   FOutput.CopyPadding(FPrevLayer.FOutput, FPadding);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
