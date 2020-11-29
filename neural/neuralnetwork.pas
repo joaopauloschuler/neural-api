@@ -103,7 +103,7 @@ type
       FBiasDelta: TNeuralFloat;
 
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
       procedure Fill(Value:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure AddInertia(); {$IFDEF Release} inline; {$ENDIF}
@@ -193,7 +193,7 @@ type
       procedure BuildArrNeurons();
       procedure AfterWeightUpdate(); virtual;
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
 
       {$IFDEF OpenCL}
@@ -292,7 +292,7 @@ type
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
       procedure RefreshNeuronWeightList();
       {$IFDEF OpenCL}
@@ -351,7 +351,7 @@ type
     FPadding: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(Padding: integer);
+    constructor Create(Padding: integer); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -392,7 +392,7 @@ type
     private
       FScale, FLowLimit, FHighLimit: TNeuralFloat;
     public
-      constructor Create(LowLimit, HighLimit: integer);
+      constructor Create(LowLimit, HighLimit: integer); overload;
       procedure Compute(); override;
   end;
 
@@ -406,7 +406,7 @@ type
       FScaleAlpha: TNeuralFloat;
       FThreshold: TNeuralFloat;
     public
-      constructor Create();
+      constructor Create(); override;
       procedure Compute(); override;
   end;
 
@@ -420,7 +420,7 @@ type
     private
       FPower: TNeuralFloat;
     public
-      constructor Create(iPower: integer);
+      constructor Create(iPower: integer); overload;
       procedure Compute(); override;
   end;
 
@@ -431,7 +431,7 @@ type
       FAlpha: TNeuralFloat;
       FThreshold: TNeuralFloat;
     public
-      constructor Create();
+      constructor Create(); override;
       procedure Compute(); override;
   end;
 
@@ -439,7 +439,7 @@ type
   // https://en.wikipedia.org/wiki/Rectifier_(neural_networks)
   TNNetVeryLeakyReLU = class(TNNetLeakyReLU)
     public
-      constructor Create();
+      constructor Create(); override;
   end;
 
   /// This is a plain Sigmoid layer.
@@ -447,7 +447,7 @@ type
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create();
+      constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -455,7 +455,7 @@ type
   /// This is a plain Hyperbolic Tangent layer.
   TNNetHyperbolicTangent = class(TNNetSigmoid)
     public
-      constructor Create();
+      constructor Create(); override;
   end;
 
   /// This layer multiplies the learning in previous layers. It can speed up
@@ -489,7 +489,7 @@ type
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(Rate: double; OneMaskPerbatch: integer = 1);
+      constructor Create(Rate: double; OneMaskPerbatch: integer = 1); overload;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -506,7 +506,7 @@ type
   protected
     FRandomBias, FRandomMul: TNeuralFloat;
   public
-    constructor Create(AddRate, MulRate: integer);
+    constructor Create(AddRate, MulRate: integer); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -517,7 +517,7 @@ type
   protected
     FRandomBias, FRandomMul: TNNetVolume;
   public
-    constructor Create(AddRate, MulRate: integer);
+    constructor Create(AddRate, MulRate: integer); overload;
     destructor Destroy; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
@@ -548,7 +548,7 @@ type
   // parameters.
   TNNetMovingStdNormalization = class(TNNetIdentityWithoutL2)
     public
-      constructor Create();
+      constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -562,7 +562,7 @@ type
       FOutputChannelSize: TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
   end;
 
@@ -627,7 +627,7 @@ type
       FAuxOutput: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -641,7 +641,7 @@ type
     private
       FLRN: TNNetVolume;
     public
-      constructor Create(pSize: integer);
+      constructor Create(pSize: integer); overload;
       destructor Destroy(); override;
 
       procedure Compute(); override;
@@ -674,7 +674,7 @@ type
     FPrevOutputErrorDeriv: TNNetVolumeList;
     FPrevLayerList: TNNetLayerList;
   public
-    constructor Create();
+    constructor Create(); override;
     destructor Destroy(); override;
 
     function SaveStructureToString(): string; override;
@@ -749,7 +749,7 @@ type
       procedure ComputePreviousLayerError(); override;
       procedure ComputePreviousLayerErrorCPU(); virtual;
     public
-      constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload;
+      constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); virtual;
       constructor Create(pSize:integer; pSuppressBias: integer = 0); overload;
       procedure Compute(); override;
       procedure ComputeCPU(); virtual;
@@ -771,14 +771,14 @@ type
   public
     procedure ComputeCPU(); override;
     procedure BackpropagateCPU(); override;
-    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
   /// Fully connected layer with Sigmoid activation function.
   TNNetFullConnectSigmoid = class(TNNetFullConnect)
   public
-    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
@@ -789,7 +789,7 @@ type
   public
     procedure ComputeCPU(); override;
     procedure BackpropagateCPU(); override;
-    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
@@ -798,7 +798,7 @@ type
   private
     procedure ComputePreviousLayerError(); override;
   public
-    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
 
     procedure Compute(); override;
@@ -835,7 +835,7 @@ type
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+      constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload;
       destructor Destroy(); override;
       procedure InitDefault(); override;
   end;
@@ -851,7 +851,7 @@ type
     procedure ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUFast();
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer);
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); virtual; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -860,13 +860,13 @@ type
   /// Depthwise Convolutional layer with Linear activation function.
   TNNetDepthwiseConvLinear = class(TNNetDepthwiseConv)
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer);
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); override;
   end;
 
   /// Depthwise Convolutional layer with ReLU activation function.
   TNNetDepthwiseConvReLU = class(TNNetDepthwiseConv)
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer);
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); override;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -885,7 +885,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); virtual;
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); virtual; overload;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
@@ -942,19 +942,19 @@ type
   /// Pointwise convolution with tanh activation.
   TNNetPointwiseConv = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); virtual;
   end;
 
   /// Pointwise convolution with Linear activation.
   TNNetPointwiseConvLinear = class(TNNetConvolutionLinear)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Pointwise convolution with ReLU activation.
   TNNetPointwiseConvReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); override;
   end;
 
   { TNNetDeconvolution }
@@ -1027,7 +1027,7 @@ type
       procedure BackpropagateWithStride();
       procedure ComputePreviousLayerError(); override;
     public
-      constructor Create(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0);
+      constructor Create(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0); overload;
       destructor Destroy(); override;
       procedure Backpropagate(); override;
     end;
@@ -1063,7 +1063,7 @@ type
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create();
+    constructor Create(); override;
   end;
 
   /// This layer gets the manimum number from the entire channel.
@@ -1071,7 +1071,7 @@ type
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create();
+    constructor Create(); override;
   end;
 
   /// Common avgpool layer.
@@ -1079,7 +1079,7 @@ type
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(pPoolSize: integer);
+    constructor Create(pPoolSize: integer); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -1089,7 +1089,7 @@ type
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create();
+    constructor Create(); override;
   end;
 
   { TNNetDeMaxPool }
@@ -1098,7 +1098,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function CalcOutputSize(pInputSize: integer) : integer; override;
     public
-      constructor Create(pPoolSize: integer);
+      constructor Create(pPoolSize: integer); overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure ComputePreviousLayerError(); override;
@@ -1109,7 +1109,7 @@ type
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create();
+      constructor Create(); override;
       procedure Compute(); override;
       procedure ComputePreviousLayerError(); override;
   end;
@@ -1129,7 +1129,7 @@ type
       FDotProductKernel: TDotProductKernel;
       {$ENDIF}
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
 
       function CreateLayer(strData: string): TNNetLayer;
@@ -1387,7 +1387,10 @@ type
       {$ENDIF}
   end;
 
+  procedure CompareComputing(NN1, NN2: TNNet);
+  procedure CompareNNStructure(NN, NN2: TNNet);
   procedure TestConvolutionAPI();
+  procedure TestDataParallelism(NN: TNNet);
 
   {$IFDEF OpenCL}
   procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
@@ -4882,50 +4885,53 @@ begin
   end;
 end;
 
-procedure TestConvolutionAPI();
+procedure TestDataParallelism(NN: TNNet);
 var
-  NN: THistoricalNets;
-  NN2: TNNet;
   I: integer;
+  NN2: TNNet;
   Par: TNNetDataParallelism;
-  AuxVolume: TNNetVolume;
 begin
-  NN := THistoricalNets.Create();
-  AuxVolume := TNNetVolume.Create;
+  WriteLn('Test Data Parallelism');
 
-  NN.AddLayer( TNNetInput.Create(32,32,3) );
-
-  NN.AddDenseNetBlockCAI({pUnits=}4, {k=}32, {supressBias=}0,
-        {PointWiseConv=} TNNetConvolutionLinear,
-        {IsSeparable=}true,
-        {HasNorm=}true,
-        {pBeforeBottleNeck=}nil,
-        {pAfterBottleNeck=}nil,
-        {pBeforeConv=}nil,
-        {pAfterConv=}TNNetHyperbolicTangent,
-        {BottleNeck=}16,
-        {Compression=}2,
-        {DropoutRate=}0.5,
-        {RandomBias=}1, {RandomAmplifier=}1,
-        {FeatureSize=}3
-        );
-  NN.AddLayer( TNNetConvolutionReLU.Create(16,5,0,0) );
-  NN.AddLayer( TNNetMaxPool.Create(2) );
-  NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
-  NN.AddLayer( TNNetMaxPool.Create(2) );
-  NN.AddLayer( TNNetCellBias.Create() );
-  NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
-  NN.AddLayer( TNNetConvolutionLinear.Create(32,5,0,0) );
-  NN.AddLayer( TNNetConvolution.Create(32,5,0,0) );
-  NN.AddLayer( TNNetFullConnectReLU.Create(32) );
-  NN.AddLayer( TNNetFullConnectReLU.Create(10) );
-  NN.AddLayer( TNNetFullConnectLinear.Create(10) );
-  NN.AddLayer( TNNetFullConnect.Create(10) );
-  NN.AddLayer( TNNetHyperbolicTangent.Create() );
-  NN.AddLayer( TNNetReLU.Create() );
-
+  Par := TNNetDataParallelism.Create(NN, 4);
   NN2 := NN.Clone();
+  Par.SumWeights(NN2);
 
+  for I := 0 to NN.Layers.Count - 1 do
+  begin
+    if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
+    begin
+      WriteLn('Data Parallelism Error: neuron count doesn''t match on layer:',I);
+    end;
+
+    if NN.Layers[I].CountWeights() <> NN2.Layers[I].CountWeights() then
+    begin
+      WriteLn('Data Parallelism Error: weight count doesn''t match on layer:',I);
+    end;
+
+    if 4 * NN.Layers[I].GetWeightSum() <> NN2.Layers[I].GetWeightSum() then
+    begin
+      WriteLn('Data Parallelism Error: weight sum doesn''t match on layer:',I);
+    end;
+
+    if 4 * NN.Layers[I].GetBiasSum() <> NN2.Layers[I].GetBiasSum() then
+    begin
+      WriteLn('Data Parallelism Error: bias sum doesn''t match on layer:',I);
+    end;
+
+    if 4 * NN.Layers[I].GetInertiaSum() <> NN2.Layers[I].GetInertiaSum() then
+    begin
+      WriteLn('Data Parallelism Error: inertial sum doesn''t match on layer:',I);
+    end;
+  end;
+  NN2.Free;
+  Par.Free;
+end;
+
+procedure CompareNNStructure(NN, NN2: TNNet);
+var
+  I: integer;
+begin
   WriteLn('Test Convolution API Start');
 
   if NN.SaveToString() <> NN2.SaveToString() then
@@ -4967,39 +4973,113 @@ begin
       WriteLn('Error: weight sum doesn''t match on layer:',I);
     end;
   end;
+end;
 
-  WriteLn('Test Data Parallelism');
+procedure CompareComputing(NN1, NN2: TNNet);
+var
+  InputVolume, OutputVolume1, OutputVolume2: TNNetVolume;
+  SumDiff: TNeuralFloat;
+begin
+  InputVolume := TNNetVolume.Create(NN1.Layers[0].Output);
+  OutputVolume1 := TNNetVolume.Create();
+  OutputVolume2 := TNNetVolume.Create();
 
-  Par := TNNetDataParallelism.Create(NN,4);
-  Par.SumWeights(NN2);
-
-  for I := 0 to NN.Layers.Count - 1 do
+  if NN1.Layers[0] is TNNetInput then
   begin
-    if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
-    begin
-      WriteLn('Error: neuron count doesn''t match on layer:',I);
-    end;
-
-    if NN.Layers[I].CountWeights() <> NN2.Layers[I].CountWeights() then
-    begin
-      WriteLn('Error: weight count doesn''t match on layer:',I);
-    end;
-
-    if 4 * NN.Layers[I].GetWeightSum() <> NN2.Layers[I].GetWeightSum() then
-    begin
-      WriteLn('Error: weight sum doesn''t match on layer:',I);
-    end;
-
-    if 4 * NN.Layers[I].GetBiasSum() <> NN2.Layers[I].GetBiasSum() then
-    begin
-      WriteLn('Error: bias sum doesn''t match on layer:',I);
-    end;
-
-    if 4 * NN.Layers[I].GetInertiaSum() <> NN2.Layers[I].GetInertiaSum() then
-    begin
-      WriteLn('Error: inertial sum doesn''t match on layer:',I);
-    end;
+    TNNetInput(NN1.Layers[0]).EnableErrorCollection;
   end;
+  if NN2.Layers[0] is TNNetInput then
+  begin
+    TNNetInput(NN2.Layers[0]).EnableErrorCollection;
+  end;
+
+  InputVolume.Fill(10);
+  NN1.Compute(InputVolume);
+  NN2.Compute(InputVolume);
+
+  NN1.GetOutput(OutputVolume1);
+  NN2.GetOutput(OutputVolume2);
+
+  SumDiff := OutputVolume1.SumDiff(OutputVolume2);
+
+  if SumDiff <> 0 then
+  begin
+    WriteLn('Compute differs: ', SumDiff);
+    WriteLn('Output sum 1: ', OutputVolume1.GetSum());
+    WriteLn('Output sum 2: ', OutputVolume2.GetSum());
+    OutputVolume1.DebugDiff(OutputVolume2, 0.1);
+  end;
+
+  OutputVolume1.Fill(0.001);
+  NN1.Backpropagate(OutputVolume1);
+  NN2.Backpropagate(OutputVolume1);
+  SumDiff := NN1.Layers[0].OutputError.SumDiff(NN2.Layers[0].OutputError);
+
+  if SumDiff <> 0 then
+  begin
+    WriteLn('Backprop error differs:', SumDiff);
+    WriteLn('Backprop sum 1: ', NN1.Layers[0].OutputError.GetSum());
+    WriteLn('Backprop sum 2: ', NN2.Layers[0].OutputError.GetSum());
+    //NN1.Layers[0].OutputError.DebugDiff(NN2.Layers[0].OutputError, 0.001);
+  end;
+
+  OutputVolume2.Free;
+  OutputVolume1.Free;
+  InputVolume.Free;
+end;
+
+procedure TestConvolutionAPI();
+var
+  NN: THistoricalNets;
+  NN2: TNNet;
+  AuxVolume: TNNetVolume;
+begin
+  NN := THistoricalNets.Create();
+  AuxVolume := TNNetVolume.Create;
+
+  NN.AddLayer( TNNetInput.Create(32,32,3) );
+
+  NN.AddLayer( TNNetConvolutionLinear.Create(32, 1, 0, 0) );
+  NN.AddDenseNetBlockCAI
+  (
+        {pUnits=}4, {k=}32, {supressBias=}0,
+        {PointWiseConv=}TNNetConvolutionLinear,
+        {IsSeparable=}true,
+        {HasNorm=}true,
+        {pBeforeBottleNeck=}nil,
+        {pAfterBottleNeck=}nil,
+        {pBeforeConv=}nil,
+        {pAfterConv=}TNNetHyperbolicTangent,
+        {BottleNeck=}16,
+        {Compression=}1,
+        {DropoutRate=}0,
+        {RandomBias=}0, {RandomAmplifier=}0,
+        {FeatureSize=}3
+  );
+  NN.AddLayer( TNNetConvolutionReLU.Create(16,5,0,0) );
+  NN.AddLayer( TNNetMaxPool.Create(2) );
+  NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
+  NN.AddLayer( TNNetMaxPool.Create(2) );
+  NN.AddLayer( TNNetCellBias.Create() );
+  NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
+  NN.AddLayer( TNNetConvolutionLinear.Create(32,5,0,0) );
+  NN.AddLayer( TNNetConvolution.Create(32,5,0,0) );
+  NN.AddLayer( TNNetFullConnectReLU.Create(32) );
+  NN.AddLayer( TNNetFullConnectReLU.Create(10) );
+  NN.AddLayer( TNNetFullConnectLinear.Create(10) );
+  NN.AddLayer( TNNetFullConnect.Create(10) );
+  NN.AddLayer( TNNetHyperbolicTangent.Create() );
+  NN.AddLayer( TNNetReLU.Create() );
+
+  NN2 := NN.Clone();
+
+  CompareNNStructure(NN, NN2);
+  TestDataParallelism(NN);
+
+  NN2.Free;
+  NN2 := NN.Clone();
+
+  CompareComputing(NN, NN2);
 
   NN.Clear;
 
@@ -5032,7 +5112,6 @@ begin
   *)
   WriteLn('Testing has finished.');
   AuxVolume.Free;
-  Par.Free;
   NN.Free;
   NN2.Free;
 end;

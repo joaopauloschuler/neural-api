@@ -192,6 +192,7 @@ type
     class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
     class function Product(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
     function SumDiff(Original: TVolume): T;  {$IFDEF Release} inline; {$ENDIF}
+    procedure DebugDiff(Original: TVolume; Limit: Single = 0);
     procedure SumToPos(Original: TVolume);
     function GetDistanceSqr(Original: TVolume): T;  overload; {$IFDEF Release} inline; {$ENDIF}
     function GetDistance(Original: TVolume): T;  overload; {$IFDEF Release} inline; {$ENDIF}
@@ -376,7 +377,7 @@ type
       FErrorProc: TGetStrProc;
 
     public
-      constructor Create();
+      constructor Create(); virtual;
       destructor Destroy(); override;
 
       procedure DefaultMessageProc(const S: string);
@@ -3297,6 +3298,28 @@ begin
   begin
     AuxDiff := FData[I] - Original.FData[I];
     Result := Result + Abs(AuxDiff);
+  end;
+end;
+
+procedure TVolume.DebugDiff(Original: TVolume; Limit: Single);
+var
+  I: integer;
+  vHigh: integer;
+  AuxDiff: Single;
+begin
+  {$IFDEF Debug}
+  if Original.Size <> Self.Size then
+    raise Exception.Create('Sizes don''t match at SumDiff: ' +
+      IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
+  {$ENDIF}
+  vHigh := High(FData);
+  for I := 0 to vHigh do
+  begin
+    AuxDiff := FData[I] - Original.FData[I];
+    if AuxDiff > Limit then
+    begin
+      WriteLn('Diff at pos ', I, ':', AuxDiff,'. Self:', FData[I], ' Original:', Original.FData[I]);
+    end;
   end;
 end;
 

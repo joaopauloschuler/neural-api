@@ -89,7 +89,7 @@ type
     procedure CompileProgram(); overload;
 
   public
-    constructor Create();
+    constructor Create(); override;
     destructor Destroy(); override;
 
     procedure printDevicesInfo();
