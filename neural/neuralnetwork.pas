@@ -1136,6 +1136,11 @@ type
       function AddLayer(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayer(strData: string): TNNetLayer; overload;
       function AddLayer(pLayers: array of TNNetLayer): TNNetLayer; overload;
+      function AddLayerAfter(pLayer, pAfterLayer: TNNetLayer): TNNetLayer; overload;
+      function AddLayerAfter(pLayer: TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
+      function AddLayerAfter(strData: string; pAfterLayerIdx: integer): TNNetLayer; overload;
+      function AddLayerAfter(pLayers: array of TNNetLayer; pLayer: TNNetLayer): TNNetLayer; overload;
+      function AddLayerAfter(pLayers: array of TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
       function AddLayerConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
       function AddLayerConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerDeepConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
@@ -1174,9 +1179,6 @@ type
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
-      function AddLayerAfter(pLayer, pAfterLayer: TNNetLayer): TNNetLayer; overload;
-      function AddLayerAfter(pLayer: TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
-      function AddLayerAfter(strData: string; pAfterLayerIdx: integer): TNNetLayer; overload;
       function GetFirstNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFirstImageNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFirstNeuronalLayerIdxWithChannels(FromLayerIdx, Channels:integer): integer; {$IFDEF Release} inline; {$ENDIF}
@@ -5735,13 +5737,14 @@ var
   OutX, OutY: integer;
   StartTime: double;
 begin
-  StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if
+    (FBackPropCallCurrentCnt < FDepartingBranchesCnt) or
+    (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
+  StartTime := Now();
   OutputError.Divi(FPoolSize*FPoolSize);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
-
   for CntX := 0 to MaxX do
   begin
     OutX := CntX div FPoolSize;
@@ -8626,6 +8629,29 @@ function TNNet.AddLayerAfter(strData: string; pAfterLayerIdx: integer
   ): TNNetLayer;
 begin
   Result := AddLayerAfter(CreateLayer(strData), pAfterLayerIdx);
+end;
+
+function TNNet.AddLayerAfter(pLayers: array of TNNetLayer; pLayer: TNNetLayer
+  ): TNNetLayer;
+var
+  LocalLayer: TNNetLayer;
+  LayerCnt: integer;
+begin
+  LayerCnt := 0;
+  for LocalLayer in pLayers do
+  begin
+    if LayerCnt = 0
+    then AddLayerAfter(LocalLayer, pLayer)
+    else AddLayer(LocalLayer);
+    Inc(LayerCnt);
+  end;
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddLayerAfter(pLayers: array of TNNetLayer;
+  pAfterLayerIdx: integer): TNNetLayer;
+begin
+  AddLayerAfter(pLayers, FLayers[pAfterLayerIdx]);
 end;
 
 function TNNet.GetFirstNeuronalLayerIdx(FromLayerIdx:integer = 0): integer;
