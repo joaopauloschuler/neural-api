@@ -927,6 +927,14 @@ type
       procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
   end;
 
+  TNNetConvolutionSharedWeights = class(TNNetConvolution)
+    private
+      FLinkedLayer: TNNetConvolution;
+    public
+      constructor Create(LinkedLayer: TNNetLayer); virtual; overload;
+      destructor Destroy; override;
+  end;
+
   /// Convolutional layer without activation function.
   TNNetConvolutionLinear = class(TNNetConvolution)
   public
@@ -1528,6 +1536,30 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetConvolutionSharedWeights }
+constructor TNNetConvolutionSharedWeights.Create(LinkedLayer: TNNetLayer);
+begin
+  if not(LinkedLayer is TNNetConvolution) then
+  begin
+    FErrorProc('Linked layer to TNNetConvolutionSharedWeights is not a convolution:'+LinkedLayer.ClassName);
+  end;
+  inherited Create(LinkedLayer.FStruct[0], LinkedLayer.FStruct[1], LinkedLayer.FStruct[2], LinkedLayer.FStruct[3], LinkedLayer.FStruct[4]);
+  FStruct[5] := LinkedLayer.LayerIdx;
+  FActivationFn := LinkedLayer.FActivationFn;
+  FActivationFnDerivative := LinkedLayer.FActivationFnDerivative;
+  FLinkedLayer := TNNetConvolution(LinkedLayer);
+  // change the local neural list for the remote neural list
+  FNeurons.Free;
+  FNeurons := LinkedLayer.FNeurons;
+end;
+
+destructor TNNetConvolutionSharedWeights.Destroy;
+begin
+  // recreate a new neural list to allow the destroy to work.
+  FNeurons := TNNetNeuronList.Create();
+  inherited Destroy;
 end;
 
 { TNNetPad }
@@ -8194,6 +8226,7 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolutionSharedWeights' : Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]);
       'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvLinear' :  Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]);
@@ -8268,6 +8301,7 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvLinear' then Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]) else
@@ -8651,7 +8685,7 @@ end;
 function TNNet.AddLayerAfter(pLayers: array of TNNetLayer;
   pAfterLayerIdx: integer): TNNetLayer;
 begin
-  AddLayerAfter(pLayers, FLayers[pAfterLayerIdx]);
+  Result := AddLayerAfter(pLayers, FLayers[pAfterLayerIdx]);
 end;
 
 function TNNet.GetFirstNeuronalLayerIdx(FromLayerIdx:integer = 0): integer;
