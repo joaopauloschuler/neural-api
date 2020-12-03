@@ -225,6 +225,7 @@ type
       function GetBiasSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetInertiaSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function CountWeights(): integer; {$IFDEF Release} inline; {$ENDIF}
+      function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       procedure MulWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
@@ -8106,7 +8107,7 @@ begin
   begin
     for LayerCnt := 0 to GetLastLayerIdx() do
     begin
-      Result := Result + FLayers[LayerCnt].Neurons.Count;
+      Result := Result + FLayers[LayerCnt].CountNeurons();
     end;
   end;
 end;
@@ -9515,7 +9516,7 @@ begin
     for LayerCnt := 0 to GetLastLayerIdx() do
     begin
       WeightCount := FLayers[LayerCnt].CountWeights();
-      NeuronCount := FLayers[LayerCnt].FNeurons.Count;
+      NeuronCount := FLayers[LayerCnt].CountNeurons();
       Write
         (
           'Layer ',LayerCnt:2,
@@ -10482,6 +10483,13 @@ begin
       Result := Result + FNeurons[Cnt].Weights.Size;
     end;
   end
+end;
+
+function TNNetLayer.CountNeurons(): integer;
+begin
+  if LinkedNeurons
+  then Result := 0
+  else Result := FNeurons.Count;
 end;
 
 procedure TNNetLayer.MulWeights(V: TNeuralFloat);
