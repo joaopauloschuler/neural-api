@@ -175,6 +175,7 @@ type
       //backpropagation properties
       FDepartingBranchesCnt: integer;
       FBackPropCallCurrentCnt: integer;
+      FLinkedNeurons: boolean;
 
       procedure InitStruct();
     private
@@ -274,6 +275,7 @@ type
       property SmoothErrorPropagation: boolean read FSmoothErrorPropagation write FSmoothErrorPropagation;
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
+      property LinkedNeurons: boolean read FLinkedNeurons;
   end;
 
   TNNetLayerClass = class of TNNetLayer;
@@ -1553,6 +1555,7 @@ begin
   // change the local neural list for the remote neural list
   FNeurons.Free;
   FNeurons := LinkedLayer.FNeurons;
+  FLinkedNeurons := true;
 end;
 
 destructor TNNetConvolutionSharedWeights.Destroy;
@@ -9023,7 +9026,7 @@ begin
   begin
     for LayerCnt := 1 to GetLastLayerIdx() do
     begin
-        FLayers[LayerCnt].MulWeights( V );
+      if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].MulWeights( V );
     end;
   end;
 end;
@@ -9036,7 +9039,7 @@ begin
   begin
     for LayerCnt := 1 to GetLastLayerIdx() do
     begin
-      FLayers[LayerCnt].MulDeltas( V );
+      if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].MulDeltas( V );
     end;
   end;
 end;
@@ -9053,7 +9056,7 @@ begin
     begin
       for LayerCnt := 1 to GetLastLayerIdx() do
       begin
-        FLayers[LayerCnt].SumWeights(Origin.Layers[LayerCnt]);
+        if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].SumWeights(Origin.Layers[LayerCnt]);
       end;
     end;
   end
@@ -9080,8 +9083,11 @@ begin
       MaxLayerIdx := GetLastLayerIdx();
       for LayerCnt := 1 to MaxLayerIdx do
       begin
-        FLayers[LayerCnt].SumDeltas(Origin.Layers[LayerCnt]);
-        FLayers[LayerCnt].AddTimes(Origin.Layers[LayerCnt]);
+        if not(FLayers[LayerCnt].LinkedNeurons) then
+        begin
+          FLayers[LayerCnt].SumDeltas(Origin.Layers[LayerCnt]);
+          FLayers[LayerCnt].AddTimes(Origin.Layers[LayerCnt]);
+        end;
       end;
     end;
   end
@@ -9104,14 +9110,18 @@ begin
   MaxLayerIdx := GetLastLayerIdx();
   for LayerCnt := 1 to MaxLayerIdx do
   begin
-    FLayers[LayerCnt].SumDeltasNoChecks(Origin.Layers[LayerCnt]);
-    FLayers[LayerCnt].AddTimes(Origin.Layers[LayerCnt]);
+    if not(FLayers[LayerCnt].LinkedNeurons) then
+    begin
+      FLayers[LayerCnt].SumDeltasNoChecks(Origin.Layers[LayerCnt]);
+      FLayers[LayerCnt].AddTimes(Origin.Layers[LayerCnt]);
+    end;
   end;
 end;
 
 procedure TNNet.CopyWeights(Origin: TNNet);
 var
   LayerCnt: integer;
+  MaxLayerIdx: integer;
 begin
   FForwardTime := Origin.FForwardTime;
   FBackwardTime := Origin.FBackwardTime;
@@ -9119,10 +9129,14 @@ begin
   begin
     if FLayers.Count > 1 then
     begin
-      for LayerCnt := 1 to GetLastLayerIdx() do
+      MaxLayerIdx := GetLastLayerIdx();
+      for LayerCnt := 1 to MaxLayerIdx do
       begin
-        FLayers[LayerCnt].CopyWeights(Origin.Layers[LayerCnt]);
-        FLayers[LayerCnt].CopyTimes(Origin.Layers[LayerCnt]);
+        if not(FLayers[LayerCnt].LinkedNeurons) then
+        begin
+          FLayers[LayerCnt].CopyWeights(Origin.Layers[LayerCnt]);
+          FLayers[LayerCnt].CopyTimes(Origin.Layers[LayerCnt]);
+        end;
       end;
     end;
   end
@@ -9146,13 +9160,16 @@ begin
   begin
     for LayerCnt := 0 to GetLastLayerIdx() do
     begin
-      LayerMul := FLayers[LayerCnt].ForceMaxAbsoluteDelta(vMax);
-      if LayerMul < Result then
+      if not(FLayers[LayerCnt].LinkedNeurons) then
       begin
-        Result := LayerMul;
-        MessageProc('Deltas have been multiplied by '+FloatToStr(LayerMul)+
-          ' on layer '+IntToStr(LayerCnt)+' - '+
-          FLayers[LayerCnt].ClassName+'.');
+        LayerMul := FLayers[LayerCnt].ForceMaxAbsoluteDelta(vMax);
+        if LayerMul < Result then
+        begin
+          Result := LayerMul;
+          MessageProc('Deltas have been multiplied by '+FloatToStr(LayerMul)+
+            ' on layer '+IntToStr(LayerCnt)+' - '+
+            FLayers[LayerCnt].ClassName+'.');
+        end;
       end;
     end;
   end;
@@ -9891,6 +9908,7 @@ begin
   FOutputErrorDeriv := TNNetVolume.Create(1,1,1);
 
   FNeurons := TNNetNeuronList.Create();
+  FLinkedNeurons := false;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
@@ -10456,6 +10474,7 @@ var
   Cnt: integer;
 begin
   Result := 0;
+  if FLinkedNeurons then exit;
   if FNeurons.Count > 0 then
   begin
     for Cnt := 0 to FNeurons.Count-1 do
@@ -10537,6 +10556,7 @@ procedure TNNetLayer.MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNe
 var
   Cnt: integer;
 begin
+  if FLinkedNeurons then exit;
   if Neurons.Count = Origin.Neurons.Count then
   begin
     if FNeurons.Count > 0 then
@@ -10568,6 +10588,7 @@ procedure TNNetLayer.SumWeights(Origin: TNNetLayer);
 var
   Cnt: integer;
 begin
+  if FLinkedNeurons then exit;
   if Neurons.Count = Origin.Neurons.Count then
   begin
     if FNeurons.Count > 0 then
@@ -10602,6 +10623,7 @@ end;
 
 procedure TNNetLayer.SumDeltas(Origin: TNNetLayer);
 begin
+  if FLinkedNeurons then exit;
   if Neurons.Count = Origin.Neurons.Count then
   begin
     SumDeltasNoChecks(Origin);
@@ -10624,6 +10646,7 @@ var
   Cnt: integer;
   NeuronCount, NeuronCountM1: integer;
 begin
+  if FLinkedNeurons then exit;
   NeuronCount := Neurons.Count;
   if NeuronCount > 0 then
   begin
@@ -10644,6 +10667,7 @@ procedure TNNetLayer.CopyWeights(Origin: TNNetLayer);
 var
   Cnt: integer;
 begin
+  if FLinkedNeurons then exit;
   if Neurons.Count = Origin.Neurons.Count then
   begin
     if FNeurons.Count > 0 then
@@ -10687,6 +10711,7 @@ procedure TNNetLayer.ForceRangeWeights(V: TNeuralFloat);
 var
   Cnt: integer;
 begin
+  if FLinkedNeurons then exit;
   if FNeurons.Count > 0 then
   begin
     for Cnt := 0 to FNeurons.Count-1 do
@@ -10701,6 +10726,7 @@ procedure TNNetLayer.NormalizeWeights(VMax: TNeuralFloat);
 var
   MaxV: TNeuralFloat;
 begin
+  if FLinkedNeurons then exit;
   MaxV := GetMaxWeight();
   if MaxV > VMax then
   begin
