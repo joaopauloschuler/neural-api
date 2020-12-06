@@ -1106,10 +1106,11 @@ type
   { TNNetDeMaxPool }
   TNNetDeMaxPool = class(TNNetMaxPool)
     private
+      FSpacing: integer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function CalcOutputSize(pInputSize: integer) : integer; override;
     public
-      constructor Create(pPoolSize: integer); overload;
+      constructor Create(pPoolSize: integer; pSpacing: integer = 0); overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure ComputePreviousLayerError(); override;
@@ -5812,9 +5813,11 @@ begin
   Result := pInputSize * FPoolSize;
 end;
 
-constructor TNNetDeMaxPool.Create(pPoolSize: integer);
+constructor TNNetDeMaxPool.Create(pPoolSize: integer; pSpacing: integer = 0);
 begin
   inherited Create(pPoolSize);
+  FSpacing := pSpacing;
+  FStruct[7] := FSpacing;
 end;
 
 procedure TNNetDeMaxPool.Compute();
@@ -5824,25 +5827,50 @@ var
   OutX, OutY: integer;
   CurrValue: TNeuralFloat;
   StartTime: double;
+  PrevLayerRawPos, OutputRawPos: integer;
 begin
   StartTime := Now();
-  Output.Fill(-1000000);
+  Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
 
-  for CntD := 0 to MaxD do
+  if FSpacing = 1 then
   begin
     for CntX := 0 to MaxX do
     begin
+      OutX := CntX*FPoolSize;
       for CntY := 0 to MaxY do
       begin
-        CurrValue := FPrevLayer.Output[CntX,CntY,CntD];
-        for OutX := CntX*FPoolSize to CntX*FPoolSize + FPoolSize - 1 do
+        OutY := CntY*FPoolSize;
+        PrevLayerRawPos := FPrevLayer.FOutput.GetRawPos(CntX,CntY,0);
+        OutputRawPos := FOutput.GetRawPos(OutX,OutY,0);
+        for CntD := 0 to MaxD do
         begin
-          for OutY := CntY*FPoolSize to CntY*FPoolSize + FPoolSize - 1 do
+          //CurrValue := FPrevLayer.FOutput[CntX,CntY,CntD];
+          //FOutput[OutX,OutY,CntD] := CurrValue;
+          FOutput.FData[OutputRawPos] := FPrevLayer.FOutput.FData[PrevLayerRawPos];
+          Inc(PrevLayerRawPos);
+          Inc(OutputRawPos);
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    for CntD := 0 to MaxD do
+    begin
+      for CntX := 0 to MaxX do
+      begin
+        for CntY := 0 to MaxY do
+        begin
+          CurrValue := FPrevLayer.Output[CntX,CntY,CntD];
+          for OutX := CntX*FPoolSize to CntX*FPoolSize + FPoolSize - 1 do
           begin
-            Output[OutX,OutY,CntD] := CurrValue;
+            for OutY := CntY*FPoolSize to CntY*FPoolSize + FPoolSize - 1 do
+            begin
+              Output[OutX,OutY,CntD] := CurrValue;
+            end;
           end;
         end;
       end;
@@ -5873,32 +5901,62 @@ var
   RawPos, PrevRawPos: integer;
   PrevPosX, PrevPosY: integer;
   floatPoolSize: TNeuralFloat;
+  OutX, OutY: integer;
 begin
-  MaxX := Output.SizeX - 1;
-  MaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
 
   floatPoolSize := FPoolSize;
-  FOutputError.Divi(floatPoolSize);
 
-  for CntY := 0 to MaxY do
+  if FSpacing = 1 then
   begin
+    MaxX := FPrevLayer.FOutput.SizeX - 1;
+    MaxY := FPrevLayer.FOutput.SizeY - 1;
     for CntX := 0 to MaxX do
     begin
-      RawPos := FOutput.GetRawPos(CntX, CntY, 0);
-      for CntD := 0 to MaxD do
+      OutX := CntX*FPoolSize;
+      for CntY := 0 to MaxY do
+      begin
+        OutY := CntY*FPoolSize;
+        PrevRawPos := FPrevLayer.FOutputError.GetRawPos(CntX,CntY,0);
+        RawPos := FOutputError.GetRawPos(OutX,OutY,0);
+        for CntD := 0 to MaxD do
+        begin
+          {$IFDEF FPC}
+          FPrevLayer.FOutputError.FData[PrevRawPos] += FOutputError.FData[RawPos];
+          {$ELSE}
+          FPrevLayer.FOutputError.FData[PrevRawPos] :=
+            FPrevLayer.FOutputError.FData[PrevRawPos] + FOutputError.FData[RawPos];
+          {$ENDIF}
+          Inc(PrevRawPos);
+          Inc(RawPos);
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    FOutputError.Divi(floatPoolSize);
+    for CntY := 0 to MaxY do
+    begin
+      PrevPosY := CntY div FPoolSize;
+      for CntX := 0 to MaxX do
       begin
         PrevPosX := CntX div FPoolSize;
-        PrevPosY := CntY div FPoolSize;
-        PrevRawPos := FPrevLayer.FOutputError.GetRawPos(PrevPosX, PrevPosY, CntD);
-
-        {$IFDEF FPC}
-        FPrevLayer.FOutputError.FData[PrevRawPos] += FOutPutError.FData[RawPos];
-        {$ELSE}
-        FPrevLayer.FOutputError.FData[PrevRawPos] :=
-          FPrevLayer.FOutputError.FData[PrevRawPos] + FOutPutError.FData[RawPos];
-        {$ENDIF}
-        Inc(RawPos);
+        RawPos := FOutput.GetRawPos(CntX, CntY, 0);
+        PrevRawPos := FPrevLayer.FOutputError.GetRawPos(PrevPosX, PrevPosY, 0);
+        for CntD := 0 to MaxD do
+        begin
+          {$IFDEF FPC}
+          FPrevLayer.FOutputError.FData[PrevRawPos] += FOutPutError.FData[RawPos];
+          {$ELSE}
+          FPrevLayer.FOutputError.FData[PrevRawPos] :=
+            FPrevLayer.FOutputError.FData[PrevRawPos] + FOutPutError.FData[RawPos];
+          {$ENDIF}
+          Inc(RawPos);
+          Inc(PrevRawPos);
+        end;
       end;
     end;
   end;
@@ -8253,7 +8311,7 @@ begin
       'TNNetDeLocalConnectReLU' :   Result := TNNetDeLocalConnectReLU.Create(St[0], St[1], St[4]);
       'TNNetDeconvolution' :        Result := TNNetDeconvolution.Create(St[0], St[1], St[4]);
       'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[4]);
-      'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0]);
+      'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
@@ -8328,7 +8386,7 @@ begin
       if S[0] = 'TNNetDeLocalConnectReLU' then Result := TNNetDeLocalConnectReLU.Create(St[0], St[1], St[4]) else
       if S[0] = 'TNNetDeconvolution' then Result := TNNetDeconvolution.Create(St[0], St[1], St[4]) else
       if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[4]) else
-      if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0]) else
+      if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
