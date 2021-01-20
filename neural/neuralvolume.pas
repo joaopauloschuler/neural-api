@@ -140,6 +140,7 @@ type
     procedure Add(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     class procedure Add(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure AddAtDepth(pDepth: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
+    procedure AddAtDepth(pDepth: integer; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure AddLayers(A,B: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Sub(x, y, d: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Sub(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -2415,6 +2416,35 @@ begin
       FData[RawPos] := FData[RawPos] + Value;
       {$ENDIF}
     end;
+  end;
+end;
+
+procedure TVolume.AddAtDepth(pDepth: integer; Original: TVolume);
+var
+  CntX, CntY: integer;
+  MaxX, MaxY: integer;
+  RawPos: integer;
+begin
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  if Self.Size = Original.Size then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        RawPos := Self.GetRawPos(CntX, CntY, pDepth);
+        {$IFDEF FPC}
+        FData[RawPos] += Original.FData[RawPos];
+        {$ELSE}
+        FData[RawPos] := FData[RawPos] + Original.FData[RawPos];
+        {$ENDIF}
+      end;
+    end;
+  end
+  else
+  begin
+    WriteLn('To Be Implemented.');
   end;
 end;
 

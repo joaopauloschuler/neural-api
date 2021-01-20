@@ -167,6 +167,7 @@ var
   StatingSum, CurrentSum, InputForce: TNeuralFloat;
   LayerHasDepth: boolean;
   StopRatio: TNeuralFloat;
+  vOutputSum: TNeuralFloat;
 begin
   iEpochCount := 0;
   iEpochCountAfterLoading := 0;
@@ -205,10 +206,10 @@ begin
   FormVisualLearning.Height := GrBoxNeurons.Top + GrBoxNeurons.Height + 10;
   Application.ProcessMessages;
 
-  if ChkForceInputRange.Checked
-  then StopRatio := 100
-  else StopRatio := vInput.Size;
-
+  // if ChkForceInputRange.Checked
+  // then StopRatio := 10
+  // else StopRatio := vInput.Size;
+  StopRatio := 100;
   for OutputCount := 0 to FOutputSize - 1 do
   begin
     //vInput.Randomize(10000, 5000, 5000000);
@@ -236,7 +237,8 @@ begin
       if ChkForceInputRange.Checked then vInput.ForceMaxRange(2);
       FNN.ClearDeltas();
       FNN.ClearInertia();
-      if K mod 100 = 0 then
+      vOutputSum := FNN.Layers[FLastLayerIdx].Output.GetSumAbs();
+      if ((K mod 100 = 0) or (vOutputSum > 1000000000)) then
       begin
         vDisplay.Copy(vInput);
         vDisplay.NeuronalWeightToImg(0);
@@ -245,7 +247,7 @@ begin
         aImage[OutputCount].Height  := FFilterSize;
         Application.ProcessMessages();
         CurrentSum := vInput.GetSumAbs();
-        WriteLn(StatingSum,' - ',CurrentSum,' - ',(CurrentSum/StatingSum));
+        WriteLn(StatingSum,' - ', StopRatio, ' - ',CurrentSum,' - ',(CurrentSum/StatingSum),' - ', vOutputSum);
         if (CurrentSum > StopRatio*StatingSum) or Not(LayerHasDepth)
           then break
           else vInput.AddSaltAndPepper(4, InputForce/10, -InputForce/10, true);

@@ -10045,6 +10045,7 @@ begin
   begin
     if (FOutputError.Depth > 1) then
     begin
+      FOutputError.AddAtDepth(NeuronIdx, FOutput);
       FOutputError.AddAtDepth(NeuronIdx, -value);
       ComputeErrorDeriv();
     end
