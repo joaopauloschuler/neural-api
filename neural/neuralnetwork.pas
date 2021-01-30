@@ -752,7 +752,7 @@ type
       procedure ComputePreviousLayerError(); override;
       procedure ComputePreviousLayerErrorCPU(); virtual;
     public
-      constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); virtual;
+      constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload; virtual;
       constructor Create(pSize:integer; pSuppressBias: integer = 0); overload;
       procedure Compute(); override;
       procedure ComputeCPU(); virtual;
@@ -854,7 +854,7 @@ type
     procedure ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUFast();
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); virtual; overload;
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); overload; virtual;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
