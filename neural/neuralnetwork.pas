@@ -888,7 +888,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); virtual; overload;
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
@@ -934,7 +934,7 @@ type
     private
       FLinkedLayer: TNNetConvolution;
     public
-      constructor Create(LinkedLayer: TNNetLayer); virtual; overload;
+      constructor Create(LinkedLayer: TNNetLayer); overload; virtual;
       destructor Destroy; override;
   end;
 
