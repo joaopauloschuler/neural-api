@@ -14,9 +14,9 @@ __kernel void cai_dot_product
   const int FNumBs,
   const int FSize,
   int ActFN,
-  __global __read_only float* FInputBufferAs,
-  __global __read_only float* FInputBufferBs,
-  __global   float* FResultBuffer
+  __global float* FInputBufferAs,
+  __global float* FInputBufferBs,
+  __global float* FResultBuffer
 )
 {
   const int a_id = get_global_id(0);
@@ -118,9 +118,9 @@ __kernel void cai_dot_product2
   const int FNumBs,
   const int FSize,
   int ActFN,
-  __global __read_only float* FInputBufferAs,
-  __global __read_only float* FInputBufferBs,
-  __global   float* FResultBuffer
+  __global float* FInputBufferAs,
+  __global float* FInputBufferBs,
+  __global float* FResultBuffer
 )
 {
   const int a_id = get_global_id(0);
@@ -252,8 +252,8 @@ __kernel void simpleGEMMT(
   const int FThreadCount,
   const int M, const int N, const int K,
   int ActFN,
-  __global __read_only float* A,
-  __global __read_only float* B,
+  __global float* A,
+  __global float* B,
   __global float* C) {
 
     // Thread identifiers
@@ -304,8 +304,8 @@ __kernel void cai_dot_product_simple
   const int FNumBs,
   const int FSize,
   int ActFN,
-  __global __read_only float16* FInputBufferAs,
-  __global __read_only float16* FInputBufferBs,
+  __global   float16* FInputBufferAs,
+  __global   float16* FInputBufferBs,
   __global   float* FResultBuffer
 )
 {
@@ -355,8 +355,8 @@ __kernel void myGEMM5(
   const int FThreadCount,
   const int M, const int N, const int K,
   int ActFN,
-  __global __read_only float* A,
-  __global __read_only float* B,
+  __global float* A,
+  __global float* B,
   __global float* C) {
 
     // Thread identifiers
@@ -423,8 +423,8 @@ __kernel void myGEMM6(
   const int FThreadCount,
   const int M, const int N, const int K,
   int ActFN,
-  __global __read_only float* A,
-  __global __read_only float* B,
+  __global float* A,
+  __global float* B,
   __global float* C) {
     // Thread identifiers
     const int tidm = get_local_id(0); // Local row ID (max: TSM/WPTM)
