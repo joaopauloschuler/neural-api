@@ -108,6 +108,7 @@ type
     NN.Free;
     Write('Press ENTER to exit.');
     ReadLn;
+    Terminate;
   end;
 
   procedure TTestFitLoading.GetTrainingPair(Idx: integer; ThreadId: integer;
