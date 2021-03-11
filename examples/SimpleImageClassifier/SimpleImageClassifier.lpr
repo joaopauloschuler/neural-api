@@ -7,7 +7,8 @@ program SimpleImageClassifier;
 
 uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
-  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets, neuralfit;
+  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume,
+  Math, neuraldatasets, neuralfit, neuralthread;
 
 type
   TTestCNNAlgo = class(TCustomApplication)
@@ -46,7 +47,7 @@ type
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     NeuralFit := TNeuralImageFit.Create;
-    NeuralFit.FileNameBase := 'SimpleImageClassifier';
+    NeuralFit.FileNameBase := 'SimpleImageClassifier-'+IntToStr(GetProcessId());
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
