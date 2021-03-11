@@ -265,6 +265,7 @@ end;
 constructor TNeuralThread.Create(CreateSuspended: boolean; pIndex: integer);
 var
   NStartName, NFinishName: string;
+  Pid: integer;
 begin
   inherited Create(CreateSuspended);
   FProc := nil;
@@ -272,8 +273,9 @@ begin
   FThreadNum := 1;
   FShouldStart := false;
   FProcFinished := false;
-  NStartName := 'NStart-'+IntToStr(GetProcessId())+'-'+IntToStr(pIndex);
-  NFinishName := 'NFinish-'+IntToStr(GetProcessId())+'-'+IntToStr(pIndex);
+  Pid := GetProcessId();
+  NStartName := 'NStart-'+IntToStr(Pid)+'-'+IntToStr(pIndex);
+  NFinishName := 'NFinish-'+IntToStr(Pid)+'-'+IntToStr(pIndex);
   {$IFDEF FPC}
   FNeuronStart := TEventObject.Create(nil, True, False, NStartName) ;
   FNeuronFinish := TEventObject.Create(nil, True, False, NFinishName) ;
