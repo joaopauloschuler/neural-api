@@ -8,6 +8,11 @@ uses
   Classes, SysUtils,
   {$IFDEF FPC}
   fgl, MTPCPU
+    {$IFDEF WINDOWS}
+    ,windows
+    {$ELSE}
+    ,BaseUnix
+    {$ENDIF}
   {$ELSE}
   Generics.Collections, Windows
   {$ENDIF}
@@ -66,6 +71,7 @@ type
   function NeuralDefaultThreadCount: integer;
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
   procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
+  function GetProcessId(): {$IFDEF FPC}integer{$ELSE}integer{$ENDIF};
 
 implementation
 
@@ -121,6 +127,19 @@ begin
   Result := TThread.ProcessorCount;
   {$ENDIF}
 end;
+
+{$IFDEF FPC}
+function GetProcessId(): integer;
+begin
+  GetProcessId := {$IFDEF WINDOWS}GetCurrentProcessId(){$ELSE}fpgetppid(){$ENDIF};
+end;
+{$ELSE}
+//TODO: properly implement process ID for delphi
+function GetProcessId(): integer;
+begin
+  GetProcessId := Random(MaxInt);
+end;
+{$ENDIF}
 
 function fNTL: TNeuralThreadList;
 begin
@@ -244,6 +263,8 @@ begin
 end;
 
 constructor TNeuralThread.Create(CreateSuspended: boolean; pIndex: integer);
+var
+  NStartName, NFinishName: string;
 begin
   inherited Create(CreateSuspended);
   FProc := nil;
@@ -251,12 +272,14 @@ begin
   FThreadNum := 1;
   FShouldStart := false;
   FProcFinished := false;
+  NStartName := 'NStart-'+IntToStr(GetProcessId())+'-'+IntToStr(pIndex);
+  NFinishName := 'NFinish-'+IntToStr(GetProcessId())+'-'+IntToStr(pIndex);
   {$IFDEF FPC}
-  FNeuronStart := TEventObject.Create(nil, True, False, 'NStart '+IntToStr(pIndex)) ;
-  FNeuronFinish := TEventObject.Create(nil, True, False, 'NFinish '+IntToStr(pIndex)) ;
+  FNeuronStart := TEventObject.Create(nil, True, False, NStartName) ;
+  FNeuronFinish := TEventObject.Create(nil, True, False, NFinishName) ;
   {$ELSE}
-  FNeuronStart := TEvent.Create(nil, True, False, 'NStart '+IntToStr(pIndex)) ;
-  FNeuronFinish := TEvent.Create(nil, True, False, 'NFinish '+IntToStr(pIndex)) ;
+  FNeuronStart := TEvent.Create(nil, True, False, NStartName) ;
+  FNeuronFinish := TEvent.Create(nil, True, False, NFinishName) ;
   {$ENDIF}
 end;
 
