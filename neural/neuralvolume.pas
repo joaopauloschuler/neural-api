@@ -419,6 +419,7 @@ type
       procedure SortByTagDesc;
       procedure GetColumn(V: TNNetVolume; colIdx: integer);
       procedure ResizeImage(NewSizeX, NewSizeY: integer);
+      procedure AddPadding(Padding: integer);
      {$IFNDEF FPC}
       property Items[Index: Integer]: TNNetVolume read GetItem write SetItem; default;
      {$ENDIF}
@@ -2157,6 +2158,23 @@ begin
     begin
       AuxVolume.Copy(Self[I]);
       Self[I].CopyResizing(AuxVolume, NewSizeX, NewSizeY);
+    end;
+    AuxVolume.Free;
+  end;
+end;
+
+procedure TNNetVolumeList.AddPadding(Padding: integer);
+var
+  I: integer;
+  AuxVolume: TNNetVolume;
+begin
+  if (Count>0) then
+  begin
+    AuxVolume := TNNetVolume.Create();
+    for I := 0 to Count - 1 do
+    begin
+      AuxVolume.Copy(Self[I]);
+      Self[I].CopyPadding(AuxVolume, Padding);
     end;
     AuxVolume.Free;
   end;
