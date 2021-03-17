@@ -17,6 +17,7 @@ type
   end;
 
 const
+  // Padding and cropping constants.
   csPadding = 4;
   csCropSize = csPadding * 2;
 
@@ -50,18 +51,18 @@ const
     NN.DebugStructure();
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
-    // Add Padding
+    // Add padding to dataset
     ImgTrainingVolumes.AddPadding(csPadding);
     ImgValidationVolumes.AddPadding(csPadding);
     ImgTestVolumes.AddPadding(csPadding);
 
     NeuralFit := TNeuralImageFit.Create;
 
-    // Enables cropping
+    // Enable cropping while fitting.
     NeuralFit.HasImgCrop := true;
     NeuralFit.MaxCropSize := csCropSize;
 
-    NeuralFit.FileNameBase := 'SimpleImageClassifier-'+IntToStr(GetProcessId());
+    NeuralFit.FileNameBase := 'SimpleImageClassifierPaddingCropping-'+IntToStr(GetProcessId());
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
