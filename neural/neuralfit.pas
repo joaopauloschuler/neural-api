@@ -1831,7 +1831,7 @@ begin
         sumOutput.Add( pOutput );
       end;
 
-      if FMaxCropSize >= 2 then
+      if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
         ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
         ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
