@@ -143,9 +143,21 @@ type
     if bPaddingCropping then
     begin
       // Add padding to dataset
+      WriteLn
+      (
+        'Original image size: ',
+        ImgTrainingVolumes[0].SizeX,',',
+        ImgTrainingVolumes[0].SizeY,' px.'
+      );
       ImgTrainingVolumes.AddPadding(csPadding);
       ImgValidationVolumes.AddPadding(csPadding);
       ImgTestVolumes.AddPadding(csPadding);
+      WriteLn
+      (
+        'New image size after padding: ',
+        ImgTrainingVolumes[0].SizeX,',',
+        ImgTrainingVolumes[0].SizeY,' px.'
+      );
     end;
 
     WriteLn('Neural Network will minimize error with:');
