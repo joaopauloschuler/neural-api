@@ -4998,7 +4998,7 @@ begin
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
   MaxTileA := (NumAs div TileSizeA) - 1;
-  MaxTileB := (NumAs div TileSizeB) - 1;
+  MaxTileB := (NumBs div TileSizeB) - 1;
   for TileBCnt := 0 to MaxTileB do
   begin
     StartTileB := TileBCnt * TileSizeB;
