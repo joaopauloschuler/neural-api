@@ -3302,10 +3302,10 @@ begin
 
   for CntX := 0 to MaxX do
   begin
-    OrigPosX := Round(CntX / RatioX);
+    OrigPosX := Floor(CntX / RatioX);
     for CntY := 0 to MaxY do
     begin
-      OrigPosY := Round(CntY / RatioY);
+      OrigPosY := Floor(CntY / RatioY);
       RawPostDest := GetRawPos(CntX, CntY);
       RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
       Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
@@ -4732,8 +4732,10 @@ begin
   MaxA := NumAs - 1;
   MaxB := NumBs - 1;
 
-  localNumElements := (VectorSize div 4) * 4;
-  MissedElements := VectorSize - localNumElements;
+  //localNumElements := (VectorSize div 4) * 4;
+  //MissedElements := VectorSize - localNumElements;
+  MissedElements := VectorSize and 3;
+  localNumElements := VectorSize xor MissedElements;
 
   for CntB := 0 to MaxB do
   begin
