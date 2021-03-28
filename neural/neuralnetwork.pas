@@ -84,7 +84,7 @@ uses
   {$IFDEF FPC}
   fgl,
   {$ENDIF}
-  Classes, SysUtils, math, syncobjs, neuralvolume;
+  Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric;
 
 const
   csMaxInterleavedSize: integer = 95;
@@ -879,6 +879,9 @@ type
       //FDotProductResult: TNNetVolume;
       FPointwise: boolean;
       FLearnSmoothener: TNeuralFloat;
+      // Tiling
+      FMaxTileX, FMaxTileY, FMaxTileD: integer;
+      FTileSizeX, FTileSizeY, FTileSizeD: integer;
 
       {$IFDEF Debug}
       procedure PrepareInputForConvolution(); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -906,6 +909,10 @@ type
     private
       procedure ComputeCPU();
       procedure ComputeInterleaved();
+      procedure BackpropagateCPU();
+      procedure BackpropagateFastCPU();
+      procedure BackpropagateFastTiledCPU();
+      procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
 
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
@@ -925,9 +932,6 @@ type
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
-      procedure BackpropagateCPU();
-      procedure BackpropagateFastCPU();
-      procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
   end;
 
   TNNetConvolutionSharedWeights = class(TNNetConvolution)
@@ -6776,6 +6780,24 @@ begin
   {$ENDIF}
   FShouldConcatWeights := true;
   InitDefault();
+
+  FTileSizeX := GetMaxDivisor(FOutputSizeX, 4);
+  FTileSizeY := GetMaxDivisor(FOutputSizeY, 4);
+  FTileSizeD := GetMaxDivisor(FNeurons.Count, 4);
+
+  if FTileSizeX = 1 then FTileSizeX := GetMaxDivisor(FOutputSizeX, 64);
+  if FTileSizeY = 1 then FTileSizeY := GetMaxDivisor(FOutputSizeY, 64);
+  if FTileSizeD = 1 then FTileSizeD := GetMaxDivisor(FNeurons.Count, 64);
+
+  FMaxTileX := (FOutputSizeX div FTileSizeX) - 1;
+  FMaxTileY := (FOutputSizeY div FTileSizeY) - 1;
+  FMaxTileD := (FNeurons.Count div FTileSizeD) - 1;
+
+  // Debug Tiles
+  //WriteLn(FOutputSizeX,' ',FOutputSizeY,' ',FNeurons.Count,
+  //  '-->',FTileSizeX,' ',FTileSizeY,' ',FTileSizeD,
+  //  '-->',FMaxTileX,' ',FMaxTileY,' ',FMaxTileD
+  //  );
 end;
 
 procedure TNNetConvolutionAbstract.RefreshCalculatePrevLayerError();
@@ -6953,6 +6975,7 @@ end;
 procedure TNNetConvolution.ComputeCPU();
 begin
   FOutputRaw.DotProducts(FNeurons.Count, FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared);
+  //FOutputRaw.DotProductsTiled(FNeurons.Count, FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared, FTileSizeD, FTileSizeX * FTileSizeY);
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
 end;
@@ -7114,6 +7137,7 @@ begin
 
     //BackpropagateFastCPUDev();
     BackpropagateFastCPU();
+    //BackpropagateFastTiledCPU();
     //BackpropagateCPU();
 
     {$IFDEF CheckRange}ForceRangeWeights(1000);{$ENDIF}
@@ -7442,6 +7466,297 @@ begin
         end;
       end;
     end;
+
+  if (not FBatchUpdate) then
+  begin
+    for OutputD := 0 to MaxD do FArrNeurons[OutputD].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetConvolution.BackpropagateFastTiledCPU();
+var
+  OutputX, OutputY, OutputD: integer;
+  MaxX, MaxY, MaxD: integer;
+  PrevX, PrevY: integer;
+  OutputRawPos: integer;
+  CanBackpropOnPos: boolean;
+  LocalCntY: integer;
+  LocalLearningErrorDeriv: TNeuralFloat;
+  LocalOutputErrorDeriv: TNeuralFloat;
+  SmoothLocalOutputErrorDeriv: TNeuralFloat;
+  LocalWeight, LocalPrevError: TNNetVolume;
+  {SrcPtr,} LocalDestPtr: TNeuralFloatArrPtr;
+  SmoothLocalOutputErrorDerivPtr: pointer;
+  PrevNumElements, PrevMissedElements: integer;
+  PtrNeuronDelta, PtrPreparedInput: TNeuralFloatArrPtr;
+  PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
+  NeuronWeights: integer;
+  LocalLearningErrorDerivPtr: pointer;
+  localNumElements, MissedElements: integer;
+  MaxPrevX, MaxPrevY: integer;
+  // Tiling
+  TileXCnt, TileYCnt, TileDCnt: integer;
+  StartTileX, EndTileX, StartTileY, EndTileY, StartTileD, EndTileD: integer;
+begin
+  MaxX := OutputError.SizeX - 1;
+  MaxY := OutputError.SizeY - 1;
+  MaxD := OutputError.Depth - 1;
+  MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
+  MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
+  LocalPrevError := FPrevLayer.OutputError;
+  PrevNumElements := (FSizeXDepth div 4) * 4;
+  PrevMissedElements := FSizeXDepth - PrevNumElements;
+  NeuronWeights := FArrNeurons[0].Delta.Size;
+  localNumElements := (NeuronWeights div 4) * 4;
+  MissedElements := NeuronWeights - localNumElements;
+  SmoothLocalOutputErrorDerivPtr := Addr(SmoothLocalOutputErrorDeriv);
+  LocalLearningErrorDerivPtr := Addr(LocalLearningErrorDeriv);
+  for TileYCnt := 0 to FMaxTileY do
+  begin
+    StartTileY := TileYCnt * FTileSizeY;
+    EndTileY := StartTileY + FTileSizeY - 1;
+    for TileXCnt := 0 to FMaxTileX do
+    begin
+      StartTileX := TileXCnt * FTileSizeX;
+      EndTileX := StartTileX + FTileSizeX - 1;
+      for TileDCnt := 0 to FMaxTileD do
+      begin
+        StartTileD := TileDCnt * FTileSizeD;
+        EndTileD := StartTileD + FTileSizeD - 1;
+        //WriteLn(StartTileX,' ',EndTileX,' - ',StartTileY,' ',EndTileY,' - ',StartTileD,' ',EndTileD);
+        for OutputY := StartTileY to EndTileY do
+        begin
+          PrevY := (OutputY*FStride)-FPadding;
+          for OutputX := StartTileX to EndTileX do
+          begin
+            PrevX := (OutputX*FStride)-FPadding;
+            if (FCalculatePrevLayerError) then LocalDestPtr  := LocalPrevError.GetRawPtr(OutputX, OutputY);
+            PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
+            CanBackpropOnPos :=
+              (PrevX >= 0) and (PrevY >= 0) and
+              (PrevX < MaxPrevX) and
+              (PrevY < MaxPrevY);
+            OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
+            for OutputD := StartTileD to EndTileD do
+            begin
+              {$IFDEF FPC}
+              if FActivationFn = @RectifiedLinearUnit then
+              begin
+                if FOutputRaw.FData[OutputRawPos] >= 0 then
+                begin
+                  LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
+                end
+                else
+                begin
+                  LocalOutputErrorDeriv := 0;
+                end;
+              end
+              else if FActivationFn = @Identity then
+              begin
+                LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
+              end
+              else
+              begin
+                LocalOutputErrorDeriv :=
+                  FOutputError.FData[OutputRawPos] *
+                  FActivationFnDerivative(FOutputRaw.FData[OutputRawPos]);
+              end;
+              {$ELSE}
+                LocalOutputErrorDeriv :=
+                  FOutputError.FData[OutputRawPos] *
+                  FActivationFnDerivative(FOutputRaw.FData[OutputRawPos]);
+              {$ENDIF}
+
+              FOutputErrorDeriv.FData[OutputRawPos] := LocalOutputErrorDeriv;
+              LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
+              if (LocalLearningErrorDeriv <> 0.0) then
+              begin
+                  {$IFNDEF AVX64}
+                  FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                  {$ELSE}
+                  {$IFDEF Debug}
+                  if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
+                  then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
+                  {$ENDIF}
+                  PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
+                  if localNumElements > 0 then
+                  asm
+                  mov ecx, localNumElements
+                  mov rax, PtrPreparedInput
+                  mov rdx, LocalLearningErrorDerivPtr
+
+                  {$IFDEF AVX512}
+                  VBROADCASTSS zmm5, [rdx]
+                  {$ELSE}
+                  VBROADCASTSS ymm5, [rdx]
+                  {$ENDIF}
+
+                  mov rdx, PtrNeuronDelta
+
+                  push rcx
+                  shr ecx,5  // number of large iterations = number of elements / 32
+                  jz @SkipLargeAddLoop
+
+                @LargeAddLoop:
+                  {$IFDEF AVX512}
+                  vmulps  zmm0, zmm5, [rax]
+                  vmulps  zmm1, zmm5, [rax+64]
+
+                  vaddps  zmm0, zmm0, [rdx]
+                  vaddps  zmm1, zmm1, [rdx+64]
+
+                  vmovups [rdx],    zmm0
+                  vmovups [rdx+64], zmm1
+                  {$ELSE}
+                    {$IFDEF AVX2}
+                    vmovups ymm0, [rdx]
+                    vmovups ymm1, [rdx+32]
+                    vmovups ymm2, [rdx+64]
+                    vmovups ymm3, [rdx+96]
+
+                    vfmadd231ps ymm0, ymm5, [rax]
+                    vfmadd231ps ymm1, ymm5, [rax+32]
+                    vfmadd231ps ymm2, ymm5, [rax+64]
+                    vfmadd231ps ymm3, ymm5, [rax+96]
+                    {$ELSE}
+                    vmulps  ymm0, ymm5, [rax]
+                    vmulps  ymm1, ymm5, [rax+32]
+                    vmulps  ymm2, ymm5, [rax+64]
+                    vmulps  ymm3, ymm5, [rax+96]
+
+                    vaddps  ymm0, ymm0, [rdx]
+                    vaddps  ymm1, ymm1, [rdx+32]
+                    vaddps  ymm2, ymm2, [rdx+64]
+                    vaddps  ymm3, ymm3, [rdx+96]
+                    {$ENDIF}
+
+                    vmovups [rdx],    ymm0
+                    vmovups [rdx+32], ymm1
+                    vmovups [rdx+64], ymm2
+                    vmovups [rdx+96], ymm3
+                  {$ENDIF}
+
+                  add rax, 128
+                  add rdx, 128
+                  dec ecx
+                  jnz @LargeAddLoop
+
+                @SkipLargeAddLoop:
+                  vzeroupper
+
+                  pop rcx
+                  and ecx,$0000001F
+                  jz @EndAdd
+                  shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
+
+                @SmallAddLoop:
+
+                  movups  xmm2, [rax]
+                  movups  xmm4, [rdx]
+
+                  mulps   xmm2, xmm5
+                  addps   xmm4, xmm2
+
+                  movups  [rdx], xmm4
+
+                  add rax, 16
+                  add rdx, 16
+
+                  dec ecx
+                  jnz @SmallAddLoop
+
+                @EndAdd:
+                  end  [
+                    'RAX', 'RCX', 'RDX',
+                    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+                    {$IFDEF AVX512},'zmm0', 'zmm1', 'zmm5'{$ENDIF}
+                  ];
+
+                  if MissedElements>0 then
+                  begin
+                    PtrNeuronDelta^[localNumElements] += LocalLearningErrorDeriv*PtrPreparedInput^[localNumElements];
+                    if MissedElements>1 then
+                    begin
+                      PtrNeuronDelta^[localNumElements+1] += LocalLearningErrorDeriv*PtrPreparedInput^[localNumElements+1];
+                      if MissedElements>2 then PtrNeuronDelta^[localNumElements+2] += LocalLearningErrorDeriv*PtrPreparedInput^[localNumElements+2];
+                    end;
+                  end;
+                  {$ENDIF}
+
+                  {$IFDEF FPC}
+                  FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
+                  {$ELSE}
+                  FArrNeurons[OutputD].FBiasDelta :=
+                    FArrNeurons[OutputD].FBiasDelta + LocalLearningErrorDeriv;
+                  {$ENDIF}
+
+                  if (FCalculatePrevLayerError) then
+                  begin
+                    LocalWeight := FArrNeurons[OutputD].Weights;
+                    if FPointwise then
+                    begin
+                      {$IFNDEF AVX64}
+                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
+                      {$ELSE}
+                      {$IFDEF Debug}
+                      if PrevNumElements + PrevMissedElements <> FInputCopy.Depth
+                      then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): pointwise vector size doesn''t match.');
+                      {$ENDIF}
+                      PrevPtrA := LocalDestPtr;
+                      PrevPtrB := LocalWeight.DataPtr;
+                      SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv;
+                      asm_avx64_prev_backprop;
+                      {$ENDIF}
+                    end
+                    else
+                    begin
+                      if CanBackpropOnPos then
+                      begin
+                        SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                        PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY);
+                        PrevPtrB := LocalWeight.DataPtr;
+                        for LocalCntY := 0 to FFeatureSizeYMinus1 do
+                        begin
+                          {$IFNDEF AVX64}
+                          LocalPrevError.MulAdd
+                          (
+                            PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
+                            PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
+                            SmoothLocalOutputErrorDeriv,
+                            FSizeXDepth
+                          );
+                          {$ELSE}
+                          {$IFDEF Debug}
+                          if PrevNumElements + PrevMissedElements <> FSizeXDepth
+                          then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
+                          {$ENDIF}
+                          //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
+                          //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
+                          asm_avx64_prev_backprop;
+                          {$ENDIF}
+                          if LocalCntY < FFeatureSizeYMinus1 then
+                          begin
+                            {$IFDEF FPC}
+                            PrevPtrA := (pointer(PrevPtrA) + FPrevSizeXDepthBytes);
+                            PrevPtrB := (pointer(PrevPtrB) + FSizeXDepthBytes);
+                            {$ELSE}
+                            PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY + 1);
+                            PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY + 1);
+                            {$ENDIF}
+                          end;
+                        end;
+                      end;
+                    end;
+                  end; // if (FCalculatePrevLayerError)
+              end; // (LocalLearningErrorDeriv <> 0.0)
+              Inc(OutputRawPos);
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
 
   if (not FBatchUpdate) then
   begin
