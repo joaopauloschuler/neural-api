@@ -58,10 +58,17 @@ implementation
 function GetMaxDivisor(x, acceptableMax: integer): integer;
 begin
   Result := acceptableMax;
-  while (Result > 1) do
+  if x <= acceptableMax then
   begin
-    if x mod Result = 0 then break;
-    Dec(Result);
+    Result := x;
+  end
+  else
+  begin
+    while (Result > 1) do
+    begin
+      if x mod Result = 0 then break;
+      Dec(Result);
+    end;
   end;
 end;
 

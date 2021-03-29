@@ -6792,10 +6792,10 @@ begin
   FMaxTileD := (FNeurons.Count div FTileSizeD) - 1;
 
   // Debug Tiles
-  //WriteLn(FOutputSizeX,' ',FOutputSizeY,' ',FNeurons.Count,
-  //  '-->',FTileSizeX,' ',FTileSizeY,' ',FTileSizeD,
-  //  '-->',FMaxTileX,' ',FMaxTileY,' ',FMaxTileD
-  //  );
+  WriteLn(FOutputSizeX,' ',FNeurons.Count,
+    '-->',FTileSizeX,' ',FTileSizeD,
+    '-->',FMaxTileX,' ',FMaxTileD
+    );
 end;
 
 procedure TNNetConvolutionAbstract.RefreshCalculatePrevLayerError();
@@ -7077,8 +7077,8 @@ procedure TNNetConvolution.Compute();
     end
     else
     begin
-      //ComputeTiledCPU();
-      ComputeCPU();
+      ComputeTiledCPU();
+      //ComputeCPU();
     end;
   end;
 var
@@ -7141,8 +7141,8 @@ begin
     // ClearDeltas() is not required as it's done in BackpropagateNTL
 
     //BackpropagateFastCPUDev();
-    BackpropagateFastCPU();
-    //BackpropagateFastTiledCPU();
+    //BackpropagateFastCPU();
+    BackpropagateFastTiledCPU();
     //BackpropagateCPU();
 
     {$IFDEF CheckRange}ForceRangeWeights(1000);{$ENDIF}
