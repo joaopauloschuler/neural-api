@@ -880,8 +880,8 @@ type
       FPointwise: boolean;
       FLearnSmoothener: TNeuralFloat;
       // Tiling
-      FMaxTileX, FMaxTileY, FMaxTileD: integer;
-      FTileSizeX, FTileSizeY, FTileSizeD: integer;
+      FMaxTileX, FMaxTileD: integer;
+      FTileSizeX, FTileSizeD: integer;
 
       {$IFDEF Debug}
       procedure PrepareInputForConvolution(); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -908,6 +908,7 @@ type
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
     private
       procedure ComputeCPU();
+      procedure ComputeTiledCPU();
       procedure ComputeInterleaved();
       procedure BackpropagateCPU();
       procedure BackpropagateFastCPU();
@@ -6781,16 +6782,13 @@ begin
   FShouldConcatWeights := true;
   InitDefault();
 
-  FTileSizeX := GetMaxDivisor(FOutputSizeX, 4);
-  FTileSizeY := GetMaxDivisor(FOutputSizeY, 4);
-  FTileSizeD := GetMaxDivisor(FNeurons.Count, 4);
+  FTileSizeX := GetMaxDivisor(FOutputSizeX, 64);
+  FTileSizeD := GetMaxDivisor(FNeurons.Count, 64);
 
-  if FTileSizeX = 1 then FTileSizeX := GetMaxDivisor(FOutputSizeX, 64);
-  if FTileSizeY = 1 then FTileSizeY := GetMaxDivisor(FOutputSizeY, 64);
-  if FTileSizeD = 1 then FTileSizeD := GetMaxDivisor(FNeurons.Count, 64);
+  if FTileSizeX = 1 then FTileSizeX := GetMaxDivisor(FOutputSizeX, 256);
+  if FTileSizeD = 1 then FTileSizeD := GetMaxDivisor(FNeurons.Count, 256);
 
   FMaxTileX := (FOutputSizeX div FTileSizeX) - 1;
-  FMaxTileY := (FOutputSizeY div FTileSizeY) - 1;
   FMaxTileD := (FNeurons.Count div FTileSizeD) - 1;
 
   // Debug Tiles
@@ -6975,7 +6973,13 @@ end;
 procedure TNNetConvolution.ComputeCPU();
 begin
   FOutputRaw.DotProducts(FNeurons.Count, FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared);
-  //FOutputRaw.DotProductsTiled(FNeurons.Count, FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared, FTileSizeD, FTileSizeX * FTileSizeY);
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+
+procedure TNNetConvolution.ComputeTiledCPU();
+begin
+  FOutputRaw.DotProductsTiled(FNeurons.Count, FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared, FTileSizeD, FTileSizeX);
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
 end;
@@ -7073,6 +7077,7 @@ procedure TNNetConvolution.Compute();
     end
     else
     begin
+      //ComputeTiledCPU();
       ComputeCPU();
     end;
   end;
@@ -7496,8 +7501,8 @@ var
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
   // Tiling
-  TileXCnt, TileYCnt, TileDCnt: integer;
-  StartTileX, EndTileX, StartTileY, EndTileY, StartTileD, EndTileD: integer;
+  TileXCnt, TileDCnt: integer;
+  StartTileX, EndTileX, StartTileD, EndTileD: integer;
 begin
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
@@ -7512,10 +7517,9 @@ begin
   MissedElements := NeuronWeights - localNumElements;
   SmoothLocalOutputErrorDerivPtr := Addr(SmoothLocalOutputErrorDeriv);
   LocalLearningErrorDerivPtr := Addr(LocalLearningErrorDeriv);
-  for TileYCnt := 0 to FMaxTileY do
+  for OutputY := 0 to MaxY do
   begin
-    StartTileY := TileYCnt * FTileSizeY;
-    EndTileY := StartTileY + FTileSizeY - 1;
+    PrevY := (OutputY*FStride)-FPadding;
     for TileXCnt := 0 to FMaxTileX do
     begin
       StartTileX := TileXCnt * FTileSizeX;
@@ -7525,9 +7529,7 @@ begin
         StartTileD := TileDCnt * FTileSizeD;
         EndTileD := StartTileD + FTileSizeD - 1;
         //WriteLn(StartTileX,' ',EndTileX,' - ',StartTileY,' ',EndTileY,' - ',StartTileD,' ',EndTileD);
-        for OutputY := StartTileY to EndTileY do
         begin
-          PrevY := (OutputY*FStride)-FPadding;
           for OutputX := StartTileX to EndTileX do
           begin
             PrevX := (OutputX*FStride)-FPadding;
