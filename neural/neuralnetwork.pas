@@ -6792,10 +6792,10 @@ begin
   FMaxTileD := (FNeurons.Count div FTileSizeD) - 1;
 
   // Debug Tiles
-  WriteLn(FOutputSizeX,' ',FNeurons.Count,
-    '-->',FTileSizeX,' ',FTileSizeD,
-    '-->',FMaxTileX,' ',FMaxTileD
-    );
+  //WriteLn(FOutputSizeX,' ',FNeurons.Count,
+  //  '-->',FTileSizeX,' ',FTileSizeD,
+  //  '-->',FMaxTileX,' ',FMaxTileD
+  //  );
 end;
 
 procedure TNNetConvolutionAbstract.RefreshCalculatePrevLayerError();
