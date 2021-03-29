@@ -3289,6 +3289,7 @@ var
   RatioX, RatioY: TNeuralFloat;
   CntX, CntY: integer;
   MaxX, MaxY: integer;
+  OrigMaxX, OrigMaxY: integer;
   OrigPosX, OrigPosY: integer;
   MoveSizeBytes: integer;
   RawPostDest, RawPosSource: integer;
@@ -3299,14 +3300,16 @@ begin
 
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
+  OrigMaxX := Original.SizeX - 1;
+  OrigMaxY := Original.SizeY - 1;
   MoveSizeBytes := Depth * SizeOf(T);
 
   for CntX := 0 to MaxX do
   begin
-    OrigPosX := Floor(CntX / RatioX);
+    OrigPosX := Min(OrigMaxX, Round(CntX / RatioX));
     for CntY := 0 to MaxY do
     begin
-      OrigPosY := Floor(CntY / RatioY);
+      OrigPosY := Min(OrigMaxY, Round(CntY / RatioY));
       RawPostDest := GetRawPos(CntX, CntY);
       RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
       Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
