@@ -6782,11 +6782,11 @@ begin
   FShouldConcatWeights := true;
   InitDefault();
 
-  FTileSizeX := GetMaxDivisor(FOutputSizeX, 64);
-  FTileSizeD := GetMaxDivisor(FNeurons.Count, 64);
+  FTileSizeX := GetMaxDivisor(FOutputSizeX, 16);
+  FTileSizeD := GetMaxDivisor(FNeurons.Count, 16);
 
-  if FTileSizeX = 1 then FTileSizeX := GetMaxDivisor(FOutputSizeX, 256);
-  if FTileSizeD = 1 then FTileSizeD := GetMaxDivisor(FNeurons.Count, 256);
+  if FTileSizeX = 1 then FTileSizeX := GetMaxDivisor(FOutputSizeX, 128);
+  if FTileSizeD = 1 then FTileSizeD := GetMaxDivisor(FNeurons.Count, 128);
 
   FMaxTileX := (FOutputSizeX div FTileSizeX) - 1;
   FMaxTileD := (FNeurons.Count div FTileSizeD) - 1;
