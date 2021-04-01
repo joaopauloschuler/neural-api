@@ -494,7 +494,7 @@ NeuralFit.HideMessages();
 ```
 
 ## Parallel Computing - The neuralthread.pas
-This API has easy to use and lightweight parallel processing API methods.
+This API has easy to use, lightweight and platform independent parallel processing API methods.
 
 As an example, assuming that you need to run a procedure 10 times in parallel, you can create 10 thread workers as follows:
 ```
