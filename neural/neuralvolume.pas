@@ -1213,6 +1213,13 @@ begin
   end;
   WriteLn(' A + B:',Result);
 
+  Result := 0;
+  for I := 0 to A.Size - 1 do
+  begin
+    Result := Result + ( A.Raw[I] * B.Raw[I]);
+  end;
+  WriteLn(' A . B:',Result - A.DotProduct(B));
+
   R.Copy(A);
   R.Sub(B);
   Result := 0;
@@ -2785,9 +2792,41 @@ class procedure TVolume.MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
 var
   I: integer;
   vHigh: integer;
+  BasePos: integer;
+  AddrA, AddrB: TNeuralFloatPtr;
 begin
+  BasePos := 0;
+  AddrA := pointer(PtrA);
+  AddrB := pointer(PtrB);
   vHigh := pSize - 1;
-  for I := 0 to vHigh do
+
+  while BasePos <= vHigh - 7 do
+  begin
+    (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
+    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * Value;
+    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * Value;
+    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * Value;
+    (AddrA+4)^ := (AddrA+4)^ + (AddrB+4)^ * Value;
+    (AddrA+5)^ := (AddrA+5)^ + (AddrB+5)^ * Value;
+    (AddrA+6)^ := (AddrA+6)^ + (AddrB+6)^ * Value;
+    (AddrA+7)^ := (AddrA+7)^ + (AddrB+7)^ * Value;
+    BasePos := BasePos + 8;
+    AddrA := AddrA + 8;
+    AddrB := AddrB + 8;
+  end;
+
+  while BasePos <= vHigh - 3 do
+  begin
+    (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
+    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * Value;
+    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * Value;
+    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * Value;
+    BasePos := BasePos + 4;
+    AddrA := AddrA + 4;
+    AddrB := AddrB + 4;
+  end;
+
+  if BasePos <= vHigh then for I := BasePos to vHigh do
     {$IFDEF FPC}
     PtrA^[I] += PtrB^[I]*Value;
     {$ELSE}
@@ -2800,9 +2839,44 @@ class procedure TVolume.MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
 var
   I: integer;
   vHigh: integer;
+  BasePos: integer;
+  AddrA, AddrB, AddrC: TNeuralFloatPtr;
 begin
+  BasePos := 0;
+  AddrA := pointer(PtrA);
+  AddrB := pointer(PtrB);
+  AddrC := pointer(PtrC);
   vHigh := pSize - 1;
-  for I := 0 to vHigh do
+
+  while BasePos <= vHigh - 7 do
+  begin
+    (AddrA)^   := (AddrA)^   + (AddrB)^   * (AddrC)^;
+    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * (AddrC+1)^;
+    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * (AddrC+2)^;
+    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * (AddrC+3)^;
+    (AddrA+4)^ := (AddrA+4)^ + (AddrB+4)^ * (AddrC+4)^;
+    (AddrA+5)^ := (AddrA+5)^ + (AddrB+5)^ * (AddrC+5)^;
+    (AddrA+6)^ := (AddrA+6)^ + (AddrB+6)^ * (AddrC+6)^;
+    (AddrA+7)^ := (AddrA+7)^ + (AddrB+7)^ * (AddrC+7)^;
+    BasePos := BasePos + 8;
+    AddrA := AddrA + 8;
+    AddrB := AddrB + 8;
+    AddrC := AddrC + 8;
+  end;
+
+  while BasePos <= vHigh - 3 do
+  begin
+    (AddrA)^   := (AddrA)^   + (AddrB)^   * (AddrC)^;
+    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * (AddrC+1)^;
+    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * (AddrC+2)^;
+    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * (AddrC+3)^;
+    BasePos := BasePos + 4;
+    AddrA := AddrA + 4;
+    AddrB := AddrB + 4;
+    AddrC := AddrC + 4;
+  end;
+
+  if BasePos <= vHigh then for I := BasePos to vHigh do
     {$IFDEF FPC}
     PtrA^[I] += PtrB^[I]*PtrC^[I];
     {$ELSE}
@@ -3321,6 +3395,7 @@ function TVolume.DotProduct(Original: TVolume): T;
 var
   I: integer;
   vHigh: integer;
+  BasePos: integer;
 begin
   {$IFDEF Debug}
   if Original.Size <> Self.Size then
@@ -3329,7 +3404,33 @@ begin
   {$ENDIF}
   Result := 0;
   vHigh := High(FData);
-  for I := 0 to vHigh do
+  BasePos := 0;
+
+  while BasePos <= vHigh - 7 do
+  begin
+    Result := Result +
+      FData[BasePos] * Original.FData[BasePos] +
+      FData[BasePos+1] * Original.FData[BasePos+1] +
+      FData[BasePos+2] * Original.FData[BasePos+2] +
+      FData[BasePos+3] * Original.FData[BasePos+3] +
+      FData[BasePos+4] * Original.FData[BasePos+4] +
+      FData[BasePos+5] * Original.FData[BasePos+5] +
+      FData[BasePos+6] * Original.FData[BasePos+6] +
+      FData[BasePos+7] * Original.FData[BasePos+7];
+    BasePos := BasePos + 8;
+  end;
+
+  while BasePos <= vHigh - 3 do
+  begin
+    Result := Result +
+      FData[BasePos] * Original.FData[BasePos] +
+      FData[BasePos+1] * Original.FData[BasePos+1] +
+      FData[BasePos+2] * Original.FData[BasePos+2] +
+      FData[BasePos+3] * Original.FData[BasePos+3];
+    BasePos := BasePos + 4;
+  end;
+
+  if BasePos <= vHigh then for I := BasePos to vHigh do
     Result := Result + FData[I] * Original.FData[I];
 end;
 
@@ -8500,11 +8601,44 @@ class function TVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: i
   ): Single;
 var
   I: integer;
-  vHigh: integer;
+  BasePos, vHigh: integer;
+  AddrA, AddrB: TNeuralFloatPtr;
 begin
   Result := 0;
+  BasePos := 0;
   vHigh := NumElements - 1;
-  for I := 0 to vHigh do
+  AddrA := pointer(PtrA);
+  AddrB := pointer(PtrB);
+
+  while BasePos <= vHigh - 7 do
+  begin
+    Result := Result +
+      (AddrA)^   * (AddrB)^ +
+      (AddrA+1)^ * (AddrB+1)^ +
+      (AddrA+2)^ * (AddrB+2)^ +
+      (AddrA+3)^ * (AddrB+3)^ +
+      (AddrA+4)^ * (AddrB+4)^ +
+      (AddrA+5)^ * (AddrB+5)^ +
+      (AddrA+6)^ * (AddrB+6)^ +
+      (AddrA+7)^ * (AddrB+7)^ ;
+    BasePos := BasePos + 8;
+    AddrA := AddrA + 8;
+    AddrB := AddrB + 8;
+  end;
+
+  while BasePos <= vHigh - 3 do
+  begin
+    Result := Result +
+      (AddrA)^   * (AddrB)^ +
+      (AddrA+1)^ * (AddrB+1)^ +
+      (AddrA+2)^ * (AddrB+2)^ +
+      (AddrA+3)^ * (AddrB+3)^;
+    BasePos := BasePos + 4;
+    AddrA := AddrA + 4;
+    AddrB := AddrB + 4;
+  end;
+
+  if BasePos <= vHigh then for I := BasePos to vHigh do
     //Uncomment for debugging only: WriteLn(PtrA^[I]:8:6,' # ', PtrB^[I]:8:6,' # ', Result:8:6);
     Result := Result + PtrA^[I] * PtrB^[I];
 end;
