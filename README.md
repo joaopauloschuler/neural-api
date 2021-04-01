@@ -493,6 +493,43 @@ NeuralFit.Verbose := false;
 NeuralFit.HideMessages();
 ```
 
+## Parallel Computing - The neuralthread.pas
+This API has easy to use and lightweight parallel processing API methods.
+
+As an example, assuming that you need to run a procedure 10 times in parallel, you can create 10 thread workers as follows:
+```
+FProcs := TNeuralThreadList.Create( 10 );
+```
+
+As an example, this is the procedure that we intend to run in parallel:
+```
+procedure MyClassName.RunNNThread(index, threadnum: integer);
+begin
+  WriteLn('This is thread ',index,' out of ',threadnum,' threads.');
+end; 
+```
+Then, to run the procedure RunNNThread passed as parameter 10 times in parallel, do this:
+```
+FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
+```
+You can control the blocking mode (waiting threads to finish
+before the program continues) as per declaration:
+```
+procedure StartProc(pProc: TNeuralProc; pBlock: boolean = true);
+```
+
+Or, if you prefer, you can specifically say when to wait for threads to finish
+as per this example:
+```
+FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF}, false);
+// insert your code here
+FProcs.WaitForProc(); // waits until all threads are finished.
+```
+When you are done, you should call:
+```
+FProcs.Free; 
+```
+
 ## Paid Support
 In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
 to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
