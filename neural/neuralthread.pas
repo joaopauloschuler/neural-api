@@ -1,4 +1,53 @@
-// Neural Threads
+(*
+Neural Threads
+Copyright (C) 2021 Joao Paulo Schwarz Schuler
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*)
+(*
+USAGE:
+This API has easy to use, lightweight and platform independent parallel
+processing API methods.
+
+As an example, assuming that you need to run a procedure 10 times in parallel,
+you can create 10 thread workers as follows:
+FProcs := TNeuralThreadList.Create( 10 );
+
+As an example, this is the procedure that we intend to run in parallel:
+procedure MyClassName.RunNNThread(index, threadnum: integer);
+begin
+  WriteLn('This is thread ',index,' out of ',threadnum,' threads.');
+end;
+
+Then, to run the procedure RunNNThread passed as parameter 10 times in parallel, do this:
+FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
+
+You can control the blocking mode (waiting threads to finish
+before the program continues) as per declaration:
+procedure StartProc(pProc: TNeuralProc; pBlock: boolean = true);
+
+Or, if you prefer, you can specifically say when to wait for threads to finish
+as per this example:
+FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF}, false);
+// insert your code here
+FProcs.WaitForProc(); // waits until all threads are finished.
+
+When you are done, you should call:
+FProcs.Free;
+*)
+
 unit neuralthread;
 {$include neuralnetwork.inc}
 
