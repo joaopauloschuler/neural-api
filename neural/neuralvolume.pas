@@ -111,6 +111,8 @@ type
     procedure SetTag(I: integer); {$IFDEF Release} inline; {$ENDIF}
     function GetTags(x: integer): integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTags(x: integer; AValue: integer); {$IFDEF Release} inline; {$ENDIF}
+    class procedure MulAddPPVS(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
+      pSize: integer); {$IFDEF Release} inline; {$ENDIF}
   public
     // FData was made public to allow other fast operations
     FData: array of T;
@@ -163,6 +165,7 @@ type
     procedure VSqrt(); {$IFDEF Release} inline; {$ENDIF}
     procedure MulAdd(Value: T; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulMulAdd(Value1, Value2: T; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+    class procedure MulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value1, Value2: T; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulAdd(Value: T; PtrB: TNeuralFloatArrPtr); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulAdd(Original1, Original2: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     class procedure MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: T; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -2603,6 +2606,73 @@ begin
     end;
   end;
 end;
+(*
+// this is a new version to be validated.
+var
+  NewX: integer;
+  I: integer;
+  vHigh: integer;
+  posX, posD, maxPosX: integer;
+  NewDepth2, NewDepth3, NewDepth4, vHighM4: integer;
+  SourcePtr, DestPtr: TNeuralFloatPtr;
+begin
+  NewX := Original.FSize div NewDepth;
+  Resize(NewX,1,NewDepth);
+  NewDepth2 := NewDepth  + NewDepth;
+  NewDepth3 := NewDepth2 + NewDepth;
+  NewDepth4 := NewDepth3 + NewDepth;
+
+  vHigh := High(FData);
+  vHighM4 := vHigh - 4;
+
+  posX := 0;
+  posD := 0;
+
+  maxPosX := NewX * NewDepth;
+
+  SourcePtr := Addr(Original.FData[0]);
+  DestPtr := Addr(FData[posX + posD]);
+
+  //for I := 0 to vHigh do
+  I := 0;
+  while I <= vHigh do
+  begin
+    //posX := I mod NewX;
+    //posD := I div NewX;
+    //Self.Data[posX, 0, posD] := Original.FData[I];
+    while ( (I<vHighM4) and (posX + NewDepth4 < maxPosX) ) do
+    begin
+      (DestPtr            )^ := (SourcePtr)^;
+      (DestPtr + NewDepth )^ := (SourcePtr+1)^;
+      (DestPtr + NewDepth2)^ := (SourcePtr+2)^;
+      (DestPtr + NewDepth3)^ := (SourcePtr+3)^;
+      Inc(I, 4);
+      Inc(posX, NewDepth4);
+      Inc(SourcePtr,4);
+      Inc(DestPtr, NewDepth4);
+    end;
+
+    (DestPtr)^ := (SourcePtr)^;
+    Inc(SourcePtr, 1);
+    Inc(posX, NewDepth);
+    Inc(I);
+
+    if I <= vHigh then
+    begin
+      if posX >= maxPosX then
+      begin
+        posX := 0;
+        posD := posD + 1;
+        DestPtr := Addr(FData[posX + posD]);
+      end
+      else
+      begin
+        Inc(DestPtr, NewDepth);
+      end;
+    end;
+  end;
+end;
+*)
 
 procedure TVolume.InterleaveWithXFrom(Original: TVolume; NewX: integer);
 begin
@@ -2754,40 +2824,29 @@ begin
 end;
 
 procedure TVolume.MulMulAdd(Value1, Value2: T; Original: TVolume);
-var
-  I: integer;
-  vHigh: integer;
 begin
-  vHigh := High(FData);
-  for I := 0 to vHigh do
-    FData[I] := FData[I]*Value1 + Original.FData[I]*Value2;
+  MulMulAdd(Addr(Self.FData[0]), Addr(Original.FData[0]), Value1, Value2, Self.Size);
 end;
 
 procedure TVolume.MulAdd(Value: T; PtrB: TNeuralFloatArrPtr);
-var
-  I: integer;
-  vHigh: integer;
 begin
-  vHigh := High(FData);
-  for I := 0 to vHigh do
-    {$IFDEF FPC}
-    FData[I] += PtrB^[I]*Value;
-    {$ELSE}
-    FData[I] := FData[I] + PtrB^[I]*Value;
-    {$ENDIF}
+  MulAddPPVS(TNeuralFloatArrPtr(Addr(Self.FData[0])), PtrB, Value, Self.Size);
 end;
 
 procedure TVolume.MulAdd(Original1, Original2: TVolume);
-var
-  I: integer;
-  vHigh: integer;
 begin
-  vHigh := High(FData);
-  for I := 0 to vHigh do
-    FData[I] := FData[I] + Original1.FData[I] * Original2.FData[I];
+  {$IFDEF Debug}
+  if Original1.Size <> Self.Size then
+    raise Exception.Create('Sizes don''t match at MulAdd parameter 1: ' +
+      IntToStr(Self.Size) + ' and ' + IntToStr(Original1.Size) + ' .');
+  if Original2.Size <> Self.Size then
+    raise Exception.Create('Sizes don''t match at MulAdd parameter 2: ' +
+      IntToStr(Self.Size) + ' and ' + IntToStr(Original2.Size) + ' .');
+  {$ENDIF}
+  MulAdd(Addr(Self.FData[0]), Addr(Original1.FData[0]), Addr(Original2.FData[0]), Self.Size);
 end;
 
-class procedure TVolume.MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
+class procedure TVolume.MulAddPPVS(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
   pSize: integer);
 var
   I: integer;
@@ -2796,10 +2855,11 @@ var
   AddrA, AddrB: TNeuralFloatPtr;
 begin
   BasePos := 0;
-  AddrA := pointer(PtrA);
-  AddrB := pointer(PtrB);
   vHigh := pSize - 1;
 
+  {$IFDEF FPC}
+  AddrA := pointer(PtrA);
+  AddrB := pointer(PtrB);
   while BasePos <= vHigh - 7 do
   begin
     (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
@@ -2825,6 +2885,7 @@ begin
     AddrA := AddrA + 4;
     AddrB := AddrB + 4;
   end;
+  {$ENDIF}
 
   if BasePos <= vHigh then for I := BasePos to vHigh do
     {$IFDEF FPC}
@@ -2832,6 +2893,56 @@ begin
     {$ELSE}
     PtrA^[I] := PtrA^[I] + PtrB^[I]*Value;
     {$ENDIF}
+end;
+
+class procedure TVolume.MulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value1,
+  Value2: T; pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+  BasePos: integer;
+  AddrA, AddrB: TNeuralFloatPtr;
+begin
+  BasePos := 0;
+  vHigh := pSize - 1;
+  {$IFDEF FPC}
+  AddrA := pointer(PtrA);
+  AddrB := pointer(PtrB);
+  while BasePos <= vHigh - 7 do
+  begin
+    (AddrA)^   := (AddrA)^   * Value1 + (AddrB)^   * Value2;
+    (AddrA+1)^ := (AddrA+1)^ * Value1 + (AddrB+1)^ * Value2;
+    (AddrA+2)^ := (AddrA+2)^ * Value1 + (AddrB+2)^ * Value2;
+    (AddrA+3)^ := (AddrA+3)^ * Value1 + (AddrB+3)^ * Value2;
+    (AddrA+4)^ := (AddrA+4)^ * Value1 + (AddrB+4)^ * Value2;
+    (AddrA+5)^ := (AddrA+5)^ * Value1 + (AddrB+5)^ * Value2;
+    (AddrA+6)^ := (AddrA+6)^ * Value1 + (AddrB+6)^ * Value2;
+    (AddrA+7)^ := (AddrA+7)^ * Value1 + (AddrB+7)^ * Value2;
+    BasePos := BasePos + 8;
+    AddrA := AddrA + 8;
+    AddrB := AddrB + 8;
+  end;
+
+  while BasePos <= vHigh - 3 do
+  begin
+    (AddrA)^   := (AddrA)^   * Value1 + (AddrB)^   * Value2;
+    (AddrA+1)^ := (AddrA+1)^ * Value1 + (AddrB+1)^ * Value2;
+    (AddrA+2)^ := (AddrA+2)^ * Value1 + (AddrB+2)^ * Value2;
+    (AddrA+3)^ := (AddrA+3)^ * Value1 + (AddrB+3)^ * Value2;
+    BasePos := BasePos + 4;
+    AddrA := AddrA + 4;
+    AddrB := AddrB + 4;
+  end;
+  {$ENDIF}
+  if BasePos <= vHigh then for I := BasePos to vHigh do
+    PtrA^[I] := PtrA^[I] * Value1 + PtrB^[I] * Value2;
+end;
+
+
+class procedure TVolume.MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
+  pSize: integer);
+begin
+  Self.MulAddPPVS(PtrA, PtrB, Value, pSize);
 end;
 
 class procedure TVolume.MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
@@ -2847,7 +2958,7 @@ begin
   AddrB := pointer(PtrB);
   AddrC := pointer(PtrC);
   vHigh := pSize - 1;
-
+  {$IFDEF FPC}
   while BasePos <= vHigh - 7 do
   begin
     (AddrA)^   := (AddrA)^   + (AddrB)^   * (AddrC)^;
@@ -2875,7 +2986,7 @@ begin
     AddrB := AddrB + 4;
     AddrC := AddrC + 4;
   end;
-
+  {$ENDIF}
   if BasePos <= vHigh then for I := BasePos to vHigh do
     {$IFDEF FPC}
     PtrA^[I] += PtrB^[I]*PtrC^[I];
@@ -3392,46 +3503,13 @@ begin
 end;
 
 function TVolume.DotProduct(Original: TVolume): T;
-var
-  I: integer;
-  vHigh: integer;
-  BasePos: integer;
 begin
   {$IFDEF Debug}
   if Original.Size <> Self.Size then
     raise Exception.Create('Sizes don''t match at DotProduct: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  Result := 0;
-  vHigh := High(FData);
-  BasePos := 0;
-
-  while BasePos <= vHigh - 7 do
-  begin
-    Result := Result +
-      FData[BasePos] * Original.FData[BasePos] +
-      FData[BasePos+1] * Original.FData[BasePos+1] +
-      FData[BasePos+2] * Original.FData[BasePos+2] +
-      FData[BasePos+3] * Original.FData[BasePos+3] +
-      FData[BasePos+4] * Original.FData[BasePos+4] +
-      FData[BasePos+5] * Original.FData[BasePos+5] +
-      FData[BasePos+6] * Original.FData[BasePos+6] +
-      FData[BasePos+7] * Original.FData[BasePos+7];
-    BasePos := BasePos + 8;
-  end;
-
-  while BasePos <= vHigh - 3 do
-  begin
-    Result := Result +
-      FData[BasePos] * Original.FData[BasePos] +
-      FData[BasePos+1] * Original.FData[BasePos+1] +
-      FData[BasePos+2] * Original.FData[BasePos+2] +
-      FData[BasePos+3] * Original.FData[BasePos+3];
-    BasePos := BasePos + 4;
-  end;
-
-  if BasePos <= vHigh then for I := BasePos to vHigh do
-    Result := Result + FData[I] * Original.FData[I];
+  Result := Self.DotProduct(Addr(Self.FData[0]), Addr(Original.FData[0]), Self.Size);
 end;
 
 function TVolume.SumDiff(Original: TVolume): T;
@@ -3460,11 +3538,9 @@ var
   vHigh: integer;
   AuxDiff: Single;
 begin
-  {$IFDEF Debug}
   if Original.Size <> Self.Size then
-    raise Exception.Create('Sizes don''t match at SumDiff: ' +
+    raise Exception.Create('Sizes don''t match at DebugDiff: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
-  {$ENDIF}
   vHigh := High(FData);
   for I := 0 to vHigh do
   begin
@@ -8607,9 +8683,9 @@ begin
   Result := 0;
   BasePos := 0;
   vHigh := NumElements - 1;
+  {$IFDEF FPC}
   AddrA := pointer(PtrA);
   AddrB := pointer(PtrB);
-
   while BasePos <= vHigh - 7 do
   begin
     Result := Result +
@@ -8637,6 +8713,7 @@ begin
     AddrA := AddrA + 4;
     AddrB := AddrB + 4;
   end;
+  {$ENDIF}
 
   if BasePos <= vHigh then for I := BasePos to vHigh do
     //Uncomment for debugging only: WriteLn(PtrA^[I]:8:6,' # ', PtrB^[I]:8:6,' # ', Result:8:6);
