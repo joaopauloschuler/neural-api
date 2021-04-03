@@ -34,6 +34,25 @@ with this program; if not, write to the Free Software Foundation, Inc.,
   {$MACRO ON}
   {$LONGSTRINGS ON}
   {$CODEPAGE UTF8}
+  {$IFDEF CPUARM}
+    {$DEFINE NOTAVX}
+  {$ENDIF}
+  {$IFDEF CPUAARCH64}
+    {$DEFINE NOTAVX}
+  {$ENDIF}
+  {$IFDEF CPUPOWERPC}
+    {$DEFINE NOTAVX}
+  {$ENDIF}
+  {$IFDEF CPUM68K}
+    {$DEFINE NOTAVX}
+  {$ENDIF}
+  {$IFDEF NOTAVX}
+    {$UNDEF AVX}
+    {$UNDEF AVX2}
+    {$UNDEF AVX512}
+    {$UNDEF AVXANY}
+    {$UNDEF Release} //Release seems to brake on ARM
+  {$ENDIF}
 {$ELSE}
   // AVX code is supported only under FPC
   {$UNDEF AVX}
