@@ -158,8 +158,7 @@ type
       function CreateOutputSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem; {$IFDEF Release} inline; {$ENDIF}
   end;
 
-  /// This is a base class - do not use it directly.
-  TDotProductKernel = class(TEasyOpenCLV)
+  TNeuralKernel = class(TEasyOpenCLV)
     private
       /// OpenCL Kernel
       FKernel: cl_kernel;
@@ -170,6 +169,24 @@ type
       destructor Destroy(); override;
 
       property Kernel: cl_kernel read FKernel;
+  end;
+
+  TDotProductKernel = class(TNeuralKernel);
+
+  // Do not use this class. It's under development
+  TNNetVolumeCL = class(TNNetVolume)
+    private
+      // OpenCL Kernel
+      FKernel: TNeuralKernel;
+      // OpenCL Buffer
+      FBufferCL: cl_mem;
+    public
+      procedure ReSize(pSizeX, pSizeY, pDepth: integer); override;
+      procedure WriteToDevice(blocking: cl_bool = CL_FALSE);
+      procedure ReadFromDevice(blocking: cl_bool = CL_TRUE);
+      destructor Destroy(); override;
+
+      property Kernel: TNeuralKernel read FKernel write FKernel;
   end;
 
   { TDotProductSharedKernel }
@@ -232,7 +249,7 @@ type
       /// OpenCL Group Sizes;
       FGroupSizeA, FGroupSizeB: longint;
     public
-      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id);
+      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
@@ -289,6 +306,41 @@ const
     (id: CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE; Name: 'DEVICE MAX CONSTANT BUFFER SIZE'),
     (id: CL_DEVICE_MAX_CONSTANT_ARGS; Name: 'DEVICE MAX CONSTANT ARGS')
     );
+
+{ TNNetVolumeCL }
+
+procedure TNNetVolumeCL.ReSize(pSizeX, pSizeY, pDepth: integer);
+begin
+  inherited ReSize(pSizeX, pSizeY, pDepth);
+  if Assigned(FBufferCL) then
+  begin
+    clReleaseMemObject(FBufferCL);
+  end;
+
+  if Assigned(FKernel) then
+  begin
+    FBufferCL := FKernel.CreateBuffer(Self);
+  end;
+end;
+
+procedure TNNetVolumeCL.WriteToDevice(blocking: cl_bool);
+begin
+  FKernel.WriteBuffer(FBufferCL, Self, blocking);
+end;
+
+procedure TNNetVolumeCL.ReadFromDevice(blocking: cl_bool);
+begin
+  FKernel.ReadBuffer(FBufferCL, Self, blocking);
+end;
+
+destructor TNNetVolumeCL.Destroy();
+begin
+  if Assigned(FBufferCL) then
+  begin
+    clReleaseMemObject(FBufferCL);
+  end;
+  inherited Destroy();
+end;
 
 function TDotProductSharedKernel.Kernel(): cl_kernel;
 begin
@@ -498,20 +550,20 @@ begin
   end;
 end;
 
-function TDotProductKernel.PrepareKernel(kernelname: string): integer;
+function TNeuralKernel.PrepareKernel(kernelname: string): integer;
 begin
   UnprepareKernel();
   FKernel := CreateKernel(kernelname);
   PrepareKernel := CL_SUCCESS;
 end;
 
-procedure TDotProductKernel.UnprepareKernel();
+procedure TNeuralKernel.UnprepareKernel();
 begin
   if Assigned(FKernel) then clReleaseKernel(FKernel);
   FKernel := nil;
 end;
 
-constructor TDotProductKernel.Create(pCurrentPlatform: cl_platform_id;
+constructor TNeuralKernel.Create(pCurrentPlatform: cl_platform_id;
   pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
 begin
   inherited Create();
@@ -534,16 +586,16 @@ begin
   PrepareKernel(kernelname);
 end;
 
-destructor TDotProductKernel.Destroy();
+destructor TNeuralKernel.Destroy();
 begin
   UnprepareKernel();
   inherited Destroy();
 end;
 
 { TDotProductCL }
-constructor TDotProductCL.Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id);
+constructor TDotProductCL.Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
 begin
-  inherited Create(pCurrentPlatform, pCurrentDevice);
+  inherited Create(pCurrentPlatform, pCurrentDevice, kernelname);
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;

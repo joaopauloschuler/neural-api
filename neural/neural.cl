@@ -503,3 +503,31 @@ __kernel void myGEMM6(
         }
     }
 }
+
+// this function is under development - do not use it.
+__kernel void volume_operations
+(
+  const int OpID,
+  const int FSize,
+  __global float* FAs,
+  __global float* FBs,
+  __global float* FCs,
+  const float FA,
+  const float FB,
+  const float FC
+)
+{
+  const int g_id = get_global_id(0);
+
+  // MulAdd
+  if (OpID == 1)
+  {
+     FAs[g_id] = FAs[g_id] + FBs[g_id] * FB;
+  }
+
+  // MulMulAdd
+  if (OpID == 2)
+  {
+     FAs[g_id] = FAs[g_id] * FA + FBs[g_id] * FB;
+  }
+}
