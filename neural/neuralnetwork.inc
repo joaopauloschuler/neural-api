@@ -51,7 +51,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
     {$UNDEF AVX2}
     {$UNDEF AVX512}
     {$UNDEF AVXANY}
-    {$UNDEF Release} //Release seems to brake on ARM
   {$ENDIF}
 {$ELSE}
   // AVX code is supported only under FPC
