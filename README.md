@@ -239,7 +239,8 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetIdentity` (input/output: 1D, 2D or 3D).
 * `TNNetIdentityWithoutBackprop` (input/output: 1D, 2D or 3D). Allows the forward pass to proceed but prevents backpropagation.
 * `TNNetReshape` (input/output: 1D, 2D or 3D).
-* `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits layers/channels from the input.
+* `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits (or copies) channels from the input. This layer allows getting a subset of the input channels.
+* `TNNetSplitChannelEvery` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits (or copies) channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.
 * `TNNetSum` (input/output: 1D, 2D or 3D). Sums outputs from previous layers allowing ResNet style networks.
 
 ### Layers with Activation Functions and no Trainable Parameter
