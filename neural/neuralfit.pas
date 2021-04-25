@@ -352,7 +352,7 @@ var
 begin
   if FTrainingVolumeCacheEnabled then
   begin
-    CacheId := Idx mod FTrainingVolumeCacheSize;
+    CacheId := Random(FTrainingVolumeCacheSize);
     LocalCacheVolume := FTrainingVolumeCache[CacheId];
     if ((LocalCacheVolume.Tag = -1) or (Random(1000)<100)) then
     begin
@@ -507,15 +507,17 @@ begin
 
   if FVerbose then
   begin
-    WriteLn('Learning rate:',FCurrentLearningRate:8:6,
-      ' L2 decay:', FL2Decay:8:6,
-      ' Inertia:', FInertia:8:6,
-      ' Batch size:', FBatchSize,
-      ' Step size:', FStepSize,
-      ' Staircase ephocs:',FStaircaseEpochs);
-    if TrainingCnt > 0 then WriteLn('Training volumes:', TrainingCnt);
-    if ValidationCnt > 0 then WriteLn('Validation volumes: ', ValidationCnt);
-    if TestCnt > 0 then WriteLn('Test volumes: ', TestCnt);
+    MessageProc(
+      'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffGeneral,8,6) +
+      ' L2 decay:' + FloatToStrF(FL2Decay,ffGeneral,8,6) +
+      ' Inertia:' + FloatToStrF(FInertia,ffGeneral,8,6) +
+      ' Batch size:' + IntToStr(FBatchSize) +
+      ' Step size:' + IntToStr(FStepSize) +
+      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
+    );
+    if TrainingCnt > 0 then MessageProc('Training volumes: '+IntToStr(TrainingCnt));
+    if ValidationCnt > 0 then MessageProc('Validation volumes: '+IntToStr(ValidationCnt));
+    if TestCnt > 0 then MessageProc('Test volumes: '+IntToStr(TestCnt));
   end;
 
   if FVerbose then
@@ -1395,9 +1397,9 @@ begin
     // expressed with 0.01 and not 0.99
     FLearningRateDecay := 1 - FLearningRateDecay;
     if FVerbose then
-    WriteLn
+    MessageProc
     (
-      'Learning rate decay set to:',FLearningRateDecay:7:5
+      'Learning rate decay set to:'+FloatToStrF(FLearningRateDecay,ffGeneral,7,5)
     );
   end;
   if Assigned(FCustomLearningRateScheduleFn) then
@@ -1532,15 +1534,17 @@ begin
 
   if FVerbose then
   begin
-    WriteLn('Learning rate:',FCurrentLearningRate:8:6,
-      ' L2 decay:', FL2Decay:8:6,
-      ' Inertia:', FInertia:8:6,
-      ' Batch size:', FBatchSize,
-      ' Step size:', FStepSize,
-      ' Staircase ephocs:',FStaircaseEpochs);
-    if Assigned(FImgVolumes) then WriteLn('Training images:', FImgVolumes.Count);
-    if Assigned(FImgValidationVolumes) then WriteLn('Validation images:', FImgValidationVolumes.Count);
-    if Assigned(FImgTestVolumes) then WriteLn('Test images:', FImgTestVolumes.Count);
+    MessageProc(
+      'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffGeneral,8,6) +
+      ' L2 decay:' + FloatToStrF(FL2Decay,ffGeneral,8,6) +
+      ' Inertia:' + FloatToStrF(FInertia,ffGeneral,8,6) +
+      ' Batch size:' + IntToStr(FBatchSize) +
+      ' Step size:' + IntToStr(FStepSize) +
+      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
+    );
+    if Assigned(FImgVolumes) then MessageProc('Training images: '+IntToStr(FImgVolumes.Count));
+    if Assigned(FImgValidationVolumes) then MessageProc('Validation images: '+IntToStr(FImgValidationVolumes.Count));
+    if Assigned(FImgTestVolumes) then MessageProc('Test images: '+IntToStr(FImgTestVolumes.Count));
   end;
 
   FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
