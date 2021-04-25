@@ -412,6 +412,7 @@ type
       function GetManhattanClosestId(Original: TNNetVolume; var MinDist: TNeuralFloat): integer;
       procedure Fill(c: Single = 0);
       procedure ClearTag();
+      procedure FillTag(TagId, TagValue: integer);
       procedure ConcatInto(V: TNNetVolume);
       procedure InterleaveInto(V: TNNetVolume);
       procedure SplitFrom(V: TNNetVolume);
@@ -1985,6 +1986,19 @@ begin
     for I := 0 to Count - 1 do
     begin
       Self[I].ClearTag();
+    end;
+  end;
+end;
+
+procedure TNNetVolumeList.FillTag(TagId, TagValue: integer);
+var
+  I: integer;
+begin
+  if (Count>0) then
+  begin
+    for I := 0 to Count - 1 do
+    begin
+      Self[I].Tags[TagId] := TagValue;
     end;
   end;
 end;
