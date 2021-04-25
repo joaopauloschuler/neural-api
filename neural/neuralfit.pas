@@ -19,7 +19,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 unit neuralfit;
 
 {$include neuralnetwork.inc}
-{$DEFINE HASTHREADS}
 
 {$IFDEF FPC}
 {$H+}
@@ -28,7 +27,7 @@ unit neuralfit;
 interface
 
 uses
-  Classes, SysUtils, neuralnetwork, neuralvolume, neuralthread
+  Classes, SysUtils, neuralnetwork, neuralvolume, neuralthread, neuraldatasets
   {$IFDEF OpenCL}, cl
   {$IFNDEF FPC}, neuralopencl {$ENDIF}
   {$ENDIF}
@@ -91,7 +90,7 @@ type
       FProcs: TNeuralThreadList;
       procedure CheckLearningRate(iEpochCount: integer);
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
       procedure WaitUntilFinished;
       {$IFDEF OpenCL}
@@ -132,6 +131,27 @@ type
       property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
 
+  TNeuralFitWithImageBase = class(TNeuralFitBase)
+    protected
+      FMaxCropSize: integer;
+      FHasImgCrop: boolean;
+      FHasMakeGray: boolean;
+      FHasFlipX: boolean;
+      FHasFlipY: boolean;
+      FColorEncoding: integer;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
+      procedure EnableDefaultImageTreatment(); virtual;
+
+      property HasImgCrop: boolean read FHasImgCrop write FHasImgCrop;
+      property HasMakeGray: boolean read FHasMakeGray write FHasMakeGray;
+      property HasFlipX: boolean read FHasFlipX write FHasFlipX;
+      property HasFlipY: boolean read FHasFlipY write FHasFlipY;
+      property MaxCropSize: integer read FMaxCropSize write FMaxCropSize;
+  end;
+
   TNNetDataAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
   TNNetLossFn = function(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat of object;
   TNNetInferHitFn = function(A, B: TNNetVolume; ThreadId: integer): boolean;
@@ -139,7 +159,7 @@ type
   TNNetGet2VolumesProc = procedure(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume) of object;
 
   /// Fitting algorithm with data (pairs) loading
-  TNeuralDataLoadingFit = class(TNeuralFitBase)
+  TNeuralDataLoadingFit = class(TNeuralFitWithImageBase)
     protected
       FDataAugmentationFn: TNNetDataAugmentationFn;
       FInferHitFn: TNNetInferHitFn;
@@ -151,7 +171,7 @@ type
       FGetTrainingPair, FGetValidationPair, FGetTestPair: TNNetGetPairFn;
       FGetTrainingProc, FGetValidationProc, FGetTestProc: TNNetGet2VolumesProc;
     public
-      constructor Create();
+      constructor Create(); override;
       procedure FitLoading(pNN: TNNet;
         TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
         pGetTrainingPair, pGetValidationPair, pGetTestPair: TNNetGetPairFn); overload;
@@ -163,6 +183,7 @@ type
       procedure EnableBipolarHitComparison();
       procedure EnableBipolar99HitComparison();
       procedure EnableClassComparison();
+      procedure EnableDefaultImageTreatment(); override;
 
       // On most cases, you should never call the following methods directly
       procedure RunNNThread(index, threadnum: integer);
@@ -194,7 +215,7 @@ type
       function FitValidationPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
       function FitTestPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
 
       procedure Fit(pNN: TNNet;
@@ -202,21 +223,44 @@ type
         pBatchSize, Epochs: integer);
   end;
 
-  /// Image Classification Fitting Algorithm
-  TNeuralImageFit = class(TNeuralFitBase)
+  {$IFDEF FPC}
+  { TNeuralImageLoadingFit }
+  TNeuralImageLoadingFit = class(TNeuralDataLoadingFit)
     protected
+      FSizeX, FSizeY: integer;
+      FTrainingFileNames, FValidationFileNames, FTestFileNames: TFileNameList;
+      FTrainingVolumeCache: TNNetVolumeList;
+      FTrainingVolumeCacheEnabled: boolean;
+      FTrainingVolumeCacheSize: integer;
+
+      procedure GetTrainingProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
+      procedure GetValidationProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
+      procedure GetTestProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+
+      procedure FitLoading(pNN: TNNet;
+        pSizeX, pSizeY: integer;
+        pTrainingFileNames, pValidationFileNames, pTestFileNames: TFileNameList;
+        pBatchSize, Epochs: integer); overload;
+
+      property SizeX:integer read FSizeX;
+      property SizeY:integer read FSizeX;
+      property TrainingVolumeCacheEnabled: boolean read FTrainingVolumeCacheEnabled write FTrainingVolumeCacheEnabled;
+      property TrainingVolumeCacheSize: integer read FTrainingVolumeCacheSize write FTrainingVolumeCacheSize;
+  end;
+  {$ENDIF}
+
+  /// Image Classification Fitting Algorithm
+  TNeuralImageFit = class(TNeuralFitWithImageBase)
+    protected
+      FWorkingVolumes: TNNetVolumeList;
       FNumClasses: integer;
       FImgVolumes, FImgValidationVolumes, FImgTestVolumes: TNNetVolumeList;
-      FMaxCropSize: integer;
-      FHasImgCrop: boolean;
-      FHasMakeGray: boolean;
-      FHasFlipX: boolean;
-      FHasFlipY: boolean;
       FIsSoftmax: boolean;
-      FColorEncoding: integer;
-      FWorkingVolumes: TNNetVolumeList;
     public
-      constructor Create();
+      constructor Create(); override;
       destructor Destroy(); override;
 
       procedure Fit(pNN: TNNet;
@@ -224,15 +268,7 @@ type
         pNumClasses, pBatchSize, Epochs: integer);
       procedure RunNNThread(index, threadnum: integer);
       procedure TestNNThread(index, threadnum: integer);
-      procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
-
-      property HasImgCrop: boolean read FHasImgCrop write FHasImgCrop;
-      property HasMakeGray: boolean read FHasMakeGray write FHasMakeGray;
-      property HasFlipX: boolean read FHasFlipX write FHasFlipX;
-      property HasFlipY: boolean read FHasFlipY write FHasFlipY;
-      property MaxCropSize: integer read FMaxCropSize write FMaxCropSize;
   end;
-
 
   function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
   function BipolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
@@ -304,6 +340,120 @@ function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 begin
   Result := (A.GetClass() = B.GetClass());
 end;
+
+{$IFDEF FPC}
+{ TNeuralImageLoadingFit }
+procedure TNeuralImageLoadingFit.GetTrainingProc(Idx: integer;
+  ThreadId: integer; pInput, pOutput: TNNetVolume);
+var
+  AuxVolume: TNNetVolume;
+  CacheId: integer;
+  LocalCacheVolume: TNNetVolume;
+begin
+  if FTrainingVolumeCacheEnabled then
+  begin
+    CacheId := Idx mod FTrainingVolumeCacheSize;
+    LocalCacheVolume := FTrainingVolumeCache[CacheId];
+    if ((LocalCacheVolume.Tag = -1) or (Random(1000)<100)) then
+    begin
+      AuxVolume := TNNetVolume.Create();
+      FTrainingFileNames.GetRandomImagePair(AuxVolume, pOutput);
+      pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
+      pInput.Tag := AuxVolume.Tag;
+      LocalCacheVolume.Copy(pInput);
+      LocalCacheVolume.Tag := pInput.Tag;
+      AuxVolume.Free;
+    end
+    else
+    begin
+      pInput.Copy(LocalCacheVolume);
+      pOutput.ReSize(FTrainingFileNames.ClassCount);
+      pOutput.SetClassForSoftMax(LocalCacheVolume.Tag);
+    end;
+  end
+  else
+  begin
+    AuxVolume := TNNetVolume.Create();
+    FTrainingFileNames.GetRandomImagePair(AuxVolume, pOutput);
+    pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
+    pInput.Tag := AuxVolume.Tag;
+    AuxVolume.Free;
+  end;
+end;
+
+procedure TNeuralImageLoadingFit.GetValidationProc(Idx: integer;
+  ThreadId: integer; pInput, pOutput: TNNetVolume);
+var
+  AuxVolume: TNNetVolume;
+begin
+  AuxVolume := TNNetVolume.Create();
+  FValidationFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
+  pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
+  AuxVolume.Free;
+end;
+
+procedure TNeuralImageLoadingFit.GetTestProc(Idx: integer; ThreadId: integer;
+  pInput, pOutput: TNNetVolume);
+var
+  AuxVolume: TNNetVolume;
+begin
+  AuxVolume := TNNetVolume.Create();
+  FTestFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
+  pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
+  AuxVolume.Free;
+end;
+
+constructor TNeuralImageLoadingFit.Create();
+begin
+  inherited Create();
+  FTrainingVolumeCacheSize := 1000;
+  FTrainingVolumeCacheEnabled := true;
+  EnableDefaultImageTreatment();
+end;
+
+destructor TNeuralImageLoadingFit.Destroy();
+begin
+  inherited Destroy();
+end;
+
+procedure TNeuralImageLoadingFit.FitLoading(pNN: TNNet; pSizeX,
+  pSizeY: integer; pTrainingFileNames, pValidationFileNames,
+  pTestFileNames: TFileNameList; pBatchSize, Epochs: integer);
+begin
+  FSizeX := pSizeX;
+  FSizeY := pSizeY;
+  FTrainingFileNames   := pTrainingFileNames;
+  FValidationFileNames := pValidationFileNames;
+  FTestFileNames       := pTestFileNames;
+  FTrainingVolumeCache := TNNetVolumeList.Create;
+  if Not(FTrainingVolumeCacheEnabled) then FTrainingVolumeCacheSize := 1;
+  FTrainingVolumeCache.AddVolumes(FTrainingVolumeCacheSize, FSizeX, FSizeY, 3);
+  FTrainingVolumeCache.FillTag({TagId}0, {TagValue}-1);
+  FitLoading(pNN,
+    FTrainingFileNames.Count, FValidationFileNames.Count, FTestFileNames.Count,
+    pBatchSize, Epochs, @Self.GetTrainingProc, @Self.GetValidationProc, @Self.GetTestProc
+  );
+  FTrainingVolumeCache.Free;
+end;
+{$ENDIF}
+
+constructor TNeuralFitWithImageBase.Create();
+begin
+  inherited Create();
+  FMaxCropSize := 0;
+  FHasImgCrop := false;
+  FHasFlipX := false;
+  FHasFlipY := false;
+  FHasMakeGray := false;
+  FColorEncoding := 0;
+  FMultipleSamplesAtValidation := false;
+end;
+
+destructor TNeuralFitWithImageBase.Destroy();
+begin
+  inherited Destroy();
+end;
+
 { TNeuralDataLoadingFit }
 
 constructor TNeuralDataLoadingFit.Create();
@@ -676,6 +826,7 @@ var
   BlockSize, BlockSizeRest: integer;
   LocalNN: TNNet;
   vInput: TNNetVolume;
+  vInputCopy: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
   I: integer;
   CurrentLoss: TNeuralFloat;
@@ -685,10 +836,12 @@ var
   {$IFDEF DEBUG}
   InitialWeightSum, FinalWeightSum: TNeuralFloat;
   {$ENDIF}
+  CropSizeX, CropSizeY: integer;
 begin
-  vInput  := TNNetVolume.Create();
-  pOutput := TNNetVolume.Create();
-  vOutput := TNNetVolume.Create();
+  vInput     := TNNetVolume.Create();
+  pOutput    := TNNetVolume.Create();
+  vOutput    := TNNetVolume.Create();
+  vInputCopy := TNNetVolume.Create();
 
   LocalHit := 0;
   LocalMiss := 0;
@@ -723,8 +876,43 @@ begin
       FGetTrainingProc(I, Index, vInput, vOutput)
     end;
 
-    if Assigned(FDataAugmentationFn)
-      then FDataAugmentationFn(vInput, Index);
+    if Assigned(FDataAugmentationFn) then
+    begin
+      FDataAugmentationFn(vInput, Index);
+    end
+    else if FDataAugmentation then
+    begin
+      if FHasImgCrop then
+      begin
+        vInputCopy.CopyCropping(vInput, random(FMaxCropSize), random(FMaxCropSize), vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
+        vInput.Copy(vInputCopy);
+      end
+      else
+      begin
+        CropSizeX := random(FMaxCropSize + 1);
+        CropSizeY := random(FMaxCropSize + 1);
+        vInputCopy.CopyCropping(vInput, random(CropSizeX), random(CropSizeY), vInput.SizeX-CropSizeX, vInput.SizeY-CropSizeY);
+        vInput.CopyResizing(vInputCopy, vInput.SizeX, vInput.SizeY);
+      end;
+
+      if (vInput.Depth = 3) then
+      begin
+        if FHasMakeGray and (Random(1000) > 750) then
+        begin
+          vInput.MakeGray(FColorEncoding);
+        end;
+      end;
+
+      if FHasFlipX and (Random(1000) > 500) then
+      begin
+        vInput.FlipX();
+      end;
+
+      if FHasFlipY and (Random(1000) > 500) then
+      begin
+        vInput.FlipY();
+      end;
+    end;
 
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
@@ -790,12 +978,12 @@ begin
   end;
   {$ENDIF}
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
-  FGlobalHit       := FGlobalHit + LocalHit;
+  FGlobalHit       := FGlobalHit  + LocalHit;
   FGlobalMiss      := FGlobalMiss + LocalMiss;
   FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
-  FGlobalErrorSum  := FGlobalErrorSum + LocalErrorSum;
+  FGlobalErrorSum  := FGlobalErrorSum  + LocalErrorSum;
 
-  FNN.ForwardTime := FNN.ForwardTime + LocalNN.ForwardTime;
+  FNN.ForwardTime  := FNN.ForwardTime  + LocalNN.ForwardTime;
   FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
   {$IFDEF Debug}
   if Index and 3 = 0 then FNN.SumDeltas(LocalNN);
@@ -803,6 +991,7 @@ begin
   if Index and 3 = 0 then FNN.SumDeltasNoChecks(LocalNN);
   {$ENDIF}
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
+  vInputCopy.Free;
   vInput.Free;
   vOutput.Free;
   pOutput.Free;
@@ -814,15 +1003,20 @@ var
   LocalNN: TNNet;
   vInput: TNNetVolume;
   pOutput, vOutput, LocalFrequency: TNNetVolume;
+  vInputCopy: TNNetVolume;
+  sumOutput: TNNetVolume;
   I: integer;
   StartPos, FinishPos: integer;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTestPair: TNNetVolumePair;
+  TotalDiv: TNeuralFloat;
 begin
-  vInput  := TNNetVolume.Create();
-  pOutput := TNNetVolume.Create();
-  vOutput := TNNetVolume.Create();
+  vInput     := TNNetVolume.Create();
+  pOutput    := TNNetVolume.Create();
+  vOutput    := TNNetVolume.Create();
+  sumOutput  := TNNetVolume.Create();
+  vInputCopy := TNNetVolume.Create();
   LocalFrequency := TNNetVolume.Create();
 
   LocalHit := 0;
@@ -855,6 +1049,35 @@ begin
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
 
+    if FMultipleSamplesAtValidation then
+    begin
+      TotalDiv := 1;
+      sumOutput.ReSize( pOutput );
+      sumOutput.Copy( pOutput );
+
+      if FHasFlipX then
+      begin
+        vInput.FlipX();
+        TotalDiv := TotalDiv + 1;
+        LocalNN.Compute( vInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+      end;
+
+      if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
+      begin
+        vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX - FMaxCropSize, vInput.SizeY - FMaxCropSize);
+        vInput.CopyResizing(vInputCopy, vInput.SizeX, vInput.SizeY);
+        LocalNN.Compute( vInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+        TotalDiv := TotalDiv + 1;
+      end;
+      sumOutput.Divi(TotalDiv);
+
+      pOutput.Copy(sumOutput);
+    end;
+
     LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
 
     if Assigned(FInferHitFn) then
@@ -882,6 +1105,8 @@ begin
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
 
   LocalFrequency.Free;
+  vInputCopy.Free;
+  sumOutput.Free;
   vInput.Free;
   vOutput.Free;
   pOutput.Free;
@@ -1064,6 +1289,12 @@ begin
   FInferHitFn := @ClassCompare;
 end;
 
+procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
+begin
+  inherited EnableDefaultImageTreatment();
+  EnableClassComparison();
+end;
+
 { TNeuralFitBase }
 
 constructor TNeuralFitBase.Create();
@@ -1205,12 +1436,12 @@ end;
 constructor TNeuralImageFit.Create();
 begin
   inherited Create();
+  FIsSoftmax := true;
   FMaxCropSize := 8;
   FHasImgCrop := false;
   FHasFlipX := true;
   FHasFlipY := false;
   FHasMakeGray := true;
-  FIsSoftmax := true;
   FColorEncoding := 0;
   FMultipleSamplesAtValidation := true;
 end;
@@ -1888,7 +2119,7 @@ begin
   pOutput.Free;
 end;
 
-procedure TNeuralImageFit.ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
+procedure TNeuralFitWithImageBase.ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
 var
   ImgInput, ImgInputCp: TNNetVolume;
   sumOutput: TNNetVolume;
@@ -1896,7 +2127,7 @@ var
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
-  sumOutput := TNNetVolume.Create(FNumClasses,1,1);
+  sumOutput := TNNetVolume.Create(pNN.GetLastLayer().Output);
 
   ImgInput.Copy( pImgInput );
   pNN.Compute( ImgInput );
@@ -1933,6 +2164,17 @@ begin
   sumOutput.Free;
   ImgInputCp.Free;
   ImgInput.Free;
+end;
+
+procedure TNeuralFitWithImageBase.EnableDefaultImageTreatment();
+begin
+  FMaxCropSize := 8;
+  FHasImgCrop := false;
+  FHasFlipX := True;
+  FHasFlipY := false;
+  FHasMakeGray := True;
+  FColorEncoding := 0;
+  FMultipleSamplesAtValidation := True;
 end;
 
 end.
