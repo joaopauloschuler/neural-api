@@ -37,6 +37,8 @@ uses
   {$ENDIF}
   ;
 
+{$include neuralnetwork.inc}
+
 type
   TTinyImageChannel = packed array [0..31, 0..31] of byte;
   TTinyImageChannel1D = packed array [0..32 * 32 - 1] of byte;
@@ -115,6 +117,23 @@ const
 
 {$IFDEF FPC}
 type
+
+  { TFileNameList }
+  TFileNameList = class(TStringListInt)
+    protected
+      FClassCount: integer;
+      {$IFDEF HASTHREADS}FCritSecLoad: TRTLCriticalSection;{$ENDIF}
+    public
+      constructor Create();
+      destructor Destroy(); override;
+
+      procedure GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume);
+      procedure GetRandomImagePair(vInput, vOutput: TNNetVolume);
+      function ThreadSafeLoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
+
+      property ClassCount: integer read FClassCount write FClassCount;
+  end;
+
   { TClassesAndElements }
   TClassesAndElements = class(TStringStringListVolume)
     private
@@ -131,9 +150,15 @@ type
       procedure LoadImages(color_encoding: integer; NewSizeX: integer = 0; NewSizeY: integer = 0); overload;
       procedure LoadClass_FilenameFromFolder(FolderName: string);
       function GetRandomClassId(): integer; {$IFDEF Release} inline; {$ENDIF}
+      function GetClassesCount(): integer; {$IFDEF Release} inline; {$ENDIF}
+      procedure GetRandomFileId(out ClassId:integer; out FileId:integer; StartPos: TNeuralFloat=0; Range: TNeuralFloat=1);
+      procedure GetRandomFileName(out ClassId:integer; out FileName:string; StartPos: TNeuralFloat=0; Range: TNeuralFloat=1);
+      procedure GetRandomImgVolumes(vInput, vOutput: TNNetVolume; StartPos: TNeuralFloat=0; Range: TNeuralFloat=1);
       function GetFileName(ClassId, ElementId: integer): string; {$IFDEF Release} inline; {$ENDIF}
       procedure AddVolumesTo(Volumes: TNNetVolumeList; EmptySource:boolean = false);
+      procedure AddFileNamesTo(FileNames: TFileNameList);
       procedure MakeMonopolar();
+      function FileCountAtClassId(ClassId: integer): integer; {$IFDEF Release} inline; {$ENDIF}
 
       procedure LoadImages_NTL(index, threadnum: integer);
   end;
@@ -141,12 +166,20 @@ type
   /// add volumes into ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes
   // according to percentages found in TrainingPct, ValidationPct, TestPct.
   // folder names are classes
-  procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
-    ImgTestVolumes: TNNetVolumeList;
+  procedure CreateVolumesFromImagesFromFolder(
+    out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
     FolderName, pImageSubFolder: string;
     color_encoding: integer;
     TrainingProp, ValidationProp, TestProp: single;
     NewSizeX: integer = 0; NewSizeY: integer = 0);
+
+  /// add file names into TrainingFileNames, ValidationFileNames, TestFileNames
+  // according to percentages found in TrainingPct, ValidationPct, TestPct.
+  // folder names are classes
+  procedure CreateFileNameListsFromImagesFromFolder(
+    out TrainingFileNames, ValidationFileNames, TestFileNames: TFileNameList;
+    FolderName, pImageSubFolder: string;
+    TrainingProp, ValidationProp, TestProp: single);
 
   procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume);
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
@@ -287,6 +320,43 @@ begin
   end;
 
   ClassesAndElements.Free;
+end;
+
+constructor TFileNameList.Create();
+begin
+  inherited Create();
+  {$IFDEF HASTHREADS}
+  NeuralInitCriticalSection(FCritSecLoad);
+  {$ENDIF}
+end;
+
+destructor TFileNameList.Destroy();
+begin
+  {$IFDEF HASTHREADS}
+  NeuralDoneCriticalSection(FCritSecLoad);
+  {$ENDIF}
+  inherited Destroy();
+end;
+
+{ TFileNameList }
+procedure TFileNameList.GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume);
+var
+  FileName: string;
+  ClassId: integer;
+begin
+  FileName := Self[ImageId];
+  ClassId := Self.Integers[Imageid];
+  ThreadSafeLoadImageFromFileIntoVolume(FileName, vInput);
+  vInput.Tag := ClassId;
+  vInput.Divi(64);
+  vInput.Sub(2);
+  vOutput.Resize(FClassCount);
+  vOutput.SetClassForSoftMax(ClassId);
+end;
+
+procedure TFileNameList.GetRandomImagePair(vInput, vOutput: TNNetVolume);
+begin
+  GetImageVolumePairFromId(Self.GetRandomIndex(), vInput, vOutput);
 end;
 
 { TClassesAndElements }
@@ -431,6 +501,44 @@ begin
   end;
 end;
 
+function TClassesAndElements.GetClassesCount(): integer;
+begin
+  result := Self.Count;
+end;
+
+procedure TClassesAndElements.GetRandomFileId(out ClassId: integer; out
+  FileId:integer; StartPos: TNeuralFloat; Range: TNeuralFloat);
+var
+  StartPosId: integer;
+  FileCnt: integer;
+begin
+  ClassId := GetRandomClassId();
+  FileCnt := FileCountAtClassId(ClassId);
+  StartPosId := Round(StartPos * FileCnt);
+  FileId := Min(StartPosId + Random(Round(Range * FileCnt)), FileCnt-1);
+end;
+
+procedure TClassesAndElements.GetRandomFileName(out ClassId: integer; out
+  FileName: string; StartPos: TNeuralFloat; Range: TNeuralFloat);
+var
+  FileId: integer;
+begin
+  GetRandomFileId(ClassId, FileId, StartPos, Range);
+  FileName := GetFileName(ClassId, FileId);
+end;
+
+procedure TClassesAndElements.GetRandomImgVolumes(vInput,
+  vOutput: TNNetVolume; StartPos: TNeuralFloat; Range: TNeuralFloat);
+var
+  ClassId: integer;
+  FileName: string;
+begin
+  GetRandomFileName(ClassId, FileName, StartPos, Range);
+  vOutput.Resize(GetClassesCount());
+  vOutput.SetClassForSoftMax(ClassId);
+  LoadImageFromFileIntoVolume(FileName, vInput);
+end;
+
 function TClassesAndElements.GetFileName(ClassId, ElementId: integer): string;
 begin
   Result := Self.List[ClassId].Strings[ElementId];
@@ -455,6 +563,29 @@ begin
           SourceVolume := Self.List[ClassId].List[ImageId];
           Volumes.AddCopy(SourceVolume);
           if EmptySource then SourceVolume.ReSize(1,1,1);
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TClassesAndElements.AddFileNamesTo(FileNames: TFileNameList);
+var
+  SourceVolume: TNNetVolume;
+  ClassId, FileId: integer;
+  MaxClassId, MaxFileId: integer;
+begin
+  if Self.Count > 0 then
+  begin
+    MaxClassId := Self.Count - 1;
+    for ClassId := 0 to MaxClassId do
+    begin
+      MaxFileId := Self.List[ClassId].Count - 1;
+      if MaxFileId >= 0 then
+      begin
+        for FileId := 0 to MaxFileId do
+        begin
+          FileNames.AddInteger(GetFileName(ClassId, FileId), ClassId);
         end;
       end;
     end;
@@ -487,6 +618,24 @@ begin
       end;
     end;
   end;
+end;
+
+function TClassesAndElements.FileCountAtClassId(ClassId: integer): integer;
+begin
+  result := Self.List[ClassId].Count;
+end;
+
+function TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
+  ImageFileName: string; V: TNNetVolume): boolean;
+var
+  M: TFPMemoryImage;
+begin
+  M := TFPMemoryImage.Create(1, 1);
+  {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
+  Result := M.LoadFromFile( ImageFileName );
+  {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
+  if Result then LoadImageIntoVolume(M, V);
+  M.Free;
 end;
 
 function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
@@ -570,6 +719,46 @@ begin
   LocalPicture.Free;
   {$ENDIF}
   AuxVolume.Free;
+end;
+
+procedure CreateFileNameListsFromImagesFromFolder(out TrainingFileNames,
+  ValidationFileNames, TestFileNames: TFileNameList; FolderName,
+  pImageSubFolder: string; TrainingProp,
+  ValidationProp, TestProp: single);
+var
+  ClassesAndElements: TClassesAndElements;
+begin
+  TrainingFileNames := TFileNameList.Create();
+  ValidationFileNames := TFileNameList.Create();
+  TestFileNames := TFileNameList.Create();
+
+  ClassesAndElements := TClassesAndElements.Create();
+
+  if ValidationProp > 0 then
+  begin
+    ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, TrainingProp, ValidationProp);
+    ClassesAndElements.AddFileNamesTo(ValidationFileNames);
+    ValidationFileNames.ClassCount := ClassesAndElements.GetClassesCount();
+    ClassesAndElements.Clear;
+  end;
+
+  if TestProp > 0 then
+  begin
+    ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, TrainingProp + ValidationProp, TestProp);
+    ClassesAndElements.AddFileNamesTo(TestFileNames);
+    TestFileNames.ClassCount := ClassesAndElements.GetClassesCount();
+    ClassesAndElements.Clear;
+  end;
+
+  if TrainingProp > 0 then
+  begin
+    ClassesAndElements.LoadFoldersAsClassesProportional(FolderName, pImageSubFolder, 0, TrainingProp);
+    ClassesAndElements.AddFileNamesTo(TrainingFileNames);
+    TrainingFileNames.ClassCount := ClassesAndElements.GetClassesCount();
+    ClassesAndElements.Clear;
+  end;
+
+  ClassesAndElements.Free;
 end;
 
 procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume);
