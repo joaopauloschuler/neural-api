@@ -405,6 +405,7 @@ begin
   AuxVolume := TNNetVolume.Create();
   FTestFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
   pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
+  pInput.Tag := AuxVolume.Tag;
   AuxVolume.Free;
 end;
 
