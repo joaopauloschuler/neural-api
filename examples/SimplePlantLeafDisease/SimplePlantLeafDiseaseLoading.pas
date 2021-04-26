@@ -16,10 +16,9 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
 
 type
 
-  { TTestCNNAlgo }
-
   TTestCNNAlgo = class(TCustomApplication)
   protected
+    FSizeX, FSizeY: integer;
     FTrainingFileNames, FValidationFileNames, FTestFileNames: TFileNameList;
     procedure DoRun; override;
   public
@@ -34,26 +33,8 @@ type
     NeuralFit: TNeuralDataLoadingFit;
     ProportionToLoad: Single;
   begin
-    WriteLn('Creating Neural Network...');
-    NN := TNNet.Create();
-    NN.AddLayer([
-      TNNetInput.Create(128, 128, 3),
-      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}2),
-      TNNetMaxPool.Create(2),
-      TNNetMovingStdNormalization.Create(),
-      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetMaxPool.Create(2),
-      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}2),
-      TNNetDropout.Create(0.5),
-      TNNetMaxPool.Create(2),
-      TNNetFullConnectLinear.Create(39),
-      TNNetSoftMax.Create()
-    ]);
-    NN.DebugStructure();
-    // change ProportionToLoad to a smaller number if you don't have available 32GB of RAM.
+    FSizeX := 128;
+    FSizeY := 128;
     ProportionToLoad := 1;
     WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease file names into memory.');
 
@@ -65,16 +46,35 @@ type
       {TestProp=}0.05*ProportionToLoad
     );
 
+    WriteLn('Creating Neural Network...');
+    NN := TNNet.Create();
+    NN.AddLayer([
+      TNNetInput.Create(FSizeX, FSizeY, 3),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}2),
+      TNNetMaxPool.Create(2),
+      TNNetMovingStdNormalization.Create(),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}2),
+      TNNetMaxPool.Create(2),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
+      TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}2),
+      TNNetMaxPool.Create(2),
+      TNNetFullConnectLinear.Create(FTrainingFileNames.ClassCount),
+      TNNetSoftMax.Create()
+    ]);
+    NN.DebugStructure();
     WriteLn
     (
       'Training Images:', FTrainingFileNames.Count,
       ' Validation Images:', FValidationFileNames.Count,
-      ' Test Images:', FTestFileNames.Count
+      ' Test Images:', FTestFileNames.Count,
+      ' Classes:', FTrainingFileNames.ClassCount
     );
 
     NeuralFit := TNeuralDataLoadingFit.Create;
     NeuralFit.EnableDefaultImageTreatment();
-    NeuralFit.FileNameBase := 'SimplePlantLeafDisease';
+    NeuralFit.FileNameBase := 'SimplePlantLeafDiseaseLoading';
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
@@ -99,7 +99,7 @@ type
   begin
     AuxVolume := TNNetVolume.Create();
     FTrainingFileNames.GetRandomImagePair(AuxVolume, pOutput);
-    pInput.CopyResizing(AuxVolume, 128, 128);
+    pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
     AuxVolume.Free;
   end;
 
@@ -110,9 +110,7 @@ type
   begin
     AuxVolume := TNNetVolume.Create();
     FValidationFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
-    pInput.CopyResizing(AuxVolume, 128, 128);
-    pInput.Divi(64);
-    pInput.Sub(2);
+    pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
     AuxVolume.Free;
   end;
 
@@ -123,9 +121,7 @@ type
   begin
     AuxVolume := TNNetVolume.Create();
     FTestFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
-    pInput.CopyResizing(AuxVolume, 128, 128);
-    pInput.Divi(64);
-    pInput.Sub(2);
+    pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
     AuxVolume.Free;
   end;
 
