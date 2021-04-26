@@ -138,6 +138,7 @@ type
       FHasMakeGray: boolean;
       FHasFlipX: boolean;
       FHasFlipY: boolean;
+      FHasResizing: boolean;
       FColorEncoding: integer;
     public
       constructor Create(); override;
@@ -149,6 +150,7 @@ type
       property HasMakeGray: boolean read FHasMakeGray write FHasMakeGray;
       property HasFlipX: boolean read FHasFlipX write FHasFlipX;
       property HasFlipY: boolean read FHasFlipY write FHasFlipY;
+      property HasResizing: boolean read FHasResizing write FHasResizing;
       property MaxCropSize: integer read FMaxCropSize write FMaxCropSize;
   end;
 
@@ -508,9 +510,9 @@ begin
   if FVerbose then
   begin
     MessageProc(
-      'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffGeneral,8,6) +
-      ' L2 decay:' + FloatToStrF(FL2Decay,ffGeneral,8,6) +
-      ' Inertia:' + FloatToStrF(FInertia,ffGeneral,8,6) +
+      'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
+      ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
+      ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
       ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
@@ -545,11 +547,11 @@ begin
         if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
         begin
           AccuracyWithInertia := CurrentAccuracy;
-        end else if (FStepSize < 100) then
+        end else if (FStepSize < 1280) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.99 + CurrentAccuracy*0.01;
         end
-        else if (FStepSize < 500) then
+        else if (FStepSize < 5120) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.9 + CurrentAccuracy*0.1;
         end
@@ -563,16 +565,16 @@ begin
       if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
-        if FVerbose then WriteLn
+        if FVerbose then MessageProc
         (
-          (FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*TrainingCnt,
-          ' Examples seen. Accuracy:', (FTrainingAccuracy):6:4,
-          ' Error:', TrainingError:10:5,
-          ' Loss:', TrainingLoss:7:5,
-          ' Threads: ', FThreadNum,
-          ' Forward time:', (FNN.ForwardTime * 24 * 60 * 60):6:2,'s',
-          ' Backward time:', (FNN.BackwardTime * 24 * 60 * 60):6:2,'s',
-          ' Step time:', totalTimeSeconds:6:2,'s'
+          IntToStr((FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*TrainingCnt) +
+          ' Examples seen. Accuracy: ' + FloatToStrF(FTrainingAccuracy,ffFixed,6,4) +
+          ' Error: ' + FloatToStrF(TrainingError,ffFixed,10,5) +
+          ' Loss: ' + FloatToStrF(TrainingLoss,ffFixed,7,5) +
+          ' Threads: ' + IntToStr(FThreadNum) +
+          ' Forward time: ' + FloatToStrF(FNN.ForwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
+          ' Backward time: ' + FloatToStrF(FNN.BackwardTime * 24 * 60 * 60,ffFixed,6,2)+'s'+
+          ' Step time: ' + FloatToStrF(totalTimeSeconds,ffFixed,6,2) + 's'
         );
 
         startTime := Now();
@@ -719,12 +721,12 @@ begin
       Append(CSVFile);
 
       MessageProc(
-        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*10))/60,ffGeneral,1,4)+' minutes.' +
-        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*10))/3600,ffGeneral,1,4)+' hours.');
+        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
+        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
 
       MessageProc(
         'Epochs: '+IntToStr(FCurrentEpoch)+
-        '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffGeneral,4,2)+' hours.');
+        '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
     end;
     if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
   end;
@@ -888,8 +890,9 @@ begin
       begin
         vInputCopy.CopyCropping(vInput, random(FMaxCropSize), random(FMaxCropSize), vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
         vInput.Copy(vInputCopy);
-      end
-      else
+      end;
+
+      if FHasResizing then
       begin
         CropSizeX := random(FMaxCropSize + 1);
         CropSizeY := random(FMaxCropSize + 1);
@@ -1399,7 +1402,7 @@ begin
     if FVerbose then
     MessageProc
     (
-      'Learning rate decay set to:'+FloatToStrF(FLearningRateDecay,ffGeneral,7,5)
+      'Learning rate decay set to:'+FloatToStrF(FLearningRateDecay,ffFixed,7,5)
     );
   end;
   if Assigned(FCustomLearningRateScheduleFn) then
@@ -1426,9 +1429,9 @@ begin
     FNN.SetLearningRate(FCurrentLearningRate, FInertia);
     FNN.ClearInertia();
     if FVerbose then
-    WriteLn
+    MessageProc
     (
-      'Learning rate set to:',FCurrentLearningRate:7:5
+      'Learning rate set to: ' + FloatToStrF(FCurrentLearningRate, ffFixed, 7, 5)
     );
   end;
 end;
@@ -1441,6 +1444,7 @@ begin
   FIsSoftmax := true;
   FMaxCropSize := 8;
   FHasImgCrop := false;
+  FHasResizing := True;
   FHasFlipX := true;
   FHasFlipY := false;
   FHasMakeGray := true;
@@ -1535,9 +1539,9 @@ begin
   if FVerbose then
   begin
     MessageProc(
-      'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffGeneral,8,6) +
-      ' L2 decay:' + FloatToStrF(FL2Decay,ffGeneral,8,6) +
-      ' Inertia:' + FloatToStrF(FInertia,ffGeneral,8,6) +
+      'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
+      ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
+      ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
       ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
@@ -1608,11 +1612,11 @@ begin
         if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
         begin
           AccuracyWithInertia := CurrentAccuracy;
-        end else if (FStepSize < 100) then
+        end else if (FStepSize < 1280) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.99 + CurrentAccuracy*0.01;
         end
-        else if (FStepSize < 500) then
+        else if (FStepSize < 5120) then
         begin
           AccuracyWithInertia := AccuracyWithInertia*0.9 + CurrentAccuracy*0.1;
         end
@@ -1626,16 +1630,16 @@ begin
       if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
-        if FVerbose then WriteLn
+        if FVerbose then MessageProc
         (
-          (FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*FImgVolumes.Count,
-          ' Examples seen. Accuracy:', (TrainingAccuracy):6:4,
-          ' Error:', TrainingError:10:5,
-          ' Loss:', TrainingLoss:7:5,
-          ' Threads: ', FThreadNum,
-          ' Forward time:', (FNN.ForwardTime * 24 * 60 * 60):6:2,'s',
-          ' Backward time:', (FNN.BackwardTime * 24 * 60 * 60):6:2,'s',
-          ' Step time:', totalTimeSeconds:6:2,'s'
+          IntToStr((FGlobalHit + FGlobalMiss) * I + FCurrentEpoch*FImgVolumes.Count) +
+          ' Examples seen. Accuracy: ' + FloatToStrF(FTrainingAccuracy,ffFixed,6,4) +
+          ' Error: ' + FloatToStrF(TrainingError,ffFixed,10,5) +
+          ' Loss: ' + FloatToStrF(TrainingLoss,ffFixed,7,5) +
+          ' Threads: ' + IntToStr(FThreadNum) +
+          ' Forward time: ' + FloatToStrF(FNN.ForwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
+          ' Backward time: ' + FloatToStrF(FNN.BackwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
+          ' Step time: ' + FloatToStrF(totalTimeSeconds,ffFixed,6,2) + 's'
         );
 
         startTime := Now();
@@ -1809,12 +1813,12 @@ begin
       Append(CSVFile);
 
       MessageProc(
-        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/60,ffGeneral,1,4)+' minutes.' +
-        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/3600,ffGeneral,1,4)+' hours.');
+        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
+        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
 
       MessageProc(
         'Epochs: '+IntToStr(FCurrentEpoch)+
-        '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffGeneral,4,2)+' hours.');
+        '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
     end;
   end;
 
@@ -1868,8 +1872,9 @@ begin
       if FHasImgCrop then
       begin
         ImgInput.CopyCropping(FImgVolumes[ImgIdx], random(FMaxCropSize), random(FMaxCropSize), FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
-      end
-      else
+      end;
+
+      if FHasResizing then
       begin
         CropSizeX := random(FMaxCropSize + 1);
         CropSizeY := random(FMaxCropSize + 1);
@@ -2174,6 +2179,7 @@ procedure TNeuralFitWithImageBase.EnableDefaultImageTreatment();
 begin
   FMaxCropSize := 8;
   FHasImgCrop := false;
+  FHasResizing := True;
   FHasFlipX := True;
   FHasFlipY := false;
   FHasMakeGray := True;
