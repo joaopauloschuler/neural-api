@@ -172,6 +172,7 @@ type
       FLocalTestProc: TNNetGet2VolumesProc;
       FGetTrainingPair, FGetValidationPair, FGetTestPair: TNNetGetPairFn;
       FGetTrainingProc, FGetValidationProc, FGetTestProc: TNNetGet2VolumesProc;
+      function DefaultLossFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
     public
       constructor Create(); override;
       procedure FitLoading(pNN: TNNet;
@@ -361,9 +362,9 @@ begin
       AuxVolume := TNNetVolume.Create();
       FTrainingFileNames.GetRandomImagePair(AuxVolume, pOutput);
       pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
-      pInput.Tag := AuxVolume.Tag;
       LocalCacheVolume.Copy(pInput);
       LocalCacheVolume.Tag := pInput.Tag;
+      pInput.Tag := AuxVolume.Tag;
       AuxVolume.Free;
     end
     else
@@ -371,6 +372,8 @@ begin
       pInput.Copy(LocalCacheVolume);
       pOutput.ReSize(FTrainingFileNames.ClassCount);
       pOutput.SetClassForSoftMax(LocalCacheVolume.Tag);
+      pInput.Tag := LocalCacheVolume.Tag;
+      pOutput.Tag := LocalCacheVolume.Tag;
     end;
   end
   else
@@ -457,6 +460,36 @@ begin
 end;
 
 { TNeuralDataLoadingFit }
+
+function TNeuralDataLoadingFit.DefaultLossFn(ExpectedOutput,
+  FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+var
+  ClassId: integer;
+  OutputValue: TNeuralFloat;
+begin
+  ClassId := ExpectedOutput.Tag;
+  OutputValue := FoundOutput.FData[ ClassId ];
+
+  {$IFDEF Debug}
+  if ClassId <> ExpectedOutput.GetClass() then
+  begin
+    FErrorProc(
+      'Error - classes do not match at TNeuralDataLoadingFit.DefaultLossFn:' +
+      IntToStr(ClassId)+','+IntToStr(ExpectedOutput.GetClass())
+    );
+  end;
+  {$ENDIF}
+
+  if (OutputValue > 0) then
+  begin
+    result := -Ln(OutputValue);
+  end
+  else
+  begin
+    FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+    result := 1;
+  end;
+end;
 
 constructor TNeuralDataLoadingFit.Create();
 begin
@@ -874,6 +907,8 @@ begin
       LocalTrainingPair := FGetTrainingPair(I, Index);
       vInput.Copy( LocalTrainingPair.I );
       vOutput.Copy( LocalTrainingPair.O );
+      vInput.Tag := LocalTrainingPair.I.Tag;
+      vOutput.Tag := LocalTrainingPair.O.Tag;
     end
     else
     begin
@@ -1298,6 +1333,7 @@ procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
 begin
   inherited EnableDefaultImageTreatment();
   EnableClassComparison();
+  FLossFn := @DefaultLossFn;
 end;
 
 { TNeuralFitBase }
@@ -1941,7 +1977,7 @@ begin
     end
     else
     begin
-      WriteLn('Error - invalid output value:',OutputValue);
+      FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
       CurrentLoss := 1;
     end;
     LocalTotalLoss := LocalTotalLoss + CurrentLoss;

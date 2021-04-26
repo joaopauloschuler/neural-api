@@ -348,6 +348,7 @@ begin
   ClassId := Self.Integers[Imageid];
   ThreadSafeLoadImageFromFileIntoVolume(FileName, vInput);
   vInput.Tag := ClassId;
+  vOutput.Tag := ClassId;
   vInput.Divi(64);
   vInput.Sub(2);
   vOutput.Resize(FClassCount);
