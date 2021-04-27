@@ -381,7 +381,8 @@ begin
   else
   begin
     AuxVolume := TNNetVolume.Create();
-    FTrainingFileNames.GetRandomImagePair(AuxVolume, pOutput);
+    ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count);
+    FTrainingFileNames.GetImageVolumePairFromId(ImageId, AuxVolume, pOutput, false);
     pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
     pInput.Tag := AuxVolume.Tag;
     AuxVolume.Free;
