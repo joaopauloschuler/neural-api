@@ -106,6 +106,10 @@ type
     constructor Create(pSize: integer);
     destructor Destroy; override;
 
+    class procedure CalculateWorkingRange(pIndex, pThreadnum, pSize: integer; out
+      StartPos, FinishPos: integer);
+    class function GetRandomNumberOnWorkingRange(pIndex, pThreadnum, pSize: integer): integer;
+
     procedure StartEngine();
     procedure StopEngine();
 
@@ -214,6 +218,29 @@ destructor TNeuralThreadList.Destroy;
 begin
   StopEngine();
   inherited Destroy;
+end;
+
+class procedure TNeuralThreadList.CalculateWorkingRange(pIndex, pThreadnum, pSize: integer; out StartPos, FinishPos: integer);
+var
+  BlockSize: integer;
+begin
+  BlockSize := pSize div pThreadnum {$IFDEF MakeQuick}div 10{$ENDIF};
+  StartPos  := BlockSize * pIndex;
+  FinishPos := BlockSize * (pIndex + 1) - 1;
+
+  if pIndex = (pThreadnum-1) then
+  begin
+    FinishPos := pSize - 1;
+  end;
+end;
+
+class function TNeuralThreadList.GetRandomNumberOnWorkingRange(pIndex,
+  pThreadnum, pSize: integer): integer;
+var
+  StartPos, FinishPos: integer;
+begin
+  CalculateWorkingRange(pIndex, pThreadnum, pSize, StartPos, FinishPos);
+  result := StartPos + Random(FinishPos - StartPos + 1);
 end;
 
 procedure TNeuralThreadList.StartEngine();
