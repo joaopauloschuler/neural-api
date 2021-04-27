@@ -365,7 +365,7 @@ begin
       FTrainingFileNames.GetImageVolumePairFromId(ImageId, AuxVolume, pOutput, false);
       pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
       LocalCacheVolume.Copy(pInput);
-      LocalCacheVolume.Tag := pInput.Tag;
+      LocalCacheVolume.Tag := AuxVolume.Tag;
       pInput.Tag := AuxVolume.Tag;
       AuxVolume.Free;
     end
