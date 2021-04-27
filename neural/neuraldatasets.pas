@@ -127,7 +127,7 @@ type
       constructor Create();
       destructor Destroy(); override;
 
-      procedure GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume);
+      procedure GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume; ThreadDangerous: boolean = True);
       procedure GetRandomImagePair(vInput, vOutput: TNNetVolume);
       function ThreadSafeLoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
 
@@ -339,14 +339,16 @@ begin
 end;
 
 { TFileNameList }
-procedure TFileNameList.GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume);
+procedure TFileNameList.GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume; ThreadDangerous: boolean = True);
 var
   FileName: string;
   ClassId: integer;
 begin
   FileName := Self[ImageId];
   ClassId := Self.Integers[Imageid];
-  ThreadSafeLoadImageFromFileIntoVolume(FileName, vInput);
+  if ThreadDangerous
+  then ThreadSafeLoadImageFromFileIntoVolume(FileName, vInput)
+  else LoadImageFromFileIntoVolume(FileName, vInput);
   vInput.Tag := ClassId;
   vOutput.Tag := ClassId;
   vInput.Divi(64);

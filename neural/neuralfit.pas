@@ -352,6 +352,7 @@ var
   AuxVolume: TNNetVolume;
   CacheId: integer;
   LocalCacheVolume: TNNetVolume;
+  ImageId: integer;
 begin
   if FTrainingVolumeCacheEnabled then
   begin
@@ -360,7 +361,8 @@ begin
     if ((LocalCacheVolume.Tag = -1) or (Random(1000)<100)) then
     begin
       AuxVolume := TNNetVolume.Create();
-      FTrainingFileNames.GetRandomImagePair(AuxVolume, pOutput);
+      ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count);
+      FTrainingFileNames.GetImageVolumePairFromId(ImageId, AuxVolume, pOutput, false);
       pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
       LocalCacheVolume.Copy(pInput);
       LocalCacheVolume.Tag := pInput.Tag;
@@ -392,7 +394,7 @@ var
   AuxVolume: TNNetVolume;
 begin
   AuxVolume := TNNetVolume.Create();
-  FValidationFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
+  FValidationFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput, false);
   pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
   AuxVolume.Free;
 end;
@@ -403,7 +405,7 @@ var
   AuxVolume: TNNetVolume;
 begin
   AuxVolume := TNNetVolume.Create();
-  FTestFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput);
+  FTestFileNames.GetImageVolumePairFromId(Idx, AuxVolume, pOutput, false);
   pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
   pInput.Tag := AuxVolume.Tag;
   AuxVolume.Free;
@@ -2071,6 +2073,11 @@ begin
   BlockSize := (FWorkingVolumes.Count div FThreadNum) {$IFDEF MakeQuick}div 10{$ENDIF};
   StartPos  := BlockSize * index;
   FinishPos := BlockSize * (index + 1) - 1;
+
+  if index = (FThreadNum-1) then
+  begin
+    FinishPos := FWorkingVolumes.Count - 1;
+  end;
 
   LocalNN := FThreadNN[Index];
   LocalNN.CopyWeights(FAvgWeight);
