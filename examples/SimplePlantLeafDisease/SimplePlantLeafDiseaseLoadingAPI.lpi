@@ -90,12 +90,13 @@
           <Other>
             <CustomOptions Value="-dRelease
 -dAVX"/>
-            <OtherDefines Count="5">
+            <OtherDefines Count="6">
               <Define0 Value="Release"/>
               <Define1 Value="Debug"/>
               <Define2 Value="CheckRange"/>
               <Define3 Value="AVX2"/>
               <Define4 Value="AVX"/>
+              <Define5 Value="MakeQuick"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>

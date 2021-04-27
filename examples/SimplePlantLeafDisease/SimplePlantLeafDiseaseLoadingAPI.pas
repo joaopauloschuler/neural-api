@@ -29,14 +29,20 @@ type
     NeuralFit: TNeuralImageLoadingFit;
     ProportionToLoad: Single;
   begin
-    FSizeX := 128;
-    FSizeY := 128;
+    FSizeX := 64;
+    FSizeY := 64;
 
     ProportionToLoad := 1;
     WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease file names into memory.');
 
-    // for testing with Tiny Imagenet 200, do this:
-    // {FolderName=}'tiny-imagenet-200\train', {pImageSubFolder=}'images',
+    // for testing with Tiny Imagenet 200, do this (http://cs231n.stanford.edu/tiny-imagenet-200.zip):
+    // {FolderName=}'tiny-imagenet-200/train', {pImageSubFolder=}'images',
+
+    // for testing with places standard small images
+    // http://places2.csail.mit.edu/download.html
+    // Download small images (256 * 256) with easy directory structure)
+    // http://data.csail.mit.edu/places/places365/places365standard_easyformat.tar
+    // {FolderName=}'places_folder/train', {pImageSubFolder=}'',
 
     CreateFileNameListsFromImagesFromFolder(
       FTrainingFileNames, FValidationFileNames, FTestFileNames,
@@ -57,8 +63,8 @@ type
       TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
       TNNetMaxPool.Create(2),
       TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
-      TNNetConvolutionReLU.Create({Features=}128, {FeatureSize=}3, {Padding=}1, {Stride=}2),
-      TNNetConvolutionLinear.Create({Features=}256, {FeatureSize=}3, {Padding=}1, {Stride=}2),
+      TNNetConvolutionReLU.Create({Features=}256, {FeatureSize=}3, {Padding=}1, {Stride=}2),
+      TNNetConvolutionLinear.Create({Features=}512, {FeatureSize=}3, {Padding=}1, {Stride=}2),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(FTrainingFileNames.ClassCount),
       TNNetSoftMax.Create()
@@ -84,7 +90,7 @@ type
 
     //NeuralFit.MaxThreadNum := 1;
     //NeuralFit.FitLoading(NN, FTrainingFileNames.Count, FValidationFileNames.Count, FTestFileNames.Count, 64, 10, @GetTrainingProc, @GetValidationProc, @GetTestProc);
-    NeuralFit.FitLoading(NN, FSizeX, FSizeY, FTrainingFileNames, FValidationFileNames, FTestFileNames, {BatchSize}64, {Epochs}10);
+    NeuralFit.FitLoading(NN, FSizeX, FSizeY, FTrainingFileNames, FValidationFileNames, FTestFileNames, {BatchSize}256, {Epochs}10);
     NeuralFit.Free;
 
     FTrainingFileNames.Free;
