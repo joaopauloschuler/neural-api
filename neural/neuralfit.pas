@@ -358,7 +358,7 @@ begin
   begin
     CacheId := Random(FTrainingVolumeCacheSize);
     LocalCacheVolume := FTrainingVolumeCache[CacheId];
-    if ((LocalCacheVolume.Tag = -1) or (Random(1000)<100)) then
+    if ((LocalCacheVolume.Tag = -1) or (Random(1000)<500)) then
     begin
       AuxVolume := TNNetVolume.Create();
       ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count);
@@ -417,7 +417,7 @@ constructor TNeuralImageLoadingFit.Create();
 begin
   inherited Create();
   FTrainingVolumeCacheSize := 1000;
-  FTrainingVolumeCacheEnabled := true;
+  FTrainingVolumeCacheEnabled := false;
   EnableDefaultImageTreatment();
 end;
 
