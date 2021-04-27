@@ -79,14 +79,14 @@ type
     );
 
     NeuralFit := TNeuralImageLoadingFit.Create;
-    NeuralFit.TrainingVolumeCacheEnabled := true;
+    NeuralFit.TrainingVolumeCacheEnabled := false;
     NeuralFit.FileNameBase := 'SimplePlantLeafDiseaseAPI';
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
-    NeuralFit.L2Decay := 0.00001;
-    NeuralFit.AvgWeightEpochCount := 10;
+    NeuralFit.L2Decay := 0.0000001;
+    NeuralFit.AvgWeightEpochCount := 0;
 
     //NeuralFit.MaxThreadNum := 1;
     //NeuralFit.FitLoading(NN, FTrainingFileNames.Count, FValidationFileNames.Count, FTestFileNames.Count, 64, 10, @GetTrainingProc, @GetValidationProc, @GetTestProc);
