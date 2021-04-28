@@ -218,6 +218,8 @@ type
     function GetSumSqr(): T; virtual;
     function GetAvg(): T; {$IFDEF Release} inline; {$ENDIF}
     function GetVariance(): T; {$IFDEF Release} inline; {$ENDIF}
+    function GetValueCount(Value: T): integer;
+    function GetSmallestIdxInRange(StartPos, Len: integer): integer;
     function GetStdDeviation(): T; {$IFDEF Release} inline; {$ENDIF}
     function GetMagnitude(): T; {$IFDEF Release} inline; {$ENDIF}
     procedure FlipX();
@@ -3901,6 +3903,50 @@ begin
     floatSize := FSize;
     Result := Result / floatSize;
   end
+end;
+
+function TVolume.GetValueCount(Value: T): integer;
+var
+  I, vHigh: integer;
+begin
+  Result := 0;
+  if FSize > 0 then
+  begin
+    vHigh := FSize - 1;
+    for I := 0 to vHigh do
+    begin
+      if FData[I]=Value then Inc(Result);
+    end;
+  end;
+end;
+
+function TVolume.GetSmallestIdxInRange(StartPos, Len: integer): integer;
+var
+  FinishPos: integer;
+  PosCnt: integer;
+  SmallestValue: T;
+begin
+  Result := 0;
+  if StartPos < FSize then
+  begin
+    FinishPos := Min(FSize - 1, StartPos + Len - 1);
+    if FinishPos >= StartPos then
+    begin
+      SmallestValue := FData[StartPos];
+      Result := StartPos;
+      if FinishPos > StartPos then
+      begin
+        for PosCnt := StartPos to FinishPos do
+        begin
+          if FData[PosCnt] < SmallestValue then
+          begin
+            SmallestValue := FData[PosCnt];
+            Result := PosCnt;
+          end;
+        end;
+      end;
+    end;
+  end;
 end;
 
 function TVolume.GetStdDeviation(): T;
