@@ -235,6 +235,8 @@ type
       FTrainingVolumeCache: TNNetVolumeList;
       FTrainingVolumeCacheEnabled: boolean;
       FTrainingVolumeCacheSize: integer;
+      FTrainingVolumeCachePct: integer;
+      FTrainingSampleProcessedCnt: TNNetVolume;
 
       procedure GetTrainingProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
       procedure GetValidationProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
@@ -252,6 +254,7 @@ type
       property SizeY:integer read FSizeX;
       property TrainingVolumeCacheEnabled: boolean read FTrainingVolumeCacheEnabled write FTrainingVolumeCacheEnabled;
       property TrainingVolumeCacheSize: integer read FTrainingVolumeCacheSize write FTrainingVolumeCacheSize;
+      property TrainingVolumeCachePct: integer read FTrainingVolumeCachePct write FTrainingVolumeCachePct;
   end;
   {$ENDIF}
 
@@ -262,6 +265,7 @@ type
       FNumClasses: integer;
       FImgVolumes, FImgValidationVolumes, FImgTestVolumes: TNNetVolumeList;
       FIsSoftmax: boolean;
+      FTrainingSampleProcessedCnt: TNNetVolume;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -353,15 +357,17 @@ var
   CacheId: integer;
   LocalCacheVolume: TNNetVolume;
   ImageId: integer;
+  MaxLen: integer;
 begin
   if FTrainingVolumeCacheEnabled then
   begin
     CacheId := Random(FTrainingVolumeCacheSize);
     LocalCacheVolume := FTrainingVolumeCache[CacheId];
-    if ((LocalCacheVolume.Tag = -1) or (Random(1000)<500)) then
+    if ((LocalCacheVolume.Tag = -1) or (Random(1000)>FTrainingVolumeCachePct*10)) then
     begin
       AuxVolume := TNNetVolume.Create();
-      ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count);
+      ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count, MaxLen);
+      ImageId := FTrainingSampleProcessedCnt.GetSmallestIdxInRange(ImageId, Min(MaxLen,100));
       FTrainingFileNames.GetImageVolumePairFromId(ImageId, AuxVolume, pOutput, false);
       pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
       LocalCacheVolume.Copy(pInput);
@@ -381,7 +387,8 @@ begin
   else
   begin
     AuxVolume := TNNetVolume.Create();
-    ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count);
+    ImageId := TNeuralThreadList.GetRandomNumberOnWorkingRange(ThreadId, FThreadNum, FTrainingFileNames.Count, MaxLen);
+    ImageId := FTrainingSampleProcessedCnt.GetSmallestIdxInRange(ImageId, Min(MaxLen,100));
     FTrainingFileNames.GetImageVolumePairFromId(ImageId, AuxVolume, pOutput, false);
     pInput.CopyResizing(AuxVolume, FSizeX, FSizeY);
     pInput.Tag := AuxVolume.Tag;
@@ -417,12 +424,15 @@ constructor TNeuralImageLoadingFit.Create();
 begin
   inherited Create();
   FTrainingVolumeCacheSize := 1000;
+  FTrainingVolumeCachePct := 50;
   FTrainingVolumeCacheEnabled := false;
   EnableDefaultImageTreatment();
+  FTrainingSampleProcessedCnt := TNNetVolume.Create();
 end;
 
 destructor TNeuralImageLoadingFit.Destroy();
 begin
+  FTrainingSampleProcessedCnt.Free;
   inherited Destroy();
 end;
 
@@ -436,6 +446,7 @@ begin
   FValidationFileNames := pValidationFileNames;
   FTestFileNames       := pTestFileNames;
   FTrainingVolumeCache := TNNetVolumeList.Create;
+  FTrainingSampleProcessedCnt.Resize(FTrainingFileNames.Count);
   if Not(FTrainingVolumeCacheEnabled) then FTrainingVolumeCacheSize := 1;
   FTrainingVolumeCache.AddVolumes(FTrainingVolumeCacheSize, FSizeX, FSizeY, 3);
   FTrainingVolumeCache.FillTag({TagId}0, {TagValue}-1);
@@ -1491,10 +1502,12 @@ begin
   FHasMakeGray := true;
   FColorEncoding := 0;
   FMultipleSamplesAtValidation := true;
+  FTrainingSampleProcessedCnt := TNNetVolume.Create;
 end;
 
 destructor TNeuralImageFit.Destroy();
 begin
+  FTrainingSampleProcessedCnt.Free;
   inherited Destroy;
 end;
 
@@ -1524,6 +1537,7 @@ begin
   FCurrentStep := 0;
   FCurrentLearningRate := FInitialLearningRate;
   FImgVolumes := pImgVolumes;
+  FTrainingSampleProcessedCnt.Resize(FImgVolumes.Count);
   FImgValidationVolumes := pImgValidationVolumes;
   FImgTestVolumes := pImgTestVolumes;
   FThreadNum := Min(FMaxThreadNum, FDefaultThreadCount);
@@ -1611,6 +1625,7 @@ begin
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
+    // the following for command will run 1 epoch
     for I := 1 to (FImgVolumes.Count div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
     begin
       if (FShouldQuit) then break;
@@ -1687,7 +1702,12 @@ begin
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
       Inc(FCurrentStep);
-    end;
+    end; // of epoch
+    {$IFDEF Debug}
+    FMessageProc(
+      IntToStr(FTrainingSampleProcessedCnt.GetValueCount(0)) +
+      ' of samples haven''t been processed.');
+    {$ENDIF}
 
     Inc(FCurrentEpoch);
 
@@ -1907,6 +1927,8 @@ begin
   begin
     if (FShouldQuit) then Break;
     ImgIdx := Random(FImgVolumes.Count);
+    ImgIdx := FTrainingSampleProcessedCnt.GetSmallestIdxInRange(ImgIdx, 100);
+    FTrainingSampleProcessedCnt.FData[ImgIdx] := FTrainingSampleProcessedCnt.FData[ImgIdx] + 1;
 
     if FDataAugmentation then
     begin
