@@ -108,7 +108,8 @@ type
 
     class procedure CalculateWorkingRange(pIndex, pThreadnum, pSize: integer; out
       StartPos, FinishPos: integer);
-    class function GetRandomNumberOnWorkingRange(pIndex, pThreadnum, pSize: integer): integer;
+    class function GetRandomNumberOnWorkingRange(pIndex, pThreadnum, pSize: integer): integer; overload;
+    class function GetRandomNumberOnWorkingRange(pIndex, pThreadnum, pSize: integer; out MaxLen: integer): integer; overload;
 
     procedure StartEngine();
     procedure StopEngine();
@@ -240,7 +241,17 @@ var
   StartPos, FinishPos: integer;
 begin
   CalculateWorkingRange(pIndex, pThreadnum, pSize, StartPos, FinishPos);
-  result := StartPos + Random(FinishPos - StartPos + 1);
+  Result := StartPos + Random(FinishPos - StartPos + 1);
+end;
+
+class function TNeuralThreadList.GetRandomNumberOnWorkingRange(pIndex,
+  pThreadnum, pSize: integer; out MaxLen: integer): integer;
+var
+  StartPos, FinishPos: integer;
+begin
+  CalculateWorkingRange(pIndex, pThreadnum, pSize, StartPos, FinishPos);
+  Result := StartPos + Random(FinishPos - StartPos + 1);
+  MaxLen := FinishPos - Result;
 end;
 
 procedure TNeuralThreadList.StartEngine();
