@@ -674,13 +674,14 @@ begin
 
         if (FGlobalTotal > 0) and (FVerbose) then
         begin
-          WriteLn(
-            'Epochs: ',FCurrentEpoch,
-            ' Examples seen:', FCurrentEpoch * TrainingCnt,
-            ' Validation Accuracy: ', ValidationRate:6:4,
-            ' Validation Error: ', ValidationError:6:4,
-            ' Validation Loss: ', ValidationLoss:6:4,
-            ' Total time: ', (((Now() - globalStartTime)) * 24 * 60): 6: 2, 'min'
+          FMessageProc(
+            'Epochs: ' + IntToStr(FCurrentEpoch) +
+            ' Examples seen:' + IntToStr(FCurrentEpoch * TrainingCnt) +
+            ' Validation Accuracy: ' + FloatToStrF(ValidationRate,ffFixed,6,4) +
+            ' Validation Error: ' + FloatToStrF(ValidationError,ffFixed,6,4) +
+            ' Validation Loss: ' + FloatToStrF(ValidationLoss,ffFixed,6,4) +
+            ' Total time: ' + FloatToStrF(((Now() - globalStartTime)) * 24 * 60,ffFixed,6,2) +
+            'min'
           );
         end;
 
@@ -711,13 +712,14 @@ begin
           end;
           if (FGlobalTotal > 0) and (FVerbose) then
           begin
-            WriteLn(
-              'Epochs: ', FCurrentEpoch,
-              ' Examples seen:', FCurrentEpoch * TrainingCnt,
-              ' Test Accuracy: ', TestRate:6:4,
-              ' Test Error: ', TestError:6:4,
-              ' Test Loss: ', TestLoss:6:4,
-              ' Total time: ', (((Now() - globalStartTime)) * 24 * 60): 6: 2, 'min'
+            FMessageProc(
+              'Epochs: ' + IntToStr(FCurrentEpoch) +
+              ' Examples seen:' + IntToStr(FCurrentEpoch * TrainingCnt) +
+              ' Test Accuracy: ' + FloatToStrF(TestRate,ffFixed,6,4) +
+              ' Test Error: ' + FloatToStrF(TestError,ffFixed,6,4) +
+              ' Test Loss: ' + FloatToStrF(TestLoss,ffFixed,6,4) +
+              ' Total time: ' + FloatToStrF(((Now() - globalStartTime)) * 24 * 60,ffFixed,6,2) +
+              'min'
             );
           end;
         end;
@@ -1763,13 +1765,14 @@ begin
 
         if (FGlobalTotal > 0) and (FVerbose) then
         begin
-          WriteLn(
-            'Epochs: ',FCurrentEpoch,
-            ' Examples seen:', FCurrentEpoch * FImgVolumes.Count,
-            ' Validation Accuracy: ', ValidationRate:6:4,
-            ' Validation Error: ', ValidationError:6:4,
-            ' Validation Loss: ', ValidationLoss:6:4,
-            ' Total time: ', (((Now() - globalStartTime)) * 24 * 60): 6: 2, 'min'
+          FMessageProc(
+            'Epochs: ' + IntToStr(FCurrentEpoch) +
+            ' Examples seen:' + IntToStr(FCurrentEpoch * FImgVolumes.Count) +
+            ' Validation Accuracy: ' + FloatToStrF(ValidationRate,ffFixed,6,4) +
+            ' Validation Error: ' + FloatToStrF(ValidationError,ffFixed,6,4) +
+            ' Validation Loss: ' + FloatToStrF(ValidationLoss,ffFixed,6,4) +
+            ' Total time: ' + FloatToStrF(((Now() - globalStartTime)) * 24 * 60,ffFixed,6,2) +
+            'min'
           );
         end;
 
@@ -1814,13 +1817,14 @@ begin
 
           if (FGlobalTotal > 0) and (FVerbose) then
           begin
-            WriteLn(
-              'Epochs: ',FCurrentEpoch,
-              ' Examples seen:', FCurrentEpoch * FImgVolumes.Count,
-              ' Test Accuracy: ', TestRate:6:4,
-              ' Test Error: ', TestError:6:4,
-              ' Test Loss: ', TestLoss:6:4,
-              ' Total time: ', (((Now() - globalStartTime)) * 24 * 60): 6: 2, 'min'
+            FMessageProc(
+              'Epochs: ' + IntToStr(FCurrentEpoch) +
+              ' Examples seen:' + IntToStr(FCurrentEpoch * FImgVolumes.Count) +
+              ' Test Accuracy: ' + FloatToStrF(TestRate,ffFixed,6,4) +
+              ' Test Error: ' + FloatToStrF(TestError,ffFixed,6,4) +
+              ' Test Loss: ' + FloatToStrF(TestLoss,ffFixed,6,4) +
+              ' Total time: ' + FloatToStrF(((Now() - globalStartTime)) * 24 * 60,ffFixed,6,2) +
+              'min'
             );
           end;
         end;
