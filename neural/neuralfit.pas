@@ -2169,7 +2169,10 @@ begin
     end
     else
     begin
-      WriteLn('Error - invalid output value:',OutputValue);
+      FErrorProc(
+        'Error - invalid output value at loss function:' +
+        FloatToStrF(OutputValue,ffFixed,6,4)
+      );
       CurrentLoss := 1;
     end;
     LocalTotalLoss := LocalTotalLoss + CurrentLoss;
