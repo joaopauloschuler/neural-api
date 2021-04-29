@@ -385,6 +385,29 @@ Source code examples:
 * [Simple Plant Leaf Disease Image Classifier for the PlantVillage Dataset](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimplePlantLeafDisease)
 * [Tiny ImageNet 200](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleTinyImageNet)
 
+#### Is your Dataset too Big for RAM? You should use TNeuralImageLoadingFit.
+In the case that your image classification dataset is too big to be stored in RAM, you can follow this example:
+```
+    FTrainingFileNames, FValidationFileNames, FTestFileNames: TFileNameList;
+...
+    ProportionToLoad := 1;
+    CreateFileNameListsFromImagesFromFolder(
+      FTrainingFileNames, FValidationFileNames, FTestFileNames,
+      {FolderName=}'places_folder/train', {pImageSubFolder=}'',
+      {TrainingProp=}0.9*ProportionToLoad,
+      {ValidationProp=}0.05*ProportionToLoad,
+      {TestProp=}0.05*ProportionToLoad
+    );
+```
+Then, you can call a fitting method made specific for this:
+```
+NeuralFit := TNeuralImageLoadingFit.Create;
+...
+NeuralFit.FitLoading({NeuralNetworkModel}NN, {ImageSizeX}256, {ImageSizeY}256, FTrainingFileNames, FValidationFileNames, FTestFileNames, {BatchSize}256, {Epochs}100);
+```
+`TNeuralImageLoadingFit.FitLoading` has been tested with [Places365-Standard Small images 256x256 with easy directory structure](http://places2.csail.mit.edu/download.html).
+You can follow this example:
+* [Simple Plant Leaf Disease Image Classifier with Few RAM](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimplePlantLeafDisease/SimplePlantLeafDiseaseLoadingAPI.pas)
 ### Loading and Saving Images with Volumes
 When loading an image from a file, the easiest and fastest method is calling `LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume)`. When loading from an **TFPMemoryImage**, you can load with `LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume)`. For saving an image, the fastest method is `SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string)`.
 
