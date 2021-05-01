@@ -47,7 +47,7 @@ unit neuralbyteprediction; // this unit used to be called UBup3
 
 interface
 
-uses neuralabfun, neuralcache;
+uses neuralabfun, neuralcache, neuralnetwork, neuralvolume;
 
 type
   TCountings = array of longint;
@@ -344,9 +344,126 @@ type
     function GetD(posPredictedState: longint): single;
   end;
 
+  // This class is very experimental - do not use it.
+  TEasyLearnAndPredictDeepLearning = class(TMObject)
+  private
+    NN: TNNet;
+    FActions, FStates, FPredictedStates, FOutput: TNNetVolume;
+    aActions, aCurrentState, aPredictedState: array of byte;
+    FCached: boolean;
+    FUseCache: boolean;
+  public
+    FCache: TCacheMem;
+
+    constructor Create(
+      pActionByteLen {action array size in bytes},
+      pStateByteLen{state array size in bytes}: word;
+      // false = creates operation/neurons for non zero entries only.
+      NumNeurons: integer;
+      // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
+      pUseCache: boolean
+      // replies the same prediction for the same given state. Use false if you aren't sure.
+    );
+    destructor Destroy(); override;
+
+    // THIS METHOD WILL PREDICT THE NEXT SATE GIVEN AN ARRAY OF ACTIONS AND STATES.
+    // You can understand ACTIONS as a kind of "current state".
+    // Returned value "predicted states" contains the neural network prediction.
+    procedure Predict(var pActions, pCurrentState: array of byte;
+      var pPredictedState: array of byte);
+
+    // Call this method to train the neural network so it can learn from the "found state".
+    // Call this method and when the state of your environment changes so the neural
+    // network can learn how the state changes from time to time.
+    function newStateFound(stateFound: array of byte): extended;
+  end;
+
 implementation
 
 uses neuralab, SysUtils, Classes;
+
+constructor TEasyLearnAndPredictDeepLearning.Create(pActionByteLen,
+  pStateByteLen: word; NumNeurons: integer;
+  pUseCache: boolean);
+var
+  NNetInputLayer1, NNetInputLayer2: TNNetLayer;
+begin
+  inherited Create();
+  NN := TNNet.Create;
+  FActions := TNNetVolume.Create();
+  FStates := TNNetVolume.Create();
+  FPredictedStates := TNNetVolume.Create();
+  FOutput := TNNetVolume.Create();
+  SetLength(aActions, pActionByteLen);
+  SetLength(aCurrentState, pStateByteLen);
+  SetLength(aPredictedState, pStateByteLen);
+  if (pUseCache)
+  then FCache.Init(pActionByteLen, pStateByteLen)
+  else FCache.Init(1, 1);
+  FUseCache := pUseCache;
+  NNetInputLayer1 := NN.AddLayer( TNNetInput.Create(pActionByteLen*8) );
+  NNetInputLayer2 := NN.AddLayer( TNNetInput.Create(pStateByteLen*8) );
+  NN.AddLayer( TNNetConcat.Create([NNetInputLayer1, NNetInputLayer2]));
+  NN.AddLayer( TNNetFullConnectReLU.Create( NumNeurons ) );
+  NN.AddLayer( TNNetFullConnectReLU.Create( NumNeurons ) );
+  NN.AddLayer( TNNetFullConnectReLU.Create( NumNeurons ) );
+  NN.AddLayer( TNNetFullConnect.Create( (pStateByteLen)*8 ) );
+  NN.SetLearningRate(0.01, 0.9);
+  NN.DebugStructure();
+end;
+
+destructor TEasyLearnAndPredictDeepLearning.Destroy();
+begin
+  FOutput.Free;
+  FActions.Free;
+  FStates.Free;
+  FPredictedStates.Free;
+  NN.Free;
+  inherited Destroy();
+end;
+
+procedure TEasyLearnAndPredictDeepLearning.Predict(var pActions,
+  pCurrentState: array of byte; var pPredictedState: array of byte);
+var
+  idxCache: longint;
+  Equal: boolean;
+begin
+  ABCopy(aActions, pActions);
+  ABCopy(aCurrentState, pCurrentState);
+  if FUseCache then
+    idxCache := FCache.Read(pActions, pPredictedState);
+  Equal := ABCmp(pActions, pCurrentState);
+  if FUseCache and (idxCache <> -1) and Equal then
+  begin
+    FCached := True;
+  end
+  else
+  begin
+    //BytePred.Prediction(aActions, aCurrentState, pPredictedState, FRelationProbability, FVictoryIndex);
+    FActions.CopyAsBits(aActions);
+    FStates.CopyAsBits(pCurrentState);
+    NN.Compute([FActions, FStates]);
+    NN.GetOutput(FPredictedStates);
+    FPredictedStates.ReadAsBits(pPredictedState);
+    FCached := False;
+  end;
+  ABCopy(aPredictedState, pPredictedState);
+end;
+
+function TEasyLearnAndPredictDeepLearning.newStateFound(stateFound: array of byte): extended;
+begin
+  newStateFound := ABCountDif(stateFound, aPredictedState);
+  // Do we have a cached prediction
+  if Not(FCached) then
+  begin
+    FPredictedStates.CopyAsBits(stateFound);
+    NN.GetOutput(FOutput);
+    NN.Backpropagate(FPredictedStates);
+    //newStateFound := FOutput.SumDiff(FPredictedStates);
+  end;
+  if FUseCache then
+    FCache.Include(aActions, stateFound);
+end;
 
 { TClassifier }
 

@@ -35,6 +35,9 @@ unit neuralvolume;
 // TVolume has also been inpired on Exentia
 // http://www.tommesani.com/ExentiaWhatsNew.html
 
+{$IFDEF FPC}
+{$mode objfpc}
+{$ENDIF}
 
 interface
 

@@ -1,6 +1,6 @@
 unit neuralab;
 {
-U stands for Unit. A stands for Array. B stands for Bytes.
+A stands for Array. B stands for Bytes.
 This unit contains "array of bytes" functions.
 Copyright (C) 2017 Joao Paulo Schwarz Schuler
 
@@ -86,7 +86,7 @@ function ABToString(var AB: array of byte): string;
 // returns a string from the array
 function ABToStringR(var AB: array of byte): string;
 
-// clears array (fills with zeros
+// clears array (fills with zeros)
 procedure ABClear(var AB: array of byte);
 
 // fills with 1 the array.
