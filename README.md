@@ -195,11 +195,12 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNet.AddConvOrSeparableConv` (input/output: 1D, 2D or 3D). Adds a convolution or a separable convolutions with/without ReLU and normalization.
 * `TNNet.AddGroupedConvolution` (input/output: 1D, 2D or 3D). Adds grouped convolutions. 
 
-### Fully Connected Layers
+### Fully Connected (Dense) Layers
 * `TNNetFullConnect` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectReLU` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectLinear` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectSigmoid` (input/output: 1D, 2D or 3D).
+* `TNNet.AddGroupedFullConnect`: inspired on `TNNet.AddGroupedConvolution`, adds a grouped fully connected layer.
 
 ### Locally Connected Layers
 * `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
