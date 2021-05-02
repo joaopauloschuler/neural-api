@@ -1329,29 +1329,29 @@ end;
 
 procedure TNeuralDataLoadingFit.EnableMonopolarHitComparison();
 begin
-  FInferHitFn := @MonopolarCompare;
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}MonopolarCompare;
 end;
 
 procedure TNeuralDataLoadingFit.EnableBipolarHitComparison();
 begin
-  FInferHitFn := @BipolarCompare;
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}BipolarCompare;
 end;
 
 procedure TNeuralDataLoadingFit.EnableBipolar99HitComparison();
 begin
-  FInferHitFn := @BipolarCompare99;
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}BipolarCompare99;
 end;
 
 procedure TNeuralDataLoadingFit.EnableClassComparison();
 begin
-  FInferHitFn := @ClassCompare;
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompare;
 end;
 
 procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
 begin
   inherited EnableDefaultImageTreatment();
   EnableClassComparison();
-  FLossFn := @DefaultLossFn;
+  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
 end;
 
 { TNeuralFitBase }
