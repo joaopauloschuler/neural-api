@@ -766,6 +766,9 @@ type
       {$ENDIF}
   end;
 
+  //FullyConnectedLayers
+  TNNetFullConnectClass = class of TNNetFullConnect;
+
   /// Fully connected layer without activation function. This layer is useful
   // before softmax layers.
   TNNetFullConnectLinear = class(TNNetFullConnect)
@@ -1168,7 +1171,11 @@ type
       function AddSeparableConvLinear(pNumFeatures{filters}, pFeatureSize, pInputPadding, pStride: integer; pDepthMultiplier: integer = 1; pSuppressBias: integer = 0; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddGroupedConvolution(Conv2d: TNNetConvolutionClass;
         Groups, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
-        pSuppressBias: integer = 0): TNNetLayer;
+        pSuppressBias: integer = 0;
+        ChannelInterleaving: boolean = True): TNNetLayer;
+      function AddGroupedFullConnect(FullConnect: TNNetFullConnectClass;
+        Groups, pNumFeatures: integer; pSuppressBias: integer = 0;
+        ChannelInterleaving: boolean = True): TNNetLayer;
       /// Instead of a batch normalization (or a normalization per batch),
       // this is a moving normalization. It contains zero centering, std. norm.,
       // multiplication and summation. All parameters are trainable. PerCell
@@ -8819,7 +8826,7 @@ end;
 
 function TNNet.AddGroupedConvolution(Conv2d: TNNetConvolutionClass;
   Groups, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
-  pSuppressBias: integer): TNNetLayer;
+  pSuppressBias: integer; ChannelInterleaving: boolean): TNNetLayer;
 var
   PreviousLayer: TNNetLayer;
   FeaturesPerGroup: integer;
@@ -8840,8 +8847,50 @@ begin
   begin
     for GroupCnt := 0 to Groups - 1 do
     begin
-      AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
+      if ChannelInterleaving
+        then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
+        else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
       EachGroupOutput[GroupCnt] := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, pInputPadding, pStride, pSuppressBias) );
+    end;
+    Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+  end;
+  SetLength(EachGroupOutput, 0);
+end;
+
+function TNNet.AddGroupedFullConnect(FullConnect: TNNetFullConnectClass;
+  Groups, pNumFeatures: integer; pSuppressBias: integer;
+  ChannelInterleaving: boolean): TNNetLayer;
+var
+  PreviousLayer: TNNetLayer;
+  FeaturesPerGroup: integer;
+  InputChannelsPerGroup: integer;
+  EachGroupOutput: array of TNNetLayer;
+  GroupCnt: integer;
+begin
+  if Groups > 1 then
+  begin
+    PreviousLayer := AddLayer( TNNetReshape.Create(1, 1, GetLastLayer().Output.Size) );
+  end
+  else
+  begin
+    PreviousLayer := GetLastLayer();
+  end;
+  Result := PreviousLayer;
+  SetLength(EachGroupOutput, Groups);
+  FeaturesPerGroup := pNumFeatures div Groups;
+  InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Groups;
+  if Groups = 1 then
+  begin
+    Result := AddLayer( FullConnect.Create(FeaturesPerGroup, pSuppressBias) );
+  end;
+  if Groups > 1 then
+  begin
+    for GroupCnt := 0 to Groups - 1 do
+    begin
+      if ChannelInterleaving
+        then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
+        else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
+      EachGroupOutput[GroupCnt] := AddLayer( FullConnect.Create(FeaturesPerGroup, pSuppressBias) );
     end;
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
