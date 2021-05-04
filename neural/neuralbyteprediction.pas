@@ -47,7 +47,7 @@ unit neuralbyteprediction; // this unit used to be called UBup3
 
 interface
 
-uses neuralabfun, neuralcache, neuralnetwork, neuralvolume;
+uses neuralabfun, neuralcache, neuralvolume;
 
 type
   TCountings = array of longint;
@@ -315,11 +315,15 @@ type
     // number of combinatorial NEURONS. If you don't know how many to crete, give 200.
       pNumberOfSearches: integer;
     // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
-      pUseCache: boolean
+      pUseCache: boolean;
     // replies the same prediction for the same given state. Use false if you aren't sure.
-      );
+      CacheSize: integer = 1000
+    );
 
-    // THIS METHOD WILL PREDICT THE NEXT SATE GIVEN AN ARRAY OF ACTIONS AND STATES.
+    /// Frees memory
+    procedure DeInitiate();
+
+    /// THIS METHOD WILL PREDICT THE NEXT SATE GIVEN AN ARRAY OF ACTIONS AND STATES.
     // You can understand ACTIONS as a kind of "current state".
     // Returned value "predicted states" contains the neural network prediction.
     procedure Predict(var pActions, pCurrentState: array of byte;
@@ -344,158 +348,11 @@ type
     function GetD(posPredictedState: longint): single;
   end;
 
-  // This class is very experimental - do not use it.
-  TBytePredictionViaNNet = class(TMObject)
-  private
-    FNN: TNNet;
-    FActions, FStates, FPredictedStates, FOutput: TNNetVolume;
-    aActions, aCurrentState, aPredictedState: array of byte;
-    FCached: boolean;
-    FUseCache: boolean;
-  public
-    FCache: TCacheMem;
-
-    constructor Create(
-      pNN: TNNet;
-      pActionByteLen{action array size in bytes},
-      pStateByteLen{state array size in bytes}: word;
-      // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
-      pUseCache: boolean
-      // replies the same prediction for the same given state. Use false if you aren't sure.
-    );
-    destructor Destroy(); override;
-
-    // THIS METHOD WILL PREDICT THE NEXT SATE GIVEN AN ARRAY OF ACTIONS AND STATES.
-    // You can understand ACTIONS as a kind of "current state".
-    // Returned value "predicted states" contains the neural network prediction.
-    procedure Predict(var pActions, pCurrentState: array of byte;
-      var pPredictedState: array of byte);
-
-    // Call this method to train the neural network so it can learn from the "found state".
-    // Call this method and when the state of your environment changes so the neural
-    // network can learn how the state changes from time to time.
-    function newStateFound(stateFound: array of byte): extended;
-
-    property NN: TNNet read FNN;
-  end;
-
-
-  // This class is very experimental - do not use it.
-  TEasyBytePredictionViaNNet = class(TBytePredictionViaNNet)
-  public
-    constructor Create(
-      pActionByteLen {action array size in bytes},
-      pStateByteLen{state array size in bytes}: word;
-      // false = creates operation/neurons for non zero entries only.
-      NumNeurons: integer;
-      // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
-      pUseCache: boolean
-      // replies the same prediction for the same given state. Use false if you aren't sure.
-    );
-    destructor Destroy(); override;
-  end;
 
 implementation
 
 uses neuralab, SysUtils, Classes;
 
-constructor TEasyBytePredictionViaNNet.Create(pActionByteLen,
-  pStateByteLen: word; NumNeurons: integer;
-  pUseCache: boolean);
-var
-  NNetInputLayer1, NNetInputLayer2: TNNetLayer;
-begin
-  inherited Create(FNN, pActionByteLen, pStateByteLen, pUseCache);
-  FNN := TNNet.Create;
-  NNetInputLayer1 := NN.AddLayer( TNNetInput.Create(pActionByteLen*8) );
-  NNetInputLayer2 := NN.AddLayer( TNNetInput.Create(pStateByteLen*8) );
-  NN.AddLayer( TNNetConcat.Create([NNetInputLayer1, NNetInputLayer2]));
-  NN.AddLayer( TNNetFullConnect.Create( NumNeurons ) );
-  NN.AddGroupedFullConnect(TNNetFullConnect, 4, 400, 0);
-  NN.AddGroupedFullConnect(TNNetFullConnect, 8, 400, 0);
-  NN.AddGroupedFullConnect(TNNetFullConnect, 8, 400, 0);
-  NN.AddLayer( TNNetFullConnect.Create( (pStateByteLen)*8 ) );
-  NN.SetLearningRate(0.01, 0.9);
-  NN.DebugStructure();
-end;
-
-destructor TEasyBytePredictionViaNNet.Destroy();
-begin
-  NN.Free;
-  inherited Destroy();
-end;
-
-constructor TBytePredictionViaNNet.Create(pNN: TNNet; pActionByteLen,
-  pStateByteLen: word; pUseCache: boolean);
-begin
-  inherited Create();
-  FNN := pNN;
-  FActions := TNNetVolume.Create();
-  FStates := TNNetVolume.Create();
-  FPredictedStates := TNNetVolume.Create();
-  FOutput := TNNetVolume.Create();
-  SetLength(aActions, pActionByteLen);
-  SetLength(aCurrentState, pStateByteLen);
-  SetLength(aPredictedState, pStateByteLen);
-  if (pUseCache)
-  then FCache.Init(pActionByteLen, pStateByteLen)
-  else FCache.Init(1, 1);
-  FUseCache := pUseCache;
-end;
-
-destructor TBytePredictionViaNNet.Destroy();
-begin
-  FOutput.Free;
-  FActions.Free;
-  FStates.Free;
-  FPredictedStates.Free;
-  inherited Destroy();
-end;
-
-procedure TBytePredictionViaNNet.Predict(var pActions,
-  pCurrentState: array of byte; var pPredictedState: array of byte);
-var
-  idxCache: longint;
-  Equal: boolean;
-begin
-  ABCopy(aActions, pActions);
-  ABCopy(aCurrentState, pCurrentState);
-  if FUseCache then
-    idxCache := FCache.Read(pActions, pPredictedState);
-  Equal := ABCmp(pActions, pCurrentState);
-  if FUseCache and (idxCache <> -1) and Equal then
-  begin
-    FCached := True;
-  end
-  else
-  begin
-    //BytePred.Prediction(aActions, aCurrentState, pPredictedState, FRelationProbability, FVictoryIndex);
-    FActions.CopyAsBits(aActions);
-    FStates.CopyAsBits(pCurrentState);
-    NN.Compute([FActions, FStates]);
-    NN.GetOutput(FPredictedStates);
-    FPredictedStates.ReadAsBits(pPredictedState);
-    FCached := False;
-  end;
-  ABCopy(aPredictedState, pPredictedState);
-end;
-
-function TBytePredictionViaNNet.newStateFound(stateFound: array of byte): extended;
-begin
-  Result := ABCountDif(stateFound, aPredictedState);
-  // Do we have a cached prediction
-  if Not(FCached) then
-  begin
-    FPredictedStates.CopyAsBits(stateFound);
-    // backpropagates only when fails
-    //if Result > 0 then
-    NN.Backpropagate(FPredictedStates);
-    //NN.GetOutput(FOutput);
-    //newStateFound := FOutput.SumDiff(FPredictedStates);
-  end;
-  if FUseCache and (Result>0) then
-    FCache.Include(aActions, stateFound);
-end;
 
 { TClassifier }
 
@@ -833,7 +690,7 @@ end;
 
 procedure TEasyLearnAndPredictClass.Initiate(pActionByteLen, pStateByteLen: word;
   pIncludeZeros: boolean; NumNeuronGroups: integer; pNumberOfSearches: integer;
-  pUseCache: boolean);
+  pUseCache: boolean; CacheSize: integer);
 begin
   BytePred.Init(pIncludeZeros, NumNeuronGroups, pNumberOfSearches);
   BytePred.DefineLens(pActionByteLen, pStateByteLen);
@@ -843,9 +700,14 @@ begin
   SetLength(FRelationProbability, pStateByteLen);
   SetLength(FVictoryIndex, pStateByteLen);
   if (pUseCache)
-  then FCache.Init(pActionByteLen, pStateByteLen)
-  else FCache.Init(1, 1);
+  then FCache.Init(pActionByteLen, pStateByteLen, CacheSize)
+  else FCache.Init(1, 1, 1);
   FUseCache := pUseCache;
+end;
+
+procedure TEasyLearnAndPredictClass.DeInitiate();
+begin
+  FCache.DeInit;
 end;
 
 procedure TEasyLearnAndPredictClass.Predict(var pActions, pCurrentState: array of byte;
@@ -908,7 +770,7 @@ begin
   else
     PNormalProcedure;
   newStateFound := predictionError;
-  if FUseCache then
+  if FUseCache and (predictionError=0) then
     FCache.Include(aActions, stateFound);
 end;
 

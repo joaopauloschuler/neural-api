@@ -84,7 +84,8 @@ uses
   {$IFDEF FPC}
   fgl,
   {$ENDIF}
-  Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric;
+  Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
+  neuralbyteprediction, neuralcache, neuralab;
 
 const
   csMaxInterleavedSize: integer = 95;
@@ -380,6 +381,17 @@ type
   /// This is a base/abstract class. Do not use it directly.
   TNNetReLUBase = class(TNNetIdentity)
     public
+      procedure Backpropagate(); override;
+  end;
+
+  TNNetDigital = class(TNNetIdentity)
+    private
+      FMiddleValue: TNeuralFloat;
+      FLowValue, FHighValue: TNeuralFloat;
+      FMiddleDist: TNeuralFloat;
+    public
+      constructor Create(LowValue, HighValue: integer); overload;
+      procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
 
@@ -1416,6 +1428,71 @@ type
       {$ENDIF}
   end;
 
+  /// This class is experimental - do not use it.
+  TNNetByteProcessing = class(TNNetIdentity)
+    private
+      FByteLearning: TEasyLearnAndPredictClass;
+      FByteInput: array of byte;
+      FByteOutput: array of byte;
+      FByteOutputFound: array of byte;
+      FActionBytes: array of byte;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(CacheSize, TestCount, OperationCount: integer); overload;
+      destructor Destroy; override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  // This class is very experimental - do not use it.
+  TBytePredictionViaNNet = class(TMObject)
+  private
+    FNN: TNNet;
+    FActions, FStates, FPredictedStates, FOutput: TNNetVolume;
+    aActions, aCurrentState, aPredictedState: array of byte;
+    FCached: boolean;
+    FUseCache: boolean;
+  public
+    FCache: TCacheMem;
+
+    constructor Create(
+      pNN: TNNet;
+      pActionByteLen{action array size in bytes},
+      pStateByteLen{state array size in bytes}: word;
+      // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
+      CacheSize: integer
+      // replies the same prediction for the same given state. Use false if you aren't sure.
+    );
+    destructor Destroy(); override;
+
+    // THIS METHOD WILL PREDICT THE NEXT SATE GIVEN AN ARRAY OF ACTIONS AND STATES.
+    // You can understand ACTIONS as a kind of "current state".
+    // Returned value "predicted states" contains the neural network prediction.
+    procedure Predict(var pActions, pCurrentState: array of byte;
+      var pPredictedState: array of byte);
+
+    // Call this method to train the neural network so it can learn from the "found state".
+    // Call this method and when the state of your environment changes so the neural
+    // network can learn how the state changes from time to time.
+    function newStateFound(stateFound: array of byte): extended;
+
+    property NN: TNNet read FNN;
+  end;
+
+  // This class is very experimental - do not use it.
+  TEasyBytePredictionViaNNet = class(TBytePredictionViaNNet)
+  public
+    constructor Create(
+      pActionByteLen {action array size in bytes},
+      pStateByteLen{state array size in bytes}: word;
+      // false = creates operation/neurons for non zero entries only.
+      NumNeurons: integer;
+      // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
+      CacheSize: integer
+    );
+    destructor Destroy(); override;
+  end;
+
   procedure CompareComputing(NN1, NN2: TNNet);
   procedure CompareNNStructure(NN, NN2: TNNet);
   procedure TestConvolutionAPI();
@@ -1555,6 +1632,117 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetByteProcessing }
+
+procedure TNNetByteProcessing.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ByteLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  ByteLen := pPrevLayer.Output.Size div 8;
+  if (pPrevLayer.Output.Size mod 8 > 0) then Inc(ByteLen);
+  FByteLearning.Initiate(ByteLen, ByteLen, False{pFullEqual},
+    FStruct[1]{relationTableSize}, FStruct[2]{pNumberOfSearches},
+    (FStruct[0]>0){pUseCache}, FStruct[0]{CacheSize});
+  FOutput.Resize(1, 1, ByteLen*8);
+  FOutputError.Resize(FOutput);
+  SetLength(FByteInput, ByteLen);
+  SetLength(FByteOutput, ByteLen);
+  SetLength(FByteOutputFound, ByteLen);
+  SetLength(FActionBytes, 0);
+  FByteLearning.BytePred.FUseBelief := True;
+  FByteLearning.BytePred.FGeneralize := True;
+end;
+
+constructor TNNetByteProcessing.Create(CacheSize, TestCount,
+  OperationCount: integer);
+begin
+  inherited Create;
+  FStruct[0] := CacheSize;
+  FStruct[1] := TestCount;
+  FStruct[2] := OperationCount;
+end;
+
+destructor TNNetByteProcessing.Destroy;
+begin
+  SetLength(FByteInput, 0);
+  SetLength(FByteOutput, 0);
+  SetLength(FByteOutputFound, 0);
+  inherited Destroy;
+end;
+
+procedure TNNetByteProcessing.Compute();
+begin
+  FPrevLayer.Output.ReadAsBits(FByteInput, 0.0);
+  FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
+  FOutput.CopyAsBits(FByteOutput, -0.5, +0.5);
+end;
+
+procedure TNNetByteProcessing.Backpropagate();
+begin
+  FOutputError.Mul(-1);
+  FOutputError.Add(FOutput);
+  FOutputError.ReadAsBits(FByteOutputFound, 0.0);
+  FByteLearning.newStateFound(FByteOutputFound);
+  // This layer doesn't backpropagate.
+end;
+
+{ TNNetDigital }
+
+constructor TNNetDigital.Create(LowValue, HighValue: integer);
+begin
+  inherited Create();
+  FLowValue := LowValue;
+  FHighValue := HighValue;
+  FMiddleValue := (LowValue + HighValue) / 2;
+  FMiddleDist := (HighValue - LowValue) / 2;
+end;
+
+procedure TNNetDigital.Compute();
+var
+  PosCnt: integer;
+  MaxPos: integer;
+  Value: TNeuralFloat;
+begin
+  MaxPos := FPrevLayer.FOutput.Size - 1;
+
+  for PosCnt := 0 to MaxPos do
+  begin
+    Value := FPrevLayer.FOutput.FData[PosCnt];
+    if Value > FMiddleValue
+    then FOutput.FData[PosCnt] := FHighValue
+    else FOutput.FData[PosCnt] := FLowValue;
+  end;
+end;
+
+procedure TNNetDigital.Backpropagate();
+var
+  MaxOutputCnt: integer;
+  OutputCnt: integer;
+  LocalPrevError: TNNetVolume;
+  LocalError, LocalValue: TNeuralFloat;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+
+  MaxOutputCnt := FOutput.Size - 1;
+  for OutputCnt := 0 to MaxOutputCnt do
+  begin
+    LocalError := FOutputError.FData[OutputCnt];
+    LocalValue := FOutput.FData[OutputCnt];
+    if (Abs(LocalError) > FMiddleDist) then
+    begin
+      if
+        ((LocalValue = FHighValue) and (LocalError > 0)) or
+        ((LocalValue = FLowValue) and (LocalError < 0)) then
+      begin
+        LocalPrevError.FData [OutputCnt] :=
+          LocalPrevError.FData[OutputCnt] + LocalError;
+      end;
+    end;
+  end;
+  FPrevLayer.Backpropagate();
 end;
 
 { TNNetConvolutionSharedWeights }
@@ -8362,16 +8550,19 @@ begin
       end
       else
       begin
-        localNeuron.FBackInertia.MulMulAdd(FInertia, localLearErrorDeriv * (1-FInertia), FPrevLayer.Output);
+        if (FInertia<>0.0) or (localLearErrorDeriv<>0.0) then
+        begin
+          localNeuron.FBackInertia.MulMulAdd(FInertia, localLearErrorDeriv * (1-FInertia), FPrevLayer.Output);
 
-        localNeuron.FBiasInertia :=
-          (1-FInertia)*localLearErrorDeriv +
-          (  FInertia)*localNeuron.FBiasInertia;
-        {$IFDEF CheckRange}
-        NeuronForceRange(localNeuron.FBiasInertia,FLearningRate);
-        {$ENDIF}
+          localNeuron.FBiasInertia :=
+            (1-FInertia)*localLearErrorDeriv +
+            (  FInertia)*localNeuron.FBiasInertia;
+          {$IFDEF CheckRange}
+          NeuronForceRange(localNeuron.FBiasInertia,FLearningRate);
+          {$ENDIF}
 
-        localNeuron.AddInertia();
+          localNeuron.AddInertia();
+        end;
       end;
   end;
   if not FBatchUpdate then AfterWeightUpdate();
@@ -11540,6 +11731,122 @@ begin
   FDelta.Fill(0);
   FBiasDelta := 0;
 end;
+
+constructor TEasyBytePredictionViaNNet.Create(pActionByteLen,
+  pStateByteLen: word; NumNeurons: integer;
+  CacheSize: integer);
+var
+  NNetInputLayer1, NNetInputLayer2, RootLayer: TNNetLayer;
+  BranchCnt: integer;
+  BranchEnd: array of TNNetLayer;
+begin
+  inherited Create(FNN, pActionByteLen, pStateByteLen, CacheSize);
+  SetLength(BranchEnd, pStateByteLen);
+  FNN := TNNet.Create;
+  NNetInputLayer1 := NN.AddLayer( TNNetInput.Create(pActionByteLen*8) );
+  NNetInputLayer2 := NN.AddLayer( TNNetInput.Create(pStateByteLen*8) );
+  RootLayer := NN.AddLayer( TNNetConcat.Create([NNetInputLayer1, NNetInputLayer2]) );
+  NN.AddLayer( TNNetByteProcessing.Create(0, NumNeurons, 40) );
+  NN.AddLayer( TNNetSplitChannels.Create(pActionByteLen*8, pStateByteLen*8) );
+  (*
+  // A traditional NN - one branch for each output byte
+  for BranchCnt := 0 to pStateByteLen - 1 do
+  begin
+    NN.AddLayerAfter( TNNetFullConnect.Create( NumNeurons ), RootLayer);
+    NN.AddLayer( TNNetFullConnect.Create( NumNeurons ) );
+    NN.AddLayer( TNNetFullConnect.Create( NumNeurons ) );
+//    NN.AddGroupedFullConnect(TNNetFullConnect, 4, 80, 0);
+//    NN.AddGroupedFullConnect(TNNetFullConnect, 8, 80, 0);
+//    NN.AddGroupedFullConnect(TNNetFullConnect, 8, 80, 0);
+    NN.AddLayer( TNNetFullConnect.Create( 8 ) );
+    BranchEnd[BranchCnt] := NN.AddLayer( TNNetDigital.Create(-1, +1) );
+  end;
+  NN.AddLayer( TNNetConcat.Create(BranchEnd) );
+  *)
+  NN.SetLearningRate(0.01, 0.0);
+  NN.SetL2Decay(0.0);
+  NN.DebugStructure();
+end;
+
+destructor TEasyBytePredictionViaNNet.Destroy();
+begin
+  NN.Free;
+  inherited Destroy();
+end;
+
+constructor TBytePredictionViaNNet.Create(pNN: TNNet; pActionByteLen,
+  pStateByteLen: word; CacheSize: integer);
+begin
+  inherited Create();
+  FNN := pNN;
+  FActions := TNNetVolume.Create();
+  FStates := TNNetVolume.Create();
+  FPredictedStates := TNNetVolume.Create();
+  FOutput := TNNetVolume.Create();
+  SetLength(aActions, pActionByteLen);
+  SetLength(aCurrentState, pStateByteLen);
+  SetLength(aPredictedState, pStateByteLen);
+  if (CacheSize>0)
+  then FCache.Init(pActionByteLen, pStateByteLen, CacheSize)
+  else FCache.Init(1, 1, 1);
+  FUseCache := (CacheSize>0);
+end;
+
+destructor TBytePredictionViaNNet.Destroy();
+begin
+  FCache.DeInit;
+  FOutput.Free;
+  FActions.Free;
+  FStates.Free;
+  FPredictedStates.Free;
+  inherited Destroy();
+end;
+
+procedure TBytePredictionViaNNet.Predict(var pActions,
+  pCurrentState: array of byte; var pPredictedState: array of byte);
+var
+  idxCache: longint;
+  Equal: boolean;
+begin
+  ABCopy(aActions, pActions);
+  ABCopy(aCurrentState, pCurrentState);
+  if FUseCache then
+    idxCache := FCache.Read(pActions, pPredictedState);
+  Equal := ABCmp(pActions, pCurrentState);
+  if FUseCache and (idxCache <> -1) and Equal then
+  begin
+    FCached := True;
+  end
+  else
+  begin
+    //BytePred.Prediction(aActions, aCurrentState, pPredictedState, FRelationProbability, FVictoryIndex);
+    FActions.CopyAsBits(aActions, -1, 1);
+    FStates.CopyAsBits(pCurrentState, -1, 1);
+    NN.Compute([FActions, FStates]);
+    NN.GetOutput(FPredictedStates);
+    FPredictedStates.ReadAsBits(pPredictedState);
+    FCached := False;
+  end;
+  ABCopy(aPredictedState, pPredictedState);
+end;
+
+function TBytePredictionViaNNet.newStateFound(stateFound: array of byte): extended;
+begin
+  Result := ABCountDif(stateFound, aPredictedState);
+  // Do we have a cached prediction
+  if Not(FCached) then
+  begin
+    FPredictedStates.CopyAsBits(stateFound, -1, 1);
+    // backpropagates only when fails
+    //if Result > 0 then
+    NN.Backpropagate(FPredictedStates);
+    //NN.GetOutput(FOutput);
+    //newStateFound := FOutput.SumDiff(FPredictedStates);
+  end;
+  if FUseCache then
+    FCache.Include(aActions, stateFound);
+end;
+
 
 {$IFDEF Debug}
 procedure TNNetConvolutionBase.PrepareInputForConvolution();

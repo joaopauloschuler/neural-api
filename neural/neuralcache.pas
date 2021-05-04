@@ -28,10 +28,6 @@ unit neuralcache; // this unit used to be called UCashST2 (not sure why)
 
 interface
 
-// maximum number of states to be cached
-const
-  MaxStates = 400000;
-
 // type of key and data in the memory.
 type
   TState = array of byte;
@@ -43,14 +39,17 @@ type
   // This class represents an array such as "Memory[array of byte] maps into array of byte".
   TCacheMem = object
   protected
+    // maximum number of states to be cached
+    FMaxStates: integer;
+
     // indicates that the position is filled with data.
-    FFilledStatePosition: array[0..MaxStates - 1] of boolean;
+    FFilledStatePosition: array of boolean;
 
     // Keys in the memory structure.
-    FKeyStates: array[0..MaxStates - 1] of TState;
+    FKeyStates: array of TState;
 
     // Data stored in the memory structure.
-    DataA: array[0..MaxStates - 1] of TState;
+    DataA: array of TState;
 
     // number of hits in the cache memory.
     NHit: longint;
@@ -60,7 +59,8 @@ type
     NOver: longint;
 
   public
-    procedure Init(StateLength, DataLength: longint);
+    procedure Init(StateLength, DataLength: longint; CacheSize: integer = 1000);
+    procedure DeInit;
 
     // clears the memory
     procedure Clear;
@@ -93,10 +93,10 @@ var
   S: extended;
 begin
   S := 0;
-  for I := 0 to MaxStates - 1 do
+  for I := 0 to FMaxStates - 1 do
     if FFilledStatePosition[I] then
       S := S + 1;
-  Used := S / MaxStates;
+  Used := S / FMaxStates;
 end;
 
 function TCacheMem.HitsOverAll: extended;
@@ -107,7 +107,7 @@ begin
   HitsOverAll := NHit / (T + 0.01);
 end;
 
-procedure TCacheMem.Init(StateLength, DataLength: longint);
+procedure TCacheMem.Init(StateLength, DataLength: longint; CacheSize: integer);
 var
   I: integer;
 begin
@@ -115,7 +115,11 @@ begin
   NHit := 0;
   NMiss := 0;
   NOver := 0;
-  for I := 0 to MaxStates - 1 do
+  FMaxStates := CacheSize;
+  SetLength(FKeyStates, FMaxStates);
+  SetLength(DataA, FMaxStates);
+  SetLength(FFilledStatePosition, FMaxStates);
+  for I := 0 to FMaxStates - 1 do
   begin
     SetLength(FKeyStates[I], StateLength);
     SetLength(DataA[I], DataLength);
@@ -123,11 +127,25 @@ begin
   end;
 end;
 
+procedure TCacheMem.DeInit;
+var
+  I: integer;
+begin
+  for I := 0 to FMaxStates - 1 do
+  begin
+    SetLength(FKeyStates[I], 0);
+    SetLength(DataA[I], 0);
+  end;
+  SetLength(FKeyStates, 0);
+  SetLength(DataA, 0);
+  SetLength(FFilledStatePosition, 0);
+end;
+
 procedure TCacheMem.Clear;
 var
   I: integer;
 begin
-  for I := 0 to MaxStates - 1 do
+  for I := 0 to FMaxStates - 1 do
     FFilledStatePosition[I] := False;
 end;
 
@@ -143,8 +161,8 @@ procedure TCacheMem.Include(var ST, DTA: array of byte);
 var
   POS, POS1: longint;
 begin
-  POS := ABKey(ST, MaxStates);
-  POS1 := (POS + 1) mod MaxStates;
+  POS := ABKey(ST, FMaxStates);
+  POS1 := (POS + 1) mod FMaxStates;
 
   // is it valid entry with wrong/other index?
   if FFilledStatePosition[POS] and not (ABCmp(FKeyStates[POS], ST)){ or
@@ -168,8 +186,8 @@ function TCacheMem.ValidEntry(var ST: array of byte): boolean;
 var
   POS, POS1: longint;
 begin
-  POS := ABKey(ST, MaxStates);
-  POS1 := (POS + 1) mod MaxStates;
+  POS := ABKey(ST, FMaxStates);
+  POS1 := (POS + 1) mod FMaxStates;
   ValidEntry := (FFilledStatePosition[POS] and ABCmp(ST, FKeyStates[POS])) or
     (FFilledStatePosition[POS1] and ABCmp(ST, FKeyStates[POS1]));
 end;
@@ -186,14 +204,14 @@ function TCacheMem.Read(var ST, DTA: array of byte): longint;
 var
   POS: longint;
 begin
-  POS := ABKey(ST, MaxStates);
+  POS := ABKey(ST, FMaxStates);
   if FFilledStatePosition[POS] and ABCmp(ST, FKeyStates[POS]) then
   begin
     PRead(POS);
   end
   else
   begin
-    POS := (POS + 1) mod MaxStates;
+    POS := (POS + 1) mod FMaxStates;
     if FFilledStatePosition[POS] and ABCmp(ST, FKeyStates[POS]) then
       PRead(POS)
     else

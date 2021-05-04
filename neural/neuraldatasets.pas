@@ -157,9 +157,8 @@ type
       function GetFileName(ClassId, ElementId: integer): string; {$IFDEF Release} inline; {$ENDIF}
       procedure AddVolumesTo(Volumes: TNNetVolumeList; EmptySource:boolean = false);
       procedure AddFileNamesTo(FileNames: TFileNameList);
-      procedure MakeMonopolar();
+      procedure MakeMonopolar(Divisor: TNeuralFloat = 4);
       function FileCountAtClassId(ClassId: integer): integer; {$IFDEF Release} inline; {$ENDIF}
-
       procedure LoadImages_NTL(index, threadnum: integer);
   end;
 
@@ -595,7 +594,7 @@ begin
   end;
 end;
 
-procedure TClassesAndElements.MakeMonopolar();
+procedure TClassesAndElements.MakeMonopolar(Divisor: TNeuralFloat);
 var
   SourceVolume: TNNetVolume;
   ClassId, ImageId: integer;
@@ -615,7 +614,7 @@ begin
           if Assigned(SourceVolume) then
           begin
             SourceVolume.Add(2);
-            SourceVolume.Divi(2);
+            SourceVolume.Divi(Divisor);
           end;
         end;
       end;

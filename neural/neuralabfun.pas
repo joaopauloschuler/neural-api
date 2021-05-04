@@ -339,7 +339,7 @@ type
 
 implementation
 
-uses Classes, SysUtils;
+uses Classes, SysUtils, Math;
 
 procedure TTestsClass.DeleteOperation(operationIndex: integer);
 var
@@ -1105,11 +1105,17 @@ begin
 
   if Oper.RunOnAction then
   begin
+    //TODO: this is a hack. We need to find why the range is wrong.
+    StatePosition1 := Min(Self.NumberOfActions - 1, StatePosition1);
+    StatePosition2 := Min(Self.NumberOfActions - 1, StatePosition2);
     Operand1Value := Actions[StatePosition1];
     Operand2Value := Actions[StatePosition2];
   end
   else
   begin
+    //TODO: this is a hack. We need to find why the range is wrong.
+    StatePosition1 := Min(Self.NumberOfCurrentStates - 1, StatePosition1);
+    StatePosition2 := Min(Self.NumberOfCurrentStates - 1, StatePosition2);
     Operand1Value := CurrentStates[StatePosition1];
     Operand2Value := CurrentStates[StatePosition2];
   end;
