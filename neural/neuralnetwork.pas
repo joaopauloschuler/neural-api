@@ -11746,23 +11746,19 @@ begin
   NNetInputLayer1 := NN.AddLayer( TNNetInput.Create(pActionByteLen*8) );
   NNetInputLayer2 := NN.AddLayer( TNNetInput.Create(pStateByteLen*8) );
   RootLayer := NN.AddLayer( TNNetConcat.Create([NNetInputLayer1, NNetInputLayer2]) );
-  NN.AddLayer( TNNetByteProcessing.Create(0, NumNeurons, 40) );
-  NN.AddLayer( TNNetSplitChannels.Create(pActionByteLen*8, pStateByteLen*8) );
-  (*
+  //Experimental implementation with TNNetByteProcessing
+  //NN.AddLayer( TNNetByteProcessing.Create(0, NumNeurons, 40) );
+  //NN.AddLayer( TNNetSplitChannels.Create(pActionByteLen*8, pStateByteLen*8) );
   // A traditional NN - one branch for each output byte
   for BranchCnt := 0 to pStateByteLen - 1 do
   begin
     NN.AddLayerAfter( TNNetFullConnect.Create( NumNeurons ), RootLayer);
     NN.AddLayer( TNNetFullConnect.Create( NumNeurons ) );
     NN.AddLayer( TNNetFullConnect.Create( NumNeurons ) );
-//    NN.AddGroupedFullConnect(TNNetFullConnect, 4, 80, 0);
-//    NN.AddGroupedFullConnect(TNNetFullConnect, 8, 80, 0);
-//    NN.AddGroupedFullConnect(TNNetFullConnect, 8, 80, 0);
     NN.AddLayer( TNNetFullConnect.Create( 8 ) );
-    BranchEnd[BranchCnt] := NN.AddLayer( TNNetDigital.Create(-1, +1) );
+    BranchEnd[BranchCnt] := NN.GetLastLayer(); // NN.AddLayer( TNNetDigital.Create(-1, +1) );
   end;
   NN.AddLayer( TNNetConcat.Create(BranchEnd) );
-  *)
   NN.SetLearningRate(0.01, 0.0);
   NN.SetL2Decay(0.0);
   NN.DebugStructure();
@@ -11843,7 +11839,7 @@ begin
     //NN.GetOutput(FOutput);
     //newStateFound := FOutput.SumDiff(FPredictedStates);
   end;
-  if FUseCache then
+  if FUseCache and (Result = 0) then
     FCache.Include(aActions, stateFound);
 end;
 
