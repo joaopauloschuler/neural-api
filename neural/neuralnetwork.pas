@@ -1226,15 +1226,15 @@ type
       function GetRandomLayer(): TNNetLayer;
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
-      procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput: array of TNNetVolume); overload;
       procedure Compute(pInput: array of TNeuralFloatDynArr); overload;
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
-      procedure Backpropagate(pOutput: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Backpropagate(pOutput: TNNetVolume); overload;
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
       procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
       procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
-      procedure GetOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
+      procedure GetOutput(pOutput: TNNetVolume);
       procedure AddOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure SetActivationFn(ActFn, ActFnDeriv: TNeuralActivationFunction);
       procedure SetLearningRate(pLearningRate, pInertia: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -1445,6 +1445,22 @@ type
   end;
 
   // This class is very experimental - do not use it.
+  TNNetForByteProcessing = class(TNNet)
+    private
+      FInput, FOutput: TNNetVolume;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+
+      procedure AddBasicByteProcessingLayers(InputByteCount, OutputByteCount: integer;
+        FullyConnectedLayersCnt: integer = 3; NeuronsPerPath: integer = 16);
+
+      procedure Compute(var pInput: array of byte);
+      procedure Backpropagate(var pOutput: array of byte);
+      procedure GetOutput(var pOutput: array of byte);
+  end;
+
+  // This class is very experimental - do not use it.
   TBytePredictionViaNNet = class(TMObject)
   private
     FNN: TNNet;
@@ -1633,6 +1649,70 @@ begin
     );
   end;
 end;
+
+{ TNNetForByteProcessing }
+
+constructor TNNetForByteProcessing.Create();
+begin
+  inherited Destroy();
+  FInput := TNNetVolume.Create();
+  FOutput := TNNetVolume.Create();
+end;
+
+destructor TNNetForByteProcessing.Destroy();
+begin
+  FOutput.Free;
+  FInput.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetForByteProcessing.AddBasicByteProcessingLayers(InputByteCount,
+  OutputByteCount, FullyConnectedLayersCnt, NeuronsPerPath: integer);
+var
+  BranchCnt: integer;
+  BranchEnd: array of TNNetLayer;
+  NNetInputLayer: TNNetLayer;
+  LayerCnt: integer;
+begin
+  SetLength(BranchEnd, OutputByteCount);
+  NNetInputLayer := AddLayer( TNNetInput.Create(InputByteCount*8) );
+  for BranchCnt := 0 to OutputByteCount - 1 do
+  begin
+    AddLayerAfter( TNNetFullConnect.Create( NeuronsPerPath ), NNetInputLayer);
+    if FullyConnectedLayersCnt > 1 then
+    begin
+      for LayerCnt := 2 to FullyConnectedLayersCnt do
+      begin
+        AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
+      end;
+    end;
+    AddLayer( TNNetFullConnect.Create( 8 ) );
+    BranchEnd[BranchCnt] := GetLastLayer();
+  end;
+  AddLayer( TNNetConcat.Create(BranchEnd) );
+  SetLearningRate(0.01, 0.0);
+  SetL2Decay(0.0);
+  SetLength(BranchEnd, 0);
+end;
+
+procedure TNNetForByteProcessing.Compute(var pInput: array of byte);
+begin
+  FInput.CopyAsBits(pInput, -0.5, +0.5);
+  inherited Compute(FInput);
+end;
+
+procedure TNNetForByteProcessing.Backpropagate(var pOutput: array of byte);
+begin
+  FOutput.CopyAsBits(pOutput);
+  inherited Backpropagate(FOutput);
+end;
+
+procedure TNNetForByteProcessing.GetOutput(var pOutput: array of byte);
+begin
+  inherited GetOutput(FOutput);
+  FOutput.ReadAsBits(pOutput);
+end;
+
 
 { TNNetByteProcessing }
 
