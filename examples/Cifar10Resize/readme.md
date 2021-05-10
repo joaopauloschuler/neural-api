@@ -8,6 +8,12 @@ Please refer to https://www.cs.toronto.edu/~kriz/cifar.html and to [Learning Mul
 ## Resizing Images
 Plenty of modern neural network architectures wont work with small images. 
 You may look at this [API example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) if you are curious to know more about how the resizing internally works. There is also [this bug report](https://github.com/joaopauloschuler/neural-api/issues/26) that gives insights about how it was built.
+<p>
+  <img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/bird.png?raw=true"> </img>
+</p>
+<p>
+  <img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/stealth.png?raw=true"> </img>
+</p>
 
 ## Download
 You can download resized images from:
