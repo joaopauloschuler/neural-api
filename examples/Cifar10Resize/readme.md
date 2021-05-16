@@ -1,0 +1,21 @@
+# CIFAR-10 Resized
+This folder contains a program that resizes CIFAR-10 images to 64x64, 128x128 and 256x256 pixels. 
+
+## Original Work
+The [CIFAR-10 Dataset](https://www.cs.toronto.edu/~kriz/cifar.html) is a fantastic contribution to computer science made by the original authors.
+Please refer to https://www.cs.toronto.edu/~kriz/cifar.html and to [Learning Multiple Layers of Features from Tiny Images, Alex Krizhevsky, 2009](https://www.cs.toronto.edu/~kriz/learning-features-2009-TR.pdf) for the original work.
+
+## Resizing Images
+Plenty of modern neural network architectures wont work with small images. 
+You may look at this [API example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) if you are curious to know more about how the resizing internally works. There is also [this bug report](https://github.com/joaopauloschuler/neural-api/issues/26) that gives insights about how it was built.
+<p>
+  <img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/bird.png?raw=true"> </img>
+</p>
+<p>
+  <img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/stealth.png?raw=true"> </img>
+</p>
+
+## Download
+You can download resized images from:
+* https://www.kaggle.com/joaopauloschuler/cifar10-64x64-resized-via-cai-super-resolution
+* https://www.kaggle.com/joaopauloschuler/cifar10-128x128-resized-via-cai-super-resolution
