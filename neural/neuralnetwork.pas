@@ -91,6 +91,7 @@ const
   csMaxInterleavedSize: integer = 95;
 
 type
+  TNNet = class;
   { TNNetNeuron }
   TNNetNeuron = class (TMObject)
     protected
@@ -177,6 +178,7 @@ type
       FDepartingBranchesCnt: integer;
       FBackPropCallCurrentCnt: integer;
       FLinkedNeurons: boolean;
+      FNN: TNNet;
 
       procedure InitStruct();
     private
@@ -265,6 +267,7 @@ type
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
       property ActivationFnDerivative: TNeuralActivationFunction read FActivationFnDerivative write FActivationFnDerivative;
       property Neurons: TNNetNeuronList read FNeurons;
+      property NN:TNNet read FNN write FNN;
       property Output: TNNetVolume read FOutput;
       property OutputRaw: TNNetVolume read FOutputRaw;
       property PrevLayer: TNNetLayer read FPrevLayer write SetPrevLayer;
@@ -600,6 +603,32 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+  end;
+
+  // This is an experimental class. Do not use it.
+  TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
+    private
+      FLayerWithChannelsIdx, FLayerMulIdx: integer;
+      FLayerWithChannels, FLayerMul: TNNetLayer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(LayerWithChannels, LayerMul: TNNetLayer);
+      constructor Create(LayerWithChannelsIdx, LayerMulIdx: integer);
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  // This is an experimental class. Do not use it.
+  TNNetCellMulByLayer = class(TNNetChannelTransformBase)
+    private
+      FLayerAIdx, FLayerBIdx: integer;
+      FLayerA, FLayerB: TNNetLayer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(LayerA, LayerB: TNNetLayer);
+      constructor Create(LayerAIdx, LayerBIdx: integer);
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
   end;
 
   /// This layer adds a trainable bias to each output cell. Placing
@@ -1650,8 +1679,77 @@ begin
   end;
 end;
 
-{ TNNetForByteProcessing }
+procedure TNNetCellMulByLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  FLayerA := pPrevLayer.NN.Layers[FLayerAIdx];
+  FLayerB := pPrevLayer.NN.Layers[FLayerBIdx];
+  FLayerA.IncDepartingBranchesCnt();
+  FLayerB.IncDepartingBranchesCnt();
+  inherited SetPrevLayer(FLayerA);
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  if FLayerA.Output.Size <> FLayerB.Output.Size then
+  begin
+    FErrorProc('TNNetCellMulByLayer - A size is ' +
+      IntToStr(FLayerA.Output.Size) +
+      ' does not match B size ' + IntToStr(FLayerB.Output.Size)
+    );
+  end;
+end;
 
+constructor TNNetCellMulByLayer.Create(LayerA, LayerB: TNNetLayer);
+begin
+  Self.Create(LayerA.LayerIdx, LayerB.LayerIdx);
+end;
+
+constructor TNNetCellMulByLayer.Create(LayerAIdx, LayerBIdx: integer);
+begin
+  inherited Create();
+  FLayerAIdx := LayerAIdx;
+  FLayerBIdx := LayerBIdx;
+  FStruct[0] := LayerAIdx;
+  FStruct[1] := LayerBIdx;
+end;
+
+procedure TNNetCellMulByLayer.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FLayerA.Output.Size <> FLayerB.Output.Size then
+  begin
+    FErrorProc('TNNetCellMulByLayer - A size is ' +
+      IntToStr(FLayerA.Output.Size) +
+      ' does not match B size ' + IntToStr(FLayerB.Output.Size)
+    );
+  end;
+  {$ENDIF}
+  FOutput.Mul(FLayerB.Output);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCellMulByLayer.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  StartTime := Now();
+  // Calculates the FLayerA Error
+  FOutputErrorDeriv.Copy(FOutputError);
+  FOutputErrorDeriv.Mul(FLayerA.Output);
+  FLayerB.OutputError.Add(FOutputErrorDeriv);
+  // Calculates the FLayerB Error
+  FOutputErrorDeriv.Copy(FOutputError);
+  FOutputErrorDeriv.Mul(FLayerB.Output);
+  FLayerA.OutputError.Add(FOutputErrorDeriv);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FLayerA.Backpropagate();
+  FLayerB.Backpropagate();
+end;
+
+{ TNNetForByteProcessing }
 constructor TNNetForByteProcessing.Create();
 begin
   inherited Destroy();
@@ -3386,6 +3484,79 @@ begin
   SetNumWeightsForAllNeurons(FOutput);
   FOutputError.ReSize(FOutput);
   InitDefault();
+end;
+
+procedure TNNetChannelMulByLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  FLayerWithChannels := pPrevLayer.NN.Layers[FLayerWithChannelsIdx];
+  FLayerMul := pPrevLayer.NN.Layers[FLayerMulIdx];
+  FLayerWithChannels.IncDepartingBranchesCnt();
+  FLayerMul.IncDepartingBranchesCnt();
+  inherited SetPrevLayer(FLayerWithChannels);
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  if FLayerWithChannels.Output.Depth <> FLayerMul.Output.Size then
+  begin
+    FErrorProc('TNNetChannelMulByLayer - Channels in origin ' +
+      IntToStr(FLayerWithChannels.Output.Depth) +
+      ' do not match operand size ' + IntToStr(FLayerMul.Output.Size)
+    );
+  end;
+end;
+
+constructor TNNetChannelMulByLayer.Create(LayerWithChannels, LayerMul: TNNetLayer);
+begin
+  Self.Create(LayerWithChannels.LayerIdx, LayerMul.LayerIdx);
+end;
+
+constructor TNNetChannelMulByLayer.Create(LayerWithChannelsIdx, LayerMulIdx: integer);
+begin
+  inherited Create();
+  FLayerWithChannelsIdx := LayerWithChannelsIdx;
+  FLayerMulIdx := LayerMulIdx;
+  FStruct[0] := LayerWithChannelsIdx;
+  FStruct[1] := LayerMulIdx;
+end;
+
+procedure TNNetChannelMulByLayer.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FLayerWithChannels.Output.Depth <> FLayerMul.Output.Size then
+  begin
+    FErrorProc('TNNetChannelMulByLayer - Channels in origin ' +
+      IntToStr(FLayerWithChannels.Output.Depth) +
+      ' does not match operand size ' + IntToStr(FLayerMul.Output.Size)
+    );
+  end;
+  {$ENDIF}
+  FOutput.MulChannels(FLayerMul.Output);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetChannelMulByLayer.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  StartTime := Now();
+  // Calculates the FLayerWithChannels Error
+  FOutputErrorDeriv.Copy(FOutputError);
+  FOutputErrorDeriv.MulChannels(FLayerMul.Output);
+  FLayerWithChannels.OutputError.Add(FOutputErrorDeriv);
+  // Calculates the FLayerMul Error
+  FOutputErrorDeriv.Copy(FOutputError);
+  FOutputErrorDeriv.Mul(FLayerWithChannels.Output);
+  FAuxDepth.Fill(0);
+  FAuxDepth.AddSumChannel(FOutputErrorDeriv);
+  FAuxDepth.Divi(FOutputChannelSize);
+  FLayerMul.OutputError.Add(FAuxDepth);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FLayerWithChannels.Backpropagate();
+  FLayerMul.Backpropagate();
 end;
 
 procedure TNNetCellBias.Compute();
@@ -5453,6 +5624,26 @@ begin
   NN.Clear;
 
   (*
+  WriteLn('Test DeMaxPool:');
+
+  NN.AddLayer( TNNetInput.Create(2,2,1) );
+  NN.AddLayer( TNNetDeMaxPool.Create(2, 1) );
+  AuxVolume.Resize(2,2,1);
+  AuxVolume.FillForDebug();
+  NN.Compute(AuxVolume);
+  NN.GetOutput(AuxVolume);
+
+  WriteLn('MaxPool Output:');
+  AuxVolume.PrintWithIndex();
+  NN.AddLayer( TNNetConvolutionLinear.Create(1,3,0,0) );
+
+  AuxVolume.Resize(2,2,1);
+  AuxVolume.FillForDebug();
+  NN.Compute(AuxVolume);
+  NN.GetOutput(AuxVolume);
+  WriteLn('Convolution Output:');
+  AuxVolume.PrintWithIndex();
+
   WriteLn('Test MaxPool:');
 
   NN.AddLayer( TNNetInput.Create(4,4,1) );
@@ -6122,10 +6313,10 @@ begin
   begin
     for CntX := 0 to MaxX do
     begin
-      OutX := CntX*FPoolSize;
+      OutX := CntX*FPoolSize + Random(FPoolSize);
       for CntY := 0 to MaxY do
       begin
-        OutY := CntY*FPoolSize;
+        OutY := CntY*FPoolSize + Random(FPoolSize);
         PrevLayerRawPos := FPrevLayer.FOutput.GetRawPos(CntX,CntY,0);
         OutputRawPos := FOutput.GetRawPos(OutX,OutY,0);
         for CntD := 0 to MaxD do
@@ -6190,6 +6381,7 @@ begin
 
   floatPoolSize := FPoolSize;
 
+(*
   if FSpacing = 1 then
   begin
     MaxX := FPrevLayer.FOutput.SizeX - 1;
@@ -6216,11 +6408,11 @@ begin
       end;
     end;
   end
-  else
+  else *)
   begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    FOutputError.Divi(floatPoolSize);
+    if (FSpacing=0) then FOutputError.Divi(floatPoolSize);
     for CntY := 0 to MaxY do
     begin
       PrevPosY := CntY div FPoolSize;
@@ -6231,12 +6423,15 @@ begin
         PrevRawPos := FPrevLayer.FOutputError.GetRawPos(PrevPosX, PrevPosY, 0);
         for CntD := 0 to MaxD do
         begin
-          {$IFDEF FPC}
-          FPrevLayer.FOutputError.FData[PrevRawPos] += FOutPutError.FData[RawPos];
-          {$ELSE}
-          FPrevLayer.FOutputError.FData[PrevRawPos] :=
-            FPrevLayer.FOutputError.FData[PrevRawPos] + FOutPutError.FData[RawPos];
-          {$ENDIF}
+          if (FSpacing=0) or (FOutPut.FData[RawPos]<>0) then
+          begin
+            {$IFDEF FPC}
+            FPrevLayer.FOutputError.FData[PrevRawPos] += FOutPutError.FData[RawPos];
+            {$ELSE}
+            FPrevLayer.FOutputError.FData[PrevRawPos] :=
+              FPrevLayer.FOutputError.FData[PrevRawPos] + FOutPutError.FData[RawPos];
+            {$ENDIF}
+          end;
           Inc(RawPos);
           Inc(PrevRawPos);
         end;
@@ -8918,8 +9113,10 @@ begin
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
+      'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
+      'TNNetCellMulByLayer':        Result := TNNetCellMulByLayer.Create(St[0], St[1]);
       'TNNetRandomMulAdd':          Result := TNNetRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelRandomMulAdd':   Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelZeroCenter':     Result := TNNetChannelZeroCenter.Create();
@@ -8993,8 +9190,10 @@ begin
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
+      if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
+      if S[0] = 'TNNetCellMulByLayer' then Result := TNNetCellMulByLayer.Create(St[0], St[1]);
       if S[0] = 'TNNetRandomMulAdd' then Result := TNNetRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelRandomMulAdd' then Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelZeroCenter' then Result := TNNetChannelZeroCenter.Create() else
@@ -9017,11 +9216,13 @@ function TNNet.AddLayer(pLayer: TNNetLayer):TNNetLayer;
 var
   AfterLayer: TNNetLayer;
 begin
+  pLayer.NN := Self;
   if CountLayers()>0 then
   begin
     AfterLayer := FLayers[CountLayers() - 1];
     pLayer.SetPrevLayer(AfterLayer);
-    if Not(pLayer is TNNetConcatBase) then AfterLayer.IncDepartingBranchesCnt();
+    if Not((pLayer is TNNetConcatBase) or (pLayer is TNNetChannelMulByLayer))
+      then AfterLayer.IncDepartingBranchesCnt();
   end;
   FLayers.Add(pLayer);
   pLayer.FLayerIdx := GetLastLayerIdx();
@@ -9367,6 +9568,7 @@ function TNNet.AddLayerAfter(pLayer, pAfterLayer: TNNetLayer): TNNetLayer;
 begin
   if Assigned(pAfterLayer) then
   begin
+    pLayer.NN := Self;
     pLayer.SetPrevLayer(pAfterLayer);
     FLayers.Add(pLayer);
     pLayer.FLayerIdx := GetLastLayerIdx();
@@ -9382,6 +9584,7 @@ end;
 function TNNet.AddLayerAfter(pLayer: TNNetLayer; pAfterLayerIdx: integer
   ): TNNetLayer;
 begin
+  pLayer.NN := Self;
   if pAfterLayerIdx >= 0 then
   begin
     pLayer.SetPrevLayer(FLayers[pAfterLayerIdx]);
