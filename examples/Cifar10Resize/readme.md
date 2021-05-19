@@ -19,3 +19,4 @@ You may look at this [API example](https://github.com/joaopauloschuler/neural-ap
 You can download resized images from:
 * https://www.kaggle.com/joaopauloschuler/cifar10-64x64-resized-via-cai-super-resolution
 * https://www.kaggle.com/joaopauloschuler/cifar10-128x128-resized-via-cai-super-resolution
+* https://www.kaggle.com/joaopauloschuler/cifar100-128x128-resized-via-cai-super-resolution
