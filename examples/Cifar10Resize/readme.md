@@ -1,5 +1,5 @@
 # CIFAR-10 Resized
-This folder contains a program that resizes CIFAR-10 images to 64x64 and 128x128 pixels. 
+This folder contains a program that resizes CIFAR-10 and CIFAR-100 images to 64x64 and 128x128 pixels. 
 
 ## Original Work
 The [CIFAR-10 Dataset](https://www.cs.toronto.edu/~kriz/cifar.html) is a fantastic contribution to computer science made by the original authors.
