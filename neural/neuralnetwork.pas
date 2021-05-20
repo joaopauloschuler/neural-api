@@ -619,7 +619,7 @@ type
   end;
 
   // This is an experimental class. Do not use it.
-  TNNetCellMulByLayer = class(TNNetChannelTransformBase)
+  TNNetCellMulByCell = class(TNNetChannelTransformBase)
     private
       FLayerAIdx, FLayerBIdx: integer;
       FLayerA, FLayerB: TNNetLayer;
@@ -1679,7 +1679,7 @@ begin
   end;
 end;
 
-procedure TNNetCellMulByLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
+procedure TNNetCellMulByCell.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   FLayerA := pPrevLayer.NN.Layers[FLayerAIdx];
   FLayerB := pPrevLayer.NN.Layers[FLayerBIdx];
@@ -1696,12 +1696,12 @@ begin
   end;
 end;
 
-constructor TNNetCellMulByLayer.Create(LayerA, LayerB: TNNetLayer);
+constructor TNNetCellMulByCell.Create(LayerA, LayerB: TNNetLayer);
 begin
   Self.Create(LayerA.LayerIdx, LayerB.LayerIdx);
 end;
 
-constructor TNNetCellMulByLayer.Create(LayerAIdx, LayerBIdx: integer);
+constructor TNNetCellMulByCell.Create(LayerAIdx, LayerBIdx: integer);
 begin
   inherited Create();
   FLayerAIdx := LayerAIdx;
@@ -1710,7 +1710,7 @@ begin
   FStruct[1] := LayerBIdx;
 end;
 
-procedure TNNetCellMulByLayer.Compute();
+procedure TNNetCellMulByCell.Compute();
 var
   StartTime: double;
 begin
@@ -1729,7 +1729,7 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
-procedure TNNetCellMulByLayer.Backpropagate();
+procedure TNNetCellMulByCell.Backpropagate();
 var
   StartTime: double;
 begin
@@ -1752,7 +1752,7 @@ end;
 { TNNetForByteProcessing }
 constructor TNNetForByteProcessing.Create();
 begin
-  inherited Destroy();
+  inherited Create();
   FInput := TNNetVolume.Create();
   FOutput := TNNetVolume.Create();
 end;
@@ -1770,6 +1770,7 @@ var
   BranchCnt: integer;
   BranchEnd: array of TNNetLayer;
   NNetInputLayer: TNNetLayer;
+  //ASide, BSide: TNNetLayer;
   LayerCnt: integer;
 begin
   SetLength(BranchEnd, OutputByteCount);
@@ -1782,6 +1783,12 @@ begin
       for LayerCnt := 2 to FullyConnectedLayersCnt do
       begin
         AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
+        //ASide := AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
+        //BSide := AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
+        //AddLayer( TNNetCellMulByCell.Create(ASide, BSide) ); // AND block
+        //AddLayer( TNNetFullConnectDiff.Create(NeuronsPerPath*2) );
+        //AddLayer( TNNetReLU.Create() );
+        //AddLayer( TNNetConcat.Create([ASide, BSide] ) );
       end;
     end;
     AddLayer( TNNetFullConnect.Create( 8 ) );
@@ -9116,7 +9123,7 @@ begin
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
-      'TNNetCellMulByLayer':        Result := TNNetCellMulByLayer.Create(St[0], St[1]);
+      'TNNetCellMulByCell':         Result := TNNetCellMulByCell.Create(St[0], St[1]);
       'TNNetRandomMulAdd':          Result := TNNetRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelRandomMulAdd':   Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelZeroCenter':     Result := TNNetChannelZeroCenter.Create();
@@ -9193,7 +9200,7 @@ begin
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
-      if S[0] = 'TNNetCellMulByLayer' then Result := TNNetCellMulByLayer.Create(St[0], St[1]);
+      if S[0] = 'TNNetCellMulByCell' then Result := TNNetCellMulByCell.Create(St[0], St[1]);
       if S[0] = 'TNNetRandomMulAdd' then Result := TNNetRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelRandomMulAdd' then Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelZeroCenter' then Result := TNNetChannelZeroCenter.Create() else
