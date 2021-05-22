@@ -618,7 +618,8 @@ type
       procedure Backpropagate(); override;
   end;
 
-  // This is an experimental class. Do not use it.
+  /// This layer multiplies each cell from one branch to each cell from another
+  // branch.
   TNNetCellMulByCell = class(TNNetChannelTransformBase)
     private
       FLayerAIdx, FLayerBIdx: integer;
@@ -1214,6 +1215,10 @@ type
         Groups, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
         pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
+      function AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
+        MinGroupSize, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
+        pSuppressBias: integer = 0;
+        ChannelInterleaving: boolean = True): TNNetLayer;
       function AddGroupedFullConnect(FullConnect: TNNetFullConnectClass;
         Groups, pNumFeatures: integer; pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
@@ -1240,6 +1245,8 @@ type
         pActFn: TNNetActivationFunctionClass = nil;
         pAfterLayer: TNNetLayer = nil): TNNetLayer; overload;
       function AddCompression(Compression: TNeuralFloat = 0.5; supressBias: integer = 1): TNNetLayer;
+      function AddGroupedCompression(Compression: TNeuralFloat = 0.5;
+        MinGroupSize:integer = 16; supressBias: integer = 1): TNNetLayer;
       /// This function does both max and min pools and then concatenates results.
       function AddMinMaxPool(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0): TNNetLayer;
       function AddAvgMaxPool(pPoolSize: integer; pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
@@ -1251,7 +1258,7 @@ type
       function GetFirstImageNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFirstNeuronalLayerIdxWithChannels(FromLayerIdx, Channels:integer): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
-      function GetLastLayer(): TNNetLayer; {$IFDEF Release} inline; {$ENDIF}
+      function GetLastLayer(): TNNetLayer;
       function GetRandomLayer(): TNNetLayer;
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
@@ -1340,6 +1347,9 @@ type
       // deprecated
       procedure MulWeightsGlorotBengio(V:TNeuralFloat); deprecated;
       procedure MulWeightsHe(V:TNeuralFloat); deprecated;
+
+      // custom layers support
+      function ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean; virtual;
 
     published
       property BackwardTime: double read FBackwardTime write FBackwardTime;
@@ -1770,7 +1780,7 @@ var
   BranchCnt: integer;
   BranchEnd: array of TNNetLayer;
   NNetInputLayer: TNNetLayer;
-  //ASide, BSide: TNNetLayer;
+  //ASide, BSide, ASideEnd, BSideEnd, NewBranch, MainTrunk: TNNetLayer;
   LayerCnt: integer;
 begin
   SetLength(BranchEnd, OutputByteCount);
@@ -1783,12 +1793,15 @@ begin
       for LayerCnt := 2 to FullyConnectedLayersCnt do
       begin
         AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
-        //ASide := AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
-        //BSide := AddLayer( TNNetFullConnect.Create( NeuronsPerPath ) );
-        //AddLayer( TNNetCellMulByCell.Create(ASide, BSide) ); // AND block
+        //MainTrunk := GetLastLayer();
+        //ASide := AddLayerAfter( TNNetFullConnect.Create( NeuronsPerPath div 2 ), MainTrunk);
+        //ASideEnd := AddLayer( TNNetFullConnect.Create( NeuronsPerPath div 2) );
+        //BSide := AddLayerAfter( TNNetFullConnect.Create( NeuronsPerPath div 2 ), MainTrunk);
+        //BSideEnd := AddLayer( TNNetFullConnect.Create( NeuronsPerPath div 2) );
+        //NewBranch := AddLayer( TNNetCellMulByCell.Create(ASide, BSide) ); // AND block
         //AddLayer( TNNetFullConnectDiff.Create(NeuronsPerPath*2) );
         //AddLayer( TNNetReLU.Create() );
-        //AddLayer( TNNetConcat.Create([ASide, BSide] ) );
+        //AddLayer( TNNetConcat.Create([ ASide, BSide, NewBranch] ) ); // GetLastLayer(),
       end;
     end;
     AddLayer( TNNetFullConnect.Create( 8 ) );
@@ -4484,6 +4497,10 @@ begin
         begin
           if pBefore <> nil then AddLayer( pBefore.Create() );
           AddLayer( PointWiseConv.Create(BottleNeck, {featuresize}1, {padding}0, {stride}1, supressBias) );
+          //AddAutoGroupedConvolution(PointWiseConv,
+          //  {MinGroupSize=}16, {pNumFeatures=}BottleNeck, {pFeatureSize=}1,
+          //  {pInputPadding=}0, {pStride=}1, supressBias,
+          //  {ChannelInterleaving=} true);
           if pAfter <> nil then AddLayer( pAfter.Create() );
         end;
       end;
@@ -4524,6 +4541,10 @@ begin
         begin
           if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
           AddLayer( PointWiseConv.Create(BottleNeck, {featuresize}1, {padding}0, {stride}1, supressBias) );
+          //AddAutoGroupedConvolution(PointWiseConv,
+          //  {MinGroupSize=}16, {pNumFeatures=}BottleNeck, {pFeatureSize=}1,
+          //  {pInputPadding=}0, {pStride=}1, supressBias,
+          //  {ChannelInterleaving=} true);
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
       end;
@@ -9219,6 +9240,15 @@ begin
   S.Free;
 end;
 
+function TNNet.ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean;
+begin
+  Result := Not(
+    (pLayer is TNNetConcatBase) or
+    (pLayer is TNNetChannelMulByLayer) or
+    (pLayer is TNNetCellMulByCell)
+  );
+end;
+
 function TNNet.AddLayer(pLayer: TNNetLayer):TNNetLayer;
 var
   AfterLayer: TNNetLayer;
@@ -9228,7 +9258,7 @@ begin
   begin
     AfterLayer := FLayers[CountLayers() - 1];
     pLayer.SetPrevLayer(AfterLayer);
-    if Not((pLayer is TNNetConcatBase) or (pLayer is TNNetChannelMulByLayer))
+    if ShouldIncDepartingBranchesCnt(pLayer)
       then AfterLayer.IncDepartingBranchesCnt();
   end;
   FLayers.Add(pLayer);
@@ -9334,6 +9364,22 @@ begin
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
   SetLength(EachGroupOutput, 0);
+end;
+
+function TNNet.AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
+  MinGroupSize, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
+  pSuppressBias: integer; ChannelInterleaving: boolean): TNNetLayer;
+var
+  MaxGroupCount: integer;
+  GroupCount: integer;
+  PrevLayerChannelCount: integer;
+begin
+  PrevLayerChannelCount := GetLastLayer().Output.Depth;
+  MaxGroupCount := (PrevLayerChannelCount div MinGroupSize);
+  GroupCount := GetMaxAcceptableCommonDivisor(
+    PrevLayerChannelCount, pNumFeatures, MaxGroupCount);
+  Result := AddGroupedConvolution(Conv2d, GroupCount, pNumFeatures,
+    pFeatureSize, pInputPadding, pStride, pSuppressBias, ChannelInterleaving);
 end;
 
 function TNNet.AddGroupedFullConnect(FullConnect: TNNetFullConnectClass;
@@ -9482,6 +9528,21 @@ end;
 function TNNet.AddCompression(Compression: TNeuralFloat; supressBias: integer): TNNetLayer;
 begin
   AddLayer( TNNetPointwiseConvLinear.Create(Round(GetLastLayer().Output.Depth * Compression ), supressBias) );
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddGroupedCompression(Compression: TNeuralFloat;
+  MinGroupSize:integer; supressBias: integer): TNNetLayer;
+var
+  FilterCount: integer;
+begin
+  FilterCount := Round(GetLastLayer().Output.Depth * Compression );
+  if Odd(FilterCount) then Inc(FilterCount);
+  //AddLayer( TNNetPointwiseConvLinear.Create(, supressBias) );
+  AddAutoGroupedConvolution(TNNetPointwiseConvLinear,
+    {MinGroupSize=}MinGroupSize, {pNumFeatures=}FilterCount, {pFeatureSize=}1,
+    {pInputPadding=}0, {pStride=}1, supressBias,
+    {ChannelInterleaving=} true);
   Result := GetLastLayer();
 end;
 
