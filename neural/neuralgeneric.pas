@@ -53,7 +53,18 @@ type
 function MaxSingle(x, y: single): single;
 function GetMaxDivisor(x, acceptableMax: integer): integer;
 
+/// This is an inefficient max acceptable common divisor implementation to be improved.
+//  # Arguments
+//     a: is an integer.
+//     b: is an integer.
+//     max_acceptable: maximum acceptable common divisor.
+// This implementation has been ported from:
+// https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/util.py
+function GetMaxAcceptableCommonDivisor(a, b: integer;
+  max_acceptable: integer=1000000):integer;
+
 implementation
+uses math;
 
 function GetMaxDivisor(x, acceptableMax: integer): integer;
 begin
@@ -70,6 +81,23 @@ begin
       Dec(Result);
     end;
   end;
+end;
+
+function GetMaxAcceptableCommonDivisor(a, b: integer;
+  max_acceptable: integer=1000000):integer;
+var
+  divisor: integer;
+begin
+ divisor := Max(1, Min(Min(a, b), max_acceptable));
+ while (divisor > 0) do
+ begin
+   if (a mod divisor=0) and (b mod divisor=0) then
+   begin
+     break;
+   end;
+   Dec(divisor);
+ end;
+ Result := divisor;
 end;
 
 constructor TIncDec.Init(PMin, PMax, PStep, Start: longint);
