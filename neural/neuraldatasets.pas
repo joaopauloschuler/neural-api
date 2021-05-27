@@ -863,22 +863,22 @@ procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
   Verbose:boolean = true);
 var
-  I, HalfSize, LastElement: integer;
+  I, LastElement: integer;
 begin
   ImgTrainingVolumes := TNNetVolumeList.Create();
+  ImgTrainingVolumes.FreeObjects := false;
   ImgValidationVolumes := TNNetVolumeList.Create();
   ImgTestVolumes := TNNetVolumeList.Create();
   loadCifar100Dataset(ImgTrainingVolumes, 'train.bin', color_encoding, Verbose);
-  loadCifar100Dataset(ImgValidationVolumes, 'test.bin', color_encoding, Verbose);
-  ImgValidationVolumes.FreeObjects := false;
-  HalfSize := ImgValidationVolumes.Count div 2;
-  LastElement := ImgValidationVolumes.Count - 1;
-  for I := LastElement downto HalfSize do
+  loadCifar100Dataset(ImgTestVolumes, 'test.bin', color_encoding, Verbose);
+
+  LastElement := ImgTrainingVolumes.Count - 1;
+  for I := LastElement downto (LastElement-4999) do
   begin
-    ImgTestVolumes.Add(ImgValidationVolumes[I]);
-    ImgValidationVolumes.Delete(I);
+    ImgValidationVolumes.Add(ImgTrainingVolumes[I]);
+    ImgTrainingVolumes.Delete(I);
   end;
-  ImgValidationVolumes.FreeObjects := true;
+  ImgTrainingVolumes.FreeObjects := true;
 end;
 
 procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
