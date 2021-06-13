@@ -288,12 +288,21 @@ This API is really big. The following list gives a general idea about this API b
 
 ### Closest Layer Types to Other APIs (work in progress)
 
-CAI                       | Keras                               | PyTorch
-------------------------- | ----------------------------------- | -------------------------
-TNNetFullConnect          | layers.Dense(activation='thanh')    | nn.Linear nn.Tanh()
-TNNetFullConnectReLU      | layers.Dense(activation='relu')     | nn.Linear nn.ReLU()
-TNNetFullConnectLinear    | layers.Dense(activation=None)       | nn.Linear
-TNNetFullConnectSigmoid   | layers.Dense(activation='sigmoid')  | nn.Linear nn.Sigmoid()
+CAI                         | Keras                                 | PyTorch
+--------------------------- | ------------------------------------- | -------------------------
+`TNNetFullConnect`          | `layers.Dense(activation='thanh')`    | `nn.Linear nn.Tanh()`
+`TNNetFullConnectReLU`      | `layers.Dense(activation='relu')`     | `nn.Linear nn.ReLU()`
+`TNNetFullConnectLinear`    | `layers.Dense(activation=None)`       | `nn.Linear`
+`TNNetFullConnectSigmoid`   | `layers.Dense(activation='sigmoid')`  | `nn.Linear nn.Sigmoid()`
+`TNNetReLU`                 | `activations.relu`                    | `nn.ReLU()`
+`TNNetLeakyReLU`            | `activations.relu(alpha=0.01)`        | `nn.LeakyReLU(0.01)`
+`TNNetVeryLeakyReLU`        | `activations.relu(alpha=1/3)`         | `nn.LeakyReLU(1/3)`
+`TNNetReLUSqrt`             |  don't know                           | don't know
+`TNNetSELU`                 | `activations.selu`                    | `nn.SELU`
+`TNNetSigmoid`              | `activations.sigmoid`                 | `nn.Sigmoid`
+`TNNetSoftMax`              | `activations.softmax`                 | `nn.Softmax`
+`TNNetHyperbolicTangent`    | `activations.tanh`                    | `nn.Tanh`
+`TNNetPower`                | don't know                            | don't know
 
 ## Adding Layers
 You can add layers one by one or you can add an array of layers in one go. Follows an example adding layers one by one:
