@@ -303,6 +303,15 @@ CAI                         | Keras                                 | PyTorch
 `TNNetSoftMax`              | `activations.softmax`                 | `nn.Softmax`
 `TNNetHyperbolicTangent`    | `activations.tanh`                    | `nn.Tanh`
 `TNNetPower`                | don't know                            | don't know
+`TNNetAvgPool`              | `layers.AveragePooling2D`             | `nn.AvgPool2d`
+`TNNetMaxPool`              | `layers.MaxPool2D`                    | `nn.MaxPool2d`
+`TNNetMinPool`              | don't know                            | don't know   
+`TNNet.AddMinMaxPool`       | don't know                            | don't know   
+`TNNet.AddAvgMaxPool`       | don't know                            | don't know   
+`TNNetAvgChannel`           | `layers.GlobalAveragePooling2D`       | `nn.AvgPool2d`
+`TNNetMaxChannel`           | `layers.GlobalMaxPool2D`              | `nn.MaxPool2d`
+`TNNetMinChannel`           | don't know                            | don't know
+
 
 ## Adding Layers
 You can add layers one by one or you can add an array of layers in one go. Follows an example adding layers one by one:
