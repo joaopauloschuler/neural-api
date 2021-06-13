@@ -311,6 +311,14 @@ CAI                         | Keras                                 | PyTorch
 `TNNetAvgChannel`           | `layers.GlobalAveragePooling2D`       | `nn.AvgPool2d`
 `TNNetMaxChannel`           | `layers.GlobalMaxPool2D`              | `nn.MaxPool2d`
 `TNNetMinChannel`           | don't know                            | don't know
+`TNNetConcat`                 | `layers.Concatenate(axis=1)`          | `torch.cat`
+`TNNetDeepConcat`             | `layers.Concatenate(axis=3)`          | `torch.cat`
+`TNNetIdentity`               | don't know                            | `nn.Identity`
+`TNNetIdentityWithoutBackprop`| don't know                            | don't know  
+`TNNetReshape`                | `layers.Reshape`                      | `torch.reshape`
+`TNNetSplitChannels`          | [cai.layers.CopyChannels](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | don't know  
+`TNNetSplitChannelEvery`      | don't know                            | don't know
+`TNNetSum`                    | `layers.Add`                          | `torch.add`
 
 
 ## Adding Layers
