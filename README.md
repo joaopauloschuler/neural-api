@@ -286,6 +286,15 @@ This API is really big. The following list gives a general idea about this API b
 * `procedure AddGaussianNoise(pMul: TNeuralFloat);`
 * `procedure AddSaltAndPepper(pNum: integer; pSalt: integer = 2; pPepper: integer = -2);`
 
+### Closest Layer Types to Other APIs (work in progress)
+
+CAI                       | Keras                               | PyTorch
+------------------------- | ----------------------------------- | -------------------------
+TNNetFullConnect          | layers.Dense(activation='thanh')    | nn.Linear nn.Tanh()
+TNNetFullConnectReLU      | layers.Dense(activation='relu')     | nn.Linear nn.ReLU()
+TNNetFullConnectLinear    | layers.Dense(activation=None)       | nn.Linear
+TNNetFullConnectSigmoid   | layers.Dense(activation='sigmoid')  | nn.Linear nn.Sigmoid()
+
 ## Adding Layers
 You can add layers one by one or you can add an array of layers in one go. Follows an example adding layers one by one:
 ```
