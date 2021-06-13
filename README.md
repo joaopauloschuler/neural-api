@@ -305,6 +305,7 @@ CAI                         | Keras                                 | PyTorch
 `TNNetPower`                | don't know                            | don't know
 `TNNetAvgPool`              | `layers.AveragePooling2D`             | `nn.AvgPool2d`
 `TNNetMaxPool`              | `layers.MaxPool2D`                    | `nn.MaxPool2d`
+`TNNetMaxPoolPortable`      | `layers.MaxPool2D`                    | `nn.MaxPool2d`
 `TNNetMinPool`              | don't know                            | don't know   
 `TNNet.AddMinMaxPool`       | don't know                            | don't know   
 `TNNet.AddAvgMaxPool`       | don't know                            | don't know   
