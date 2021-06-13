@@ -319,6 +319,8 @@ CAI                         | Keras                                 | PyTorch
 `TNNetSplitChannels`          | [cai.layers.CopyChannels](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | don't know  
 `TNNetSplitChannelEvery`      | don't know                            | don't know
 `TNNetSum`                    | `layers.Add`                          | `torch.add`
+`TNNetCellMulByCell`          | `layers.Multiply`                     | don't know
+`TNNetChannelMulByLayer`      | `layers.Multiply`                     | don't know
 
 
 ## Adding Layers
