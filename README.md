@@ -290,40 +290,40 @@ This API is really big. The following list gives a general idea about this API b
 
 CAI                         | Keras                                 | PyTorch
 --------------------------- | ------------------------------------- | -------------------------
-`TNNetFullConnect`          | `layers.Dense(activation='thanh')`    | `nn.Linear nn.Tanh()`
+`TNNetFullConnect`          | `layers.Dense(activation='tanh')`     | `nn.Linear nn.Tanh()`
 `TNNetFullConnectReLU`      | `layers.Dense(activation='relu')`     | `nn.Linear nn.ReLU()`
 `TNNetFullConnectLinear`    | `layers.Dense(activation=None)`       | `nn.Linear`
 `TNNetFullConnectSigmoid`   | `layers.Dense(activation='sigmoid')`  | `nn.Linear nn.Sigmoid()`
 `TNNetReLU`                 | `activations.relu`                    | `nn.ReLU()`
 `TNNetLeakyReLU`            | `activations.relu(alpha=0.01)`        | `nn.LeakyReLU(0.01)`
 `TNNetVeryLeakyReLU`        | `activations.relu(alpha=1/3)`         | `nn.LeakyReLU(1/3)`
-`TNNetReLUSqrt`             |  don't know                           | don't know
+`TNNetReLUSqrt`             |                                       |           
 `TNNetSELU`                 | `activations.selu`                    | `nn.SELU`
 `TNNetSigmoid`              | `activations.sigmoid`                 | `nn.Sigmoid`
 `TNNetSoftMax`              | `activations.softmax`                 | `nn.Softmax`
 `TNNetHyperbolicTangent`    | `activations.tanh`                    | `nn.Tanh`
-`TNNetPower`                | don't know                            | don't know
+`TNNetPower`                |                                       |           
 `TNNetAvgPool`              | `layers.AveragePooling2D`             | `nn.AvgPool2d`
 `TNNetMaxPool`              | `layers.MaxPool2D`                    | `nn.MaxPool2d`
 `TNNetMaxPoolPortable`      | `layers.MaxPool2D`                    | `nn.MaxPool2d`
-`TNNetMinPool`              | don't know                            | don't know   
-`TNNet.AddMinMaxPool`       | don't know                            | don't know   
-`TNNet.AddAvgMaxPool`       | don't know                            | don't know   
+`TNNetMinPool`              |                                       |              
+`TNNet.AddMinMaxPool`       |                                       |              
+`TNNet.AddAvgMaxPool`       |                                       |              
 `TNNetAvgChannel`           | `layers.GlobalAveragePooling2D`       | `nn.AvgPool2d`
 `TNNetMaxChannel`           | `layers.GlobalMaxPool2D`              | `nn.MaxPool2d`
-`TNNetMinChannel`           | don't know                            | don't know
-`TNNet.AddMinMaxChannel`      | don't know                            | don't know
+`TNNetMinChannel`           |                                       |           
+`TNNet.AddMinMaxChannel`      |                                       |           
 `TNNet.AddAvgMaxChannel`      | [cai.layers.GlobalAverageMaxPooling2D](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | don't know  
 `TNNetConcat`                 | `layers.Concatenate(axis=1)`          | `torch.cat`
 `TNNetDeepConcat`             | `layers.Concatenate(axis=3)`          | `torch.cat`
-`TNNetIdentity`               | don't know                            | `nn.Identity`
-`TNNetIdentityWithoutBackprop`| don't know                            | don't know  
+`TNNetIdentity`               |                                       | `nn.Identity`
+`TNNetIdentityWithoutBackprop`|                                       |             
 `TNNetReshape`                | `layers.Reshape`                      | `torch.reshape`
 `TNNetSplitChannels`          | [cai.layers.CopyChannels](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | don't know  
-`TNNetSplitChannelEvery`      | don't know                            | don't know
+`TNNetSplitChannelEvery`      |                                       |           
 `TNNetSum`                    | `layers.Add`                          | `torch.add`
-`TNNetCellMulByCell`          | `layers.Multiply`                     | don't know
-`TNNetChannelMulByLayer`      | `layers.Multiply`                     | don't know
+`TNNetCellMulByCell`          | `layers.Multiply`                     |           
+`TNNetChannelMulByLayer`      | `layers.Multiply`                     |           
 
 
 ## Adding Layers
