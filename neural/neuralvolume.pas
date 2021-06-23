@@ -1373,6 +1373,7 @@ begin
   B.Resize(A);
   A.FillForDebug();
   B.Copy(A);
+
   Write('Pearson Correlation (A,A):', A.PearsonCorrelation(B) );
   WriteLnPassIfZero(A.PearsonCorrelation(B)-1);
   B.Mul(-1);
@@ -1381,6 +1382,23 @@ begin
   B.Randomize();
   Write('Pearson Correlation (A,Random):', A.PearsonCorrelation(B) );
   WriteLnPassIfZero(A.PearsonCorrelation(B), 0.1);
+
+  // Testing Grouped Dot Product
+  // 2 vectors of 2 elements
+  A.Resize(1,2,2); // 0 1 and 2 3
+  // 2 vectors of 4 elements
+  B.Resize(1,2,4); // 0 1 2 3 and 4 5 6 7
+  // 1 resulting vector with 4 elements
+  R.Resize(1,1,4);
+
+  A.FillForDebug();
+  B.FillForDebug();
+  A.Mul(100);
+  B.Mul(100);
+  Write('Grouped dot product result:');
+  R.GroupedDotProductsTiled({Groups=}2, {NumAs=}2, {NumBs=}2,{VectorSize=}2, A, B, {TileSizeA=}1, {TileSizeB=}1);
+  //R.Print();
+  WriteLnPassIfZero(R.GetSum() -1 -5 -13 -33);
   R.Free;
   B.Free;
   A.Free;
