@@ -430,6 +430,7 @@ type
 
   //Does a ReLU followed by a Square Root
   TNNetReLUSqrt = class(TNNetReLUBase)
+    public
       procedure Compute(); override;
   end;
 
@@ -482,6 +483,19 @@ type
     public
       constructor Create(pMul: integer); overload;
       procedure Backpropagate(); override;
+  end;
+
+  /// This layer multiplies the output by a constant.
+  TNNetMulByConstant = class(TNNetMulLearning)
+    public
+      //constructor Create(pMul: integer); overload;
+      procedure Compute(); override;
+  end;
+
+  // This layer multiplies the previous output by -1
+  TNNetNegate = class(TNNetMulByConstant)
+    public
+      constructor Create(); override;
   end;
 
   /// This is an experimental layer. Do not use it.
@@ -873,7 +887,8 @@ type
       FPadding: integer;
       FStride: integer;
       FOutputSizeX, FOutputSizeY: integer;
-      FFeatureSizeX, FFeatureSizeY, FFeatureSizeYMinus1: integer;
+      FFeatureSizeX, FFeatureSizeY: integer;
+      FFeatureSizeYMinus1, FFeatureSizeXMinus1: integer;
       FInputCopy: TNNetVolume;
       FSizeXDepth: integer;
       FSizeXDepthBytes: integer;
@@ -946,6 +961,20 @@ type
   end;
 
   TNNetConvolutionClass = class of TNNetConvolutionBase;
+
+  /// This layer is under construction. DO NOT USE IT.
+  TNNetGroupedConvolutionLinear = class(TNNetConvolutionBase)
+    private
+      procedure ComputeCPU();
+      procedure BackpropagateCPU();
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups: integer; pSuppressBias: integer = 0); overload; virtual;
+      destructor Destroy(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
 
   /// Convolutional layer with hyperbolic tangent activation function.
   TNNetConvolution = class(TNNetConvolutionBase)
@@ -1687,6 +1716,292 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetGroupedConvolutionLinear }
+procedure TNNetGroupedConvolutionLinear.ComputeCPU();
+begin
+  if FNeurons.Count * FVectorSize <> FConcatedWeights.Size then
+  begin
+    AfterWeightUpdate();
+  end;
+  FOutputRaw.GroupedDotProductsTiled(FStruct[5], FNeurons.Count,
+    FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared,
+    FTileSizeD, FTileSizeX);
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+
+procedure TNNetGroupedConvolutionLinear.BackpropagateCPU();
+var
+  OutputX, OutputY, OutputD: integer;
+  MaxX, MaxY, MaxD: integer;
+  GroupId, GroupDSize, GroupDStart: integer;
+  PrevX, PrevY: integer;
+  OutputRawPos: integer;
+  CanBackpropOnPos: boolean;
+  LocalCntY, LocalCntX: integer;
+  LocalLearningErrorDeriv: TNeuralFloat;
+  LocalOutputErrorDeriv: TNeuralFloat;
+  SmoothLocalOutputErrorDeriv: TNeuralFloat;
+  LocalWeight, LocalPrevError: TNNetVolume;
+  {SrcPtr,} LocalDestPtr: TNeuralFloatArrPtr;
+  //SmoothLocalOutputErrorDerivPtr: pointer;
+  //PrevNumElements: integer;
+  //MissedElements, PrevMissedElements: integer;
+  //PtrNeuronDelta,
+  PtrPreparedInput: TNeuralFloatArrPtr;
+  //PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
+  NeuronWeights: integer;
+  //LocalLearningErrorDerivPtr: pointer;
+  //localNumElements : integer;
+  MaxPrevX, MaxPrevY: integer;
+  // Tiling
+  TileXCnt, TileDCnt: integer;
+  StartTileX, EndTileX, StartTileD, EndTileD: integer;
+begin
+  MaxX := OutputError.SizeX - 1;
+  MaxY := OutputError.SizeY - 1;
+  MaxD := OutputError.Depth - 1;
+  GroupDSize := OutputError.Depth div FStruct[5];
+  MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
+  MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
+  LocalPrevError := FPrevLayer.OutputError;
+  //PrevNumElements := (FSizeXDepth div 4) * 4;
+  //PrevMissedElements := FSizeXDepth - PrevNumElements;
+  NeuronWeights := FArrNeurons[0].Delta.Size;
+  //localNumElements := (NeuronWeights div 4) * 4;
+  //MissedElements := NeuronWeights - localNumElements;
+  //SmoothLocalOutputErrorDerivPtr := Addr(SmoothLocalOutputErrorDeriv);
+  //LocalLearningErrorDerivPtr := Addr(LocalLearningErrorDeriv);
+  for OutputY := 0 to MaxY do
+  begin
+    PrevY := (OutputY*FStride)-FPadding;
+    for TileXCnt := 0 to FMaxTileX do
+    begin
+      StartTileX := TileXCnt * FTileSizeX;
+      EndTileX := StartTileX + FTileSizeX - 1;
+      for TileDCnt := 0 to FMaxTileD do
+      begin
+        StartTileD := TileDCnt * FTileSizeD;
+        EndTileD := StartTileD + FTileSizeD - 1;
+        //WriteLn(StartTileX,' ',EndTileX,' - ',StartTileY,' ',EndTileY,' - ',StartTileD,' ',EndTileD);
+        begin
+          for OutputX := StartTileX to EndTileX do
+          begin
+            PrevX := (OutputX*FStride)-FPadding;
+            CanBackpropOnPos :=
+              (PrevX >= 0) and (PrevY >= 0) and
+              (PrevX < MaxPrevX) and
+              (PrevY < MaxPrevY);
+            OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
+            for OutputD := StartTileD to EndTileD do
+            begin
+              GroupId := OutputD div GroupDSize;
+              GroupDStart := GroupId*GroupDSize;
+              PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, GroupDStart);
+              if (FCalculatePrevLayerError and CanBackpropOnPos) then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, GroupDStart);
+              {$IFDEF FPC}
+              if FActivationFn = @RectifiedLinearUnit then
+              begin
+                if FOutputRaw.FData[OutputRawPos] >= 0 then
+                begin
+                  LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
+                end
+                else
+                begin
+                  LocalOutputErrorDeriv := 0;
+                end;
+              end
+              else if FActivationFn = @Identity then
+              begin
+                LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
+              end
+              else
+              begin
+                LocalOutputErrorDeriv :=
+                  FOutputError.FData[OutputRawPos] *
+                  FActivationFnDerivative(FOutputRaw.FData[OutputRawPos]);
+              end;
+              {$ELSE}
+                LocalOutputErrorDeriv :=
+                  FOutputError.FData[OutputRawPos] *
+                  FActivationFnDerivative(FOutputRaw.FData[OutputRawPos]);
+              {$ENDIF}
+
+              FOutputErrorDeriv.FData[OutputRawPos] := LocalOutputErrorDeriv;
+              LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
+              if (LocalLearningErrorDeriv <> 0.0) then
+              begin
+                  FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+
+                  {$IFDEF FPC}
+                  FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
+                  {$ELSE}
+                  FArrNeurons[OutputD].FBiasDelta :=
+                    FArrNeurons[OutputD].FBiasDelta + LocalLearningErrorDeriv;
+                  {$ENDIF}
+
+                  if (FCalculatePrevLayerError) then
+                  begin
+                    LocalWeight := FArrNeurons[OutputD].Weights;
+                    if FPointwise then
+                    begin
+                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, GroupDSize);
+                    end
+                    else
+                    begin
+                      if CanBackpropOnPos then
+                      begin
+                        SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                        for LocalCntY := 0 to FFeatureSizeYMinus1 do
+                        for LocalCntX := 0 to FFeatureSizeXMinus1 do
+                        begin
+                          LocalPrevError.MulAdd
+                          (
+                            LocalPrevError.GetRawPtr(PrevX + LocalCntX, PrevY + LocalCntY, GroupDStart), //PrevPtrA
+                            LocalWeight.GetRawPtr(LocalCntX, LocalCntY), //PrevPtrB
+                            SmoothLocalOutputErrorDeriv,
+                            GroupDSize
+                          );
+                        end;
+                      end;
+                    end;
+                  end; // if (FCalculatePrevLayerError)
+              end; // (LocalLearningErrorDeriv <> 0.0)
+              Inc(OutputRawPos);
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  if (not FBatchUpdate) then
+  begin
+    for OutputD := 0 to MaxD do FArrNeurons[OutputD].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetGroupedConvolutionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FVectorSize := FFeatureSizeX*FFeatureSizeY*(pPrevLayer.Output.Depth div FStruct[5]);
+  FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
+  SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY,
+    pPrevLayer.Output.Depth div FStruct[5]);
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+constructor TNNetGroupedConvolutionLinear.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride, pGroups: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding,
+    pStride, pSuppressBias);
+  FStruct[5] := pGroups;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+destructor TNNetGroupedConvolutionLinear.Destroy();
+begin
+  inherited Destroy();
+end;
+
+procedure TNNetGroupedConvolutionLinear.Compute();
+var
+  StartTime: double;
+begin
+  if FNeurons.Count > 0 then
+  begin
+    StartTime := Now();
+    RefreshCalculatePrevLayerError();
+    if FPadding > 0
+      then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
+      else FInputCopy := FPrevLayer.Output;
+
+    if FSmoothErrorPropagation then
+    begin
+      FLearnSmoothener := FFeatureSizeX * FFeatureSizeY;
+    end
+    else
+    begin
+      FLearnSmoothener := 1;
+    end;
+
+    FSizeXDepth := FFeatureSizeX * FInputCopy.Depth div FStruct[5];
+    FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
+    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+
+    //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
+    PrepareInputForConvolutionFast();
+
+    //{$IFDEF OpenCL}
+    //if (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL) then
+    //begin
+    //  ComputeOpenCL();
+    //end
+    //else
+    //begin
+    //  ComputeOnCPU;
+    //end;
+    //{$ELSE}
+      ComputeCPU;
+    //{$ENDIF}
+    FForwardTime := FForwardTime + (Now() - StartTime);
+  end
+  else
+  begin
+    FErrorProc('Neuronal layer contains no neuron:'+ IntToStr(FNeurons.Count));
+  end;
+end;
+
+procedure TNNetGroupedConvolutionLinear.Backpropagate();
+var
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if (FNeurons.Count = FOutput.Depth) and (FPrevLayer.Output.Size > 0) then
+  begin
+    // ComputeErrorDeriv() isn't required as it's done on BackpropagateAtOutputPos
+    // ClearDeltas() is not required as it's done in BackpropagateNTL
+
+    BackpropagateCPU();
+  end
+  else
+  begin
+    FErrorProc
+    (
+      'TNNetConvolution.Backpropagate should have same sizes.' +
+      'Neurons:' + IntToStr(FNeurons.Count) +
+      ' Output Depth:' + IntToStr(FOutput.Depth) +
+      ' PrevLayer:' + IntToStr(FPrevLayer.Output.Size)
+    );
+  end;
+  LocalNow := Now();
+  {$IFDEF Debug}
+  if LocalNow > StartTime + 1000
+    then FErrorProc('TNNetConvolution.Backpropagate bad StartTime.');
+  {$ENDIF}
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetNegate }
+constructor TNNetNegate.Create();
+begin
+  inherited Create(-1);
+end;
+
+{ TNNetMulByConstant }
+procedure TNNetMulByConstant.Compute();
+begin
+  inherited Compute();
+  FOutput.Mul(FStruct[0]);
 end;
 
 procedure TNNetCellMulByCell.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -4019,7 +4334,7 @@ begin
   FBiasOutput.ReSize(FOutputRaw);
   if High(FArrNeurons) < MaxNeurons then BuildArrNeurons();
 
-  if Self is TNNetConvolution then
+  if (Self is TNNetConvolution) or (Self is TNNetGroupedConvolutionLinear) then
   begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
@@ -5419,40 +5734,48 @@ var
   I: integer;
   NN2: TNNet;
   Par: TNNetDataParallelism;
+  AllGood: boolean;
 begin
-  WriteLn('Test Data Parallelism');
+  WriteLn('Testing Data Parallelism...');
 
   Par := TNNetDataParallelism.Create(NN, 4);
   NN2 := NN.Clone();
   Par.SumWeights(NN2);
-
+  AllGood := True;
   for I := 0 to NN.Layers.Count - 1 do
   begin
     if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
     begin
       WriteLn('Data Parallelism Error: neuron count doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if NN.Layers[I].CountWeights() <> NN2.Layers[I].CountWeights() then
     begin
       WriteLn('Data Parallelism Error: weight count doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if 4 * NN.Layers[I].GetWeightSum() <> NN2.Layers[I].GetWeightSum() then
     begin
       WriteLn('Data Parallelism Error: weight sum doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if 4 * NN.Layers[I].GetBiasSum() <> NN2.Layers[I].GetBiasSum() then
     begin
       WriteLn('Data Parallelism Error: bias sum doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if 4 * NN.Layers[I].GetInertiaSum() <> NN2.Layers[I].GetInertiaSum() then
     begin
       WriteLn('Data Parallelism Error: inertial sum doesn''t match on layer:',I);
+      AllGood := False;
     end;
   end;
+  if AllGood
+  then WriteLn('Data Parallelism testing has passed.');
   NN2.Free;
   Par.Free;
 end;
@@ -5460,12 +5783,19 @@ end;
 procedure CompareNNStructure(NN, NN2: TNNet);
 var
   I: integer;
+  AllGood: boolean;
 begin
-  WriteLn('Test Convolution API Start');
+  WriteLn('Structural Test Start');
+  AllGood := True;
 
   if NN.SaveToString() <> NN2.SaveToString() then
   begin
     WriteLn('Error: network save to string differs.');
+    AllGood := False;
+  end
+  else
+  begin
+    WriteLn('Saving to string has passed.');
   end;
 
   for I := 0 to NN.Layers.Count - 1 do
@@ -5473,6 +5803,7 @@ begin
     if NN.Layers[I].SaveDataToString() <> NN2.Layers[I].SaveDataToString() then
     begin
       WriteLn('Error: save data to string doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if NN.Layers[I].SaveStructureToString() <> NN2.Layers[I].SaveStructureToString() then
@@ -5480,28 +5811,35 @@ begin
       WriteLn('Error: save structure to string doesn''t match on layer:',I);
       WriteLn('NN Structure:', NN.Layers[I].SaveStructureToString());
       WriteLn('NN2 Structure:', NN2.Layers[I].SaveStructureToString());
+      AllGood := False;
     end;
 
     if NN.Layers[I].ClassName <> NN2.Layers[I].ClassName then
     begin
       WriteLn('Error: class name doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
     begin
       WriteLn('Error: neuron count doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if NN.Layers[I].CountWeights() <> NN2.Layers[I].CountWeights() then
     begin
       WriteLn('Error: weight count doesn''t match on layer:',I);
+      AllGood := False;
     end;
 
     if NN.Layers[I].GetWeightSum() <> NN2.Layers[I].GetWeightSum() then
     begin
       WriteLn('Error: weight sum doesn''t match on layer:',I);
+      AllGood := False;
     end;
   end;
+  if AllGood
+  then WriteLn('Structural testing has passed.');
 end;
 
 procedure TestBackProp();
@@ -5572,10 +5910,14 @@ begin
 
   if SumDiff <> 0 then
   begin
-    WriteLn('Compute differs: ', SumDiff);
+    WriteLn('Forward computing FAILS: ', SumDiff);
     WriteLn('Output sum 1: ', OutputVolume1.GetSum());
     WriteLn('Output sum 2: ', OutputVolume2.GetSum());
     OutputVolume1.DebugDiff(OutputVolume2, 0.1);
+  end
+  else
+  begin
+    WriteLn('Forward computing has passed.');
   end;
 
   OutputVolume1.Fill(0.001);
@@ -5585,10 +5927,14 @@ begin
 
   if SumDiff <> 0 then
   begin
-    WriteLn('Backprop error differs:', SumDiff);
+    WriteLn('Backprop error FAILS:', SumDiff);
     WriteLn('Backprop sum 1: ', NN1.Layers[0].OutputError.GetSum());
     WriteLn('Backprop sum 2: ', NN2.Layers[0].OutputError.GetSum());
     //NN1.Layers[0].OutputError.DebugDiff(NN2.Layers[0].OutputError, 0.001);
+  end
+  else
+  begin
+    WriteLn('Backpropagation computing has passed.');
   end;
 
   OutputVolume2.Free;
@@ -7314,6 +7660,7 @@ begin
   FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY);
   SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, pPrevLayer.Output.Depth);
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
+  FFeatureSizeXMinus1 := FFeatureSizeX - 1;
   RefreshCalculatePrevLayerError();
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureSizeX, FPadding, FStride);
   FOutputSizeY := CalcOutputSize(pPrevLayer.Output.SizeY, FFeatureSizeY, FPadding, FStride);
@@ -7749,6 +8096,7 @@ begin
         begin
           PrevX := (OutputX*FStride)-FPadding;
           OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY);
+          //TODO: the next line is probably wrong.
           if (FCalculatePrevLayerError) then LocalDestPtr  := LocalPrevError.GetRawPtr(OutputX, OutputY);
           PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
           CanBackpropOnPos :=
@@ -8034,12 +8382,12 @@ begin
           for OutputX := StartTileX to EndTileX do
           begin
             PrevX := (OutputX*FStride)-FPadding;
-            if (FCalculatePrevLayerError) then LocalDestPtr  := LocalPrevError.GetRawPtr(OutputX, OutputY);
             PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
             CanBackpropOnPos :=
               (PrevX >= 0) and (PrevY >= 0) and
               (PrevX < MaxPrevX) and
               (PrevY < MaxPrevY);
+            if (FCalculatePrevLayerError and CanBackpropOnPos) then LocalDestPtr  := LocalPrevError.GetRawPtr(PrevX, PrevY);
             OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
             for OutputD := StartTileD to EndTileD do
             begin
@@ -9104,11 +9452,14 @@ begin
       'TNNetLocalProduct' :         Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalConnectReLU' :     Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(St[0]);
+      'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(St[0]);
+      'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetConvolutionSharedWeights' : Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]);
       'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
@@ -9181,11 +9532,14 @@ begin
       if S[0] = 'TNNetLocalProduct' then Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalConnectReLU' then Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(St[0]) else
+      if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(St[0]) else
+      if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
