@@ -314,6 +314,7 @@ type
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -1192,6 +1193,13 @@ begin
   Result := StrToFloat(V,LocalFormatSettings);
 end;
 
+procedure WriteLnPassIfZero(x: TNeuralFloat; Tolerance: TNeuralFloat=0.0001);
+begin
+  if Abs(x) < Tolerance
+  then WriteLn(' Passed.')
+  else WriteLn(' FAILED.');
+end;
+
 procedure TestTNNetVolume();
 var
   TestSize: integer;
@@ -1211,7 +1219,8 @@ begin
 
   R.Fill(2);
 
-  WriteLn('Fill/Inner sum:', (R.GetSum() - 2*TestSize));
+  Write('Fill/Inner sum:', (R.GetSum() - 2*TestSize));
+  WriteLnPassIfZero(R.GetSum() - 2*TestSize);
 
   R.Copy(A);
   R.Add(B);
@@ -1220,14 +1229,16 @@ begin
   begin
     Result := Result + Abs( R.Raw[I] - (A.Raw[I]+B.Raw[I]) );
   end;
-  WriteLn(' A + B:',Result);
+  Write(' A + B:',Result);
+  WriteLnPassIfZero(Result);
 
   Result := 0;
   for I := 0 to A.Size - 1 do
   begin
     Result := Result + ( A.Raw[I] * B.Raw[I]);
   end;
-  WriteLn(' A . B:',Result - A.DotProduct(B));
+  Write(' A . B:',Result - A.DotProduct(B));
+  WriteLnPassIfZero(Result - A.DotProduct(B));
 
   R.Copy(A);
   R.Sub(B);
@@ -1236,7 +1247,8 @@ begin
   begin
     Result := Result + Abs( A.Raw[I] - B.Raw[I] );
   end;
-  WriteLn(' Sum( Abs(A - B) ):', Result - A.SumDiff(B),' ',Result,' ',A.SumDiff(B));
+  Write(' Sum( Abs(A - B) ):', Result - A.SumDiff(B),' ',Result,' ',A.SumDiff(B));
+  WriteLnPassIfZero(Result - A.SumDiff(B));
 
   R.Copy(A);
   R.Sub(B);
@@ -1245,7 +1257,8 @@ begin
   begin
     Result := Result + Sqr( A.Raw[I] - B.Raw[I] );
   end;
-  WriteLn(' Sum( Sqr(A - B) ):', Result - A.GetDistanceSqr(B),' ',Result,' ',A.GetDistanceSqr(B));
+  Write(' Sum( Sqr(A - B) ):', Result - A.GetDistanceSqr(B),' ',Result,' ',A.GetDistanceSqr(B));
+  WriteLnPassIfZero(Result - A.GetDistanceSqr(B));
 
   R.Copy(A);
   R.Mul(B);
@@ -1254,7 +1267,8 @@ begin
   begin
     Result := Result + Abs( R.Raw[I] - (A.Raw[I]*B.Raw[I]) );
   end;
-  WriteLn(' A * B:',Result);
+  Write(' A * B:',Result);
+  WriteLnPassIfZero(Result);
 
   Result := 0;
   R.Randomize();
@@ -1263,14 +1277,16 @@ begin
     R.Raw[I] := Abs(R.Raw[I]);
     Result := Result + R.Raw[I];
   end;
-  WriteLn(' Inner Sum(A):', (Result - R.GetSum()),' ', Result,' ', R.GetSum());
+  Write(' Inner Sum(A):', (Result - R.GetSum()),' ', Result,' ', R.GetSum());
+  WriteLnPassIfZero(Result - R.GetSum());
 
   Result := 0;
   for I := 0 to A.Size - 1 do
   begin
     Result := Result + Sqr(R.Raw[I]);
   end;
-  WriteLn(' Inner SumSqr(A):', (Result - R.GetSumSqr()),' ', Result,' ', R.GetSumSqr());
+  Write(' Inner SumSqr(A):', (Result - R.GetSumSqr()),' ', Result,' ', R.GetSumSqr());
+  WriteLnPassIfZero(Result - R.GetSumSqr());
 
   Result := 0;
   A.Randomize();
@@ -1280,7 +1296,8 @@ begin
   begin
     Result := Result + Abs( R.Raw[I] - 3*A.Raw[I] );
   end;
-  WriteLn(' A * 3:', Result);
+  Write(' A * 3:', Result);
+  WriteLnPassIfZero(Result);
 
   R.Copy(A);
   R.MulAdd(3,B);
@@ -1294,7 +1311,8 @@ begin
       WriteLn(' A + 3B ERROR: ',I,' : ',Aux, ' :: ', R.Raw[I], ' ?= ', A.Raw[I], ' + 3*', B.Raw[I] );
     end;
   end;
-  WriteLn(' A + 3B:',Result);
+  Write(' A + 3B:',Result);
+  WriteLnPassIfZero(Result);
 
   R.Copy(A);
   R.MulMulAdd(2,3,B);
@@ -1303,7 +1321,8 @@ begin
   begin
     Result := Result + Abs( R.Raw[I] - (2*A.Raw[I] + 3*B.Raw[I]) );
   end;
-  WriteLn(' 2A + 3B:',Result);
+  Write(' 2A + 3B:',Result);
+  WriteLnPassIfZero(Result);
 
   R.Fill(10);
   TNNetVolume.MulAdd(R.DataPtr, A.DataPtr, B.DataPtr, R.Size);
@@ -1312,7 +1331,8 @@ begin
   begin
     Result := Result + Abs( R.Raw[I] - (10 + A.Raw[I] * B.Raw[I]) );
   end;
-  WriteLn(' R += A * B:',Result);
+  Write(' R += A * B:',Result);
+  WriteLnPassIfZero(Result);
 
   WriteLn('Channel testing:');
   A.Resize(32, 32, 3);
@@ -1324,12 +1344,13 @@ begin
   A.GetMinMaxAtDepth(1, Min1, Max1);
   A.GetMinMaxAtDepth(2, Min2, Max2);
 
-  WriteLn
+  Write
   (
     'Min/Max at 0:',  Min0:4:0,' ',Max0:4:0,
     ' at 1:', Min1:4:0,' ',Max1:4:0,
     ' at 2:', Min2:4:0,' ',Max2:4:0
   );
+  WriteLnPassIfZero(Abs(Min0-2)+Abs(Min1-3)+Abs(Min2-4));
 
   B.Fill(0);
   B.AddSumChannel(A);
@@ -1352,11 +1373,14 @@ begin
   B.Resize(A);
   A.FillForDebug();
   B.Copy(A);
-  WriteLn('Pearson Correlation (A,A):', A.PearsonCorrelation(B) );
+  Write('Pearson Correlation (A,A):', A.PearsonCorrelation(B) );
+  WriteLnPassIfZero(A.PearsonCorrelation(B)-1);
   B.Mul(-1);
-  WriteLn('Pearson Correlation (A,-A):', A.PearsonCorrelation(B) );
+  Write('Pearson Correlation (A,-A):', A.PearsonCorrelation(B) );
+  WriteLnPassIfZero(A.PearsonCorrelation(B)+1);
   B.Randomize();
-  WriteLn('Pearson Correlation (A,Random):', A.PearsonCorrelation(B) );
+  Write('Pearson Correlation (A,Random):', A.PearsonCorrelation(B) );
+  WriteLnPassIfZero(A.PearsonCorrelation(B), 0.1);
   R.Free;
   B.Free;
   A.Free;
@@ -1403,8 +1427,11 @@ begin
     if KMeans.Clusters[ClusterCnt].Tag > 0 then Inc(ClustersWithElements);
     Inc(ClusteredElements, KMeans.Clusters[ClusterCnt].Tag);
   end;
-  WriteLn(ClustersWithElements, ' clusters have ', ClusteredElements,
-    ' elements. KMeans testing has finished.');
+  Write(ClustersWithElements, ' clusters have ', ClusteredElements,
+    ' elements.');
+  WriteLnPassIfZero(ClusteredElements-Samples);
+
+  WriteLn('KMeans testing has finished.');
   KMeans.Free;
 end;
 
@@ -2018,7 +2045,7 @@ begin
   begin
 
     TotalSize := Self.GetTotalSize();
-    if V.Size < TotalSize then
+    if V.Size <> TotalSize then
     begin
       V.ReSize(TotalSize,1,1);
     end;
@@ -5257,6 +5284,298 @@ begin
         begin
           PtrA := VAs.GetRawPtr(CntA*VectorSize);
 
+          {$IFDEF AVXANY}
+          {$IFDEF AVX32}
+          if localNumElements > 0 then
+          begin
+          asm
+          mov ecx, localNumElements
+          mov eax, PtrA
+          mov edx, PtrB
+          vxorps ymm0, ymm0, ymm0
+
+          push ecx
+          shr ecx,5  // number of large iterations = number of elements / 32
+          jz @SkipLargeAddLoop
+          vxorps ymm1, ymm1, ymm1
+          vxorps ymm2, ymm2, ymm2
+          vxorps ymm3, ymm3, ymm3
+        @LargeAddLoop:
+
+          vmovups ymm4, [eax]
+          vmovups ymm5, [eax+32]
+          vmovups ymm6, [eax+64]
+          vmovups ymm7, [eax+96]
+
+          {$IFDEF AVX2}
+          vfmadd231ps ymm0, ymm4, [edx]
+          vfmadd231ps ymm1, ymm5, [edx+32]
+          vfmadd231ps ymm2, ymm6, [edx+64]
+          vfmadd231ps ymm3, ymm7, [edx+96]
+          {$ELSE}
+          vmulps  ymm4, ymm4, [edx]
+          vmulps  ymm5, ymm5, [edx+32]
+          vmulps  ymm6, ymm6, [edx+64]
+          vmulps  ymm7, ymm7, [edx+96]
+
+          vaddps  ymm0, ymm0, ymm4
+          vaddps  ymm1, ymm1, ymm5
+          vaddps  ymm2, ymm2, ymm6
+          vaddps  ymm3, ymm3, ymm7
+          {$ENDIF}
+
+          add eax, 128
+          add edx, 128
+          dec ecx
+          jnz @LargeAddLoop
+
+          vaddps ymm2, ymm2, ymm3
+          vaddps ymm0, ymm0, ymm1
+          vaddps ymm0, ymm0, ymm2
+          VEXTRACTF128 xmm2, ymm0, 1
+
+          vzeroupper
+          addps xmm0, xmm2
+
+        @SkipLargeAddLoop:
+          pop ecx
+          and ecx,$0000001F
+          jz @EndAdd
+          shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
+        @SmallAddLoop:
+          vzeroupper
+
+          movups xmm2, [eax]
+          movups xmm3, [edx]
+          mulps xmm2, xmm3
+          addps xmm0, xmm2
+
+          add eax, 16
+          add edx, 16
+          dec ecx
+          jnz @SmallAddLoop
+
+        @EndAdd:
+          // Sums all elements of xmm0 into the first position
+          HADDPS xmm0,xmm0
+          HADDPS xmm0,xmm0
+
+          movups vRes, xmm0
+          end
+          [
+            'EAX', 'ECX', 'EDX',
+            'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7'
+          ];
+
+            Result := vRes[0];
+          end else
+          begin
+            Result := 0;
+          end;
+          {$ENDIF}
+          {$IFDEF AVX64}
+          //Write(localNumElements,' ',MissedElements);
+          if localNumElements > 0 then
+          begin
+          asm
+          mov ecx, localNumElements
+          mov rax, PtrA
+          mov rdx, PtrB
+          {$IFDEF AVX512}
+          vxorps zmm0, zmm0, zmm0
+          {$ELSE}
+          vxorps ymm0, ymm0, ymm0
+          {$ENDIF}
+
+          push rcx
+          shr ecx,5  // number of large iterations = number of elements / 32
+          jz @SkipLargeAddLoop
+
+          {$IFDEF AVX512}
+          vxorps zmm1, zmm1, zmm1
+          {$ELSE}
+          vxorps ymm1, ymm1, ymm1
+          {$ENDIF}
+
+        @LargeAddLoop:
+
+          {$IFDEF AVX512}
+          vmovups zmm2, [rax]
+          vmovups zmm3, [rax+64]
+
+          vmulps  zmm2, zmm2, [rdx]
+          vmulps  zmm3, zmm3, [rdx+64]
+
+          vaddps  zmm0, zmm0, zmm2
+          vaddps  zmm1, zmm1, zmm3
+          {$ELSE}
+            vmovups ymm2, [rax]
+            vmovups ymm3, [rax+32]
+            vmovups ymm4, [rax+64]
+            vmovups ymm5, [rax+96]
+
+            {$IFDEF AVX2}
+            vfmadd231ps ymm0, ymm2, [rdx]
+            vfmadd231ps ymm1, ymm3, [rdx+32]
+            vfmadd231ps ymm0, ymm4, [rdx+64]
+            vfmadd231ps ymm1, ymm5, [rdx+96]
+            {$ELSE}
+            vmulps  ymm2, ymm2, [rdx]
+            vmulps  ymm3, ymm3, [rdx+32]
+            vmulps  ymm4, ymm4, [rdx+64]
+            vmulps  ymm5, ymm5, [rdx+96]
+
+            vaddps  ymm0, ymm0, ymm2
+            vaddps  ymm1, ymm1, ymm3
+            vaddps  ymm0, ymm0, ymm4
+            vaddps  ymm1, ymm1, ymm5
+            {$ENDIF}
+          {$ENDIF}
+
+          add rax, 128
+          add rdx, 128
+          dec ecx
+          jnz @LargeAddLoop
+
+          {$IFDEF AVX512}
+          vaddps zmm0, zmm0, zmm1
+          VEXTRACTF32x4 xmm2, zmm0, 1
+          VEXTRACTF32x4 xmm3, zmm0, 2
+          VEXTRACTF32x4 xmm4, zmm0, 3
+          vzeroupper
+          addps  xmm0, xmm2
+          addps  xmm0, xmm3
+          addps  xmm0, xmm4
+          {$ELSE}
+          vaddps ymm0, ymm0, ymm1
+          VEXTRACTF128 xmm2, ymm0, 1
+          vzeroupper
+          addps  xmm0, xmm2
+          {$ENDIF}
+
+        @SkipLargeAddLoop:
+          pop rcx
+          and ecx,$0000001F
+          jz @EndAdd
+          shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
+        @SmallAddLoop:
+          vzeroupper
+
+          movups xmm2, [rax]
+          movups xmm3, [rdx]
+          mulps xmm2, xmm3
+          addps xmm0, xmm2
+
+          add rax, 16
+          add rdx, 16
+          dec ecx
+          jnz @SmallAddLoop
+
+        @EndAdd:
+          vzeroupper
+          // Sums all elements of xmm0 into the first position
+          HADDPS xmm0,xmm0
+          HADDPS xmm0,xmm0
+
+          movups vRes, xmm0
+          end
+          [
+            'RAX', 'RCX', 'RDX',
+            'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+            {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+          ];
+
+            Result := vRes[0];
+          end else
+          begin
+            Result := 0;
+          end;
+          {$ENDIF}
+          //Write(' A:', PtrA^[0],' B:', PtrB^[0],' -> ',Result);
+          if MissedElements>0 then
+          begin
+            if MissedElements = 1
+            then Result += PtrA^[localNumElements] * PtrB^[localNumElements]
+            else if MissedElements = 2
+            then Result +=
+                   PtrA^[localNumElements] * PtrB^[localNumElements] +
+                   PtrA^[localNumElements+1] * PtrB^[localNumElements+1]
+            else Result +=
+                   PtrA^[localNumElements] * PtrB^[localNumElements] +
+                   PtrA^[localNumElements+1] * PtrB^[localNumElements+1] +
+                   PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
+          end;
+          //WriteLn(' ', Result);
+          {$ENDIF}
+          {$IFNDEF AVXANY}
+          Result := DotProduct(PtrA, PtrB, VectorSize);
+          {$ENDIF}
+          FData[CntB * NumAs + CntA] := Result;
+        end;
+      end;
+
+    end; // A Tiling.
+  end; // B Tiling.
+end;
+
+/// In this function, "As" should be weights, "VectorSize" should be the number
+// of weights from each neuron. "VBs" contains input vectors. Input vectors
+// should have VectorSize * Groups.
+procedure TNNetVolume.GroupedDotProductsTiled(Groups, NumAs, NumBs,
+  VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+var
+  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
+  GroupId, GroupASize: integer;
+  VectoreBSize: integer;
+  DestPointer: pointer;
+  CntBVectorSizePlusCntBPos: integer;
+  vRes: array[0..3] of Single;
+  localNumElements, MissedElements: integer;
+  PtrA, PtrB: TNeuralFloatArrPtr;
+  Result: TNeuralFloat;
+  // Tiling
+  TileACnt, TileBCnt: integer;
+  StartTileA, EndTileA, StartTileB, EndTileB: integer;
+  MaxTileA, MaxTileB: integer;
+begin
+  MaxA := NumAs - 1;
+  MaxB := NumBs - 1;
+  GroupASize := NumAs div Groups;
+  VectoreBSize := VectorSize * Groups;
+
+  {$IFDEF Debug}
+  if NumAs * VectorSize <> VAs.Size then
+  begin
+    WriteLn('TNNetVolume.GroupedDotProductsTiled VAs size has failed.');
+  end;
+
+  if NumBs * VectoreBSize <> VBs.Size then
+  begin
+    WriteLn('TNNetVolume.GroupedDotProductsTiled VBs size has failed.');
+  end;
+  {$ENDIF}
+
+  //localNumElements := (VectorSize div 4) * 4;
+  //MissedElements := VectorSize - localNumElements;
+  MissedElements := VectorSize and 3;
+  localNumElements := VectorSize xor MissedElements;
+  MaxTileA := (NumAs div TileSizeA) - 1;
+  MaxTileB := (NumBs div TileSizeB) - 1;
+  for TileBCnt := 0 to MaxTileB do
+  begin
+    StartTileB := TileBCnt * TileSizeB;
+    EndTileB := StartTileB + TileSizeB - 1;
+    for TileACnt := 0 to MaxTileA do
+    begin
+      StartTileA := TileACnt * TileSizeA;
+      EndTileA := StartTileA + TileSizeA - 1;
+      for CntA := StartTileA to EndTileA do
+      begin
+        GroupId := CntA div GroupASize;
+        PtrA := VAs.GetRawPtr(CntA*VectorSize);
+        for CntB := StartTileB to EndTileB do
+        begin
+          PtrB := VBs.GetRawPtr(CntB*VectoreBSize + GroupId*VectorSize);
           {$IFDEF AVXANY}
           {$IFDEF AVX32}
           if localNumElements > 0 then
