@@ -2952,11 +2952,15 @@ begin
   {$ENDIF}
 
   if BasePos <= vHigh then for I := BasePos to vHigh do
+  begin
+    //Write(PtrA^[I],' ', PtrB^[I],' ', Value,'->');
     {$IFDEF FPC}
     PtrA^[I] += PtrB^[I]*Value;
     {$ELSE}
     PtrA^[I] := PtrA^[I] + PtrB^[I]*Value;
     {$ENDIF}
+    //WriteLn(PtrA^[I]);
+  end;
 end;
 
 class procedure TVolume.MulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value1,
@@ -4657,7 +4661,7 @@ begin
     begin
       for CD := 0 to Depth - 1 do
       begin
-        WriteLn(CX,' ',CY,' ',CD,':',Self[CX,CY,0]);
+        WriteLn(CX,' ',CY,' ',CD,':',Self[CX, CY, CD]);
       end;
     end;
   end;
@@ -5820,6 +5824,7 @@ begin
           {$IFNDEF AVXANY}
           Result := DotProduct(PtrA, PtrB, VectorSize);
           {$ENDIF}
+          // Use for debug only: WriteLn('Grouped dot product result [', CntB,' ',NumAs,' ',CntA,' Pos:',CntB * NumAs + CntA,']:',Result);
           FData[CntB * NumAs + CntA] := Result;
         end;
       end;
@@ -9083,6 +9088,7 @@ begin
   Result := 0;
   BasePos := 0;
   vHigh := NumElements - 1;
+
   {$IFDEF FPC}
   AddrA := pointer(PtrA);
   AddrB := pointer(PtrB);
@@ -9116,8 +9122,12 @@ begin
   {$ENDIF}
 
   if BasePos <= vHigh then for I := BasePos to vHigh do
-    //Uncomment for debugging only: WriteLn(PtrA^[I]:8:6,' # ', PtrB^[I]:8:6,' # ', Result:8:6);
+  begin
     Result := Result + PtrA^[I] * PtrB^[I];
+    //Uncomment for debugging only: WriteLn(PtrA^[I]:8:6,' # ', PtrB^[I]:8:6,' # ', Result:8:6);
+  end;
+  //WriteLn('Hello: ', Result);
+  //ReadLn();
 end;
 
 class function TVolume.Product(PtrA: TNeuralFloatArrPtr;
