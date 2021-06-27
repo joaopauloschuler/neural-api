@@ -965,6 +965,7 @@ type
   /// This layer is under construction. DO NOT USE IT.
   TNNetGroupedConvolutionLinear = class(TNNetConvolutionBase)
     private
+      procedure PrepareInputForGroupedConvolutionFast();
       procedure ComputeCPU();
       procedure BackpropagateCPU();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1718,6 +1719,75 @@ begin
   end;
 end;
 
+procedure TNNetGroupedConvolutionLinear.PrepareInputForGroupedConvolutionFast();
+var
+  OutputCntX, OutputCntY, OutputD: integer;
+  MaxX, MaxY: integer;
+  ChannelsPerGroup, ChannelsPerGroupSize: integer;
+  yCount, xCount, groupCount: integer;
+  InputX, InputY: integer;
+  RowSize: integer;
+  FeatureSizeXYD: integer;
+  {$IFDEF AVXANY}
+  SourceRawPos, DestRawPos: pointer;
+  {$ENDIF}
+begin
+  if (FPointwise) then
+  begin
+    // There is nothing to do. YAY!
+  end
+  else
+  begin
+    ChannelsPerGroup := FInputCopy.Depth div FStruct[5];
+    RowSize := ChannelsPerGroup;
+    ChannelsPerGroupSize := ChannelsPerGroup * SizeOf(TNeuralFloat);
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    FeatureSizeXYD := FFeatureSizeX * FFeatureSizeY * ChannelsPerGroup;
+    {$IFDEF Debug}
+    if FeatureSizeXYD <> FArrNeurons[0].Weights.Size then
+    begin
+      FErrorProc('TNNetGroupedConvolutionLinear weight size is incorrect:' +
+        IntToStr(FArrNeurons[0].Weights.Size) +
+        '. Should be:' +
+        IntToStr(FeatureSizeXYD)+'.');
+    end;
+    {$ENDIF}
+    FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
+
+    for OutputCntX := 0 to MaxX do
+    begin
+      for OutputCntY := 0 to MaxY do
+      begin
+        for yCount := 0 to FFeatureSizeYMinus1 do
+        begin
+          InputY := OutputCntY * FStride + yCount;
+          for xCount := 0 to FFeatureSizeXMinus1 do
+          begin
+            InputX := OutputCntX * FStride + xCount;
+            for groupCount := 0 to FStruct[5] - 1 do
+            begin
+              OutputD := FeatureSizeXYD * groupCount +
+                FArrNeurons[0].Weights.GetRawPos(xCount, yCount);
+              {$IFDEF AVXANY}
+              SourceRawPos := FInputCopy.GetRawPtr(InputX, InputY, ChannelsPerGroup*groupCount);
+              DestRawPos := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY, OutputD);
+              asm_dword_copy;
+              {$ELSE}
+              Move(
+                FInputCopy.FData[FInputCopy.GetRawPos(InputX, InputY, ChannelsPerGroup*groupCount)],
+                FInputPrepared.FData[FInputPrepared.GetRawPos(OutputCntX, OutputCntY, OutputD)],
+                ChannelsPerGroupSize
+              );
+              {$ENDIF}
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
 { TNNetGroupedConvolutionLinear }
 procedure TNNetGroupedConvolutionLinear.ComputeCPU();
 begin
@@ -1935,8 +2005,7 @@ begin
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
     FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
 
-    //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
-    PrepareInputForConvolutionFast();
+    PrepareInputForGroupedConvolutionFast();
 
     //{$IFDEF OpenCL}
     //if (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL) then
@@ -5947,6 +6016,7 @@ var
   NN: THistoricalNets;
   NN2: TNNet;
   AuxVolume: TNNetVolume;
+  I: integer;
 begin
   NN := THistoricalNets.Create();
   AuxVolume := TNNetVolume.Create;
@@ -5977,6 +6047,7 @@ begin
   NN.AddLayer( TNNetCellBias.Create() );
   NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
   NN.AddLayer( TNNetConvolutionLinear.Create(32,5,0,0) );
+  NN.AddLayer( TNNetGroupedConvolutionLinear.Create(32,1,0,0,4,0) );
   NN.AddLayer( TNNetConvolution.Create(32,5,0,0) );
   NN.AddLayer( TNNetFullConnectReLU.Create(32) );
   NN.AddLayer( TNNetFullConnectReLU.Create(10) );
@@ -5996,7 +6067,45 @@ begin
   CompareComputing(NN, NN2);
 
   NN.Clear;
+  (*
+  WriteLn('Test Grouped Convolution:');
 
+  NN.AddLayer( TNNetInput.Create(3,3,4).EnableErrorCollection() );
+  NN.AddLayer( TNNetGroupedConvolutionLinear.Create(4,3,1,1,4,1) );
+
+  AuxVolume.Resize(3,3,4);
+  AuxVolume.FillForDebug();
+  AuxVolume.Mul(100);AuxVolume.Add(1);
+  WriteLn('Input:');
+  AuxVolume.PrintWithIndex();
+
+  for I:=0 to 3 do
+  begin
+    WriteLn(I, ' weights:');
+    NN.Layers[1].Neurons[I].Weights.PrintWithIndex();
+  end;
+
+  NN.Layers[1].Neurons[0].Weights.FData[0] := 1;
+  NN.Layers[1].Neurons[1].Weights.FData[0] := 2;
+  NN.Layers[1].Neurons[2].Weights.FData[0] := 3;
+  NN.Layers[1].Neurons[3].Weights.FData[0] := 4;
+  NN.Layers[1].AfterWeightUpdate();
+
+  NN.Compute(AuxVolume);
+  NN.GetOutput(AuxVolume);
+
+  WriteLn('Output:');
+  AuxVolume.PrintWithIndex();
+
+  AuxVolume.FillForDebug();AuxVolume.Mul(100);
+  NN.Backpropagate(AuxVolume);
+
+  WriteLn('Error at grouped conv:');
+  NN.Layers[1].OutputError.PrintWithIndex();
+
+  WriteLn('Error at input:');
+  NN.Layers[0].OutputError.PrintWithIndex();
+  *)
   (*
   WriteLn('Test DeMaxPool:');
 
