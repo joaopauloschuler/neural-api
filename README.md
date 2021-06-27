@@ -313,13 +313,13 @@ NEURAL                      | Keras                                 | PyTorch
 `TNNetMaxChannel`           | `layers.GlobalMaxPool2D`              | `nn.MaxPool2d`
 `TNNetMinChannel`           |                                       |           
 `TNNet.AddMinMaxChannel`      |                                       |           
-`TNNet.AddAvgMaxChannel`      | [cai.layers.GlobalAverageMaxPooling2D](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | don't know  
+`TNNet.AddAvgMaxChannel`      | [cai.layers.GlobalAverageMaxPooling2D](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) |  
 `TNNetConcat`                 | `layers.Concatenate(axis=1)`          | `torch.cat`
 `TNNetDeepConcat`             | `layers.Concatenate(axis=3)`          | `torch.cat`
 `TNNetIdentity`               |                                       | `nn.Identity`
 `TNNetIdentityWithoutBackprop`|                                       |             
 `TNNetReshape`                | `layers.Reshape`                      | `torch.reshape`
-`TNNetSplitChannels`          | [cai.layers.CopyChannels](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | don't know  
+`TNNetSplitChannels`          | [cai.layers.CopyChannels](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) | 
 `TNNetSplitChannelEvery`      |                                       |           
 `TNNetSum`                    | `layers.Add`                          | `torch.add`
 `TNNetCellMulByCell`          | `layers.Multiply`                     |           
