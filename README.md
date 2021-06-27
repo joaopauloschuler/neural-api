@@ -192,8 +192,8 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetDepthwiseConvLinear` (input/output: 1D, 2D or 3D).
 * `TNNet.AddSeparableConvReLU` (input/output: 1D, 2D or 3D). Adds a separable convolution.
 * `TNNet.AddSeparableConvLinear` (input/output: 1D, 2D or 3D). Adds a separable convolution.
-* `TNNet.AddConvOrSeparableConv` (input/output: 1D, 2D or 3D). Adds a convolution or a separable convolutions with/without ReLU and normalization.
-* `TNNet.AddGroupedConvolution` (input/output: 1D, 2D or 3D). Adds grouped convolutions. 
+* `TNNet.AddConvOrSeparableConv` (input/output: 1D, 2D or 3D). Adds a convolution or a separable convolution with/without ReLU and normalization.
+* `TNNet.AddGroupedConvolution` (input/output: 1D, 2D or 3D). Adds a grouped convolution. 
 
 ### Fully Connected (Dense) Layers
 * `TNNetFullConnect` (input/output: 1D, 2D or 3D).
@@ -288,7 +288,7 @@ This API is really big. The following list gives a general idea about this API b
 
 ### Closest Layer Types to Other APIs (work in progress)
 
-CAI                         | Keras                                 | PyTorch
+NEURAL                      | Keras                                 | PyTorch
 --------------------------- | ------------------------------------- | -------------------------
 `TNNetFullConnect`          | `layers.Dense(activation='tanh')`     | `nn.Linear nn.Tanh()`
 `TNNetFullConnectReLU`      | `layers.Dense(activation='relu')`     | `nn.Linear nn.ReLU()`
