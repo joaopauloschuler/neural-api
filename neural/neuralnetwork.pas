@@ -977,6 +977,24 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// This layer is under construction. DO NOT USE IT.
+  TNNetGroupedConvolutionReLU = class(TNNetGroupedConvolutionLinear)
+    public
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups: integer; pSuppressBias: integer = 0); overload; override;
+  end;
+
+  /// Grouped pointwise convolution with Linear activation.
+  TNNetGroupedPointwiseConvLinear = class(TNNetGroupedConvolutionLinear)
+  public
+    constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); virtual;
+  end;
+
+  /// Grouped pointwise convolution with ReLU activation.
+  TNNetGroupedPointwiseConvReLU = class(TNNetGroupedConvolutionReLU)
+  public
+    constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); virtual;
+  end;
+
   /// Convolutional layer with hyperbolic tangent activation function.
   TNNetConvolution = class(TNNetConvolutionBase)
     protected
@@ -1246,7 +1264,7 @@ type
         pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
       function AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
-        MinGroupSize, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
+        MinChannelsPerGroupCount, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
         pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
       function AddGroupedFullConnect(FullConnect: TNNetFullConnectClass;
@@ -1719,6 +1737,33 @@ begin
   end;
 end;
 
+{ TNNetGroupedPointwiseConvReLU }
+
+constructor TNNetGroupedPointwiseConvReLU.Create(pNumFeatures,
+  pGroups: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, {pFeatureSize=}1, {pInputPadding=}0,
+    {pStride=}1, pGroups, pSuppressBias);
+end;
+
+{ TNNetGroupedPointwiseConvLinear }
+
+constructor TNNetGroupedPointwiseConvLinear.Create(pNumFeatures,
+  pGroups: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, {pFeatureSize=}1, {pInputPadding=}0,
+    {pStride=}1, pGroups, pSuppressBias);
+end;
+
+{ TNNetGroupedConvolutionReLU }
+constructor TNNetGroupedConvolutionReLU.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride, pGroups: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups, pSuppressBias);
+  FActivationFn := @RectifiedLinearUnit;
+  FActivationFnDerivative := @RectifiedLinearUnitDerivative;
+end;
+
 procedure TNNetGroupedConvolutionLinear.PrepareInputForGroupedConvolutionFast();
 var
   OutputCntX, OutputCntY, OutputD: integer;
@@ -1870,7 +1915,8 @@ begin
               GroupId := OutputD div GroupDSize;
               GroupDStart := GroupId*GroupDSize;
               PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, GroupDStart);
-              if (FCalculatePrevLayerError and CanBackpropOnPos) then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, GroupDStart);
+              if (FCalculatePrevLayerError and CanBackpropOnPos)
+                then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, GroupDStart);
               {$IFDEF FPC}
               if FActivationFn = @RectifiedLinearUnit then
               begin
@@ -9569,6 +9615,9 @@ begin
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
+      'TNNetGroupedConvolutionReLU'   : Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
+      'TNNetGroupedPointwiseConvLinear' : Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
+      'TNNetGroupedPointwiseConvReLU'   : Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
       'TNNetConvolutionSharedWeights' : Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]);
       'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
@@ -9649,6 +9698,7 @@ begin
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
+      if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
@@ -9830,7 +9880,7 @@ begin
 end;
 
 function TNNet.AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
-  MinGroupSize, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
+  MinChannelsPerGroupCount, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
   pSuppressBias: integer; ChannelInterleaving: boolean): TNNetLayer;
 var
   MaxGroupCount: integer;
@@ -9838,7 +9888,7 @@ var
   PrevLayerChannelCount: integer;
 begin
   PrevLayerChannelCount := GetLastLayer().Output.Depth;
-  MaxGroupCount := (PrevLayerChannelCount div MinGroupSize);
+  MaxGroupCount := (PrevLayerChannelCount div MinChannelsPerGroupCount);
   GroupCount := GetMaxAcceptableCommonDivisor(
     PrevLayerChannelCount, pNumFeatures, MaxGroupCount);
   Result := AddGroupedConvolution(Conv2d, GroupCount, pNumFeatures,
