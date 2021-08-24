@@ -707,6 +707,19 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// This layer interleaves input channels.
+  TNNetInterleaveChannels = class(TNNetIdentity)
+    private
+      ToChannels: TNeuralIntegerArray;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(StepSize: integer); overload;
+      destructor Destroy(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -1735,6 +1748,76 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetInterleaveChannels }
+
+procedure TNNetInterleaveChannels.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  CntDepth, MaxDepth: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  MaxDepth := FOutput.Depth - 1;
+  SetLength(ToChannels, FOutput.Depth);
+  for CntDepth := 0 to MaxDepth do
+  begin
+    ToChannels[CntDepth] :=
+      (
+        ((CntDepth * FStruct[0]) mod FOutput.Depth) +
+        (CntDepth * FStruct[0]) div FOutput.Depth
+      ) mod FOutput.Depth;
+    // Write(CntDepth,':',ToChannels[CntDepth],'    ');
+  end;
+  // WriteLn();
+end;
+
+constructor TNNetInterleaveChannels.Create(StepSize: integer);
+begin
+  inherited Create();
+  FStruct[0] := StepSize;
+end;
+
+destructor TNNetInterleaveChannels.Destroy();
+begin
+  SetLength(ToChannels, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetInterleaveChannels.Compute();
+var
+  CntDepth, MaxDepth: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxDepth := FOutput.Depth - 1;
+  for CntDepth := 0 to MaxDepth do
+  begin
+    FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput,CntDepth,ToChannels[CntDepth]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetInterleaveChannels.Backpropagate();
+var
+  CntDepth, MaxDepth: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxDepth := FOutput.Depth - 1;
+    for CntDepth := 0 to MaxDepth do
+    begin
+      FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError,ToChannels[CntDepth],CntDepth);
+    end;
+  end;
+
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetGroupedPointwiseConvReLU }
@@ -9634,6 +9717,7 @@ begin
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
+      'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetSum' :                  Result := TNNetSum.Create(aL);
       'TNNetSplitChannels' :        Result := TNNetSplitChannels.Create(aIdx);
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
@@ -9699,6 +9783,8 @@ begin
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
+      if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
+      if S[0] = 'TNNetGroupedPointwiseConvReLU' then Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
@@ -9714,6 +9800,7 @@ begin
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
+      if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]);
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else

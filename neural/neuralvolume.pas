@@ -146,6 +146,8 @@ type
     class procedure Add(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure AddAtDepth(pDepth: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure AddAtDepth(pDepth: integer; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+    procedure AddFromDepthToDepth(Original: TVolume; FromDepth, ToDepth: integer); {$IFDEF Release} inline; {$ENDIF}
+    procedure CopyFromDepthToDepth(Original: TVolume; FromDepth, ToDepth: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure AddLayers(A,B: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Sub(x, y, d: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Sub(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -2532,6 +2534,60 @@ begin
         {$ELSE}
         FData[RawPos] := FData[RawPos] + Original.FData[RawPos];
         {$ENDIF}
+      end;
+    end;
+  end
+  else
+  begin
+    WriteLn('To Be Implemented.');
+  end;
+end;
+
+procedure TVolume.AddFromDepthToDepth(Original: TVolume; FromDepth,
+  ToDepth: integer);
+var
+  CntX, CntY: integer;
+  MaxX, MaxY: integer;
+  RawPos: integer;
+begin
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  if Self.Size = Original.Size then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        RawPos := Self.GetRawPos(CntX, CntY, ToDepth);
+        {$IFDEF FPC}
+        FData[RawPos] += Original[CntX, CntY, FromDepth];
+        {$ELSE}
+        FData[RawPos] := FData[RawPos] + Original[CntX, CntY, FromDepth];
+        {$ENDIF}
+      end;
+    end;
+  end
+  else
+  begin
+    WriteLn('To Be Implemented.');
+  end;
+end;
+
+procedure TVolume.CopyFromDepthToDepth(Original: TVolume; FromDepth,
+  ToDepth: integer);
+var
+  CntX, CntY: integer;
+  MaxX, MaxY: integer;
+begin
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  if Self.Size = Original.Size then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        Self[CntX, CntY, ToDepth] := Original[CntX, CntY, FromDepth];
       end;
     end;
   end
