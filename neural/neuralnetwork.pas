@@ -1002,10 +1002,12 @@ type
     constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); virtual;
   end;
 
+  TNNetGroupedPointwiseConvClass = class of TNNetGroupedPointwiseConvLinear;
+
   /// Grouped pointwise convolution with ReLU activation.
-  TNNetGroupedPointwiseConvReLU = class(TNNetGroupedConvolutionReLU)
+  TNNetGroupedPointwiseConvReLU = class(TNNetGroupedPointwiseConvLinear)
   public
-    constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); virtual;
+    constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Convolutional layer with hyperbolic tangent activation function.
@@ -1276,6 +1278,17 @@ type
         Groups, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
         pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
+      /// AddAutoGroupedPointwiseConvkEffNet implements
+      // pointwise convolutions of the kEffNet architecture
+      // described on the paper: "Grouped Pointwise Convolutions Significantly
+      // Reduces Parameters in EfficientNet" by Joao Paulo Schwarz Schuler,
+      // Santiago Romani, Mohamed Abdel-Nasser and Hatem Rashwan.
+      function AddAutoGroupedPointwiseConvkEffNet(
+        Conv2d: TNNetGroupedPointwiseConvClass;
+        MinChannelsPerGroupCount, pNumFeatures: integer;
+        HasNormalization: boolean;
+        pSuppressBias: integer = 0
+        ): TNNetLayer;
       function AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
         MinChannelsPerGroupCount, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
         pSuppressBias: integer = 0;
@@ -1825,8 +1838,9 @@ end;
 constructor TNNetGroupedPointwiseConvReLU.Create(pNumFeatures,
   pGroups: integer; pSuppressBias: integer);
 begin
-  inherited Create(pNumFeatures, {pFeatureSize=}1, {pInputPadding=}0,
-    {pStride=}1, pGroups, pSuppressBias);
+  inherited Create(pNumFeatures, pGroups, pSuppressBias);
+  FActivationFn := @RectifiedLinearUnit;
+  FActivationFnDerivative := @RectifiedLinearUnitDerivative;
 end;
 
 { TNNetGroupedPointwiseConvLinear }
@@ -9964,6 +9978,50 @@ begin
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
   SetLength(EachGroupOutput, 0);
+end;
+
+function TNNet.AddAutoGroupedPointwiseConvkEffNet(
+  Conv2d: TNNetGroupedPointwiseConvClass;
+  MinChannelsPerGroupCount, pNumFeatures: integer;
+  HasNormalization: boolean;
+  pSuppressBias: integer = 0
+  ): TNNetLayer;
+var
+  MaxGroupCount: integer;
+  GroupCount: integer;
+  PrevLayerChannelCount: integer;
+  OutputGroupSize: integer;
+  FirstLayer: TNNetLayer;
+begin
+  PrevLayerChannelCount := GetLastLayer().Output.Depth;
+  MaxGroupCount := (PrevLayerChannelCount div MinChannelsPerGroupCount);
+  GroupCount := GetMaxAcceptableCommonDivisor(
+    PrevLayerChannelCount, pNumFeatures, MaxGroupCount);
+  FirstLayer := AddLayer(
+    Conv2d.Create(
+      {Features=}pNumFeatures,
+      {Groups=}GroupCount,
+      {SupressBias=}pSuppressBias) );
+  if HasNormalization then
+    FirstLayer := AddLayer( TNNetChannelStdNormalization.Create() );
+  if GroupCount > 1 then
+  begin
+    OutputGroupSize := pNumFeatures div GroupCount;
+    AddLayer( TNNetInterleaveChannels.Create(OutputGroupSize) );
+    if (PrevLayerChannelCount >= pNumFeatures) then
+    begin
+      AddLayer(
+        Conv2d.Create(
+          {Features=}pNumFeatures,
+          {Groups=}GroupCount,
+          {SupressBias=}pSuppressBias) );
+      if HasNormalization then
+        AddLayer( TNNetChannelStdNormalization.Create() );
+      AddLayer( TNNetSum.Create([GetLastLayer(), FirstLayer]) );
+    end;
+  end;
+
+  Result := GetLastLayer();
 end;
 
 function TNNet.AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
