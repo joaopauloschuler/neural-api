@@ -1283,7 +1283,7 @@ type
       // described on the paper: "Grouped Pointwise Convolutions Significantly
       // Reduces Parameters in EfficientNet" by Joao Paulo Schwarz Schuler,
       // Santiago Romani, Mohamed Abdel-Nasser and Hatem Rashwan.
-      function AddAutoGroupedPointwiseConvkEffNet(
+      function AddAutoGroupedPointwiseConv(
         Conv2d: TNNetGroupedPointwiseConvClass;
         MinChannelsPerGroupCount, pNumFeatures: integer;
         HasNormalization: boolean;
@@ -1462,6 +1462,20 @@ type
         ): TNNetLayer; overload;
       function AddDenseNetBlockCAI(pUnits, k, supressBias: integer;
         PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
+        IsSeparable: boolean = false;
+        HasNorm: boolean = true;
+        pBeforeBottleNeck: TNNetLayerClass = nil;
+        pAfterBottleNeck: TNNetLayerClass = nil;
+        pBeforeConv: TNNetLayerClass = nil;
+        pAfterConv: TNNetLayerClass = nil;
+        BottleNeck: integer = 0;
+        Compression: integer = 1; // Compression factor. 2 means taking half of channels.
+        DropoutRate: TNeuralFloat = 0;
+        RandomBias: integer = 1; RandomAmplifier: integer = 1;
+        FeatureSize: integer = 3
+        ): TNNetLayer; overload;
+      function AddDenseNetBlockk(pUnits, k, supressBias: integer;
+        PointWiseConv: TNNetGroupedPointwiseConvClass;
         IsSeparable: boolean = false;
         HasNorm: boolean = true;
         pBeforeBottleNeck: TNNetLayerClass = nil;
@@ -5072,6 +5086,46 @@ begin
           //  {MinGroupSize=}16, {pNumFeatures=}BottleNeck, {pFeatureSize=}1,
           //  {pInputPadding=}0, {pStride=}1, supressBias,
           //  {ChannelInterleaving=} true);
+          if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
+        end;
+      end;
+      if pBeforeConv <> nil then AddLayer( pBeforeConv.Create() );
+      AddConvOrSeparableConv(IsSeparable, {HasReLU=} false, HasNorm, k, FeatureSize, (FeatureSize-1) div 2, 1, {PerCell=}false, supressBias, RandomBias, RandomAmplifier);
+      if pAfterConv <> nil then AddLayer( pAfterConv.Create() );
+      if DropoutRate > 0 then AddLayer( TNNetDropout.Create(DropoutRate) );
+      LastLayer := GetLastLayer();
+      if (UnitCnt=pUnits) and (Compression > 1) then
+      begin
+        PreviousLayer := AddLayerAfter( TNNetSplitChannelEvery.Create(Compression, 0),PreviousLayer );
+      end;
+      AddLayer( TNNetDeepConcat.Create([PreviousLayer, LastLayer]) );
+    end;
+  end;
+  Result := GetLastLayer();
+end;
+
+function THistoricalNets.AddDenseNetBlockk(pUnits, k, supressBias: integer;
+  PointWiseConv: TNNetGroupedPointwiseConvClass; IsSeparable: boolean;
+  HasNorm: boolean; pBeforeBottleNeck: TNNetLayerClass;
+  pAfterBottleNeck: TNNetLayerClass; pBeforeConv: TNNetLayerClass;
+  pAfterConv: TNNetLayerClass; BottleNeck: integer; Compression: integer;
+  DropoutRate: TNeuralFloat; RandomBias: integer; RandomAmplifier: integer;
+  FeatureSize: integer): TNNetLayer;
+var
+  UnitCnt: integer;
+  PreviousLayer, LastLayer: TNNetLayer;
+begin
+  if pUnits > 0 then
+  begin
+    for UnitCnt := 1 to pUnits do
+    begin
+      PreviousLayer := GetLastLayer();
+      if BottleNeck > 0 then
+      begin
+        if (PreviousLayer.Output.Depth > BottleNeck * 2) and (PointWiseConv <> nil) then
+        begin
+          if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
+          AddAutoGroupedPointwiseConv( PointWiseConv, 16, BottleNeck, HasNorm, supressBias );
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
       end;
@@ -9980,7 +10034,7 @@ begin
   SetLength(EachGroupOutput, 0);
 end;
 
-function TNNet.AddAutoGroupedPointwiseConvkEffNet(
+function TNNet.AddAutoGroupedPointwiseConv(
   Conv2d: TNNetGroupedPointwiseConvClass;
   MinChannelsPerGroupCount, pNumFeatures: integer;
   HasNormalization: boolean;
@@ -10196,11 +10250,11 @@ var
 begin
   FilterCount := Round(GetLastLayer().Output.Depth * Compression );
   if Odd(FilterCount) then Inc(FilterCount);
-  //AddLayer( TNNetPointwiseConvLinear.Create(, supressBias) );
-  AddAutoGroupedConvolution(TNNetPointwiseConvLinear,
-    {MinGroupSize=}MinGroupSize, {pNumFeatures=}FilterCount, {pFeatureSize=}1,
-    {pInputPadding=}0, {pStride=}1, supressBias,
-    {ChannelInterleaving=} true);
+  //AddAutoGroupedConvolution(TNNetPointwiseConvLinear,
+  //  {MinGroupSize=}MinGroupSize, {pNumFeatures=}FilterCount, {pFeatureSize=}1,
+  //  {pInputPadding=}0, {pStride=}1, supressBias,
+  //  {ChannelInterleaving=} true);
+  AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinGroupSize, FilterCount, False, supressBias);
   Result := GetLastLayer();
 end;
 
