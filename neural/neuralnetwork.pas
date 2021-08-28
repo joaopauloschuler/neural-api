@@ -1320,7 +1320,7 @@ type
         pAfterLayer: TNNetLayer = nil): TNNetLayer; overload;
       function AddCompression(Compression: TNeuralFloat = 0.5; supressBias: integer = 1): TNNetLayer;
       function AddGroupedCompression(Compression: TNeuralFloat = 0.5;
-        MinGroupSize:integer = 16; supressBias: integer = 1): TNNetLayer;
+        MinGroupSize:integer = 32; supressBias: integer = 1): TNNetLayer;
       /// This function does both max and min pools and then concatenates results.
       function AddMinMaxPool(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0): TNNetLayer;
       function AddAvgMaxPool(pPoolSize: integer; pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
@@ -1474,7 +1474,7 @@ type
         RandomBias: integer = 1; RandomAmplifier: integer = 1;
         FeatureSize: integer = 3
         ): TNNetLayer; overload;
-      function AddDenseNetBlockk(pUnits, k, supressBias: integer;
+      function AddkDenseNetBlock(pUnits, k, supressBias: integer;
         PointWiseConv: TNNetGroupedPointwiseConvClass;
         IsSeparable: boolean = false;
         HasNorm: boolean = true;
@@ -1486,7 +1486,8 @@ type
         Compression: integer = 1; // Compression factor. 2 means taking half of channels.
         DropoutRate: TNeuralFloat = 0;
         RandomBias: integer = 1; RandomAmplifier: integer = 1;
-        FeatureSize: integer = 3
+        FeatureSize: integer = 3;
+        MinGroupSize: integer = 32
         ): TNNetLayer; overload;
       function AddParallelConvs(
         PointWiseConv: TNNetConvolutionClass {= TNNetConvolutionLinear};
@@ -5104,13 +5105,13 @@ begin
   Result := GetLastLayer();
 end;
 
-function THistoricalNets.AddDenseNetBlockk(pUnits, k, supressBias: integer;
+function THistoricalNets.AddkDenseNetBlock(pUnits, k, supressBias: integer;
   PointWiseConv: TNNetGroupedPointwiseConvClass; IsSeparable: boolean;
   HasNorm: boolean; pBeforeBottleNeck: TNNetLayerClass;
   pAfterBottleNeck: TNNetLayerClass; pBeforeConv: TNNetLayerClass;
   pAfterConv: TNNetLayerClass; BottleNeck: integer; Compression: integer;
   DropoutRate: TNeuralFloat; RandomBias: integer; RandomAmplifier: integer;
-  FeatureSize: integer): TNNetLayer;
+  FeatureSize: integer; MinGroupSize: integer): TNNetLayer;
 var
   UnitCnt: integer;
   PreviousLayer, LastLayer: TNNetLayer;
@@ -5125,7 +5126,7 @@ begin
         if (PreviousLayer.Output.Depth > BottleNeck * 2) and (PointWiseConv <> nil) then
         begin
           if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
-          AddAutoGroupedPointwiseConv( PointWiseConv, 16, BottleNeck, HasNorm, supressBias );
+          AddAutoGroupedPointwiseConv( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias );
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
       end;
@@ -10058,6 +10059,11 @@ begin
       {SupressBias=}pSuppressBias) );
   if HasNormalization then
     FirstLayer := AddLayer( TNNetChannelStdNormalization.Create() );
+//  WriteLn(
+//      'Group count:',GroupCount,
+//      ' Output group size:', pNumFeatures div GroupCount,
+//      ' Input group size:', PrevLayerChannelCount div GroupCount
+//  );
   if GroupCount > 1 then
   begin
     OutputGroupSize := pNumFeatures div GroupCount;
@@ -10071,6 +10077,15 @@ begin
           {SupressBias=}pSuppressBias) );
       if HasNormalization then
         AddLayer( TNNetChannelStdNormalization.Create() );
+      {$IFDEF Debug}
+      if (FirstLayer.Output.Depth <> GetLastLayer().Output.Depth) then
+      begin
+        WriteLn('AddAutoGroupedPointwiseConv - Bad input channel counts:',
+          FirstLayer.Output.Depth,' ',
+          GetLastLayer().Output.Depth
+        );
+      end;
+      {$ENDIF}
       AddLayer( TNNetSum.Create([GetLastLayer(), FirstLayer]) );
     end;
   end;
