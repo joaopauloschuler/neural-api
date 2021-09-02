@@ -236,3 +236,112 @@ begin
 end;
 }
 {$ENDIF}
+
+{$IFDEF AVX64}
+{$define asm_avx64_train_neuron :=
+if localNumElements > 0 then
+asm
+mov ecx, localNumElements
+mov rax, PtrPreparedInput
+mov rdx, LocalLearningErrorDerivPtr
+
+{$IFDEF AVX512}
+VBROADCASTSS zmm5, [rdx]
+{$ELSE}
+VBROADCASTSS ymm5, [rdx]
+{$ENDIF}
+
+mov rdx, PtrNeuronDelta
+
+push rcx
+shr ecx,5  // number of large iterations = number of elements / 32
+jz @SkipLargeAddLoop
+
+@LargeAddLoop:
+{$IFDEF AVX512}
+vmulps  zmm0, zmm5, [rax]
+vmulps  zmm1, zmm5, [rax+64]
+
+vaddps  zmm0, zmm0, [rdx]
+vaddps  zmm1, zmm1, [rdx+64]
+
+vmovups [rdx],    zmm0
+vmovups [rdx+64], zmm1
+{$ELSE}
+  {$IFDEF AVX2}
+  vmovups ymm0, [rdx]
+  vmovups ymm1, [rdx+32]
+  vmovups ymm2, [rdx+64]
+  vmovups ymm3, [rdx+96]
+
+  vfmadd231ps ymm0, ymm5, [rax]
+  vfmadd231ps ymm1, ymm5, [rax+32]
+  vfmadd231ps ymm2, ymm5, [rax+64]
+  vfmadd231ps ymm3, ymm5, [rax+96]
+  {$ELSE}
+  vmulps  ymm0, ymm5, [rax]
+  vmulps  ymm1, ymm5, [rax+32]
+  vmulps  ymm2, ymm5, [rax+64]
+  vmulps  ymm3, ymm5, [rax+96]
+
+  vaddps  ymm0, ymm0, [rdx]
+  vaddps  ymm1, ymm1, [rdx+32]
+  vaddps  ymm2, ymm2, [rdx+64]
+  vaddps  ymm3, ymm3, [rdx+96]
+  {$ENDIF}
+
+  vmovups [rdx],    ymm0
+  vmovups [rdx+32], ymm1
+  vmovups [rdx+64], ymm2
+  vmovups [rdx+96], ymm3
+{$ENDIF}
+
+add rax, 128
+add rdx, 128
+dec ecx
+jnz @LargeAddLoop
+
+@SkipLargeAddLoop:
+vzeroupper
+
+pop rcx
+and ecx,$0000001F
+jz @EndAdd
+shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
+
+@SmallAddLoop:
+
+movups  xmm2, [rax]
+movups  xmm4, [rdx]
+
+mulps   xmm2, xmm5
+addps   xmm4, xmm2
+
+movups  [rdx], xmm4
+
+add rax, 16
+add rdx, 16
+
+dec ecx
+jnz @SmallAddLoop
+
+@EndAdd:
+end  [
+  'RAX', 'RCX', 'RDX',
+  'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+  {$IFDEF AVX512},'zmm0', 'zmm1', 'zmm5'{$ENDIF}
+];
+
+if MissedElements>0 then
+begin
+  PtrNeuronDelta^[localNumElements] += LocalLearningErrorDeriv*PtrPreparedInput^[localNumElements];
+  if MissedElements>1 then
+  begin
+    PtrNeuronDelta^[localNumElements+1] += LocalLearningErrorDeriv*PtrPreparedInput^[localNumElements+1];
+    if MissedElements>2 then PtrNeuronDelta^[localNumElements+2] += LocalLearningErrorDeriv*PtrPreparedInput^[localNumElements+2];
+  end;
+end;
+
+}
+{$ENDIF}
+
