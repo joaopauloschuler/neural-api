@@ -978,6 +978,8 @@ type
   /// This layer is under construction. DO NOT USE IT.
   TNNetGroupedConvolutionLinear = class(TNNetConvolutionBase)
     private
+      FArrGroupId: array of integer;
+      FArrGroupIdStart: array of integer;
       procedure PrepareInputForGroupedConvolutionFast();
       procedure ComputeCPU();
       procedure BackpropagateCPU();
@@ -2025,8 +2027,8 @@ begin
             OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
             for OutputD := StartTileD to EndTileD do
             begin
-              GroupId := OutputD div GroupDSize;
-              GroupDStart := GroupId*GroupDSize;
+              GroupId := FArrGroupId[OutputD];
+              GroupDStart := FArrGroupIdStart[OutputD];
               PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, GroupDStart);
               if (FCalculatePrevLayerError and CanBackpropOnPos)
                 then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, GroupDStart);
@@ -2119,14 +2121,27 @@ begin
 end;
 
 procedure TNNetGroupedConvolutionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  GroupDSize: integer;
+  OutputD: integer;
+  GroupId, GroupDStart: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*(pPrevLayer.Output.Depth div FStruct[5]);
   FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
-  SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY,
-    pPrevLayer.Output.Depth div FStruct[5]);
+  GroupDSize := pPrevLayer.Output.Depth div FStruct[5];
+  SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, GroupDSize);
   InitDefault();
   AfterWeightUpdate();
+  SetLength(FArrGroupId, pPrevLayer.Output.Depth);
+  SetLength(FArrGroupIdStart, pPrevLayer.Output.Depth);
+  for OutputD := 0 to pPrevLayer.Output.Depth - 1 do
+  begin
+    GroupId := OutputD div GroupDSize;
+    GroupDStart := GroupId * GroupDSize;
+    FArrGroupId[OutputD] := GroupId;
+    FArrGroupIdStart[OutputD] := GroupDStart;
+  end;
 end;
 
 constructor TNNetGroupedConvolutionLinear.Create(pNumFeatures, pFeatureSize,
@@ -2141,6 +2156,8 @@ end;
 
 destructor TNNetGroupedConvolutionLinear.Destroy();
 begin
+  SetLength(FArrGroupId, 0);
+  SetLength(FArrGroupIdStart, 0);
   inherited Destroy();
 end;
 
