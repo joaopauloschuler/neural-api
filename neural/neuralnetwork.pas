@@ -980,6 +980,7 @@ type
     private
       FArrGroupId: array of integer;
       FArrGroupIdStart: array of integer;
+      FMaxPrevX, FMaxPrevY: integer;
       procedure PrepareInputForGroupedConvolutionFast();
       procedure ComputeCPU();
       procedure BackpropagateCPU();
@@ -1992,7 +1993,6 @@ var
   NeuronWeights: integer;
   LocalLearningErrorDerivPtr: pointer;
   localNumElements : integer;
-  MaxPrevX, MaxPrevY: integer;
   // Tiling
   TileXCnt, TileDCnt: integer;
   StartTileX, EndTileX, StartTileD, EndTileD: integer;
@@ -2001,8 +2001,6 @@ begin
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
   GroupDSize := OutputError.Depth div FStruct[5];
-  MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
-  MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
   LocalPrevError := FPrevLayer.OutputError;
   //PrevNumElements := (FSizeXDepth div 4) * 4;
   //PrevMissedElements := FSizeXDepth - PrevNumElements;
@@ -2029,14 +2027,13 @@ begin
             PrevX := (OutputX*FStride)-FPadding;
             CanBackpropOnPos :=
               (PrevX >= 0) and (PrevY >= 0) and
-              (PrevX < MaxPrevX) and
-              (PrevY < MaxPrevY);
+              (PrevX < FMaxPrevX) and
+              (PrevY < FMaxPrevY);
             OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
             for OutputD := StartTileD to EndTileD do
             begin
               GroupId := FArrGroupId[OutputD];
               GroupDStart := FArrGroupIdStart[OutputD];
-              PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, GroupDStart);
               if (FCalculatePrevLayerError and CanBackpropOnPos)
                 then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, GroupDStart);
               {$IFDEF FPC}
@@ -2071,6 +2068,7 @@ begin
               LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
               if (LocalLearningErrorDeriv <> 0.0) then
               begin
+                  PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, GroupDStart);
                   {$IFNDEF AVX64}
                   FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
                   {$ELSE}
@@ -2149,6 +2147,8 @@ begin
     FArrGroupId[OutputD] := GroupId;
     FArrGroupIdStart[OutputD] := GroupDStart;
   end;
+  FMaxPrevX := 1 + FPrevLayer.FOutput.SizeX - FFeatureSizeX;
+  FMaxPrevY := 1 + FPrevLayer.FOutput.SizeY - FFeatureSizeY;
 end;
 
 constructor TNNetGroupedConvolutionLinear.Create(pNumFeatures, pFeatureSize,
