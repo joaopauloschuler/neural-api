@@ -1290,14 +1290,16 @@ type
         Conv2d: TNNetGroupedPointwiseConvClass;
         MinChannelsPerGroupCount, pNumFeatures: integer;
         HasNormalization: boolean;
-        pSuppressBias: integer = 0
+        pSuppressBias: integer = 0;
+        HasIntergroup: boolean = true
         ): TNNetLayer;
       function AddAutoGroupedPointwiseConv2(
         Conv2d: TNNetGroupedPointwiseConvClass;
         MinChannelsPerGroupCount, pNumFeatures: integer;
         HasNormalization: boolean;
         pSuppressBias: integer = 0;
-        AlwaysIntergroup: boolean = true
+        AlwaysIntergroup: boolean = true;
+        HasIntergroup: boolean = true
         ): TNNetLayer;
       function AddAutoGroupedConvolution(Conv2d: TNNetConvolutionClass;
         MinChannelsPerGroupCount, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
@@ -1330,7 +1332,8 @@ type
         pAfterLayer: TNNetLayer = nil): TNNetLayer; overload;
       function AddCompression(Compression: TNeuralFloat = 0.5; supressBias: integer = 1): TNNetLayer;
       function AddGroupedCompression(Compression: TNeuralFloat = 0.5;
-        MinGroupSize:integer = 32; supressBias: integer = 1): TNNetLayer;
+        MinGroupSize:integer = 32; supressBias: integer = 1;
+        HasIntergroup: boolean = true): TNNetLayer;
       /// This function does both max and min pools and then concatenates results.
       function AddMinMaxPool(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0): TNNetLayer;
       function AddAvgMaxPool(pPoolSize: integer; pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
@@ -5156,7 +5159,7 @@ begin
         if (PreviousLayer.Output.Depth > BottleNeck * 2) and (PointWiseConv <> nil) then
         begin
           if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
-          AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias );
+          AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias, false, false );
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
       end;
@@ -9867,7 +9870,8 @@ function TNNet.AddAutoGroupedPointwiseConv(
   Conv2d: TNNetGroupedPointwiseConvClass;
   MinChannelsPerGroupCount, pNumFeatures: integer;
   HasNormalization: boolean;
-  pSuppressBias: integer = 0
+  pSuppressBias: integer = 0;
+  HasIntergroup: boolean = true
   ): TNNetLayer;
 var
   MaxGroupCount: integer;
@@ -9892,7 +9896,7 @@ begin
 //      ' Output group size:', pNumFeatures div GroupCount,
 //      ' Input group size:', PrevLayerChannelCount div GroupCount
 //  );
-  if GroupCount > 1 then
+  if ( (GroupCount > 1) and (HasIntergroup) ) then
   begin
     OutputGroupSize := pNumFeatures div GroupCount;
     AddLayer( TNNetInterleaveChannels.Create(OutputGroupSize) );
@@ -9924,7 +9928,8 @@ end;
 function TNNet.AddAutoGroupedPointwiseConv2(
   Conv2d: TNNetGroupedPointwiseConvClass; MinChannelsPerGroupCount,
   pNumFeatures: integer; HasNormalization: boolean; pSuppressBias: integer;
-  AlwaysIntergroup: boolean): TNNetLayer;
+  AlwaysIntergroup: boolean;
+  HasIntergroup: boolean): TNNetLayer;
 var
   MaxGroupCount, SecondMaxGroupCount: integer;
   GroupCount, SecondGroupCount: integer;
@@ -9948,7 +9953,7 @@ begin
   //    ' Output group size:', pNumFeatures div GroupCount,
   //    ' Input group size:', PrevLayerChannelCount div GroupCount
   //);
-  if GroupCount > 1 then
+  if ( (GroupCount > 1) and (HasIntergroup) ) then
   begin
     SecondMaxGroupCount := (pNumFeatures div MinChannelsPerGroupCount);
     SecondGroupCount := GetMaxAcceptableCommonDivisor(
@@ -10155,7 +10160,8 @@ begin
 end;
 
 function TNNet.AddGroupedCompression(Compression: TNeuralFloat;
-  MinGroupSize:integer; supressBias: integer): TNNetLayer;
+  MinGroupSize:integer; supressBias: integer;
+  HasIntergroup: boolean): TNNetLayer;
 var
   FilterCount: integer;
 begin
@@ -10165,7 +10171,8 @@ begin
   //  {MinGroupSize=}MinGroupSize, {pNumFeatures=}FilterCount, {pFeatureSize=}1,
   //  {pInputPadding=}0, {pStride=}1, supressBias,
   //  {ChannelInterleaving=} true);
-  AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvLinear, MinGroupSize, FilterCount, False, supressBias);
+  AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvLinear, MinGroupSize,
+    FilterCount, False, supressBias, False, HasIntergroup);
   Result := GetLastLayer();
 end;
 
