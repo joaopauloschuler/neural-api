@@ -416,6 +416,8 @@ type
       function GetTotalSize(): integer;
       function GetSum(): TNeuralFloat;
       function GetAvg(): TNeuralFloat;
+      procedure AddValue(Value: TNeuralFloat);
+      procedure Divi(Value: TNeuralFloat);
       function GetClosestId(Original: TNNetVolume; var MinDist: TNeuralFloat): integer;
       function GetManhattanClosestId(Original: TNNetVolume; var MinDist: TNeuralFloat): integer;
       procedure Fill(c: Single = 0);
@@ -1965,6 +1967,34 @@ begin
   else
   begin
     Result := 0;
+  end;
+end;
+
+procedure TNNetVolumeList.AddValue(Value: TNeuralFloat);
+var
+  I: integer;
+  AuxVolume: TNNetVolume;
+begin
+  if (Count>0) then
+  begin
+    for I := 0 to Count - 1 do
+    begin
+      Self[I].Add(Value);
+    end;
+  end;
+end;
+
+procedure TNNetVolumeList.Divi(Value: TNeuralFloat);
+var
+  I: integer;
+  AuxVolume: TNNetVolume;
+begin
+  if (Count>0) then
+  begin
+    for I := 0 to Count - 1 do
+    begin
+      Self[I].Divi(Value);
+    end;
   end;
 end;
 
