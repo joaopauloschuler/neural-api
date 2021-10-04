@@ -142,6 +142,7 @@ type
   {$ENDIF}
       constructor CreateWithElements(ElementCount: integer);
       function GetMaxWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function GetMaxAbsWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMinWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure InitForDebug();
   end;
@@ -3062,6 +3063,29 @@ begin
   end;
 end;
 
+function TNNetNeuronList.GetMaxAbsWeight(): TNeuralFloat;
+var
+  Cnt: integer;
+  MaxValue: TNeuralFloat;
+begin
+  if Count > 0 then
+  begin
+    Result := Self[0].Weights.GetMaxAbs();
+    if Count > 1 then
+    begin
+      for Cnt := 0 to Count-1 do
+      begin
+        MaxValue := Self[Cnt].Weights.GetMaxAbs();
+        if MaxValue > Result then Result := MaxValue;
+      end;
+    end;
+  end
+  else
+  begin
+    Result := -1;
+  end;
+end;
+
 function TNNetNeuronList.GetMinWeight(): TNeuralFloat;
 var
   Cnt: integer;
@@ -5159,7 +5183,9 @@ begin
         if (PreviousLayer.Output.Depth > BottleNeck * 2) and (PointWiseConv <> nil) then
         begin
           if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
+          //if UnitCnt > 1 then AddLayer( TNNetInterleaveChannels.Create(UnitCnt) );
           AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias, false, false );
+          //AddAutoGroupedConvolution(TNNetConvolutionReLU, MinGroupSize, BottleNeck, 1, 0, 1, supressBias, False);
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
       end;
@@ -8967,8 +8993,17 @@ begin
 end;
 
 procedure TNNetConvolutionAbstract.InitDefault();
+var
+  MaxAbsW: TNeuralFloat;
 begin
   InitHeUniform(1);
+  MaxAbsW := FNeurons.GetMaxAbsWeight();
+  if MaxAbsW > 0.4 then
+  begin
+    //MulWeights(0.4/MaxAbsW);
+    //AfterWeightUpdate();
+    //WriteLn('ooops at layer',Self.LayerIdx,' -> ', MaxAbsW);
+  end;
 end;
 
 { TNNetFullConnect }
