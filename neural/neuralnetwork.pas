@@ -8993,17 +8993,21 @@ begin
 end;
 
 procedure TNNetConvolutionAbstract.InitDefault();
+{$IFDEF Debug}
 var
   MaxAbsW: TNeuralFloat;
+{$ENDIF}
 begin
   InitHeUniform(1);
+  {$IFDEF Debug}
   MaxAbsW := FNeurons.GetMaxAbsWeight();
   if MaxAbsW > 0.4 then
   begin
-    //MulWeights(0.4/MaxAbsW);
-    //AfterWeightUpdate();
-    //WriteLn('ooops at layer',Self.LayerIdx,' -> ', MaxAbsW);
+    MulWeights(0.4/MaxAbsW);
+    AfterWeightUpdate();
+    WriteLn('Too high initial value at layer',Self.LayerIdx,' -> ', MaxAbsW);
   end;
+  {$ENDIF}
 end;
 
 { TNNetFullConnect }
