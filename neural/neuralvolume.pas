@@ -654,17 +654,29 @@ begin
   end;
 end;
 
+// https://stackoverflow.com/questions/51976461/optimal-way-of-defining-a-numerically-stable-sigmoid-function-for-a-list-in-pyth
 function Sigmoid(x: TNeuralFloat): TNeuralFloat;
+var
+  S: TNeuralFloat;
 begin
-  Result := x / ( 1 + Exp(-x) );
+  if x > 0 then
+  begin
+    Result := 1 / ( 1 + Exp(-x) )
+  end
+  else
+  begin
+    S := Exp(x);
+    Result := S / (1 + S);
+  end;
 end;
 
+// https://towardsdatascience.com/derivative-of-the-sigmoid-function-536880cf918e
 function SigmoidDerivative(x: TNeuralFloat): TNeuralFloat;
 var
   S: TNeuralFloat;
 begin
-  S := Exp(x);
-  Result := S / Sqr(1 + S);
+  S := Sigmoid(x);
+  Result := S * (1 - S);
 end;
 
 function Identity(x: TNeuralFloat): TNeuralFloat;
