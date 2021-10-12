@@ -9770,8 +9770,8 @@ begin
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
-      if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
-      if S[0] = 'TNNetGroupedPointwiseConvReLU' then Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
+      if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
+      if S[0] = 'TNNetGroupedPointwiseConvReLU' then Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
@@ -9787,7 +9787,7 @@ begin
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
-      if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]);
+      if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else
@@ -9805,10 +9805,10 @@ begin
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
-      if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
+      if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
-      if S[0] = 'TNNetCellMulByCell' then Result := TNNetCellMulByCell.Create(St[0], St[1]);
+      if S[0] = 'TNNetCellMulByCell' then Result := TNNetCellMulByCell.Create(St[0], St[1]) else
       if S[0] = 'TNNetRandomMulAdd' then Result := TNNetRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelRandomMulAdd' then Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelZeroCenter' then Result := TNNetChannelZeroCenter.Create() else
