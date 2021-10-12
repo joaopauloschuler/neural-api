@@ -91,7 +91,6 @@ const
   csMaxInterleavedSize: integer = 95;
 
 type
-  TNNet = class;
   { TNNetNeuron }
   TNNetNeuron = class (TMObject)
     protected
@@ -151,6 +150,7 @@ type
     csNNetMaxParameterIdx = 7;
 
   type
+  TNNet = class;
   /// neural network layer
   TNNetLayer = class(TMObject)
     protected
