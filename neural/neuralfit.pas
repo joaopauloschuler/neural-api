@@ -943,9 +943,8 @@ begin
       begin
         vInputCopy.CopyCropping(vInput, random(FMaxCropSize), random(FMaxCropSize), vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
         vInput.Copy(vInputCopy);
-      end;
-
-      if FHasResizing then
+      end
+      else if FHasResizing then
       begin
         CropSizeX := random(FMaxCropSize + 1);
         CropSizeY := random(FMaxCropSize + 1);
@@ -1939,14 +1938,17 @@ begin
       if FHasImgCrop then
       begin
         ImgInput.CopyCropping(FImgVolumes[ImgIdx], random(FMaxCropSize), random(FMaxCropSize), FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
-      end;
-
-      if FHasResizing then
+      end
+      else if FHasResizing then
       begin
         CropSizeX := random(FMaxCropSize + 1);
         CropSizeY := random(FMaxCropSize + 1);
         ImgInputCp.CopyCropping(FImgVolumes[ImgIdx], random(CropSizeX), random(CropSizeY),FImgVolumes[ImgIdx].SizeX-CropSizeX, FImgVolumes[ImgIdx].SizeY-CropSizeY);
         ImgInput.CopyResizing(ImgInputCp, FImgVolumes[ImgIdx].SizeX, FImgVolumes[ImgIdx].SizeY);
+      end
+      else
+      begin
+        ImgInput.Copy(FImgVolumes[ImgIdx]);
       end;
 
       if (ImgInput.Depth = 3) then
@@ -1967,7 +1969,8 @@ begin
         ImgInput.FlipY();
       end;
     end
-    else begin
+    else
+    begin
       ImgInput.Copy(FImgVolumes[ImgIdx]);
     end;
     ImgInput.Tag := FImgVolumes[ImgIdx].Tag;

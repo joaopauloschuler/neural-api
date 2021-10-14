@@ -9060,6 +9060,8 @@ var
 {$ENDIF}
 begin
   InitHeUniform(1);
+  (*
+  // High values can be usual in small networks.
   {$IFDEF Debug}
   MaxAbsW := FNeurons.GetMaxAbsWeight();
   if MaxAbsW > 0.4 then
@@ -9069,6 +9071,7 @@ begin
     WriteLn('Too high initial value at layer',Self.LayerIdx,' -> ', MaxAbsW);
   end;
   {$ENDIF}
+  *)
 end;
 
 { TNNetFullConnect }
