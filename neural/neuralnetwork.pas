@@ -406,13 +406,21 @@ type
       procedure Compute(); override;
   end;
 
-  /// This is an experimental layer - do not use it.
+  /// This is a leaky ReLU with minimum and maximum values. You can
+  // scale leakiness via the Leaky parameter.
   TNNetReLUL = class(TNNetReLUBase)
     private
       FScale, FLowLimit, FHighLimit: TNeuralFloat;
     public
-      constructor Create(LowLimit, HighLimit: integer); overload;
+      constructor Create(LowLimit, HighLimit, Leakiness: integer); overload;
       procedure Compute(); override;
+  end;
+
+  /// This is a Relu with low limit = 0 and high limit = 6. You
+  // can optionally make this activation function leaky.
+  TNNetReLU6 = class(TNNetReLUL)
+    public
+      constructor Create(Leakiness: integer = 0); overload;
   end;
 
   /// Scaled Exponential Linear Unit
@@ -1799,6 +1807,12 @@ begin
   end;
 end;
 
+{ TNNetReLU6 }
+constructor TNNetReLU6.Create(Leakiness: integer);
+begin
+  inherited Create(0, 6, Leakiness);
+end;
+
 { TNNetSwish }
 
 procedure TNNetSwish.Compute();
@@ -2934,14 +2948,15 @@ end;
 
 { TNNetReLUL }
 
-constructor TNNetReLUL.Create(LowLimit, HighLimit: integer);
+constructor TNNetReLUL.Create(LowLimit, HighLimit, Leakiness: integer);
 begin
   inherited Create();
-  FScale := 0.001;
+  FScale := 0.001*Leakiness;
   FHighLimit := HighLimit;
   FLowLimit := LowLimit;
   FStruct[0] := LowLimit;
   FStruct[1] := HighLimit;
+  FStruct[2] := Leakiness;
 end;
 
 procedure TNNetReLUL.Compute();
@@ -9656,7 +9671,8 @@ begin
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
-      'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1]);
+      'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
+      'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
       'TNNetPower' :                Result := TNNetPower.Create(St[0]);
       'TNNetSELU' :                 Result := TNNetSELU.Create();
       'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
@@ -9741,7 +9757,8 @@ begin
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
-      if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1]) else
+      if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
       if S[0] = 'TNNetPower' then Result := TNNetPower.Create(St[0]) else
       if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
       if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
