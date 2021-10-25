@@ -115,6 +115,9 @@ const
     'cat'    // used to be truck
   );
 
+var
+  directory: string = ''; // path to the dataset
+
 {$IFDEF FPC}
 type
 
@@ -925,6 +928,7 @@ var
   globalMin2, globalMax2: TNeuralFloat;
 
 begin
+  filename := directory + fileName;
   Write('Loading 10K images from file "'+fileName+'" ...');
   AssignFile(cifarFile, fileName);
   Reset(cifarFile);
@@ -988,6 +992,7 @@ var
   cifarFile: TCifar100File;
   AuxVolume: TNNetVolume;
 begin
+  filename := directory + fileName;
   if Verbose then Write('Loading images from CIFAR-100 file "'+fileName+'" ...');
   AssignFile(cifarFile, fileName);
   Reset(cifarFile);
