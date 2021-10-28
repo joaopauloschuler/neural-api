@@ -110,6 +110,7 @@ type
     FDepth: integer;
     FTag: array[0..1] of integer;
     FFormatSettings: TFormatSettings;
+    FLastPos: integer;
     function GetTag: integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTag(I: integer); {$IFDEF Release} inline; {$ENDIF}
     function GetTags(x: integer): integer; {$IFDEF Release} inline; {$ENDIF}
@@ -3822,6 +3823,7 @@ begin
   if Length(FData) > 0 then
   begin
     Result := FData[0];
+    FLastPos := 0;
     vHigh := High(FData);
     if vHigh > 0 then
     begin
@@ -3830,6 +3832,7 @@ begin
         if FData[I] > Result then
         begin
           Result := FData[I];
+          FLastPos := I;
         end;
       end;
     end;
@@ -3865,6 +3868,7 @@ begin
   if Length(FData) > 0 then
   begin
     auxSingle := FData[0];
+    FLastPos := 0;
     Result := Abs(auxSingle);
     vHigh := High(FData);
     if vHigh > 0 then
@@ -3875,6 +3879,7 @@ begin
         if Abs(auxSingle) > Result then
         begin
           Result := Abs(auxSingle);
+          FLastPos := I;
         end;
       end;
     end;
@@ -3893,6 +3898,7 @@ begin
   if Length(FData) > 0 then
   begin
     Result := FData[0];
+    FLastPos := 0;
     vHigh := High(FData);
     if vHigh > 0 then
     begin
@@ -3901,6 +3907,7 @@ begin
         if FData[I] < Result then
         begin
           Result := FData[I];
+          FLastPos := I;
         end;
       end;
     end;
@@ -4766,9 +4773,20 @@ begin
 end;
 
 procedure TVolume.PrintDebug();
+var
+  MinVal, MaxVal: TNeuralFloat;
+  MinPos, MaxPos: integer;
 begin
-  Write('(',SizeX,',',SizeY,',',Depth,') - ');
-  Write('Min: ',GetMin(),' Max:',GetMax(),' Avg:',GetAvg(),' Non Zero:',GetNonZero(),' Size:', FSize);
+  MinVal :=  GetMin();
+  MinPos := FLastPos;
+  MaxVal :=  GetMax();
+  MaxPos := FLastPos;
+
+  Write(
+    '(',SizeX,',',SizeY,',',Depth,') - ',
+    'Min: ',MinVal,' Min Pos:',MinPos,
+    ' Max:',MaxVal,' Max Pos:',MaxPos,
+    ' Avg:',GetAvg(),' Non Zero:',GetNonZero(),' Size:', FSize);
 end;
 
 procedure TVolume.PrintDebugChannel();
