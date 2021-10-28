@@ -351,6 +351,14 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// This layer allows you to debug activation and backpropagation of an
+  TNNetDebug = class(TNNetIdentity)
+    public
+      constructor Create(hasForward, hasBackward: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Padding layer: adds padding to the input.
   // This layer has no trainable parameter. Adding a padding layer may be
   // more efficient than padding at the convolutional layer.
@@ -1805,6 +1813,38 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+constructor TNNetDebug.Create(hasForward, hasBackward: integer);
+begin
+  inherited Create();
+  FStruct[0] := hasForward;
+  FStruct[1] := hasBackward;
+end;
+
+{ TNNetDebug }
+procedure TNNetDebug.Compute();
+begin
+  inherited Compute();
+  if ((FStruct[0]>0) and (Random(1000)=0)) then
+  begin
+    Write('Forward:');
+    FOutput.PrintDebug();
+    WriteLn;
+  end;
+end;
+
+procedure TNNetDebug.Backpropagate();
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if ((FStruct[1]>0) and (Random(1000)=0)) then
+  begin
+    Write('Backward:');
+    FOutputError.PrintDebug();
+    WriteLn;
+  end;
+  inherited Backpropagate();
 end;
 
 { TNNetReLU6 }
@@ -9669,6 +9709,7 @@ begin
     case S[0] of
       'TNNetInput' :                Result := TNNetInput.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
+      'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0]);
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
@@ -9755,6 +9796,7 @@ begin
     {$ELSE}
       if S[0] = 'TNNetInput' then Result := TNNetInput.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
+      if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0]) else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
