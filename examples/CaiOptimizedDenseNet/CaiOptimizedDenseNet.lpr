@@ -74,7 +74,7 @@ type
     end;
 
     bSeparable := HasOption('s', 'separable');
-    bPaddingCropping := HasOption('p', 'padding');
+    bPaddingCropping := true; // HasOption('p', 'padding');
 
     iInnerConvNum := 12;
     if HasOption('c', 'convolutions') then
@@ -123,16 +123,37 @@ type
     NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
     NN.AddCompression(1);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    //NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddCompression(1);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {IsSeparable=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    //NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {IsSeparable=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddCompression(1);
     NN.AddLayer( TNNetDropout.Create(0.25) );
     NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
     NN.AddLayer( TNNetSoftMax.Create() );
     NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
+    (*
+    // First block shouldn't be separable.
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}false, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}nil, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}0, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}nil, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddCompression(1);
+    NN.AddLayer( TNNetMaxPool.Create(2) );
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}0, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddCompression(1);
+    NN.AddLayer( TNNetSwish.Create() );
+    NN.AddLayer( TNNetMaxPool.Create(2) );
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {IsSeparable=}0, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddCompression(1);
+    NN.AddLayer( TNNetSwish.Create() );
+    NN.AddLayer( TNNetDropout.Create(0.25) );
+    NN.AddLayer( TNNetMaxChannel.Create() );
+    NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
+    NN.AddLayer( TNNetSoftMax.Create() );
+    NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
+    *)
 
     WriteLn('Learning rate set to: [',fLearningRate:7:5,']');
     WriteLn('Inertia set to: [',fInertia:7:5,']');
@@ -211,7 +232,7 @@ type
       ' -c : defines the number of convolutions. Default is 12.', sLineBreak,
       ' -b : defines the bottleneck. Default is 32.', sLineBreak,
       ' -n : defines convolutional neurons (growth rate). Default is 32.', sLineBreak,
-      ' -p : enables padding and cropping data augmentation.', sLineBreak,
+//      ' -p : enables padding and cropping data augmentation.', sLineBreak,
       ' https://github.com/joaopauloschuler/neural-api/tree/master/examples/CaiOptimizedDenseNet',sLineBreak,
       ' More info at:',sLineBreak,
       '   https://github.com/joaopauloschuler/neural-api'
