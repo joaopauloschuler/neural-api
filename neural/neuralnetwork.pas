@@ -445,9 +445,15 @@ type
       procedure Compute(); override;
   end;
 
-  // Swish activation function
+  /// Swish activation function
   // https://arxiv.org/abs/1710.05941
   TNNetSwish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
+  /// Swish activation function with maximum limit of 6
+  TNNetSwish6 = class(TNNetReLUBase)
   public
     procedure Compute(); override;
   end;
@@ -1813,6 +1819,51 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+procedure TNNetSwish6.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue: TNeuralFloat;
+  SigmoidValue: TNeuralFloat;
+  OutputValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      SigmoidValue := 1 / ( 1 + Exp(-PrevValue) );
+      OutputValue := PrevValue * SigmoidValue;
+      if OutputValue < 6 then
+      begin
+        FOutput.FData[OutputCnt] := OutputValue;
+        FOutputErrorDeriv.FData[OutputCnt] := OutputValue + SigmoidValue * (1-OutputValue);
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 6;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Min(6.0, PrevValue / ( 1 + Exp(-PrevValue) ));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 constructor TNNetDebug.Create(hasForward, hasBackward: integer);
@@ -9714,6 +9765,7 @@ begin
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
+      'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -9801,6 +9853,7 @@ begin
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
+      if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
