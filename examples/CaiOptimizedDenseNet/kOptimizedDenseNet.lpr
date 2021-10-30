@@ -23,7 +23,7 @@ const
   // Padding and cropping constants.
   csPadding = 4;
   csCropSize = csPadding * 2;
-  csGroupSize = 32;
+  csGroupSize = 16;
 
 type
   TTestCNNAlgo = class(TCustomApplication)
@@ -91,7 +91,7 @@ type
       iBottleneck := StrToInt(ParStr);
     end;
 
-    iConvNeuronCount := 32;
+    iConvNeuronCount := 64;
     if HasOption('n', 'neurons') then
     begin
       ParStr := GetOptionValue('n', 'neurons');
@@ -112,6 +112,7 @@ type
     fileNameBase: string;
     HasMovingNorm: boolean;
     HasRandomAddBias: integer;
+    SupressBias: integer;
     HasIntergroup: boolean;
   begin
     if not CheckCIFARFile() then exit;
@@ -119,45 +120,46 @@ type
     NumClasses  := 10;
     NN := THistoricalNets.Create();
     fileNameBase := 'kCaiOptimizedDenseNet';
-    HasMovingNorm := true;
+    HasMovingNorm := false;
     HasRandomAddBias := 0;
+    SupressBias := 1;
     HasIntergroup := false;
     NN.AddLayer( TNNetInput.Create(32, 32, 3).EnableErrorCollection() );
     NN.AddLayerDeepConcatingInputOutput( TNNetConvolutionReLU.Create(29,3,1,1,0) );
 //(*
     // First block shouldn't be separable.
-    NN.AddkDenseNetBlock(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}1, TNNetGroupedPointwiseConvReLU, {IsSeparable=}false, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}nil, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomBias=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
+    NN.AddkDenseNetBlock(iInnerConvNum div 6, iConvNeuronCount, SupressBias, TNNetGroupedPointwiseConvLinear, {IsSeparable=}true, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}TNNetReLU6, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU6, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomBias=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
+    NN.AddLayer( TNNetMaxPool.Create(2) );
+    NN.AddkDenseNetBlock(iInnerConvNum div 6, iConvNeuronCount, SupressBias, TNNetGroupedPointwiseConvLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}TNNetReLU6, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU6, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
     NN.AddGroupedCompression(1, csGroupSize, 1, HasIntergroup);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddkDenseNetBlock(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}1, TNNetGroupedPointwiseConvReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}nil, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
+    NN.AddLayer( TNNetReLU6.Create() );
+    NN.AddkDenseNetBlock(iInnerConvNum div 3, iConvNeuronCount, SupressBias, TNNetGroupedPointwiseConvLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}TNNetSwish6, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish6, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
+    NN.AddLayer( TNNetInterleaveChannels.Create(12) );
     NN.AddGroupedCompression(1, csGroupSize, 1, HasIntergroup);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddkDenseNetBlock(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetGroupedPointwiseConvReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}nil, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
-    NN.AddGroupedCompression(1, csGroupSize, 1, HasIntergroup);
-    NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddkDenseNetBlock(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetGroupedPointwiseConvReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}nil, {pBeforeConv=}nil, {pAfterConv=}TNNetReLU, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
+    NN.AddLayer( TNNetReLU6.Create() );
+    NN.AddkDenseNetBlock(iInnerConvNum div 3, iConvNeuronCount, SupressBias, TNNetGroupedPointwiseConvLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBot=}nil, {pAfterBot=}TNNetSwish6, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish6, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}HasRandomAddBias, {RandomMul=}HasRandomAddBias, {FeatureSize=}3, {MinGroupSize=}csGroupSize);
+    NN.AddLayer( TNNetInterleaveChannels.Create(16) );
     NN.AddGroupedCompression(1, csGroupSize, 1, HasIntergroup);
 //*)
 (*
     // First block shouldn't be separable.
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}false, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, SupressBias, TNNetConvolutionReLU, {IsSeparable=}true, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 6, iConvNeuronCount, SupressBias, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
     NN.AddCompression(1);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, SupressBias, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
     NN.AddCompression(1);
     NN.AddLayer( TNNetMaxPool.Create(2) );
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {IsSeparable=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, SupressBias, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
     NN.AddCompression(1);
 *)
-    //NN.AddLayer( TNNetDropout.Create(0.25) );
     NN.AddLayer( TNNetMaxChannel.Create() );
+    NN.AddLayer( TNNetReLU6.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
     NN.AddLayer( TNNetSoftMax.Create() );
     NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
-    WriteLn('Learning rate set to: [',fLearningRate:7:5,']');
-    WriteLn('Inertia set to: [',fInertia:7:5,']');
-    WriteLn('Target set to: [',fTarget:7:5,']');
 
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
@@ -181,12 +183,21 @@ type
       );
     end;
 
-    WriteLn('Neural Network will minimize error with:');
-    WriteLn(' Layers: ', NN.CountLayers());
-    WriteLn(' Neurons:', NN.CountNeurons());
-    WriteLn(' Weights:', NN.CountWeights());
     NN.DebugWeights();
     NN.DebugStructure();
+
+    WriteLn('Learning rate set to: [',fLearningRate:7:5,']');
+    WriteLn('Inertia set to: [',fInertia:7:5,']');
+    WriteLn('Target set to: [',fTarget:7:5,']');
+
+    WriteLn('Has AVX: ', ImgTrainingVolumes[0].HasAVX);
+    WriteLn('Has AVX2: ', ImgTrainingVolumes[0].HasAVX2);
+    WriteLn('Has AVX512: ', ImgTrainingVolumes[0].HasAVX512);
+
+    WriteLn('Neural Network will minimize error with:');
+    WriteLn(' Layers: ', NN.CountLayers());
+    WriteLn(' Neurons: ', NN.CountNeurons());
+    WriteLn(' Weights: ', NN.CountWeights());
 
     NeuralFit := TNeuralImageFit.Create;
 
@@ -204,6 +215,7 @@ type
     NeuralFit.StaircaseEpochs := 15;
     NeuralFit.Inertia := fInertia;
     NeuralFit.TargetAccuracy := fTarget;
+    NeuralFit.ClipDelta := 0.01;
     NeuralFit.MaxThreadNum := 1;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize=}64, {epochs=}300);
     NeuralFit.Free;
