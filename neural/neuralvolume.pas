@@ -181,6 +181,7 @@ type
     procedure Divi(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMinRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
+    procedure ForceMaxAbs(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
     procedure AddGaussianNoise(pMul: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -3208,6 +3209,19 @@ begin
   vHigh := High(FData);
   for I := 0 to vHigh do
     FData[I] := NeuronForceRange(FData[I], Value);
+end;
+
+procedure TVolume.ForceMaxAbs(Value: T);
+var
+  VMaxAbs, VFix: Single;
+begin
+  VMaxAbs := GetMaxAbs();
+  if VMaxAbs > Value then
+  begin
+    VFix := Value/VMaxAbs;
+    Self.Mul( VFix );
+    WriteLn(VMaxAbs:6:2);
+  end;
 end;
 
 destructor TVolume.Destroy();
