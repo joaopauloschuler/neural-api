@@ -100,6 +100,8 @@ type
 
       property AvgWeightEpochCount: integer read FAvgWeightEpochCount write FAvgWeightEpochCount;
       property AvgNN: TNNet read FAvgWeight;
+      /// ClipDelta is a per neuron absolute max normalization.
+      // This is useful for This is useful for making SGD numerically stable.
       property ClipDelta: single read FClipDelta write FClipDelta;
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentStep: integer read FCurrentStep;
