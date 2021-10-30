@@ -124,11 +124,11 @@ type
     NN.AddCompression(1);
     NN.AddLayer( TNNetMaxPool.Create(2) );
     //NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish6, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish6, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddCompression(1);
     NN.AddLayer( TNNetMaxPool.Create(2) );
     //NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {IsSeparable=}1, TNNetConvolutionReLU, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeNorm=}nil, {pAfterNorm=}nil, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0, {RandomAdd=}1, {RandomMul=}1);
-    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
+    NN.AddDenseNetBlockCAI(iInnerConvNum div 3, iConvNeuronCount, {supressBias=}1, TNNetConvolutionLinear, {IsSeparable=}bSeparable, {HasMovingNorm=}HasMovingNorm, {pBeforeBottleNeck=}nil, {pAfterBottleNeck=}TNNetSwish6, {pBeforeConv=}nil, {pAfterConv=}TNNetSwish6, {BottleNeck=}iBottleneck, {Compression=}0, {Dropout=}0);
     NN.AddCompression(1);
     NN.AddLayer( TNNetDropout.Create(0.25) );
     NN.AddLayer( TNNetMaxChannel.Create() );
