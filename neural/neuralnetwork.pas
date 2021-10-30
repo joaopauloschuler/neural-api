@@ -2155,6 +2155,7 @@ begin
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
+  // Debug code: FOutputError.ForceMaxAbs(1);
   GroupDSize := OutputError.Depth div FStruct[5];
   LocalPrevError := FPrevLayer.OutputError;
   //PrevNumElements := (FSizeXDepth div 4) * 4;
@@ -10996,6 +10997,7 @@ begin
       if not(FLayers[LayerCnt].LinkedNeurons) then
       begin
         LayerMul := FLayers[LayerCnt].ForceMaxAbsoluteDelta(vMax);
+        {$IFDEF Debug}
         if LayerMul < Result then
         begin
           Result := LayerMul;
@@ -11003,6 +11005,7 @@ begin
             ' on layer '+IntToStr(LayerCnt)+' - '+
             FLayers[LayerCnt].ClassName+'.');
         end;
+        {$ENDIF}
       end;
     end;
   end;
