@@ -226,12 +226,13 @@ function TinyImageTo1D(var TI: TTinySingleChannelImage): TTinySingleChannelImage
 
 // creates CIFAR10 volumes required for training, testing and validation
 procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
-  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB);
+  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
+  ValidationSampleSize: integer = 2000);
 
 // creates CIFAR100 volumes required for training, testing and validation
 procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
-  Verbose:boolean = true);
+  Verbose:boolean = true; ValidationSampleSize: integer = 2000);
 
 // creates MNIST volumes required for training, testing and validation
 procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
@@ -831,13 +832,16 @@ begin
 end;
 
 procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
-  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB);
+  ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
+  ValidationSampleSize: integer = 2000);
 var
-  I: integer;
+  I, LastElement: integer;
 begin
   ImgTrainingVolumes := TNNetVolumeList.Create();
   ImgValidationVolumes := TNNetVolumeList.Create();
   ImgTestVolumes := TNNetVolumeList.Create();
+
+  if ValidationSampleSize > 10000 then ValidationSampleSize := 10000;
 
   // creates required volumes to store images
   for I := 0 to 39999 do
@@ -857,28 +861,44 @@ begin
   loadCifar10Dataset(ImgTrainingVolumes, 4, 30000, color_encoding);
   loadCifar10Dataset(ImgValidationVolumes, 5, 0, color_encoding);
   loadCifar10Dataset(ImgTestVolumes, 'test_batch.bin', 0, color_encoding);
+
+  // Should move validation volumes to training volumes?
+  if ValidationSampleSize < 10000 then
+  begin
+    ImgValidationVolumes.FreeObjects := False;
+    LastElement := ImgValidationVolumes.Count - 1;
+    for I := LastElement downto (LastElement-(10000-ValidationSampleSize)+1) do
+    begin
+      ImgTrainingVolumes.Add(ImgValidationVolumes[I]);
+      ImgValidationVolumes.Delete(I);
+    end;
+    ImgValidationVolumes.FreeObjects := True;
+  end;
 end;
 
 procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ImgTestVolumes: TNNetVolumeList; color_encoding: byte = csEncodeRGB;
-  Verbose:boolean = true);
+  Verbose:boolean = true; ValidationSampleSize: integer = 2000);
 var
   I, LastElement: integer;
 begin
   ImgTrainingVolumes := TNNetVolumeList.Create();
-  ImgTrainingVolumes.FreeObjects := false;
   ImgValidationVolumes := TNNetVolumeList.Create();
   ImgTestVolumes := TNNetVolumeList.Create();
   loadCifar100Dataset(ImgTrainingVolumes, 'train.bin', color_encoding, Verbose);
   loadCifar100Dataset(ImgTestVolumes, 'test.bin', color_encoding, Verbose);
-
   LastElement := ImgTrainingVolumes.Count - 1;
-  for I := LastElement downto (LastElement-4999) do
+  if ValidationSampleSize > 0 then
   begin
-    ImgValidationVolumes.Add(ImgTrainingVolumes[I]);
-    ImgTrainingVolumes.Delete(I);
+    ImgTrainingVolumes.FreeObjects := false;
+    if ValidationSampleSize > 25000 then ValidationSampleSize := 25000;
+    for I := LastElement downto (LastElement-ValidationSampleSize+1) do
+    begin
+      ImgValidationVolumes.Add(ImgTrainingVolumes[I]);
+      ImgTrainingVolumes.Delete(I);
+    end;
+    ImgTrainingVolumes.FreeObjects := true;
   end;
-  ImgTrainingVolumes.FreeObjects := true;
 end;
 
 procedure CreateMNISTVolumes(out ImgTrainingVolumes, ImgValidationVolumes,
