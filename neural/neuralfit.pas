@@ -532,16 +532,8 @@ procedure TNeuralDataLoadingFit.FitLoading(pNN: TNNet; TrainingCnt,
   pGetTrainingPair, pGetValidationPair,
   pGetTestPair: TNNetGetPairFn);
 var
-  I: integer;
-  startTime, totalTimeSeconds: double;
   globalStartTime: double;
-  fileName, FileNameCSV: string;
-  TrainingError, TrainingLoss: TNeuralFloat;
-  ValidationError, ValidationLoss, ValidationRate: TNeuralFloat;
   TestError, TestLoss, TestRate: TNeuralFloat;
-  CSVFile: TextFile;
-  CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
-  ValidationRecord: TNeuralFloat;
   procedure RunTest();
   begin
           RunTestBatch(TestCnt);
@@ -565,7 +557,15 @@ var
             );
           end;
   end;
-
+var
+  I: integer;
+  startTime, totalTimeSeconds: double;
+  fileName, FileNameCSV: string;
+  TrainingError, TrainingLoss: TNeuralFloat;
+  ValidationError, ValidationLoss, ValidationRate: TNeuralFloat;
+  CSVFile: TextFile;
+  CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
+  ValidationRecord: TNeuralFloat;
 begin
   AllocateMemory(pNN, pBatchSize, pGetTrainingPair,
     pGetValidationPair, pGetTestPair);
@@ -726,6 +726,12 @@ begin
           break;
         end;
       end;// Assigned(pGetValidationPair)
+
+      if (ValidationCnt=0) then
+      begin
+        FMessageProc('Saving NN at '+fileName);
+        FAvgWeight.SaveToFile(fileName);
+      end;
 
       if (FCurrentEpoch mod FThreadNN.Count = 0) and (FVerbose) then
       begin
@@ -1586,17 +1592,8 @@ procedure TNeuralImageFit.Fit(pNN: TNNet;
   pImgVolumes, pImgValidationVolumes, pImgTestVolumes: TNNetVolumeList;
   pNumClasses, pBatchSize, Epochs: integer);
 var
-  I: integer;
-  startTime, totalTimeSeconds: double;
-  globalStartTime: double;
-  fileName, FileNameCSV: string;
-  TrainingError, TrainingLoss: TNeuralFloat;
-  ValidationError, ValidationLoss, ValidationRate: TNeuralFloat;
   TestError, TestLoss, TestRate: TNeuralFloat;
-  CSVFile: TextFile;
-  CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
-  MaxDelta: TNeuralFloat;
-  ValidationRecord: TNeuralFloat;
+  globalStartTime: double;
   procedure RunTest();
   begin
           FWorkingVolumes := FImgTestVolumes;
@@ -1634,6 +1631,17 @@ var
             );
           end;
   end;
+var
+  I: integer;
+  startTime, totalTimeSeconds: double;
+  fileName, FileNameCSV: string;
+  TrainingError, TrainingLoss: TNeuralFloat;
+  ValidationError, ValidationLoss, ValidationRate: TNeuralFloat;
+  LocalHasValidation: boolean;
+  CSVFile: TextFile;
+  CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
+  MaxDelta: TNeuralFloat;
+  ValidationRecord: TNeuralFloat;
 begin
   FRunning := true;
   FShouldQuit := false;
@@ -1648,6 +1656,14 @@ begin
   FTrainingSampleProcessedCnt.Resize(FImgVolumes.Count);
   FImgValidationVolumes := pImgValidationVolumes;
   FImgTestVolumes := pImgTestVolumes;
+  LocalHasValidation := False;
+  if Assigned(FImgValidationVolumes) then
+  begin
+    if FImgValidationVolumes.Count>0 then
+    begin
+      LocalHasValidation := True;
+    end;
+  end;
   FThreadNum := Min(FMaxThreadNum, FDefaultThreadCount);
   FBatchSize := pBatchSize;
   FMaxEpochs := Epochs;
@@ -1838,7 +1854,7 @@ begin
         FAvgWeight.CopyWeights(FNN);
       end;
 
-      if Assigned(FImgValidationVolumes) and Not(FShouldQuit) then
+      if LocalHasValidation and Not(FShouldQuit) then
       begin
         FWorkingVolumes := FImgValidationVolumes;
         FGlobalHit       := 0;
@@ -1889,6 +1905,12 @@ begin
           break;
         end;
       end;// Assigned(FImgValidationVolumes)
+
+      if Not(LocalHasValidation) then
+      begin
+        FMessageProc('Saving NN at '+fileName);
+        FAvgWeight.SaveToFile(fileName);
+      end;
 
       if (FCurrentEpoch mod FThreadNN.Count = 0) and (FVerbose) then
       begin
