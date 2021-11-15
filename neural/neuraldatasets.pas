@@ -842,6 +842,7 @@ begin
   ImgTestVolumes := TNNetVolumeList.Create();
 
   if ValidationSampleSize > 10000 then ValidationSampleSize := 10000;
+  if ValidationSampleSize < 0 then ValidationSampleSize := 0;
 
   // creates required volumes to store images
   for I := 0 to 39999 do
