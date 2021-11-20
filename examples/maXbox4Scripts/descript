@@ -1,0 +1,16 @@
+Subject: CAI Framework
+
+Docu of main Neural Unit for maXbox:
+http://www.softwareschule.ch/examples/uPSI_NeuralNetworkCAI.txt
+http://www.softwareschule.ch/examples/uPSI_neuralnetworkcai.txt
+http://www.softwareschule.ch/examples/uPSI_neuralvolume.txt
+http://www.softwareschule.ch/examples/uPSI_neuraldatasets.txt
+http://www.softwareschule.ch/examples/uPSI_neuralfit.txt
+Source https://github.com/joaopauloschuler/neural-api
+https://github.com/joaopauloschuler/neural-api/blob/master/neural/neuralvolume.pas
+
+1441 unit uPSI_neuralgeneric.pas; CAI
+1442 unit uPSI_neuralthread.pas; CAI
+1443 unit uPSI_uSysTools; TuO
+1444 unit upsi_neuralsets; mX4
+1445 unit uPSI_uWinNT.pas mX4
