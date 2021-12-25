@@ -1781,6 +1781,7 @@ begin
         end;
       end;
       FNN.UpdateWeights();
+      //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
       if FL2Decay > 0.0 then FNN.ComputeL2Decay();
 
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
