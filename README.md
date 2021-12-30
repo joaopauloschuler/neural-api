@@ -1,4 +1,4 @@
-# CAI NEURAL API [![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)
+# CAI NEURAL API [![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)[![DOI](https://zenodo.org/badge/210370571.svg)](https://zenodo.org/badge/latestdoi/210370571)
 <img align="right" src="docs/cai.png" height="192">
 CAI NEURAL API is a pascal based neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus
 OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux.
