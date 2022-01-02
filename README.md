@@ -1,4 +1,4 @@
-# CAI NEURAL API [![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)
+# CAI NEURAL API [![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)[![DOI](https://zenodo.org/badge/210370571.svg)](https://zenodo.org/badge/latestdoi/210370571)
 <img align="right" src="docs/cai.png" height="192">
 CAI NEURAL API is a pascal based neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus
 OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux.
@@ -76,6 +76,7 @@ it's mentioned.
 ### Advanced Examples
 Although these examples require deeper understanding about neural networks, they are very interesting:
 * [DenseNetBC L40](https://github.com/joaopauloschuler/neural-api/tree/master/examples/DenseNetBCL40)
+* [ResNet-20](https://github.com/joaopauloschuler/neural-api/blob/master/examples/ResNet/ResNet20.lpr)
 * [Separable Convolutions](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SeparableConvolution) - MobileNet building block
 * [Identity Shortcut Connection](https://github.com/joaopauloschuler/neural-api/tree/master/examples/IdentityShortcutConnection) - ResNet building block [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/IdentityShortcutConnection/IdentityShortcutConnection.ipynb)
 * [Gradient Ascent](https://github.com/joaopauloschuler/neural-api/tree/master/examples/GradientAscent) - Visualizing patterns from inner neurons in image classification <p><img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/gradientascent3layer.jpg" height="130"></img></p>
@@ -247,6 +248,8 @@ This API is really big. The following list gives a general idea about this API b
 
 ### Layers with Activation Functions and no Trainable Parameter
 * `TNNetReLU` (input/output: 1D, 2D or 3D).
+* `TNNetReLU6` (input/output: 1D, 2D or 3D).
+* `TNNetReLUL` (input/output: 1D, 2D or 3D).
 * `TNNetLeakyReLU` (input/output: 1D, 2D or 3D).
 * `TNNetVeryLeakyReLU` (input/output: 1D, 2D or 3D).
 * `TNNetReLUSqrt` (input/output: 1D, 2D or 3D).
@@ -254,6 +257,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetSigmoid` (input/output: 1D, 2D or 3D).
 * `TNNetSoftMax` (input/output: 1D, 2D or 3D).
 * `TNNetSwish` (input/output: 1D, 2D or 3D).
+* `TNNetSwish6` (input/output: 1D, 2D or 3D).
 * `TNNetHyperbolicTangent` (input/output: 1D, 2D or 3D).
 * `TNNetPower` (input/output: 1D, 2D or 3D).
 
