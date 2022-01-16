@@ -275,6 +275,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetDeMaxPool` (input/output: 1D, 2D or 3D - max is done on a single layer).
 
 ### Weight Initializers
+This API implements popular weight initialization methods including He (Kaming) and Glorot/Bengio (Xavier):
 * `InitUniform(Value: TNeuralFloat = 1)`.
 * `InitLeCunUniform(Value: TNeuralFloat = 1)`.
 * `InitHeUniform(Value: TNeuralFloat = 1)`.
