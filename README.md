@@ -183,12 +183,12 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetInput` (input/output: 1D, 2D or 3D).
 
 ### Convolutional Layers
-* `TNNetConvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
+* `TNNetConvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). This layer has `tanh` as default activation function.
 * `TNNetConvolutionReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetConvolutionLinear` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetPointwiseConvReLU` (input/output: 1D, 2D or 3D).
 * `TNNetPointwiseConvLinear` (input/output: 1D, 2D or 3D).
-* `TNNetDepthwiseConv` (input/output: 1D, 2D or 3D).
+* `TNNetDepthwiseConv` (input/output: 1D, 2D or 3D). This layer has `tanh` as default activation function.
 * `TNNetDepthwiseConvReLU` (input/output: 1D, 2D or 3D).
 * `TNNetDepthwiseConvLinear` (input/output: 1D, 2D or 3D).
 * `TNNet.AddSeparableConvReLU` (input/output: 1D, 2D or 3D). Adds a separable convolution.
@@ -197,14 +197,14 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNet.AddGroupedConvolution` (input/output: 1D, 2D or 3D). Adds a grouped convolution. 
 
 ### Fully Connected (Dense) Layers
-* `TNNetFullConnect` (input/output: 1D, 2D or 3D).
+* `TNNetFullConnect` (input/output: 1D, 2D or 3D). This layer has `tanh` as default activation function.
 * `TNNetFullConnectReLU` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectLinear` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectSigmoid` (input/output: 1D, 2D or 3D).
 * `TNNet.AddGroupedFullConnect`: inspired on `TNNet.AddGroupedConvolution`, adds a grouped fully connected layer.
 
 ### Locally Connected Layers
-* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
+* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). This layer has `htan` as default activation function.
 * `TNNetLocalConnectReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 
 ### Min / Max / Avg Pools
@@ -282,6 +282,7 @@ This API is really big. The following list gives a general idea about this API b
 * `InitHeGaussian(Value: TNeuralFloat = 0.5)`.
 * `InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5)`.
 * `InitGlorotBengioUniform(Value: TNeuralFloat = 1)`.
+* `InitSELU(Value: TNeuralFloat = 1)`.
 
 ### Data Augmentation Methods Implemented at TVolume
 * `procedure FlipX();`
@@ -600,10 +601,6 @@ When you are done, you should call:
 ```
 FProcs.Free; 
 ```
-
-## Paid Support
-In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
-to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
 
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
