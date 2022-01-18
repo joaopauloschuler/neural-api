@@ -29,8 +29,8 @@ The first row in `reluoutputs` has expected outputs for **XOR**, **AND** and **O
 
 This is how the training data is prepared with training pairs (input,output):
 ```
-TrainingPairs := TNNetVolumePairList.Create();
-...
+    TrainingPairs := TNNetVolumePairList.Create();
+    ...
     for Cnt := Low(cs_inputs) to High(cs_inputs) do
     begin
       TrainingPairs.Add(
@@ -60,8 +60,8 @@ As you can see, there is one input layer followed by 2 fully connected layers wi
 
 This is how the fitting object is created and run:
 ```
-NFit := TNeuralFit.Create();
-...
+    NFit := TNeuralFit.Create();
+    ...
     NFit.InitialLearningRate := 0.01;
     NFit.LearningRateDecay := 0;
     NFit.L2Decay := 0;
