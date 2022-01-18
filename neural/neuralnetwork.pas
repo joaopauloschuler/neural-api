@@ -13753,5 +13753,11 @@ begin
 end;
 {$ENDIF}
 
+{$IFNDEF Debug}
+initialization
+
+Randomize();
+{$ENDIF}
+
 end.
 
