@@ -244,6 +244,7 @@ type
       procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyWeights(Origin: TNNetLayer); virtual;
       procedure ForceRangeWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      procedure ForcePositiveWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeWeights(VMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function SaveDataToString(): string; virtual;
       procedure LoadDataFromString(strData: string); virtual;
@@ -259,10 +260,12 @@ type
       // Initializers
       function InitUniform(Value: TNeuralFloat = 1): TNNetLayer;
       function InitLeCunUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      // He initializations are also called Kaiming initializations.
       function InitHeUniform(Value: TNeuralFloat = 1): TNNetLayer;
       function InitHeUniformDepthwise(Value: TNeuralFloat = 1): TNNetLayer;
       function InitHeGaussian(Value: TNeuralFloat = 0.5): TNNetLayer;
       function InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5): TNNetLayer;
+      // Glorot Bengio initializations are also called Xavier initializations.
       function InitGlorotBengioUniform(Value: TNeuralFloat = 1): TNNetLayer;
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       procedure InitDefault(); virtual;
@@ -5400,7 +5403,7 @@ begin
         begin
           if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
           //if UnitCnt > 1 then AddLayer( TNNetInterleaveChannels.Create(UnitCnt) );
-          AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias, false, false );
+          AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias, false, true );
           //AddAutoGroupedConvolution(TNNetConvolutionReLU, MinGroupSize, BottleNeck, 1, 0, 1, supressBias, False);
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
@@ -9983,6 +9986,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
+      if S[0] = 'TNNetScaleLearning' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
@@ -10230,12 +10234,15 @@ begin
       if (PrevLayerChannelCount >= pNumFeatures) or (AlwaysIntergroup) then
       begin
         FeaturesPerGroup := pNumFeatures div GroupCount;
-        AddLayer( TNNetInterleaveChannels.Create(FeaturesPerGroup) );
-        AddLayer(
-          Conv2d.Create(
+        AddLayer([
+          TNNetInterleaveChannels.Create(FeaturesPerGroup),
+          TNNetGroupedPointwiseConvLinear.Create(
             {Features=}pNumFeatures,
             {Groups=}SecondGroupCount,
-            {SupressBias=}pSuppressBias) );
+            {SupressBias=}pSuppressBias),
+          TNNetReLUL.Create(-3, +3, 0)
+        ]);
+
         //WriteLn
         //(
         //  'Second group count:', SecondGroupCount,
@@ -12668,6 +12675,21 @@ begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
       FNeurons[Cnt].Weights.ForceMaxRange(V);
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.ForcePositiveWeights();
+var
+  Cnt: integer;
+begin
+  if FLinkedNeurons then exit;
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].Weights.ForcePositive();
     end;
   end;
   AfterWeightUpdate();
