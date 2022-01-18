@@ -9217,7 +9217,8 @@ var
   MaxAbsW: TNeuralFloat;
 {$ENDIF}
 begin
-  InitHeUniform(1);
+  //InitHeUniform(1);
+  InitGlorotBengioUniform(1);
   (*
   // High values can be usual in small networks.
   {$IFDEF Debug}
