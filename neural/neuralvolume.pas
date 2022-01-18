@@ -182,6 +182,7 @@ type
     procedure ForceMinRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxAbs(Value: T); {$IFDEF Release} inline; {$ENDIF}
+    procedure ForcePositive(); {$IFDEF Release} inline; {$ENDIF}
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
     procedure AddGaussianNoise(pMul: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -3222,6 +3223,16 @@ begin
     Self.Mul( VFix );
     WriteLn(VMaxAbs:6:2);
   end;
+end;
+
+procedure TVolume.ForcePositive();
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := High(FData);
+  for I := 0 to vHigh do
+    if FData[I] < 0 then FData[I] := -FData[I];
 end;
 
 destructor TVolume.Destroy();
