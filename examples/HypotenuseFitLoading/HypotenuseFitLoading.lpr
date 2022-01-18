@@ -64,7 +64,7 @@ type
       TNNetInput.Create(2),
       TNNetFullConnectReLU.Create(32),
       TNNetFullConnectReLU.Create(32),
-      TNNetFullConnectReLU.Create(1)
+      TNNetFullConnectLinear.Create(1)
     ]);
 
     WriteLn('Computing...');
