@@ -61,7 +61,7 @@ const cs_outputs : TBackOutput =
     TrainingPairs := TNNetVolumePairList.Create();
     NN.AddLayer( TNNetInput.Create(2) );
     NN.AddLayer( TNNetFullConnect.Create(3) );
-    NN.AddLayer( TNNetFullConnect.Create(3) );
+    NN.AddLayer( TNNetFullConnectLinear.Create(3) );
 
     vInputs := cs_inputs;
     vOutput := cs_outputs;
