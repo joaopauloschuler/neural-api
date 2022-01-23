@@ -1194,6 +1194,15 @@ begin
         sumOutput.Add( pOutput );
       end;
 
+      if FHasFlipY then
+      begin
+        vInput.FlipY();
+        TotalDiv := TotalDiv + 1;
+        LocalNN.Compute( vInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+      end;
+
       if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
         vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX - FMaxCropSize, vInput.SizeY - FMaxCropSize);
@@ -2286,6 +2295,15 @@ begin
       if FHasFlipX then
       begin
         ImgInput.FlipX();
+        TotalDiv := TotalDiv + 1;
+        LocalNN.Compute( ImgInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+      end;
+
+      if FHasFlipY then
+      begin
+        ImgInput.FlipY();
         TotalDiv := TotalDiv + 1;
         LocalNN.Compute( ImgInput );
         LocalNN.GetOutput( pOutput );
