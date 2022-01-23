@@ -81,6 +81,7 @@ const cs_outputs : TBackOutput =
     NFit.L2Decay := 0;
     NFit.Verbose := false;
     NFit.HideMessages();
+    NFit.InferHitFn := @MonopolarCompare;
     NFit.Fit(NN, TrainingPairs, nil, nil, {batchsize=}4, {epochs=}6000);
 
     pOutPut := TNNetVolume.Create(3,1,1,1);
