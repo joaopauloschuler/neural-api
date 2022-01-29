@@ -605,3 +605,18 @@ FProcs.Free;
 
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
+
+## Citing this Work
+You can cite this work in BibTeX format with:
+```
+@software{cai_neural_api_2021_5810077,
+  author       = {Joao Paulo Schwarz Schuler},
+  title        = {CAI NEURAL API},
+  month        = dec,
+  year         = 2021,
+  publisher    = {Zenodo},
+  version      = {v1.0.6},
+  doi          = {10.5281/zenodo.5810077},
+  url          = {https://doi.org/10.5281/zenodo.5810077}
+}
+```
