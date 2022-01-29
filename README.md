@@ -606,8 +606,8 @@ FProcs.Free;
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
 
-## Citing this Work
-You can cite this work in BibTeX format with:
+## Citing this API
+You can cite this API in BibTeX format with:
 ```
 @software{cai_neural_api_2021_5810077,
   author       = {Joao Paulo Schwarz Schuler},
