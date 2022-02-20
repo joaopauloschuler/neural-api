@@ -3671,25 +3671,32 @@ var
   MoveSizeBytes: integer;
   RawPostDest, RawPosSource: integer;
 begin
-  ReSize(NewSizeX, NewSizeY, Original.Depth);
-  RatioX := NewSizeX / Original.SizeX;
-  RatioY := NewSizeY / Original.SizeY;
-
-  MaxX := SizeX - 1;
-  MaxY := SizeY - 1;
-  OrigMaxX := Original.SizeX - 1;
-  OrigMaxY := Original.SizeY - 1;
-  MoveSizeBytes := Depth * SizeOf(T);
-
-  for CntX := 0 to MaxX do
+  if (NewSizeX=Original.SizeX) and (NewSizeY=Original.SizeY) then
   begin
-    OrigPosX := Min(OrigMaxX, Round(CntX / RatioX));
-    for CntY := 0 to MaxY do
+    Copy(Original);
+  end
+  else
+  begin
+    ReSize(NewSizeX, NewSizeY, Original.Depth);
+    RatioX := NewSizeX / Original.SizeX;
+    RatioY := NewSizeY / Original.SizeY;
+
+    MaxX := SizeX - 1;
+    MaxY := SizeY - 1;
+    OrigMaxX := Original.SizeX - 1;
+    OrigMaxY := Original.SizeY - 1;
+    MoveSizeBytes := Depth * SizeOf(T);
+
+    for CntX := 0 to MaxX do
     begin
-      OrigPosY := Min(OrigMaxY, Round(CntY / RatioY));
-      RawPostDest := GetRawPos(CntX, CntY);
-      RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
-      Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+      OrigPosX := Min(OrigMaxX, Round(CntX / RatioX));
+      for CntY := 0 to MaxY do
+      begin
+        OrigPosY := Min(OrigMaxY, Round(CntY / RatioY));
+        RawPostDest := GetRawPos(CntX, CntY);
+        RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
+        Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+      end;
     end;
   end;
 end;
