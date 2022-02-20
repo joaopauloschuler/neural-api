@@ -1176,6 +1176,12 @@ begin
       FLocalTestProc(I, Index, vInput, vOutput);
     end;
 
+    if FHasImgCrop then
+    begin
+      vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
+      vInput.Copy(vInputCopy);
+    end;
+
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
 
