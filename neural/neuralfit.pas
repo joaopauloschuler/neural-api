@@ -1744,7 +1744,8 @@ begin
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
-      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
+      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs) +
+      ' Min backprop error:' + FloatToStrF(MinBackpropagationError,ffFixed,4,2)
     );
     if Assigned(FImgVolumes) then MessageProc('Training images: '+IntToStr(FImgVolumes.Count));
     if Assigned(FImgValidationVolumes) then MessageProc('Validation images: '+IntToStr(FImgValidationVolumes.Count));
@@ -2149,7 +2150,6 @@ begin
         'Invalid image ' + IntToStr(ImgIdx) +
         ' input class: ' + IntToStr(ImgInput.Tag)
       );
-      ReadLn;
       Continue;
     end;
 
@@ -2166,11 +2166,17 @@ begin
     if Not(FIsSoftmax) then
     begin
       OutputValue := Max(OutputValue, 0.001);
-      if (CurrentError>FMinBackpropagationError) then LocalNN.Backpropagate(vOutput);
+    end;
+
+    if (CurrentError>FMinBackpropagationError) then
+    begin
+      LocalNN.Backpropagate(vOutput);
     end
     else
     begin
-      if (CurrentError>FMinBackpropagationError) then LocalNN.Backpropagate(vOutput);
+      // TODO: this is an experiment to be tested:
+      // decreases probability to train with good sample.
+      // FTrainingSampleProcessedCnt.FData[ImgIdx] := FTrainingSampleProcessedCnt.FData[ImgIdx] + 1;
     end;
 
     if (OutputValue > 0) then
