@@ -83,6 +83,7 @@ type
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
+      FMinBackpropagationError: TNeuralFloat;
       FLoadBestAdEnd: boolean;
       FTestBestAtEnd: boolean;
       {$IFDEF OpenCL}
@@ -119,6 +120,7 @@ type
       property LoadBestAtEnd: boolean read FLoadBestAdEnd write FLoadBestAdEnd;
       property L2Decay: single read FL2Decay write FL2Decay;
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
+      property MinBackpropagationError: TNeuralFloat read FMinBackpropagationError write FMinBackpropagationError;
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
       property NN: TNNet read FNN;
@@ -945,7 +947,7 @@ var
   vInputCopy: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
   I: integer;
-  CurrentLoss: TNeuralFloat;
+  CurrentLoss, CurrentError: TNeuralFloat;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTrainingPair: TNNetVolumePair;
@@ -1046,9 +1048,11 @@ begin
 
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
-    LocalNN.Backpropagate( vOutput );
 
-    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
+    CurrentError := vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + CurrentError;
+
+    if CurrentError > FMinBackpropagationError then LocalNN.Backpropagate( vOutput );
 
     CurrentLoss := 0;
     if Assigned(FLossFn) then
@@ -1473,6 +1477,7 @@ begin
   FInitialLearningRate := 0.001;
   FCyclicalLearningRateLen := 0; // not cyclical by default.
   FInitialEpoch := 0;
+  FMinBackpropagationError := 0;
   fMinLearnRate := FInitialLearningRate * 0.01;
   FInertia := 0.9;
   FClipDelta := 0.0;
@@ -1584,17 +1589,18 @@ end;
 constructor TNeuralImageFit.Create();
 begin
   inherited Create();
-  FIsSoftmax := true;
-  FMaxCropSize := 8;
+  FChannelShiftRate := 0;
+  FColorEncoding := 0;
   FHasImgCrop := false;
   FHasResizing := True;
   FHasFlipX := true;
   FHasFlipY := false;
   FHasMakeGray := true;
-  FColorEncoding := 0;
+  FIsSoftmax := true;
+  FMaxCropSize := 8;
+  FMinBackpropagationError := 0.2;
   FMultipleSamplesAtValidation := true;
   FTrainingSampleProcessedCnt := TNNetVolume.Create;
-  FChannelShiftRate := 0;
 end;
 
 destructor TNeuralImageFit.Destroy();
@@ -2053,7 +2059,7 @@ var
   I, ImgIdx: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
-  LocalTotalLoss, LocalErrorSum: TNeuralFloat;
+  LocalTotalLoss, LocalErrorSum, CurrentError: TNeuralFloat;
   DepthCnt: integer;
   LocalChannelShiftRate: TNeuralFloat;
 begin
@@ -2154,16 +2160,17 @@ begin
       then vOutput.SetClassForSoftMax( ImgInput.Tag )
       else vOutput.SetClass( ImgInput.Tag, +0.9, -0.1);
 
-    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
+    CurrentError := vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + CurrentError;
     OutputValue := pOutput.FData[ ImgInput.Tag ];
     if Not(FIsSoftmax) then
     begin
       OutputValue := Max(OutputValue, 0.001);
-      LocalNN.Backpropagate(vOutput);
+      if (CurrentError>FMinBackpropagationError) then LocalNN.Backpropagate(vOutput);
     end
     else
     begin
-      LocalNN.Backpropagate(vOutput);
+      if (CurrentError>FMinBackpropagationError) then LocalNN.Backpropagate(vOutput);
     end;
 
     if (OutputValue > 0) then
@@ -2425,13 +2432,14 @@ end;
 
 procedure TNeuralFitWithImageBase.EnableDefaultImageTreatment();
 begin
-  FMaxCropSize := 8;
+  FColorEncoding := 0;
   FHasImgCrop := false;
   FHasResizing := True;
   FHasFlipX := True;
   FHasFlipY := false;
   FHasMakeGray := True;
-  FColorEncoding := 0;
+  FMaxCropSize := 8;
+  FMinBackpropagationError := 0.2;
   FMultipleSamplesAtValidation := True;
 end;
 
