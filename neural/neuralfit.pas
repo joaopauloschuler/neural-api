@@ -53,6 +53,7 @@ type
       FAvgWeightEpochCount: integer;
       FCurrentEpoch: integer;
       FCurrentStep: integer;
+      FCurrentTrainingError: TNeuralFloat;
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
@@ -109,6 +110,7 @@ type
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentStep: integer read FCurrentStep;
       property CurrentLearningRate: single read FCurrentLearningRate;
+      property CurrentTrainingError: TNeuralFloat read FCurrentTrainingError;
       property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
       property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
       property CyclicalLearningRateLen: integer read FCyclicalLearningRateLen write FCyclicalLearningRateLen;
@@ -627,6 +629,7 @@ begin
       if (FGlobalTotal > 0) then
       begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
+        FCurrentTrainingError := TrainingError;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
         if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
@@ -1052,7 +1055,9 @@ begin
     CurrentError := vOutput.SumDiff( pOutput );
     LocalErrorSum := LocalErrorSum + CurrentError;
 
-    if CurrentError > FMinBackpropagationError then LocalNN.Backpropagate( vOutput );
+    if (CurrentError > FMinBackpropagationError) or
+      (CurrentError > FCurrentTrainingError/4)
+      then LocalNN.Backpropagate( vOutput );
 
     CurrentLoss := 0;
     if Assigned(FLossFn) then
@@ -1810,6 +1815,7 @@ begin
       if (FGlobalTotal > 0) then
       begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
+        FCurrentTrainingError := TrainingError;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
         if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
@@ -2168,7 +2174,8 @@ begin
       OutputValue := Max(OutputValue, 0.001);
     end;
 
-    if (CurrentError>FMinBackpropagationError) then
+    if (CurrentError>FMinBackpropagationError) or
+      (CurrentError>FCurrentTrainingError/4) then
     begin
       LocalNN.Backpropagate(vOutput);
     end
