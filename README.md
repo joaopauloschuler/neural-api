@@ -25,7 +25,15 @@ The documentation is composed by:
 * Youtube Videos.
 * Advanced Examples.
 
-### Easy Examples
+In this readme file, you’ll find information about: 
+* Data structures (Volumes).
+* Available neural network layers.
+* Dataset support.
+* Training (fitting) your neural network.
+* Parallel computing.
+* Other scientific publications from the same author.
+
+### Easy Examples First Please!
 Some recommended introductory source code examples are:
 * [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
 * [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
@@ -92,7 +100,7 @@ Although these examples require deeper understanding about neural networks, they
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at.
 
 ## Volumes
-Volumes behave like dynamically created arrays. They are the main array like structure used by this API. `TNNetVolume` class allows you to create volumes that can be accessed as 1D, 2D or 3D arrays and be operated with [Advanced Vector Extensions (AVX)](https://en.wikipedia.org/wiki/Advanced_Vector_Extensions) - [Single Instruction Multiple Data (SIMD)](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) instruction set. This is the most common way to create a volume:
+Volumes behave like dynamically created arrays. They are the main array like structure used by this API. `TNNetVolume` class allows you to create volumes that can be accessed as 1D, 2D or 3D arrays and be operated with [Advanced Vector Extensions (AVX)](https://en.wikipedia.org/wiki/Advanced_Vector_Extensions) - [Single Instruction Multiple Data (SIMD)](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) instruction set. The usual way to create a volume is:
 ```
 constructor Create(pSizeX, pSizeY, pDepth: integer; c: T = 0);
 ```
