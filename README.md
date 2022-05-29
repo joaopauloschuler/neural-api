@@ -17,8 +17,24 @@ This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of 
 
 ## Installation
 Clone this project, add the **neural** folder to your Lazarus unit search path and you'll be ready to go!
+ 
+## Documentation
+The documentation is composed by:
+* Easy Examples.
+* Simple Image Classification Examples.
+* Youtube Videos.
+* Advanced Examples.
 
-## How Does the Code Look like for a CIFAR-10 Classification Example?
+### Easy Examples
+Some recommended introductory source code examples are:
+* [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
+* [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
+* [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
+* [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+
+### Simple Image Classification Examples
+
+#### How Does the Code Look like for an Image Classification (CIFAR-10) Example?
 This is an example for image classification:
 ```
 NN := TNNet.Create();
@@ -46,21 +62,7 @@ NeuralFit.InitialLearningRate := fLearningRate;
 NeuralFit.Inertia := fInertia;
 NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize}128, {epochs}100);
  ```
- 
-## Documentation
-The documentation is under construction and is currently composed by:
-* Introductory Examples.
-* Youtube Videos.
-* Advanced Examples.
 
-### Easy Examples
-Some recommended introductory source code examples are:
-* [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
-* [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
-* [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
-* [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
-
-### Simple Image Classification Examples
 These examples train a neural network to classify images in classes such as: image has a cat, image has a dog, image has an airplane...
 * [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierCPU.ipynb)
 * [Simple CIFAR-10 Image Classifier with OpenCL](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifierGPU)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifierGPU/SimpleImageClassifierGPU.ipynb)
