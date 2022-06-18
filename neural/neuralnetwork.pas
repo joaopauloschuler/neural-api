@@ -219,10 +219,12 @@ type
       procedure SetNumWeightsForAllNeurons(x, y, d: integer); overload;
       procedure SetNumWeightsForAllNeurons(Origin: TNNetVolume); overload;
       function GetMaxWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function GetMaxAbsWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMinWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMinDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function ForceMaxAbsoluteDelta(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat; virtual;
       procedure GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function GetWeightSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -242,6 +244,7 @@ type
       procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyWeights(Origin: TNNetLayer); virtual;
       procedure ForceRangeWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      procedure ForcePositiveWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeWeights(VMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function SaveDataToString(): string; virtual;
       procedure LoadDataFromString(strData: string); virtual;
@@ -257,10 +260,12 @@ type
       // Initializers
       function InitUniform(Value: TNeuralFloat = 1): TNNetLayer;
       function InitLeCunUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      // He initializations are also called Kaiming initializations.
       function InitHeUniform(Value: TNeuralFloat = 1): TNNetLayer;
       function InitHeUniformDepthwise(Value: TNeuralFloat = 1): TNNetLayer;
       function InitHeGaussian(Value: TNeuralFloat = 0.5): TNNetLayer;
       function InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5): TNNetLayer;
+      // Glorot Bengio initializations are also called Xavier initializations.
       function InitGlorotBengioUniform(Value: TNeuralFloat = 1): TNNetLayer;
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       procedure InitDefault(); virtual;
@@ -615,6 +620,13 @@ type
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       function GetMaxAbsoluteDelta(): TNeuralFloat; override;
+  end;
+
+  // This is an experimental layer. Do not use it.
+  TNNetScaleLearning = class(TNNetMovingStdNormalization)
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -1414,6 +1426,7 @@ type
       procedure SumDeltasNoChecks(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyWeights(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       function ForceMaxAbsoluteDelta(vMax: TNeuralFloat = 0.01): TNeuralFloat;
+      function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat;
       function NormalizeMaxAbsoluteDelta(NewMax: TNeuralFloat = 0.1): TNeuralFloat;
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
@@ -1819,6 +1832,43 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetScaleLearning }
+
+procedure TNNetScaleLearning.Compute();
+begin
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+end;
+
+procedure TNNetScaleLearning.Backpropagate();
+var
+  StartTime: double;
+  MagnitudeDelta: TNeuralFloat;
+  Magnitude: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  StartTime := Now();
+  if FNeurons[0].Weights.FData[1] > 1 then
+  begin
+    FOutputError.Mul(FNeurons[0].Weights.FData[1]);
+  end;
+  Magnitude := FOutput.GetMagnitude();
+  MagnitudeDelta := (1-Magnitude);
+  if (MagnitudeDelta>0) or (FNeurons[0].Weights.FData[1] > 0) then
+  begin
+    FNeurons[0].FDelta.Add(0,0,1, NeuronForceRange(MagnitudeDelta, FLearningRate*10) );
+  end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  //if Random(100)=0 then WriteLn(MagnitudeDelta:6:4,' - ',FNeurons[0].Weights.FData[1]:6:4);
+  FPrevLayer.FOutputError.Add(FOutputError);
+  FPrevLayer.Backpropagate();
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetSwish6.Compute();
@@ -5040,7 +5090,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  FOutputError.Divi(FPrevOutput.Count);
+  //FOutputError.Divi(FPrevOutput.Count);
   for LayerCnt := 0 to FPrevOutput.Count - 1 do
   begin
     FPrevOutputError[LayerCnt].Add(FOutputError);
@@ -5171,12 +5221,28 @@ end;
 
 procedure THistoricalNets.AddResNetUnit(pNeurons: integer);
 var
-  PreviousLayer: TNNetLayer;
+  PreviousLayer, ShortCut, LongPath: TNNetLayer;
+  Stride: integer;
 begin
   PreviousLayer := GetLastLayer();
-  AddLayer( TNNetConvolutionReLU.Create(pNeurons, {featuresize}3, {padding}1, {stride}1) );
-  AddLayer( TNNetConvolutionLinear.Create(pNeurons, {featuresize}3, {padding}1, {stride}1) );
-  AddLayer( TNNetSum.Create([PreviousLayer, GetLastLayer()]) );
+  if PreviousLayer.Output.Depth = pNeurons
+    then Stride := 1
+    else Stride := 2;
+  LongPath := AddLayer([
+    TNNetConvolutionReLU.Create(pNeurons, {featuresize}3, {padding}1, Stride),
+    TNNetConvolutionLinear.Create(pNeurons, {featuresize}3, {padding}1, {stride}1)
+  ]);
+  if PreviousLayer.Output.Depth = pNeurons then
+  begin
+    AddLayer( TNNetSum.Create([PreviousLayer, LongPath]) );
+  end
+  else
+  begin
+    ShortCut := AddLayerAfter([
+      TNNetConvolutionLinear.Create(pNeurons, {featuresize}3, {padding}1, Stride)
+    ], PreviousLayer);
+    AddLayer( TNNetSum.Create([ShortCut, LongPath]) );
+  end;
   AddLayer( TNNetReLU.Create() );
 end;
 
@@ -5337,7 +5403,7 @@ begin
         begin
           if pBeforeBottleNeck <> nil then AddLayer( pBeforeBottleNeck.Create() );
           //if UnitCnt > 1 then AddLayer( TNNetInterleaveChannels.Create(UnitCnt) );
-          AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias, false, false );
+          AddAutoGroupedPointwiseConv2( PointWiseConv, MinGroupSize, BottleNeck, HasNorm, supressBias, false, true );
           //AddAutoGroupedConvolution(TNNetConvolutionReLU, MinGroupSize, BottleNeck, 1, 0, 1, supressBias, False);
           if pAfterBottleNeck <> nil then AddLayer( pAfterBottleNeck.Create() );
         end;
@@ -9151,7 +9217,10 @@ var
   MaxAbsW: TNeuralFloat;
 {$ENDIF}
 begin
+  // Although Keras works better with Glorot, CAI seems to work better with He.
+  // https://keras.io/api/layers/convolution_layers/convolution2d/#conv2d-class
   InitHeUniform(1);
+  //InitGlorotBengioUniform(1);
   (*
   // High values can be usual in small networks.
   {$IFDEF Debug}
@@ -9831,6 +9900,7 @@ begin
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
+      'TNNetScaleLearning' :        Result := TNNetScaleLearning.Create();
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
@@ -9919,6 +9989,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
+      if S[0] = 'TNNetScaleLearning' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
@@ -10166,12 +10237,15 @@ begin
       if (PrevLayerChannelCount >= pNumFeatures) or (AlwaysIntergroup) then
       begin
         FeaturesPerGroup := pNumFeatures div GroupCount;
-        AddLayer( TNNetInterleaveChannels.Create(FeaturesPerGroup) );
-        AddLayer(
-          Conv2d.Create(
+        AddLayer([
+          TNNetInterleaveChannels.Create(FeaturesPerGroup),
+          TNNetGroupedPointwiseConvLinear.Create(
             {Features=}pNumFeatures,
             {Groups=}SecondGroupCount,
-            {SupressBias=}pSuppressBias) );
+            {SupressBias=}pSuppressBias),
+          TNNetReLUL.Create(-3, +3, 0)
+        ]);
+
         //WriteLn
         //(
         //  'Second group count:', SecondGroupCount,
@@ -11006,6 +11080,32 @@ begin
             FLayers[LayerCnt].ClassName+'.');
         end;
         {$ENDIF}
+      end;
+    end;
+  end;
+end;
+
+function TNNet.ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat;
+var
+  LayerCnt: integer;
+  LayerMax: TNeuralFloat;
+begin
+  Result := 0;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      if (
+         (not(FLayers[LayerCnt].LinkedNeurons)) and
+         (not(FLayers[LayerCnt] is TNNetChannelShiftBase)) and
+         (not(FLayers[LayerCnt] is TNNetScaleLearning))
+         ) then
+      begin
+        LayerMax := FLayers[LayerCnt].ForceMaxAbsoluteWeight(vMax);
+        if LayerMax > Result then
+        begin
+          Result := LayerMax;
+        end;
       end;
     end;
   end;
@@ -12147,6 +12247,11 @@ begin
   Result := FNeurons.GetMaxWeight();
 end;
 
+function TNNetLayer.GetMaxAbsWeight(): TNeuralFloat;
+begin
+  Result := FNeurons.GetMaxAbsWeight();
+end;
+
 function TNNetLayer.GetMinWeight(): TNeuralFloat;
 begin
   Result := FNeurons.GetMinWeight();
@@ -12240,6 +12345,18 @@ begin
       end;
     end;
   end
+end;
+
+function TNNetLayer.ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat;
+var
+  V: TNeuralFloat;
+begin
+  V := Self.GetMaxAbsWeight();
+  if V > vMax then
+  begin
+    Self.MulWeights(vMax/V);
+  end;
+  Result := V;
 end;
 
 procedure TNNetLayer.GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat);
@@ -12561,6 +12678,21 @@ begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
       FNeurons[Cnt].Weights.ForceMaxRange(V);
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.ForcePositiveWeights();
+var
+  Cnt: integer;
+begin
+  if FLinkedNeurons then exit;
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].Weights.ForcePositive();
     end;
   end;
   AfterWeightUpdate();
@@ -13622,6 +13754,12 @@ procedure TNNetDataParallelism.SetItem(Index: Integer; AObject: TNNet);
 begin
   Put(Index,AObject);
 end;
+{$ENDIF}
+
+{$IFNDEF Debug}
+initialization
+
+Randomize();
 {$ENDIF}
 
 end.

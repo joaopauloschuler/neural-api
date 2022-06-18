@@ -1,4 +1,4 @@
-# CAI NEURAL API [![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)
+# CAI NEURAL API [![VERSION](https://img.shields.io/github/v/release/joaopauloschuler/neural-api)](https://github.com/joaopauloschuler/neural-api/releases)[![DOI](https://zenodo.org/badge/210370571.svg)](https://zenodo.org/badge/latestdoi/210370571)
 <img align="right" src="docs/cai.png" height="192">
 CAI NEURAL API is a pascal based neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus
 OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux.
@@ -17,8 +17,32 @@ This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of 
 
 ## Installation
 Clone this project, add the **neural** folder to your Lazarus unit search path and you'll be ready to go!
+ 
+## Documentation
+The documentation is composed by:
+* Easy Examples.
+* Simple Image Classification Examples.
+* Youtube Videos.
+* Advanced Examples.
 
-## How Does the Code Look like for a CIFAR-10 Classification Example?
+In this readme file, you’ll find information about: 
+* Data structures (Volumes).
+* Available neural network layers.
+* Dataset support.
+* Training (fitting) your neural network.
+* Parallel computing.
+* Other scientific publications from the same author.
+
+### Easy Examples First Please!
+Some recommended introductory source code examples are:
+* [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
+* [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
+* [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
+* [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+
+### Simple Image Classification Examples
+
+#### How Does the Code Look like for an Image Classification (CIFAR-10) Example?
 This is an example for image classification:
 ```
 NN := TNNet.Create();
@@ -46,19 +70,8 @@ NeuralFit.InitialLearningRate := fLearningRate;
 NeuralFit.Inertia := fInertia;
 NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, NumClasses, {batchsize}128, {epochs}100);
  ```
- 
-## Documentation
-The documentation is under construction and is currently composed by:
-* Introductory Examples.
-* Youtube Videos.
-* Advanced Examples.
 
-### Introductory Examples
-Some recommended introductory source code examples are:
-* [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
-* [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
-* [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
-* [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+These examples train a neural network to classify images in classes such as: image has a cat, image has a dog, image has an airplane...
 * [Simple CIFAR-10 Image Classifier](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifier)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierCPU.ipynb)
 * [Simple CIFAR-10 Image Classifier with OpenCL](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifierGPU)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifierGPU/SimpleImageClassifierGPU.ipynb)
 * [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
@@ -76,17 +89,19 @@ it's mentioned.
 ### Advanced Examples
 Although these examples require deeper understanding about neural networks, they are very interesting:
 * [DenseNetBC L40](https://github.com/joaopauloschuler/neural-api/tree/master/examples/DenseNetBCL40)
+* [ResNet-20](https://github.com/joaopauloschuler/neural-api/blob/master/examples/ResNet/ResNet20.lpr)
 * [Separable Convolutions](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SeparableConvolution) - MobileNet building block
 * [Identity Shortcut Connection](https://github.com/joaopauloschuler/neural-api/tree/master/examples/IdentityShortcutConnection) - ResNet building block [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/IdentityShortcutConnection/IdentityShortcutConnection.ipynb)
 * [Gradient Ascent](https://github.com/joaopauloschuler/neural-api/tree/master/examples/GradientAscent) - Visualizing patterns from inner neurons in image classification <p><img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/gradientascent3layer.jpg" height="130"></img></p>
 * [Artificial Art](https://github.com/joaopauloschuler/neural-api/tree/master/examples/VisualGAN) - Let a neural network produce art via a generative adversarial network <p><img src="https://github.com/joaopauloschuler/neural-api/blob/master/docs/art1.png" height="130"></img></p>
 * [Super Resolution](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) - A neural network learns how to increase image resolution<p><img src="examples/SuperResolution/results/building_result.png"></img></p>
+* [CIFAR-10 Resized](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Cifar10Resize) - A program that resizes CIFAR-10 and CIFAR-100 images to 64x64 and 128x128 pixels.<p><img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/bird.png?raw=true"> </img></p><p><img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/stealth.png?raw=true"> </img></p>
 * [Autoencoder](https://github.com/joaopauloschuler/neural-api/tree/master/examples/VisualAutoencoder) - Shows an autoencoder built with hyperbolic tangents and trained with [Tiny ImageNet 200](https://tiny-imagenet.herokuapp.com/). <p><img src="docs/autoencoder_small.png"></img></p>
 
 There are also some [older code examples](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/) that you can look at.
 
 ## Volumes
-This API heavily relies on volumes. `TNNetVolume` class allows you to create volumes that can be accessed as 1D, 2D or 3D arrays and be operated with AVX SIMD instruction set. This is the most common way to create a volume:
+Volumes behave like dynamically created arrays. They are the main array like structure used by this API. `TNNetVolume` class allows you to create volumes that can be accessed as 1D, 2D or 3D arrays and be operated with [Advanced Vector Extensions (AVX)](https://en.wikipedia.org/wiki/Advanced_Vector_Extensions) - [Single Instruction Multiple Data (SIMD)](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) instruction set. The usual way to create a volume is:
 ```
 constructor Create(pSizeX, pSizeY, pDepth: integer; c: T = 0);
 ```
@@ -182,12 +197,12 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetInput` (input/output: 1D, 2D or 3D).
 
 ### Convolutional Layers
-* `TNNetConvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
+* `TNNetConvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). This layer has `tanh` as default activation function.
 * `TNNetConvolutionReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetConvolutionLinear` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 * `TNNetPointwiseConvReLU` (input/output: 1D, 2D or 3D).
 * `TNNetPointwiseConvLinear` (input/output: 1D, 2D or 3D).
-* `TNNetDepthwiseConv` (input/output: 1D, 2D or 3D).
+* `TNNetDepthwiseConv` (input/output: 1D, 2D or 3D). This layer has `tanh` as default activation function.
 * `TNNetDepthwiseConvReLU` (input/output: 1D, 2D or 3D).
 * `TNNetDepthwiseConvLinear` (input/output: 1D, 2D or 3D).
 * `TNNet.AddSeparableConvReLU` (input/output: 1D, 2D or 3D). Adds a separable convolution.
@@ -196,14 +211,14 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNet.AddGroupedConvolution` (input/output: 1D, 2D or 3D). Adds a grouped convolution. 
 
 ### Fully Connected (Dense) Layers
-* `TNNetFullConnect` (input/output: 1D, 2D or 3D).
+* `TNNetFullConnect` (input/output: 1D, 2D or 3D). This layer has `tanh` as default activation function.
 * `TNNetFullConnectReLU` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectLinear` (input/output: 1D, 2D or 3D).
 * `TNNetFullConnectSigmoid` (input/output: 1D, 2D or 3D).
 * `TNNet.AddGroupedFullConnect`: inspired on `TNNet.AddGroupedConvolution`, adds a grouped fully connected layer.
 
 ### Locally Connected Layers
-* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
+* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). This layer has `htan` as default activation function.
 * `TNNetLocalConnectReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
 
 ### Min / Max / Avg Pools
@@ -247,6 +262,8 @@ This API is really big. The following list gives a general idea about this API b
 
 ### Layers with Activation Functions and no Trainable Parameter
 * `TNNetReLU` (input/output: 1D, 2D or 3D).
+* `TNNetReLU6` (input/output: 1D, 2D or 3D).
+* `TNNetReLUL` (input/output: 1D, 2D or 3D).
 * `TNNetLeakyReLU` (input/output: 1D, 2D or 3D).
 * `TNNetVeryLeakyReLU` (input/output: 1D, 2D or 3D).
 * `TNNetReLUSqrt` (input/output: 1D, 2D or 3D).
@@ -254,6 +271,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetSigmoid` (input/output: 1D, 2D or 3D).
 * `TNNetSoftMax` (input/output: 1D, 2D or 3D).
 * `TNNetSwish` (input/output: 1D, 2D or 3D).
+* `TNNetSwish6` (input/output: 1D, 2D or 3D).
 * `TNNetHyperbolicTangent` (input/output: 1D, 2D or 3D).
 * `TNNetPower` (input/output: 1D, 2D or 3D).
 
@@ -271,6 +289,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetDeMaxPool` (input/output: 1D, 2D or 3D - max is done on a single layer).
 
 ### Weight Initializers
+This API implements popular weight initialization methods including He (Kaiming) and Glorot/Bengio (Xavier):
 * `InitUniform(Value: TNeuralFloat = 1)`.
 * `InitLeCunUniform(Value: TNeuralFloat = 1)`.
 * `InitHeUniform(Value: TNeuralFloat = 1)`.
@@ -278,6 +297,7 @@ This API is really big. The following list gives a general idea about this API b
 * `InitHeGaussian(Value: TNeuralFloat = 0.5)`.
 * `InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5)`.
 * `InitGlorotBengioUniform(Value: TNeuralFloat = 1)`.
+* `InitSELU(Value: TNeuralFloat = 1)`.
 
 ### Data Augmentation Methods Implemented at TVolume
 * `procedure FlipX();`
@@ -597,9 +617,30 @@ When you are done, you should call:
 FProcs.Free; 
 ```
 
-## Paid Support
-In the case that you need help with your own A.I. project (Pascal, Python, PHP or Java), please feel free
-to contact [me](https://au.linkedin.com/in/joão-paulo-schwarz-schuler-785a9b2).
+## Scientific Publications from the Author
+In the case that you would like to know more about what the CAI's author is working at, here we go:
+- [Grouped Pointwise Convolutions Reduce Parameters in Convolutional Neural Networks.](https://mendel-journal.org/index.php/mendel/article/view/169)
+- [Grouped Pointwise Convolutions Significantly Reduces Parameters in EfficientNet.](https://www.researchgate.net/publication/355214501_Grouped_Pointwise_Convolutions_Significantly_Reduces_Parameters_in_EfficientNet)
+- [Reliable Deep Learning Plant Leaf Disease Classification Based on Light-Chroma Separated Branches.](https://www.researchgate.net/publication/355215213_Reliable_Deep_Learning_Plant_Leaf_Disease_Classification_Based_on_Light-Chroma_Separated_Branches)
+- [A Evolu&#231;&#227;o dos Algoritmos Mentais.](https://www.researchgate.net/publication/357204541_A_Evolucao_dos_Algoritmos_Mentais)
+- [Da F&#237;sica &#224; Intelig&#234;ncia Extrassom&#225;tica.](http://schulers.com/jpss/estudos/schuler_inteligencia_artificial.pdf)
+- [Intelig&#234;ncia Artificial Popperiana.](https://www.researchgate.net/publication/357164807_Inteligencia_Artificial_Popperiana)
+- [Opera&#231;&#245;es L&#243;gicas Qu&#226;nticas e Colorabilidade de Grafos.](https://www.researchgate.net/publication/357205247_Operacoes_Logicas_Quanticas_e_Colorabilidade_de_Grafos)
 
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
+
+## Citing this API
+You can cite this API in BibTeX format with:
+```
+@software{cai_neural_api_2021_5810077,
+  author       = {Joao Paulo Schwarz Schuler},
+  title        = {CAI NEURAL API},
+  month        = dec,
+  year         = 2021,
+  publisher    = {Zenodo},
+  version      = {v1.0.6},
+  doi          = {10.5281/zenodo.5810077},
+  url          = {https://doi.org/10.5281/zenodo.5810077}
+}
+```

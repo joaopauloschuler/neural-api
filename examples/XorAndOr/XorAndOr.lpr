@@ -30,15 +30,15 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
 type TBackInput  = array[0..3] of array[0..1] of TNeuralFloat;
 type TBackOutput = array[0..3] of array[0..2] of TNeuralFloat;
 
-const inputs : TBackInput =
+const cs_inputs : TBackInput =
   ( // x1,   x2
     ( 0.1,  0.1), // False, False
-    ( 0.1,  0.9), // False, True
-    ( 0.9,  0.1), // True,  False
-    ( 0.9,  0.9)  // True,  True
+    ( 0.1,  0.8), // False, True
+    ( 0.8,  0.1), // True,  False
+    ( 0.8,  0.8)  // True,  True
   );
 
-const reluoutputs : TBackOutput =
+const cs_outputs : TBackOutput =
   (// XOR, AND,   OR
     ( 0.1, 0.1, 0.1),
     ( 0.8, 0.1, 0.8),
@@ -60,12 +60,12 @@ const reluoutputs : TBackOutput =
     NFit := TNeuralFit.Create();
     TrainingPairs := TNNetVolumePairList.Create();
     NN.AddLayer( TNNetInput.Create(2) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(3) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(3) );
+    NN.AddLayer( TNNetFullConnect.Create(3) );
+    NN.AddLayer( TNNetFullConnectLinear.Create(3) );
 
-    vInputs := inputs;
-    vOutput := reluoutputs;
-    for Cnt := Low(inputs) to High(inputs) do
+    vInputs := cs_inputs;
+    vOutput := cs_outputs;
+    for Cnt := Low(cs_inputs) to High(cs_inputs) do
     begin
       TrainingPairs.Add(
         TNNetVolumePair.Create(
@@ -81,12 +81,13 @@ const reluoutputs : TBackOutput =
     NFit.L2Decay := 0;
     NFit.Verbose := false;
     NFit.HideMessages();
-    NFit.Fit(NN, TrainingPairs, nil, nil, {batchsize=}4, {epochs=}3000);
+    NFit.InferHitFn := @MonopolarCompare;
+    NFit.Fit(NN, TrainingPairs, nil, nil, {batchsize=}4, {epochs=}6000);
 
     pOutPut := TNNetVolume.Create(3,1,1,1);
 
     // tests the learning
-    for Cnt := Low(inputs) to High(inputs) do
+    for Cnt := Low(cs_inputs) to High(cs_inputs) do
     begin
       NN.Compute(vInputs[Cnt]);
       NN.GetOutput(pOutPut);

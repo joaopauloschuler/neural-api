@@ -8,15 +8,15 @@ This example has these main steps:
 
 These are the inputs and expected outputs:
 ```
-const inputs : TBackInput =
+const cs_inputs : TBackInput =
   ( // x1,   x2
     ( 0.1,  0.1), // False, False
-    ( 0.1,  0.9), // False, True
-    ( 0.9,  0.1), // True,  False
-    ( 0.9,  0.9)  // True,  True
+    ( 0.1,  0.8), // False, True
+    ( 0.8,  0.1), // True,  False
+    ( 0.8,  0.8)  // True,  True
   );
 
-const reluoutputs : TBackOutput =
+const cs_outputs : TBackOutput =
   (// XOR, AND,   OR
     ( 0.1, 0.1, 0.1),
     ( 0.8, 0.1, 0.8),
@@ -29,9 +29,9 @@ The first row in `reluoutputs` has expected outputs for **XOR**, **AND** and **O
 
 This is how the training data is prepared with training pairs (input,output):
 ```
-TrainingPairs := TNNetVolumePairList.Create();
-...
-    for Cnt := Low(inputs) to High(inputs) do
+    TrainingPairs := TNNetVolumePairList.Create();
+    ...
+    for Cnt := Low(cs_inputs) to High(cs_inputs) do
     begin
       TrainingPairs.Add(
         TNNetVolumePair.Create(
@@ -52,22 +52,22 @@ This is how the neural network is created:
     NN := TNNet.Create();
     ...
     NN.AddLayer( TNNetInput.Create(2) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(3) );
-    NN.AddLayer( TNNetFullConnectReLU.Create(3) );
+    NN.AddLayer( TNNetFullConnect.Create(3) );
+    NN.AddLayer( TNNetFullConnectLinear.Create(3) );
 ```
 
-As you can see, there is one input layer followed by 2 fully connected layers with 3 neurons each.
+As you can see, there is one input layer followed by 2 fully connected layers with 3 neurons each. The furst fully connected layer has hyperbolic tangent as activation function while se second layer has no activation function.
 
 This is how the fitting object is created and run:
 ```
-NFit := TNeuralFit.Create();
-...
+    NFit := TNeuralFit.Create();
+    ...
     NFit.InitialLearningRate := 0.01;
     NFit.LearningRateDecay := 0;
     NFit.L2Decay := 0;
     NFit.Verbose := false;
     NFit.HideMessages();
-    NFit.Fit(NN, TrainingPairs, nil, nil, {batchsize=}4, {epochs=}3000);
+    NFit.Fit(NN, TrainingPairs, nil, nil, {batchsize=}4, {epochs=}6000);
 ```
 
 The neural network is then tested for each input with:

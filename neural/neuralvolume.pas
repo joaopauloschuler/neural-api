@@ -182,6 +182,7 @@ type
     procedure ForceMinRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxAbs(Value: T); {$IFDEF Release} inline; {$ENDIF}
+    procedure ForcePositive(); {$IFDEF Release} inline; {$ENDIF}
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
     procedure AddGaussianNoise(pMul: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -3224,6 +3225,16 @@ begin
   end;
 end;
 
+procedure TVolume.ForcePositive();
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := High(FData);
+  for I := 0 to vHigh do
+    if FData[I] < 0 then FData[I] := -FData[I];
+end;
+
 destructor TVolume.Destroy();
 begin
   SetLength(FData, 0);
@@ -3660,25 +3671,32 @@ var
   MoveSizeBytes: integer;
   RawPostDest, RawPosSource: integer;
 begin
-  ReSize(NewSizeX, NewSizeY, Original.Depth);
-  RatioX := NewSizeX / Original.SizeX;
-  RatioY := NewSizeY / Original.SizeY;
-
-  MaxX := SizeX - 1;
-  MaxY := SizeY - 1;
-  OrigMaxX := Original.SizeX - 1;
-  OrigMaxY := Original.SizeY - 1;
-  MoveSizeBytes := Depth * SizeOf(T);
-
-  for CntX := 0 to MaxX do
+  if (NewSizeX=Original.SizeX) and (NewSizeY=Original.SizeY) then
   begin
-    OrigPosX := Min(OrigMaxX, Round(CntX / RatioX));
-    for CntY := 0 to MaxY do
+    Copy(Original);
+  end
+  else
+  begin
+    ReSize(NewSizeX, NewSizeY, Original.Depth);
+    RatioX := NewSizeX / Original.SizeX;
+    RatioY := NewSizeY / Original.SizeY;
+
+    MaxX := SizeX - 1;
+    MaxY := SizeY - 1;
+    OrigMaxX := Original.SizeX - 1;
+    OrigMaxY := Original.SizeY - 1;
+    MoveSizeBytes := Depth * SizeOf(T);
+
+    for CntX := 0 to MaxX do
     begin
-      OrigPosY := Min(OrigMaxY, Round(CntY / RatioY));
-      RawPostDest := GetRawPos(CntX, CntY);
-      RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
-      Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+      OrigPosX := Min(OrigMaxX, Round(CntX / RatioX));
+      for CntY := 0 to MaxY do
+      begin
+        OrigPosY := Min(OrigMaxY, Round(CntY / RatioY));
+        RawPostDest := GetRawPos(CntX, CntY);
+        RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
+        Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+      end;
     end;
   end;
 end;

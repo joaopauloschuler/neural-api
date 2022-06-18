@@ -53,6 +53,7 @@ type
       FAvgWeightEpochCount: integer;
       FCurrentEpoch: integer;
       FCurrentStep: integer;
+      FCurrentTrainingError: TNeuralFloat;
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
@@ -83,6 +84,7 @@ type
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
+      FMinBackpropagationError: TNeuralFloat;
       FLoadBestAdEnd: boolean;
       FTestBestAtEnd: boolean;
       {$IFDEF OpenCL}
@@ -108,6 +110,7 @@ type
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentStep: integer read FCurrentStep;
       property CurrentLearningRate: single read FCurrentLearningRate;
+      property CurrentTrainingError: TNeuralFloat read FCurrentTrainingError;
       property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
       property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
       property CyclicalLearningRateLen: integer read FCyclicalLearningRateLen write FCyclicalLearningRateLen;
@@ -119,6 +122,7 @@ type
       property LoadBestAtEnd: boolean read FLoadBestAdEnd write FLoadBestAdEnd;
       property L2Decay: single read FL2Decay write FL2Decay;
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
+      property MinBackpropagationError: TNeuralFloat read FMinBackpropagationError write FMinBackpropagationError;
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
       property NN: TNNet read FNN;
@@ -625,6 +629,7 @@ begin
       if (FGlobalTotal > 0) then
       begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
+        FCurrentTrainingError := TrainingError;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
         if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
@@ -945,7 +950,7 @@ var
   vInputCopy: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
   I: integer;
-  CurrentLoss: TNeuralFloat;
+  CurrentLoss, CurrentError: TNeuralFloat;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTrainingPair: TNNetVolumePair;
@@ -1046,9 +1051,13 @@ begin
 
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
-    LocalNN.Backpropagate( vOutput );
 
-    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
+    CurrentError := vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + CurrentError;
+
+    if (CurrentError > FMinBackpropagationError) or
+      (CurrentError > FCurrentTrainingError/4)
+      then LocalNN.Backpropagate( vOutput );
 
     CurrentLoss := 0;
     if Assigned(FLossFn) then
@@ -1176,6 +1185,12 @@ begin
       FLocalTestProc(I, Index, vInput, vOutput);
     end;
 
+    if FHasImgCrop then
+    begin
+      vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
+      vInput.Copy(vInputCopy);
+    end;
+
     LocalNN.Compute( vInput );
     LocalNN.GetOutput( pOutput );
 
@@ -1188,6 +1203,15 @@ begin
       if FHasFlipX then
       begin
         vInput.FlipX();
+        TotalDiv := TotalDiv + 1;
+        LocalNN.Compute( vInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+      end;
+
+      if FHasFlipY then
+      begin
+        vInput.FlipY();
         TotalDiv := TotalDiv + 1;
         LocalNN.Compute( vInput );
         LocalNN.GetOutput( pOutput );
@@ -1458,6 +1482,7 @@ begin
   FInitialLearningRate := 0.001;
   FCyclicalLearningRateLen := 0; // not cyclical by default.
   FInitialEpoch := 0;
+  FMinBackpropagationError := 0;
   fMinLearnRate := FInitialLearningRate * 0.01;
   FInertia := 0.9;
   FClipDelta := 0.0;
@@ -1569,17 +1594,18 @@ end;
 constructor TNeuralImageFit.Create();
 begin
   inherited Create();
-  FIsSoftmax := true;
-  FMaxCropSize := 8;
+  FChannelShiftRate := 0;
+  FColorEncoding := 0;
   FHasImgCrop := false;
   FHasResizing := True;
   FHasFlipX := true;
   FHasFlipY := false;
   FHasMakeGray := true;
-  FColorEncoding := 0;
+  FIsSoftmax := true;
+  FMaxCropSize := 8;
+  FMinBackpropagationError := 0.2;
   FMultipleSamplesAtValidation := true;
   FTrainingSampleProcessedCnt := TNNetVolume.Create;
-  FChannelShiftRate := 0;
 end;
 
 destructor TNeuralImageFit.Destroy();
@@ -1723,7 +1749,8 @@ begin
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
-      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
+      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs) +
+      ' Min backprop error:' + FloatToStrF(MinBackpropagationError,ffFixed,4,2)
     );
     if Assigned(FImgVolumes) then MessageProc('Training images: '+IntToStr(FImgVolumes.Count));
     if Assigned(FImgValidationVolumes) then MessageProc('Validation images: '+IntToStr(FImgValidationVolumes.Count));
@@ -1781,12 +1808,14 @@ begin
         end;
       end;
       FNN.UpdateWeights();
+      //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
       if FL2Decay > 0.0 then FNN.ComputeL2Decay();
 
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
       if (FGlobalTotal > 0) then
       begin
         TrainingError := FGlobalErrorSum / FGlobalTotal;
+        FCurrentTrainingError := TrainingError;
         TrainingLoss  := FGlobalTotalLoss / FGlobalTotal;
         CurrentAccuracy := (FGlobalHit*100) div FGlobalTotal;
         if (FCurrentEpoch = FInitialEpoch) and (I = 1) then
@@ -2037,7 +2066,7 @@ var
   I, ImgIdx: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
-  LocalTotalLoss, LocalErrorSum: TNeuralFloat;
+  LocalTotalLoss, LocalErrorSum, CurrentError: TNeuralFloat;
   DepthCnt: integer;
   LocalChannelShiftRate: TNeuralFloat;
 begin
@@ -2127,7 +2156,6 @@ begin
         'Invalid image ' + IntToStr(ImgIdx) +
         ' input class: ' + IntToStr(ImgInput.Tag)
       );
-      ReadLn;
       Continue;
     end;
 
@@ -2138,16 +2166,24 @@ begin
       then vOutput.SetClassForSoftMax( ImgInput.Tag )
       else vOutput.SetClass( ImgInput.Tag, +0.9, -0.1);
 
-    LocalErrorSum := LocalErrorSum + vOutput.SumDiff( pOutput );
+    CurrentError := vOutput.SumDiff( pOutput );
+    LocalErrorSum := LocalErrorSum + CurrentError;
     OutputValue := pOutput.FData[ ImgInput.Tag ];
     if Not(FIsSoftmax) then
     begin
       OutputValue := Max(OutputValue, 0.001);
+    end;
+
+    if (CurrentError>FMinBackpropagationError) or
+      (CurrentError>FCurrentTrainingError/4) then
+    begin
       LocalNN.Backpropagate(vOutput);
     end
     else
     begin
-      LocalNN.Backpropagate(vOutput);
+      // TODO: this is an experiment to be tested:
+      // decreases probability to train with good sample.
+      // FTrainingSampleProcessedCnt.FData[ImgIdx] := FTrainingSampleProcessedCnt.FData[ImgIdx] + 1;
     end;
 
     if (OutputValue > 0) then
@@ -2291,6 +2327,15 @@ begin
         sumOutput.Add( pOutput );
       end;
 
+      if FHasFlipY then
+      begin
+        ImgInput.FlipY();
+        TotalDiv := TotalDiv + 1;
+        LocalNN.Compute( ImgInput );
+        LocalNN.GetOutput( pOutput );
+        sumOutput.Add( pOutput );
+      end;
+
       if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
         ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
@@ -2400,13 +2445,14 @@ end;
 
 procedure TNeuralFitWithImageBase.EnableDefaultImageTreatment();
 begin
-  FMaxCropSize := 8;
+  FColorEncoding := 0;
   FHasImgCrop := false;
   FHasResizing := True;
   FHasFlipX := True;
   FHasFlipY := false;
   FHasMakeGray := True;
-  FColorEncoding := 0;
+  FMaxCropSize := 8;
+  FMinBackpropagationError := 0.2;
   FMultipleSamplesAtValidation := True;
 end;
 
