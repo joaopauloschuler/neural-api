@@ -258,6 +258,7 @@ type
     // This function returns the probability to win of a given neuron from position pos.
     function ProbToWin(neuronPos: longint): extended;
 
+  public
     // This function returns all relation indexes with a minimun number of victories (selections)
     // and a minimum probability MinF.
     procedure SelectBestIndexes(MinimumNumberOfVictories: longint; MinF: extended);
@@ -371,6 +372,7 @@ begin
   CurrentState[0] := 0;
   NextState[0] := pLabel;
   FStates[FNextFreePos].FTester.Load(FCS, pState, CurrentState, NextState);
+  Result := FNextFreePos;
 
   Inc(FNextFreePos);
 end;
@@ -485,7 +487,7 @@ begin
   if (NG.TestNeuronLayer.N > 10) then
   begin
     NG.TestNeuronLayer.TestThreshold :=
-    NG.TestNeuronLayer.N - Random(NG.TestNeuronLayer.N div 10);
+    NG.TestNeuronLayer.N - Random(Integer(NG.TestNeuronLayer.N div 10));
   end
   else
   begin
@@ -718,10 +720,11 @@ var
 begin
   ABCopy(aActions, pActions);
   ABCopy(aCurrentState, pCurrentState);
+  idxCache := -1;
   if FUseCache then
     idxCache := FCache.Read(pActions, pPredictedState);
   Equal := ABCmp(pActions, pCurrentState);
-  if FUseCache and (idxCache <> -1) and Equal then
+  if (idxCache <> -1) and Equal then
   begin
     FCached := True;
   end
@@ -866,28 +869,37 @@ var
   pStatelen: integer;
   inputNeuronCnt: integer;
 begin
-  version := 1;
   S := TStringList.Create;
-  S.Sorted := false;
-  S.Delimiter := chr(10);
-  S.StrictDelimiter := true;
-  S.DelimitedText := str;
+  try
+     S.Sorted := false;
+     S.Delimiter := chr(10);
+     S.StrictDelimiter := true;
+     S.DelimitedText := str;
 
-  version := StrToInt(S[0]);
-  evaluation := StrToInt(S[1]);
-  pActionLen := StrToInt(S[2]);
-  pStatelen := StrToInt(S[3]);
+     version := StrToInt(S[0]);
+     evaluation := StrToInt(S[1]);
+     pActionLen := StrToInt(S[2]);
+     pStatelen := StrToInt(S[3]);
 
-  //TODO: treat above info here.
+     if version <> 1 then
+        raise Exception.Create( 'Version V' + IntToStr( version ) + '.' + IntToStr(evaluation) + ' found but V1.0 expected');
 
-  if (S.Count>4) then
-  begin
-    neuronPos := pos;
-    for inputNeuronCnt := 4 to S.Count-1 do
-    begin
-      FNN[neuronPos].LoadFromString(S[inputNeuronCnt]);
-      inc(neuronPos);
-    end;
+     if pActionLen <> FActionByteLen then
+        raise Exception.Create('Action length differs');
+     if pStateLen <> FStateByteLen then
+        raise Exception.Create('State length differs');
+
+     if (S.Count>4) then
+     begin
+       neuronPos := pos;
+       for inputNeuronCnt := 4 to S.Count-1 do
+       begin
+         FNN[neuronPos].LoadFromString(S[inputNeuronCnt]);
+         inc(neuronPos);
+       end;
+     end;
+  finally
+         S.Free;
   end;
 end;
 
@@ -1057,11 +1069,11 @@ begin
 
     if (Actual > Best) then
     begin
-      Best := actual;
+      // Best := actual; // this is due to the exit...
       posBest := neuronPos;
       R := True;
       Result := R;
-      exit;
+      exit; //
     end;
   end;
 end;

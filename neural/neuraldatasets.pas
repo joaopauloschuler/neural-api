@@ -27,7 +27,7 @@ unit neuraldatasets;
 interface
 
 uses
-  {$IFNDEF FPC}System.Classes,{$ENDIF}
+  {$IFNDEF FPC} {$IF (CompilerVersion <= 21)} Classes, {$ELSE}  System.Classes, {$IFEND} {$ENDIF}
   neuralvolume, neuralnetwork
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
@@ -277,7 +277,7 @@ implementation
 
 uses
   SysUtils, math, neuralthread,
-  {$IFDEF FPC}fileutil{$ELSE} Winapi.Windows{$ENDIF};
+  {$IFDEF FPC}fileutil{$ELSE} Windows{$ENDIF};
 
 {$IFDEF FPC}
 procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
@@ -822,12 +822,13 @@ end;
 {$ENDIF}
 
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
-var
-  Volume: TNNetVolume;
+var i : integer;
+    Volume: TNNetVolume;
 begin
-  for Volume in VolumeList do
+  for i := 0 to VolumeList.Count - 1 do
   begin
-    Volume.Tag := csMachineAnimalCifar10Pos[Volume.Tag];
+       volume := volumeList[i];
+       Volume.Tag := csMachineAnimalCifar10Pos[Volume.Tag];
   end;
 end;
 

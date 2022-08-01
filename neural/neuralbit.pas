@@ -925,4 +925,4 @@ begin
     VARS[Cont] := 0;
 end;
 
-end. { of unit }
+end.

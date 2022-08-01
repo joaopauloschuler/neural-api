@@ -106,7 +106,7 @@ const
 
 // this array maps OpCode into its string representation
 const
-  csStrOp: array[0..csMaxOperations - 1] of string[15] =
+  csStrOp: array[0..csMaxOperations - 1] of string =
     //0    1   2    3    4   5   6   7      8     9     10  11  12  13    14
     ('nop', '=', '=', '<>', '>', '<', 'V', ' := ', 'inc', 'dec', '+', '-', '*', 'div', 'mod',
     //15    16   17    18    19
@@ -699,7 +699,7 @@ procedure TCreateValidOperations.Create(Tests, FullEqual: boolean;
   var ERRORS: array of byte);
 var
   LocalNonZeroPrevStates, NonZeroErrors: TPositionArray;
-  LocalNonZeroPrevStatesCount, NonZeroErrorsCount: integer;
+  LocalNonZeroPrevStatesCount(*, NonZeroErrorsCount*): integer;
   LocalNumberOfPreviousStates: integer;
   LocalPreviousStates: array of byte;
   OnAction: boolean;
@@ -866,7 +866,7 @@ begin
   Clear;
   SetLength(NonZeroErrors,Self.NumberOfCurrentStates);
   NumberOfErrors := NumberOfNextStates;
-  NonZeroErrorsCount := getNonZeroElementsPos(NumberOfErrors, ERRORS, NonZeroErrors);
+  (*NonZeroErrorsCount := *)getNonZeroElementsPos(NumberOfErrors, ERRORS, NonZeroErrors);
 
   if not(FCS.TestOnStates) then RunOnActionFlag := 1
   else if not(FCS.TestOnActions) then RunOnActionFlag := 0
@@ -1012,6 +1012,7 @@ var
   efeito: byte;
   PermissibleErrors: ShortInt;
 begin
+  PermissibleErrors := 0;
   if Tests.N > 0 then
   begin
     PermissibleErrors := Tests.N - Tests.TestThreshold;

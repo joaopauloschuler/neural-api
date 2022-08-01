@@ -35,7 +35,7 @@ unit neuralopencl;
 interface
 
 uses
-  Classes, SysUtils, cl, {$IFDEF FPC}ctypes{$ELSE}Winapi.Windows,AnsiStrings,CL_Platform{$ENDIF}, neuralvolume;
+  Classes, SysUtils, cl, {$IFDEF FPC}ctypes{$ELSE}Windows,AnsiStrings,CL_Platform{$ENDIF}, neuralvolume;
 
 type
   {$IFDEF FPC}
@@ -84,14 +84,14 @@ type
     FCompilerOptions: ShortString;
     {$ENDIF}
 
-    procedure LoadPlatforms();
     procedure FreeContext();
     procedure CompileProgram(); overload;
 
   public
-    constructor Create(); override;
+    constructor Create(); //override;
     destructor Destroy(); override;
 
+    procedure LoadPlatforms();
     procedure printDevicesInfo();
     function GetPlatformCount(): integer;
     function GetDeviceCount(): integer;
@@ -160,11 +160,13 @@ type
 
   TNeuralKernel = class(TEasyOpenCLV)
     private
+      fkernelname : string;
       /// OpenCL Kernel
       FKernel: cl_kernel;
       function PrepareKernel(kernelname: string = 'cai_dot_product'): integer;
       procedure UnprepareKernel();
     public
+      procedure Prepare;
       constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
       destructor Destroy(); override;
 
@@ -396,7 +398,14 @@ begin
   FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
   FPreviousComputeTime := 0;
 
-  PrepareForCompute := CL_SUCCESS;
+  if Assigned(FResultBuffer) and Assigned(FInputBufferAs) and Assigned(FInputBufferBs)
+  then
+    PrepareForCompute := CL_SUCCESS
+  else
+  begin
+       UnprepareForCompute;
+       Result := CL_INVALID_MEM_OBJECT;
+  end;
 end;
 
 procedure TDotProductSharedKernel.Compute
@@ -550,6 +559,39 @@ begin
   end;
 end;
 
+procedure TNeuralKernel.Prepare;
+var resStream : TResourceStream;
+begin
+     // ###########################################
+     // #### Check if the neural.cl file is part of the resources
+     try
+        resStream := TResourceStream.Create(hInstance, 'NeuralCL', RT_RCDATA);
+        FOpenCLProgramSource.LoadFromStream(resStream, TEncoding.UTF8);
+
+        resStream.Free;
+        CompileProgram();
+        PrepareKernel(fkernelname);
+        exit;
+     except
+           MessageProc('Resource NeuralCL not found - try to open file...');
+     end;
+
+     // Create the OpenCL Kernel Here:
+     if FileExists('../../../neural/neural.cl') then
+     begin
+       CompileProgramFromFile('../../../neural/neural.cl');
+     end
+     else if FileExists('neural.cl') then
+     begin
+       CompileProgramFromFile('neural.cl');
+     end
+     else
+     begin
+       MessageProc('File neural.cl could not be found.');
+     end;
+     PrepareKernel(fkernelname);
+end;
+
 function TNeuralKernel.PrepareKernel(kernelname: string): integer;
 begin
   UnprepareKernel();
@@ -569,21 +611,7 @@ begin
   inherited Create();
   SetCurrentPlatform(pCurrentPlatform);
   SetCurrentDevice(pCurrentDevice);
-
-  // Create the OpenCL Kernel Here:
-  if FileExists('../../../neural/neural.cl') then
-  begin
-    CompileProgramFromFile('../../../neural/neural.cl');
-  end
-  else if FileExists('neural.cl') then
-  begin
-    CompileProgramFromFile('neural.cl');
-  end
-  else
-  begin
-    MessageProc('File neural.cl could not be found.');
-  end;
-  PrepareKernel(kernelname);
+  fkernelname := kernelname;
 end;
 
 destructor TNeuralKernel.Destroy();
@@ -834,6 +862,12 @@ end;
 function TEasyOpenCLV.ReadBuffer(buffer: cl_mem; V: TNNetVolume; blocking: cl_bool): integer;
 begin
   Result := ReadBuffer(buffer, V.GetMemSize(), V.DataPtr, blocking);
+
+  if Result <> CL_SUCCESS then
+  begin
+       FErrorProc(Format( 'Error: %p, %p, %d', [buffer, V.DataPtr, V.GetMemSize ]));
+  end;
+
 end;
 
 function TEasyOpenCLV.CreateAndWriteBuffer(V: TNNetVolume; var buffer: cl_mem
@@ -899,11 +933,15 @@ begin
     begin
       {$IFDEF FPC}
       err := clGetPlatformInfo(local_platformids[i], CL_PLATFORM_NAME, sizeof(buf), @buf, bufwritten);
-      FPlatformNames[i] := buf;
+      if err <> CL_SUCCESS then
+         FErrorProc('ERROR: ' + GetString(err) );
+      FPlatformNames[i] := string(buf);
       FPlatformIds[i]   := local_platformids[i];
       {$ELSE}
       err := clGetPlatformInfo(local_platformids^, CL_PLATFORM_NAME, sizeof(buf), @buf, @bufwritten);
-      FPlatformNames[i] := buf;
+      if err <> CL_SUCCESS then
+         FErrorProc('ERROR: ' + String(GetString(err) ) );
+      FPlatformNames[i] := string(buf);
       FPlatformIds[i]   := local_platformids^;
       Inc(local_platformids);
       {$ENDIF}
@@ -933,7 +971,11 @@ begin
   {$IFDEF FPC}
   localKernelSource := FOpenCLProgramSource.GetText();
   {$ELSE}
+  {$if CompilerVersion >= 23}
   localKernelSource := AnsiStrings.StrNew(PAnsiChar(AnsiString(FOpenCLProgramSource.Text)));
+  {$ELSE}
+  localKernelSource := PAnsiChar(AnsiString(FOpenCLProgramSource.Text));
+  {$IFEND}
   {$ENDIF}
 
   // Create a compute context
@@ -965,7 +1007,7 @@ begin
   {$ENDIF}
   if FProg = nil then
   begin
-    FMessageProc(localKernelSource);
+    FMessageProc(String(localKernelSource));
     FErrorProc('Error: Failed to create compute program:' + IntToStr(err));
     exit;
   end
@@ -973,19 +1015,19 @@ begin
     FMessageProc('clCreateProgramWithSource OK!');
 
   localCompilerOptions := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(FCompilerOptions)+1);
-  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localCompilerOptions,FCompilerOptions);
+  {$IFDEF FPC}StrPCopy{$ELSE} {$IF CompilerVersion >= 23}AnsiStrings.StrPCopy{$ELSE}StrPCopy{$IFEND} {$ENDIF}(localCompilerOptions,FCompilerOptions);
 
   // Build the program executable
   err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
 
-  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
+  {$IFDEF FPC}StrDispose{$ELSE}{$IF CompilerVersion >= 23}AnsiStrings.StrDispose{$ELSE}StrDispose{$IFEND}{$ENDIF}(localCompilerOptions);
 
   if (err <> CL_SUCCESS) then
   begin
     errorlog := @errorlogstr[1];
     loglen := SizeOf(errorlogstr);
     clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, SizeOf(errorlogstr), errorlog, {$IFDEF FPC}loglen{$ELSE}@loglen{$ENDIF});
-    FErrorProc('Error: Failed to build program executable:' + IntToStr(err) + ' ' + errorlog);
+    FErrorProc('Error: Failed to build program executable:' + IntToStr(err) + ' ' + String(errorlog));
     exit;
   end
   else
@@ -1009,7 +1051,7 @@ begin
       for k := low(platform_str_info) to high(platform_str_info) do
       begin
         clGetPlatformInfo(FPlatformIds[i], platform_str_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
-        MessageProc(platform_str_info[k].Name + ': ' + buf);
+        MessageProc(platform_str_info[k].Name + ': ' + String(buf));
       end;
 
       GetDevicesFromPlatform(FPlatformIds[i], local_devices, local_deviceids);
@@ -1022,7 +1064,7 @@ begin
           for k := low(device_str_info) to high(device_str_info) do
           begin
             clGetDeviceInfo(local_deviceids[j], device_str_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
-            MessageProc(device_str_info[k].Name + ': ' + buf);
+            MessageProc(device_str_info[k].Name + ': ' + String(buf));
           end;
 
           for k := low(device_word_info) to high(device_word_info) do
@@ -1070,22 +1112,32 @@ begin
     firstpointer := local_deviceids;
     err := clGetDeviceIDs(PlatformId, CL_DEVICE_TYPE_ALL, local_devices, local_deviceids, nil);
 
-    if (local_devices > 0) then
+    if err = CL_SUCCESS then
     begin
-      for j := 0 to local_devices - 1 do
+      if (local_devices > 0) then
       begin
-        {$IFDEF FPC}
-        err := clGetDeviceInfo(local_deviceids[j], CL_DEVICE_NAME, sizeof(buf), @buf, bufwritten);
-        pDeviceNames[j] := buf;
-        pDevices[j] := local_deviceids[j];
-        {$ELSE}
-        err := clGetDeviceInfo(local_deviceids^, CL_DEVICE_NAME, sizeof(buf), @buf, @bufwritten);
-        pDeviceNames[j] := buf;
-        pDevices[j] := local_deviceids^;
-        Inc(local_deviceids);
-        {$ENDIF}
+        for j := 0 to local_devices - 1 do
+        begin
+          {$IFDEF FPC}
+          err := clGetDeviceInfo(local_deviceids[j], CL_DEVICE_NAME, sizeof(buf), @buf, bufwritten);
+          if err = CL_SUCCESS then
+             FErrorProc('ERROR: ' + GetString(err));
+          pDeviceNames[j] := buf;
+          pDevices[j] := local_deviceids[j];
+          {$ELSE}
+          err := clGetDeviceInfo(local_deviceids^, CL_DEVICE_NAME, sizeof(buf), @buf, @bufwritten);
+          if err <> CL_SUCCESS then
+             FErrorProc('ERROR: ' + String(GetString(err)));
+          pDeviceNames[j] := String(buf);
+          pDevices[j] := local_deviceids^;
+          Inc(local_deviceids);
+          {$ENDIF}
+        end;
       end;
-    end;
+    end
+    else
+        FErrorProc('ERROR: ' + String(GetString( err ) ));
+
     freemem(firstpointer);
   end;
 end;
@@ -1224,7 +1276,7 @@ var
 begin
   err := 0;
   localKernelName := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(kernelname)+1);
-  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localKernelName,kernelname);
+  {$IFDEF FPC}StrPCopy{$ELSE}{$IF CompilerVersion >= 23}AnsiStrings.StrPCopy{$ELSE}StrPCopy{$IFEND}{$ENDIF}(localKernelName,AnsiString(kernelname));
 
   // Create the compute kernel in the program we wish to run
   Result := clCreateKernel(prog, localKernelName, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
@@ -1236,7 +1288,7 @@ begin
   begin
     FMessageProc('clCreateKernel '+kernelname+' OK!');
   end;
-  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelName);
+  {$IFDEF FPC}StrDispose{$ELSE}{$IF CompilerVersion >= 23}AnsiStrings.StrDispose{$ELSE}StrDispose{$IFEND} {$ENDIF}(localKernelName);
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
@@ -1369,7 +1421,6 @@ begin
   MessageProc := Self.DefaultMessageProc;
   ErrorProc := Self.DefaultErrorProc;
   {$ENDIF}
-  LoadPlatforms();
   SetLength(FDeviceNames, 0);
   SetLength(FDevices, 0);
 

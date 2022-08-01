@@ -201,7 +201,7 @@ type
     procedure CopyChannels(Original: TVolume; aChannels: array of integer);
     procedure Define(Original: array of T);
     function DotProduct(Original: TVolume): T; overload; {$IFDEF Release} inline; {$ENDIF}
-    class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
+    class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload;
     class function Product(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
     function SumDiff(Original: TVolume): T;  {$IFDEF Release} inline; {$ENDIF}
     procedure DebugDiff(Original: TVolume; Limit: Single = 0);
@@ -321,9 +321,9 @@ type
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
-      function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
-      function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
-      function HasAVX512: boolean; {$IFDEF Release} inline; {$ENDIF}
+      function HasAVX: boolean;
+      function HasAVX2: boolean;
+      function HasAVX512: boolean;
       function PearsonCorrelation(Y : TNNetVolume): TNeuralFloat;
       procedure AddSumChannel(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure AddSumSqrChannel(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
@@ -375,8 +375,7 @@ type
       FB: TNNetVolume;
     public
       constructor Create(); overload;
-      constructor Create(pA, pB: TNNetVolume); overload;
-      constructor CreateCopying(pA, pB: TNNetVolume); overload;
+      constructor Create(pA, pB: TNNetVolume; createCopy : boolean = False); overload;
 
       destructor Destroy(); override;
 
@@ -391,9 +390,8 @@ type
     protected
       FMessageProc: TGetStrProc;
       FErrorProc: TGetStrProc;
-
     public
-      constructor Create(); virtual;
+      constructor Create(); //virtual;
       destructor Destroy(); override;
 
       procedure DefaultMessageProc(const S: string);
@@ -401,7 +399,6 @@ type
       procedure DefaultHideMessages(const S: string);
       procedure HideMessages();
 
-    published
       property MessageProc: TGetStrProc read FMessageProc write FMessageProc;
       property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
   end;
@@ -558,6 +555,14 @@ type
   function ReLULeakyBound(x: TNeuralFloat): TNeuralFloat;
   function ReLULeakyBoundDerivative(x: TNeuralFloat): TNeuralFloat;
 
+  function GaussErrorLinUnit(x : TNeuralFloat) : TNeuralFloat;
+  function GaussErrorLinUnitDerivative(x : TNeuralFloat) : TNeuralFloat;
+
+  function Swish6Unit(x : TNeuralFloat) : TNeuralFloat;
+  function Swish6Derivative(x : TNeuralFloat) : TNeuralFloat;
+  function SwishUnit(x : TNeuralFloat) : TNeuralFloat;
+  function SwishDerivative(x : TNeuralFloat) : TNeuralFloat;
+
   function Sigmoid(x: TNeuralFloat): TNeuralFloat;
   function SigmoidDerivative(x: TNeuralFloat): TNeuralFloat;
 
@@ -599,8 +604,15 @@ type
 
 implementation
 
-uses
-  Math, neuralbit;
+{$IFDEF CPUX64}
+{$DEFINE x64}
+{$ENDIF}
+{$IFDEF cpux86_64}
+{$DEFINE x64}
+{$ENDIF}
+
+uses {$IFNDEF x64} Neural.AVX {$ELSE} Neural.AVXx64{$ENDIF}, neuralbit,
+     Math, CPUFeatures;
 
 function CreateTokenizedStringList(str: string; c:char):TStringList;
 begin
@@ -1500,6 +1512,109 @@ begin
     else Result := 0;
 end;
 
+// paper: GAUSSIAN ERROR LINEAR UNITS (GELUS) Gimpel et al. 2018
+function GaussErrorLinUnit(x : TNeuralFloat) : TNeuralFloat;
+const cSqrt_2_pi = 0.797884560803;
+begin
+     // I define some calculational boundaries here ->
+     if x > 6
+     then
+         Result := x
+     else if x < -4
+     then
+         Result := 0
+     else
+         Result := 0.5*x*(1 + tanh( cSqrt_2_pi*( x + 0.044715*x*x*x)));
+end;
+
+function GaussErrorLinUnitDerivative(x : TNeuralFloat) : TNeuralFloat;
+begin
+     // from https://mlfromscratch.com/activation-functions-explained/#/
+     // plus the derrivatives higher than 5
+     if x > 6.5
+     then
+         Result := 1
+     else if x < -5
+     then
+         Result := 0
+     else
+         Result := 0.5 + 0.5*tanh(0.0356774*x*x*x + 0.797885 * x) + (0.0535161*x*x*x + 0.398942*x)*sqr( sech(0.0356774*x*x*x + 0.797885*x) )
+end;
+
+function Swish6Unit(x : TNeuralFloat) : TNeuralFloat;
+begin
+     if x < -6 then
+     begin
+          Result := 0;
+     end
+     else if x < 6 then
+     begin
+          Result := x* (1 / ( 1 + Exp(-x) ));
+     end
+     else
+     begin
+          // max out at 6
+          Result := 6;
+    end;
+end;
+
+function Swish6Derivative(x : TNeuralFloat) : TNeuralFloat;
+var sigmoidValue : TNeuralFloat;
+begin
+     if x < -6 then
+     begin
+          Result := 0;
+     end
+     else if x < 6 then
+     begin
+          sigmoidValue := (1 / ( 1 + Exp(-x) ));
+          Result := x*sigmoidValue;
+          Result := Result + sigmoidValue*(1 - Result);
+     end
+     else
+     begin
+          // max out at 6
+          Result := 0;
+    end;
+end;
+
+function SwishUnit(x : TNeuralFloat) : TNeuralFloat;
+begin
+     if x < -6 then
+     begin
+          Result := 0;
+     end
+     else if x < 6 then
+     begin
+          Result := x* (1 / ( 1 + Exp(-x) ));
+     end
+     else
+     begin
+          //
+          Result := x;
+    end;
+end;
+
+function SwishDerivative(x : TNeuralFloat) : TNeuralFloat;
+var sigmoidValue : TNeuralFloat;
+begin
+     if x < -6 then
+     begin
+          Result := 0;
+     end
+     else if x < 6 then
+     begin
+          sigmoidValue := (1 / ( 1 + Exp(-x) ));
+          Result := x*sigmoidValue;
+          Result := Result + sigmoidValue*(1 - Result);
+     end
+     else
+     begin
+          //
+          Result := 1;
+    end;
+end;
+
 constructor TNNetVolumePair.Create();
 begin
   inherited Create();
@@ -1507,20 +1622,22 @@ begin
   FB := TNNetVolume.Create();
 end;
 
-constructor TNNetVolumePair.Create(pA, pB: TNNetVolume);
+constructor TNNetVolumePair.Create(pA, pB: TNNetVolume; createCopy : boolean = False);
 begin
-  inherited Create();
-  FA := pA;
-  FB := pB;
-end;
+  inherited Create;
 
-constructor TNNetVolumePair.CreateCopying(pA, pB: TNNetVolume);
-begin
-  inherited Create();
-  FA := TNNetVolume.Create(pA);
-  FB := TNNetVolume.Create(pB);
-  FA.Copy(pA);
-  FB.Copy(pB);
+  if createCopy then
+  begin
+       FA := TNNetVolume.Create(pA);
+       FB := TNNetVolume.Create(pB);
+       FA.Copy(pA);
+       FB.Copy(pB);
+  end
+  else
+  begin
+       FA := pA;
+       FB := pB;
+  end;
 end;
 
 destructor TNNetVolumePair.Destroy();
@@ -1988,7 +2105,6 @@ end;
 procedure TNNetVolumeList.AddValue(Value: TNeuralFloat);
 var
   I: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -2002,7 +2118,6 @@ end;
 procedure TNNetVolumeList.Divi(Value: TNeuralFloat);
 var
   I: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -2476,6 +2591,7 @@ var
   r, x, y: TNeuralFloat;
 begin
   r := 0;
+  x := 0;
   // loop executed 4 / pi = 1.273.. times on average
   while ( (r > 1) or (r = 0) ) do
   begin
@@ -3017,7 +3133,9 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
+  {$IFDEF FPC}
   AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   BasePos := 0;
   vHigh := pSize - 1;
@@ -3070,7 +3188,9 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
+  {$IFDEF FPC}
   AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   BasePos := 0;
   vHigh := pSize - 1;
@@ -3120,14 +3240,16 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
+  {$IFDEF FPC}
   AddrA, AddrB, AddrC: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   BasePos := 0;
+  vHigh := pSize - 1;
+  {$IFDEF FPC}
   AddrA := pointer(PtrA);
   AddrB := pointer(PtrB);
   AddrC := pointer(PtrC);
-  vHigh := pSize - 1;
-  {$IFDEF FPC}
   while BasePos <= vHigh - 7 do
   begin
     (AddrA)^   := (AddrA)^   + (AddrB)^   * (AddrC)^;
@@ -4946,10 +5068,13 @@ var
   I: integer;
   AuxFloat: Single;
 begin
-  version := 1;
   S := CreateTokenizedStringList(strData,';');
 
   version := StrToInt(S[0]);
+
+  if version <> 1 then
+     raise Exception.Create('Error V' + IntToStr(version) + ' found but V1.0 expected');
+
   pSizeX  := StrToInt(S[1]);
   pSizeY  := StrToInt(S[2]);
   pDepth  := StrToInt(S[3]);
@@ -5162,11 +5287,12 @@ end;
 
 procedure TNNetVolume.DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
-  DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
+  CntA, CntB, MaxA, MaxB: integer;
+  {$IFDEF AVXANY}
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
+  {$ENDIF}
+
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
 begin
@@ -5175,8 +5301,10 @@ begin
 
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
+  {$IFDEF AVXANY}
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
+  {$ENDIF}
 
   for CntB := 0 to MaxB do
   begin
@@ -5418,11 +5546,12 @@ end;
 
 procedure TNNetVolume.DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
-  DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
+  CntA, CntB: integer;
+ {$IFDEF AVXANY}
   vRes: array[0..3] of Single;
-  localNumElements, MissedElements: integer;
+  localNumElements : integer;
+  MissedElements: integer;
+  {$ENDIF}
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
   // Tiling
@@ -5430,13 +5559,12 @@ var
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
 begin
-  MaxA := NumAs - 1;
-  MaxB := NumBs - 1;
-
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
+  {$IFDEF AVXANY}
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
+  {$ENDIF}
   MaxTileA := (NumAs div TileSizeA) - 1;
   MaxTileB := (NumBs div TileSizeB) - 1;
   for TileBCnt := 0 to MaxTileB do
@@ -5694,13 +5822,14 @@ end;
 procedure TNNetVolume.GroupedDotProductsTiled(Groups, NumAs, NumBs,
   VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
+  CntA, CntB: integer;
   GroupId, GroupASize: integer;
   VectoreBSize: integer;
+  {$IFDEF AVXANY}
   DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
+  {$ENDIF}
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
   // Tiling
@@ -5708,8 +5837,6 @@ var
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
 begin
-  MaxA := NumAs - 1;
-  MaxB := NumBs - 1;
   GroupASize := NumAs div Groups;
   VectoreBSize := VectorSize * Groups;
 
@@ -5727,8 +5854,10 @@ begin
 
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
+  {$IFDEF AVXANY}
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
+  {$ENDIF}
   MaxTileA := (NumAs div TileSizeA) - 1;
   MaxTileB := (NumBs div TileSizeB) - 1;
   for TileBCnt := 0 to MaxTileB do
@@ -6000,31 +6129,26 @@ begin
   end;
 end;
 
+// ###########################################
+// #### local definitions for AVX determiniation
+
+var locAVX : boolean = False;
+    locAVX2 : boolean = False;
+    locAVX512 : boolean = False;
+
 function TNNetVolume.HasAVX: boolean;
 begin
-  {$IFDEF AVXANY}
-  Result := true;
-  {$ELSE}
-  Result := false;
-  {$ENDIF}
+  Result := locAVX;
 end;
 
 function TNNetVolume.HasAVX2: boolean;
 begin
-  {$IFDEF AVX2}
-  Result := true;
-  {$ELSE}
-  Result := false;
-  {$ENDIF}
+  Result := locAVX2;
 end;
 
 function TNNetVolume.HasAVX512: boolean;
 begin
-  {$IFDEF AVX512}
-  Result := true;
-  {$ELSE}
-  Result := false;
-  {$ENDIF}
+  Result := locAVX512;
 end;
 
 function TNNetVolume.PearsonCorrelation(Y: TNNetVolume): TNeuralFloat;
@@ -9230,9 +9354,25 @@ class function TVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: i
   ): Single;
 var
   I: integer;
+  {$IFDEF FPC}
   BasePos, vHigh: integer;
   AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
 begin
+  {$IFNDEF FPC}
+  if false //locAVX and (NumElements > 4)
+  then
+      Result := AVXDotProd(PSingle(PtrA), PSingle(PtrB), NumElements)
+  else
+  begin
+       Result := 0;
+       for i := 0 to NumElements - 1 do
+           Result := Result + PtrA^[i]*PtrB^[i];
+  end;
+
+  exit;
+
+  {$ELSE}
   Result := 0;
   BasePos := 0;
   vHigh := NumElements - 1;
@@ -9276,6 +9416,7 @@ begin
   end;
   //WriteLn('Hello: ', Result);
   //ReadLn();
+  {$ENDIF}
 end;
 
 class function TVolume.Product(PtrA: TNeuralFloatArrPtr;
@@ -9323,4 +9464,13 @@ begin
 end;
 {$ENDIF}
 
+
+// ###########################################
+// #### Initialize cpu set variables
+// ###########################################
+
+initialization
+  locAVX := IsAVXPresent;
+  locAVX2 := IsFMAPresent;
+  locAVX512 := IsAVX512Present;
 end.

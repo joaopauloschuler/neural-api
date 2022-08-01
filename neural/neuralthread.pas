@@ -169,7 +169,7 @@ procedure CreateNeuralThreadListIfRequired();
 begin
   if Not(Assigned(vNTL)) then
   begin
-    NeuralThreadListCreate(TThread.ProcessorCount);
+    NeuralThreadListCreate(System.CPUCount);
   end;
 end;
 
@@ -178,7 +178,7 @@ begin
   {$IFDEF FPC}
   Result := GetSystemThreadCount;
   {$ELSE}
-  Result := TThread.ProcessorCount;
+  Result := System.CPUCount;
   {$ENDIF}
 end;
 

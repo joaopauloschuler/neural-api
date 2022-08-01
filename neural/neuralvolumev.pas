@@ -25,7 +25,7 @@ interface
 
 uses
   Classes, SysUtils, ExtCtrls, Graphics, neuralvolume,
-  {$IFDEF FPC}LCLType, FPImage {$ELSE}Winapi.Windows{$ENDIF} ;
+  {$IFDEF FPC}LCLType, FPImage {$ELSE}Windows{$ENDIF} ;
 
 /// saves a bitmap into a file from a handle HWND
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
@@ -47,7 +47,7 @@ procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
 {$ENDIF}
 
 implementation
-{$IFDEF FPC}uses LCLIntf;{$ENDIF}
+uses {$IFDEF FPC}LCLIntf,{$ENDIF}Math;
 
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
 {$IFDEF FPC}

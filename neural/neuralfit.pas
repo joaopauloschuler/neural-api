@@ -94,7 +94,7 @@ type
       FProcs: TNeuralThreadList;
       procedure CheckLearningRate(iEpochCount: integer);
     public
-      constructor Create(); override;
+      constructor Create();
       destructor Destroy(); override;
       procedure WaitUntilFinished;
       {$IFDEF OpenCL}
@@ -119,6 +119,7 @@ type
       property InitialEpoch: integer read FInitialEpoch write FInitialEpoch;
       property InitialLearningRate: single read FInitialLearningRate write FInitialLearningRate;
       property LearningRateDecay: single read FLearningRateDecay write FLearningRateDecay;
+      property MinLearnRate : single read FMinLearnRate write FMinLearnRate;
       property LoadBestAtEnd: boolean read FLoadBestAdEnd write FLoadBestAdEnd;
       property L2Decay: single read FL2Decay write FL2Decay;
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
@@ -152,7 +153,7 @@ type
       FColorEncoding: integer;
       FChannelShiftRate: TNeuralFloat;
     public
-      constructor Create(); override;
+      constructor Create();
       destructor Destroy(); override;
       procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
       procedure EnableDefaultImageTreatment(); virtual;
@@ -187,7 +188,7 @@ type
       FGetTrainingProc, FGetValidationProc, FGetTestProc: TNNetGet2VolumesProc;
       function DefaultLossFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
     public
-      constructor Create(); override;
+      constructor Create();
       procedure FitLoading(pNN: TNNet;
         TrainingCnt, ValidationCnt, TestCnt, pBatchSize, Epochs: integer;
         pGetTrainingPair, pGetValidationPair, pGetTestPair: TNNetGetPairFn); overload;
@@ -231,7 +232,7 @@ type
       function FitValidationPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
       function FitTestPair(Idx: integer; ThreadId: integer): TNNetVolumePair;
     public
-      constructor Create(); override;
+      constructor Create();
       destructor Destroy(); override;
 
       procedure Fit(pNN: TNNet;
@@ -280,7 +281,7 @@ type
       FIsSoftmax: boolean;
       FTrainingSampleProcessedCnt: TNNetVolume;
     public
-      constructor Create(); override;
+      constructor Create();
       destructor Destroy(); override;
 
       procedure Fit(pNN: TNNet;
@@ -602,7 +603,7 @@ begin
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
-      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs)
+      ' Staircase epochs:' + IntToStr(FStaircaseEpochs)
     );
     if TrainingCnt > 0 then MessageProc('Training volumes: '+IntToStr(TrainingCnt));
     if ValidationCnt > 0 then MessageProc('Validation volumes: '+IntToStr(ValidationCnt));
@@ -1370,6 +1371,7 @@ begin
   if FClipDelta > 0 then
   begin
     MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
+    MessageProc('Deltas have maxed to: '+FloatToStr(MaxDelta));
   end
   else
   begin
@@ -1749,7 +1751,7 @@ begin
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
-      ' Staircase ephocs:' + IntToStr(FStaircaseEpochs) +
+      ' Staircase epochs:' + IntToStr(FStaircaseEpochs) +
       ' Min backprop error:' + FloatToStrF(MinBackpropagationError,ffFixed,4,2)
     );
     if Assigned(FImgVolumes) then MessageProc('Training images: '+IntToStr(FImgVolumes.Count));
@@ -1796,6 +1798,7 @@ begin
       if FClipDelta > 0 then
       begin
         MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
+        MessageProc('Deltas have maxed to: '+FloatToStr(MaxDelta));
       end
       else
       begin
