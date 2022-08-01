@@ -9360,7 +9360,7 @@ var
   {$ENDIF}
 begin
   {$IFNDEF FPC}
-  if false //locAVX and (NumElements > 4)
+  if locAVX and (NumElements > 4)
   then
       Result := AVXDotProd(PSingle(PtrA), PSingle(PtrB), NumElements)
   else
