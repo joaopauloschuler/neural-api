@@ -252,6 +252,7 @@ type
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       procedure MulWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
@@ -1465,6 +1466,7 @@ type
       function GetMaxAbsoluteDelta(): TNeuralFloat;
       function NormalizeMaxAbsoluteDelta(NewMax: TNeuralFloat = 0.1): TNeuralFloat;
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
+      procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
 
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
@@ -6417,6 +6419,12 @@ begin
       WriteLn('Error: weight sum doesn''t match on layer:',I);
       AllGood := False;
     end;
+
+    if NN.Layers[I].GetBiasSum() <> NN2.Layers[I].GetBiasSum() then
+    begin
+      WriteLn('Error: bias sum doesn''t match on layer:',I);
+      AllGood := False;
+    end;
   end;
   if AllGood
   then WriteLn('Structural testing has passed.');
@@ -11196,6 +11204,20 @@ begin
   end;
 end;
 
+procedure TNNet.ClearBias();
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count > 1 then
+  begin
+    for LayerCnt := 1 to GetLastLayerIdx() do
+    begin
+      FLayers[LayerCnt].ClearBias();
+      FLayers[LayerCnt].AfterWeightUpdate();
+    end;
+  end;
+end;
+
 {$IFDEF OpenCL}
 procedure TNNet.DisableOpenCL();
 var
@@ -11503,7 +11525,8 @@ begin
           IntToStr(FLayers[LayerCnt].Output.Depth),
           ' Learning Rate:',FLayers[LayerCnt].LearningRate:6:4,
           ' Inertia:',FLayers[LayerCnt].Inertia:4:2,
-          ' Weight Sum:', FLayers[LayerCnt].GetWeightSum():8:4
+          ' Weight Sum:', FLayers[LayerCnt].GetWeightSum():8:4,
+          ' Bias Sum:', FLayers[LayerCnt].GetBiasSum():8:4
         );
 
       if Assigned(FLayers[LayerCnt].PrevLayer) then
@@ -12509,6 +12532,19 @@ begin
     end;
   end;
   AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.ClearBias();
+var
+  Cnt: integer;
+begin
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].FBiasWeight := 0;
+    end;
+  end
 end;
 
 procedure TNNetLayer.ClearInertia();
