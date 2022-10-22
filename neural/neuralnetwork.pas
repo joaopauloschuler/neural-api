@@ -169,6 +169,7 @@ type
 
   type
   TNNet = class;
+
   /// neural network layer
   TNNetLayer = class(TMObject)
     protected
@@ -223,21 +224,35 @@ type
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); virtual;
       {$ENDIF}
+      // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
+      // Computes the backward pass.
+      // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
       procedure Backpropagate(); virtual; abstract;
+
       procedure ComputeOutputErrorForOneNeuron(NeuronIdx: integer; value: TNeuralFloat);
       procedure ComputeOutputErrorWith(pOutput: TNNetVolume); virtual;
       procedure ComputeOutputErrorForIdx(pOutput: TNNetVolume; const aIdx: array of integer); virtual;
       procedure ComputeErrorDeriv(); {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
       procedure Fill(value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
+      // Adds neurons to the layer.
       procedure AddNeurons(NeuronNum: integer);
+      // Calculates the number of missing neurons so the layer can have
+      // NeuronNum neurons. The missing neurons are then added.
       procedure AddMissingNeurons(NeuronNum: integer);
+      // Defines the number of weights for all neurons in the layer.
       procedure SetNumWeightsForAllNeurons(NumWeights: integer); overload;
+      // Defines the number of weights for all neurons in the layer.
       procedure SetNumWeightsForAllNeurons(x, y, d: integer); overload;
+      // Defines the number of weights for all neurons in the layer copying
+      // the configuration found at the Origin parameters.
       procedure SetNumWeightsForAllNeurons(Origin: TNNetVolume); overload;
+      // Returns the maximum weight value from all neurons in the layer.
       function GetMaxWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the maximum absolute weight value from all neurons in the layer.
       function GetMaxAbsWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the minimum weight value from all neurons in the layer.
       function GetMinWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMinDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -245,35 +260,52 @@ type
       function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat; virtual;
       procedure GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      // Returns the sum of all weights from all neurons in the layer.
       function GetWeightSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the sum of all biases from all neurons in the layer.
       function GetBiasSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetInertiaSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the number of weights in the layer.
       function CountWeights(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the number of neurons in the layer.
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Multiplies all weights in the layer by value V.
       procedure MulWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      // Clear all biases from all neurons in the layer.
       procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      // Sums all weights by their corresponding weights found at Origin.
+      // Both layers must have the same number of weights and neurons for this
+      // function to work as expected.
       procedure SumWeights(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltas(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      // Copies all weights by their corresponding weights found at Origin.
+      // Both layers must have the same number of weights and neurons for this
+      // function to work as expected.
       procedure CopyWeights(Origin: TNNetLayer); virtual;
       procedure ForceRangeWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ForcePositiveWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeWeights(VMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function SaveDataToString(): string; virtual;
       procedure LoadDataFromString(strData: string); virtual;
+      // Saves the layer structure to a string so the layer can be later
+      // restored/reconstructed.
       function SaveStructureToString(): string; virtual;
       procedure SetBatchUpdate(pBatchUpdate: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
       function InitBasicPatterns(): TNNetLayer;
 
-      // Backprop call cnt
+      // Increments an internal counter that counts how many branches load
+      // the output of the current layer.
       procedure IncDepartingBranchesCnt(); {$IFDEF Release} inline; {$ENDIF}
+      // Decrements an internal counter that counts how many branches load
+      // the output of the current layer.
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
 
       // Initializers
@@ -1425,16 +1457,36 @@ type
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetLastLayer(): TNNetLayer;
       function GetRandomLayer(): TNNetLayer;
+      // Computes the forward pass of this layer with pInput. The output is returned
+      // at pOutput. You can optionally compute from an intermediate layer defined
+      // at FromLayerIdx.
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
+      // Computes the forward pass of this layer with pInput. The output is returned
+      // at pOutput. You can optionally compute from an intermediate layer defined
+      // at FromLayerIdx.
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
+      // Computes the forward pass of this layer with pInput.
+      // You can optionally compute from an intermediate layer defined
+      // at FromLayerIdx.
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload;
+      // Computes the forward pass of this layer with pInput.
       procedure Compute(pInput: array of TNNetVolume); overload;
+      // Computes the forward pass of this layer with pInput.
       procedure Compute(pInput: array of TNeuralFloatDynArr); overload;
+      // Computes the forward pass of this layer with pInput.
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
+      // Computes the backward pass.
+      // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
+      // This method will train the neural network to find the desired pOutput
+      // for the previously called "compute" forward pass method.
       procedure Backpropagate(pOutput: TNNetVolume); overload;
+      // Computes the backward pass.
+      // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
+      // This method will train the neural network to find the desired pOutput
+      // for the previously called "compute" forward pass method.
+      procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
       procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
-      procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
       procedure GetOutput(pOutput: TNNetVolume);
       procedure AddOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure SetActivationFn(ActFn, ActFnDeriv: TNeuralActivationFunction);
