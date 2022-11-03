@@ -1537,7 +1537,6 @@ type
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
 
-      // load and save functions
       // Save weights to string
       function SaveDataToString(): string;
       // Load weights from string
@@ -1550,21 +1549,26 @@ type
       // Load architecture from string
       procedure LoadStructureFromString(strData: string);
 
-      // Save both architecture and weights to string (complete saving).
+      // Save both architecture and weights to string.
+      // You can use SaveToString to store a trained NN to a string.
       function SaveToString(): string;
-      // Save both architecture and weights to file (complete saving).
+      // Save both architecture and weights to file.
+      // You can use SaveToFile to store a trained NN to a file.
       procedure SaveToFile(filename: string);
 
-      // Save both architecture and weights from string (complete saving).
+      // Load both architecture and weights from string.
+      // You can use LoadFromString to load a trained NN from a string.
       procedure LoadFromString(strData: string);
-      // Load both architecture and weights from file (complete saving).
+      // Load both architecture and weights from file.
+      // You can use LoadFromFile to load a trained NN from a file.
       procedure LoadFromFile(filename: string);
 
-      // Returns a cloned neural network
+      // Clones the neural network and returns the clone.
       function Clone(): TNNet;
 
-      // deprecated
+      // deprecated - do not use it.
       procedure MulWeightsGlorotBengio(V:TNeuralFloat); deprecated;
+      // deprecated - do not use it.
       procedure MulWeightsHe(V:TNeuralFloat); deprecated;
 
       // custom layers support
