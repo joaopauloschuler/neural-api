@@ -5987,17 +5987,26 @@ var
   CntY: integer;
   SizeXDepth: integer;
   PtrA, PtrB: Pointer;
+  MaxLenY: integer;
 begin
   if Self.Depth = Original.Depth then
   begin
     SizeXDepth := LenX * Self.Depth;
-    for CntY := 0 to LenY - 1 do
+    MaxLenY := LenY - 1;
+    for CntY := 0 to MaxLenY do
     begin
       PtrA := Self.GetRawPtr(DestX, DestY+CntY);
       PtrB := Original.GetRawPtr(OriginX, OriginY+CntY);
       Add(PtrA, PtrB, SizeXDepth);
     end;
-  end;
+  end
+  {$IFDEF Debug}
+  else
+  begin
+    WriteLn('Error at TNNetVolume.AddArea: depth size doesn''t match. ',
+      Self.Depth, ' ',Original.Depth);
+  end
+  {$ENDIF};
 end;
 
 function TNNetVolume.HasAVX: boolean;
