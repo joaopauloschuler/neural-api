@@ -1021,6 +1021,7 @@ type
       function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer;
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure RefreshPrevSizeXDepthBytes();
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload;
       destructor Destroy(); override;
@@ -2301,7 +2302,15 @@ begin
   MaxD := OutputError.Depth - 1;
   // Debug code: FOutputError.ForceMaxAbs(1);
   GroupDSize := OutputError.Depth div FStruct[5];
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
   //PrevNumElements := (FSizeXDepth div 4) * 4;
   //PrevMissedElements := FSizeXDepth - PrevNumElements;
   NeuronWeights := FArrNeurons[0].Delta.Size;
@@ -2311,7 +2320,7 @@ begin
   MissedElements := NeuronWeights - localNumElements;
   for OutputY := 0 to MaxY do
   begin
-    PrevY := (OutputY*FStride)-FPadding;
+    PrevY := (OutputY*FStride);
     for TileXCnt := 0 to FMaxTileX do
     begin
       StartTileX := TileXCnt * FTileSizeX;
@@ -2324,9 +2333,9 @@ begin
         begin
           for OutputX := StartTileX to EndTileX do
           begin
-            PrevX := (OutputX*FStride)-FPadding;
+            PrevX := (OutputX*FStride);
             CanBackpropOnPos :=
-              (PrevX >= 0) and (PrevY >= 0) and
+              //(PrevX >= 0) and (PrevY >= 0) and
               (PrevX < FMaxPrevX) and
               (PrevY < FMaxPrevY);
             OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
@@ -2430,6 +2439,7 @@ var
   GroupDSize: integer;
   OutputD: integer;
   GroupId, GroupDStart: integer;
+  LocalPrevError: TNNetVolume;
 begin
   inherited SetPrevLayer(pPrevLayer);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*(pPrevLayer.Output.Depth div FStruct[5]);
@@ -2447,8 +2457,18 @@ begin
     FArrGroupId[OutputD] := GroupId;
     FArrGroupIdStart[OutputD] := GroupDStart;
   end;
-  FMaxPrevX := 1 + FPrevLayer.FOutput.SizeX - FFeatureSizeX;
-  FMaxPrevY := 1 + FPrevLayer.FOutput.SizeY - FFeatureSizeY;
+
+  if FPadding > 0 then
+  begin
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
+
+  FMaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  FMaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
 end;
 
 constructor TNNetGroupedConvolutionLinear.Create(pNumFeatures, pFeatureSize,
@@ -2491,7 +2511,8 @@ begin
 
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth div FStruct[5];
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
-    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+
+    RefreshPrevSizeXDepthBytes();
 
     PrepareInputForGroupedConvolutionFast();
 
@@ -4210,7 +4231,7 @@ begin
       else FInputCopy := FPrevLayer.Output;
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
-    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+    RefreshPrevSizeXDepthBytes();
     ComputeCPUFast();
     FForwardTime := FForwardTime + (Now() - StartTime);
   end
@@ -8386,6 +8407,18 @@ begin
   end;
 end;
 
+procedure TNNetConvolutionAbstract.RefreshPrevSizeXDepthBytes();
+begin
+  if FPadding > 0 then
+  begin
+    FPrevSizeXDepthBytes := FPrevLayerErrorPadded.IncYSizeBytes();
+  end
+  else
+  begin
+    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+  end;
+end;
+
 function TNNetConvolutionAbstract.CalcOutputSize(pInputSize, pFeatureSize, pInputPadding,
   pStride: integer): integer;
 begin
@@ -8679,14 +8712,8 @@ begin
 
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
-    if FPadding > 0 then
-    begin
-      FPrevSizeXDepthBytes := FPrevLayerErrorPadded.IncYSizeBytes();
-    end
-    else
-    begin
-      FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
-    end;
+
+    RefreshPrevSizeXDepthBytes();
 
     //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
     PrepareInputForConvolutionFast();
