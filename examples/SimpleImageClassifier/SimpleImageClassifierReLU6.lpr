@@ -56,7 +56,7 @@ type
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
-    NeuralFit.L2Decay := 0.00001;
+    NeuralFit.L2Decay := 0;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}64, {epochs=}50);
     NeuralFit.Free;
 
