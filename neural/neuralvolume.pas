@@ -1554,7 +1554,7 @@ begin
   end
   else
   begin
-    Result := 0.66*x + 0.5;
+    Result := 0.3333*x + 0.5;
   end;
 end;
 
