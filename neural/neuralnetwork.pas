@@ -1178,6 +1178,20 @@ type
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
+  /// Convolutional layer with Swish activation function.
+  /// This layer is still experimental. Do not use it.
+  TNNetConvolutionSwish = class(TNNetConvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+  end;
+
+  /// Convolutional layer with Hard Swish activation function.
+  /// This layer is still experimental. Do not use it.
+  TNNetConvolutionHardSwish = class(TNNetConvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+  end;
+
   /// Pointwise convolution with tanh activation.
   TNNetPointwiseConv = class(TNNetConvolution)
   public
@@ -1927,6 +1941,26 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetConvolutionHardSwish }
+
+constructor TNNetConvolutionHardSwish.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @HardSwish;
+  FActivationFnDerivative := @HardSwishDerivative;
+end;
+
+{ TNNetConvolutionSwish }
+
+constructor TNNetConvolutionSwish.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @Swish;
+  FActivationFnDerivative := @SwishDerivative;
 end;
 
 { TNNetScaleLearning }
@@ -10084,6 +10118,8 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolutionHardSwish' : Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetGroupedConvolutionReLU'   : Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetGroupedPointwiseConvLinear' : Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
@@ -10336,14 +10372,21 @@ var
   EachGroupOutput: array of TNNetLayer;
   GroupCnt: integer;
 begin
-  PreviousLayer := GetLastLayer();
+  if pInputPadding > 0 then
+  begin
+    PreviousLayer := AddLayer( TNNetPad.Create(pInputPadding) );
+  end
+  else
+  begin
+    PreviousLayer := GetLastLayer();
+  end;
   Result := PreviousLayer;
   SetLength(EachGroupOutput, Groups);
   FeaturesPerGroup := pNumFeatures div Groups;
   InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Groups;
   if Groups = 1 then
   begin
-    Result := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, pInputPadding, pStride, pSuppressBias) );
+    Result := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, {pInputPadding=}0, pStride, pSuppressBias) );
   end;
   if Groups > 1 then
   begin
@@ -10352,7 +10395,7 @@ begin
       if ChannelInterleaving
         then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
         else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
-      EachGroupOutput[GroupCnt] := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, pInputPadding, pStride, pSuppressBias) );
+      EachGroupOutput[GroupCnt] := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, {pInputPadding=}0, pStride, pSuppressBias) );
     end;
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
