@@ -12059,6 +12059,7 @@ end;
 procedure TNNetLayer.ApplyActivationFunctionToOutput();
 var
   OutputCnt, OutputMax: integer;
+  x: TNeuralFloat;
 begin
   OutputMax := FOutput.Size - 1;
   if OutputMax >= 0 then
@@ -12082,6 +12083,26 @@ begin
     if FActivationFn = @RectifiedLinearUnit then
     begin
       FOutput.CopyRelu(FOutputRaw);
+    end
+    else
+    if FActivationFn = @HardSwish then
+    begin
+      for OutputCnt := 0 to OutputMax do
+      begin
+        x := FOutputRaw.FData[OutputCnt];
+        if x > 3 then
+        begin
+          FOutput.FData[OutputCnt] := x;
+        end
+        else if x < -3 then
+        begin
+          FOutput.FData[OutputCnt] := 0;
+        end
+        else
+        begin
+          FOutput.FData[OutputCnt] := x*(x + 3)/6;
+        end;
+      end;
     end
     else
     begin

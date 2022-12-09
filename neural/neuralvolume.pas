@@ -1522,27 +1522,22 @@ end;
 
 // https://paperswithcode.com/method/hard-swish
 function HardSwish(x: TNeuralFloat): TNeuralFloat;
-var
-  LocalRelu6: TNeuralFloat;
 begin
-  LocalRelu6 := x + 3;
-  if LocalRelu6 > 6 then
+  if x > 3 then
   begin
     Result := x;
   end
-  else if LocalRelu6 < 0 then
+  else if x < -3 then
   begin
     Result := 0;
   end
   else
   begin
-    Result := x*(LocalRelu6)/6;
+    Result := x*(x + 3)/6;
   end;
 end;
 
 function HardSwishDerivative(x: TNeuralFloat): TNeuralFloat;
-var
-  LocalRelu6: TNeuralFloat;
 begin
   if x<-3 then
   begin
