@@ -525,6 +525,13 @@ type
     procedure Compute(); override;
   end;
 
+  /// Hard Swish Activation function
+  // https://paperswithcode.com/method/hard-swish
+  TNNetHardSwish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -1179,14 +1186,12 @@ type
   end;
 
   /// Convolutional layer with Swish activation function.
-  /// This layer is still experimental. Do not use it.
   TNNetConvolutionSwish = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// Convolutional layer with Hard Swish activation function.
-  /// This layer is still experimental. Do not use it.
   TNNetConvolutionHardSwish = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
@@ -1941,6 +1946,65 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetHardSwish }
+
+procedure TNNetHardSwish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else if x < -3 then
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x*(x + 3)/6;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.3333*x + 0.5;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+      end
+      else if x < -3 then
+      begin
+        FOutput.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x*(x + 3)/6;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetConvolutionHardSwish }
@@ -10088,6 +10152,7 @@ begin
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
+      'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
