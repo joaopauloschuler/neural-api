@@ -99,7 +99,7 @@ The Hard Swish variant is implemented with:
 ```
 
 
-These are the results with ReLU, Swish and HardSwish examples when classifying the CIFAR-10 dataset:
+These are the CIFAR-10 classification accuracies with ReLU, Swish and HardSwish activation functions:
 
 Activation Function (source) | Test Classification Accuracy (%)
 ---------------------------- | -------------------------------------
