@@ -272,6 +272,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetSoftMax` (input/output: 1D, 2D or 3D).
 * `TNNetSwish` (input/output: 1D, 2D or 3D).
 * `TNNetSwish6` (input/output: 1D, 2D or 3D).
+* `TNNetHardSwish` (input/output: 1D, 2D or 3D).
 * `TNNetHyperbolicTangent` (input/output: 1D, 2D or 3D).
 * `TNNetPower` (input/output: 1D, 2D or 3D).
 
