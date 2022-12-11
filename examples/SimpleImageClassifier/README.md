@@ -79,6 +79,30 @@ or as
       TNNetSoftMax.Create()
     ]); 
 ```
-.
+
+The Hard Swish variant is implemented with:
+```
+    NN.AddLayer([
+      TNNetInput.Create(32, 32, 3),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1, {SuppressBias=}1),
+      TNNetMaxPool.Create(4),
+      TNNetMovingStdNormalization.Create(),
+      TNNetConvolutionHardSwish.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionHardSwish.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionHardSwish.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetConvolutionHardSwish.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1),
+      TNNetDropout.Create(0.5),
+      TNNetMaxPool.Create(2),
+      TNNetFullConnectLinear.Create(10),
+      TNNetSoftMax.Create()
+    ]);
+```
 
 
+These are the results with ReLU, Swish and HardSwish examples when classifying the CIFAR-10 dataset:
+
+Activation Function (source) | Test Classification Accuracy (%)
+---------------------------- | -------------------------------------
+[ReLU](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifier.lpr) | 85.53%
+[Swish](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierSwish.lpr) | 86.55%
+[Hard Swish](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierHardSwish.lpr) | 86.82% 
