@@ -103,6 +103,6 @@ These are the CIFAR-10 classification accuracies with ReLU, Swish and HardSwish 
 
 Activation Function (source) | Test Classification Accuracy (%)
 ---------------------------- | -------------------------------------
-[ReLU](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifier.lpr) | 85.53%
-[Swish](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierSwish.lpr) | 86.55%
-[Hard Swish](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierHardSwish.lpr) | 86.82% 
+[ReLU](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifier.lpr) | [85.53%](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/results/SimpleImageClassifier20221206.csv)
+[Swish](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierSwish.lpr) | [86.55%](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/results/SimpleImageClassifierSwish20221207.csv)
+[Hard Swish](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifierHardSwish.lpr) | [86.82%](https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/results/SimpleImageClassifierHardSwish20221208.csv) 
