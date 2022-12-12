@@ -10244,6 +10244,7 @@ begin
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
+      if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
@@ -10274,6 +10275,8 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionHardSwish' then Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
