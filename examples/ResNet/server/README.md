@@ -1,4 +1,4 @@
-# Test server
+# Test Web Server
 
 After training, take the `SimpleImageClassifier-xxxxx.nn` file and the `classes.txt` from this folder and run:
 
