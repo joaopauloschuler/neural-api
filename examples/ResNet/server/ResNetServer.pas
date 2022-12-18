@@ -11,7 +11,6 @@ uses
 
 var
   NN: TNNet;
-  InputV, OutputV: TNNetVolume;
   Labels: TStringList;
   LabelFile: TextFile;
   line: string;
@@ -40,9 +39,14 @@ var
   PredImage: TBitmap;
   TI: TTinyImage;
   i: integer;
+  InputV, OutputV: TNNetVolume;
+  LocalNN: TNNet;
 begin
   SrcImage := TPicture.Create;
   PredImage := TBitmap.Create;
+  InputV := TNNetVolume.Create;
+  OutputV := TNNetVolume.Create;
+  LocalNN := NN.Clone();
   PredImage.SetSize(32,32);
 
   try
@@ -56,8 +60,8 @@ begin
     PredImage.Free;
   end;
 
-  NN.Compute(InputV);
-  NN.GetOutput(OutputV);
+  LocalNN.Compute(InputV);
+  LocalNN.GetOutput(OutputV);
 
   jObject := TJSONObject.Create;
   try
@@ -71,6 +75,9 @@ begin
   finally
     jObject.Free;
   end;
+  InputV.Free;
+  OutputV.Free;
+  LocalNN.Free;
 end;
 
 procedure Home(aRequest: TRequest; aResponse: TResponse);
@@ -98,8 +105,6 @@ begin
    end;
    NN := TNNet.Create;
    NN.LoadFromFile(paramStr(2));
-   InputV := TNNetVolume.Create;
-   OutputV := TNNetVolume.Create;
 
    Labels := TStringList.Create;
    AssignFile(LabelFile, paramStr(3));
