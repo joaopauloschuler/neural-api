@@ -34,13 +34,13 @@ type
       TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}2, {Stride=}1, {SuppressBias=}1),
       TNNetMaxPool.Create(4)
     ]);
-    NN.AddGroupedConvolution(TNNetConvolutionReLU,
-      {Groups=}8, {Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1);
-    NN.AddGroupedConvolution(TNNetConvolutionReLU,
+    NN.AddGroupedConvolution(TNNetConvolutionHardSwish,
       {Groups=}4, {Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1);
-    NN.AddGroupedConvolution(TNNetConvolutionReLU,
-      {Groups=}8, {Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1);
-    NN.AddGroupedConvolution(TNNetConvolutionReLU,
+    NN.AddGroupedConvolution(TNNetConvolutionHardSwish,
+      {Groups=}4, {Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1);
+    NN.AddGroupedConvolution(TNNetConvolutionHardSwish,
+      {Groups=}4, {Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1);
+    NN.AddGroupedConvolution(TNNetConvolutionHardSwish,
       {Groups=}4, {Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1, {SuppressBias=}1);
     NN.AddLayer([
       TNNetMaxPool.Create(2),
@@ -52,12 +52,12 @@ type
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
     NeuralFit := TNeuralImageFit.Create;
-    NeuralFit.FileNameBase := 'SimpleImageClassifier-'+IntToStr(GetProcessId());
+    NeuralFit.FileNameBase := 'SimpleImageClassifierGroupedConv-'+IntToStr(GetProcessId());
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
-    NeuralFit.L2Decay := 0.00001;
+    NeuralFit.L2Decay := 0;
     //NeuralFit.MaxThreadNum := 1;
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}64, {epochs=}50);
     NeuralFit.Free;
