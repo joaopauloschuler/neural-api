@@ -1132,6 +1132,12 @@ type
     constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); override;
   end;
 
+  /// Grouped pointwise convolution with HardSwish activation.
+  TNNetGroupedPointwiseConvHardSwish = class(TNNetGroupedPointwiseConvLinear)
+  public
+    constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); override;
+  end;
+
   /// Convolutional layer with hyperbolic tangent activation function.
   TNNetConvolution = class(TNNetConvolutionBase)
     protected
@@ -1946,6 +1952,15 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetGroupedPointwiseConvHardSwish }
+constructor TNNetGroupedPointwiseConvHardSwish.Create(pNumFeatures,
+  pGroups: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pGroups, pSuppressBias);
+  FActivationFn := @HardSwish;
+  FActivationFnDerivative := @HardSwishDerivative;
 end;
 
 { TNNetHardSwish }
@@ -10187,8 +10202,9 @@ begin
       'TNNetConvolutionHardSwish' : Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetGroupedConvolutionReLU'   : Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
-      'TNNetGroupedPointwiseConvLinear' : Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
-      'TNNetGroupedPointwiseConvReLU'   : Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
+      'TNNetGroupedPointwiseConvLinear'    : Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
+      'TNNetGroupedPointwiseConvReLU'      : Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
+      'TNNetGroupedPointwiseConvHardSwish' : Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
       'TNNetConvolutionSharedWeights' : Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]);
       'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
@@ -10281,6 +10297,7 @@ begin
       if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
       if S[0] = 'TNNetGroupedPointwiseConvReLU' then Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
+      if S[0] = 'TNNetGroupedPointwiseConvHardSwish' then Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
