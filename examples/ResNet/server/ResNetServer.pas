@@ -9,12 +9,6 @@ uses
   neuralnetwork, neuralvolume, neuraldatasets,
   fphttpapp, httpdefs, httproute, fpjson;
 
-var
-  NN: TNNet;
-  Labels: TStringList;
-  LabelFile: TextFile;
-  line: string;
-
 procedure LoadBitmapIntoTinyImage(var Bitmap: TBitmap; out TI: TTinyImage);
 var
   I, J: integer;
@@ -31,6 +25,27 @@ begin
     end;
   end;
 end;
+
+procedure Home(aRequest: TRequest; aResponse: TResponse);
+begin
+  aResponse.ContentType := 'text/html';
+  with aResponse.Contents do
+  begin
+    Add('<html><body>');
+    Add('<form action="/nn" method="post" enctype="multipart/form-data">');
+    Add('<input type="file" name="input" />');
+    Add('<br/><br/>');
+    Add('<input type="submit" value="Classify" />');
+    Add('</form>');
+    Add('</body></html>');
+  end;
+  aResponse.SendContent;
+end;
+
+
+var
+  NN: TNNet;
+  Labels: TStringList;
 
 procedure Endpoint(aRequest: TRequest; aResponse: TResponse);
 var
@@ -55,6 +70,9 @@ begin
     {PredImage.SaveToFile('/tmp/tmp.bmp');}
     LoadBitmapIntoTinyImage(PredImage, TI);
     LoadTinyImageIntoNNetVolume(TI, InputV);
+    // Bipolar representation.
+    InputV.Divi(64);
+    InputV.Sub(2);
   finally
     SrcImage.Free;
     PredImage.Free;
@@ -62,6 +80,13 @@ begin
 
   LocalNN.Compute(InputV);
   LocalNN.GetOutput(OutputV);
+
+  // Increases accuracy with a flipped version.
+  InputV.FlipX();
+  LocalNN.Compute(InputV);
+  LocalNN.AddOutput(OutputV);
+
+  OutputV.Divi(2);
 
   jObject := TJSONObject.Create;
   try
@@ -80,22 +105,10 @@ begin
   LocalNN.Free;
 end;
 
-procedure Home(aRequest: TRequest; aResponse: TResponse);
-begin
-  aResponse.ContentType := 'text/html';
-  with aResponse.Contents do
-  begin
-    Add('<html><body>');
-    Add('<form action="/nn" method="post" enctype="multipart/form-data">');
-    Add('<input type="file" name="input" />');
-    Add('<br/>');
-    Add('<input type="submit" value="Classify" />');
-    Add('</form>');
-    Add('</body></html>');
-  end;
-  aResponse.SendContent;
-end;
 
+var
+  LabelFile: TextFile;
+  line: string;
 
 begin
    if paramCount <> 3 then
@@ -125,5 +138,8 @@ begin
    Application.Initialize;
    WriteLn('Listening in port ', paramStr(1));
    Application.Run;
+   Labels.Free;
+   NN.Free;
+   WriteLn('Bye bye.');
 end.
 
