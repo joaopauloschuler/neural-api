@@ -35,6 +35,18 @@ begin
     Add('<form action="/nn" method="post" enctype="multipart/form-data">');
     Add('<input type="file" name="input" />');
     Add('<br/><br/>');
+    Add('<fieldset style="border: 0">'+
+    '<legend>Select the output type:</legend>'+
+    '<div>'+
+    '  <input type="radio" id="text" name="otype" value="text" checked>'+
+    '  <label for="text">text</label>'+
+    '</div>'+
+    '<div>'+
+    '  <input type="radio" id="json" name="otype" value="json">'+
+    '  <label for="huey">json</label>'+
+    '</div>'+
+'</fieldset>');
+    Add('<br/>');
     Add('<input type="submit" value="Classify" />');
     Add('</form>');
     Add('</body></html>');
@@ -56,13 +68,17 @@ var
   i: integer;
   InputV, OutputV: TNNetVolume;
   LocalNN: TNNet;
+  OutputType, OutputStr: string;
+  FoundClassId: integer;
 begin
   SrcImage := TPicture.Create;
   PredImage := TBitmap.Create;
   InputV := TNNetVolume.Create;
   OutputV := TNNetVolume.Create;
   LocalNN := NN.Clone();
+  LocalNN.EnableDropouts(false);
   PredImage.SetSize(32,32);
+  OutputType := ARequest.ContentFields.Values['otype'];
 
   try
     SrcImage.LoadFromStream(ARequest.Files[0].Stream);
@@ -71,8 +87,7 @@ begin
     LoadBitmapIntoTinyImage(PredImage, TI);
     LoadTinyImageIntoNNetVolume(TI, InputV);
     // Bipolar representation.
-    InputV.Divi(64);
-    InputV.Sub(2);
+    InputV.RgbImgToNeuronalInput(csEncodeRGB);
   finally
     SrcImage.Free;
     PredImage.Free;
@@ -88,18 +103,37 @@ begin
 
   OutputV.Divi(2);
 
-  jObject := TJSONObject.Create;
-  try
-    for i := 0 to OutputV.SizeX - 1 do
+  if (OutputType = 'text') then
+  begin
+    FoundClassId := OutputV.GetClass();
+    OutputStr := '<html><body>'+
+      'The found class is: '+Labels.ValueFromIndex[FoundClassId]+'.<br/><br/>';
+    for i := 0 to OutputV.Size - 1 do
     begin
-      jObject.Floats[Labels.ValueFromIndex[i]] := OutputV.Raw[i];
+      if i = FoundClassId then OutputStr += '<b>';
+      OutputStr += Labels.ValueFromIndex[i]+': '+FloatToStr(OutputV.Raw[i])+'.<br/>';
+      if i = FoundClassId then OutputStr += '</b>';
     end;
-    aResponse.Content := jObject.AsJSON;
-    aResponse.ContentType := 'application/json';
-    aResponse.SendContent;
-  finally
-    jObject.Free;
+    OutputStr += '</body></html>';
+    aResponse.ContentType := 'text/html';
+    aResponse.Content := OutputStr;
+  end
+  else
+  begin
+    jObject := TJSONObject.Create;
+    try
+      for i := 0 to OutputV.Size - 1 do
+      begin
+        jObject.Floats[Labels.ValueFromIndex[i]] := OutputV.Raw[i];
+      end;
+      aResponse.Content := jObject.AsJSON;
+      aResponse.ContentType := 'application/json';
+    finally
+      jObject.Free;
+    end;
   end;
+  aResponse.SendContent;
+
   InputV.Free;
   OutputV.Free;
   LocalNN.Free;
@@ -131,6 +165,12 @@ begin
      Close(LabelFile);
    end;
 
+   WriteLn(Labels.Count,' class labels loaded.');
+   if NN.GetLastLayer().Output.Size <> Labels.Count then
+   begin
+     WriteLn('WARNING: you have ',Labels.Count,' lables and ',
+     NN.GetLastLayer().Output.Size,' outputs on the last layer.');
+   end;
    HTTPRouter.RegisterRoute('/nn', @Endpoint);
    HTTPRouter.RegisterRoute('/', @Home);
    Application.Port := StrToInt(paramStr(1));
