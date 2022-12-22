@@ -6,7 +6,7 @@ uses
   {$ifdef unix}cthreads, {$endif}
   Interfaces, // this includes the LCL widgetset
   Classes, SysUtils, FileUtil, Graphics, GraphUtil,
-  neuralnetwork, neuralvolume, neuraldatasets,
+  neuralnetwork, neuralvolume, neuraldatasets, neuralthread,
   fphttpapp, httpdefs, httproute, fpjson;
 
 procedure LoadBitmapIntoTinyImage(var Bitmap: TBitmap; out TI: TTinyImage);
@@ -58,6 +58,7 @@ end;
 var
   NN: TNNet;
   Labels: TStringList;
+  FCritSec: TRTLCriticalSection;
 
 procedure Endpoint(aRequest: TRequest; aResponse: TResponse);
 var
@@ -70,13 +71,13 @@ var
   LocalNN: TNNet;
   OutputType, OutputStr: string;
   FoundClassId: integer;
+  OutputStrLst: TStringList;
 begin
   SrcImage := TPicture.Create;
   PredImage := TBitmap.Create;
   InputV := TNNetVolume.Create;
   OutputV := TNNetVolume.Create;
-  LocalNN := NN.Clone();
-  LocalNN.EnableDropouts(false);
+  LocalNN := NN;
   PredImage.SetSize(32,32);
   OutputType := ARequest.ContentFields.Values['otype'];
 
@@ -93,30 +94,41 @@ begin
     PredImage.Free;
   end;
 
-  LocalNN.Compute(InputV);
-  LocalNN.GetOutput(OutputV);
-
-  // Increases accuracy with a flipped version.
-  InputV.FlipX();
-  LocalNN.Compute(InputV);
-  LocalNN.AddOutput(OutputV);
+  // Critical Section - Enter
+  EnterCriticalSection(FCritSec);
+  try
+    LocalNN.Compute(InputV);
+    LocalNN.GetOutput(OutputV);
+    // Increases accuracy with a flipped version.
+    InputV.FlipX();
+    LocalNN.Compute(InputV);
+    LocalNN.AddOutput(OutputV);
+  finally
+    // Critical Section - Exit
+    LeaveCriticalSection(FCritSec);
+  end;
 
   OutputV.Divi(2);
 
   if (OutputType = 'text') then
   begin
     FoundClassId := OutputV.GetClass();
-    OutputStr := '<html><body>'+
-      'The found class is: '+Labels.ValueFromIndex[FoundClassId]+'.<br/><br/>';
+    OutputStrLst := TStringList.Create;
+    OutputStrLst.Delimiter := ' ';
+    OutputStrLst.Add('<html><body>'+
+      'The found class is: '+Labels.ValueFromIndex[FoundClassId]+'.<br/><br/>');
     for i := 0 to OutputV.Size - 1 do
     begin
+      OutputStr := '';
       if i = FoundClassId then OutputStr += '<b>';
-      OutputStr += Labels.ValueFromIndex[i]+': '+FloatToStr(OutputV.Raw[i])+'.<br/>';
+      OutputStr += Labels.ValueFromIndex[i]+': '+FloatToStr(Round(OutputV.Raw[i]*10000)/100)+'%.<br/>';
       if i = FoundClassId then OutputStr += '</b>';
+      OutputStrLst.Add(OutputStr);
     end;
-    OutputStr += '</body></html>';
+    OutputStrLst.Add('</body></html>');
     aResponse.ContentType := 'text/html';
-    aResponse.Content := OutputStr;
+    aResponse.Content := OutputStrLst.Text;
+    OutputStrLst.Free;
   end
   else
   begin
@@ -136,7 +148,6 @@ begin
 
   InputV.Free;
   OutputV.Free;
-  LocalNN.Free;
 end;
 
 
@@ -150,8 +161,10 @@ begin
      WriteLn('Usage: ResNetServer <port> <model> <labels>');
      exit;
    end;
+   NeuralInitCriticalSection(FCritSec);
    NN := TNNet.Create;
    NN.LoadFromFile(paramStr(2));
+   NN.EnableDropouts(false);
 
    Labels := TStringList.Create;
    AssignFile(LabelFile, paramStr(3));
@@ -180,6 +193,7 @@ begin
    Application.Run;
    Labels.Free;
    NN.Free;
+   NeuralDoneCriticalSection(FCritSec);
    WriteLn('Bye bye.');
 end.
 
