@@ -732,12 +732,6 @@ begin
         end;
       end;// Assigned(pGetValidationPair)
 
-      if (ValidationCnt=0) then
-      begin
-        FMessageProc('Saving NN at '+fileName);
-        FAvgWeight.SaveToFile(fileName);
-      end;
-
       if (FCurrentEpoch mod FThreadNN.Count = 0) and (FVerbose) then
       begin
         FThreadNN[0].DebugWeights();
@@ -756,9 +750,14 @@ begin
           break;
         end;
       end;
-
-      if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
-      begin
+    end
+    else
+    begin
+      FMessageProc('Skipping Validation. Saving NN at '+fileName);
+      FAvgWeight.SaveToFile(fileName);
+    end;
+    if ( (FCurrentEpoch mod 10 = 0) and (FCurrentEpoch > 0) ) then
+    begin
         WriteLn
         (
           CSVFile,
@@ -775,9 +774,9 @@ begin
           TestLoss:6:4,',',
           TestError:6:4
         );
-      end
-      else
-      begin
+    end
+    else
+    begin
         WriteLn
         (
           CSVFile,
@@ -791,20 +790,20 @@ begin
           FCurrentLearningRate:9:7,',',
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
-      end;
-
-      CloseFile(CSVFile);
-      AssignFile(CSVFile, FileNameCSV);
-      Append(CSVFile);
-
-      MessageProc(
-        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
-        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
-
-      MessageProc(
-        'Epochs: '+IntToStr(FCurrentEpoch)+
-        '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
     end;
+
+    CloseFile(CSVFile);
+    AssignFile(CSVFile, FileNameCSV);
+    Append(CSVFile);
+
+    MessageProc(
+      'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
+      ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
+
+    MessageProc(
+      'Epochs: '+IntToStr(FCurrentEpoch)+
+      '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
+
     if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
   end;
 
