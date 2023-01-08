@@ -1369,7 +1369,7 @@ type
       procedure ComputePreviousLayerError(); override;
   end;
 
-  /// This is an experimental layer. Do not use it yet.
+  /// This layer can also be called depth_to_space.
   TNNetUpsample = class(TNNetDeMaxPool)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
