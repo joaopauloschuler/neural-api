@@ -259,6 +259,7 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits (or copies) channels from the input. This layer allows getting a subset of the input channels.
 * `TNNetSplitChannelEvery` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits (or copies) channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.
 * `TNNetSum` (input/output: 1D, 2D or 3D). Sums outputs from previous layers allowing ResNet style networks.
+* `TNNetUpsample` (input/output: 3D). Converts channels (depth) into spatial data. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.
 
 ### Layers with Activation Functions and no Trainable Parameter
 * `TNNetReLU` (input/output: 1D, 2D or 3D).
@@ -345,7 +346,8 @@ NEURAL                      | Keras                                 | PyTorch
 `TNNetSplitChannelEvery`      |                                       |           
 `TNNetSum`                    | `layers.Add`                          | `torch.add`
 `TNNetCellMulByCell`          | `layers.Multiply`                     |           
-`TNNetChannelMulByLayer`      | `layers.Multiply`                     |           
+`TNNetChannelMulByLayer`      | `layers.Multiply`                     |
+`TNNetUpsample`               | `tf.nn.depth_to_space`                | 
 
 
 ## Adding Layers
