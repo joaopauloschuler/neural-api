@@ -15,6 +15,7 @@ This is how the **encoder** is implemented:
       TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //4x4
       TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
 ```
+In the encoder shown above, the resolution is decreased via `{Stride=}2`.
 
 This is how the **decoder** is implemented:
 ```
