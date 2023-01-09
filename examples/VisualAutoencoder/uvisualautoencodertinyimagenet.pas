@@ -173,40 +173,11 @@ var
 begin
   FDisplay.Resize(ImgInput);
   FDisplay.Copy(ImgInput);
-
-  if color_encoding = csEncodeLAB then
-  begin
-    FDisplay.GetMinMaxAtDepth(0, pMin0, pMax0);
-    FDisplay.GetMinMaxAtDepth(1, pMin1, pMax1);
-    FDisplay.GetMinMaxAtDepth(2, pMin2, pMax2);
-    pMax0 := Max(Abs(pMin0), Abs(pMax0));
-    pMax1 := Max(Abs(pMin1), Abs(pMax1));
-    pMax2 := Max(Abs(pMin2), Abs(pMax2));
-
-    if pMax0 > 2 then
-    begin
-      FDisplay.MulAtDepth(0, 2/pMax0);
-    end;
-
-    if pMax1 > 2 then
-    begin
-      FDisplay.MulAtDepth(1, 2/pMax1);
-    end;
-
-    if pMax2 > 2 then
-    begin
-      FDisplay.MulAtDepth(2, 2/pMax2);
-    end;
-  end
-  else if FDisplay.GetMaxAbs() > 2 then
-  begin
-    FDisplay.NormalizeMax(2);
-  end;
+  FDisplay.ForceMaxRange(2);
 
   //Debug only: FDisplay.PrintDebugChannel();
 
   FDisplay.NeuronalInputToRgbImg(color_encoding);
-
   LoadVolumeIntoTImage(FDisplay, aImage[FImageCnt]);
   aImage[FImageCnt].Width := 128;
   aImage[FImageCnt].Height := 128;
@@ -286,28 +257,20 @@ begin
       TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
       TNNetConvolution.Create(64 * NeuronMultiplier,3,1,2,0), //8x8
       TNNetConvolution.Create(64 * NeuronMultiplier,3,1,1,0),
-
       TNNetConvolution.Create(128 * NeuronMultiplier,3,1,2,1), //4x4
       TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
 
-      //TNNetDeMaxPool.Create(2),
-      TNNetUpsample.Create(),
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1), //8x8
+      TNNetUpsample.Create(), //8x8
       TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
-
-      //TNNetDeMaxPool.Create(2),
-      TNNetUpsample.Create(),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1), //16x16
       TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
-
-      //TNNetDeMaxPool.Create(2),
-      TNNetUpsample.Create(),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1), //32x32
+      TNNetUpsample.Create(), //16x16
+      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
       TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
-
-      //TNNetDeMaxPool.Create(2),
-      TNNetUpsample.Create(),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1), //64x64
+      TNNetUpsample.Create(), //32x32
+      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
+      TNNetUpsample.Create(), //64x64
+      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
       TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
       TNNetConvolutionLinear.Create(3,1,0,1,0),
       TNNetReLUL.Create(-40, +40, 0) // Protection against overflow
