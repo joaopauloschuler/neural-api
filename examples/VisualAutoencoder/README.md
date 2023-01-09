@@ -2,7 +2,7 @@
 <p><img src="../../docs/autoencoder_small.png"></img></p>
 
 Autoencoders have 2 pieces: an **encoder** and a **decoder**. In this example, the encoder encodes an image
-from the [TinyImageNet dataset](https://paperswithcode.com/dataset/tiny-imagenet) with 64x64x3 pixels (12,228 numbers per image) into a 4x4x128 representation (2,048 numbers per image). The neural network is trained to produce an output that matches the input image.
+from the [TinyImageNet dataset](https://paperswithcode.com/dataset/tiny-imagenet) with 64x64x3 pixels (12,228 numbers per image) into a 4x4x128 representation (2,048 numbers per image). Then, the decoder transforms the 4x4x128 representation back to 64x64x3 pixels. The neural network is trained to produce an output that matches the input image.
 
 This is how the **encoder** is implemented:
 ```
