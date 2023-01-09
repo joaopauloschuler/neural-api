@@ -6,31 +6,31 @@ from the [TinyImageNet dataset](https://paperswithcode.com/dataset/tiny-imagenet
 
 This is how the **encoder** is implemented:
 ```
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,2,1), //32x32
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,2,1), //16x16
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(64 * NeuronMultiplier,3,1,2,0), //8x8
-      TNNetConvolution.Create(64 * NeuronMultiplier,3,1,1,0),
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,2,1), //4x4
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //32x32
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //16x16
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}0), //8x8
+      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}0),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //4x4
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
 ```
 
 This is how the **decoder** is implemented:
 ```
       TNNetUpsample.Create(), //8x8
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
       TNNetUpsample.Create(), //16x16
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
       TNNetUpsample.Create(), //32x32
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
       TNNetUpsample.Create(), //64x64
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolutionLinear.Create(3,1,0,1,0),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolutionLinear.Create({Features=}3,{FeatureSize=}1,{Padding=}0,{Stride=}1,{SuppressBias=}0),
       TNNetReLUL.Create(-40, +40, 0) // Protection against overflow
 ```
 
