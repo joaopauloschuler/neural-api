@@ -106,8 +106,6 @@ uses strutils, LCLIntf, LCLType;
 
 procedure TFormVisualLearning.ButLearnClick(Sender: TObject);
 begin
-  if not CheckCIFARFile() then exit;
-
   if (FRunning) then
   begin
     SendStop;
@@ -166,10 +164,6 @@ begin
 end;
 
 procedure TFormVisualLearning.DisplayInputImage(ImgInput: TNNetVolume; color_encoding: integer);
-var
-  pMin0, pMax0: TNeuralFloat;
-  pMin1, pMax1: TNeuralFloat;
-  pMin2, pMax2: TNeuralFloat;
 begin
   FDisplay.Resize(ImgInput);
   FDisplay.Copy(ImgInput);
