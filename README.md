@@ -632,9 +632,9 @@ Optimizing deep layers of a convolutional neural network:
 - [An Enhanced Scheme for Reducing the Complexity of Pointwise Convolutions in CNNs for Image Classification Based on Interleaved Grouped Filters without Divisibility Constraints.](https://www.researchgate.net/publication/363413038_An_Enhanced_Scheme_for_Reducing_the_Complexity_of_Pointwise_Convolutions_in_CNNs_for_Image_Classification_Based_on_Interleaved_Grouped_Filters_without_Divisibility_Constraints)
 
 Happy Little Green (Science Fiction Short Read):
-  - [English](https://www.amazon.com/dp/B0BSKPW3GM).
-  - [Spanish](https://www.amazon.com/dp/B0BSG34Y4J).
-  - [Portuguese](https://www.amazon.com/dp/B0BSCKBSDX).
+  - [English](https://mybook.to/EmLJ).
+  - [Spanish](https://mybook.to/5aldz).
+  - [Portuguese](https://mybook.to/nKoWS).
 
 
 Publica&ccedil;&otilde;es em Portugu&ecirc;s:
