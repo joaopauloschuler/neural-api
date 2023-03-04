@@ -249,8 +249,8 @@ begin
       TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
       TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //16x16
       TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
-      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}0), //8x8
-      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}0),
+      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //8x8
+      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
       TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //4x4
       TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
 
@@ -276,8 +276,6 @@ begin
     FAutoencoder.LoadFromFile(FBaseName+'autoencoder.nn');
   end;
   FAutoencoder.DebugStructure();
-  FAutoencoder.SetLearningRate(0.001,0.9);
-  FAutoencoder.SetL2Decay(0.0);
 
   FFit.OnAfterEpoch := @Self.AutoencoderOnAfterEpoch;
   FFit.OnAfterStep := @Self.AutoencoderOnAfterStep;
@@ -296,7 +294,7 @@ begin
     FAutoencoder.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
   end;
   {$endif}
-  //Debug only: FFit.MaxThreadNum := 2;
+  //Debug only: FFit.MaxThreadNum := 1;
   FFit.FitLoading(FAutoencoder, {EpochSize=}FTrainImages.CountElements(), 0, 0, {Batch=}64, {Epochs=}35000, @GetTrainingData, nil, nil); // This line does the same as above
 
   FAutoencoder.Free;
