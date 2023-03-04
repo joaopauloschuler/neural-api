@@ -620,7 +620,7 @@ When you are done, you should call:
 FProcs.Free; 
 ```
 
-## Scientific Publications from the Author
+## Publications from the Author
 In the case that you would like to know more about what the CAI's author is working at, here we go.
 
 Optimizing the first layers of a convolutional neural network:
@@ -631,9 +631,15 @@ Optimizing deep layers of a convolutional neural network:
 - [Grouped Pointwise Convolutions Reduce Parameters in Convolutional Neural Networks.](https://www.researchgate.net/publication/360226228_Grouped_Pointwise_Convolutions_Reduce_Parameters_in_Convolutional_Neural_Networks)
 - [An Enhanced Scheme for Reducing the Complexity of Pointwise Convolutions in CNNs for Image Classification Based on Interleaved Grouped Filters without Divisibility Constraints.](https://www.researchgate.net/publication/363413038_An_Enhanced_Scheme_for_Reducing_the_Complexity_of_Pointwise_Convolutions_in_CNNs_for_Image_Classification_Based_on_Interleaved_Grouped_Filters_without_Divisibility_Constraints)
 
+Happy Little Green (Science Fiction Short Read):
+  - [English](https://mybook.to/EmLJ).
+  - [Spanish](https://mybook.to/nKoWS).
+  - [Portuguese](https://mybook.to/5aldz).
+
+
 Publica&ccedil;&otilde;es em Portugu&ecirc;s:
 - [A Evolu&#231;&#227;o dos Algoritmos Mentais.](https://www.researchgate.net/publication/357204541_A_Evolucao_dos_Algoritmos_Mentais)
-- [Da F&#237;sica &#224; Intelig&#234;ncia Extrassom&#225;tica.](http://schulers.com/jpss/estudos/schuler_inteligencia_artificial.pdf)
+- [Da F&#237;sica &#224; Intelig&#234;ncia Extrassom&#225;tica.](https://www.researchgate.net/publication/365687206_DA_FISICA_A_INTELIGENCIA_EXTRASSOMATICA)
 - [Intelig&#234;ncia Artificial Popperiana.](https://www.researchgate.net/publication/357164807_Inteligencia_Artificial_Popperiana)
 - [Opera&#231;&#245;es L&#243;gicas Qu&#226;nticas e Colorabilidade de Grafos.](https://www.researchgate.net/publication/357205247_Operacoes_Logicas_Quanticas_e_Colorabilidade_de_Grafos)
 
