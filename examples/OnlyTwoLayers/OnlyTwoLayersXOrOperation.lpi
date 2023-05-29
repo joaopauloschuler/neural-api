@@ -9,7 +9,7 @@
       </Flags>
       <SessionStorage Value="InProjectDir"/>
       <MainUnit Value="0"/>
-      <Title Value="Only Two Layers - Abs(x+y)"/>
+      <Title Value="Only Two Layers - XOR Operation"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
     </General>
@@ -23,7 +23,7 @@
           <Version Value="11"/>
           <PathDelim Value="\"/>
           <Target>
-            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\OnlyTwoLayersAbs"/>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\OnlyTwoLayersXOrOperation"/>
           </Target>
           <SearchPaths>
             <IncludeFiles Value="..\neural;$(ProjOutDir)"/>
@@ -66,7 +66,7 @@
           <Version Value="11"/>
           <PathDelim Value="\"/>
           <Target>
-            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\OnlyTwoLayersAbs"/>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\OnlyTwoLayersXOrOperation"/>
           </Target>
           <SearchPaths>
             <IncludeFiles Value="..\..\neural;$(ProjOutDir)"/>
@@ -114,7 +114,7 @@
     </RequiredPackages>
     <Units Count="1">
       <Unit0>
-        <Filename Value="OnlyTwoLayersAbs.pas"/>
+        <Filename Value="OnlyTwoLayersXOrOperation.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit0>
     </Units>
@@ -123,7 +123,7 @@
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\OnlyTwoLayersAbs"/>
+      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\OnlyTwoLayersXOrOperation"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="..\..\experiments\neural;$(ProjOutDir)"/>
