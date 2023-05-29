@@ -54,17 +54,17 @@ begin
 
   WriteLn;
 
-  for EpochCnt := 1 to 600000 do
+  for EpochCnt := 1 to 100000 do
   begin
-    vInputs[0] := (Random(10000) - 50)/100;
-    vInputs[1] := (Random(10000) - 50)/100;
+    vInputs[0] := (Random(10000) - 5000)/100;          // Random number in the interval [-50,+50].
+    vInputs[1] := (Random(10000) - 5000)/100;          // Random number in the interval [-50,+50].
     vOutput[0] := 2*vInputs[0] - 3*vInputs[1] + 4;     // 2x - 3y + 4
     // Feed forward and backpropagation
     NN.Compute(vInputs);                               // Perform feedforward computation
     NN.GetOutput(pOutPut);                             // Get the output of the network
     NN.Backpropagate(vOutput);                         // Perform backpropagation to adjust weights
 
-    if EpochCnt mod 10000 = 0 then
+    if EpochCnt mod 5000 = 0 then
         WriteLn(
           EpochCnt:7, 'x',
           ' Output:', pOutPut.Raw[0]:5:2,' ',
