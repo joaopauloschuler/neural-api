@@ -907,6 +907,11 @@ var
   buf: TNeuralStrBuffer;
   bufwritten: csize_t;
 begin
+  if @clGetPlatformIDs = nil then
+  begin
+    FErrorProc('Error: no opencl dll found');
+    exit;
+  end;
   bufwritten := 0;
   err := clGetPlatformIDs(0, nil, @local_platforms);
   if (err <> CL_SUCCESS) then
