@@ -7,7 +7,8 @@ program SimpleMNist;
 
 uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
-  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets, neuralfit;
+  Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math,
+  neuraldatasets, neuralfit;
 
 type
   TTestCNNAlgo = class(TCustomApplication)
@@ -17,17 +18,21 @@ type
 
   procedure TTestCNNAlgo.DoRun;
   var
-    NN: THistoricalNets;
-    NeuralFit: TNeuralImageFit;
-    ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
+    NN: TNNet; // Neural network object
+    NeuralFit: TNeuralImageFit; // Object for neural network fitting
+    ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList; // Volumes for training, validation, and testing
   begin
-    if Not(CheckMNISTFile('train')) or Not(CheckMNISTFile('t10k')) then
+    // Check if MNIST files exist
+    if not (CheckMNISTFile('train')) or not (CheckMNISTFile('t10k')) then
     begin
       Terminate;
-      exit;
+      Exit; // Exit the procedure if MNIST files are not found
     end;
+
     WriteLn('Creating Neural Network...');
-    NN := THistoricalNets.Create();
+    NN := TNNet.Create(); // Create an instance of the neural network
+
+    // Define the layers of the neural network
     NN.AddLayer([
       TNNetInput.Create(28, 28, 1),
       TNNetConvolutionLinear.Create(32, 5, 2, 1, 1),
@@ -41,8 +46,11 @@ type
       TNNetFullConnectLinear.Create(10),
       TNNetSoftMax.Create()
     ]);
+
+    // Create MNIST volumes for training, validation, and testing
     CreateMNISTVolumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, 'train', 't10k');
 
+    // Configure the neural network fitting
     NeuralFit := TNeuralImageFit.Create;
     NeuralFit.FileNameBase := 'SimpleMNist';
     NeuralFit.InitialLearningRate := 0.001;
@@ -50,12 +58,15 @@ type
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
-    NeuralFit.HasFlipX := false;
-    NeuralFit.HasFlipY := false;
+    NeuralFit.HasFlipX := False;
+    NeuralFit.HasFlipY := False;
     NeuralFit.MaxCropSize := 4;
+
+    // Fit the neural network using the training, validation, and testing volumes
     NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}10, {batchsize=}128, {epochs=}20);
     NeuralFit.Free;
 
+    // Clean up resources
     NN.Free;
     ImgTestVolumes.Free;
     ImgValidationVolumes.Free;
@@ -66,8 +77,8 @@ type
 var
   Application: TTestCNNAlgo;
 begin
-  Application := TTestCNNAlgo.Create(nil);
-  Application.Title:='MNist Classification Example';
-  Application.Run;
-  Application.Free;
+  Application := TTestCNNAlgo.Create(nil); // Create an instance of TTestCNNAlgo
+  Application.Title := 'MNist Classification Example'; // Set the application title
+  Application.Run; // Run the application
+  Application.Free; // Free the application instance
 end.
