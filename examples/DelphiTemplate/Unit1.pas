@@ -103,8 +103,9 @@ const
         if EpochCnt mod 100 = 0 then
           WriteLn(
             EpochCnt:7, 'x', Cnt,
-            ' Output:', pOutPut.Raw[0]:5:2,' ',
-            ' - Training/Desired Output:', vOutput[cnt][0]:5:2,' '
+            ' Inputs: ', cs_inputs[Cnt][0]:3:1,', ' ,cs_inputs[Cnt][1]:3:1,
+            '   Output:', pOutPut.Raw[0]:5:2,' ',
+            ' - Training/Desired Output: ', vOutput[cnt][0]:5:2,' '
           );
       end;
 

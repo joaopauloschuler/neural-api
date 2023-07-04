@@ -31,16 +31,16 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
 
 type
   // Define the input and output types for training data
-  TBackInput  = array[0..1] of TNeuralFloat;  // Input data for 2x - 3y + 4
-  TBackOutput = array[0..0] of TNeuralFloat;  // Expected output for 2x - 3y + 4
+  TBackFloatInput  = array[0..1] of TNeuralFloat;  // Input data for 2x - 3y + 4
+  TBackFloatOutput = array[0..0] of TNeuralFloat;  // Expected output for 2x - 3y + 4
 
-procedure RunAlgo();
+procedure RunFloatAlgo();
 var
   NN: TNNet;
   EpochCnt: integer;
   pOutPut: TNNetVolume;
-  vInputs: TBackInput;
-  vOutput: TBackOutput;
+  vInputs: TBackFloatInput;
+  vOutput: TBackFloatOutput;
 begin
   NN := TNNet.Create();
 
@@ -87,5 +87,5 @@ var
 
 begin
   Application.Title:='Only One Neuron - 2x - 3y + 4';
-  RunAlgo();
+  RunFloatAlgo();
 end.
