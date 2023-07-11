@@ -453,7 +453,7 @@ begin
         begin
           WriteLn(ClassFolder,' - error: not assigned list');
         end;
-        FindAllFiles(Self.List[ClassCnt], ClassFolder, '*.png;*.jpg;*.jpeg;*.bmp', {SearchSubDirs} false);
+        FindAllFiles(Self.List[ClassCnt], ClassFolder, '*.png;*.jpg;*.jpeg;*.bmp;*.tif', {SearchSubDirs} false);
         Self.List[ClassCnt].FixObjects();
         ElementCnt := Self.List[ClassCnt].Count;
         SkipFirst := Round(ElementCnt * fSkipFirst);
