@@ -141,6 +141,7 @@ type
       FBaseFolder: string;
       FNewSizeX, FNewSizeY: integer;
       FColorEncoding: integer;
+      {$IFDEF HASTHREADS}FCritSecLoad: TRTLCriticalSection;{$ENDIF}
     public
       constructor Create();
       destructor Destroy(); override;
@@ -368,10 +369,16 @@ begin
   inherited Create();
   FImageSubFolder := '';
   FBaseFolder := '';
+  {$IFDEF HASTHREADS}
+  NeuralInitCriticalSection(FCritSecLoad);
+  {$ENDIF}
 end;
 
 destructor TClassesAndElements.Destroy();
 begin
+  {$IFDEF HASTHREADS}
+  NeuralDoneCriticalSection(FCritSecLoad);
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -694,13 +701,20 @@ begin
           begin
             SourceVolume := Self.List[ClassId].List[ImageId];
             // Debug: WriteLn('Loading: ', Self.GetFileName(ClassId, ImageId));
+            try
             {$IFDEF FPC}
-            M.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
-            LoadImageIntoVolume(M, SourceVolume);
+              {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
+              M.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
+              {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
+              LoadImageIntoVolume(M, SourceVolume);
             {$ELSE}
-            LocalPicture.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
-            LoadPictureIntoVolume(LocalPicture, SourceVolume);
+              LocalPicture.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
+              LoadPictureIntoVolume(LocalPicture, SourceVolume);
             {$ENDIF}
+            except
+              WriteLn('Failed loading image: ',Self.GetFileName(ClassId, ImageId));
+              {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
+            end;
             if (FNewSizeX > 0) and (FNewSizeY > 0) then
             begin
               if (SourceVolume.SizeX <> FNewSizeX) or (SourceVolume.SizeY <> FNewSizeY) then
