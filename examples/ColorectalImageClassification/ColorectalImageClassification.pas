@@ -75,10 +75,11 @@ type
     NeuralFit.FileNameBase := 'Colorectal';
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
+    NeuralFit.CyclicalLearningRateLen := 10;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}8, {batchsize=}64, {epochs=}50);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}8, {batchsize=}64, {epochs=}250);
     NeuralFit.Free;
 
     NN.Free;
