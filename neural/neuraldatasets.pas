@@ -713,6 +713,7 @@ begin
             {$ENDIF}
             except
               WriteLn('Failed loading image: ',Self.GetFileName(ClassId, ImageId));
+              SourceVolume.ReSize(FNewSizeX, FNewSizeY, 3);
               {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
             end;
             if (FNewSizeX > 0) and (FNewSizeY > 0) then
