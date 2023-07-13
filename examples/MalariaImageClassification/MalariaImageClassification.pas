@@ -5,9 +5,6 @@
 // https://data.lhncbc.nlm.nih.gov/public/Malaria/cell_images.zip
 // https://www.tensorflow.org/datasets/catalog/malaria
 
-// Change ProportionToLoad variable (see below) to a
-// smaller number if you don't have available 16GB of RAM.
-
 program MalariaImageClassification;
 (*
  Coded by Joao Paulo Schwarz Schuler.
@@ -52,7 +49,7 @@ type
       TNNetSoftMax.Create()
     ]);
     NN.DebugStructure();
-    // change ProportionToLoad to a smaller number if you don't have available 16GB of RAM.
+    // change ProportionToLoad to a smaller number if you don't have available 4GB of RAM.
     ProportionToLoad := 1;
     WriteLn('Loading ', Round(ProportionToLoad*100), '% of the malaria dataset into memory.');
     CreateVolumesFromImagesFromFolder
