@@ -30,8 +30,8 @@ type
     WriteLn('Creating Neural Network...');
     NN := TNNet.Create();
     NN.AddLayer([
-      TNNetInput.Create(128, 128, 3),
-      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}2),
+      TNNetInput.Create(64, 64, 3),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}1),
       TNNetMaxPool.Create(2),
       TNNetMovingStdNormalization.Create(),
       TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
@@ -46,7 +46,7 @@ type
       TNNetSoftMax.Create()
     ]);
     NN.DebugStructure();
-    // change ProportionToLoad to a smaller number if you don't have available 32GB of RAM.
+    // change ProportionToLoad to a smaller number if you don't have available 16GB of RAM.
     ProportionToLoad := 1;
     WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease dataset into memory.');
     CreateVolumesFromImagesFromFolder
@@ -57,7 +57,7 @@ type
       {TrainingProp=}0.9*ProportionToLoad,
       {ValidationProp=}0.05*ProportionToLoad,
       {TestProp=}0.05*ProportionToLoad,
-      {NewSizeX=}128, {NewSizeY=}128
+      {NewSizeX=}64, {NewSizeY=}64
     );
 
     WriteLn
