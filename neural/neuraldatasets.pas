@@ -782,8 +782,8 @@ var
   LocalColor: TColor;
   RawPos: integer;
 begin
-  MaxX := Picture.Bitmap.Width - 1;
-  MaxY := Picture.Bitmap.Height - 1;
+  MaxX := Picture.Width - 1;
+  MaxY := Picture.Height - 1;
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
   for CountX := 0 to MaxX do
