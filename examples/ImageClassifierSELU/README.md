@@ -9,12 +9,13 @@ The program will create a neural network with the following layers:
 3. Max Pooling layer with a pool size of 4x4.
 4. SELU activation layer.
 5. Moving Standard Deviation Normalization layer.
-6. Four additional convolutional layers with 64 filters, kernel size 3x3, stride 1, and padding 1x1. All these layers use SELU activation.
-7. A Dropout layer with a dropout rate of 0.5.
-8. A Max Pooling layer with a pool size of 2x2.
-9. Another SELU activation layer.
-10. A Fully Connected layer with 10 output neurons (for 10 classes in CIFAR-10).
-11. A Softmax activation layer for classification.
+6. Three convolutional layers with 64 filters, kernel size 3x3, stride 1, and padding 1x1. All these layers use SELU activation.
+7. One convolutional layers with 64 filters, kernel size 3x3, stride 1, and padding 1x1 without activation function.
+8. A Dropout layer with a dropout rate of 0.5.
+9. A Max Pooling layer with a pool size of 2x2.
+10. Another SELU activation layer.
+11. A Fully Connected layer with 10 output neurons (for 10 classes in CIFAR-10).
+12. A Softmax activation layer for classification.
 
 The program then proceeds to fit the neural network to the CIFAR-10 dataset using the following hyperparameters:
 
@@ -32,8 +33,6 @@ The program then proceeds to fit the neural network to the CIFAR-10 dataset usin
 During execution, the program will output the progress of the training process, including the loss and accuracy values for each epoch. After training is complete, the neural network will be evaluated on the test dataset, and the final accuracy on the test set will be displayed.
 
 ## Acknowledgments
-
-The `ImageClassifierSELU` program is coded by Joao Paulo Schwarz Schuler. You can find the original source code and other related projects on [GitHub](https://github.com/joaopauloschuler).
 
 If you encounter any issues or have suggestions for improvements, feel free to create an issue or contribute to the project through pull requests.
 
