@@ -6,8 +6,8 @@ This repository contains an implementation for classifying malaria-infected cell
 
 The dataset used for this project can be obtained from the following sources:
 
-1. Download the dataset from the NIH-LHCBC Data Archive: [Malaria Cell Images](https://data.lhncbc.nlm.nih.gov/public/Malaria/cell_images.zip)
-2. Alternatively, the dataset can also be found on TensorFlow Datasets catalog: [Malaria Dataset](https://www.tensorflow.org/datasets/catalog/malaria)
+1. Download the dataset from the NIH-LHCBC Data Archive: [Malaria Cell Images](https://data.lhncbc.nlm.nih.gov/public/Malaria/cell_images.zip).
+2. Alternatively, the dataset can also be found on TensorFlow Datasets catalog: [Malaria Dataset](https://www.tensorflow.org/datasets/catalog/malaria).
 
 Please download and extract the dataset before running the code.
 
