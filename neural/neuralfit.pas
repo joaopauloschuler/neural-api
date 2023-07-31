@@ -2423,6 +2423,16 @@ begin
       sumOutput.Add( pOutput );
     end;
 
+    if FHasFlipY then
+    begin
+      ImgInput.FlipY();
+      TotalDiv := TotalDiv + 1;
+      pNN.Compute( ImgInput );
+      pNN.GetOutput( pOutput );
+      sumOutput.Add( pOutput );
+      ImgInput.FlipY();
+    end;
+
     if FMaxCropSize >= 2 then
     begin
       ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
