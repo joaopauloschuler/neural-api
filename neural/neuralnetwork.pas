@@ -1397,15 +1397,19 @@ type
       constructor Create(); override;
       destructor Destroy(); override;
 
+      // Creates a layer from an input string.
       function CreateLayer(strData: string): TNNetLayer;
+      // Adds a layer or layers to this neural network.
       function AddLayer(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayer(strData: string): TNNetLayer; overload;
+      // Adds a layer of layers after another layers (for non sequencial models)
       function AddLayer(pLayers: array of TNNetLayer): TNNetLayer; overload;
       function AddLayerAfter(pLayer, pAfterLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerAfter(pLayer: TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
       function AddLayerAfter(strData: string; pAfterLayerIdx: integer): TNNetLayer; overload;
       function AddLayerAfter(pLayers: array of TNNetLayer; pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerAfter(pLayers: array of TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
+      // Adds a layer and concats the input into the output.
       function AddLayerConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
       function AddLayerConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerDeepConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
@@ -1478,29 +1482,35 @@ type
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
+      // Returns the layer index of the first neuronal layer (layers that have neurons).
       function GetFirstNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the layer index of the first neuronal layer that can process an image as input.
       function GetFirstImageNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFirstNeuronalLayerIdxWithChannels(FromLayerIdx, Channels:integer): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the index of the last layer.
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the last layer.
       function GetLastLayer(): TNNetLayer;
+      // Returns a layer of random index.
       function GetRandomLayer(): TNNetLayer;
-      // Computes the forward pass of this layer with pInput. The output is returned
+      // Computes the forward pass with pInput. The output is returned
       // at pOutput. You can optionally compute from an intermediate layer defined
-      // at FromLayerIdx.
+      // at FromLayerIdx. This method should be used when you have either multiple
+      // inputs or multiple outputs.
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
-      // Computes the forward pass of this layer with pInput. The output is returned
+      // Computes the forward pass with pInput. The output is returned
       // at pOutput. You can optionally compute from an intermediate layer defined
       // at FromLayerIdx.
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
-      // Computes the forward pass of this layer with pInput.
+      // Computes the forward pass with pInput.
       // You can optionally compute from an intermediate layer defined
       // at FromLayerIdx.
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload;
-      // Computes the forward pass of this layer with pInput.
+      // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNNetVolume); overload;
-      // Computes the forward pass of this layer with pInput.
+      // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNeuralFloatDynArr); overload;
-      // Computes the forward pass of this layer with pInput.
+      // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
       // Computes the backward pass.
       // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
@@ -1514,7 +1524,9 @@ type
       procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
       procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
+      // Returns the output.
       procedure GetOutput(pOutput: TNNetVolume);
+      // Sums the output of this NN into pOutput.
       procedure AddOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure SetActivationFn(ActFn, ActFnDeriv: TNeuralActivationFunction);
       procedure SetLearningRate(pLearningRate, pInertia: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
