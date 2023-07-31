@@ -187,7 +187,14 @@ type
   {$ENDIF}
 
   // Loads an image from a file and stores it into a Volume.
-  function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
+  function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean; overload;
+
+  // Loads an image from a file and stores it into a Volume resizing to
+  // SizeX, SizeY and optionally encoding as neuronal input if has a
+  // color encoding such as csEncodeRGB.
+  function LoadImageFromFileIntoVolume(
+    ImageFileName:string; V:TNNetVolume; SizeX, SizeY: integer;
+    EncodeNeuronalInput: integer = -1):boolean; overload;
 
 // Writes the header of a confusion matrix into a CSV file
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
@@ -1308,6 +1315,34 @@ begin
     WriteLn('File Not Fount:', FullFileName);
     WriteLn('Please download from ', Link);
     //TODO: automatically download file
+    Result := false;
+  end;
+end;
+
+function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume;
+  SizeX, SizeY: integer;
+  EncodeNeuronalInput: integer = -1
+  ): boolean;
+var
+  VAux: TNNetVolume;
+begin
+  if LoadImageFromFileIntoVolume(ImageFileName, V) then
+  begin
+    if (V.SizeX<>SizeX) or (V.SizeY<>SizeY) then
+    begin
+      VAux := TNNetVolume.Create;
+      VAux.Copy(V);
+      V.CopyResizing(VAux, SizeX, SizeY);
+      VAux.Free;
+    end;
+    if (EncodeNeuronalInput >= 0) then
+    begin
+      V.RgbImgToNeuronalInput( (EncodeNeuronalInput) and 255 );
+    end;
+    Result := true;
+  end
+  else
+  begin
     Result := false;
   end;
 end;
