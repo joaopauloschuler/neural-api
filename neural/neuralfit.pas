@@ -155,6 +155,8 @@ type
       constructor Create(); override;
       destructor Destroy(); override;
       procedure ClassifyImage(pNN: TNNet; pImgInput, pOutput: TNNetVolume);
+      procedure ClassifyImageFromFile(pNN: TNNet; pFilename: string; pOutput: TNNetVolume); overload;
+      function ClassifyImageFromFile(pNN: TNNet; pFilename: string):integer; overload;
       procedure EnableDefaultImageTreatment(); virtual;
 
       // ChannelShiftRate: 0 means no augmentation. 0.1 means 10% of maximum change per channel.
@@ -2450,6 +2452,38 @@ begin
   sumOutput.Free;
   ImgInputCp.Free;
   ImgInput.Free;
+end;
+
+procedure TNeuralFitWithImageBase.ClassifyImageFromFile(pNN: TNNet;
+  pFilename: string; pOutput: TNNetVolume);
+var
+  vInputImage: TNNetVolume;
+  InputSizeX, InputSizeY, NumberOfClasses: integer;
+begin
+  vInputImage := TNNetVolume.Create();
+  InputSizeX := pNN.Layers[0].Output.SizeX;
+  InputSizeY := pNN.Layers[0].Output.SizeY;
+  NumberOfClasses := pNN.GetLastLayer().Output.Size;
+  if pOutput.Size <> NumberOfClasses then pOutput.ReSize(pNN.GetLastLayer().Output);
+  pOutput.Fill(0);
+  if LoadImageFromFileIntoVolume(
+      pFilename, vInputImage, InputSizeX, InputSizeY,
+      {EncodeNeuronalInput=}csEncodeRGB) then
+  begin
+    ClassifyImage(pNN, vInputImage, pOutput);
+  end;
+  vInputImage.Free;
+end;
+
+function TNeuralFitWithImageBase.ClassifyImageFromFile(pNN: TNNet;
+  pFilename: string): integer;
+var
+  vOutput: TNNetVolume;
+begin
+  vOutput := TNNetVolume.Create();
+  ClassifyImageFromFile(pNN, pFilename, vOutput);
+  Result := vOutput.GetClass();
+  vOutput.Free;
 end;
 
 procedure TNeuralFitWithImageBase.EnableDefaultImageTreatment();
