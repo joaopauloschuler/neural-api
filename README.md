@@ -3,7 +3,7 @@
 CAI NEURAL API is a pascal based deep learning neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus
 OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux.
 
-This project is a subproject from a bigger and older project called [CAI](https://sourceforge.net/projects/cai/) and is sister to Keras based [K-CAI NEURAL API](https://github.com/joaopauloschuler/k-neural-api). You can find trained neural network models in the [pre-trained-neural-api-networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/tree/main) repository.
+This project is a subproject from a bigger and older project called [CAI](https://sourceforge.net/projects/cai/) and is sister to Keras based [K-CAI NEURAL API](https://github.com/joaopauloschuler/k-neural-api). You can find trained neural network models in the [pre-trained-neural-api-networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) repository.
 
 ## Why Pascal?
 * Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
@@ -76,6 +76,29 @@ These examples train a neural network to classify images in classes such as: ima
 * [Simple CIFAR-10 Image Classifier with OpenCL](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleImageClassifierGPU)  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifierGPU/SimpleImageClassifierGPU.ipynb)
 * [Many neural network architectures for CIFAR-10 image classification](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/testcnnalgo/testcnnalgo.lpr)
 * [MNIST](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleMNist), [Fashion MNIST](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleFashionMNIST) and [CIFAR-100](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Cifar100CaiDenseNet)
+
+You can save and load trained models (neural networks) with `TNNet.LoadFromFile` and `TNNet.SaveToFile`. The file format is portable meaning that you can train on CPU and run on GPU or train in AMD and run on ARM as examples. The following code shows a simple example for image classification loading a [pre-trained](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) model:
+```
+  procedure ClassifyOneImageSimple;
+  var
+    NN: TNNet;
+    ImageFileName: string;
+    NeuralFit: TNeuralImageFit;
+  begin
+    WriteLn('Loading Neural Network...');
+    NN := TNNet.Create;
+    NN.LoadFromFile('SimplePlantLeafDisease-20230720.nn');
+    NeuralFit := TNeuralImageFit.Create;
+    ImageFileName := 'plant/Apple___Black_rot/image (1).JPG';
+    WriteLn('Processing image: ', ImageFileName);
+    WriteLn(
+      'The class of the image is: ',
+      NeuralFit.ClassifyImageFromFile(NN, ImageFileName)
+    );
+    NeuralFit.Free;
+    NN.Free;
+  end;  
+```
 
 ### Youtube Videos
 There are some available videos:
