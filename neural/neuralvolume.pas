@@ -88,8 +88,10 @@ type
 
   { TVolume }
   {$IFDEF FPC}
+  TIntegerList = class (specialize TFPGList<integer>);
   generic TVolume<T> = class(TObject)
   {$ELSE}
+  TIntegerList = TList<Integer>;
   T = TNeuralFloat;
   PtrInt = Integer;
   // This is a hack to allow compilation with other compilers
@@ -235,6 +237,12 @@ type
     procedure IncTag(); {$IFDEF Release} inline; {$ENDIF}
     procedure ClearTag(); {$IFDEF Release} inline; {$ENDIF}
     function NeuralToStr(V: TNeuralFloat): string;
+
+    // create lists with positions that are non zeros.
+    procedure LoadNonZeroPosIntoTIntegerList(Ints: TIntegerList;
+      IncludePositive: boolean=true; IncludeNegative:boolean = true);
+    function CreateIntegerListWithNonZeroPos(IncludePositive: boolean=true;
+      IncludeNegative:boolean = true): TIntegerList;
 
     // Color and Neuronal Weights Transformations
     procedure RgbImgToNeuronalInput(color_encoding: integer);
@@ -489,6 +497,8 @@ type
   TNNetStringList = class(TStringList)
     public
       function GetRandomIndex():integer; {$IFDEF Release} inline; {$ENDIF}
+      procedure KeepFirst(Cnt: integer);
+      procedure KeepLast(Cnt: integer);
       procedure DeleteFirst(Cnt: integer);
       procedure DeleteLast(Cnt: integer);
   end;
@@ -521,8 +531,14 @@ type
       property List[Index: Integer]: TObj read GetList;
   end;
 
+  TStringIntegerList = class (specialize TStringsObj<TIntegerList>);
   TStringStringList = class (specialize TStringsObj<TStringList>);
-  TStringVolumeList = class (specialize TStringsObj<TNNetVolume>);
+
+  TStringVolumeList = class (specialize TStringsObj<TNNetVolume>)
+    public
+      function CreateNonZeroPositionLists(): TStringIntegerList;
+  end;
+
   TStringStringListVolume = class (specialize TStringsObj<TStringVolumeList>);
 
   {$ELSE}
@@ -552,6 +568,8 @@ type
       function GetList(Index: Integer): TNNetVolume;
       function CreateObject: TObject;  override;
     public
+      function CreateTStringIntegerList(): TStringIntegerList;
+
       property List[Index: Integer]: TNNetVolume read GetList;
     end;
 
@@ -575,10 +593,17 @@ type
 
       function AddWordToDictionary(pWord:string): boolean;
       function AddWordsToDictionary(pString:string): boolean;
+      procedure AddWordFromCsvField(filename: string; fieldId: integer;
+        SkipFirstLine: boolean = True; Separator:char = ',');
 
       function WordToIndex(pWord:string): integer;
       procedure StringToVolume(pString: string; Volume: TNNetVolume);
       function VolumeToString(Volume: TNNetVolume; Threshold: TNeuralFloat = 0.2): string;
+      procedure CsvToTStringVolumeList(filename: string;
+        GroupByFieldId, DataFieldId: integer; SVL: TStringVolumeList;
+        SkipFirstLine: boolean = True; Separator:char = ',');
+
+      procedure PrintDebug(FirstElements: integer);
   end;
 
   function CreateTokenizedStringList(str: string; c:char):TStringList; overload;
@@ -644,7 +669,7 @@ type
 implementation
 
 uses
-  Math, neuralbit;
+  Math, neuralbit, strutils;
 
 function CreateTokenizedStringList(str: string; c:char):TStringList;
 begin
@@ -1591,6 +1616,24 @@ begin
   end;
 end;
 
+{ TStringVolumeList }
+
+function TStringVolumeList.CreateNonZeroPositionLists: TStringIntegerList;
+var
+  ElementCnt: integer;
+  MaxCnt: integer;
+begin
+  Result := TStringIntegerList.Create;
+  if Count > 0 then
+  begin
+    MaxCnt := Count - 1;
+    for ElementCnt := 0 to MaxCnt do
+    begin
+      Result.AddObject(Self[ElementCnt], Self.List[ElementCnt].CreateIntegerListWithNonZeroPos() );
+    end;
+  end;
+end;
+
 constructor TNNetVolumePair.Create();
 begin
   inherited Create();
@@ -1633,6 +1676,16 @@ begin
   begin
     Result := -1;
   end;
+end;
+
+procedure TNNetStringList.KeepFirst(Cnt: integer);
+begin
+  DeleteLast(Count-Cnt);
+end;
+
+procedure TNNetStringList.KeepLast(Cnt: integer);
+begin
+  DeleteFirst(Count-Cnt);
 end;
 
 procedure TNNetStringList.DeleteFirst(Cnt: integer);
@@ -1900,6 +1953,39 @@ begin
   end;
 end;
 
+procedure TNNetDictionary.AddWordFromCsvField(filename: string; fieldId: integer
+  ; SkipFirstLine: boolean = True; Separator:char = ',');
+var
+  Sep: TStringList;
+  CurrentLine: string;
+  WordToAdd: string;
+  FileHandler: Text;
+  LineCnt: integer;
+begin
+  Sep := CreateTokenizedStringList(Separator);
+  AssignFile(FileHandler, filename);
+  Reset(FileHandler);
+  LineCnt := 0;
+  while not Eof(FileHandler) do
+  begin
+    ReadLn(FileHandler, CurrentLine);
+    if not( (LineCnt = 0) and (SkipFirstLine) ) then
+    begin
+      Sep.DelimitedText := CurrentLine;
+      if Sep.Count > fieldId then
+      begin
+        WordToAdd := Sep[fieldId];
+        AddWordToDictionary(TrimSet(WordToAdd,['"',' ']));
+      end;
+    end;
+    LineCnt := LineCnt + 1;
+    //Debug line:
+    //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
+  end;
+  CloseFile(FileHandler);
+  Sep.Free;
+end;
+
 function TNNetDictionary.WordToIndex(pWord: string): integer;
 begin
   if not(Self.Find(pWord, Result)) then Result := -1;
@@ -1955,6 +2041,74 @@ begin
   end;
 
   Result := FTokenizer.DelimitedText;
+end;
+
+procedure TNNetDictionary.CsvToTStringVolumeList(filename: string;
+  GroupByFieldId, DataFieldId: integer; SVL: TStringVolumeList;
+  SkipFirstLine: boolean = True; Separator:char = ',');
+var
+  Sep: TStringList;
+  CurrentLine: string;
+  KeyStr, DataStr: string;
+  DataId, KeyId: integer;
+  FileHandler: Text;
+  LineCnt: integer;
+  V: TNNetVolume;
+begin
+  Sep := CreateTokenizedStringList(Separator);
+  AssignFile(FileHandler, filename);
+  Reset(FileHandler);
+  LineCnt := 0;
+  while not Eof(FileHandler) do
+  begin
+    ReadLn(FileHandler, CurrentLine);
+    if not( (LineCnt = 0) and (SkipFirstLine) ) then
+    begin
+      Sep.DelimitedText := CurrentLine;
+      if (Sep.Count > GroupByFieldId) and (Sep.Count > DataFieldId) then
+      begin
+        KeyStr := Sep[GroupByFieldId];
+        DataStr := Sep[DataFieldId];
+        DataId := IndexOf(DataStr);
+        if DataId > -1 then
+        begin
+          KeyId := SVL.IndexOf(KeyStr);
+          if KeyId > -1 then
+          begin
+            V := SVL.List[KeyId];
+            V.FData[DataId] := 1;
+          end
+          else
+          begin
+            V := TNNetVolume.Create(Count);
+            V.FData[DataId] := 1;
+            SVL.AddObject(KeyStr, V);
+          end;
+        end;
+      end;
+    end;
+    LineCnt := LineCnt + 1;
+    // debug line only:
+    //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
+  end;
+  CloseFile(FileHandler);
+  Sep.Free;
+end;
+
+procedure TNNetDictionary.PrintDebug(FirstElements: integer);
+var
+  ElementCnt: integer;
+begin
+  WriteLn('Number of elements: ', Count);
+  if Count > 0 then
+  begin
+    if FirstElements > Count then FirstElements := Count;
+    WriteLn('Showing first ',FirstElements,' elements.');
+    for ElementCnt := 0 to FirstElements - 1 do
+    begin
+      WriteLn(ElementCnt,': ',Self[ElementCnt],' -> ', Self.Integers[ElementCnt]);
+    end;
+  end;
 end;
 
 { TNNetKMeans }
@@ -4409,6 +4563,30 @@ function TVolume.NeuralToStr(V: TNeuralFloat): string;
 begin
   Result := FloatToStr(V, FFormatSettings);
 end;
+
+procedure TVolume.LoadNonZeroPosIntoTIntegerList(Ints: TIntegerList;
+  IncludePositive: boolean=true; IncludeNegative:boolean = true);
+var
+  I: integer;
+  vHigh: integer;
+  Value: TNeuralFloat;
+begin
+  vHigh := High(FData);
+  for I := 0 to vHigh do
+  begin
+    Value := FData[I];
+    if IncludePositive and (value > 0) then Ints.Add(I)
+    else if IncludeNegative and (value < 0) then Ints.Add(I);
+  end;
+end;
+
+function TVolume.CreateIntegerListWithNonZeroPos(IncludePositive: boolean;
+  IncludeNegative: boolean): TIntegerList;
+begin
+  Result := TIntegerList.Create();
+  LoadNonZeroPosIntoTIntegerList(Result, IncludePositive, IncludeNegative);
+end;
+
 
 procedure TVolume.RgbImgToNeuronalInput(color_encoding: integer);
 begin
