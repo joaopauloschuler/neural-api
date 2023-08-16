@@ -114,13 +114,27 @@ type
       procedure ClearDelta; {$IFDEF Release} inline; {$ENDIF}
 
       // Initializers
+
+      // Weight Initializer - Uniform Distribution.
       procedure InitUniform(Value: TNeuralFloat = 1);
+      // Weight Initializer - Gaussian Distribution.
       procedure InitGaussian(Value: TNeuralFloat = 1);
+      // Weight Initializer - LeCun 98, Efficient Backprop
+      // http://yann.lecun.com/exdb/publis/pdf/lecun-98b.pdf
       procedure InitLeCunUniform(Value: TNeuralFloat = 1);
+      // Weight Initializer - This implementation is inspired on:
+      // Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification
+      // Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+      // https://arxiv.org/abs/1502.01852
+      // He initializations are also called Kaiming initializations.
       procedure InitHeUniform(Value: TNeuralFloat = 1);
-      procedure InitHeGaussian(Value: TNeuralFloat = 1);
+      // Weight Initializer - same as InitHeUniform for depthwise convolutions.
       procedure InitHeUniformDepthwise(Value: TNeuralFloat = 1);
+      // Weight Initializer - same as InitHeUniform with gaussian distribution.
+      procedure InitHeGaussian(Value: TNeuralFloat = 1);
+      // Weight Initializer - same as InitHeGaussian for depthwise convolutions.
       procedure InitHeGaussianDepthwise(Value: TNeuralFloat = 1);
+      // Weight Initializer for SELU activation function.
       procedure InitSELU(Value: TNeuralFloat = 1);
 
       property Weights: TNNetVolume read FWeights;
@@ -139,9 +153,13 @@ type
     public
       property Items[Index: Integer]: TNNetNeuron read GetItem write SetItem; default;
   {$ENDIF}
+      // Creates the list with ElementCount elements.
       constructor CreateWithElements(ElementCount: integer);
+      // Returns the maximum weight value.
       function GetMaxWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the maximum absolute weight value.
       function GetMaxAbsWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the minimum weight value.
       function GetMinWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure InitForDebug();
   end;
@@ -260,15 +278,32 @@ type
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
 
       // Initializers
+
+      // Weight Initializer - Uniform Distribution.
       function InitUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      // Weight Initializer - LeCun 98, Efficient Backprop
+      // http://yann.lecun.com/exdb/publis/pdf/lecun-98b.pdf
       function InitLeCunUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      // Weight Initializer - This implementation is inspired on:
+      // Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification
+      // Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+      // https://arxiv.org/abs/1502.01852
       // He initializations are also called Kaiming initializations.
       function InitHeUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      // Weight Initializer - same as InitHeUniform for depthwise convolutions.
       function InitHeUniformDepthwise(Value: TNeuralFloat = 1): TNNetLayer;
+      // Weight Initializer - same as InitHeUniform with gaussian distribution.
       function InitHeGaussian(Value: TNeuralFloat = 0.5): TNNetLayer;
+      // Weight Initializer - same as InitHeGaussian for depthwise convolutions.
       function InitHeGaussianDepthwise(Value: TNeuralFloat = 0.5): TNNetLayer;
       // Glorot Bengio initializations are also called Xavier initializations.
+      // This implementation is inspired on:
+      // Understanding the difficulty of training deep feedforward neural networks
+      // Xavier Glorot, Yoshua Bengio ; Proceedings of the Thirteenth International
+      // Conference on Artificial Intelligence and Statistics, PMLR 9:249-256, 2010.
+      // http://proceedings.mlr.press/v9/glorot10a.html
       function InitGlorotBengioUniform(Value: TNeuralFloat = 1): TNNetLayer;
+      // Weight Initializer for SELU activation function.
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       procedure InitDefault(); virtual;
 
@@ -1499,6 +1534,7 @@ type
       procedure LoadFromString(strData: string);
       // Load both architecture and weights from file (complete saving).
       procedure LoadFromFile(filename: string);
+      procedure LoadFromStream(stream : TStream);
 
       // Returns a cloned neural network
       function Clone(): TNNet;
@@ -11629,6 +11665,29 @@ begin
   S.Free;
 end;
 
+procedure TNNet.LoadFromStream(stream: TStream);
+var
+  S: TStringList;
+begin
+  S := CreateTokenizedStringList('>');
+  S.LoadFromStream(stream);
+
+  if (S.Count = 2) then
+  begin
+    LoadStructureFromString(S[0]);
+    LoadDataFromString(S[1]);
+  end
+  else
+  begin
+    FErrorProc
+    (
+      'TNNet.LoadFromString - wrong number of arguments: ' + IntToStr(S.Count)
+    );
+  end;
+
+  S.Free;
+end;
+
 procedure TNNet.LoadFromString(strData: string);
 var
   S: TStringList;
@@ -11652,26 +11711,14 @@ begin
 end;
 
 procedure TNNet.LoadFromFile(filename: string);
-var
-  S: TStringList;
+var fs : TFileStream;
 begin
-  S := CreateTokenizedStringList('>');
-  S.LoadFromFile(filename);
-
-  if (S.Count = 2) then
-  begin
-    LoadStructureFromString(S[0]);
-    LoadDataFromString(S[1]);
-  end
-  else
-  begin
-    FErrorProc
-    (
-      'TNNet.LoadFromString - wrong number of arguments: ' + IntToStr(S.Count)
-    );
-  end;
-
-  S.Free;
+     fs := TFileStream.Create(filename, fmOpenRead or fmShareDenyWrite);
+     try
+        LoadFromStream(fs);
+     finally
+            fs.Free;
+     end;
 end;
 
 function TNNet.Clone(): TNNet;
