@@ -41,7 +41,7 @@ unit neuralvolume;
 
 interface
 
-uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,{$ENDIF} classes, sysutils;
+uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils;
 
 {$include neuralnetwork.inc}
 
@@ -555,6 +555,14 @@ type
       property List[Index: Integer]: TObject read GetList;
   end;
 
+  TStringIntegerList = class (TStringsObj)
+    private
+      function GetList(Index: Integer): TIntegerList;
+      function CreateObject: TObject; override;
+    public
+      property List[Index: Integer]: TIntegerList read GetList;
+  end;
+
   TStringStringList = class(TStringsObj)
     private
       function GetList(Index: Integer): TStringList;
@@ -568,7 +576,7 @@ type
       function GetList(Index: Integer): TNNetVolume;
       function CreateObject: TObject;  override;
     public
-      function CreateTStringIntegerList(): TStringIntegerList;
+      function CreateNonZeroPositionLists(): TStringIntegerList;
 
       property List[Index: Integer]: TNNetVolume read GetList;
     end;
@@ -1857,6 +1865,17 @@ begin
   Result := TStringVolumeList(inherited GetList(Index) );
 end;
 
+{ TStringIntegerList }
+
+function TStringIntegerList.CreateObject: TObject;
+begin
+  Result := TIntegerList.Create();
+end;
+
+function TStringIntegerList.GetList(Index: Integer): TIntegerList;
+begin
+  Result := TIntegerList(inherited GetList(Index) );
+end;
 
 {$ENDIF}
 
@@ -1959,7 +1978,7 @@ var
   Sep: TStringList;
   CurrentLine: string;
   WordToAdd: string;
-  FileHandler: Text;
+  FileHandler: TextFile;
   LineCnt: integer;
 begin
   Sep := CreateTokenizedStringList(Separator);
@@ -1975,7 +1994,11 @@ begin
       if Sep.Count > fieldId then
       begin
         WordToAdd := Sep[fieldId];
+        {$IFDEF FPC}
         AddWordToDictionary(TrimSet(WordToAdd,['"',' ']));
+        {$ELSE}
+        AddWordToDictionary(Trim(WordToAdd));
+        {$ENDIF}
       end;
     end;
     LineCnt := LineCnt + 1;
@@ -2051,7 +2074,7 @@ var
   CurrentLine: string;
   KeyStr, DataStr: string;
   DataId, KeyId: integer;
-  FileHandler: Text;
+  FileHandler: TextFile;
   LineCnt: integer;
   V: TNNetVolume;
 begin
