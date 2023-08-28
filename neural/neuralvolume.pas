@@ -616,7 +616,7 @@ type
       function AddWordsToDictionary(pString:string): boolean;
       procedure AddWordFromCsvField(filename: string; fieldId: integer;
         SkipFirstLine: boolean = True; Separator:char = ',');
-
+      procedure RemoveAllStringsWithLessThen(I:integer);
       function WordToIndex(pWord:string): integer;
       procedure StringToVolume(pString: string; Volume: TNNetVolume);
       function VolumeToString(Volume: TNNetVolume; Threshold: TNeuralFloat = 0.2): string;
@@ -2085,6 +2085,30 @@ begin
   end;
   CloseFile(FileHandler);
   Sep.Free;
+end;
+
+procedure TNNetDictionary.RemoveAllStringsWithLessThen(I: integer);
+var
+  MaxPos, CurrentPos: integer;
+begin
+  MaxPos := Count - 1;
+  if MaxPos > -1 then
+  begin
+    Self.Sorted := false;
+    Self.SortByIntegerDesc;
+    CurrentPos := 0;
+    while CurrentPos <= MaxPos do
+    begin
+      if Self.Integers[CurrentPos] < I then
+      begin
+        Self.KeepFirst(CurrentPos);
+        MaxPos := -1; // exit the while loop
+      end;
+      CurrentPos := CurrentPos + 1;
+    end;
+    Self.Sort;
+    Self.Sorted := true;
+  end;
 end;
 
 function TNNetDictionary.WordToIndex(pWord: string): integer;
