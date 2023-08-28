@@ -521,18 +521,31 @@ type
   { TStringsObj }
   generic TStringsObj<TObj> = class(TNNetStringList)
     private
+      FSortedList: boolean;
       function GetList(Index: Integer): TObj; {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create;
       function AddObject(const S: string; AObject: TObject): Integer; override;
       procedure FixObjects();
-
       procedure AddStringObj(const S: string); {$IFDEF Release} inline; {$ENDIF}
+
       property List[Index: Integer]: TObj read GetList;
+      property SortedList: boolean read FSortedList write FSortedList;
   end;
 
   TStringIntegerList = class (specialize TStringsObj<TIntegerList>);
-  TStringStringList = class (specialize TStringsObj<TStringList>);
+
+  { TStringStringList }
+
+  TStringStringList = class (specialize TStringsObj<TStringList>)
+    public
+      procedure LoadFromCsv(filename: string;
+        SkipFirstLine:boolean = true;
+        KeyId: integer = -1;
+        Separator: char = ',');
+      procedure SaveToCsv(filename: string;
+        Separator: char = ',');
+  end;
 
   TStringVolumeList = class (specialize TStringsObj<TNNetVolume>)
     public
@@ -1624,6 +1637,70 @@ begin
   end;
 end;
 
+{ TStringStringList }
+
+procedure TStringStringList.LoadFromCsv(filename: string;
+  SkipFirstLine:boolean = true;
+  KeyId: integer = -1;
+  Separator: char = ',');
+var
+  Sep: TStringList;
+  CurrentLine: string;
+  KeyStr: string;
+  FileHandler: TextFile;
+  LineCnt: integer;
+begin
+  Self.Sorted := false;
+  Self.SortedList := false;
+  AssignFile(FileHandler, filename);
+  Reset(FileHandler);
+  LineCnt := 0;
+  while (not Eof(FileHandler)) do // and (LineCnt<10000)
+  begin
+    ReadLn(FileHandler, CurrentLine);
+    if not( (LineCnt = 0) and (SkipFirstLine) ) then
+    begin
+      Sep := CreateTokenizedStringList(Separator);
+      Sep.DelimitedText := CurrentLine;
+      if (KeyId = -1) then
+      begin
+        KeyStr := IntToStr(LineCnt);
+      end
+      else
+      begin
+        KeyStr := Sep[KeyId];
+      end;
+      AddObject(KeyStr, TObject(Sep));
+    end;
+    LineCnt := LineCnt + 1;
+    if (LineCnt mod 1000 = 0) then WriteLn(LineCnt);
+    // debug line only:
+    //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
+  end;
+  CloseFile(FileHandler);
+end;
+
+procedure TStringStringList.SaveToCsv(filename: string;
+  Separator: char = ',');
+var
+  RowCnt: integer;
+  MaxCnt: integer;
+  FileHandler: TextFile;
+begin
+  MaxCnt := Count - 1;
+  if MaxCnt > -1 then
+  begin
+    AssignFile(FileHandler, filename);
+    ReWrite(FileHandler);
+    for RowCnt := 0 to MaxCnt do
+    begin
+      List[RowCnt].Delimiter := Separator;
+      WriteLn(FileHandler, List[RowCnt].DelimitedText);
+    end;
+    CloseFile(FileHandler);
+  end;
+end;
+
 { TStringVolumeList }
 
 function TStringVolumeList.CreateNonZeroPositionLists: TStringIntegerList;
@@ -1736,6 +1813,7 @@ begin
   inherited Create;
   Self.OwnsObjects := true;
   Self.Sorted := true;
+  Self.FSortedList := true;
 end;
 
 function TStringsObj.AddObject(const S: string; AObject: TObject): Integer;
@@ -1745,7 +1823,7 @@ begin
     AObject := TObj.Create;
   end;
 
-  if AObject is TStringList then
+  if (FSortedList) and (AObject is TStringList) then
   begin
     TStringList(AObject).Sorted := true;
   end;
@@ -1766,7 +1844,7 @@ begin
         Self.Objects[ElementId] := TObj.Create;
       end;
 
-      if Self.Objects[ElementId] is TStringList then
+      if (FSortedList) and (Self.Objects[ElementId] is TStringList) then
       begin
         TStringList(Self.Objects[ElementId]).Sorted := true;
       end;
