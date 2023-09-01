@@ -138,6 +138,7 @@ type
       procedure InitSELU(Value: TNeuralFloat = 1);
 
       property Weights: TNNetVolume read FWeights;
+      property Bias: TNeuralFloat read FBiasWeight;
       property BackInertia: TNNetVolume read FBackInertia;
       property Delta: TNNetVolume read FDelta;
   end;
