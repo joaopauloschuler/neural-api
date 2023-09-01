@@ -1673,7 +1673,6 @@ begin
       AddObject(KeyStr, TObject(Sep));
     end;
     LineCnt := LineCnt + 1;
-    if (LineCnt mod 1000 = 0) then WriteLn(LineCnt);
     // debug line only:
     //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
   end;
