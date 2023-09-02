@@ -8,6 +8,6 @@ You can find more about ResNet architecture at:
 
 This folder contains 2 source code examples:
 - [ResNet-20](ResNet20.lpr): closely implements the ResNet-20 architecture.
-- [CaiResNet-20](ResNet20.lpr): implements a modified ResNet-20 that takes adantage of CAI specific layers.
+- [CaiResNet-20](CaiResNet20.lpr): implements a modified ResNet-20 that takes adantage of CAI specific layers.
 
 There is also a [web server](server) source code example ready to be used.
