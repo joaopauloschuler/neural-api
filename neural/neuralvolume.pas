@@ -623,8 +623,9 @@ type
       procedure CsvToTStringVolumeList(filename: string;
         GroupByFieldId, DataFieldId: integer; SVL: TStringVolumeList;
         SkipFirstLine: boolean = True; Separator:char = ',');
-
       procedure PrintDebug(FirstElements: integer);
+      procedure SaveDictionaryToFile(Filename: string; Separator:char = ',');
+      procedure LoadDictionaryFromFile(Filename: string; Separator:char = ',');
   end;
 
   function CreateTokenizedStringList(str: string; c:char):TStringList; overload;
@@ -2233,6 +2234,68 @@ begin
       WriteLn(ElementCnt,': ',Self[ElementCnt],' -> ', Self.Integers[ElementCnt]);
     end;
   end;
+end;
+
+procedure TNNetDictionary.SaveDictionaryToFile(Filename: string; Separator: char
+  );
+var
+  RowCnt: integer;
+  MaxCnt: integer;
+  FileHandler: TextFile;
+begin
+  MaxCnt := Count - 1;
+  if MaxCnt > -1 then
+  begin
+    AssignFile(FileHandler, Filename);
+    ReWrite(FileHandler);
+    for RowCnt := 0 to MaxCnt do
+    begin
+      WriteLn(FileHandler, Self[RowCnt]+Separator+IntToStr(Self.Integers[RowCnt]));
+    end;
+    CloseFile(FileHandler);
+  end;
+end;
+
+procedure TNNetDictionary.LoadDictionaryFromFile(Filename: string;
+  Separator: char);
+var
+  Sep: TStringList;
+  CurrentLine: string;
+  Word: string;
+  WordCount: string;
+  FileHandler: TextFile;
+  LineCnt: integer;
+begin
+  Clear;
+  Sep := CreateTokenizedStringList(Separator);
+  AssignFile(FileHandler, Filename);
+  Reset(FileHandler);
+  LineCnt := 0;
+  while not Eof(FileHandler) do
+  begin
+    ReadLn(FileHandler, CurrentLine);
+    Sep.DelimitedText := CurrentLine;
+    if Sep.Count = 2 then
+    begin
+      {$IFDEF Debug}
+      Word := Sep[0];
+      WordCount := Sep[1];
+      Self.AddInteger(Word,StrToInt(WordCount));
+      {$ELSE}
+      Self.AddInteger(Sep[0],StrToInt(Sep[1]));
+      {$ENDIF}
+      LineCnt := LineCnt + 1;
+    end
+    else
+    begin
+      WriteLn('Bad dictionary entry:', CurrentLine);
+    end;
+
+    // debug line only:
+    //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
+  end;
+  CloseFile(FileHandler);
+  Sep.Free;
 end;
 
 { TNNetKMeans }
