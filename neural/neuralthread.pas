@@ -175,10 +175,17 @@ end;
 
 function NeuralDefaultThreadCount: integer;
 begin
+  {$IFDEF MSWINDOWS}
+  // for systems with more than 64 cores thes System.CPUCount only returns 64 at max
+  // -> we need to group them together so count the cpu's differntly
+  // https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups
+  Result := GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); // get all of all groups
+  {$ELSE}
   {$IFDEF FPC}
   Result := GetSystemThreadCount;
   {$ELSE}
   Result := System.CPUCount;
+  {$ENDIF}
   {$ENDIF}
 end;
 
@@ -330,7 +337,40 @@ end;
 
 { TNeuralThread }
 procedure TNeuralThread.Execute;
+{$IFDEF MSWINDOWS}
+
+var i : integer;
+    numGroups : integer;
+    maxIdxInGroup : integer;
+    ga : TGroupAffinity;
+{$ENDIF}
 begin
+  {$IFDEF MSWINDOWS}
+  // set group affinity
+  maxIdxInGroup := -1;
+  numGroups := GetActiveProcessorGroupCount;
+
+  // set affinity to physical cpu's - leave it as is otherwise
+  for i := 0 to numGroups - 1 do
+  begin
+       maxIdxInGroup := maxIdxInGroup + Integer(GetActiveProcessorCount(i));
+       if maxIdxInGroup >= FIndex then
+       begin
+            FillChar( ga, sizeof(ga), 0);
+            GetThreadGroupAffinity(GetCurrentThread, ga);
+            ga.Group := Word(i);
+            if not SetThreadGroupAffinity( Handle, ga, nil) then
+               RaiseLastOSError;
+
+            break;
+       end;
+  end;
+  {$ENDIF}
+
+
+
+  // ###########################################
+  // #### do the work
   while (not Terminated) do
   begin
     FNeuronStart.WaitFor(INFINITE);
