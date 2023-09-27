@@ -173,6 +173,38 @@ begin
   end;
 end;
 
+{$IF CompilerVersion <= 23}
+// delphi 2010 does not define the following functions and constants
+{$IFDEF MSWINDOWS}
+const ALL_PROCESSOR_GROUPS = $ffff;
+
+  //
+  // Structure to represent a group-specific affinity, such as that of a
+  // thread.  Specifies the group number and the affinity within that group.
+  //
+type
+  KAFFINITY = ULONG_PTR;
+  _GROUP_AFFINITY = record
+      Mask: KAFFINITY;
+      Group: WORD;
+      Reserved: array[0..2] of WORD;
+  end;
+  {$EXTERNALSYM _GROUP_AFFINITY}
+  GROUP_AFFINITY = _GROUP_AFFINITY;
+  {$EXTERNALSYM GROUP_AFFINITY}
+  PGROUP_AFFINITY = ^_GROUP_AFFINITY;
+  {$EXTERNALSYM PGROUP_AFFINITY}
+  TGroupAffinity = _GROUP_AFFINITY;
+  PGroupAffinity = PGROUP_AFFINITY;
+
+function GetActiveProcessorCount(GroupNumber: WORD): DWORD; stdcall; external 'kernel32.dll';
+function SetThreadGroupAffinity(hThread: THandle; var GroupAffinity: TGroupAffinity;
+  PreviousGroupAffinity: PGroupAffinity): ByteBool; stdcall; external kernel32 name 'GetThreadGroupAffinity';
+function GetThreadGroupAffinity(hThread: THandle; var GroupAffinity: TGroupAffinity): ByteBool; stdcall; external kernel32 name 'GetThreadGroupAffinity';
+function GetActiveProcessorGroupCount: WORD; stdcall; external kernel32 name 'GetThreadGroupAffinity';
+{$ENDIF}
+{$IFEND}
+
 function NeuralDefaultThreadCount: integer;
 begin
   {$IFDEF MSWINDOWS}
@@ -195,10 +227,14 @@ begin
   GetProcessId := {$IFDEF WINDOWS}GetCurrentProcessId(){$ELSE}fpgetppid(){$ENDIF};
 end;
 {$ELSE}
-//TODO: properly implement process ID for delphi
 function GetProcessId(): integer;
 begin
+  {$IFDEF WINDOWS}
+  Result := GetCurrentProcessId()
+  {$ELSE}
+  //TODO: properly implement process ID for non windows delphi
   GetProcessId := Random(MaxInt);
+  {$ENDIF}
 end;
 {$ENDIF}
 

@@ -322,7 +322,7 @@ begin
       TNNetConvolutionReLU.Create(32 * NeuronMultiplier,3,1,1,0),
       TNNetMovingStdNormalization.Create(),
       TNNetConvolutionLinear.Create(3,3,1,1,0),
-      TNNetReLUL.Create(-40, +40) // Protection against overflow
+      TNNetReLUL.Create(-40, +40, 0) // Protection against overflow
     ]);
     FGenerative.Layers[FGenerative.GetFirstImageNeuronalLayerIdx()].InitBasicPatterns();
   end

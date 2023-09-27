@@ -1,8 +1,12 @@
 ///This file has an implementation to classify
-//plant leaf diseases. You can get the dataset at
-//https://data.mendeley.com/datasets/tywbtsjrjv/1/files/d5652a28-c1d8-4b76-97f3-72fb80f94efc/Plant_leaf_diseases_dataset_without_augmentation.zip?dl=1 .
-//Folders with plant diseases will need to be stored inside of a folder named "plant".
-program SimplePlantLeafDisease;
+// the Colorectal Cancer Dataset:
+// https://zenodo.org/record/53169/
+// https://zenodo.org/record/53169/files/Kather_texture_2016_image_tiles_5000.zip?download=1
+// https://www.tensorflow.org/datasets/catalog/colorectal_histology
+
+// Change ProportionToLoad to a smaller number if you don't have available 4GB of RAM.
+
+program ColorectalImageClassification;
 (*
  Coded by Joao Paulo Schwarz Schuler.
  https://github.com/joaopauloschuler/neural-api
@@ -30,8 +34,8 @@ type
     WriteLn('Creating Neural Network...');
     NN := TNNet.Create();
     NN.AddLayer([
-      TNNetInput.Create(64, 64, 3),
-      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}1),
+      TNNetInput.Create(128, 128, 3),
+      TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}5, {Padding=}4, {Stride=}2),
       TNNetMaxPool.Create(2),
       TNNetMovingStdNormalization.Create(),
       TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}1),
@@ -42,22 +46,22 @@ type
       TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}2),
       TNNetDropout.Create(0.5),
       TNNetMaxPool.Create(2),
-      TNNetFullConnectLinear.Create(39),
+      TNNetFullConnectLinear.Create(8),
       TNNetSoftMax.Create()
     ]);
     NN.DebugStructure();
-    // change ProportionToLoad to a smaller number if you don't have available 16GB of RAM.
+    // change ProportionToLoad to a smaller number if you don't have available 8GB of RAM.
     ProportionToLoad := 1;
     WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease dataset into memory.');
     CreateVolumesFromImagesFromFolder
     (
       ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
-      {FolderName=}'plant', {pImageSubFolder=}'',
+      {FolderName=}'Kather_texture_2016_image_tiles_5000', {pImageSubFolder=}'',
       {color_encoding=}0{RGB},
       {TrainingProp=}0.9*ProportionToLoad,
       {ValidationProp=}0.05*ProportionToLoad,
       {TestProp=}0.05*ProportionToLoad,
-      {NewSizeX=}64, {NewSizeY=}64
+      {NewSizeX=}128, {NewSizeY=}128
     );
 
     WriteLn
@@ -68,14 +72,14 @@ type
     );
 
     NeuralFit := TNeuralImageFit.Create;
-    NeuralFit.FileNameBase := 'SimplePlantLeafDisease';
+    NeuralFit.FileNameBase := 'Colorectal';
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
+    NeuralFit.CyclicalLearningRateLen := 10;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
-    //NeuralFit.MaxThreadNum := 8;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}39, {batchsize=}64, {epochs=}50);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}8, {batchsize=}64, {epochs=}250);
     NeuralFit.Free;
 
     NN.Free;
@@ -89,7 +93,7 @@ var
   Application: TTestCNNAlgo;
 begin
   Application := TTestCNNAlgo.Create(nil);
-  Application.Title:='Plant Leaf Disease Classification';
+  Application.Title:='Colorectal Cancer Image Classification';
   Application.Run;
   Application.Free;
 end.

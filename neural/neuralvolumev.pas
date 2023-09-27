@@ -24,8 +24,9 @@ unit neuralvolumev;
 interface
 
 uses
-  Classes, SysUtils, ExtCtrls, Graphics, neuralvolume,
-  {$IFDEF FPC}LCLType, FPImage {$ELSE}Windows{$ENDIF} ;
+  Classes, SysUtils, neuralvolume,
+  {$IFDEF FPC}ExtCtrls, Graphics, LCLType, FPImage
+  {$ELSE} Windows, {$IF CompilerVersion >= 23} VCL.ExtCtrls, VCL.Graphics {$ELSE} ExtCtrls, Graphics {$ENDIF} {$ENDIF};
 
 /// saves a bitmap into a file from a handle HWND
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
@@ -40,14 +41,14 @@ procedure LoadRGBVolumeIntoTImage(V:TNNetVolume; Image:TImage);
 procedure LoadPictureIntoVolume(LocalPicture: TPicture; Vol:TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
 
 /// Loads a Bitmat into a Volume
-procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol:TNNetVolume);
+procedure LoadBitmapIntoVolume(LocalBitmap: TBitmap; Vol:TNNetVolume);
 
 {$IFNDEF FPC}
 procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
 {$ENDIF}
 
 implementation
-uses {$IFDEF FPC}LCLIntf,{$ENDIF}Math;
+{$IFDEF FPC}uses LCLIntf;{$ENDIF}
 
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);
 {$IFDEF FPC}
@@ -67,13 +68,13 @@ begin
 end;
 {$ELSE}
 var
-  MyBitmap: Graphics.TBitmap;
+  MyBitmap: TBitmap;
   MyDC    : HDC;
   pRect   : TRect;
   w,h     : integer;
 begin
   MyDC := GetDC(hWnd);
-  MyBitmap := Graphics.TBitmap.Create;
+  MyBitmap := TBitmap.Create;
   try
     GetWindowRect(HWND,pRect);
     w  := pRect.Right - pRect.Left;
@@ -132,7 +133,7 @@ begin
 end;
 {$ENDIF}
 
-procedure LoadBitmapIntoVolume(LocalBitmap: Graphics.TBitmap; Vol: TNNetVolume);
+procedure LoadBitmapIntoVolume(LocalBitmap: TBitmap; Vol: TNNetVolume);
 var
   CountX, CountY, MaxX, MaxY: integer;
   LocalCanvas: TCanvas;

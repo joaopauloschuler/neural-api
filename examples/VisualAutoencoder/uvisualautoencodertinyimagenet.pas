@@ -106,8 +106,6 @@ uses strutils, LCLIntf, LCLType;
 
 procedure TFormVisualLearning.ButLearnClick(Sender: TObject);
 begin
-  if not CheckCIFARFile() then exit;
-
   if (FRunning) then
   begin
     SendStop;
@@ -166,47 +164,14 @@ begin
 end;
 
 procedure TFormVisualLearning.DisplayInputImage(ImgInput: TNNetVolume; color_encoding: integer);
-var
-  pMin0, pMax0: TNeuralFloat;
-  pMin1, pMax1: TNeuralFloat;
-  pMin2, pMax2: TNeuralFloat;
 begin
   FDisplay.Resize(ImgInput);
   FDisplay.Copy(ImgInput);
-
-  if color_encoding = csEncodeLAB then
-  begin
-    FDisplay.GetMinMaxAtDepth(0, pMin0, pMax0);
-    FDisplay.GetMinMaxAtDepth(1, pMin1, pMax1);
-    FDisplay.GetMinMaxAtDepth(2, pMin2, pMax2);
-    pMax0 := Max(Abs(pMin0), Abs(pMax0));
-    pMax1 := Max(Abs(pMin1), Abs(pMax1));
-    pMax2 := Max(Abs(pMin2), Abs(pMax2));
-
-    if pMax0 > 2 then
-    begin
-      FDisplay.MulAtDepth(0, 2/pMax0);
-    end;
-
-    if pMax1 > 2 then
-    begin
-      FDisplay.MulAtDepth(1, 2/pMax1);
-    end;
-
-    if pMax2 > 2 then
-    begin
-      FDisplay.MulAtDepth(2, 2/pMax2);
-    end;
-  end
-  else if FDisplay.GetMaxAbs() > 2 then
-  begin
-    FDisplay.NormalizeMax(2);
-  end;
+  FDisplay.ForceMaxRange(2);
 
   //Debug only: FDisplay.PrintDebugChannel();
 
   FDisplay.NeuronalInputToRgbImg(color_encoding);
-
   LoadVolumeIntoTImage(FDisplay, aImage[FImageCnt]);
   aImage[FImageCnt].Width := 128;
   aImage[FImageCnt].Height := 128;
@@ -246,7 +211,7 @@ begin
   if ChkBigNetwork.Checked
     then NeuronMultiplier := 2
     else NeuronMultiplier := 1;
-  FBaseName := 'IMAGEART'+IntToStr(NeuronMultiplier)+'-';
+  FBaseName := 'IMAGEART-v1.1-'+IntToStr(NeuronMultiplier)+'-';
   if RadRGB.Checked then
   begin
     FColorEncoding := csEncodeRGB;
@@ -280,30 +245,29 @@ begin
     WriteLn('Creating auto encoder.');
     FAutoencoder.AddLayer([
       TNNetInput.Create(64, 64, 3),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,2,1), //32x32
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,2,1), //16x16
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolution.Create(64 * NeuronMultiplier,3,1,2,0), //8x8
-      TNNetConvolution.Create(64 * NeuronMultiplier,3,1,1,0),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //32x32
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //16x16
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //8x8
+      TNNetConvolution.Create({Features=}64 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}2,{SuppressBias=}1), //4x4
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
 
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,2,1), //4x4
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
-      TNNetDeMaxPool.Create(2),
-      TNNetConvolution.Create(128 * NeuronMultiplier,5,2,1,1), //8x8
-      TNNetConvolution.Create(128 * NeuronMultiplier,3,1,1,1),
-
-      TNNetDeMaxPool.Create(2),
-      TNNetConvolution.Create(32 * NeuronMultiplier,5,2,1,1), //16x16
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetDeMaxPool.Create(2),
-      TNNetConvolution.Create(32 * NeuronMultiplier,5,2,1,1), //32x32
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetDeMaxPool.Create(2),
-      TNNetConvolution.Create(32 * NeuronMultiplier,5,2,1,1), //64x64
-      TNNetConvolution.Create(32 * NeuronMultiplier,3,1,1,1),
-      TNNetConvolutionLinear.Create(3,1,0,1,0),
-      TNNetReLUL.Create(-40, +40) // Protection against overflow
+      TNNetUpsample.Create(), //8x8
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetUpsample.Create(), //16x16
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetUpsample.Create(), //32x32
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}128 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetUpsample.Create(), //64x64
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolution.Create({Features=}32 * NeuronMultiplier,{FeatureSize=}3,{Padding=}1,{Stride=}1,{SuppressBias=}1),
+      TNNetConvolutionLinear.Create({Features=}3,{FeatureSize=}1,{Padding=}0,{Stride=}1,{SuppressBias=}0),
+      TNNetReLUL.Create(-40, +40, 0) // Protection against overflow
     ]);
   end
   else
@@ -312,8 +276,6 @@ begin
     FAutoencoder.LoadFromFile(FBaseName+'autoencoder.nn');
   end;
   FAutoencoder.DebugStructure();
-  FAutoencoder.SetLearningRate(0.001,0.9);
-  FAutoencoder.SetL2Decay(0.0);
 
   FFit.OnAfterEpoch := @Self.AutoencoderOnAfterEpoch;
   FFit.OnAfterStep := @Self.AutoencoderOnAfterStep;
@@ -322,6 +284,7 @@ begin
   FFit.L2Decay := 0.0;
   FFit.AvgWeightEpochCount := 1;
   FFit.InitialLearningRate := 0.0001;
+  FFit.ClipDelta := 0.01;
   FFit.FileNameBase := FBaseName+'autoencoder';
   FFit.EnableBipolar99HitComparison();
   {$ifdef OpenCL}
@@ -331,9 +294,8 @@ begin
     FAutoencoder.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
   end;
   {$endif}
-  //Debug only:
-  FFit.MaxThreadNum := 2;
-  FFit.FitLoading(FAutoencoder, {EpochSize=}FTrainImages.CountElements(), 500, 500, {Batch=}64, {Epochs=}35000, @GetTrainingData, nil, nil); // This line does the same as above
+  //Debug only: FFit.MaxThreadNum := 1;
+  FFit.FitLoading(FAutoencoder, {EpochSize=}FTrainImages.CountElements(), 0, 0, {Batch=}64, {Epochs=}35000, @GetTrainingData, nil, nil); // This line does the same as above
 
   FAutoencoder.Free;
 end;
@@ -352,6 +314,7 @@ end;
 
 procedure TFormVisualLearning.AutoencoderOnAfterEpoch(Sender: TObject);
 begin
+  WriteLn('Finished epoch number: ', FFit.CurrentEpoch);
 end;
 
 procedure TFormVisualLearning.AutoencoderOnAfterStep(Sender: TObject);
@@ -360,13 +323,13 @@ var
 begin
   LabClassRate.Caption := PadLeft(IntToStr(Round(FFit.TrainingAccuracy*100))+'%',4);
   ProcessMessages();
-  //if FFit.CurrentStep mod 10 = 0 then
+  if FFit.CurrentStep mod FFit.ThreadNN.Count = 0 then
   begin
     ClassId := FTrainImages.GetRandomClassId();
     ImageId := FTrainImages.List[ClassId].GetRandomIndex();
     FFit.NN.Compute(FTrainImages.List[ClassId].List[ImageId]);
     DisplayInputImage(FFit.NN.GetLastLayer().Output, 0);
-    FFit.NN.GetLastLayer().Output.PrintDebug();
+    //Debug only: FFit.NN.GetLastLayer().Output.PrintDebug();
   end;
 end;
 

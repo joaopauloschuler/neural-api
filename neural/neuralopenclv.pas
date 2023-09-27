@@ -24,7 +24,7 @@ unit neuralopenclv;
 interface
 
 uses
-  Classes, SysUtils, neuralopencl, StdCtrls;
+  Classes, SysUtils, neuralopencl, {$IF CompilerVersion >= 23} VCL.StdCtrls {$ELSE} StdCtrls {$IFEND};
 
 type
   { TEasyOpenCLCL }

@@ -138,6 +138,7 @@ type
       procedure InitSELU(Value: TNeuralFloat = 1);
 
       property Weights: TNNetVolume read FWeights;
+      property Bias: TNeuralFloat read FBiasWeight;
       property BackInertia: TNNetVolume read FBackInertia;
       property Delta: TNNetVolume read FDelta;
   end;
@@ -225,21 +226,35 @@ type
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); virtual;
       {$ENDIF}
+      // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
+      // Computes the backward pass.
+      // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
       procedure Backpropagate(); virtual; abstract;
+
       procedure ComputeOutputErrorForOneNeuron(NeuronIdx: integer; value: TNeuralFloat);
       procedure ComputeOutputErrorWith(pOutput: TNNetVolume); virtual;
       procedure ComputeOutputErrorForIdx(pOutput: TNNetVolume; const aIdx: array of integer); virtual;
       procedure ComputeErrorDeriv(); {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
       procedure Fill(value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
+      // Adds neurons to the layer.
       procedure AddNeurons(NeuronNum: integer);
+      // Calculates the number of missing neurons so the layer can have
+      // NeuronNum neurons. The missing neurons are then added.
       procedure AddMissingNeurons(NeuronNum: integer);
+      // Defines the number of weights for all neurons in the layer.
       procedure SetNumWeightsForAllNeurons(NumWeights: integer); overload;
+      // Defines the number of weights for all neurons in the layer.
       procedure SetNumWeightsForAllNeurons(x, y, d: integer); overload;
+      // Defines the number of weights for all neurons in the layer copying
+      // the configuration found at the Origin parameters.
       procedure SetNumWeightsForAllNeurons(Origin: TNNetVolume); overload;
+      // Returns the maximum weight value from all neurons in the layer.
       function GetMaxWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the maximum absolute weight value from all neurons in the layer.
       function GetMaxAbsWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the minimum weight value from all neurons in the layer.
       function GetMinWeight(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMinDelta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -247,34 +262,52 @@ type
       function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat; virtual;
       procedure GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      // Returns the sum of all weights from all neurons in the layer.
       function GetWeightSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the sum of all biases from all neurons in the layer.
       function GetBiasSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetInertiaSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the number of weights in the layer.
       function CountWeights(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the number of neurons in the layer.
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Multiplies all weights in the layer by value V.
       procedure MulWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      // Clear all biases from all neurons in the layer.
+      procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      // Sums all weights by their corresponding weights found at Origin.
+      // Both layers must have the same number of weights and neurons for this
+      // function to work as expected.
       procedure SumWeights(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltas(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      // Copies all weights by their corresponding weights found at Origin.
+      // Both layers must have the same number of weights and neurons for this
+      // function to work as expected.
       procedure CopyWeights(Origin: TNNetLayer); virtual;
       procedure ForceRangeWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ForcePositiveWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeWeights(VMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function SaveDataToString(): string; virtual;
-      procedure LoadDataFromString(strData: string);
+      procedure LoadDataFromString(strData: string); virtual;
+      // Saves the layer structure to a string so the layer can be later
+      // restored/reconstructed.
       function SaveStructureToString(): string; virtual;
       procedure SetBatchUpdate(pBatchUpdate: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
       function InitBasicPatterns(): TNNetLayer;
 
-      // Backprop call cnt
+      // Increments an internal counter that counts how many branches load
+      // the output of the current layer.
       procedure IncDepartingBranchesCnt(); {$IFDEF Release} inline; {$ENDIF}
+      // Decrements an internal counter that counts how many branches load
+      // the output of the current layer.
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
 
       // Initializers
@@ -490,6 +523,13 @@ type
   /// Swish activation function
   // https://arxiv.org/abs/1710.05941
   TNNetSwish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
+  /// Hard Swish Activation function
+  // https://paperswithcode.com/method/hard-swish
+  TNNetHardSwish = class(TNNetReLUBase)
   public
     procedure Compute(); override;
   end;
@@ -982,6 +1022,7 @@ type
       FFeatureSizeX, FFeatureSizeY: integer;
       FFeatureSizeYMinus1, FFeatureSizeXMinus1: integer;
       FInputCopy: TNNetVolume;
+      FPrevLayerErrorPadded: TNNetVolume;
       FSizeXDepth: integer;
       FSizeXDepthBytes: integer;
       FPrevSizeXDepthBytes: integer;
@@ -989,6 +1030,7 @@ type
       function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer;
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure RefreshPrevSizeXDepthBytes();
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
       destructor Destroy(); override;
@@ -1100,6 +1142,12 @@ type
     constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); override;
   end;
 
+  /// Grouped pointwise convolution with HardSwish activation.
+  TNNetGroupedPointwiseConvHardSwish = class(TNNetGroupedPointwiseConvLinear)
+  public
+    constructor Create(pNumFeatures, pGroups: integer; pSuppressBias: integer = 0); override;
+  end;
+
   /// Convolutional layer with hyperbolic tangent activation function.
   TNNetConvolution = class(TNNetConvolutionBase)
     protected
@@ -1164,6 +1212,12 @@ type
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
   TNNetConvolutionSwish = class(TNNetConvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+  end;
+
+  /// Convolutional layer with Hard Swish activation function.
+  TNNetConvolutionHardSwish = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
@@ -1366,15 +1420,19 @@ type
       constructor Create();
       destructor Destroy(); override;
 
+      // Creates a layer from an input string.
       function CreateLayer(strData: string): TNNetLayer;
+      // Adds a layer or layers to this neural network.
       function AddLayer(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayer(strData: string): TNNetLayer; overload;
+      // Adds a layer of layers after another layers (for non sequencial models)
       function AddLayer(pLayers: array of TNNetLayer): TNNetLayer; overload;
       function AddLayerAfter(pLayer, pAfterLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerAfter(pLayer: TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
       function AddLayerAfter(strData: string; pAfterLayerIdx: integer): TNNetLayer; overload;
       function AddLayerAfter(pLayers: array of TNNetLayer; pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerAfter(pLayers: array of TNNetLayer; pAfterLayerIdx: integer): TNNetLayer; overload;
+      // Adds a layer and concats the input into the output.
       function AddLayerConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
       function AddLayerConcatingInputOutput(pLayer: TNNetLayer): TNNetLayer; overload;
       function AddLayerDeepConcatingInputOutput(pLayers: array of TNNetLayer): TNNetLayer; overload;
@@ -1447,23 +1505,51 @@ type
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
+      // Returns the layer index of the first neuronal layer (layers that have neurons).
       function GetFirstNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the layer index of the first neuronal layer that can process an image as input.
       function GetFirstImageNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
       function GetFirstNeuronalLayerIdxWithChannels(FromLayerIdx, Channels:integer): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the index of the last layer.
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Returns the last layer.
       function GetLastLayer(): TNNetLayer;
+      // Returns a layer of random index.
       function GetRandomLayer(): TNNetLayer;
+      // Computes the forward pass with pInput. The output is returned
+      // at pOutput. You can optionally compute from an intermediate layer defined
+      // at FromLayerIdx. This method should be used when you have either multiple
+      // inputs or multiple outputs.
       procedure Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx:integer = 0); overload;
+      // Computes the forward pass with pInput. The output is returned
+      // at pOutput. You can optionally compute from an intermediate layer defined
+      // at FromLayerIdx.
       procedure Compute(pInput, pOutput: TNNetVolume; FromLayerIdx:integer = 0); overload;
+      // Computes the forward pass with pInput.
+      // You can optionally compute from an intermediate layer defined
+      // at FromLayerIdx.
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0); overload;
+      // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNNetVolume); overload;
+      // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNeuralFloatDynArr); overload;
+      // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNeuralFloat; FromLayerIdx:integer = 0); overload;
+      // Computes the backward pass.
+      // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
+      // This method will train the neural network to find the desired pOutput
+      // for the previously called "compute" forward pass method.
       procedure Backpropagate(pOutput: TNNetVolume); overload;
+      // Computes the backward pass.
+      // You may find theoretical info at https://en.wikipedia.org/wiki/Backpropagation.
+      // This method will train the neural network to find the desired pOutput
+      // for the previously called "compute" forward pass method.
+      procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
       procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
-      procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
+      // Returns the output.
       procedure GetOutput(pOutput: TNNetVolume);
+      // Sums the output of this NN into pOutput.
       procedure AddOutput(pOutput: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure SetActivationFn(ActFn, ActFnDeriv: TNeuralActivationFunction);
       procedure SetLearningRate(pLearningRate, pInertia: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -1494,6 +1580,7 @@ type
       function GetMaxAbsoluteDelta(): TNeuralFloat;
       function NormalizeMaxAbsoluteDelta(NewMax: TNeuralFloat = 0.1): TNeuralFloat;
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
+      procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
 
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
@@ -1525,22 +1612,27 @@ type
       // Load architecture from string
       procedure LoadStructureFromString(strData: string);
 
-      // Save both architecture and weights to string (complete saving).
+      // Save both architecture and weights to string.
+      // You can use SaveToString to store a trained NN to a string.
       function SaveToString(): string;
-      // Save both architecture and weights to file (complete saving).
+      // Save both architecture and weights to file.
+      // You can use SaveToFile to store a trained NN to a file.
       procedure SaveToFile(filename: string);
 
-      // Save both architecture and weights from string (complete saving).
+      // Load both architecture and weights from string.
+      // You can use LoadFromString to load a trained NN from a string.
       procedure LoadFromString(strData: string);
-      // Load both architecture and weights from file (complete saving).
+      // Load both architecture and weights from file.
+      // You can use LoadFromFile to load a trained NN from a file.
       procedure LoadFromFile(filename: string);
       procedure LoadFromStream(stream : TStream);
 
-      // Returns a cloned neural network
+      // Clones the neural network and returns the clone.
       function Clone(): TNNet;
 
-      // deprecated
+      // deprecated - do not use it.
       procedure MulWeightsGlorotBengio(V:TNeuralFloat); deprecated;
+      // deprecated - do not use it.
       procedure MulWeightsHe(V:TNeuralFloat); deprecated;
 
       // custom layers support
@@ -1896,6 +1988,94 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+{ TNNetGroupedPointwiseConvHardSwish }
+constructor TNNetGroupedPointwiseConvHardSwish.Create(pNumFeatures,
+  pGroups: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pGroups, pSuppressBias);
+  FActivationFn := @HardSwish;
+  FActivationFnDerivative := @HardSwishDerivative;
+end;
+
+{ TNNetHardSwish }
+
+procedure TNNetHardSwish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else if x < -3 then
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x*(x + 3)/6;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.3333*x + 0.5;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+      end
+      else if x < -3 then
+      begin
+        FOutput.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x*(x + 3)/6;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetConvolutionHardSwish }
+
+constructor TNNetConvolutionHardSwish.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @HardSwish;
+  FActivationFnDerivative := @HardSwishDerivative;
+end;
+
+{ TNNetConvolutionSwish }
+
+constructor TNNetConvolutionSwish.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @Swish;
+  FActivationFnDerivative := @SwishDerivative;
 end;
 
 { TNNetScaleLearning }
@@ -2274,7 +2454,15 @@ begin
   LocalDestPtr := nil;
   // Debug code: FOutputError.ForceMaxAbs(1);
   GroupDSize := OutputError.Depth div FStruct[5];
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
   //PrevNumElements := (FSizeXDepth div 4) * 4;
   //PrevMissedElements := FSizeXDepth - PrevNumElements;
   NeuronWeights := FArrNeurons[0].Delta.Size;
@@ -2284,7 +2472,7 @@ begin
   MissedElements := NeuronWeights - localNumElements;
   for OutputY := 0 to MaxY do
   begin
-    PrevY := (OutputY*FStride)-FPadding;
+    PrevY := (OutputY*FStride);
     for TileXCnt := 0 to FMaxTileX do
     begin
       StartTileX := TileXCnt * FTileSizeX;
@@ -2297,9 +2485,9 @@ begin
         begin
           for OutputX := StartTileX to EndTileX do
           begin
-            PrevX := (OutputX*FStride)-FPadding;
+            PrevX := (OutputX*FStride);
             CanBackpropOnPos :=
-              (PrevX >= 0) and (PrevY >= 0) and
+              //(PrevX >= 0) and (PrevY >= 0) and
               (PrevX < FMaxPrevX) and
               (PrevY < FMaxPrevY);
             OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
@@ -2403,6 +2591,7 @@ var
   GroupDSize: integer;
   OutputD: integer;
   GroupId, GroupDStart: integer;
+  LocalPrevError: TNNetVolume;
 begin
   inherited SetPrevLayer(pPrevLayer);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*(pPrevLayer.Output.Depth div FStruct[5]);
@@ -2420,8 +2609,18 @@ begin
     FArrGroupId[OutputD] := GroupId;
     FArrGroupIdStart[OutputD] := GroupDStart;
   end;
-  FMaxPrevX := 1 + FPrevLayer.FOutput.SizeX - FFeatureSizeX;
-  FMaxPrevY := 1 + FPrevLayer.FOutput.SizeY - FFeatureSizeY;
+
+  if FPadding > 0 then
+  begin
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
+
+  FMaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  FMaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
 end;
 
 constructor TNNetGroupedConvolutionLinear.Create(pNumFeatures, pFeatureSize,
@@ -2464,7 +2663,8 @@ begin
 
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth div FStruct[5];
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
-    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+
+    RefreshPrevSizeXDepthBytes();
 
     PrepareInputForGroupedConvolutionFast();
 
@@ -3752,18 +3952,28 @@ begin
   bCanBackPropagate :=
     (FPrevLayer.OutputError.Depth = FArrNeurons[0].Weights.Depth) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+  end;
   for CntY := 0 to MaxY do
   begin
-    PrevY := (CntY*FStride)-FPadding;
+    PrevY := (CntY*FStride);
     for CntX := 0 to MaxX do
     begin
-      PrevX := (CntX*FStride)-FPadding;
+      PrevX := (CntX*FStride);
       for NeuronIdx := 0 to MaxNeuronIdx do
       begin
         BackpropagateAtOutputPos(CntX, CntY, NeuronIdx, PrevX, PrevY, bCanBackPropagate);
       end;
     end;
   end;
+
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
+  end;
+
   //Write('Error:');FOutputError.PrintDebug();WriteLn;
   //Write('Error Deriv:');FOutputErrorDeriv.PrintDebug();WriteLn;
   if (not FBatchUpdate) then
@@ -3796,7 +4006,15 @@ begin
   MaxFeatureX := FFeatureSizeX - 1;
   MaxFeatureY := FFeatureSizeY - 1;
   MaxNeuronIdx := FNeurons.Count - 1;
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
   LocalPrevSizeX := LocalPrevError.SizeX;
   LocalPrevSizeY := LocalPrevError.SizeY;
   bCanBackPropagate :=
@@ -3814,10 +4032,10 @@ begin
     LocalWeight := FArrNeurons[0].Weights;
     for OutputY := 0 to MaxY do
     begin
-      PrevY := (OutputY*FStride)-FPadding;
+      PrevY := (OutputY*FStride);
       for OutputX := 0 to MaxX do
       begin
-        PrevX := (OutputX*FStride)-FPadding;
+        PrevX := (OutputX*FStride);
         OutputErrorDerivLearningPtr := FOutputError.GetRawPtr(OutputX, OutputY);
         OutputErrorDerivPtr := FOutputErrorDeriv.GetRawPtr(OutputX, OutputY);
           {$IFDEF Debug}
@@ -3878,10 +4096,10 @@ begin
   begin
     for OutputY := 0 to MaxY do
     begin
-      PrevY := (OutputY*FStride)-FPadding;
+      PrevY := (OutputY*FStride);
       for OutputX := 0 to MaxX do
       begin
-        PrevX := (OutputX*FStride)-FPadding;
+        PrevX := (OutputX*FStride);
         for NeuronIdx := 0 to MaxNeuronIdx do
         begin
           LocalDelta := FArrNeurons[NeuronIdx].Delta;
@@ -3931,6 +4149,11 @@ begin
     end;
   end;
 
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
+  end;
+
   //Write('Error:');FOutputError.PrintDebug();WriteLn;
   //Write('Error Deriv:');FOutputErrorDeriv.PrintDebug();WriteLn;
   if (not FBatchUpdate) then
@@ -3958,7 +4181,14 @@ begin
   LocalDepth := LocalWeight.Depth * NeuronIdx;
   OutputErrorDerivLearningPtr := FOutputError.GetRawPtr(OutputX, OutputY, LocalDepth);
   OutputErrorDerivPtr := FOutputErrorDeriv.GetRawPtr(OutputX, OutputY, LocalDepth);
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
   LocalPrevSizeX := LocalPrevError.SizeX;
   LocalPrevSizeY := LocalPrevError.SizeY;
   {$IFDEF Debug}
@@ -4159,7 +4389,7 @@ begin
       else FInputCopy := FPrevLayer.Output;
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
-    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+    RefreshPrevSizeXDepthBytes();
     ComputeCPUFast();
     FForwardTime := FForwardTime + (Now() - StartTime);
   end
@@ -4184,6 +4414,7 @@ begin
     FOutputError.Copy(FOutputErrorDeriv);
     FOutputError.Mul(-FLearningRate);
     BackpropagateCPUFast();
+    //BackpropagateCPU();
   end
   else
   begin
@@ -6461,6 +6692,12 @@ begin
       WriteLn('Error: weight sum doesn''t match on layer:',I);
       AllGood := False;
     end;
+
+    if NN.Layers[I].GetBiasSum() <> NN2.Layers[I].GetBiasSum() then
+    begin
+      WriteLn('Error: bias sum doesn''t match on layer:',I); 
+      AllGood := False;
+    end;
   end;
   if AllGood
   then WriteLn('Structural testing has passed.');
@@ -7994,14 +8231,6 @@ begin
   FActivationFnDerivative := @Swish6Derivative;
 end;
 
-constructor TNNetConvolutionSwish.Create(pNumFeatures, pFeatureSize,
-  pInputPadding, pStride, pSuppressBias: integer);
-begin
-  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
-  FActivationFn := @SwishUnit;
-  FActivationFnDerivative := @SwishDerivative;
-end;
-
 { TNNetPoolBase }
 procedure TNNetPoolBase.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
@@ -8347,6 +8576,22 @@ begin
   RefreshCalculatePrevLayerError();
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureSizeX, FPadding, FStride);
   FOutputSizeY := CalcOutputSize(pPrevLayer.Output.SizeY, FFeatureSizeY, FPadding, FStride);
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.ReSize( pPrevLayer.OutputError.SizeX + FPadding*2, pPrevLayer.OutputError.SizeY + FPadding*2, pPrevLayer.OutputError.Depth );
+  end;
+end;
+
+procedure TNNetConvolutionAbstract.RefreshPrevSizeXDepthBytes();
+begin
+  if FPadding > 0 then
+  begin
+    FPrevSizeXDepthBytes := FPrevLayerErrorPadded.IncYSizeBytes();
+  end
+  else
+  begin
+    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+  end;
 end;
 
 function TNNetConvolutionAbstract.CalcOutputSize(pInputSize, pFeatureSize, pInputPadding,
@@ -8412,7 +8657,15 @@ begin
       if (FCalculatePrevLayerError) then
       begin
         LocalWeight := FArrNeurons[OutputD].Weights;
-        LocalPrevError := FPrevLayer.OutputError;
+        if FPadding > 0 then
+        begin
+          LocalPrevError := FPrevLayerErrorPadded;
+        end
+        else
+        begin
+          LocalPrevError := FPrevLayer.OutputError;
+        end;
+
         if FPointwise then
         begin
           LocalDestPtr := LocalPrevError.GetRawPtr(OutputX, OutputY);
@@ -8634,7 +8887,8 @@ begin
 
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
-    FPrevSizeXDepthBytes := FPrevLayer.Output.IncYSizeBytes();
+
+    RefreshPrevSizeXDepthBytes();
 
     //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
     PrepareInputForConvolutionFast();
@@ -8708,16 +8962,20 @@ begin
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+  end;
 
   for CntY := 0 to MaxY do
   begin
-    PrevY := (CntY*FStride)-FPadding;
+    PrevY := (CntY*FStride);
     for CntX := 0 to MaxX do
     begin
-      PrevX := (CntX*FStride)-FPadding;
+      PrevX := (CntX*FStride);
       OutputRawPos := FOutputErrorDeriv.GetRawPos(CntX, CntY);
       CanBackpropOnPos :=
-        (PrevX >= 0) and (PrevY >= 0) and
+        //(PrevX >= 0) and (PrevY >= 0) and
         (PrevX < 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX) and
         (PrevY < 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY);
       for NeuronIdx := 0 to MaxD do
@@ -8726,6 +8984,11 @@ begin
         Inc(OutputRawPos);
       end;
     end;
+  end;
+
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
   end;
 
   if (not FBatchUpdate) then
@@ -8763,9 +9026,17 @@ begin
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
   LocalDestPtr := nil;
-  MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
-  MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
+  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
 //  PrevNumElements := (FSizeXDepth div 4) * 4;
 //  PrevMissedElements := FSizeXDepth - PrevNumElements;
 //  NeuronWeights := FArrNeurons[0].Delta.Size;
@@ -8776,16 +9047,16 @@ begin
     begin
       for OutputY := 0 to MaxY do
       begin
-        PrevY := (OutputY*FStride)-FPadding;
+        PrevY := (OutputY*FStride);
         for OutputX := 0 to MaxX do
         begin
-          PrevX := (OutputX*FStride)-FPadding;
+          PrevX := (OutputX*FStride);
           OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY);
           //TODO: the next line is probably wrong.
-          if (FCalculatePrevLayerError) then LocalDestPtr  := LocalPrevError.GetRawPtr(OutputX, OutputY);
+          if (FCalculatePrevLayerError) then LocalDestPtr := LocalPrevError.GetRawPtr(OutputX, OutputY);
           PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
           CanBackpropOnPos :=
-            (PrevX >= 0) and (PrevY >= 0) and
+            //(PrevX >= 0) and (PrevY >= 0) and
             (PrevX < MaxPrevX) and
             (PrevY < MaxPrevY);
           for OutputD := 0 to MaxD do
@@ -8905,6 +9176,11 @@ begin
       end;
     end;
 
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
+  end;
+
   if (not FBatchUpdate) then
   begin
     for OutputD := 0 to MaxD do FArrNeurons[OutputD].UpdateWeights(FInertia);
@@ -8941,9 +9217,18 @@ begin
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
   LocalDestPtr := nil;
-  MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
-  MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
+  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
+
   PrevNumElements := (FSizeXDepth div 4) * 4;
   PrevMissedElements := FSizeXDepth - PrevNumElements;
   NeuronWeights := FArrNeurons[0].Delta.Size;
@@ -8953,7 +9238,7 @@ begin
   LocalLearningErrorDerivPtr := Addr(LocalLearningErrorDeriv);
   for OutputY := 0 to MaxY do
   begin
-    PrevY := (OutputY*FStride)-FPadding;
+    PrevY := (OutputY*FStride);
     for TileXCnt := 0 to FMaxTileX do
     begin
       StartTileX := TileXCnt * FTileSizeX;
@@ -8966,10 +9251,10 @@ begin
         begin
           for OutputX := StartTileX to EndTileX do
           begin
-            PrevX := (OutputX*FStride)-FPadding;
+            PrevX := (OutputX*FStride);
             PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
             CanBackpropOnPos :=
-              (PrevX >= 0) and (PrevY >= 0) and
+              //(PrevX >= 0) and (PrevY >= 0) and
               (PrevX < MaxPrevX) and
               (PrevY < MaxPrevY);
             if (FCalculatePrevLayerError and CanBackpropOnPos) then LocalDestPtr  := LocalPrevError.GetRawPtr(PrevX, PrevY);
@@ -9091,6 +9376,11 @@ begin
         end;
       end;
     end;
+  end;
+
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
   end;
 
   if (not FBatchUpdate) then
@@ -9302,14 +9592,20 @@ begin
   FPadding := pInputPadding;
   FStride := Max(pStride,1);
   FSuppressBias := pSuppressBias;
-  if FPadding > 0
-    then FInputCopy := TNNetVolume.Create;
+  if FPadding > 0 then
+  begin
+    FInputCopy := TNNetVolume.Create;
+    FPrevLayerErrorPadded := TNNetVolume.Create;
+  end;
 end;
 
 destructor TNNetConvolutionAbstract.Destroy();
 begin
-  if FPadding > 0
-    then FInputCopy.Free;
+  if FPadding > 0 then
+  begin
+    FInputCopy.Free;
+    FPrevLayerErrorPadded.Free;
+  end;
   inherited Destroy();
 end;
 
@@ -9937,6 +10233,7 @@ begin
     if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
     if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
     if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
+    if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
     if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
     if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
     if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
@@ -9969,11 +10266,13 @@ begin
     if S[0] = 'TNNetConvolutionGeLU' then Result := TNNetConvolutionGeLU.Create(St[0], St[1], St[2], St[3], St[4]) else
     if S[0] = 'TNNetConvolutionSwish6' then Result := TNNetConvolutionSwish6.Create(St[0], St[1], St[2], St[3], St[4]) else
     if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
+    if S[0] = 'TNNetConvolutionHardSwish' then Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
     if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
     if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
     if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
     if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
     if S[0] = 'TNNetGroupedPointwiseConvReLU' then Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
+    if S[0] = 'TNNetGroupedPointwiseConvHardSwish' then Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
     if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
     if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
     if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
@@ -10132,14 +10431,21 @@ var
   EachGroupOutput: array of TNNetLayer;
   GroupCnt: integer;
 begin
-  PreviousLayer := GetLastLayer();
+  if pInputPadding > 0 then
+  begin
+    PreviousLayer := AddLayer( TNNetPad.Create(pInputPadding) );
+  end
+  else
+  begin
+    PreviousLayer := GetLastLayer();
+  end;
   Result := PreviousLayer;
   SetLength(EachGroupOutput, Groups);
   FeaturesPerGroup := pNumFeatures div Groups;
   InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Groups;
   if Groups = 1 then
   begin
-    Result := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, pInputPadding, pStride, pSuppressBias) );
+    Result := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, {pInputPadding=}0, pStride, pSuppressBias) );
   end;
   if Groups > 1 then
   begin
@@ -10148,7 +10454,7 @@ begin
       if ChannelInterleaving
         then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
         else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
-      EachGroupOutput[GroupCnt] := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, pInputPadding, pStride, pSuppressBias) );
+      EachGroupOutput[GroupCnt] := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, {pInputPadding=}0, pStride, pSuppressBias) );
     end;
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
@@ -11191,6 +11497,20 @@ begin
   end;
 end;
 
+procedure TNNet.ClearBias();
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count > 1 then
+  begin
+    for LayerCnt := 1 to GetLastLayerIdx() do
+    begin
+      FLayers[LayerCnt].ClearBias();
+      FLayers[LayerCnt].AfterWeightUpdate();
+    end;
+  end;
+end;
+
 {$IFDEF OpenCL}
 procedure TNNet.DisableOpenCL();
 var
@@ -11501,7 +11821,8 @@ begin
           IntToStr(FLayers[LayerCnt].Output.Depth),
           ' Learning Rate:',FLayers[LayerCnt].LearningRate:6:4,
           ' Inertia:',FLayers[LayerCnt].Inertia:4:2,
-          ' Weight Sum:', FLayers[LayerCnt].GetWeightSum():8:4
+          ' Weight Sum:', FLayers[LayerCnt].GetWeightSum():8:4,
+          ' Bias Sum:', FLayers[LayerCnt].GetBiasSum():8:4
         );
 
       if Assigned(FLayers[LayerCnt].PrevLayer) then
@@ -11842,6 +12163,9 @@ end;
 procedure TNNetLayer.ApplyActivationFunctionToOutput();
 var
   OutputCnt, OutputMax: integer;
+  {$IFDEF FPC}
+  x: TNeuralFloat;
+  {$ENDIF}
 begin
   OutputMax := FOutput.Size - 1;
   if OutputMax >= 0 then
@@ -11865,6 +12189,26 @@ begin
     if FActivationFn = @RectifiedLinearUnit then
     begin
       FOutput.CopyRelu(FOutputRaw);
+    end
+    else
+    if FActivationFn = @HardSwish then
+    begin
+      for OutputCnt := 0 to OutputMax do
+      begin
+        x := FOutputRaw.FData[OutputCnt];
+        if x > 3 then
+        begin
+          FOutput.FData[OutputCnt] := x;
+        end
+        else if x < -3 then
+        begin
+          FOutput.FData[OutputCnt] := 0;
+        end
+        else
+        begin
+          FOutput.FData[OutputCnt] := x*(x + 3)/6;
+        end;
+      end;
     end
     else
     begin
@@ -12578,6 +12922,19 @@ begin
     end;
   end;
   AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.ClearBias();
+var
+  Cnt: integer;
+begin
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].FBiasWeight := 0;
+    end;
+  end
 end;
 
 procedure TNNetLayer.ClearInertia();

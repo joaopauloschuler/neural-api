@@ -1,8 +1,11 @@
 ///This file has an implementation to classify
-//plant leaf diseases. You can get the dataset at
-//https://data.mendeley.com/datasets/tywbtsjrjv/1/files/d5652a28-c1d8-4b76-97f3-72fb80f94efc/Plant_leaf_diseases_dataset_without_augmentation.zip?dl=1 .
-//Folders with plant diseases will need to be stored inside of a folder named "plant".
-program SimplePlantLeafDisease;
+// malaria infected cell images.
+//
+// You can get the dataset at
+// https://data.lhncbc.nlm.nih.gov/public/Malaria/cell_images.zip
+// https://www.tensorflow.org/datasets/catalog/malaria
+
+program MalariaImageClassification;
 (*
  Coded by Joao Paulo Schwarz Schuler.
  https://github.com/joaopauloschuler/neural-api
@@ -42,17 +45,17 @@ type
       TNNetConvolutionReLU.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}2),
       TNNetDropout.Create(0.5),
       TNNetMaxPool.Create(2),
-      TNNetFullConnectLinear.Create(39),
+      TNNetFullConnectLinear.Create(2),
       TNNetSoftMax.Create()
     ]);
     NN.DebugStructure();
-    // change ProportionToLoad to a smaller number if you don't have available 16GB of RAM.
+    // change ProportionToLoad to a smaller number if you don't have available 4GB of RAM.
     ProportionToLoad := 1;
-    WriteLn('Loading ', Round(ProportionToLoad*100), '% of the Plant leave disease dataset into memory.');
+    WriteLn('Loading ', Round(ProportionToLoad*100), '% of the malaria dataset into memory.');
     CreateVolumesFromImagesFromFolder
     (
       ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes,
-      {FolderName=}'plant', {pImageSubFolder=}'',
+      {FolderName=}'cell_images', {pImageSubFolder=}'',
       {color_encoding=}0{RGB},
       {TrainingProp=}0.9*ProportionToLoad,
       {ValidationProp=}0.05*ProportionToLoad,
@@ -68,14 +71,13 @@ type
     );
 
     NeuralFit := TNeuralImageFit.Create;
-    NeuralFit.FileNameBase := 'SimplePlantLeafDisease';
+    NeuralFit.FileNameBase := 'Malaria';
     NeuralFit.InitialLearningRate := 0.001;
     NeuralFit.LearningRateDecay := 0.01;
     NeuralFit.StaircaseEpochs := 10;
     NeuralFit.Inertia := 0.9;
     NeuralFit.L2Decay := 0.00001;
-    //NeuralFit.MaxThreadNum := 8;
-    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}39, {batchsize=}64, {epochs=}50);
+    NeuralFit.Fit(NN, ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes, {NumClasses=}2, {batchsize=}64, {epochs=}50);
     NeuralFit.Free;
 
     NN.Free;
@@ -89,7 +91,7 @@ var
   Application: TTestCNNAlgo;
 begin
   Application := TTestCNNAlgo.Create(nil);
-  Application.Title:='Plant Leaf Disease Classification';
+  Application.Title:='Malaria Cell Infection Classification';
   Application.Run;
   Application.Free;
 end.

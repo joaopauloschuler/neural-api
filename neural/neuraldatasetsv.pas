@@ -25,9 +25,25 @@ unit neuraldatasetsv;
 interface
 
 uses
-  neuraldatasets, Classes, SysUtils, ExtCtrls, Graphics,
-  neuralvolume, neuralnetwork, StdCtrls
-  {$IFNDEF FPC}, Windows{$ENDIF}
+  neuraldatasets, Classes, SysUtils,
+  neuralvolume, neuralnetwork,
+  {$IFDEF FPC}
+  ExtCtrls,
+  StdCtrls,
+  Graphics
+  {$ENDIF}
+  {$IFNDEF FPC}
+  Windows,
+  {$IF CompilerVersion >= 23}
+  VCL.ExtCtrls,
+  VCL.StdCtrls,
+  VCL.Graphics
+  {$ELSE}
+  ExtCtrls,
+  StdCtrls,
+  Graphics
+  {$IFEND}
+  {$ENDIF}
   ;
 
 type
