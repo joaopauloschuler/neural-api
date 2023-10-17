@@ -203,7 +203,7 @@ type
     procedure CopyChannels(Original: TVolume; aChannels: array of integer);
     procedure Define(Original: array of T);
     function DotProduct(Original: TVolume): T; overload; {$IFDEF Release} inline; {$ENDIF}
-    class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
+    class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload;
     class function Product(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
     function SumDiff(Original: TVolume): T;  {$IFDEF Release} inline; {$ENDIF}
     procedure DebugDiff(Original: TVolume; Limit: Single = 0);
@@ -700,7 +700,7 @@ implementation
 {$ENDIF}
 
 uses {$IFNDEF x64} Neural.AVX {$ELSE} Neural.AVXx64{$ENDIF}, neuralbit,
-     Math, CPUFeatures;
+     CPUFeatures;
 
 function CreateTokenizedStringList(str: string; c:char):TStringList;
 begin
@@ -2364,8 +2364,10 @@ procedure TNNetDictionary.LoadDictionaryFromFile(Filename: string;
 var
   Sep: TStringList;
   CurrentLine: string;
+  {$IFDEF DEBUG}
   Word: string;
   WordCount: string;
+  {$ENDIF}
   FileHandler: TextFile;
 begin
   Clear;

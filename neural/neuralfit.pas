@@ -93,6 +93,10 @@ type
       {$ENDIF}
       FProcs: TNeuralThreadList;
       procedure CheckLearningRate(iEpochCount: integer);
+    protected
+      procedure DoAfterEpoch; virtual;
+      procedure DoAfterStep; virtual;
+      procedure DoOnStart; virtual;
     public
       constructor Create();
       destructor Destroy(); override;
@@ -616,7 +620,7 @@ begin
   begin
     MessageProc('Computing...');
   end;
-  if Assigned(FOnStart) then FOnStart(Self);
+  DoOnStart;
   globalStartTime := Now();
   while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
@@ -670,7 +674,7 @@ begin
 
         startTime := Now();
       end;
-      if Assigned(FOnAfterStep) then FOnAfterStep(Self);
+      DoAfterStep;
       Inc(FCurrentStep);
     end;
 
@@ -807,7 +811,7 @@ begin
         'Epochs: '+IntToStr(FCurrentEpoch)+
         '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
 
-    if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
+    DoAfterEpoch;
   end;
 
   if TestBestAtEnd and
@@ -880,7 +884,7 @@ function TNeuralFit.FitTrainingPair(Idx: integer; ThreadId: integer): TNNetVolum
 var
   ElementIdx: integer;
 begin
-  ElementIdx := Random(FTrainingVolumes.Count);
+  ElementIdx := Random(FTrainingVolumes.Count);          // this is not thread save!
   FitTrainingPair := FTrainingVolumes[ElementIdx];
 end;
 
@@ -1516,6 +1520,24 @@ begin
   inherited Destroy();
 end;
 
+procedure TNeuralFitBase.DoAfterEpoch;
+begin
+     if Assigned(FOnAfterEpoch) then
+        fOnAfterEpoch(self);
+end;
+
+procedure TNeuralFitBase.DoOnStart;
+begin
+     if Assigned(FOnStart) then
+        FOnStart(self);
+end;
+
+procedure TNeuralFitBase.DoAfterStep;
+begin
+     if Assigned(FOnAfterStep) then
+        fOnAfterStep(self);
+end;
+
 procedure TNeuralFitBase.WaitUntilFinished;
 begin
   FShouldQuit := true;
@@ -1771,7 +1793,8 @@ begin
   begin
     MessageProc('Computing...');
   end;
-  if Assigned(FOnStart) then FOnStart(Self);
+  DoOnStart;
+
   globalStartTime := Now();
   while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
@@ -1855,7 +1878,7 @@ begin
 
         startTime := Now();
       end;
-      if Assigned(FOnAfterStep) then FOnAfterStep(Self);
+      DoAfterStep;
       Inc(FCurrentStep);
     end; // of epoch
     {$IFDEF Debug}
@@ -1997,7 +2020,7 @@ begin
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
       end;
-      if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
+      DoAfterEpoch;
 
       CloseFile(CSVFile);
       AssignFile(CSVFile, FileNameCSV);
