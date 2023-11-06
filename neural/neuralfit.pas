@@ -559,7 +559,7 @@ var
           begin
             FMessageProc(
               'Epochs: ' + IntToStr(FCurrentEpoch) +
-              ' Examples seen:' + IntToStr(FCurrentEpoch * TrainingCnt) +
+              ' Examples seen:' + IntToStr(Int64(FCurrentEpoch) * Int64(TrainingCnt)) +
               ' Test Accuracy: ' + FloatToStrF(TestRate,ffFixed,6,4) +
               ' Test Error: ' + FloatToStrF(TestError,ffFixed,6,4) +
               ' Test Loss: ' + FloatToStrF(TestLoss,ffFixed,6,4) +
@@ -662,7 +662,7 @@ begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
         if FVerbose then MessageProc
         (
-          IntToStr((FGlobalHit + FGlobalMiss)*I + FCurrentEpoch*TrainingCnt) +
+          IntToStr(Int64((FGlobalHit + FGlobalMiss))*Int64(I) + Int64(FCurrentEpoch)*Int64(TrainingCnt)) +
           ' Examples seen. Accuracy: ' + FloatToStrF(FTrainingAccuracy,ffFixed,6,4) +
           ' Error: ' + FloatToStrF(TrainingError,ffFixed,10,5) +
           ' Loss: ' + FloatToStrF(TrainingLoss,ffFixed,7,5) +
@@ -722,7 +722,7 @@ begin
         begin
           FMessageProc(
             'Epochs: ' + IntToStr(FCurrentEpoch) +
-            ' Examples seen:' + IntToStr(FCurrentEpoch * TrainingCnt) +
+            ' Examples seen:' + IntToStr(Int64(FCurrentEpoch) * Int64(TrainingCnt)) +
             ' Validation Accuracy: ' + FloatToStrF(ValidationRate,ffFixed,6,4) +
             ' Validation Error: ' + FloatToStrF(ValidationError,ffFixed,6,4) +
             ' Validation Loss: ' + FloatToStrF(ValidationLoss,ffFixed,6,4) +
@@ -1672,7 +1672,7 @@ var
           begin
             FMessageProc(
               'Epochs: ' + IntToStr(FCurrentEpoch) +
-              ' Examples seen:' + IntToStr(FCurrentEpoch * FImgVolumes.Count) +
+              ' Examples seen:' + IntToStr(Int64(FCurrentEpoch) * Int64(FImgVolumes.Count)) +
               ' Test Accuracy: ' + FloatToStrF(TestRate,ffFixed,6,4) +
               ' Test Error: ' + FloatToStrF(TestError,ffFixed,6,4) +
               ' Test Loss: ' + FloatToStrF(TestLoss,ffFixed,6,4) +
@@ -1866,7 +1866,7 @@ begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
         if FVerbose then MessageProc
         (
-          IntToStr((FGlobalHit + FGlobalMiss) * I + FCurrentEpoch*FImgVolumes.Count) +
+          IntToStr(Int64(FGlobalHit + FGlobalMiss) * Int64(I) + Int64(FCurrentEpoch)*Int64(FImgVolumes.Count)) +
           ' Examples seen. Accuracy: ' + FloatToStrF(FTrainingAccuracy,ffFixed,6,4) +
           ' Error: ' + FloatToStrF(TrainingError,ffFixed,10,5) +
           ' Loss: ' + FloatToStrF(TrainingLoss,ffFixed,7,5) +
@@ -1943,7 +1943,7 @@ begin
         begin
           FMessageProc(
             'Epochs: ' + IntToStr(FCurrentEpoch) +
-            ' Examples seen:' + IntToStr(FCurrentEpoch * FImgVolumes.Count) +
+            ' Examples seen:' + IntToStr(Int64(FCurrentEpoch) * Int64(FImgVolumes.Count)) +
             ' Validation Accuracy: ' + FloatToStrF(ValidationRate,ffFixed,6,4) +
             ' Validation Error: ' + FloatToStrF(ValidationError,ffFixed,6,4) +
             ' Validation Loss: ' + FloatToStrF(ValidationLoss,ffFixed,6,4) +
