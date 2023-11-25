@@ -275,14 +275,19 @@ type
     procedure CopyAsBits(var Original: array of byte; pFlase: T = -0.5; pTrue: T = +0.5); overload;
     procedure ReadAsBits(var Dest: array of byte; Threshold: T = 0.0);
 
-    // Classification Functions
+    // Classification Functions (SetClass is similar to One Hot Encoding)
     procedure SetClass(pClass: integer; value: T); {$IFNDEF FPC} overload; {$ENDIF}
     procedure SetClass(pClass: integer; TrueValue, FalseValue: T); {$IFNDEF FPC} overload; {$ENDIF}
     procedure SetClassForHiperbolicTangent(pClass: integer);
     procedure SetClassForReLU(pClass: integer);
     procedure SetClassForSoftMax(pClass: integer);
+    // GetClass is similar to argmax
     function GetClass(): integer;
     function SoftMax(): T;
+
+    procedure OneHotEncoding(aTokens: array of integer); overload;
+    procedure OneHotEncoding(aTokens: string); overload;
+    procedure OneHotEncodingReversed(aTokens: string); overload;
 
     // Color Encoding Functions
     procedure RgbToHsv(); {$IFDEF Release} inline; {$ENDIF}
@@ -5043,6 +5048,79 @@ begin
   end;
 
   Result := TotalSum;
+end;
+
+procedure TVolume.OneHotEncoding(aTokens: array of integer);
+var
+  CntToken, MaxToken, Token: integer;
+begin
+  MaxToken := Length(aTokens) - 1;
+  Self.Fill(0);
+  if MaxToken < SizeX then
+  begin
+    for CntToken := 0 to MaxToken do
+    begin
+      Token := aTokens[CntToken];
+      if Token < FDepth then
+      begin
+        Self[CntToken, 0, Token] := 1;
+      end
+      else
+      begin
+        WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncoding.');
+      end;
+    end;
+  end
+  else
+  begin
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncoding.');
+  end;
+end;
+
+procedure TVolume.OneHotEncoding(aTokens: string);
+var
+  CntToken, MaxToken, Token: integer;
+begin
+  MaxToken := Length(aTokens);
+  Self.Fill(0);
+  if MaxToken <= SizeX then
+  begin
+    for CntToken := 1 to MaxToken do
+    begin
+      Token := Ord(aTokens[CntToken]);
+      if Token < FDepth then
+      begin
+        Self[CntToken-1, 0, Token] := 1;
+      end
+    end;
+  end
+  else
+  begin
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingReversed.');
+  end;
+end;
+
+procedure TVolume.OneHotEncodingReversed(aTokens: string);
+var
+  CntToken, MaxToken, Token: integer;
+begin
+  MaxToken := Length(aTokens);
+  Self.Fill(0);
+  if MaxToken <= SizeX then
+  begin
+    for CntToken := 1 to MaxToken do
+    begin
+      Token := Ord(aTokens[CntToken]);
+      if Token < FDepth then
+      begin
+        Self[MaxToken-CntToken, 0, Token] := 1;
+      end;
+    end;
+  end
+  else
+  begin
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingReversed.');
+  end;
 end;
 
 procedure TVolume.RgbToHsv();
