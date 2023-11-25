@@ -1483,6 +1483,7 @@ type
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
+      function GetFirstLayer(): TNNetLayer;
       // Returns the layer index of the first neuronal layer (layers that have neurons).
       function GetFirstNeuronalLayerIdx(FromLayerIdx:integer = 0): integer; {$IFDEF Release} inline; {$ENDIF}
       // Returns the layer index of the first neuronal layer that can process an image as input.
@@ -1831,6 +1832,7 @@ type
   procedure TestConvolutionAPI();
   procedure TestDataParallelism(NN: TNNet);
 
+
   {$IFDEF OpenCL}
   procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
   procedure TestFullConnectOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
@@ -1854,6 +1856,9 @@ type
     ReLU: boolean = false;
     Threshold: TNeuralFloat = 0.5
   );
+
+  // Simple character based NLP function for building a string from characters.
+  function GenerateStringFromChars(NN: TNNet; InputString: string): string;
 
 implementation
 
@@ -1965,6 +1970,26 @@ begin
      {Threshold=}Threshold
     );
   end;
+end;
+
+function GenerateStringFromChars(NN: TNNet; InputString: string): string;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  NextTokenInt: integer;
+  NextTokenChar: char;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  repeat
+    InputVolume.OneHotEncodingReversed(InputString);
+    NN.Compute(InputVolume, OutputVolume);
+    NextTokenInt := OutputVolume.GetClass();
+    NextTokenChar := Char(NextTokenInt);
+    if NextTokenInt > 1 then InputString := InputString + NextTokenChar;
+  until (NextTokenInt < 2) or (Length(InputString)>=InputVolume.SizeX);
+  Result := InputString;
+  InputVolume.Free;
+  OutputVolume.Free;
 end;
 
 { TNNetGroupedPointwiseConvHardSwish }
@@ -10897,6 +10922,11 @@ end;
 procedure TNNet.AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
 begin
   MulMulAddWeights(CurrentElementCount/(CurrentElementCount+1), 1/(CurrentElementCount+1), NewElement);
+end;
+
+function TNNet.GetFirstLayer: TNNetLayer;
+begin
+  Result := FLayers[0];
 end;
 
 function TNNet.AddLayerAfter(pLayer, pAfterLayer: TNNetLayer): TNNetLayer;
