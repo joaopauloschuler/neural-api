@@ -178,7 +178,11 @@ type
   TNNetGet2VolumesProc = procedure(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume) of object;
 
   /// Fitting algorithm with data (pairs) loading
+
+  { TNeuralDataLoadingFit }
+
   TNeuralDataLoadingFit = class(TNeuralFitWithImageBase)
+  private
     protected
       FDataAugmentationFn: TNNetDataAugmentationFn;
       FInferHitFn: TNNetInferHitFn;
@@ -204,6 +208,7 @@ type
       procedure EnableBipolar99HitComparison();
       procedure EnableClassComparison();
       procedure EnableDefaultImageTreatment(); override;
+      procedure EnableDefaultLoss;
 
       // On most cases, you should never call the following methods directly
       procedure RunNNThread(index, threadnum: integer);
@@ -1446,11 +1451,16 @@ begin
   FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompare;
 end;
 
+procedure TNeuralDataLoadingFit.EnableDefaultLoss();
+begin
+  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
+end;
+
 procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
 begin
   inherited EnableDefaultImageTreatment();
   EnableClassComparison();
-  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
+  EnableDefaultLoss();
 end;
 
 { TNeuralFitBase }
