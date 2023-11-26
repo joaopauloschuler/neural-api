@@ -54,33 +54,34 @@ type
       FCurrentEpoch: integer;
       FCurrentStep: integer;
       FCurrentTrainingError: TNeuralFloat;
+      FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
+      FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
+      FDataAugmentation: boolean;
+      FFinishedThread: TNNetVolume;
+      {$IFDEF HASTHREADS}FCritSec: TRTLCriticalSection;{$ENDIF}
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
       FGlobalTotal: integer;
       FGlobalTotalLoss: single;
       FGlobalErrorSum: single;
-      FFinishedThread: TNNetVolume;
-      {$IFDEF HASTHREADS}FCritSec: TRTLCriticalSection;{$ENDIF}
-      FMultipleSamplesAtValidation: boolean;
-      FDataAugmentation: boolean;
-      FVerbose: boolean;
+      FInertia: single;
       FStaircaseEpochs: integer;
       FStepSize: integer;
+      FMaxEpochs: integer;
+      FMultipleSamplesAtValidation: boolean;
+      FVerbose: boolean;
       FLearningRateDecay: single;
       FInitialLearningRate: single;
       FCyclicalLearningRateLen: integer;
       FInitialEpoch: integer;
-      FMaxEpochs: integer;
       FMinLearnRate: single;
       FCurrentLearningRate: single;
-      FInertia: single;
       FL2Decay: TNeuralFloat;
+      FLogEveryBatches: integer;
       FFileNameBase: string;
       FClipDelta: single;
       FTargetAccuracy: single;
-      FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
-      FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
@@ -120,6 +121,7 @@ type
       property InitialLearningRate: single read FInitialLearningRate write FInitialLearningRate;
       property LearningRateDecay: single read FLearningRateDecay write FLearningRateDecay;
       property LoadBestAtEnd: boolean read FLoadBestAdEnd write FLoadBestAdEnd;
+      property LogEveryBatches: integer read FLogEveryBatches write FLogEveryBatches;
       property L2Decay: single read FL2Decay write FL2Decay;
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
       property MinBackpropagationError: TNeuralFloat read FMinBackpropagationError write FMinBackpropagationError;
@@ -652,7 +654,7 @@ begin
         FTrainingAccuracy := AccuracyWithInertia/100;
       end;
 
-      if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
+      if ( (FGlobalTotal > 0) and (I mod FLogEveryBatches = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
         if FVerbose then MessageProc
@@ -799,8 +801,8 @@ begin
     Append(CSVFile);
 
     MessageProc(
-      'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
-      ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
+      'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*FLogEveryBatches))/60,ffFixed,1,4)+' minutes.' +
+      ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*FLogEveryBatches))/3600,ffFixed,1,4)+' hours.');
 
     MessageProc(
       'Epochs: '+IntToStr(FCurrentEpoch)+
@@ -1504,6 +1506,7 @@ begin
   FCurrentStep := 0;
   FLoadBestAdEnd := True;
   FTestBestAtEnd := True;
+  FLogEveryBatches := 10;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -1837,7 +1840,7 @@ begin
         FTrainingAccuracy := AccuracyWithInertia/100;
       end;
 
-      if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
+      if ( (FGlobalTotal > 0) and (I mod FLogEveryBatches = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
         if FVerbose then MessageProc
@@ -2003,8 +2006,8 @@ begin
       Append(CSVFile);
 
       MessageProc(
-        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
-        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
+        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(pImgVolumes.Count/(FStepSize*FLogEveryBatches))/60,ffFixed,1,4)+' minutes.' +
+        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(pImgVolumes.Count/(FStepSize*FLogEveryBatches))/3600,ffFixed,1,4)+' hours.');
 
       MessageProc(
         'Epochs: '+IntToStr(FCurrentEpoch)+
