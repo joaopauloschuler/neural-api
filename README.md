@@ -40,6 +40,18 @@ Some recommended introductory source code examples are:
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
 * [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
 
+### Loading and Saving Neural Networks
+Loading is very easy:
+```
+    NN := TNNet.Create;
+    NN.LoadFromFile('MyTrainedNeuralNetwork.nn');
+```
+Saving is as easy:
+
+```
+    NN.SaveToFile('MyTrainedNeuralNetwork.nn');
+```
+
 ### Simple Image Classification Examples
 
 #### How Does the Code Look like for an Image Classification (CIFAR-10) Example?
