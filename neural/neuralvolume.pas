@@ -196,7 +196,8 @@ type
     procedure Copy(var Original: array of T); overload;
     procedure Copy(var Original: array of byte); overload;
     procedure Copy(Original: TBits; pFlase: T = -0.5; pTrue: T = +0.5); overload;
-    procedure CopyPadding(Original: TVolume; Padding: integer); {$IFDEF Release} inline; {$ENDIF}
+    procedure CopyPadding(Original: TVolume; Padding: integer); {$IFDEF Release} inline; {$ENDIF} overload;
+    procedure CopyPadding(Original: TVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
     procedure CopyCropping(Original: TVolume; StartX, StartY, pSizeX, pSizeY: integer);
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
     procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
@@ -369,7 +370,8 @@ type
       procedure Divi(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Copy(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure CopyRelu(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
-      procedure CopyPadding(Original: TNNetVolume; Padding: integer);
+      procedure CopyPadding(Original: TNNetVolume; Padding: integer); overload;
+      procedure CopyPadding(Original: TNNetVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
       procedure CopyNoChecks(Original: TNNetVolume);
       function GetSum(): TNeuralFloat; override;
       function GetSumSqr(): TNeuralFloat; override;
@@ -4162,6 +4164,30 @@ begin
   begin
     SourceRawPos := Original.GetRawPos(0, CntY, 0);
     DestRawPos := GetRawPos(Padding, CntY + Padding, 0);
+    Move(Original.FData[SourceRawPos], Self.FData[DestRawPos], RowSize);
+  end;
+end;
+
+procedure TVolume.CopyPadding(Original: TVolume; PaddingX, PaddingY: integer);
+var
+  CntY: integer;
+  NewSizeX, NewSizeY: integer;
+  MaxY: integer;
+  RowSize: integer;
+  SourceRawPos, DestRawPos: integer;
+begin
+  NewSizeX := Original.SizeX + PaddingX * 2;
+  NewSizeY := Original.SizeY + PaddingY * 2;
+  MaxY := Original.SizeY - 1;
+  RowSize := Original.SizeX * Original.Depth * SizeOf(TNeuralFloat);
+
+  Resize(NewSizeX, NewSizeY, Original.Depth);
+  Fill(0);
+
+  for CntY := 0 to MaxY do
+  begin
+    SourceRawPos := Original.GetRawPos(0, CntY, 0);
+    DestRawPos := GetRawPos(PaddingX, CntY + PaddingY, 0);
     Move(Original.FData[SourceRawPos], Self.FData[DestRawPos], RowSize);
   end;
 end;
@@ -9840,6 +9866,31 @@ begin
   begin
     SourceRawPos := Original.GetRawPtr(0, CntY, 0);
     DestRawPos := GetRawPtr(Padding, CntY + Padding, 0);
+    asm_dword_copy;
+  end;
+end;
+
+procedure TNNetVolume.CopyPadding(Original: TNNetVolume; PaddingX, PaddingY: integer
+  );
+var
+  CntY: integer;
+  NewSizeX, NewSizeY: integer;
+  MaxY: integer;
+  RowSize: integer;
+  SourceRawPos, DestRawPos: pointer;
+begin
+  NewSizeX := Original.SizeX + PaddingX * 2;
+  NewSizeY := Original.SizeY + PaddingY * 2;
+  MaxY := Original.SizeY - 1;
+  RowSize := Original.SizeX * Original.Depth;
+
+  Resize(NewSizeX, NewSizeY, Original.Depth);
+  Fill(0);
+
+  for CntY := 0 to MaxY do
+  begin
+    SourceRawPos := Original.GetRawPtr(0, CntY, 0);
+    DestRawPos := GetRawPtr(PaddingX, CntY + PaddingY, 0);
     asm_dword_copy;
   end;
 end;

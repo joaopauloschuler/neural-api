@@ -446,6 +446,21 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Padding layer: adds padding to the input.
+  // This layer is similar to TNNetPad except that it allows you to add distinct
+  // paddings to X and Y.
+  // This layer has no trainable parameter. Adding a padding layer may be
+  // more efficient than padding at the convolutional layer.
+  TNNetPadXY = class(TNNetLayer)
+  private
+    FPaddingX, FPaddingY: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(PaddingX, PaddingY: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Base class to be used with layers that aren't compatible with L2
   TNNetIdentityWithoutL2 = class(TNNetIdentity)
     private
@@ -1990,6 +2005,69 @@ begin
   Result := InputString;
   InputVolume.Free;
   OutputVolume.Free;
+end;
+
+{ TNNetPadXY }
+
+procedure TNNetPadXY.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX + FPaddingX*2, pPrevLayer.FOutput.SizeY + FPaddingY*2, pPrevLayer.FOutput.Depth);
+  if (pPrevLayer.FOutputError.Size = pPrevLayer.FOutput.Size) then
+  begin
+    FOutputError.ReSize(FOutput);
+    FOutputErrorDeriv.ReSize(FOutput);
+  end;
+end;
+
+constructor TNNetPadXY.Create(PaddingX, PaddingY: integer);
+begin
+  inherited Create();
+  FStruct[0] := PaddingX;
+  FStruct[1] := PaddingY;
+  FPaddingX := PaddingX;
+  FPaddingY := PaddingY;
+end;
+
+procedure TNNetPadXY.Compute;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  if
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FOutput.Size <> FOutputError.Size)
+    then
+  begin
+    FOutputError.ReSize(FOutput);
+    FOutputErrorDeriv.ReSize(FOutput);
+  end;
+  FOutput.CopyPadding(FPrevLayer.FOutput, FPaddingX, FPaddingY);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPadXY.Backpropagate;
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    FPrevLayer.FOutputError.AddArea
+    (
+      {DestX=}0,
+      {DestY=}0,
+      {OriginX=}FPaddingX,
+      {OriginY=}FPaddingY,
+      {LenX=}FPrevLayer.OutputError.SizeX,
+      {LenY=}FPrevLayer.OutputError.SizeY,
+      FOutputError
+    );
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetGroupedPointwiseConvHardSwish }
@@ -10202,6 +10280,7 @@ begin
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0]);
+      'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1]);
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
@@ -10295,6 +10374,7 @@ begin
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0]) else
+      if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1]) else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
