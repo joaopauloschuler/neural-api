@@ -461,6 +461,19 @@ type
     procedure Backpropagate(); override;
   end;
 
+  { TNNetCrop }
+
+  TNNetCrop = class(TNNetLayer)
+  private
+    FStartX, FStartY: integer;
+    FLenX, FLenY: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(StartX, StartY, LenX, LenY: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Base class to be used with layers that aren't compatible with L2
   TNNetIdentityWithoutL2 = class(TNNetIdentity)
     private
@@ -2005,6 +2018,73 @@ begin
   Result := InputString;
   InputVolume.Free;
   OutputVolume.Free;
+end;
+
+{ TNNetCrop }
+
+procedure TNNetCrop.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(FLenX, FLenY, pPrevLayer.FOutput.Depth);
+  if (pPrevLayer.FOutputError.Size = pPrevLayer.FOutput.Size) then
+  begin
+    FOutputError.ReSize(FOutput);
+    FOutputErrorDeriv.ReSize(FOutput);
+  end;
+end;
+
+constructor TNNetCrop.Create(StartX, StartY, LenX, LenY: integer);
+begin
+  inherited Create();
+  FStartX := StartX;
+  FStartY := StartY;
+  FLenX := Max(LenX, 1);
+  FLenY := Max(LenY, 1);
+  FStruct[0] := StartX;
+  FStruct[1] := StartY;
+  FStruct[2] := FLenX;
+  FStruct[3] := FLenY;
+end;
+
+procedure TNNetCrop.Compute;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  if
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FOutput.Size <> FOutputError.Size)
+    then
+  begin
+    FOutputError.ReSize(FOutput);
+    FOutputErrorDeriv.ReSize(FOutput);
+  end;
+  FOutput.CopyCropping(FPrevLayer.FOutput, FStartX, FStartY, FLenX, FLenY);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCrop.Backpropagate;
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    FPrevLayer.FOutputError.AddArea
+    (
+      {DestX=}FStartX,
+      {DestY=}FStartY,
+      {OriginX=}0,
+      {OriginY=}0,
+      {LenX=}FLenX,
+      {LenY=}FLenY,
+      FOutputError
+    );
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetPadXY }
@@ -10281,6 +10361,7 @@ begin
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0]);
       'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1]);
+      'TNNetCrop' :                 Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
@@ -10375,6 +10456,7 @@ begin
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0]) else
       if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1]) else
+      if S[0] = 'TNNetCrop' then Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
