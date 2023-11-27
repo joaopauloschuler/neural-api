@@ -1341,6 +1341,7 @@ type
     private
       FLogPosX, FLogPosY: boolean;
       FExtraSize: integer;
+      FPosX, FPosY: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputeDefaultStride(); override;
       procedure ComputeWithStride(); override;
@@ -1349,6 +1350,7 @@ type
       constructor Create(pPoolSize: integer;
         pStride:integer = 0; pPadding: integer = 0;
         pLogPosX: integer = 1; pLogPosY: integer = 1); overload;
+      destructor Destroy(); override;
   end;
 
   /// PORTABLE maxpool layer (similar to other APIs)
@@ -2079,12 +2081,12 @@ begin
         if FLogPosX then
         begin
           Inc(PositionBlockCnt);
-          FOutput.FData[OutputRawPos + PrevDepth*PositionBlockCnt] := PosX/PrevSizeX;
+          FOutput.FData[OutputRawPos + PrevDepth*PositionBlockCnt] := FPosX[PosX];
         end;
         if FLogPosY then
         begin
           Inc(PositionBlockCnt);
-          FOutput.FData[OutputRawPos + PrevDepth*PositionBlockCnt] := PosY/PrevSizeY;
+          FOutput.FData[OutputRawPos + PrevDepth*PositionBlockCnt] := FPosY[PosY];
         end;
         Inc(OutputRawPos);
       end;
@@ -2105,7 +2107,16 @@ begin
   if FLogPosY then Inc(FExtraSize);
 end;
 
+destructor TNNetMaxPoolWithPosition.Destroy;
+begin
+  SetLength(FPosX, 0);
+  SetLength(FPosY, 0);
+  inherited Destroy;
+end;
+
 procedure TNNetMaxPoolWithPosition.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  CntSizeX, CntSizeY: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   if FExtraSize > 0 then
@@ -2115,6 +2126,16 @@ begin
     FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD * (1+FExtraSize));
     SetLength(FMaxPosX, FOutput.Size);
     SetLength(FMaxPosY, FOutput.Size);
+    SetLength(FPosX, FPrevLayer.Output.SizeX);
+    SetLength(FPosY, FPrevLayer.Output.SizeY);
+    for CntSizeX := 0 to FPrevLayer.Output.SizeX - 1 do
+    begin
+      FPosX[CntSizeX] := CntSizeX/FPrevLayer.Output.SizeX;
+    end;
+    for CntSizeY := 0 to FPrevLayer.Output.SizeY - 1 do
+    begin
+      FPosY[CntSizeY] := CntSizeY/FPrevLayer.Output.SizeY;
+    end;
   end;
 end;
 
