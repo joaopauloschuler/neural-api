@@ -9,7 +9,8 @@ In this source code example, to make things very simple, the dataset has 3 strin
 
 The neural network is built with:
 
-```    FNN.AddLayer([
+```
+    FNN.AddLayer([
       TNNetInput.Create(csContextLen, 1, csVocabSize),
       TNNetPointwiseConvReLU.Create(32),
       TNNetFullConnectReLU.Create(32),
@@ -20,7 +21,8 @@ The neural network is built with:
 ```
 
 The constants above are defined with:
-```const
+```
+const
   csContextLen = 64;  // The input string can have up to 64 characters.
   csVocabSize  = 128; // Character based vocabulary/dictionary.
   csMinSampleSize = 3; // Minimum of 3 characters.
@@ -28,14 +30,16 @@ The constants above are defined with:
 
 After training the NN, we test with:
 
-```    WriteLn('Testing.');
+```
+    WriteLn('Testing.');
     WriteLn(GenerateStringFromChars(FNN, 'happy'));
     WriteLn(GenerateStringFromChars(FNN, 'fantastic'));
     WriteLn(GenerateStringFromChars(FNN, 'superb'));
 ```
 
 Then NN gets it 100% right with the following output:
-```happy good morning.
+```
+happy good morning.
 fantastic good evening.
 superb good night.
 ```
