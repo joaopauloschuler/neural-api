@@ -46,12 +46,14 @@ This is why the input is defined with (csContextLen, 1, csVocabSize). Then, to d
 Each input character is converted into an 128 elements vector in reverse order so “good” will become “doog”. The last layer of the NN has 128 elements so the element with highest value (or probability) is the next predicted character.
 
 The one-hot encoding is done with one API call:
-```procedure TVolume.OneHotEncodingReversed(aTokens: string); overload;
+```
+procedure TVolume.OneHotEncodingReversed(aTokens: string); overload;
 ```
 
 In the case that your input is not a string, you could call the following instead:
 
-```procedure TVolume.OneHotEncoding(aTokens: array of integer); overload;
+```
+procedure TVolume.OneHotEncoding(aTokens: array of integer); overload;
 ```
 
 So, for each character predicted, this character is added to the input string and the process is repeated until a termination token is found (chr(0) or chr(1)). This is how calling GenerateStringFromChars(FNN, 'superb') outputs ‘superb good night’.
