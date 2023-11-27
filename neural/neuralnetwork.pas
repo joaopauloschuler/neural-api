@@ -1328,10 +1328,27 @@ type
   /// DEFAULT CAI maxpool layer.
   TNNetMaxPool = class(TNNetPoolBase)
     private
-      procedure ComputeDefaultStride();
-      procedure ComputeWithStride();
+      procedure ComputeDefaultStride(); virtual;
+      procedure ComputeWithStride();  virtual;
     public
       procedure Compute(); override;
+  end;
+
+  /// This layer is experimental. DO NOT USE IT.
+  // This layer implements a maxpool that also stores the position
+  // of the maximum values.
+  TNNetMaxPoolWithPosition = class(TNNetMaxPool)
+    private
+      FLogPosX, FLogPosY: boolean;
+      FExtraSize: integer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure ComputeDefaultStride(); override;
+      procedure ComputeWithStride(); override;
+      procedure ComputePositions();
+    public
+      constructor Create(pPoolSize: integer;
+        pStride:integer = 0; pPadding: integer = 0;
+        pLogPosX: integer = 1; pLogPosY: integer = 1); overload;
   end;
 
   /// PORTABLE maxpool layer (similar to other APIs)
@@ -2018,6 +2035,87 @@ begin
   Result := InputString;
   InputVolume.Free;
   OutputVolume.Free;
+end;
+
+{ TNNetMaxPoolWithPosition }
+
+procedure TNNetMaxPoolWithPosition.ComputeDefaultStride;
+begin
+  inherited ComputeDefaultStride();
+  ComputePositions();
+end;
+
+procedure TNNetMaxPoolWithPosition.ComputeWithStride;
+begin
+  inherited ComputeWithStride();
+  ComputePositions();
+end;
+
+procedure TNNetMaxPoolWithPosition.ComputePositions;
+var
+  CntOutputX, CntOutputY, CntD: integer;
+  OutputMaxX, OutputMaxY, MaxD: integer;
+  OutputRawPos, PosX, PosY: integer;
+  PrevDepth: integer;
+  PrevSizeX, PrevSizeY: integer;
+  PositionBlockCnt: integer;
+begin
+  OutputMaxX := Output.SizeX - 1;
+  OutputMaxY := Output.SizeY - 1;
+  PrevSizeX := FPrevLayer.Output.SizeX;
+  PrevSizeY := FPrevLayer.Output.SizeY;
+  PrevDepth := FPrevLayer.Output.Depth;
+  MaxD := PrevDepth - 1;
+  for CntOutputY := 0 to OutputMaxY do
+  begin
+    for CntOutputX := 0 to OutputMaxX do
+    begin
+      OutputRawPos := Output.GetRawPos(CntOutputX, CntOutputY);
+      for CntD := 0 to MaxD do
+      begin
+        PosX := FMaxPosX[OutputRawPos];  // Position X
+        PosY := FMaxPosY[OutputRawPos];  // Position Y
+        PositionBlockCnt := 0;
+        if FLogPosX then
+        begin
+          Inc(PositionBlockCnt);
+          FOutput.FData[OutputRawPos + PrevDepth*PositionBlockCnt] := PosX/PrevSizeX;
+        end;
+        if FLogPosY then
+        begin
+          Inc(PositionBlockCnt);
+          FOutput.FData[OutputRawPos + PrevDepth*PositionBlockCnt] := PosY/PrevSizeY;
+        end;
+        Inc(OutputRawPos);
+      end;
+    end;
+  end;
+end;
+
+constructor TNNetMaxPoolWithPosition.Create(pPoolSize: integer;
+  pStride: integer; pPadding: integer; pLogPosX: integer; pLogPosY: integer);
+begin
+  inherited Create(pPoolSize, pStride, pPadding);
+  FStruct[3] := pLogPosX;
+  FStruct[4] := pLogPosY;
+  FLogPosX := (pLogPosX>0);
+  FLogPosY := (pLogPosY>0);
+  FExtraSize := 0;
+  if FLogPosX then Inc(FExtraSize);
+  if FLogPosY then Inc(FExtraSize);
+end;
+
+procedure TNNetMaxPoolWithPosition.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FExtraSize > 0 then
+  begin
+    FOutput.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD * (1+FExtraSize));
+    FOutputError.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD * (1+FExtraSize));
+    FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD * (1+FExtraSize));
+    SetLength(FMaxPosX, FOutput.Size);
+    SetLength(FMaxPosY, FOutput.Size);
+  end;
 end;
 
 { TNNetCrop }
@@ -8495,7 +8593,7 @@ var
 begin
   OutputMaxX := Output.SizeX - 1;
   OutputMaxY := Output.SizeY - 1;
-  MaxD := Output.Depth - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
   LocalPoolSizeM1 := FPoolSize - 1;
   InputSizeXM1 := FInputCopy.SizeX - 1;
   InputSizeYM1 := FInputCopy.SizeY - 1;
@@ -8564,7 +8662,7 @@ var
 begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
-  MaxD := Output.Depth - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
   //Although the below line makes all the sense, it might brake compatibility
   //with existing code.
   //if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
@@ -8598,7 +8696,7 @@ var
 begin
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
-  MaxD := Output.Depth - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
   //Although the below line makes all the sense, it might brake compatibility
   //with existing code.
   //if FStride > 1 then FOutputError.Mul( Min(FStride, 4) );
@@ -10411,6 +10509,7 @@ begin
       'TNNetPointwiseConvReLU' :    Result := TNNetPointwiseConvReLU.Create(St[0], St[4]);
       'TNNetPointwiseConvLinear' :  Result := TNNetPointwiseConvLinear.Create(St[0], St[4]);
       'TNNetMaxPool' :              Result := TNNetMaxPool.Create(St[0], St[1], St[2]);
+      'TNNetMaxPoolWithPosition' :  Result := TNNetMaxPoolWithPosition.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetMaxPoolPortable' :      Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]);
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
@@ -10506,6 +10605,7 @@ begin
       if S[0] = 'TNNetPointwiseConvReLU' then Result := TNNetPointwiseConvReLU.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvLinear' then Result := TNNetPointwiseConvLinear.Create(St[0], St[4]) else
       if S[0] = 'TNNetMaxPool' then Result := TNNetMaxPool.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetMaxPoolWithPosition' then Result := TNNetMaxPoolWithPosition.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMaxPoolPortable' then Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
