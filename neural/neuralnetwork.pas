@@ -13430,14 +13430,11 @@ end;
 
 function TNNetLayer.SaveDataToString(): string;
 var
-  S: TStringList;
+  S: TNNetStringList;
   Cnt: integer;
 begin
-  S := TStringList.Create;
-  S.Sorted := false;
-  S.Delimiter := '[';
-  S.StrictDelimiter := true;
-
+  S := CreateTokenizedStringList('[');
+  S.SetCapacity(FNeurons.Count);
   if FNeurons.Count > 0 then
   begin
     for Cnt := 0 to FNeurons.Count-1 do

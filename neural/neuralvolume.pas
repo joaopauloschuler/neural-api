@@ -508,6 +508,7 @@ type
       procedure KeepLast(Cnt: integer);
       procedure DeleteFirst(Cnt: integer);
       procedure DeleteLast(Cnt: integer);
+      procedure SetCapacity(NewCapacity: Integer); override;
   end;
 
   { TStringListInt }
@@ -635,8 +636,8 @@ type
       procedure LoadDictionaryFromFile(Filename: string; Separator:char = ',');
   end;
 
-  function CreateTokenizedStringList(str: string; c:char):TStringList; overload;
-  function CreateTokenizedStringList(c:char):TStringList; overload;
+  function CreateTokenizedStringList(str: string; c:char):TNNetStringList; overload;
+  function CreateTokenizedStringList(c:char):TNNetStringList; overload;
 
   function HiperbolicTangent(x: TNeuralFloat): TNeuralFloat;
   function HiperbolicTangentDerivative(x: TNeuralFloat): TNeuralFloat;
@@ -700,15 +701,15 @@ implementation
 uses
   Math, neuralbit, strutils;
 
-function CreateTokenizedStringList(str: string; c:char):TStringList;
+function CreateTokenizedStringList(str: string; c:char):TNNetStringList;
 begin
   Result := CreateTokenizedStringList(c);
   Result.DelimitedText := str;
 end;
 
-function CreateTokenizedStringList(c: char): TStringList;
+function CreateTokenizedStringList(c: char): TNNetStringList;
 begin
-  Result := TStringList.Create;
+  Result := TNNetStringList.Create;
   Result.Sorted := false;
   Result.Delimiter := c;
   Result.StrictDelimiter := true;
@@ -1806,6 +1807,11 @@ begin
   begin
     for I := 1 to Cnt do Delete(Count-1);
   end;
+end;
+
+procedure TNNetStringList.SetCapacity(NewCapacity: Integer);
+begin
+  inherited SetCapacity(NewCapacity);
 end;
 
 {$IFDEF FPC}
@@ -5560,17 +5566,14 @@ end;
 
 function TVolume.SaveToString(): string;
 var
-  S: TStringList;
+  S: TNNetStringList;
   I: integer;
   version: integer;
   AuxFloat: Single;
 begin
   version := 1;
-  S := TStringList.Create;
-  S.Sorted := false;
-  S.Delimiter := ';';
-  S.StrictDelimiter := true;
-
+  S := CreateTokenizedStringList(';');
+  S.SetCapacity(FSize+10);
   S.Add( IntToStr(version) );
   S.Add( IntToStr(FSizeX) );
   S.Add( IntToStr(FSizeY) );
