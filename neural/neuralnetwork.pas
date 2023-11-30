@@ -12276,7 +12276,7 @@ end;
 function TNNet.SaveDataToString(): string;
 var
   LayerCnt: integer;
-  S: TStringList;
+  S: TNNetStringList;
 begin
   S := CreateTokenizedStringList('!');
   if FLayers.Count > 0 then
@@ -12286,7 +12286,7 @@ begin
       S.Add( FLayers[LayerCnt].SaveDataToString() );
     end;
   end;
-  Result := S.DelimitedText;
+  Result := S.GetDelimitedTextFast();
   S.Free;
 end;
 
@@ -13474,7 +13474,7 @@ begin
     end;
   end;
 
-  Result := S.DelimitedText;
+  Result := S.GetDelimitedTextFast();
   S.Free;
 end;
 

@@ -509,6 +509,7 @@ type
       procedure DeleteFirst(Cnt: integer);
       procedure DeleteLast(Cnt: integer);
       procedure SetCapacity(NewCapacity: Integer); override;
+      function GetDelimitedTextFast: string;
   end;
 
   { TStringListInt }
@@ -1812,6 +1813,62 @@ end;
 procedure TNNetStringList.SetCapacity(NewCapacity: Integer);
 begin
   inherited SetCapacity(NewCapacity);
+end;
+
+/// Helper function to check if a string contains any character from a set
+// This function was coded by chatGPT4.
+function StrHasChars(const Str: string; Strict: Boolean; const Chars: TSysCharSet): Boolean;
+var
+  P: PChar;
+begin
+  P := PChar(Str);
+  while (P^ <> #0) and (not CharInSet(P^, Chars) or Strict) do Inc(P);
+  Result := P^ <> #0;
+end;
+
+// This function was coded by chatGPT4.
+function TNNetStringList.GetDelimitedTextFast: string;
+var
+  I: Integer;
+  S: String;
+  BreakChars: set of Char;
+  DoQuote: Boolean;
+  StringBuilder: TAnsiStringBuilder;
+begin
+  CheckSpecialChars;
+  if StrictDelimiter then
+    BreakChars := [#0, QuoteChar, Delimiter]
+  else
+    BreakChars := [#0..' ', QuoteChar, Delimiter];
+
+  StringBuilder := TAnsiStringBuilder.Create();
+  try
+    for I := 0 to Count - 1 do
+    begin
+      S := Strings[I];
+      DoQuote := AlwaysQuote;
+      if not DoQuote then
+      begin
+        // Quote strings that include BreakChars
+        DoQuote := StrHasChars(S, True, BreakChars);
+      end;
+      if DoQuote and (QuoteChar <> #0) then
+        StringBuilder.Append(AnsiQuotedStr(S, QuoteChar))
+      else
+        StringBuilder.Append(S);
+
+      if I < Count - 1 then
+        StringBuilder.Append(Delimiter);
+    end;
+
+    // Quote empty string
+    if (StringBuilder.Length = 0) and (Count = 1) and (QuoteChar <> #0) then
+      StringBuilder.Append(QuoteChar).Append(QuoteChar);
+
+    Result := StringBuilder.ToString;
+  finally
+    StringBuilder.Free;
+  end;
 end;
 
 {$IFDEF FPC}
@@ -5585,7 +5642,8 @@ begin
     S.Add( FloatToStr(AuxFloat, FFormatSettings) );
   end;
 
-  Result := S.DelimitedText;
+  Result := S.GetDelimitedTextFast();
+  //Result := S.DelimitedText;
   S.Free;
 end;
 
