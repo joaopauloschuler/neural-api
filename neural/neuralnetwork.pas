@@ -1126,8 +1126,13 @@ type
   /// This layer is under construction. DO NOT USE IT.
   TNNetGroupedConvolutionLinear = class(TNNetConvolutionBase)
     private
-      FArrGroupId: array of integer;
-      FArrGroupIdStart: array of integer;
+      FArrPrevLayerGroupId: array of integer;
+      FArrPrevLayerGroupIdStart: array of integer;
+      FOutputGroupId: array of integer;
+      FOutputGroupIdStart: array of integer;
+      FGroupIdToPrevLayerIdStart: array of integer;
+      FGroupIdToOutputIdStart: array of integer;
+
       FMaxPrevX, FMaxPrevY: integer;
       procedure PrepareInputForGroupedConvolutionFast();
       procedure ComputeCPU();
@@ -2701,7 +2706,9 @@ procedure TNNetGroupedConvolutionLinear.BackpropagateCPU();
 var
   OutputX, OutputY, OutputD: integer;
   MaxX, MaxY, MaxD: integer;
-  GroupId, GroupDSize, GroupDStart: integer;
+  OutputGroupDSize: integer;
+  PrevLayerGroupDSize, PrevLayerGroupDStart: integer;
+  OutputGroupId: integer;
   PrevX, PrevY: integer;
   OutputRawPos: integer;
   CanBackpropOnPos: boolean;
@@ -2729,7 +2736,8 @@ begin
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
   // Debug code: FOutputError.ForceMaxAbs(1);
-  GroupDSize := OutputError.Depth div FStruct[5];
+  OutputGroupDSize := OutputError.Depth div FStruct[5];
+  PrevLayerGroupDSize := FPrevLayer.OutputError.Depth div FStruct[5];
   if FPadding > 0 then
   begin
     FPrevLayerErrorPadded.Fill(0);
@@ -2769,10 +2777,12 @@ begin
             OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, StartTileD);
             for OutputD := StartTileD to EndTileD do
             begin
-              GroupId := FArrGroupId[OutputD];
-              GroupDStart := FArrGroupIdStart[OutputD];
+              // What is the current group id for OutputD?
+              OutputGroupId := FOutputGroupId[OutputD];
+              // What is the starting point (depth) in the previous layer for this group id?
+              PrevLayerGroupDStart := FGroupIdToPrevLayerIdStart[OutputGroupId];
               if (FCalculatePrevLayerError and CanBackpropOnPos)
-                then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, GroupDStart);
+                then LocalDestPtr := LocalPrevError.GetRawPtr(PrevX, PrevY, PrevLayerGroupDStart);
               {$IFDEF FPC}
               if FActivationFn = @RectifiedLinearUnit then
               begin
@@ -2805,7 +2815,7 @@ begin
               LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
               if (LocalLearningErrorDeriv <> 0.0) then
               begin
-                  PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, GroupDStart);
+                  PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY, PrevLayerGroupDStart);
                   {$IFNDEF AVX64}
                   FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
                   {$ELSE}
@@ -2825,7 +2835,7 @@ begin
                     LocalWeight := FArrNeurons[OutputD].Weights;
                     if FPointwise then
                     begin
-                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, GroupDSize);
+                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, PrevLayerGroupDSize);
                     end
                     else
                     begin
@@ -2837,10 +2847,10 @@ begin
                         begin
                           LocalPrevError.MulAdd
                           (
-                            LocalPrevError.GetRawPtr(PrevX + LocalCntX, PrevY + LocalCntY, GroupDStart), //PrevPtrA
+                            LocalPrevError.GetRawPtr(PrevX + LocalCntX, PrevY + LocalCntY, PrevLayerGroupDStart), //PrevPtrA
                             LocalWeight.GetRawPtr(LocalCntX, LocalCntY), //PrevPtrB
                             SmoothLocalOutputErrorDeriv,
-                            GroupDSize
+                            OutputGroupDSize
                           );
                         end;
                       end;
@@ -2864,7 +2874,8 @@ end;
 
 procedure TNNetGroupedConvolutionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  GroupDSize: integer;
+  PrevLayerGroupDSize: integer;
+  OutputGroupDSize: integer;
   OutputD: integer;
   GroupId, GroupDStart: integer;
   LocalPrevError: TNNetVolume;
@@ -2872,18 +2883,34 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*(pPrevLayer.Output.Depth div FStruct[5]);
   FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
-  GroupDSize := pPrevLayer.Output.Depth div FStruct[5];
-  SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, GroupDSize);
+  PrevLayerGroupDSize := pPrevLayer.Output.Depth div FStruct[5];
+  OutputGroupDSize := FOutput.Depth div FStruct[5];
+  SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, PrevLayerGroupDSize);
   InitDefault();
   AfterWeightUpdate();
-  SetLength(FArrGroupId, pPrevLayer.Output.Depth);
-  SetLength(FArrGroupIdStart, pPrevLayer.Output.Depth);
+  SetLength(FArrPrevLayerGroupId, pPrevLayer.Output.Depth);
+  SetLength(FArrPrevLayerGroupIdStart, pPrevLayer.Output.Depth);
+  SetLength(FOutputGroupId, FOutput.Depth);
+  SetLength(FOutputGroupIdStart, FOutput.Depth);
+  SetLength(FGroupIdToPrevLayerIdStart, FStruct[5]);
+  SetLength(FGroupIdToOutputIdStart, FStruct[5]);
+
   for OutputD := 0 to pPrevLayer.Output.Depth - 1 do
   begin
-    GroupId := OutputD div GroupDSize;
-    GroupDStart := GroupId * GroupDSize;
-    FArrGroupId[OutputD] := GroupId;
-    FArrGroupIdStart[OutputD] := GroupDStart;
+    GroupId := OutputD div PrevLayerGroupDSize;
+    GroupDStart := GroupId * PrevLayerGroupDSize;
+    FGroupIdToPrevLayerIdStart[GroupId] := GroupDStart;
+    FArrPrevLayerGroupId[OutputD] := GroupId;
+    FArrPrevLayerGroupIdStart[OutputD] := GroupDStart;
+  end;
+
+  for OutputD := 0 to FOutput.Depth - 1 do
+  begin
+    GroupId := OutputD div OutputGroupDSize;
+    GroupDStart := GroupId * OutputGroupDSize;
+    FGroupIdToOutputIdStart[GroupId] := GroupDStart;
+    FOutputGroupId[OutputD] := GroupId;
+    FOutputGroupIdStart[OutputD] := GroupDStart;
   end;
 
   if FPadding > 0 then
@@ -2911,8 +2938,12 @@ end;
 
 destructor TNNetGroupedConvolutionLinear.Destroy();
 begin
-  SetLength(FArrGroupId, 0);
-  SetLength(FArrGroupIdStart, 0);
+  SetLength(FArrPrevLayerGroupId, 0);
+  SetLength(FArrPrevLayerGroupIdStart, 0);
+  SetLength(FOutputGroupId, 0);
+  SetLength(FOutputGroupIdStart, 0);
+  SetLength(FGroupIdToPrevLayerIdStart, 0);
+  SetLength(FGroupIdToOutputIdStart, 0);
   inherited Destroy();
 end;
 
