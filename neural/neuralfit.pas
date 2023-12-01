@@ -86,6 +86,7 @@ type
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
       FMinBackpropagationError: TNeuralFloat;
+      FMinBackpropagationErrorProportion: TNeuralFloat;
       FLoadBestAdEnd: boolean;
       FTestBestAtEnd: boolean;
       {$IFDEF OpenCL}
@@ -125,6 +126,7 @@ type
       property L2Decay: single read FL2Decay write FL2Decay;
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
       property MinBackpropagationError: TNeuralFloat read FMinBackpropagationError write FMinBackpropagationError;
+      property MinBackpropagationErrorProportion: TNeuralFloat read FMinBackpropagationErrorProportion write FMinBackpropagationErrorProportion;
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
       property NN: TNNet read FNN;
@@ -1064,8 +1066,14 @@ begin
     LocalErrorSum := LocalErrorSum + CurrentError;
 
     if (CurrentError > FMinBackpropagationError) or
-      (CurrentError > FCurrentTrainingError/4)
-      then LocalNN.Backpropagate( vOutput );
+      (
+        (FCurrentTrainingError>0) and
+        (CurrentError > FCurrentTrainingError*FMinBackpropagationErrorProportion)
+      )
+      then
+    begin
+      LocalNN.Backpropagate( vOutput );
+    end;
 
     CurrentLoss := 0;
     if Assigned(FLossFn) then
@@ -1496,6 +1504,7 @@ begin
   FCyclicalLearningRateLen := 0; // not cyclical by default.
   FInitialEpoch := 0;
   FMinBackpropagationError := 0;
+  FMinBackpropagationErrorProportion := 0.25;
   fMinLearnRate := FInitialLearningRate * 0.01;
   FInertia := 0.9;
   FClipDelta := 0.0;
@@ -1618,6 +1627,7 @@ begin
   FIsSoftmax := true;
   FMaxCropSize := 8;
   FMinBackpropagationError := 0.2;
+  FMinBackpropagationErrorProportion := 0.25;
   FMultipleSamplesAtValidation := true;
   FTrainingSampleProcessedCnt := TNNetVolume.Create;
 end;
@@ -1764,7 +1774,9 @@ begin
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
       ' Staircase ephocs:' + IntToStr(FStaircaseEpochs) +
-      ' Min backprop error:' + FloatToStrF(MinBackpropagationError,ffFixed,4,2)
+      ' Min backprop error and proportion:' +
+        FloatToStrF(FMinBackpropagationError,ffFixed,4,2)+' '+
+        FloatToStrF(FMinBackpropagationErrorProportion,ffFixed,4,2)
     );
     if Assigned(FImgVolumes) then MessageProc('Training images: '+IntToStr(FImgVolumes.Count));
     if Assigned(FImgValidationVolumes) then MessageProc('Validation images: '+IntToStr(FImgValidationVolumes.Count));
@@ -2188,8 +2200,12 @@ begin
       OutputValue := Max(OutputValue, 0.001);
     end;
 
-    if (CurrentError>FMinBackpropagationError) or
-      (CurrentError>FCurrentTrainingError/4) then
+    if
+      (CurrentError > FMinBackpropagationError) or
+      (
+        (FCurrentTrainingError>0) and
+        (CurrentError > FCurrentTrainingError*FMinBackpropagationErrorProportion)
+      ) then
     begin
       LocalNN.Backpropagate(vOutput);
     end
@@ -2509,6 +2525,7 @@ begin
   FHasMakeGray := True;
   FMaxCropSize := 8;
   FMinBackpropagationError := 0.2;
+  FMinBackpropagationErrorProportion := 0.25;
   FMultipleSamplesAtValidation := True;
 end;
 
