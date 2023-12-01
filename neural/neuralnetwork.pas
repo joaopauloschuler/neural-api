@@ -356,6 +356,11 @@ type
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
       property LinkedNeurons: boolean read FLinkedNeurons;
+      {$IFDEF OpenCL}
+      property HasOpenCL: boolean read FHasOpenCL;
+      property ShouldOpenCL:boolean read FShouldOpenCL;
+      {$ENDIF}
+
   end;
 
   TNNetLayerClass = class of TNNetLayer;
@@ -12189,6 +12194,10 @@ begin
           ' Weight Sum:', FLayers[LayerCnt].GetWeightSum():8:4,
           ' Bias Sum:', FLayers[LayerCnt].GetBiasSum():8:4
         );
+      {$IFDEF OpenCL}
+      if FLayers[LayerCnt].HasOpenCL then write(' H');
+      if FLayers[LayerCnt].HasOpenCL and FLayers[LayerCnt].ShouldOpenCL then write(' OpenCl');
+      {$ENDIF}
 
       if Assigned(FLayers[LayerCnt].PrevLayer) then
       begin
@@ -12389,7 +12398,7 @@ begin
   begin
     FErrorProc
     (
-      'TNNet.LoadFromString - wrong number of arguments: ' + IntToStr(S.Count)
+      'TNNet.LoadFromFile - wrong number of arguments: ' + IntToStr(S.Count)
     );
   end;
 
