@@ -318,6 +318,13 @@ type
     property Depth: integer read FDepth;
   end;
 
+  TNNetToken = record
+    Token: Integer;
+    Score: TNeuralFloat;
+  end;
+
+  TNNetTokenArray = array of TNNetToken;
+
   { TNNetVolume }
   {$IFDEF FPC}
   TNNetVolume = class (specialize TVolume<TNeuralFloat>)
@@ -331,6 +338,7 @@ type
       function GetMemSize(): integer; {$IFDEF Release} inline; {$ENDIF}
       procedure CalculateLocalResponseFrom2D(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure CalculateLocalResponseFromDepth(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
+      procedure GetTokenArray(var TokenArray: TNNetTokenArray);
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
@@ -384,6 +392,42 @@ type
     property
       DataPtr: TNeuralFloatArrPtr read FDataPtr;
   end;
+
+  { TNNetSamplerBase }
+
+  TNNetSamplerBase = class(TObject)
+    protected
+      FTokenArr: TNNetTokenArray;
+    public
+      function GetToken(Origin: TNNetVolume): integer; virtual; abstract;
+      procedure SortTokenArray();
+      destructor Destroy(); override;
+  end;
+
+  { TNNetSamplerGreedy }
+  TNNetSamplerGreedy = class (TNNetSamplerBase)
+    public
+      function GetToken(Origin: TNNetVolume): integer; override;
+  end;
+
+  { TNNetSamplerTopK }
+  TNNetSamplerTopK = class (TNNetSamplerBase)
+    protected
+      FTopK: integer;
+    public
+      constructor Create(TopK: integer);
+      function GetToken(Origin: TNNetVolume): integer; override;
+  end;
+
+  { TNNetSamplerTopP }
+  TNNetSamplerTopP = class (TNNetSamplerBase)
+    protected
+      FTopP: integer;
+    public
+      constructor Create(TopP: integer);
+      function GetToken(Origin: TNNetVolume): integer; override;
+  end;
+
 
   /// Implements a pair of volumes
   TNNetVolumePair = class(TObject)
@@ -1647,6 +1691,99 @@ begin
   begin
     Result := 0.3333*x + 0.5;
   end;
+end;
+
+procedure QuickSortTokenArray(var A: TNNetTokenArray; iLo, iHi: Integer);
+var
+  Lo, Hi: Integer;
+  Mid, T: TNNetToken;
+begin
+  Lo := iLo;
+  Hi := iHi;
+  Mid := A[(Lo + Hi) div 2];
+  repeat
+    while A[Lo].Score > Mid.Score do Inc(Lo);
+    while A[Hi].Score < Mid.Score do Dec(Hi);
+    if Lo <= Hi then
+    begin
+      T := A[Lo];
+      A[Lo] := A[Hi];
+      A[Hi] := T;
+      Inc(Lo);
+      Dec(Hi);
+    end;
+  until Lo > Hi;
+  if Hi > iLo then QuickSortTokenArray(A, iLo, Hi);
+  if Lo < iHi then QuickSortTokenArray(A, Lo, iHi);
+end;
+
+{ TNNetSamplerTopP }
+
+constructor TNNetSamplerTopP.Create(TopP: integer);
+begin
+  inherited Create();
+  FTopP := TopP;
+end;
+
+function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
+var
+  CumulativeSum: TNeuralFloat;
+  I, Threshold: Integer;
+begin
+  Origin.GetTokenArray(FTokenArr);
+  SortTokenArray();
+  CumulativeSum := 0;
+  Threshold := 0;
+  for I := Low(FTokenArr) to High(FTokenArr) do
+  begin
+    CumulativeSum := CumulativeSum + FTokenArr[i].Score;
+    if CumulativeSum > FTopP then
+    begin
+      Threshold := I;
+      Break;
+    end;
+  end;
+
+  // Randomly select one of the top tokens within the threshold.
+  if Threshold > 0 then
+    Result := FTokenArr[Random(Threshold)].Token
+  else
+    Result := FTokenArr[0].Token; // Fallback in case P is too low.
+end;
+
+{ TNNetSamplerTopK }
+
+constructor TNNetSamplerTopK.Create(TopK: integer);
+begin
+  inherited Create();
+  FTopK := TopK;
+end;
+
+function TNNetSamplerTopK.GetToken(Origin: TNNetVolume): integer;
+begin
+  Origin.GetTokenArray(FTokenArr);
+  SortTokenArray();
+  Result := FTokenArr[Random(FTopK)].Token;
+end;
+
+{ TNNetSamplerBase }
+
+procedure TNNetSamplerBase.SortTokenArray;
+begin
+  QuickSortTokenArray(FTokenArr, Low(FTokenArr), High(FTokenArr));
+end;
+
+destructor TNNetSamplerBase.Destroy;
+begin
+  SetLength(FTokenArr, 0);
+  inherited Destroy;
+end;
+
+{ TNNetSamplerGreedy }
+
+function TNNetSamplerGreedy.GetToken(Origin: TNNetVolume): integer;
+begin
+  Result := Origin.GetClass();
 end;
 
 { TStringStringList }
@@ -5837,6 +5974,22 @@ begin
   Pow(beta);
 
   SqrElements.Free;
+end;
+
+procedure TNNetVolume.GetTokenArray(var TokenArray: TNNetTokenArray);
+var
+  I, vHigh: integer;
+begin
+  if (Length(TokenArray) <> FSize) then SetLength(TokenArray, FSize);
+  if FSize > 0 then
+  begin
+    vHigh := FSize - 1;
+    for I := 0 to vHigh do
+    begin
+      TokenArray[I].Token:=I;
+      TokenArray[I].Score:=FData[I];
+    end;
+  end;
 end;
 
 procedure TNNetVolume.InterleavedDotProduct(InterleavedAs,
