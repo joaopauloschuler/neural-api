@@ -12171,6 +12171,11 @@ begin
 
   if FLayers.Count > 1 then
   begin
+    WriteLn(
+      'Has AVX: ', FLayers[0].Output.HasAVX,
+      ' Has AVX2: ', FLayers[0].Output.HasAVX2,
+      ' Has AVX512: ', FLayers[0].Output.HasAVX512
+    );
     for LayerCnt := 0 to GetLastLayerIdx() do
     begin
       WeightCount := FLayers[LayerCnt].CountWeights();
