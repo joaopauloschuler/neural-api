@@ -7415,14 +7415,15 @@ var
   NN: TNNet;
 begin
   inherited Create(pFreeObjects);
-  NNData := CloneNN.SaveToString();
-
+  NNData := CloneNN.SaveStructureToString();
   for I := 1 to pSize do
   begin
     NN := TNNet.Create;
-    NN.LoadFromString(NNData);
+    NN.LoadStructureFromString(NNData);
+    NN.CopyWeights(CloneNN);
     Self.Add(NN);
   end;
+  NNData := '';
 end;
 
 constructor TNNetDataParallelism.Create(pSize: integer; pFreeObjects: Boolean);
@@ -12414,10 +12415,10 @@ function TNNet.Clone(): TNNet;
 var
   NNData: String;
 begin
-  NNData := SaveToString();
-
+  NNData := SaveStructureToString();
   Result := TNNet.Create;
-  Result.LoadFromString(NNData);
+  Result.LoadStructureFromString(NNData);
+  Result.CopyWeights(Self);
 end;
 
 procedure TNNet.LoadDataFromString(strData: string);
