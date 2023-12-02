@@ -1915,7 +1915,7 @@ type
   );
 
   // Simple character based NLP function for building a string from characters.
-  function GenerateStringFromChars(NN: TNNet; InputString: string): string;
+  function GenerateStringFromChars(NN: TNNet; InputString: string; oSampler: TNNetSamplerBase = nil): string; overload;
 
 implementation
 
@@ -2029,7 +2029,8 @@ begin
   end;
 end;
 
-function GenerateStringFromChars(NN: TNNet; InputString: string): string;
+function GenerateStringFromChars(NN: TNNet; InputString: string;
+  oSampler: TNNetSamplerBase): string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   NextTokenInt: integer;
@@ -2040,7 +2041,9 @@ begin
   repeat
     InputVolume.OneHotEncodingReversed(InputString);
     NN.Compute(InputVolume, OutputVolume);
-    NextTokenInt := OutputVolume.GetClass();
+    if Assigned(oSampler)
+    then NextTokenInt := oSampler.GetToken(OutputVolume)
+    else NextTokenInt := OutputVolume.GetClass();
     NextTokenChar := Char(NextTokenInt);
     if NextTokenInt > 1 then InputString := InputString + NextTokenChar;
   until (NextTokenInt < 2) or (Length(InputString)>=InputVolume.SizeX);

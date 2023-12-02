@@ -422,9 +422,9 @@ type
   { TNNetSamplerTopP }
   TNNetSamplerTopP = class (TNNetSamplerBase)
     protected
-      FTopP: integer;
+      FTopP: TNeuralFloat;
     public
-      constructor Create(TopP: integer);
+      constructor Create(TopP: TNeuralFloat);
       function GetToken(Origin: TNNetVolume): integer; override;
   end;
 
@@ -1719,7 +1719,7 @@ end;
 
 { TNNetSamplerTopP }
 
-constructor TNNetSamplerTopP.Create(TopP: integer);
+constructor TNNetSamplerTopP.Create(TopP: TNeuralFloat);
 begin
   inherited Create();
   FTopP := TopP;
