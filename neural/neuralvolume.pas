@@ -233,6 +233,8 @@ type
     function GetSmallestIdxInRange(StartPos, Len: integer): integer;
     function GetStdDeviation(): T; {$IFDEF Release} inline; {$ENDIF}
     function GetMagnitude(): T; {$IFDEF Release} inline; {$ENDIF}
+    function GetEntropy(): T;
+    function GetPerplexity(): T;
     procedure FlipX();
     procedure FlipY();
     procedure IncTag(); {$IFDEF Release} inline; {$ENDIF}
@@ -4766,6 +4768,29 @@ var
 begin
   Aux := GetSumSqr();
   Result := Sqrt( Aux );
+end;
+
+function TVolume.GetEntropy: T;
+var
+  I, vHigh: integer;
+  vSum: TNeuralFloat;
+begin
+  vSum := 0;
+  if FSize > 0 then
+  begin
+    vHigh := FSize - 1;
+    for I := 0 to vHigh do
+    begin
+      if FData[I] > 0 then // To avoid log(0) which is undefined
+        vSum := vSum + (FData[i] * log2(FData[i]));
+    end;
+  end;
+  Result := -vSum;
+end;
+
+function TVolume.GetPerplexity: T;
+begin
+  Result := Power(2, GetEntropy());
 end;
 
 procedure TVolume.FlipX();
