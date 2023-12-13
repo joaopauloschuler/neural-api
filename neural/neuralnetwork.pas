@@ -521,6 +521,13 @@ type
       procedure Compute(); override;
   end;
 
+  /// This is almost the same as ReLU except that it doesn't
+  // backpropagate on zero values (Positive only)
+  TNNetReLUP = class(TNNetReLUBase)
+    public
+      procedure Compute(); override;
+  end;
+
   /// This is a leaky ReLU with minimum and maximum values. You can
   // scale leakiness via the Leaky parameter.
   TNNetReLUL = class(TNNetReLUBase)
@@ -1917,6 +1924,8 @@ type
   // Simple character based NLP function for building a string from characters.
   function GenerateStringFromChars(NN: TNNet; InputString: string; oSampler: TNNetSamplerBase = nil): string; overload;
 
+  // Takes a neural network (NN) and an input string, and returns the predicted class as an integer.
+  function GetClassFromChars(NN: TNNet; InputString: string): integer;
 implementation
 
 procedure RebuildPatternOnPreviousPatterns
@@ -2050,6 +2059,77 @@ begin
   Result := InputString;
   InputVolume.Free;
   OutputVolume.Free;
+end;
+
+// Takes a neural network (NN) and an input string,
+// and returns the predicted class as an integer.
+function GetClassFromChars(NN: TNNet; InputString: string): integer;
+var
+  InputVolume: TNNetVolume; // Declare a variable for the input volume.
+begin
+  // Create a new TNNetVolume based on the output size of the first layer of the neural network.
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+
+  // Convert the input string into a one-hot encoded volume, which is the format
+  // expected by the neural network for processing.
+  InputVolume.OneHotEncodingReversed(InputString);
+
+  // Run the forward pass of the neural network with the one-hot encoded input.
+  NN.Compute(InputVolume);
+
+  // After the network has computed the output, retrieve the class with the highest
+  // probability from the last layer's output.
+  Result := NN.GetLastLayer().Output.GetClass();
+
+  // Release the memory allocated for the input volume to prevent memory leaks.
+  InputVolume.Free;
+end;
+
+{ TNNetReLUP }
+
+procedure TNNetReLUP.Compute;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      if LocalPrevOutput.FData[OutputCnt] > 0 then // Positive Values Only
+      begin
+        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      if LocalPrevOutput.FData[OutputCnt]>0 then
+      begin
+        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetMaxPoolWithPosition }
@@ -10523,6 +10603,7 @@ begin
       'TNNetCrop' :                 Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
+      'TNNetReLUP' :                Result := TNNetReLUP.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
@@ -10619,6 +10700,7 @@ begin
       if S[0] = 'TNNetCrop' then Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
+      if S[0] = 'TNNetReLUP' then Result := TNNetReLUP.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
@@ -12490,7 +12572,7 @@ begin
   begin
     FErrorProc
     (
-      'TNNet.LoadFromString - wrong number of arguments: ' + IntToStr(S.Count)
+      'TNNet.LoadDataFromFile - wrong number of arguments: ' + IntToStr(S.Count)
     );
   end;
 
