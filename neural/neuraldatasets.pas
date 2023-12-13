@@ -277,6 +277,33 @@ procedure TestBatch
 // This function translates the original CIFAR10 labels to Animal/Machine labels.
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 
+{
+  RandomSubstring:
+  This NLP function takes a string as input and returns a substring that starts
+  immediately after a randomly selected space character within the input string.
+  If there are no spaces in the input string, the entire string is returned as is.
+  The function is useful for obtaining a random piece of text from a given string,
+  which can be applied in various scenarios that require text randomization.
+
+  Space positions are tracked using a TIntegerList. The Copy function is used
+  to extract the substring from the randomly selected space position to the end
+  of the input string.
+}
+function RandomSubstring(const InputString: string): string;
+
+{
+  RemoveRandomChars:
+  This function takes a string and an integer count as input. It removes Count
+  number of characters at random positions from the given string Str. The length
+  of the string is recalculated in each iteration to account for the reduction in
+  the string's length after each character removal.
+}
+function RemoveRandomChars(const Str: string; Count: integer): string;
+
+
+// This function randomly removes one word from the input string.
+function RemoveRandomWord(const Str: string): string;
+
 {$IFNDEF FPC}
 function SwapEndian(I:integer):integer;
 procedure FindAllDirectories(AList: TStrings; const SearchPath: String;
@@ -1689,6 +1716,87 @@ begin
 
   vOutput.Free;
   pOutput.Free;
+end;
+
+function RemoveRandomWord(const Str: string): string;
+var
+  WordList: TNNetStringList;
+  RandomWordIndex: integer;
+begin
+  Result := Str;
+  // Split the string into words based on spaces.
+  WordList := CreateTokenizedStringList(Result,' ');
+  // Check if there are any words to remove.
+  if WordList.Count > 1 then
+  begin
+    // Select a random word to remove.
+    RandomWordIndex := Random(WordList.Count);
+    WordList.Delete(RandomWordIndex);
+    // Reconstruct the string from the remaining words.
+    Result := WordList.DelimitedText;
+  end;
+  // Free the TStringList to prevent memory leaks.
+  WordList.Free;
+end;
+
+
+function RemoveRandomChars(const Str: string; Count: integer): string;
+var
+  i: integer;
+  StrLen: integer;
+begin
+  Result := Str;
+  // Calculate the length of the string before removing characters.
+  StrLen := Length(Result);
+  if (Count > 0) and (StrLen>1) then
+  begin
+    // Loop for the number of characters to be removed.
+    for i := 1 to Count do
+    begin
+      // Check if the string is not empty.
+      if StrLen > 1 then
+      begin
+        // Randomly select a character position and remove one character from that position.
+        // The '+ 1' is necessary because Pascal strings are 1-indexed, not 0-indexed.
+        Delete(Result, Random(StrLen) + 1, 1);
+        Dec(StrLen);
+      end;
+    end;
+  end;
+end;
+
+
+function RandomSubstring(const InputString: string): string;
+var
+  SpacePositions: TIntegerList;
+  I, RandomSpacePos: Integer;
+  InputStringLen: integer;
+begin
+  InputStringLen := Length(InputString);
+  if InputStringLen > 0 then
+  begin
+    // Create a new integer list instance
+    SpacePositions := TIntegerList.Create;
+    // Find the positions of all spaces in the string
+    for I := 1 to InputStringLen do
+    begin
+      if InputString[I] = ' ' then
+      begin
+        SpacePositions.Add(I);
+      end;
+    end;
+
+    // Append -1 to handle the case with no spaces
+    SpacePositions.Add(0);
+
+    // Randomly select one of the space positions
+    RandomSpacePos := SpacePositions[Random(SpacePositions.Count)];
+
+    // Return the substring starting from the position after the random space
+    Result := Copy(InputString, RandomSpacePos + 1, InputStringLen - RandomSpacePos);
+    SpacePositions.Free;
+  end
+  else Result := '';
 end;
 
 end.
