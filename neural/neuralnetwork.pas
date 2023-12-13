@@ -2044,15 +2044,24 @@ var
   InputVolume, OutputVolume: TNNetVolume;
   NextTokenInt: integer;
   NextTokenChar: char;
+  AB: array [0..0] of byte;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   repeat
     InputVolume.OneHotEncodingReversed(InputString);
     NN.Compute(InputVolume, OutputVolume);
-    if Assigned(oSampler)
-    then NextTokenInt := oSampler.GetToken(OutputVolume)
-    else NextTokenInt := OutputVolume.GetClass();
+    if (OutputVolume.Size = 8) then
+    begin
+      OutputVolume.ReadAsBits(AB, 0.5);
+      NextTokenInt := AB[0];
+    end
+    else
+    begin
+      if Assigned(oSampler)
+      then NextTokenInt := oSampler.GetToken(OutputVolume)
+      else NextTokenInt := OutputVolume.GetClass();
+    end;
     NextTokenChar := Char(NextTokenInt);
     if NextTokenInt > 1 then InputString := InputString + NextTokenChar;
   until (NextTokenInt < 2) or (Length(InputString)>=InputVolume.SizeX);
