@@ -201,6 +201,9 @@ type
     procedure CopyCropping(Original: TVolume; StartX, StartY, pSizeX, pSizeY: integer);
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
     procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
+    procedure CopyNoChecks(var Original: array of byte); overload;
+    procedure CopyNoChecks(var Original: string); overload;
+    procedure CopyReversedNoChecks(var Original: string); overload;
     procedure CopyChannels(Original: TVolume; aChannels: array of integer);
     procedure Define(Original: array of T);
     function DotProduct(Original: TVolume): T; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -275,7 +278,9 @@ type
     procedure LoadFromString(strData: string);
 
     // bit operations
-    procedure CopyAsBits(var Original: array of byte; pFlase: T = -0.5; pTrue: T = +0.5); overload;
+    procedure CopyAsBits(var Original: array of byte; pFalse: T = -0.5; pTrue: T = +0.5; CanResize: boolean = True); overload;
+    procedure CopyAsBits(Original: string; pFalse: T = -0.5; pTrue: T = +0.5; CanResize: boolean = True);
+    procedure CopyAsBitsReversed(Original: string; pFalse: T = -0.5; pTrue: T = +0.5);
     procedure ReadAsBits(var Dest: array of byte; Threshold: T = 0.0);
 
     // Classification Functions (SetClass is similar to One Hot Encoding)
@@ -288,6 +293,7 @@ type
     function GetClass(): integer;
     function SoftMax(): T;
 
+    // Encoding Functions
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure OneHotEncoding(aTokens: string); overload;
     procedure OneHotEncodingReversed(aTokens: string); overload;
@@ -556,6 +562,7 @@ type
       procedure DeleteLast(Cnt: integer);
       procedure SetCapacity(NewCapacity: Integer); override;
       function GetDelimitedTextFast: string;
+      procedure LoadLargeFile(Filename: string);
   end;
 
   { TStringListInt }
@@ -739,6 +746,8 @@ type
 
   function NeuralFloatToStr(V: TNeuralFloat): string;
   function NeuralStrToFloat(V: String): TNeuralFloat;
+
+  function GetLastChars(const InputStr: string; LenStr: Integer): string;
 
   procedure TestTNNetVolume();
   procedure TestKMeans();
@@ -2008,6 +2017,21 @@ begin
   finally
     StringBuilder.Free;
   end;
+end;
+
+procedure TNNetStringList.LoadLargeFile(Filename: string);
+var
+  LargeFile: TextFile;
+  StrLine: string;
+begin
+  AssignFile(LargeFile, Filename);
+  Reset(LargeFile);
+  while not Eof(LargeFile) do
+  begin
+    ReadLn(LargeFile, StrLine);
+    Self.Add(StrLine);
+  end;
+  CloseFile(LargeFile);
 end;
 
 {$IFDEF FPC}
@@ -4179,6 +4203,52 @@ begin
   Move(Original.FData[0], Self.FData[0], Self.Size * SizeOf(T));
 end;
 
+procedure TVolume.CopyNoChecks(var Original: array of byte);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  if Length(Original) > 0 then
+  begin
+    vHigh := High(Original);
+
+    for I := 0 to vHigh do
+    begin
+      FData[I] := Original[I];
+    end;
+  end;
+end;
+
+procedure TVolume.CopyNoChecks(var Original: string);
+var
+  I: integer;
+  LenOriginal: integer;
+begin
+  LenOriginal := Length(Original);
+  if LenOriginal > 0 then
+  begin
+    for I := 1 to LenOriginal do
+    begin
+      FData[I-1] := Ord(Original[I]);
+    end;
+  end;
+end;
+
+procedure TVolume.CopyReversedNoChecks(var Original: string);
+var
+  I: integer;
+  LenOriginal: integer;
+begin
+  LenOriginal := Length(Original);
+  if LenOriginal > 0 then
+  begin
+    for I := 1 to LenOriginal do
+    begin
+      FData[I-1] := Ord(Original[LenOriginal - I + 1]);
+    end;
+  end;
+end;
+
 procedure TVolume.CopyChannels(Original: TVolume; aChannels: array of integer);
 var
   MaxX, MaxY: integer;
@@ -4292,27 +4362,70 @@ begin
   end;
 end;
 
-procedure TVolume.CopyAsBits(var Original: array of byte; pFlase: T = -0.5; pTrue: T = +0.5);
+procedure TVolume.CopyAsBits(var Original: array of byte; pFalse: T = -0.5; pTrue: T = +0.5; CanResize:boolean = True);
 var
   I: integer;
   vHigh: integer;
+  LenOriginal: integer;
   aTranslate: array [0..1] of T;
 begin
-  if Length(Original) > 0 then
+  LenOriginal := Length(Original);
+  if LenOriginal > 0 then
   begin
-    if (Length(Original)*8 <> Self.Size) then
+    if CanResize and (LenOriginal*8 <> Self.Size) then
     begin
-      Self.ReSize(Length(Original), 1, 8);
+      Self.ReSize(LenOriginal, 1, 8);
     end;
 
-    vHigh := Length(Original) * 8 - 1;
-    aTranslate[0] := pFlase;
+    vHigh := LenOriginal * 8 - 1;
+    aTranslate[0] := pFalse;
     aTranslate[1] := pTrue;
 
     for I := 0 to vHigh do
     begin
       FData[I] := aTranslate[BARead(Original,I)];
     end;
+  end;
+end;
+
+procedure TVolume.CopyAsBits(Original: string; pFalse: T; pTrue: T; CanResize:boolean);
+var
+  AB: array of byte;
+  I: integer;
+  vHigh: integer;
+  LenOriginal: integer;
+begin
+  LenOriginal := Length(Original);
+  if LenOriginal > 0 then
+  begin
+    SetLength(AB, LenOriginal);
+    vHigh := LenOriginal;
+    for I := 1 to vHigh do
+    begin
+      AB[I-1] := Min(Ord(Original[I]), 255);
+    end;
+    Self.CopyAsBits(AB, pFalse, pTrue, CanResize);
+  end;
+end;
+
+procedure TVolume.CopyAsBitsReversed(Original: string; pFalse: T; pTrue: T);
+var
+  AB: array of byte;
+  I: integer;
+  vHigh: integer;
+  LenOriginal: integer;
+begin
+  LenOriginal := Length(Original);
+  if LenOriginal > 0 then
+  begin
+    SetLength(AB, LenOriginal);
+    vHigh := LenOriginal;
+    for I := 1 to vHigh do
+    begin
+      AB[I-1] := Min(Ord(Original[vHigh-I+1]), 255);
+    end;
+    Self.CopyAsBits(AB, pFalse, pTrue, False);
+    SetLength(AB, 0);
   end;
 end;
 
@@ -5351,26 +5464,63 @@ begin
   end;
 end;
 
+function GetLastChars(const InputStr: string; LenStr: Integer): string;
+begin
+  if Length(InputStr) > LenStr then
+    Result := Copy(InputStr, Length(InputStr) - LenStr + 1, LenStr)
+  else
+    Result := InputStr;
+end;
+
 procedure TVolume.OneHotEncodingReversed(aTokens: string);
 var
   CntToken, MaxToken, Token: integer;
+  LocalTokens: string;
 begin
   MaxToken := Length(aTokens);
-  Self.Fill(0);
-  if MaxToken <= SizeX then
+  if MaxToken > SizeX then
   begin
-    for CntToken := 1 to MaxToken do
+    LocalTokens := GetLastChars(aTokens, SizeX);
+    MaxToken := Length(aTokens);
+  end
+  else
+  begin
+    LocalTokens := aTokens;
+  end;
+  Self.Fill(0);
+  if MaxToken > 0 then
+  begin
+    {$IFDEF DEBUG}
+    if Ord(LocalTokens[MaxToken]) < 2 then
     begin
-      Token := Ord(aTokens[CntToken]);
-      if Token < FDepth then
+      WriteLn('A string for prediction should not end with terminal symbol.');
+    end;
+    if Ord(LocalTokens[1]) < 2 then
+    begin
+      WriteLn('A string for prediction should not start with terminal symbol.');
+    end;
+    {$ENDIF}
+    if MaxToken <= SizeX then
+    begin
+      for CntToken := 1 to MaxToken do
       begin
-        Self[MaxToken-CntToken, 0, Token] := 1;
+        Token := Ord(LocalTokens[CntToken]);
+        if Token < FDepth then
+        begin
+          Self[MaxToken-CntToken, 0, Token] := 1;
+        end;
       end;
+    end
+    else
+    begin
+      WriteLn('This should never happend. Token length '+IntToStr(MaxToken)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingReversed.');
     end;
   end
   else
   begin
-    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingReversed.');
+    {$IFDEF DEBUG}
+    WriteLn('Zero len at OneHotEncodingReversed');
+    {$ENDIF}
   end;
 end;
 
