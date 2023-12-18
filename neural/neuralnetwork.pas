@@ -1359,6 +1359,7 @@ type
       FLogPosX, FLogPosY: boolean;
       FExtraSize: integer;
       FPosX, FPosY: array of TNeuralFloat;
+      FMaxBackpropX: integer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputeDefaultStride(); override;
       procedure ComputeWithStride(); override;
@@ -1366,8 +1367,10 @@ type
     public
       constructor Create(pPoolSize: integer;
         pStride:integer = 0; pPadding: integer = 0;
-        pLogPosX: integer = 1; pLogPosY: integer = 1); overload;
+        pLogPosX: integer = 1; pLogPosY: integer = 1;
+        pMaxBackpropX: integer = 0); overload;
       destructor Destroy(); override;
+      procedure Backpropagate(); override;
   end;
 
   /// PORTABLE maxpool layer (similar to other APIs)
@@ -2161,13 +2164,10 @@ var
   OutputMaxX, OutputMaxY, MaxD: integer;
   OutputRawPos, PosX, PosY: integer;
   PrevDepth: integer;
-  PrevSizeX, PrevSizeY: integer;
   PositionBlockCnt: integer;
 begin
   OutputMaxX := Output.SizeX - 1;
   OutputMaxY := Output.SizeY - 1;
-  PrevSizeX := FPrevLayer.Output.SizeX;
-  PrevSizeY := FPrevLayer.Output.SizeY;
   PrevDepth := FPrevLayer.Output.Depth;
   MaxD := PrevDepth - 1;
   for CntOutputY := 0 to OutputMaxY do
@@ -2197,14 +2197,18 @@ begin
 end;
 
 constructor TNNetMaxPoolWithPosition.Create(pPoolSize: integer;
-  pStride: integer; pPadding: integer; pLogPosX: integer; pLogPosY: integer);
+  pStride: integer; pPadding: integer;
+  pLogPosX: integer; pLogPosY: integer;
+  pMaxBackpropX: integer = 0);
 begin
   inherited Create(pPoolSize, pStride, pPadding);
   FStruct[3] := pLogPosX;
   FStruct[4] := pLogPosY;
+  FStruct[5] := pMaxBackpropX;
   FLogPosX := (pLogPosX>0);
   FLogPosY := (pLogPosY>0);
   FExtraSize := 0;
+  FMaxBackpropX := pMaxBackpropX;
   if FLogPosX then Inc(FExtraSize);
   if FLogPosY then Inc(FExtraSize);
 end;
@@ -2214,6 +2218,35 @@ begin
   SetLength(FPosX, 0);
   SetLength(FPosY, 0);
   inherited Destroy;
+end;
+
+procedure TNNetMaxPoolWithPosition.Backpropagate;
+var
+  CntOutputX, CntOutputY, CntD: integer;
+  OutputMaxX, OutputMaxY, MaxD: integer;
+  OutputRawPos: integer;
+  PrevDepth: integer;
+begin
+  if FMaxBackpropX < Output.SizeX then
+  begin
+    OutputMaxX := Output.SizeX - 1;
+    OutputMaxY := Output.SizeY - 1;
+    PrevDepth := FPrevLayer.Output.Depth;
+    MaxD := PrevDepth - 1;
+    for CntOutputY := 0 to OutputMaxY do
+    begin
+      for CntOutputX := FMaxBackpropX to OutputMaxX do
+      begin
+        OutputRawPos := Output.GetRawPos(CntOutputX, CntOutputY);
+        for CntD := 0 to MaxD do
+        begin
+          FOutput.FData[OutputRawPos] := 0;
+          Inc(OutputRawPos);
+        end;
+      end;
+    end;
+  end;
+  inherited Backpropagate;
 end;
 
 procedure TNNetMaxPoolWithPosition.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -2238,6 +2271,12 @@ begin
     begin
       FPosY[CntSizeY] := CntSizeY/FPrevLayer.Output.SizeY;
     end;
+    if FMaxBackpropX = 0 then
+    begin
+      FMaxBackpropX := FOutputSizeX;
+    end;
+    FMaxBackpropX := Min(FOutputSizeX, FMaxBackpropX);
+    FStruct[5] := FMaxBackpropX;
   end;
 end;
 
@@ -10660,7 +10699,7 @@ begin
       'TNNetPointwiseConvReLU' :    Result := TNNetPointwiseConvReLU.Create(St[0], St[4]);
       'TNNetPointwiseConvLinear' :  Result := TNNetPointwiseConvLinear.Create(St[0], St[4]);
       'TNNetMaxPool' :              Result := TNNetMaxPool.Create(St[0], St[1], St[2]);
-      'TNNetMaxPoolWithPosition' :  Result := TNNetMaxPoolWithPosition.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetMaxPoolWithPosition' :  Result := TNNetMaxPoolWithPosition.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetMaxPoolPortable' :      Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]);
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
@@ -10757,7 +10796,7 @@ begin
       if S[0] = 'TNNetPointwiseConvReLU' then Result := TNNetPointwiseConvReLU.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvLinear' then Result := TNNetPointwiseConvLinear.Create(St[0], St[4]) else
       if S[0] = 'TNNetMaxPool' then Result := TNNetMaxPool.Create(St[0], St[1], St[2]) else
-      if S[0] = 'TNNetMaxPoolWithPosition' then Result := TNNetMaxPoolWithPosition.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetMaxPoolWithPosition' then Result := TNNetMaxPoolWithPosition.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetMaxPoolPortable' then Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
