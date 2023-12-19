@@ -63,6 +63,48 @@ Saving is as easy:
     NN.SaveToFile('MyTrainedNeuralNetwork.nn');
 ```
 
+### NLP - Training a Simple Neural Network Model for Text Generation
+This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). This code
+
+```
+    WriteLn(GenerateStringFromChars(NFit.NN, 'once', FSampler),'.');
+    WriteLn(GenerateStringFromChars(NFit.NN, 'one ', FSampler),'.');
+```
+
+produces this output:
+```
+once upon a time, there was a little girl named lily. she loved to play outside i.
+one day, a little girl named lily was playing in her garden. she saw a big car wi.
+```
+
+You can open on colab the raw training file and run it by yourself at:
+https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/NLP_CAI_TinyStories_Simple_Example.ipynb
+
+#### Creating Your Own Chat Bot
+Once your neural network is trained, you can run your own chat bot with:
+```
+var
+  S: string;
+  oSampler: TNNetSamplerBase;
+  NN: TNNet;
+begin
+  oSampler := TNNetSamplerTopP.Create(0.6);
+  NN := TNNet.Create();
+  WriteLn('Loading neural network.');
+  NN.LoadFromFile('MyNeuralNetwork.nn');
+  NN.DebugStructure();
+  WriteLn();
+  WriteLn('Write something and I will reply.');
+  repeat
+    Write('User: ');
+    ReadLn(S);
+    WriteLn('Neural network: ',GenerateStringFromChars(NN, LowerCase(S), oSampler),'.');
+  until S = 'exit';
+  NN.Free;
+  oSampler.Free;
+end;
+```
+
 ### Simple Image Classification Examples
 
 #### CIFAR-10 Image Classification Example
