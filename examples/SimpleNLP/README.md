@@ -44,11 +44,11 @@ const
 ```
 
 This neural network has some characteristics:
-* It’s character based. Therefore, there is no dictionary. The convolutional layers are responsible for learning the words. In the first epochs of the training, we can see that the neural network is learning the words.This architecture benefits from the small vocabulary found in the “Tiny Stories” dataset.
+* It’s character based. Therefore, there is no dictionary. The convolutional layers are responsible for learning the words. In the first epochs of the training, we can see that the neural network is learning the words. This architecture benefits from the small vocabulary found in the “Tiny Stories” dataset.
 * It predicts the next character in an input sequence (or context). In this example, the context is 81 characters.
 * There is no recursive computation. It’s a convolutional model. Therefore, it’s memory efficient and can be computed in a highly parallel environment.
 * One of the max pooling layers inserts the positional information of the max values.
-* In this particular example, it learns very well the “Tiny Stories”. I also tried to train this model with wikipedia but wikipedia vocabulary and sentence structures are too complex for this small 2.8 million parameters model. You can just replace tinystories.txt and train it on your own text file (dataset). This source code is the “hello world” of the NLP. Don’t expect too much from it.
+* In this particular example, it learns very well the [Tiny Stories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). The very same model was used to train with wikipedia but wikipedia vocabulary and sentence structures are too complex for this small 2.8 million parameters model. You can just replace tinystories.txt and train it on your own text file (dataset). This source code is the “hello world” of the NLP. Don’t expect too much from it.
 
 In the case that you are curious, there are plenty of scientific studies supporting NLP with CNNs:
 * https://aclanthology.org/W18-6127/ - Convolutions Are All You Need (For Classifying Character Sequences)
