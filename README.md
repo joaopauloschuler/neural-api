@@ -65,8 +65,10 @@ Saving is as easy:
 
 ### Simple Image Classification Examples
 
-#### How Does the Code Look like for an Image Classification (CIFAR-10) Example?
-This is an example for image classification:
+#### CIFAR-10 Image Classification Example
+The CIFAR-10 dataset is a well-known collection of images commonly used to train machine learning and computer vision algorithms. It was created by the Canadian Institute for Advanced Research (CIFAR). It contains 60K 32x32 color images. The images are classified into 10 different classes, with 6,000 images per class. The classes represent airplanes, cars, birds, cats, deer, dogs, frogs, horses, ships, and trucks. Despite its relatively low resolution and small size, CIFAR-10 can be challenging for models to achieve high accuracy, making it a good dataset for testing advancements in machine learning techniques.
+
+Follows a source code example for the CIFAR-10 image classification:
 ```
 NN := TNNet.Create();
 NN.AddLayer([
