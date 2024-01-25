@@ -420,6 +420,24 @@ type
       function DisableErrorCollection: TNNetInput;
   end;
 
+  // This layer transposes the X and Depth axis.
+  TNNetTransposeXD = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  // This layer transposes the Y and Depth axis.
+  TNNetTransposeYD = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer copies the input to the output and can be used as a base class
   // to your new layers.
   TNNetIdentity = class(TNNetLayer)
@@ -2095,6 +2113,62 @@ begin
 
   // Release the memory allocated for the input volume to prevent memory leaks.
   InputVolume.Free;
+end;
+
+{ TNNetTransposeYD }
+
+procedure TNNetTransposeYD.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.Depth, pPrevLayer.Output.SizeY);
+  FOutputError.ReSize(pPrevLayer.OutputError.SizeX, pPrevLayer.OutputError.Depth, pPrevLayer.OutputError.SizeY);
+  FOutputErrorDeriv.ReSize(pPrevLayer.OutputErrorDeriv.SizeX, pPrevLayer.OutputErrorDeriv.Depth, pPrevLayer.OutputErrorDeriv.SizeY);
+end;
+
+procedure TNNetTransposeYD.Compute;
+begin
+    FOutput.CopyTransposingYD(FPrevLayer.FOutput);
+end;
+
+procedure TNNetTransposeYD.Backpropagate;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    FPrevLayer.FOutputError.AddTransposingYD(FOutputError);
+  end;
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetTransposeXD }
+
+procedure TNNetTransposeXD.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(pPrevLayer.Output.Depth, pPrevLayer.Output.SizeY, pPrevLayer.Output.SizeX);
+  FOutputError.ReSize(pPrevLayer.OutputError.Depth, pPrevLayer.OutputError.SizeY, pPrevLayer.OutputError.SizeX);
+  FOutputErrorDeriv.ReSize(pPrevLayer.OutputErrorDeriv.Depth, pPrevLayer.OutputErrorDeriv.SizeY, pPrevLayer.OutputErrorDeriv.SizeX);
+end;
+
+procedure TNNetTransposeXD.Compute;
+begin
+  FOutput.CopyTransposingXD(FPrevLayer.FOutput);
+end;
+
+procedure TNNetTransposeXD.Backpropagate;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    FPrevLayer.FOutputError.AddTransposingXD(FOutputError);
+  end;
+  FPrevLayer.Backpropagate();
 end;
 
 { TNNetReLUP }
@@ -10645,6 +10719,8 @@ begin
     case S[0] of
       'TNNetInput' :                Result := TNNetInput.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
+      'TNNetTransposeXD' :          Result := TNNetTransposeXD.Create();
+      'TNNetTransposeYD' :          Result := TNNetTransposeYD.Create();
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0]);
       'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1]);
@@ -10742,6 +10818,8 @@ begin
     {$ELSE}
       if S[0] = 'TNNetInput' then Result := TNNetInput.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
+      if S[0] = 'TNNetTransposeXD' then Result := TNNetTransposeXD.Create() else
+      if S[0] = 'TNNetTransposeYD' then Result := TNNetTransposeYD.Create() else
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0]) else
       if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1]) else

@@ -150,6 +150,8 @@ type
     procedure AddAtDepth(pDepth: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure AddAtDepth(pDepth: integer; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure AddFromDepthToDepth(Original: TVolume; FromDepth, ToDepth: integer); {$IFDEF Release} inline; {$ENDIF}
+    procedure AddTransposingXD(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
+    procedure AddTransposingYD(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure CopyFromDepthToDepth(Original: TVolume; FromDepth, ToDepth: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure AddLayers(A,B: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Sub(x, y, d: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -200,6 +202,8 @@ type
     procedure CopyPadding(Original: TVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
     procedure CopyCropping(Original: TVolume; StartX, StartY, pSizeX, pSizeY: integer);
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
+    procedure CopyTransposingXD(Original: TVolume);
+    procedure CopyTransposingYD(Original: TVolume);
     procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure CopyNoChecks(var Original: array of byte); overload;
     procedure CopyNoChecks(var Original: string); overload;
@@ -3371,6 +3375,74 @@ begin
   end;
 end;
 
+procedure TVolume.AddTransposingXD(Original: TVolume);
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+begin
+  ReSize(Original.Depth, Original.SizeY, Original.SizeX);
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  MaxD := FDepth - 1;
+  if MaxY > 0 then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        for CntD := 0 to MaxD do
+        begin
+          Add(CntX, CntY, CntD, Original[CntD, CntY, CntX]);
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntD := 0 to MaxD do
+      begin
+          Add(CntX, 0, CntD, Original[CntD, 0, CntX]);
+      end;
+    end;
+  end;
+end;
+
+procedure TVolume.AddTransposingYD(Original: TVolume);
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+begin
+  ReSize(Original.SizeX, Original.Depth, Original.SizeY);
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  MaxD := FDepth - 1;
+  if MaxX > 0 then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        for CntD := 0 to MaxD do
+        begin
+          Add(CntX, CntY, CntD, Original[CntX, CntD, CntY]);
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      for CntD := 0 to MaxD do
+      begin
+        Add(0, CntY, CntD, Original[0, CntD, CntY]);
+      end;
+    end;
+  end;
+end;
+
 procedure TVolume.CopyFromDepthToDepth(Original: TVolume; FromDepth,
   ToDepth: integer);
 var
@@ -4562,6 +4634,74 @@ begin
         RawPostDest := GetRawPos(CntX, CntY);
         RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
         Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+      end;
+    end;
+  end;
+end;
+
+procedure TVolume.CopyTransposingXD(Original: TVolume);
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+begin
+  ReSize(Original.Depth, Original.SizeY, Original.SizeX);
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  MaxD := FDepth - 1;
+  if MaxY > 0 then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        for CntD := 0 to MaxD do
+        begin
+          Self[CntX, CntY, CntD] := Original[CntD, CntY, CntX];
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntD := 0 to MaxD do
+      begin
+        Self[CntX, 0, CntD] := Original[CntD, 0, CntX];
+      end;
+    end;
+  end;
+end;
+
+procedure TVolume.CopyTransposingYD(Original: TVolume);
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+begin
+  ReSize(Original.SizeX, Original.Depth, Original.SizeY);
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  MaxD := FDepth - 1;
+  if MaxX > 0 then
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        for CntD := 0 to MaxD do
+        begin
+          Self[CntX, CntY, CntD] := Original[CntX, CntD, CntY];
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      for CntD := 0 to MaxD do
+      begin
+        Self[0, CntY, CntD] := Original[0, CntD, CntY];
       end;
     end;
   end;
