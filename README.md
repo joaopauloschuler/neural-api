@@ -34,7 +34,18 @@ In this readme file, you’ll find information about:
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
-Some recommended introductory source code examples are:
+Assuming that you would like to train a neural network to learn a function that has 2 inputs and one output, you could start with something like this:
+```
+    NN.AddLayer([
+      TNNetInput.Create(2),
+      TNNetFullConnectReLU.Create(32),
+      TNNetFullConnectReLU.Create(32),
+      TNNetFullConnectLinear.Create(1)
+    ]);
+```
+The example above has 2 inputs (`TNNetInput`), 2 dense layers (`TNNetFullConnectReLU`) with 32 neurons each and one output (`TNNetFullConnectLinear`).
+
+You can learn more about how to build and train simple neural networks at the following source code examples:
 * [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
 * [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
@@ -52,10 +63,54 @@ Saving is as easy:
     NN.SaveToFile('MyTrainedNeuralNetwork.nn');
 ```
 
+### NLP - Training a Simple Neural Network Model for Text Generation
+This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). This code
+
+```
+    WriteLn(GenerateStringFromChars(NFit.NN, 'once', FSampler),'.');
+    WriteLn(GenerateStringFromChars(NFit.NN, 'one ', FSampler),'.');
+```
+
+produces this output:
+```
+once upon a time, there was a little girl named lily. she loved to play outside i.
+one day, a little girl named lily was playing in her garden. she saw a big car wi.
+```
+
+You can open on colab the raw training file and run it by yourself at:
+https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/NLP_CAI_TinyStories_Simple_Example.ipynb
+
+#### Creating Your Own Chat Bot
+Once your neural network is trained, you can run your own chat bot with:
+```
+var
+  S: string;
+  oSampler: TNNetSamplerBase;
+  NN: TNNet;
+begin
+  oSampler := TNNetSamplerTopP.Create(0.6);
+  NN := TNNet.Create();
+  WriteLn('Loading neural network.');
+  NN.LoadFromFile('MyNeuralNetwork.nn');
+  NN.DebugStructure();
+  WriteLn();
+  WriteLn('Write something and I will reply.');
+  repeat
+    Write('User: ');
+    ReadLn(S);
+    WriteLn('Neural network: ',GenerateStringFromChars(NN, LowerCase(S), oSampler),'.');
+  until S = 'exit';
+  NN.Free;
+  oSampler.Free;
+end;
+```
+
 ### Simple Image Classification Examples
 
-#### How Does the Code Look like for an Image Classification (CIFAR-10) Example?
-This is an example for image classification:
+#### CIFAR-10 Image Classification Example
+The CIFAR-10 dataset is a well-known collection of images commonly used to train machine learning and computer vision algorithms. It was created by the Canadian Institute for Advanced Research (CIFAR). It contains 60K 32x32 color images. The images are classified into 10 different classes, with 6,000 images per class. The classes represent airplanes, cars, birds, cats, deer, dogs, frogs, horses, ships, and trucks. Despite its relatively low resolution and small size, CIFAR-10 can be challenging for models to achieve high accuracy, making it a good dataset for testing advancements in machine learning techniques.
+
+Follows a source code example for the CIFAR-10 image classification:
 ```
 NN := TNNet.Create();
 NN.AddLayer([
