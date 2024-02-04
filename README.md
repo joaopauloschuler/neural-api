@@ -5,7 +5,7 @@ OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested
 
 This project is a subproject from a bigger and older project called [CAI](https://sourceforge.net/projects/cai/) and is sister to Keras based [K-CAI NEURAL API](https://github.com/joaopauloschuler/k-neural-api). You can find trained neural network models in the [pre-trained-neural-api-networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) repository.
 
-## Promo Ad
+## Promo Ad @ YouTube
 [![Watch the video](https://img.youtube.com/vi/FHmyT5WfffU/0.jpg)](https://youtu.be/FHmyT5WfffU)
 
 ## Why Pascal?
