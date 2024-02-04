@@ -5,6 +5,9 @@ OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested
 
 This project is a subproject from a bigger and older project called [CAI](https://sourceforge.net/projects/cai/) and is sister to Keras based [K-CAI NEURAL API](https://github.com/joaopauloschuler/k-neural-api). You can find trained neural network models in the [pre-trained-neural-api-networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) repository.
 
+## Promo Ad
+[![Watch the video](https://img.youtube.com/vi/FHmyT5WfffU/0.jpg)](https://youtu.be/FHmyT5WfffU)
+
 ## Why Pascal?
 * Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
 * Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code and at the same time have a readable code.
