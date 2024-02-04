@@ -168,10 +168,9 @@ You can save and load trained models (neural networks) with `TNNet.SaveToFile` a
 ```
 
 ### Youtube Videos
-There are some available videos:
-* [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
-* [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
-* [AVX and AVX2 Code Optimization](https://www.youtube.com/watch?v=Pnv174V_emw)
+[![Watch the video](https://img.youtube.com/vi/jdFixaZ2P4w/0.jpg)](https://youtu.be/jdFixaZ2P4w) | [![Watch the video](https://img.youtube.com/vi/qGnfwpKUTIQ/0.jpg)](https://youtu.be/qGnfwpKUTIQ) | [![Watch the video](https://img.youtube.com/vi/Pnv174V_emw/0.jpg)](https://youtu.be/Pnv174V_emw)
+--------------------------- | ------------------------------------- | -------------------------
+Increasing Image Resolution with Neural Networks | Ultra Fast Single Precision Floating Point Computing | AVX and AVX2 Code Optimization
 
 Some videos make referrence to **uvolume** unit. The current **neuralvolume** unit used to be called **uvolume**. This is why
 it's mentioned.
