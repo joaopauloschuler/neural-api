@@ -9,8 +9,9 @@ This project is a subproject from a bigger and older project called [CAI](https:
 [![Watch the video](https://img.youtube.com/vi/FHmyT5WfffU/0.jpg)](https://youtu.be/FHmyT5WfffU)
 
 ## Why Pascal?
-* Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
-* Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code and at the same time have a readable code.
+* The Pascal computer language is easy to learn. Pascal allows developers to make a readable and understandable source code.
+* You'll be able to make super-fast **native code** and at the same time have a readable code.
+* This API can outperform some major APIs in some architectures.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers. Many examples use the [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) dataset. You'll also find examples for the [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html), [MNIST](http://yann.lecun.com/exdb/mnist/), [Fashion MNIST](https://www.kaggle.com/zalando-research/fashionmnist) and the [Places365-Standard Small images 256x256](http://places2.csail.mit.edu/download.html) dataset.
