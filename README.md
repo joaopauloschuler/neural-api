@@ -177,7 +177,7 @@ You can save and load trained models (neural networks) with `TNNet.SaveToFile` a
 ```
 
 ### Youtube Videos
-[![Watch the video](https://img.youtube.com/vi/jdFixaZ2P4w/0.jpg)](https://youtu.be/jdFixaZ2P4w) | [![Watch the video](https://img.youtube.com/vi/qGnfwpKUTIQ/0.jpg)](https://youtu.be/qGnfwpKUTIQ) | [![Watch the video](https://img.youtube.com/vi/Pnv174V_emw/0.jpg)](https://youtu.be/Pnv174V_emw)
+[![Watch the video](https://img.youtube.com/vi/SEvWB7k8uy0/0.jpg)](https://youtu.be/SEvWB7k8uy0) | [![Watch the video](https://img.youtube.com/vi/3QwIaAsDmJw/0.jpg)](https://youtu.be/3QwIaAsDmJw) | [![Watch the video](https://img.youtube.com/vi/VH6v3D5cxxs/0.jpg)](https://youtu.be/VH6v3D5cxxs)
 --------------------------- | ------------------------------------- | -------------------------
 Increasing Image Resolution with Neural Networks | Ultra Fast Single Precision Floating Point Computing | AVX and AVX2 Code Optimization
 
