@@ -1,4 +1,4 @@
-# Simple Super Resolution Example
+# Super Resolution Command Line Tool
 <img align="right" src="results/street_result.png"></img>
 ## Introduction
 The image at the right side shows an example. The smaller image is the original image while the bigger image is the image processed twice by a neural network trained to increase image resolution.
