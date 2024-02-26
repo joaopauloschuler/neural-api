@@ -43,6 +43,10 @@ In this readme file, you’ll find information about:
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
+[![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+
+You can click on the image above to watch the video.
+
 Assuming that you would like to train a neural network to learn a function that has 2 inputs and one output, you could start with something like this:
 ```
     NN.AddLayer([
