@@ -8,7 +8,8 @@ To make the learning of neural networks very easy, this folder contains 2 source
 This example covers:
 * data preparation (the training data),  
 * neural network architecture,
-* 
+* training and
+* testing.
 
 ### The Training Data
 The training data consists of all possible input combinations for the OR operation and their corresponding outputs:
