@@ -37,7 +37,7 @@ type
 const
   cs_false = 0.1;                          // Encoding for "false" value
   cs_true  = 0.8;                          // Encoding for "true" value
-  cs_threshold = (cs_false + cs_true) / 2; // Threshold for neuron activation
+  cs_threshold = (cs_false + cs_true) / 2; // Threshold for False/True values
 
 const
   cs_inputs : TBackInput =
@@ -71,18 +71,18 @@ begin
   NN := TNNet.Create();
 
   // Create the neural network layers
-  NN.AddLayer(TNNetInput.Create(2));                     // Input layer with 2 neurons
+  NN.AddLayer(TNNetInput.Create(2));                     // Input layer with 2 inputs
   NN.AddLayer(TNNetFullConnectLinear.Create(1));         // Single neuron layer connected to both inputs from the previous layer.
 
   NN.SetLearningRate(0.01, 0.9);                         // Set the learning rate and momentum
 
   vInputs := cs_inputs;                                  // Assign the input data
   vOutput := cs_outputs;                                 // Assign the expected output data
-  pOutPut := TNNetVolume.Create(1, 1, 1, 1);             // Create a volume to hold the output
+  pOutPut := TNNetVolume.Create(1, 1, 1, 1);             // Create a volume to hold the computed output
 
-  WriteLn('Value encoding FALSE is: ', cs_false:4:2);    // Display the encoding for "false"
-  WriteLn('Value encoding TRUE is: ', cs_true:4:2);      // Display the encoding for "true"
-  WriteLn('Threshold is: ', cs_threshold:4:2);           // Display the threshold value
+  WriteLn('The value encoding FALSE is: ', cs_false:4:2);    // Display the encoding for "false"
+  WriteLn('The value encoding TRUE is: ', cs_true:4:2);      // Display the encoding for "true"
+  WriteLn('The threshold is: ', cs_threshold:4:2);           // Display the threshold value
   WriteLn;
 
   for EpochCnt := 1 to 600 do
@@ -97,8 +97,9 @@ begin
       if EpochCnt mod 100 = 0 then
         WriteLn(
           EpochCnt:7, 'x', Cnt,
-          ' Output:', pOutPut.Raw[0]:5:2,' ',
-          ' - Training/Desired Output:', vOutput[cnt][0]:5:2,' '
+          ' Inputs:', vInputs[Cnt][0]:5:3,' ',vInputs[Cnt][1]:5:3,
+          ' Computed Output:', pOutPut.Raw[0]:5:2,' ',
+          ' Desired Output:', vOutput[cnt][0]:5:2
         );
     end;
 
