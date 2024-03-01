@@ -5,9 +5,13 @@ OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested
 
 This project is a subproject from a bigger and older project called [CAI](https://sourceforge.net/projects/cai/) and is sister to Keras based [K-CAI NEURAL API](https://github.com/joaopauloschuler/k-neural-api). You can find trained neural network models in the [pre-trained-neural-api-networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) repository.
 
+## 2 Minutes Promo Video
+[![Watch the video](https://img.youtube.com/vi/4EPX4RyPzSQ/0.jpg)](https://youtu.be/4EPX4RyPzSQ)
+
 ## Why Pascal?
-* Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
-* Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code and at the same time have a readable code.
+* The Pascal computer language is easy to learn. Pascal allows developers to make a readable and understandable source code.
+* You'll be able to make super-fast **native code** and at the same time have a readable code.
+* This API can outperform some major APIs in some architectures.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers. Many examples use the [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) dataset. You'll also find examples for the [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html), [MNIST](http://yann.lecun.com/exdb/mnist/), [Fashion MNIST](https://www.kaggle.com/zalando-research/fashionmnist) and the [Places365-Standard Small images 256x256](http://places2.csail.mit.edu/download.html) dataset.
@@ -17,6 +21,11 @@ This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of 
 
 ## Installation
 Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neural-api/tree/master/neural) folder to your [Lazarus](https://www.lazarus-ide.org/) unit search path and you'll be ready to go!
+
+## A.I. Powered Support
+You can get A.I. powered help from these tools:
+* [CAI Neural API support at ChatGPT4](https://chat.openai.com/g/g-bqMxEDpIg-neural-api-free-pascal-developer).
+* [CAI Neural API support at Poe](https://poe.com/CAI-NEURAL-API).
  
 ## Documentation
 The documentation is composed by:
@@ -34,6 +43,10 @@ In this readme file, you’ll find information about:
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
+[![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+
+You can click on the image above to watch the video.
+
 Assuming that you would like to train a neural network to learn a function that has 2 inputs and one output, you could start with something like this:
 ```
     NN.AddLayer([
@@ -168,10 +181,9 @@ You can save and load trained models (neural networks) with `TNNet.SaveToFile` a
 ```
 
 ### Youtube Videos
-There are some available videos:
-* [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
-* [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
-* [AVX and AVX2 Code Optimization](https://www.youtube.com/watch?v=Pnv174V_emw)
+[![Watch the video](https://img.youtube.com/vi/SEvWB7k8uy0/0.jpg)](https://youtu.be/SEvWB7k8uy0) | [![Watch the video](https://img.youtube.com/vi/3QwIaAsDmJw/0.jpg)](https://youtu.be/3QwIaAsDmJw) | [![Watch the video](https://img.youtube.com/vi/VH6v3D5cxxs/0.jpg)](https://youtu.be/VH6v3D5cxxs)
+--------------------------- | ------------------------------------- | -------------------------
+Increasing Image Resolution with Neural Networks | Ultra Fast Single Precision Floating Point Computing | AVX and AVX2 Code Optimization
 
 Some videos make referrence to **uvolume** unit. The current **neuralvolume** unit used to be called **uvolume**. This is why
 it's mentioned.

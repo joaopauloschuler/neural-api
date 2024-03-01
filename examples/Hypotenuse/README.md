@@ -1,5 +1,8 @@
 # Learning Hypotenuse Function
 
+## 2 Minutes Intro Video
+[![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+
 This example has these main steps:
 * Preparing training data
 * Creating the neural network
