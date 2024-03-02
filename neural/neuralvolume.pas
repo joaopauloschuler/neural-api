@@ -349,6 +349,48 @@ type
       procedure CalculateLocalResponseFrom2D(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure CalculateLocalResponseFromDepth(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure GetTokenArray(var TokenArray: TNNetTokenArray);
+      (*
+      Assume that "As" and "Bs" contain lists of vectors "A" and "B".
+      "NumAs and NumBs" are the number of elements in the
+      The DotProducts function runs dot products for all combinations of "As" and "Bs".
+      "Convolutions" are "dot products".
+      Assume 3 matrixes 2x2 of the type TNNetVolume: A, B and B transposed (BT)
+      Assume c,d,e,f,x,y,z,w are of the type TNeuralFloat.
+
+      These are the matrixes A, B and BT (B Transposed):
+      A       B       BT
+      c  d    x  y    x  z
+      e  f    z  w    y  w
+
+      A = [c, d, e, f]
+      B = [x, y, z, w]
+
+      a1  = [c, d]
+      a2  = [e, f]
+
+      b1  = [x, y]
+      b2  = [z, w]
+
+      bt1 = [x, z]
+      bt2 = [y, w]
+
+      A  = [a1 ,  a2]
+      B  = [b1 ,  b2]
+      BT = [bt1, bt2]
+
+      * denotes "dot product".
+      The result of DotProducts (2, 2, 2, A, B) will be: [a1* b1, a2* b1, a1* b2, a2* b2]
+      The result of a matrix multiplicaton would be:     [a1*bt1, a1*bt2, a2*bt1, a2*bt2]
+      The result of DotProducts (2, 2, 2, A, BT)will be: [a1*bt1, a2*bt1, a1*bt2, a2*bt2]
+      The transposed result of DotProducts (2, 2, 4, A, BT) will be the same as a matrix multiplication AB.
+      OR
+      Given that (A B)T = (BT AT),
+      The result of DotProducts (2, 2, 2, BT, A) is the same as a matrix multiplication AB.
+      This interpretation is valid for the functions:
+      * InterleavedDotProduct
+      * DotProducts
+      * DotProductsTiled
+      *)
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
