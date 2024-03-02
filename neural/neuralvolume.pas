@@ -301,6 +301,10 @@ type
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure OneHotEncoding(aTokens: string); overload;
     procedure OneHotEncodingReversed(aTokens: string); overload;
+    // Inserts positional embedding at the depth. If depth is -1, then inserts
+    // positional embedding at the last channel.
+    // https://arxiv.org/abs/1706.03762 .
+    procedure PositionalEncoding(n: integer = 10000);
 
     // Color Encoding Functions
     procedure RgbToHsv(); {$IFDEF Release} inline; {$ENDIF}
@@ -401,9 +405,16 @@ type
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX512: boolean; {$IFDEF Release} inline; {$ENDIF}
       function PearsonCorrelation(Y : TNNetVolume): TNeuralFloat;
+      // AddSumChannel adds the sum of each channel to the current 1D array.
       procedure AddSumChannel(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
+      // AddSumSqrChannel is designed to compute the sum of the squares of elements
+      // channel-wise from Original and add this sum to the current volume.
       procedure AddSumSqrChannel(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
+      // AddToChannels receives an 1D array (Original). Each element in Original
+      // will be summed to the entire XY 2D slice at the same depth.
       procedure AddToChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
+      // MulChannels receives an 1D array (Original). Each element in Original
+      // will multiply the entire XY 2D slice at the same depth.
       procedure MulChannels(Original: TNNetVolume); {$IFDEF Release} inline; {$ENDIF}
       procedure Mul(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeMax(Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -1418,6 +1429,23 @@ begin
   if Abs(x) < Tolerance
   then WriteLn(' Passed.')
   else WriteLn(' FAILED.');
+end;
+
+// https://machinelearningmastery.com/a-gentle-introduction-to-positional-encoding-in-transformer-models-part-1/
+// Expected result is:
+// [[ 0.          1.          0.          1.        ]
+//  [ 0.84147098  0.54030231  0.09983342  0.99500417]
+//  [ 0.90929743 -0.41614684  0.19866933  0.98006658]
+//  [ 0.14112001 -0.9899925   0.29552021  0.95533649]]
+procedure TestTNNetVolumePositionalEncoding;
+var
+  X: TNNetVolume;
+begin
+  X := TNNetVolume.Create(4,1,4);
+  X.PositionalEncoding(100);
+  X.Print();
+  X.Free;
+  readln;
 end;
 
 procedure TestTNNetVolume();
@@ -5706,6 +5734,34 @@ begin
   end;
 end;
 
+procedure TVolume.PositionalEncoding(n: integer);
+var
+  Position: Integer;
+  divTerm: Double;
+  MaxX, MaxY, MaxDepth: integer;
+  CntX, CntY, CntDepth: integer;
+  EmbeddingSize: integer;
+begin
+  EmbeddingSize := FDepth;
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  MaxDepth := FDepth - 1;
+  for CntDepth := 0 to MaxDepth do
+  begin
+    divTerm := Power(n, (2 * (CntDepth div 2)) / EmbeddingSize);
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        Position := CntY*FSizeX + CntX;
+        if CntDepth mod 2 = 0
+          then Self[CntX, CntY, CntDepth] := Sin(Position / divTerm)
+          else Self[CntX, CntY, CntDepth] := Cos(Position / divTerm);
+      end;
+    end;
+  end;
+end;
+
 procedure TVolume.RgbToHsv();
 var
   I, J: integer;
@@ -5720,7 +5776,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5749,7 +5805,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5778,7 +5834,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5806,7 +5862,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5834,7 +5890,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5863,7 +5919,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5887,7 +5943,7 @@ begin
   if Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
@@ -5911,7 +5967,7 @@ begin
   if Rgb.Depth >= 3 then
   begin
     MaxX := FSizeX - 1;
-    MaxY := FSizeX - 1;
+    MaxY := FSizeY - 1;
 
     for I := 0 to MaxX do
     begin
