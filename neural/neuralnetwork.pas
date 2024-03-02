@@ -674,6 +674,20 @@ type
     procedure Compute(); override;
   end;
 
+  { TNNetAddPositionalEmbedding }
+  // Adds positional embedding as per paper "Attention Is All You Need".
+  // https://arxiv.org/abs/1706.03762 .
+  TNNetAddPositionalEmbedding = class(TNNetIdentity)
+  private
+    FPositionalEmbedding: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(n: integer = 0); overload;
+    destructor Destroy(); override;
+
+    procedure Compute(); override;
+  end;
+
   TNNetAddNoiseBase = class(TNNetIdentity)
   protected
     FEnabled: boolean;
@@ -2113,6 +2127,35 @@ begin
 
   // Release the memory allocated for the input volume to prevent memory leaks.
   InputVolume.Free;
+end;
+
+{ TNNetAddPositionalEmbedding }
+procedure TNNetAddPositionalEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FPositionalEmbedding.ReSize(FOutput);
+  FPositionalEmbedding.PositionalEncoding(FStruct[0]);
+end;
+
+constructor TNNetAddPositionalEmbedding.Create(n: integer);
+begin
+  inherited Create;
+  FPositionalEmbedding := TNNetVolume.Create;
+  if n=0
+  then FStruct[0] := 10000
+  else FStruct[0] := n;
+end;
+
+destructor TNNetAddPositionalEmbedding.Destroy;
+begin
+  FPositionalEmbedding.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetAddPositionalEmbedding.Compute;
+begin
+  inherited Compute;
+  FOutput.Add(FPositionalEmbedding);
 end;
 
 { TNNetTransposeYD }
@@ -10812,6 +10855,7 @@ begin
       'TNNetLocalResponseNorm2D':   Result := TNNetLocalResponseNorm2D.Create(St[0]);
       'TNNetLocalResponseNormDepth':Result := TNNetLocalResponseNormDepth.Create(St[0]);
       'TNNetAddAndDiv'             :Result := TNNetAddAndDiv.Create(St[0], St[1]);
+      'TNNetAddPositionalEmbedding':Result := TNNetAddPositionalEmbedding.Create(St[0]);
     else
        raise Exception.create(strData + ' not allowed in CreateLayer.');
     end;
@@ -10911,6 +10955,7 @@ begin
       if S[0] = 'TNNetLocalResponseNorm2D' then   Result := TNNetLocalResponseNorm2D.Create(St[0]) else
       if S[0] = 'TNNetLocalResponseNormDepth' then Result := TNNetLocalResponseNormDepth.Create(St[0]) else
       if S[0] = 'TNNetAddAndDiv' then Result := TNNetAddAndDiv.Create(St[0], St[1]) else
+      if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
       raise Exception.create(strData + ' not allowed in CreateLayer.');
     {$ENDIF}
 

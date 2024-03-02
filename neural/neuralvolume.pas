@@ -301,8 +301,7 @@ type
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure OneHotEncoding(aTokens: string); overload;
     procedure OneHotEncodingReversed(aTokens: string); overload;
-    // Inserts positional embedding at the depth. If depth is -1, then inserts
-    // positional embedding at the last channel.
+    // Sets positional embedding as per paper "Attention Is All You Need".
     // https://arxiv.org/abs/1706.03762 .
     procedure PositionalEncoding(n: integer = 10000);
 
