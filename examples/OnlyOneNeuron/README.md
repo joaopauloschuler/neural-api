@@ -1,15 +1,81 @@
 # Only One Neuron - Source Code Examples
 
 To make the learning of neural networks very easy, this folder contains 2 source code examples with neural networks that contain only one neuron:
-* Compute the boolean OR operation.
 * Compute the linear function 2*x + 3*y + 4.
+* Compute the boolean OR operation.
+
+## Compute the linear function 2*x + 3*y + 4
+This example covers:
+* data preparation (the training data),  
+* neural network architecture,
+* training and testing.
+
+### The Training Data
+While training, we calculate inputs and expected outputs with:
+```
+    vInputs[0] := (Random(10000) - 5000)/100;          // Random number in the interval [-50,+50].
+    vInputs[1] := (Random(10000) - 5000)/100;          // Random number in the interval [-50,+50].
+    vOutput[0] := 2*vInputs[0] - 3*vInputs[1] + 4;     // 2x - 3y + 4  
+```
+The actual data structures with input and output are defined with:
+```
+type
+  // Define the input and output types for training data
+  TBackFloatInput  = array[0..1] of TNeuralFloat;  // Input data for 2x - 3y + 4
+  TBackFloatOutput = array[0..0] of TNeuralFloat;  // Expected output for 2x - 3y + 4
+...
+var
+...
+  vInputs: TBackFloatInput;
+  vOutput: TBackFloatOutput;
+```
+### Neural Network Architecture
+The neural network consists of only 2 layers:
+* an input layer with two inputs (representing the two inputs of the OR operation)
+* and a single output neuron that provides the result. It uses a fully connected architecture without activation function.
+
+The above is created with:
+```
+  NN := TNNet.Create();
+  // Create the neural network layers
+  NN.AddLayer(TNNetInput.Create(2));                     // Input layer with 2 neurons
+  NN.AddLayer(TNNetFullConnectLinear.Create(1));         // Single neuron layer connected to both inputs from the previous layer.
+```
+
+### Training and Testing the Neural Network
+The training and testing are done in a single code:
+```
+  for EpochCnt := 1 to 100000 do
+  begin
+    vInputs[0] := (Random(10000) - 5000)/100;          // Random number in the interval [-50,+50].
+    vInputs[1] := (Random(10000) - 5000)/100;          // Random number in the interval [-50,+50].
+    vOutput[0] := 2*vInputs[0] - 3*vInputs[1] + 4;     // 2x - 3y + 4
+    // Feed forward and backpropagation
+    NN.Compute(vInputs);                               // Perform feedforward computation
+    NN.GetOutput(pOutPut);                             // Get the output of the network
+    NN.Backpropagate(vOutput);                         // Perform backpropagation to adjust weights
+
+    if EpochCnt mod 5000 = 0 then
+        WriteLn(
+          EpochCnt:7, 'x',
+          ' Output:', pOutPut.Raw[0]:5:2,' ',
+          ' - Training/Desired Output:', vOutput[0]:5:2,' '
+        );
+  end;
+```
+In the above code, `vOutput` has the desired output while `pOutPut` has the output that was calculated by the neural network. In the output, you'll find:
+```
+  90000x Output:39.17  - Training/Desired Output:39.17
+  95000x Output: 8.12  - Training/Desired Output: 8.12
+ 100000x Output:110.15  - Training/Desired Output:110.15
+```
+As you can see above, the desired output is exactly the calculated output.
 
 ## Computing the Boolean OR Operation
 This example covers:
 * data preparation (the training data),  
 * neural network architecture,
-* training and
-* testing.
+* training and testing.
 
 ### The Training Data
 The training data consists of all possible input combinations for the OR operation and their corresponding outputs:
