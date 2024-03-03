@@ -296,6 +296,7 @@ type
     // GetClass is similar to argmax
     function GetClass(): integer;
     function SoftMax(): T;
+    procedure PointwiseSoftMax();
 
     // Encoding Functions
     procedure OneHotEncoding(aTokens: array of integer); overload;
@@ -5621,6 +5622,59 @@ begin
   end;
 
   Result := TotalSum;
+end;
+
+procedure TVolume.PointwiseSoftMax;
+var
+  I, StartPointPos: integer;
+  MaxX, MaxY, MaxD: integer;
+  CountX, CountY, CountD: integer;
+  MaxValue: T;
+  LocalValue: T;
+  TotalSum: TNeuralFloat;
+begin
+  // TODO: This portion of code can be optimized
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  MaxD := FDepth - 1;
+
+  if MaxD > 0 then
+  begin
+    for CountX := 0 to MaxX do
+    begin
+      for CountY := 0 to MaxY do
+      begin
+        StartPointPos := GetRawPos(CountX, CountY);
+        I := StartPointPos;
+        // Find the point max value.
+        MaxValue := FData[0];
+        for CountD := 1 to MaxD do
+        begin
+          if FData[CountD] > MaxValue
+            then MaxValue := FData[CountD];
+          Inc(I);
+        end;
+        TotalSum := 0;
+        I := StartPointPos;
+        for CountD := 0 to MaxD do
+        begin
+          LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+          FData[I] := LocalValue;
+          TotalSum := TotalSum + FData[I];
+          Inc(I);
+        end;
+        if TotalSum > 0 then
+        begin
+          I := StartPointPos;
+          for CountD := 0 to MaxD do
+          begin
+            FData[I] := FData[I] / TotalSum;
+            Inc(I);
+          end;
+        end;
+      end;
+    end;
+  end;
 end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);

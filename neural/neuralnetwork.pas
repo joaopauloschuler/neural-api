@@ -1078,6 +1078,13 @@ type
       procedure Compute(); override;
   end;
 
+  // This layer is experimental - do not use it.
+  // Pointwise softmax operation.
+  TNNetPointwiseSoftMax = class(TNNetIdentity)
+  public
+    procedure Compute(); override;
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -2127,6 +2134,14 @@ begin
 
   // Release the memory allocated for the input volume to prevent memory leaks.
   InputVolume.Free;
+end;
+
+{ TNNetPointwiseSoftMax }
+
+procedure TNNetPointwiseSoftMax.Compute;
+begin
+  inherited Compute;
+  FOutput.PointwiseSoftMax();
 end;
 
 { TNNetAddPositionalEmbedding }
@@ -10800,6 +10815,7 @@ begin
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create();
+      'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -10900,6 +10916,7 @@ begin
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create() else
+      if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
