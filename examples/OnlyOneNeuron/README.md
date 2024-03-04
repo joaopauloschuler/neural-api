@@ -1,10 +1,10 @@
 # Only One Neuron - Source Code Examples
 
 To make the learning of neural networks very easy, this folder contains 2 source code examples with neural networks that contain only one neuron:
-* Compute the linear function 2*x + 3*y + 4.
-* Compute the boolean OR operation.
+* Learn the linear function 2*x + 3*y + 4.
+* Learn the boolean OR operation.
 
-## Compute the linear function 2*x + 3*y + 4
+## Learn the linear function 2*x + 3*y + 4
 This example covers:
 * data preparation (the training data),  
 * neural network architecture,
@@ -71,7 +71,7 @@ In the above code, `vOutput` has the desired output while `pOutPut` has the outp
 ```
 As you can see above, the desired output is exactly the calculated output.
 
-## Computing the Boolean OR Operation
+## Learn the Boolean OR Operation
 This example covers:
 * data preparation (the training data),  
 * neural network architecture,
