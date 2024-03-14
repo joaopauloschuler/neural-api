@@ -152,6 +152,7 @@ type
     procedure AddFromDepthToDepth(Original: TVolume; FromDepth, ToDepth: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure AddTransposingXD(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure AddTransposingYD(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
+    procedure AddTransposingAs2D(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure CopyFromDepthToDepth(Original: TVolume; FromDepth, ToDepth: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure AddLayers(A,B: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Sub(x, y, d: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -192,6 +193,7 @@ type
     procedure AddGaussianNoise(pMul: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
     procedure AddSaltAndPepper(pNum: integer; pSalt: T = 1.0; pPepper: T = -1.0; pColor:boolean = false); {$IFDEF Release} inline; {$ENDIF}
     function RandomGaussianValue(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+    // Copy
     procedure Copy(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure CopyRelu(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Copy(Original: TVolume; Len: integer); {$IFNDEF FPC} overload; {$ENDIF} {$IFDEF Release} inline; {$ENDIF}
@@ -202,13 +204,15 @@ type
     procedure CopyPadding(Original: TVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
     procedure CopyCropping(Original: TVolume; StartX, StartY, pSizeX, pSizeY: integer);
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
-    procedure CopyTransposingXD(Original: TVolume);
-    procedure CopyTransposingYD(Original: TVolume);
     procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure CopyNoChecks(var Original: array of byte); overload;
     procedure CopyNoChecks(var Original: string); overload;
     procedure CopyReversedNoChecks(var Original: string); overload;
     procedure CopyChannels(Original: TVolume; aChannels: array of integer);
+    // Transpose Copying
+    procedure CopyTransposingXD(Original: TVolume);
+    procedure CopyTransposingYD(Original: TVolume);
+    procedure CopyTransposingAs2D(Original: TVolume);
     procedure Define(Original: array of T);
     function DotProduct(Original: TVolume): T; overload; {$IFDEF Release} inline; {$ENDIF}
     class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -398,6 +402,7 @@ type
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
+      procedure DotProductsPointwise(VAs, VBs: TNNetVolume);
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
@@ -3186,6 +3191,7 @@ end;
 constructor TVolume.Create(pSizeX, pSizeY, pDepth: integer; c: T);
 begin
   inherited Create();
+  FSize := 0;
 
   ReSize(pSizeX, pSizeY, pDepth);
   Fill(c);
@@ -3511,6 +3517,18 @@ begin
       end;
     end;
   end;
+end;
+
+procedure TVolume.AddTransposingAs2D(Original: TVolume);
+var
+  OriginalSizeX, OriginalSizeY, OriginalDepth: integer;
+begin
+  OriginalSizeX := Original.SizeX;
+  OriginalSizeY := Original.SizeY;
+  OriginalDepth := Original.Depth;
+  Original.ReSize(OriginalSizeX*OriginalSizeY, 1, OriginalDepth);
+  AddTransposingXD(Original);
+  Original.ReSize(OriginalSizeX, OriginalSizeY, OriginalDepth);
 end;
 
 procedure TVolume.CopyFromDepthToDepth(Original: TVolume; FromDepth,
@@ -4189,21 +4207,18 @@ begin
 end;
 
 procedure TVolume.ReSize(pSizeX, pSizeY, pDepth: integer);
+var
+  NewSize: integer;
 begin
-  if
-    (FSizeX <> pSizeX) or
-    (FSizeY <> pSizeY) or
-    (FDepth <> pDepth) or
-    (Length(FData) = 0) then
+  NewSize := pSizeX * pSizeY * pDepth;
+  if (NewSize <> FSize) then
   begin
-    FSizeX := pSizeX;
-    FSizeY := pSizeY;
-    FDepth := pDepth;
-
-    FSize := FSizeX * FSizeY * FDepth;
-
+    FSize := NewSize;
     SetLength(FData, FSize);
   end;
+  FSizeX := pSizeX;
+  FSizeY := pSizeY;
+  FDepth := pDepth;
 end;
 
 procedure TVolume.ReSize(Original: TVolume);
@@ -4775,6 +4790,18 @@ begin
       end;
     end;
   end;
+end;
+
+procedure TVolume.CopyTransposingAs2D(Original: TVolume);
+var
+  OriginalSizeX, OriginalSizeY, OriginalDepth: integer;
+begin
+  OriginalSizeX := Original.SizeX;
+  OriginalSizeY := Original.SizeY;
+  OriginalDepth := Original.Depth;
+  Original.ReSize(OriginalSizeX*OriginalSizeY, 1, OriginalDepth);
+  CopyTransposingXD(Original);
+  Original.ReSize(OriginalSizeX, OriginalSizeY, OriginalDepth);
 end;
 
 function TVolume.DotProduct(Original: TVolume): T;
@@ -6485,8 +6512,46 @@ begin
       Inc(CntBVectorSizePlusCntBPos);
     end;
   end;
-
 end;
+
+procedure TNNetVolume.DotProductsPointwise(VAs, VBs: TNNetVolume);
+var
+  VAsCount, VBsCount: integer;
+begin
+  VAsCount := VAs.SizeX * VAs.SizeY;
+  VBsCount := VBs.SizeX * VBs.SizeY;
+  if (VAsCount*VBsCount <> FSize) then
+  begin
+    Resize(VBsCount, 1, VAsCount);
+  end;
+
+  if (VAs.Depth = VBs.Depth) then
+  begin
+    DotProducts(VAsCount, VBsCount, VAs.Depth, VAs, VBs);
+  end
+  else
+  begin
+    WriteLn(
+      'TNNetVolume.DotProductsPointwise - Depths differ '+
+      IntToStr(VAs.Depth) + ' ' +
+      IntToStr(VBs.Depth) + '.'
+    );
+  end;
+end;
+
+(*
+// A reference implementation of DotProducts is:
+for CntB := 0 to MaxB do
+begin
+  PtrB := VBs.GetRawPtr(CntB*VectorSize);
+  for CntA := 0 to MaxA do
+  begin
+    PtrA := VAs.GetRawPtr(CntA*VectorSize);
+    Result := DotProduct(PtrA, PtrB, VectorSize);
+    FData[CntB * NumAs + CntA] := Result;
+  end;
+end;
+*)
 
 procedure TNNetVolume.DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
 var
