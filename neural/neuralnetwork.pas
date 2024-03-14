@@ -980,6 +980,27 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// This layer is under construction. DO NOT USE IT.
+  // This layer run the TNNetVolume.DotProducts for layers A and B.
+  TNNetDotProducts = class(TNNetLayer)
+  private
+    FA: TNNetLayer; // Layer A
+    FB: TNNetLayer; // Layer B
+    FAError: TNNetVolume; // Layer A: Error
+    FBError: TNNetVolume; // Layer B: Error
+    FAT: TNNetVolume; // Layer A: Output Transposed
+    FBT: TNNetVolume; // Layer B: Output Transposed
+    FET: TNNetVolume; // Error Transposed
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(A, B: TNNetLayer); overload;
+    constructor Create(AIdx, BIdx: integer); overload;
+    destructor Destroy(); override;
+
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// picks/splits from previous layer selected channels.
   TNNetSplitChannels = class(TNNetLayer)
   private
@@ -2136,6 +2157,90 @@ begin
   InputVolume.Free;
 end;
 
+{ TNNetDotProducts }
+
+procedure TNNetDotProducts.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FA := pPrevLayer.NN.Layers[ FStruct[0] ];
+  FB := pPrevLayer.NN.Layers[ FStruct[1] ];
+  if FA.Output.Depth <> FB.Output.Depth then
+  begin
+    FErrorProc(
+      'TNNetDotProducts - Depths differ '+
+      IntToStr(FA.Output.Depth) + ' ' +
+      IntToStr(FB.Output.Depth) + '.'
+    );
+  end;
+  FOutput.ReSize(
+    FB.Output.SizeX,
+    FB.Output.SizeY,
+    FA.Output.SizeX * FA.Output.SizeY
+  );
+  FOutputError.Resize(FOutput);
+  FOutputErrorDeriv.Resize(FOutput);
+end;
+
+constructor TNNetDotProducts.Create(A, B: TNNetLayer);
+begin
+  Self.Create(A.LayerIdx, B.LayerIdx);
+end;
+
+constructor TNNetDotProducts.Create(AIdx, BIdx: integer);
+begin
+  inherited Create;
+  FAT := TNNetVolume.Create();
+  FBT := TNNetVolume.Create();
+  FET := TNNetVolume.Create();
+  FAError := TNNetVolume.Create();
+  FBError := TNNetVolume.Create();
+
+  FStruct[0] := AIdx;
+  FStruct[1] := BIdx;
+end;
+
+destructor TNNetDotProducts.Destroy;
+begin
+  FAError.Free;
+  FBError.Free;
+  FET.Free;
+  FBT.Free;
+  FAT.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetDotProducts.Compute;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  FOutput.DotProductsPointwise(FA.Output, FB.Output);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDotProducts.Backpropagate;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+
+  FAT.CopyTransposingAs2D(FA.Output);
+  FBT.CopyTransposingAs2D(FB.Output);
+  FET.CopyTransposingAs2D(FOutputError);
+
+  FAError.DotProductsPointwise(FBT, FET);
+  FBError.DotProductsPointwise(FAT, FOutputError);
+
+  FA.OutputError.Add(FAError);
+  FB.OutputError.Add(FBError);
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FB.Backpropagate();
+  FA.Backpropagate();
+end;
+
 { TNNetPointwiseSoftMax }
 
 procedure TNNetPointwiseSoftMax.Compute;
@@ -2185,7 +2290,7 @@ end;
 
 procedure TNNetTransposeYD.Compute;
 begin
-    FOutput.CopyTransposingYD(FPrevLayer.FOutput);
+  FOutput.CopyTransposingYD(FPrevLayer.FOutput);
 end;
 
 procedure TNNetTransposeYD.Backpropagate;
