@@ -1838,6 +1838,8 @@ type
         ): TNNetLayer;
       function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
+      // AddSingleHeadSelfAttention is under construction - do not use it
+      function AddSingleHeadSelfAttention(): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -6595,6 +6597,26 @@ begin
     {RandomAmplifier=}0
   );
   Result := AddLayer( TNNetConvolutionLinear.Create(3,1,0,0) );
+end;
+
+// Ported code from:
+// https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
+function THistoricalNets.AddSingleHeadSelfAttention: TNNetLayer;
+var
+  x, Query, Key, Value, W, WT, YT: TNNetLayer;
+  EmbeddingDim: integer;
+begin
+  x := GetLastLayer();
+  EmbeddingDim := x.Output.Depth;
+  Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  Value := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  WT := AddLayer( TNNetDotProducts.Create(Query, Key) );
+  //WT := AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  W := AddLayer( TNNetTransposeXD.Create() );
+  W := AddLayer( TNNetPointwiseSoftMax.Create() );
+  YT := AddLayer( TNNetDotProducts.Create(W, Value) );
+  result := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
 { TNNetFullConnectLinear }
