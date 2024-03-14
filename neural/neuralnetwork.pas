@@ -10885,6 +10885,7 @@ begin
       'TNNetTransposeXD' :          Result := TNNetTransposeXD.Create();
       'TNNetTransposeYD' :          Result := TNNetTransposeYD.Create();
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
+      'TNNetDotProducts' :          Result := TNNetDotProducts.Create(St[0], St[1]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0]);
       'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1]);
       'TNNetCrop' :                 Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]);
@@ -10986,6 +10987,7 @@ begin
       if S[0] = 'TNNetTransposeXD' then Result := TNNetTransposeXD.Create() else
       if S[0] = 'TNNetTransposeYD' then Result := TNNetTransposeYD.Create() else
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
+      if S[0] = 'TNNetDotProducts' then Result := TNNetDotProducts.Create(St[0], St[1]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0]) else
       if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1]) else
       if S[0] = 'TNNetCrop' then Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]) else
