@@ -1841,7 +1841,7 @@ type
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
       // AddSingleHeadSelfAttention is under construction - do not use it
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
-      procedure AddSingleHeadTransformerBlock(out Attended, W: TNNetLayer);
+      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer);
   end;
 
   { TNNetDataParallelism }
@@ -6621,10 +6621,23 @@ begin
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
-procedure THistoricalNets.AddSingleHeadTransformerBlock(out Attended,
+// Ported code from:
+// https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
+procedure THistoricalNets.AddSingleHeadTransformerBlock(out Result,
   W: TNNetLayer);
+var
+  PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
+  EmbeddingDim: integer;
 begin
-
+  PrevLayer := GetLastLayer();
+  EmbeddingDim := PrevLayer.Output.Depth;
+  AddSingleHeadSelfAttention(Attended, W);
+  AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
+  AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() );
+  AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
+  AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
+  Result := AddLayer( TNNetLayerStdNormalization.Create() );
 end;
 
 { TNNetFullConnectLinear }
