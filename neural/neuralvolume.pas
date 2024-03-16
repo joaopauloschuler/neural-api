@@ -334,6 +334,7 @@ type
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property Depth: integer read FDepth;
+    property FormatSettings: TFormatSettings read FFormatSettings;
   end;
 
   TNNetToken = record
@@ -813,6 +814,8 @@ type
 
   procedure TestTNNetVolume();
   procedure TestKMeans();
+
+  function GetDefaultNumericFormat: TFormatSettings;
 
 implementation
 
@@ -1704,6 +1707,12 @@ begin
 
   WriteLn('KMeans testing has finished.');
   KMeans.Free;
+end;
+
+function GetDefaultNumericFormat: TFormatSettings;
+begin
+  {$IFDEF FPC} Result := DefaultFormatSettings; {$ENDIF}
+  Result.DecimalSeparator := '.';
 end;
 
 function HiperbolicTangent(x: TNeuralFloat): TNeuralFloat;
@@ -3197,8 +3206,7 @@ begin
   Fill(c);
   ClearTag();
 
-  {$IFDEF FPC} FFormatSettings := DefaultFormatSettings; {$ENDIF}
-  FFormatSettings.DecimalSeparator := '.';
+  FFormatSettings := GetDefaultNumericFormat;
 end;
 
 constructor TVolume.Create(pInput: array of T);
