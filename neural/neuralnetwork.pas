@@ -194,6 +194,7 @@ type
       FLearningRate: TNeuralFloat;
       FL2Decay: TNeuralFloat;
       FStruct: array [0..csNNetMaxParameterIdx] of integer;
+      FFloatSt: array [0..csNNetMaxParameterIdx] of TNeuralFloat;
 
       //backpropagation properties
       FDepartingBranchesCnt: integer;
@@ -650,14 +651,14 @@ type
   // learning but can also provoke overflows.
   TNNetMulLearning = class(TNNetIdentity)
     public
-      constructor Create(pMul: integer); overload;
+      constructor Create(pMul: TNeuralFloat); overload;
       procedure Backpropagate(); override;
   end;
 
   /// This layer multiplies the output by a constant.
   TNNetMulByConstant = class(TNNetMulLearning)
     public
-      //constructor Create(pMul: integer); overload;
+      // constructor Create(pMul: integer); overload;
       procedure Compute(); override;
   end;
 
@@ -1839,7 +1840,8 @@ type
       function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
       // AddSingleHeadSelfAttention is under construction - do not use it
-      function AddSingleHeadSelfAttention(): TNNetLayer;
+      procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
+      procedure AddSingleHeadTransformerBlock(out Attended, W: TNNetLayer);
   end;
 
   { TNNetDataParallelism }
@@ -3413,7 +3415,7 @@ end;
 procedure TNNetMulByConstant.Compute();
 begin
   inherited Compute();
-  FOutput.Mul(FStruct[0]);
+  FOutput.Mul(FFloatSt[0]);
 end;
 
 procedure TNNetCellMulByCell.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -5974,10 +5976,10 @@ begin
 end;
 
 { TNNetMulLearning }
-constructor TNNetMulLearning.Create(pMul: integer);
+constructor TNNetMulLearning.Create(pMul: TNeuralFloat);
 begin
   inherited Create();
-  FStruct[0] := pMul;
+  FFloatSt[0] := pMul;
 end;
 
 procedure TNNetMulLearning.Backpropagate();
@@ -5987,7 +5989,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  FOutputError.Mul(FStruct[0]);
+  FOutputError.Mul(FFloatSt[0]);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited Backpropagate();
 end;
@@ -6601,9 +6603,9 @@ end;
 
 // Ported code from:
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
-function THistoricalNets.AddSingleHeadSelfAttention: TNNetLayer;
+procedure THistoricalNets.AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
 var
-  x, Query, Key, Value, W, WT, YT: TNNetLayer;
+  x, Query, Key, Value: TNNetLayer; // WT, YT
   EmbeddingDim: integer;
 begin
   x := GetLastLayer();
@@ -6611,12 +6613,18 @@ begin
   Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   Value := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-  WT := AddLayer( TNNetDotProducts.Create(Query, Key) );
-  //WT := AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
-  W := AddLayer( TNNetTransposeXD.Create() );
+  (*WT := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
+  (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  (*W := *) AddLayer( TNNetTransposeXD.Create() );
   W := AddLayer( TNNetPointwiseSoftMax.Create() );
-  YT := AddLayer( TNNetDotProducts.Create(W, Value) );
-  result := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  (*YT := *)AddLayer( TNNetDotProducts.Create(W, Value) );
+  Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+end;
+
+procedure THistoricalNets.AddSingleHeadTransformerBlock(out Attended,
+  W: TNNetLayer);
+begin
+
 end;
 
 { TNNetFullConnectLinear }
@@ -10861,6 +10869,7 @@ function TNNet.CreateLayer(strData: string): TNNetLayer;
 var
   S, S2: TStringList;
   St: array [0..csNNetMaxParameterIdx] of integer;
+  Ft: array [0..csNNetMaxParameterIdx] of TNeuralFloat;
   aL: array of TNNetLayer;
   aIdx: TNeuralIntegerArray;
   IdxCnt: integer;
@@ -10879,7 +10888,7 @@ begin
       for I := 0 to Min(S2.Count - 1, High(St)) do St[I] := StrToInt(S2[I]);
     end;
 
-    if S.Count = 3 then
+    if S.Count >= 3 then
     begin
       S2.DelimitedText := S[2];
 
@@ -10898,6 +10907,21 @@ begin
           IdxsToLayers(aIdx, aL);
         end;
       end;
+    end;
+
+    if S.Count >= 4 then
+    begin
+      for I := Low(Ft) to High(Ft) do Ft[i] := 0;
+      S2.DelimitedText := S[1];
+      if S2.Count > 0 then
+      begin
+        for I := 0 to Min(S2.Count - 1, High(St)) do Ft[I] := StrToFloat(S2[I], GetDefaultNumericFormat());
+      end;
+    end
+    else
+    // backward compatibility
+    begin
+      for I := Low(Ft) to High(Ft) do Ft[i] := St[i];
     end;
 
     {$IFDEF FPC}
@@ -10938,8 +10962,8 @@ begin
       'TNNetLocalConnect' :         Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalProduct' :         Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalConnectReLU' :     Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]);
-      'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(St[0]);
-      'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(St[0]);
+      'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(Ft[0]);
+      'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(Ft[0]);
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create();
@@ -11040,8 +11064,8 @@ begin
       if S[0] = 'TNNetLocalConnect' then Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalProduct' then Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalConnectReLU' then Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(St[0]) else
-      if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(St[0]) else
+      if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(Ft[0]) else
+      if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(Ft[0]) else
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create() else
@@ -13936,6 +13960,14 @@ begin
   begin
     if I > 0 then Result := Result + ';';
     Result := Result + IntToStr(FStruct[I]);
+  end;
+
+  Result := Result + '::';
+
+  for I := Low(FFloatSt) to High(FFloatSt) do
+  begin
+    if I > 0 then Result := Result + ';';
+    Result := Result + FloatToStr(FFloatSt[I], GetDefaultNumericFormat);
   end;
 end;
 
