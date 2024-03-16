@@ -5980,6 +5980,10 @@ constructor TNNetMulLearning.Create(pMul: TNeuralFloat);
 begin
   inherited Create();
   FFloatSt[0] := pMul;
+  if pMul = 0 then
+  begin
+    FErrorProc('TNNetMulLearning or TNNetMulByConstant can not be zero.');
+  end;
 end;
 
 procedure TNNetMulLearning.Backpropagate();
@@ -6001,9 +6005,6 @@ var
   SizeX, SizeY, Deep: integer;
 begin
   inherited Create();
-  SizeX := aL[0].FOutput.SizeX;
-  SizeY := aL[0].FOutput.SizeY;
-  Deep  := aL[0].FOutput.Depth;
 
   if Length(aL) < 1 then
   begin
@@ -6011,6 +6012,10 @@ begin
   end
   else
   begin
+    SizeX := aL[0].FOutput.SizeX;
+    SizeY := aL[0].FOutput.SizeY;
+    Deep  := aL[0].FOutput.Depth;
+
     for LayerCnt := Low(aL) to High(aL) do
     begin
       if
@@ -6605,7 +6610,7 @@ end;
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
 procedure THistoricalNets.AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
 var
-  x, Query, Key, Value: TNNetLayer; // WT, YT
+  x, Query, Key, Value, ValueT: TNNetLayer; // WT, YT
   EmbeddingDim: integer;
 begin
   x := GetLastLayer();
@@ -6613,11 +6618,12 @@ begin
   Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   Value := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  ValueT := AddLayer( TNNetTransposeXD.Create() );
   (*WT := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
   (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
   (*W := *) AddLayer( TNNetTransposeXD.Create() );
   W := AddLayer( TNNetPointwiseSoftMax.Create() );
-  (*YT := *)AddLayer( TNNetDotProducts.Create(W, Value) );
+  (*YT := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
@@ -6633,11 +6639,11 @@ begin
   EmbeddingDim := PrevLayer.Output.Depth;
   AddSingleHeadSelfAttention(Attended, W);
   AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
-  AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() );
+  AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() ); // GetLastLayer(); //
   AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
   AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
   AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
-  Result := AddLayer( TNNetLayerStdNormalization.Create() );
+  Result := AddLayer( TNNetLayerStdNormalization.Create() ); // GetLastLayer(); //
 end;
 
 { TNNetFullConnectLinear }
@@ -7155,13 +7161,15 @@ end;
 function TNNetConcatBase.SaveStructureToString(): string;
 var
   I: integer;
+  LayersStr: string;
 begin
-  Result := inherited SaveStructureToString + ':';
+  LayersStr := '';
   for I := 0 to FPrevLayerList.Count - 1 do
   begin
-    if I > 0 then Result := Result + ';';
-    Result := Result + IntToStr(FPrevLayerList[I].FLayerIdx);
+    if I > 0 then LayersStr := LayersStr + ';';
+    LayersStr := LayersStr + IntToStr(FPrevLayerList[I].FLayerIdx);
   end;
+  Result := StringReplace(inherited SaveStructureToString,'::',':'+LayersStr+':',[rfReplaceAll]);
 end;
 
 procedure TNNetConcatBase.BackpropagateConcat();
@@ -10887,21 +10895,31 @@ var
   aIdx: TNeuralIntegerArray;
   IdxCnt: integer;
   I: integer;
+  ClassNameStr: string;
+  SCount: integer;
 begin
   Result := nil;
   S := CreateTokenizedStringList(strData,':');
   S2 := CreateTokenizedStringList(strData,';');
 
-  if S.Count >= 2 then
+  SCount := S.Count;
+
+  if SCount >= 2 then
   begin
+    ClassNameStr := S[0];
+    // This code is good for debug
+    // if ClassNameStr = 'TNNetSum' then
+    // begin
+    //   WriteLn('hello');
+    // end;
+
     for I := Low(St) to High(St) do St[i] := 0;
     S2.DelimitedText := S[1];
     if S2.Count > 0 then
     begin
       for I := 0 to Min(S2.Count - 1, High(St)) do St[I] := StrToInt(S2[I]);
     end;
-
-    if S.Count >= 3 then
+    if SCount >= 3 then
     begin
       S2.DelimitedText := S[2];
 
@@ -10922,10 +10940,10 @@ begin
       end;
     end;
 
-    if S.Count >= 4 then
+    if SCount >= 4 then
     begin
       for I := Low(Ft) to High(Ft) do Ft[i] := 0;
-      S2.DelimitedText := S[1];
+      S2.DelimitedText := S[3];
       if S2.Count > 0 then
       begin
         for I := 0 to Min(S2.Count - 1, High(St)) do Ft[I] := StrToFloat(S2[I], GetDefaultNumericFormat());
@@ -10938,7 +10956,8 @@ begin
     end;
 
     {$IFDEF FPC}
-    case S[0] of
+
+    case ClassNameStr of
       'TNNetInput' :                Result := TNNetInput.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
       'TNNetTransposeXD' :          Result := TNNetTransposeXD.Create();
