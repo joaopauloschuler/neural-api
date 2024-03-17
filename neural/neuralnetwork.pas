@@ -1551,6 +1551,8 @@ type
         Groups, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer;
         pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
+      function AddGroupedDotProducts(A,B: TNNetLayer; Groups: integer; ChannelInterleaving: boolean): TNNetLayer;
+      function AddGroupedPointwiseSoftMax(Groups: integer; ChannelInterleaving: boolean): TNNetLayer;
       /// AddAutoGroupedPointwiseConv implements
       // pointwise convolutions of the kEffNet architecture
       // described on the paper: "Grouped Pointwise Convolutions Significantly
@@ -1839,9 +1841,11 @@ type
         ): TNNetLayer;
       function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
-      // AddSingleHeadSelfAttention is under construction - do not use it
+      // AddSingleHeadSelfAttention are AddSingleHeadTransformerBlock under construction - do not use it
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
-      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer);
+      function AddSelfAttention(Heads: integer): TNNetLayer;
+      procedure AddSingleHeadTransformerBlock(HasNorm: boolean; out Result, W: TNNetLayer);
+      function AddTransformerBlock(Heads: integer; HasNorm: boolean): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -6610,27 +6614,74 @@ end;
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
 procedure THistoricalNets.AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
 var
-  x, Query, Key, Value, ValueT: TNNetLayer; // WT, YT
+  x, Query, Key, ValueT: TNNetLayer; // WT, YT, Value
   EmbeddingDim: integer;
 begin
   x := GetLastLayer();
   EmbeddingDim := x.Output.Depth;
   Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-  Value := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   ValueT := AddLayer( TNNetTransposeXD.Create() );
   (*WT := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
-  (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  //(*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  AddLayer( TNNetLayerMaxNormalization.Create() );
   (*W := *) AddLayer( TNNetTransposeXD.Create() );
   W := AddLayer( TNNetPointwiseSoftMax.Create() );
   (*YT := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
+function THistoricalNets.AddSelfAttention(Heads: integer): TNNetLayer;
+var
+  W, x, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
+  EmbeddingDim: integer;
+  PreviousLayer: TNNetLayer;
+  InputChannelsPerGroup: integer;
+  EachGroupOutput: array of TNNetLayer;
+  HeadCnt: integer;
+  QueryGroup, KeyGroup, ValueGroup, ValueTGroup: TNNetLayer;
+begin
+  if Heads <= 1 then
+  begin
+    AddSingleHeadSelfAttention(Result, W);
+  end
+  else
+  begin
+    x := GetLastLayer();
+    EmbeddingDim := x.Output.Depth;
+    Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+    Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+    Value := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+    (*ValueT:=*)
+
+    PreviousLayer := GetLastLayer();
+    SetLength(EachGroupOutput, Heads);
+    InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Heads;
+    for HeadCnt := 0 to Heads - 1 do
+    begin
+      QueryGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup), Query);
+      KeyGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup), Key);
+      ValueGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup), Value);
+      ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
+      (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
+      //(*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
+      AddLayer( TNNetLayerMaxNormalization.Create() );
+      (*W := *) AddLayer( TNNetTransposeXD.Create() );
+      W := AddLayer( TNNetPointwiseSoftMax.Create() );
+      (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
+      EachGroupOutput[HeadCnt] := AddLayer( TNNetPointwiseSoftMax.Create() );
+    end;
+    AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+    SetLength(EachGroupOutput, 0);
+    Result := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  end;
+end;
+
 // Ported code from:
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
-procedure THistoricalNets.AddSingleHeadTransformerBlock(out Result,
-  W: TNNetLayer);
+procedure THistoricalNets.AddSingleHeadTransformerBlock(HasNorm: boolean;
+  out Result, W: TNNetLayer);
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
   EmbeddingDim: integer;
@@ -6639,11 +6690,36 @@ begin
   EmbeddingDim := PrevLayer.Output.Depth;
   AddSingleHeadSelfAttention(Attended, W);
   AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
-  AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() ); // GetLastLayer(); //
+  if HasNorm
+  then AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() )
+  else AttendedPlusPrev := GetLastLayer();
   AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
   AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
   AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
-  Result := AddLayer( TNNetLayerStdNormalization.Create() ); // GetLastLayer(); //
+  if HasNorm
+  then Result := AddLayer( TNNetLayerStdNormalization.Create() )
+  else Result := GetLastLayer();
+end;
+
+function THistoricalNets.AddTransformerBlock(Heads: integer; HasNorm: boolean
+  ): TNNetLayer;
+var
+  PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
+  EmbeddingDim: integer;
+begin
+  PrevLayer := GetLastLayer();
+  EmbeddingDim := PrevLayer.Output.Depth;
+  Attended := AddSelfAttention(Heads);
+  AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
+  if HasNorm
+  then AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() )
+  else AttendedPlusPrev := GetLastLayer();
+  AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
+  AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
+  if HasNorm
+  then Result := AddLayer( TNNetLayerStdNormalization.Create() )
+  else Result := GetLastLayer();
 end;
 
 { TNNetFullConnectLinear }
@@ -11297,6 +11373,65 @@ begin
         then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
         else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
       EachGroupOutput[GroupCnt] := AddLayer( Conv2d.Create(FeaturesPerGroup, pFeatureSize, {pInputPadding=}0, pStride, pSuppressBias) );
+    end;
+    Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+  end;
+  SetLength(EachGroupOutput, 0);
+end;
+
+function TNNet.AddGroupedDotProducts(A, B: TNNetLayer; Groups: integer; ChannelInterleaving: boolean): TNNetLayer;
+var
+  PreviousLayer: TNNetLayer;
+  InputChannelsPerGroup: integer;
+  EachGroupOutput: array of TNNetLayer;
+  GroupCnt: integer;
+begin
+  PreviousLayer := GetLastLayer();
+  Result := PreviousLayer;
+  SetLength(EachGroupOutput, Groups);
+  InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Groups;
+  if Groups = 1 then
+  begin
+    Result := AddLayer( TNNetDotProducts.Create(A, B) );
+  end;
+  if Groups > 1 then
+  begin
+    for GroupCnt := 0 to Groups - 1 do
+    begin
+      if ChannelInterleaving
+        then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
+        else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
+      EachGroupOutput[GroupCnt] := AddLayer( TNNetDotProducts.Create(A, B) );
+    end;
+    Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+  end;
+  SetLength(EachGroupOutput, 0);
+end;
+
+function TNNet.AddGroupedPointwiseSoftMax(Groups: integer;
+  ChannelInterleaving: boolean): TNNetLayer;
+var
+  PreviousLayer: TNNetLayer;
+  InputChannelsPerGroup: integer;
+  EachGroupOutput: array of TNNetLayer;
+  GroupCnt: integer;
+begin
+  PreviousLayer := GetLastLayer();
+  Result := PreviousLayer;
+  SetLength(EachGroupOutput, Groups);
+  InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Groups;
+  if Groups = 1 then
+  begin
+    Result := AddLayer( TNNetPointwiseSoftMax.Create() );
+  end;
+  if Groups > 1 then
+  begin
+    for GroupCnt := 0 to Groups - 1 do
+    begin
+      if ChannelInterleaving
+        then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
+        else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
+      EachGroupOutput[GroupCnt] := AddLayer( TNNetPointwiseSoftMax.Create() );
     end;
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
