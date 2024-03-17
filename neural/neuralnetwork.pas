@@ -7369,14 +7369,16 @@ end;
 function TNNetSplitChannels.SaveStructureToString(): string;
 var
   I, MaxChannels: integer;
+  LayersStr: string;
 begin
-  Result := inherited SaveStructureToString + ':';
+  LayersStr := '';
   MaxChannels := Length(FChannels) - 1;
   for I := 0 to MaxChannels do
   begin
-    if I > 0 then Result := Result + ';';
-    Result := Result + IntToStr(FChannels[I]);
+    if I > 0 then LayersStr := LayersStr + ';';
+    LayersStr := LayersStr + IntToStr(FChannels[I]);
   end;
+  Result := StringReplace(inherited SaveStructureToString,'::',':'+LayersStr+':',[rfReplaceAll]);
 end;
 
 procedure TestDataParallelism(NN: TNNet);
