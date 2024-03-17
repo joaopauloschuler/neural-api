@@ -6634,8 +6634,7 @@ end;
 
 function THistoricalNets.AddSelfAttention(Heads: integer): TNNetLayer;
 var
-  W, x, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
-  EmbeddingDim: integer;
+  W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
   InputChannelsPerGroup: integer;
   EachGroupOutput: array of TNNetLayer;
@@ -6648,21 +6647,14 @@ begin
   end
   else
   begin
-    x := GetLastLayer();
-    EmbeddingDim := x.Output.Depth;
-    Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-    Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-    Value := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-    (*ValueT:=*)
-
     PreviousLayer := GetLastLayer();
     SetLength(EachGroupOutput, Heads);
     InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Heads;
     for HeadCnt := 0 to Heads - 1 do
     begin
-      QueryGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup), Query);
-      KeyGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup), Key);
-      ValueGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup), Value);
+      QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+      KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+      ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
       ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
       (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
       //(*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
@@ -6674,7 +6666,7 @@ begin
     end;
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
     SetLength(EachGroupOutput, 0);
-    Result := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+    Result := AddLayer( TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth) );
   end;
 end;
 
