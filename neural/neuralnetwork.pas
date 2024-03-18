@@ -1105,6 +1105,7 @@ type
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   public
     procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   TNNetLayerFullConnect = class(TNNetFullConnect);
@@ -1841,7 +1842,7 @@ type
         ): TNNetLayer;
       function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
-      // AddSingleHeadSelfAttention are AddSingleHeadTransformerBlock under construction - do not use it
+      // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
       function AddSelfAttention(Heads: integer): TNNetLayer;
       procedure AddSingleHeadTransformerBlock(HasNorm: boolean; out Result, W: TNNetLayer);
@@ -2252,9 +2253,37 @@ end;
 { TNNetPointwiseSoftMax }
 
 procedure TNNetPointwiseSoftMax.Compute;
+var
+  StartTime: double;
 begin
+  StartTime := Now();
   inherited Compute;
   FOutput.PointwiseSoftMax();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPointwiseSoftMax.Backpropagate;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    // derivative is: x*(1-x)
+    // https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
+    // https://github.com/neuroph/neuroph/blob/master/neuroph-2.9/Contrib/src/main/java/org/neuroph/contrib/learning/SoftMax.java
+
+    FOutputErrorDeriv.Fill(1);
+    FOutputErrorDeriv.Sub(FOutput);
+    FOutputErrorDeriv.Mul(FOutput);
+    FPrevLayer.OutputError.MulAdd(FOutputError, FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
 end;
 
 { TNNetAddPositionalEmbedding }
@@ -6624,8 +6653,8 @@ begin
   (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
   ValueT := AddLayer( TNNetTransposeXD.Create() );
   (*WT := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
-  //(*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
-  AddLayer( TNNetLayerMaxNormalization.Create() );
+  (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  //AddLayer( TNNetLayerMaxNormalization.Create() );
   (*W := *) AddLayer( TNNetTransposeXD.Create() );
   W := AddLayer( TNNetPointwiseSoftMax.Create() );
   (*YT := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
@@ -6657,8 +6686,8 @@ begin
       ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
       ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
       (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
-      //(*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
-      AddLayer( TNNetLayerMaxNormalization.Create() );
+      (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
+      //AddLayer( TNNetLayerMaxNormalization.Create() );
       (*W := *) AddLayer( TNNetTransposeXD.Create() );
       W := AddLayer( TNNetPointwiseSoftMax.Create() );
       (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
