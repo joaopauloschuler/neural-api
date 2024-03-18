@@ -5695,7 +5695,7 @@ begin
         begin
           LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
           FData[I] := LocalValue;
-          TotalSum := TotalSum + FData[I];
+          TotalSum := TotalSum + LocalValue;
           Inc(I);
         end;
         if TotalSum > 0 then
