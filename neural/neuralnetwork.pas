@@ -771,6 +771,15 @@ type
       function GetMaxAbsoluteDelta(): TNeuralFloat; override;
   end;
 
+  // This layer is experimental. Do not use.
+  TNNetMovingScale = class(TNNetIdentityWithoutL2)
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   // This is an experimental layer. Do not use it.
   TNNetScaleLearning = class(TNNetMovingStdNormalization)
     public
@@ -1843,10 +1852,10 @@ type
       function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
       // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
-      procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
-      function AddSelfAttention(Heads: integer): TNNetLayer;
+      procedure AddSingleHeadSelfAttention(HasNorm: boolean; out Attended, W: TNNetLayer);
+      function AddSelfAttention(HasNorm: boolean; Heads: integer): TNNetLayer;
       procedure AddSingleHeadTransformerBlock(HasNorm: boolean; out Result, W: TNNetLayer);
-      function AddTransformerBlock(Heads: integer; HasNorm: boolean): TNNetLayer;
+      function AddTransformerBlock(HasNorm: boolean; Heads: integer): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -2164,6 +2173,73 @@ begin
 
   // Release the memory allocated for the input volume to prevent memory leaks.
   InputVolume.Free;
+end;
+
+{ TNNetMovingScale }
+
+constructor TNNetMovingScale.Create;
+begin
+  inherited Create;
+  InitDefault();
+end;
+
+procedure TNNetMovingScale.Compute;
+var
+  StartTime: double;
+  Multiplier: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  Multiplier := FNeurons[0].FWeights.FData[0];
+  if Multiplier <= 0.001 then
+  begin
+    Multiplier := 0.001;
+  end;
+  if (Multiplier<>1) then
+  begin
+    FOutput.Mul(Multiplier);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMovingScale.Backpropagate;
+var
+  StartTime: double;
+  MaxAbs: TNeuralFloat;
+  Multiplier: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  StartTime := Now();
+  Multiplier := FNeurons[0].FWeights.FData[0];
+  if Multiplier <= 0.001 then
+  begin
+    Multiplier := 0.001;
+  end;
+  MaxAbs := FOutput.GetMaxAbs();
+  if MaxAbs <> 0 then
+  begin
+    FNeurons[0].FDelta.Add(0, 0, 0, (1-MaxAbs)*FLearningRate);
+    if (not FBatchUpdate) then
+    begin
+      FNeurons[0].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
+  end;
+  if (Multiplier > 0) and (Multiplier <> 1) then
+  begin
+    FOutputError.Mul(Multiplier);
+    //if Random(100)=0 then WriteLn(MaxAbs,' ->', Multiplier:10:8);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited Backpropagate();
+end;
+
+procedure TNNetMovingScale.InitDefault;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  FNeurons[0].FWeights.FData[0] := 1;
 end;
 
 { TNNetDotProducts }
@@ -6641,27 +6717,39 @@ end;
 
 // Ported code from:
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
-procedure THistoricalNets.AddSingleHeadSelfAttention(out Attended, W: TNNetLayer);
+procedure THistoricalNets.AddSingleHeadSelfAttention(HasNorm: boolean;
+  out Attended, W: TNNetLayer);
 var
   x, Query, Key, ValueT: TNNetLayer; // WT, YT, Value
   EmbeddingDim: integer;
 begin
   x := GetLastLayer();
   EmbeddingDim := x.Output.Depth;
-  Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-  Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-  (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  if HasNorm then
+  begin
+    Query := AddLayerAfter( [TNNetPointwiseConvLinear.Create(EmbeddingDim), TNNetMovingScale.Create()], x);
+    Key   := AddLayerAfter( [TNNetPointwiseConvLinear.Create(EmbeddingDim), TNNetMovingScale.Create()], x);
+    (*Value:=*)AddLayerAfter( [TNNetPointwiseConvLinear.Create(EmbeddingDim), TNNetMovingScale.Create()], x);
+  end
+  else
+  begin
+    Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+    Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+    (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  end;
   ValueT := AddLayer( TNNetTransposeXD.Create() );
   (*WT := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
+  (*WT := *)AddLayer( TNNetReLUL.Create(-100,+100,0) );
   (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
-  //AddLayer( TNNetLayerMaxNormalization.Create() );
   (*W := *) AddLayer( TNNetTransposeXD.Create() );
   W := AddLayer( TNNetPointwiseSoftMax.Create() );
   (*YT := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
-  Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  if HasNorm
+  then Attended := AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim), TNNetMovingScale.Create()] )
+  else Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
-function THistoricalNets.AddSelfAttention(Heads: integer): TNNetLayer;
+function THistoricalNets.AddSelfAttention(HasNorm: boolean; Heads: integer): TNNetLayer;
 var
   W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -6672,7 +6760,7 @@ var
 begin
   if Heads <= 1 then
   begin
-    AddSingleHeadSelfAttention(Result, W);
+    AddSingleHeadSelfAttention(HasNorm, Result, W);
   end
   else
   begin
@@ -6681,13 +6769,22 @@ begin
     InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Heads;
     for HeadCnt := 0 to Heads - 1 do
     begin
-      QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
-      KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
-      ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+      if HasNorm then
+      begin
+        QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), TNNetMovingScale.Create()], PreviousLayer);
+        KeyGroup := AddLayerAfter(   [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), TNNetMovingScale.Create()], PreviousLayer);
+        ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), TNNetMovingScale.Create()], PreviousLayer);
+      end
+      else
+      begin
+        QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+        KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+        ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+      end;
       ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
       (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
+      (*WT := *)AddLayer( TNNetReLUL.Create(-100,+100,0) );
       (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
-      //AddLayer( TNNetLayerMaxNormalization.Create() );
       (*W := *) AddLayer( TNNetTransposeXD.Create() );
       W := AddLayer( TNNetPointwiseSoftMax.Create() );
       (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
@@ -6695,7 +6792,9 @@ begin
     end;
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
     SetLength(EachGroupOutput, 0);
-    Result := AddLayer( TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth) );
+    if HasNorm
+    then Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth), TNNetMovingScale.Create()])
+    else Result := AddLayer( TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth) );
   end;
 end;
 
@@ -6709,20 +6808,21 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  AddSingleHeadSelfAttention(Attended, W);
+  AddSingleHeadSelfAttention(HasNorm, Attended, W);
   AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
   if HasNorm
-  then AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() )
+  then AttendedPlusPrev := AddLayer( TNNetMovingScale.Create() )
   else AttendedPlusPrev := GetLastLayer();
   AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
   AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  if HasNorm then Result := AddLayer( TNNetMovingScale.Create() );
   AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
   if HasNorm
-  then Result := AddLayer( TNNetLayerStdNormalization.Create() )
+  then Result := AddLayer( TNNetMovingScale.Create() )
   else Result := GetLastLayer();
 end;
 
-function THistoricalNets.AddTransformerBlock(Heads: integer; HasNorm: boolean
+function THistoricalNets.AddTransformerBlock(HasNorm: boolean; Heads: integer
   ): TNNetLayer;
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
@@ -6730,16 +6830,17 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddSelfAttention(Heads);
+  Attended := AddSelfAttention(HasNorm, Heads);
   AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
   if HasNorm
-  then AttendedPlusPrev := AddLayer( TNNetLayerStdNormalization.Create() )
+  then AttendedPlusPrev := AddLayer( TNNetMovingScale.Create() )
   else AttendedPlusPrev := GetLastLayer();
   AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
   AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  if HasNorm then Result := AddLayer( TNNetMovingScale.Create() );
   AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
   if HasNorm
-  then Result := AddLayer( TNNetLayerStdNormalization.Create() )
+  then Result := AddLayer( TNNetMovingScale.Create() )
   else Result := GetLastLayer();
 end;
 
@@ -11140,6 +11241,7 @@ begin
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
+      'TNNetMovingScale':           Result := TNNetMovingScale.Create();
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetScaleLearning' :        Result := TNNetScaleLearning.Create();
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
@@ -11242,6 +11344,7 @@ begin
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
+      if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create() else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetScaleLearning' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
