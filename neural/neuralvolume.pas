@@ -2953,7 +2953,9 @@ begin
     TotalSize := Self.GetTotalSize();
     if V.Size <> TotalSize then
     begin
-      V.ReSize(TotalSize,1,1);
+      if TotalSize = Count * Self[0].Size
+      then V.ReSize(Count,1,Self[0].Size)
+      else V.ReSize(TotalSize,1,1);
     end;
 
     CurrPos := 0;

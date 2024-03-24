@@ -372,7 +372,7 @@ type
       FVectorSize, FVectorSizeBytes: integer;
       FNeuronWeightList: TNNetVolumeList;
       FConcatedWeights: TNNetVolume;
-      FConcatedWInter: TNNetVolume;
+      FConcatedWInter: TNNetVolume; // This is the same as transposed concated weights
       FBiasOutput: TNNetVolume;
       FShouldConcatWeights: boolean;
       FShouldInterleaveWeights: boolean;
@@ -773,8 +773,11 @@ type
 
   // This layer is experimental. Do not use.
   TNNetMovingScale = class(TNNetIdentityWithoutL2)
+    private
+      FChangeRate: TNeuralFloat;
+      FMaxTarget: TNeuralFloat;
     public
-      constructor Create(); override;
+      constructor Create(pMaxTarget: TNeuralFloat = 1; pChangeRate: TNeuralFloat = 1); overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -2177,10 +2180,14 @@ end;
 
 { TNNetMovingScale }
 
-constructor TNNetMovingScale.Create;
+constructor TNNetMovingScale.Create(pMaxTarget: TNeuralFloat; pChangeRate: TNeuralFloat);
 begin
   inherited Create;
   InitDefault();
+  FMaxTarget := pMaxTarget;
+  FChangeRate := pChangeRate;
+  FFloatSt[0] := pMaxTarget;
+  FFloatSt[1] := pChangeRate;
 end;
 
 procedure TNNetMovingScale.Compute;
@@ -2219,7 +2226,7 @@ begin
   MaxAbs := FOutput.GetMaxAbs();
   if MaxAbs <> 0 then
   begin
-    FNeurons[0].FDelta.Add(0, 0, 0, (1-MaxAbs)*FLearningRate);
+    FNeurons[0].FDelta.Add(0, 0, 0, (FMaxTarget-MaxAbs)*FLearningRate*FChangeRate);
     if (not FBatchUpdate) then
     begin
       FNeurons[0].UpdateWeights(FInertia);
@@ -6009,9 +6016,9 @@ begin
     RefreshNeuronWeightList();
     AfterWeightUpdate();
 
-    FConcatedWeights.ReSize(FNeuronWeightList.GetTotalSize(),1,1);
+    FConcatedWeights.ReSize(FNeuronWeightList.Count, 1, FNeuronWeightList[0].Size);
 
-    FConcatedWInter.ReSize(FNeuronWeightList.GetTotalSize(),1,1);
+    FConcatedWInter.ReSize(FNeuronWeightList[0].Size, 1, FNeuronWeightList.Count);
 
     //WriteLn(' Layer:', Self.LayerIdx,' Vector:',FVectorSize,' Neuron count:',FNeuronWeightList.Count,' Output size:',FOutput.Size);
     FShouldInterleaveWeights := true;
@@ -9433,7 +9440,7 @@ begin
     FInputPrepared.Resize(FOutputSizeX, FOutputSizeY, FVectorSize);
   end;
   RefreshNeuronWeightList();
-  if ShouldUseInterleavedDotProduct then
+  if ShouldUseInterleavedDotProduct (*or FPointwise*) then
   begin
     FShouldConcatWeights := true;
     FShouldInterleaveWeights := true;
@@ -9836,7 +9843,7 @@ begin
 
     //BackpropagateFastCPUDev();
     //BackpropagateFastCPU();
-    BackpropagateFastTiledCPU();
+    BackpropagateFastTiledCPU(); // This is our default backprop
     //BackpropagateCPU();
 
     {$IFDEF CheckRange}ForceRangeWeights(1000);{$ENDIF}
@@ -10217,7 +10224,7 @@ begin
                     FArrNeurons[OutputD].FBiasDelta + LocalLearningErrorDeriv;
                   {$ENDIF}
 
-                  if (FCalculatePrevLayerError) then
+                  if (FCalculatePrevLayerError) (*and not(FPointwise)*) then
                   begin
                     LocalWeight := FArrNeurons[OutputD].Weights;
                     if FPointwise then
@@ -10284,6 +10291,14 @@ begin
     end;
   end;
 
+  (*
+  if (FPointwise and FCalculatePrevLayerError) then
+  begin
+    FPrevLayerErrorPadded.DotProductsPointwise(FConcatedWInter, FOutputErrorDeriv);
+    LocalPrevError.Add(FPrevLayerErrorPadded);
+  end;
+  *)
+
   if FPadding > 0 then
   begin
     FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
@@ -10317,18 +10332,21 @@ var
   LocalLearningErrorDerivPtr: pointer;
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
-  InterErrorDeriv, InterInput: TNNetVolume;
-  NeuronCnt, NeuronPosCnt: integer;
-  LocalDelta: TNNetVolume;
 begin
-  InterErrorDeriv := TNNetVolume.Create();
-  InterInput := TNNetVolume.Create();
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
-  MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
-  MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
-  LocalPrevError := FPrevLayer.OutputError;
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
+  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
   PrevNumElements := (FSizeXDepth div 4) * 4;
   PrevMissedElements := FSizeXDepth - PrevNumElements;
   NeuronWeights := FArrNeurons[0].Delta.Size;
@@ -10339,15 +10357,16 @@ begin
     begin
       for OutputY := 0 to MaxY do
       begin
-        PrevY := (OutputY*FStride)-FPadding;
+        PrevY := (OutputY*FStride);
         for OutputX := 0 to MaxX do
         begin
-          PrevX := (OutputX*FStride)-FPadding;
+          PrevX := (OutputX*FStride);
           OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY);
-          if (FCalculatePrevLayerError) then LocalDestPtr  := LocalPrevError.GetRawPtr(OutputX, OutputY);
+          //TODO: the next line is probably wrong.
+          if (FCalculatePrevLayerError) then LocalDestPtr := LocalPrevError.GetRawPtr(OutputX, OutputY);
           PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
           CanBackpropOnPos :=
-            (PrevX >= 0) and (PrevY >= 0) and
+            //(PrevX >= 0) and (PrevY >= 0) and
             (PrevX < MaxPrevX) and
             (PrevY < MaxPrevY);
           for OutputD := 0 to MaxD do
@@ -10355,7 +10374,7 @@ begin
             {$IFDEF FPC}
             if FActivationFn = @RectifiedLinearUnit then
             begin
-              if FOutput.FData[OutputRawPos] > 0 then
+              if FOutputRaw.FData[OutputRawPos] >= 0 then
               begin
                 LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
               end
@@ -10384,7 +10403,17 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                //FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFNDEF AVX64}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$ELSE}
+                {$IFDEF Debug}
+                if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
+                then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
+                {$ENDIF}
+                PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
+                asm_avx64_train_neuron
+                {$ENDIF}
+
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
                 {$ELSE}
@@ -10392,10 +10421,10 @@ begin
                   FArrNeurons[OutputD].FBiasDelta + LocalLearningErrorDeriv;
                 {$ENDIF}
 
-                if (FCalculatePrevLayerError) then
+                if (FCalculatePrevLayerError and not(FPointwise)) then
                 begin
                   LocalWeight := FArrNeurons[OutputD].Weights;
-                  if FPointwise then
+                  (*if FPointwise then
                   begin
                     {$IFNDEF AVX64}
                     LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
@@ -10410,7 +10439,7 @@ begin
                     asm_avx64_prev_backprop;
                     {$ENDIF}
                   end
-                  else
+                  else *)
                   begin
                     if CanBackpropOnPos then
                     begin
@@ -10457,6 +10486,13 @@ begin
       end;
     end;
 
+  if (FPointwise and FCalculatePrevLayerError) then
+  begin
+    FPrevLayerErrorPadded.DotProductsPointwise(FConcatedWInter, FOutputErrorDeriv);
+    LocalPrevError.Add(FPrevLayerErrorPadded);
+  end;
+
+  (*
   FOutputErrorDeriv.Mul(-FLearningRate);
   InterErrorDeriv.InterleaveWithDepthFrom(FOutputErrorDeriv, FOutputErrorDeriv.SizeX * FOutputErrorDeriv.SizeY);
   InterInput.InterleaveWithDepthFrom(FInputPrepared, FInputPrepared.SizeX * FInputPrepared.SizeY);
@@ -10478,15 +10514,18 @@ begin
         );
     end;
   end;
+  *)
+
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
+  end;
 
   if (not FBatchUpdate) then
   begin
     for OutputD := 0 to MaxD do FArrNeurons[OutputD].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
-
-  InterErrorDeriv.Free;
-  InterInput.Free;
 end;
 
 constructor TNNetConvolutionAbstract.Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -10500,8 +10539,8 @@ begin
   if FPadding > 0 then
   begin
     FInputCopy := TNNetVolume.Create;
-    FPrevLayerErrorPadded := TNNetVolume.Create;
   end;
+  FPrevLayerErrorPadded := TNNetVolume.Create;
 end;
 
 destructor TNNetConvolutionAbstract.Destroy();
@@ -10509,8 +10548,8 @@ begin
   if FPadding > 0 then
   begin
     FInputCopy.Free;
-    FPrevLayerErrorPadded.Free;
   end;
+  FPrevLayerErrorPadded.Free;
   inherited Destroy();
 end;
 
@@ -11241,7 +11280,7 @@ begin
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
-      'TNNetMovingScale':           Result := TNNetMovingScale.Create();
+      'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetScaleLearning' :        Result := TNNetScaleLearning.Create();
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
@@ -11344,7 +11383,7 @@ begin
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
-      if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create() else
+      if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetScaleLearning' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
