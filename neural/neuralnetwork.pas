@@ -1104,20 +1104,20 @@ type
     procedure Backpropagate(); override;
   end;
 
-  /// Common softmax layer.
-  TNNetSoftMax = class(TNNetIdentity)
-    protected
-      FSoftTotalSum: TNeuralFloat;
-    public
-      procedure Compute(); override;
-  end;
-
   // This layer is experimental - do not use it.
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   public
     procedure Compute(); override;
     procedure Backpropagate(); override;
+  end;
+
+  /// Common softmax layer.
+  TNNetSoftMax = class(TNNetPointwiseSoftMax)
+    protected
+      FSoftTotalSum: TNeuralFloat;
+    public
+      procedure Compute(); override;
   end;
 
   TNNetLayerFullConnect = class(TNNetFullConnect);
@@ -2359,7 +2359,6 @@ begin
     // derivative is: x*(1-x)
     // https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
     // https://github.com/neuroph/neuroph/blob/master/neuroph-2.9/Contrib/src/main/java/org/neuroph/contrib/learning/SoftMax.java
-
     FOutputErrorDeriv.Fill(1);
     FOutputErrorDeriv.Sub(FOutput);
     FOutputErrorDeriv.Mul(FOutput);
@@ -9133,9 +9132,13 @@ end;
 
 { TNNetSoftMax }
 procedure TNNetSoftMax.Compute();
+var
+  StartTime: double;
 begin
-  inherited Compute();
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FSoftTotalSum := FOutput.SoftMax();
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetConvolutionReLU }
