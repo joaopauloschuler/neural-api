@@ -550,6 +550,7 @@ type
       function GetSum(): TNeuralFloat;
       function GetAvg(): TNeuralFloat;
       procedure AddValue(Value: TNeuralFloat);
+      procedure Mul(Value: TNeuralFloat);
       procedure Divi(Value: TNeuralFloat);
       function GetClosestId(Original: TNNetVolume; var MinDist: TNeuralFloat): integer;
       function GetManhattanClosestId(Original: TNNetVolume; var MinDist: TNeuralFloat): integer;
@@ -2836,6 +2837,20 @@ begin
     for I := 0 to Count - 1 do
     begin
       Self[I].Add(Value);
+    end;
+  end;
+end;
+
+procedure TNNetVolumeList.Mul(Value: TNeuralFloat);
+var
+  I: integer;
+  AuxVolume: TNNetVolume;
+begin
+  if (Count>0) then
+  begin
+    for I := 0 to Count - 1 do
+    begin
+      Self[I].Mul(Value);
     end;
   end;
 end;
@@ -5640,22 +5655,32 @@ var
   vHigh: integer;
   LocalValue: T;
   TotalSum: TNeuralFloat;
-  MaxValue: T;
+  MinValue, MaxValue: T;
 begin
   MaxValue := GetMax();
+  if MaxValue <> 0 then Sub(MaxValue);
+  MinValue := GetMin();
+
   TotalSum := 0;
 
-  vHigh := High(FData);
-  for I := 0 to vHigh do
+  // forces range [-1000,0]
+  if MinValue <> 0 then
   begin
-    LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
-    FData[I] := LocalValue;
-    TotalSum := TotalSum + FData[I];
-  end;
+    if MinValue < -1000 then Mul( -1000/MinValue );
+    vHigh := High(FData);
 
-  if TotalSum > 0 then
-  begin
-    Divi(TotalSum);
+    for I := 0 to vHigh do
+    begin
+      // LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+      LocalValue := Exp( FData[I] );
+      FData[I] := LocalValue;
+      TotalSum := TotalSum + FData[I];
+    end;
+
+    if TotalSum > 0 then
+    begin
+      Divi(TotalSum);
+    end;
   end;
 
   Result := TotalSum;

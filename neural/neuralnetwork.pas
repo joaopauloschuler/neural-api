@@ -2213,7 +2213,7 @@ procedure TNNetMovingScale.Backpropagate;
 var
   StartTime: double;
   MaxAbs: TNeuralFloat;
-  Multiplier: TNeuralFloat;
+  Multiplier, Diff: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -2226,11 +2226,15 @@ begin
   MaxAbs := FOutput.GetMaxAbs();
   if MaxAbs <> 0 then
   begin
-    FNeurons[0].FDelta.Add(0, 0, 0, (FMaxTarget-MaxAbs)*FLearningRate*FChangeRate);
-    if (not FBatchUpdate) then
+    Diff := FMaxTarget-MaxAbs;
+    if Diff < 0 then
     begin
-      FNeurons[0].UpdateWeights(FInertia);
-      AfterWeightUpdate();
+      FNeurons[0].FDelta.Add(0, 0, 0, (Diff)*FLearningRate*FChangeRate);
+      if (not FBatchUpdate) then
+      begin
+        FNeurons[0].UpdateWeights(FInertia);
+        AfterWeightUpdate();
+      end;
     end;
   end;
   if (Multiplier > 0) and (Multiplier <> 1) then
