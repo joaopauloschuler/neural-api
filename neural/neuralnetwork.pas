@@ -2352,6 +2352,9 @@ end;
 procedure TNNetPointwiseSoftMax.Backpropagate;
 var
   StartTime: double;
+  {$IFDEF Debug}
+  Min, Max: TNeuralFloat;
+  {$ENDIF}
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -2368,6 +2371,12 @@ begin
     FOutputErrorDeriv.Mul(FOutput);
     FPrevLayer.OutputError.MulAdd(FOutputError, FOutputErrorDeriv);
   end;
+  {$IFDEF Debug}
+  Min := FOutputErrorDeriv.GetMin();
+  Max := FOutputErrorDeriv.GetMax();
+  if Min < 0 then FErrorProc('Softmax derivative is negative: '+FloatToStrF(Min,ffFixed,6,4));
+  if Max > 0.25 then FErrorProc('Softmax derivative is bigger than 0.25: '+FloatToStrF(Max,ffFixed,6,4));
+  {$ENDIF}
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FPrevLayer.Backpropagate();
 end;

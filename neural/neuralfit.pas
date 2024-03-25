@@ -528,7 +528,7 @@ begin
   else
   begin
     {$IFDEF Debug}
-    FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+    //FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
     {$ENDIF}
     result := 100;
   end;
@@ -2225,7 +2225,7 @@ begin
     else
     begin
       {$IFDEF Debug}
-      FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+      //FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
       {$ENDIF}
       CurrentLoss := 100;
     end;
@@ -2397,7 +2397,7 @@ begin
     else
     begin
       {$IFDEF Debug}
-      FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+      //FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
       {$ENDIF}
       CurrentLoss := 100;
     end;
