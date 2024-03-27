@@ -1856,9 +1856,11 @@ type
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
       // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
       procedure AddSingleHeadSelfAttention(HasNorm: boolean; out Attended, W: TNNetLayer);
-      function AddSelfAttention(HasNorm: boolean; Heads: integer): TNNetLayer;
-      procedure AddSingleHeadTransformerBlock(HasNorm: boolean; out Result, W: TNNetLayer);
-      function AddTransformerBlock(HasNorm: boolean; Heads: integer): TNNetLayer;
+      function AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      function AddSelfAttentionCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; HasNorm: boolean = False);
+      function AddTransformerBlock(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      function AddTransformerBlockCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -6768,7 +6770,7 @@ begin
   else Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
-function THistoricalNets.AddSelfAttention(HasNorm: boolean; Heads: integer): TNNetLayer;
+function THistoricalNets.AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
 var
   W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -6817,10 +6819,67 @@ begin
   end;
 end;
 
+function THistoricalNets.AddSelfAttentionCAI(Heads: integer;
+  HasNorm: boolean = False
+  ): TNNetLayer;
+var
+  W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
+  PreviousLayer: TNNetLayer;
+  InputChannelsPerGroup: integer;
+  EachGroupOutput: array of TNNetLayer;
+  HeadCnt: integer;
+  QueryGroup, KeyGroup, ValueGroup, ValueTGroup: TNNetLayer;
+begin
+  if Heads <= 1 then
+  begin
+    AddSingleHeadSelfAttention(HasNorm, Result, W);
+  end
+  else
+  begin
+    PreviousLayer := GetLastLayer();
+    SetLength(EachGroupOutput, Heads);
+    InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Heads;
+    for HeadCnt := 0 to Heads - 1 do
+    begin
+      if HasNorm then
+      begin
+        QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), TNNetMovingScale.Create()], PreviousLayer);
+        KeyGroup := AddLayerAfter(   [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), TNNetMovingScale.Create()], PreviousLayer);
+        ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), TNNetMovingScale.Create()], PreviousLayer);
+      end
+      else
+      begin
+        QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+        KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+        ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+      end;
+      ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
+      (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
+      (*WT := *)AddLayer( TNNetReLUL.Create(-100,+100,0) );
+      (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
+      (*W := *) AddLayer( TNNetTransposeXD.Create() );
+      W := AddLayer( TNNetPointwiseSoftMax.Create() );
+      (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
+      EachGroupOutput[HeadCnt] := AddLayer( TNNetPointwiseSoftMax.Create() );
+    end;
+    AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+    // Groups with few channels tend to be numerically unstable
+    if InputChannelsPerGroup < 64 then
+    begin
+      AddLayer( TNNetMulByConstant.Create(InputChannelsPerGroup/64) );
+    end;
+    SetLength(EachGroupOutput, 0);
+    if HasNorm
+    then Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth), TNNetMovingScale.Create()])
+    else Result := AddLayer( TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth) );
+  end;
+end;
+
 // Ported code from:
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
-procedure THistoricalNets.AddSingleHeadTransformerBlock(HasNorm: boolean;
-  out Result, W: TNNetLayer);
+procedure THistoricalNets.AddSingleHeadTransformerBlock(
+  out Result, W: TNNetLayer;
+  HasNorm: boolean = False);
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
   EmbeddingDim: integer;
@@ -6841,7 +6900,8 @@ begin
   else Result := GetLastLayer();
 end;
 
-function THistoricalNets.AddTransformerBlock(HasNorm: boolean; Heads: integer
+function THistoricalNets.AddTransformerBlock(Heads: integer;
+  HasNorm: boolean = False
   ): TNNetLayer;
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
@@ -6849,7 +6909,30 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddSelfAttention(HasNorm, Heads);
+  Attended := AddSelfAttention(Heads, HasNorm);
+  AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
+  if HasNorm
+  then AttendedPlusPrev := AddLayer( TNNetMovingScale.Create() )
+  else AttendedPlusPrev := GetLastLayer();
+  AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
+  AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+  if HasNorm then Result := AddLayer( TNNetMovingScale.Create() );
+  AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
+  if HasNorm
+  then Result := AddLayer( TNNetMovingScale.Create() )
+  else Result := GetLastLayer();
+end;
+
+function THistoricalNets.AddTransformerBlockCAI(Heads: integer;
+  HasNorm: boolean = False
+  ): TNNetLayer;
+var
+  PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
+  EmbeddingDim: integer;
+begin
+  PrevLayer := GetLastLayer();
+  EmbeddingDim := PrevLayer.Output.Depth;
+  Attended := AddSelfAttentionCAI(Heads, HasNorm);
   AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
   if HasNorm
   then AttendedPlusPrev := AddLayer( TNNetMovingScale.Create() )
