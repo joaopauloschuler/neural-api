@@ -1062,8 +1062,7 @@ type
   //FullyConnectedLayers
   TNNetFullConnectClass = class of TNNetFullConnect;
 
-  /// Fully connected layer without activation function. This layer is useful
-  // before softmax layers.
+  /// Fully connected layer without activation function.
   TNNetFullConnectLinear = class(TNNetFullConnect)
   private
     procedure ComputePreviousLayerErrorCPU(); override;
@@ -1082,6 +1081,7 @@ type
   end;
 
   /// Fully connected layer with ReLU.
+  // This layer is useful before softmax layers.
   TNNetFullConnectReLU = class(TNNetFullConnectLinear)
   private
     procedure ComputePreviousLayerErrorCPU(); override;
@@ -1104,7 +1104,6 @@ type
     procedure Backpropagate(); override;
   end;
 
-  // This layer is experimental - do not use it.
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   public
@@ -1116,8 +1115,15 @@ type
   TNNetSoftMax = class(TNNetPointwiseSoftMax)
     protected
       FSoftTotalSum: TNeuralFloat;
+      FSkipBackpropDerivative: boolean;
     public
+      // Although skipping the derivative calculation is a non standard usage,
+      // skipping the derivative can give higher classification accuracy at
+      // image classification tasks with 10x smaller learning rate.
+      constructor Create(SkipBackpropDerivative: integer = 0);
+
       procedure Compute(); override;
+      procedure Backpropagate(); override;
   end;
 
   TNNetLayerFullConnect = class(TNNetFullConnect);
@@ -9226,8 +9232,15 @@ begin
   Self.Create(pSize, 1, 1, pSuppressBias);
 end;
 
+constructor TNNetSoftMax.Create(SkipBackpropDerivative: integer);
+begin
+  inherited Create();
+  FSkipBackpropDerivative := (SkipBackpropDerivative > 0);
+  FStruct[0] := SkipBackpropDerivative;
+end;
+
 { TNNetSoftMax }
-procedure TNNetSoftMax.Compute();
+procedure TNNetSoftMax.Compute;
 var
   StartTime: double;
 begin
@@ -9235,6 +9248,30 @@ begin
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FSoftTotalSum := FOutput.SoftMax();
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftMax.Backpropagate;
+var
+  StartTime: double;
+begin
+  if FSkipBackpropDerivative then
+  begin
+    Inc(FBackPropCallCurrentCnt);
+    if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+    StartTime := Now();
+    if Assigned(FPrevLayer) and
+      (FPrevLayer.OutputError.Size > 0) and
+      (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+    begin
+      FPrevLayer.OutputError.Add(FOutputError);
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    FPrevLayer.Backpropagate();
+  end
+  else
+  begin
+    inherited Backpropagate();
+  end;
 end;
 
 { TNNetConvolutionReLU }
@@ -11336,7 +11373,7 @@ begin
       'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(Ft[0]);
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
-      'TNNetSoftMax' :              Result := TNNetSoftMax.Create();
+      'TNNetSoftMax' :              Result := TNNetSoftMax.Create(St[0]);
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -11439,7 +11476,7 @@ begin
       if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(Ft[0]) else
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
-      if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create() else
+      if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create(St[0]) else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
