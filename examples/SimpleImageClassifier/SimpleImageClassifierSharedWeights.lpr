@@ -56,7 +56,7 @@ type
     NN.AddLayer([
       TNNetDeepConcat.Create([FirstBranch, SecondBranch]),
       TNNetFullConnectLinear.Create(10),
-      TNNetSoftMax.Create()
+      TNNetSoftMax.Create({SkipBackpropDerivative=}1)
     ]);
 
     NN.DebugStructure();
