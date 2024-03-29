@@ -45,7 +45,7 @@ type
     NN.AddLayer( TNNetMaxPool.Create(2) );
     NN.AddLayer( TNNetSELU.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(10) );
-    NN.AddLayer( TNNetSoftMax.Create() );
+    NN.AddLayer( TNNetSoftMax.Create({SkipBackpropDerivative=}1) );
 
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);
 
