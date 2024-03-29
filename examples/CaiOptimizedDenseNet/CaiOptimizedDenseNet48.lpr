@@ -124,7 +124,7 @@ type
     NN.AddLayer( TNNetDropout.Create(0.25) );
     NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
-    NN.AddLayer( TNNetSoftMax.Create() );
+    NN.AddLayer( TNNetSoftMax.Create({SkipBackpropDerivative=}1) );
     NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
 
     WriteLn('Learning rate set to: [',fLearningRate:7:5,']');

@@ -49,7 +49,7 @@ type
       TNNetFullConnectReLU.Create(32),  // Fully connected layer with ReLU activation
       TNNetFullConnectReLU.Create(32),  // Fully connected layer with ReLU activation
       TNNetFullConnectLinear.Create(10),  // Fully connected layer with linear activation
-      TNNetSoftMax.Create()  // Softmax layer for classification
+      TNNetSoftMax.Create({SkipBackpropDerivative=}1)  // Softmax layer for classification
     ]);
 
     // Creating the training, validation, and test image volumes from the fashion MNIST files

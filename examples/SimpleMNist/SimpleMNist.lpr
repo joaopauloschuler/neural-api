@@ -44,7 +44,7 @@ type
       TNNetDropout.Create(0.2),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(10),
-      TNNetSoftMax.Create()
+      TNNetSoftMax.Create({SkipBackpropDerivative=}1)
     ]);
 
     // Create MNIST volumes for training, validation, and testing

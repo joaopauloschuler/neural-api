@@ -133,7 +133,7 @@ type
     NN.AddLayer( TNNetDropout.Create(0.5) );
     NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
-    NN.AddLayer( TNNetSoftMax.Create() );
+    NN.AddLayer( TNNetSoftMax.Create({SkipBackpropDerivative=}1) );
     NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
     (*
     // First block shouldn't be separable.
