@@ -1630,6 +1630,13 @@ type
       function AddAvgMaxPool(pPoolSize: integer; pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddMinMaxChannel(pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
+      // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
+      procedure AddSingleHeadSelfAttention(HasNorm: boolean; out Attended, W: TNNetLayer);
+      function AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      function AddSelfAttentionCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; HasNorm: boolean = False);
+      function AddTransformerBlock(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      function AddTransformerBlockCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
       function GetFirstLayer(): TNNetLayer;
@@ -1860,13 +1867,6 @@ type
         ): TNNetLayer;
       function AddSuperResolution(pSizeX, pSizeY, BottleNeck, pNeurons,
         pLayerCnt: integer; IsSeparable:boolean): TNNetLayer;
-      // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
-      procedure AddSingleHeadSelfAttention(HasNorm: boolean; out Attended, W: TNNetLayer);
-      function AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
-      function AddSelfAttentionCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
-      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; HasNorm: boolean = False);
-      function AddTransformerBlock(Heads: integer; HasNorm: boolean = False): TNNetLayer;
-      function AddTransformerBlockCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
   end;
 
   { TNNetDataParallelism }
@@ -6744,7 +6744,7 @@ end;
 
 // Ported code from:
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
-procedure THistoricalNets.AddSingleHeadSelfAttention(HasNorm: boolean;
+procedure TNNet.AddSingleHeadSelfAttention(HasNorm: boolean;
   out Attended, W: TNNetLayer);
 var
   x, Query, Key, ValueT: TNNetLayer; // WT, YT, Value
@@ -6776,7 +6776,7 @@ begin
   else Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
-function THistoricalNets.AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+function TNNet.AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
 var
   W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -6825,7 +6825,7 @@ begin
   end;
 end;
 
-function THistoricalNets.AddSelfAttentionCAI(Heads: integer;
+function TNNet.AddSelfAttentionCAI(Heads: integer;
   HasNorm: boolean = False
   ): TNNetLayer;
 var
@@ -6883,7 +6883,7 @@ end;
 
 // Ported code from:
 // https://github.com/tgautam03/Transformers/blob/master/classification.ipynb
-procedure THistoricalNets.AddSingleHeadTransformerBlock(
+procedure TNNet.AddSingleHeadTransformerBlock(
   out Result, W: TNNetLayer;
   HasNorm: boolean = False);
 var
@@ -6906,7 +6906,7 @@ begin
   else Result := GetLastLayer();
 end;
 
-function THistoricalNets.AddTransformerBlock(Heads: integer;
+function TNNet.AddTransformerBlock(Heads: integer;
   HasNorm: boolean = False
   ): TNNetLayer;
 var
@@ -6929,7 +6929,7 @@ begin
   else Result := GetLastLayer();
 end;
 
-function THistoricalNets.AddTransformerBlockCAI(Heads: integer;
+function TNNet.AddTransformerBlockCAI(Heads: integer;
   HasNorm: boolean = False
   ): TNNetLayer;
 var
