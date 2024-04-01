@@ -21,43 +21,7 @@ unit neuralnetwork;
 
 (*
 // coded, adapted and ported by Joao Paulo Schwarz Schuler
-// https://sourceforge.net/p/cai/
-----------------------------------------------
-You can find simple to understand examples at:
-https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/
-https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimplecorrelation/
-----------------------------------------------
-There are CIFAR-10 examples at:
-https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/testcnnalgo/testcnnalgo.lpr
-https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/visualCifar10BatchUpdate/
-https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/visualCifar10OpenCL/
-----------------------------------------------
-Example - How to Create Your Network
-NumClasses := 10;
-NN := TNNet.Create();
-NN.AddLayer( TNNetInput.Create(32,32,3) );
-NN.AddLayer( TNNetConvolutionReLU.Create( 16,5,0,0) );
-NN.AddLayer( TNNetMaxPool.Create(2) );
-NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
-NN.AddLayer( TNNetMaxPool.Create(2) );
-NN.AddLayer( TNNetConvolutionReLU.Create(128,5,0,0) );
-NN.AddLayer( TNNetLayerFullConnectReLU.Create(64) );
-NN.AddLayer( TNNetLayerFullConnect.Create(NumClasses) );
-NN.SetLearningRate(0.01,0.8);
-----------------------------------------------
-Example - How to create a simple fully forward connected network 3x3
-NN := TNNet.Create();
-NN.AddLayer( TNNetInput.Create(3) );
-NN.AddLayer( TNNetLayerFullConnectReLU.Create(3) );
-NN.AddLayer( TNNetLayerFullConnectReLU.Create(3) );
-NN.SetLearningRate(0.01,0.8);
-----------------------------------------------
-Example - How to Train Your Network
-// InputVolume and vDesiredVolume are of the type TNNetVolume
-NN.Compute(InputVolume);
-NN.GetOutput(PredictedVolume);
-vDesiredVolume.SetClassForReLU(DesiredClass);
-NN.Backpropagate(vDesiredVolume);
+// https://github.com/joaopauloschuler/neural-api/
 ----------------------------------------------
 Interesting links:
 http://cs.stanford.edu/people/karpathy/convnetjs/demo/cifar10.html
