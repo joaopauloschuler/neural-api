@@ -669,6 +669,19 @@ type
     procedure Compute(); override;
   end;
 
+  { TNNetTokenAndPositionalEmbedding }
+  TNNetTokenAndPositionalEmbedding = class(TNNetEmbedding)
+  private
+    FPositionalEmbedding: TNNetVolume;
+    FPositionalEmbeddingN: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pVocabSize, pEmbeddingSize: integer; PositionalEmbeddingN: integer = 0);
+    destructor Destroy; override;
+
+    procedure Compute(); override;
+  end;
+
   TNNetAddNoiseBase = class(TNNetIdentity)
   protected
     FEnabled: boolean;
@@ -11242,6 +11255,42 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+end;
+
+{ TNNetTokenAndPositionalEmbedding }
+
+procedure TNNetTokenAndPositionalEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FPositionalEmbedding.ReSize(FOutput);
+  FPositionalEmbedding.PositionalEncoding(FEmbeddingSize);
+end;
+
+constructor TNNetTokenAndPositionalEmbedding.Create(pVocabSize,
+  pEmbeddingSize: integer; PositionalEmbeddingN: integer = 0);
+begin
+  inherited Create(pVocabSize, pEmbeddingSize);
+  FPositionalEmbedding := TNNetVolume.Create;
+  if PositionalEmbeddingN=0
+  then FPositionalEmbeddingN := 10000
+  else FPositionalEmbeddingN := PositionalEmbeddingN;
+  FStruct[2] := FPositionalEmbeddingN;
+end;
+
+destructor TNNetTokenAndPositionalEmbedding.Destroy;
+begin
+  FPositionalEmbedding.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetTokenAndPositionalEmbedding.Compute();
+var
+  StartTime: double;
+begin
+  inherited Compute;
+  StartTime := Now();
+  FOutput.Add(FPositionalEmbedding);
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetInputBase.Compute;
