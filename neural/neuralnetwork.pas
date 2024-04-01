@@ -385,6 +385,22 @@ type
       function DisableErrorCollection: TNNetInput;
   end;
 
+  { TNNetEmbedding }
+  // Do not use this layer. It's under construction.
+  TNNetEmbedding = class(TNNetLayer)
+  private
+    FVocabSize: integer;
+    FEmbeddingSize: integer;
+    FInputTokens: array of integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pVocabSize, pEmbeddingSize: integer);
+    destructor Destroy; override;
+
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   // This layer transposes the X and Depth axis.
   TNNetTransposeXD = class(TNNetLayer)
     private
@@ -2393,11 +2409,17 @@ begin
 end;
 
 procedure TNNetTransposeYD.Compute;
+var
+  StartTime: double;
 begin
+  StartTime := Now();
   FOutput.CopyTransposingYD(FPrevLayer.FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetTransposeYD.Backpropagate;
+var
+  StartTime: double;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -2405,7 +2427,9 @@ begin
     (FPrevLayer.OutputError.Size > 0) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
   begin
+    StartTime := Now();
     FPrevLayer.FOutputError.AddTransposingYD(FOutputError);
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   FPrevLayer.Backpropagate();
 end;
@@ -2421,8 +2445,12 @@ begin
 end;
 
 procedure TNNetTransposeXD.Compute;
+var
+  StartTime: double;
 begin
+  StartTime := Now();
   FOutput.CopyTransposingXD(FPrevLayer.FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetTransposeXD.Backpropagate;
@@ -2930,25 +2958,34 @@ end;
 
 { TNNetDebug }
 procedure TNNetDebug.Compute();
+var
+  StartTime: double;
 begin
   inherited Compute();
   if ((FStruct[0]>0) and (Random(1000)=0)) then
   begin
+    StartTime := Now();
     Write('Forward:');
     FOutput.PrintDebug();
     WriteLn;
+    FForwardTime := FForwardTime + (Now() - StartTime);
   end;
 end;
 
 procedure TNNetDebug.Backpropagate();
+var
+  StartTime: double;
 begin
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  // FBackPropCallCurrentCnt check is inherited done.
+  //Inc(FBackPropCallCurrentCnt);
+  //if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   if ((FStruct[1]>0) and (Random(1000)=0)) then
   begin
+    StartTime := Now();
     Write('Backward:');
     FOutputError.PrintDebug();
     WriteLn;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   inherited Backpropagate();
 end;
@@ -8856,8 +8893,12 @@ begin
 end;
 
 procedure TNNetIdentity.Compute;
+var
+  StartTime: double;
 begin
+  StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetIdentity.Backpropagate;
@@ -11121,6 +11162,86 @@ begin
   FOutputError.ReSize(1,1,1);
   FOutputErrorDeriv.ReSize(1,1,1);
   Result := Self;
+end;
+
+{ TNNetEmbedding }
+
+procedure TNNetEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(pPrevLayer.Output.Size, 1, FEmbeddingSize);
+  FOutputError.ReSize(FOutput);
+  SetLength(FInputTokens, pPrevLayer.Output.Size);
+end;
+
+constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer);
+begin
+  inherited Create();
+  FVocabSize := pVocabSize;
+  FEmbeddingSize := pEmbeddingSize;
+  FStruct[0] := pVocabSize;
+  FStruct[1] := pEmbeddingSize;
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(pVocabSize, 1, pEmbeddingSize);
+end;
+
+destructor TNNetEmbedding.Destroy;
+begin
+  SetLength(FInputTokens, 0);
+  inherited Destroy;
+end;
+
+procedure TNNetEmbedding.Compute();
+var
+  MaxToken, CntToken, CurrentToken: integer;
+  SourcePtr, DestPtr: TNeuralFloatArrPtr;
+  LocalWeights: TNNetVolume;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxToken := FPrevLayer.Output.Size - 1;
+  LocalWeights := FNeurons[0].Weights;
+  FOutput.Fill(0);
+  for CntToken := 0 to MaxToken do
+  begin
+    CurrentToken := Round(FPrevLayer.Output.FData[CntToken]);
+    if CurrentToken >= FVocabSize then
+    begin
+      FErrorProc('Token is bigger than vocab size:'+ IntToStr(CurrentToken));
+      CurrentToken := 0;
+    end;
+    FInputTokens[CntToken] := CurrentToken;
+    SourcePtr := LocalWeights.GetRawPtr(CurrentToken);
+    DestPtr := FOutput.GetRawPtr(CntToken);
+    // TODO: replace this call by a copy function.
+    TNNetVolume.MulAdd(DestPtr, SourcePtr, 1, FEmbeddingSize);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetEmbedding.Backpropagate();
+var
+  MaxToken, CntToken, CurrentToken: integer;
+  SourcePtr, DestPtr: TNeuralFloatArrPtr;
+  LocalWeights: TNNetVolume;
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    MaxToken := FPrevLayer.Output.Size - 1;
+    LocalWeights := FNeurons[0].Weights;
+    for CntToken := 0 to MaxToken do
+    begin
+      CurrentToken := FInputTokens[CntToken];
+      DestPtr := LocalWeights.GetRawPtr(CurrentToken);
+      SourcePtr := FOutputError.GetRawPtr(CntToken);
+      TNNetVolume.MulAdd(DestPtr, SourcePtr, FLearningRate, FEmbeddingSize);
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
 end;
 
 procedure TNNetInputBase.Compute;
