@@ -304,6 +304,10 @@ function RemoveRandomChars(const Str: string; Count: integer): string;
 // This function randomly removes one word from the input string.
 function RemoveRandomWord(const Str: string): string;
 
+type TNNetAAInteger = array of array of integer;
+
+procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger);
+
 {$IFNDEF FPC}
 function SwapEndian(I:integer):integer;
 procedure FindAllDirectories(AList: TStrings; const SearchPath: String;
@@ -1739,6 +1743,45 @@ begin
   WordList.Free;
 end;
 
+procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger);
+var
+  LargeFile: TextFile;
+  StrLine: string;
+  RowCnt, WordCnt: integer;
+  Separator: TNNetStringList;
+begin
+  Separator := CreateTokenizedStringList(',');
+  RowCnt := 0;
+  WriteLn('Counting rows from: ', filename);
+  AssignFile(LargeFile, filename);
+  Reset(LargeFile);
+  while not Eof(LargeFile) do
+  begin
+    ReadLn(LargeFile, StrLine);
+    RowCnt := RowCnt + 1;
+  end;
+  CloseFile(LargeFile);
+  WriteLn('Loading: ', filename);
+  SetLength(aTokens, RowCnt);
+  WriteLn('Loading ', RowCnt,' rows.');
+  Reset(LargeFile);
+  RowCnt := 0;
+  while not Eof(LargeFile) do
+  begin
+    ReadLn(LargeFile, StrLine);
+    Separator.DelimitedText := StrLine;
+    SetLength(aTokens[RowCnt], Separator.Count);
+    if Separator.Count > 0 then
+    begin
+      for WordCnt := 0 to Separator.Count - 1 do
+      begin
+        aTokens[RowCnt][WordCnt] := StrToInt(Separator[WordCnt]);
+      end;
+    end;
+    RowCnt := RowCnt + 1;
+  end;
+  CloseFile(LargeFile);
+end;
 
 function RemoveRandomChars(const Str: string; Count: integer): string;
 var

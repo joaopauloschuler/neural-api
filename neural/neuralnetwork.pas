@@ -665,6 +665,7 @@ type
     constructor Create(pVocabSize, pEmbeddingSize: integer);
     destructor Destroy; override;
 
+    //procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -11197,6 +11198,7 @@ begin
   FStruct[1] := pEmbeddingSize;
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(pVocabSize, 1, pEmbeddingSize);
+  InitDefault();
 end;
 
 destructor TNNetEmbedding.Destroy;
@@ -11205,6 +11207,26 @@ begin
   inherited Destroy;
 end;
 
+(*
+// This is a glorot implementation.
+procedure TNNetEmbedding.InitDefault;
+var
+  Cnt: integer;
+  MulAux: Single;
+begin
+  if (FNeurons.Count > 0) then
+  begin
+    InitUniform(1);
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      //MulAux := Sqrt(6/(FNeurons[Cnt].Weights.Depth));
+      //FNeurons[Cnt].Weights.Mul( MulAux );
+    end;
+    AfterWeightUpdate();
+  end;
+end;
+*)
+
 procedure TNNetEmbedding.Compute();
 var
   MaxToken, CntToken, CurrentToken: integer;
@@ -11212,6 +11234,12 @@ var
   LocalWeights: TNNetVolume;
   StartTime: double;
 begin
+  {$IFDEF Debug}
+  if FEmbeddingSize=0 then
+  begin
+    FErrorProc('Embedding size can not be zero.');
+  end;
+  {$ENDIF}
   StartTime := Now();
   MaxToken := FPrevLayer.Output.Size - 1;
   LocalWeights := FNeurons[0].Weights;
@@ -11237,25 +11265,36 @@ procedure TNNetEmbedding.Backpropagate();
 var
   MaxToken, CntToken, CurrentToken: integer;
   SourcePtr, DestPtr: TNeuralFloatArrPtr;
-  LocalWeights: TNNetVolume;
+  LocalWeights, LocalDelta: TNNetVolume;
   StartTime: double;
 begin
+  LocalWeights := FNeurons[0].Weights;
+  LocalDelta := FNeurons[0].Delta;
+  {$IFDEF Debug}
+  if FEmbeddingSize=0 then
+  begin
+    FErrorProc('Embedding size can not be zero.');
+  end;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetEmbedding: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
+  //WriteLn( LocalWeights.GetSum() );
+  {$ENDIF}
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  StartTime := Now();
+  MaxToken := FPrevLayer.Output.Size - 1;
+  for CntToken := 0 to MaxToken do
   begin
-    StartTime := Now();
-    MaxToken := FPrevLayer.Output.Size - 1;
-    LocalWeights := FNeurons[0].Weights;
-    for CntToken := 0 to MaxToken do
-    begin
-      CurrentToken := FInputTokens[CntToken];
-      DestPtr := LocalWeights.GetRawPtr(CurrentToken);
-      SourcePtr := FOutputError.GetRawPtr(CntToken);
-      TNNetVolume.MulAdd(DestPtr, SourcePtr, FLearningRate, FEmbeddingSize);
-    end;
-    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    CurrentToken := FInputTokens[CntToken];
+    SourcePtr := FOutputError.GetRawPtr(CntToken);
+    if FBatchUpdate
+      then DestPtr := LocalDelta.GetRawPtr(CurrentToken)
+      else DestPtr := LocalWeights.GetRawPtr(CurrentToken);
+    TNNetVolume.MulAdd(DestPtr, SourcePtr, FLearningRate, FEmbeddingSize);
   end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
 end;
 
 { TNNetTokenAndPositionalEmbedding }

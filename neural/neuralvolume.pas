@@ -206,6 +206,7 @@ type
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
     procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure CopyNoChecks(var Original: array of byte); overload;
+    procedure CopyNoChecksAI(var Original: array of integer); overload;
     procedure CopyNoChecks(var Original: string); overload;
     procedure CopyReversedNoChecks(var Original: string); overload;
     procedure CopyChannels(Original: TVolume; aChannels: array of integer);
@@ -4393,7 +4394,21 @@ begin
   if Length(Original) > 0 then
   begin
     vHigh := High(Original);
+    for I := 0 to vHigh do
+    begin
+      FData[I] := Original[I];
+    end;
+  end;
+end;
 
+procedure TVolume.CopyNoChecksAI(var Original: array of integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  if Length(Original) > 0 then
+  begin
+    vHigh := High(Original);
     for I := 0 to vHigh do
     begin
       FData[I] := Original[I];
