@@ -206,7 +206,8 @@ type
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
     procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
     procedure CopyNoChecks(var Original: array of byte); overload;
-    procedure CopyNoChecksAI(var Original: array of integer); overload;
+    procedure CopyNoChecksIntArr(var Original: array of integer); overload;
+    procedure CopyReversedNoChecksIntArr(var Original: array of integer); overload;
     procedure CopyNoChecks(var Original: string); overload;
     procedure CopyReversedNoChecks(var Original: string); overload;
     procedure CopyChannels(Original: TVolume; aChannels: array of integer);
@@ -633,13 +634,26 @@ type
   { TStringListInt }
   TStringListInt = class(TNNetStringList)
     private
+      FTokenizer: TStringList;
+      FIntegerToStr: array of string;
+
       function GetInteger(Index: Integer): PtrInt; {$IFDEF Release} inline; {$ENDIF}
       procedure PutInteger(Index: Integer; AValue: PtrInt); {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create;
+      destructor Destroy; override;
+
       procedure SortByIntegerAsc;
       procedure SortByIntegerDesc;
       function AddInteger(const S: string; AValue: PtrInt): integer; {$IFDEF Release} inline; {$ENDIF}
+      function WordToIndex(pWord:string): integer;
+      function WordToInteger(pWord:string): integer;
+      function IntegerToWord(pInteger: integer): string;
+      procedure SaveCurrentPositionAndSort();
+      procedure StringToIndexArray(pString: string; var IntArr: TNeuralIntegerArray);
+      procedure StringToIntegerArray(pString: string; var IntArr: TNeuralIntegerArray);
+      function IndexArrayToString(var IntArr: TNeuralIntegerArray): string;
+      function IntegerArrayToString(var IntArr: TNeuralIntegerArray): string;
 
       property Integers[Index: Integer]: PtrInt read GetInteger write PutInteger;
   end;
@@ -731,20 +745,18 @@ type
   {$ENDIF}
 
   { TNNetDictionary }
+  // This class creates a dictionary where integers contains the frequency.
   TNNetDictionary = class(TStringListInt)
     protected
-      FTokenizer: TStringList;
       FMaxSize: integer;
     public
       constructor Create(pMaxSize: integer);
-      destructor Destroy; override;
 
       function AddWordToDictionary(pWord:string): boolean;
       function AddWordsToDictionary(pString:string): boolean;
       procedure AddWordFromCsvField(filename: string; fieldId: integer;
         SkipFirstLine: boolean = True; Separator:char = ',');
       procedure RemoveAllStringsWithLessThen(I:integer);
-      function WordToIndex(pWord:string): integer;
       procedure StringToVolume(pString: string; Volume: TNNetVolume);
       function VolumeToString(Volume: TNNetVolume; Threshold: TNeuralFloat = 0.2): string;
       procedure CsvToTStringVolumeList(filename: string;
@@ -2295,6 +2307,15 @@ constructor TStringListInt.Create;
 begin
   inherited Create;
   Self.OwnsObjects := false;
+  FTokenizer := CreateTokenizedStringList(' ');
+  SetLength(FIntegerToStr, 0);
+end;
+
+destructor TStringListInt.Destroy;
+begin
+  SetLength(FIntegerToStr, 0);
+  FTokenizer.Free;
+  inherited Destroy;
 end;
 
 procedure TStringListInt.SortByIntegerAsc;
@@ -2322,15 +2343,8 @@ begin
   Self.CaseSensitive := false;
 
   FMaxSize := pMaxSize;
-
-  FTokenizer := CreateTokenizedStringList(' ');
 end;
 
-destructor TNNetDictionary.Destroy;
-begin
-  FTokenizer.Free;
-  inherited Destroy;
-end;
 
 function TNNetDictionary.AddWordToDictionary(pWord: string): boolean;
 var
@@ -2434,9 +2448,132 @@ begin
   end;
 end;
 
-function TNNetDictionary.WordToIndex(pWord: string): integer;
+function TStringListInt.WordToIndex(pWord: string): integer;
 begin
   if not(Self.Find(pWord, Result)) then Result := -1;
+end;
+
+function TStringListInt.WordToInteger(pWord: string): integer;
+var
+  Position: integer;
+begin
+  if Self.Find(pWord, Position) then
+  begin
+    Result := Integers[Position];
+  end
+  else
+  begin
+    Result := -1;
+  end;
+end;
+
+function TStringListInt.IntegerToWord(pInteger: integer): string;
+begin
+  Result := FIntegerToStr[pInteger];
+end;
+
+procedure TStringListInt.StringToIndexArray(pString: string;
+  var IntArr: TNeuralIntegerArray);
+var
+  WordCount: integer;
+  WordIndex: integer;
+begin
+  FTokenizer.DelimitedText := pString;
+
+  if FTokenizer.Count > 0 then
+  begin
+    SetLength(IntArr, FTokenizer.Count);
+    for WordCount := 0  to FTokenizer.Count - 1 do
+    begin
+      WordIndex := Self.WordToIndex(FTokenizer[WordCount]);
+      //WriteLn(WordIndex,':',FTokenizer[WordCount]);
+      if WordIndex >= 0 then
+      begin
+        IntArr[WordCount] := WordIndex;
+      end;
+    end;
+  end;
+end;
+
+procedure TStringListInt.StringToIntegerArray(pString: string;
+  var IntArr: TNeuralIntegerArray);
+var
+  WordCount: integer;
+  WordInteger: integer;
+begin
+  FTokenizer.DelimitedText := pString;
+
+  if FTokenizer.Count > 0 then
+  begin
+    SetLength(IntArr, FTokenizer.Count);
+    for WordCount := 0  to FTokenizer.Count - 1 do
+    begin
+      WordInteger := Self.WordToInteger(FTokenizer[WordCount]);
+      //WriteLn(WordIndex,':',FTokenizer[WordCount]);
+      if WordInteger >= 0 then
+      begin
+        IntArr[WordCount] := WordInteger;
+      end;
+    end;
+  end;
+end;
+
+function TStringListInt.IndexArrayToString(var IntArr: TNeuralIntegerArray
+  ): string;
+var
+  WordCount, WordMax: integer;
+  WordIndex: integer;
+begin
+  Result := '';
+  WordMax := Length(IntArr) - 1;
+  if WordMax >= 0 then
+  begin
+    for WordCount := 0 to WordMax do
+    begin
+      WordIndex := IntArr[WordCount];
+      //WriteLn(WordIndex,':',FTokenizer[WordCount]);
+      if WordIndex >= 0 then
+      begin
+        Result := Result + Self[WordIndex];
+      end;
+    end;
+  end;
+end;
+
+function TStringListInt.IntegerArrayToString(var IntArr: TNeuralIntegerArray
+  ): string;
+var
+  WordCount, WordMax: integer;
+  WordInteger: integer;
+begin
+  Result := '';
+  WordMax := Length(IntArr) - 1;
+  if WordMax >= 0 then
+  begin
+    for WordCount := 0 to WordMax do
+    begin
+      WordInteger := IntArr[WordCount];
+      //WriteLn(WordIndex,':',FTokenizer[WordCount]);
+      if WordInteger >= 0 then
+      begin
+        Result := Result + FIntegerToStr[WordInteger];
+      end;
+    end;
+  end;
+end;
+
+procedure TStringListInt.SaveCurrentPositionAndSort();
+var
+  RowCnt: integer;
+begin
+  SetLength(FIntegerToStr, Self.Count);
+  for RowCnt := 0 to Self.Count - 1 do
+  begin
+    Self.Integers[RowCnt] := RowCnt;
+    FIntegerToStr[RowCnt] := Self[RowCnt];
+  end;
+  Self.Sort();
+  Self.Sorted := true;
 end;
 
 procedure TNNetDictionary.StringToVolume(pString: string; Volume: TNNetVolume);
@@ -4401,7 +4538,7 @@ begin
   end;
 end;
 
-procedure TVolume.CopyNoChecksAI(var Original: array of integer);
+procedure TVolume.CopyNoChecksIntArr(var Original: array of integer);
 var
   I: integer;
   vHigh: integer;
@@ -4412,6 +4549,21 @@ begin
     for I := 0 to vHigh do
     begin
       FData[I] := Original[I];
+    end;
+  end;
+end;
+
+procedure TVolume.CopyReversedNoChecksIntArr(var Original: array of integer);
+var
+  I: integer;
+  MaxLen: integer;
+begin
+  MaxLen := Length(Original) - 1;
+  if MaxLen >= 0 then
+  begin
+    for I := 0 to MaxLen do
+    begin
+      FData[I] := Original[MaxLen - I];
     end;
   end;
 end;
