@@ -665,7 +665,7 @@ type
     constructor Create(pVocabSize, pEmbeddingSize: integer);
     destructor Destroy; override;
 
-    //procedure InitDefault(); override;
+    procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -2013,6 +2013,9 @@ type
 
   // Takes a neural network (NN) and an input string, and returns the predicted class as an integer.
   function GetClassFromChars(NN: TNNet; InputString: string): integer;
+
+  function GenerateStringFromTokens(NN: TNNet; Dict:TStringListInt; InputString: string; oSampler: TNNetSamplerBase = nil): string;
+
 implementation
 
 procedure RebuildPatternOnPreviousPatterns
@@ -2179,6 +2182,40 @@ begin
 
   // Release the memory allocated for the input volume to prevent memory leaks.
   InputVolume.Free;
+end;
+
+function GenerateStringFromTokens(NN: TNNet; Dict: TStringListInt;
+  InputString: string; oSampler: TNNetSamplerBase): string;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  NextTokenInt: integer;
+  NextTokenStr: string;
+  Tokens: array of integer;
+  TokenCnt: integer;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  Result := InputString;
+  Dict.StringToIntegerArray(InputString, Tokens);
+  TokenCnt := Length(Tokens);
+  repeat
+    InputVolume.CopyReversedNoChecksIntArr(Tokens);
+    NN.Compute(InputVolume, OutputVolume);
+    if Assigned(oSampler)
+    then NextTokenInt := oSampler.GetToken(OutputVolume)
+    else NextTokenInt := OutputVolume.GetClass();
+    if NextTokenInt < Dict.Count then
+    begin
+      NextTokenStr := Dict.IntegerToWord(NextTokenInt);
+      Result := Result + ' ' + NextTokenStr;
+    end;
+    TokenCnt := TokenCnt + 1;
+    SetLength(Tokens, TokenCnt);
+    Tokens[TokenCnt - 1] := NextTokenInt;
+  until (NextTokenInt < 2) or (TokenCnt>=InputVolume.SizeX);
+  SetLength(Tokens, 0);
+  InputVolume.Free;
+  OutputVolume.Free;
 end;
 
 { TNNetMovingScale }
@@ -11199,6 +11236,7 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(pVocabSize, 1, pEmbeddingSize);
   InitDefault();
+  AfterWeightUpdate();
 end;
 
 destructor TNNetEmbedding.Destroy;
@@ -11207,25 +11245,18 @@ begin
   inherited Destroy;
 end;
 
-(*
 // This is a glorot implementation.
 procedure TNNetEmbedding.InitDefault;
 var
-  Cnt: integer;
-  MulAux: Single;
+  MaxAbs: TNeuralFloat;
 begin
-  if (FNeurons.Count > 0) then
+  inherited InitDefault;
+  MaxAbs := FNeurons[0].FWeights.GetMaxAbs();
+  if MaxAbs > 0 then
   begin
-    InitUniform(1);
-    for Cnt := 0 to FNeurons.Count-1 do
-    begin
-      //MulAux := Sqrt(6/(FNeurons[Cnt].Weights.Depth));
-      //FNeurons[Cnt].Weights.Mul( MulAux );
-    end;
-    AfterWeightUpdate();
+    FNeurons[0].FWeights.Mul(0.5/MaxAbs);
   end;
 end;
-*)
 
 procedure TNNetEmbedding.Compute();
 var
@@ -11234,16 +11265,25 @@ var
   LocalWeights: TNNetVolume;
   StartTime: double;
 begin
+  StartTime := Now();
+  MaxToken := FPrevLayer.Output.Size - 1;
+  LocalWeights := FNeurons[0].Weights;
+  FOutput.Fill(0);
   {$IFDEF Debug}
   if FEmbeddingSize=0 then
   begin
     FErrorProc('Embedding size can not be zero.');
   end;
+  if LocalWeights.Size <> FEmbeddingSize * FVocabSize then
+  begin
+    FErrorProc('Weights size do not match at TNNetEmbedding:' +
+      IntToStr(LocalWeights.Size)+' EmbeddingSize * Vocab Size:'+
+        IntToStr(FEmbeddingSize * FVocabSize)+' '+
+      ' EmbeddingSize: '+IntToStr(FEmbeddingSize)+
+      ' Vocab Size: '+IntToStr(FVocabSize)
+    );
+  end;
   {$ENDIF}
-  StartTime := Now();
-  MaxToken := FPrevLayer.Output.Size - 1;
-  LocalWeights := FNeurons[0].Weights;
-  FOutput.Fill(0);
   for CntToken := 0 to MaxToken do
   begin
     CurrentToken := Round(FPrevLayer.Output.FData[CntToken]);
@@ -11253,8 +11293,8 @@ begin
       CurrentToken := 0;
     end;
     FInputTokens[CntToken] := CurrentToken;
-    SourcePtr := LocalWeights.GetRawPtr(CurrentToken);
-    DestPtr := FOutput.GetRawPtr(CntToken);
+    SourcePtr := LocalWeights.GetRawPtr(CurrentToken, 0, 0);
+    DestPtr := FOutput.GetRawPtr(CntToken, 0, 0);
     // TODO: replace this call by a copy function.
     TNNetVolume.MulAdd(DestPtr, SourcePtr, 1, FEmbeddingSize);
   end;
@@ -11279,6 +11319,22 @@ begin
   begin
     FErrorProc('Backprop call count does not look right at TNNetEmbedding: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
   end;
+  if LocalWeights.Size <> FEmbeddingSize * FVocabSize then
+  begin
+    FErrorProc('Weights size do not match at TNNetEmbedding:' +
+      IntToStr(LocalWeights.Size)+' EmbeddingSize * Vocab Size:'+
+        IntToStr(FEmbeddingSize * FVocabSize)+' '+
+      ' EmbeddingSize: '+IntToStr(FEmbeddingSize)+
+      ' Vocab Size: '+IntToStr(FVocabSize)
+    );
+  end;
+  if LocalDelta.Size <> LocalWeights.Size then
+  begin
+    FErrorProc('Weights size and Delta Size do not match at TNNetEmbedding.' +
+      ' Weights Size: '+IntToStr(LocalWeights.Size)+
+      ' Delta Size: '+IntToStr(LocalDelta.Size)
+    );
+  end;
   //WriteLn( LocalWeights.GetSum() );
   {$ENDIF}
   Inc(FBackPropCallCurrentCnt);
@@ -11290,8 +11346,8 @@ begin
     CurrentToken := FInputTokens[CntToken];
     SourcePtr := FOutputError.GetRawPtr(CntToken);
     if FBatchUpdate
-      then DestPtr := LocalDelta.GetRawPtr(CurrentToken)
-      else DestPtr := LocalWeights.GetRawPtr(CurrentToken);
+      then DestPtr := LocalDelta.GetRawPtr(CurrentToken, 0, 0)
+      else DestPtr := LocalWeights.GetRawPtr(CurrentToken, 0, 0);
     TNNetVolume.MulAdd(DestPtr, SourcePtr, FLearningRate, FEmbeddingSize);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
