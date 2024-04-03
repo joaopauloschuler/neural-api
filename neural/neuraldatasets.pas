@@ -1752,7 +1752,7 @@ var
 begin
   Separator := CreateTokenizedStringList(',');
   RowCnt := 0;
-  WriteLn('Counting rows from: ', filename);
+  //WriteLn('Counting rows from: ', filename);
   AssignFile(LargeFile, filename);
   Reset(LargeFile);
   while not Eof(LargeFile) do
@@ -1761,9 +1761,9 @@ begin
     RowCnt := RowCnt + 1;
   end;
   CloseFile(LargeFile);
-  WriteLn('Loading: ', filename);
+  //WriteLn('Loading: ', filename);
   SetLength(aTokens, RowCnt);
-  WriteLn('Loading ', RowCnt,' rows.');
+  //WriteLn('Loading ', RowCnt,' rows.');
   Reset(LargeFile);
   RowCnt := 0;
   while not Eof(LargeFile) do
