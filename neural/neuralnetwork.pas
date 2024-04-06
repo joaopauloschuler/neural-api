@@ -1426,7 +1426,6 @@ type
       procedure Compute(); override;
   end;
 
-  /// This layer is experimental. DO NOT USE IT.
   // This layer implements a maxpool that also stores the position
   // of the maximum values.
   TNNetMaxPoolWithPosition = class(TNNetMaxPool)
@@ -1630,8 +1629,8 @@ type
       function AddSelfAttention(Heads: integer; HasNorm: boolean = False): TNNetLayer;
       function AddSelfAttentionCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
       procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; HasNorm: boolean = False);
-      function AddTransformerBlock(Heads: integer; HasNorm: boolean = False): TNNetLayer;
-      function AddTransformerBlockCAI(Heads: integer; HasNorm: boolean = False): TNNetLayer;
+      function AddTransformerBlock(Heads: integer; IntermediateDim: integer; HasNorm: boolean = False): TNNetLayer;
+      function AddTransformerBlockCAI(Heads: integer; IntermediateDim: integer; HasNorm: boolean = False): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
       function GetFirstLayer(): TNNetLayer;
@@ -2267,7 +2266,7 @@ begin
   if MaxAbs <> 0 then
   begin
     Diff := FMaxTarget-MaxAbs;
-    if Diff < 0 then
+    if (Diff < 0) or (Diff>0.75) then
     begin
       FNeurons[0].FDelta.Add(0, 0, 0, (Diff)*FLearningRate*FChangeRate);
       if (not FBatchUpdate) then
@@ -6960,7 +6959,7 @@ begin
 end;
 
 function TNNet.AddTransformerBlock(Heads: integer;
-  HasNorm: boolean = False
+  IntermediateDim: integer; HasNorm: boolean = False
   ): TNNetLayer;
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
@@ -6973,7 +6972,7 @@ begin
   if HasNorm
   then AttendedPlusPrev := AddLayer( TNNetMovingScale.Create() )
   else AttendedPlusPrev := GetLastLayer();
-  AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
+  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim) );
   AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
   if HasNorm then Result := AddLayer( TNNetMovingScale.Create() );
   AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
@@ -6983,6 +6982,7 @@ begin
 end;
 
 function TNNet.AddTransformerBlockCAI(Heads: integer;
+  IntermediateDim: integer;
   HasNorm: boolean = False
   ): TNNetLayer;
 var
@@ -6996,7 +6996,7 @@ begin
   if HasNorm
   then AttendedPlusPrev := AddLayer( TNNetMovingScale.Create() )
   else AttendedPlusPrev := GetLastLayer();
-  AddLayer( TNNetPointwiseConvReLU.Create(EmbeddingDim*4) );
+  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim) );
   AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
   if HasNorm then Result := AddLayer( TNNetMovingScale.Create() );
   AddLayer( TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) );
