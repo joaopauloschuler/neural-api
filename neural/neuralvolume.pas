@@ -308,6 +308,7 @@ type
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure OneHotEncoding(aTokens: string); overload;
     procedure OneHotEncodingReversed(aTokens: string); overload;
+    procedure OneHotEncodingReversed(var aTokens: array of integer); overload;
     // Sets positional embedding as per paper "Attention Is All You Need".
     // https://arxiv.org/abs/1706.03762 .
     procedure PositionalEncoding(n: integer = 10000);
@@ -6013,6 +6014,33 @@ begin
     {$IFDEF DEBUG}
     WriteLn('Zero len at OneHotEncodingReversed');
     {$ENDIF}
+  end;
+end;
+
+procedure TVolume.OneHotEncodingReversed(var aTokens: array of integer);
+var
+  CntToken, MaxToken, Token: integer;
+begin
+  MaxToken := Length(aTokens) - 1;
+  Self.Fill(0);
+  if MaxToken < SizeX then
+  begin
+    for CntToken := 0 to MaxToken do
+    begin
+      Token := aTokens[CntToken];
+      if Token < FDepth then
+      begin
+        Self[MaxToken-CntToken, 0, Token] := 1;
+      end
+      else
+      begin
+        WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncoding.');
+      end;
+    end;
+  end
+  else
+  begin
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncoding.');
   end;
 end;
 
