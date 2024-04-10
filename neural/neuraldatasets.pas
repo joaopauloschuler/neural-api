@@ -306,7 +306,8 @@ function RemoveRandomWord(const Str: string): string;
 
 type TNNetAAInteger = array of array of integer;
 
-procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger);
+procedure LoadIntegersInCSV(filename: string;
+  var aTokens: TNNetAAInteger; MaxRows: integer = 0);
 
 {$IFNDEF FPC}
 function SwapEndian(I:integer):integer;
@@ -1743,7 +1744,8 @@ begin
   WordList.Free;
 end;
 
-procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger);
+procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger;
+  MaxRows: integer = 0);
 var
   LargeFile: TextFile;
   StrLine: string;
@@ -1755,7 +1757,7 @@ begin
   //WriteLn('Counting rows from: ', filename);
   AssignFile(LargeFile, filename);
   Reset(LargeFile);
-  while not Eof(LargeFile) do
+  while (not Eof(LargeFile)) and ( (MaxRows=0) or (RowCnt<MaxRows) ) do
   begin
     ReadLn(LargeFile, StrLine);
     RowCnt := RowCnt + 1;
@@ -1766,7 +1768,7 @@ begin
   //WriteLn('Loading ', RowCnt,' rows.');
   Reset(LargeFile);
   RowCnt := 0;
-  while not Eof(LargeFile) do
+  while (not Eof(LargeFile)) and ( (MaxRows=0) or (RowCnt<MaxRows) ) do
   begin
     ReadLn(LargeFile, StrLine);
     Separator.DelimitedText := StrLine;

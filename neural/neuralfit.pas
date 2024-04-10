@@ -35,6 +35,40 @@ uses
   ;
 
 type
+
+  // This is a base class for all optimizers
+  TNeuralOptimizer = class(TMObject)
+  private
+    FNN: TNNet;
+  public
+    procedure SetNN(pNN: TNNet);
+    procedure Optimize(); virtual; abstract;
+  end;
+
+  // SGD optimization method
+  TNeuralOptimizerSGD = class(TNeuralOptimizer)
+  public
+    procedure Optimize(); override;
+  end;
+
+  // Adam optimization method
+  TNeuralOptimizerAdam = class(TNeuralOptimizer)
+    FBeta1: TNeuralFloat;
+    FBeta2: TNeuralFloat;
+    FEpsilon: TNeuralFloat;
+    FAdamInitialized: boolean;
+  public
+    constructor Create(
+      Beta1: TNeuralFloat = 0.9;
+      Beta2: TNeuralFloat = 0.999;
+      Epsilon: TNeuralFloat = 1e-07); overload;
+
+    // Memory Initializer for Adam optimizer
+    function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
+
+    procedure Optimize(); override;
+  end;
+
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
 
@@ -94,7 +128,11 @@ type
       FDeviceId: cl_device_id;
       {$ENDIF}
       FProcs: TNeuralThreadList;
+      FOptimizer: TNeuralOptimizer;
+      FOptimizerOwned: boolean;
       procedure CheckLearningRate(iEpochCount: integer);
+      procedure Optimize();
+      procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -133,6 +171,7 @@ type
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
       property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
       property OnStart: TNotifyEvent read FOnStart write FOnStart;
+      property Optimizer: TNeuralOptimizer write SetOptimizer;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -144,6 +183,8 @@ type
       property Running: boolean read FRunning;
       property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
+
+  { TNeuralFitWithImageBase }
 
   TNeuralFitWithImageBase = class(TNeuralFitBase)
     protected
@@ -180,9 +221,6 @@ type
   TNNetGet2VolumesProc = procedure(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume) of object;
 
   /// Fitting algorithm with data (pairs) loading
-
-  { TNeuralDataLoadingFit }
-
   TNeuralDataLoadingFit = class(TNeuralFitWithImageBase)
   private
     protected
@@ -196,6 +234,7 @@ type
       FGetTrainingPair, FGetValidationPair, FGetTestPair: TNNetGetPairFn;
       FGetTrainingProc, FGetValidationProc, FGetTestProc: TNNetGet2VolumesProc;
       function DefaultLossFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+      function DefaultLossInFirstPixelFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
     public
       constructor Create(); override;
       procedure FitLoading(pNN: TNNet;
@@ -211,6 +250,7 @@ type
       procedure EnableClassComparison();
       procedure EnableDefaultImageTreatment(); override;
       procedure EnableDefaultLoss;
+      procedure EnableDefaultLossInFirstPixel();
 
       // On most cases, you should never call the following methods directly
       procedure RunNNThread(index, threadnum: integer);
@@ -482,6 +522,37 @@ begin
 end;
 {$ENDIF}
 
+procedure TNeuralFitBase.Optimize();
+var
+  MaxDelta: TNeuralFloat;
+begin
+  if FOptimizer = nil then
+  begin
+    FOptimizer := TNeuralOptimizerSGD.Create();
+    FOptimizerOwned := true;
+  end;
+  FOptimizer.SetNN(FNN);
+  if FClipDelta > 0 then
+  begin
+    MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
+  end
+  else
+  begin
+    //FNN.NormalizeMaxAbsoluteDeltaPerNeuron(FCurrentLearningRate);
+    //MaxDelta := FNN.NormalizeMinMaxAbsoluteDeltaPerLayer(FCurrentLearningRate, FCurrentLearningRate);
+    MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
+    if MaxDelta < 1 then
+    begin
+      MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
+        ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
+        FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
+    end;
+  end;
+  FOptimizer.Optimize();
+  //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
+  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+end;
+
 constructor TNeuralFitWithImageBase.Create();
 begin
   inherited Create();
@@ -510,6 +581,38 @@ var
 begin
   ClassId := ExpectedOutput.Tag;
   OutputValue := FoundOutput.FData[ ClassId ];
+
+  {$IFDEF Debug}
+  //if ClassId <> ExpectedOutput.GetClass() then
+  //begin
+  //  FErrorProc(
+  //    'Error - classes do not match at TNeuralDataLoadingFit.DefaultLossFn:' +
+  //    IntToStr(ClassId)+','+IntToStr(ExpectedOutput.GetClass())
+  //  );
+  //end;
+  {$ENDIF}
+
+  if (OutputValue > 0) then
+  begin
+    result := -Ln(OutputValue);
+  end
+  else
+  begin
+    {$IFDEF Debug}
+    //FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+    {$ENDIF}
+    result := 100;
+  end;
+end;
+
+function TNeuralDataLoadingFit.DefaultLossInFirstPixelFn(ExpectedOutput,
+  FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+var
+  ClassId: integer;
+  OutputValue: TNeuralFloat;
+begin
+  ClassId := ExpectedOutput.Tag;
+  OutputValue := FoundOutput[0, 0, ClassId];
 
   {$IFDEF Debug}
   if ClassId <> ExpectedOutput.GetClass() then
@@ -1385,22 +1488,7 @@ begin
   {$ELSE}
   RunNNThread(0, 1);
   {$ENDIF}
-  if FClipDelta > 0 then
-  begin
-    MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
-  end
-  else
-  begin
-    MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
-    if MaxDelta < 1 then
-    begin
-      MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
-      ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
-      FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
-    end;
-  end;
-  FNN.UpdateWeights();
-  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+  Optimize();
 end;
 
 procedure TNeuralDataLoadingFit.RunValidationBatch(ValidationSize: integer);
@@ -1466,6 +1554,11 @@ begin
   FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
 end;
 
+procedure TNeuralDataLoadingFit.EnableDefaultLossInFirstPixel();
+begin
+  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossInFirstPixelFn;
+end;
+
 procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
 begin
   inherited EnableDefaultImageTreatment();
@@ -1473,8 +1566,55 @@ begin
   EnableDefaultLoss();
 end;
 
-{ TNeuralFitBase }
+{ TNeuralOptimizer }
 
+procedure TNeuralOptimizer.SetNN(pNN: TNNet);
+begin
+  FNN := pNN;
+end;
+
+{ TNeuralOptimizerSGD }
+
+procedure TNeuralOptimizerSGD.Optimize();
+begin
+  FNN.UpdateWeights();
+end;
+
+{ TNeuralOptimizerAdam }
+
+constructor TNeuralOptimizerAdam.Create(Beta1: TNeuralFloat;
+  Beta2: TNeuralFloat; Epsilon: TNeuralFloat);
+begin
+  inherited Create();
+  FBeta1 := Beta1;
+  FBeta2 := Beta2;
+  FEpsilon := Epsilon;
+  FAdamInitialized := false;
+end;
+
+function TNeuralOptimizerAdam.InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat
+  ): TNNetLayer;
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to FNN.GetLastLayerIdx() do
+  begin
+    FNN.Layers[LayerCnt].InitAdam(Beta1, Beta2, Epsilon);
+  end;
+  Result := FNN.GetLastLayer();
+end;
+
+procedure TNeuralOptimizerAdam.Optimize();
+begin
+  if not(FAdamInitialized) then
+  begin
+    InitAdam(FBeta1, FBeta2, FEpsilon);
+    FAdamInitialized := true;
+  end;
+  FNN.UpdateWeightsAdam();
+end;
+
+{ TNeuralFitBase }
 constructor TNeuralFitBase.Create();
 begin
   inherited Create();
@@ -1528,10 +1668,13 @@ begin
   FLoadBestAdEnd := True;
   FTestBestAtEnd := True;
   FLogEveryBatches := 10;
+  FOptimizer := nil;
+  FOptimizerOwned := false;
 end;
 
 destructor TNeuralFitBase.Destroy();
 begin
+  if FOptimizerOwned and Assigned(FOptimizer) then FOptimizer.Free;
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
@@ -1612,6 +1755,14 @@ begin
       'Learning rate set to: ' + FloatToStrF(FCurrentLearningRate, ffFixed, 7, 5)
     );
   end;
+end;
+
+procedure TNeuralFitBase.SetOptimizer(pOptimizer: TNeuralOptimizer);
+begin
+  if FOptimizerOwned and Assigned(FOptimizer) then FOptimizer.Free;
+  FOptimizer := pOptimizer;
+  FOptimizerOwned := false;
+  FOptimizer.SetNN(FNN);
 end;
 
 { TNeuralImageFit }
@@ -1821,24 +1972,7 @@ begin
       {$ELSE}
       RunNNThread(0, 1);
       {$ENDIF}
-      if FClipDelta > 0 then
-      begin
-        MaxDelta := FNN.ForceMaxAbsoluteDelta(FClipDelta);
-      end
-      else
-      begin
-        MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
-        if MaxDelta < 1 then
-        begin
-          MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
-          ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
-          FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
-        end;
-      end;
-      FNN.UpdateWeights();
-      //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
-      if FL2Decay > 0.0 then FNN.ComputeL2Decay();
-
+      Optimize();
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
       if (FGlobalTotal > 0) then
       begin

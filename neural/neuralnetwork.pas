@@ -55,24 +55,34 @@ const
   csMaxInterleavedSize: integer = 95;
 
 type
+  TNNet = class;
+  TNNetLayer = class;
+
   { TNNetNeuron }
   TNNetNeuron = class (TMObject)
     protected
       FWeights: TNNetVolume;
       FBackInertia: TNNetVolume;
+      FBackInertia2: TNNetVolume;
       FDelta: TNNetVolume;
+      FDelta2: TNNetVolume;
+      FParentLayer: TNNetLayer;
 
     private
       FBiasWeight: TNeuralFloat;
       FBiasInertia: TNeuralFloat;
+      FBiasInertia2: TNeuralFloat;
       FBiasDelta: TNeuralFloat;
 
     public
+
       constructor Create(); override;
       destructor Destroy(); override;
       procedure Fill(Value:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure AddInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure UpdateWeights(Inertia:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      procedure UpdateWeightsWithoutInertia(); {$IFDEF Release} inline; {$ENDIF}
+      procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
       function SaveToString(): string;
       procedure LoadFromString(strData: string);
       procedure ClearDelta; {$IFDEF Release} inline; {$ENDIF}
@@ -100,6 +110,8 @@ type
       procedure InitHeGaussianDepthwise(Value: TNeuralFloat = 1);
       // Weight Initializer for SELU activation function.
       procedure InitSELU(Value: TNeuralFloat = 1);
+      // Memory Initializer for Adam Optimizer
+      procedure InitAdam(ParentLayer: TNNetLayer);
 
       property Weights: TNNetVolume read FWeights;
       property Bias: TNeuralFloat read FBiasWeight;
@@ -133,8 +145,6 @@ type
     csNNetMaxParameterIdx = 7;
 
   type
-  TNNet = class;
-
   /// neural network layer
   TNNetLayer = class(TMObject)
     protected
@@ -152,11 +162,15 @@ type
       FSuppressBias: integer;
       // Fast access to TNNetNeuron
       FArrNeurons: array of TNNetNeuron;
-
       FInertia: TNeuralFloat;
       FPrevLayer: TNNetLayer;
       FLearningRate: TNeuralFloat;
       FL2Decay: TNeuralFloat;
+      // Adam settings
+      FBeta1, FBeta2, FEpsilon: TNeuralFloat;
+      FBeta1Decay, FBeta2Decay: TNeuralFloat;
+      FOneMinusBeta1Decay, FOneMinusBeta2Decay: TNeuralFloat;
+
       FStruct: array [0..csNNetMaxParameterIdx] of integer;
       FFloatSt: array [0..csNNetMaxParameterIdx] of TNeuralFloat;
 
@@ -225,6 +239,7 @@ type
       function ForceMaxAbsoluteDelta(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat; virtual;
+      procedure NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta: TNeuralFloat);
       procedure GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       // Returns the sum of all weights from all neurons in the layer.
       function GetWeightSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -265,6 +280,7 @@ type
       function SaveStructureToString(): string; virtual;
       procedure SetBatchUpdate(pBatchUpdate: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
+      procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
       function InitBasicPatterns(): TNNetLayer;
 
       // Increments an internal counter that counts how many branches load
@@ -302,6 +318,9 @@ type
       function InitGlorotBengioUniform(Value: TNeuralFloat = 1): TNNetLayer;
       // Weight Initializer for SELU activation function.
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
+      // Memory Initializer for Adam optimizer
+      function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
+
       procedure InitDefault(); virtual;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
@@ -779,7 +798,7 @@ type
   end;
 
   // This is an experimental layer. Do not use it.
-  TNNetScaleLearning = class(TNNetMovingStdNormalization)
+  TNNetScaleLearning = class(TNNetIdentity)
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -1685,6 +1704,7 @@ type
       procedure SetBatchUpdate(pBatchUpdate: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure InitWeights();
       procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
+      procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -1708,6 +1728,9 @@ type
       function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat;
       function NormalizeMaxAbsoluteDelta(NewMax: TNeuralFloat = 0.1): TNeuralFloat;
+      function NormalizeMinAbsoluteDeltaPerLayer(MinDelta: TNeuralFloat = 0.001): TNeuralFloat;
+      function NormalizeMinMaxAbsoluteDeltaPerLayer(MinDelta, MaxDelta: TNeuralFloat): TNeuralFloat;
+      procedure NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta: TNeuralFloat);
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
 
@@ -2922,34 +2945,23 @@ end;
 
 procedure TNNetScaleLearning.Compute();
 begin
-  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  inherited Compute();
 end;
 
 procedure TNNetScaleLearning.Backpropagate();
 var
   StartTime: double;
-  MagnitudeDelta: TNeuralFloat;
   Magnitude: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   StartTime := Now();
-  if FNeurons[0].Weights.FData[1] > 1 then
+  Magnitude := FOutputError.GetMagnitude();
+  if (Magnitude > 0) and (Magnitude < 1) then
   begin
-    FOutputError.Mul(FNeurons[0].Weights.FData[1]);
+    FOutputError.Mul(1/Magnitude);
   end;
-  Magnitude := FOutput.GetMagnitude();
-  MagnitudeDelta := (1-Magnitude);
-  if (MagnitudeDelta>0) or (FNeurons[0].Weights.FData[1] > 0) then
-  begin
-    FNeurons[0].FDelta.Add(0,0,1, NeuronForceRange(MagnitudeDelta, FLearningRate*10) );
-  end;
-  if (not FBatchUpdate) then
-  begin
-    FNeurons[0].UpdateWeights(FInertia);
-    AfterWeightUpdate();
-  end;
-  //if Random(100)=0 then WriteLn(MagnitudeDelta:6:4,' - ',FNeurons[0].Weights.FData[1]:6:4);
+  //if Random(100)=0 then WriteLn(Magnitude:6:4,' - ',FNeurons[0].Weights.FData[1]:6:4);
   FPrevLayer.FOutputError.Add(FOutputError);
   FPrevLayer.Backpropagate();
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -12779,11 +12791,12 @@ end;
 
 procedure TNNet.MulDeltas(V: TNeuralFloat);
 var
-  LayerCnt: integer;
+  LayerCnt, LastLayerIdx: integer;
 begin
+  LastLayerIdx := GetLastLayerIdx();
   if FLayers.Count > 1 then
   begin
-    for LayerCnt := 1 to GetLastLayerIdx() do
+    for LayerCnt := 1 to LastLayerIdx do
     begin
       if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].MulDeltas( V );
     end;
@@ -12953,12 +12966,14 @@ function TNNet.GetMaxAbsoluteDelta(): TNeuralFloat;
 var
   LayerCnt: integer;
   LayerDelta: TNeuralFloat;
+  MaxLayerIdx: integer;
 begin
   Result := 0;
   FMaxDeltaLayer := 0;
-  if FLayers.Count > 0 then
+  MaxLayerIdx := FLayers.Count - 1;
+  if MaxLayerIdx >= 0 then
   begin
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    for LayerCnt := 0 to MaxLayerIdx do
     begin
       LayerDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
       if Result < LayerDelta then
@@ -12983,6 +12998,84 @@ begin
   else
   begin
     Result := 1;
+  end;
+end;
+
+function TNNet.NormalizeMinAbsoluteDeltaPerLayer(MinDelta: TNeuralFloat
+  ): TNeuralFloat;
+var
+  LayerCnt, LastLayerIdx: integer;
+  MaxAbsDelta: TNeuralFloat;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  Result := 1;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      if not(FLayers[LayerCnt].LinkedNeurons) then
+      begin
+        MaxAbsDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
+        if (MaxAbsDelta < MinDelta) and (MaxAbsDelta > 0) then
+        begin
+          FLayers[LayerCnt].MulDeltas( MinDelta/MaxAbsDelta );
+          Result := Max(Result, MinDelta/MaxAbsDelta );
+          FMaxDeltaLayer := LayerCnt;
+        end;
+      end;
+    end;
+  end;
+end;
+
+function TNNet.NormalizeMinMaxAbsoluteDeltaPerLayer(MinDelta,
+  MaxDelta: TNeuralFloat): TNeuralFloat;
+var
+  LayerCnt, LastLayerIdx: integer;
+  MaxAbsDelta: TNeuralFloat;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  Result := 1;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      if not(FLayers[LayerCnt].LinkedNeurons) then
+      begin
+        MaxAbsDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
+        if (MaxAbsDelta > 0) then
+        begin
+          if (MaxAbsDelta < MinDelta) then
+          begin
+            FLayers[LayerCnt].MulDeltas( MinDelta/MaxAbsDelta );
+            //WriteLn(LayerCnt, ' Force Min:', (MinDelta/MaxAbsDelta):8:4);
+          end
+          else if (MaxAbsDelta > MaxDelta) then
+          begin
+            FLayers[LayerCnt].MulDeltas( MaxDelta/MaxAbsDelta );
+            Result := Min(Result, MaxDelta/MaxAbsDelta );
+            FMaxDeltaLayer := LayerCnt;
+            //WriteLn(LayerCnt, ' Force Max:', (MaxDelta/MaxAbsDelta):8:4);
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNet.NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta: TNeuralFloat);
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      if not(FLayers[LayerCnt].LinkedNeurons) then
+      begin
+        FLayers[LayerCnt].NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta);
+      end;
+    end;
   end;
 end;
 
@@ -13127,6 +13220,16 @@ begin
   for LayerCnt := 0 to GetLastLayerIdx() do
   begin
     FLayers[LayerCnt].UpdateWeights();
+  end;
+end;
+
+procedure TNNet.UpdateWeightsAdam();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    FLayers[LayerCnt].UpdateWeightsAdam();
   end;
 end;
 
@@ -14032,6 +14135,27 @@ begin
   Result := Self;
 end;
 
+function TNNetLayer.InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
+var
+  Cnt: integer;
+begin
+  FBeta1 := Beta1;
+  FBeta2 := Beta2;
+  FEpsilon := Epsilon;
+  FBeta1Decay := 1;
+  FBeta2Decay := 1;
+
+  if (FNeurons.Count > 0) then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].InitAdam(Self);
+    end;
+    AfterWeightUpdate();
+  end;
+  Result := Self;
+end;
+
 procedure TNNetLayer.InitDefault();
 begin
   InitGlorotBengioUniform();
@@ -14163,13 +14287,15 @@ function TNNetLayer.GetMaxAbsoluteDelta(): TNeuralFloat;
 var
   Cnt: integer;
   MaxValue: TNeuralFloat;
+  MaxNeurons: integer;
 begin
-  if FNeurons.Count > 0 then
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons >= 0 then
   begin
     Result := FNeurons[0].Delta.GetMaxAbs();
-    if FNeurons.Count > 1 then
+    if MaxNeurons > 0 then
     begin
-      for Cnt := 0 to FNeurons.Count-1 do
+      for Cnt := 0 to MaxNeurons do
       begin
         MaxValue := FNeurons[Cnt].Delta.GetMaxAbs();
         if MaxValue > Result then Result := MaxValue;
@@ -14180,6 +14306,26 @@ begin
   begin
     Result := 0;
   end;
+end;
+
+procedure TNNetLayer.NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta: TNeuralFloat);
+var
+  Cnt: integer;
+  MaxValue: TNeuralFloat;
+  MaxNeurons: integer;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons >= 0 then
+  begin
+    for Cnt := 0 to MaxNeurons do
+    begin
+      MaxValue := FNeurons[Cnt].Delta.GetMaxAbs();
+      if (MaxDelta <> MaxValue) and (MaxValue>0) then
+      begin
+        FNeurons[Cnt].Delta.Mul(MaxDelta/MaxValue);
+      end;
+    end;
+  end
 end;
 
 function TNNetLayer.GetMinDelta(): TNeuralFloat;
@@ -14685,9 +14831,38 @@ begin
   MaxNeurons := FNeurons.Count - 1;
   if MaxNeurons >= 0 then
   begin
+    if FInertia > 0 then
+    begin
+      for Cnt := 0 to MaxNeurons do
+      begin
+        FNeurons[Cnt].UpdateWeights(FInertia);
+      end;
+    end
+    else
+    begin
+      for Cnt := 0 to MaxNeurons do
+      begin
+        FNeurons[Cnt].UpdateWeightsWithoutInertia();
+      end;
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.UpdateWeightsAdam();
+var
+  Cnt, MaxNeurons: integer;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons >= 0 then
+  begin
+    FBeta1Decay := FBeta1Decay * FBeta1;
+    FBeta2Decay := FBeta2Decay * FBeta2;
+    FOneMinusBeta1Decay := (1 - FBeta1Decay);
+    FOneMinusBeta2Decay := (1 - FBeta2Decay);
     for Cnt := 0 to MaxNeurons do
     begin
-      FNeurons[Cnt].UpdateWeights(FInertia);
+      FNeurons[Cnt].UpdateWeightsAdam();
     end;
   end;
   AfterWeightUpdate();
@@ -14810,13 +14985,17 @@ begin
   FBiasDelta := 0;
   FWeights := TNNetVolume.Create(1,1,1);
   FBackInertia := TNNetVolume.Create(1,1,1);
+  FBackInertia2 := TNNetVolume.Create(1,1,1);
   FDelta := TNNetVolume.Create(1,1,1);
+  FDelta2 := TNNetVolume.Create(1,1,1);
 end;
 
 destructor TNNetNeuron.Destroy();
 begin
   FDelta.Free;
+  FDelta2.Free;
   FBackInertia.Free;
+  FBackInertia2.Free;
   FWeights.Free;
   inherited Destroy();
 end;
@@ -14826,6 +15005,7 @@ begin
   FWeights.InitUniform(Value);
   FBiasWeight := 0;
   FBackInertia.Fill(0);
+  FBackInertia2.Fill(0);
   FDelta.Fill(0);
   FBiasInertia := 0;
   FBiasDelta := 0;
@@ -14836,6 +15016,7 @@ begin
   FWeights.InitGaussian(Value);
   FBiasWeight := 0;
   FBackInertia.Fill(0);
+  FBackInertia2.Fill(0);
   FDelta.Fill(0);
   FBiasInertia := 0;
   FBiasDelta := 0;
@@ -14891,6 +15072,16 @@ begin
   InitGaussian( Value * Sqrt(1/FWeights.Size) );
 end;
 
+procedure TNNetNeuron.InitAdam(ParentLayer: TNNetLayer);
+begin
+  FBackInertia2.Resize(FBackInertia);
+  FDelta2.Resize(FDelta);
+  FBackInertia2.Fill(0);
+  FDelta2.Fill(0);
+  FBiasInertia2 := 0;
+  FParentLayer := ParentLayer;
+end;
+
 procedure TNNetNeuron.Fill(Value: TNeuralFloat);
 begin
   FWeights.Fill(Value) ;
@@ -14909,13 +15100,76 @@ end;
 // (BackInertia*Inertia) + (Delta*(1-Inertia))
 procedure TNNetNeuron.UpdateWeights(Inertia:TNeuralFloat);
 begin
-  FBiasDelta := FBiasDelta * ( 1 - Inertia );
-  FBiasInertia := FBiasInertia * Inertia;
-  FBiasInertia := FBiasInertia + FBiasDelta;
-  FBiasWeight := FBiasWeight + FBiasInertia;
+  if (Inertia>0) then
+  begin
+    FBiasDelta := FBiasDelta * ( 1 - Inertia );
+    FBiasInertia := FBiasInertia * Inertia;
+    FBiasInertia := FBiasInertia + FBiasDelta;
+    FBiasWeight := FBiasWeight + FBiasInertia;
 
-  FBackInertia.MulMulAdd(Inertia, 1-Inertia, FDelta);
-  FWeights.Add(FBackInertia);
+    FBackInertia.MulMulAdd(Inertia, 1-Inertia, FDelta);
+    FWeights.Add(FBackInertia);
+  end
+  else
+  begin
+    FWeights.Add(FDelta);
+    FBiasWeight := FBiasWeight + FBiasDelta;
+  end;
+  ClearDelta();
+end;
+
+procedure TNNetNeuron.UpdateWeightsWithoutInertia();
+begin
+  FWeights.Add(FDelta);
+  FBiasWeight := FBiasWeight + FBiasDelta;
+  ClearDelta();
+end;
+
+// https://github.com/theroyakash/Adam
+// https://github.com/theroyakash/Adam/blob/master/src/Screen%20Shot%202020-02-05%20at%2010.23.14%20PM.png
+procedure TNNetNeuron.UpdateWeightsAdam();
+begin
+  // Weights Update
+  FDelta2.Copy(FDelta);
+  FDelta2.Mul(FDelta2);
+
+  FBackInertia.MulMulAdd(FParentLayer.FBeta1, 1-FParentLayer.FBeta1, FDelta);
+  FBackInertia2.MulMulAdd(FParentLayer.FBeta2, 1-FParentLayer.FBeta2, FDelta2);
+  (*
+  if random(100)=00 then
+  WriteLn(
+    'D1:',  FDelta.GetMaxAbs():8:4,
+    ' D2:', FDelta2.GetMaxAbs():8:4,
+    ' I1:', FBackInertia.GetMaxAbs():8:4,
+    ' I2:', FBackInertia2.GetMaxAbs():8:4
+  );
+  *)
+  FDelta2.Copy(FBackInertia2);
+  FDelta2.Divi(FParentLayer.FOneMinusBeta2Decay);
+  FDelta2.VSqrt();
+  FDelta2.Add(FParentLayer.FEpsilon);
+
+  FDelta.Fill(FParentLayer.FLearningRate/FParentLayer.FOneMinusBeta1Decay);
+  FDelta.Mul(FBackInertia);
+  FDelta.Divi(FDelta2);
+  (*
+  if random(100)=00 then
+  WriteLn(
+    'CALC D1:',  FDelta.GetMaxAbs():8:4,
+    ' CALC D2:', FDelta2.GetMaxAbs():8:4
+  );
+  *)
+  //ReadLn;
+
+  FWeights.Add(FDelta);
+  // debug only: FWeights.Add(FBackInertia);
+
+  // Bias Update
+  FBiasInertia  := FParentLayer.FBeta1 * FBiasInertia  + (1 - FParentLayer.FBeta1) * FBiasDelta;
+  FBiasInertia2 := FParentLayer.FBeta2 * FBiasInertia2 + (1 - FParentLayer.FBeta2) * (FBiasDelta*FBiasDelta);
+
+  FBiasWeight := FBiasWeight +
+    FParentLayer.FLearningRate*( (FBiasInertia/FParentLayer.FOneMinusBeta1Decay) / (sqrt(FBiasInertia2/FParentLayer.FOneMinusBeta2Decay)+FParentLayer.FEpsilon) ) ;
   ClearDelta();
 end;
 
