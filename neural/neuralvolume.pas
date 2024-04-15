@@ -301,6 +301,7 @@ type
     procedure SetClassForSoftMax(pClass: integer);
     // GetClass is similar to argmax
     function GetClass(): integer;
+    function GetClassOnPixel(X, Y: integer): integer;
     function SoftMax(): T;
     procedure PointwiseSoftMax();
 
@@ -5817,6 +5818,36 @@ begin
   end;
 end;
 
+function TVolume.GetClassOnPixel(X, Y: integer): integer;
+var
+  I: integer;
+  vHigh: integer;
+  vMax: T;
+  Pos: integer;
+  Value: T;
+begin
+  vHigh := Depth;
+  if (vHigh>0) then
+  begin
+    Result := 0;
+    Pos := GetRawPos(X, Y);
+    vMax := FData[Pos];
+    for I := 1 to vHigh do
+    begin
+      Inc(Pos);
+      Value := FData[Pos];
+      if Value > vMax then
+      begin
+        Result := I;
+        vMax := Value;
+      end;
+    end;
+  end else
+  begin
+    Result := -1;
+  end;
+end;
+
 function TVolume.SoftMax(): T;
 var
   I: integer;
@@ -5877,12 +5908,12 @@ begin
         StartPointPos := GetRawPos(CountX, CountY);
         I := StartPointPos;
         // Find the point max value.
-        MaxValue := FData[0];
+        MaxValue := FData[I];
         for CountD := 1 to MaxD do
         begin
-          if FData[CountD] > MaxValue
-            then MaxValue := FData[CountD];
           Inc(I);
+          if FData[I] > MaxValue
+            then MaxValue := FData[I];
         end;
         TotalSum := 0;
         I := StartPointPos;
