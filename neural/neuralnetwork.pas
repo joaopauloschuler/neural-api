@@ -680,11 +680,13 @@ type
   private
     FVocabSize: integer;
     FEmbeddingSize: integer;
+    FScaleEmbedding: TNeuralFloat;
     FEncodeZero: boolean;
     FInputTokens: array of integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(pVocabSize, pEmbeddingSize: integer; EncodeZero: integer = 0);
+    constructor Create(pVocabSize, pEmbeddingSize: integer;
+      EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 2);
     destructor Destroy; override;
 
     procedure InitDefault(); override;
@@ -698,9 +700,14 @@ type
   private
     FPositionalEmbedding: TNNetVolume;
     FPositionalEmbeddingN: integer;
+    FScalePositional: TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(pVocabSize, pEmbeddingSize: integer; EncodeZero: integer = 0; PositionalEmbeddingN: integer = 0);
+    constructor Create(pVocabSize, pEmbeddingSize: integer;
+      EncodeZero: integer = 0;
+      ScaleEmbedding: TNeuralFloat = 2;
+      ScalePositional: TNeuralFloat = 1;
+      PositionalEmbeddingN: integer = 0);
     destructor Destroy; override;
 
     procedure Compute(); override;
@@ -11184,15 +11191,17 @@ begin
 end;
 
 constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer;
-  EncodeZero: integer = 0);
+  EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 2);
 begin
   inherited Create();
   FVocabSize := pVocabSize;
   FEmbeddingSize := pEmbeddingSize;
   FEncodeZero := (EncodeZero>0);
+  FScaleEmbedding := ScaleEmbedding;
   FStruct[0] := pVocabSize;
   FStruct[1] := pEmbeddingSize;
   FStruct[2] := EncodeZero;
+  FFloatSt[0] := ScaleEmbedding;
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(pVocabSize, 1, pEmbeddingSize);
   InitDefault();
@@ -11205,15 +11214,9 @@ begin
   inherited Destroy;
 end;
 
-// This is a glorot implementation.
 procedure TNNetEmbedding.InitDefault;
-// var
-//  MaxAbs: TNeuralFloat;
 begin
-  // We use the same initialization as Keras:
-  // https://keras.io/api/layers/core_layers/embedding/
-  // https://keras.io/api/layers/initializers/
-  InitUniform(0.05);
+  InitUniform(FScaleEmbedding);
 end;
 
 procedure TNNetEmbedding.Compute();
@@ -11324,19 +11327,24 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FPositionalEmbedding.ReSize(FOutput);
   FPositionalEmbedding.PositionalEncoding(FEmbeddingSize);
+  if FScalePositional<>1 then FPositionalEmbedding.Mul(FScalePositional);
 end;
 
 constructor TNNetTokenAndPositionalEmbedding.Create(pVocabSize,
   pEmbeddingSize: integer;
   EncodeZero: integer = 0;
+  ScaleEmbedding: TNeuralFloat = 2;
+  ScalePositional: TNeuralFloat = 1;
   PositionalEmbeddingN: integer = 0);
 begin
-  inherited Create(pVocabSize, pEmbeddingSize, EncodeZero);
+  inherited Create(pVocabSize, pEmbeddingSize, EncodeZero, ScaleEmbedding);
   FPositionalEmbedding := TNNetVolume.Create;
   if PositionalEmbeddingN=0
   then FPositionalEmbeddingN := 10000
   else FPositionalEmbeddingN := PositionalEmbeddingN;
+  FScalePositional := ScalePositional;
   FStruct[3] := FPositionalEmbeddingN;
+  FFloatSt[1] := FScalePositional;
 end;
 
 destructor TNNetTokenAndPositionalEmbedding.Destroy;
@@ -11666,8 +11674,8 @@ begin
       'TNNetLocalResponseNormDepth':Result := TNNetLocalResponseNormDepth.Create(St[0]);
       'TNNetAddAndDiv'             :Result := TNNetAddAndDiv.Create(St[0], St[1]);
       'TNNetAddPositionalEmbedding':Result := TNNetAddPositionalEmbedding.Create(St[0]);
-      'TNNetEmbedding':             Result := TNNetEmbedding.Create(St[0], St[1], St[2]);
-      'TNNetTokenAndPositionalEmbedding':Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], St[3]);
+      'TNNetEmbedding':             Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]);
+      'TNNetTokenAndPositionalEmbedding':Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]);
     else
        raise Exception.create(strData + ' not allowed in CreateLayer.');
     end;
@@ -11771,8 +11779,8 @@ begin
       if S[0] = 'TNNetLocalResponseNormDepth' then Result := TNNetLocalResponseNormDepth.Create(St[0]) else
       if S[0] = 'TNNetAddAndDiv' then Result := TNNetAddAndDiv.Create(St[0], St[1]) else
       if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
-      if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2]) else
-      if S[0] = 'TNNetTokenAndPositionalEmbedding' then Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]) else
+      if S[0] = 'TNNetTokenAndPositionalEmbedding' then Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]) else
       raise Exception.create(strData + ' not allowed in CreateLayer.');
     {$ENDIF}
 
