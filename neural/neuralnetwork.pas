@@ -6876,10 +6876,9 @@ begin
       KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
       ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
       ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
-      (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
-      (*WT := *)AddLayer( TNNetReLUL.Create(-100,+100,0) );
-      (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
-      (*W := *) AddLayer( TNNetTransposeXD.Create() );
+      (*W := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
+      (*W := *)AddLayer( TNNetReLUL.Create(-100,+100,0) );
+      (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
       W := AddLayer( TNNetPointwiseSoftMax.Create() );
       (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
@@ -6892,7 +6891,7 @@ end;
 
 function TNNet.AddSelfAttentionCAI(Heads: integer): TNNetLayer;
 var
-  W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
+  W: TNNetLayer;
   PreviousLayer: TNNetLayer;
   InputChannelsPerGroup: integer;
   EachGroupOutput: array of TNNetLayer;
@@ -6913,11 +6912,9 @@ begin
       QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
       KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
       ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
-      ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
-      (*WT := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
-      (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
-      (*WT := *)AddLayer( TNNetReLUL.Create(-500, +500, 0) );
-      (*W := *) AddLayer( TNNetTransposeXD.Create() );
+      ValueTGroup := AddLayerAfter( TNNetTransposeXD.Create(), ValueGroup);
+      (*W := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
+      (*W := *)AddLayer( TNNetLayerMaxNormalization.Create() );
       W := AddLayer( TNNetPointwiseSoftMax.Create() );
       (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
