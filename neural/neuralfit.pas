@@ -35,6 +35,43 @@ uses
   ;
 
 type
+  TNeuralFitBase = class;
+
+  // This is a base class for all optimizers
+  TNeuralOptimizer = class(TMObject)
+  private
+    FNN: TNNet;
+    FFit: TNeuralFitBase;
+  public
+    procedure SetNN(pNN: TNNet; pFit: TNeuralFitBase);
+    procedure Optimize(); virtual; abstract;
+    procedure ForceDeltaLimists();
+  end;
+
+  // SGD optimization method
+  TNeuralOptimizerSGD = class(TNeuralOptimizer)
+  public
+    procedure Optimize(); override;
+  end;
+
+  // Adam optimization method
+  TNeuralOptimizerAdam = class(TNeuralOptimizer)
+    FBeta1: TNeuralFloat;
+    FBeta2: TNeuralFloat;
+    FEpsilon: TNeuralFloat;
+    FAdamInitialized: boolean;
+  public
+    constructor Create(
+      Beta1: TNeuralFloat = 0.9;
+      Beta2: TNeuralFloat = 0.999;
+      Epsilon: TNeuralFloat = 1e-07); overload;
+
+    // Memory Initializer for Adam optimizer
+    function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
+
+    procedure Optimize(); override;
+  end;
+
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
 
@@ -54,37 +91,39 @@ type
       FCurrentEpoch: integer;
       FCurrentStep: integer;
       FCurrentTrainingError: TNeuralFloat;
+      FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
+      FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
+      FDataAugmentation: boolean;
+      FFinishedThread: TNNetVolume;
+      {$IFDEF HASTHREADS}FCritSec: TRTLCriticalSection;{$ENDIF}
       FNN: TNNet;
       FGlobalHit: integer;
       FGlobalMiss: integer;
       FGlobalTotal: integer;
       FGlobalTotalLoss: single;
       FGlobalErrorSum: single;
-      FFinishedThread: TNNetVolume;
-      {$IFDEF HASTHREADS}FCritSec: TRTLCriticalSection;{$ENDIF}
-      FMultipleSamplesAtValidation: boolean;
-      FDataAugmentation: boolean;
-      FVerbose: boolean;
+      FInertia: single;
       FStaircaseEpochs: integer;
       FStepSize: integer;
+      FMaxEpochs: integer;
+      FMultipleSamplesAtValidation: boolean;
+      FVerbose: boolean;
       FLearningRateDecay: single;
       FInitialLearningRate: single;
       FCyclicalLearningRateLen: integer;
       FInitialEpoch: integer;
-      FMaxEpochs: integer;
       FMinLearnRate: single;
       FCurrentLearningRate: single;
-      FInertia: single;
       FL2Decay: TNeuralFloat;
+      FLogEveryBatches: integer;
       FFileNameBase: string;
       FClipDelta: single;
       FTargetAccuracy: single;
-      FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
-      FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
       FMinBackpropagationError: TNeuralFloat;
+      FMinBackpropagationErrorProportion: TNeuralFloat;
       FLoadBestAdEnd: boolean;
       FTestBestAtEnd: boolean;
       {$IFDEF OpenCL}
@@ -92,7 +131,11 @@ type
       FDeviceId: cl_device_id;
       {$ENDIF}
       FProcs: TNeuralThreadList;
+      FOptimizer: TNeuralOptimizer;
+      FOptimizerOwned: boolean;
       procedure CheckLearningRate(iEpochCount: integer);
+      procedure Optimize();
+      procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
     protected
       procedure DoAfterEpoch; virtual;
       procedure DoAfterStep; virtual;
@@ -123,17 +166,19 @@ type
       property InitialEpoch: integer read FInitialEpoch write FInitialEpoch;
       property InitialLearningRate: single read FInitialLearningRate write FInitialLearningRate;
       property LearningRateDecay: single read FLearningRateDecay write FLearningRateDecay;
-      property MinLearnRate : single read FMinLearnRate write FMinLearnRate;
       property LoadBestAtEnd: boolean read FLoadBestAdEnd write FLoadBestAdEnd;
+      property LogEveryBatches: integer read FLogEveryBatches write FLogEveryBatches;
       property L2Decay: single read FL2Decay write FL2Decay;
       property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
       property MinBackpropagationError: TNeuralFloat read FMinBackpropagationError write FMinBackpropagationError;
+      property MinBackpropagationErrorProportion: TNeuralFloat read FMinBackpropagationErrorProportion write FMinBackpropagationErrorProportion;
       property Momentum: single read FInertia write FInertia;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
       property NN: TNNet read FNN;
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
       property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
       property OnStart: TNotifyEvent read FOnStart write FOnStart;
+      property Optimizer: TNeuralOptimizer write SetOptimizer;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -193,6 +238,7 @@ type
       FGetTrainingPair, FGetValidationPair, FGetTestPair: TNNetGetPairFn;
       FGetTrainingProc, FGetValidationProc, FGetTestProc: TNNetGet2VolumesProc;
       function DefaultLossFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+      function DefaultLossInFirstPixelFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
     public
       constructor Create();
       procedure FitLoading(pNN: TNNet;
@@ -206,7 +252,10 @@ type
       procedure EnableBipolarHitComparison();
       procedure EnableBipolar99HitComparison();
       procedure EnableClassComparison();
+      procedure EnableClassComparisonInFirstPixel();
       procedure EnableDefaultImageTreatment(); override;
+      procedure EnableDefaultLoss;
+      procedure EnableDefaultLossInFirstPixel();
 
       // On most cases, you should never call the following methods directly
       procedure RunNNThread(index, threadnum: integer);
@@ -301,6 +350,7 @@ type
   function BipolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
   function BipolarCompare99(A, B: TNNetVolume; ThreadId: integer): boolean;
   function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+  function ClassCompareOnFirstPixel(A, B: TNNetVolume; ThreadId: integer): boolean;
 
 implementation
 uses
@@ -366,6 +416,12 @@ end;
 function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
 begin
   Result := (A.GetClass() = B.GetClass());
+end;
+
+function ClassCompareOnFirstPixel(A, B: TNNetVolume; ThreadId: integer
+  ): boolean;
+begin
+  Result := (A.GetClassOnPixel(0, 0) = B.GetClassOnPixel(0, 0));
 end;
 
 {$IFDEF FPC}
@@ -478,6 +534,19 @@ begin
 end;
 {$ENDIF}
 
+procedure TNeuralFitBase.Optimize();
+begin
+  if FOptimizer = nil then
+  begin
+    FOptimizer := TNeuralOptimizerSGD.Create();
+    FOptimizerOwned := true;
+  end;
+  FOptimizer.SetNN(FNN, Self);
+  FOptimizer.Optimize();
+  //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
+  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+end;
+
 constructor TNeuralFitWithImageBase.Create();
 begin
   inherited Create();
@@ -508,13 +577,13 @@ begin
   OutputValue := FoundOutput.FData[ ClassId ];
 
   {$IFDEF Debug}
-  if ClassId <> ExpectedOutput.GetClass() then
-  begin
-    FErrorProc(
-      'Error - classes do not match at TNeuralDataLoadingFit.DefaultLossFn:' +
-      IntToStr(ClassId)+','+IntToStr(ExpectedOutput.GetClass())
-    );
-  end;
+  //if ClassId <> ExpectedOutput.GetClass() then
+  //begin
+  //  FErrorProc(
+  //    'Error - classes do not match at TNeuralDataLoadingFit.DefaultLossFn:' +
+  //    IntToStr(ClassId)+','+IntToStr(ExpectedOutput.GetClass())
+  //  );
+  //end;
   {$ENDIF}
 
   if (OutputValue > 0) then
@@ -524,7 +593,39 @@ begin
   else
   begin
     FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
-    result := 1;
+    result := 100;
+  end;
+end;
+
+function TNeuralDataLoadingFit.DefaultLossInFirstPixelFn(ExpectedOutput,
+  FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+var
+  ClassId: integer;
+  OutputValue: TNeuralFloat;
+begin
+  ClassId := ExpectedOutput.Tag;
+  OutputValue := FoundOutput[0, 0, ClassId];
+
+  {$IFDEF Debug}
+  (*
+  if ClassId <> ExpectedOutput.GetClass() then
+  begin
+    FErrorProc(
+      'Error - classes do not match at TNeuralDataLoadingFit.DefaultLossFn:' +
+      IntToStr(ClassId)+','+IntToStr(ExpectedOutput.GetClass())
+    );
+  end;
+  *)
+  {$ENDIF}
+
+  if (OutputValue > 0) then
+  begin
+    result := -Ln(OutputValue);
+  end
+  else
+  begin
+    FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+    result := 100;
   end;
 end;
 
@@ -657,7 +758,7 @@ begin
         FTrainingAccuracy := AccuracyWithInertia/100;
       end;
 
-      if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
+      if ( (FGlobalTotal > 0) and (I mod FLogEveryBatches = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
         if FVerbose then MessageProc
@@ -803,13 +904,13 @@ begin
       AssignFile(CSVFile, FileNameCSV);
       Append(CSVFile);
 
-      MessageProc(
-        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
-        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
+    MessageProc(
+      'Epoch time: ' + FloatToStrF( totalTimeSeconds*(TrainingCnt/(FStepSize*FLogEveryBatches))/60,ffFixed,1,4)+' minutes.' +
+      ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(TrainingCnt/(FStepSize*FLogEveryBatches))/3600,ffFixed,1,4)+' hours.');
 
-      MessageProc(
-        'Epochs: '+IntToStr(FCurrentEpoch)+
-        '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
+    MessageProc(
+      'Epochs: '+IntToStr(FCurrentEpoch)+
+      '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
 
     DoAfterEpoch;
   end;
@@ -1062,8 +1163,14 @@ begin
     LocalErrorSum := LocalErrorSum + CurrentError;
 
     if (CurrentError > FMinBackpropagationError) or
-      (CurrentError > FCurrentTrainingError/4)
-      then LocalNN.Backpropagate( vOutput );
+      (
+        (FCurrentTrainingError>0) and
+        (CurrentError > FCurrentTrainingError*FMinBackpropagationErrorProportion)
+      )
+      then
+    begin
+      LocalNN.Backpropagate( vOutput );
+    end;
 
     CurrentLoss := 0;
     if Assigned(FLossFn) then
@@ -1357,8 +1464,6 @@ begin
 end;
 
 procedure TNeuralDataLoadingFit.RunTrainingBatch();
-var
-  MaxDelta: TNeuralFloat;
 begin
   FGlobalHit       := 0;
   FGlobalMiss      := 0;
@@ -1373,22 +1478,7 @@ begin
   {$ELSE}
   RunNNThread(0, 1);
   {$ENDIF}
-  if FClipDelta > 0 then
-  begin
-    FNN.ForceMaxAbsoluteDelta(FClipDelta);
-  end
-  else
-  begin
-    MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
-    if MaxDelta < 1 then
-    begin
-      MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
-      ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
-      FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
-    end;
-  end;
-  FNN.UpdateWeights();
-  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+  Optimize();
 end;
 
 procedure TNeuralDataLoadingFit.RunValidationBatch(ValidationSize: integer);
@@ -1449,15 +1539,105 @@ begin
   FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompare;
 end;
 
+procedure TNeuralDataLoadingFit.EnableClassComparisonInFirstPixel();
+begin
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompareOnFirstPixel;
+end;
+
+procedure TNeuralDataLoadingFit.EnableDefaultLoss();
+begin
+  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
+end;
+
+procedure TNeuralDataLoadingFit.EnableDefaultLossInFirstPixel();
+begin
+  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossInFirstPixelFn;
+end;
+
 procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
 begin
   inherited EnableDefaultImageTreatment();
   EnableClassComparison();
-  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
+  EnableDefaultLoss();
+end;
+
+{ TNeuralOptimizer }
+
+procedure TNeuralOptimizer.SetNN(pNN: TNNet; pFit: TNeuralFitBase);
+begin
+  FNN := pNN;
+  FFit := pFit;
+  FMessageProc := pFit.MessageProc;
+  FErrorProc := pFit.ErrorProc;
+end;
+
+procedure TNeuralOptimizer.ForceDeltaLimists();
+var
+  MaxDelta: TNeuralFloat;
+begin
+  if FFit.FClipDelta > 0 then
+  begin
+    {MaxDelta := }FNN.ForceMaxAbsoluteDelta(FFit.FClipDelta);
+  end
+  else
+  begin
+    //FNN.NormalizeMaxAbsoluteDeltaPerNeuron(FCurrentLearningRate);
+    //MaxDelta := FNN.NormalizeMinMaxAbsoluteDeltaPerLayer(FCurrentLearningRate, FCurrentLearningRate);
+    MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
+    if MaxDelta < 1 then
+    begin
+      MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
+        ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
+        FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
+    end;
+  end;
+end;
+
+{ TNeuralOptimizerSGD }
+
+procedure TNeuralOptimizerSGD.Optimize();
+begin
+  ForceDeltaLimists();
+  FNN.UpdateWeights();
+end;
+
+{ TNeuralOptimizerAdam }
+
+constructor TNeuralOptimizerAdam.Create(Beta1: TNeuralFloat;
+  Beta2: TNeuralFloat; Epsilon: TNeuralFloat);
+begin
+  inherited Create();
+  FBeta1 := Beta1;
+  FBeta2 := Beta2;
+  FEpsilon := Epsilon;
+  FAdamInitialized := false;
+end;
+
+function TNeuralOptimizerAdam.InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat
+  ): TNNetLayer;
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to FNN.GetLastLayerIdx() do
+  begin
+    FNN.Layers[LayerCnt].InitAdam(Beta1, Beta2, Epsilon);
+  end;
+  Result := FNN.GetLastLayer();
+end;
+
+procedure TNeuralOptimizerAdam.Optimize();
+begin
+  if not(FAdamInitialized) then
+  begin
+    InitAdam(FBeta1, FBeta2, FEpsilon);
+    FAdamInitialized := true;
+  end;
+  FNN.CalcAdamDelta();
+  ForceDeltaLimists();
+  FNN.UpdateWeightsAdam();
 end;
 
 { TNeuralFitBase }
-
 constructor TNeuralFitBase.Create();
 begin
   inherited Create();
@@ -1489,6 +1669,7 @@ begin
   FCyclicalLearningRateLen := 0; // not cyclical by default.
   FInitialEpoch := 0;
   FMinBackpropagationError := 0;
+  FMinBackpropagationErrorProportion := 0.25;
   fMinLearnRate := FInitialLearningRate * 0.01;
   FInertia := 0.9;
   FClipDelta := 0.0;
@@ -1509,10 +1690,14 @@ begin
   FCurrentStep := 0;
   FLoadBestAdEnd := True;
   FTestBestAtEnd := True;
+  FLogEveryBatches := 10;
+  FOptimizer := nil;
+  FOptimizerOwned := false;
 end;
 
 destructor TNeuralFitBase.Destroy();
 begin
+  if FOptimizerOwned and Assigned(FOptimizer) then FOptimizer.Free;
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
@@ -1613,6 +1798,14 @@ begin
   end;
 end;
 
+procedure TNeuralFitBase.SetOptimizer(pOptimizer: TNeuralOptimizer);
+begin
+  if FOptimizerOwned and Assigned(FOptimizer) then FOptimizer.Free;
+  FOptimizer := pOptimizer;
+  FOptimizerOwned := false;
+  FOptimizer.SetNN(FNN, Self);
+end;
+
 { TNeuralImageFit }
 
 constructor TNeuralImageFit.Create();
@@ -1628,6 +1821,7 @@ begin
   FIsSoftmax := true;
   FMaxCropSize := 8;
   FMinBackpropagationError := 0.2;
+  FMinBackpropagationErrorProportion := 0.25;
   FMultipleSamplesAtValidation := true;
   FTrainingSampleProcessedCnt := TNNetVolume.Create;
 end;
@@ -1690,7 +1884,6 @@ var
   LocalHasValidation: boolean;
   CSVFile: TextFile;
   CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
-  MaxDelta: TNeuralFloat;
   ValidationRecord: TNeuralFloat;
 begin
   FRunning := true;
@@ -1774,7 +1967,9 @@ begin
       ' Batch size:' + IntToStr(FBatchSize) +
       ' Step size:' + IntToStr(FStepSize) +
       ' Staircase epochs:' + IntToStr(FStaircaseEpochs) +
-      ' Min backprop error:' + FloatToStrF(MinBackpropagationError,ffFixed,4,2)
+      ' Min backprop error and proportion:' +
+        FloatToStrF(FMinBackpropagationError,ffFixed,4,2)+' '+
+        FloatToStrF(FMinBackpropagationErrorProportion,ffFixed,4,2)
     );
     if Assigned(FImgVolumes) then MessageProc('Training images: '+IntToStr(FImgVolumes.Count));
     if Assigned(FImgValidationVolumes) then MessageProc('Validation images: '+IntToStr(FImgValidationVolumes.Count));
@@ -1818,24 +2013,7 @@ begin
       {$ELSE}
       RunNNThread(0, 1);
       {$ENDIF}
-      if FClipDelta > 0 then
-      begin
-        FNN.ForceMaxAbsoluteDelta(FClipDelta);
-      end
-      else
-      begin
-        MaxDelta := FNN.NormalizeMaxAbsoluteDelta();
-        if MaxDelta < 1 then
-        begin
-          MessageProc('Deltas have been multiplied by: '+FloatToStr(MaxDelta)+'.'+
-          ' Max delta on layer: '+IntToStr(FNN.MaxDeltaLayer)+' - '+
-          FNN.Layers[FNN.MaxDeltaLayer].ClassName+'.');
-        end;
-      end;
-      FNN.UpdateWeights();
-      //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
-      if FL2Decay > 0.0 then FNN.ComputeL2Decay();
-
+      Optimize();
       FGlobalTotal := (FGlobalHit + FGlobalMiss);
       if (FGlobalTotal > 0) then
       begin
@@ -1861,7 +2039,7 @@ begin
         FTrainingAccuracy := AccuracyWithInertia/100;
       end;
 
-      if ( (FGlobalTotal > 0) and (I mod 10 = 0) ) then
+      if ( (FGlobalTotal > 0) and (I mod FLogEveryBatches = 0) ) then
       begin
         totalTimeSeconds := (Now() - startTime) * 24 * 60 * 60;
         if FVerbose then MessageProc
@@ -2027,8 +2205,8 @@ begin
       Append(CSVFile);
 
       MessageProc(
-        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/60,ffFixed,1,4)+' minutes.' +
-        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(pImgVolumes.Count/(FStepSize*10))/3600,ffFixed,1,4)+' hours.');
+        'Epoch time: ' + FloatToStrF( totalTimeSeconds*(pImgVolumes.Count/(FStepSize*FLogEveryBatches))/60,ffFixed,1,4)+' minutes.' +
+        ' '+IntToStr(Epochs)+' epochs: ' + FloatToStrF( Epochs*totalTimeSeconds*(pImgVolumes.Count/(FStepSize*FLogEveryBatches))/3600,ffFixed,1,4)+' hours.');
 
       MessageProc(
         'Epochs: '+IntToStr(FCurrentEpoch)+
@@ -2199,8 +2377,12 @@ begin
       OutputValue := Max(OutputValue, 0.001);
     end;
 
-    if (CurrentError>FMinBackpropagationError) or
-      (CurrentError>FCurrentTrainingError/4) then
+    if
+      (CurrentError > FMinBackpropagationError) or
+      (
+        (FCurrentTrainingError>0) and
+        (CurrentError > FCurrentTrainingError*FMinBackpropagationErrorProportion)
+      ) then
     begin
       LocalNN.Backpropagate(vOutput);
     end
@@ -2218,7 +2400,7 @@ begin
     else
     begin
       FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
-      CurrentLoss := 1;
+      CurrentLoss := 100;
     end;
     LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
@@ -2391,7 +2573,7 @@ begin
         'Error - invalid output value at loss function:' +
         FloatToStrF(OutputValue,ffFixed,6,4)
       );
-      CurrentLoss := 1;
+      CurrentLoss := 100;
     end;
     LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
@@ -2520,6 +2702,7 @@ begin
   FHasMakeGray := True;
   FMaxCropSize := 8;
   FMinBackpropagationError := 0.2;
+  FMinBackpropagationErrorProportion := 0.25;
   FMultipleSamplesAtValidation := True;
 end;
 

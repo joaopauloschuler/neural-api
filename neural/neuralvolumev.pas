@@ -26,7 +26,7 @@ interface
 uses
   Classes, SysUtils, neuralvolume,
   {$IFDEF FPC}ExtCtrls, Graphics, LCLType, FPImage
-  {$ELSE} Windows, {$IF CompilerVersion >= 23} VCL.ExtCtrls, VCL.Graphics {$ELSE} ExtCtrls, Graphics {$ENDIF} {$ENDIF};
+  {$ELSE} Windows, {$IF CompilerVersion >= 23} VCL.ExtCtrls, VCL.Graphics {$ELSE} ExtCtrls, Graphics {$IFEND} {$ENDIF};
 
 /// saves a bitmap into a file from a handle HWND
 procedure SaveHandleToBitmap(OutputFileName: string; hWnd: HWND);

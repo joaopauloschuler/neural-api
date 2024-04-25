@@ -144,7 +144,7 @@ type
     NN.AddLayer( TNNetMaxChannel.Create() );
     NN.AddLayer( TNNetReLU6.Create() );
     NN.AddLayer( TNNetFullConnectLinear.Create(NumClasses) );
-    NN.AddLayer( TNNetSoftMax.Create() );
+    NN.AddLayer( TNNetSoftMax.Create({SkipBackpropDerivative=}1) );
     NN.Layers[ NN.GetFirstImageNeuronalLayerIdx() ].InitBasicPatterns();
 
     CreateCifar10Volumes(ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes);

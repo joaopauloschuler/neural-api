@@ -61,7 +61,7 @@ type
       TNNetConvolutionLinear.Create({Features=}64, {FeatureSize=}3, {Padding=}1, {Stride=}2),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(FTrainingFileNames.ClassCount),
-      TNNetSoftMax.Create()
+      TNNetSoftMax.Create({SkipBackpropDerivative=}1)
     ]);
     NN.DebugStructure();
     WriteLn

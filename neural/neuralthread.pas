@@ -126,6 +126,7 @@ type
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
   procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
   function GetProcessId(): {$IFDEF FPC}integer{$ELSE}integer{$ENDIF};
+  procedure DebugThreadCount();
 
 implementation
 
@@ -226,6 +227,7 @@ function GetProcessId(): integer;
 begin
   GetProcessId := {$IFDEF WINDOWS}GetCurrentProcessId(){$ELSE}fpgetppid(){$ENDIF};
 end;
+
 {$ELSE}
 function GetProcessId(): integer;
 begin
@@ -237,6 +239,11 @@ begin
   {$ENDIF}
 end;
 {$ENDIF}
+
+procedure DebugThreadCount;
+begin
+  WriteLn('CPU threads reported by the operating system: ', NeuralDefaultThreadCount,'.');
+end;
 
 function fNTL: TNeuralThreadList;
 begin

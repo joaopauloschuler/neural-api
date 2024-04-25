@@ -42,7 +42,7 @@ type
       TNNetDropout.Create(0.5),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(10),
-      TNNetSoftMax.Create()
+      TNNetSoftMax.Create({SkipBackpropDerivative=}1)
     ]);
     NN.DebugWeights();
     NN.DebugStructure();

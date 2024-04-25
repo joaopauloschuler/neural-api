@@ -46,7 +46,7 @@ type
       TNNetDropout.Create(0.5),
       TNNetMaxPool.Create(2),
       TNNetFullConnectLinear.Create(2),
-      TNNetSoftMax.Create()
+      TNNetSoftMax.Create({SkipBackpropDerivative=}1)
     ]);
     NN.DebugStructure();
     // change ProportionToLoad to a smaller number if you don't have available 4GB of RAM.

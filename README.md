@@ -5,9 +5,15 @@ OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested
 
 This project is a subproject from a bigger and older project called [CAI](https://sourceforge.net/projects/cai/) and is sister to Keras based [K-CAI NEURAL API](https://github.com/joaopauloschuler/k-neural-api). You can find trained neural network models in the [pre-trained-neural-api-networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) repository.
 
+## Intro Videos
+[![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+--------------------------- | ------------------------------------- | -------------------------
+Basics of Neural Networks in Pascal - Loading and Saving | Neural Networks for Absolute Beginners! Learning a Simple Function | Coding a Neural Network in Pascal that Learns to Calculate the Hypotenuse
+
 ## Why Pascal?
-* Compiled pascal code is super fast! This API can outperform some major APIs in some architectures.
-* Pascal is easy to learn and easy to make a readable and understandable source code. You'll be able to make super fast **native** code and at the same time have a readable code.
+* The Pascal computer language is easy to learn. Pascal allows developers to make a readable and understandable source code.
+* You'll be able to make super-fast **native code** and at the same time have a readable code.
+* This API can outperform some major APIs in some architectures.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers. Many examples use the [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) dataset. You'll also find examples for the [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html), [MNIST](http://yann.lecun.com/exdb/mnist/), [Fashion MNIST](https://www.kaggle.com/zalando-research/fashionmnist) and the [Places365-Standard Small images 256x256](http://places2.csail.mit.edu/download.html) dataset.
@@ -17,6 +23,11 @@ This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of 
 
 ## Installation
 Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neural-api/tree/master/neural) folder to your [Lazarus](https://www.lazarus-ide.org/) unit search path and you'll be ready to go!
+
+## A.I. Powered Support
+You can get A.I. powered help from these tools:
+* [CAI Neural API support at ChatGPT4](https://chat.openai.com/g/g-bqMxEDpIg-neural-api-free-pascal-developer).
+* [CAI Neural API support at Poe](https://poe.com/CAI-NEURAL-API).
  
 ## Documentation
 The documentation is composed by:
@@ -34,16 +45,88 @@ In this readme file, you’ll find information about:
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
-Some recommended introductory source code examples are:
+[![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+
+You can click on the image above to watch the video.
+
+Assuming that you would like to train a neural network to learn a function that has 2 inputs and one output, you could start with something like this:
+```
+    NN.AddLayer([
+      TNNetInput.Create(2),
+      TNNetFullConnectReLU.Create(32),
+      TNNetFullConnectReLU.Create(32),
+      TNNetFullConnectLinear.Create(1)
+    ]);
+```
+The example above has 2 inputs (`TNNetInput`), 2 dense layers (`TNNetFullConnectReLU`) with 32 neurons each and one output (`TNNetFullConnectLinear`).
+
+You can learn more about how to build and train simple neural networks at the following source code examples:
+* [Only one neuron](https://github.com/joaopauloschuler/neural-api/tree/master/examples/OnlyOneNeuron).
 * [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
 * [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
 * [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
 
+### Loading and Saving Neural Networks
+Loading is very easy:
+```
+    NN := TNNet.Create;
+    NN.LoadFromFile('MyTrainedNeuralNetwork.nn');
+```
+Saving is as easy:
+
+```
+    NN.SaveToFile('MyTrainedNeuralNetwork.nn');
+```
+
+### NLP - Training a Simple Neural Network Model for Text Generation
+This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). This code
+
+```
+    WriteLn(GenerateStringFromChars(NFit.NN, 'once', FSampler),'.');
+    WriteLn(GenerateStringFromChars(NFit.NN, 'one ', FSampler),'.');
+```
+
+produces this output:
+```
+once upon a time, there was a little girl named lily. she loved to play outside i.
+one day, a little girl named lily was playing in her garden. she saw a big car wi.
+```
+
+You can open on colab the raw training file and run it by yourself at:
+https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/NLP_CAI_TinyStories_Simple_Example.ipynb
+
+#### Creating Your Own Chat Bot
+Once your neural network is trained, you can run your own chat bot with:
+```
+var
+  S: string;
+  oSampler: TNNetSamplerBase;
+  NN: TNNet;
+begin
+  oSampler := TNNetSamplerTopP.Create(0.6);
+  NN := TNNet.Create();
+  WriteLn('Loading neural network.');
+  NN.LoadFromFile('MyNeuralNetwork.nn');
+  NN.DebugStructure();
+  WriteLn();
+  WriteLn('Write something and I will reply.');
+  repeat
+    Write('User: ');
+    ReadLn(S);
+    WriteLn('Neural network: ',GenerateStringFromChars(NN, LowerCase(S), oSampler),'.');
+  until S = 'exit';
+  NN.Free;
+  oSampler.Free;
+end;
+```
+
 ### Simple Image Classification Examples
 
-#### How Does the Code Look like for an Image Classification (CIFAR-10) Example?
-This is an example for image classification:
+#### CIFAR-10 Image Classification Example
+The CIFAR-10 dataset is a well-known collection of images commonly used to train machine learning and computer vision algorithms. It was created by the Canadian Institute for Advanced Research (CIFAR). It contains 60K 32x32 color images. The images are classified into 10 different classes, with 6,000 images per class. The classes represent airplanes, cars, birds, cats, deer, dogs, frogs, horses, ships, and trucks. Despite its relatively low resolution and small size, CIFAR-10 can be challenging for models to achieve high accuracy, making it a good dataset for testing advancements in machine learning techniques.
+
+Follows a source code example for the CIFAR-10 image classification:
 ```
 NN := TNNet.Create();
 NN.AddLayer([
@@ -101,10 +184,13 @@ You can save and load trained models (neural networks) with `TNNet.SaveToFile` a
 ```
 
 ### Youtube Videos
-There are some available videos:
-* [Increasing Image Resolution with Neural Networks](https://www.youtube.com/watch?v=jdFixaZ2P4w)
-* [Ultra Fast Single Precision Floating Point Computing](https://www.youtube.com/watch?v=qGnfwpKUTIQ)
-* [AVX and AVX2 Code Optimization](https://www.youtube.com/watch?v=Pnv174V_emw)
+[![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+--------------------------- | ------------------------------------- | -------------------------
+Basics of Neural Networks in Pascal - Loading and Saving | Neural Networks for Absolute Beginners! Learning a Simple Function | Coding a Neural Network in Pascal that Learns to Calculate the Hypotenuse
+[![Watch the video](https://img.youtube.com/vi/tODsv6Ks2DM/0.jpg)](https://youtu.be/tODsv6Ks2DM) | [![Watch the video](https://img.youtube.com/vi/f4T9IB-He_k/0.jpg)](https://youtu.be/f4T9IB-He_k) | [![Watch the video](https://img.youtube.com/vi/o-8NuoSsdck/0.jpg)](https://youtu.be/o-8NuoSsdck)
+Pre-trained Neural Networks & Transfer Learning with Pascal's CAI Neural API | Coding a Neural Network in Pascal that Learns the OR Boolean Operation | A Dive into Identity Shortcut Connection - The ResNet building block
+[![Watch the video](https://img.youtube.com/vi/SEvWB7k8uy0/0.jpg)](https://youtu.be/SEvWB7k8uy0) | [![Watch the video](https://img.youtube.com/vi/3QwIaAsDmJw/0.jpg)](https://youtu.be/3QwIaAsDmJw) | [![Watch the video](https://img.youtube.com/vi/VH6v3D5cxxs/0.jpg)](https://youtu.be/VH6v3D5cxxs)
+Increasing Image Resolution with Neural Networks | Ultra Fast Single Precision Floating Point Computing | AVX and AVX2 Code Optimization
 
 Some videos make referrence to **uvolume** unit. The current **neuralvolume** unit used to be called **uvolume**. This is why
 it's mentioned.
