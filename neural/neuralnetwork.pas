@@ -11296,6 +11296,13 @@ begin
       ' Delta Size: '+IntToStr(LocalDelta.Size)
     );
   end;
+  if FPrevLayer.Output.SizeX <> FOutput.SizeX then
+  begin
+    FErrorProc('PrevLayer SizeX and Output SizeX do not match at TNNetEmbedding.' +
+      ' PrevLayer SizeX: '+IntToStr(FPrevLayer.Output.SizeX)+
+      ' Output SizeX: '+IntToStr(FOutput.SizeX)
+    );
+  end;
   //WriteLn( LocalWeights.GetSum() );
   {$ENDIF}
   Inc(FBackPropCallCurrentCnt);
@@ -11307,11 +11314,11 @@ begin
     CurrentToken := FInputTokens[CntToken];
     if FEncodeZero or (CurrentToken>0) then
     begin
-      SourcePtr := FOutputError.GetRawPtr(CntToken);
+      SourcePtr := FOutputError.GetRawPtr(CntToken, 0 , 0);
       if FBatchUpdate
         then DestPtr := LocalDelta.GetRawPtr(CurrentToken, 0, 0)
         else DestPtr := LocalWeights.GetRawPtr(CurrentToken, 0, 0);
-      TNNetVolume.MulAdd(DestPtr, SourcePtr, FLearningRate, FEmbeddingSize);
+      TNNetVolume.MulAdd(DestPtr, SourcePtr, -FLearningRate, FEmbeddingSize);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -15191,6 +15198,13 @@ end;
 
 procedure TNNetNeuron.UpdateWeightsAdam();
 begin
+  (*
+  if (Self.FParentLayer is TNNetEmbedding) then
+  begin
+    FDelta.PrintDebug();
+    WriteLn();
+  end;
+  *)
   // CalcAdamDelta() must be called before UpdateWeightsAdam;
   FWeights.Add(FDelta);
   FBiasWeight := FBiasWeight + FBiasDelta;
