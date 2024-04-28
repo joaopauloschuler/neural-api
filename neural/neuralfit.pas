@@ -112,7 +112,6 @@ type
       FInitialLearningRate: single;
       FCyclicalLearningRateLen: integer;
       FInitialEpoch: integer;
-      FMinLearnRate: single;
       FCurrentLearningRate: single;
       FL2Decay: TNeuralFloat;
       FLogEveryBatches: integer;
@@ -1675,7 +1674,6 @@ begin
   FInitialEpoch := 0;
   FMinBackpropagationError := 0;
   FMinBackpropagationErrorProportion := 0.25;
-  fMinLearnRate := FInitialLearningRate * 0.01;
   FInertia := 0.9;
   FClipDelta := 0.0;
   FFileNameBase := 'autosave';
@@ -1771,7 +1769,7 @@ begin
   begin
     fNewLearningRate := (fInitialLearningRate * power(1-FLearningRateDecay,iEpochCount));
   end;
-  if ( ( fNewLearningRate >= fMinLearnRate ) and (fNewLearningRate <> FCurrentLearningRate) ) then
+  if ( fNewLearningRate <> FCurrentLearningRate ) then
   begin
     FCurrentLearningRate := fNewLearningRate;
     FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
