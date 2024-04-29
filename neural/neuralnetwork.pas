@@ -15350,11 +15350,14 @@ procedure TNNetNeuron.Assign(neuron: TNNetNeuron);
 begin
      FWeights.Copy( neuron.fWeights );
      FBackInertia.Copy(neuron.fBackInertia);
+     FBackInertia2.Copy(neuron.FBackInertia2);
      FDelta.Copy(neuron.FDelta);
+     FDelta2.Copy(neuron.FDelta2);
 
      FBiasWeight := neuron.fBiasWeight;
      FBiasInertia := neuron.FBiasInertia;
      FBiasDelta := neuron.FBiasDelta;
+     FBiasInertia2 := neuron.FBiasInertia2;
 end;
 
 constructor TEasyBytePredictionViaNNet.Create(pActionByteLen,
