@@ -2340,6 +2340,8 @@ begin
       IntToStr(FB.Output.Depth) + '.'
     );
   end;
+  FA.IncDepartingBranchesCnt();
+  FB.IncDepartingBranchesCnt();
   FOutput.ReSize(
     FB.Output.SizeX,
     FB.Output.SizeY,
@@ -2393,6 +2395,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetDotProducts: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
 
   FAT.CopyTransposingAs2D(FA.Output);
   FBT.CopyTransposingAs2D(FB.Output);
@@ -3602,6 +3608,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetGroupedConvolutionLinear: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
   if (FNeurons.Count = FOutput.Depth) and (FPrevLayer.Output.Size > 0) then
   begin
     // ComputeErrorDeriv() isn't required as it's done on BackpropagateAtOutputPos
@@ -5307,6 +5317,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetDepthwiseConv: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
   if (FOutput.Depth = FPrevLayer.Output.Depth * FNeurons.Count) then
   begin
     ComputeErrorDeriv();
@@ -6190,6 +6204,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetReLUBase: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     FOutputError.Mul(FOutputErrorDeriv);
@@ -6300,6 +6318,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetSum: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
   //FOutputError.Divi(FPrevOutput.Count);
   for LayerCnt := 0 to FPrevOutput.Count - 1 do
   begin
@@ -6839,16 +6861,15 @@ var
 begin
   x := GetLastLayer();
   EmbeddingDim := x.Output.Depth;
-  Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-  Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
-  (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim), x);
+  Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
+  Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
+  (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
   ValueT := AddLayer( TNNetTransposeXD.Create() );
-  (*WT := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
-  (*WT := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
-  (*WT := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
-  (*W := *) AddLayer( TNNetTransposeXD.Create() );
+  (*W := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
+  (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
   W := AddLayer( TNNetPointwiseSoftMax.Create() );
-  (*YT := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
+  (*Y := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
@@ -6872,15 +6893,15 @@ begin
     InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Heads;
     for HeadCnt := 0 to Heads - 1 do
     begin
-      QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
-      KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
-      ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup), PreviousLayer);
+      QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 1), PreviousLayer);
+      KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 1), PreviousLayer);
+      ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 1), PreviousLayer);
       ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
       (*W := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
-      (*W := *)AddLayer( TNNetReLUL.Create(-100,+100,0) );
       (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
+      (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
       W := AddLayer( TNNetPointwiseSoftMax.Create() );
-      (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
+      (*Y := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
     end;
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
@@ -6916,7 +6937,7 @@ begin
       (*W := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup) );
       (*W := *)AddLayer( TNNetLayerMaxNormalization.Create() );
       W := AddLayer( TNNetPointwiseSoftMax.Create() );
-      (*YT := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
+      (*Y := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
     end;
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
@@ -9473,6 +9494,10 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetPoolBase: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
+  end;
   if (Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
   begin
     StartTime := Now();
@@ -9990,6 +10015,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc('Backprop call count does not look right at TNNetConvolution: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt)+' '+IntToStr(FLayerIdx));
+  end;
   if (FNeurons.Count = FOutput.Depth) and (FPrevLayer.Output.Size > 0) then
   begin
     // ComputeErrorDeriv() isn't required as it's done on BackpropagateAtOutputPos
@@ -11802,7 +11831,8 @@ begin
   Result := Not(
     (pLayer is TNNetConcatBase) or
     (pLayer is TNNetChannelMulByLayer) or
-    (pLayer is TNNetCellMulByCell)
+    (pLayer is TNNetCellMulByCell) or
+    (pLayer is TNNetDotProducts)
   );
 end;
 
@@ -12401,7 +12431,7 @@ begin
     pLayer.SetPrevLayer(pAfterLayer);
     FLayers.Add(pLayer);
     pLayer.FLayerIdx := GetLastLayerIdx();
-    if Not(pLayer is TNNetConcatBase) then pAfterLayer.IncDepartingBranchesCnt();
+    if (ShouldIncDepartingBranchesCnt(pLayer)) then pAfterLayer.IncDepartingBranchesCnt();
     Result := pLayer;
   end
   else
@@ -12417,7 +12447,7 @@ begin
   if pAfterLayerIdx >= 0 then
   begin
     pLayer.SetPrevLayer(FLayers[pAfterLayerIdx]);
-    if Not(pLayer is TNNetConcatBase) then FLayers[pAfterLayerIdx].IncDepartingBranchesCnt();
+    if (ShouldIncDepartingBranchesCnt(pLayer)) then FLayers[pAfterLayerIdx].IncDepartingBranchesCnt();
   end;
   FLayers.Add(pLayer);
   pLayer.FLayerIdx := GetLastLayerIdx();
