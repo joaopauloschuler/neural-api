@@ -1,8 +1,8 @@
-# Simple Super Resolution Example
+# Super Resolution Command Line Tool
 <img align="right" src="results/street_result.png"></img>
 ## Introduction
 The image at the right side shows an example. The smaller image is the original image while the bigger image is the image processed twice by a neural network trained to increase image resolution.
-This example has been created via the **SuperResolution.lpi** command line tool with:
+This example has been created via the **SuperResolution.lpi** command line tool. The parameter `-i` defines the input file while `-o` defines the output file:
 
 ```
 #SuperResolution -i street.png -o street2.png

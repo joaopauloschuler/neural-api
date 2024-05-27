@@ -56,7 +56,7 @@ interface
 uses
   Classes, SysUtils,
   {$IFDEF FPC}
-  fgl, MTPCPU
+  fgl {$IFNDEF WINDOWS} , MTPCPU {$ENDIF}
     {$IFDEF WINDOWS}
     ,windows
     {$ELSE}
@@ -126,6 +126,7 @@ type
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
   procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
   function GetProcessId(): {$IFDEF FPC}integer{$ELSE}integer{$ENDIF};
+  procedure DebugThreadCount();
 
 implementation
 
@@ -173,9 +174,21 @@ begin
   end;
 end;
 
-{$IF CompilerVersion <= 23}
-// delphi 2010 does not define the following functions and constants
+{$UNDEF IMPORT_AFFINITAPI}
 {$IFDEF MSWINDOWS}
+{$IFNDEF FPC}
+{$IF CompilerVersion <= 23}
+{$DEFINE IMPORT_AFFINITAPI}
+{$IFEND}
+{$ELSE}
+{$DEFINE IMPORT_AFFINITAPI}
+{$ENDIF}
+{$ENDIF}
+
+
+{$IFDEF IMPORT_AFFINITAPI}
+// delphi 2010 does not define the following functions and constants
+
 const ALL_PROCESSOR_GROUPS = $ffff;
 
   //
@@ -203,7 +216,6 @@ function SetThreadGroupAffinity(hThread: THandle; var GroupAffinity: TGroupAffin
 function GetThreadGroupAffinity(hThread: THandle; var GroupAffinity: TGroupAffinity): ByteBool; stdcall; external kernel32 name 'GetThreadGroupAffinity';
 function GetActiveProcessorGroupCount: WORD; stdcall; external kernel32 name 'GetThreadGroupAffinity';
 {$ENDIF}
-{$IFEND}
 
 function NeuralDefaultThreadCount: integer;
 begin
@@ -237,6 +249,11 @@ begin
   {$ENDIF}
 end;
 {$ENDIF}
+
+procedure DebugThreadCount;
+begin
+  WriteLn('CPU threads reported by the operating system: ', NeuralDefaultThreadCount,'.');
+end;
 
 function fNTL: TNeuralThreadList;
 begin

@@ -187,7 +187,7 @@ type
   {$ENDIF}
 
   // Loads an image from a file and stores it into a Volume.
-  function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean; overload;
+  procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume); overload;
 
   // Loads an image from a file and stores it into a Volume resizing to
   // SizeX, SizeY and optionally encoding as neuronal input if has a
@@ -276,6 +276,38 @@ procedure TestBatch
 
 // This function translates the original CIFAR10 labels to Animal/Machine labels.
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
+
+{
+  RandomSubstring:
+  This NLP function takes a string as input and returns a substring that starts
+  immediately after a randomly selected space character within the input string.
+  If there are no spaces in the input string, the entire string is returned as is.
+  The function is useful for obtaining a random piece of text from a given string,
+  which can be applied in various scenarios that require text randomization.
+
+  Space positions are tracked using a TIntegerList. The Copy function is used
+  to extract the substring from the randomly selected space position to the end
+  of the input string.
+}
+function RandomSubstring(const InputString: string): string;
+
+{
+  RemoveRandomChars:
+  This function takes a string and an integer count as input. It removes Count
+  number of characters at random positions from the given string Str. The length
+  of the string is recalculated in each iteration to account for the reduction in
+  the string's length after each character removal.
+}
+function RemoveRandomChars(const Str: string; Count: integer): string;
+
+
+// This function randomly removes one word from the input string.
+function RemoveRandomWord(const Str: string): string;
+
+type TNNetAAInteger = array of array of integer;
+
+procedure LoadIntegersInCSV(filename: string;
+  var aTokens: TNNetAAInteger; MaxRows: integer = 0);
 
 {$IFNDEF FPC}
 function SwapEndian(I:integer):integer;
@@ -568,7 +600,7 @@ begin
     {$IFDEF Debug}
     Self.LoadImages_NTL(0,1);
     {$ELSE}
-    NTL.StartProc(@Self.LoadImages_NTL);
+    NTL.StartProc({$IFDEF FPC}@{$ENDIF}Self.LoadImages_NTL);
     {$ENDIF}
   end;
   NTL.Free;
@@ -715,16 +747,16 @@ begin
 end;
 
 {$IFDEF FPC}
-function TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
-  ImageFileName: string; V: TNNetVolume): boolean;
+procedure TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
+  ImageFileName: string; V: TNNetVolume);
 var
   M: TFPMemoryImage;
 begin
   M := TFPMemoryImage.Create(1, 1);
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
-  Result := M.LoadFromFile( ImageFileName );
+  M.LoadFromFile( ImageFileName );
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
-  if Result then LoadImageIntoVolume(M, V);
+  LoadImageIntoVolume(M, V);
   M.Free;
 end;
 
@@ -819,6 +851,7 @@ begin
   end;
 end;
 
+
 procedure TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
   ImageFileName: string; V: TNNetVolume);
 var
@@ -832,7 +865,7 @@ begin
   LocalPicture.Free;
 end;
 
-function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
+procedure LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
 var
   LocalPicture: TPicture;
 begin
@@ -840,7 +873,6 @@ begin
   LocalPicture.LoadFromFile( ImageFileName );
   LoadPictureIntoVolume(LocalPicture, V);
   LocalPicture.Free;
-  Result := true;
 end;
 
 (*
@@ -1339,25 +1371,20 @@ function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume;
 var
   VAux: TNNetVolume;
 begin
-  if LoadImageFromFileIntoVolume(ImageFileName, V) then
+  LoadImageFromFileIntoVolume(ImageFileName, V);
+  if (V.SizeX<>SizeX) or (V.SizeY<>SizeY) then
   begin
-    if (V.SizeX<>SizeX) or (V.SizeY<>SizeY) then
-    begin
-      VAux := TNNetVolume.Create;
-      VAux.Copy(V);
-      V.CopyResizing(VAux, SizeX, SizeY);
-      VAux.Free;
-    end;
-    if (EncodeNeuronalInput >= 0) then
-    begin
-      V.RgbImgToNeuronalInput( (EncodeNeuronalInput) and 255 );
-    end;
-    Result := true;
-  end
-  else
-  begin
-    Result := false;
+    VAux := TNNetVolume.Create;
+    VAux.Copy(V);
+    V.CopyResizing(VAux, SizeX, SizeY);
+    VAux.Free;
   end;
+  if (EncodeNeuronalInput >= 0) then
+  begin
+    V.RgbImgToNeuronalInput( (EncodeNeuronalInput) and 255 );
+  end;
+
+  Result := True;
 end;
 
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
@@ -1702,6 +1729,127 @@ begin
 
   vOutput.Free;
   pOutput.Free;
+end;
+
+function RemoveRandomWord(const Str: string): string;
+var
+  WordList: TNNetStringList;
+  RandomWordIndex: integer;
+begin
+  Result := Str;
+  // Split the string into words based on spaces.
+  WordList := CreateTokenizedStringList(Result,' ');
+  // Check if there are any words to remove.
+  if WordList.Count > 1 then
+  begin
+    // Select a random word to remove.
+    RandomWordIndex := Random(WordList.Count);
+    WordList.Delete(RandomWordIndex);
+    // Reconstruct the string from the remaining words.
+    Result := WordList.DelimitedText;
+  end;
+  // Free the TStringList to prevent memory leaks.
+  WordList.Free;
+end;
+
+procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger;
+  MaxRows: integer = 0);
+var
+  LargeFile: TextFile;
+  StrLine: string;
+  RowCnt, WordCnt: integer;
+  Separator: TNNetStringList;
+begin
+  Separator := CreateTokenizedStringList(',');
+  RowCnt := 0;
+  //WriteLn('Counting rows from: ', filename);
+  AssignFile(LargeFile, filename);
+  Reset(LargeFile);
+  while (not Eof(LargeFile)) and ( (MaxRows=0) or (RowCnt<MaxRows) ) do
+  begin
+    ReadLn(LargeFile, StrLine);
+    RowCnt := RowCnt + 1;
+  end;
+  CloseFile(LargeFile);
+  //WriteLn('Loading: ', filename);
+  SetLength(aTokens, RowCnt);
+  //WriteLn('Loading ', RowCnt,' rows.');
+  Reset(LargeFile);
+  RowCnt := 0;
+  while (not Eof(LargeFile)) and ( (MaxRows=0) or (RowCnt<MaxRows) ) do
+  begin
+    ReadLn(LargeFile, StrLine);
+    Separator.DelimitedText := StrLine;
+    SetLength(aTokens[RowCnt], Separator.Count);
+    if Separator.Count > 0 then
+    begin
+      for WordCnt := 0 to Separator.Count - 1 do
+      begin
+        aTokens[RowCnt][WordCnt] := StrToInt(Separator[WordCnt]);
+      end;
+    end;
+    RowCnt := RowCnt + 1;
+  end;
+  CloseFile(LargeFile);
+end;
+
+function RemoveRandomChars(const Str: string; Count: integer): string;
+var
+  i: integer;
+  StrLen: integer;
+begin
+  Result := Str;
+  // Calculate the length of the string before removing characters.
+  StrLen := Length(Result);
+  if (Count > 0) and (StrLen>1) then
+  begin
+    // Loop for the number of characters to be removed.
+    for i := 1 to Count do
+    begin
+      // Check if the string is not empty.
+      if StrLen > 1 then
+      begin
+        // Randomly select a character position and remove one character from that position.
+        // The '+ 1' is necessary because Pascal strings are 1-indexed, not 0-indexed.
+        Delete(Result, Random(StrLen) + 1, 1);
+        Dec(StrLen);
+      end;
+    end;
+  end;
+end;
+
+
+function RandomSubstring(const InputString: string): string;
+var
+  SpacePositions: TIntegerList;
+  I, RandomSpacePos: Integer;
+  InputStringLen: integer;
+begin
+  InputStringLen := Length(InputString);
+  if InputStringLen > 0 then
+  begin
+    // Create a new integer list instance
+    SpacePositions := TIntegerList.Create;
+    // Find the positions of all spaces in the string
+    for I := 1 to InputStringLen do
+    begin
+      if InputString[I] = ' ' then
+      begin
+        SpacePositions.Add(I);
+      end;
+    end;
+
+    // Append -1 to handle the case with no spaces
+    SpacePositions.Add(0);
+
+    // Randomly select one of the space positions
+    RandomSpacePos := SpacePositions[Random(SpacePositions.Count)];
+
+    // Return the substring starting from the position after the random space
+    Result := Copy(InputString, RandomSpacePos + 1, InputStringLen - RandomSpacePos);
+    SpacePositions.Free;
+  end
+  else Result := '';
 end;
 
 end.

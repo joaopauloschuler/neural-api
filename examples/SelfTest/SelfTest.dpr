@@ -6,35 +6,37 @@ uses
   Classes,
   SysUtils,
   Math,
-  CPUFeatures in '..\..\neural\CPUFeatures.pas',
-  Neural.AVX in '..\..\neural\Neural.AVX.pas',
-  Neural.AVXx64 in '..\..\neural\Neural.AVXx64.pas',
-  neuralab in '..\..\neural\neuralab.pas',
-  neuralabfun in '..\..\neural\neuralabfun.pas',
-  neuralbit in '..\..\neural\neuralbit.pas',
-  neuralbyteprediction in '..\..\neural\neuralbyteprediction.pas',
-  neuralcache in '..\..\neural\neuralcache.pas',
-  neuraldatasets in '..\..\neural\neuraldatasets.pas',
-  neuraldatasetsv in '..\..\neural\neuraldatasetsv.pas',
-  neuralevolutionary in '..\..\neural\neuralevolutionary.pas',
-  neuralfit in '..\..\neural\neuralfit.pas',
-  neuralgeneric in '..\..\neural\neuralgeneric.pas',
-  neuralnetwork in '..\..\neural\neuralnetwork.pas',
-  neuralopencl in '..\..\neural\neuralopencl.pas',
-  neuralopenclv in '..\..\neural\neuralopenclv.pas',
-  neuralplanbuilder in '..\..\neural\neuralplanbuilder.pas',
-  neuralthread in '..\..\neural\neuralthread.pas',
-  neuralvolume in '..\..\neural\neuralvolume.pas',
-  neuralvolumev in '..\..\neural\neuralvolumev.pas';
+  NeuralAVX in '..\..\Neural\NeuralAVX.pas',
+  NeuralAVXx64 in '..\..\Neural\NeuralAVXx64.pas',
+  neuralab in '..\..\Neural\neuralab.pas',
+  neuralabfun in '..\..\Neural\neuralabfun.pas',
+  neuralbit in '..\..\Neural\neuralbit.pas',
+  neuralbyteprediction in '..\..\Neural\neuralbyteprediction.pas',
+  neuralcache in '..\..\Neural\neuralcache.pas',
+  neuraldatasets in '..\..\Neural\neuraldatasets.pas',
+  neuraldatasetsv in '..\..\Neural\neuraldatasetsv.pas',
+  neuralevolutionary in '..\..\Neural\neuralevolutionary.pas',
+  neuralfit in '..\..\Neural\neuralfit.pas',
+  neuralgeneric in '..\..\Neural\neuralgeneric.pas',
+  neuralnetwork in '..\..\Neural\neuralnetwork.pas',
+  neuralopencl in '..\..\Neural\neuralopencl.pas',
+  neuralopenclv in '..\..\Neural\neuralopenclv.pas',
+  neuralplanbuilder in '..\..\Neural\neuralplanbuilder.pas',
+  neuralthread in '..\..\Neural\neuralthread.pas',
+  neuralvolume in '..\..\Neural\neuralvolume.pas',
+  neuralvolumev in '..\..\Neural\neuralvolumev.pas';
 
 begin
-    WriteLn('Testing Volumes API ...');
-    TestTNNetVolume();
-    TestKMeans();
+     Writeln('Test AVX');
+     TestAVX;
 
-    WriteLn('Testing Convolutional API ...');
-    TestConvolutionAPI;
+     WriteLn('Testing Volumes API ...');
+     TestTNNetVolume();
+     TestKMeans();
 
-    WriteLn('Press ENTER to quit.');
-    ReadLn;
+     WriteLn('Testing Convolutional API ...');
+     TestConvolutionAPI();
+
+     WriteLn('Press ENTER to quit.');
+     ReadLn;
 end.
