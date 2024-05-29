@@ -118,7 +118,7 @@ type
     function GetTags(x: integer): integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTags(x: integer; AValue: integer); {$IFDEF Release} inline; {$ENDIF}
     class procedure MulAddPPVS(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
-      pSize: integer); {$IFDEF Release} inline; {$ENDIF}
+      pSize: integer); {$IFDEF Release} {$IFDEF FPC} inline; {$ENDIF} {$ENDIF}
   public
     // FData was made public to allow other fast operations
     FData: array of T;
