@@ -5849,8 +5849,8 @@ var
   Pos: integer;
   Value: T;
 begin
-  vHigh := Depth;
-  if (vHigh>0) then
+  vHigh := Depth - 1;
+  if (vHigh>=0) then
   begin
     Result := 0;
     Pos := GetRawPos(X, Y);
