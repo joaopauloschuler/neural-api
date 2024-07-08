@@ -63,7 +63,7 @@ type
   public
     constructor Create(
       Beta1: TNeuralFloat = 0.9;
-      Beta2: TNeuralFloat = 0.999;
+      Beta2: TNeuralFloat = 0.98;
       Epsilon: TNeuralFloat = 1e-07); overload;
 
     // Memory Initializer for Adam optimizer
@@ -121,6 +121,7 @@ type
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
+      FValidationError, FValidationLoss: TNeuralFloat;
       FMinBackpropagationError: TNeuralFloat;
       FMinBackpropagationErrorProportion: TNeuralFloat;
       FLoadBestAdEnd: boolean;
@@ -178,6 +179,8 @@ type
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
       property ValidationAccuracy: TNeuralFloat read FValidationAccuracy;
+      property ValidationError: TNeuralFloat read FValidationError;
+      property ValidationLoss: TNeuralFloat read FValidationLoss;
       property Verbose: boolean read FVerbose write FVerbose;
       property TestAccuracy: TNeuralFloat read FTestAccuracy;
       property ThreadNN: TNNetDataParallelism read FThreadNN;
@@ -238,6 +241,7 @@ type
       function DefaultLossFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
       function MultiClassLossFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
       function DefaultLossInFirstPixelFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+      function DefaultLossInLastPixelFn(ExpectedOutput, FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
     public
       constructor Create(); override;
       procedure FitLoading(pNN: TNNet;
@@ -253,10 +257,12 @@ type
       procedure EnableClassComparison();
       procedure EnableMultiClassComparison();
       procedure EnableClassComparisonInFirstPixel();
+      procedure EnableClassComparisonInLastPixel();
       procedure EnableDefaultImageTreatment(); override;
       procedure EnableDefaultLoss;
       procedure EnableMultiClassLoss;
       procedure EnableDefaultLossInFirstPixel();
+      procedure EnableDefaultLossInLastPixel();
 
       // On most cases, you should never call the following methods directly
       procedure RunNNThread(index, threadnum: integer);
@@ -353,6 +359,7 @@ type
   function ClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
   function MultiClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
   function ClassCompareOnFirstPixel(A, B: TNNetVolume; ThreadId: integer): boolean;
+  function ClassCompareOnLastPixel(A, B: TNNetVolume; ThreadId: integer): boolean;
 
 implementation
 uses
@@ -424,6 +431,16 @@ function ClassCompareOnFirstPixel(A, B: TNNetVolume; ThreadId: integer
   ): boolean;
 begin
   Result := (A.GetClassOnPixel(0, 0) = B.GetClassOnPixel(0, 0));
+end;
+
+function ClassCompareOnLastPixel(A, B: TNNetVolume; ThreadId: integer): boolean;
+// var
+//  AClass, BClass: integer;
+begin
+//  AClass := A.GetClassOnPixel(A.SizeX-1, A.SizeY-1);
+//  BClass := B.GetClassOnPixel(B.SizeX-1, B.SizeY-1);
+//  if (Random(1000)=0) then WriteLn(AClass,'-->',BClass);
+  Result := (A.GetClassOnPixel(A.SizeX-1, A.SizeY-1) = B.GetClassOnPixel(B.SizeX-1, B.SizeY-1));
 end;
 
 function MultiClassCompare(A, B: TNNetVolume; ThreadId: integer
@@ -674,11 +691,11 @@ function TNeuralDataLoadingFit.MultiClassLossFn(ExpectedOutput,
 var
   I, StartPointPos: integer;
   MaxX, MaxY, MaxD: integer;
-  LocalPos, ExpectedClass: integer;
   CountX, CountY, CountD: integer;
   LocalValue, MaxValue: TNeuralFloat;
   ClassesCnt: TNeuralFloat;
   LossSum: TNeuralFloat;
+  MaxPos: integer;
 begin
   if Not(ExpectedOutput.SameSize(FoundOutput)) then
   begin
@@ -702,23 +719,21 @@ begin
         // Get the A Class
         I := StartPointPos;
         MaxValue := ExpectedOutput.FData[I];
-        LocalPos := 0;
-        ExpectedClass := 0;
+        MaxPos := 0;
         for CountD := 1 to MaxD do
         begin
           Inc(I);
-          Inc(LocalPos);
           if ExpectedOutput.FData[I] > MaxValue then
           begin
             MaxValue := ExpectedOutput.FData[I];
-            ExpectedClass := LocalPos;
+            MaxPos := I;
           end;
           if MaxValue >= 1 then break;
         end;
         If MaxValue > 0 then
         begin
           ClassesCnt := ClassesCnt + 1;
-          LocalValue := FoundOutput.FData[StartPointPos + ExpectedClass];
+          LocalValue := FoundOutput.FData[MaxPos];
           if LocalValue>0
           then LossSum := LossSum + -Ln(LocalValue)
           else LossSum := LossSum + 100;
@@ -752,6 +767,27 @@ begin
   *)
   {$ENDIF}
 
+  if (OutputValue > 0) then
+  begin
+    result := -Ln(OutputValue);
+  end
+  else
+  begin
+    {$IFDEF Debug}
+    //FErrorProc('Error - invalid output value at loss function:' + FloatToStrF(OutputValue,ffFixed,6,4));
+    {$ENDIF}
+    result := 100;
+  end;
+end;
+
+function TNeuralDataLoadingFit.DefaultLossInLastPixelFn(ExpectedOutput,
+  FoundOutput: TNNetVolume; ThreadId: integer): TNeuralFloat;
+var
+  ClassId: integer;
+  OutputValue: TNeuralFloat;
+begin
+  ClassId := ExpectedOutput.GetClassOnPixel(ExpectedOutput.SizeX - 1, ExpectedOutput.SizeY - 1);
+  OutputValue := FoundOutput[FoundOutput.SizeX - 1, FoundOutput.SizeY - 1, ClassId];
   if (OutputValue > 0) then
   begin
     result := -Ln(OutputValue);
@@ -810,7 +846,7 @@ var
   startTime, totalTimeSeconds: double;
   fileName, FileNameCSV: string;
   CurrentError, CurrentLoss: TNeuralFloat;
-  ValidationError, ValidationLoss, ValidationRate: TNeuralFloat;
+  ValidationRate: TNeuralFloat;
   CSVFile: TextFile;
   CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
   ValidationRecord: TNeuralFloat;
@@ -822,8 +858,8 @@ begin
   CurrentError := 0;
   CurrentLoss := 0;
   ValidationRate := 0;
-  ValidationLoss := 0;
-  ValidationError := 0;
+  FValidationLoss := 0;
+  FValidationError := 0;
   TestRate := 0;
   TestLoss := 0;
   TestError := 0;
@@ -943,8 +979,8 @@ begin
         if FGlobalTotal > 0 then
         begin
           ValidationRate  := FGlobalHit / FGlobalTotal;
-          ValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
-          ValidationError := FGlobalErrorSum / FGlobalTotal;
+          FValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
+          FValidationError := FGlobalErrorSum / FGlobalTotal;
           FValidationAccuracy := ValidationRate;
         end;
 
@@ -961,8 +997,8 @@ begin
             'Epochs: ' + IntToStr(FCurrentEpoch) +
             ' Examples seen:' + IntToStr(FCurrentEpoch * TrainingCnt) +
             ' Validation Accuracy: ' + FloatToStrF(ValidationRate,ffFixed,6,4) +
-            ' Validation Error: ' + FloatToStrF(ValidationError,ffFixed,6,4) +
-            ' Validation Loss: ' + FloatToStrF(ValidationLoss,ffFixed,6,4) +
+            ' Validation Error: ' + FloatToStrF(FValidationError,ffFixed,6,4) +
+            ' Validation Loss: ' + FloatToStrF(FValidationLoss,ffFixed,6,4) +
             ' Total time: ' + FloatToStrF(((Now() - globalStartTime)) * 24 * 60,ffFixed,6,2) +
             'min'
           );
@@ -1010,8 +1046,8 @@ begin
           CurrentLoss:6:4,',',
           CurrentError:6:4,',',
           ValidationRate:6:4,',',
-          ValidationLoss:6:4,',',
-          ValidationError:6:4,',',
+          FValidationLoss:6:4,',',
+          FValidationError:6:4,',',
           FCurrentLearningRate:9:7,',',
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',',
           TestRate:6:4,',',
@@ -1029,8 +1065,8 @@ begin
           CurrentLoss:6:4,',',
           CurrentError:6:4,',',
           ValidationRate:6:4,',',
-          ValidationLoss:6:4,',',
-          ValidationError:6:4,',',
+          FValidationLoss:6:4,',',
+          FValidationError:6:4,',',
           FCurrentLearningRate:9:7,',',
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
@@ -1687,6 +1723,11 @@ begin
   FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompareOnFirstPixel;
 end;
 
+procedure TNeuralDataLoadingFit.EnableClassComparisonInLastPixel();
+begin
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompareOnLastPixel;
+end;
+
 procedure TNeuralDataLoadingFit.EnableDefaultLoss();
 begin
   FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossFn;
@@ -1700,6 +1741,11 @@ end;
 procedure TNeuralDataLoadingFit.EnableDefaultLossInFirstPixel();
 begin
   FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossInFirstPixelFn;
+end;
+
+procedure TNeuralDataLoadingFit.EnableDefaultLossInLastPixel();
+begin
+  FLossFn := {$IFDEF FPC}@{$ENDIF}DefaultLossInLastPixelFn;
 end;
 
 procedure TNeuralDataLoadingFit.EnableDefaultImageTreatment();
@@ -2009,7 +2055,7 @@ var
   startTime, totalTimeSeconds: double;
   fileName, FileNameCSV: string;
   CurrentError, CurrentLoss: TNeuralFloat;
-  ValidationError, ValidationLoss, ValidationRate: TNeuralFloat;
+  ValidationRate: TNeuralFloat;
   LocalHasValidation: boolean;
   CSVFile: TextFile;
   CurrentAccuracy, AccuracyWithInertia: TNeuralFloat;
@@ -2068,8 +2114,8 @@ begin
   CurrentError := 0;
   CurrentLoss := 0;
   ValidationRate := 0;
-  ValidationLoss := 0;
-  ValidationError := 0;
+  FValidationLoss := 0;
+  FValidationError := 0;
   TestRate := 0;
   TestLoss := 0;
   TestError := 0;
@@ -2234,8 +2280,8 @@ begin
         if (FGlobalTotal > 0) then
         begin
           ValidationRate  := FGlobalHit / FGlobalTotal;
-          ValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
-          ValidationError := FGlobalErrorSum / FGlobalTotal;
+          FValidationLoss  := FGlobalTotalLoss / FGlobalTotal;
+          FValidationError := FGlobalErrorSum / FGlobalTotal;
           FValidationAccuracy := ValidationRate;
         end;
 
@@ -2252,8 +2298,8 @@ begin
             'Epochs: ' + IntToStr(FCurrentEpoch) +
             ' Examples seen:' + IntToStr(FCurrentEpoch * FImgVolumes.Count) +
             ' Validation Accuracy: ' + FloatToStrF(ValidationRate,ffFixed,6,4) +
-            ' Validation Error: ' + FloatToStrF(ValidationError,ffFixed,6,4) +
-            ' Validation Loss: ' + FloatToStrF(ValidationLoss,ffFixed,6,4) +
+            ' Validation Error: ' + FloatToStrF(FValidationError,ffFixed,6,4) +
+            ' Validation Loss: ' + FloatToStrF(FValidationLoss,ffFixed,6,4) +
             ' Total time: ' + FloatToStrF(((Now() - globalStartTime)) * 24 * 60,ffFixed,6,2) +
             'min'
           );
@@ -2302,8 +2348,8 @@ begin
           CurrentLoss:6:4,',',
           CurrentError:6:4,',',
           ValidationRate:6:4,',',
-          ValidationLoss:6:4,',',
-          ValidationError:6:4,',',
+          FValidationLoss:6:4,',',
+          FValidationError:6:4,',',
           FCurrentLearningRate:9:7,',',
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',',
           TestRate:6:4,',',
@@ -2321,8 +2367,8 @@ begin
           CurrentLoss:6:4,',',
           CurrentError:6:4,',',
           ValidationRate:6:4,',',
-          ValidationLoss:6:4,',',
-          ValidationError:6:4,',',
+          FValidationLoss:6:4,',',
+          FValidationError:6:4,',',
           FCurrentLearningRate:9:7,',',
           Round( (Now() - globalStartTime) * 24 * 60 * 60),',,,'
         );
