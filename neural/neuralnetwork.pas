@@ -686,7 +686,7 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pVocabSize, pEmbeddingSize: integer;
-      EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 2);
+      EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02);
     destructor Destroy; override;
 
     procedure InitDefault(); override;
@@ -705,8 +705,8 @@ type
   public
     constructor Create(pVocabSize, pEmbeddingSize: integer;
       EncodeZero: integer = 0;
-      ScaleEmbedding: TNeuralFloat = 2;
-      ScalePositional: TNeuralFloat = 1;
+      ScaleEmbedding: TNeuralFloat = 0.02;
+      ScalePositional: TNeuralFloat = 0.01;
       PositionalEmbeddingN: integer = 0);
     destructor Destroy; override;
 
@@ -1396,6 +1396,12 @@ type
       procedure ComputeCPU();
       procedure Backpropagate(); override;
       procedure BackpropagateCPU();
+  end;
+
+  { TNNetLocalConnectLinear }
+  TNNetLocalConnectLinear = class(TNNetLocalConnect)
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
   end;
 
   { TNNetLocalProduct }
@@ -9132,7 +9138,7 @@ begin
         if FSuppressBias = 0 then Sum := Sum + FNeurons[NeuronIdx].FBiasWeight;
 
         FOutputRaw.FData[NeuronIdx] := Sum;
-        FOutput.FData[NeuronIdx] := FActivationFn(Sum);
+        ApplyActivationFunctionToOutput();
         Inc(OutputCntD);
         Inc(CntXYD);
       end;
@@ -9196,6 +9202,16 @@ begin
     for NeuronIdx := 0 to MaxD do FNeurons[NeuronIdx].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
+end;
+
+{ TNNetLocalConnectLinear }
+
+constructor TNNetLocalConnectLinear.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
 end;
 
 procedure TNNetFullConnectReLU.ComputePreviousLayerErrorCPU();
@@ -11217,7 +11233,7 @@ begin
 end;
 
 constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer;
-  EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 2);
+  EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02);
 begin
   inherited Create();
   FVocabSize := pVocabSize;
@@ -11276,7 +11292,7 @@ begin
     CurrentToken := Round(FPrevLayer.Output.FData[CntToken]);
     if CurrentToken >= FVocabSize then
     begin
-      FErrorProc('Token is bigger than vocab size:'+ IntToStr(CurrentToken));
+      FErrorProc('Input token '+IntToStr(CurrentToken)+' is bigger than vocab size '+IntToStr(FVocabSize)+'.');
       CurrentToken := 0;
     end;
     if FEncodeZero or (CurrentToken>0) then
@@ -11365,10 +11381,10 @@ end;
 
 constructor TNNetTokenAndPositionalEmbedding.Create(pVocabSize,
   pEmbeddingSize: integer;
-  EncodeZero: integer = 0;
-  ScaleEmbedding: TNeuralFloat = 2;
-  ScalePositional: TNeuralFloat = 1;
-  PositionalEmbeddingN: integer = 0);
+  EncodeZero: integer;
+  ScaleEmbedding: TNeuralFloat;
+  ScalePositional: TNeuralFloat;
+  PositionalEmbeddingN: integer);
 begin
   inherited Create(pVocabSize, pEmbeddingSize, EncodeZero, ScaleEmbedding);
   FPositionalEmbedding := TNNetVolume.Create;
@@ -11417,7 +11433,7 @@ begin
     CurrentToken := Round(FPrevLayer.Output.FData[CntToken]);
     if CurrentToken >= FVocabSize then
     begin
-      FErrorProc('Token is bigger than vocab size:'+ IntToStr(CurrentToken));
+      FErrorProc('Input token '+IntToStr(CurrentToken)+' is bigger than vocab size '+IntToStr(FVocabSize)+'.');
       CurrentToken := 0;
     end;
     if FEncodeZero or (CurrentToken>0) then
@@ -11642,6 +11658,7 @@ begin
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetLocalConnect' :         Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetLocalConnectLinear' :   Result := TNNetLocalConnectLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalProduct' :         Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalConnectReLU' :     Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(Ft[0]);
@@ -11747,6 +11764,7 @@ begin
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetLocalConnect' then Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetLocalConnectLinear' then Result := TNNetLocalConnectLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalProduct' then Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalConnectReLU' then Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(Ft[0]) else
