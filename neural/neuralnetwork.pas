@@ -216,7 +216,6 @@ type
       procedure ComputeOutputErrorForIdx(pOutput: TNNetVolume; const aIdx: array of integer); virtual;
       procedure ComputeErrorDeriv(); {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
       procedure Fill(value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
-      procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       // Adds neurons to the layer.
       procedure AddNeurons(NeuronNum: integer);
       // Calculates the number of missing neurons so the layer can have
@@ -246,6 +245,7 @@ type
       function GetWeightSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       // Returns the sum of all biases from all neurons in the layer.
       function GetBiasSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function GetDeltaSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetInertiaSum(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       // Returns the number of weights in the layer.
       function CountWeights(): integer; {$IFDEF Release} inline; {$ENDIF}
@@ -253,24 +253,29 @@ type
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Multiplies all weights in the layer by value V.
       procedure MulWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      procedure MulInertia(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       // Clear all biases from all neurons in the layer.
       procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
+      procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      procedure MulMulAddInertia(Value1, Value2: TNeuralFloat; Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       // Sums all weights by their corresponding weights found at Origin.
       // Both layers must have the same number of weights and neurons for this
       // function to work as expected.
       procedure SumWeights(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      procedure SumInertia(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltas(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       // Copies all weights by their corresponding weights found at Origin.
       // Both layers must have the same number of weights and neurons for this
       // function to work as expected.
       procedure CopyWeights(Origin: TNNetLayer); virtual;
+      procedure CopyInertia(Origin: TNNetLayer); virtual;
       procedure ForceRangeWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ForcePositiveWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure NormalizeWeights(VMax: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -1737,13 +1742,17 @@ type
       procedure EnableDropouts(pFlag: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure RefreshDropoutMask(); {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
+      procedure MulMulAddInertia(Value1, Value2: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure MulAddWeights(Value: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
+      procedure MulAddInertia(Value: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure MulWeights(V: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SumWeights(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
+      procedure SumInertia(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltas(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltasNoChecks(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyWeights(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
+      procedure CopyInertia(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       function ForceMaxAbsoluteDelta(vMax: TNeuralFloat = 0.01): TNeuralFloat;
       function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat;
@@ -1770,6 +1779,8 @@ type
       function CountWeights(): integer;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
+      function GetInertiaSum(): TNeuralFloat;
+      function GetDeltaSum(): TNeuralFloat;
 
       // Save weights to string
       function SaveDataToString(): string;
@@ -11552,6 +11563,34 @@ begin
   end;
 end;
 
+function TNNet.GetInertiaSum(): TNeuralFloat;
+var
+  LayerCnt: integer;
+begin
+  Result := 0;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Result := Result + FLayers[LayerCnt].GetInertiaSum();
+    end;
+  end;
+end;
+
+function TNNet.GetDeltaSum(): TNeuralFloat;
+var
+  LayerCnt: integer;
+begin
+  Result := 0;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Result := Result + FLayers[LayerCnt].GetDeltaSum();
+    end;
+  end;
+end;
+
 function TNNet.CreateLayer(strData: string): TNNetLayer;
 var
   S, S2: TStringList;
@@ -12876,7 +12915,32 @@ begin
   begin
     FErrorProc
     (
-      'TNNet.SumWeights - SumWeights does not match: ' + IntToStr(Origin.Layers.Count)
+      'TNNet.SumWeights - Layer count does not match: ' + IntToStr(Origin.Layers.Count)
+    );
+  end;
+end;
+
+procedure TNNet.SumInertia(Origin: TNNet);
+var
+  LayerCnt: integer;
+begin
+  FForwardTime := FForwardTime + Origin.FForwardTime;
+  FBackwardTime := FBackwardTime + Origin.FBackwardTime;
+  if FLayers.Count = Origin.Layers.Count then
+  begin
+    if FLayers.Count > 1 then
+    begin
+      for LayerCnt := 1 to GetLastLayerIdx() do
+      begin
+        if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].SumInertia(Origin.Layers[LayerCnt]);
+      end;
+    end;
+  end
+  else
+  begin
+    FErrorProc
+    (
+      'TNNet.SumInertia - Layer count does not match: ' + IntToStr(Origin.Layers.Count)
     );
   end;
 end;
@@ -12957,6 +13021,35 @@ begin
     FErrorProc
     (
       'TNNet.CopyWeights does not match. Origin: ' + IntToStr(Origin.Layers.Count) +
+      ' Self: ' + IntToStr(FLayers.Count)
+    );
+  end;
+end;
+
+procedure TNNet.CopyInertia(Origin: TNNet);
+var
+  LayerCnt: integer;
+  MaxLayerIdx: integer;
+begin
+  if FLayers.Count = Origin.Layers.Count then
+  begin
+    if FLayers.Count > 1 then
+    begin
+      MaxLayerIdx := GetLastLayerIdx();
+      for LayerCnt := 1 to MaxLayerIdx do
+      begin
+        if not(FLayers[LayerCnt].LinkedNeurons) then
+        begin
+          FLayers[LayerCnt].CopyInertia(Origin.Layers[LayerCnt]);
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    FErrorProc
+    (
+      'TNNet.CopyInertia does not match. Origin: ' + IntToStr(Origin.Layers.Count) +
       ' Self: ' + IntToStr(FLayers.Count)
     );
   end;
@@ -13462,7 +13555,11 @@ var
 begin
   WriteLn(' Layers: ', CountLayers()  );
   WriteLn(' Neurons:', CountNeurons() );
-  WriteLn(' Weights:' ,CountWeights(), ' Sum:', GetWeightSum():12:6 );
+  WriteLn(' Weights:' ,CountWeights(),
+    ' Weight Sum:', GetWeightSum():12:6,
+    ' Bias sum:', GetBiasSum():12:6,
+    ' Inertia sum:', GetInertiaSum():12:6,
+    ' Delta sum:', GetDeltaSum():12:6);
 
   if FLayers.Count > 1 then
   begin
@@ -13572,7 +13669,30 @@ begin
   begin
     FErrorProc
     (
-      'TNNet.SumWeights - SumWeights does not match: ' + IntToStr(Origin.Layers.Count)
+      'TNNet.MulMulAddWeights - layer count does not match: ' + IntToStr(Origin.Layers.Count)
+    );
+  end;
+end;
+
+procedure TNNet.MulMulAddInertia(Value1, Value2: TNeuralFloat; Origin: TNNet);
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count = Origin.Layers.Count then
+  begin
+    if FLayers.Count > 1 then
+    begin
+      for LayerCnt := 1 to GetLastLayerIdx() do
+      begin
+        FLayers[LayerCnt].MulMulAddInertia(Value1, Value2, Origin.Layers[LayerCnt]);
+      end;
+    end;
+  end
+  else
+  begin
+    FErrorProc
+    (
+      'TNNet.MulMulAddInertia - layer count does not match: ' + IntToStr(Origin.Layers.Count)
     );
   end;
 end;
@@ -13580,6 +13700,11 @@ end;
 procedure TNNet.MulAddWeights(Value: TNeuralFloat; Origin: TNNet);
 begin
   MulMulAddWeights(1, Value, Origin);
+end;
+
+procedure TNNet.MulAddInertia(Value: TNeuralFloat; Origin: TNNet);
+begin
+  MulMulAddInertia(1, Value, Origin);
 end;
 
 function TNNet.SaveDataToString(): string;
@@ -14497,6 +14622,23 @@ begin
   end
 end;
 
+function TNNetLayer.GetDeltaSum(): TNeuralFloat;
+var
+  Cnt: integer;
+begin
+  Result := 0;
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      Result := Result +
+        FNeurons[Cnt].FBiasDelta +
+        FNeurons[Cnt].FDelta.GetSum() +
+        FNeurons[Cnt].FDelta2.GetSum();
+    end;
+  end
+end;
+
 function TNNetLayer.GetInertiaSum(): TNeuralFloat;
 var
   Cnt: integer;
@@ -14506,7 +14648,11 @@ begin
   begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
-      Result := Result + FNeurons[Cnt].FBackInertia.GetSum() + FNeurons[Cnt].FBiasInertia;
+      Result := Result +
+        FNeurons[Cnt].FBiasInertia +
+        FNeurons[Cnt].FBiasInertia2 +
+        FNeurons[Cnt].FBackInertia.GetSum() +
+        FNeurons[Cnt].FBackInertia2.GetSum();
     end;
   end
 end;
@@ -14542,12 +14688,29 @@ begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
       FNeurons[Cnt].Weights.Mul(V);
-      FNeurons[Cnt].BackInertia.Mul(V);
       {$IFDEF FPC}
       FNeurons[Cnt].FBiasWeight *= V;
-      FNeurons[Cnt].FBiasInertia *= V;
       {$ELSE}
       FNeurons[Cnt].FBiasWeight := FNeurons[Cnt].FBiasWeight * V;
+      {$ENDIF}
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.MulInertia(V: TNeuralFloat);
+var
+  Cnt: integer;
+begin
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      FNeurons[Cnt].BackInertia.Mul(V);
+      FNeurons[Cnt].FBackInertia2.Mul(V);
+      {$IFDEF FPC}
+      FNeurons[Cnt].FBiasInertia *= V;
+      {$ELSE}
       FNeurons[Cnt].FBiasInertia := FNeurons[Cnt].FBiasInertia * V;
       {$ENDIF}
     end;
@@ -14591,7 +14754,9 @@ begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
       FNeurons[Cnt].BackInertia.Fill(0);
+      FNeurons[Cnt].FBackInertia2.Fill(0);
       FNeurons[Cnt].FBiasInertia := 0;
+      FNeurons[Cnt].FBiasInertia2:= 0;
     end;
   end
 end;
@@ -14626,9 +14791,7 @@ begin
       for Cnt := 0 to FNeurons.Count-1 do
       begin
         FNeurons[Cnt].Weights.MulMulAdd(Value1, Value2, Origin.Neurons[Cnt].Weights);
-        FNeurons[Cnt].BackInertia.MulMulAdd(Value1, Value2, Origin.Neurons[Cnt].BackInertia);
         FNeurons[Cnt].FBiasWeight := FNeurons[Cnt].FBiasWeight * Value1 + Origin.Neurons[Cnt].FBiasWeight * Value2;
-        FNeurons[Cnt].FBiasInertia := FNeurons[Cnt].FBiasInertia * Value1 + Origin.Neurons[Cnt].FBiasInertia * Value2;
       end;
     end
   end
@@ -14638,6 +14801,38 @@ begin
       FErrorProc
       (
         'Error while adding neuron weights layer: '+
+        IntToStr(FNeurons.Count)+' differs from '+
+        IntToStr(Origin.Neurons.Count)
+      );
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.MulMulAddInertia(Value1, Value2: TNeuralFloat;
+  Origin: TNNetLayer);
+var
+  Cnt: integer;
+begin
+  if FLinkedNeurons then exit;
+  if Neurons.Count = Origin.Neurons.Count then
+  begin
+    if FNeurons.Count > 0 then
+    begin
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].FBackInertia.MulMulAdd(Value1, Value2, Origin.Neurons[Cnt].FBackInertia);
+        FNeurons[Cnt].FBackInertia2.MulMulAdd(Value1, Value2, Origin.Neurons[Cnt].FBackInertia2);
+        FNeurons[Cnt].FBiasInertia := FNeurons[Cnt].FBiasInertia * Value1 + Origin.Neurons[Cnt].FBiasInertia * Value2;
+      end;
+    end
+  end
+  else
+  begin
+    begin
+      FErrorProc
+      (
+        'Error while adding neuron inertia layer: '+
         IntToStr(FNeurons.Count)+' differs from '+
         IntToStr(Origin.Neurons.Count)
       );
@@ -14658,10 +14853,8 @@ begin
       for Cnt := 0 to FNeurons.Count-1 do
       begin
         FNeurons[Cnt].Weights.Add(Origin.Neurons[Cnt].Weights);
-        FNeurons[Cnt].BackInertia.Add(Origin.Neurons[Cnt].BackInertia);
         {$IFDEF FPC}
         FNeurons[Cnt].FBiasWeight += Origin.Neurons[Cnt].FBiasWeight;
-        FNeurons[Cnt].FBiasInertia += Origin.Neurons[Cnt].FBiasInertia;
         {$ELSE}
         FNeurons[Cnt].FBiasWeight := FNeurons[Cnt].FBiasWeight + Origin.Neurons[Cnt].FBiasWeight;
         FNeurons[Cnt].FBiasInertia := FNeurons[Cnt].FBiasInertia + Origin.Neurons[Cnt].FBiasInertia;
@@ -14675,6 +14868,41 @@ begin
       FErrorProc
       (
         'Error while adding neuron weights layer: '+
+        IntToStr(FNeurons.Count)+' differs from '+
+        IntToStr(Origin.Neurons.Count)
+      );
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.SumInertia(Origin: TNNetLayer);
+var
+  Cnt: integer;
+begin
+  if FLinkedNeurons then exit;
+  if Neurons.Count = Origin.Neurons.Count then
+  begin
+    if FNeurons.Count > 0 then
+    begin
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].FBackInertia.Add(Origin.Neurons[Cnt].FBackInertia);
+        FNeurons[Cnt].FBackInertia2.Add(Origin.Neurons[Cnt].FBackInertia2);
+        {$IFDEF FPC}
+        FNeurons[Cnt].FBiasInertia += Origin.Neurons[Cnt].FBiasInertia;
+        {$ELSE}
+        FNeurons[Cnt].FBiasInertia := FNeurons[Cnt].FBiasInertia + Origin.Neurons[Cnt].FBiasInertia;
+        {$ENDIF}
+      end;
+    end
+  end
+  else
+  begin
+    begin
+      FErrorProc
+      (
+        'Error while adding neuron inertia layer: '+
         IntToStr(FNeurons.Count)+' differs from '+
         IntToStr(Origin.Neurons.Count)
       );
@@ -14739,9 +14967,7 @@ begin
         if FNeurons[Cnt].Weights.Size = Origin.Neurons[Cnt].Weights.Size then
         begin
           FNeurons[Cnt].Weights.CopyNoChecks(Origin.Neurons[Cnt].Weights);
-          FNeurons[Cnt].BackInertia.CopyNoChecks(Origin.Neurons[Cnt].BackInertia);
           FNeurons[Cnt].FBiasWeight := Origin.Neurons[Cnt].FBiasWeight;
-          FNeurons[Cnt].FBiasInertia := Origin.Neurons[Cnt].FBiasInertia;
         end
         else
         begin
@@ -14761,6 +14987,49 @@ begin
       FErrorProc
       (
         'Error while copying neuron weights layer: '+
+        IntToStr(FNeurons.Count)+' differs from '+
+        IntToStr(Origin.Neurons.Count)
+      );
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.CopyInertia(Origin: TNNetLayer);
+var
+  Cnt: integer;
+begin
+  if FLinkedNeurons then exit;
+  if Neurons.Count = Origin.Neurons.Count then
+  begin
+    if FNeurons.Count > 0 then
+    begin
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        if FNeurons[Cnt].BackInertia.Size = Origin.Neurons[Cnt].BackInertia.Size then
+        begin
+          FNeurons[Cnt].BackInertia.CopyNoChecks(Origin.Neurons[Cnt].BackInertia);
+          FNeurons[Cnt].FBackInertia2.Copy(Origin.Neurons[Cnt].BackInertia);
+          FNeurons[Cnt].FBiasInertia := Origin.Neurons[Cnt].FBiasInertia;
+        end
+        else
+        begin
+          FErrorProc
+          (
+            'Error while copying neuron inertia layer: '+
+            IntToStr(FNeurons[Cnt].Weights.Size)+' neuron differs from '+
+            IntToStr(Origin.Neurons[Cnt].Weights.Size)
+          );
+        end;
+      end;
+    end
+  end
+  else
+  begin
+    begin
+      FErrorProc
+      (
+        'Error while copying neuron inertia layer: '+
         IntToStr(FNeurons.Count)+' differs from '+
         IntToStr(Origin.Neurons.Count)
       );
@@ -14857,6 +15126,8 @@ begin
       IntToStr(S.Count)
     );
   end;
+  ClearInertia();
+  ClearDeltas();
   AfterWeightUpdate();
   S.Free;
 end;
@@ -15279,6 +15550,7 @@ end;
 procedure TNNetNeuron.ClearDelta;
 begin
   FDelta.Fill(0);
+  // So far, there is no need to ClearDelta2.
   FBiasDelta := 0;
 end;
 

@@ -79,6 +79,8 @@ type
   TMultiThreadProcItem = TObject;
   {$ENDIF}
 
+  TNeuralSaveBest = (SaveBestAccuracy, SaveBestLoss);
+
   /// This is a base class. Do not use it directly.
   TNeuralFitBase = class(TMObject)
     protected
@@ -120,6 +122,7 @@ type
       FTargetAccuracy: single;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
+      FSaveBest: TNeuralSaveBest;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
       FValidationError, FValidationLoss: TNeuralFloat;
       FMinBackpropagationError: TNeuralFloat;
@@ -174,7 +177,8 @@ type
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
       property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
       property OnStart: TNotifyEvent read FOnStart write FOnStart;
-      property Optimizer: TNeuralOptimizer write SetOptimizer;
+      property Optimizer: TNeuralOptimizer read FOptimizer write SetOptimizer;
+      property SaveBest: TNeuralSaveBest read FSaveBest write FSaveBest;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -863,7 +867,9 @@ begin
   TestRate := 0;
   TestLoss := 0;
   TestError := 0;
-  ValidationRecord := 0;
+  if FSaveBest = SaveBestAccuracy
+  then ValidationRecord := 0
+  else ValidationRecord := 100;
   totalTimeSeconds := 0;
 
   FMessageProc('File name is: ' + FFileNameBase);
@@ -984,11 +990,24 @@ begin
           FValidationAccuracy := ValidationRate;
         end;
 
-        if (ValidationRate > ValidationRecord) then
+        if (FSaveBest = SaveBestAccuracy) then
         begin
-          ValidationRecord := ValidationRate;
-          FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
-          FAvgWeight.SaveToFile(fileName);
+          if (ValidationRate > ValidationRecord) then
+          begin
+            ValidationRecord := ValidationRate;
+            FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
+            FAvgWeight.SaveToFile(fileName);
+          end;
+        end;
+
+        if (FSaveBest = SaveBestLoss) then
+        begin
+          if (FValidationLoss < ValidationRecord) then
+          begin
+            ValidationRecord := FValidationLoss;
+            FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
+            FAvgWeight.SaveToFile(fileName);
+          end;
         end;
 
         if (FGlobalTotal > 0) and (FVerbose) then
@@ -1235,6 +1254,7 @@ var
   LocalTrainingPair: TNNetVolumePair;
   {$IFDEF DEBUG}
   InitialWeightSum, FinalWeightSum: TNeuralFloat;
+  InitialInertia, FinalInertia: TNeuralFloat;
   {$ENDIF}
   CropSizeX, CropSizeY: integer;
   DepthCnt: integer;
@@ -1261,7 +1281,8 @@ begin
   LocalNN.ClearDeltas();
   LocalNN.EnableDropouts(true);
   {$IFDEF DEBUG}
-  InitialWeightSum := LocalNN.GetWeightSum();
+  InitialWeightSum := LocalNN.GetWeightSum() + LocalNN.GetBiasSum();
+  InitialInertia := LocalNN.GetInertiaSum();
   {$ENDIF}
   for I := 1 to BlockSize do
   begin
@@ -1395,10 +1416,15 @@ begin
     end;
   end;
   {$IFDEF DEBUG}
-  FinalWeightSum := LocalNN.GetWeightSum();
+  FinalWeightSum := LocalNN.GetWeightSum() + LocalNN.GetBiasSum();
+  FinalInertia := LocalNN.GetInertiaSum();
   if InitialWeightSum <> FinalWeightSum then
   begin
-    FErrorProc('Weights changed on thread:'+FloatToStr(FinalWeightSum - InitialWeightSum));
+    FErrorProc('Weights changed from '+FloatToStr(FinalWeightSum)+' to '+FloatToStr(FinalWeightSum));
+  end;
+  if FinalInertia <> FinalInertia then
+  begin
+    FErrorProc('Inertia changed from '+FloatToStr(InitialInertia)+' to '+FloatToStr(FinalInertia));
   end;
   {$ENDIF}
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
@@ -1771,7 +1797,8 @@ var
 begin
   if FFit.FClipDelta > 0 then
   begin
-    MaxDelta := FNN.ForceMaxAbsoluteDelta(FFit.FClipDelta);
+    //MaxDelta := FNN.ForceMaxAbsoluteDelta(FFit.FClipDelta);
+    MaxDelta := FNN.NormalizeMinMaxAbsoluteDeltaPerLayer(0, FFit.FClipDelta);
   end
   else
   begin
@@ -1886,6 +1913,7 @@ begin
   FLogEveryBatches := 10;
   FOptimizer := nil;
   FOptimizerOwned := false;
+  FSaveBest := SaveBestAccuracy;
 end;
 
 destructor TNeuralFitBase.Destroy();
@@ -1964,7 +1992,7 @@ begin
     FCurrentLearningRate := fNewLearningRate;
     FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
     FNN.SetLearningRate(FCurrentLearningRate, FInertia);
-    FNN.ClearInertia();
+    FNN.ClearInertia(); //TODO: this may be a problem for adam.
     if FVerbose then
     MessageProc
     (
@@ -2119,7 +2147,9 @@ begin
   TestRate := 0;
   TestLoss := 0;
   TestError := 0;
-  ValidationRecord := 0;
+  if FSaveBest = SaveBestAccuracy
+  then ValidationRecord := 0
+  else ValidationRecord := 100;
   totalTimeSeconds := 0;
 
   FMessageProc('File name is: ' + FFileNameBase);
@@ -2285,11 +2315,24 @@ begin
           FValidationAccuracy := ValidationRate;
         end;
 
-        if (ValidationRate > ValidationRecord) then
+        if (FSaveBest = SaveBestAccuracy) then
         begin
-          ValidationRecord := ValidationRate;
-          FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
-          FAvgWeight.SaveToFile(fileName);
+          if (ValidationRate > ValidationRecord) then
+          begin
+            ValidationRecord := ValidationRate;
+            FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
+            FAvgWeight.SaveToFile(fileName);
+          end;
+        end;
+
+        if (FSaveBest = SaveBestLoss) then
+        begin
+          if (FValidationLoss < ValidationRecord) then
+          begin
+            ValidationRecord := FValidationLoss;
+            FMessageProc('VALIDATION RECORD! Saving NN at '+fileName);
+            FAvgWeight.SaveToFile(fileName);
+          end;
         end;
 
         if (FGlobalTotal > 0) and (FVerbose) then
