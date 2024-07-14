@@ -10807,18 +10807,12 @@ begin
 end;
 
 function TNNetVolume.GetSumSqr(): TNeuralFloat;
-var
-  I: integer;
-  vHigh: integer;
 begin
   if FSize >= csMinAvxSize
     then Result := AVXGetSumSqr(FDataPtr, FSize)
     else
     begin
-      Result := 0;
-      vHigh := High(FData);
-      for I := 0 to vHigh do
-        Result += Sqr(FData[I]);
+      Result := DotProduct(Self);
     end;
 end;
 

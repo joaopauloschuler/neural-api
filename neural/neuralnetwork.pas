@@ -179,6 +179,7 @@ type
       FDepartingBranchesCnt: integer;
       FBackPropCallCurrentCnt: integer;
       FLinkedNeurons: boolean;
+      FCanNormalizeDelta: boolean;
       FNN: TNNet;
 
       procedure InitStruct();
@@ -285,9 +286,9 @@ type
       // restored/reconstructed.
       function SaveStructureToString(): string; virtual;
       procedure SetBatchUpdate(pBatchUpdate: boolean); {$IFDEF Release} inline; {$ENDIF}
-      procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
-      procedure CalcAdamDelta(); {$IFDEF Release} inline; {$ENDIF}
-      procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
+      procedure UpdateWeights(); virtual;
+      procedure CalcAdamDelta(); virtual;
+      procedure UpdateWeightsAdam(); virtual;
       function InitBasicPatterns(): TNNetLayer;
 
       // Increments an internal counter that counts how many branches load
@@ -296,6 +297,7 @@ type
       // Decrements an internal counter that counts how many branches load
       // the output of the current layer.
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
+      procedure TestBackPropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
 
       // Initializers
 
@@ -434,6 +436,7 @@ type
   TNNetIdentity = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure BackpropagateNoTest();
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -476,7 +479,6 @@ type
   end;
 
   { TNNetCrop }
-
   TNNetCrop = class(TNNetLayer)
   private
     FStartX, FStartY: integer;
@@ -494,6 +496,17 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       procedure ComputeL2Decay(); override;
+  end;
+
+  /// Base class to be used with layers that aren't compatible with L2
+  // and do not run the default optimizer.
+  TNNetIdentityWithoutL2AndOptimizer = class(TNNetIdentityWithoutL2)
+    public
+      constructor Create();
+      procedure InitDefault(); override;
+      procedure UpdateWeights(); override;
+      procedure CalcAdamDelta(); override;
+      procedure UpdateWeightsAdam(); override;
   end;
 
   /// This layer can be used when you need the forward pass but can't let
@@ -791,25 +804,24 @@ type
 
   /// This layer does zero centering and standard normalization with trainable
   // parameters.
-  TNNetMovingStdNormalization = class(TNNetIdentityWithoutL2)
+  TNNetMovingStdNormalization = class(TNNetIdentityWithoutL2AndOptimizer)
     public
-      constructor Create(); override;
+      constructor Create();
       procedure Compute(); override;
       procedure Backpropagate(); override;
-      procedure InitDefault(); override;
       function GetMaxAbsoluteDelta(): TNeuralFloat; override;
   end;
 
   // This layer is experimental. Do not use.
-  TNNetMovingScale = class(TNNetIdentityWithoutL2)
+  TNNetMovingScale = class(TNNetIdentityWithoutL2AndOptimizer)
     private
       FChangeRate: TNeuralFloat;
       FMaxTarget: TNeuralFloat;
+      FMultiplier: TNeuralFloat;
     public
       constructor Create(pMaxTarget: TNeuralFloat = 1; pChangeRate: TNeuralFloat = 1); overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
-      procedure InitDefault(); override;
   end;
 
   // This is an experimental layer. Do not use it.
@@ -1772,6 +1784,7 @@ type
       procedure DebugWeights();
       procedure DebugErrors();
       procedure DebugStructure();
+      procedure DebugBackpropagation();
 
       // count/debug functions
       function CountLayers(): integer;
@@ -2188,19 +2201,24 @@ end;
 procedure TNNetMovingScale.Compute;
 var
   StartTime: double;
-  Multiplier: TNeuralFloat;
 begin
   StartTime := Now();
   inherited Compute;
-  Multiplier := FNeurons[0].FWeights.FData[0];
-  if Multiplier <= 0.001 then
+  FMultiplier := FNeurons[0].FWeights.FData[1];
+  if FMultiplier <= 0.001 then
   begin
-    Multiplier := 0.001;
+    FMultiplier := 0.001;
   end;
-  if (Multiplier<>1) then
+  if (FMultiplier<>1) then
   begin
-    FOutput.Mul(Multiplier);
+    FOutput.Mul(FMultiplier);
   end;
+  (*
+  if (FMultiplier=1) then
+  begin
+    WriteLn(FLayerIdx,' ',FMultiplier:4:2,' this is strange.');
+  end;
+  *)
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -2208,44 +2226,26 @@ procedure TNNetMovingScale.Backpropagate;
 var
   StartTime: double;
   MaxAbs: TNeuralFloat;
-  Multiplier, Diff: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Backprop Counter
+  FNeurons[0].FDelta.Add(0, 0, 2, 1);
   StartTime := Now();
-  Multiplier := FNeurons[0].FWeights.FData[0];
-  if Multiplier <= 0.001 then
+  MaxAbs := FPrevLayer.FOutput.GetMaxAbs();
+  FNeurons[0].FDelta.Add(0, 0, 1, FMaxTarget/MaxAbs);
+  if (not FBatchUpdate) then
   begin
-    Multiplier := 0.001;
+    UpdateWeights();
   end;
-  MaxAbs := FOutput.GetMaxAbs();
-  if MaxAbs <> 0 then
+  if (FMultiplier > 0) and (FMultiplier <> 1) then
   begin
-    Diff := FMaxTarget-MaxAbs;
-    if (Diff < 0) or (Diff>0.75) then
-    begin
-      FNeurons[0].FDelta.Add(0, 0, 0, (Diff)*FLearningRate*FChangeRate);
-      if (not FBatchUpdate) then
-      begin
-        FNeurons[0].UpdateWeights(FInertia);
-        AfterWeightUpdate();
-      end;
-    end;
-  end;
-  if (Multiplier > 0) and (Multiplier <> 1) then
-  begin
-    FOutputError.Mul(Multiplier);
+    FOutputError.Mul(FMultiplier);
     //if Random(100)=0 then WriteLn(MaxAbs,' ->', Multiplier:10:8);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
-end;
-
-procedure TNNetMovingScale.InitDefault;
-begin
-  if FNeurons.Count < 1 then AddMissingNeurons(1);
-  SetNumWeightsForAllNeurons(1, 1, 1);
-  FNeurons[0].FWeights.FData[0] := 1;
+  BackpropagateNoTest();
 end;
 
 { TNNetDotProducts }
@@ -2369,11 +2369,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetDotProducts: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
-  end;
-
+  TestBackPropCallCurrCnt();
   if FNoForward then
   begin
     FOutputError.Mul(FOutputErrorDeriv);
@@ -2438,10 +2434,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetPointwiseSoftMax: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt)+' '+IntToStr(FLayerIdx) );
-  end;
+  TestBackPropCallCurrCnt();
   if Assigned(FPrevLayer) and
     (FPrevLayer.OutputError.Size > 0) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
@@ -2525,6 +2518,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if Assigned(FPrevLayer) and
     (FPrevLayer.OutputError.Size > 0) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
@@ -2559,10 +2553,7 @@ procedure TNNetTransposeXD.Backpropagate;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetTransposeXD: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
-  end;
+  TestBackPropCallCurrCnt();
   if Assigned(FPrevLayer) and
     (FPrevLayer.OutputError.Size > 0) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
@@ -2702,6 +2693,9 @@ var
   OutputRawPos: integer;
   PrevDepth: integer;
 begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if FMaxBackpropX < Output.SizeX then
   begin
     OutputMaxX := Output.SizeX - 1;
@@ -2804,6 +2798,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
@@ -2867,6 +2862,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
@@ -2987,6 +2983,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   Magnitude := FOutputError.GetMagnitude();
   if (Magnitude > 0) and (Magnitude < 1) then
@@ -3185,7 +3182,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-
+  TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
     MaxDepth := FOutput.Depth - 1;
@@ -3611,10 +3608,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetGroupedConvolutionLinear: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
-  end;
+  TestBackPropCallCurrCnt();
   if (FNeurons.Count = FOutput.Depth) and (FPrevLayer.Output.Size > 0) then
   begin
     // ComputeErrorDeriv() isn't required as it's done on BackpropagateAtOutputPos
@@ -3710,6 +3704,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   // Calculates the FLayerA Error
   FOutputErrorDeriv.Copy(FOutputError);
@@ -3887,6 +3882,10 @@ var
   LocalPrevError: TNNetVolume;
   LocalError, LocalValue: TNeuralFloat;
 begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+
   LocalPrevError := FPrevLayer.OutputError;
 
   MaxOutputCnt := FOutput.Size - 1;
@@ -3924,6 +3923,7 @@ begin
   FNeurons.Free;
   FNeurons := LinkedLayer.FNeurons;
   FLinkedNeurons := true;
+  FCanNormalizeDelta := false;
 end;
 
 destructor TNNetConvolutionSharedWeights.Destroy;
@@ -3976,6 +3976,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
@@ -4218,6 +4219,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
@@ -4698,6 +4700,9 @@ end;
 procedure TNNetIdentityWithoutBackprop.Backpropagate();
 begin
   // Doesn't backprop any error
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   FPrevLayer.Backpropagate();
 end;
 
@@ -4749,8 +4754,11 @@ end;
 
 procedure TNNetChannelRandomMulAdd.Backpropagate();
 begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if FEnabled then FOutput.MulChannels(FRandomMul);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 constructor TNNetRandomMulAdd.Create(AddRate, MulRate: integer);
@@ -4775,11 +4783,14 @@ end;
 
 procedure TNNetRandomMulAdd.Backpropagate();
 begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if FEnabled then
   begin
     FOutputError.Mul(FRandomMul);
   end;
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 { TNNetPointwiseConvLinear }
@@ -5383,6 +5394,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   localNeuron := FNeurons[0];
   FOutputErrorDeriv.Fill(0);
@@ -5450,6 +5462,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   localNeuron := FNeurons[0];
   FOutputErrorDeriv.Fill(0);
@@ -5498,6 +5511,10 @@ end;
 
 procedure TNNetSigmoid.Backpropagate();
 begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+
   ComputeErrorDeriv();
   FPrevLayer.FOutputError.Add(FOutputErrorDeriv);
   inherited Backpropagate();
@@ -5586,6 +5603,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   // Calculates the FLayerWithChannels Error
   FOutputErrorDeriv.Copy(FOutputError);
@@ -5619,6 +5637,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputError);
   if (not FBatchUpdate) then
@@ -5767,6 +5786,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   FAuxDepth.Fill(0);
   FAuxDepth.AddSumChannel(FOutput);
@@ -5777,7 +5797,7 @@ begin
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 procedure TNNetChannelZeroCenter.ComputeL2Decay();
@@ -5839,6 +5859,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   FAuxDepth.Fill(0);
   FAuxDepth.AddSumChannel(FOutputError);
@@ -5849,7 +5870,7 @@ begin
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 { TNNetChannelStdNormalization }
@@ -5890,6 +5911,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   FAuxOutput.Copy(FOutput);
   FAuxOutput.Mul(FAuxOutput);
@@ -5924,7 +5946,7 @@ begin
   end;
   *)
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 procedure TNNetChannelStdNormalization.InitDefault();
@@ -5967,49 +5989,93 @@ procedure TNNetMovingStdNormalization.Backpropagate();
 var
   StartTime: double;
   StdDev, CurrentStdDev: TNeuralFloat;
-  StdDevError: TNeuralFloat;
   FloatSize: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
+  // This is done for backward compatibility
+  if FNeurons[0].FWeights.Size<>3 then
+  begin
+    SetNumWeightsForAllNeurons(1, 1, 3);
+  end;
+  // Backprop Counter
+  FNeurons[0].FDelta.Add(0, 0, 2, 1);
   FloatSize := FOutput.Size;
-  CurrentStdDev := Sqrt(FOutput.GetSumSqr()/FloatSize);
-  StdDevError := (CurrentStdDev - 1);
+  CurrentStdDev := Sqrt(FPrevLayer.FOutput.GetSumSqr()/FloatSize);
   StdDev := FNeurons[0].FWeights.FData[1];
   (*if Random(1000) = 0 then
   begin
-    WriteLn(' Current StdDev:',CurrentStdDev:8:6,' Current Avg:',FOutput.GetAvg():8:6,' Current StdDevError:',StdDevError:8:6,' Learned StdDev:',StdDev:8:6);
+  WriteLn(
+    'StdDev:', FOutput.GetStdDeviation():8:6,
+    ' Avg:',FOutput.GetAvg():8:6,
+    ' Learned StdDev:',StdDev:8:6,
+    ' Learned Avg:', FNeurons[0].FWeights.FData[0]:8:6
+  );
   end;*)
-  FNeurons[0].FDelta.Add(0,0,0, FOutput.GetAvg()*FLearningRate );
-  FNeurons[0].FDelta.Add(0,0,1, NeuronForceRange(StdDevError*FLearningRate*0.01, FLearningRate) );
+  FNeurons[0].FDelta.Add(0,0,0, FPrevLayer.FOutput.GetAvg() );
+  FNeurons[0].FDelta.Add(0,0,1, CurrentStdDev );
   if (not FBatchUpdate) then
   begin
-    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[0].UpdateWeights(0.99);
+    FNeurons[0].ClearDelta;
     AfterWeightUpdate();
   end;
-  //WriteLn(FOutput.GetAvg(),' ',StdDevError,' ',CurrentStdDev);
   if StdDev > 1 then
   begin
     // The direction of the error is more important than its magnitude.
     FOutputError.Divi(StdDev);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
-end;
-
-procedure TNNetMovingStdNormalization.InitDefault();
-begin
-  if FNeurons.Count < 1 then AddMissingNeurons(1);
-  SetNumWeightsForAllNeurons(1, 1, 2);
-  FNeurons[0].FWeights.FData[0] := 0;
-  FNeurons[0].FWeights.FData[1] := 1;
+  BackpropagateNoTest();
 end;
 
 function TNNetMovingStdNormalization.GetMaxAbsoluteDelta(): TNeuralFloat;
 begin
   // channel standard normalization has lower impact on deltas.
   Result := inherited GetMaxAbsoluteDelta() * 0.01;
+end;
+
+constructor TNNetIdentityWithoutL2AndOptimizer.Create();
+begin
+  inherited Create();
+  FCanNormalizeDelta := false;
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, 3);
+  FNeurons[0].FWeights.FData[0] := 0;
+  FNeurons[0].FWeights.FData[1] := 1;
+  FNeurons[0].FWeights.FData[2] := 0;
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.UpdateWeights;
+var
+  LocalInertia: TNeuralFloat;
+  LocalCount: TNeuralFloat;
+begin
+  LocalInertia := 0.9;
+  LocalCount := FNeurons[0].FDelta.FData[2];
+  if (LocalCount>0) then
+  begin
+    FNeurons[0].FWeights.MulMulAdd(LocalInertia, (1-LocalInertia)/LocalCount, FNeurons[0].FDelta);
+  end;
+  //Write('-->'); FNeurons[0].FWeights.Print();
+  ClearDeltas();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.CalcAdamDelta;
+begin
+  // nothing is done.
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.UpdateWeightsAdam;
+begin
+  Self.UpdateWeights;
 end;
 
 { TNNetLayerConcatedWeights }
@@ -6207,16 +6273,13 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetReLUBase: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
-  end;
+  TestBackPropCallCurrCnt();
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     FOutputError.Mul(FOutputErrorDeriv);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetMulLearning }
@@ -6237,9 +6300,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   FOutputError.Mul(FFloatSt[0]);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetSum }
@@ -6321,10 +6385,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetSum: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
-  end;
+  TestBackPropCallCurrCnt();
   //FOutputError.Divi(FPrevOutput.Count);
   for LayerCnt := 0 to FPrevOutput.Count - 1 do
   begin
@@ -7185,9 +7246,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   FOutputError.Divi(FLRN);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 { TNNetFullConnectDiff }
@@ -7289,6 +7351,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FNeurons.Count = FOutput.Size) and (FPrevLayer.Output.Size>0) then
   begin
     ComputeErrorDeriv();
@@ -7481,6 +7544,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxDepth := Output.Depth - 1;
@@ -7656,6 +7720,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
   begin
     StartTime := Now();
@@ -8453,7 +8518,7 @@ begin
     FOutputError.Divi(FLastStdDev);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate;
+  BackpropagateNoTest();
 end;
 
 { TNNetLayerMaxNormalization }
@@ -8479,12 +8544,13 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if FLastMax > 0 then
   begin
     FOutputError.Divi(FLastMax);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate;
+  BackpropagateNoTest();
 end;
 
 { TNNetDropout }
@@ -8563,9 +8629,10 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if ( FEnabled and (FOutputError.Size = FOutput.Size) ) then FOutputError.Mul(FDropoutMask);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 procedure TNNetDropout.RefreshDropoutMask();
@@ -8638,6 +8705,7 @@ begin
   if
     (FBackPropCallCurrentCnt < FDepartingBranchesCnt) or
     (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   OutputError.Divi(FPoolSize*FPoolSize);
   MaxX := FPrevLayer.Output.SizeX - 1;
@@ -8746,6 +8814,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
   begin
     ComputePreviousLayerError;
@@ -8915,6 +8984,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   FPrevOutputError.SplitFrom(FOutputError);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   BackpropagateConcat();
@@ -8958,6 +9028,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   //TODO: check this for possible crash.
   FPrevLayer.FOutputError.Add(FOutputError);
@@ -8974,6 +9045,17 @@ begin
   FOutputErrorDeriv.ReSize(pPrevLayer.FOutputErrorDeriv);
 end;
 
+procedure TNNetIdentity.BackpropagateNoTest();
+begin
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    FPrevLayer.FOutputError.Add(FOutputError);
+  end;
+  FPrevLayer.Backpropagate();
+end;
+
 procedure TNNetIdentity.Compute;
 var
   StartTime: double;
@@ -8987,13 +9069,8 @@ procedure TNNetIdentity.Backpropagate;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if Assigned(FPrevLayer) and
-    (FPrevLayer.OutputError.Size > 0) and
-    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
-  begin
-    FPrevLayer.FOutputError.Add(FOutputError);
-  end;
-  FPrevLayer.Backpropagate();
+  TestBackPropCallCurrCnt();
+  BackpropagateNoTest();
 end;
 
 { TNNetLocalConnectReLU }
@@ -9167,6 +9244,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FNeurons.Count = FOutput.Size) and (FPrevLayer.Output.Size > 0) then
   begin
     StartTime := Now();
@@ -9519,12 +9597,10 @@ procedure TNNetPoolBase.Backpropagate();
 var
   StartTime: double;
 begin
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetPoolBase: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt));
-  end;
+  //TODO: look at this
+  // Inc(FBackPropCallCurrentCnt);
+  // if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  // TestBackPropCallCurrCnt();
   if (Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
   begin
     StartTime := Now();
@@ -10042,10 +10118,7 @@ begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
-  begin
-    FErrorProc('Backprop call count does not look right at TNNetConvolution: '+IntToStr(FBackPropCallCurrentCnt)+' '+IntToStr(FDepartingBranchesCnt)+' '+IntToStr(FLayerIdx));
-  end;
+  TestBackPropCallCurrCnt();
   if (FNeurons.Count = FOutput.Depth) and (FPrevLayer.Output.Size > 0) then
   begin
     // ComputeErrorDeriv() isn't required as it's done on BackpropagateAtOutputPos
@@ -11083,6 +11156,7 @@ var
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FNeurons.Count = FOutput.Size) and (FPrevLayer.FOutput.Size>0) then
   begin
     // ComputeErrorDeriv() is not required as it's done by BackpropagateCPU
@@ -11363,6 +11437,7 @@ begin
   {$ENDIF}
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   StartTime := Now();
   MaxToken := FPrevLayer.Output.Size - 1;
   for CntToken := 0 to MaxToken do
@@ -12764,6 +12839,9 @@ begin
     FLayers[LastLayer].ComputeOutputErrorWith(pOutput);
     FLayers[LastLayer].Backpropagate();
     ComputeL2Decay();
+    {$IFDEF Debug}
+    DebugBackpropagation();
+    {$ENDIF}
   end else
   begin
     FErrorProc('Backpropagate - Neural Network doesn''t have suficcient layers.');
@@ -12890,7 +12968,7 @@ begin
   begin
     for LayerCnt := 1 to LastLayerIdx do
     begin
-      if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].MulDeltas( V );
+      if not(FLayers[LayerCnt].LinkedNeurons) and FLayers[LayerCnt].FCanNormalizeDelta then FLayers[LayerCnt].MulDeltas( V );
     end;
   end;
 end;
@@ -13159,7 +13237,7 @@ begin
   begin
     for LayerCnt := 0 to LastLayerIdx do
     begin
-      if not(FLayers[LayerCnt].LinkedNeurons) then
+      if not(FLayers[LayerCnt].LinkedNeurons) and (FLayers[LayerCnt].FCanNormalizeDelta) then
       begin
         MaxAbsDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
         if (MaxAbsDelta < MinDelta) and (MaxAbsDelta > 0) then
@@ -13185,7 +13263,7 @@ begin
   begin
     for LayerCnt := 0 to LastLayerIdx do
     begin
-      if not(FLayers[LayerCnt].LinkedNeurons) then
+      if not(FLayers[LayerCnt].LinkedNeurons) and (FLayers[LayerCnt].FCanNormalizeDelta) then
       begin
         MaxAbsDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
         if (MaxAbsDelta > 0) then
@@ -13217,7 +13295,7 @@ begin
   begin
     for LayerCnt := 0 to LastLayerIdx do
     begin
-      if not(FLayers[LayerCnt].LinkedNeurons) then
+      if not(FLayers[LayerCnt].LinkedNeurons) and (FLayers[LayerCnt].FCanNormalizeDelta) then
       begin
         FLayers[LayerCnt].NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta);
       end;
@@ -13602,6 +13680,46 @@ begin
       end;
       WriteLn(' Branches:',FLayers[LayerCnt].FDepartingBranchesCnt );
     end; // of for
+  end;
+  if FLayers.Count > 2 then
+  begin
+    for LayerCnt := 1 to GetLastLayerIdx()-1 do
+    begin
+      if (FLayers[LayerCnt].FDepartingBranchesCnt=0) then
+      begin
+        WriteLn(
+          'Layer '+IntToStr(LayerCnt)+
+          ' from class '+FLayers[LayerCnt].ClassName+
+          ' is a termination point. Is this correct?');
+      end;
+    end;
+  end;
+end;
+
+procedure TNNet.DebugBackpropagation();
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count > 1 then
+  begin
+    for LayerCnt := 1 to GetLastLayerIdx() do
+    begin
+      if (FLayers[LayerCnt].FBackPropCallCurrentCnt=0) then
+      begin
+        FErrorProc(
+          'Layer '+IntToStr(LayerCnt)+
+          ' from class '+FLayers[LayerCnt].ClassName+
+          ' has not been called at the backpropagation step.');
+      end
+      else if (FLayers[LayerCnt].FBackPropCallCurrentCnt < FLayers[LayerCnt].FDepartingBranchesCnt) then
+      begin
+        FErrorProc(
+          'Layer '+IntToStr(LayerCnt)+
+          ' from class '+FLayers[LayerCnt].ClassName+
+          ' has been called '+IntToStr(FLayers[LayerCnt].FBackPropCallCurrentCnt)+
+          ' times. But departing branches are:'+IntToStr(FLayers[LayerCnt].FDepartingBranchesCnt)+'.');
+      end;
+    end;
   end;
 end;
 
@@ -14020,6 +14138,7 @@ begin
 
   FNeurons := TNNetNeuronList.Create();
   FLinkedNeurons := false;
+  FCanNormalizeDelta := true;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
@@ -15042,7 +15161,7 @@ procedure TNNetLayer.ForceRangeWeights(V: TNeuralFloat);
 var
   Cnt: integer;
 begin
-  if FLinkedNeurons then exit;
+  if (FLinkedNeurons) or not(FCanNormalizeDelta) then exit;
   if FNeurons.Count > 0 then
   begin
     for Cnt := 0 to FNeurons.Count-1 do
@@ -15057,7 +15176,7 @@ procedure TNNetLayer.ForcePositiveWeights();
 var
   Cnt: integer;
 begin
-  if FLinkedNeurons then exit;
+  if FLinkedNeurons and not(FCanNormalizeDelta) then exit;
   if FNeurons.Count > 0 then
   begin
     for Cnt := 0 to FNeurons.Count-1 do
@@ -15072,7 +15191,7 @@ procedure TNNetLayer.NormalizeWeights(VMax: TNeuralFloat);
 var
   MaxV: TNeuralFloat;
 begin
-  if FLinkedNeurons then exit;
+  if FLinkedNeurons and not(FCanNormalizeDelta) then exit;
   MaxV := GetMaxWeight();
   if MaxV > VMax then
   begin
@@ -15317,6 +15436,18 @@ procedure TNNetLayer.ResetBackpropCallCurrCnt();
 begin
   FBackPropCallCurrentCnt := 0;
   FOutputError.Fill(0);
+end;
+
+procedure TNNetLayer.TestBackPropCallCurrCnt();
+begin
+  if FBackPropCallCurrentCnt > FDepartingBranchesCnt then
+  begin
+    FErrorProc(
+      'Too many backprop calls at '+Self.ClassName+
+      '. Should be:'+IntToStr(FDepartingBranchesCnt)+
+      ', Got:'+IntToStr(FBackPropCallCurrentCnt)
+    );
+  end;
 end;
 
 procedure TNNetLayer.AfterWeightUpdate();
