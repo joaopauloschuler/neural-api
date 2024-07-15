@@ -1469,6 +1469,7 @@ type
     public
       constructor Create(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0); overload;
       destructor Destroy(); override;
+      procedure BackpropagateNoTest();
       procedure Backpropagate(); override;
     end;
 
@@ -2715,7 +2716,7 @@ begin
       end;
     end;
   end;
-  inherited Backpropagate;
+  BackpropagateNoTest();
 end;
 
 procedure TNNetMaxPoolWithPosition.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -5638,6 +5639,11 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  {$IFDEF Debug}
+  if (FNeurons[0].FDelta.Size <> FOutput.Size) then FErrorProc('TNNetCellBias: wrong delta size.');
+  if (FOutputError.Size <> FOutput.Size) then FErrorProc('TNNetCellBias: wrong error size.');
+  //if (FOutputError.GetSum()=0) then MessageProc('TNNetCellBias: zero backprop error.');
+  {$ENDIF}
   StartTime := Now();
   FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputError);
   if (not FBatchUpdate) then
@@ -9053,6 +9059,15 @@ begin
   begin
     FPrevLayer.FOutputError.Add(FOutputError);
   end;
+  {$IFDEF Debug}
+  if (Assigned(FPrevLayer)) and (FLayerIdx>2) then
+  begin
+    if (FPrevLayer.OutputError.Size <> FOutputError.Size) then
+    begin
+      FErrorProc('Output sizes do not match at layer:'+IntToStr(FLayerIdx));
+    end;
+  end;
+  {$ENDIF}
   FPrevLayer.Backpropagate();
 end;
 
@@ -9488,6 +9503,29 @@ begin
   inherited Destroy;
 end;
 
+procedure TNNetPoolBase.BackpropagateNoTest();
+var
+  StartTime: double;
+begin
+  if (Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
+  begin
+    StartTime := Now();
+    //TODO: experiment the following line.
+    //FOutputError.Mul(FStride*FStride);
+
+    if ((FStride = FPoolSize) and (FPadding = 0)) then
+    begin
+      BackpropagateDefaultStride();
+    end
+    else
+    begin
+      BackpropagateWithStride();
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
 procedure TNNetMaxPool.Compute();
 var
   StartTime: double;
@@ -9594,30 +9632,11 @@ begin
 end;
 
 procedure TNNetPoolBase.Backpropagate();
-var
-  StartTime: double;
 begin
-  //TODO: look at this
-  // Inc(FBackPropCallCurrentCnt);
-  // if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  // TestBackPropCallCurrCnt();
-  if (Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
-  begin
-    StartTime := Now();
-    //TODO: experiment the following line.
-    //FOutputError.Mul(FStride*FStride);
-
-    if ((FStride = FPoolSize) and (FPadding = 0)) then
-    begin
-      BackpropagateDefaultStride();
-    end
-    else
-    begin
-      BackpropagateWithStride();
-    end;
-    FBackwardTime := FBackwardTime + (Now() - StartTime);
-    FPrevLayer.Backpropagate();
-  end;
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  BackpropagateNoTest();
 end;
 
 procedure TNNetPoolBase.BackpropagateDefaultStride();
@@ -13199,11 +13218,14 @@ begin
   begin
     for LayerCnt := 0 to MaxLayerIdx do
     begin
-      LayerDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
-      if Result < LayerDelta then
+      if (FLayers[LayerCnt].FCanNormalizeDelta) then
       begin
-        Result := LayerDelta;
-        FMaxDeltaLayer := LayerCnt;
+        LayerDelta := FLayers[LayerCnt].GetMaxAbsoluteDelta();
+        if Result < LayerDelta then
+        begin
+          Result := LayerDelta;
+          FMaxDeltaLayer := LayerCnt;
+        end;
       end;
     end;
   end;
@@ -15325,6 +15347,12 @@ var
   Cnt, MaxNeurons: integer;
 begin
   MaxNeurons := FNeurons.Count - 1;
+  (*
+  if FLayerIdx = 55 then
+  begin
+    WriteLn('Hello');
+  end;
+  *)
   if MaxNeurons >= 0 then
   begin
     for Cnt := 0 to MaxNeurons do
