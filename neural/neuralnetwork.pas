@@ -1153,6 +1153,8 @@ type
   protected
     FSkipBackpropDerivative: boolean;
     FNoForward: boolean;
+    procedure PrepareNoForwardMask();
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     // Although skipping the derivative calculation is a non standard usage,
     // skipping the derivative can give higher classification accuracy at
@@ -2404,6 +2406,35 @@ begin
   FA.Backpropagate();
 end;
 
+procedure TNNetPointwiseSoftMax.PrepareNoForwardMask();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+begin
+  FOutputErrorDeriv.ReSize(FOutput);
+  MaxX := FOutputErrorDeriv.SizeX - 1;
+  MaxY := FOutputErrorDeriv.SizeY - 1;
+  MaxD := FOutputErrorDeriv.Depth - 1;
+  FOutputErrorDeriv.Fill(1);
+  for CntX := 0 to MaxX do
+  begin
+    for CntD := 0 to MaxD do
+    begin
+      if FNoForward and (CntX < CntD) then
+      begin
+        for CntY := 0 to MaxY do
+        begin
+          FOutputErrorDeriv[CntX, CntY, CntD] := 0;
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetPointwiseSoftMax.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FNoForward and FSkipBackpropDerivative then PrepareNoForwardMask();
+end;
 
 { TNNetPointwiseSoftMax }
 constructor TNNetPointwiseSoftMax.Create(SkipBackpropDerivative: integer; NoForward: integer = 0);
@@ -2442,6 +2473,10 @@ begin
   begin
     if FSkipBackpropDerivative then
     begin
+      if FNoForward then
+      begin
+        FOutputError.Mul(FOutputErrorDeriv);
+      end;
       FPrevLayer.OutputError.Add(FOutputError);
     end
     else
@@ -2453,14 +2488,14 @@ begin
       FOutputErrorDeriv.Sub(FOutput);
       FOutputErrorDeriv.Mul(FOutput);
       FPrevLayer.OutputError.MulAdd(FOutputError, FOutputErrorDeriv);
+      {$IFDEF Debug}
+      Min := FOutputErrorDeriv.GetMin();
+      Max := FOutputErrorDeriv.GetMax();
+      if Min < 0 then FErrorProc('Softmax derivative is negative: '+FloatToStrF(Min,ffFixed,6,4));
+      if Max > 0.25 then FErrorProc('Softmax derivative is bigger than 0.25: '+FloatToStrF(Max,ffFixed,6,4));
+      {$ENDIF}
     end;
   end;
-  {$IFDEF Debug}
-  Min := FOutputErrorDeriv.GetMin();
-  Max := FOutputErrorDeriv.GetMax();
-  if Min < 0 then FErrorProc('Softmax derivative is negative: '+FloatToStrF(Min,ffFixed,6,4));
-  if Max > 0.25 then FErrorProc('Softmax derivative is bigger than 0.25: '+FloatToStrF(Max,ffFixed,6,4));
-  {$ENDIF}
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FPrevLayer.Backpropagate();
 end;
