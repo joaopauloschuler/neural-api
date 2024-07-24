@@ -10897,27 +10897,11 @@ begin
 end;
 
 procedure TNNetConvolutionAbstract.InitDefault();
-{$IFDEF Debug}
-var
-  MaxAbsW: TNeuralFloat;
-{$ENDIF}
 begin
-  // Although Keras works better with Glorot, CAI seems to work better with He.
+  // We follow Keras with Glorot.
   // https://keras.io/api/layers/convolution_layers/convolution2d/#conv2d-class
-  InitHeUniform(1);
-  //InitGlorotBengioUniform(1);
-  (*
-  // High values can be usual in small networks.
-  {$IFDEF Debug}
-  MaxAbsW := FNeurons.GetMaxAbsWeight();
-  if MaxAbsW > 0.4 then
-  begin
-    MulWeights(0.4/MaxAbsW);
-    AfterWeightUpdate();
-    WriteLn('Too high initial value at layer',Self.LayerIdx,' -> ', MaxAbsW);
-  end;
-  {$ENDIF}
-  *)
+  //InitHeUniform(1);
+  InitGlorotBengioUniform(1);
 end;
 
 { TNNetFullConnect }
@@ -14474,18 +14458,17 @@ end;
 
 function TNNetLayer.InitGlorotBengioUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  Cnt: integer;
-  MulAux: Single;
+  FanIn, FanOut, MulAux: TNeuralFloat;
 begin
   if (FNeurons.Count > 0) then
   begin
     InitUniform(Value);
-    for Cnt := 0 to FNeurons.Count-1 do
-    begin
-      MulAux := Sqrt(6/(FNeurons[Cnt].Weights.Size + FNeurons.Count));
-      FNeurons[Cnt].Weights.Mul( MulAux );
-    end;
-    AfterWeightUpdate();
+    FanIn := FNeurons[0].Weights.Size;
+    if (Self is TNNetConvolutionAbstract)
+    then FanOut := FNeurons[0].Weights.SizeX * FNeurons[0].Weights.SizeY * FNeurons.Count
+    else FanOut := FNeurons.Count;
+    MulAux := Sqrt(6/(FanIn + FanOut));
+    MulWeights(MulAux);
   end;
   Result := Self;
 end;
