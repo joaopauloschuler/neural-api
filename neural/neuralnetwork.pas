@@ -7052,9 +7052,9 @@ begin
     InputChannelsPerGroup := PreviousLayer.Output.Depth div Heads;
     for HeadCnt := 0 to Heads - 1 do
     begin
-      QueryGroup  := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 1), TNNetCellMul.Create(), TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
-      KeyGroup    := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 1), TNNetCellMul.Create(), TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
-      ValueGroup  := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 1), TNNetCellMul.Create(), TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+      QueryGroup  := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 0), TNNetCellMul.Create(), TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+      KeyGroup    := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 0), TNNetCellMul.Create(), TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+      ValueGroup  := AddLayerAfter( [TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 0), TNNetCellMul.Create(), TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
       ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
       (*W := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup, NoForward) );
       W := AddLayer( TNNetReLUL.Create(-3,+3,0) );
@@ -7131,9 +7131,9 @@ begin
   EmbeddingDim := PrevLayer.Output.Depth;
   Attended := AddSelfAttentionCAI(Heads, NoForward);
   AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
-  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim, 1) );
+  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim, 0) );
   if HasNorm then AddLayer( TNNetMovingStdNormalization.create() );
-  AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), TNNetReLUL.Create(-3,+3,0)] );
+  AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 0), TNNetReLUL.Create(-3,+3,0)] );
   AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]), TNNetReLUL.Create(-3,+3,0)]);
   Result := GetLastLayer();
 end;
