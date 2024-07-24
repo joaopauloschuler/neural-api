@@ -271,6 +271,7 @@ type
     procedure ZeroCenter();
 
     procedure Print();
+    procedure PrintXD(Digits:integer=9; Decimals: integer=5);
     procedure PrintWithIndex();
     procedure PrintDebug();
     procedure PrintDebugChannel();
@@ -6529,6 +6530,22 @@ begin
     Write(FloatToStr(AuxData), ' ');
   end;
   WriteLn;
+end;
+
+procedure TVolume.PrintXD(Digits, Decimals: integer);
+var
+  CX, CD: integer;
+  AUX: TNeuralFloat;
+begin
+  for CD := 0 to Depth - 1 do
+  begin
+    for CX := 0 to SizeX - 1 do
+    begin
+      AUX := Self[CX, 0, CD];
+      Write(AUX:Digits:Decimals);
+    end;
+    WriteLn;
+  end;
 end;
 
 procedure TVolume.PrintWithIndex();
