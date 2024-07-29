@@ -1742,6 +1742,8 @@ type
       procedure SetLearningRate(pLearningRate, pInertia: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetBatchUpdate(pBatchUpdate: boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure InitWeights();
+      procedure InitGlorotBengioUniformForAllConvLayers(Value: TNeuralFloat = 1);
+      procedure InitHeUniformForAllDenseLayers(Value: TNeuralFloat = 1);
       procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure CalcAdamDelta();
       procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
@@ -5565,8 +5567,7 @@ begin
   TestBackPropCallCurrCnt();
 
   ComputeErrorDeriv();
-  FPrevLayer.FOutputError.Add(FOutputErrorDeriv);
-  inherited Backpropagate();
+  BackpropagateNoTest();
 end;
 
 { TNNetFullConnectSigmoid }
@@ -10898,10 +10899,11 @@ end;
 
 procedure TNNetConvolutionAbstract.InitDefault();
 begin
-  // We follow Keras with Glorot.
+  // Keras uses Glorot.
   // https://keras.io/api/layers/convolution_layers/convolution2d/#conv2d-class
-  //InitHeUniform(1);
-  InitGlorotBengioUniform(1);
+  // InitGlorotBengioUniform(1);
+  // But CAI works better with He:
+  InitHeUniform(1);
 end;
 
 { TNNetFullConnect }
@@ -12990,13 +12992,41 @@ begin
   ClearDeltas();
 end;
 
+procedure TNNet.InitGlorotBengioUniformForAllConvLayers(Value: TNeuralFloat);
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count > 1 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      if (FLayers[LayerCnt]) is TNNetConvolutionAbstract then FLayers[LayerCnt].InitGlorotBengioUniform(Value);
+    end;
+  end;
+end;
+
+procedure TNNet.InitHeUniformForAllDenseLayers(Value: TNeuralFloat);
+var
+  LayerCnt: integer;
+begin
+  if FLayers.Count > 1 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      if
+        ((FLayers[LayerCnt] is TNNetFullConnect) or
+         (FLayers[LayerCnt] is TNNetLocalConnect)) then FLayers[LayerCnt].InitHeUniform();
+    end;
+  end;
+end;
+
 procedure TNNet.MulWeights(V: TNeuralFloat);
 var
   LayerCnt: integer;
 begin
   if FLayers.Count > 1 then
   begin
-    for LayerCnt := 1 to GetLastLayerIdx() do
+    for LayerCnt := 0 to GetLastLayerIdx() do
     begin
       if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].MulWeights( V );
     end;
@@ -13010,7 +13040,7 @@ begin
   LastLayerIdx := GetLastLayerIdx();
   if FLayers.Count > 1 then
   begin
-    for LayerCnt := 1 to LastLayerIdx do
+    for LayerCnt := 0 to LastLayerIdx do
     begin
       if not(FLayers[LayerCnt].LinkedNeurons) and FLayers[LayerCnt].FCanNormalizeDelta then FLayers[LayerCnt].MulDeltas( V );
     end;
@@ -13027,7 +13057,7 @@ begin
   begin
     if FLayers.Count > 1 then
     begin
-      for LayerCnt := 1 to GetLastLayerIdx() do
+      for LayerCnt := 0 to GetLastLayerIdx() do
       begin
         if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].SumWeights(Origin.Layers[LayerCnt]);
       end;
@@ -13052,7 +13082,7 @@ begin
   begin
     if FLayers.Count > 1 then
     begin
-      for LayerCnt := 1 to GetLastLayerIdx() do
+      for LayerCnt := 0 to GetLastLayerIdx() do
       begin
         if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].SumInertia(Origin.Layers[LayerCnt]);
       end;
@@ -13079,7 +13109,7 @@ begin
       FForwardTime := FForwardTime + Origin.FForwardTime;
       FBackwardTime := FBackwardTime + Origin.FBackwardTime;
       MaxLayerIdx := GetLastLayerIdx();
-      for LayerCnt := 1 to MaxLayerIdx do
+      for LayerCnt := 0 to MaxLayerIdx do
       begin
         if not(FLayers[LayerCnt].LinkedNeurons) then
         begin
@@ -13106,7 +13136,7 @@ begin
   FForwardTime := FForwardTime + Origin.FForwardTime;
   FBackwardTime := FBackwardTime + Origin.FBackwardTime;
   MaxLayerIdx := GetLastLayerIdx();
-  for LayerCnt := 1 to MaxLayerIdx do
+  for LayerCnt := 0 to MaxLayerIdx do
   begin
     if not(FLayers[LayerCnt].LinkedNeurons) then
     begin
@@ -13128,7 +13158,7 @@ begin
     if FLayers.Count > 1 then
     begin
       MaxLayerIdx := GetLastLayerIdx();
-      for LayerCnt := 1 to MaxLayerIdx do
+      for LayerCnt := 0 to MaxLayerIdx do
       begin
         if not(FLayers[LayerCnt].LinkedNeurons) then
         begin
@@ -13158,7 +13188,7 @@ begin
     if FLayers.Count > 1 then
     begin
       MaxLayerIdx := GetLastLayerIdx();
-      for LayerCnt := 1 to MaxLayerIdx do
+      for LayerCnt := 0 to MaxLayerIdx do
       begin
         if not(FLayers[LayerCnt].LinkedNeurons) then
         begin
