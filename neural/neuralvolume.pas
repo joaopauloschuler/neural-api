@@ -311,6 +311,8 @@ type
     // Encoding Functions
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure GroupedOneHotEncoding(aTokens: array of integer; Groups: integer); overload;
+    procedure ReverseGroupedOneHotEncoding(out aTokens: TNeuralIntegerArray; Groups: integer);
+    function ReverseGroupedOneHotEncodingOnPixel(Groups, X, Y: integer):integer;
     procedure OneHotEncoding(aTokens: string); overload;
     procedure OneHotEncodingReversed(aTokens: string); overload;
     procedure OneHotEncodingReversed(var aTokens: array of integer); overload;
@@ -6070,18 +6072,18 @@ procedure TVolume.GroupedOneHotEncoding(aTokens: array of integer;
   Groups: integer);
 var
   CntToken, MaxToken, Token: integer;
-  GroupSize, GroupCnt, TokenPos, TokenMod, TokenDiv: integer;
+  GroupSize, GroupCnt, MaxGroup, TokenPos, TokenMod, TokenDiv: integer;
 begin
   MaxToken := Length(aTokens) - 1;
   GroupSize := FDepth div Groups;
+  MaxGroup := Groups - 1;
   Self.Fill(0);
   if MaxToken <= SizeX then
   begin
     for CntToken := 0 to MaxToken do
     begin
       Token := aTokens[CntToken];
-      GroupCnt := 0;
-      while (Token > 0) do
+      for GroupCnt := 0 to MaxGroup do
       begin
         TokenDiv := Token div GroupSize;
         TokenMod := Token mod GroupSize;
@@ -6097,7 +6099,6 @@ begin
             '.');
         end;
         Token := TokenDiv;
-        GroupCnt := GroupCnt + 1;
       end;
     end;
   end
@@ -6105,6 +6106,99 @@ begin
   begin
     WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at GroupedOneHotEncoding.');
   end;
+end;
+
+procedure TVolume.ReverseGroupedOneHotEncoding(out aTokens: TNeuralIntegerArray; Groups: integer);
+var
+  CntToken, MaxToken, Token: integer;
+  GroupSize, MaxGroupSize, GroupCnt, MaxGroup, TokenMod: integer;
+  GroupSizePower: integer;
+  InitTokenPos: integer;
+  RawTokenPos: integer;
+  MaxValue: TNeuralFloat;
+  MaxTokenMod: integer;
+begin
+  // Calculate maximum token index
+  MaxToken := FSizeX - 1;
+  // Calculate size of each group
+  GroupSize := FDepth div Groups;
+  MaxGroupSize := GroupSize - 1;
+  // Calculate maximum group index
+  MaxGroup := Groups - 1;
+  // Initialize the tokens array with zeros
+  SetLength(aTokens, FSizeX);
+  for CntToken := 0 to MaxToken do
+    aTokens[CntToken] := 0;
+  // Iterate through the volume data to reconstruct tokens
+  for CntToken := 0 to MaxToken do
+  begin
+    Token := 0;
+    GroupSizePower := 1;
+    for GroupCnt := 0 to MaxGroup do
+    begin
+      InitTokenPos := GroupCnt * GroupSize;
+      RawTokenPos := GetRawPos(CntToken, 0, InitTokenPos);
+      MaxValue := FData[RawTokenPos];
+      MaxTokenMod := 0;
+      // Calculate the position within the group
+      for TokenMod := 1 to MaxGroupSize do
+      begin
+        if FData[RawTokenPos + TokenMod] > MaxValue then
+        begin
+          MaxValue := FData[RawTokenPos + TokenMod];
+          MaxTokenMod := TokenMod;
+        end;
+      end;
+      // Reconstruct the token by reversing the modulus and division
+      Token := Token + MaxTokenMod * GroupSizePower;
+      GroupSizePower := GroupSizePower * GroupSize;
+    end;
+    // Store the reconstructed token
+    aTokens[CntToken] := Token;
+  end;
+end;
+
+function TVolume.ReverseGroupedOneHotEncodingOnPixel(Groups, X, Y: integer): integer;
+var
+  CntToken, MaxToken, Token: integer;
+  GroupSize, MaxGroupSize, GroupCnt, MaxGroup, TokenMod: integer;
+  GroupSizePower: integer;
+  InitTokenPos: integer;
+  RawTokenPos: integer;
+  MaxValue: TNeuralFloat;
+  MaxTokenMod: integer;
+begin
+  // Calculate maximum token index
+  MaxToken := FSizeX - 1;
+  // Calculate size of each group
+  GroupSize := FDepth div Groups;
+  MaxGroupSize := GroupSize - 1;
+  // Calculate maximum group index
+  MaxGroup := Groups - 1;
+  begin
+    Token := 0;
+    GroupSizePower := 1;
+    for GroupCnt := 0 to MaxGroup do
+    begin
+      InitTokenPos := GroupCnt * GroupSize;
+      RawTokenPos := GetRawPos(X, Y, InitTokenPos);
+      MaxValue := FData[RawTokenPos];
+      MaxTokenMod := 0;
+      // Calculate the position within the group
+      for TokenMod := 1 to MaxGroupSize do
+      begin
+        if FData[RawTokenPos + TokenMod] > MaxValue then
+        begin
+          MaxValue := FData[RawTokenPos + TokenMod];
+          MaxTokenMod := TokenMod;
+        end;
+      end;
+      // Reconstruct the token by reversing the modulus and division
+      Token := Token + MaxTokenMod * GroupSizePower;
+      GroupSizePower := GroupSizePower * GroupSize;
+    end;
+  end;
+  Result := Token;
 end;
 
 procedure TVolume.OneHotEncoding(aTokens: string);
@@ -6532,7 +6626,7 @@ begin
   WriteLn;
 end;
 
-procedure TVolume.PrintXD(Digits, Decimals: integer);
+procedure TVolume.PrintXD(Digits: integer; Decimals: integer);
 var
   CX, CD: integer;
   AUX: TNeuralFloat;
