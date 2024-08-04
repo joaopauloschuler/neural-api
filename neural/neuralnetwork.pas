@@ -253,7 +253,7 @@ type
       // Returns the number of neurons in the layer.
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Multiplies all weights in the layer by value V.
-      procedure MulWeights(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      function MulWeights(V:TNeuralFloat): TNNetLayer;
       procedure MulInertia(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       // Clear all biases from all neurons in the layer.
@@ -1623,7 +1623,7 @@ type
         pSuppressBias: integer = 0;
         ChannelInterleaving: boolean = True): TNNetLayer;
       function AddGroupedDotProducts(A,B: TNNetLayer; Groups: integer; ChannelInterleaving: boolean): TNNetLayer;
-      function AddGroupedPointwiseSoftMax(Groups: integer; ChannelInterleaving: boolean): TNNetLayer;
+      function AddGroupedPointwiseSoftMax(Groups: integer; ChannelInterleaving: boolean; SkipBackpropDerivative: integer = 0): TNNetLayer;
       /// AddAutoGroupedPointwiseConv implements
       // pointwise convolutions of the kEffNet architecture
       // described on the paper: "Grouped Pointwise Convolutions Significantly
@@ -7034,6 +7034,7 @@ begin
 end;
 
 function TNNet.AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false): TNNetLayer;
+(*
 var
   W : TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -7065,6 +7066,45 @@ begin
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
     SetLength(EachGroupOutput, 0);
     Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousLayer.Output.Depth), TNNetReLUL.Create(-3,+3,0)] );
+  end;
+end;
+*)
+var
+  W : TNNetLayer; // WT, YT, Value
+  PreviousLayer: TNNetLayer;
+  PreviousDepth, InputChannelsPerGroup: integer;
+  EachGroupOutput: array of TNNetLayer;
+  HeadCnt: integer;
+  QueryGroup, KeyGroup, ValueGroup, ValueTGroup: TNNetLayer;
+  LocalQueryGroup, LocalKeyGroup, LocalValueGroup, LocalValueTGroup: TNNetLayer;
+begin
+  if Heads <= 1 then
+  begin
+    AddSingleHeadSelfAttention(Result, W, NoForward);
+  end
+  else
+  begin
+    PreviousLayer := GetLastLayer();
+    PreviousDepth := PreviousLayer.Output.Depth;
+    QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetCellMul.Create(),TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+    KeyGroup   := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetCellMul.Create(),TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+    ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetCellMul.Create(),TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+    SetLength(EachGroupOutput, Heads);
+    InputChannelsPerGroup := PreviousDepth div Heads;
+    for HeadCnt := 0 to Heads - 1 do
+    begin
+      LocalQueryGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), QueryGroup);
+      LocalKeyGroup   := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), KeyGroup);
+      LocalValueGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), ValueGroup);
+      LocalValueTGroup:= AddLayerAfter( TNNetTransposeXD.Create(), LocalValueGroup);
+      (*W := *)AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
+      W := AddLayer( TNNetReLUL.Create(-3,+3,0) );
+      (*Y := *)AddLayer( TNNetDotProducts.Create(LocalValueTGroup, W) );
+      EachGroupOutput[HeadCnt] := GetLastLayer();
+    end;
+    AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+    SetLength(EachGroupOutput, 0);
+    Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1), TNNetReLUL.Create(-3,+3,0)] );
   end;
 end;
 
@@ -12168,7 +12208,7 @@ begin
 end;
 
 function TNNet.AddGroupedPointwiseSoftMax(Groups: integer;
-  ChannelInterleaving: boolean): TNNetLayer;
+  ChannelInterleaving: boolean; SkipBackpropDerivative: integer): TNNetLayer;
 var
   PreviousLayer: TNNetLayer;
   InputChannelsPerGroup: integer;
@@ -12181,7 +12221,7 @@ begin
   InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Groups;
   if Groups = 1 then
   begin
-    Result := AddLayer( TNNetPointwiseSoftMax.Create() );
+    Result := AddLayer( TNNetPointwiseSoftMax.Create(SkipBackpropDerivative) );
   end;
   if Groups > 1 then
   begin
@@ -12190,7 +12230,7 @@ begin
       if ChannelInterleaving
         then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
         else AddLayerAfter( TNNetSplitChannels.Create(GroupCnt*InputChannelsPerGroup, InputChannelsPerGroup), PreviousLayer);
-      EachGroupOutput[GroupCnt] := AddLayer( TNNetPointwiseSoftMax.Create() );
+      EachGroupOutput[GroupCnt] := AddLayer( TNNetPointwiseSoftMax.Create(SkipBackpropDerivative) );
     end;
     Result := AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
   end;
@@ -14760,7 +14800,7 @@ var
   V: TNeuralFloat;
 begin
   V := Self.GetMaxAbsWeight();
-  if V > vMax then
+  if (V <> vMax) and (V>0) then
   begin
     Self.MulWeights(vMax/V);
   end;
@@ -14874,7 +14914,7 @@ begin
   else Result := FNeurons.Count;
 end;
 
-procedure TNNetLayer.MulWeights(V: TNeuralFloat);
+function TNNetLayer.MulWeights(V: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
@@ -14891,6 +14931,7 @@ begin
     end;
   end;
   AfterWeightUpdate();
+  Result := Self;
 end;
 
 procedure TNNetLayer.MulInertia(V: TNeuralFloat);
@@ -15637,8 +15678,11 @@ procedure TNNetNeuron.InitAdam(ParentLayer: TNNetLayer);
 begin
   FBackInertia2.Resize(FBackInertia);
   FDelta2.Resize(FDelta);
+  FBackInertia.Fill(0);
   FBackInertia2.Fill(0);
+  FDelta.Fill(0);
   FDelta2.Fill(0);
+  FBiasInertia := 0;
   FBiasInertia2 := 0;
   FParentLayer := ParentLayer;
 end;
