@@ -1,6 +1,6 @@
 (*
 neuralfit
-Copyright (C) 2017 Joao Paulo Schwarz Schuler
+Copyright (C) 2024 Joao Paulo Schwarz Schuler
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -43,6 +43,7 @@ type
     FNN: TNNet;
     FFit: TNeuralFitBase;
   public
+    procedure ReSet(); virtual;
     procedure SetNN(pNN: TNNet; pFit: TNeuralFitBase);
     procedure Optimize(); virtual; abstract;
     procedure ForceDeltaLimists();
@@ -51,6 +52,7 @@ type
   // SGD optimization method
   TNeuralOptimizerSGD = class(TNeuralOptimizer)
   public
+    procedure Reset(); override;
     procedure Optimize(); override;
   end;
 
@@ -70,6 +72,7 @@ type
     function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
 
     procedure Optimize(); override;
+    procedure ReSet(); override;
   end;
 
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
@@ -1783,6 +1786,11 @@ end;
 
 { TNeuralOptimizer }
 
+procedure TNeuralOptimizer.ReSet;
+begin
+  // This method may be implemented in descending classes.
+end;
+
 procedure TNeuralOptimizer.SetNN(pNN: TNNet; pFit: TNeuralFitBase);
 begin
   FNN := pNN;
@@ -1815,6 +1823,12 @@ begin
 end;
 
 { TNeuralOptimizerSGD }
+
+procedure TNeuralOptimizerSGD.Reset();
+begin
+  inherited Reset;
+  FNN.ClearInertia();
+end;
 
 procedure TNeuralOptimizerSGD.Optimize();
 begin
@@ -1850,12 +1864,18 @@ procedure TNeuralOptimizerAdam.Optimize();
 begin
   if not(FAdamInitialized) then
   begin
-    InitAdam(FBeta1, FBeta2, FEpsilon);
+    ReSet();
     FAdamInitialized := true;
   end;
   FNN.CalcAdamDelta();
   ForceDeltaLimists();
   FNN.UpdateWeightsAdam();
+end;
+
+procedure TNeuralOptimizerAdam.ReSet;
+begin
+  inherited ReSet;
+  InitAdam(FBeta1, FBeta2, FEpsilon);
 end;
 
 { TNeuralFitBase }
@@ -1992,7 +2012,14 @@ begin
     FCurrentLearningRate := fNewLearningRate;
     FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
     FNN.SetLearningRate(FCurrentLearningRate, FInertia);
-    FNN.ClearInertia(); //TODO: this may be a problem for adam.
+    if Assigned(FOptimizer) then
+    begin
+      if (not Assigned(FOptimizer.FNN)) then
+      begin
+        FOptimizer.SetNN(FNN, Self);
+      end;
+      FOptimizer.ReSet();
+    end;
     if FVerbose then
     MessageProc
     (
