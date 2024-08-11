@@ -170,7 +170,8 @@ type
     procedure SetMax(Value: TNeuralFloat); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Mul(x, y, d: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Mul(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
-    class procedure Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+    class procedure Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; pSize: integer); overload;
+    class procedure Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload;
     procedure Mul(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulAtDepth(pDepth: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Pow(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -416,6 +417,7 @@ type
       procedure DotProductsPointwise(VAs, VBs: TNNetVolume; NoForward:boolean = false);
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure PointwiseNorm();
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -449,6 +451,7 @@ type
       function DotProduct(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
       class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Mul(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; pSize: integer); overload;
       class procedure Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulAdd(Value: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulAdd(Original1, Original2: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -3998,6 +4001,21 @@ begin
     {$ENDIF}
 end;
 
+class procedure TVolume.Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat;
+  pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := pSize - 1;
+  for I := 0 to vHigh do
+    {$IFDEF FPC}
+    PtrA^[I] *= MulOp;
+    {$ELSE}
+    PtrA^[I] := PtrA^[I] * MulOp;
+    {$ENDIF}
+end;
+
 class procedure TVolume.Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer);
 var
   I: integer;
@@ -5224,16 +5242,18 @@ begin
   begin
     auxSingle := FData[0];
     FLastPos := 0;
-    Result := Abs(auxSingle);
+    Result := auxSingle;
+    if auxSingle < 0 then auxSingle := -auxSingle;
     vHigh := High(FData);
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
       begin
         auxSingle := FData[I];
-        if Abs(auxSingle) > Result then
+        if auxSingle < 0 then auxSingle := -auxSingle;
+        if auxSingle > Result then
         begin
-          Result := Abs(auxSingle);
+          Result := auxSingle;
           FLastPos := I;
         end;
       end;
@@ -5969,6 +5989,29 @@ begin
             Inc(I);
           end;
         end;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetVolume.PointwiseNorm();
+var
+  StartPointPtr: pointer;
+  MaxX, MaxY: integer;
+  CountX, CountY: integer;
+  Modulus: TNeuralFloat;
+begin
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  for CountX := 0 to MaxX do
+  begin
+    for CountY := 0 to MaxY do
+    begin
+      StartPointPtr := GetRawPtr(CountX, CountY);
+      Modulus := Sqrt(DotProduct(StartPointPtr, StartPointPtr, FDepth));
+      if Modulus > 0 then
+      begin
+        Mul(StartPointPtr, 1/Sqrt(Modulus), FDepth);
       end;
     end;
   end;
@@ -8126,6 +8169,11 @@ end;
 
 procedure TNNetVolume.Mul(Original: TNNetVolume);
 begin
+  {$IFDEF Debug}
+  if Original.Size <> Self.Size then
+    raise Exception.Create('Sizes don''t match at TNNetVolume.Mul: ' +
+      IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
+  {$ENDIF}
   Mul(FDataPtr, Original.DataPtr, Size);
 end;
 
@@ -11011,6 +11059,12 @@ begin
     end;
 end;
 
+class procedure TNNetVolume.Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat;
+  pSize: integer);
+begin
+  AVXMul(PtrA, MulOp, pSize);
+end;
+
 class procedure TNNetVolume.Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer);
 begin
   AVXMul(PtrA, PtrB, pSize);
@@ -11018,6 +11072,15 @@ end;
 
 procedure TNNetVolume.MulAdd(Value: TNeuralFloat; Original: TNNetVolume);
 begin
+  {$IFDEF Debug}
+  if (Original.Size <> Self.Size) then
+  begin
+    raise Exception.Create('Sizes don''t match at MulAdd: ' +
+      IntToStr(Self.Size) + ' and ' +
+      IntToStr(Original.Size) +
+      '.');
+  end;
+  {$ENDIF}
   AVXMulAdd(FDataPtr, Original.FDataPtr, Value, FSize);
 end;
 
@@ -11030,7 +11093,7 @@ begin
       IntToStr(Self.Size) + ', ' +
       IntToStr(Original1.Size) + ' and ' +
       IntToStr(Original2.Size) +
-      ' .');
+      '.');
   end;
   {$ENDIF}
   AVXMulAdd(FDataPtr, Original1.DataPtr, Original2.DataPtr, FSize);
@@ -11039,6 +11102,11 @@ end;
 procedure TNNetVolume.MulMulAdd(Value1, Value2: TNeuralFloat;
   Original: TNNetVolume);
 begin
+  {$IFDEF Debug}
+  if Original.Size <> Self.Size then
+    raise Exception.Create('Sizes don''t match at TNNetVolume.MulMulAdd: ' +
+      IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + '.');
+  {$ENDIF}
   AVXMulMulAdd(FDataPtr, Original.FDataPtr, Value1, Value2, FSize);
 end;
 
@@ -11185,6 +11253,11 @@ var
   SourceRawPos, DestRawPos: pointer;
   RowSize: integer;
 begin
+  {$IFDEF Debug}
+  if Original.Size <> Self.Size then
+    raise Exception.Create('Sizes don''t match at TNNetVolume.CopyNoChecks: ' +
+      IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
+  {$ENDIF}
   RowSize := Size;
   SourceRawPos := Addr(Original.FData[0]);
   DestRawPos := Addr(FData[0]);
