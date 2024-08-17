@@ -122,6 +122,7 @@ type
       FLogEveryBatches: integer;
       FFileNameBase: string;
       FClipDelta: single;
+      FClipNorm: single;
       FTargetAccuracy: single;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
@@ -142,6 +143,8 @@ type
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
       procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
+      procedure SetClipDelta(Value: TNeuralFloat);
+      procedure SetClipNorm(Value: TNeuralFloat);
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -155,7 +158,8 @@ type
       property AvgNN: TNNet read FAvgWeight;
       /// ClipDelta is a per neuron absolute max normalization.
       // This is useful for This is useful for making SGD numerically stable.
-      property ClipDelta: single read FClipDelta write FClipDelta;
+      property ClipDelta: single read FClipDelta write SetClipDelta;
+      property ClipNorm: single read FClipNorm write SetClipNorm;
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentStep: integer read FCurrentStep;
       property CurrentLearningRate: single read FCurrentLearningRate;
@@ -887,6 +891,8 @@ begin
   begin
     MessageProc(
       'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
+      ' Clip norm:' + FloatToStrF(FClipNorm,ffFixed,8,6) +
+      ' Clip delta:' + FloatToStrF(FClipDelta,ffFixed,8,6) +
       ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
@@ -1803,7 +1809,10 @@ procedure TNeuralOptimizer.ForceDeltaLimists();
 var
   MaxDelta: TNeuralFloat;
 begin
-  if FFit.FClipDelta > 0 then
+  if FFit.ClipNorm > 0 then
+  begin
+    FNN.NormalizeNormPerLayer(FFit.ClipNorm);
+  end else if FFit.FClipDelta > 0 then
   begin
     //MaxDelta := FNN.ForceMaxAbsoluteDelta(FFit.FClipDelta);
     MaxDelta := FNN.NormalizeMinMaxAbsoluteDeltaPerLayer(0, FFit.FClipDelta);
@@ -1913,6 +1922,7 @@ begin
   FMinBackpropagationErrorProportion := 0.25;
   FInertia := 0.9;
   FClipDelta := 0.0;
+  FClipNorm := 1.0;
   FFileNameBase := 'autosave';
   FL2Decay := 0.0000001;
   FTargetAccuracy := 1;
@@ -2034,6 +2044,18 @@ begin
   FOptimizer := pOptimizer;
   FOptimizerOwned := false;
   FOptimizer.SetNN(FNN, Self);
+end;
+
+procedure TNeuralFitBase.SetClipDelta(Value: TNeuralFloat);
+begin
+  FClipDelta := Value;
+  FClipNorm  := 0.0;
+end;
+
+procedure TNeuralFitBase.SetClipNorm(Value: TNeuralFloat);
+begin
+  FClipDelta := 0.0;
+  FClipNorm  := Value;
 end;
 
 { TNeuralImageFit }
@@ -2195,6 +2217,8 @@ begin
   begin
     MessageProc(
       'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
+      ' Clip norm:' + FloatToStrF(FClipNorm,ffFixed,8,6) +
+      ' Clip delta:' + FloatToStrF(FClipDelta,ffFixed,8,6) +
       ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
       ' Batch size:' + IntToStr(FBatchSize) +
