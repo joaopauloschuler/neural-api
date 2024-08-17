@@ -188,6 +188,7 @@ type
     procedure Divi(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMinRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
+    procedure ForceMaxMagnitude(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxAbs(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForcePositive(); {$IFDEF Release} inline; {$ENDIF}
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
@@ -417,7 +418,8 @@ type
       procedure DotProductsPointwise(VAs, VBs: TNNetVolume; NoForward:boolean = false);
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
-      procedure PointwiseNorm();
+      procedure PointwiseNorm(pNorms: TNNetVolume = nil);
+      procedure PointwiseMul(pNorms: TNNetVolume);
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -4324,6 +4326,14 @@ begin
     FData[I] := NeuronForceRange(FData[I], Value);
 end;
 
+procedure TVolume.ForceMaxMagnitude(Value: T);
+var
+  VNorm: Single;
+begin
+  VNorm := GetMagnitude();
+  if VNorm > Value then Mul(Value/VNorm);
+end;
+
 procedure TVolume.ForceMaxAbs(Value: T);
 var
   VMaxAbs, VFix: Single;
@@ -5994,13 +6004,18 @@ begin
   end;
 end;
 
-procedure TNNetVolume.PointwiseNorm();
+procedure TNNetVolume.PointwiseNorm(pNorms: TNNetVolume = nil);
 var
   StartPointPtr: pointer;
   MaxX, MaxY: integer;
   CountX, CountY: integer;
-  Modulus: TNeuralFloat;
+  Modulus, Multiplier: TNeuralFloat;
 begin
+  if Assigned(pNorms) then
+  begin
+    pNorms.ReSize(SizeX, SizeY, 1);
+    pNorms.Fill(1);
+  end;
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
   for CountX := 0 to MaxX do
@@ -6011,7 +6026,33 @@ begin
       Modulus := Sqrt(DotProduct(StartPointPtr, StartPointPtr, FDepth));
       if Modulus > 0 then
       begin
-        Mul(StartPointPtr, 1/Sqrt(Modulus), FDepth);
+        Multiplier := 1/Modulus;
+        if Assigned(pNorms) then pNorms[CountX, CountY, 0] := Multiplier;
+        Mul(StartPointPtr, Multiplier, FDepth);
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetVolume.PointwiseMul(pNorms: TNNetVolume);
+var
+  StartPointPtr: pointer;
+  MaxX, MaxY: integer;
+  CountX, CountY: integer;
+  Modulus: TNeuralFloat;
+begin
+  if Assigned(pNorms) then pNorms.ReSize(SizeX, SizeY, 1);
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  for CountX := 0 to MaxX do
+  begin
+    for CountY := 0 to MaxY do
+    begin
+      StartPointPtr := GetRawPtr(CountX, CountY);
+      Modulus := pNorms[CountX, CountY, 0];
+      if Modulus <> 1 then
+      begin
+        Mul(StartPointPtr, Modulus, FDepth);
       end;
     end;
   end;
