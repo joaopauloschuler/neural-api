@@ -207,7 +207,7 @@ type
     procedure CopyPadding(Original: TVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
     procedure CopyCropping(Original: TVolume; StartX, StartY, pSizeX, pSizeY: integer);
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
-    procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF}
+    procedure CopyNoChecks(Original: TVolume); overload;
     procedure CopyNoChecks(var Original: array of byte); overload;
     procedure CopyNoChecksIntArr(var Original: array of integer); overload;
     procedure CopyReversedNoChecksIntArr(var Original: array of integer); overload;
@@ -293,7 +293,7 @@ type
 
     // bit operations
     procedure CopyAsBits(var Original: array of byte; pFalse: T = -0.5; pTrue: T = +0.5; CanResize: boolean = True); overload;
-    procedure CopyAsBits(Original: string; pFalse: T = -0.5; pTrue: T = +0.5; CanResize: boolean = True);
+    procedure CopyAsBits(Original: string; pFalse: T = -0.5; pTrue: T = +0.5; CanResize: boolean = True); overload;
     procedure CopyAsBitsReversed(Original: string; pFalse: T = -0.5; pTrue: T = +0.5);
     procedure ReadAsBits(var Dest: array of byte; Threshold: T = 0.0);
 
@@ -1910,69 +1910,6 @@ begin
   Result := Origin.GetClass();
 end;
 
-{ TStringStringList }
-
-procedure TStringStringList.LoadFromCsv(filename: string;
-  SkipFirstLine:boolean = true;
-  KeyId: integer = -1;
-  Separator: char = ',');
-var
-  Sep: TStringList;
-  CurrentLine: string;
-  KeyStr: string;
-  FileHandler: TextFile;
-  LineCnt: integer;
-begin
-  Self.Sorted := false;
-  Self.SortedList := false;
-  AssignFile(FileHandler, filename);
-  Reset(FileHandler);
-  LineCnt := 0;
-  while (not Eof(FileHandler)) do // and (LineCnt<10000)
-  begin
-    ReadLn(FileHandler, CurrentLine);
-    if not( (LineCnt = 0) and (SkipFirstLine) ) then
-    begin
-      Sep := CreateTokenizedStringList(Separator);
-      Sep.DelimitedText := CurrentLine;
-      if (KeyId = -1) then
-      begin
-        KeyStr := IntToStr(LineCnt);
-      end
-      else
-      begin
-        KeyStr := Sep[KeyId];
-      end;
-      AddObject(KeyStr, TObject(Sep));
-    end;
-    LineCnt := LineCnt + 1;
-    // debug line only:
-    //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
-  end;
-  CloseFile(FileHandler);
-end;
-
-procedure TStringStringList.SaveToCsv(filename: string;
-  Separator: char = ',');
-var
-  RowCnt: integer;
-  MaxCnt: integer;
-  FileHandler: TextFile;
-begin
-  MaxCnt := Count - 1;
-  if MaxCnt > -1 then
-  begin
-    AssignFile(FileHandler, filename);
-    ReWrite(FileHandler);
-    for RowCnt := 0 to MaxCnt do
-    begin
-      List[RowCnt].Delimiter := Separator;
-      WriteLn(FileHandler, List[RowCnt].DelimitedText);
-    end;
-    CloseFile(FileHandler);
-  end;
-end;
-
 { TStringVolumeList }
 
 function TStringVolumeList.CreateNonZeroPositionLists: TStringIntegerList;
@@ -2091,6 +2028,7 @@ end;
 
 // This function was coded by chatGPT4.
 function TNNetStringList.GetDelimitedTextFast: string;
+{$IFDEF FPC}
 var
   I: Integer;
   S: String;
@@ -2133,6 +2071,11 @@ begin
     StringBuilder.Free;
   end;
 end;
+{$ELSE}
+begin
+  Result := DelimitedText;
+end;
+{$ENDIF}
 
 procedure TNNetStringList.LoadLargeFile(Filename: string);
 var
@@ -2204,6 +2147,70 @@ procedure TStringsObj.AddStringObj(const S: string);
 begin
   Self.AddObject(S, TObj.Create);
 end;
+
+{ TStringStringList }
+
+procedure TStringStringList.LoadFromCsv(filename: string;
+  SkipFirstLine:boolean = true;
+  KeyId: integer = -1;
+  Separator: char = ',');
+var
+  Sep: TStringList;
+  CurrentLine: string;
+  KeyStr: string;
+  FileHandler: TextFile;
+  LineCnt: integer;
+begin
+  Self.Sorted := false;
+  Self.SortedList := false;
+  AssignFile(FileHandler, filename);
+  Reset(FileHandler);
+  LineCnt := 0;
+  while (not Eof(FileHandler)) do // and (LineCnt<10000)
+  begin
+    ReadLn(FileHandler, CurrentLine);
+    if not( (LineCnt = 0) and (SkipFirstLine) ) then
+    begin
+      Sep := CreateTokenizedStringList(Separator);
+      Sep.DelimitedText := CurrentLine;
+      if (KeyId = -1) then
+      begin
+        KeyStr := IntToStr(LineCnt);
+      end
+      else
+      begin
+        KeyStr := Sep[KeyId];
+      end;
+      AddObject(KeyStr, TObject(Sep));
+    end;
+    LineCnt := LineCnt + 1;
+    // debug line only:
+    //if LineCnt mod 100000 = 0 then WriteLn(LineCnt);
+  end;
+  CloseFile(FileHandler);
+end;
+
+procedure TStringStringList.SaveToCsv(filename: string;
+  Separator: char = ',');
+var
+  RowCnt: integer;
+  MaxCnt: integer;
+  FileHandler: TextFile;
+begin
+  MaxCnt := Count - 1;
+  if MaxCnt > -1 then
+  begin
+    AssignFile(FileHandler, filename);
+    ReWrite(FileHandler);
+    for RowCnt := 0 to MaxCnt do
+    begin
+      List[RowCnt].Delimiter := Separator;
+      WriteLn(FileHandler, List[RowCnt].DelimitedText);
+    end;
+    CloseFile(FileHandler);
+  end;
+end;
+
 {$ELSE}
 function TStringsObj.GetList(Index: Integer): TObject;
 begin

@@ -58,6 +58,7 @@ type
 
   // Adam optimization method
   TNeuralOptimizerAdam = class(TNeuralOptimizer)
+  protected
     FBeta1: TNeuralFloat;
     FBeta2: TNeuralFloat;
     FEpsilon: TNeuralFloat;

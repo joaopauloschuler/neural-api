@@ -53,13 +53,14 @@ uses
 
 const
   csMaxInterleavedSize: integer = 95;
+  csNNetMaxParameterIdx = 7;
 
 type
-  TNNet = class;
   TNNetLayer = class;
+  TNNet = class;
 
   { TNNetNeuron }
-  TNNetNeuron = class (TMObject)
+  TNNetNeuron = class(TMObject)
     protected
       FWeights: TNNetVolume;
       FBackInertia: TNNetVolume;
@@ -142,10 +143,6 @@ type
       procedure InitForDebug();
   end;
 
-  const
-    csNNetMaxParameterIdx = 7;
-
-  type
   /// neural network layer
   TNNetLayer = class(TMObject)
     protected
@@ -2473,7 +2470,7 @@ begin
 end;
 
 { TNNetPointwiseSoftMax }
-constructor TNNetPointwiseSoftMax.Create(SkipBackpropDerivative: integer; NoForward: integer = 0);
+constructor TNNetPointwiseSoftMax.Create(SkipBackpropDerivative: integer = 0; NoForward: integer = 0);
 begin
   inherited Create();
   FSkipBackpropDerivative := (SkipBackpropDerivative > 0);
@@ -2784,7 +2781,7 @@ end;
 constructor TNNetMaxPoolWithPosition.Create(pPoolSize: integer;
   pStride: integer; pPadding: integer;
   pLogPosX: integer; pLogPosY: integer;
-  pMaxBackpropX: integer = 0);
+  pMaxBackpropX: integer);
 begin
   inherited Create(pPoolSize, pStride, pPadding);
   FStruct[3] := pLogPosX;
@@ -7070,43 +7067,6 @@ begin
 end;
 
 function TNNet.AddSelfAttention(Heads: integer; NoForward:boolean = false): TNNetLayer;
-(*
-var
-  W, Query, Key, Value, ValueT: TNNetLayer; // WT, YT, Value
-  PreviousLayer: TNNetLayer;
-  InputChannelsPerGroup: integer;
-  EachGroupOutput: array of TNNetLayer;
-  HeadCnt: integer;
-  QueryGroup, KeyGroup, ValueGroup, ValueTGroup: TNNetLayer;
-begin
-  if Heads <= 1 then
-  begin
-    AddSingleHeadSelfAttention(Result, W, NoForward);
-  end
-  else
-  begin
-    PreviousLayer := GetLastLayer();
-    SetLength(EachGroupOutput, Heads);
-    InputChannelsPerGroup := PreviousLayer.FOutput.Depth div Heads;
-    for HeadCnt := 0 to Heads - 1 do
-    begin
-      QueryGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 0), PreviousLayer);
-      KeyGroup := AddLayerAfter(   TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 0), PreviousLayer);
-      ValueGroup := AddLayerAfter( TNNetPointwiseConvLinear.Create(InputChannelsPerGroup, 0), PreviousLayer);
-      ValueTGroup := AddLayer( TNNetTransposeXD.Create() );
-      (*W := *)AddLayer( TNNetDotProducts.Create(QueryGroup, KeyGroup, NoForward) );
-      (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
-      (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
-      W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
-      (*Y := *)AddLayer( TNNetDotProducts.Create(ValueTGroup, W) );
-      EachGroupOutput[HeadCnt] := GetLastLayer();
-    end;
-    AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
-    SetLength(EachGroupOutput, 0);
-    Result := AddLayer( TNNetPointwiseConvLinear.Create(PreviousLayer.FOutput.Depth) );
-  end;
-end;
-*)
 var
   W: TNNetLayer;
   PreviousLayer: TNNetLayer;
@@ -12543,7 +12503,7 @@ function TNNet.AddAutoGroupedPointwiseConv2(
   pNumFeatures: integer; HasNormalization: boolean; pSuppressBias: integer;
   AlwaysIntergroup: boolean;
   HasIntergroup: boolean;
-  PrevLayer: TNNetLayer = nil
+  PrevLayer: TNNetLayer
   ): TNNetLayer;
 var
   MaxGroupCount, SecondMaxGroupCount: integer;

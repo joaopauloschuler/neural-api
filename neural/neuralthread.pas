@@ -183,15 +183,15 @@ begin
   {$ENDIF}
 end;
 
+procedure DebugThreadCount;
+begin
+  WriteLn('CPU threads reported by the operating system: ', NeuralDefaultThreadCount,'.');
+end;
+
 {$IFDEF FPC}
 function GetProcessId(): integer;
 begin
   GetProcessId := {$IFDEF WINDOWS}GetCurrentProcessId(){$ELSE}fpgetppid(){$ENDIF};
-end;
-
-procedure DebugThreadCount;
-begin
-  WriteLn('CPU threads reported by the operating system: ', NeuralDefaultThreadCount,'.');
 end;
 
 {$ELSE}

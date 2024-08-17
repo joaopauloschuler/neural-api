@@ -462,7 +462,7 @@ var
   InputVolume, OutputVolume: TNNetVolume;
   NextTokenInt: integer;
   NextTokenStr: string;
-  Tokens: array of integer;
+  Tokens: TNeuralIntegerArray;
   TokenCnt: integer;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
@@ -497,7 +497,7 @@ var
   InputVolume, OutputVolume: TNNetVolume;
   NextTokenInt: integer;
   NextTokenStr: string;
-  Tokens: array of integer;
+  Tokens: TNeuralIntegerArray;
   TokenCnt: integer;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
@@ -533,7 +533,7 @@ var
   SampleLen: integer;
   SampleCutPosition: integer;
   ExpectedTokenInt: integer;
-  AIntegerArray: array of integer;
+  AIntegerArray: TNeuralIntegerArray;
   pInput, pOutput: TNNetVolume;
   CntHit, CntMiss: integer;
   InputString: string;
@@ -553,7 +553,11 @@ begin
     // The expected token is the next character in the string
     ExpectedTokenInt := Dataset[SampleId][SampleCutPosition];
     // Encode the input and output volumes
+    {$IFDEF FPC}
     AIntegerArray := Copy(Dataset[SampleId], 0, SampleCutPosition);
+    {$ELSE}
+    //TODO: fix this
+    {$ENDIF}
     pInput.Fill(0);
     pInput.CopyReversedNoChecksIntArr( AIntegerArray );
     NN.Compute(pInput, pOutput);
