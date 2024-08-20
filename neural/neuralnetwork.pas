@@ -436,7 +436,7 @@ type
   TNNetIdentity = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-      procedure BackpropagateNoTest();
+      procedure BackpropagateNoTest(); virtual;
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -920,6 +920,7 @@ type
   TNNetChannelZeroCenter = class(TNNetChannelShiftBase)
     public
       procedure Backpropagate(); override;
+      procedure BackpropagateNoTest(); override;
       procedure ComputeL2Decay(); override;
   end;
 
@@ -5910,6 +5911,11 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  BackpropagateNoTest();
+end;
+
+procedure TNNetChannelZeroCenter.BackpropagateNoTest;
+begin
   StartTime := Now();
   FAuxDepth.Fill(0);
   FAuxDepth.AddSumChannel(FOutput);
@@ -5920,7 +5926,7 @@ begin
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-  BackpropagateNoTest();
+  inherited BackpropagateNoTest;
 end;
 
 procedure TNNetChannelZeroCenter.ComputeL2Decay();
