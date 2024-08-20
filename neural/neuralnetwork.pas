@@ -927,6 +927,19 @@ type
       procedure ComputeL2Decay(); override;
   end;
 
+  { TNNetChannelNorm }
+  // This layer does a channel normalization without trainable parameter
+  TNNetChannelNorm = class(TNNetChannelShiftBase)
+    private
+      FAuxOutput: TNNetVolume;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer does zero centering and standard normalization per channel with
   // trainable parameters.
   TNNetChannelStdNormalization = class(TNNetChannelZeroCenter)
@@ -5935,6 +5948,55 @@ end;
 procedure TNNetChannelZeroCenter.ComputeL2Decay();
 begin
   // it makes no sense to compute L2 decay on a normalization layer.
+end;
+
+{ TNNetChannelNorm }
+
+procedure TNNetChannelNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FAuxDepth.ReSize(1, 1, FOutput.Depth);
+end;
+
+constructor TNNetChannelNorm.Create;
+begin
+  inherited Create();
+  FAuxOutput := TNNetVolume.Create();
+end;
+
+destructor TNNetChannelNorm.Destroy;
+begin
+  FAuxOutput.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetChannelNorm.Compute;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  inherited Compute;
+  FAuxOutput.Copy(FOutput);
+  FAuxOutput.Mul(FAuxOutput);
+  FAuxDepth.Fill(0);
+  FAuxDepth.AddSumChannel(FAuxOutput);
+  FAuxDepth.VSqrt();
+  FAuxDepth.PowMinus1();
+  FOutput.MulChannels(FAuxDepth);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetChannelNorm.Backpropagate;
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  FOutputError.MulChannels(FAuxDepth);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetChannelBias }
@@ -12297,6 +12359,7 @@ begin
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
+      'TNNetChannelNorm':           Result := TNNetChannelNorm.Create();
       'TNNetScaleLearning' :        Result := TNNetScaleLearning.Create();
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
@@ -12404,6 +12467,7 @@ begin
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
+      if S[0] = 'TNNetChannelNorm' then Result := TNNetChannelNorm.Create() else
       if S[0] = 'TNNetScaleLearning' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
