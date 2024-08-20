@@ -731,10 +731,13 @@ type
     procedure Compute(); override;
   end;
 
+  { TNNetAddNoiseBase }
+  // TNNetAddNoiseBase is a base class. Do not use it directly.
   TNNetAddNoiseBase = class(TNNetIdentity)
   protected
     FEnabled: boolean;
   public
+    constructor Create(); override;
     property Enabled:boolean read FEnabled write FEnabled;
   end;
 
@@ -5905,8 +5908,6 @@ end;
 
 { TNNetChannelZeroCenter }
 procedure TNNetChannelZeroCenter.Backpropagate();
-var
-  StartTime: double;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -5915,6 +5916,8 @@ begin
 end;
 
 procedure TNNetChannelZeroCenter.BackpropagateNoTest;
+var
+  StartTime: double;
 begin
   StartTime := Now();
   FAuxDepth.Fill(0);
@@ -11996,6 +11999,13 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetAddNoiseBase }
+constructor TNNetAddNoiseBase.Create;
+begin
+  inherited Create;
+  FEnabled := false;
 end;
 
 procedure TNNetInputBase.Compute;

@@ -1570,7 +1570,6 @@ begin
     if Assigned(FLossFn)
       then LocalTotalLoss := LocalTotalLoss + FLossFn(vOutput, pOutput, Index);
   end; // of for
-  LocalNN.EnableDropouts(true);
 
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
   FGlobalHit       := FGlobalHit + LocalHit;
@@ -2858,7 +2857,6 @@ begin
       Inc(LocalMiss);
     end;
   end; // of for
-  LocalNN.EnableDropouts(true);
 
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
   FGlobalHit       := FGlobalHit + LocalHit;
