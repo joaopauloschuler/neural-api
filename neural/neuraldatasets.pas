@@ -556,7 +556,10 @@ begin
     {$IFDEF FPC}
     AIntegerArray := Copy(Dataset[SampleId], 0, SampleCutPosition);
     {$ELSE}
-    //TODO: fix this
+    // This portion of code was coded by https://chatgpt.com/g/g-bqMxEDpIg-neural-api-free-pascal-developer
+    SetLength(AIntegerArray, SampleCutPosition);
+    if SampleCutPosition > 0 then
+    Move(Dataset[SampleId][0], AIntegerArray[0], SampleCutPosition * SizeOf(Integer));
     {$ENDIF}
     pInput.Fill(0);
     pInput.CopyReversedNoChecksIntArr( AIntegerArray );
@@ -788,7 +791,7 @@ begin
     {$IFDEF Debug}
     Self.LoadImages_NTL(0,1);
     {$ELSE}
-    NTL.StartProc(@Self.LoadImages_NTL);
+    NTL.StartProc({$IFDEF FPC}@{$ENDIF}Self.LoadImages_NTL);
     {$ENDIF}
   end;
   NTL.Free;
