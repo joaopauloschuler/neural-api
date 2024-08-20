@@ -175,6 +175,7 @@ type
     procedure Mul(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulAtDepth(pDepth: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Pow(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
+    procedure PowMinus1();
     procedure VSqrt(); {$IFDEF Release} inline; {$ENDIF}
     procedure MulAdd(Value: T; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulMulAdd(Value1, Value2: T; Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -4086,6 +4087,18 @@ begin
     vHigh := High(FData);
     for I := 0 to vHigh do
       FData[I] := Power(FData[I],Value);
+  end;
+end;
+
+procedure TVolume.PowMinus1();
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := High(FData);
+  for I := 0 to vHigh do
+  begin
+    if FData[I] <> 0 then FData[I] := (1/FData[I]);
   end;
 end;
 
