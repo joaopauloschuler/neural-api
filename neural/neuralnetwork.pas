@@ -918,7 +918,7 @@ type
 
   /// This layer zero centers the output. This layer placed
   // before convolutional layers can speed up learning A LOT. Use
-  // this layer in combination with batch update and NormalizeMaxAbsoluteDelta()
+  // this layer in combination with batch update or default ClipNorm
   // as it can produce spikes in the learning provoking overflow.
   TNNetChannelZeroCenter = class(TNNetChannelShiftBase)
     public
@@ -928,7 +928,8 @@ type
   end;
 
   { TNNetChannelNorm }
-  // This layer does a channel normalization without trainable parameter
+  // TNNetChannelNorm has not been tested. Do not use it.
+  // This layer does a channel normalization without zero centering and trainable parameters.
   TNNetChannelNorm = class(TNNetChannelShiftBase)
     private
       FAuxOutput: TNNetVolume;
@@ -1717,7 +1718,7 @@ type
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
-      function AddSelfAttention(Heads: integer; NoForward:boolean = false): TNNetLayer;
+      function AddSelfAttention(Heads: integer; NoForward:boolean = false; HasNorm: boolean = False): TNNetLayer;
       function AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false; CellMul: boolean = True; HasNorm: boolean = False): TNNetLayer;
       function AddGroupedSelfAttentionCAI(Heads: integer; NoForward:boolean = false; CellMul: boolean = True; HasNorm: boolean = False): TNNetLayer;
       procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; NoForward:boolean = false; HasNorm: boolean = False);
@@ -5981,6 +5982,7 @@ begin
   FAuxDepth.Fill(0);
   FAuxDepth.AddSumChannel(FAuxOutput);
   FAuxDepth.VSqrt();
+  FAuxDepth.Divi(FOutputChannelSize);
   FAuxDepth.PowMinus1();
   FOutput.MulChannels(FAuxDepth);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -7140,7 +7142,8 @@ begin
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
-function TNNet.AddSelfAttention(Heads: integer; NoForward:boolean = false): TNNetLayer;
+function TNNet.AddSelfAttention(Heads: integer; NoForward:boolean = false;
+  HasNorm: boolean = False): TNNetLayer;
 var
   W: TNNetLayer;
   PreviousLayer: TNNetLayer;
@@ -7158,27 +7161,46 @@ begin
   begin
     PreviousLayer := GetLastLayer();
     PreviousDepth := PreviousLayer.Output.Depth;
-    QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
-    KeyGroup := AddLayerAfter(   [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
-    ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetReLUL.Create(-3,+3,0)], PreviousLayer);
+    QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+    KeyGroup   := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+    ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+    if not HasNorm then
+    begin
+      QueryGroup := AddLayerAfter( [TNNetReLUL.Create(-3,+3,0)], QueryGroup);
+      KeyGroup   := AddLayerAfter( [TNNetReLUL.Create(-3,+3,0)], KeyGroup);
+      ValueGroup := AddLayerAfter( [TNNetReLUL.Create(-3,+3,0)], ValueGroup);
+    end;
     SetLength(EachGroupOutput, Heads);
     InputChannelsPerGroup := PreviousDepth div Heads;
     for HeadCnt := 0 to Heads - 1 do
     begin
-      LocalQueryGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), QueryGroup);
-      LocalKeyGroup   := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), KeyGroup);
-      LocalValueGroup := AddLayerAfter( TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), ValueGroup);
+      if HasNorm then
+      begin
+        LocalQueryGroup := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), TNNetPointwiseNorm.Create()], QueryGroup);
+        LocalKeyGroup   := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), TNNetPointwiseNorm.Create()], KeyGroup);
+        LocalValueGroup := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup ), TNNetPointwiseNorm.Create()], ValueGroup);
+      end
+      else
+      begin
+        LocalQueryGroup := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup )], QueryGroup);
+        LocalKeyGroup   := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup )], KeyGroup);
+        LocalValueGroup := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup )], ValueGroup);
+      end;
       LocalValueTGroup:= AddLayerAfter( TNNetTransposeXD.Create(), LocalValueGroup);
       (*W := *)AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
-      (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
-      (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
+      if Not(HasNorm) then
+      begin
+        (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
+        (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
+      end;
       W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
       (*Y := *)AddLayer( TNNetDotProducts.Create(LocalValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
     end;
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
     SetLength(EachGroupOutput, 0);
-    Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1),TNNetReLUL.Create(-3,+3,0)] );
+    Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)] );
+    if Not(HasNorm) then Result := AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
   end;
 end;
 
@@ -7315,11 +7337,12 @@ begin
         LocalValueGroup := AddLayerAfter( [TNNetSplitChannels.Create(HeadCnt*InputChannelsPerGroup, InputChannelsPerGroup )], ValueGroup);
       end;
       LocalValueTGroup:= AddLayerAfter( TNNetTransposeXD.Create(), LocalValueGroup);
-      (*W := *)AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
+      W := AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
       if HasNorm then
       begin
-        W := AddLayer( TNNetPointwiseNorm.Create() );
-        (*Y := *)AddLayer( [TNNetDotProducts.Create(LocalValueTGroup, W), TNNetPointwiseNorm.Create()] );
+        //W := AddLayer( TNNetPointwiseNorm.Create() );
+        //(*Y := *)AddLayer( [TNNetDotProducts.Create(LocalValueTGroup, W), TNNetPointwiseNorm.Create()] );
+        (*Y := *)AddLayer( [TNNetDotProducts.Create(LocalValueTGroup, W)] );
       end
       else
       begin
@@ -7330,8 +7353,8 @@ begin
     end;
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
     SetLength(EachGroupOutput, 0);
-    AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, 32, PreviousDepth, false, 1, true);
-    Result := AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
+    Result := AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, 32, PreviousDepth, false, 1, true);
+    if Not(HasNorm) then Result := AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
   end;
 end;
 
@@ -7372,12 +7395,11 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddSelfAttention(Heads, NoForward);
+  Attended := AddSelfAttention(Heads, NoForward, HasNorm);
   if HasNorm then Attended := AddLayer( TNNetPointwiseNorm.create() );
   AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
-  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim) );
-  AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim),TNNetReLUL.Create(-3,+3,0)] );
-  AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev])] );
+  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim, 1) );
+  AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 1)] );
   if HasNorm then
   begin
     AddLayer( TNNetPointwiseNorm.create() );
@@ -7385,8 +7407,9 @@ begin
   end
   else
   begin
+    AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
     AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
-    AddLayer( TNNetReLUL.Create(-3,+3,0) );
+    AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
   end;
   Result := GetLastLayer();
 end;
@@ -7406,7 +7429,7 @@ begin
   if HasNorm then Attended := AddLayer( TNNetPointwiseNorm.create() );
   AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
   AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim, 1) );
-  AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), TNNetReLUL.Create(-3,+3,0)] );
+  AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 1)] );
   if HasNorm then
   begin
     AddLayer( TNNetPointwiseNorm.create() );
@@ -7414,8 +7437,9 @@ begin
   end
   else
   begin
+    AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
     AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
-    AddLayer( TNNetReLUL.Create(-3,+3,0) );
+    AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
   end;
   Result := GetLastLayer();
 end;
@@ -7434,7 +7458,6 @@ begin
   AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
   AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvReLU, 32, IntermediateDim, false, 1, true);
   AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, 32, EmbeddingDim, false, 1, true);
-  AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
   if HasNorm then
   begin
     AddLayer( TNNetPointwiseNorm.create() );
@@ -7442,8 +7465,9 @@ begin
   end
   else
   begin
+    AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
     AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
-    AddLayer( TNNetReLUL.Create(-3,+3,0) );
+    AddLayer( [TNNetReLUL.Create(-3,+3,0)] );
   end;
   Result := GetLastLayer();
 end;
