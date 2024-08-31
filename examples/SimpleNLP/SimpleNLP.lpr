@@ -1,6 +1,6 @@
 program smallLanguageModelConvFromFile;
 (*
-Copyright (C) 2023 Joao Paulo Schwarz Schuler
+Copyright (C) 2024 Joao Paulo Schwarz Schuler
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   neuralvolume,
   neuralfit,
   neuralthread,
+  neuraldatasets,
   CustApp,
   Math;
 

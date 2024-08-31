@@ -25,6 +25,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   neuralnetwork,
   neuralvolume,
   neuralfit,
+  neuraldatasets,
   neuralthread,
   CustApp,
   Math;
@@ -97,7 +98,7 @@ type
 
     for I := 1 to 2 do
     begin
-      FNN.AddTransformerBlockCAI(16);
+      FNN.AddTransformerBlockCAI(16, 512);
     end;
 
     FNN.AddLayer([
