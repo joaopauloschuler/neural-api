@@ -317,6 +317,7 @@ type
     procedure ReverseGroupedOneHotEncoding(out aTokens: TNeuralIntegerArray; Groups: integer);
     function ReverseGroupedOneHotEncodingOnPixel(Groups, X, Y: integer):integer;
     procedure OneHotEncoding(aTokens: string); overload;
+    procedure OneHotEncodingAtEnd(aTokens: string); overload;
     procedure OneHotEncodingReversed(aTokens: string); overload;
     procedure OneHotEncodingReversed(var aTokens: array of integer); overload;
     // Sets positional embedding as per paper "Attention Is All You Need".
@@ -6324,7 +6325,31 @@ begin
   end
   else
   begin
-    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingReversed.');
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncoding.');
+  end;
+end;
+
+procedure TVolume.OneHotEncodingAtEnd(aTokens: string);
+var
+  CntToken, MaxToken, Token, Offset: integer;
+begin
+  MaxToken := Length(aTokens);
+  Offset := SizeX - MaxToken;
+  Self.Fill(0);
+  if MaxToken <= SizeX then
+  begin
+    for CntToken := 1 to MaxToken do
+    begin
+      Token := Ord(aTokens[CntToken]);
+      if Token < FDepth then
+      begin
+        Self[Offset+CntToken-1, 0, Token] := 1;
+      end
+    end;
+  end
+  else
+  begin
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingAtEnd.');
   end;
 end;
 

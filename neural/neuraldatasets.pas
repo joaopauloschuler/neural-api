@@ -328,6 +328,10 @@ function GetClassFromChars(NN: TNNet; InputString: string): integer;
 // Simple token based NLP function for building a string from an array of tokens.
 function GenerateStringFromTokens(NN: TNNet; Dict:TStringListInt; InputString: string; oSampler: TNNetSamplerBase = nil): string;
 
+function GenerateStringFromCasualCharNN(NN: TNNet;
+  InputString: string; oSampler: TNNetSamplerBase = nil;
+  EncodingMethod: integer = 0; EncodingMethod2: integer = 0): string;
+
 function GenerateStringFromCasualNN(NN: TNNet; Dict:TStringListInt;
   InputString: string; oSampler: TNNetSamplerBase = nil;
   EncodingMethod: integer = 0; EncodingMethod2: integer = 0): string;
@@ -335,6 +339,8 @@ function GenerateStringFromCasualNN(NN: TNNet; Dict:TStringListInt;
 // Simple function for debugging an NLP NN predicting the next token.
 procedure DebugNLPOnPos(NN: TNNet; Dict: TStringListInt; var Dataset: TNNetAAInteger; Pos, Samples: integer);
 
+// Converts a string into an array of integer
+function StringToArrayOfInteger(InputString: string): TNeuralIntegerArray;
 
 implementation
 
@@ -490,6 +496,45 @@ begin
   OutputVolume.Free;
 end;
 
+function GenerateStringFromCasualCharNN(NN: TNNet; InputString: string;
+  oSampler: TNNetSamplerBase; EncodingMethod: integer; EncodingMethod2: integer
+  ): string;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  NextTokenInt: integer;
+  Tokens: TNeuralIntegerArray;
+  TokenCnt: integer;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  if Length(InputString) > InputVolume.SizeX then
+  begin
+    InputString := Copy(InputString, Length(inputString) - InputVolume.SizeX + 1,InputVolume.SizeX);
+  end;
+  Result := InputString;
+  Tokens := StringToArrayOfInteger(InputString);
+  TokenCnt := Length(Tokens);
+  repeat
+    if EncodingMethod = 0 then InputVolume.CopyNoChecksIntArr(Tokens)
+    else if EncodingMethod = 1 then InputVolume.OneHotEncoding(Tokens)
+    else if EncodingMethod = 2 then InputVolume.GroupedOneHotEncoding(Tokens, EncodingMethod2);
+
+    NN.Compute(InputVolume, OutputVolume);
+    //TODO: add sampler suppport here.
+    NextTokenInt := OutputVolume.GetClassOnPixel(TokenCnt - 1, 0);
+    if NextTokenInt < 256 then
+    begin
+      Result := Result + Chr(NextTokenInt);
+    end;
+    TokenCnt := TokenCnt + 1;
+    SetLength(Tokens, TokenCnt);
+    Tokens[TokenCnt - 1] := NextTokenInt;
+  until (NextTokenInt < 2) or (TokenCnt>=InputVolume.SizeX);
+  SetLength(Tokens, 0);
+  InputVolume.Free;
+  OutputVolume.Free;
+end;
+
 function GenerateStringFromCasualNN(NN: TNNet; Dict: TStringListInt;
   InputString: string; oSampler: TNNetSamplerBase = nil;
   EncodingMethod: integer = 0; EncodingMethod2: integer = 0): string;
@@ -582,6 +627,22 @@ begin
   WriteLn('Pos: ',Pos,' Hit:',CntHit);
   pOutput.Free;
   pInput.Free;
+end;
+
+function StringToArrayOfInteger(InputString: string): TNeuralIntegerArray;
+var
+  InputLen, CntChar: integer;
+begin
+  InputLen := Length(InputString);
+  SetLength(Result, InputLen);
+
+  if InputLen>0 then
+  begin
+    for CntChar := 1 to InputLen do
+    begin
+      Result[CntChar-1] := ord(InputString[CntChar]);
+    end;
+  end;
 end;
 
 procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
