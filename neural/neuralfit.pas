@@ -1626,7 +1626,9 @@ begin
   FProcs := TNeuralThreadList.Create(FThreadNum);
   FStepSize := FBatchSize;
   if Assigned(FThreadNN) then FThreadNN.Free;
+  FMessageProc('Allocating memory for ' + IntToStr(FThreadNum) + ' threads.');
   FThreadNN := TNNetDataParallelism.Create(FNN, FThreadNum);
+  FMessageProc('Memory allocated.');
   {$IFDEF OpenCL}
   if (FPlatformId <> nil) and (FDeviceId <> nil) then
     FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
@@ -1879,6 +1881,7 @@ begin
   FNN.CalcAdamDelta();
   ForceDeltaLimists();
   FNN.UpdateWeightsAdam();
+  //FNN.ForceMaxWeightNorm(10);
 end;
 
 procedure TNeuralOptimizerAdam.ReSet;
