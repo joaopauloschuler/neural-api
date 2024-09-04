@@ -178,6 +178,7 @@ type
       FBackPropCallCurrentCnt: integer;
       FLinkedNeurons: boolean;
       FCanNormalizeDelta: boolean;
+      FCanSetNumWeightsForAllNeurons: boolean;
       FNN: TNNet;
 
       procedure InitStruct();
@@ -1740,13 +1741,14 @@ type
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
-      function AddSelfAttention(Heads: integer; NoForward:boolean = false; HasNorm: boolean = False): TNNetLayer;
-      function AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false; CellMul: boolean = True; HasNorm: boolean = False): TNNetLayer;
-      function AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads: integer; NoForward:boolean = false; CellMul: boolean = True; HasNorm: boolean = False): TNNetLayer;
-      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; NoForward:boolean = false; HasNorm: boolean = False);
-      function AddTransformerBlock(Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = False): TNNetLayer;
-      function AddTransformerBlockCAI(Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = False; CellMul: boolean = False): TNNetLayer;
-      function AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = False; CellMul: boolean = True): TNNetLayer;
+      function AddSelfAttention(Heads: integer; NoForward:boolean = false; HasNorm: boolean = false): TNNetLayer;
+      function AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
+      function AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
+      procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; NoForward:boolean = false; HasNorm: boolean = false);
+      function AddTransformerBlock(Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false): TNNetLayer;
+      function AddTransformerBlockCAI(Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
+      function AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = False): TNNetLayer;
+      function AddCompressedTransformerBlockCAI(CompressedChannelsCount, MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = False): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
       function GetFirstLayer(): TNNetLayer;
@@ -3653,7 +3655,9 @@ var
   GroupId, GroupDStart: integer;
   LocalPrevError: TNNetVolume;
 begin
+  FCanSetNumWeightsForAllNeurons := False;
   inherited SetPrevLayer(pPrevLayer);
+  FCanSetNumWeightsForAllNeurons := True;
   FVectorSize := FFeatureSizeX*FFeatureSizeY*(pPrevLayer.Output.Depth div FStruct[5]);
   FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
   PrevLayerGroupDSize := pPrevLayer.Output.Depth div FStruct[5];
@@ -7364,8 +7368,8 @@ begin
 end;
 
 function TNNet.AddSelfAttentionCAI(Heads: integer;
-  NoForward:boolean = false; CellMul: boolean = True;
-  HasNorm: boolean = False): TNNetLayer;
+  NoForward:boolean = false;
+  HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
 var
   W : TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -7428,8 +7432,8 @@ begin
 end;
 
 function TNNet.AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads: integer;
-  NoForward: boolean;
-  CellMul: boolean; HasNorm: boolean): TNNetLayer;
+  NoForward: boolean; HasNorm: boolean;
+  CellMul: boolean): TNNetLayer;
 var
   W : TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -7555,7 +7559,7 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddSelfAttentionCAI(Heads, NoForward, CellMul, HasNorm);
+  Attended := AddSelfAttentionCAI(Heads, NoForward, HasNorm, CellMul);
   AttendedPlusPrev := AddLayer( [TNNetSum.Create([Attended, PrevLayer]), TNNetSignedSquareRoot1.Create()] );
   AddLayer( [TNNetPointwiseConvReLU.Create(IntermediateDim, 1), TNNetSignedSquareRoot1.Create()] );
   AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 1)] );
@@ -7574,7 +7578,7 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads, NoForward, CellMul, HasNorm);
+  Attended := AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads, NoForward, HasNorm, CellMul);
   AttendedPlusPrev := AddLayer( [TNNetSum.Create([Attended, PrevLayer]), TNNetSignedSquareRoot1.Create()] );
   AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvReLU, MinChannelsPerGroupCount, IntermediateDim, false, 1, true);
   AddLayer( TNNetSignedSquareRoot1.Create() );
@@ -7582,6 +7586,32 @@ begin
   AddLayer( [TNNetSignedSquareRoot1.Create()] );
   AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
   AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddCompressedTransformerBlockCAI(CompressedChannelsCount,
+  MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer;
+  NoForward: boolean; HasNorm: boolean; CellMul: boolean): TNNetLayer;
+var
+  PrevLayer: TNNetLayer;
+  EmbeddingDim: integer;
+begin
+  PrevLayer := GetLastLayer();
+  EmbeddingDim := PrevLayer.Output.Depth;
+  // Should Compress?
+  if (EmbeddingDim<>CompressedChannelsCount) then
+  begin
+    AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, CompressedChannelsCount, false, 1, true);
+    AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  end;
+  AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads, IntermediateDim, NoForward, HasNorm, CellMul);
+  // Should Uncompress?
+  if (EmbeddingDim<>CompressedChannelsCount) then
+  begin
+    AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, EmbeddingDim, false, 1, true);
+    AddLayer( [TNNetSum.Create([ GetLastLayer(), PrevLayer]) ] );
+    AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  end;
   Result := GetLastLayer();
 end;
 
@@ -13804,6 +13834,12 @@ begin
       begin
         if not(FLayers[LayerCnt].LinkedNeurons) then
         begin
+          {$IFDEF Debug}
+          if (FLayers[LayerCnt].ClassName <> Origin.Layers[LayerCnt].ClassName) then
+          begin
+            FMessageProc('Origin class name '+Origin.Layers[LayerCnt].ClassName+'differs from '+FLayers[LayerCnt].ClassName+' at copy weights');
+          end;
+          {$ENDIF}
           FLayers[LayerCnt].CopyWeights(Origin.Layers[LayerCnt]);
           FLayers[LayerCnt].CopyTimes(Origin.Layers[LayerCnt]);
         end;
@@ -14651,6 +14687,7 @@ begin
     for Cnt := 0 to S.Count - 1 do
     begin
       S2.DelimitedText := S[Cnt];
+      //WriteLn(Cnt,':',S2[1],'->',S2[0]);
       AddLayerAfter(S2[1], StrToInt(S2[0]));
     end;
   end;
@@ -14911,6 +14948,7 @@ begin
   FNeurons := TNNetNeuronList.Create();
   FLinkedNeurons := false;
   FCanNormalizeDelta := true;
+  FCanSetNumWeightsForAllNeurons := True;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
@@ -15290,7 +15328,7 @@ procedure TNNetLayer.SetNumWeightsForAllNeurons(NumWeights: integer);
 var
   Cnt: integer;
 begin
-  if FNeurons.Count > 0 then
+  if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
@@ -15298,15 +15336,15 @@ begin
       FNeurons[Cnt].BackInertia.ReSize(NumWeights,1,1);
       FNeurons[Cnt].Delta.ReSize(NumWeights,1,1);
     end;
+    AfterWeightUpdate();
   end;
-  AfterWeightUpdate();
 end;
 
 procedure TNNetLayer.SetNumWeightsForAllNeurons(x, y, d: integer);
 var
   Cnt: integer;
 begin
-  if FNeurons.Count > 0 then
+  if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
@@ -15314,8 +15352,8 @@ begin
       FNeurons[Cnt].BackInertia.ReSize(x,y,d);
       FNeurons[Cnt].Delta.ReSize(x,y,d);
     end;
+    AfterWeightUpdate();
   end;
-  AfterWeightUpdate();
 end;
 
 procedure TNNetLayer.SetNumWeightsForAllNeurons(Origin: TNNetVolume);
