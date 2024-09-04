@@ -800,6 +800,9 @@ type
   function RectifiedLinearUnitLeaky(x: TNeuralFloat): TNeuralFloat;
   function RectifiedLinearUnitLeakyDerivative(x: TNeuralFloat): TNeuralFloat;
 
+  function SignedSquareRoot1(x: TNeuralFloat): TNeuralFloat;
+  function SignedSquareRoot1Derivative(x: TNeuralFloat): TNeuralFloat;
+
   function ReLULeakyBound(x: TNeuralFloat): TNeuralFloat;
   function ReLULeakyBoundDerivative(x: TNeuralFloat): TNeuralFloat;
 
@@ -881,6 +884,40 @@ begin
     else Result := 0.01;
 
   if x<-1 then Result := 0;
+end;
+
+function SignedSquareRoot1(x: TNeuralFloat): TNeuralFloat;
+begin
+  if x > 1 then
+  begin
+    Result := Sqrt(x);
+  end
+  else
+  if x < -1 then
+  begin
+    Result := Sqrt(-x);
+  end
+  else
+  begin
+    Result := x;
+  end;
+end;
+
+function SignedSquareRoot1Derivative(x: TNeuralFloat): TNeuralFloat;
+begin
+  if x > 1 then
+  begin
+    Result := 1/(2*Sqrt(x));
+  end
+  else
+  if x < -1 then
+  begin
+    Result := 1/(2*Sqrt(-x));
+  end
+  else
+  begin
+    Result := 1;
+  end;
 end;
 
 function ReLULeakyBound(x: TNeuralFloat): TNeuralFloat;
