@@ -169,4 +169,9 @@ Finally, an output layer with one output per input in the context can be added w
 ```
 The full source code can be found at [NLP with Vocabulary](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/transformer_decoder_tiny_stories_dataset_3k_vocab.ipynb).
 
+After training, this model produces sentences such as:
+* one day , a little boy named tim went to the park with his mom . they saw a big tree with many leaves . tim wanted to climb the tree , but his mom said , " no , tim , you can ' t climb the tree . it ' s not safe . " tim was sad and said , " but i want to climb the tree . " his mom said , " don '.
+* once upon a time , there was a little girl named lily . she loved to play outside in the sunshine . one day , she saw a big , scary dog . the dog looked scary and lily was scared . she ran to her mommy and said , " mommy , there ' s a big dog outside ! " her mommy said , " don ' t worry , lily . the dog is friendly and friendly.
+* billy was a little boy who loved to play . he had a lot of toys , but his favorite was a big red ball . he would throw it up and catch it , and he would throw it . one day , billy was playing with his ball in the park . he saw a big , shiny red ball and he wanted to play with it . he ran to the ball and tried to grab it.
+
 
