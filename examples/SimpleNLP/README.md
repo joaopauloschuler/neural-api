@@ -146,7 +146,7 @@ begin
 end;
 ```
 
-## Example With Vocabulary and Multiple Outputs
+## Example with Transformer Decoder, Vocabulary and Multiple Outputs
 The currently leading NLP neural network models use tokenized datasets and vocabulary. The tokenized dataset and the vocabulary can be downloaded with:
 ```
 git clone https://huggingface.co/datasets/schuler/TinyStories4Pascal
