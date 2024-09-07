@@ -153,7 +153,7 @@ type
       FBackwardTime: double;
       FNeurons: TNNetNeuronList;
       FOutput: TNNetVolume;
-      FOutputRaw: TNNetVolume;
+      FOutputRaw: TNNetGroupedVolume;
       FOutputError: TNNetVolume;
       FOutputErrorDeriv: TNNetVolume;
       FSmoothErrorPropagation: boolean;
@@ -339,7 +339,7 @@ type
       property Neurons: TNNetNeuronList read FNeurons;
       property NN:TNNet read FNN write FNN;
       property Output: TNNetVolume read FOutput;
-      property OutputRaw: TNNetVolume read FOutputRaw;
+      property OutputRaw: TNNetGroupedVolume read FOutputRaw;
       property PrevLayer: TNNetLayer read FPrevLayer write SetPrevLayer;
       property LearningRate: TNeuralFloat read FLearningRate write FLearningRate;
       property L2Decay: TNeuralFloat read FL2Decay write FL2Decay;
@@ -355,7 +355,6 @@ type
       property HasOpenCL: boolean read FHasOpenCL;
       property ShouldOpenCL:boolean read FShouldOpenCL;
       {$ENDIF}
-
   end;
 
   TNNetLayerClass = class of TNNetLayer;
@@ -3524,11 +3523,14 @@ begin
   end;
   //PrevNumElements := (FSizeXDepth div 4) * 4;
   //PrevMissedElements := FSizeXDepth - PrevNumElements;
-  NeuronWeights := FArrNeurons[0].Delta.Size;
+  NeuronWeights := FArrNeurons[0].Weights.Size;
   //SmoothLocalOutputErrorDerivPtr := Addr(SmoothLocalOutputErrorDeriv);
   LocalLearningErrorDerivPtr := Addr(LocalLearningErrorDeriv);
-  localNumElements := (NeuronWeights div 4) * 4;
-  MissedElements := NeuronWeights - localNumElements;
+  //localNumElements := (NeuronWeights div 4) * 4;
+  //MissedElements := NeuronWeights - localNumElements;
+  MissedElements := NeuronWeights and 3;
+  localNumElements := NeuronWeights xor MissedElements;
+
   for OutputY := 0 to MaxY do
   begin
     PrevY := (OutputY*FStride);
@@ -14941,7 +14943,7 @@ begin
   inherited Create();
   InitStruct();
   FOutput := TNNetVolume.Create(1,1,1);
-  FOutputRaw := TNNetVolume.Create(1,1,1);
+  FOutputRaw := TNNetGroupedVolume.Create(1,1,1);
   FOutputError := TNNetVolume.Create(1,1,1);
   FOutputErrorDeriv := TNNetVolume.Create(1,1,1);
 

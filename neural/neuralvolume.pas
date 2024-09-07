@@ -352,11 +352,19 @@ type
   end;
 
   TNNetToken = record
-    Token: Integer;
+    Token: integer;
     Score: TNeuralFloat;
   end;
 
+  TNNetGroupInfo = record
+    GroupId: integer;
+    GroupIdVectorSize: integer;
+    PtrA: TNeuralFloatArrPtr;
+  end;
+
   TNNetTokenArray = array of TNNetToken;
+
+  TNNetGroupInfoArray = array of TNNetGroupInfo;
 
   { TNNetVolume }
   {$IFDEF FPC}
@@ -419,7 +427,6 @@ type
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false);
       procedure DotProductsPointwise(VAs, VBs: TNNetVolume; NoForward:boolean = false);
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
-      procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
@@ -477,6 +484,16 @@ type
       {$ENDIF}
     property
       DataPtr: TNeuralFloatArrPtr read FDataPtr;
+  end;
+
+  { TNNetGroupedVolume }
+
+  TNNetGroupedVolume = class(TNNetVolume)
+    protected
+      FGrInfoArray: TNNetGroupInfoArray;
+    public
+      destructor Destroy(); override;
+      procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
   end;
 
   { TNNetSamplerBase }
@@ -1528,13 +1545,14 @@ var
   I: integer;
   Result, Aux: TNeuralFloat;
   Min0, Max0, Min1, Max1, Min2, Max2: TNeuralFloat;
-  A, B, R: TNNetVolume;
+  A, B: TNNetVolume;
+  R: TNNetGroupedVolume;
 begin
   TestSize := 1+Random(2630);
   WriteLn(' TestTNNetVolume Testing size:', TestSize);
   A := TNNetVolume.Create(TestSize);
   B := TNNetVolume.Create(TestSize);
-  R := TNNetVolume.Create(TestSize);
+  R := TNNetGroupedVolume.Create(TestSize);
 
   A.Randomize();
   B.Randomize();
@@ -7796,11 +7814,11 @@ end;
 /// In this function, "As" should be weights, "VectorSize" should be the number
 // of weights from each neuron. "VBs" contains input vectors. Input vectors
 // should have VectorSize * Groups.
-procedure TNNetVolume.GroupedDotProductsTiled(Groups, NumAs, NumBs,
+procedure TNNetGroupedVolume.GroupedDotProductsTiled(Groups, NumAs, NumBs,
   VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
   CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
-  GroupId, GroupASize: integer;
+  GroupASize: integer;
   VectoreBSize: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
@@ -7812,6 +7830,7 @@ var
   TileACnt, TileBCnt: integer;
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
+  LocalGroupInfo: TNNetGroupInfo;
 begin
   MaxA := NumAs - 1;
   MaxB := NumBs - 1;
@@ -7830,6 +7849,19 @@ begin
   end;
   {$ENDIF}
 
+  // is group info not cached?
+  if Length(FGrInfoArray) <> NumAs then
+  begin
+    SetLength(FGrInfoArray, NumAs);
+    for CntA := 0 to MaxA do
+    begin
+      LocalGroupInfo.GroupId := CntA div GroupASize;
+      LocalGroupInfo.GroupIdVectorSize := LocalGroupInfo.GroupId*VectorSize;
+      LocalGroupInfo.PtrA := VAs.GetRawPtr(CntA*VectorSize);
+      FGrInfoArray[CntA] := LocalGroupInfo;
+    end;
+  end;
+
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
   MissedElements := VectorSize and 3;
@@ -7846,11 +7878,14 @@ begin
       EndTileA := StartTileA + TileSizeA - 1;
       for CntA := StartTileA to EndTileA do
       begin
-        GroupId := CntA div GroupASize;
-        PtrA := VAs.GetRawPtr(CntA*VectorSize);
+        //GroupId := CntA div GroupASize;
+        //GroupIdVectorSize := GroupId*VectorSize;
+        //PtrA := VAs.GetRawPtr(CntA*VectorSize);
+        LocalGroupInfo := FGrInfoArray[CntA];
+        PtrA := LocalGroupInfo.PtrA;
         for CntB := StartTileB to EndTileB do
         begin
-          PtrB := VBs.GetRawPtr(CntB*VectoreBSize + GroupId*VectorSize);
+          PtrB := VBs.GetRawPtr(CntB*VectoreBSize + LocalGroupInfo.GroupIdVectorSize);
           {$IFDEF AVXANY}
           {$IFDEF AVX32}
           if localNumElements > 0 then
@@ -11385,6 +11420,14 @@ begin
   SourceRawPos := Addr(Original.FData[0]);
   DestRawPos := Addr(FData[0]);
   asm_dword_copy;
+end;
+
+{ TNNetGroupedVolume }
+
+destructor TNNetGroupedVolume.Destroy;
+begin
+  SetLength(FGrInfoArray, 0);
+  inherited Destroy;
 end;
 
 {$ENDIF}
