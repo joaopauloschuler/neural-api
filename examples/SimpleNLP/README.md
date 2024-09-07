@@ -1,4 +1,5 @@
 # Training a Simple Neural Network Model for Text Generation
+## The Simple Example
 This source code example shows a (hello world) small neural network trained on the [Tiny Stories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). This code
 
 ```
@@ -15,7 +16,7 @@ one day, a little girl named lily was playing in her garden. she saw a big car w
 You can find the raw training file and run by yourself at:
 https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/NLP_CAI_TinyStories_Simple_Example.ipynb
 
-## Details
+### Details
 This source code above uses a neural network to guesses the next character in a string.
 It downloads the [Tiny Stories dataset](https://huggingface.co/datasets/roneneldan/TinyStories) and trains a small Pascal written neural network model. The neural network model is built with:
 
@@ -57,7 +58,7 @@ In the case that you are curious, there are plenty of scientific studies support
 * https://aclanthology.org/N19-1407.pdf - Convolutional Self-Attention Networks
 * https://arxiv.org/pdf/1805.08318.pdf - Self-Attention Generative Adversarial Networks
 
-## A Bit of the API Behind the Scenes
+### API Methods
 Samplers are used to probabilistically select the next token (character) from the probabilities guessed by the neural network. The Greedy, Top-K, and Top-P samplers provide different ways to predict the next character in a sequence.
 
 Greedy Sampling:
@@ -144,3 +145,28 @@ begin
   oSampler.Free;
 end;
 ```
+
+## Example With Vocabulary and Multiple Outputs
+The currently leading NLP neural network models use tokenized datasets and vocabulary. The tokenized dataset and the vocabulary can be downloaded with:
+```
+git clone https://huggingface.co/datasets/schuler/TinyStories4Pascal
+unzip TinyStories4Pascal/tinystories_tokenized_81.csv.zip
+unzip TinyStories4Pascal/tinystories_vocab.csv.zip
+```
+
+Plenty of models are constructed via a stack of transformer decoder modules. This stack can be created with:
+```
+for I := 1 to 2 do FNN.AddTransformerBlockCAI(8, 2048, true, false, false);
+```
+
+Finally, an output layer with one output per input in the context can be added with:
+```
+    FNN.AddLayer([
+      TNNetPointwiseConvLinear.Create(csEmbedDim),
+      TNNetPointwiseConvLinear.Create(csModelVocabSize),
+      TNNetPointwiseSoftMax.Create(1)
+    ]);
+```
+The full source code can be found at [NLP with Vocabulary](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/transformer_decoder_tiny_stories_dataset_3k_vocab.ipynb).
+
+
