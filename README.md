@@ -28,7 +28,7 @@ Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neu
 You can get A.I. powered help from these tools:
 * [CAI Neural API support at Poe (free)](https://poe.com/CAI-NEURAL-API-FREE).
 * [CAI Neural API support at Poe](https://poe.com/CAI-NEURAL-API).
-* [CAI Neural API support at ChatGPT4](https://chat.openai.com/g/g-bqMxEDpIg-neural-api-free-pascal-developer).
+* [CAI Neural API support at ChatGPT4](https://chatgpt.com/g/g-6BrAwhTQ9-free-pascal-developer-neural-api).
  
 ## Documentation
 The documentation is composed by:
