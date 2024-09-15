@@ -1,4 +1,21 @@
-// This UNIT is under construction. DO NOT USE IT.
+(*
+neuraltokenizer
+Copyright (C) 2024 Joao Paulo Schwarz Schuler
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*)
 unit neuraltokenizer;
 
 {$mode ObjFPC}{$H+}
@@ -23,7 +40,8 @@ type
       function DeTokenize(TokenIds: TIntegerList): string; overload;
       function TokenizerHasSeparator: boolean; override;
 
-      procedure FitOnFile(const FileName: string; VocabSize: integer);
+      procedure FitOnFile(const FileName: string; VocabSize: integer;
+        WriteDebug: boolean = true);
       procedure TokenizeFileToCsv(const InputFileName, OutputFileName: string);
       // This function will be removed - do not use it.
       procedure Test;
@@ -41,7 +59,9 @@ type
       class procedure CountPairs(const vocab: TNNetStringList; var pairCounts: TPairFrequency); static;
       class function GetMostFrequentPair(const pairCounts: TPairFrequency): string; static;
       class procedure MergePair(var vocab: TNNetStringList; const pair: string; const replacement: string); static;
-      class procedure Encode(var vocab: TNNetStringList; numMerges: integer; var merges: TMergeList; MergesPerLoop: integer = 1); static;
+      class procedure Encode(var vocab: TNNetStringList; numMerges: integer;
+        var merges: TMergeList; MergesPerLoop: integer = 1;
+        WriteDebug: boolean = true); static;
       class function LoadDataset(const filename: string): TNNetStringList; static;
       class function InsertCharBetweenChars(const input: string; const SpaceChar:char = ' '): string; static;
   end;
@@ -85,7 +105,7 @@ begin
           else
           begin
             pairCounts.Integers[PairIndex] := pairCounts.Integers[PairIndex] + 1;
-            if pairCounts.Integers[PairIndex] > 99 then ShouldQuit := true;
+            if pairCounts.Integers[PairIndex] > 32 then ShouldQuit := true;
           end;
         end;
         if ShouldQuit then break;
@@ -112,7 +132,7 @@ begin
       maxPair := pairCounts[i];
     end;
   end;
-  Write('[',maxCount,']');
+  //Write('[',maxCount,']');
   Result := maxPair;
 end;
 
@@ -129,7 +149,8 @@ end;
 class procedure TTokenizerBase.Encode(var vocab: TNNetStringList;
   numMerges: integer;
   var merges: TMergeList;
-  MergesPerLoop: integer = 1);
+  MergesPerLoop: integer = 1;
+  WriteDebug: boolean = true);
 var
   pairCounts: TPairFrequency;
   I, J, MaxJ: integer;
@@ -143,9 +164,9 @@ begin
     for I := 0 to MergesLoopCnt - 1 do
     begin
       StartTime := Now();
-      Write(I*MergesPerLoop, ' Counting pairs. ');
+      if WriteDebug then Write(I*MergesPerLoop, ' Counting pairs. ');
       CountPairs(vocab, pairCounts);
-      Write(FloatToStrF((Now()-StartTime) * 24 * 60 * 60 ,ffFixed,6,2) + 's. ');
+      if WriteDebug then Write(FloatToStrF((Now()-StartTime) * 24 * 60 * 60 ,ffFixed,6,2) + 's. ');
       //pair := GetMostFrequentPair(pairCounts);
       if pairCounts.Count>1 then
       begin
@@ -159,7 +180,7 @@ begin
           newToken := StringReplace(pair, csBPESeparator, '', [rfReplaceAll]);
           MergePair(vocab, pair, newToken);
           merges.Values[pair] := newToken;
-          WriteLn(
+          if WriteDebug then WriteLn(
             ' : ', pair, ' -> ', newToken,
             ' [',pairCounts.Integers[J],']',
             ' Time: ', FloatToStrF((Now()-StartTime) * 24 * 60 * 60 ,ffFixed,6,2) + 's');
@@ -392,7 +413,8 @@ begin
   Result := false;
 end;
 
-procedure TNeuralTokenizer.FitOnFile(const FileName: string; VocabSize: integer);
+procedure TNeuralTokenizer.FitOnFile(const FileName: string; VocabSize: integer;
+  WriteDebug: boolean = true);
 var
   vocab: TNNetStringList;
   merges: TMergeList;
@@ -403,23 +425,13 @@ begin
     // Load vocabulary from file
     vocab := TTokenizerBase.LoadDataset(FileName);
     Tokens := TIntegerList.Create;
-    //WriteLn('Loaded dataset.');
-    //for i := 0 to vocab.Count - 1 do
-    //  WriteLn(vocab[i]);
-    //WriteLn;
 
     // Perform Encoding
     merges := TMergeList.Create;
     merges.Sorted := true;
-    //WriteLn('Encoding vocabulary.');
-    TTokenizerBase.Encode(vocab, VocabSize, merges);
 
-    // Save merges to file
-    // merges.SaveToFile('merges.txt');
-    // WriteLn('Merges saved to merges.txt');
+    TTokenizerBase.Encode(vocab, VocabSize, merges, 1, WriteDebug);
 
-    //WriteLn;
-    //WriteLn('Final vocabulary has:',merges.Count - 1,' elements.');
     Self.Clear;
     Self.Sorted := true;
     for i := 0 to merges.Count - 1 do
@@ -528,10 +540,10 @@ var
 begin
   X := TNeuralTokenizer.Create;
   //X.Test;
-  //X.FitOnFile('datasets/tinystories-100k.txt', 3000);
-  //X.SaveToFile('datasets/tinystories-vocab-3k-cai.txt');
-  X.LoadVocabularyFromFile('datasets/tinystories-vocab-3k-cai.txt');
-  X.TokenizeFileToCsv('datasets/tinystories.txt','datasets/tinystories-2.1M-tokenized3k.csv');
+  X.FitOnFile('datasets/tinystories-10k.txt', 3000, true);
+  X.SaveToFile('datasets/experiment-tinystories-vocab-3k-cai.txt');
+  //X.LoadVocabularyFromFile('datasets/tinystories-vocab-3k-cai.txt');
+  //X.TokenizeFileToCsv('datasets/tinystories.txt','datasets/tinystories-2.1M-tokenized3k.csv');
   X.Free;
 end;
 
