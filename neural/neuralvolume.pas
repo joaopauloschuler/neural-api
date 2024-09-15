@@ -380,6 +380,7 @@ type
       procedure CalculateLocalResponseFrom2D(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure CalculateLocalResponseFromDepth(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure GetTokenArray(var TokenArray: TNNetTokenArray);
+      procedure GetTokenArrayOnPixel(var TokenArray: TNNetTokenArray; X,Y: integer);
       (*
       Assume that "As" and "Bs" contain lists of vectors "A" and "B".
       "NumAs and NumBs" are the number of elements in the
@@ -503,6 +504,7 @@ type
       FTokenArr: TNNetTokenArray;
     public
       function GetToken(Origin: TNNetVolume): integer; virtual; abstract;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; virtual; abstract;
       procedure SortTokenArray();
       destructor Destroy(); override;
   end;
@@ -511,6 +513,7 @@ type
   TNNetSamplerGreedy = class (TNNetSamplerBase)
     public
       function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
 
   { TNNetSamplerTopK }
@@ -520,6 +523,7 @@ type
     public
       constructor Create(TopK: integer);
       function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
 
   { TNNetSamplerTopP }
@@ -529,8 +533,8 @@ type
     public
       constructor Create(TopP: TNeuralFloat);
       function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
-
 
   /// Implements a pair of volumes
   TNNetVolumePair = class(TObject)
@@ -674,6 +678,7 @@ type
     public
       constructor Create;
       destructor Destroy; override;
+      procedure LoadVocabularyFromFile(const filename: string);
 
       procedure SortByIntegerAsc;
       procedure SortByIntegerDesc;
@@ -681,11 +686,18 @@ type
       function WordToIndex(pWord:string): integer;
       function WordToInteger(pWord:string): integer;
       function IntegerToWord(pInteger: integer): string;
+      procedure SaveCurrentPosition();
       procedure SaveCurrentPositionAndSort();
       procedure StringToIndexArray(pString: string; var IntArr: TNeuralIntegerArray);
       procedure StringToIntegerArray(pString: string; var IntArr: TNeuralIntegerArray);
       function IndexArrayToString(var IntArr: TNeuralIntegerArray): string;
       function IntegerArrayToString(var IntArr: TNeuralIntegerArray): string;
+      function IntegerListToCsv(IL: TIntegerList; pDelimiter: char = ','): string;
+
+      function DeTokenize(TokenId: integer): string; virtual; overload;
+      procedure Tokenize(pString: string; var IntArr: TNeuralIntegerArray); virtual; overload;
+      function GetVocabCount(): integer; virtual;
+      function TokenizerHasSeparator: boolean; virtual;
 
       property Integers[Index: Integer]: PtrInt read GetInteger write PutInteger;
   end;
@@ -801,6 +813,9 @@ type
 
   function CreateTokenizedStringList(str: string; c:char):TNNetStringList; overload;
   function CreateTokenizedStringList(c:char):TNNetStringList; overload;
+
+  function CreateQuotedTokenizedStringList(Str: string; Separator:char; QuoteChar: char):TNNetStringList; overload;
+  function CreateQuotedTokenizedStringList(Separator:char; QuoteChar: char):TNNetStringList; overload;
 
   function HiperbolicTangent(x: TNeuralFloat): TNeuralFloat;
   function HiperbolicTangentDerivative(x: TNeuralFloat): TNeuralFloat;
@@ -1799,6 +1814,18 @@ begin
   Result.DecimalSeparator := '.';
 end;
 
+function CreateQuotedTokenizedStringList(Str: string; Separator:char; QuoteChar: char): TNNetStringList;
+begin
+  Result := CreateQuotedTokenizedStringList(Separator, QuoteChar);
+  Result.DelimitedText := Str;
+end;
+
+function CreateQuotedTokenizedStringList(Separator:char; QuoteChar: char): TNNetStringList;
+begin
+  Result := CreateTokenizedStringList(Separator);
+  Result.QuoteChar := QuoteChar;
+end;
+
 function HiperbolicTangent(x: TNeuralFloat): TNeuralFloat;
 var
   exp2x: TNeuralFloat;
@@ -1932,6 +1959,33 @@ begin
     Result := FTokenArr[0].Token; // Fallback in case P is too low.
 end;
 
+function TNNetSamplerTopP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+var
+  CumulativeSum: TNeuralFloat;
+  I, Threshold: Integer;
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  SortTokenArray();
+  CumulativeSum := 0;
+  Threshold := 0;
+  for I := Low(FTokenArr) to High(FTokenArr) do
+  begin
+    CumulativeSum := CumulativeSum + FTokenArr[i].Score;
+    if CumulativeSum > FTopP then
+    begin
+      Threshold := I;
+      Break;
+    end;
+  end;
+
+  // Randomly select one of the top tokens within the threshold.
+  if Threshold > 0 then
+    Result := FTokenArr[Random(Threshold)].Token
+  else
+    Result := FTokenArr[0].Token; // Fallback in case P is too low.
+end;
+
 { TNNetSamplerTopK }
 
 constructor TNNetSamplerTopK.Create(TopK: integer);
@@ -1943,6 +1997,14 @@ end;
 function TNNetSamplerTopK.GetToken(Origin: TNNetVolume): integer;
 begin
   Origin.GetTokenArray(FTokenArr);
+  SortTokenArray();
+  Result := FTokenArr[Random(FTopK)].Token;
+end;
+
+function TNNetSamplerTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
   SortTokenArray();
   Result := FTokenArr[Random(FTopK)].Token;
 end;
@@ -1965,6 +2027,12 @@ end;
 function TNNetSamplerGreedy.GetToken(Origin: TNNetVolume): integer;
 begin
   Result := Origin.GetClass();
+end;
+
+function TNNetSamplerGreedy.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+begin
+  Result := Origin.GetClassOnPixel(PixelX, PixelY);
 end;
 
 { TStringVolumeList }
@@ -2395,6 +2463,12 @@ begin
   inherited Destroy;
 end;
 
+procedure TStringListInt.LoadVocabularyFromFile(const filename: string);
+begin
+  Self.LoadFromFile(filename);
+  SaveCurrentPositionAndSort();
+end;
+
 procedure TStringListInt.SortByIntegerAsc;
 begin
   Sorted := false;
@@ -2453,6 +2527,7 @@ var
   WordCount: integer;
 begin
   Result := false;
+  FTokenizer.Delimiter := ' ';
   FTokenizer.DelimitedText := pString;
 
   if FTokenizer.Count > 0 then
@@ -2549,12 +2624,46 @@ begin
   Result := FIntegerToStr[pInteger];
 end;
 
+function TStringListInt.DeTokenize(TokenId: integer): string;
+begin
+  Result := IntegerToWord(TokenId);
+end;
+
+procedure TStringListInt.Tokenize(pString: string;
+  var IntArr: TNeuralIntegerArray);
+begin
+  StringToIntegerArray(pString, IntArr);
+end;
+
+function TStringListInt.GetVocabCount(): integer;
+begin
+  Result := Count;
+end;
+
+function TStringListInt.TokenizerHasSeparator: boolean;
+begin
+  Result := true;
+end;
+
+procedure TStringListInt.SaveCurrentPosition();
+var
+  RowCnt: integer;
+begin
+  SetLength(FIntegerToStr, Self.Count);
+  for RowCnt := 0 to Self.Count - 1 do
+  begin
+    Self.Integers[RowCnt] := RowCnt;
+    FIntegerToStr[RowCnt] := Self[RowCnt];
+  end;
+end;
+
 procedure TStringListInt.StringToIndexArray(pString: string;
   var IntArr: TNeuralIntegerArray);
 var
   WordCount: integer;
   WordIndex: integer;
 begin
+  FTokenizer.Delimiter := ' ';
   FTokenizer.DelimitedText := pString;
 
   if FTokenizer.Count > 0 then
@@ -2578,6 +2687,7 @@ var
   WordCount: integer;
   WordInteger: integer;
 begin
+  FTokenizer.Delimiter := ' ';
   FTokenizer.DelimitedText := pString;
 
   if FTokenizer.Count > 0 then
@@ -2601,7 +2711,8 @@ var
   WordCount, WordMax: integer;
   WordIndex: integer;
 begin
-  Result := '';
+  FTokenizer.Clear;
+  FTokenizer.Delimiter := ' ';
   WordMax := Length(IntArr) - 1;
   if WordMax >= 0 then
   begin
@@ -2611,10 +2722,11 @@ begin
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
       if WordIndex >= 0 then
       begin
-        Result := Result + Self[WordIndex];
+        FTokenizer.Add(Self[WordIndex]);
       end;
     end;
   end;
+  Result := FTokenizer.DelimitedText;
 end;
 
 function TStringListInt.IntegerArrayToString(var IntArr: TNeuralIntegerArray
@@ -2623,7 +2735,8 @@ var
   WordCount, WordMax: integer;
   WordInteger: integer;
 begin
-  Result := '';
+  FTokenizer.Clear;
+  FTokenizer.Delimiter := ' ';
   WordMax := Length(IntArr) - 1;
   if WordMax >= 0 then
   begin
@@ -2633,24 +2746,33 @@ begin
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
       if WordInteger >= 0 then
       begin
-        if WordCount = 0
-        then Result := FIntegerToStr[WordInteger]
-        else Result := Result + ' ' + FIntegerToStr[WordInteger];
+        FTokenizer.Add(FIntegerToStr[WordInteger]);
       end;
     end;
   end;
+  Result := FTokenizer.DelimitedText;
+end;
+
+function TStringListInt.IntegerListToCsv(IL: TIntegerList; pDelimiter: char = ','): string;
+var
+  WordCount, WordMax: integer;
+begin
+  FTokenizer.Clear;
+  FTokenizer.Delimiter := Delimiter;
+  WordMax := IL.Count - 1;
+  if WordMax >= 0 then
+  begin
+    for WordCount := 0 to WordMax do
+    begin
+      FTokenizer.Add(IntToStr(IL[WordCount]));
+    end;
+  end;
+  Result := FTokenizer.DelimitedText;
 end;
 
 procedure TStringListInt.SaveCurrentPositionAndSort();
-var
-  RowCnt: integer;
 begin
-  SetLength(FIntegerToStr, Self.Count);
-  for RowCnt := 0 to Self.Count - 1 do
-  begin
-    Self.Integers[RowCnt] := RowCnt;
-    FIntegerToStr[RowCnt] := Self[RowCnt];
-  end;
+  SaveCurrentPosition();
   Self.Sort();
   Self.Sorted := true;
 end;
@@ -7151,8 +7273,25 @@ begin
     vHigh := FSize - 1;
     for I := 0 to vHigh do
     begin
-      TokenArray[I].Token:=I;
-      TokenArray[I].Score:=FData[I];
+      TokenArray[I].Token := I;
+      TokenArray[I].Score := FData[I];
+    end;
+  end;
+end;
+
+procedure TNNetVolume.GetTokenArrayOnPixel(var TokenArray: TNNetTokenArray; X,
+  Y: integer);
+var
+  I, vHigh: integer;
+begin
+  if (Length(TokenArray) <> FDepth) then SetLength(TokenArray, FDepth);
+  if FDepth > 0 then
+  begin
+    vHigh := FDepth - 1;
+    for I := 0 to vHigh do
+    begin
+      TokenArray[I].Token := I;
+      TokenArray[I].Score := Self[X, Y, I];
     end;
   end;
 end;
