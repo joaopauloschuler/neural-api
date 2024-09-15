@@ -39,6 +39,12 @@ uses
 
 {$include neuralnetwork.inc}
 
+const
+  csNeuralEncodingMethodInt = 0;
+  csNeuralEncodingMethodOneHot = 1;
+  csNeuralEncodingMethodGroupedOnHot = 2;
+  csNeuralEncodingMethodIntChar = 3;
+
 type
   TTinyImageChannel = packed array [0..31, 0..31] of byte;
   TTinyImageChannel1D = packed array [0..32 * 32 - 1] of byte;
@@ -330,11 +336,11 @@ function GenerateStringFromTokens(NN: TNNet; Dict:TStringListInt; InputString: s
 
 function GenerateStringFromCasualCharNN(NN: TNNet;
   InputString: string; oSampler: TNNetSamplerBase = nil;
-  EncodingMethod: integer = 0; EncodingMethod2: integer = 0): string;
+  EncodingMethod: integer = csNeuralEncodingMethodInt; EncodingMethod2: integer = 0): string;
 
 function GenerateStringFromCasualNN(NN: TNNet; Dict:TStringListInt;
   InputString: string; oSampler: TNNetSamplerBase = nil;
-  EncodingMethod: integer = 0; EncodingMethod2: integer = 0): string;
+  EncodingMethod: integer = csNeuralEncodingMethodInt; EncodingMethod2: integer = 0): string;
 
 // Simple function for debugging an NLP NN predicting the next token.
 procedure DebugNLPOnPos(NN: TNNet; Dict: TStringListInt; var Dataset: TNNetAAInteger; Pos, Samples: integer);
@@ -515,13 +521,13 @@ begin
   Tokens := StringToArrayOfInteger(InputString);
   TokenCnt := Length(Tokens);
   repeat
-    if EncodingMethod = 0 then InputVolume.CopyNoChecksIntArr(Tokens)
-    else if EncodingMethod = 1 then InputVolume.OneHotEncoding(Tokens)
-    else if EncodingMethod = 2 then InputVolume.GroupedOneHotEncoding(Tokens, EncodingMethod2);
-
+    if      EncodingMethod = csNeuralEncodingMethodOneHot then InputVolume.OneHotEncoding(Tokens)
+    else if EncodingMethod = csNeuralEncodingMethodGroupedOnHot then InputVolume.GroupedOneHotEncoding(Tokens, EncodingMethod2)
+    else InputVolume.CopyNoChecksIntArr(Tokens);
     NN.Compute(InputVolume, OutputVolume);
-    //TODO: add sampler suppport here.
-    NextTokenInt := OutputVolume.GetClassOnPixel(TokenCnt - 1, 0);
+    if Assigned(oSampler)
+    then NextTokenInt := oSampler.GetTokenOnPixel(OutputVolume, TokenCnt-1, 0)
+    else NextTokenInt := OutputVolume.GetClassOnPixel(TokenCnt - 1, 0);
     if NextTokenInt < 256 then
     begin
       Result := Result + Chr(NextTokenInt);
@@ -537,31 +543,36 @@ end;
 
 function GenerateStringFromCasualNN(NN: TNNet; Dict: TStringListInt;
   InputString: string; oSampler: TNNetSamplerBase = nil;
-  EncodingMethod: integer = 0; EncodingMethod2: integer = 0): string;
+  EncodingMethod: integer = csNeuralEncodingMethodInt; EncodingMethod2: integer = 0): string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   NextTokenInt: integer;
   NextTokenStr: string;
   Tokens: TNeuralIntegerArray;
   TokenCnt: integer;
+  VocabCount: integer;
 begin
+  VocabCount := Dict.GetVocabCount();
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   Result := InputString;
-  Dict.StringToIntegerArray(InputString, Tokens);
+  Dict.Tokenize(InputString, Tokens);
   TokenCnt := Length(Tokens);
   repeat
-    if EncodingMethod = 0 then InputVolume.CopyNoChecksIntArr(Tokens)
-    else if EncodingMethod = 1 then InputVolume.OneHotEncoding(Tokens)
-    else if EncodingMethod = 2 then InputVolume.GroupedOneHotEncoding(Tokens, EncodingMethod2);
-
+    if      EncodingMethod = csNeuralEncodingMethodOneHot then InputVolume.OneHotEncoding(Tokens)
+    else if EncodingMethod = csNeuralEncodingMethodGroupedOnHot then InputVolume.GroupedOneHotEncoding(Tokens, EncodingMethod2)
+    else InputVolume.CopyNoChecksIntArr(Tokens);
     NN.Compute(InputVolume, OutputVolume);
-    //TODO: add sampler suppport here.
-    NextTokenInt := OutputVolume.GetClassOnPixel(TokenCnt - 1, 0);
-    if NextTokenInt < Dict.Count then
+    if Assigned(oSampler)
+    then NextTokenInt := oSampler.GetTokenOnPixel(OutputVolume, TokenCnt-1, 0)
+    else NextTokenInt := OutputVolume.GetClassOnPixel(TokenCnt - 1, 0);
+    if NextTokenInt < VocabCount then
     begin
-      NextTokenStr := Dict.IntegerToWord(NextTokenInt);
-      Result := Result + ' ' + NextTokenStr;
+      NextTokenStr := Dict.DeTokenize(NextTokenInt);
+      // todo: make a more efficient code.
+      if Dict.TokenizerHasSeparator
+      then Result := Result + ' ' + NextTokenStr
+      else Result := Result + NextTokenStr
     end;
     TokenCnt := TokenCnt + 1;
     SetLength(Tokens, TokenCnt);
