@@ -691,7 +691,12 @@ FProcs.Free;
 ```
 
 ### NLP
-This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset. A more [complex NLP example](https://github.com/joaopauloschuler/gpt-3-for-pascal) is also available.
+This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset. A more [complex NLP example showing the implementation of the GPT-3 Small architecture](https://github.com/joaopauloschuler/gpt-3-for-pascal) is also available.
+
+In short, this API supports:
+* Samplers: `TNNetSamplerGreedy`, `TNNetSamplerTopK` and `TNNetSamplerTopP`.
+* A tokenizer: `TNeuralTokenizer`.
+* A transformer decoder: `AddTransformerBlockCAI`.
 
 ## Publications from the Author
 In the case that you would like to know more about what the CAI's author is working at, here we go.
