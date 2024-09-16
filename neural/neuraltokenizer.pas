@@ -539,7 +539,6 @@ var
   X: TNeuralTokenizer;
 begin
   X := TNeuralTokenizer.Create;
-  //X.Test;
   X.FitOnFile('datasets/tinystories-10k.txt', 3000, true);
   X.SaveToFile('datasets/experiment-tinystories-vocab-3k-cai.txt');
   //X.LoadVocabularyFromFile('datasets/tinystories-vocab-3k-cai.txt');

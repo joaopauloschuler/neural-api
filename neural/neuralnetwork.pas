@@ -1738,7 +1738,6 @@ type
       function AddAvgMaxPool(pPoolSize: integer; pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddMinMaxChannel(pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
-      // Transformers, AddSingleHeadSelfAttention and AddSingleHeadTransformerBlock are under construction - do not use it
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false; HasNorm: boolean = false): TNNetLayer;
       function AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
