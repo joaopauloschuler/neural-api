@@ -145,6 +145,29 @@ begin
   oSampler.Free;
 end;
 ```
+## Creating a Vocabulary and Tokenizing a Dataset
+You can create your own vocabulary with CAI’s tokenizer from the unit [neuraltokenizer.pas](https://github.com/joaopauloschuler/neural-api/blob/master/neural/neuraltokenizer.pas). A vocabulary with 3000 tokens can be created with:
+```
+var
+  X: TNeuralTokenizer;
+begin
+  X := TNeuralTokenizer.Create;
+  X.FitOnFile('datasets/tinystories-10k.txt', 3000);
+  X.SaveToFile('datasets/tinystories-vocab-3k-cai.txt');
+  X.Free;
+end;
+```
+You can then tokenize your dataset with:
+```
+var
+  X: TNeuralTokenizer;
+begin
+  X := TNeuralTokenizer.Create;
+  X.LoadVocabularyFromFile('datasets/tinystories-vocab-3k-cai.txt');
+  X.TokenizeFileToCsv('datasets/tinystories-100k.txt','datasets/tinystories-100k-tokenized3k.csv');
+  X.Free;
+end;
+```
 
 ## Example with Transformer Decoder, Vocabulary and Multiple Outputs
 The currently leading NLP neural network models use tokenized datasets and vocabulary. The tokenized dataset and the vocabulary can be downloaded with:
