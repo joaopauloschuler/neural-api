@@ -157,7 +157,7 @@ begin
   X.Free;
 end;
 ```
-You can then tokenize your dataset with:
+The dataset can then be tokenized with:
 ```
 var
   X: TNeuralTokenizer;
@@ -168,6 +168,7 @@ begin
   X.Free;
 end;
 ```
+Above files can be found at the [TinyStories4Pascal-Tokenized-v2](https://huggingface.co/datasets/schuler/TinyStories4Pascal-Tokenized-v2) repository.
 
 ## Example with Transformer Decoder, Vocabulary and Multiple Outputs
 The currently leading NLP neural network models use tokenized datasets and vocabulary. The tokenized dataset and the vocabulary can be downloaded with:
