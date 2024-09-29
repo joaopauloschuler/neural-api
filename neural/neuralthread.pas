@@ -56,7 +56,7 @@ interface
 uses
   Classes, SysUtils,
   {$IFDEF FPC}
-  fgl, MTPCPU
+  fgl
     {$IFDEF WINDOWS}
     ,windows
     {$ELSE}
@@ -177,7 +177,7 @@ end;
 function NeuralDefaultThreadCount: integer;
 begin
   {$IFDEF FPC}
-  Result := GetSystemThreadCount;
+  Result := GetCPUCount;
   {$ELSE}
   Result := TThread.ProcessorCount;
   {$ENDIF}
