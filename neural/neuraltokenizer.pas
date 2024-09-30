@@ -17,8 +17,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 *)
 unit neuraltokenizer;
-
-{$mode ObjFPC}{$H+}
+{$include neuralnetwork.inc}
 
 interface
 
@@ -33,10 +32,10 @@ type
   TNeuralTokenizer = class(TStringListInt)
     public
       function GetVocabCount(): integer; override;
-      procedure Tokenize(const pText: string; Result: TIntegerList);
-      procedure Tokenize(pString: string; var IntArr: TNeuralIntegerArray); override; overload;
+      procedure Tokenize(const pText: string; Result: TIntegerList); overload;
+      procedure Tokenize(pString: string; var IntArr: TNeuralIntegerArray); overload; override;
       procedure TokenizeWord(const pText: string; Result: TIntegerList);
-      function DeTokenize(TokenId: integer): string; override; overload;
+      function DeTokenize(TokenId: integer): string; overload; override;
       function DeTokenize(TokenIds: TIntegerList): string; overload;
       function TokenizerHasSeparator: boolean; override;
 

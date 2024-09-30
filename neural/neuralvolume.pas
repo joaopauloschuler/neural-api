@@ -694,8 +694,8 @@ type
       function IntegerArrayToString(var IntArr: TNeuralIntegerArray): string;
       function IntegerListToCsv(IL: TIntegerList; pDelimiter: char = ','): string;
 
-      function DeTokenize(TokenId: integer): string; virtual; overload;
-      procedure Tokenize(pString: string; var IntArr: TNeuralIntegerArray); virtual; overload;
+      function DeTokenize(TokenId: integer): string; virtual;
+      procedure Tokenize(pString: string; var IntArr: TNeuralIntegerArray); overload; virtual;
       function GetVocabCount(): integer; virtual;
       function TokenizerHasSeparator: boolean; virtual;
 
@@ -11561,6 +11561,8 @@ begin
   asm_dword_copy;
 end;
 
+{$ENDIF} // of AVXANY
+
 { TNNetGroupedVolume }
 
 destructor TNNetGroupedVolume.Destroy;
@@ -11568,8 +11570,6 @@ begin
   SetLength(FGrInfoArray, 0);
   inherited Destroy;
 end;
-
-{$ENDIF}
 
 class function TVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer
   ): Single;
