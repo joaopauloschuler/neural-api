@@ -31,15 +31,13 @@ You can get A.I. powered help from these tools:
 * [CAI Neural API support at ChatGPT4](https://chatgpt.com/g/g-6BrAwhTQ9-free-pascal-developer-neural-api).
  
 ## Documentation
-The documentation is composed by:
-* Easy Examples.
-* Simple Image Classification Examples.
-* Youtube Videos.
-* Advanced Examples.
-
 In this readme file, you’ll find information about: 
+* Easy examples.
+* Simple image classification examples.
+* Youtube videos.
+* Advanced examples.
 * Data structures (Volumes).
-* Available neural network layers.
+* Neural network layers.
 * Dataset support.
 * Training (fitting) your neural network.
 * Parallel computing.
