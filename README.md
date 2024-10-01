@@ -259,10 +259,27 @@ TNNetVolumeList = class (specialize TFPGObjectList<TNNetVolume>
 TNNetVolumePairList = class (specialize TFPGObjectList<TNNetVolumePair>)
 ```
 ## Neural Network Layers
-This API is really big. The following list gives a general idea about this API but it doesn't contain everything.
+The layered structure of artificial neural networks is inspired by the organization of the human brain and nervous system. In the human brain, information processing occurs in a hierarchical manner. Sensory inputs are first processed by lower-level neurons, which extract simple features. These features are then passed on to deeper neurons that combine them to recognize more complex patterns. This hierarchical processing is mirrored in artificial neural networks through the use of stacked layers.
+
+Biological neurons are connected to each other through synapses, forming complex networks. Similarly, in artificial neural networks, neurons in one layer are connected to neurons in the next layer, mimicking this interconnected structure. Biological neurons fire (activate) based on a non-linear response to their inputs. This non-linearity is crucial for the brain's ability to learn complex patterns. In artificial neural networks, we use non-linear activation functions (such as ReLU) to introduce this non-linearity. Different regions of the brain specialize in processing different types of information. For instance, the visual cortex has layers specialized for detecting edges, shapes, and complex objects. This specialization is reflected in artificial neural networks, where different layers can learn to recognize different levels of abstraction.
+
+In the context of artificial neural networks, we can see this biologically-inspired layered approach implemented. For example:
+
+```pascal
+NN := TNNet.Create();
+NN.AddLayer([
+  TNNetInput.Create(32, 32, 3),
+  TNNetConvolutionLinear.Create({neurons=}16, {featuresize}3, {padding}1, {stride}1),
+  TNNetReLU6.Create()
+]);
+```
+
+This code snippet demonstrates the creation of a neural network with an input layer and a convolutional layer followed by a ReLU6 activation. This structure is inspired by the visual cortex in the brain, where neurons respond to specific patterns in their receptive fields, similar to how convolutional layers operate. The CAI Neural API also supports the creation of more complex, biologically-inspired architectures. These architectures are designed with multiple layers of different types, mirroring the complex structure of the brain.
+
+Artificial neural networks with multiple layers and specialized structures are inspired by the hierarchical and specialized nature of biological neural processing. It's important to note that while artificial neural networks are inspired by biological neural networks, they are highly simplified models. The human brain is far more complex, with various types of neurons, complex connectivity patterns, and mechanisms we don't yet fully understand. However, the layered structure in artificial neural networks has proven to be a powerful approach for solving complex problems in machine learning, inspired by the remarkable capabilities of biological neural networks.
 
 ### Input Layer
-* `TNNetInput` (input/output: 1D, 2D or 3D).
+The input layer serves as the gateway to the entire network. It's like the sensory organs of our brain, receiving information from the outside world. Without an input layer, the neural network would have no way to receive and interpret the initial data, making it impossible to perform any meaningful computations or learning tasks. The `TNNetInput` class implements the input layer.
 
 ### Fully Connected (Dense) Layers
 Fully connected layers, also known as dense layers, are a fundamental component of neural networks. In these layers, every neuron is connected to every neuron in the previous layer, allowing for comprehensive information processing across the entire network.
