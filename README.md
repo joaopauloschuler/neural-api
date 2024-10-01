@@ -265,6 +265,54 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetInput` (input/output: 1D, 2D or 3D).
 
 ### Convolutional Layers
+Convolutional layers are fundamental building blocks in neural networks, particularly in the field of computer vision and image processing. They are designed to automatically and adaptively learn spatial hierarchies of features from input data, such as images.
+
+In the context of the CAI Neural API, convolutional layers are implemented as classes derived from TNNetConvolutionAbstract. This abstract base class provides the core functionality for convolutional operations.
+
+The structure of a convolutional layer typically includes:
+1. Input: A multi-dimensional array (usually 3D for images: width, height, and channels).
+2. Kernels (or filters): small matrices of weights that slide over the input.
+3. Feature maps: the output produced by applying the kernels to the input.
+
+Key parameters of convolutional layers include:
+- Number of features (or filters)
+- Feature size (kernel size)
+- Padding
+- Stride
+
+The CAI Neural API offers several types of convolutional layers:
+1. `TNNetConvolution`: the standard convolutional layer.
+2. `TNNetConvolutionLinear`: a convolutional layer without an activation function.
+3. `TNNetConvolutionReLU`: a convolutional layer with a ReLU activation function.
+
+Convolutional layers are crucial in neural networks because they:
+1. Automatically learn hierarchical features from data.
+2. Maintain spatial relationships in the input.
+3. Reduce the number of parameters compared to fully connected layers.
+4. Enable the network to be translation-invariant.
+
+In practice, convolutional layers are often used in combination with other layer types, such as pooling layers (e.g., TNNetMaxPool) and normalization layers (e.g., TNNetMovingStdNormalization), to create powerful neural network architectures for tasks like image classification, object detection, and segmentation.
+
+Here's a brief example of how to create a convolutional layer using the CAI Neural API:
+
+```pascal
+NN := TNNet.Create();
+NN.AddLayer([
+  TNNetInput.Create(32, 32, 3),  // Input layer for 32x32 RGB images
+  TNNetConvolutionLinear.Create(
+    {Features=}64,     // Number of output features
+    {FeatureSize=}5,   // 5x5 kernel size
+    {Padding=}2,       // Padding of 2 pixels
+    {Stride=}1,        // Stride of 1 pixel
+    {SuppressBias=}1   // Suppress bias
+  ),
+  TNNetReLU6.Create()  // Activation function
+]);
+```
+
+This example creates a convolutional layer with 64 features, a 5x5 kernel size, padding of 2, and a stride of 1, followed by a ReLU6 activation function.
+
+These are tha available convolutional layers in CAI:
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
 |-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetConvolution`           | 1D, 2D, or 3D               | tanh          | Standard convolutional layer. Versatile for feature extraction in tasks like image recognition.        |
