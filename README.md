@@ -342,10 +342,10 @@ The structure of a convolutional layer typically includes:
 3. Feature maps: the output produced by applying the kernels to the input.
 
 Key parameters of convolutional layers include:
-- Number of features (or filters)
-- Feature size (kernel size)
-- Padding
-- Stride
+- Number of features (or filters).
+- Feature size (kernel size).
+- Padding.
+- Stride.
 
 The CAI Neural API offers several types of convolutional layers:
 1. `TNNetConvolution`: the standard convolutional layer.
@@ -358,7 +358,7 @@ Convolutional layers are crucial in neural networks because they:
 3. Reduce the number of parameters compared to fully connected layers.
 4. Enable the network to be translation-invariant.
 
-In practice, convolutional layers are often used in combination with other layer types, such as pooling layers (e.g., TNNetMaxPool) and normalization layers (e.g., TNNetMovingStdNormalization), to create powerful neural network architectures for tasks like image classification, object detection, and segmentation.
+In practice, convolutional layers are often used in combination with other layer types, such as pooling layers (e.g., `TNNetMaxPool`) and normalization layers (e.g., `TNNetMovingStdNormalization`), to create powerful neural network architectures for tasks like image classification, object detection, and segmentation.
 
 Here's a brief example of how to create a convolutional layer using the CAI Neural API:
 
@@ -412,17 +412,17 @@ A locally connected layer is a type of neural network layer that shares some sim
 ### Min / Max / Avg Pools
 Max, min, and avg poolings are downsampling techniques used in neural networks, particularly in convolutional neural networks (CNNs). Let's explore each of these pooling types as implemented in the CAI Neural API:
 
-1. Max Pooling (TNNetMaxPool):
+1. Max Pooling (`TNNetMaxPool`):
 Max pooling selects the maximum value from a defined region of the input.
 - It reduces spatial dimensions while retaining the most prominent features.
 - Useful for detecting specific features regardless of their position in the input.
 
-2. Min Pooling (TNNetMinPool):
+2. Min Pooling (`TNNetMinPool`):
 Min pooling selects the minimum value from a defined region of the input.
 - It can be useful for detecting dark features or gaps in the input.
 - Less common than max pooling but valuable in specific scenarios.
 
-3. Average Pooling (TNNetAvgPool):
+3. Average Pooling (`TNNetAvgPool`):
 Average pooling calculates the average value of a defined region of the input.
 - It smooths the input and can help in reducing noise.
 - Often used when we want to preserve more contextual information compared to max pooling.
@@ -437,21 +437,21 @@ During backpropagation, pooling layers distribute the gradient differently:
 - Min Pooling: Similar to max pooling, but for the minimum value.
 - Average Pooling: The gradient is divided equally among all neurons in the pooling region.
 
-The CAI Neural API implements these backpropagation methods in the respective Backpropagate() functions of each pooling class.
+The CAI Neural API implements these backpropagation methods in the respective `Backpropagate()` functions of each pooling class.
 
 Deconvolution (Upsampling) counterparts:
 The API also provides deconvolution or upsampling layers, which can be seen as the inverse operations of pooling:
-- TNNetDeMaxPool: A deconvolution layer that can upsample the input.
-- TNNetUpsample: Also known as depth_to_space, this layer can increase the spatial dimensions of the input.
+- `TNNetDeMaxPool`: a deconvolution layer that can upsample the input.
+- `TNNetUpsample`: also known as depth_to_space, this layer can increase the spatial dimensions of the input.
 
 These layers are crucial in architectures like autoencoders or in tasks requiring upsampling, such as image segmentation.
 
 When to use each pooling type:
-- Max Pooling: Best for detecting features regardless of their exact location. Commonly used in classification tasks.
-- Min Pooling: Useful when the absence of features is important, or when working with inverted data.
-- Average Pooling: Good for preserving more context and reducing noise. Often used in later layers of the network.
-- TNNetMinMaxPool: When you want to capture both the presence and absence of features.
-- TNNetAvgMaxPool: When you need to balance between preserving prominent features and maintaining context.
+- Max Pooling: it is useful for detecting features regardless of their exact location. It's commonly used in classification tasks.
+- Min Pooling: it is useful when the absence of features is important, or when working with inverted data.
+- Average Pooling: it is good for preserving more context and reducing noise. Often used in later layers of the network.
+- `TNNetMinMaxPool`: used when you want to capture both the presence and absence of features.
+- `TNNetAvgMaxPool`: used when you need to balance between preserving prominent features and maintaining context.
 
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
@@ -462,8 +462,8 @@ When to use each pooling type:
 | `TNNet.AddAvgMaxPool`        | 1D, 2D, or 3D               | Performs both average and max pooling, then concatenates the results.                                  |
 
 The CAI Neural API also provides specialized versions:
-- TNNetMaxChannel and TNNetMinChannel: Perform max and min operations across the entire channel into a single number per channel.
-- TNNetAvgChannel: Averages the entire channel into a single number per channel.
+- `TNNetMaxChannel` and `TNNetMinChannel`: perform max and min operations across the entire channel into a single number per channel.
+- `TNNetAvgChannel`: averages the entire channel into a single number per channel.
 
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
