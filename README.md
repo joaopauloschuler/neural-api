@@ -320,9 +320,21 @@ NN.AddLayer([
 | `TNNet.AddGroupedFullConnect`| 1D, 2D, or 3D               | Optional      | Adds a grouped fully connected layer, inspired by `TNNet.AddGroupedConvolution`.                       |
 
 ### Convolutional Layers
+Neurons, filters, and kernels are often used as synonyms in the context of neural networks, particularly in convolutional neural networks (CNNs). They are closely related concepts that are used interchangeably. Here's why:
+
+* Neurons: in artificial neural networks, neurons are the basic computational units. They receive input, process it, and produce an output. In the context of CNNs, the term "neuron" is sometimes used to refer to a single element in a feature map.
+* Filters: in CNNs, filters (also called convolution kernels) are small matrices of weights that slide over the input data to detect specific features. Each filter produces a feature map in the output layer.
+* Kernels: in image processing and CNNs, kernels are small matrices used for various operations like blurring, sharpening, or edge detection. In the context of CNNs, kernels and filters are essentially the same thing.
+The reason these terms are often used synonymously is that they all contribute to the feature detection and transformation process in neural networks:
+    * A single filter/kernel can be thought of as a specialized neuron that detects a specific feature across the entire input.
+    * The weights in a filter/kernel are analogous to the weights in a traditional neuron.
+    * The output of applying a filter/kernel to an input region is similar to the activation of a neuron in response to its inputs.
+
+In practice, when implementing CNNs, the terms "filter" and "kernel" are more commonly used than "neuron" when referring to the convolutional layers. However, the underlying concept of a computational unit that processes input and produces output remains the same across these terms.
+
 Convolutional layers are fundamental building blocks in neural networks, particularly in the field of computer vision and image processing. They are designed to automatically and adaptively learn spatial hierarchies of features from input data, such as images.
 
-In the context of the CAI Neural API, convolutional layers are implemented as classes derived from TNNetConvolutionAbstract. This abstract base class provides the core functionality for convolutional operations.
+In the context of the CAI Neural API, convolutional layers are implemented as classes derived from `TNNetConvolutionAbstract`. This abstract base class provides the core functionality for convolutional operations.
 
 The structure of a convolutional layer typically includes:
 1. Input: A multi-dimensional array (usually 3D for images: width, height, and channels).
