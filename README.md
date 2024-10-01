@@ -474,6 +474,15 @@ The CAI Neural API also provides specialized versions:
 | `TNNet.AddAvgMaxChannel`     | 1D, 2D, or 3D               | Performs both average and max channel operations, then concatenates the results.                       |
 
 ### Trainable Normalization Layers Allowing Faster Learning/Convergence
+Normalization layers may offer:
+* Improved training stability.
+* Better generalization.
+* Potential for faster convergence.
+
+The available normalization techniques are:
+* Zero-centering (`TNNetChannelZeroCenter`).
+* Standard deviation normalization (`TNNetMovingStdNormalization`, `TNNetChannelStdNormalization`).
+
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetChannelZeroCenter`     | 1D, 2D, or 3D               | Trainable zero-centering normalization.                                                              |
