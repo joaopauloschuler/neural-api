@@ -369,30 +369,36 @@ The CAI Neural API also provides specialized versions:
 | `TNNet.AddAvgMaxChannel`     | 1D, 2D, or 3D               | Performs both average and max channel operations, then concatenates the results.                       |
 
 ### Trainable Normalization Layers Allowing Faster Learning/Convergence
-* `TNNetChannelZeroCenter` (input/output: 1D, 2D or 3D). Trainable zero centering.
-* `TNNetMovingStdNormalization` (input/output: 1D, 2D or 3D). Trainable std. normalization.
-* `TNNetChannelStdNormalization` (input/output: 1D, 2D or 3D). Trainable per channel std. normalization.
-* `TNNet.AddMovingNorm` (input/output: 1D, 2D or 3D). Possible replacement for batch normalization.
-* `TNNet.AddChannelMovingNorm` (input/output: 1D, 2D or 3D). Possible replacement for per batch normalization.
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetChannelZeroCenter`     | 1D, 2D, or 3D               | Trainable zero-centering normalization.                                                              |
+| `TNNetMovingStdNormalization`| 1D, 2D, or 3D               | Trainable standard deviation normalization.                                                          |
+| `TNNetChannelStdNormalization`| 1D, 2D, or 3D              | Trainable per-channel standard deviation normalization.                                              |
+| `TNNet.AddMovingNorm`        | 1D, 2D, or 3D               | Possible replacement for batch normalization.                                                        |
+| `TNNet.AddChannelMovingNorm` | 1D, 2D, or 3D               | Possible replacement for batch normalization, applied per channel.                                   |
 
 ### Non Trainable and per Sample Normalization Layers
-* `TNNetLayerMaxNormalization` (input/output: 1D, 2D or 3D).
-* `TNNetLayerStdNormalization` (input/output: 1D, 2D or 3D).
-* `TNNetLocalResponseNorm2D` (input/output: 2D or 3D).
-* `TNNetLocalResponseNormDepth` (input/output: 2D or 3D).
-* `TNNetRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication (scale) and a random bias (shift).
-* `TNNetChannelRandomMulAdd` (input/output: 1D, 2D or 3D). Adds a random multiplication (scale) and random bias (shift) per channel.
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetLayerMaxNormalization` | 1D, 2D, or 3D               | Non-trainable max normalization per layer.                                                           |
+| `TNNetLayerStdNormalization` | 1D, 2D, or 3D               | Non-trainable standard deviation normalization per layer.                                            |
+| `TNNetLocalResponseNorm2D`   | 2D or 3D                    | Non-trainable local response normalization for 2D or 3D input.                                       |
+| `TNNetLocalResponseNormDepth`| 2D or 3D                    | Non-trainable local response normalization with depth normalization.                                 |
+| `TNNetRandomMulAdd`          | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift).                                                  |
+| `TNNetChannelRandomMulAdd`   | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift) per channel.                                      |
 
 ### Concatenation, Summation and Reshaping Layers
-* `TNNetConcat` (input/output: 1D, 2D or 3D). Allows concatenating previous layers into a single layer.
-* `TNNetDeepConcat` (input/output: 1D, 2D or 3D). Concatenates previous layers into the depth axis. This is useful with DenseNet like architectures. Use `TNNetDeepConcat` instead of `TNNetConcat` if you need to add convolutions after concating layers.
-* `TNNetIdentity` (input/output: 1D, 2D or 3D).
-* `TNNetIdentityWithoutBackprop` (input/output: 1D, 2D or 3D). Allows the forward pass to proceed but prevents backpropagation.
-* `TNNetReshape` (input/output: 1D, 2D or 3D).
-* `TNNetSplitChannels` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits (or copies) channels from the input. This layer allows getting a subset of the input channels.
-* `TNNetSplitChannelEvery` (input: 1D, 2D or 3D / output: 1D, 2D or 3D). Splits (or copies) channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.
-* `TNNetSum` (input/output: 1D, 2D or 3D). Sums outputs from previous layers allowing ResNet style networks.
-* `TNNetUpsample` (input/output: 3D). Converts channels (depth) into spatial data. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetConcat`                | 1D, 2D, or 3D               | Concatenates previous layers into a single layer.                                                      |
+| `TNNetDeepConcat`            | 1D, 2D, or 3D               | Concatenates previous layers along the depth axis. This is useful with DenseNet like architectures. Use `TNNetDeepConcat` instead of `TNNetConcat` if you need to add convolutions after concating layers.                                                    |
+| `TNNetIdentity`              | 1D, 2D, or 3D               | Identity layer that passes the input unchanged.                                                        |
+| `TNNetIdentityWithoutBackprop`| 1D, 2D, or 3D              | Allows the forward pass but prevents backpropagation.                                                  |
+| `TNNetReshape`               | 1D, 2D, or 3D               | Reshapes the input into a different dimension.                                                         |
+| `TNNetSplitChannels`         | 1D, 2D, or 3D               | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |
+| `TNNetSplitChannelEvery`     | 1D, 2D, or 3D               | Splits channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.|
+| `TNNetSum`                   | 1D, 2D, or 3D               | Sums the outputs from previous layers, useful for ResNet-style networks.                               |
+| `TNNetUpsample`              | 3D                          | Upsamples channels (depth) into spatial data, converting depth into spatial resolution. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.|
 
 ### Layers with Activation Functions and no Trainable Parameter
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
