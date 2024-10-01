@@ -264,6 +264,44 @@ This API is really big. The following list gives a general idea about this API b
 ### Input Layer
 * `TNNetInput` (input/output: 1D, 2D or 3D).
 
+### Fully Connected (Dense) Layers
+Fully connected layers, also known as dense layers, are a fundamental component of neural networks. In these layers, every neuron is connected to every neuron in the previous layer, allowing for comprehensive information processing across the entire network.
+
+In the context of the CAI Neural API, fully connected layers are represented by various classes derived from TNNetFullConnect. These layers play a crucial role in transforming input data and learning complex patterns.
+
+The computation process in a fully connected layer involves:
+1. Multiplying input values by the layer's weights.
+2. Adding bias terms (if not suppressed).
+3. Applying an activation function (if present).
+
+Key types of fully connected layers include:
+1. `TNNetFullConnectLinear`: a basic fully connected layer without an activation function. It performs a linear transformation of the input data.
+2. `TNNetFullConnectReLU`: incorporates the Rectified Linear Unit (ReLU) activation function. ReLU introduces non-linearity by outputting the input for positive values and zero for negative values, helping the network learn complex patterns.
+3. `TNNetFullConnectSigmoid`: applies the sigmoid activation function to the layer's output. Sigmoid squashes the output between 0 and 1, useful for binary classification tasks.
+
+Fully connected layers are typically used in neural network architectures as:
+1. Hidden layers for processing and transforming features.
+2. Output layers for producing final predictions.
+
+For example, in the provided context, we see a simple neural network structure:
+
+```pascal
+NN := TNNet.Create();
+NN.AddLayer([
+  TNNetInput.Create(2),       // Input layer with 2 inputs
+  TNNetFullConnect.Create(2), // Hidden fully connected layer with 2 neurons
+  TNNetFullConnect.Create(1)  // Output fully connected layer with 1 neuron  
+]);
+```
+
+| Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
+|-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetFullConnect`           | 1D, 2D, or 3D               | tanh          | Fully connected layer with `tanh` as the default activation function.                                  |
+| `TNNetFullConnectReLU`       | 1D, 2D, or 3D               | ReLU          | Fully connected layer with ReLU activation.                                                            |
+| `TNNetFullConnectLinear`     | 1D, 2D, or 3D               | None          | Fully connected layer without an activation function (linear).                                         |
+| `TNNetFullConnectSigmoid`    | 1D, 2D, or 3D               | Sigmoid       | Fully connected layer with Sigmoid activation.                                                         |
+| `TNNet.AddGroupedFullConnect`| 1D, 2D, or 3D               | Optional      | Adds a grouped fully connected layer, inspired by `TNNet.AddGroupedConvolution`.                       |
+
 ### Convolutional Layers
 Convolutional layers are fundamental building blocks in neural networks, particularly in the field of computer vision and image processing. They are designed to automatically and adaptively learn spatial hierarchies of features from input data, such as images.
 
@@ -327,16 +365,6 @@ These are tha available convolutional layers in CAI:
 | `TNNet.AddSeparableConvLinear`| 1D, 2D, or 3D              | None          | Adds a linear separable convolution. Useful for lightweight models with reduced parameter count.       |
 | `TNNet.AddConvOrSeparableConv`| 1D, 2D, or 3D              | Optional      | Adds standard or separable convolution. Supports optional ReLU and normalization for versatile design. |
 | `TNNet.AddGroupedConvolution`| 1D, 2D, or 3D               | Optional      | Adds a grouped convolution. Allows efficient parallel processing of input channels.                    |
-
-### Fully Connected (Dense) Layers
-
-| Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
-|-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
-| `TNNetFullConnect`           | 1D, 2D, or 3D               | tanh          | Fully connected layer with `tanh` as the default activation function.                                  |
-| `TNNetFullConnectReLU`       | 1D, 2D, or 3D               | ReLU          | Fully connected layer with ReLU activation.                                                            |
-| `TNNetFullConnectLinear`     | 1D, 2D, or 3D               | None          | Fully connected layer without an activation function (linear).                                         |
-| `TNNetFullConnectSigmoid`    | 1D, 2D, or 3D               | Sigmoid       | Fully connected layer with Sigmoid activation.                                                         |
-| `TNNet.AddGroupedFullConnect`| 1D, 2D, or 3D               | Optional      | Adds a grouped fully connected layer, inspired by `TNNet.AddGroupedConvolution`.                       |
 
 ### Locally Connected Layers
 A locally connected layer is a type of neural network layer that shares some similarities with convolutional layers but has some distinct characteristics:
