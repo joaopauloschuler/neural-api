@@ -265,18 +265,20 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetInput` (input/output: 1D, 2D or 3D).
 
 ### Convolutional Layers
-* `TNNetConvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). This layer has `tanh` as default activation function.
-* `TNNetConvolutionReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
-* `TNNetConvolutionLinear` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
-* `TNNetPointwiseConvReLU` (input/output: 1D, 2D or 3D).
-* `TNNetPointwiseConvLinear` (input/output: 1D, 2D or 3D).
-* `TNNetDepthwiseConv` (input/output: 1D, 2D or 3D). This layer has `tanh` as default activation function.
-* `TNNetDepthwiseConvReLU` (input/output: 1D, 2D or 3D).
-* `TNNetDepthwiseConvLinear` (input/output: 1D, 2D or 3D).
-* `TNNet.AddSeparableConvReLU` (input/output: 1D, 2D or 3D). Adds a separable convolution.
-* `TNNet.AddSeparableConvLinear` (input/output: 1D, 2D or 3D). Adds a separable convolution.
-* `TNNet.AddConvOrSeparableConv` (input/output: 1D, 2D or 3D). Adds a convolution or a separable convolution with/without ReLU and normalization.
-* `TNNet.AddGroupedConvolution` (input/output: 1D, 2D or 3D). Adds a grouped convolution. 
+| Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
+|-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetConvolution`           | 1D, 2D, or 3D               | tanh          | Standard convolutional layer. Versatile for feature extraction in tasks like image recognition.        |
+| `TNNetConvolutionReLU`       | 1D, 2D, or 3D               | ReLU          | Convolutional layer with ReLU activation. Helps mitigate vanishing gradient problem.                   |
+| `TNNetConvolutionLinear`     | 1D, 2D, or 3D               | None          | Linear convolutional layer without activation. Useful for intermediate layers.                        |
+| `TNNetPointwiseConvReLU`     | 1D, 2D, or 3D               | ReLU          | 1x1 convolution with ReLU. Efficient for channel-wise dimensionality reduction or expansion.           |
+| `TNNetPointwiseConvLinear`   | 1D, 2D, or 3D               | None          | Linear 1x1 convolution. Useful for channel mixing without spatial operations.                         |
+| `TNNetDepthwiseConv`         | 1D, 2D, or 3D               | tanh          | Depthwise convolution with tanh activation. Reduces computational cost by processing each channel separately. |
+| `TNNetDepthwiseConvReLU`     | 1D, 2D, or 3D               | ReLU          | Depthwise convolution with ReLU activation. Combines depthwise efficiency with the benefits of ReLU.   |
+| `TNNetDepthwiseConvLinear`   | 1D, 2D, or 3D               | None          | Linear depthwise convolution. Useful when additional non-linearity is not required.                    |
+| `TNNet.AddSeparableConvReLU` | 1D, 2D, or 3D               | ReLU          | Adds a separable convolution with ReLU. Combines depthwise and pointwise for efficient feature extraction. |
+| `TNNet.AddSeparableConvLinear`| 1D, 2D, or 3D              | None          | Adds a linear separable convolution. Useful for lightweight models with reduced parameter count.       |
+| `TNNet.AddConvOrSeparableConv`| 1D, 2D, or 3D              | Optional      | Adds standard or separable convolution. Supports optional ReLU and normalization for versatile design. |
+| `TNNet.AddGroupedConvolution`| 1D, 2D, or 3D               | Optional      | Adds a grouped convolution. Allows efficient parallel processing of input channels.                    |
 
 ### Fully Connected (Dense) Layers
 * `TNNetFullConnect` (input/output: 1D, 2D or 3D). This layer has `tanh` as default activation function.
