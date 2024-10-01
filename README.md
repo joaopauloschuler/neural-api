@@ -335,20 +335,22 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetUpsample` (input/output: 3D). Converts channels (depth) into spatial data. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.
 
 ### Layers with Activation Functions and no Trainable Parameter
-* `TNNetReLU` (input/output: 1D, 2D or 3D).
-* `TNNetReLU6` (input/output: 1D, 2D or 3D).
-* `TNNetReLUL` (input/output: 1D, 2D or 3D).
-* `TNNetLeakyReLU` (input/output: 1D, 2D or 3D).
-* `TNNetVeryLeakyReLU` (input/output: 1D, 2D or 3D).
-* `TNNetReLUSqrt` (input/output: 1D, 2D or 3D).
-* `TNNetSELU` (input/output: 1D, 2D or 3D).
-* `TNNetSigmoid` (input/output: 1D, 2D or 3D).
-* `TNNetSoftMax` (input/output: 1D, 2D or 3D).
-* `TNNetSwish` (input/output: 1D, 2D or 3D).
-* `TNNetSwish6` (input/output: 1D, 2D or 3D).
-* `TNNetHardSwish` (input/output: 1D, 2D or 3D).
-* `TNNetHyperbolicTangent` (input/output: 1D, 2D or 3D).
-* `TNNetPower` (input/output: 1D, 2D or 3D).
+| Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
+|-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetReLU`                  | 1D, 2D, or 3D               | ReLU          | Applies the ReLU activation function.                                                                 |
+| `TNNetReLU6`                 | 1D, 2D, or 3D               | ReLU6         | ReLU activation clipped at 6.                                                                          |
+| `TNNetReLUL`                 | 1D, 2D, or 3D               | ReLUL         | Leaky version of ReLU.                                                                                 |
+| `TNNetLeakyReLU`             | 1D, 2D, or 3D               | Leaky ReLU    | Applies a leaky ReLU activation function.                                                              |
+| `TNNetVeryLeakyReLU`         | 1D, 2D, or 3D               | Very Leaky ReLU| Applies a very leaky ReLU activation function.                                                         |
+| `TNNetReLUSqrt`              | 1D, 2D, or 3D               | ReLU Sqrt     | ReLU activation function with square root scaling.                                                     |
+| `TNNetSELU`                  | 1D, 2D, or 3D               | SELU          | Self-normalizing activation function.                                                                  |
+| `TNNetSigmoid`               | 1D, 2D, or 3D               | Sigmoid       | Sigmoid activation function.                                                                           |
+| `TNNetSoftMax`               | 1D, 2D, or 3D               | SoftMax       | SoftMax activation function.                                                                           |
+| `TNNetSwish`                 | 1D, 2D, or 3D               | Swish         | Swish activation function.                                                                             |
+| `TNNetSwish6`                | 1D, 2D, or 3D               | Swish 6       | Swish activation clipped at 6.                                                                         |
+| `TNNetHardSwish`             | 1D, 2D, or 3D               | Hard Swish    | Hard version of Swish activation.                                                                      |
+| `TNNetHyperbolicTangent`     | 1D, 2D, or 3D               | tanh          | Hyperbolic tangent activation function.                                                                |
+| `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
 
 ### Trainable Bias (Shift) and Multiplication (Scaling) per Cell or Channel Allowing Faster Learning and Convergence
 * `TNNetCellBias` (input/output: 1D, 2D or 3D).
@@ -357,11 +359,13 @@ This API is really big. The following list gives a general idea about this API b
 * `TNNetChannelMul` (input/output: 1D, 2D or 3D).
 
 ### Opposing Operations
-* `TNNetDeLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
-* `TNNetDeLocalConnectReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
-* `TNNetDeconvolution` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
-* `TNNetDeconvolutionReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
-* `TNNetDeMaxPool` (input/output: 1D, 2D or 3D - max is done on a single layer).
+| Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
+|-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetDeLocalConnect`        | 1D, 2D, or 3D               | tanh          | Opposing operation to `TNNetLocalConnect`.                                                            |
+| `TNNetDeLocalConnectReLU`    | 1D, 2D, or 3D               | ReLU          | Opposing operation to `TNNetLocalConnectReLU`.                                                        |
+| `TNNetDeconvolution`         | 1D, 2D, or 3D               | tanh          | Opposing operation to convolution, also known as transposed convolution.                               |
+| `TNNetDeconvolutionReLU`     | 1D, 2D, or 3D               | ReLU          | Opposing operation to convolution with ReLU activation.                                                |
+| `TNNetDeMaxPool`             | 1D, 2D, or 3D               | None          | Opposing operation to max pooling layer (max is done on a single layer).                               |
 
 ### Weight Initializers
 This API implements popular weight initialization methods including He (Kaiming) and Glorot/Bengio (Xavier):
