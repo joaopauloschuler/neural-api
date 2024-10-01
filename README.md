@@ -361,11 +361,11 @@ This API is really big. The following list gives a general idea about this API b
 ### Opposing Operations
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
 |-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
-| `TNNetDeLocalConnect`        | 1D, 2D, or 3D               | tanh          | Opposing operation to `TNNetLocalConnect`.                                                            |
-| `TNNetDeLocalConnectReLU`    | 1D, 2D, or 3D               | ReLU          | Opposing operation to `TNNetLocalConnectReLU`.                                                        |
-| `TNNetDeconvolution`         | 1D, 2D, or 3D               | tanh          | Opposing operation to convolution, also known as transposed convolution.                               |
-| `TNNetDeconvolutionReLU`     | 1D, 2D, or 3D               | ReLU          | Opposing operation to convolution with ReLU activation.                                                |
-| `TNNetDeMaxPool`             | 1D, 2D, or 3D               | None          | Opposing operation to max pooling layer (max is done on a single layer).                               |
+| `TNNetDeLocalConnect`       | 1D, 2D, or 3D               | tanh          | Opposing operation to `TNNetLocalConnect`.                                                            |
+| `TNNetDeLocalConnectReLU`   | 1D, 2D, or 3D               | ReLU          | Opposing operation to `TNNetLocalConnectReLU`.                                                        |
+| `TNNetDeconvolution`        | 1D, 2D, or 3D               | tanh          | Opposing operation to `TNNetConvolution`, also known as transposed convolution.                       |
+| `TNNetDeconvolutionReLU`    | 1D, 2D, or 3D               | ReLU          | Opposing operation to convolution with ReLU activation (`TNNetConvolutionReLU`).                      |
+| `TNNetDeMaxPool`            | 1D, 2D, or 3D               | None          | Opposing operation to max pooling layer `TNNetMaxPool`.                                               |
 
 ### Weight Initializers
 This API implements popular weight initialization methods including He (Kaiming) and Glorot/Bengio (Xavier):
