@@ -419,10 +419,12 @@ The CAI Neural API also provides specialized versions:
 | `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
 
 ### Trainable Bias (Shift) and Multiplication (Scaling) per Cell or Channel Allowing Faster Learning and Convergence
-* `TNNetCellBias` (input/output: 1D, 2D or 3D).
-* `TNNetCellMul` (input/output: 1D, 2D or 3D).
-* `TNNetChannelBias` (input/output: 1D, 2D or 3D).
-* `TNNetChannelMul` (input/output: 1D, 2D or 3D).
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetCellBias`              | 1D, 2D, or 3D               | Trainable bias (shift) for each cell.                                                                 |
+| `TNNetCellMul`               | 1D, 2D, or 3D               | Trainable multiplication (scaling) for each cell.                                                     |
+| `TNNetChannelBias`           | 1D, 2D, or 3D               | Trainable bias (shift) for each channel.                                                              |
+| `TNNetChannelMul`            | 1D, 2D, or 3D               | Trainable multiplication (scaling) for each channel.                                                  |
 
 ### Opposing Operations
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
