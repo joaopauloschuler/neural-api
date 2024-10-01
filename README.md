@@ -291,8 +291,18 @@ This API is really big. The following list gives a general idea about this API b
 | `TNNet.AddGroupedFullConnect`| 1D, 2D, or 3D               | Optional      | Adds a grouped fully connected layer, inspired by `TNNet.AddGroupedConvolution`.                       |
 
 ### Locally Connected Layers
-* `TNNetLocalConnect` (input/output: 1D, 2D or 3D - feature size: 1D or 2D). This layer has `htan` as default activation function.
-* `TNNetLocalConnectReLU` (input/output: 1D, 2D or 3D - feature size: 1D or 2D).
+A locally connected layer is a type of neural network layer that shares some similarities with convolutional layers but has some distinct characteristics:
+* Structure: Locally connected layers, like convolutional layers, operate on local regions of the input. However, unlike convolutional layers, they do not share weights across different positions in the input.
+* Weight independence: Each local region in the input has its own set of weights, which are not shared with other regions. This allows the layer to learn position-specific features.
+* Flexibility: Locally connected layers offer more flexibility in learning spatial hierarchies compared to fully connected layers, while still maintaining position-specific information unlike convolutional layers.
+* Parameters: These layers typically have more parameters than convolutional layers due to the lack of weight sharing, which can lead to increased computational complexity and memory usage.
+* Use cases: Locally connected layers can be useful in scenarios where position-specific features are important, such as in face recognition tasks where different parts of the face have distinct characteristics based on their location.
+
+| Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
+|-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetLocalConnectLinear`   | 1D, 2D, or 3D               | None          | Locally connected layer with ReLU activation.                                                         |
+| `TNNetLocalConnect`         | 1D, 2D, or 3D               | tanh          | Locally connected layer with `htan` as the default activation function.                               |
+| `TNNetLocalConnectReLU`     | 1D, 2D, or 3D               | ReLU          | Locally connected layer with ReLU activation.                                                         |
 
 ### Min / Max / Avg Pools
 * `TNNetAvgPool` (input/output: 1D, 2D or 3D).
