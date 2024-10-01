@@ -483,6 +483,16 @@ The CAI Neural API also provides specialized versions:
 | `TNNet.AddChannelMovingNorm` | 1D, 2D, or 3D               | Possible replacement for batch normalization, applied per channel.                                   |
 
 ### Non Trainable and per Sample Normalization Layers
+Normalization layers (`TNNetLayerMaxNormalization`, `TNNetLayerStdNormalization`, `TNNetLocalResponseNorm2D`, `TNNetLocalResponseNormDepth`) help stabilize training and can improve model performance by managing the scale and distribution of activations. They are particularly useful in deep networks where the scale of values can change dramatically between layers.
+
+`TNNetLayerMaxNormalization` normalizes based on the maximum value, while `TNNetLayerStdNormalization` uses standard deviation. These are particularly useful when you want to normalize the activations within a specific range or distribution without learning any parameters. They can be applied to various network architectures and are especially helpful when dealing with varying scales of input features.
+
+`TNNetLocalResponseNorm2D` and `TNNetLocalResponseNormDepth` implement types of local Response Normalization (LRN). LRN is inspired by lateral inhibition in real neurons. It's particularly useful in Convolutional Neural Networks (CNNs) for image processing tasks. You may use it in scenarios where you want to create competition amongst neuron outputs in the same layer.
+
+`TNNetLocalResponseNorm2D` is applied across nearby kernel maps at the same spatial position, while `TNNetLocalResponseNormDepth` normalizes across the depth dimension. These layers can help in increasing the generalization capability of the model, reducing the chances of overfitting and enhancing the model's ability to detect high-frequency features with a big response.
+
+Random layers (`TNNetRandomMulAdd`, `TNNetChannelRandomMulAdd`) serve as powerful regularization techniques, helping to prevent overfitting and improve the model's ability to generalize. They can be especially beneficial when working with limited datasets or when you want your model to be robust to small variations in input.
+
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetLayerMaxNormalization` | 1D, 2D, or 3D               | Non-trainable max normalization per layer.                                                           |
@@ -491,6 +501,8 @@ The CAI Neural API also provides specialized versions:
 | `TNNetLocalResponseNormDepth`| 2D or 3D                    | Non-trainable local response normalization with depth normalization.                                 |
 | `TNNetRandomMulAdd`          | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift).                                                  |
 | `TNNetChannelRandomMulAdd`   | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift) per channel.                                      |
+
+These layers provide various tools for normalization, regularization, and introducing controlled variability in neural networks. The choice of which layers to use and where to place them in your network architecture depends on the specific problem you're trying to solve, the characteristics of your data, and the behavior you want to encourage in your model.
 
 ### Concatenation, Summation and Reshaping Layers
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
