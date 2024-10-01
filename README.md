@@ -527,6 +527,13 @@ These layers provide various tools for normalization, regularization, and introd
 | `TNNetUpsample`              | 3D                          | Upsamples channels (depth) into spatial data, converting depth into spatial resolution. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.|
 
 ### Layers with Activation Functions and no Trainable Parameter
+Activation functions are a fundamental component of neural networks. These functions play several crucial roles in neural networks:
+* Introducing non-linearity: this allows the network to model complex, non-linear relationships in data.
+* Normalizing outputs: many activation functions map inputs to a fixed range, helping to prevent issues like exploding gradients.
+* Representing features: different activation functions can help in capturing various types of patterns or features in the data.
+The choice of activation function can significantly impact the performance and learning capabilities of a neural network, and different problems may benefit from different activation functions.
+
+The CAI Neural API supports various types of activation functions, as per the below table:
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
 |-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetReLU`                  | 1D, 2D, or 3D               | ReLU          | Applies the ReLU activation function.                                                                 |
