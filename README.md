@@ -380,18 +380,22 @@ This example creates a convolutional layer with 64 features, a 5x5 kernel size, 
 These are tha available convolutional layers in CAI:
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
 |-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
-| `TNNetConvolutionLinear`     | 1D, 2D, or 3D               | None          | Linear convolutional layer without activation. Useful for intermediate layers.                        |
-| `TNNetConvolution`           | 1D, 2D, or 3D               | tanh          | Standard convolutional layer. Versatile for feature extraction in tasks like image recognition.        |
-| `TNNetConvolutionReLU`       | 1D, 2D, or 3D               | ReLU          | Convolutional layer with ReLU activation. Helps mitigate vanishing gradient problem.                   |
-| `TNNetPointwiseConvLinear`   | 1D, 2D, or 3D               | None          | Linear 1x1 convolution. Useful for channel mixing without spatial operations.                         |
-| `TNNetPointwiseConvReLU`     | 1D, 2D, or 3D               | ReLU          | 1x1 convolution with ReLU. Efficient for channel-wise dimensionality reduction or expansion.           |
-| `TNNetDepthwiseConvLinear`   | 1D, 2D, or 3D               | None          | Linear depthwise convolution. Useful when additional non-linearity is not required.                    |
-| `TNNetDepthwiseConv`         | 1D, 2D, or 3D               | tanh          | Depthwise convolution with tanh activation. Reduces computational cost by processing each channel separately. |
-| `TNNetDepthwiseConvReLU`     | 1D, 2D, or 3D               | ReLU          | Depthwise convolution with ReLU activation. Combines depthwise efficiency with the benefits of ReLU.   |
-| `TNNet.AddSeparableConvLinear`| 1D, 2D, or 3D              | None          | Adds a linear separable convolution. Useful for lightweight models with reduced parameter count.       |
-| `TNNet.AddSeparableConvReLU` | 1D, 2D, or 3D               | ReLU          | Adds a separable convolution with ReLU. Combines depthwise and pointwise for efficient feature extraction. |
+| `TNNetConvolutionLinear`    | 1D, 2D, or 3D               | None          | Linear convolutional layer without activation. Useful for intermediate layers.                        |
+| `TNNetConvolution`          | 1D, 2D, or 3D               | tanh          | Standard convolutional layer. Versatile for feature extraction in tasks like image recognition.       |
+| `TNNetConvolutionReLU`      | 1D, 2D, or 3D               | ReLU          | Convolutional layer with ReLU activation. Helps mitigate vanishing gradient problem.                  |
+| `TNNetConvolutionSwish`     | 1D, 2D, or 3D               | Swish         | Convolutional layer with Swish activation. Performs better than ReLU in some cases.                   |
+| `TNNetConvolutionHardSwish` | 1D, 2D, or 3D               | Hard Swish    | Convolutional layer with Hard Swish activation. It is similar to swish but it's faster.               |
+| `TNNetConvolutionSharedWeights`| 1D, 2D, or 3D            | same as linked layer | Convolutional layer that uses the weights from another layer                                   | 
+| `TNNetPointwiseConvLinear`  | 1D, 2D, or 3D               | None          | Linear 1x1 convolution. Useful for channel mixing without spatial operations.                         |
+| `TNNetPointwiseConvReLU`    | 1D, 2D, or 3D               | ReLU          | 1x1 convolution with ReLU. Efficient for channel-wise dimensionality reduction or expansion.          |
+| `TNNetPointwiseConv`        | 1D, 2D, or 3D               | tanh          | 1x1 convolution. Useful for autoencoding architectures.                                               |
+| `TNNetDepthwiseConvLinear`  | 1D, 2D, or 3D               | None          | Linear depthwise convolution. Useful when additional non-linearity is not required.                   |
+| `TNNetDepthwiseConv`        | 1D, 2D, or 3D               | tanh          | Depthwise convolution with tanh activation. Reduces computational cost by processing each channel separately. |
+| `TNNetDepthwiseConvReLU`    | 1D, 2D, or 3D               | ReLU          | Depthwise convolution with ReLU activation. Combines depthwise efficiency with the benefits of ReLU.  |
+| `TNNet.AddSeparableConvLinear`| 1D, 2D, or 3D              | None          | Adds a linear separable convolution. Useful for lightweight models with reduced parameter count.     |
+| `TNNet.AddSeparableConvReLU`| 1D, 2D, or 3D               | ReLU          | Adds a separable convolution with ReLU. Combines depthwise and pointwise for efficient feature extraction. |
 | `TNNet.AddConvOrSeparableConv`| 1D, 2D, or 3D              | Optional      | Adds standard or separable convolution. Supports optional ReLU and normalization for versatile design. |
-| `TNNet.AddGroupedConvolution`| 1D, 2D, or 3D               | Optional      | Adds a grouped convolution. Allows efficient parallel processing of input channels.                    |
+| `TNNet.AddGroupedConvolution`| 1D, 2D, or 3D               | Optional      | Adds a grouped convolution. Allows efficient parallel processing of input channels.                  |
 
 ### Locally Connected Layers
 A locally connected layer is a type of neural network layer that shares some similarities with convolutional layers but has some distinct characteristics:
