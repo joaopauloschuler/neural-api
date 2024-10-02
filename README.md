@@ -638,6 +638,15 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
 
 ### Trainable Bias (Shift) and Multiplication (Scaling) per Cell or Channel Allowing Faster Learning and Convergence
+When `TNNetCellBias` is added after convolutional layers, it introduces a trainable bias to each output cell of the convolutional layer. This can have several effects on the neural network:
+
+1. Fine-tuning: `TNNetCellBias` allows for fine-tuning of the network's output by adding a learnable bias to each cell. This can help the network adjust its predictions more precisely.
+2. Increased flexibility: by adding a bias to each cell individually, the network gains additional parameters to optimize, potentially allowing it to learn more complex representations.
+3. Improved learning speed: placing this layer before and after convolutions can speed up learning. This is because it gives the network an additional way to adjust its output, potentially making it easier to find optimal solutions.
+4. Parameter increase: adding `TNNetCellBias` increases the number of trainable parameters in the network. While this can be beneficial for learning, it also increases the model's complexity and the risk of overfitting.
+
+It's worth noting that the effectiveness of adding `TNNetCellBias` after convolutional layers can vary depending on the specific architecture and problem at hand. While it can potentially speed up learning and improve the network's flexibility, it's important to experiment and validate its impact on your particular use case. `TNNetChannelBias` adds a trainable bias to each channel in the output. It's like TNNetCellBias, but operating on entire channels instead of individual cells.
+
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetCellBias`              | 1D, 2D, or 3D               | Trainable bias (shift) for each cell.                                                                 |
