@@ -667,6 +667,21 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 ### Embedding Layers
 `TNNetEmbedding` is designed to convert input tokens (usually represented as integers) into dense vector representations (embedding vectors). `TNNetTokenAndPositionalEmbedding` extends `TNNetEmbedding` by adding positional information to the token embeddings. This is crucial for transformer models that don't have an inherent notion of sequence order. Both layers are crucial for modern NLP tasks, especially when working with transformer-based models. They allow the network to work with text data by converting tokens into rich, informative vector representations that capture both semantic meaning and positional information. By using `TNNetTokenAndPositionalEmbedding`, you're equipping your model with the fundamental building blocks needed for advanced NLP tasks as it provides both embedding and positional encoding.
 
+To illustrate how these layers might be used in practice, let's consider a simple example. Suppose you're building a language model for text generation. You could use these layers as follows:
+```
+    FNN.AddLayer([
+      TNNetInput.Create(csContextLen, 1, 1),
+      TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, {EncodeZero=}1, {ScaleEmbedding=}0.02, {ScalePositional=}0.01)
+    ]);
+
+    for I := 1 to 2 do FNN.AddTransformerBlockCAI({Heads=}8, {IntermediateDim=}2048, {NoForward=}true, {HasNorm=}false);
+
+    FNN.AddLayer([
+      TNNetPointwiseConvLinear.Create(csModelVocabSize),
+      TNNetPointwiseSoftMax.Create({SkipBackpropDerivative=}1)
+    ]);
+```
+
 | Layer Name                           | Input/Output Dimensions                 | Description                                                                                                     |
 |--------------------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------|
 | TNNetEmbedding                       | Input: 1D integer tokens. Output: 2D (sequence_length x embedding_size). | Converts input tokens into dense vector representations. Parameters include vocabulary size, embedding size, scaling factor, and whether to encode zero. Allows for training of embedding weights through backpropagation. |
