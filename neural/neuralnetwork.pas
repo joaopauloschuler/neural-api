@@ -715,7 +715,6 @@ type
   end;
 
   { TNNetEmbedding }
-  // Do not use this layer. It's under construction.
   TNNetEmbedding = class(TNNetLayer)
   private
     FVocabSize: integer;
@@ -735,7 +734,6 @@ type
   end;
 
   { TNNetTokenAndPositionalEmbedding }
-  // Do not use this layer. It's under construction.
   TNNetTokenAndPositionalEmbedding = class(TNNetEmbedding)
   private
     FPositionalEmbedding: TNNetVolume;
@@ -950,7 +948,6 @@ type
   end;
 
   { TNNetChannelNorm }
-  // TNNetChannelNorm has not been tested. Do not use it.
   // This layer does a channel normalization without zero centering and trainable parameters.
   TNNetChannelNorm = class(TNNetChannelShiftBase)
     private
@@ -1075,7 +1072,6 @@ type
     procedure Backpropagate(); override;
   end;
 
-  /// This layer is under construction. DO NOT USE IT.
   // This layer run the TNNetVolume.DotProducts for layers A and B.
   TNNetDotProducts = class(TNNetLayer)
   private
@@ -1205,7 +1201,7 @@ type
     procedure Backpropagate(); override;
   end;
 
-  // This class is under construction. Do not use it.
+  // This class does a pointwise (1x1) normalization.
   TNNetPointwiseNorm = class(TNNetIdentity)
     FNorms: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
