@@ -593,8 +593,9 @@ These layers could be particularly useful in scenarios where:
 
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
-| `TNNetSplitChannels`         | 1D, 2D, or 3D               | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |
-| `TNNetSplitChannelEvery`     | 1D, 2D, or 3D               | Splits channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.|
+| `TNNetSplitChannels`         | 2D or 3D                   | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |
+| `TNNetSplitChannelEvery`     | 2D or 3D                   | Splits channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.|
+| `TNNetInterleaveChannels`    | 2D or 3D                   | If you're using grouped convolutions in your network, `TNNetInterleaveChannels` could be particularly useful. It can help mix information between groups, allowing for more interaction between different feature groups.|
 
 
 ### Transposing Layers
@@ -645,7 +646,7 @@ When `TNNetCellBias` is added after convolutional layers, it introduces a traina
 3. Improved learning speed: placing this layer before and after convolutions can speed up learning. This is because it gives the network an additional way to adjust its output, potentially making it easier to find optimal solutions.
 4. Parameter increase: adding `TNNetCellBias` increases the number of trainable parameters in the network. While this can be beneficial for learning, it also increases the model's complexity and the risk of overfitting.
 
-It's worth noting that the effectiveness of adding `TNNetCellBias` after convolutional layers can vary depending on the specific architecture and problem at hand. While it can potentially speed up learning and improve the network's flexibility, it's important to experiment and validate its impact on your particular use case. `TNNetChannelBias` adds a trainable bias to each channel in the output. It's like TNNetCellBias, but operating on entire channels instead of individual cells.
+It's worth noting that the effectiveness of adding `TNNetCellBias` after convolutional layers can vary depending on the specific architecture and problem at hand. While it can potentially speed up learning and improve the network's flexibility, it's important to experiment and validate its impact on your particular use case. `TNNetChannelBias` adds a trainable bias to each channel in the output. It's like `TNNetCellBias`, but operating on entire channels instead of individual cells.
 
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
