@@ -664,6 +664,14 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 | `TNNetChannelBias`           | 1D, 2D, or 3D               | Trainable bias (shift) for each channel.                                                              |
 | `TNNetChannelMul`            | 1D, 2D, or 3D               | Trainable multiplication (scaling) for each channel.                                                  |
 
+### Embedding Layers
+`TNNetEmbedding` is designed to convert input tokens (usually represented as integers) into dense vector representations (embedding vectors). `TNNetTokenAndPositionalEmbedding` extends `TNNetEmbedding` by adding positional information to the token embeddings. This is crucial for transformer models that don't have an inherent notion of sequence order. Both layers are crucial for modern NLP tasks, especially when working with transformer-based models. They allow the network to work with text data by converting tokens into rich, informative vector representations that capture both semantic meaning and positional information. By using `TNNetTokenAndPositionalEmbedding`, you're equipping your model with the fundamental building blocks needed for advanced NLP tasks as it provides both embedding and positional encoding.
+
+| Layer Name                           | Input/Output Dimensions                 | Description                                                                                                     |
+|--------------------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| TNNetEmbedding                       | Input: 1D integer tokens. Output: 2D (sequence_length x embedding_size). | Converts input tokens into dense vector representations. Parameters include vocabulary size, embedding size, scaling factor, and whether to encode zero. Allows for training of embedding weights through backpropagation. |
+| TNNetTokenAndPositionalEmbedding     | Input: 1D integer tokens. Output: 2D (sequence_length x embedding_size) | Extends TNNetEmbedding by adding positional information to token embeddings. This layer is crucial for transformer architectures.|
+
 ### Opposing Operations
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
 |-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
