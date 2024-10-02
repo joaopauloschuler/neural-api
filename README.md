@@ -525,6 +525,34 @@ Random layers (`TNNetRandomMulAdd`, `TNNetChannelRandomMulAdd`) serve as powerfu
 These layers provide various tools for normalization, regularization, and introducing controlled variability in neural networks. The choice of which layers to use and where to place them in your network architecture depends on the specific problem you're trying to solve, the characteristics of your data, and the behavior you want to encourage in your model.
 
 ### Concatenation, Summation and Reshaping Layers
+These layers are essential for creating flexible and powerful neural network architectures. Let's break them down:
+
+1. Concatenation Layers:
+   There are two main types of concatenation layers in the CAI Neural API:
+   a. `TNNetConcat`:
+   - This layer concatenates outputs from multiple layers along the depth dimension.
+   - It's designed to work with layers that have the same spatial dimensions (X and Y sizes).
+   - Usage: It's particularly useful when you want to combine features from different processing paths in your network.
+   b. `TNNetDeepConcat`:
+   - This layer also concatenates outputs from multiple layers, but it's specifically optimized for the depth dimension.
+   - It maintains separate arrays to track the depths of each layer and channel, allowing for efficient deep concatenation.
+   - Usage: Ideal for creating architectures that process information in parallel and then combine the results.
+
+2. Summation Layer (`TNNetSum`):
+   - This layer adds together the outputs of multiple layers element-wise.
+   - It's designed to work with layers of the same size.
+   - Usage: Commonly used in residual network (ResNet) style architectures, where it allows for skip connections that help mitigate the vanishing gradient problem and enable the training of very deep networks.
+
+These layers provide several benefits in neural network design:
+
+1. Flexibility: they allow for the creation of complex, non-linear network topologies that can process information in parallel and then combine it in various ways.
+2. Feature Fusion: concatenation and summation layers enable the network to combine features from different processing streams, potentially capturing multi-scale or multi-aspect information.
+3. Skip Connections: summation layers are crucial for implementing skip connections, which are fundamental to many modern architectures like ResNets and DenseNets.
+4. Dimensionality Manipulation: the transposition layers allow for creative manipulations of data dimensions, which can be crucial for certain types of operations or for interfacing between different parts of a network.
+5. Custom Architectures: these layers provide the building blocks for designing novel network architectures tailored to specific tasks or data types.
+
+By using these layers creatively, developers can build highly customized and efficient neural network architectures that are optimized for their specific use cases.
+
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetConcat`                | 1D, 2D, or 3D               | Concatenates previous layers into a single layer.                                                      |
@@ -532,10 +560,42 @@ These layers provide various tools for normalization, regularization, and introd
 | `TNNetIdentity`              | 1D, 2D, or 3D               | Identity layer that passes the input unchanged.                                                        |
 | `TNNetIdentityWithoutBackprop`| 1D, 2D, or 3D              | Allows the forward pass but prevents backpropagation.                                                  |
 | `TNNetReshape`               | 1D, 2D, or 3D               | Reshapes the input into a different dimension.                                                         |
-| `TNNetSplitChannels`         | 1D, 2D, or 3D               | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |
-| `TNNetSplitChannelEvery`     | 1D, 2D, or 3D               | Splits channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.|
 | `TNNetSum`                   | 1D, 2D, or 3D               | Sums the outputs from previous layers, useful for ResNet-style networks.                               |
 | `TNNetUpsample`              | 3D                          | Upsamples channels (depth) into spatial data, converting depth into spatial resolution. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.|
+
+### Split Channels
+`TNNetSplitChannels` and `TNNetSplitChannelEvery` are specialized layer types in the CAI Neural API that allow for selective channel manipulation within neural networks.
+
+1. `TNNetSplitChannels`:
+   This layer is designed to pick or split selected channels from the previous layer. It provides fine-grained control over which specific channels are passed on to subsequent layers in the network.
+   Key features:
+   - It can be created with a specific range of channels (ChannelStart and ChannelLen) or with an array of specific channel indices.
+   
+   Potential uses:
+   - Feature selection: Allowing the network to focus on specific features represented by certain channels.
+   - Creating multiple parallel paths in the network that process different subsets of the input channels.
+   - Implementing attention-like mechanisms by selectively passing certain channels forward.
+
+2. `TNNetSplitChannelEvery`:
+   This layer is a specialized version of `TNNetSplitChannels`. It splits channels at regular intervals.
+
+   Potential uses:
+   - Creating regular patterns of channel selection throughout the network.
+   - Implementing a form of grouped convolutions or channel-wise operations.
+   - Reducing the computational load by consistently selecting a subset of channels at regular intervals.
+
+Both these layers offer powerful tools for manipulating the flow of information through the network's channels. They allow for the creation of more complex and efficient network architectures by providing fine control over which features (represented by channels) are processed in different parts of the network.
+
+These layers could be particularly useful in scenarios where:
+- You want to reduce the computational complexity of your model by focusing on the most important channels.
+- You're designing a network with multiple parallel paths, each operating on different subsets of the input features.
+- You're implementing custom attention mechanisms or feature selection techniques within your network.
+
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetSplitChannels`         | 1D, 2D, or 3D               | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |
+| `TNNetSplitChannelEvery`     | 1D, 2D, or 3D               | Splits channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.|
+
 
 ### Transposing Layers
 The layers `TNNetTransposeXD` and `TNNetTransposeYD` are specialized layer types in the CAI Neural API that perform specific transposition operations on the input data. These transposition operations can be particularly useful in various neural network architectures and data processing pipelines:
