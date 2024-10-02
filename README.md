@@ -667,7 +667,7 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 ### Embedding Layers
 `TNNetEmbedding` is designed to convert input tokens (usually represented as integers) into dense vector representations (embedding vectors). `TNNetTokenAndPositionalEmbedding` extends `TNNetEmbedding` by adding positional information to the token embeddings. This is crucial for transformer models that don't have an inherent notion of sequence order. Both layers are crucial for modern NLP tasks, especially when working with transformer-based models. They allow the network to work with text data by converting tokens into rich, informative vector representations that capture both semantic meaning and positional information. By using `TNNetTokenAndPositionalEmbedding`, you're equipping your model with the fundamental building blocks needed for advanced NLP tasks as it provides both embedding and positional encoding.
 
-To illustrate how these layers might be used in practice, let's consider a simple example. Suppose you're building a language model for text generation. You could use these layers as follows:
+To illustrate how these layers might be used in practice, let's consider a simple example. Suppose you're building a language model for text generation. You could use these layers:
 ```
     FNN.AddLayer([
       TNNetInput.Create(csContextLen, 1, 1),
@@ -681,6 +681,7 @@ To illustrate how these layers might be used in practice, let's consider a simpl
       TNNetPointwiseSoftMax.Create({SkipBackpropDerivative=}1)
     ]);
 ```
+The above example resembles a simplified version of models like GPT (Generative Pre-trained Transformer). It's designed to process sequential data such as text generation tasks. The use of token and positional embeddings, followed by transformer blocks, is a standard approach in modern NLP models. The final pointwise convolution and softmax layers are typical for generating probability distributions over a vocabulary, which is common in language models. The number of transformer blocks (2) indicates that this is a lightweight model. The choice of parameters like embedding dimensions, number of heads, and intermediate dimensions would depend on the specific requirements of the task and computational constraints.
 
 | Layer Name                           | Input/Output Dimensions                 | Description                                                                                                     |
 |--------------------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------|
