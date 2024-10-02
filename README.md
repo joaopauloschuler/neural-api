@@ -632,7 +632,9 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSELU`                  | 1D, 2D, or 3D               | SELU          | Self-normalizing activation function.                                                                  |
 | `TNNetSigmoid`               | 1D, 2D, or 3D               | Sigmoid       | Sigmoid activation function.                                                                           |
 | `TNNetSoftMax`               | 1D, 2D, or 3D               | SoftMax       | SoftMax activation function.                                                                           |
-| `TNNetPointwiseSoftMax`      | 1D, 2D, or 3D               | 1x1 SoftMax   | Pointwise (1x1) SoftMax activation function.                                                           |
+| `TNNetPointwiseSoftMax`      | 2D or 3D                    | 1x1 SoftMax   | Pointwise (1x1) SoftMax activation function.                                                           |
+| `TNNetPointwiseNorm`         | 2D or 3D                    | 1x1 Norm      | Pointwise (1x1) normalization.                                                                         |
+| `TNNet.AddGroupedPointwiseSoftMax`| 2D or 3D               | Gr 1x1 Norm   | Grouped pointwise (1x1) SoftMax.                                                                 |
 | `TNNetSwish`                 | 1D, 2D, or 3D               | Swish         | Swish activation function.                                                                             |
 | `TNNetSwish6`                | 1D, 2D, or 3D               | Swish 6       | Swish activation clipped at 6.                                                                         |
 | `TNNetHardSwish`             | 1D, 2D, or 3D               | Hard Swish    | Hard version of Swish activation.                                                                      |
