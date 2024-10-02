@@ -537,6 +537,21 @@ These layers provide various tools for normalization, regularization, and introd
 | `TNNetSum`                   | 1D, 2D, or 3D               | Sums the outputs from previous layers, useful for ResNet-style networks.                               |
 | `TNNetUpsample`              | 3D                          | Upsamples channels (depth) into spatial data, converting depth into spatial resolution. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.|
 
+### Transposing Layers
+The layers `TNNetTransposeXD` and `TNNetTransposeYD` are specialized layer types in the CAI Neural API that perform specific transposition operations on the input data. These transposition operations can be particularly useful in various neural network architectures and data processing pipelines:
+* Reshaping Data: they allow for flexible reshaping of data between different network layers, which can be crucial for certain model designs.
+* Feature Manipulation: by swapping spatial and depth dimensions, these layers can help in reorganizing feature representations, which might be beneficial for subsequent processing steps.
+* Dimension Reduction or Expansion: depending on the input shape, these transpositions can effectively reduce or expand certain dimensions, potentially helping in compressing or expanding feature representations.
+* Adapting to Different Input Formats: these layers can be useful when dealing with data that comes in different formats or when interfacing between different parts of a neural network that expect data in specific shapes.
+* Custom Architecture Designs: they provide flexibility in designing custom neural network architectures that may require unconventional data flows between layers.
+
+These layers are implemented with both forward (Compute) and backward (Backpropagate) methods, indicating that they are fully integrated into the network's training process and can be used in the middle of a network, not just as preprocessing steps. This can be particularly valuable for researchers and practitioners working on novel network designs or dealing with unconventional data structures.
+
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetTransposeXD`          | 2D or 3D                    | It transposes the X and Depth axes of the input data. It swaps the spatial dimension along the width (X-axis) with the channel or feature dimension (Depth axis).|
+| `TNNetTransposeYD`          | 2D or 3D                    | It transposes the Y and Depth axes of the input data. It swaps the spatial dimension along the height (Y-axis) with the channel or feature dimension (Depth axis).|
+
 ### Layers with Activation Functions and no Trainable Parameter
 Activation functions are a fundamental component of neural networks. These functions play several crucial roles in neural networks:
 * Introducing non-linearity: this allows the network to model complex, non-linear relationships in data.
