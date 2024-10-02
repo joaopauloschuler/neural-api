@@ -638,8 +638,8 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetHardSwish`             | 1D, 2D, or 3D               | Hard Swish    | Hard version of Swish activation.                                                                      |
 | `TNNetHyperbolicTangent`     | 1D, 2D, or 3D               | tanh          | Hyperbolic tangent activation function.                                                                |
 | `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
-| `TNNetMulByConstant`         | 1D, 2D, or 3D               | Power         | Multiplies the output by a constant.                                                                   |
-| `TNNetNegate`                | 1D, 2D, or 3D               | Power         | Multiplies the previous output by -1.                                                                  |
+| `TNNetMulByConstant`         | 1D, 2D, or 3D               | * C           | Multiplies the output by a constant.                                                                   |
+| `TNNetNegate`                | 1D, 2D, or 3D               | * -1          | Multiplies the previous output by -1.                                                                  |
 | `TNNetSignedSquareRoot`      | 1D, 2D, or 3D               | SSR           | Square root of the input absolute value preserving the original sign. `y = Sign(x) * Sqrt(Abs(x))`     |
 | `TNNetSignedSquareRoot1`     | 1D, 2D, or 3D               | SSR1          | If `Abs(x) < 1` then `y = x`, otherwise, `y = Sign(x) * Sqrt(Abs(x))`.                                 |
 | `TNNetSignedSquareRootN`     | 1D, 2D, or 3D               | SSRN          | If `Abs(x) < N` then `y = x`, otherwise, `y = Sign(x) * Sqrt(Abs(x)-N+1)+N-1`.                         |
