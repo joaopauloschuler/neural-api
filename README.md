@@ -664,6 +664,30 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 | `TNNetChannelBias`           | 1D, 2D, or 3D               | Trainable bias (shift) for each channel.                                                              |
 | `TNNetChannelMul`            | 1D, 2D, or 3D               | Trainable multiplication (scaling) for each channel.                                                  |
 
+### Embedding Layers
+`TNNetEmbedding` is designed to convert input tokens (usually represented as integers) into dense vector representations (embedding vectors). `TNNetTokenAndPositionalEmbedding` extends `TNNetEmbedding` by adding positional information to the token embeddings. This is crucial for transformer models that don't have an inherent notion of sequence order. Both layers are crucial for modern NLP tasks, especially when working with transformer-based models. They allow the network to work with text data by converting tokens into rich, informative vector representations that capture both semantic meaning and positional information. By using `TNNetTokenAndPositionalEmbedding`, you're equipping your model with the fundamental building blocks needed for advanced NLP tasks as it provides both embedding and positional encoding.
+
+To illustrate how these layers might be used in practice, let's consider a simple example. Suppose you're building a language model for text generation. You could use these layers:
+```
+    FNN.AddLayer([
+      TNNetInput.Create(csContextLen, 1, 1),
+      TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, {EncodeZero=}1, {ScaleEmbedding=}0.02, {ScalePositional=}0.01)
+    ]);
+
+    for I := 1 to 2 do FNN.AddTransformerBlockCAI({Heads=}8, {IntermediateDim=}2048, {NoForward=}true, {HasNorm=}false);
+
+    FNN.AddLayer([
+      TNNetPointwiseConvLinear.Create(csModelVocabSize),
+      TNNetPointwiseSoftMax.Create({SkipBackpropDerivative=}1)
+    ]);
+```
+The above example resembles a simplified version of models like GPT (Generative Pre-trained Transformer). It's designed to process sequential data such as text generation tasks. The use of token and positional embeddings, followed by transformer blocks, is a standard approach in modern NLP models. The final pointwise convolution and softmax layers are typical for generating probability distributions over a vocabulary, which is common in language models. The number of transformer blocks (2) indicates that this is a lightweight model. The choice of parameters like embedding dimensions, number of heads, and intermediate dimensions would depend on the specific requirements of the task and computational constraints.
+
+| Layer Name                           | Input/Output Dimensions                 | Description                                                                                                     |
+|--------------------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| TNNetEmbedding                       | Input: 1D integer tokens. Output: 2D (sequence_length x embedding_size). | Converts input tokens into dense vector representations. Parameters include vocabulary size, embedding size, scaling factor, and whether to encode zero. Allows for training of embedding weights through backpropagation. |
+| TNNetTokenAndPositionalEmbedding     | Input: 1D integer tokens. Output: 2D (sequence_length x embedding_size) | Extends TNNetEmbedding by adding positional information to token embeddings. This layer is crucial for transformer architectures.|
+
 ### Opposing Operations
 | Layer Name                  | Input/Output Dimensions     | Activation    | Description                                                                                           |
 |-----------------------------|-----------------------------|---------------|-------------------------------------------------------------------------------------------------------|
