@@ -7320,14 +7320,8 @@ begin
   PreviousSizeY := PreviousLayer.Output.SizeY;
   if PreviousSizeY > 1 then
   begin
-    AddLayer( TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth) );
-    PreviousLayer := GetLastLayer();
+    PreviousLayer := AddLayer( TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth) );
   end;
-  if Heads <= 1 then
-  begin
-    AddSingleHeadSelfAttention(Result, W, NoForward);
-  end
-  else
   begin
     QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
     KeyGroup   := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
@@ -7372,7 +7366,7 @@ begin
   end;
   if PreviousSizeY > 1 then
   begin
-    AddLayer( TNNetReshape.Create(PreviousSizeX, PreviousSizeY, PreviousDepth) );
+    Result := AddLayer( TNNetReshape.Create(PreviousSizeX, PreviousSizeY, PreviousDepth) );
   end;
 end;
 
@@ -7395,8 +7389,7 @@ begin
   PreviousSizeY := PreviousLayer.Output.SizeY;
   if PreviousSizeY > 1 then
   begin
-    AddLayer( TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth) );
-    PreviousLayer := GetLastLayer();
+    PreviousLayer := AddLayer( TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth) );
   end;
   begin
     if CellMul then
@@ -7438,12 +7431,12 @@ begin
     end;
     AddLayer( [TNNetDeepConcat.Create(EachGroupOutput), TNNetSignedSquareRoot1.Create()] );
     SetLength(EachGroupOutput, 0);
-    Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1) ]);
+    AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1) ]);
     Result := AddLayer( [TNNetSignedSquareRoot1.Create()] );
   end;
   if PreviousSizeY > 1 then
   begin
-    AddLayer( TNNetReshape.Create(PreviousSizeX, PreviousSizeY, PreviousDepth) );
+    Result := AddLayer( TNNetReshape.Create(PreviousSizeX, PreviousSizeY, PreviousDepth) );
   end;
 end;
 
@@ -7454,19 +7447,21 @@ var
   W : TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
   PreviousDepth, InputChannelsPerGroup: integer;
+  PreviousSizeX, PreviousSizeY: integer;
   EachGroupOutput: array of TNNetLayer;
   HeadCnt: integer;
   QueryGroup, KeyGroup, ValueGroup: TNNetLayer;
   LocalQueryGroup, LocalKeyGroup, LocalValueGroup, LocalValueTGroup: TNNetLayer;
 begin
-  if Heads <= 1 then
+  PreviousLayer := GetLastLayer();
+  PreviousDepth := PreviousLayer.Output.Depth;
+  PreviousSizeX := PreviousLayer.Output.SizeX;
+  PreviousSizeY := PreviousLayer.Output.SizeY;
+  if PreviousSizeY > 1 then
   begin
-    AddSingleHeadSelfAttention(Result, W, NoForward);
-  end
-  else
+    PreviousLayer := AddLayer( TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth) );
+  end;
   begin
-    PreviousLayer := GetLastLayer();
-    PreviousDepth := PreviousLayer.Output.Depth;
     QueryGroup := AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, PreviousDepth, false, 1, true, PreviousLayer);
     KeyGroup   := AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, PreviousDepth, false, 1, true, PreviousLayer);
     ValueGroup := AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, PreviousDepth, false, 1, true, PreviousLayer);
@@ -7505,6 +7500,10 @@ begin
     SetLength(EachGroupOutput, 0);
     AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, PreviousDepth, false, 1, true);
     Result := AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  end;
+  if PreviousSizeY > 1 then
+  begin
+    Result := AddLayer( TNNetReshape.Create(PreviousSizeX, PreviousSizeY, PreviousDepth) );
   end;
 end;
 
