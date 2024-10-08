@@ -1057,6 +1057,10 @@ Publica&ccedil;&otilde;es em Portugu&ecirc;s:
 ## Contributing
 Pull requests are welcome. Having requests accepted might be hard.
 
+## Paid Support
+In the case that you need help with your own A.I. project (Pascal, Python, or PHP), please feel free
+to contact [the author of this API](https://www.linkedin.com/in/dr-jo%C3%A3o-paulo-schwarz-schuler-785a9b2).
+
 ## Citing this API
 You can cite this API in BibTeX format with:
 ```
