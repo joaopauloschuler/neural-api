@@ -115,7 +115,7 @@ end;
 ```
 
 ## Example with Transformer Decoder, Vocabulary and Multiple Outputs
-The currently leading NLP neural network models use tokenized datasets and vocabulary. The tokenized dataset and the vocabulary can be downloaded with:
+The currently leading NLP neural network models use tokenized datasets and vocabulary. In this example, the [tokenized dataset](https://huggingface.co/datasets/schuler/TinyStories4Pascal-Tokenized-v2) and its vocabulary can be downloaded with:
 ```
 git clone https://huggingface.co/datasets/schuler/TinyStories4Pascal-Tokenized-v2
 unzip TinyStories4Pascal-Tokenized-v2/tinystories-100k-tokenized3k.csv.zip
@@ -141,4 +141,4 @@ After training, this model produces sentences such as:
 * once upon a time, there was a little girl named lily. she loved to play with her toys and her favorite toy was a teddy bear. one day, lily's mom asked her to help with.
 * billy was a little boy who loved to play outside. one day, he was playing in the park when he saw a big puddle in the grass. he ran over to it and started to .
 
-
+An advanced source code example can be found [here](https://github.com/joaopauloschuler/gpt-3-for-pascal) .
