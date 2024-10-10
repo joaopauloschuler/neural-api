@@ -89,7 +89,9 @@ type
   { TVolume }
   {$IFDEF FPC}
   TIntegerList = class (specialize TFPGList<integer>);
-  generic TVolume<T> = class(TObject)
+  T = TNeuralFloat;
+  //generic TVolume<T> = class(TObject)   // why anyway?
+  TVolume = class(TObject)
   {$ELSE}
   TIntegerList = TList<Integer>;
   T = TNeuralFloat;
@@ -111,13 +113,14 @@ type
     FSizeY: integer;
     FDepth: integer;
     FTag: array[0..1] of integer;
+    
     FLastPos: integer;
     function GetTag: integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTag(I: integer); {$IFDEF Release} inline; {$ENDIF}
     function GetTags(x: integer): integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTags(x: integer; AValue: integer); {$IFDEF Release} inline; {$ENDIF}
     class procedure MulAddPPVS(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
-      pSize: integer); {$IFDEF Release} inline; {$ENDIF}
+      pSize: integer); {$IFDEF Release} {$IFDEF FPC} inline; {$ENDIF} {$ENDIF}
   public
     // FData was made public to allow other fast operations
     FData: array of T;
@@ -198,11 +201,11 @@ type
     procedure Copy(var Original: array of T); overload;
     procedure Copy(var Original: array of byte); overload;
     procedure Copy(Original: TBits; pFlase: T = -0.5; pTrue: T = +0.5); overload;
-    procedure CopyPadding(Original: TVolume; Padding: integer); {$IFDEF Release} inline; {$ENDIF} overload;
-    procedure CopyPadding(Original: TVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
+    procedure CopyPadding(Original: TVolume; Padding: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+    procedure CopyPadding(Original: TVolume; PaddingX, PaddingY: integer); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure CopyCropping(Original: TVolume; StartX, StartY, pSizeX, pSizeY: integer);
     procedure CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
-    procedure CopyNoChecks(Original: TVolume); {$IFDEF Release} inline; {$ENDIF} overload;
+    procedure CopyNoChecks(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure CopyNoChecks(var Original: array of byte); overload;
     procedure CopyNoChecksIntArr(var Original: array of integer); overload;
     procedure CopyReversedNoChecksIntArr(var Original: array of integer); overload;
@@ -215,7 +218,7 @@ type
     procedure CopyTransposingAs2D(Original: TVolume);
     procedure Define(Original: array of T);
     function DotProduct(Original: TVolume): T; overload; {$IFDEF Release} inline; {$ENDIF}
-    class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
+    class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload;
     class function Product(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
     function SumDiff(Original: TVolume): T;  {$IFDEF Release} inline; {$ENDIF}
     procedure DebugDiff(Original: TVolume; Limit: Single = 0);
@@ -336,6 +339,7 @@ type
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property Depth: integer read FDepth;
+    
   end;
 
   TNNetToken = record
@@ -346,11 +350,11 @@ type
   TNNetTokenArray = array of TNNetToken;
 
   { TNNetVolume }
-  {$IFDEF FPC}
-  TNNetVolume = class (specialize TVolume<TNeuralFloat>)
-  {$ELSE}
+  {.$IFDEF FPC}
+  // TNNetVolume = class (specialize TVolume<TNeuralFloat>)
+  {.$ELSE}
   TNNetVolume = class (TVolume)
-  {$ENDIF}
+  {.$ENDIF}
     private
       FDataPtr: TNeuralFloatArrPtr;
     public
@@ -841,8 +845,8 @@ implementation
 {$DEFINE x64}
 {$ENDIF}
 
-uses {$IFNDEF x64} Neural.AVX {$ELSE} Neural.AVXx64{$ENDIF}, neuralbit, Math, strutils,
-     CPUFeatures;
+uses {$IFNDEF FPC} neuralavxcore, {$IFDEF x64} NeuralAVXx64, {$ELSE} NeuralAVX, {$ENDIF} {$ENDIF}neuralbit, Math,
+     CPUFeatures, strutils;
 
 var locDataFmtSet : TFormatSettings;
 
@@ -1767,6 +1771,18 @@ begin
 end;
 
 // paper: GAUSSIAN ERROR LINEAR UNITS (GELUS) Gimpel et al. 2018
+
+// https://www.musicdsp.org/en/latest/Other/178-reasonably-accurate-fastish-tanh-approximation.html
+
+function Tanh_fast(x : Single) : Single; inline;
+var a,b:Single;
+begin
+     x := x*2;
+     a := abs(x);
+     b := (6+a*(3+a));
+     Result := (x*b)/(a*b+12);
+end;
+
 function GaussErrorLinUnit(x : TNeuralFloat) : TNeuralFloat;
 const cSqrt_2_pi = 0.797884560803;
 begin
@@ -1778,7 +1794,8 @@ begin
      then
          Result := 0
      else
-         Result := 0.5*x*(1 + tanh( cSqrt_2_pi*( x + 0.044715*x*x*x)));
+         // Result := 0.5*x*(1 + tanh( cSqrt_2_pi*( x + 0.044715*x*x*x)));
+         Result := 0.5*x*(1 + 2*Tanh_fast( cSqrt_2_pi*( x + 0.044715*x*x*x)));
 end;
 
 function GaussErrorLinUnitDerivative(x : TNeuralFloat) : TNeuralFloat;
@@ -4189,61 +4206,6 @@ begin
       IntToStr(Self.Size) + ' and ' + IntToStr(Original2.Size) + ' .');
   {$ENDIF}
   MulAdd(Addr(Self.FData[0]), Addr(Original1.FData[0]), Addr(Original2.FData[0]), Self.Size);
-end;
-
-class procedure TVolume.MulAddPPVS(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
-  pSize: integer);
-var
-  I: integer;
-  vHigh: integer;
-  BasePos: integer;
-  {$IFDEF FPC}
-  AddrA, AddrB: TNeuralFloatPtr;
-  {$ENDIF}
-begin
-  BasePos := 0;
-  vHigh := pSize - 1;
-
-  {$IFDEF FPC}
-  AddrA := pointer(PtrA);
-  AddrB := pointer(PtrB);
-  while BasePos <= vHigh - 7 do
-  begin
-    (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
-    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * Value;
-    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * Value;
-    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * Value;
-    (AddrA+4)^ := (AddrA+4)^ + (AddrB+4)^ * Value;
-    (AddrA+5)^ := (AddrA+5)^ + (AddrB+5)^ * Value;
-    (AddrA+6)^ := (AddrA+6)^ + (AddrB+6)^ * Value;
-    (AddrA+7)^ := (AddrA+7)^ + (AddrB+7)^ * Value;
-    BasePos := BasePos + 8;
-    AddrA := AddrA + 8;
-    AddrB := AddrB + 8;
-  end;
-
-  while BasePos <= vHigh - 3 do
-  begin
-    (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
-    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * Value;
-    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * Value;
-    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * Value;
-    BasePos := BasePos + 4;
-    AddrA := AddrA + 4;
-    AddrB := AddrB + 4;
-  end;
-  {$ENDIF}
-
-  if BasePos <= vHigh then for I := BasePos to vHigh do
-  begin
-    //Write(PtrA^[I],' ', PtrB^[I],' ', Value,'->');
-    {$IFDEF FPC}
-    PtrA^[I] += PtrB^[I]*Value;
-    {$ELSE}
-    PtrA^[I] := PtrA^[I] + PtrB^[I]*Value;
-    {$ENDIF}
-    //WriteLn(PtrA^[I]);
-  end;
 end;
 
 class procedure TVolume.MulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value1,
@@ -11077,6 +11039,68 @@ begin
   {$ENDIF}
 end;
 
+class procedure TVolume.MulAddPPVS(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
+  pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+  BasePos: integer;
+  {$IFDEF FPC}
+  AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
+begin
+  {$IFNDEF FPC}
+  if locAVX and (pSize >= 4 ) then
+  begin
+       AVXMulAdd(PSingle(PtrA), PSingle(PtrB), pSize, Value);
+       exit;
+  end;
+  {$ENDIF}
+  BasePos := 0;
+  vHigh := pSize - 1;
+
+  {$IFDEF FPC}
+  AddrA := pointer(PtrA);
+  AddrB := pointer(PtrB);
+  while BasePos <= vHigh - 7 do
+  begin
+    (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
+    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * Value;
+    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * Value;
+    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * Value;
+    (AddrA+4)^ := (AddrA+4)^ + (AddrB+4)^ * Value;
+    (AddrA+5)^ := (AddrA+5)^ + (AddrB+5)^ * Value;
+    (AddrA+6)^ := (AddrA+6)^ + (AddrB+6)^ * Value;
+    (AddrA+7)^ := (AddrA+7)^ + (AddrB+7)^ * Value;
+    BasePos := BasePos + 8;
+    AddrA := AddrA + 8;
+    AddrB := AddrB + 8;
+  end;
+
+  while BasePos <= vHigh - 3 do
+  begin
+    (AddrA)^   := (AddrA)^   + (AddrB)^   * Value;
+    (AddrA+1)^ := (AddrA+1)^ + (AddrB+1)^ * Value;
+    (AddrA+2)^ := (AddrA+2)^ + (AddrB+2)^ * Value;
+    (AddrA+3)^ := (AddrA+3)^ + (AddrB+3)^ * Value;
+    BasePos := BasePos + 4;
+    AddrA := AddrA + 4;
+    AddrB := AddrB + 4;
+  end;
+  {$ENDIF}
+
+  if BasePos <= vHigh then for I := BasePos to vHigh do
+  begin
+    //Write(PtrA^[I],' ', PtrB^[I],' ', Value,'->');
+    {$IFDEF FPC}
+    PtrA^[I] += PtrB^[I]*Value;
+    {$ELSE}
+    PtrA^[I] := PtrA^[I] + PtrB^[I]*Value;
+    {$ENDIF}
+    //WriteLn(PtrA^[I]);
+  end;
+end;
+
 class function TVolume.Product(PtrA: TNeuralFloatArrPtr;
   NumElements: integer): Single;
 var
@@ -11122,7 +11146,6 @@ begin
 end;
 {$ENDIF}
 
-
 // ###########################################
 // #### Initialize cpu set variables
 // ###########################################
@@ -11133,12 +11156,12 @@ initialization
   locAVX512 := IsAVX512Present;
 
   {$IF DEFINED(FPC)}
-  locFmtSet := DefaultFormatSettings;
+  locDataFmtSet := DefaultFormatSettings;
   {$ELSE}
      {$IF (CompilerVersion <= 21)}
      GetLocaleFormatSettings(0, locDataFmtSet);
      {$ELSE}
-     locFmtSet := TFormatSettings.Create;
+     locDataFmtSet := TFormatSettings.Create;
      {$IFEND}
   {$IFEND}
   locDataFmtSet.DecimalSeparator := '.';

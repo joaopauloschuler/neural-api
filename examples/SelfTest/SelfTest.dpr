@@ -7,8 +7,6 @@ uses
   SysUtils,
   Math,
   CPUFeatures in '..\..\neural\CPUFeatures.pas',
-  Neural.AVX in '..\..\neural\Neural.AVX.pas',
-  Neural.AVXx64 in '..\..\neural\Neural.AVXx64.pas',
   neuralab in '..\..\neural\neuralab.pas',
   neuralabfun in '..\..\neural\neuralabfun.pas',
   neuralbit in '..\..\neural\neuralbit.pas',
@@ -25,9 +23,15 @@ uses
   neuralplanbuilder in '..\..\neural\neuralplanbuilder.pas',
   neuralthread in '..\..\neural\neuralthread.pas',
   neuralvolume in '..\..\neural\neuralvolume.pas',
-  neuralvolumev in '..\..\neural\neuralvolumev.pas';
+  neuralvolumev in '..\..\neural\neuralvolumev.pas',
+  NeuralAVX in '..\..\neural\NeuralAVX.pas',
+  NeuralAVXx64 in '..\..\neural\NeuralAVXx64.pas',
+  neuralavxcore in '..\..\neural\neuralavxcore.pas';
 
 begin
+    Writeln('Testing Delphi AVX...');
+    TestAVX;
+
     WriteLn('Testing Volumes API ...');
     TestTNNetVolume();
     TestKMeans();

@@ -311,7 +311,7 @@ type
       procedure GetValidationProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
       procedure GetTestProc(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
     public
-      constructor Create(); override;
+      constructor Create();
       destructor Destroy(); override;
 
       procedure FitLoading(pNN: TNNet;

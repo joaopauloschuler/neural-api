@@ -560,10 +560,11 @@ begin
 end;
 
 procedure TNeuralKernel.Prepare;
-var resStream : TResourceStream;
+{$IFNDEF FPC} var resStream : TResourceStream; {$ENDIF}
 begin
      // ###########################################
      // #### Check if the neural.cl file is part of the resources
+     {$IFNDEF FPC}
      try
         resStream := TResourceStream.Create(hInstance, 'NeuralCL', RT_RCDATA);
         FOpenCLProgramSource.LoadFromStream(resStream, TEncoding.UTF8);
@@ -575,6 +576,7 @@ begin
      except
            MessageProc('Resource NeuralCL not found - try to open file...');
      end;
+     {$ENDIF}
 
      // Create the OpenCL Kernel Here:
      if FileExists('../../../neural/neural.cl') then
@@ -895,6 +897,11 @@ function TEasyOpenCLV.CreateOutputSetArgument(V: TNNetVolume;
 begin
   Result := CreateOutputBuffer(V);
   clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+end;
+
+function GetString( err : integer ) : string;
+begin
+     Result := 'ERROR';
 end;
 
 { TEasyOpenCL }

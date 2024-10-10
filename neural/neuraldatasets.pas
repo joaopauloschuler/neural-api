@@ -747,16 +747,15 @@ begin
 end;
 
 {$IFDEF FPC}
-function TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
-  ImageFileName: string; V: TNNetVolume): boolean;
+procedure TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume);
 var
   M: TFPMemoryImage;
 begin
   M := TFPMemoryImage.Create(1, 1);
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
-  Result := M.LoadFromFile( ImageFileName );
+  M.LoadFromFile( ImageFileName );
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
-  if Result then LoadImageIntoVolume(M, V);
+  LoadImageIntoVolume(M, V);
   M.Free;
 end;
 
