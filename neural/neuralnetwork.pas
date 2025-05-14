@@ -1735,14 +1735,33 @@ type
       function AddMinMaxChannel(pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
-      function AddSelfAttention(Heads: integer; NoForward:boolean = false; HasNorm: boolean = false): TNNetLayer;
-      function AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
-      function AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
+      function AddSelfAttention(Heads: integer; NoForward:boolean = false;
+        HasNorm: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      function AddSelfAttentionCAI(Heads: integer; NoForward:boolean = false;
+        HasNorm: boolean = false; CellMul: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      function AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads: integer;
+        NoForward:boolean = false; HasNorm: boolean = false;
+        CellMul: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
       procedure AddSingleHeadTransformerBlock(out Result, W: TNNetLayer; NoForward:boolean = false; HasNorm: boolean = false);
-      function AddTransformerBlock(Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false): TNNetLayer;
-      function AddTransformerBlockCAI(Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
-      function AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = False): TNNetLayer;
-      function AddCompressedTransformerBlockCAI(CompressedChannelsCount, MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer; NoForward:boolean = false; HasNorm: boolean = false; CellMul: boolean = False): TNNetLayer;
+      function AddTransformerBlock(Heads: integer; IntermediateDim: integer;
+        NoForward:boolean = false; HasNorm: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      function AddTransformerBlockCAI(Heads: integer; IntermediateDim: integer;
+        NoForward:boolean = false; HasNorm: boolean = false;
+        CellMul: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      function AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads: integer;
+        IntermediateDim: integer; NoForward:boolean = false;
+        HasNorm: boolean = false; CellMul: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      function AddCompressedTransformerBlockCAI(CompressedChannelsCount,
+        MinChannelsPerGroupCount, Heads: integer;
+        IntermediateDim: integer; NoForward:boolean = false;
+        HasNorm: boolean = false; CellMul: boolean = false;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
       procedure AddToExponentialWeightAverage(NewElement: TNNet; Decay: TNeuralFloat);
       procedure AddToWeightAverage(NewElement: TNNet; CurrentElementCount: integer);
       function GetFirstLayer(): TNNetLayer;
@@ -7303,7 +7322,8 @@ begin
 end;
 
 function TNNet.AddSelfAttention(Heads: integer; NoForward:boolean = false;
-  HasNorm: boolean = False): TNNetLayer;
+  HasNorm: boolean = False;
+  pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
 var
   W: TNNetLayer;
   PreviousLayer: TNNetLayer;
@@ -7314,6 +7334,7 @@ var
   QueryGroup, KeyGroup, ValueGroup: TNNetLayer;
   LocalQueryGroup, LocalKeyGroup, LocalValueGroup, LocalValueTGroup: TNNetLayer;
 begin
+  if pActFn = nil then pActFn := TNNetSignedSquareRoot1;
   PreviousLayer := GetLastLayer();
   PreviousDepth := PreviousLayer.Output.Depth;
   PreviousSizeX := PreviousLayer.Output.SizeX;
@@ -7326,11 +7347,11 @@ begin
     QueryGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
     KeyGroup   := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
     ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
-    if not HasNorm then
+    if (not HasNorm) and (pActFn<>TNNetIdentity) then
     begin
-      QueryGroup := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], QueryGroup);
-      KeyGroup   := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], KeyGroup);
-      ValueGroup := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], ValueGroup);
+      QueryGroup := AddLayerAfter( [pActFn.Create()], QueryGroup);
+      KeyGroup   := AddLayerAfter( [pActFn.Create()], KeyGroup);
+      ValueGroup := AddLayerAfter( [pActFn.Create()], ValueGroup);
     end;
     SetLength(EachGroupOutput, Heads);
     InputChannelsPerGroup := PreviousDepth div Heads;
@@ -7362,7 +7383,7 @@ begin
     AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
     SetLength(EachGroupOutput, 0);
     Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)] );
-    if Not(HasNorm) then Result := AddLayer( [TNNetSignedSquareRoot1.Create()] );
+    if Not(HasNorm) and (pActFn<>TNNetIdentity) then Result := AddLayer( [pActFn.Create()] );
   end;
   if PreviousSizeY > 1 then
   begin
@@ -7372,7 +7393,8 @@ end;
 
 function TNNet.AddSelfAttentionCAI(Heads: integer;
   NoForward:boolean = false;
-  HasNorm: boolean = false; CellMul: boolean = false): TNNetLayer;
+  HasNorm: boolean = false; CellMul: boolean = false;
+  pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
 var
   W : TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -7383,6 +7405,7 @@ var
   QueryGroup, KeyGroup, ValueGroup: TNNetLayer;
   LocalQueryGroup, LocalKeyGroup, LocalValueGroup, LocalValueTGroup: TNNetLayer;
 begin
+  if pActFn = nil then pActFn := TNNetSignedSquareRoot1;
   PreviousLayer := GetLastLayer();
   PreviousDepth := PreviousLayer.Output.Depth;
   PreviousSizeX := PreviousLayer.Output.SizeX;
@@ -7404,9 +7427,12 @@ begin
       KeyGroup   := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
       ValueGroup := AddLayerAfter( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
     end;
-    QueryGroup := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], QueryGroup);
-    KeyGroup   := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], KeyGroup);
-    ValueGroup := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], ValueGroup);
+    if (pActFn<>TNNetIdentity) then
+    begin
+      QueryGroup := AddLayerAfter( [pActFn.Create()], QueryGroup);
+      KeyGroup   := AddLayerAfter( [pActFn.Create()], KeyGroup);
+      ValueGroup := AddLayerAfter( [pActFn.Create()], ValueGroup);
+    end;
     SetLength(EachGroupOutput, Heads);
     InputChannelsPerGroup := PreviousDepth div Heads;
     for HeadCnt := 0 to Heads - 1 do
@@ -7424,15 +7450,16 @@ begin
       else
       begin
         W := AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
-        W := AddLayer( TNNetSignedSquareRoot1.Create() );
+        if (pActFn<>TNNetIdentity) then W := AddLayer( pActFn.Create() );
       end;
      (*Y := *)AddLayer( TNNetDotProducts.Create(LocalValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
     end;
-    AddLayer( [TNNetDeepConcat.Create(EachGroupOutput), TNNetSignedSquareRoot1.Create()] );
+    AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+    if (pActFn<>TNNetIdentity) then AddLayer( TNNetSignedSquareRoot1.Create() );
     SetLength(EachGroupOutput, 0);
-    AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1) ]);
-    Result := AddLayer( [TNNetSignedSquareRoot1.Create()] );
+    Result := AddLayer( [TNNetPointwiseConvLinear.Create(PreviousDepth, 1) ]);
+    if (pActFn<>TNNetIdentity) then Result := AddLayer( TNNetSignedSquareRoot1.Create() );
   end;
   if PreviousSizeY > 1 then
   begin
@@ -7442,7 +7469,8 @@ end;
 
 function TNNet.AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads: integer;
   NoForward: boolean; HasNorm: boolean;
-  CellMul: boolean): TNNetLayer;
+  CellMul: boolean;
+  pActFn: TNNetActivationFunctionClass): TNNetLayer;
 var
   W : TNNetLayer; // WT, YT, Value
   PreviousLayer: TNNetLayer;
@@ -7453,6 +7481,7 @@ var
   QueryGroup, KeyGroup, ValueGroup: TNNetLayer;
   LocalQueryGroup, LocalKeyGroup, LocalValueGroup, LocalValueTGroup: TNNetLayer;
 begin
+  if pActFn = nil then pActFn := TNNetSignedSquareRoot1;
   PreviousLayer := GetLastLayer();
   PreviousDepth := PreviousLayer.Output.Depth;
   PreviousSizeX := PreviousLayer.Output.SizeX;
@@ -7471,9 +7500,12 @@ begin
       KeyGroup   := AddLayerAfter( [TNNetCellMul.Create()], KeyGroup);
       ValueGroup := AddLayerAfter( [TNNetCellMul.Create()], ValueGroup);
     end;
-    QueryGroup := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], QueryGroup);
-    KeyGroup   := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], KeyGroup);
-    ValueGroup := AddLayerAfter( [TNNetSignedSquareRoot1.Create()], ValueGroup);
+    if (pActFn<>TNNetIdentity) then
+    begin
+      QueryGroup := AddLayerAfter( [pActFn.Create()], QueryGroup);
+      KeyGroup   := AddLayerAfter( [pActFn.Create()], KeyGroup);
+      ValueGroup := AddLayerAfter( [pActFn.Create()], ValueGroup);
+    end;
     SetLength(EachGroupOutput, Heads);
     InputChannelsPerGroup := PreviousDepth div Heads;
     for HeadCnt := 0 to Heads - 1 do
@@ -7490,13 +7522,14 @@ begin
       end
       else
       begin
-        AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
-        W := AddLayer( TNNetSignedSquareRoot1.Create() );
+        W := AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
+        if (pActFn<>TNNetIdentity) then W := AddLayer( pActFn.Create() );
       end;
       (*Y := *)AddLayer( TNNetDotProducts.Create(LocalValueTGroup, W) );
       EachGroupOutput[HeadCnt] := GetLastLayer();
     end;
-    AddLayer( [TNNetDeepConcat.Create(EachGroupOutput), TNNetSignedSquareRoot1.Create()] );
+    AddLayer( TNNetDeepConcat.Create(EachGroupOutput) );
+    if (pActFn<>TNNetIdentity) then AddLayer( pActFn.Create() );
     SetLength(EachGroupOutput, 0);
     AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, PreviousDepth, false, 1, true);
     Result := AddLayer( [TNNetSignedSquareRoot1.Create()] );
@@ -7535,8 +7568,9 @@ end;
 
 function TNNet.AddTransformerBlock(Heads: integer;
   IntermediateDim: integer;
-  NoForward:boolean = false;
-  HasNorm: boolean = False
+  NoForward:boolean;
+  HasNorm: boolean;
+  pActFn: TNNetActivationFunctionClass
   ): TNNetLayer;
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
@@ -7544,6 +7578,7 @@ var
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
+  if pActFn = nil then pActFn := TNNetSignedSquareRoot1;
   Attended := AddSelfAttention(Heads, NoForward, HasNorm);
   if HasNorm then Attended := AddLayer( TNNetPointwiseNorm.create() );
   AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
@@ -7556,9 +7591,9 @@ begin
   end
   else
   begin
-    AddLayer( [TNNetSignedSquareRoot1.Create()] );
+    if (pActFn<>TNNetIdentity) then AddLayer( [pActFn.Create()] );
     AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
-    AddLayer( [TNNetSignedSquareRoot1.Create()] );
+    if (pActFn<>TNNetIdentity) then AddLayer( [pActFn.Create()] );
   end;
   Result := GetLastLayer();
 end;
@@ -7567,46 +7602,54 @@ function TNNet.AddTransformerBlockCAI(Heads: integer;
   IntermediateDim: integer;
   NoForward:boolean = false;
   HasNorm: boolean = False;
-  CellMul: boolean = False): TNNetLayer;
+  CellMul: boolean = False;
+  pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
   EmbeddingDim: integer;
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddSelfAttentionCAI(Heads, NoForward, HasNorm, CellMul);
-  AttendedPlusPrev := AddLayer( [TNNetSum.Create([Attended, PrevLayer]), TNNetSignedSquareRoot1.Create()] );
-  AddLayer( [TNNetPointwiseConvReLU.Create(IntermediateDim, 1), TNNetSignedSquareRoot1.Create()] );
+  if pActFn = nil then pActFn := TNNetSignedSquareRoot1;
+  Attended := AddSelfAttentionCAI(Heads, NoForward, HasNorm, CellMul, pActFn);
+  AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
+  if (pActFn<>TNNetIdentity) then AttendedPlusPrev := AddLayer( pActFn.Create() );
+  AddLayer( TNNetPointwiseConvReLU.Create(IntermediateDim, 1) );
+  if (pActFn<>TNNetIdentity) then AddLayer( pActFn.Create() );
   AddLayer( [TNNetPointwiseConvLinear.Create(EmbeddingDim, 1)] );
-  AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  if (pActFn<>TNNetIdentity) then AddLayer( pActFn.Create() );
   AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
-  AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  if (pActFn<>TNNetIdentity) then AddLayer( pActFn.Create() );
   Result := GetLastLayer();
 end;
 
 function TNNet.AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads: integer;
   IntermediateDim: integer; NoForward: boolean; HasNorm: boolean;
-  CellMul: boolean): TNNetLayer;
+  CellMul: boolean;
+  pActFn: TNNetActivationFunctionClass): TNNetLayer;
 var
   PrevLayer, AttendedPlusPrev, Attended: TNNetLayer;
   EmbeddingDim: integer;
 begin
   PrevLayer := GetLastLayer();
   EmbeddingDim := PrevLayer.Output.Depth;
-  Attended := AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads, NoForward, HasNorm, CellMul);
-  AttendedPlusPrev := AddLayer( [TNNetSum.Create([Attended, PrevLayer]), TNNetSignedSquareRoot1.Create()] );
+  if pActFn = nil then pActFn := TNNetSignedSquareRoot1;
+  Attended := AddGroupedSelfAttentionCAI(MinChannelsPerGroupCount, Heads, NoForward, HasNorm, CellMul, pActFn);
+  AttendedPlusPrev := AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
+  if (pActFn<>TNNetIdentity) then AttendedPlusPrev := AddLayer( pActFn.Create() );
   AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvReLU, MinChannelsPerGroupCount, IntermediateDim, false, 1, true);
-  AddLayer( TNNetSignedSquareRoot1.Create() );
+  if (pActFn<>TNNetIdentity) then AddLayer( pActFn.Create() );
   AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, EmbeddingDim, false, 1, true);
-  AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  if (pActFn<>TNNetIdentity) then AddLayer( [pActFn.Create()] );
   AddLayer( [TNNetSum.Create([ GetLastLayer(), AttendedPlusPrev]) ] );
-  AddLayer( [TNNetSignedSquareRoot1.Create()] );
+  if (pActFn<>TNNetIdentity) then AddLayer( [pActFn.Create()] );
   Result := GetLastLayer();
 end;
 
 function TNNet.AddCompressedTransformerBlockCAI(CompressedChannelsCount,
   MinChannelsPerGroupCount, Heads: integer; IntermediateDim: integer;
-  NoForward: boolean; HasNorm: boolean; CellMul: boolean): TNNetLayer;
+  NoForward: boolean; HasNorm: boolean; CellMul: boolean;
+  pActFn: TNNetActivationFunctionClass): TNNetLayer;
 var
   PrevLayer: TNNetLayer;
   EmbeddingDim: integer;
@@ -7617,15 +7660,15 @@ begin
   if (EmbeddingDim<>CompressedChannelsCount) then
   begin
     AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, CompressedChannelsCount, false, 1, true);
-    AddLayer( [TNNetSignedSquareRoot1.Create()] );
+    if (pActFn<>TNNetIdentity) then AddLayer( [pActFn.Create()] );
   end;
-  AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads, IntermediateDim, NoForward, HasNorm, CellMul);
+  AddGroupedTransformerBlockCAI(MinChannelsPerGroupCount, Heads, IntermediateDim, NoForward, HasNorm, CellMul, pActFn);
   // Should Uncompress?
   if (EmbeddingDim<>CompressedChannelsCount) then
   begin
     AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear, MinChannelsPerGroupCount, EmbeddingDim, false, 1, true);
     AddLayer( [TNNetSum.Create([ GetLastLayer(), PrevLayer]) ] );
-    AddLayer( [TNNetSignedSquareRoot1.Create()] );
+    if (pActFn<>TNNetIdentity) then AddLayer( [pActFn.Create()] );
   end;
   Result := GetLastLayer();
 end;
