@@ -25,7 +25,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 }
 
 unit neuralabfun;
-
+{$IFDEF FPC}
+{$mode objfpc}
+{$ENDIF}
 interface
 
 uses neuralab;

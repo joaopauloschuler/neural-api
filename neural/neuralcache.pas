@@ -25,7 +25,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 }
 unit neuralcache; // this unit used to be called UCashST2 (not sure why)
-
+{$IFDEF FPC}
+{$mode objfpc}
+{$ENDIF}
 interface
 
 // type of key and data in the memory.
