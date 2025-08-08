@@ -368,6 +368,9 @@ type
   end;
 
   /// Class with string message events
+  {$IFNDEF FPC}
+    {$M+}
+  {$ENDIF}
   TMObject = class(TObject)
     protected
       FMessageProc: TGetStrProc;
@@ -2332,6 +2335,7 @@ var
   r, x, y: TNeuralFloat;
 begin
   r := 0;
+  x := 0;
   // loop executed 4 / pi = 1.273.. times on average
   while ( (r > 1) or (r = 0) ) do
   begin
@@ -2340,7 +2344,6 @@ begin
     y := 2.0 * Random() - 1.0;
     r := x*x + y*y;
   end;
-
   RandomGaussianValue := x * Sqrt(-2.0 * Ln(r) / r);
 end;
 
@@ -4427,15 +4430,15 @@ end;
 procedure TVolume.LoadFromString(strData: string);
 var
   S: TStringList;
-  version: integer;
+  //version: integer;
   pSizeX, pSizeY, pDepth: integer;
   I: integer;
   AuxFloat: Single;
 begin
-  version := 1;
+  //version := 1;
   S := CreateTokenizedStringList(strData,';');
 
-  version := StrToInt(S[0]);
+  //version := StrToInt(S[0]);
   pSizeX  := StrToInt(S[1]);
   pSizeY  := StrToInt(S[2]);
   pDepth  := StrToInt(S[3]);
@@ -4648,19 +4651,21 @@ end;
 
 procedure TNNetVolume.DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
-  DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
+  CntA, CntB, MaxA, MaxB: integer;
+  {$IFDEF AVXANY}
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
+  {$ENDIF}
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
 begin
   MaxA := NumAs - 1;
   MaxB := NumBs - 1;
 
+  {$IFDEF AVXANY}
   localNumElements := (VectorSize div 4) * 4;
   MissedElements := VectorSize - localNumElements;
+  {$ENDIF}
 
   for CntB := 0 to MaxB do
   begin

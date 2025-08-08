@@ -804,12 +804,14 @@ type
   TNNetDepthwiseConv = class(TNNetConvolutionAbstract)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    procedure BackpropagateCPU(); {$IFDEF Release} inline; {$ENDIF}
     procedure BackpropagateCPUFast();
     procedure BackpropagateAtOutputPos(OutputX, OutputY, NeuronIdx, PrevX, PrevY: integer; bCanBackPropagate: boolean); {$IFDEF Release} inline; {$ENDIF}
-    procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUFast();
+  protected
+    //The following functions were not used. To avoid the compiler giving hints, they were temporarily moved from private to protected
+    procedure BackpropagateCPU(); {$IFDEF Release} inline; {$ENDIF}
+    procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
   public
     constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer);
     procedure Compute(); override;
@@ -838,12 +840,16 @@ type
       FLearnSmoothener: TNeuralFloat;
 
       {$IFDEF Debug}
-      procedure PrepareInputForConvolution(); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure PrepareInputForConvolution(OutputX, OutputY: integer); overload; {$IFDEF Release} inline; {$ENDIF}
       {$ENDIF}
       procedure PrepareInputForConvolutionFast();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
+    protected
+      //The following functions were not used. To avoid the compiler giving hints, they were temporarily moved from private to protected
+      {$IFDEF DEBUG}
+      procedure PrepareInputForConvolution(); overload; {$IFDEF Release} inline; {$ENDIF}
+      {$ENDIF}
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); virtual;
       destructor Destroy(); override;
@@ -869,16 +875,20 @@ type
       procedure ComputeOpenCL();
       {$ENDIF}
       {$IFDEF Debug}
+      procedure ComputeNeuronAtOutputPos(NeuronIdx, x, y: integer); {$IFDEF Release} inline; {$ENDIF}
+      function ComputeNeuronAtPreparedInput(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      {$ENDIF}
+    protected
+      //The following functions were not used. To avoid the compiler giving hints, they were temporarily moved from private to protected
+      {$IFDEF DEBUG}
       procedure ComputeNeuronCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddBiasToRawResult(); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeNeuronFromResult(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeNeuron(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
-      procedure ComputeNeuronAtOutputPos(NeuronIdx, x, y: integer); {$IFDEF Release} inline; {$ENDIF}
       function ComputeNeuronAtOutputPos3(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function ComputeNeuronAtOutputPos3D3(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function ComputeNeuronAtOutputPosDefault(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function ComputeNeuronAtOutputPosDefaultFast(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
-      function ComputeNeuronAtPreparedInput(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       {$ENDIF}
     public
       procedure Compute(); override;
@@ -891,7 +901,7 @@ type
   { TNNetDeconvolution }
   TNNetDeconvolution = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); {$IFNDEF FPC} reintroduce; {$ENDIF} overload;
   end;
 
   /// Convolutional layer with ReLU activation function.
@@ -903,7 +913,7 @@ type
   /// Pointwise convolution with ReLU activation.
   TNNetPointwiseConvReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); {$IFNDEF FPC} reintroduce; {$ENDIF} overload;
   end;
 
   /// Convolutional layer without activation function.
@@ -915,13 +925,13 @@ type
   /// Pointwise convolution with Linear activation.
   TNNetPointwiseConvLinear = class(TNNetConvolutionLinear)
   public
-    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); {$IFNDEF FPC} reintroduce; {$ENDIF} overload;
   end;
 
   { TNNetDeconvolutionReLU }
   TNNetDeconvolutionReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); {$IFNDEF FPC} reintroduce; {$ENDIF} overload;
   end;
 
   { TNNetLocalConnect }
@@ -939,7 +949,7 @@ type
   { TNNetDeLocalConnect }
   TNNetDeLocalConnect = class(TNNetLocalConnect)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); {$IFNDEF FPC} reintroduce; {$ENDIF} overload;
   end;
 
   { TNNetLocalConnectReLU }
@@ -951,7 +961,7 @@ type
   { TNNetDeLocalConnectReLU }
   TNNetDeLocalConnectReLU = class(TNNetLocalConnectReLU)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); {$IFNDEF FPC} reintroduce; {$ENDIF} overload;
   end;
 
   { TNNetPoolBase }
@@ -5115,13 +5125,13 @@ end;
 
 procedure TNNetReshape.Backpropagate;
 var
-  Len: integer;
+  //Len: integer;
   StartTime: double;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
+  //Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   //TODO: check this for possible crash.
   FPrevLayer.FOutputError.Add(FOutputError);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -5273,7 +5283,7 @@ end;
 procedure TNNetLocalConnect.ComputeNTL(index, threadnum: integer);
 var
   OutputCntX, OutputCntY, OutputCntD: integer;
-  InputCntX, InputCntY: integer;
+  //InputCntX, InputCntY: integer;
   MaxX, MaxY, MaxD: integer;
   LocalSize: integer;
   LocalW: TNNetVolume;
@@ -5287,12 +5297,12 @@ begin
   MaxD := FOutput.Depth - 1;
 
   LocalSize := FFeatureSizeX*FFeatureSizeY*FInputCopy.Depth;
-  InputCntX := 0;
+  //InputCntX := 0;
   OutputCntX := 0;
   CntXYD := 0;
   while OutputCntX <= MaxX do
   begin
-    InputCntY := 0;
+    //InputCntY := 0;
     OutputCntY := 0;
     while OutputCntY <= MaxY do
     begin
@@ -5315,10 +5325,10 @@ begin
         Inc(OutputCntD);
         Inc(CntXYD);
       end;
-      Inc(InputCntY, FStride);
+      //Inc(InputCntY, FStride);
       Inc(OutputCntY);
     end;
-    Inc(InputCntX, FStride);
+    //Inc(InputCntX, FStride);
     Inc(OutputCntX);
   end;
 end;
@@ -6000,7 +6010,7 @@ var
   DepthFSize, SizeOfDepthFSize: integer;
   yCount: integer;
   InputX: integer;
-  RowSize: integer;
+  //RowSize: integer;
   {$IFDEF AVXANY}
   SourceRawPos, DestRawPos: pointer;
   {$ENDIF}
@@ -6012,7 +6022,7 @@ begin
   else
   begin
     DepthFSize := FInputCopy.Depth * FFeatureSizeX;
-    RowSize := DepthFSize;
+    //RowSize := DepthFSize;
     SizeOfDepthFSize := DepthFSize * SizeOf(TNeuralFloat);
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
@@ -6272,13 +6282,22 @@ var
   SmoothLocalOutputErrorDeriv: TNeuralFloat;
   LocalWeight, LocalPrevError: TNNetVolume;
   {SrcPtr,} LocalDestPtr: TNeuralFloatArrPtr;
-  SmoothLocalOutputErrorDerivPtr: pointer;
+  //SmoothLocalOutputErrorDerivPtr: pointer;
+  {$IFDEF AVX64}
+    {$IFDEF DEBUG}
   PrevNumElements, PrevMissedElements: integer;
-  PtrNeuronDelta, PtrPreparedInput: TNeuralFloatArrPtr;
+    {$ENDIF}
+  {$ENDIF}
+  {$IFDEF AVX64}
+  PtrNeuronDelta: TNeuralFloatArrPtr;
+  {$ENDIF}
+  PtrPreparedInput: TNeuralFloatArrPtr;
   PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
+  {$IFDEF AVX64}
   NeuronWeights: integer;
   LocalLearningErrorDerivPtr: pointer;
   localNumElements, MissedElements: integer;
+  {$ENDIF}
   MaxPrevX, MaxPrevY: integer;
 begin
   MaxX := OutputError.SizeX - 1;
@@ -6287,13 +6306,23 @@ begin
   MaxPrevX := 1 + FPrevLayer.FOutputError.SizeX - FFeatureSizeX;
   MaxPrevY := 1 + FPrevLayer.FOutputError.SizeY - FFeatureSizeY;
   LocalPrevError := FPrevLayer.OutputError;
+  {$IFDEF AVX64}
+    {$IFDEF DEBUG}
   PrevNumElements := (FSizeXDepth div 4) * 4;
   PrevMissedElements := FSizeXDepth - PrevNumElements;
+    {$ENDIF}
+  {$ENDIF}
+
+  {$IFDEF AVX64}
   NeuronWeights := FArrNeurons[0].Delta.Size;
   localNumElements := (NeuronWeights div 4) * 4;
   MissedElements := NeuronWeights - localNumElements;
-  SmoothLocalOutputErrorDerivPtr := Addr(SmoothLocalOutputErrorDeriv);
+  {$ENDIF}
+  LocalDestPtr := nil;
+  //SmoothLocalOutputErrorDerivPtr := Addr(SmoothLocalOutputErrorDeriv);
+  {$IFDEF AVX64}
   LocalLearningErrorDerivPtr := Addr(LocalLearningErrorDeriv);
+  {$ENDIF}
     begin
       for OutputY := 0 to MaxY do
       begin
@@ -6548,7 +6577,8 @@ var
   {SrcPtr,} LocalDestPtr: TNeuralFloatArrPtr;
   SmoothLocalOutputErrorDerivPtr: pointer;
   PrevNumElements, PrevMissedElements: integer;
-  PtrNeuronDelta, PtrPreparedInput: TNeuralFloatArrPtr;
+  //PtrNeuronDelta: TNeuralFloatArrPtr;
+  //PtrPreparedInput: TNeuralFloatArrPtr;
   PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
   NeuronWeights: integer;
   LocalLearningErrorDerivPtr: pointer;
@@ -6581,8 +6611,11 @@ begin
         begin
           PrevX := (OutputX*FStride)-FPadding;
           OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY);
-          if (FCalculatePrevLayerError) then LocalDestPtr  := LocalPrevError.GetRawPtr(OutputX, OutputY);
-          PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
+          if (FCalculatePrevLayerError) then
+            LocalDestPtr := LocalPrevError.GetRawPtr(OutputX, OutputY)
+          else
+            LocalDestPtr := nil;
+          //PtrPreparedInput := FInputPrepared.GetRawPtr(OutputX, OutputY);
           CanBackpropOnPos :=
             (PrevX >= 0) and (PrevY >= 0) and
             (PrevX < MaxPrevX) and
