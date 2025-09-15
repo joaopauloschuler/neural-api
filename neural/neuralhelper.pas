@@ -31,18 +31,12 @@ type
 
   TNNetVolumeHelper = class helper for TNNetVolume
   private
-    function GetDataArr: TNeuralFloatDynArr;
-    procedure SetDataArr(const ADataArr: TNeuralFloatDynArr); 
+    procedure SetDataArr(const ADataArr: TNeuralFloatDynArr);
   public
-    property DataArr: TNeuralFloatDynArr read GetDataArr write SetDataArr;
+    property DataArr: TNeuralFloatDynArr write SetDataArr;
   end;
 
 implementation
-
-function TNNetVolumeHelper.GetDataArr: TNeuralFloatDynArr;
-begin
-  Result := FData;
-end;
 
 procedure TNNetVolumeHelper.SetDataArr(const ADataArr: TNeuralFloatDynArr);
 begin
