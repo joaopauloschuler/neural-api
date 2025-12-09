@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Free Pascal Compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y fpc
+
+    - name: Build Tests
+      run: |
+        cd tests
+        fpc -Fu../neural -FE../bin -o../bin/RunTests RunTests.lpr
+
+    - name: Run Tests
+      run: |
+        cd bin
+        ./RunTests --all --format=plain
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: bin/
+        retention-days: 5
