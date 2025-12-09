@@ -2,3 +2,13 @@ experiments
 opencl
 libs
 readme.txt
+
+# Build artifacts
+bin/
+*.o
+*.ppu
+*.exe
+*.compiled
+*.bak
+backup/
+lib/
