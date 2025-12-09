@@ -1,0 +1,19 @@
+﻿{
+  "name": "ai-coding-examples: Free Pascal",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspaces/ai-coding-examples",
+  "postCreateCommand": "fpc -v || true",
+  "remoteUser": "vscode",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "alefragnani.pascal",
+        "davidanson.vscode-markdownlint",
+        "ms-vscode.vscode-container-tools"
+      ]
+    }
+  }
+}
