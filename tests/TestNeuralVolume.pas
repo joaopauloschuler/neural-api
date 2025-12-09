@@ -287,13 +287,15 @@ begin
     PredictedClass := V.GetClass();
     AssertEquals('Predicted class should be 2', 2, PredictedClass);
     
-    // Test SetClass - note that SetClass(class, value) fills with -value for non-class elements
-    // So SetClass(3, 1.0) will set class 3 to 1.0 and others to -1.0
+    // Test SetClass with single value parameter
+    // SetClass(class, value) fills non-class elements with -value
+    // This is useful for hyperbolic tangent activations (-1 to +1 range)
     V.SetClass(3, 1.0);
     AssertEquals('After SetClass(3), class 3 should be 1.0', 1.0, V.Raw[3], 0.0001);
     AssertEquals('After SetClass(3), class 0 should be -1.0', -1.0, V.Raw[0], 0.0001);
     
-    // Test SetClass with explicit true/false values
+    // Test SetClass with explicit true/false values (two-parameter overload)
+    // This allows standard one-hot encoding (0 for false, 1 for true)
     V.SetClass(2, 1.0, 0.0);
     AssertEquals('After SetClass(2, 1.0, 0.0), class 2 should be 1.0', 1.0, V.Raw[2], 0.0001);
     AssertEquals('After SetClass(2, 1.0, 0.0), class 0 should be 0.0', 0.0, V.Raw[0], 0.0001);

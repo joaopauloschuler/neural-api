@@ -26,15 +26,28 @@ jobs:
       id: lazutils
       run: |
         # Find the correct LazUtils path for the installed version
-        LAZUTILS_PATH=$(find /usr/lib/lazarus -name "utf8process.ppu" -printf "%h\n" 2>/dev/null | head -1)
-        echo "path=${LAZUTILS_PATH}" >> $GITHUB_OUTPUT
-        echo "Found LazUtils at: ${LAZUTILS_PATH}"
+        # Search in common Lazarus installation locations
+        LAZUTILS_PATH=$(find /usr/lib/lazarus /usr/share/lazarus -name "utf8process.ppu" -printf "%h\n" 2>/dev/null | head -1)
+        if [ -z "$LAZUTILS_PATH" ]; then
+          echo "Warning: LazUtils not found, falling back to basic tests only"
+          echo "path=" >> $GITHUB_OUTPUT
+          echo "found=false" >> $GITHUB_OUTPUT
+        else
+          echo "Found LazUtils at: ${LAZUTILS_PATH}"
+          echo "path=${LAZUTILS_PATH}" >> $GITHUB_OUTPUT
+          echo "found=true" >> $GITHUB_OUTPUT
+        fi
 
     - name: Build Tests
       run: |
         mkdir -p bin
         cd tests
-        fpc -Fu../neural -Fu${{ steps.lazutils.outputs.path }} -FE../bin -o../bin/RunTests RunTests.lpr
+        if [ -n "${{ steps.lazutils.outputs.path }}" ]; then
+          fpc -Fu../neural -Fu${{ steps.lazutils.outputs.path }} -FE../bin -o../bin/RunTests RunTests.lpr
+        else
+          echo "Building without LazUtils - threading tests will be skipped"
+          fpc -Fu../neural -FE../bin -o../bin/RunTests RunTests.lpr
+        fi
 
     - name: Run Tests
       run: |

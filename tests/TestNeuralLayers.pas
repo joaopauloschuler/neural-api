@@ -355,16 +355,16 @@ procedure TTestNeuralLayers.TestConcatLayers;
 var
   NN: TNNet;
   Input: TNNetVolume;
-  Layer1, Layer2: TNNetLayer;
+  InputLayer, Layer1, Layer2: TNNetLayer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 3);
   try
-    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    InputLayer := NN.AddLayer(TNNetInput.Create(8, 8, 3));
     
-    // Create two parallel paths
+    // Create two parallel paths branching from the input layer
     Layer1 := NN.AddLayer(TNNetConvolutionReLU.Create(16, 3, 1, 1));
-    Layer2 := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1), NN.Layers[0]);
+    Layer2 := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
     
     // Concatenate the two paths
     NN.AddLayer(TNNetDeepConcat.Create([Layer1, Layer2]));
@@ -385,16 +385,16 @@ procedure TTestNeuralLayers.TestSumLayers;
 var
   NN: TNNet;
   Input: TNNetVolume;
-  Layer1, Layer2: TNNetLayer;
+  InputLayer, Layer1, Layer2: TNNetLayer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 16);
   try
-    NN.AddLayer(TNNetInput.Create(8, 8, 16));
+    InputLayer := NN.AddLayer(TNNetInput.Create(8, 8, 16));
     
-    // Create two parallel paths with same output size
+    // Create two parallel paths with same output size branching from input
     Layer1 := NN.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1));
-    Layer2 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(16, 3, 1, 1), NN.Layers[0]);
+    Layer2 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(16, 3, 1, 1), InputLayer);
     
     // Sum the two paths
     NN.AddLayer(TNNetSum.Create([Layer1, Layer2]));
