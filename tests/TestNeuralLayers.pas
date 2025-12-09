@@ -101,7 +101,7 @@ begin
   Input := TNNetVolume.Create(4, 1, 1);
   Output1 := TNNetVolume.Create(2, 1, 1);
   Output2 := TNNetVolume.Create(2, 1, 1);
-  TempFile := GetTempFileName('', 'nn');
+  TempFile := GetTempDir() + 'nn_test_' + IntToStr(Random(MaxInt)) + '.nn';
   try
     NN1.AddLayer(TNNetInput.Create(4));
     NN1.AddLayer(TNNetFullConnectReLU.Create(8));
