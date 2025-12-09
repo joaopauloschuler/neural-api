@@ -24,6 +24,7 @@ jobs:
 
     - name: Build Tests
       run: |
+        mkdir -p bin
         cd tests
         fpc -Fu../neural -FE../bin -o../bin/RunTests RunTests.lpr
 
