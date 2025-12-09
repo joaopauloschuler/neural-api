@@ -17,16 +17,24 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Free Pascal Compiler
+    - name: Install Free Pascal Compiler and LCL
       run: |
         sudo apt-get update
-        sudo apt-get install -y fpc
+        sudo apt-get install -y fpc lcl
+
+    - name: Find LazUtils path
+      id: lazutils
+      run: |
+        # Find the correct LazUtils path for the installed version
+        LAZUTILS_PATH=$(find /usr/lib/lazarus -name "utf8process.ppu" -printf "%h\n" 2>/dev/null | head -1)
+        echo "path=${LAZUTILS_PATH}" >> $GITHUB_OUTPUT
+        echo "Found LazUtils at: ${LAZUTILS_PATH}"
 
     - name: Build Tests
       run: |
         mkdir -p bin
         cd tests
-        fpc -Fu../neural -FE../bin -o../bin/RunTests RunTests.lpr
+        fpc -Fu../neural -Fu${{ steps.lazutils.outputs.path }} -FE../bin -o../bin/RunTests RunTests.lpr
 
     - name: Run Tests
       run: |
