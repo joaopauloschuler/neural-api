@@ -165,9 +165,10 @@ begin
       VL.Add(V);
     end;
     
-    // Get item by index should work
-    V := VL[Random(5)];
-    AssertTrue('Volume at random index should exist', V <> nil);
+    // Get item by fixed index should work
+    V := VL[2];
+    AssertTrue('Volume at index 2 should exist', V <> nil);
+    AssertEquals('Volume at index 2 should have value 2.0', 2.0, V.Raw[0], 0.0001);
     
     // Test that all items are accessible
     for I := 0 to 4 do
