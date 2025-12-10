@@ -435,6 +435,7 @@ procedure TTestNeuralLayers.TestDepthwiseConvolution;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 4);
@@ -448,6 +449,16 @@ begin
     // Depthwise conv with multiplier 1 keeps same depth
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output Depth should be 4', 4, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: output should be finite and non-NaN
+    for I := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
+    
+    // ReLU applied, so output should be non-negative
+    AssertTrue('Output min should be >= 0 (ReLU)', NN.GetLastLayer.Output.GetMin() >= -0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -458,6 +469,7 @@ procedure TTestNeuralLayers.TestPointwiseConvolution;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 16);
@@ -472,6 +484,16 @@ begin
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output Depth should be 32', 32, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: output should be finite and non-NaN
+    for I := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
+    
+    // ReLU applied, so output should be non-negative
+    AssertTrue('Output min should be >= 0 (ReLU)', NN.GetLastLayer.Output.GetMin() >= -0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -483,6 +505,7 @@ var
   NN: TNNet;
   Input: TNNetVolume;
   InputLayer, Layer1, Layer2: TNNetLayer;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 3);
@@ -502,6 +525,14 @@ begin
     // Concatenated depth should be 16 + 8 = 24
     AssertEquals('Concatenated depth should be 24', 24, NN.GetLastLayer.Output.Depth);
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
+    
+    // Numerical verification: total size should be 8*8*24 = 1536
+    AssertEquals('Total output size should be 1536', 1536, NN.GetLastLayer.Output.Size);
+    
+    // Output should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
     Input.Free;
@@ -513,6 +544,7 @@ var
   NN: TNNet;
   Input: TNNetVolume;
   InputLayer, Layer1, Layer2: TNNetLayer;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 16);
@@ -532,6 +564,14 @@ begin
     // Sum should maintain the same dimensions
     AssertEquals('Sum output depth should be 16', 16, NN.GetLastLayer.Output.Depth);
     AssertEquals('Sum output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Sum output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
+    
+    // Numerical verification: total size should be 8*8*16 = 1024
+    AssertEquals('Total output size should be 1024', 1024, NN.GetLastLayer.Output.Size);
+    
+    // Output should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
     Input.Free;
