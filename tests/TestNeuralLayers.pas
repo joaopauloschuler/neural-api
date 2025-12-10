@@ -7,6 +7,11 @@ interface
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
 
+const
+  // Maximum number of elements to check for NaN/Inf in large tensors.
+  // Checking all elements can be slow for large outputs, so we sample a subset.
+  MAX_NAN_CHECK_ITERATIONS = 100;
+
 type
   TTestNeuralLayers = class(TTestCase)
   published
@@ -82,8 +87,10 @@ begin
     Layer := TNNetFullConnectLinear.Create(1);
     NN.AddLayer(Layer);
 
-    // Set known weights for numerical verification (bias not set directly, use default 0)
-    // Output = w1*x1 + w2*x2 (bias is 0 by default from initialization)
+    // Set known weights for numerical verification
+    // Note: TNNetNeuron initializes bias (FBiasWeight) to 0 in its constructor
+    // (see neuralnetwork.pas line ~16402: FBiasWeight := 0)
+    // Output = w1*x1 + w2*x2 + bias, where bias = 0
     Layer.Neurons[0].Weights.Raw[0] := 2.0;  // w1 = 2
     Layer.Neurons[0].Weights.Raw[1] := 3.0;  // w2 = 3
 
@@ -531,7 +538,7 @@ begin
     AssertEquals('Total output size should be 1536', 1536, NN.GetLastLayer.Output.Size);
     
     // Output should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
@@ -570,7 +577,7 @@ begin
     AssertEquals('Total output size should be 1024', 1024, NN.GetLastLayer.Output.Size);
     
     // Output should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;

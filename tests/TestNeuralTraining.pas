@@ -138,9 +138,12 @@ begin
   Output := TNNetVolume.Create(1, 1, 1);
   Desired := TNNetVolume.Create(1, 1, 1);
   try
+    // Use 8 neurons (vs original 4) to provide more learning capacity.
+    // Neural network convergence is probabilistic due to random weight initialization.
+    // More neurons increase the likelihood of finding good initial weights.
     NN.AddLayer([
       TNNetInput.Create(2),
-      TNNetFullConnectReLU.Create(8),  // Increased neurons for better convergence
+      TNNetFullConnectReLU.Create(8),
       TNNetFullConnectLinear.Create(1)
     ]);
     NN.SetLearningRate(0.01, 0.9);  // Higher learning rate for faster convergence
