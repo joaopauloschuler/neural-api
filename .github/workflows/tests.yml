@@ -43,10 +43,10 @@ jobs:
         mkdir -p bin
         cd tests
         if [ -n "${{ steps.lazutils.outputs.path }}" ]; then
-          fpc -Fu../neural -Fu${{ steps.lazutils.outputs.path }} -FE../bin -o../bin/RunTests RunTests.lpr
+          fpc -Mobjfpc -Fu../neural -Fu${{ steps.lazutils.outputs.path }} -FE../bin -o../bin/RunTests RunTests.lpr
         else
           echo "Building without LazUtils - threading tests will be skipped"
-          fpc -Fu../neural -FE../bin -o../bin/RunTests RunTests.lpr
+          fpc -Mobjfpc -Fu../neural -FE../bin -o../bin/RunTests RunTests.lpr
         fi
 
     - name: Run Tests
