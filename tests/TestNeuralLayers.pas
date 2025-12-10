@@ -5,7 +5,7 @@ unit TestNeuralLayers;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
 
 type
   TTestNeuralLayers = class(TTestCase)
@@ -72,13 +72,20 @@ procedure TTestNeuralLayers.TestFullyConnectedForward;
 var
   NN: TNNet;
   Input, Output: TNNetVolume;
+  Layer: TNNetFullConnectLinear;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(2, 1, 1);
   Output := TNNetVolume.Create(1, 1, 1);
   try
     NN.AddLayer(TNNetInput.Create(2));
-    NN.AddLayer(TNNetFullConnectLinear.Create(1));
+    Layer := TNNetFullConnectLinear.Create(1);
+    NN.AddLayer(Layer);
+
+    // Set known weights for numerical verification (bias not set directly, use default 0)
+    // Output = w1*x1 + w2*x2 (bias is 0 by default from initialization)
+    Layer.Neurons[0].Weights.Raw[0] := 2.0;  // w1 = 2
+    Layer.Neurons[0].Weights.Raw[1] := 3.0;  // w2 = 3
 
     Input.Raw[0] := 1.0;
     Input.Raw[1] := 1.0;
@@ -86,8 +93,23 @@ begin
     NN.Compute(Input);
     NN.GetOutput(Output);
 
-    // Just verify it runs without error and produces output
-    AssertTrue('Output should have size 1', Output.Size = 1);
+    // Numerical verification
+    AssertEquals('Output should have size 1', 1, Output.Size);
+    // With zero bias: 2*1 + 3*1 = 5
+    AssertEquals('Output should be 2*1+3*1=5 (with default zero bias)', 5.0, Output.Raw[0], 0.0001);
+    
+    // Test with different input
+    Input.Raw[0] := 2.0;
+    Input.Raw[1] := 3.0;
+    // Expected: 2*2 + 3*3 = 4 + 9 = 13
+    
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    AssertEquals('Output should be 2*2+3*3=13', 13.0, Output.Raw[0], 0.0001);
+    
+    // Verify output is not NaN or Inf
+    AssertFalse('Output should not be NaN', IsNaN(Output.Raw[0]));
+    AssertFalse('Output should not be Inf', IsInfinite(Output.Raw[0]));
   finally
     NN.Free;
     Input.Free;
@@ -99,18 +121,38 @@ procedure TTestNeuralLayers.TestConvolutionForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  ConvLayer: TNNetConvolutionReLU;
+  I, OutputSize: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 3);
   try
     NN.AddLayer(TNNetInput.Create(8, 8, 3));
-    NN.AddLayer(TNNetConvolutionReLU.Create(16, 3, 1, 1));
+    ConvLayer := TNNetConvolutionReLU.Create(16, 3, 1, 1);
+    NN.AddLayer(ConvLayer);
 
     Input.Fill(1.0);
     NN.Compute(Input);
 
+    // Verify output dimensions
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output depth should be 16', 16, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: Output should exist and be finite
+    OutputSize := NN.GetLastLayer.Output.Size;
+    AssertEquals('Output size should be 8*8*16 = 1024', 1024, OutputSize);
+    
+    // Check that output values are valid (not NaN or Inf)
+    for I := 0 to OutputSize - 1 do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
+    
+    // ReLU applied, so output should be non-negative for positive weighted sums
+    // Since weights are random, we just verify the output exists and ReLU works
+    AssertTrue('Output min should be >= 0 (ReLU)', NN.GetLastLayer.Output.GetMin() >= -0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -123,16 +165,30 @@ var
   Input: TNNetVolume;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(8, 8, 3);
+  Input := TNNetVolume.Create(4, 4, 1);
   try
-    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    NN.AddLayer(TNNetInput.Create(4, 4, 1));
     NN.AddLayer(TNNetMaxPool.Create(2));
 
+    // Set up input with known values for numerical verification
+    // 2x2 pool regions: (0,0)-(1,1), (2,0)-(3,1), (0,2)-(1,3), (2,2)-(3,3)
     Input.Fill(1.0);
+    Input[0, 0, 0] := 5.0;  // Max in region (0,0)
+    Input[3, 1, 0] := 7.0;  // Max in region (1,0)
+    Input[1, 3, 0] := 3.0;  // Max in region (0,1)
+    Input[2, 2, 0] := 9.0;  // Max in region (1,1)
+    
     NN.Compute(Input);
 
-    AssertEquals('Output SizeX should be 4 after 2x2 pool', 4, NN.GetLastLayer.Output.SizeX);
-    AssertEquals('Output SizeY should be 4 after 2x2 pool', 4, NN.GetLastLayer.Output.SizeY);
+    // Verify output dimensions
+    AssertEquals('Output SizeX should be 2 after 2x2 pool', 2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 2 after 2x2 pool', 2, NN.GetLastLayer.Output.SizeY);
+    
+    // Numerical verification: each output cell should contain the max of its 2x2 region
+    AssertEquals('Max pool output (0,0) should be 5.0', 5.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    AssertEquals('Max pool output (1,0) should be 7.0', 7.0, NN.GetLastLayer.Output[1, 0, 0], 0.0001);
+    AssertEquals('Max pool output (0,1) should be 3.0', 3.0, NN.GetLastLayer.Output[0, 1, 0], 0.0001);
+    AssertEquals('Max pool output (1,1) should be 9.0', 9.0, NN.GetLastLayer.Output[1, 1, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -202,19 +258,45 @@ var
   Input: TNNetVolume;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(8, 8, 3);
+  Input := TNNetVolume.Create(4, 4, 1);
   try
-    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    NN.AddLayer(TNNetInput.Create(4, 4, 1));
     NN.AddLayer(TNNetAvgPool.Create(2));
 
-    Input.Fill(4.0);
+    // Set up input with known values for numerical verification
+    // Region (0,0)-(1,1): values 2, 4, 6, 8 -> avg = 5.0
+    Input[0, 0, 0] := 2.0;
+    Input[1, 0, 0] := 4.0;
+    Input[0, 1, 0] := 6.0;
+    Input[1, 1, 0] := 8.0;
+    // Region (2,0)-(3,1): all 4.0 -> avg = 4.0
+    Input[2, 0, 0] := 4.0;
+    Input[3, 0, 0] := 4.0;
+    Input[2, 1, 0] := 4.0;
+    Input[3, 1, 0] := 4.0;
+    // Region (0,2)-(1,3): values 0, 0, 0, 12 -> avg = 3.0
+    Input[0, 2, 0] := 0.0;
+    Input[1, 2, 0] := 0.0;
+    Input[0, 3, 0] := 0.0;
+    Input[1, 3, 0] := 12.0;
+    // Region (2,2)-(3,3): all 10.0 -> avg = 10.0
+    Input[2, 2, 0] := 10.0;
+    Input[3, 2, 0] := 10.0;
+    Input[2, 3, 0] := 10.0;
+    Input[3, 3, 0] := 10.0;
+    
     NN.Compute(Input);
 
-    AssertEquals('Output SizeX should be 4 after 2x2 avg pool', 4, NN.GetLastLayer.Output.SizeX);
-    AssertEquals('Output SizeY should be 4 after 2x2 avg pool', 4, NN.GetLastLayer.Output.SizeY);
-    AssertEquals('Output Depth should be 3', 3, NN.GetLastLayer.Output.Depth);
-    // Average of all 4.0 values should still be 4.0
-    AssertEquals('Average pooled value should be 4.0', 4.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    // Verify output dimensions
+    AssertEquals('Output SizeX should be 2 after 2x2 avg pool', 2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 2 after 2x2 avg pool', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Output Depth should be 1', 1, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: each output cell should contain the average of its 2x2 region
+    AssertEquals('Avg pool output (0,0) should be 5.0', 5.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    AssertEquals('Avg pool output (1,0) should be 4.0', 4.0, NN.GetLastLayer.Output[1, 0, 0], 0.0001);
+    AssertEquals('Avg pool output (0,1) should be 3.0', 3.0, NN.GetLastLayer.Output[0, 1, 0], 0.0001);
+    AssertEquals('Avg pool output (1,1) should be 10.0', 10.0, NN.GetLastLayer.Output[1, 1, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -232,16 +314,28 @@ begin
     NN.AddLayer(TNNetInput.Create(4, 4, 1));
     NN.AddLayer(TNNetMinPool.Create(2));
 
-    // Set values so we can test min pooling
+    // Set up input with known values for numerical verification
     Input.Fill(5.0);
-    Input[0, 0, 0] := 1.0; // This should be the min in its 2x2 region
+    // Region (0,0)-(1,1): min will be 1.0
+    Input[0, 0, 0] := 1.0;
+    // Region (2,0)-(3,1): min will be 2.0
+    Input[3, 1, 0] := 2.0;
+    // Region (0,2)-(1,3): min will be 0.5
+    Input[1, 2, 0] := 0.5;
+    // Region (2,2)-(3,3): min will be 3.0
+    Input[2, 3, 0] := 3.0;
 
     NN.Compute(Input);
 
+    // Verify output dimensions
     AssertEquals('Output SizeX should be 2 after 2x2 min pool', 2, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output SizeY should be 2 after 2x2 min pool', 2, NN.GetLastLayer.Output.SizeY);
-    // The min value 1.0 should appear in output
-    AssertEquals('Min pooled value should be 1.0', 1.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    
+    // Numerical verification: each output cell should contain the min of its 2x2 region
+    AssertEquals('Min pool output (0,0) should be 1.0', 1.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    AssertEquals('Min pool output (1,0) should be 2.0', 2.0, NN.GetLastLayer.Output[1, 0, 0], 0.0001);
+    AssertEquals('Min pool output (0,1) should be 0.5', 0.5, NN.GetLastLayer.Output[0, 1, 0], 0.0001);
+    AssertEquals('Min pool output (1,1) should be 3.0', 3.0, NN.GetLastLayer.Output[1, 1, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -616,24 +710,29 @@ var
   Input: TNNetVolume;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(4, 1, 1);
+  Input := TNNetVolume.Create(5, 1, 1);
   try
-    // TNNetReLU6 is a clamped activation layer
-    NN.AddLayer(TNNetInput.Create(4));
+    // TNNetReLU6: ReLU clamped to [0, 6]
+    // Note: Full activation behavior only applies during training when error derivatives are set
+    NN.AddLayer(TNNetInput.Create(5));
     NN.AddLayer(TNNetReLU6.Create());
 
     Input.Raw[0] := -2.0;
-    Input.Raw[1] := 3.0;
-    Input.Raw[2] := 6.0;
-    Input.Raw[3] := 10.0;
+    Input.Raw[1] := 0.0;
+    Input.Raw[2] := 3.0;
+    Input.Raw[3] := 6.0;
+    Input.Raw[4] := 10.0;
 
     NN.Compute(Input);
 
-    // Test that output is produced - the layer may not apply ReLU during forward pass
-    // for identity-based layers until backpropagation
-    AssertEquals('Output should have 4 elements', 4, NN.GetLastLayer.Output.Size);
-    // Just verify the layer processes input
-    AssertTrue('Output should exist', NN.GetLastLayer.Output <> nil);
+    // Verify output is produced
+    AssertEquals('Output should have 5 elements', 5, NN.GetLastLayer.Output.Size);
+    // ReLU6 should not produce NaN values
+    AssertFalse('Output 0 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+    AssertFalse('Output 1 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[1]));
+    AssertFalse('Output 2 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[2]));
+    AssertFalse('Output 3 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[3]));
+    AssertFalse('Output 4 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[4]));
   finally
     NN.Free;
     Input.Free;
@@ -646,22 +745,26 @@ var
   Input: TNNetVolume;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(3, 1, 1);
+  Input := TNNetVolume.Create(4, 1, 1);
   try
-    NN.AddLayer(TNNetInput.Create(3));
+    NN.AddLayer(TNNetInput.Create(4));
     NN.AddLayer(TNNetLeakyReLU.Create());
 
     Input.Raw[0] := -2.0;
     Input.Raw[1] := 0.0;
     Input.Raw[2] := 2.0;
+    Input.Raw[3] := -100.0;
 
     NN.Compute(Input);
 
-    // Leaky ReLU: for negative values outputs small negative; positive unchanged
-    // Test output is produced correctly
-    AssertEquals('Output should have 3 elements', 3, NN.GetLastLayer.Output.Size);
+    // Leaky ReLU should produce output
+    AssertEquals('Output should have 4 elements', 4, NN.GetLastLayer.Output.Size);
+    // For positive values, output equals input
     AssertEquals('LeakyReLU of 0 should be 0', 0.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
     AssertEquals('LeakyReLU of 2 should be 2', 2.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    // Output values should be finite
+    AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+    AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[3]));
   finally
     NN.Free;
     Input.Free;
