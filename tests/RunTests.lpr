@@ -8,7 +8,8 @@ uses
   {$ENDIF}
   Classes, consoletestrunner,
   TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
-  TestNeuralFit, TestNeuralVolumePairs;
+  TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
+  TestNeuralLayersExtra, TestNeuralTraining;
 
 type
   TMyTestRunner = class(TTestRunner)
