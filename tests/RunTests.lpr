@@ -3,8 +3,11 @@ program RunTests;
 {$mode objfpc}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  cthreads, cmem,
+  {$ENDIF}
   Classes, consoletestrunner,
-  TestNeuralVolume, TestNeuralLayers;
+  TestNeuralVolume, TestNeuralLayers, TestNeuralThread;
 
 type
   TMyTestRunner = class(TTestRunner)
