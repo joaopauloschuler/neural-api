@@ -7,7 +7,8 @@ uses
   cthreads, cmem,
   {$ENDIF}
   Classes, consoletestrunner,
-  TestNeuralVolume, TestNeuralLayers, TestNeuralThread;
+  TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
+  TestNeuralFit, TestNeuralVolumePairs;
 
 type
   TMyTestRunner = class(TTestRunner)

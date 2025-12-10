@@ -27,6 +27,19 @@ type
     procedure TestVolumeSoftMax;
     procedure TestVolumePadding;
     procedure TestVolumeTranspose;
+    // Additional volume tests
+    procedure TestVolumeNormalization;
+    procedure TestVolumeMagnitude;
+    procedure TestVolumeEntropy;
+    procedure TestVolumeOneHotEncoding;
+    procedure TestVolumePositionalEncoding;
+    procedure TestVolumeColorConversions;
+    procedure TestVolumeGaussianNoise;
+    procedure TestVolumeCopyResizing;
+    procedure TestVolumeCopyCropping;
+    procedure TestVolumeShift;
+    procedure TestVolumeRawPosAndPtr;
+    procedure TestVolumeDepthOperations;
   end;
 
 implementation
@@ -384,6 +397,303 @@ begin
   finally
     Original.Free;
     Transposed.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeNormalization;
+var
+  V: TNNetVolume;
+  Magnitude: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Raw[0] := 3.0;
+    V.Raw[1] := 4.0;
+    V.Raw[2] := 0.0;
+    V.Raw[3] := 0.0;
+    
+    Magnitude := V.GetMagnitude();
+    // Magnitude of [3, 4, 0, 0] = 5
+    AssertEquals('Magnitude should be 5.0', 5.0, Magnitude, 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeMagnitude;
+var
+  V: TNNetVolume;
+  Magnitude: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(3, 1, 1);
+  try
+    V.Raw[0] := 1.0;
+    V.Raw[1] := 2.0;
+    V.Raw[2] := 2.0;
+    
+    Magnitude := V.GetMagnitude();
+    // Magnitude of [1, 2, 2] = sqrt(1 + 4 + 4) = 3
+    AssertEquals('Magnitude should be 3.0', 3.0, Magnitude, 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeEntropy;
+var
+  V: TNNetVolume;
+  Entropy: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    // Uniform distribution
+    V.Raw[0] := 0.25;
+    V.Raw[1] := 0.25;
+    V.Raw[2] := 0.25;
+    V.Raw[3] := 0.25;
+    
+    Entropy := V.GetEntropy();
+    // Entropy of uniform distribution over 4 elements = log2(4) = 2
+    AssertTrue('Entropy of uniform dist should be around 2', Abs(Entropy - 2.0) < 0.1);
+    
+    // Deterministic distribution
+    V.Raw[0] := 1.0;
+    V.Raw[1] := 0.0;
+    V.Raw[2] := 0.0;
+    V.Raw[3] := 0.0;
+    
+    Entropy := V.GetEntropy();
+    // Entropy of deterministic distribution = 0
+    AssertEquals('Entropy of deterministic dist should be 0', 0.0, Entropy, 0.001);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeOneHotEncoding;
+var
+  V: TNNetVolume;
+  Tokens: array[0..2] of integer;
+begin
+  // OneHotEncoding: SizeX = number of tokens, Depth = vocab size
+  // It sets Self[TokenIndex, 0, TokenValue] := 1
+  V := TNNetVolume.Create(3, 1, 10);  // 3 tokens, vocab size 10
+  try
+    Tokens[0] := 1;
+    Tokens[1] := 5;
+    Tokens[2] := 8;
+    
+    V.Fill(0);
+    V.OneHotEncoding(Tokens);
+    
+    // Check that the correct positions are set
+    // Token 0 has value 1, so V[0, 0, 1] = 1
+    AssertEquals('V[0,0,1] should be 1.0', 1.0, V[0, 0, 1], 0.0001);
+    // Token 1 has value 5, so V[1, 0, 5] = 1
+    AssertEquals('V[1,0,5] should be 1.0', 1.0, V[1, 0, 5], 0.0001);
+    // Token 2 has value 8, so V[2, 0, 8] = 1
+    AssertEquals('V[2,0,8] should be 1.0', 1.0, V[2, 0, 8], 0.0001);
+    // Other positions should be 0
+    AssertEquals('V[0,0,0] should be 0.0', 0.0, V[0, 0, 0], 0.0001);
+    AssertEquals('V[1,0,0] should be 0.0', 0.0, V[1, 0, 0], 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumePositionalEncoding;
+var
+  V: TNNetVolume;
+begin
+  V := TNNetVolume.Create(8, 1, 16);
+  try
+    V.Fill(0);
+    V.PositionalEncoding();
+    
+    // Positional encoding should produce values in [-1, 1] range
+    AssertTrue('Max value should be <= 1', V.GetMax() <= 1.001);
+    AssertTrue('Min value should be >= -1', V.GetMin() >= -1.001);
+    // Should have non-zero values
+    AssertTrue('Should have non-zero values', V.GetSumAbs() > 0);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeColorConversions;
+var
+  V: TNNetVolume;
+begin
+  V := TNNetVolume.Create(1, 1, 3);
+  try
+    // Test RGB to HSV and back
+    // Pure red: RGB(1, 0, 0)
+    V[0, 0, 0] := 1.0;
+    V[0, 0, 1] := 0.0;
+    V[0, 0, 2] := 0.0;
+    
+    V.RgbToHsv();
+    // After conversion, we should have HSV values
+    AssertTrue('HSV converted values should be valid', V.GetSum() >= 0);
+    
+    V.HsvToRgb();
+    // After conversion back, should approximately be red
+    AssertEquals('R should be approximately 1.0', 1.0, V[0, 0, 0], 0.01);
+    AssertEquals('G should be approximately 0.0', 0.0, V[0, 0, 1], 0.01);
+    AssertEquals('B should be approximately 0.0', 0.0, V[0, 0, 2], 0.01);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeGaussianNoise;
+var
+  V: TNNetVolume;
+  SumBefore, SumAfter: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(100, 1, 1);
+  try
+    V.Fill(5.0);
+    SumBefore := V.GetSum();
+    
+    V.AddGaussianNoise(0.1);
+    SumAfter := V.GetSum();
+    
+    // Sum should change after adding noise
+    AssertTrue('Values should change after adding noise', Abs(SumAfter - SumBefore) > 0.001);
+    // Average should still be around 5.0 with small noise
+    AssertTrue('Average should be approximately 5.0', Abs(V.GetAvg() - 5.0) < 1.0);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeCopyResizing;
+var
+  Original, Resized: TNNetVolume;
+begin
+  Original := TNNetVolume.Create(4, 4, 1);
+  Resized := TNNetVolume.Create(1, 1, 1);
+  try
+    Original.Fill(1.0);
+    
+    Resized.CopyResizing(Original, 8, 8);
+    
+    AssertEquals('Resized SizeX should be 8', 8, Resized.SizeX);
+    AssertEquals('Resized SizeY should be 8', 8, Resized.SizeY);
+  finally
+    Original.Free;
+    Resized.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeCopyCropping;
+var
+  Original, Cropped: TNNetVolume;
+begin
+  Original := TNNetVolume.Create(8, 8, 1);
+  Cropped := TNNetVolume.Create(1, 1, 1);
+  try
+    Original.Fill(1.0);
+    // Set a specific value in the center
+    Original[3, 3, 0] := 5.0;
+    
+    Cropped.CopyCropping(Original, 2, 2, 4, 4);
+    
+    AssertEquals('Cropped SizeX should be 4', 4, Cropped.SizeX);
+    AssertEquals('Cropped SizeY should be 4', 4, Cropped.SizeY);
+    // The value at (3,3) in original should be at (1,1) in cropped
+    AssertEquals('Cropped value at (1,1) should be 5.0', 5.0, Cropped[1, 1, 0], 0.0001);
+  finally
+    Original.Free;
+    Cropped.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeShift;
+var
+  V: TNNetVolume;
+begin
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Raw[0] := 1.0;
+    V.Raw[1] := 2.0;
+    V.Raw[2] := 3.0;
+    V.Raw[3] := 4.0;
+    
+    V.ShiftRight(1);
+    
+    // After shifting right by 1: [0, 1, 2, 3]
+    AssertEquals('Position 0 should be 0 after shift', 0.0, V.Raw[0], 0.0001);
+    AssertEquals('Position 1 should be 1.0', 1.0, V.Raw[1], 0.0001);
+    AssertEquals('Position 2 should be 2.0', 2.0, V.Raw[2], 0.0001);
+    AssertEquals('Position 3 should be 3.0', 3.0, V.Raw[3], 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeRawPosAndPtr;
+var
+  V: TNNetVolume;
+  Pos: integer;
+  Ptr: pointer;
+begin
+  V := TNNetVolume.Create(4, 4, 3);
+  try
+    // Test GetRawPos - storage is (x, y, depth) in interleaved format
+    // The data is stored as: for each (x,y) position, all depths are consecutive
+    Pos := V.GetRawPos(0, 0, 0);
+    AssertEquals('RawPos(0,0,0) should be 0', 0, Pos);
+    
+    // Depth is interleaved, so (0,0,1) is at position 1
+    Pos := V.GetRawPos(0, 0, 1);
+    AssertEquals('RawPos(0,0,1) should be 1', 1, Pos);
+    
+    // Position (1,0,0) is at position Depth (which is 3)
+    Pos := V.GetRawPos(1, 0, 0);
+    AssertEquals('RawPos(1,0,0) should be 3 (depth)', 3, Pos);
+    
+    // Test GetRawPtr
+    Ptr := V.GetRawPtr(0, 0, 0);
+    AssertTrue('RawPtr should not be nil', Ptr <> nil);
+    
+    Ptr := V.GetRawPtr();
+    AssertTrue('RawPtr() should not be nil', Ptr <> nil);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeDepthOperations;
+var
+  V: TNNetVolume;
+  SumD0, AvgD0: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(2, 2, 3);
+  try
+    // Fill each depth with different values
+    V.FillAtDepth(0, 2.0);
+    V.FillAtDepth(1, 4.0);
+    V.FillAtDepth(2, 6.0);
+    
+    // Test SumAtDepth
+    SumD0 := V.SumAtDepth(0);
+    AssertEquals('Sum at depth 0 should be 8.0 (4 * 2.0)', 8.0, SumD0, 0.0001);
+    
+    // Test AvgAtDepth
+    AvgD0 := V.AvgAtDepth(0);
+    AssertEquals('Avg at depth 0 should be 2.0', 2.0, AvgD0, 0.0001);
+    
+    // Test AddAtDepth
+    V.AddAtDepth(0, 1.0);
+    AssertEquals('After AddAtDepth, value should be 3.0', 3.0, V[0, 0, 0], 0.0001);
+    
+    // Test MulAtDepth
+    V.MulAtDepth(1, 0.5);
+    AssertEquals('After MulAtDepth, value should be 2.0', 2.0, V[0, 0, 1], 0.0001);
+  finally
+    V.Free;
   end;
 end;
 
