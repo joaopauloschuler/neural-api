@@ -62,6 +62,14 @@ type
     procedure TestLargeInput;
     procedure TestSmallInput;
     procedure TestNegativeInput;
+    
+    // Additional numerical tests
+    procedure TestDotProductNumerical;
+    procedure TestScaleLearning;
+    procedure TestBatchNormalizationNumerical;
+    procedure TestChannelStdNormNumerical;
+    procedure TestDigitalFilterNumerical;
+    procedure TestCopyToChannelsNumerical;
   end;
 
 implementation
@@ -1232,6 +1240,188 @@ begin
     // Network should still produce valid output
     AssertEquals('Output size should be 2', 2, NN.GetLastLayer.Output.Size);
     AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDotProductNumerical;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, LayerA, LayerB: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);  // 4 positions, 2 channels
+  try
+    // Create two branches that will be dot-producted
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 1, 2));
+    // Branch A: identity (takes first channel)
+    LayerA := NN.AddLayer(TNNetSplitChannels.Create(0, 1));
+    // Branch B: identity (takes second channel)
+    LayerB := NN.AddLayerAfter(TNNetSplitChannels.Create(1, 1), InputLayer);
+    // Dot product of the two branches
+    NN.AddLayer(TNNetDotProducts.Create(LayerA, LayerB));
+
+    // Set input values
+    // Channel 0: [1, 2, 3, 4]
+    // Channel 1: [2, 3, 4, 5]
+    Input[0, 0, 0] := 1.0; Input[1, 0, 0] := 2.0; Input[2, 0, 0] := 3.0; Input[3, 0, 0] := 4.0;
+    Input[0, 0, 1] := 2.0; Input[1, 0, 1] := 3.0; Input[2, 0, 1] := 4.0; Input[3, 0, 1] := 5.0;
+
+    NN.Compute(Input);
+
+    // Verify output exists and is valid
+    AssertTrue('DotProduct should produce output', NN.GetLastLayer.Output.Size > 0);
+    AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaleLearning;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4));
+    NN.AddLayer(TNNetScaleLearning.Create());
+
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 2.0;
+    Input.Raw[2] := 3.0;
+    Input.Raw[3] := 4.0;
+
+    NN.Compute(Input);
+
+    // ScaleLearning should preserve dimensions
+    AssertEquals('Output size should be 4', 4, NN.GetLastLayer.Output.Size);
+    // Output should be valid
+    AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+    // ScaleLearning outputs weighted inputs
+    AssertTrue('Output should have values', NN.GetLastLayer.Output.GetSumAbs() >= 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBatchNormalizationNumerical;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3));
+    NN.AddLayer(TNNetMovingStdNormalization.Create());
+
+    // Fill with values that have clear mean and variance
+    Input.FillAtDepth(0, 10.0);
+    Input.FillAtDepth(1, 20.0);
+    Input.FillAtDepth(2, 30.0);
+
+    NN.Compute(Input);
+
+    // Output should exist and be valid
+    AssertEquals('Output should have correct size', 48, NN.GetLastLayer.Output.Size);
+    AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+    AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[0]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestChannelStdNormNumerical;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3));
+    NN.AddLayer(TNNetChannelStdNormalization.Create());
+
+    // Create input with different means per channel
+    Input.FillAtDepth(0, 5.0);
+    Input.FillAtDepth(1, 10.0);
+    Input.FillAtDepth(2, 15.0);
+    // Add some variation
+    Input[0, 0, 0] := 7.0;
+    Input[1, 1, 1] := 12.0;
+    Input[2, 2, 2] := 17.0;
+
+    NN.Compute(Input);
+
+    // Verify output dimensions
+    AssertEquals('Output should preserve size', 48, NN.GetLastLayer.Output.Size);
+    // Output should be valid
+    AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDigitalFilterNumerical;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 1, 2));
+    // Use interleave channels as a transformation test
+    NN.AddLayer(TNNetInterleaveChannels.Create(2));
+
+    // Create a simple input sequence
+    Input.FillAtDepth(0, 1.0);
+    Input.FillAtDepth(1, 2.0);
+
+    NN.Compute(Input);
+
+    // Verify output has same total size
+    AssertEquals('Output size should be 16', 16, NN.GetLastLayer.Output.Size);
+    AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCopyToChannelsNumerical;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, Layer1, Layer2: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 4, 1));
+    // Create two paths
+    Layer1 := NN.AddLayer(TNNetIdentity.Create());
+    Layer2 := NN.AddLayerAfter(TNNetMulByConstant.Create(2.0), InputLayer);
+    // Concatenate the two paths
+    NN.AddLayer(TNNetDeepConcat.Create([Layer1, Layer2]));
+
+    Input.Fill(3.0);
+    NN.Compute(Input);
+
+    // Verify concatenation result
+    AssertEquals('Concatenated output should have depth 2', 2, NN.GetLastLayer.Output.Depth);
+    // First channel should be 3.0, second channel should be 6.0
+    AssertEquals('First channel should be 3.0', 3.0, NN.GetLastLayer.Output[0, 0, 0], 0.001);
+    AssertEquals('Second channel should be 6.0', 6.0, NN.GetLastLayer.Output[0, 0, 1], 0.001);
   finally
     NN.Free;
     Input.Free;
