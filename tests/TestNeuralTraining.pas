@@ -67,7 +67,7 @@ begin
       TNNetFullConnectReLU.Create(8),
       TNNetFullConnectLinear.Create(1)
     ]);
-    NN.SetLearningRate(0.01, 0.9);
+    NN.SetLearningRate(0.001, 0.9);
 
     // Calculate initial error
     ErrorSum := 0;
@@ -82,7 +82,7 @@ begin
     InitialError := ErrorSum;
 
     // Train for several epochs
-    for Epoch := 1 to 500 do
+    for Epoch := 1 to 5000 do
     begin
       for I := 0 to 3 do
       begin
@@ -143,10 +143,10 @@ begin
       TNNetFullConnectReLU.Create(4),
       TNNetFullConnectLinear.Create(1)
     ]);
-    NN.SetLearningRate(0.01, 0.9);
+    NN.SetLearningRate(0.001, 0.9);
 
     // Train for several epochs
-    for Epoch := 1 to 200 do
+    for Epoch := 1 to 5000 do
     begin
       for I := 0 to 3 do
       begin
