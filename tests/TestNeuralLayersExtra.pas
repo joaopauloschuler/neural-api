@@ -79,6 +79,7 @@ procedure TTestNeuralLayersExtra.TestDeconvolutionForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(4, 4, 8);
@@ -92,6 +93,16 @@ begin
     // Deconvolution with stride 2 produces output
     AssertEquals('Output depth should be 16', 16, NN.GetLastLayer.Output.Depth);
     AssertTrue('Deconvolution should produce output', NN.GetLastLayer.Output.Size > 0);
+    
+    // Numerical verification: output values should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    begin
+      AssertFalse('Output should not be NaN at index ' + IntToStr(I), IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf at index ' + IntToStr(I), IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
+    
+    // Verify output has meaningful values (not all zeros)
+    AssertTrue('Output should have non-zero sum', NN.GetLastLayer.Output.GetSumAbs() > 0);
   finally
     NN.Free;
     Input.Free;
@@ -102,6 +113,7 @@ procedure TTestNeuralLayersExtra.TestDeconvolutionReLUForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(4, 4, 4);
@@ -114,6 +126,13 @@ begin
 
     // Output should have ReLU applied (non-negative values)
     AssertEquals('Output depth should be 8', 8, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: ReLU should produce non-negative outputs
+    AssertTrue('ReLU output min should be >= 0', NN.GetLastLayer.Output.GetMin() >= -0.0001);
+    
+    // All outputs should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
     Input.Free;
@@ -124,6 +143,7 @@ procedure TTestNeuralLayersExtra.TestDeconvolutionOutputSize;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 16);
@@ -138,6 +158,16 @@ begin
     AssertEquals('Output SizeX with stride 1', 8, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output SizeY with stride 1', 8, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output depth should be 32', 32, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: total output size should match expected
+    AssertEquals('Total output size should be 8*8*32 = 2048', 2048, NN.GetLastLayer.Output.Size);
+    
+    // Verify all outputs are finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
   finally
     NN.Free;
     Input.Free;
@@ -148,6 +178,7 @@ procedure TTestNeuralLayersExtra.TestDeLocalConnectForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(4, 4, 4);
@@ -161,6 +192,16 @@ begin
     // DeLocalConnect should produce output
     AssertEquals('Output depth should be 8', 8, NN.GetLastLayer.Output.Depth);
     AssertTrue('DeLocalConnect should produce output', NN.GetLastLayer.Output.Size > 0);
+    
+    // Numerical verification: output values should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
+    
+    // Verify output has meaningful values
+    AssertTrue('Output should have non-zero sum', NN.GetLastLayer.Output.GetSumAbs() > 0);
   finally
     NN.Free;
     Input.Free;
@@ -171,6 +212,7 @@ procedure TTestNeuralLayersExtra.TestDeLocalConnectReLUForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(4, 4, 4);
@@ -182,6 +224,13 @@ begin
     NN.Compute(Input);
 
     AssertEquals('Output depth should be 8', 8, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: ReLU should produce non-negative outputs
+    AssertTrue('ReLU output min should be >= 0', NN.GetLastLayer.Output.GetMin() >= -0.0001);
+    
+    // All outputs should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
     Input.Free;
@@ -402,9 +451,17 @@ begin
 
     NN.Compute(Input);
 
-    // SignedSquareRoot: Sign(x) * Sqrt(Abs(x))
-    // The actual behavior may differ based on implementation details
+    // Note: TNNetSignedSquareRoot requires error derivatives to be initialized
+    // to compute properly. During inference without backprop setup, it only
+    // computes when (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size)
+    // This test verifies the layer runs without error and produces valid output
     AssertEquals('Output size should match input', 4, NN.GetLastLayer.Output.Size);
+    
+    // Verify outputs are finite (not NaN/Inf)
+    AssertFalse('Output 0 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+    AssertFalse('Output 1 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[1]));
+    AssertFalse('Output 2 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[2]));
+    AssertFalse('Output 3 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[3]));
   finally
     NN.Free;
     Input.Free;
@@ -866,6 +923,7 @@ procedure TTestNeuralLayersExtra.TestGroupedPointwiseConvLinear;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 16);
@@ -878,7 +936,18 @@ begin
     NN.Compute(Input);
 
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output Depth should be 32', 32, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: outputs should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
+    end;
+    
+    // Verify output has meaningful values
+    AssertTrue('Output should have non-zero sum', NN.GetLastLayer.Output.GetSumAbs() > 0);
   finally
     NN.Free;
     Input.Free;
@@ -889,6 +958,7 @@ procedure TTestNeuralLayersExtra.TestGroupedPointwiseConvReLU;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  I: integer;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 8, 8);
@@ -900,8 +970,16 @@ begin
     Input.Fill(1.0);
     NN.Compute(Input);
 
+    AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output Depth should be 16', 16, NN.GetLastLayer.Output.Depth);
-    // ReLU should ensure non-negative outputs for positive inputs
+    
+    // ReLU should ensure non-negative outputs
+    AssertTrue('ReLU output min should be >= 0', NN.GetLastLayer.Output.GetMin() >= -0.0001);
+    
+    // Numerical verification: outputs should be finite
+    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
     Input.Free;
