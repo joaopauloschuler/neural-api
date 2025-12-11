@@ -14,19 +14,23 @@ type
     procedure TestSGDOptimizerCreation;
     procedure TestAdamOptimizerCreation;
     procedure TestAdamOptimizerReset;
+    procedure TestAdamOptimizerParameters;
     
     // TNeuralFitBase property tests
     procedure TestFitBaseDefaultProperties;
     procedure TestFitBaseLearningRateProperties;
     procedure TestFitBaseClipProperties;
+    procedure TestFitBaseEpochProperties;
     
     // TNeuralImageFit tests
     procedure TestImageFitCreation;
     procedure TestImageFitDataAugmentationProperties;
+    procedure TestImageFitColorTransformProperties;
     
     // TNeuralFit tests
     procedure TestNeuralFitCreation;
     procedure TestNeuralFitHideMessages;
+    procedure TestNeuralFitBatchSizeProperties;
   end;
 
 implementation
@@ -191,6 +195,106 @@ begin
     Fit.HideMessages;
     Fit.Verbose := False;
     AssertFalse('Verbose should be False', Fit.Verbose);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAdamOptimizerParameters;
+var
+  Optimizer: TNeuralOptimizerAdam;
+begin
+  // Test Adam optimizer with various beta parameters
+  Optimizer := TNeuralOptimizerAdam.Create(0.95, 0.99, 1e-07);
+  try
+    AssertTrue('Adam optimizer with different betas should be created', Optimizer <> nil);
+  finally
+    Optimizer.Free;
+  end;
+  
+  // Test with edge case parameters
+  Optimizer := TNeuralOptimizerAdam.Create(0.5, 0.5, 1e-10);
+  try
+    AssertTrue('Adam optimizer with low betas should be created', Optimizer <> nil);
+  finally
+    Optimizer.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestFitBaseEpochProperties;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // Test epoch-related properties
+    Fit.InitialEpoch := 5;
+    AssertEquals('InitialEpoch should be 5', 5, Fit.InitialEpoch);
+    
+    // Test initial epoch is 0 by default
+    Fit.InitialEpoch := 0;
+    AssertEquals('InitialEpoch can be reset to 0', 0, Fit.InitialEpoch);
+    
+    // Test staircase epochs property
+    Fit.StaircaseEpochs := 10;
+    AssertEquals('StaircaseEpochs should be 10', 10, Fit.StaircaseEpochs);
+    
+    // Test target accuracy
+    Fit.TargetAccuracy := 0.95;
+    AssertEquals('TargetAccuracy should be 0.95', 0.95, Fit.TargetAccuracy, 0.0001);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestImageFitColorTransformProperties;
+var
+  Fit: TNeuralImageFit;
+begin
+  Fit := TNeuralImageFit.Create;
+  try
+    // Test channel shift rate (color jitter)
+    Fit.ChannelShiftRate := 0.1;
+    AssertEquals('ChannelShiftRate should be 0.1', 0.1, Fit.ChannelShiftRate, 0.0001);
+    
+    // Test resizing property
+    Fit.HasResizing := True;
+    AssertTrue('HasResizing should be True', Fit.HasResizing);
+    
+    Fit.HasResizing := False;
+    AssertFalse('HasResizing should be False', Fit.HasResizing);
+    
+    // Test different channel shift rates
+    Fit.ChannelShiftRate := 0.0;
+    AssertEquals('ChannelShiftRate can be 0', 0.0, Fit.ChannelShiftRate, 0.0001);
+    
+    Fit.ChannelShiftRate := 0.5;
+    AssertEquals('ChannelShiftRate can be 0.5', 0.5, Fit.ChannelShiftRate, 0.0001);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestNeuralFitBatchSizeProperties;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // Test max thread num property
+    Fit.MaxThreadNum := 4;
+    AssertEquals('MaxThreadNum should be 4', 4, Fit.MaxThreadNum);
+    
+    // Test various thread counts
+    Fit.MaxThreadNum := 1;
+    AssertEquals('MaxThreadNum can be 1', 1, Fit.MaxThreadNum);
+    
+    Fit.MaxThreadNum := 8;
+    AssertEquals('MaxThreadNum can be 8', 8, Fit.MaxThreadNum);
+    
+    // Test log every batches property
+    Fit.LogEveryBatches := 100;
+    AssertEquals('LogEveryBatches should be 100', 100, Fit.LogEveryBatches);
   finally
     Fit.Free;
   end;

@@ -1420,6 +1420,11 @@ begin
     // Output should be 8 x 32 (8 tokens, 32 embedding dim)
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output Depth should be 32', 32, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: outputs should be finite
+    AssertFalse('First element should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
+    AssertFalse('First element should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[0]));
+    AssertTrue('Output should have non-zero values', NN.GetLastLayer.Output.GetSumAbs() > 0);
   finally
     NN.Free;
     Input.Free;
