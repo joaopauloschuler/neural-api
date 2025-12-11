@@ -7,6 +7,10 @@ interface
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
 
+const
+  // Maximum number of elements to check for NaN/Inf in large tensors.
+  MAX_NAN_CHECK_ITERATIONS = 100;
+
 type
   TTestNeuralLayersExtra = class(TTestCase)
   published
@@ -95,7 +99,7 @@ begin
     AssertTrue('Deconvolution should produce output', NN.GetLastLayer.Output.Size > 0);
     
     // Numerical verification: output values should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
     begin
       AssertFalse('Output should not be NaN at index ' + IntToStr(I), IsNaN(NN.GetLastLayer.Output.Raw[I]));
       AssertFalse('Output should not be Inf at index ' + IntToStr(I), IsInfinite(NN.GetLastLayer.Output.Raw[I]));
@@ -131,7 +135,7 @@ begin
     AssertTrue('ReLU output min should be >= 0', NN.GetLastLayer.Output.GetMin() >= -0.0001);
     
     // All outputs should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
@@ -163,7 +167,7 @@ begin
     AssertEquals('Total output size should be 8*8*32 = 2048', 2048, NN.GetLastLayer.Output.Size);
     
     // Verify all outputs are finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
     begin
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
       AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
@@ -194,7 +198,7 @@ begin
     AssertTrue('DeLocalConnect should produce output', NN.GetLastLayer.Output.Size > 0);
     
     // Numerical verification: output values should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
     begin
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
       AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
@@ -229,7 +233,7 @@ begin
     AssertTrue('ReLU output min should be >= 0', NN.GetLastLayer.Output.GetMin() >= -0.0001);
     
     // All outputs should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;
@@ -940,7 +944,7 @@ begin
     AssertEquals('Output Depth should be 32', 32, NN.GetLastLayer.Output.Depth);
     
     // Numerical verification: outputs should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
     begin
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
       AssertFalse('Output should not be Inf', IsInfinite(NN.GetLastLayer.Output.Raw[I]));
@@ -978,7 +982,7 @@ begin
     AssertTrue('ReLU output min should be >= 0', NN.GetLastLayer.Output.GetMin() >= -0.0001);
     
     // Numerical verification: outputs should be finite
-    for I := 0 to Min(100, NN.GetLastLayer.Output.Size - 1) do
+    for I := 0 to Min(MAX_NAN_CHECK_ITERATIONS, NN.GetLastLayer.Output.Size - 1) do
       AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
   finally
     NN.Free;

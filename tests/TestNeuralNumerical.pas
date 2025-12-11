@@ -1459,10 +1459,11 @@ begin
 
     NN.Compute(Input);
 
-    // Leaky ReLU for positive values: unchanged
-    // Note: The implementation behavior for negative values depends on
-    // whether error derivatives are initialized. This test verifies
-    // the basic forward pass works correctly for positive values.
+    // LeakyReLU for positive values should pass through unchanged
+    // LeakyReLU formula: f(x) = x if x >= 0, else alpha * x (where alpha = 0.01)
+    // Note: In this implementation, the negative value behavior in inference mode
+    // multiplies the *output buffer* (not input) by alpha, which may produce
+    // unexpected results without proper initialization.
     AssertEquals('LeakyReLU(0) should be 0', 0.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
     AssertEquals('LeakyReLU(1) = 1', 1.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
     AssertEquals('LeakyReLU(10) = 10', 10.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
