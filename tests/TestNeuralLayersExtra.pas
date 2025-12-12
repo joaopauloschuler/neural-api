@@ -5,7 +5,7 @@ unit TestNeuralLayersExtra;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
 
 type
   TTestNeuralLayersExtra = class(TTestCase)
@@ -192,20 +192,37 @@ procedure TTestNeuralLayersExtra.TestDeMaxPoolForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  X, Y, D: integer;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(4, 4, 3);
+  Input := TNNetVolume.Create(2, 2, 1);
   try
-    NN.AddLayer(TNNetInput.Create(4, 4, 3));
+    NN.AddLayer(TNNetInput.Create(2, 2, 1));
     NN.AddLayer(TNNetDeMaxPool.Create(2)); // Upsample by 2x
 
-    Input.Fill(1.0);
+    // Set known input values for numerical verification
+    Input[0, 0, 0] := 1.0;
+    Input[1, 0, 0] := 2.0;
+    Input[0, 1, 0] := 3.0;
+    Input[1, 1, 0] := 4.0;
+    
     NN.Compute(Input);
 
-    // DeMaxPool should double the spatial dimensions
-    AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
-    AssertEquals('Output SizeY should be 8', 8, NN.GetLastLayer.Output.SizeY);
-    AssertEquals('Depth should remain 3', 3, NN.GetLastLayer.Output.Depth);
+    // DeMaxPool should double the spatial dimensions (2x2 -> 4x4)
+    AssertEquals('Output SizeX should be 4', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY should be 4', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Depth should remain 1', 1, NN.GetLastLayer.Output.Depth);
+    
+    // Numerical verification: check that values are present in output
+    // DeMaxPool typically places input values in top-left of each upsampled region
+    // and fills rest with zeros or copies values
+    AssertTrue('Output should contain non-zero values', NN.GetLastLayer.Output.GetSumAbs() > 0);
+    
+    // Check that output values are finite
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        for D := 0 to 0 do
+          AssertFalse('Output values should not be NaN', IsNaN(NN.GetLastLayer.Output[X, Y, D]));
   finally
     NN.Free;
     Input.Free;
@@ -719,18 +736,34 @@ var
   Input: TNNetVolume;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(4, 2, 8);
+  Input := TNNetVolume.Create(4, 2, 3);
   try
-    NN.AddLayer(TNNetInput.Create(4, 2, 8));
+    NN.AddLayer(TNNetInput.Create(4, 2, 3));
     NN.AddLayer(TNNetTransposeXD.Create());
 
-    Input.RandomizeGaussian();
+    // Set known values for numerical verification
+    // Input[x, y, d] should become Output[d, y, x] after transpose XD
+    Input[0, 0, 0] := 1.0;
+    Input[1, 0, 0] := 2.0;
+    Input[2, 0, 0] := 3.0;
+    Input[3, 0, 0] := 4.0;
+    Input[0, 0, 1] := 10.0;
+    Input[0, 0, 2] := 20.0;
+    
     NN.Compute(Input);
 
     // TransposeXD swaps X and Depth dimensions
-    AssertEquals('After transpose, SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('After transpose, SizeX should be 3', 3, NN.GetLastLayer.Output.SizeX);
     AssertEquals('After transpose, Depth should be 4', 4, NN.GetLastLayer.Output.Depth);
     AssertEquals('SizeY should remain 2', 2, NN.GetLastLayer.Output.SizeY);
+    
+    // Numerical verification: Input[x,y,d] -> Output[d,y,x]
+    // Input[0,0,0] = 1.0 should be at Output[0,0,0]
+    AssertEquals('Transposed value should match', 1.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    // Input[0,0,1] = 10.0 should be at Output[1,0,0]
+    AssertEquals('Transposed value should match', 10.0, NN.GetLastLayer.Output[1, 0, 0], 0.0001);
+    // Input[0,0,2] = 20.0 should be at Output[2,0,0]
+    AssertEquals('Transposed value should match', 20.0, NN.GetLastLayer.Output[2, 0, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -743,18 +776,34 @@ var
   Input: TNNetVolume;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(4, 8, 2);
+  Input := TNNetVolume.Create(2, 4, 3);
   try
-    NN.AddLayer(TNNetInput.Create(4, 8, 2));
+    NN.AddLayer(TNNetInput.Create(2, 4, 3));
     NN.AddLayer(TNNetTransposeYD.Create());
 
-    Input.RandomizeGaussian();
+    // Set known values for numerical verification
+    // Input[x, y, d] should become Output[x, d, y] after transpose YD
+    Input[0, 0, 0] := 1.0;
+    Input[0, 1, 0] := 2.0;
+    Input[0, 2, 0] := 3.0;
+    Input[0, 3, 0] := 4.0;
+    Input[0, 0, 1] := 10.0;
+    Input[0, 0, 2] := 20.0;
+    
     NN.Compute(Input);
 
     // TransposeYD swaps Y and Depth dimensions
-    AssertEquals('After transpose, SizeY should be 2', 2, NN.GetLastLayer.Output.SizeY);
-    AssertEquals('After transpose, Depth should be 8', 8, NN.GetLastLayer.Output.Depth);
-    AssertEquals('SizeX should remain 4', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('After transpose, SizeY should be 3', 3, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('After transpose, Depth should be 4', 4, NN.GetLastLayer.Output.Depth);
+    AssertEquals('SizeX should remain 2', 2, NN.GetLastLayer.Output.SizeX);
+    
+    // Numerical verification: Input[x,y,d] -> Output[x,d,y]
+    // Input[0,0,0] = 1.0 should be at Output[0,0,0]
+    AssertEquals('Transposed value should match', 1.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    // Input[0,0,1] = 10.0 should be at Output[0,1,0]
+    AssertEquals('Transposed value should match', 10.0, NN.GetLastLayer.Output[0, 1, 0], 0.0001);
+    // Input[0,0,2] = 20.0 should be at Output[0,2,0]
+    AssertEquals('Transposed value should match', 20.0, NN.GetLastLayer.Output[0, 2, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
