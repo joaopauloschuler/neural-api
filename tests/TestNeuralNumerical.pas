@@ -863,7 +863,7 @@ begin
   InputMinus := TNNetVolume.Create(3, 1, 1);
   epsilon := 0.0001;
   try
-    NN.AddLayer(TNNetInput.Create(3, 1, 1, 1)); // Enable error collection
+    NN.AddLayer(TNNetInput.Create(3, 1, 1, 1)); // pError=1 resizes error volumes
     NN.AddLayer(TNNetGELU.Create());
 
     Input.Raw[0] := 0.5;
@@ -919,7 +919,7 @@ begin
   InputMinus := TNNetVolume.Create(3, 1, 1);
   epsilon := 0.0001;
   try
-    NN.AddLayer(TNNetInput.Create(3, 1, 1, 1)); // Enable error collection
+    NN.AddLayer(TNNetInput.Create(3, 1, 1, 1)); // pError=1 resizes error volumes
     NN.AddLayer(TNNetMish.Create());
 
     Input.Raw[0] := 0.5;

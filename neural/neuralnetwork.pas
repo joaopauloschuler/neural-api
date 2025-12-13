@@ -3410,29 +3410,35 @@ begin
       // softplus(x) = ln(1 + exp(x)) ≈ x for large x
       if x > 20 then
       begin
-        softplus := x;
-        expVal := Exp(x);
+        // For large x: softplus(x) ≈ x, tanh(x) ≈ 1, sigmoid(x) ≈ 1
+        // Mish(x) ≈ x * 1 = x
+        // Mish'(x) ≈ 1 + x * sech^2(x) * 1 ≈ 1 (since sech^2(x) → 0 for large x)
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
       end
       else if x < -20 then
       begin
-        softplus := Exp(x);
-        expVal := Exp(x);
+        // For very negative x: softplus(x) ≈ exp(x) ≈ 0, tanh(0) = 0
+        // Mish(x) ≈ 0
+        // Mish'(x) ≈ 0
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
       end
       else
       begin
         expVal := Exp(x);
         softplus := Ln(1 + expVal);
+        tanhSP := Tanh(softplus);
+        outputVal := x * tanhSP;
+        FOutput.FData[OutputCnt] := outputVal;
+        // Derivative: Mish'(x) = tanh(softplus(x)) + x * sigmoid(x) * (1 - tanh^2(softplus(x)))
+        // = tanh(sp) + x * sech^2(sp) * sigmoid(x)
+        // Using omega = exp(x) and delta = 1 + exp(x)
+        // sigmoid(x) = omega / delta
+        omega := expVal;
+        delta := 1 + expVal;
+        FOutputErrorDeriv.FData[OutputCnt] := tanhSP + x * (1 - tanhSP * tanhSP) * omega / delta;
       end;
-      tanhSP := Tanh(softplus);
-      outputVal := x * tanhSP;
-      FOutput.FData[OutputCnt] := outputVal;
-      // Derivative: Mish'(x) = tanh(softplus(x)) + x * sigmoid(x) * (1 - tanh^2(softplus(x)))
-      // = tanh(sp) + x * sech^2(sp) * sigmoid(x)
-      // Using omega = exp(x) and delta = 1 + exp(x)
-      // sigmoid(x) = omega / delta
-      omega := expVal;
-      delta := 1 + expVal;
-      FOutputErrorDeriv.FData[OutputCnt] := tanhSP + x * (1 - tanhSP * tanhSP) * omega / delta;
     end;
   end
   else
