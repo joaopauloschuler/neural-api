@@ -79,6 +79,25 @@ type
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
 
+  /// Helper class for creating common learning rate schedulers
+  TNeuralLearningRateScheduler = class
+  public
+    class function CreateCosineAnnealing(
+      InitialLR, MinLR: single;
+      TotalEpochs: integer
+    ): TCustomLearningRateScheduleFn;
+    
+    class function CreateWarmupCosineAnnealing(
+      InitialLR, MinLR: single;
+      WarmupEpochs, TotalEpochs: integer
+    ): TCustomLearningRateScheduleFn;
+    
+    class function CreateWarmupConstant(
+      TargetLR: single;
+      WarmupEpochs: integer
+    ): TCustomLearningRateScheduleFn;
+  end;
+
   {$IFNDEF HASTHREADS}
   TMultiThreadProcItem = TObject;
   {$ENDIF}
@@ -2976,6 +2995,93 @@ begin
   FMinBackpropagationError := 0.2;
   FMinBackpropagationErrorProportion := 0.25;
   FMultipleSamplesAtValidation := True;
+end;
+
+{ TNeuralLearningRateScheduler }
+
+// Global variables for learning rate schedulers (needed for function pointers)
+var
+  gCosineInitialLR, gCosineMinLR: single;
+  gCosineTotalEpochs: integer;
+  gWarmupTargetLR: single;
+  gWarmupEpochs: integer;
+
+function CosineAnnealingSchedule(Epoch: integer): single;
+begin
+  // Cosine annealing: lr = min_lr + 0.5 * (initial_lr - min_lr) * (1 + cos(pi * epoch / total_epochs))
+  Result := gCosineMinLR + 0.5 * (gCosineInitialLR - gCosineMinLR) *
+    (1 + Cos(Pi * Epoch / gCosineTotalEpochs));
+end;
+
+function WarmupCosineAnnealingSchedule(Epoch: integer): single;
+var
+  CosineEpoch: integer;
+begin
+  if Epoch < gWarmupEpochs then
+  begin
+    // Linear warmup: lr = target_lr * epoch / warmup_epochs
+    if gWarmupEpochs > 0 then
+      Result := gCosineInitialLR * (Epoch + 1) / gWarmupEpochs
+    else
+      Result := gCosineInitialLR;
+  end
+  else
+  begin
+    // Cosine annealing after warmup
+    CosineEpoch := Epoch - gWarmupEpochs;
+    Result := gCosineMinLR + 0.5 * (gCosineInitialLR - gCosineMinLR) *
+      (1 + Cos(Pi * CosineEpoch / (gCosineTotalEpochs - gWarmupEpochs)));
+  end;
+end;
+
+function WarmupConstantSchedule(Epoch: integer): single;
+begin
+  if Epoch < gWarmupEpochs then
+  begin
+    // Linear warmup
+    if gWarmupEpochs > 0 then
+      Result := gWarmupTargetLR * (Epoch + 1) / gWarmupEpochs
+    else
+      Result := gWarmupTargetLR;
+  end
+  else
+  begin
+    // Constant after warmup
+    Result := gWarmupTargetLR;
+  end;
+end;
+
+class function TNeuralLearningRateScheduler.CreateCosineAnnealing(
+  InitialLR, MinLR: single;
+  TotalEpochs: integer
+): TCustomLearningRateScheduleFn;
+begin
+  gCosineInitialLR := InitialLR;
+  gCosineMinLR := MinLR;
+  gCosineTotalEpochs := TotalEpochs;
+  Result := @CosineAnnealingSchedule;
+end;
+
+class function TNeuralLearningRateScheduler.CreateWarmupCosineAnnealing(
+  InitialLR, MinLR: single;
+  WarmupEpochs, TotalEpochs: integer
+): TCustomLearningRateScheduleFn;
+begin
+  gCosineInitialLR := InitialLR;
+  gCosineMinLR := MinLR;
+  gWarmupEpochs := WarmupEpochs;
+  gCosineTotalEpochs := TotalEpochs;
+  Result := @WarmupCosineAnnealingSchedule;
+end;
+
+class function TNeuralLearningRateScheduler.CreateWarmupConstant(
+  TargetLR: single;
+  WarmupEpochs: integer
+): TCustomLearningRateScheduleFn;
+begin
+  gWarmupTargetLR := TargetLR;
+  gWarmupEpochs := WarmupEpochs;
+  Result := @WarmupConstantSchedule;
 end;
 
 end.

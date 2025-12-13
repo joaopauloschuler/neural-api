@@ -5,7 +5,7 @@ unit TestNeuralLayersExtra;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume, neuralfit;
 
 type
   TTestNeuralLayersExtra = class(TTestCase)
@@ -71,6 +71,20 @@ type
     procedure TestResNetBlock;
     procedure TestDenseNetBlock;
     procedure TestMobileNetBlock;
+    
+    // New GELU and Mish activation tests
+    procedure TestGELUActivation;
+    procedure TestMishActivation;
+    procedure TestGELUNumericalValues;
+    procedure TestMishNumericalValues;
+    
+    // FLOPs counter test
+    procedure TestCountFLOPs;
+    
+    // Learning rate scheduler tests
+    procedure TestCosineAnnealingScheduler;
+    procedure TestWarmupCosineScheduler;
+    procedure TestWarmupConstantScheduler;
   end;
 
 implementation
@@ -1003,6 +1017,225 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralLayersExtra.TestGELUActivation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(10, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(10));
+    NN.AddLayer(TNNetGELU.Create());
+
+    Input.Fill(0.5);
+    NN.Compute(Input);
+
+    // GELU(0.5) should be approximately 0.345 (between 0 and 0.5)
+    AssertEquals('Output size should match input', 10, NN.GetLastLayer.Output.Size);
+    for I := 0 to 9 do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertTrue('GELU(0.5) should be positive', NN.GetLastLayer.Output.Raw[I] > 0);
+      AssertTrue('GELU(0.5) should be less than input', NN.GetLastLayer.Output.Raw[I] < 0.5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMishActivation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(10, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(10));
+    NN.AddLayer(TNNetMish.Create());
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    // Mish(1) should be approximately 0.865
+    AssertEquals('Output size should match input', 10, NN.GetLastLayer.Output.Size);
+    for I := 0 to 9 do
+    begin
+      AssertFalse('Output should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[I]));
+      AssertTrue('Mish(1) should be positive', NN.GetLastLayer.Output.Raw[I] > 0);
+      AssertTrue('Mish(1) should be less than input', NN.GetLastLayer.Output.Raw[I] < 1.0);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestGELUNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Output: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetGELU.Create());
+
+    // Test specific values
+    Input.Raw[0] := 0;     // GELU(0) = 0
+    Input.Raw[1] := 1;     // GELU(1) ≈ 0.841
+    Input.Raw[2] := -1;    // GELU(-1) ≈ -0.159
+    Input.Raw[3] := 2;     // GELU(2) ≈ 1.954
+    Input.Raw[4] := -2;    // GELU(-2) ≈ -0.046
+
+    NN.Compute(Input);
+
+    // Test GELU(0) = 0
+    AssertEquals('GELU(0) should be 0', 0, NN.GetLastLayer.Output.Raw[0], 0.01);
+    
+    // Test GELU(1) ≈ 0.841
+    Output := NN.GetLastLayer.Output.Raw[1];
+    AssertTrue('GELU(1) should be approximately 0.84', (Output > 0.8) and (Output < 0.9));
+    
+    // Test GELU(-1) ≈ -0.159
+    Output := NN.GetLastLayer.Output.Raw[2];
+    AssertTrue('GELU(-1) should be approximately -0.16', (Output > -0.2) and (Output < -0.1));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMishNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Output: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetMish.Create());
+
+    // Test specific values
+    Input.Raw[0] := 0;     // Mish(0) = 0
+    Input.Raw[1] := 1;     // Mish(1) ≈ 0.865
+    Input.Raw[2] := -1;    // Mish(-1) ≈ -0.303
+    Input.Raw[3] := 2;     // Mish(2) ≈ 1.944
+    Input.Raw[4] := -5;    // Mish(-5) ≈ -0.034
+
+    NN.Compute(Input);
+
+    // Test Mish(0) = 0
+    AssertEquals('Mish(0) should be 0', 0, NN.GetLastLayer.Output.Raw[0], 0.01);
+    
+    // Test Mish(1) ≈ 0.865
+    Output := NN.GetLastLayer.Output.Raw[1];
+    AssertTrue('Mish(1) should be approximately 0.865', (Output > 0.8) and (Output < 0.95));
+    
+    // Test Mish(-1) ≈ -0.303
+    Output := NN.GetLastLayer.Output.Raw[2];
+    AssertTrue('Mish(-1) should be approximately -0.3', (Output > -0.4) and (Output < -0.2));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestCountFLOPs;
+var
+  NN: TNNet;
+  FLOPs: double;
+begin
+  NN := TNNet.Create();
+  try
+    // Build a simple network
+    NN.AddLayer(TNNetInput.Create(32, 32, 3));
+    NN.AddLayer(TNNetConvolutionReLU.Create(16, 3, 1, 1));
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetConvolutionReLU.Create(32, 3, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+
+    FLOPs := NN.CountFLOPs();
+    
+    // FLOPs should be positive and reasonable for this network
+    AssertTrue('FLOPs should be positive', FLOPs > 0);
+    // A small CNN like this should have a few MFLOPs
+    AssertTrue('FLOPs should be reasonable (< 100 MFLOPs)', FLOPs < 100);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestCosineAnnealingScheduler;
+var
+  ScheduleFn: TCustomLearningRateScheduleFn;
+  LR0, LR5, LR10: single;
+begin
+  // Create a cosine annealing schedule: InitialLR=0.1, MinLR=0.001, TotalEpochs=10
+  ScheduleFn := TNeuralLearningRateScheduler.CreateCosineAnnealing(0.1, 0.001, 10);
+  
+  LR0 := ScheduleFn(0);   // Should be close to initial LR
+  LR5 := ScheduleFn(5);   // Should be in the middle
+  LR10 := ScheduleFn(10); // Should be close to min LR
+  
+  // At epoch 0, LR should be close to initial (within 1% tolerance)
+  AssertTrue('LR at epoch 0 should be close to initial', Abs(LR0 - 0.1) < 0.01);
+  
+  // At epoch 5 (halfway), LR should be around the middle
+  AssertTrue('LR at epoch 5 should be in middle range', (LR5 > 0.01) and (LR5 < 0.09));
+  
+  // At epoch 10, LR should be close to minimum (within 1% tolerance)  
+  AssertTrue('LR at epoch 10 should be close to min', Abs(LR10 - 0.001) < 0.01);
+end;
+
+procedure TTestNeuralLayersExtra.TestWarmupCosineScheduler;
+var
+  ScheduleFn: TCustomLearningRateScheduleFn;
+  LR0, LR2, LR5: single;
+begin
+  // Create a warmup + cosine schedule: InitialLR=0.1, MinLR=0.001, WarmupEpochs=3, TotalEpochs=10
+  ScheduleFn := TNeuralLearningRateScheduler.CreateWarmupCosineAnnealing(0.1, 0.001, 3, 10);
+  
+  LR0 := ScheduleFn(0);   // During warmup, should be small
+  LR2 := ScheduleFn(2);   // Near end of warmup
+  LR5 := ScheduleFn(5);   // After warmup, in cosine phase
+  
+  // During warmup, LR should increase linearly
+  AssertTrue('LR at epoch 0 should be small (warmup)', LR0 < 0.05);
+  AssertTrue('LR at epoch 2 should be larger than epoch 0', LR2 > LR0);
+  
+  // After warmup (epoch 5), should be in cosine phase
+  AssertTrue('LR at epoch 5 should be positive', LR5 > 0);
+end;
+
+procedure TTestNeuralLayersExtra.TestWarmupConstantScheduler;
+var
+  ScheduleFn: TCustomLearningRateScheduleFn;
+  LR0, LR3, LR10: single;
+begin
+  // Create a warmup + constant schedule: TargetLR=0.1, WarmupEpochs=5
+  ScheduleFn := TNeuralLearningRateScheduler.CreateWarmupConstant(0.1, 5);
+  
+  LR0 := ScheduleFn(0);   // During warmup
+  LR3 := ScheduleFn(3);   // Still in warmup
+  LR10 := ScheduleFn(10); // After warmup, should be at target
+  
+  // During warmup, LR should be less than target
+  AssertTrue('LR at epoch 0 should be small (warmup)', LR0 < 0.1);
+  AssertTrue('LR at epoch 3 should be less than target', LR3 < 0.1);
+  
+  // After warmup, LR should equal target
+  AssertEquals('LR after warmup should equal target', 0.1, LR10, 0.001);
 end;
 
 initialization

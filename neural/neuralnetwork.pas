@@ -602,6 +602,22 @@ type
     procedure Compute(); override;
   end;
 
+  /// GELU (Gaussian Error Linear Unit) activation function
+  // https://arxiv.org/abs/1606.08415
+  // Popular in transformer architectures like BERT and GPT
+  TNNetGELU = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
+  /// Mish activation function
+  // https://arxiv.org/abs/1908.08681
+  // A smooth, non-monotonic activation function
+  TNNetMish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   //Does a ReLU followed by a Square Root
   TNNetReLUSqrt = class(TNNetReLUBase)
     public
@@ -1870,6 +1886,9 @@ type
       function CountLayers(): integer;
       function CountNeurons(): integer;
       function CountWeights(): integer;
+      /// Estimates the number of floating point operations per forward pass.
+      // Returns the FLOPs count in millions (MFLOPs).
+      function CountFLOPs(): double;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -3218,6 +3237,111 @@ begin
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := Min(6.0, PrevValue / ( 1 + Exp(-PrevValue) ));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetGELU }
+// GELU(x) = x * Phi(x) where Phi is the cumulative distribution function of the standard normal distribution
+// Approximation: GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+procedure TNNetGELU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue: TNeuralFloat;
+  TanhValue: TNeuralFloat;
+  OutputValue: TNeuralFloat;
+  Inner: TNeuralFloat;
+const
+  // sqrt(2/pi) ≈ 0.7978845608
+  SqrtTwoPi: TNeuralFloat = 0.7978845608;
+  Coef: TNeuralFloat = 0.044715;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+      Inner := SqrtTwoPi * (PrevValue + Coef * PrevValue * PrevValue * PrevValue);
+      TanhValue := Tanh(Inner);
+      OutputValue := 0.5 * PrevValue * (1 + TanhValue);
+      FOutput.FData[OutputCnt] := OutputValue;
+      // Derivative: 0.5 * (1 + tanh(inner)) + 0.5 * x * sech^2(inner) * sqrt(2/pi) * (1 + 3 * 0.044715 * x^2)
+      // sech^2(x) = 1 - tanh^2(x)
+      FOutputErrorDeriv.FData[OutputCnt] := 0.5 * (1 + TanhValue) +
+        0.5 * PrevValue * (1 - TanhValue * TanhValue) * SqrtTwoPi * (1 + 3 * Coef * PrevValue * PrevValue);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      Inner := SqrtTwoPi * (PrevValue + Coef * PrevValue * PrevValue * PrevValue);
+      FOutput.FData[OutputCnt] := 0.5 * PrevValue * (1 + Tanh(Inner));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetMish }
+// Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + e^x))
+procedure TNNetMish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue: TNeuralFloat;
+  SoftPlus: TNeuralFloat;
+  TanhValue: TNeuralFloat;
+  OutputValue: TNeuralFloat;
+  SigmoidValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      // Softplus(x) = ln(1 + e^x)
+      // For numerical stability, use log1p for small values
+      if PrevValue > 20 then
+        SoftPlus := PrevValue  // For large x, ln(1 + e^x) ≈ x
+      else
+        SoftPlus := Ln(1 + Exp(PrevValue));
+      TanhValue := Tanh(SoftPlus);
+      OutputValue := PrevValue * TanhValue;
+      FOutput.FData[OutputCnt] := OutputValue;
+      // Derivative: mish'(x) = sech^2(softplus(x)) * sigmoid(x) * x + tanh(softplus(x))
+      // = (1 - tanh^2(sp)) * sigmoid(x) * x + tanh(sp)
+      SigmoidValue := 1 / (1 + Exp(-PrevValue));
+      FOutputErrorDeriv.FData[OutputCnt] := (1 - TanhValue * TanhValue) * SigmoidValue * PrevValue + TanhValue;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue > 20 then
+        SoftPlus := PrevValue
+      else
+        SoftPlus := Ln(1 + Exp(PrevValue));
+      FOutput.FData[OutputCnt] := PrevValue * Tanh(SoftPlus);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -12367,6 +12491,76 @@ begin
       Result := Result + FLayers[LayerCnt].CountWeights();
     end;
   end;
+end;
+
+function TNNet.CountFLOPs(): double;
+var
+  LayerCnt: integer;
+  Layer: TNNetLayer;
+  InputSize, OutputSize: integer;
+  FeatureSize, NumFeatures, NumDepth: integer;
+  FLOPs: double;
+begin
+  FLOPs := 0;
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      OutputSize := Layer.Output.Size;
+      
+      // Fully connected layers: 2 * input_size * output_size (mul + add)
+      if (Layer is TNNetFullConnect) or (Layer is TNNetFullConnectLinear) or
+         (Layer is TNNetFullConnectReLU) or (Layer is TNNetFullConnectSigmoid) then
+      begin
+        if Assigned(Layer.PrevLayer) then
+        begin
+          InputSize := Layer.PrevLayer.Output.Size;
+          FLOPs := FLOPs + 2 * InputSize * OutputSize;
+        end;
+      end
+      // Convolutional layers: 2 * kernel_size^2 * input_channels * output_channels * output_h * output_w
+      else if Layer is TNNetConvolutionBase then
+      begin
+        if Assigned(Layer.PrevLayer) then
+        begin
+          FeatureSize := TNNetConvolutionBase(Layer).FStruct[1]; // kernel size
+          NumFeatures := Layer.Output.Depth;
+          NumDepth := Layer.PrevLayer.Output.Depth;
+          // FLOPs per output element = 2 * kernel_size^2 * input_depth
+          FLOPs := FLOPs + 2 * FeatureSize * FeatureSize * NumDepth * OutputSize;
+        end;
+      end
+      // Depthwise convolutions: 2 * kernel_size^2 * channels * output_h * output_w  
+      else if Layer is TNNetDepthwiseConv then
+      begin
+        FeatureSize := TNNetDepthwiseConv(Layer).FStruct[1]; // kernel size
+        FLOPs := FLOPs + 2 * FeatureSize * FeatureSize * OutputSize;
+      end
+      // Pooling layers: minimal FLOPs (comparisons)
+      else if (Layer is TNNetMaxPool) or (Layer is TNNetAvgPool) or
+              (Layer is TNNetMinPool) then
+      begin
+        // Each output computes over pool_size^2 elements
+        FLOPs := FLOPs + OutputSize;
+      end
+      // Activation functions: 1-5 FLOPs per element
+      else if (Layer is TNNetReLU) or (Layer is TNNetIdentity) then
+      begin
+        FLOPs := FLOPs + OutputSize;
+      end
+      else if (Layer is TNNetSigmoid) or (Layer is TNNetSoftMax) then
+      begin
+        FLOPs := FLOPs + 4 * OutputSize; // exp + div + sub + add
+      end
+      else if (Layer is TNNetSwish) or (Layer is TNNetGELU) or (Layer is TNNetMish) then
+      begin
+        FLOPs := FLOPs + 6 * OutputSize; // more complex activations
+      end;
+    end;
+  end;
+  // Return in millions
+  Result := FLOPs / 1000000;
 end;
 
 function TNNet.GetWeightSum(): TNeuralFloat;

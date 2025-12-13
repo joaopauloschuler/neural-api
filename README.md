@@ -104,6 +104,7 @@ WriteLn('Neural Network will minimize error with:');
 WriteLn(' Layers: ', NN.CountLayers());
 WriteLn(' Neurons:', NN.CountNeurons());
 WriteLn(' Weights:', NN.CountWeights());
+WriteLn(' MFLOPs: ', NN.CountFLOPs():0:2);  // Estimates computational cost in millions of FLOPs
 
 NeuralFit := TNeuralImageFit.Create;
 NeuralFit.InitialLearningRate := fLearningRate;
@@ -638,6 +639,8 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSwish`                 | 1D, 2D, or 3D               | Swish         | Swish activation function.                                                                             |
 | `TNNetSwish6`                | 1D, 2D, or 3D               | Swish 6       | Swish activation clipped at 6.                                                                         |
 | `TNNetHardSwish`             | 1D, 2D, or 3D               | Hard Swish    | Hard version of Swish activation.                                                                      |
+| `TNNetGELU`                  | 1D, 2D, or 3D               | GELU          | Gaussian Error Linear Unit, popular in transformer models like BERT and GPT.                           |
+| `TNNetMish`                  | 1D, 2D, or 3D               | Mish          | Smooth, non-monotonic activation function.                                                             |
 | `TNNetHyperbolicTangent`     | 1D, 2D, or 3D               | tanh          | Hyperbolic tangent activation function.                                                                |
 | `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
 | `TNNetMulByConstant`         | 1D, 2D, or 3D               | * C           | Multiplies the output by a constant.                                                                   |
@@ -965,6 +968,37 @@ You can define your own learning rate schedule:
 property CustomLearningRateScheduleFn: TCustomLearningRateScheduleFn read FCustomLearningRateScheduleFn write FCustomLearningRateScheduleFn;
 property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read FCustomLearningRateScheduleObjFn write FCustomLearningRateScheduleObjFn;
 ```
+
+### Built-in Learning Rate Schedulers
+The API provides built-in learning rate schedulers through the `TNeuralLearningRateScheduler` class:
+
+**Cosine Annealing:** Smoothly decreases the learning rate following a cosine curve from initial to minimum:
+```
+NeuralFit.CustomLearningRateScheduleFn := TNeuralLearningRateScheduler.CreateCosineAnnealing(
+  {InitialLR=}0.001,
+  {MinLR=}0.00001,
+  {TotalEpochs=}100
+);
+```
+
+**Warmup + Cosine Annealing:** Linearly increases learning rate during warmup, then applies cosine annealing:
+```
+NeuralFit.CustomLearningRateScheduleFn := TNeuralLearningRateScheduler.CreateWarmupCosineAnnealing(
+  {InitialLR=}0.001,
+  {MinLR=}0.00001,
+  {WarmupEpochs=}5,
+  {TotalEpochs=}100
+);
+```
+
+**Warmup + Constant:** Linearly increases learning rate during warmup, then holds constant:
+```
+NeuralFit.CustomLearningRateScheduleFn := TNeuralLearningRateScheduler.CreateWarmupConstant(
+  {TargetLR=}0.001,
+  {WarmupEpochs=}5
+);
+```
+
 ### Got Too Many Console Messages?
 `TNeuralFitBase` descends from `TMObject` that allows you to code your own message treatment:
 ```
