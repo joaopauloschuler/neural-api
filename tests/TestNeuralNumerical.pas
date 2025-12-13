@@ -34,6 +34,10 @@ type
     procedure TestTanhNumericalRange;
     procedure TestSwishNumericalValues;
     procedure TestHardSwishNumericalValues;
+    procedure TestGELUNumericalValues;
+    procedure TestMishNumericalValues;
+    procedure TestGELUGradientCheck;
+    procedure TestMishGradientCheck;
     
     // Depthwise convolution numerical tests
     procedure TestDepthwiseConvNumerical;
@@ -725,6 +729,235 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGELUNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, tanhArg, tanhVal, expected: TNeuralFloat;
+const
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(7));
+    NN.AddLayer(TNNetGELU.Create());
+
+    // Test a range of values
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+    Input.Raw[4] := -2.0;
+    Input.Raw[5] := 0.5;
+    Input.Raw[6] := -0.5;
+
+    NN.Compute(Input);
+
+    // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+    // Test each value against the formula
+    x := 0.0;
+    tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x * x * x);
+    tanhVal := Tanh(tanhArg);
+    expected := 0.5 * x * (1 + tanhVal);
+    AssertEquals('GELU(0) should match formula', expected, NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    x := 1.0;
+    tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x * x * x);
+    tanhVal := Tanh(tanhArg);
+    expected := 0.5 * x * (1 + tanhVal);
+    AssertEquals('GELU(1) should match formula', expected, NN.GetLastLayer.Output.Raw[1], 0.0001);
+
+    x := -1.0;
+    tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x * x * x);
+    tanhVal := Tanh(tanhArg);
+    expected := 0.5 * x * (1 + tanhVal);
+    AssertEquals('GELU(-1) should match formula', expected, NN.GetLastLayer.Output.Raw[2], 0.0001);
+
+    // Verify known approximate values
+    AssertTrue('GELU(1) ≈ 0.841', Abs(NN.GetLastLayer.Output.Raw[1] - 0.841) < 0.01);
+    AssertTrue('GELU(-1) ≈ -0.159', Abs(NN.GetLastLayer.Output.Raw[2] - (-0.159)) < 0.01);
+    AssertTrue('GELU(2) ≈ 1.955', Abs(NN.GetLastLayer.Output.Raw[3] - 1.955) < 0.01);
+
+    // Verify asymptotic behavior
+    AssertTrue('GELU approaches identity for large positive x', NN.GetLastLayer.Output.Raw[3] > 1.9);
+    AssertTrue('GELU approaches 0 for large negative x', Abs(NN.GetLastLayer.Output.Raw[4]) < 0.1);
+
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMishNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, softplus, expected: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(7));
+    NN.AddLayer(TNNetMish.Create());
+
+    // Test a range of values
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+    Input.Raw[4] := -2.0;
+    Input.Raw[5] := 0.5;
+    Input.Raw[6] := -0.5;
+
+    NN.Compute(Input);
+
+    // Mish(x) = x * tanh(ln(1 + exp(x)))
+    // Test each value against the formula
+    x := 0.0;
+    softplus := Ln(1 + Exp(x));
+    expected := x * Tanh(softplus);
+    AssertEquals('Mish(0) should match formula', expected, NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    x := 1.0;
+    softplus := Ln(1 + Exp(x));
+    expected := x * Tanh(softplus);
+    AssertEquals('Mish(1) should match formula', expected, NN.GetLastLayer.Output.Raw[1], 0.0001);
+
+    x := -1.0;
+    softplus := Ln(1 + Exp(x));
+    expected := x * Tanh(softplus);
+    AssertEquals('Mish(-1) should match formula', expected, NN.GetLastLayer.Output.Raw[2], 0.0001);
+
+    // Verify known approximate values
+    AssertTrue('Mish(0) = 0', Abs(NN.GetLastLayer.Output.Raw[0]) < 0.0001);
+    AssertTrue('Mish(1) ≈ 0.865', Abs(NN.GetLastLayer.Output.Raw[1] - 0.865) < 0.01);
+    AssertTrue('Mish(-1) ≈ -0.303', Abs(NN.GetLastLayer.Output.Raw[2] - (-0.303)) < 0.01);
+
+    // Verify asymptotic behavior
+    AssertTrue('Mish approaches identity for large positive x', NN.GetLastLayer.Output.Raw[3] > 1.9);
+    AssertTrue('Mish is non-monotonic for negative x', 
+      Abs(NN.GetLastLayer.Output.Raw[2]) > Abs(NN.GetLastLayer.Output.Raw[4]));
+
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGELUGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, InputMinus: TNNetVolume;
+  epsilon: TNeuralFloat;
+  numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 1);
+  InputPlus := TNNetVolume.Create(3, 1, 1);
+  InputMinus := TNNetVolume.Create(3, 1, 1);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 1, 1)); // Enable error collection
+    NN.AddLayer(TNNetGELU.Create());
+
+    Input.Raw[0] := 0.5;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := 1.0;
+
+    // Compute forward pass to get the derivative
+    NN.Compute(Input);
+    
+    // Check gradient at each input position
+    for i := 0 to 2 do
+    begin
+      // Compute f(x + epsilon)
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      NN.Compute(InputPlus);
+      numericalGrad := NN.GetLastLayer.Output.Raw[i];
+
+      // Compute f(x - epsilon)
+      InputMinus.Copy(Input);
+      InputMinus.Raw[i] := Input.Raw[i] - epsilon;
+      NN.Compute(InputMinus);
+      numericalGrad := (numericalGrad - NN.GetLastLayer.Output.Raw[i]) / (2 * epsilon);
+
+      // Get analytical gradient from the layer's error derivative
+      NN.Compute(Input);
+      analyticalGrad := NN.GetLastLayer.OutputErrorDeriv.Raw[i];
+
+      // Compare numerical and analytical gradients
+      AssertTrue('GELU gradient check at position ' + IntToStr(i),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    InputMinus.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMishGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, InputMinus: TNNetVolume;
+  epsilon: TNeuralFloat;
+  numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 1);
+  InputPlus := TNNetVolume.Create(3, 1, 1);
+  InputMinus := TNNetVolume.Create(3, 1, 1);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 1, 1)); // Enable error collection
+    NN.AddLayer(TNNetMish.Create());
+
+    Input.Raw[0] := 0.5;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := 1.0;
+
+    // Compute forward pass to get the derivative
+    NN.Compute(Input);
+    
+    // Check gradient at each input position
+    for i := 0 to 2 do
+    begin
+      // Compute f(x + epsilon)
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      NN.Compute(InputPlus);
+      numericalGrad := NN.GetLastLayer.Output.Raw[i];
+
+      // Compute f(x - epsilon)
+      InputMinus.Copy(Input);
+      InputMinus.Raw[i] := Input.Raw[i] - epsilon;
+      NN.Compute(InputMinus);
+      numericalGrad := (numericalGrad - NN.GetLastLayer.Output.Raw[i]) / (2 * epsilon);
+
+      // Get analytical gradient from the layer's error derivative
+      NN.Compute(Input);
+      analyticalGrad := NN.GetLastLayer.OutputErrorDeriv.Raw[i];
+
+      // Compare numerical and analytical gradients
+      AssertTrue('Mish gradient check at position ' + IntToStr(i),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    InputMinus.Free;
   end;
 end;
 

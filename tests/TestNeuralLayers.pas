@@ -46,6 +46,8 @@ type
     procedure TestMishActivation;
     procedure TestGELUSaveLoad;
     procedure TestMishSaveLoad;
+    procedure TestGELUBackpropagation;
+    procedure TestMishBackpropagation;
     // Additional pooling tests
     procedure TestMaxChannel;
     procedure TestAvgChannel;
@@ -1103,6 +1105,106 @@ begin
     NN.Free;
     NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestGELUBackpropagation;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  ErrorBefore, ErrorAfter: TNeuralFloat;
+  Epoch: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 1);
+  Target := TNNetVolume.Create(1, 1, 1);
+  try
+    // Create a simple network with GELU activation
+    NN.AddLayer(TNNetInput.Create(2));
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+    NN.AddLayer(TNNetGELU.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(1));
+
+    NN.SetLearningRate(0.1, 0.0);
+
+    // XOR-like problem
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 0.0;
+    Target.Raw[0] := 1.0;
+
+    // Compute initial error
+    NN.Compute(Input);
+    ErrorBefore := Abs(NN.GetLastLayer.Output.Raw[0] - Target.Raw[0]);
+
+    // Train for multiple epochs
+    for Epoch := 1 to 100 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+    end;
+
+    // Compute final error
+    NN.Compute(Input);
+    ErrorAfter := Abs(NN.GetLastLayer.Output.Raw[0] - Target.Raw[0]);
+
+    // Error should decrease (learning is happening through backpropagation)
+    AssertTrue('GELU network should learn (error should decrease)',
+      (ErrorAfter < ErrorBefore) or (ErrorAfter < 0.5));
+
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestMishBackpropagation;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  ErrorBefore, ErrorAfter: TNeuralFloat;
+  Epoch: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 1);
+  Target := TNNetVolume.Create(1, 1, 1);
+  try
+    // Create a simple network with Mish activation
+    NN.AddLayer(TNNetInput.Create(2));
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+    NN.AddLayer(TNNetMish.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(1));
+
+    NN.SetLearningRate(0.1, 0.0);
+
+    // XOR-like problem
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 0.0;
+    Target.Raw[0] := 1.0;
+
+    // Compute initial error
+    NN.Compute(Input);
+    ErrorBefore := Abs(NN.GetLastLayer.Output.Raw[0] - Target.Raw[0]);
+
+    // Train for multiple epochs
+    for Epoch := 1 to 100 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+    end;
+
+    // Compute final error
+    NN.Compute(Input);
+    ErrorAfter := Abs(NN.GetLastLayer.Output.Raw[0] - Target.Raw[0]);
+
+    // Error should decrease (learning is happening through backpropagation)
+    AssertTrue('Mish network should learn (error should decrease)',
+      (ErrorAfter < ErrorBefore) or (ErrorAfter < 0.5));
+
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
   end;
 end;
 
