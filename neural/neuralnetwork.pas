@@ -603,6 +603,7 @@ type
   TNNetGELU = class(TNNetReLUBase)
   public
     procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   /// Mish activation function
@@ -612,6 +613,7 @@ type
   TNNetMish = class(TNNetReLUBase)
   public
     procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   /// Swish activation function with maximum limit of 6
@@ -3381,6 +3383,23 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetGELU.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
 { TNNetMish }
 
 procedure TNNetMish.Compute();
@@ -3458,6 +3477,23 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMish.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetInterleaveChannels }
