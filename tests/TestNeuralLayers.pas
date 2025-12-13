@@ -42,6 +42,10 @@ type
     procedure TestSwishActivation;
     procedure TestHyperbolicTangent;
     procedure TestSELUActivation;
+    procedure TestGELUActivation;
+    procedure TestMishActivation;
+    procedure TestGELUSaveLoad;
+    procedure TestMishSaveLoad;
     // Additional pooling tests
     procedure TestMaxChannel;
     procedure TestAvgChannel;
@@ -900,6 +904,204 @@ begin
     AssertTrue('SELU of -1 should be negative', NN.GetLastLayer.Output.Raw[2] < 0);
   finally
     NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestGELUActivation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  OutputLayer: TNNetLayer;
+  ExpectedGELU0, ExpectedGELU1, ExpectedGELUNeg1: TNeuralFloat;
+const
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetGELU.Create());
+
+    // Test values: 0, 1, -1, 2, -2
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+    Input.Raw[4] := -2.0;
+
+    NN.Compute(Input);
+
+    OutputLayer := NN.GetLastLayer;
+
+    // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+    // GELU(0) = 0
+    ExpectedGELU0 := 0.0;
+    AssertEquals('GELU of 0 should be 0', ExpectedGELU0, OutputLayer.Output.Raw[0], 0.0001);
+
+    // GELU(1) ≈ 0.8413 (approximately)
+    ExpectedGELU1 := 0.5 * 1.0 * (1 + Tanh(SQRT_2_OVER_PI * (1.0 + GELU_CONST * 1.0)));
+    AssertEquals('GELU of 1 should match approximation', ExpectedGELU1, OutputLayer.Output.Raw[1], 0.001);
+    AssertTrue('GELU of 1 should be around 0.84', Abs(OutputLayer.Output.Raw[1] - 0.841) < 0.01);
+
+    // GELU(-1) ≈ -0.1587 (approximately - close to 0 but negative)
+    ExpectedGELUNeg1 := 0.5 * (-1.0) * (1 + Tanh(SQRT_2_OVER_PI * (-1.0 + GELU_CONST * (-1.0))));
+    AssertEquals('GELU of -1 should match approximation', ExpectedGELUNeg1, OutputLayer.Output.Raw[2], 0.001);
+    AssertTrue('GELU of -1 should be around -0.16', Abs(OutputLayer.Output.Raw[2] - (-0.159)) < 0.02);
+
+    // GELU(2) should be close to 2 (almost linear for large positive values)
+    AssertTrue('GELU of 2 should be close to 2', Abs(OutputLayer.Output.Raw[3] - 1.96) < 0.1);
+
+    // GELU(-2) should be very small (close to 0)
+    AssertTrue('GELU of -2 should be close to 0', Abs(OutputLayer.Output.Raw[4]) < 0.05);
+
+    // GELU is indeed monotonic: GELU(-2) > GELU(-1) (both negative, but -2 is closer to 0)
+    // Order: GELU(-1) < GELU(-2) < GELU(0) < GELU(1) < GELU(2)
+    AssertTrue('GELU should be monotonic', 
+      (OutputLayer.Output.Raw[2] < OutputLayer.Output.Raw[4]) and
+      (OutputLayer.Output.Raw[4] < OutputLayer.Output.Raw[0]) and
+      (OutputLayer.Output.Raw[0] < OutputLayer.Output.Raw[1]) and
+      (OutputLayer.Output.Raw[1] < OutputLayer.Output.Raw[3]));
+
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestMishActivation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  OutputLayer: TNNetLayer;
+  ExpectedMish0, ExpectedMish1, ExpectedMishNeg1: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetMish.Create());
+
+    // Test values: 0, 1, -1, 2, -2
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+    Input.Raw[4] := -2.0;
+
+    NN.Compute(Input);
+
+    OutputLayer := NN.GetLastLayer;
+
+    // Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+    // Mish(0) = 0 * tanh(ln(2)) = 0
+    ExpectedMish0 := 0.0;
+    AssertEquals('Mish of 0 should be 0', ExpectedMish0, OutputLayer.Output.Raw[0], 0.0001);
+
+    // Mish(1) ≈ 0.8651
+    ExpectedMish1 := 1.0 * Tanh(Ln(1 + Exp(1.0)));
+    AssertEquals('Mish of 1 should match formula', ExpectedMish1, OutputLayer.Output.Raw[1], 0.001);
+    AssertTrue('Mish of 1 should be around 0.865', Abs(OutputLayer.Output.Raw[1] - 0.865) < 0.01);
+
+    // Mish(-1) ≈ -0.3034
+    ExpectedMishNeg1 := -1.0 * Tanh(Ln(1 + Exp(-1.0)));
+    AssertEquals('Mish of -1 should match formula', ExpectedMishNeg1, OutputLayer.Output.Raw[2], 0.001);
+    AssertTrue('Mish of -1 should be around -0.30', Abs(OutputLayer.Output.Raw[2] - (-0.303)) < 0.02);
+
+    // Mish(2) should be close to 2 (almost linear for large positive values)
+    AssertTrue('Mish of 2 should be close to 2', Abs(OutputLayer.Output.Raw[3] - 1.94) < 0.1);
+
+    // Mish(-2) ≈ -0.2525 (negative but not close to 0)
+    AssertTrue('Mish of -2 should be around -0.25', Abs(OutputLayer.Output.Raw[4] - (-0.252)) < 0.05);
+
+    // Test non-monotonicity for negative values (a characteristic of Mish)
+    // For very negative values, Mish approaches 0 from below
+    // Mish(-1) is more negative than Mish(-2) which is closer to 0
+    // So |Mish(-1)| > |Mish(-2)|
+    AssertTrue('Mish shows non-monotonic behavior for negative values',
+      Abs(OutputLayer.Output.Raw[2]) > Abs(OutputLayer.Output.Raw[4]));
+
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestGELUSaveLoad;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  StructStr: string;
+  Output1, Output2: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.AddLayer(TNNetGELU.Create());
+
+    Input.Raw[0] := 0.5;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := 1.0;
+
+    NN.Compute(Input);
+    Output1 := NN.GetLastLayer.Output.Raw[0];
+
+    // Save and load
+    StructStr := NN.SaveToString();
+    NN2.LoadFromString(StructStr);
+
+    NN2.Compute(Input);
+    Output2 := NN2.GetLastLayer.Output.Raw[0];
+
+    AssertEquals('GELU output should be same after save/load', Output1, Output2, 0.0001);
+    AssertEquals('Layer count should match after load', NN.CountLayers(), NN2.CountLayers());
+
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestMishSaveLoad;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  StructStr: string;
+  Output1, Output2: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.AddLayer(TNNetMish.Create());
+
+    Input.Raw[0] := 0.5;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := 1.0;
+
+    NN.Compute(Input);
+    Output1 := NN.GetLastLayer.Output.Raw[0];
+
+    // Save and load
+    StructStr := NN.SaveToString();
+    NN2.LoadFromString(StructStr);
+
+    NN2.Compute(Input);
+    Output2 := NN2.GetLastLayer.Output.Raw[0];
+
+    AssertEquals('Mish output should be same after save/load', Output1, Output2, 0.0001);
+    AssertEquals('Layer count should match after load', NN.CountLayers(), NN2.CountLayers());
+
+  finally
+    NN.Free;
+    NN2.Free;
     Input.Free;
   end;
 end;
