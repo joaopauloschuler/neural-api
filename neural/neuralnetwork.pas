@@ -596,7 +596,7 @@ type
     procedure Compute(); override;
   end;
 
-  /// Gaussian Error Linear Unit (GELU) activation function
+  /// Gaussian Error Linear Unit (GELU) activation function - This is an experimental layer. Do not use it.
   // A smooth activation function popular in transformer models like BERT and GPT.
   // Uses the tanh approximation formula: GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
   // https://arxiv.org/abs/1606.08415
@@ -606,7 +606,7 @@ type
     procedure Backpropagate(); override;
   end;
 
-  /// Mish activation function
+  /// Mish activation function - This is an experimental layer. Do not use it.
   // A smooth, non-monotonic self-regularizing activation function.
   // Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
   // https://arxiv.org/abs/1908.08681
@@ -17548,4 +17548,5 @@ Randomize();
 {$ENDIF}
 
 end.
+
 
