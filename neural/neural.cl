@@ -531,3 +531,76 @@ __kernel void volume_operations
      FAs[g_id] = FAs[g_id] * FA + FBs[g_id] * FB;
   }
 }
+
+// CAI Fully Connected Backpropagation - Batch Update
+// This kernel performs the weight update for fully connected layers during backpropagation.
+// For each neuron n and each weight index i:
+//   Delta[n][i] += LearErrorDeriv[n] * PrevOutput[i]
+// The deltas are stored in interleaved format (like FConcatedWInter).
+// FNumNeurons: number of neurons (output size)
+// FVectorSize: size of each neuron's weights (input size from previous layer)
+// FLearErrorDeriv: array of size FNumNeurons containing -LearningRate * ErrorDeriv for each neuron
+// FPrevOutput: array of size FVectorSize containing previous layer's output
+// FConcatedDeltas: interleaved delta storage [FVectorSize][FNumNeurons]
+__kernel void cai_fc_backprop_batch
+(
+  const int FNumNeurons,
+  const int FVectorSize,
+  __global float* FLearErrorDeriv,
+  __global float* FPrevOutput,
+  __global float* FConcatedDeltas
+)
+{
+  const int neuron_id = get_global_id(0);
+  const int weight_id = get_global_id(1);
+
+  if ((neuron_id < FNumNeurons) && (weight_id < FVectorSize))
+  {
+    const float lear_error_deriv = FLearErrorDeriv[neuron_id];
+    const float prev_output = FPrevOutput[weight_id];
+    
+    // Interleaved index: [weight_id][neuron_id] = weight_id * FNumNeurons + neuron_id
+    const int delta_index = weight_id * FNumNeurons + neuron_id;
+    
+    FConcatedDeltas[delta_index] += lear_error_deriv * prev_output;
+  }
+}
+
+// CAI Fully Connected Backpropagation - Non-batch Update with Momentum (Inertia)
+// This kernel performs the weight update with momentum for fully connected layers.
+// For each neuron n and each weight index i:
+//   Inertia[n][i] = Inertia[n][i] * FInertia + (1 - FInertia) * LearErrorDeriv[n] * PrevOutput[i]
+// The inertia values are stored in interleaved format.
+// FNumNeurons: number of neurons (output size)
+// FVectorSize: size of each neuron's weights (input size from previous layer)
+// FInertia: momentum coefficient
+// FLearErrorDeriv: array of size FNumNeurons containing -LearningRate * ErrorDeriv for each neuron
+// FPrevOutput: array of size FVectorSize containing previous layer's output
+// FConcatedInertia: interleaved inertia storage [FVectorSize][FNumNeurons]
+__kernel void cai_fc_backprop_inertia
+(
+  const int FNumNeurons,
+  const int FVectorSize,
+  const float FInertia,
+  __global float* FLearErrorDeriv,
+  __global float* FPrevOutput,
+  __global float* FConcatedInertia
+)
+{
+  const int neuron_id = get_global_id(0);
+  const int weight_id = get_global_id(1);
+
+  if ((neuron_id < FNumNeurons) && (weight_id < FVectorSize))
+  {
+    const float lear_error_deriv = FLearErrorDeriv[neuron_id];
+    const float prev_output = FPrevOutput[weight_id];
+    const float one_minus_inertia = 1.0f - FInertia;
+    
+    // Interleaved index: [weight_id][neuron_id] = weight_id * FNumNeurons + neuron_id  
+    const int inertia_index = weight_id * FNumNeurons + neuron_id;
+    
+    FConcatedInertia[inertia_index] = 
+      FConcatedInertia[inertia_index] * FInertia + 
+      one_minus_inertia * lear_error_deriv * prev_output;
+  }
+}

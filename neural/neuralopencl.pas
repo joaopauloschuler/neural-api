@@ -259,6 +259,34 @@ type
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
 
+  /// Class that performs fully connected backpropagation via OpenCL
+  TFCBackpropCL = class(TMObject)
+    private
+      FDotProductKernel: TDotProductKernel;
+      /// OpenCL Kernels for batch and inertia updates
+      FBatchKernel: cl_kernel;
+      FInertiaKernel: cl_kernel;
+      /// Kernel parameters
+      FNumNeurons: longint;
+      FVectorSize: longint;
+      /// OpenCL Buffers
+      FLearErrorDerivBuffer: cl_mem;
+      FPrevOutputBuffer: cl_mem;
+      FConcatedDeltasBuffer: cl_mem;
+      /// Flag to track buffer allocation
+      FPrepared: boolean;
+    public
+      constructor Create(DotProductKernel: TDotProductKernel);
+      destructor Destroy(); override;
+
+      procedure UnprepareForCompute();
+      function PrepareForCompute(NumNeurons, VectorSize: longint): integer;
+      procedure ComputeBatch(LearErrorDeriv, PrevOutput, ConcatedDeltas: TNNetVolume);
+      procedure ComputeInertia(Inertia: TNeuralFloat; LearErrorDeriv, PrevOutput, ConcatedInertia: TNNetVolume);
+      procedure Finish();
+      procedure ReadResult(ResultVolume: TNNetVolume);
+  end;
+
 implementation
 uses math;
 
@@ -1389,6 +1417,166 @@ begin
   SetLength(FDeviceNames, 0);
   SetLength(FDevices, 0);
   inherited Destroy;
+end;
+
+{ TFCBackpropCL }
+constructor TFCBackpropCL.Create(DotProductKernel: TDotProductKernel);
+begin
+  inherited Create();
+  FDotProductKernel := DotProductKernel;
+  FBatchKernel := nil;
+  FInertiaKernel := nil;
+  FLearErrorDerivBuffer := nil;
+  FPrevOutputBuffer := nil;
+  FConcatedDeltasBuffer := nil;
+  FPrepared := False;
+  FNumNeurons := 0;
+  FVectorSize := 0;
+end;
+
+destructor TFCBackpropCL.Destroy();
+begin
+  UnprepareForCompute();
+  inherited Destroy();
+end;
+
+procedure TFCBackpropCL.UnprepareForCompute();
+begin
+  if Assigned(FLearErrorDerivBuffer) then clReleaseMemObject(FLearErrorDerivBuffer);
+  if Assigned(FPrevOutputBuffer) then clReleaseMemObject(FPrevOutputBuffer);
+  if Assigned(FConcatedDeltasBuffer) then clReleaseMemObject(FConcatedDeltasBuffer);
+  if Assigned(FBatchKernel) then clReleaseKernel(FBatchKernel);
+  if Assigned(FInertiaKernel) then clReleaseKernel(FInertiaKernel);
+
+  FLearErrorDerivBuffer := nil;
+  FPrevOutputBuffer := nil;
+  FConcatedDeltasBuffer := nil;
+  FBatchKernel := nil;
+  FInertiaKernel := nil;
+  FPrepared := False;
+end;
+
+function TFCBackpropCL.PrepareForCompute(NumNeurons, VectorSize: longint): integer;
+begin
+  UnprepareForCompute();
+  FNumNeurons := NumNeurons;
+  FVectorSize := VectorSize;
+
+  // Create kernels
+  FBatchKernel := FDotProductKernel.CreateKernel('cai_fc_backprop_batch');
+  FInertiaKernel := FDotProductKernel.CreateKernel('cai_fc_backprop_inertia');
+
+  // Create buffers
+  FLearErrorDerivBuffer := FDotProductKernel.CreateBuffer(NumNeurons * SizeOf(TNeuralFloat));
+  FPrevOutputBuffer := FDotProductKernel.CreateBuffer(VectorSize * SizeOf(TNeuralFloat));
+  FConcatedDeltasBuffer := FDotProductKernel.CreateBuffer(NumNeurons * VectorSize * SizeOf(TNeuralFloat));
+
+  FPrepared := True;
+  Result := CL_SUCCESS;
+end;
+
+procedure TFCBackpropCL.ComputeBatch(LearErrorDeriv, PrevOutput, ConcatedDeltas: TNNetVolume);
+var
+  err: integer;
+  dim_sizes: array[0..1] of csize_t;
+begin
+  if not FPrepared then Exit;
+
+  // Write data to buffers
+  err := FDotProductKernel.WriteBuffer(FLearErrorDerivBuffer, LearErrorDeriv);
+  err := err or FDotProductKernel.WriteBuffer(FPrevOutputBuffer, PrevOutput);
+  err := err or FDotProductKernel.WriteBuffer(FConcatedDeltasBuffer, ConcatedDeltas);
+
+  if (err <> CL_SUCCESS) then
+  begin
+    FDotProductKernel.ErrorProc('TFCBackpropCL.ComputeBatch: Error writing buffers: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Set kernel arguments
+  err := clSetKernelArg(FBatchKernel, 0, SizeOf(longint), @FNumNeurons);
+  err := err or clSetKernelArg(FBatchKernel, 1, SizeOf(longint), @FVectorSize);
+  err := err or clSetKernelArg(FBatchKernel, 2, SizeOf(cl_mem), @FLearErrorDerivBuffer);
+  err := err or clSetKernelArg(FBatchKernel, 3, SizeOf(cl_mem), @FPrevOutputBuffer);
+  err := err or clSetKernelArg(FBatchKernel, 4, SizeOf(cl_mem), @FConcatedDeltasBuffer);
+
+  if (err <> CL_SUCCESS) then
+  begin
+    FDotProductKernel.ErrorProc('TFCBackpropCL.ComputeBatch: Error setting kernel arguments: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Run kernel
+  dim_sizes[0] := FNumNeurons;
+  dim_sizes[1] := FVectorSize;
+  FDotProductKernel.RunKernel2D(FBatchKernel, dim_sizes[0], dim_sizes[1]);
+end;
+
+procedure TFCBackpropCL.ComputeInertia(Inertia: TNeuralFloat; LearErrorDeriv, PrevOutput, ConcatedInertia: TNNetVolume);
+var
+  err: integer;
+  dim_sizes: array[0..1] of csize_t;
+  localInertia: Single;
+begin
+  if not FPrepared then Exit;
+
+  localInertia := Inertia;
+
+  // Write data to buffers
+  err := FDotProductKernel.WriteBuffer(FLearErrorDerivBuffer, LearErrorDeriv);
+  err := err or FDotProductKernel.WriteBuffer(FPrevOutputBuffer, PrevOutput);
+  err := err or FDotProductKernel.WriteBuffer(FConcatedDeltasBuffer, ConcatedInertia);
+
+  if (err <> CL_SUCCESS) then
+  begin
+    FDotProductKernel.ErrorProc('TFCBackpropCL.ComputeInertia: Error writing buffers: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Set kernel arguments
+  err := clSetKernelArg(FInertiaKernel, 0, SizeOf(longint), @FNumNeurons);
+  err := err or clSetKernelArg(FInertiaKernel, 1, SizeOf(longint), @FVectorSize);
+  err := err or clSetKernelArg(FInertiaKernel, 2, SizeOf(Single), @localInertia);
+  err := err or clSetKernelArg(FInertiaKernel, 3, SizeOf(cl_mem), @FLearErrorDerivBuffer);
+  err := err or clSetKernelArg(FInertiaKernel, 4, SizeOf(cl_mem), @FPrevOutputBuffer);
+  err := err or clSetKernelArg(FInertiaKernel, 5, SizeOf(cl_mem), @FConcatedDeltasBuffer);
+
+  if (err <> CL_SUCCESS) then
+  begin
+    FDotProductKernel.ErrorProc('TFCBackpropCL.ComputeInertia: Error setting kernel arguments: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Run kernel
+  dim_sizes[0] := FNumNeurons;
+  dim_sizes[1] := FVectorSize;
+  FDotProductKernel.RunKernel2D(FInertiaKernel, dim_sizes[0], dim_sizes[1]);
+end;
+
+procedure TFCBackpropCL.Finish();
+var
+  err: integer;
+begin
+  if not FPrepared then Exit;
+
+  err := FDotProductKernel.Finish();
+  if (err <> CL_SUCCESS) then
+  begin
+    FDotProductKernel.ErrorProc('TFCBackpropCL.Finish: Error finishing: ' + IntToStr(err));
+  end;
+end;
+
+procedure TFCBackpropCL.ReadResult(ResultVolume: TNNetVolume);
+var
+  err: integer;
+begin
+  if not FPrepared then Exit;
+
+  err := FDotProductKernel.ReadBuffer(FConcatedDeltasBuffer, ResultVolume);
+  if (err <> CL_SUCCESS) then
+  begin
+    FDotProductKernel.ErrorProc('TFCBackpropCL.ReadResult: Error reading buffer: ' + IntToStr(err));
+  end;
 end;
 
 {$IFNDEF FPC}
