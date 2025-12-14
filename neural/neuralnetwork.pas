@@ -6766,9 +6766,11 @@ begin
     RefreshNeuronWeightList();
     AfterWeightUpdate();
 
-    FConcatedWeights.ReSize(FNeuronWeightList.Count, 1, FNeuronWeightList[0].Size);
-
-    FConcatedWInter.ReSize(FNeuronWeightList[0].Size, 1, FNeuronWeightList.Count);
+    if FNeuronWeightList.Count > 0 then
+    begin
+      FConcatedWeights.ReSize(FNeuronWeightList.Count, 1, FNeuronWeightList[0].Size);
+      FConcatedWInter.ReSize(FNeuronWeightList[0].Size, 1, FNeuronWeightList.Count);
+    end;
 
     //WriteLn(' Layer:', Self.LayerIdx,' Vector:',FVectorSize,' Neuron count:',FNeuronWeightList.Count,' Output size:',FOutput.Size);
     FShouldInterleaveWeights := true;
