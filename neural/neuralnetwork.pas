@@ -596,6 +596,26 @@ type
     procedure Compute(); override;
   end;
 
+  /// Gaussian Error Linear Unit (GELU) activation function - This is an experimental layer. Do not use it.
+  // A smooth activation function popular in transformer models like BERT and GPT.
+  // Uses the tanh approximation formula: GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+  // https://arxiv.org/abs/1606.08415
+  TNNetGELU = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Mish activation function - This is an experimental layer. Do not use it.
+  // A smooth, non-monotonic self-regularizing activation function.
+  // Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+  // https://arxiv.org/abs/1908.08681
+  TNNetMish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -3307,6 +3327,173 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetGELU }
+
+procedure TNNetGELU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+  x3: TNeuralFloat;
+  tanhArg: TNeuralFloat;
+  tanhVal: TNeuralFloat;
+  outputVal: TNeuralFloat;
+  cdf: TNeuralFloat;
+const
+  // sqrt(2/pi) ≈ 0.7978845608
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      x3 := x * x * x;
+      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
+      tanhVal := Tanh(tanhArg);
+      cdf := 0.5 * (1 + tanhVal);
+      outputVal := x * cdf;
+      FOutput.FData[OutputCnt] := outputVal;
+      // Derivative: GELU'(x) = cdf + x * pdf, where pdf is derivative of cdf
+      // pdf = 0.5 * (1 - tanh^2) * sqrt(2/pi) * (1 + 3*0.044715*x^2)
+      FOutputErrorDeriv.FData[OutputCnt] := cdf + 0.5 * x * (1 - tanhVal * tanhVal) *
+        SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * x * x);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      x3 := x * x * x;
+      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
+      FOutput.FData[OutputCnt] := 0.5 * x * (1 + Tanh(tanhArg));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGELU.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetMish }
+
+procedure TNNetMish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+  softplus: TNeuralFloat;
+  expVal: TNeuralFloat;
+  tanhSP: TNeuralFloat;
+  outputVal: TNeuralFloat;
+  omega: TNeuralFloat;
+  delta: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerical stability: for large positive x, exp(x) overflows
+      // softplus(x) = ln(1 + exp(x)) ≈ x for large x
+      if x > 20 then
+      begin
+        // For large x: softplus(x) ≈ x, tanh(x) ≈ 1, sigmoid(x) ≈ 1
+        // Mish(x) ≈ x * 1 = x
+        // Mish'(x) ≈ 1 + x * sech^2(x) * 1 ≈ 1 (since sech^2(x) → 0 for large x)
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
+      else if x < -20 then
+      begin
+        // For very negative x: softplus(x) ≈ exp(x) ≈ 0, tanh(0) = 0
+        // Mish(x) ≈ 0
+        // Mish'(x) ≈ 0
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        expVal := Exp(x);
+        softplus := Ln(1 + expVal);
+        tanhSP := Tanh(softplus);
+        outputVal := x * tanhSP;
+        FOutput.FData[OutputCnt] := outputVal;
+        // Derivative: Mish'(x) = tanh(softplus(x)) + x * sigmoid(x) * (1 - tanh^2(softplus(x)))
+        // = tanh(sp) + x * sech^2(sp) * sigmoid(x)
+        // Using omega = exp(x) and delta = 1 + exp(x)
+        // sigmoid(x) = omega / delta
+        omega := expVal;
+        delta := 1 + expVal;
+        FOutputErrorDeriv.FData[OutputCnt] := tanhSP + x * (1 - tanhSP * tanhSP) * omega / delta;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerical stability
+      if x > 20 then
+        softplus := x
+      else if x < -20 then
+        softplus := Exp(x)
+      else
+        softplus := Ln(1 + Exp(x));
+      FOutput.FData[OutputCnt] := x * Tanh(softplus);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMish.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetInterleaveChannels }
@@ -12511,6 +12698,8 @@ begin
       'TNNetReLUP' :                Result := TNNetReLUP.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
+      'TNNetGELU' :                 Result := TNNetGELU.Create();
+      'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -12622,6 +12811,8 @@ begin
       if S[0] = 'TNNetReLUP' then Result := TNNetReLUP.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
+      if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
+      if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
@@ -17357,4 +17548,5 @@ Randomize();
 {$ENDIF}
 
 end.
+
 
