@@ -15336,6 +15336,7 @@ end;
 procedure TNNetLayer.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
+  FShouldOpenCL := true;
   FDotProductKernel := DotProductKernel;
 end;
 {$ENDIF}
