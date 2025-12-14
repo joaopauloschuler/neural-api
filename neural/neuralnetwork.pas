@@ -1142,6 +1142,12 @@ type
   TNNetFullConnect = class(TNNetLayerConcatedWeights)
     private
       FAuxTransposedW: TNNetVolume;
+      {$IFDEF OpenCL}
+      FBackpropCL: TFCBackpropCL;
+      FConcatedDeltas: TNNetVolume;
+      FConcatedInertia: TNNetVolume;
+      FLearErrorDerivVol: TNNetVolume;
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputePreviousLayerError(); override;
       procedure ComputePreviousLayerErrorCPU(); virtual;
@@ -11913,6 +11919,12 @@ begin
   FAuxTransposedW := TNNetVolume.Create(FOutPut.Size);
   FActivationFn := @HiperbolicTangent;
   FActivationFnDerivative := @HiperbolicTangentDerivative;
+  {$IFDEF OpenCL}
+  FBackpropCL := nil;
+  FConcatedDeltas := TNNetVolume.Create();
+  FConcatedInertia := TNNetVolume.Create();
+  FLearErrorDerivVol := TNNetVolume.Create();
+  {$ENDIF}
 end;
 
 constructor TNNetFullConnect.Create(pSize: integer; pSuppressBias: integer = 0);
@@ -12026,54 +12038,109 @@ end;
 
 procedure TNNetFullConnect.BackpropagateOpenCL();
 var
-  MaxNeurons, NeuronCnt: integer;
+  MaxNeurons, NeuronCnt, WeightCnt: integer;
   localLearErrorDeriv: TNeuralFloat;
   localNeuron: TNNetNeuron;
+  NumWeights: integer;
 begin
+  if not Assigned(FBackpropCL) then
+  begin
+    // Fallback to CPU implementation if OpenCL is not ready
+    BackpropagateCPU();
+    Exit;
+  end;
+
   MaxNeurons := FNeurons.Count - 1;
+  NumWeights := FVectorSize;
+
+  // Step 1: Compute error derivatives and prepare learning error deriv volume
   for NeuronCnt := 0 to MaxNeurons do
   begin
-      OutputErrorDeriv.FData[NeuronCnt] :=
-        OutputError.FData[NeuronCnt] *
-        FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+    OutputErrorDeriv.FData[NeuronCnt] :=
+      OutputError.FData[NeuronCnt] *
+      FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
 
-      localNeuron := FArrNeurons[NeuronCnt];
-      localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
-
-      {$IFDEF Debug}
-      if localNeuron.FBackInertia.Size <> FPrevLayer.Output.Size then
-      begin
-        FErrorProc
-        (
-          'TNNetLayerFullConnect.Backpropagate should have same sizes.' +
-          'Inertia Size:' + IntToStr(localNeuron.FBackInertia.Size) +
-          ' PrevLayer Output:' + IntToStr(FPrevLayer.Output.Size)
-        );
-      end;
-      {$ENDIF}
-      if (FBatchUpdate) then
-      begin
-        if localLearErrorDeriv <> 0.0 then
-        begin
-          localNeuron.Delta.MulAdd(localLearErrorDeriv, FPrevLayer.Output);
-          localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
-        end;
-      end
-      else
-      begin
-        localNeuron.FBackInertia.MulMulAdd(FInertia, localLearErrorDeriv * (1-FInertia), FPrevLayer.Output);
-
-        localNeuron.FBiasInertia :=
-          (1-FInertia)*localLearErrorDeriv +
-          (  FInertia)*localNeuron.FBiasInertia;
-        {$IFDEF CheckRange}
-        NeuronForceRange(localNeuron.FBiasInertia,FLearningRate);
-        {$ENDIF}
-
-        localNeuron.AddInertia();
-      end;
+    FLearErrorDerivVol.FData[NeuronCnt] := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
   end;
-  if not FBatchUpdate then AfterWeightUpdate();
+
+  if FBatchUpdate then
+  begin
+    // Step 2: Collect current deltas into concatenated volume (interleaved format)
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      localNeuron := FArrNeurons[NeuronCnt];
+      for WeightCnt := 0 to NumWeights - 1 do
+      begin
+        // Interleaved format: [WeightCnt][NeuronCnt] = WeightCnt * FNeurons.Count + NeuronCnt
+        FConcatedDeltas.FData[WeightCnt * FNeurons.Count + NeuronCnt] := localNeuron.Delta.FData[WeightCnt];
+      end;
+    end;
+
+    // Step 3: Run OpenCL kernel for batch update
+    FBackpropCL.ComputeBatch(FLearErrorDerivVol, FPrevLayer.Output, FConcatedDeltas);
+    FBackpropCL.Finish();
+
+    // Step 4: Read results back from OpenCL buffer and distribute to neurons
+    FBackpropCL.ReadResult(FConcatedDeltas);
+
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      localNeuron := FArrNeurons[NeuronCnt];
+      for WeightCnt := 0 to NumWeights - 1 do
+      begin
+        localNeuron.Delta.FData[WeightCnt] := FConcatedDeltas.FData[WeightCnt * FNeurons.Count + NeuronCnt];
+      end;
+      // Update bias delta on CPU
+      localLearErrorDeriv := FLearErrorDerivVol.FData[NeuronCnt];
+      if localLearErrorDeriv <> 0.0 then
+      begin
+        localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
+      end;
+    end;
+  end
+  else
+  begin
+    // Non-batch update with inertia
+    // Step 2: Collect current inertia into concatenated volume (interleaved format)
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      localNeuron := FArrNeurons[NeuronCnt];
+      for WeightCnt := 0 to NumWeights - 1 do
+      begin
+        FConcatedInertia.FData[WeightCnt * FNeurons.Count + NeuronCnt] := localNeuron.FBackInertia.FData[WeightCnt];
+      end;
+    end;
+
+    // Step 3: Run OpenCL kernel for inertia update
+    FBackpropCL.ComputeInertia(FInertia, FLearErrorDerivVol, FPrevLayer.Output, FConcatedInertia);
+    FBackpropCL.Finish();
+
+    // Step 4: Read results back from OpenCL buffer and distribute to neurons
+    FBackpropCL.ReadResult(FConcatedInertia);
+
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      localNeuron := FArrNeurons[NeuronCnt];
+      for WeightCnt := 0 to NumWeights - 1 do
+      begin
+        localNeuron.FBackInertia.FData[WeightCnt] := FConcatedInertia.FData[WeightCnt * FNeurons.Count + NeuronCnt];
+      end;
+
+      // Update bias inertia on CPU
+      localLearErrorDeriv := FLearErrorDerivVol.FData[NeuronCnt];
+      localNeuron.FBiasInertia :=
+        (1-FInertia)*localLearErrorDeriv +
+        (  FInertia)*localNeuron.FBiasInertia;
+      {$IFDEF CheckRange}
+      NeuronForceRange(localNeuron.FBiasInertia, FLearningRate);
+      {$ENDIF}
+
+      // Add inertia to weights
+      localNeuron.AddInertia();
+    end;
+
+    AfterWeightUpdate();
+  end;
 end;
 
 procedure TNNetFullConnect.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -12085,6 +12152,18 @@ begin
     RefreshNeuronWeightList();
     AfterWeightUpdate();
     FDotCL.PrepareForCompute(FConcatedWInter, FPrevLayer.FOutput, FVectorSize);
+
+    // Initialize backpropagation OpenCL support
+    if not Assigned(FBackpropCL) then
+    begin
+      FBackpropCL := TFCBackpropCL.Create(DotProductKernel);
+    end;
+    FBackpropCL.PrepareForCompute(FNeurons.Count, FVectorSize);
+
+    // Resize concatenated delta/inertia volumes (interleaved format: [VectorSize][NumNeurons])
+    FConcatedDeltas.Resize(FVectorSize, 1, FNeurons.Count);
+    FConcatedInertia.Resize(FVectorSize, 1, FNeurons.Count);
+    FLearErrorDerivVol.Resize(FNeurons.Count, 1, 1);
   end;
 end;
 {$ENDIF}
@@ -12188,6 +12267,12 @@ end;
 
 destructor TNNetFullConnect.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FBackpropCL) then FBackpropCL.Free;
+  FConcatedDeltas.Free;
+  FConcatedInertia.Free;
+  FLearErrorDerivVol.Free;
+  {$ENDIF}
   FAuxTransposedW.Free;
   inherited Destroy;
 end;
