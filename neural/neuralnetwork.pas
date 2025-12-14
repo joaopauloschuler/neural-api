@@ -6756,14 +6756,6 @@ procedure TNNetLayerConcatedWeights.EnableOpenCL(
   DotProductKernel: TDotProductKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
-  (*
-  // good for debugging
-  WriteLn(
-    'Has OpenCL:', FHasOpenCL,
-    ' Should OpenCL:', FShouldOpenCL,
-    ' Current layer:', Self.LayerIdx
-  );
-  *)
   if (FHasOpenCL and FShouldOpenCL) then
   begin
     if not Assigned(FDotCL) then
