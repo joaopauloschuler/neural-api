@@ -12060,7 +12060,7 @@ begin
       OutputError.FData[NeuronCnt] *
       FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
 
-    FLearErrorDerivVol.FData[NeuronCnt] := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
+    FLearErrorDerivVol.FData[NeuronCnt] := -FLearningRate * OutputErrorDeriv.FData[NeuronCnt];
   end;
 
   if FBatchUpdate then
