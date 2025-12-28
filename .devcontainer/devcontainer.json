@@ -1,10 +1,10 @@
 ﻿{
-  "name": "ai-coding-examples: Free Pascal",
+  "name": "neural-api: Free Pascal",
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-  "workspaceFolder": "/workspaces/ai-coding-examples",
+  "workspaceFolder": "/workspaces/neural-api",
   "postCreateCommand": "fpc -v || true",
   "remoteUser": "vscode",
   "customizations": {

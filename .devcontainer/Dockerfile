@@ -16,7 +16,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Ensure workspace folder exists (devcontainers typically mount the repo)
-WORKDIR /workspaces/smolagents
+WORKDIR /workspaces/neural-api
 
 # Use the default non-root user provided by the base image
 USER vscode
