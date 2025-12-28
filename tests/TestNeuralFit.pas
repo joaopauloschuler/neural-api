@@ -27,6 +27,11 @@ type
     // TNeuralFit tests
     procedure TestNeuralFitCreation;
     procedure TestNeuralFitHideMessages;
+    
+    // Regression comparison function tests
+    procedure TestRegressionCompare;
+    procedure TestRegressionCompareWide;
+    procedure TestEnableRegressionComparison;
   end;
 
 implementation
@@ -191,6 +196,89 @@ begin
     Fit.HideMessages;
     Fit.Verbose := False;
     AssertFalse('Verbose should be False', Fit.Verbose);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestRegressionCompare;
+var
+  A, B: TNNetVolume;
+begin
+  A := TNNetVolume.Create(3, 1, 1);
+  B := TNNetVolume.Create(3, 1, 1);
+  try
+    // Test exact match
+    A.FData[0] := 0.5;
+    A.FData[1] := 0.7;
+    A.FData[2] := 0.3;
+    B.FData[0] := 0.5;
+    B.FData[1] := 0.7;
+    B.FData[2] := 0.3;
+    AssertTrue('Exact match should return True', RegressionCompare(A, B, 0));
+    
+    // Test within tolerance (0.09 difference, threshold is 0.1)
+    B.FData[0] := 0.59;
+    B.FData[1] := 0.61;
+    B.FData[2] := 0.21;
+    AssertTrue('Within tolerance should return True', RegressionCompare(A, B, 0));
+    
+    // Test outside tolerance (0.15 difference, threshold is 0.1)
+    B.FData[0] := 0.65;
+    AssertFalse('Outside tolerance should return False', RegressionCompare(A, B, 0));
+    
+    // Test size mismatch
+    B.Resize(2, 1, 1);
+    AssertFalse('Size mismatch should return False', RegressionCompare(A, B, 0));
+  finally
+    A.Free;
+    B.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestRegressionCompareWide;
+var
+  A, B: TNNetVolume;
+begin
+  A := TNNetVolume.Create(3, 1, 1);
+  B := TNNetVolume.Create(3, 1, 1);
+  try
+    // Test exact match
+    A.FData[0] := 10.0;
+    A.FData[1] := 20.0;
+    A.FData[2] := 30.0;
+    B.FData[0] := 10.0;
+    B.FData[1] := 20.0;
+    B.FData[2] := 30.0;
+    AssertTrue('Exact match should return True', RegressionCompareWide(A, B, 0));
+    
+    // Test within tolerance (0.9 difference, threshold is 1.0)
+    B.FData[0] := 10.9;
+    B.FData[1] := 19.1;
+    B.FData[2] := 29.5;
+    AssertTrue('Within tolerance should return True', RegressionCompareWide(A, B, 0));
+    
+    // Test outside tolerance (1.5 difference, threshold is 1.0)
+    B.FData[0] := 11.5;
+    AssertFalse('Outside tolerance should return False', RegressionCompareWide(A, B, 0));
+  finally
+    A.Free;
+    B.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEnableRegressionComparison;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // Test enabling regression comparison (should not crash)
+    Fit.EnableRegressionComparison();
+    AssertTrue('InferHitFn should be assigned', Fit.InferHitFn <> nil);
+    
+    Fit.EnableRegressionComparisonWide();
+    AssertTrue('InferHitFn should be assigned for wide comparison', Fit.InferHitFn <> nil);
   finally
     Fit.Free;
   end;

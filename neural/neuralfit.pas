@@ -270,6 +270,9 @@ type
       procedure EnableMultiClassComparison();
       procedure EnableClassComparisonInFirstPixel();
       procedure EnableClassComparisonInLastPixel();
+      // Regression comparison methods for floating-point targets
+      procedure EnableRegressionComparison();
+      procedure EnableRegressionComparisonWide();
       procedure EnableDefaultImageTreatment(); override;
       procedure EnableDefaultLoss;
       procedure EnableMultiClassLoss;
@@ -372,6 +375,9 @@ type
   function MultiClassCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
   function ClassCompareOnFirstPixel(A, B: TNNetVolume; ThreadId: integer): boolean;
   function ClassCompareOnLastPixel(A, B: TNNetVolume; ThreadId: integer): boolean;
+  // Regression comparison functions for floating-point outputs
+  function RegressionCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+  function RegressionCompareWide(A, B: TNNetVolume; ThreadId: integer): boolean;
 
 implementation
 uses
@@ -519,6 +525,44 @@ begin
         end;
       end;
     end;
+  end;
+end;
+
+// Regression comparison with absolute tolerance of 0.1.
+// Returns TRUE if all output values differ by less than 0.1.
+// Suitable for regression tasks with normalized outputs (e.g., 0-1 range).
+function RegressionCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
+var
+  Pos: integer;
+  ACount, BCount: integer;
+begin
+  ACount := A.Size;
+  BCount := B.Size;
+  Result := (ACount>0) and (ACount = BCount);
+  Pos := 0;
+  while Result and (Pos < ACount) do
+  begin
+    Result := Result and (Abs(A.FData[Pos] - B.FData[Pos]) < 0.1);
+    Inc(Pos);
+  end;
+end;
+
+// Regression comparison with wider absolute tolerance of 1.0.
+// Returns TRUE if all output values differ by less than 1.0.
+// Suitable for regression tasks with larger value ranges.
+function RegressionCompareWide(A, B: TNNetVolume; ThreadId: integer): boolean;
+var
+  Pos: integer;
+  ACount, BCount: integer;
+begin
+  ACount := A.Size;
+  BCount := B.Size;
+  Result := (ACount>0) and (ACount = BCount);
+  Pos := 0;
+  while Result and (Pos < ACount) do
+  begin
+    Result := Result and (Abs(A.FData[Pos] - B.FData[Pos]) < 1.0);
+    Inc(Pos);
   end;
 end;
 
@@ -1763,6 +1807,16 @@ end;
 procedure TNeuralDataLoadingFit.EnableClassComparisonInLastPixel();
 begin
   FInferHitFn := {$IFDEF FPC}@{$ENDIF}ClassCompareOnLastPixel;
+end;
+
+procedure TNeuralDataLoadingFit.EnableRegressionComparison();
+begin
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}RegressionCompare;
+end;
+
+procedure TNeuralDataLoadingFit.EnableRegressionComparisonWide();
+begin
+  FInferHitFn := {$IFDEF FPC}@{$ENDIF}RegressionCompareWide;
 end;
 
 procedure TNeuralDataLoadingFit.EnableDefaultLoss();
