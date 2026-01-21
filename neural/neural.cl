@@ -531,3 +531,62 @@ __kernel void volume_operations
      FAs[g_id] = FAs[g_id] * FA + FBs[g_id] * FB;
   }
 }
+
+// Fully Connected Layer Backpropagation Kernel
+// Computes weight gradient accumulation: Delta += LearningRate * ErrorDeriv * Input
+// Weights are stored in interleaved format: weight[neuron + input_idx * num_neurons]
+__kernel void cai_fc_backprop
+(
+  const int FNumNeurons,        // Number of neurons (output size)
+  const int FInputSize,         // Size of input vector
+  const float FLearningRate,    // Learning rate (already includes sign)
+  __global float* FErrorDeriv,  // Error derivative per neuron (FNumNeurons)
+  __global float* FInput,       // Input from previous layer (FInputSize)
+  __global float* FWeightDelta  // Weight deltas to accumulate (interleaved: FNumNeurons * FInputSize)
+)
+{
+  const int neuron_id = get_global_id(0);  // Neuron index
+  const int input_id = get_global_id(1);   // Input index
+
+  if ((neuron_id < FNumNeurons) && (input_id < FInputSize))
+  {
+    // Interleaved layout: delta[neuron + input * FNumNeurons]
+    const int weight_idx = neuron_id + input_id * FNumNeurons;
+    const float gradient = FLearningRate * FErrorDeriv[neuron_id] * FInput[input_id];
+    FWeightDelta[weight_idx] += gradient;
+  }
+}
+
+// Fully Connected Layer Backpropagation with Inertia (non-batch mode)
+// Computes: BackInertia = Inertia * BackInertia + (1-Inertia) * LearningRate * ErrorDeriv * Input
+// Then updates weights: Weights += BackInertia
+__kernel void cai_fc_backprop_inertia
+(
+  const int FNumNeurons,          // Number of neurons (output size)
+  const int FInputSize,           // Size of input vector
+  const float FLearningRate,      // Learning rate (already includes sign)
+  const float FInertia,           // Momentum/inertia factor
+  __global float* FErrorDeriv,    // Error derivative per neuron (FNumNeurons)
+  __global float* FInput,         // Input from previous layer (FInputSize)
+  __global float* FBackInertia,   // Momentum buffer (interleaved: FNumNeurons * FInputSize)
+  __global float* FWeights        // Weights to update (interleaved: FNumNeurons * FInputSize)
+)
+{
+  const int neuron_id = get_global_id(0);  // Neuron index
+  const int input_id = get_global_id(1);   // Input index
+
+  if ((neuron_id < FNumNeurons) && (input_id < FInputSize))
+  {
+    // Interleaved layout: weight[neuron + input * FNumNeurons]
+    const int weight_idx = neuron_id + input_id * FNumNeurons;
+    const float gradient = FLearningRate * FErrorDeriv[neuron_id] * FInput[input_id];
+    const float oneMinusInertia = 1.0f - FInertia;
+
+    // Update inertia: BackInertia = Inertia * BackInertia + (1-Inertia) * gradient
+    float inertia_val = FInertia * FBackInertia[weight_idx] + oneMinusInertia * gradient;
+    FBackInertia[weight_idx] = inertia_val;
+
+    // Update weights: Weights += BackInertia
+    FWeights[weight_idx] += inertia_val;
+  }
+}

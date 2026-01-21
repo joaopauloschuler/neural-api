@@ -259,6 +259,60 @@ type
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
 
+  { TFCBackpropSharedKernel }
+  // OpenCL kernel for fully connected layer backpropagation
+  TFCBackpropSharedKernel = class(TMObject)
+    private
+      FDotProductKernel: TDotProductKernel;
+      FBackpropKernel: cl_kernel;
+      FBackpropInertiaKernel: cl_kernel;
+
+      // Buffers for batch mode backprop
+      FErrorDerivBuffer: cl_mem;
+      FInputBuffer: cl_mem;
+      FWeightDeltaBuffer: cl_mem;
+
+      // Buffers for inertia mode backprop
+      FBackInertiaBuffer: cl_mem;
+      FWeightsBuffer: cl_mem;
+
+      // Parameters
+      FNumNeurons: longint;
+      FInputSize: longint;
+      FPrepared: boolean;
+      FInertiaModePrepared: boolean;
+
+      function GetKernel(): cl_kernel;
+    public
+      constructor Create(DotProductKernel: TDotProductKernel);
+      destructor Destroy(); override;
+
+      procedure UnprepareForCompute();
+      function PrepareForCompute(NumNeurons, InputSize: longint): integer;
+      function PrepareForComputeInertia(NumNeurons, InputSize: longint;
+        BackInertia, Weights: TNNetVolume): integer;
+
+      // Batch mode: accumulates gradients into weight delta buffer
+      procedure ComputeBatch(ErrorDeriv, Input: TNNetVolume;
+        LearningRate: TNeuralFloat; NewErrorDeriv: boolean = true;
+        NewInput: boolean = true);
+
+      // Inertia mode: updates weights with momentum
+      procedure ComputeInertia(ErrorDeriv, Input: TNNetVolume;
+        LearningRate, Inertia: TNeuralFloat; NewErrorDeriv: boolean = true;
+        NewInput: boolean = true);
+
+      // Finish and get results back to CPU
+      procedure FinishAndLoadDelta(Delta: TNNetVolume);
+      procedure FinishAndLoadWeights(Weights, BackInertia: TNNetVolume);
+
+      // Clear the delta buffer (for start of new batch)
+      procedure ClearDeltaBuffer();
+
+      property NumNeurons: longint read FNumNeurons;
+      property InputSize: longint read FInputSize;
+  end;
+
 implementation
 uses math;
 
@@ -1389,6 +1443,219 @@ begin
   SetLength(FDeviceNames, 0);
   SetLength(FDevices, 0);
   inherited Destroy;
+end;
+
+{ TFCBackpropSharedKernel }
+
+constructor TFCBackpropSharedKernel.Create(DotProductKernel: TDotProductKernel);
+begin
+  inherited Create();
+  FDotProductKernel := DotProductKernel;
+  FBackpropKernel := FDotProductKernel.CreateKernel('cai_fc_backprop');
+  FBackpropInertiaKernel := FDotProductKernel.CreateKernel('cai_fc_backprop_inertia');
+  FErrorDerivBuffer := nil;
+  FInputBuffer := nil;
+  FWeightDeltaBuffer := nil;
+  FBackInertiaBuffer := nil;
+  FWeightsBuffer := nil;
+  FPrepared := false;
+  FInertiaModePrepared := false;
+end;
+
+destructor TFCBackpropSharedKernel.Destroy();
+begin
+  UnprepareForCompute();
+  if Assigned(FBackpropKernel) then clReleaseKernel(FBackpropKernel);
+  if Assigned(FBackpropInertiaKernel) then clReleaseKernel(FBackpropInertiaKernel);
+  inherited Destroy();
+end;
+
+function TFCBackpropSharedKernel.GetKernel(): cl_kernel;
+begin
+  Result := FBackpropKernel;
+end;
+
+procedure TFCBackpropSharedKernel.UnprepareForCompute();
+begin
+  if Assigned(FErrorDerivBuffer) then clReleaseMemObject(FErrorDerivBuffer);
+  if Assigned(FInputBuffer) then clReleaseMemObject(FInputBuffer);
+  if Assigned(FWeightDeltaBuffer) then clReleaseMemObject(FWeightDeltaBuffer);
+  if Assigned(FBackInertiaBuffer) then clReleaseMemObject(FBackInertiaBuffer);
+  if Assigned(FWeightsBuffer) then clReleaseMemObject(FWeightsBuffer);
+
+  FErrorDerivBuffer := nil;
+  FInputBuffer := nil;
+  FWeightDeltaBuffer := nil;
+  FBackInertiaBuffer := nil;
+  FWeightsBuffer := nil;
+  FPrepared := false;
+  FInertiaModePrepared := false;
+end;
+
+function TFCBackpropSharedKernel.PrepareForCompute(NumNeurons, InputSize: longint): integer;
+var
+  DeltaSize: longint;
+begin
+  UnprepareForCompute();
+  FNumNeurons := NumNeurons;
+  FInputSize := InputSize;
+  DeltaSize := NumNeurons * InputSize * SizeOf(TNeuralFloat);
+
+  // Create buffers
+  FErrorDerivBuffer := FDotProductKernel.CreateInputBuffer(NumNeurons * SizeOf(TNeuralFloat));
+  FInputBuffer := FDotProductKernel.CreateInputBuffer(InputSize * SizeOf(TNeuralFloat));
+  FWeightDeltaBuffer := FDotProductKernel.CreateBuffer(DeltaSize);
+
+  FPrepared := true;
+  Result := CL_SUCCESS;
+end;
+
+function TFCBackpropSharedKernel.PrepareForComputeInertia(NumNeurons, InputSize: longint;
+  BackInertia, Weights: TNNetVolume): integer;
+var
+  WeightSize: longint;
+begin
+  // First prepare the basic buffers
+  if not FPrepared then
+    PrepareForCompute(NumNeurons, InputSize);
+
+  WeightSize := NumNeurons * InputSize * SizeOf(TNeuralFloat);
+
+  // Create additional buffers for inertia mode
+  if Assigned(FBackInertiaBuffer) then clReleaseMemObject(FBackInertiaBuffer);
+  if Assigned(FWeightsBuffer) then clReleaseMemObject(FWeightsBuffer);
+
+  FBackInertiaBuffer := FDotProductKernel.CreateBuffer(WeightSize);
+  FWeightsBuffer := FDotProductKernel.CreateBuffer(WeightSize);
+
+  // Write initial data
+  FDotProductKernel.WriteBuffer(FBackInertiaBuffer, BackInertia);
+  FDotProductKernel.WriteBuffer(FWeightsBuffer, Weights);
+
+  FInertiaModePrepared := true;
+  Result := CL_SUCCESS;
+end;
+
+procedure TFCBackpropSharedKernel.ComputeBatch(ErrorDeriv, Input: TNNetVolume;
+  LearningRate: TNeuralFloat; NewErrorDeriv: boolean; NewInput: boolean);
+var
+  err: integer;
+  localLearningRate: TNeuralFloat;
+begin
+  if not FPrepared then
+  begin
+    ErrorProc('TFCBackpropSharedKernel.ComputeBatch: Not prepared for compute');
+    Exit;
+  end;
+
+  localLearningRate := -LearningRate; // Negate for gradient descent
+
+  // Set kernel arguments
+  err := clSetKernelArg(FBackpropKernel, 0, SizeOf(longint), @FNumNeurons);
+  err := err or clSetKernelArg(FBackpropKernel, 1, SizeOf(longint), @FInputSize);
+  err := err or clSetKernelArg(FBackpropKernel, 2, SizeOf(TNeuralFloat), @localLearningRate);
+  err := err or clSetKernelArg(FBackpropKernel, 3, SizeOf(cl_mem), @FErrorDerivBuffer);
+  err := err or clSetKernelArg(FBackpropKernel, 4, SizeOf(cl_mem), @FInputBuffer);
+  err := err or clSetKernelArg(FBackpropKernel, 5, SizeOf(cl_mem), @FWeightDeltaBuffer);
+
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('TFCBackpropSharedKernel.ComputeBatch: Failed to set kernel arguments: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Write input data to GPU
+  if NewErrorDeriv then
+    FDotProductKernel.WriteBuffer(FErrorDerivBuffer, ErrorDeriv.GetMemSize(), ErrorDeriv.DataPtr);
+  if NewInput then
+    FDotProductKernel.WriteBuffer(FInputBuffer, Input.GetMemSize(), Input.DataPtr);
+
+  // Run kernel
+  FDotProductKernel.RunKernel2D(FBackpropKernel, FNumNeurons, FInputSize);
+end;
+
+procedure TFCBackpropSharedKernel.ComputeInertia(ErrorDeriv, Input: TNNetVolume;
+  LearningRate, Inertia: TNeuralFloat; NewErrorDeriv: boolean; NewInput: boolean);
+var
+  err: integer;
+  localLearningRate: TNeuralFloat;
+begin
+  if not FInertiaModePrepared then
+  begin
+    ErrorProc('TFCBackpropSharedKernel.ComputeInertia: Not prepared for inertia compute');
+    Exit;
+  end;
+
+  localLearningRate := -LearningRate; // Negate for gradient descent
+
+  // Set kernel arguments
+  err := clSetKernelArg(FBackpropInertiaKernel, 0, SizeOf(longint), @FNumNeurons);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 1, SizeOf(longint), @FInputSize);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 2, SizeOf(TNeuralFloat), @localLearningRate);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 3, SizeOf(TNeuralFloat), @Inertia);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 4, SizeOf(cl_mem), @FErrorDerivBuffer);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 5, SizeOf(cl_mem), @FInputBuffer);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 6, SizeOf(cl_mem), @FBackInertiaBuffer);
+  err := err or clSetKernelArg(FBackpropInertiaKernel, 7, SizeOf(cl_mem), @FWeightsBuffer);
+
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('TFCBackpropSharedKernel.ComputeInertia: Failed to set kernel arguments: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Write input data to GPU
+  if NewErrorDeriv then
+    FDotProductKernel.WriteBuffer(FErrorDerivBuffer, ErrorDeriv.GetMemSize(), ErrorDeriv.DataPtr);
+  if NewInput then
+    FDotProductKernel.WriteBuffer(FInputBuffer, Input.GetMemSize(), Input.DataPtr);
+
+  // Run kernel
+  FDotProductKernel.RunKernel2D(FBackpropInertiaKernel, FNumNeurons, FInputSize);
+end;
+
+procedure TFCBackpropSharedKernel.FinishAndLoadDelta(Delta: TNNetVolume);
+var
+  err: integer;
+begin
+  if not FPrepared then Exit;
+
+  err := FDotProductKernel.ReadBuffer(FWeightDeltaBuffer, Delta);
+  if err <> CL_SUCCESS then
+    ErrorProc('TFCBackpropSharedKernel.FinishAndLoadDelta: Failed to read delta buffer: ' + IntToStr(err));
+end;
+
+procedure TFCBackpropSharedKernel.FinishAndLoadWeights(Weights, BackInertia: TNNetVolume);
+var
+  err: integer;
+begin
+  if not FInertiaModePrepared then Exit;
+
+  err := FDotProductKernel.ReadBuffer(FWeightsBuffer, Weights);
+  if err <> CL_SUCCESS then
+    ErrorProc('TFCBackpropSharedKernel.FinishAndLoadWeights: Failed to read weights buffer: ' + IntToStr(err));
+
+  err := FDotProductKernel.ReadBuffer(FBackInertiaBuffer, BackInertia);
+  if err <> CL_SUCCESS then
+    ErrorProc('TFCBackpropSharedKernel.FinishAndLoadWeights: Failed to read inertia buffer: ' + IntToStr(err));
+end;
+
+procedure TFCBackpropSharedKernel.ClearDeltaBuffer();
+var
+  err: integer;
+  ZeroBuffer: TNNetVolume;
+begin
+  if not FPrepared then Exit;
+
+  ZeroBuffer := TNNetVolume.Create(FNumNeurons * FInputSize, 1, 1);
+  try
+    ZeroBuffer.Fill(0);
+    err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, ZeroBuffer);
+    if err <> CL_SUCCESS then
+      ErrorProc('TFCBackpropSharedKernel.ClearDeltaBuffer: Failed to clear buffer: ' + IntToStr(err));
+  finally
+    ZeroBuffer.Free;
+  end;
 end;
 
 {$IFNDEF FPC}
