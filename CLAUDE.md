@@ -97,3 +97,48 @@ Examples are in `examples/`. Key starting points:
 - `XorAndOr/` - Boolean function learning
 - `IdentityShortcutConnection/` - ResNet building blocks
 - `SimpleNLP/` - Transformer-based text generation
+
+## OpenCL Development
+
+### OpenCL Architecture
+
+OpenCL support is conditionally compiled with `-dOpenCL`. Key files:
+- **neural/neural.cl** - OpenCL kernel source code (C99-like syntax)
+- **neural/neuralopencl.pas** - OpenCL infrastructure classes (`TEasyOpenCL`, `TDotProductKernel`, etc.)
+
+### Key OpenCL Classes
+
+- `TEasyOpenCL` / `TEasyOpenCLV` - Low-level OpenCL wrapper (context, command queue, buffers)
+- `TDotProductKernel` - Manages the dot product kernel used for forward pass
+- `TDotProductSharedKernel` - Shared kernel instance for forward pass computation
+- `TFCBackpropSharedKernel` - Manages backpropagation kernels for fully connected layers
+
+### Weight Interleaving
+
+For GPU-efficient memory access, weights are stored in **interleaved format**:
+```
+weight[neuron_index + input_index * num_neurons]
+```
+This allows coalesced memory access when each GPU thread handles one neuron. The `FConcatedWInter` volume in `TNNetLayerConcatedWeights` stores weights in this format.
+
+### Implementing OpenCL for a Layer
+
+Pattern for adding OpenCL support to a layer:
+
+1. **Add kernel to `neural.cl`** - Write the OpenCL kernel function
+2. **Create kernel wrapper class in `neuralopencl.pas`** - Manage buffers and kernel execution
+3. **Add OpenCL fields to the layer class** (under `{$IFDEF OpenCL}`):
+   - Kernel wrapper instance
+   - Any GPU-side buffer volumes
+   - Preparation flag
+4. **Override `EnableOpenCL()`** - Initialize kernel and buffers
+5. **Override `DisableOpenCL()`** - Clean up resources
+6. **Implement `ComputeOpenCL()` / `BackpropagateOpenCL()`** - Use the kernel
+
+### OpenCL Kernel Conventions
+
+Kernels in `neural.cl` follow these conventions:
+- Prefix: `cai_` (CAI = Conscious Artificial Intelligence)
+- Use `get_global_id(0)` and `get_global_id(1)` for 2D work items
+- Use `mad()` for fused multiply-add operations
+- Activation function parameter: 0=none, 1=ReLU
