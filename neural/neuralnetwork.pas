@@ -12056,6 +12056,8 @@ begin
 
   MaxNeurons := FNeurons.Count - 1;
 
+  // WriteLn('Hello from OpenCL BackpropagateOpenCL');
+
   // Step 1: Compute error derivatives on CPU (O(n) - simple operation)
   for NeuronCnt := 0 to MaxNeurons do
   begin

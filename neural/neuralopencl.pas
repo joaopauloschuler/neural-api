@@ -625,9 +625,26 @@ begin
   SetCurrentDevice(pCurrentDevice);
 
   // Create the OpenCL Kernel Here:
+  // Try multiple paths to locate neural.cl
   if FileExists('../../../neural/neural.cl') then
   begin
     CompileProgramFromFile('../../../neural/neural.cl');
+  end
+  else if FileExists('../../neural/neural.cl') then
+  begin
+    CompileProgramFromFile('../../neural/neural.cl');
+  end
+  else if FileExists('../neural/neural.cl') then
+  begin
+    CompileProgramFromFile('../neural/neural.cl');
+  end
+  else if FileExists('./neural/neural.cl') then
+  begin
+    CompileProgramFromFile('./neural/neural.cl');
+  end
+  else if FileExists('neural/neural.cl') then
+  begin
+    CompileProgramFromFile('neural/neural.cl');
   end
   else if FileExists('neural.cl') then
   begin

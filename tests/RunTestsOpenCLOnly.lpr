@@ -1,4 +1,4 @@
-program RunTests;
+program RunTestsOpenCLOnly;
 
 {$mode objfpc}{$H+}
 
@@ -7,9 +7,7 @@ uses
   cthreads, cmem,
   {$ENDIF}
   Classes, consoletestrunner,
-  TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
-  TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
-  TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical, TestNeuralOpenCL;
+  TestNeuralOpenCL;
 
 type
   TMyTestRunner = class(TTestRunner)
@@ -19,7 +17,7 @@ type
 
 function TMyTestRunner.GetShortOpts: string;
 begin
-  Result := inherited GetShortOpts + 'x';
+  Result := inherited GetShortOpts + 'c';
 end;
 
 var
@@ -28,7 +26,7 @@ var
 begin
   Application := TMyTestRunner.Create(nil);
   Application.Initialize;
-  Application.Title := 'CAI Neural API Test Suite';
+  Application.Title := 'CAI Neural API OpenCL Test Suite';
   Application.Run;
   Application.Free;
 end.
