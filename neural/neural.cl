@@ -590,3 +590,65 @@ __kernel void cai_fc_backprop_inertia
     FWeights[weight_idx] += inertia_val;
   }
 }
+
+// Convolution Layer Backpropagation Kernel
+// Accumulates weight gradients over all spatial positions:
+//   WeightDelta[neuron + weight * num_neurons] +=
+//     LearningRate * sum_{pos} ErrorDeriv[pos * NumNeurons + neuron] * InputPrepared[pos * VectorSize + weight]
+// ErrorDeriv layout: (NumPositions * NumNeurons), contiguous per position
+// InputPrepared layout: (NumPositions * VectorSize), contiguous per position
+// WeightDelta layout: interleaved (NumNeurons * VectorSize)
+__kernel void cai_conv_backprop
+(
+  const int FNumNeurons,          // Number of neurons (output depth)
+  const int FVectorSize,          // Size of weight vector per neuron
+  const int FNumPositions,        // Number of spatial positions (OutputSizeX * OutputSizeY)
+  const float FLearningRate,      // Learning rate (already includes sign)
+  __global float* FErrorDeriv,    // Error derivative (FNumPositions * FNumNeurons)
+  __global float* FInputPrepared, // Prepared input (FNumPositions * FVectorSize)
+  __global float* FWeightDelta    // Weight deltas to accumulate (interleaved: FNumNeurons * FVectorSize)
+)
+{
+  const int neuron_id = get_global_id(0);  // Neuron index
+  const int weight_id = get_global_id(1);  // Weight index
+
+  if ((neuron_id < FNumNeurons) && (weight_id < FVectorSize))
+  {
+    float sum = 0.0f;
+    int err_idx = neuron_id;
+    int inp_idx = weight_id;
+
+    const int FNumPosMinus8 = FNumPositions - 8;
+
+    int pos = 0;
+    while (pos < FNumPosMinus8)
+    {
+      sum =
+        mad(FErrorDeriv[err_idx                  ], FInputPrepared[inp_idx                  ],
+        mad(FErrorDeriv[err_idx +   FNumNeurons  ], FInputPrepared[inp_idx +   FVectorSize  ],
+        mad(FErrorDeriv[err_idx + 2*FNumNeurons  ], FInputPrepared[inp_idx + 2*FVectorSize  ],
+        mad(FErrorDeriv[err_idx + 3*FNumNeurons  ], FInputPrepared[inp_idx + 3*FVectorSize  ],
+        mad(FErrorDeriv[err_idx + 4*FNumNeurons  ], FInputPrepared[inp_idx + 4*FVectorSize  ],
+        mad(FErrorDeriv[err_idx + 5*FNumNeurons  ], FInputPrepared[inp_idx + 5*FVectorSize  ],
+        mad(FErrorDeriv[err_idx + 6*FNumNeurons  ], FInputPrepared[inp_idx + 6*FVectorSize  ],
+        mad(FErrorDeriv[err_idx + 7*FNumNeurons  ], FInputPrepared[inp_idx + 7*FVectorSize  ],
+        sum))))))));
+
+      err_idx += 8 * FNumNeurons;
+      inp_idx += 8 * FVectorSize;
+      pos += 8;
+    }
+
+    while (pos < FNumPositions)
+    {
+      sum = mad(FErrorDeriv[err_idx], FInputPrepared[inp_idx], sum);
+      err_idx += FNumNeurons;
+      inp_idx += FVectorSize;
+      pos += 1;
+    }
+
+    // Interleaved layout: delta[neuron + weight * num_neurons]
+    const int weight_idx = neuron_id + weight_id * FNumNeurons;
+    FWeightDelta[weight_idx] += FLearningRate * sum;
+  }
+}

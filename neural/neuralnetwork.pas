@@ -1391,6 +1391,11 @@ type
     protected
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
     private
+      {$IFDEF OpenCL}
+      FConvBackpropCL: TConvBackpropSharedKernel;
+      FConvConcatedDelta: TNNetVolume;
+      FConvBackpropCLPrepared: boolean;
+      {$ENDIF}
       procedure ComputeCPU();
       procedure ComputeTiledCPU();
       procedure ComputeInterleaved();
@@ -1402,6 +1407,7 @@ type
 
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
+      procedure BackpropagateOpenCL();
       {$ENDIF}
       {$IFDEF Debug}
       procedure ComputeNeuronCPU(); {$IFDEF Release} inline; {$ENDIF}
@@ -1418,6 +1424,10 @@ type
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
+      {$ENDIF}
   end;
 
   TNNetConvolutionSharedWeights = class(TNNetConvolution)
@@ -10760,6 +10770,205 @@ begin
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
 end;
+
+procedure TNNetConvolution.BackpropagateOpenCL();
+var
+  OutputX, OutputY, OutputD: integer;
+  MaxX, MaxY, MaxD: integer;
+  PrevX, PrevY: integer;
+  OutputRawPos: integer;
+  CanBackpropOnPos: boolean;
+  LocalCntY: integer;
+  LocalOutputErrorDeriv: TNeuralFloat;
+  SmoothLocalOutputErrorDeriv: TNeuralFloat;
+  LocalWeight, LocalPrevError: TNNetVolume;
+  LocalDestPtr: TNeuralFloatArrPtr;
+  NeuronCnt, InputCnt: integer;
+  localNeuron: TNNetNeuron;
+  localLearErrorDeriv: TNeuralFloat;
+  WeightIdx: integer;
+  MaxPrevX, MaxPrevY: integer;
+  NumPositions: integer;
+begin
+  // Fall back to CPU implementation if not ready for OpenCL
+  if (not FConvBackpropCLPrepared) or (not Assigned(FConvBackpropCL)) or (not FBatchUpdate) then
+  begin
+    BackpropagateFastTiledCPU();
+    Exit;
+  end;
+
+  MaxX := OutputError.SizeX - 1;
+  MaxY := OutputError.SizeY - 1;
+  MaxD := OutputError.Depth - 1;
+  NumPositions := FOutputSizeX * FOutputSizeY;
+
+  // Step 1: Compute error derivatives on CPU for all output positions
+  ComputeErrorDeriv();
+
+  // Step 2: Use OpenCL for weight gradient computation (O(n*m*p) - expensive operation)
+  // The kernel computes: Delta[neuron + weight * NumNeurons] +=
+  //   -LearningRate * sum_{pos} ErrorDeriv[pos * NumNeurons + neuron] * InputPrepared[pos * VectorSize + weight]
+  FConvBackpropCL.ComputeBatch(FOutputErrorDeriv, FInputPrepared, FLearningRate, true, true);
+
+  // Step 3: Transfer deltas back from GPU
+  FConvBackpropCL.FinishAndLoadDelta(FConvConcatedDelta);
+
+  // Step 4: Scatter interleaved deltas to per-neuron delta volumes and update biases
+  for NeuronCnt := 0 to MaxD do
+  begin
+    localNeuron := FArrNeurons[NeuronCnt];
+    // Compute bias delta on CPU: sum of error derivatives across all positions for this neuron
+    localLearErrorDeriv := 0;
+    for OutputY := 0 to MaxY do
+    begin
+      for OutputX := 0 to MaxX do
+      begin
+        OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, NeuronCnt);
+        {$IFDEF FPC}
+        localLearErrorDeriv += FOutputErrorDeriv.FData[OutputRawPos];
+        {$ELSE}
+        localLearErrorDeriv := localLearErrorDeriv + FOutputErrorDeriv.FData[OutputRawPos];
+        {$ENDIF}
+      end;
+    end;
+    localLearErrorDeriv := -FLearningRate * localLearErrorDeriv;
+    if localLearErrorDeriv <> 0.0 then
+    begin
+      {$IFDEF FPC}
+      localNeuron.FBiasDelta += localLearErrorDeriv;
+      {$ELSE}
+      localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
+      {$ENDIF}
+    end;
+
+    // Add GPU-computed weight deltas to neuron deltas
+    // Interleaved layout: delta[neuron + input * num_neurons]
+    for InputCnt := 0 to FVectorSize - 1 do
+    begin
+      WeightIdx := NeuronCnt + InputCnt * FNeurons.Count;
+      {$IFDEF FPC}
+      localNeuron.Delta.FData[InputCnt] += FConvConcatedDelta.FData[WeightIdx];
+      {$ELSE}
+      localNeuron.Delta.FData[InputCnt] := localNeuron.Delta.FData[InputCnt] +
+        FConvConcatedDelta.FData[WeightIdx];
+      {$ENDIF}
+    end;
+  end;
+
+  // Step 5: Clear the GPU delta buffer for next batch sample
+  FConvBackpropCL.ClearDeltaBuffer();
+
+  // Step 6: Compute previous layer error on CPU
+  if (FCalculatePrevLayerError) then
+  begin
+    if FPadding > 0 then
+    begin
+      FPrevLayerErrorPadded.Fill(0);
+      LocalPrevError := FPrevLayerErrorPadded;
+    end
+    else
+    begin
+      LocalPrevError := FPrevLayer.OutputError;
+    end;
+    MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+    MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
+
+    for OutputY := 0 to MaxY do
+    begin
+      PrevY := (OutputY * FStride);
+      for OutputX := 0 to MaxX do
+      begin
+        PrevX := (OutputX * FStride);
+        CanBackpropOnPos :=
+          (PrevX < MaxPrevX) and
+          (PrevY < MaxPrevY);
+
+        for OutputD := 0 to MaxD do
+        begin
+          OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, OutputD);
+          LocalOutputErrorDeriv := FOutputErrorDeriv.FData[OutputRawPos];
+
+          if (LocalOutputErrorDeriv <> 0) then
+          begin
+            LocalWeight := FArrNeurons[OutputD].Weights;
+            if FPointwise then
+            begin
+              LocalDestPtr := LocalPrevError.GetRawPtr(OutputX, OutputY);
+              LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
+            end
+            else
+            begin
+              if CanBackpropOnPos then
+              begin
+                SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                for LocalCntY := 0 to FFeatureSizeYMinus1 do
+                begin
+                  LocalPrevError.MulAdd
+                  (
+                    LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
+                    LocalWeight.GetRawPtr(0, LocalCntY),
+                    SmoothLocalOutputErrorDeriv,
+                    FSizeXDepth
+                  );
+                end;
+              end;
+            end;
+          end; // (LocalOutputErrorDeriv <> 0)
+        end; // OutputD
+      end; // OutputX
+    end; // OutputY
+
+    if FPadding > 0 then
+    begin
+      FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
+    end;
+  end; // FCalculatePrevLayerError
+end;
+
+procedure TNNetConvolution.EnableOpenCL(DotProductKernel: TDotProductKernel);
+var
+  WeightSize: integer;
+  NumPositions: integer;
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FPrevLayer) and Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL then
+  begin
+    NumPositions := FOutputSizeX * FOutputSizeY;
+    WeightSize := FNeurons.Count * FVectorSize;
+
+    // Initialize backpropagation kernel
+    if not Assigned(FConvBackpropCL) then
+    begin
+      FConvBackpropCL := TConvBackpropSharedKernel.Create(DotProductKernel);
+    end;
+
+    // Create interleaved delta volume
+    if not Assigned(FConvConcatedDelta) then
+      FConvConcatedDelta := TNNetVolume.Create(WeightSize, 1, 1);
+    FConvConcatedDelta.Resize(WeightSize, 1, 1);
+    FConvConcatedDelta.Fill(0);
+
+    // Prepare the kernel
+    FConvBackpropCL.PrepareForCompute(FNeurons.Count, FVectorSize, NumPositions);
+    FConvBackpropCLPrepared := true;
+  end;
+end;
+
+procedure TNNetConvolution.DisableOpenCL();
+begin
+  FConvBackpropCLPrepared := false;
+  if Assigned(FConvBackpropCL) then
+  begin
+    FConvBackpropCL.Free;
+    FConvBackpropCL := nil;
+  end;
+  if Assigned(FConvConcatedDelta) then
+  begin
+    FConvConcatedDelta.Free;
+    FConvConcatedDelta := nil;
+  end;
+  inherited DisableOpenCL();
+end;
 {$ENDIF}
 
 procedure TNNetConvolution.ComputeCPU();
@@ -10937,10 +11146,18 @@ begin
     begin
       // ComputeErrorDeriv() isn't required as it's done on BackpropagateAtOutputPos
       // ClearDeltas() is not required as it's done in BackpropagateNTL
-      //BackpropagateFastCPUDev();
-      //BackpropagateFastCPU();
+      {$IFDEF OpenCL}
+      if FConvBackpropCLPrepared and Assigned(FConvBackpropCL) and FBatchUpdate then
+      begin
+        BackpropagateOpenCL();
+      end
+      else
+      begin
+        BackpropagateFastTiledCPU();
+      end;
+      {$ELSE}
       BackpropagateFastTiledCPU(); // This is our default backprop
-      //BackpropagateCPU();
+      {$ENDIF}
 
       {$IFDEF CheckRange}ForceRangeWeights(1000);{$ENDIF}
     end;

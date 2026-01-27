@@ -313,6 +313,47 @@ type
       property InputSize: longint read FInputSize;
   end;
 
+  { TConvBackpropSharedKernel }
+  // OpenCL kernel for convolution layer backpropagation
+  // Accumulates weight gradients over all spatial positions
+  TConvBackpropSharedKernel = class(TMObject)
+    private
+      FDotProductKernel: TDotProductKernel;
+      FBackpropKernel: cl_kernel;
+
+      // Buffers
+      FErrorDerivBuffer: cl_mem;
+      FInputPreparedBuffer: cl_mem;
+      FWeightDeltaBuffer: cl_mem;
+
+      // Parameters
+      FNumNeurons: longint;
+      FVectorSize: longint;
+      FNumPositions: longint;
+      FPrepared: boolean;
+    public
+      constructor Create(DotProductKernel: TDotProductKernel);
+      destructor Destroy(); override;
+
+      procedure UnprepareForCompute();
+      function PrepareForCompute(NumNeurons, VectorSize, NumPositions: longint): integer;
+
+      // Accumulates gradients into weight delta buffer
+      procedure ComputeBatch(ErrorDeriv, InputPrepared: TNNetVolume;
+        LearningRate: TNeuralFloat; NewErrorDeriv: boolean = true;
+        NewInputPrepared: boolean = true);
+
+      // Finish and get results back to CPU
+      procedure FinishAndLoadDelta(Delta: TNNetVolume);
+
+      // Clear the delta buffer (for start of new batch sample)
+      procedure ClearDeltaBuffer();
+
+      property NumNeurons: longint read FNumNeurons;
+      property VectorSize: longint read FVectorSize;
+      property NumPositions: longint read FNumPositions;
+  end;
+
 implementation
 uses math;
 
@@ -1670,6 +1711,125 @@ begin
     err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, ZeroBuffer);
     if err <> CL_SUCCESS then
       ErrorProc('TFCBackpropSharedKernel.ClearDeltaBuffer: Failed to clear buffer: ' + IntToStr(err));
+  finally
+    ZeroBuffer.Free;
+  end;
+end;
+
+{ TConvBackpropSharedKernel }
+
+constructor TConvBackpropSharedKernel.Create(DotProductKernel: TDotProductKernel);
+begin
+  inherited Create();
+  FDotProductKernel := DotProductKernel;
+  FBackpropKernel := FDotProductKernel.CreateKernel('cai_conv_backprop');
+  FErrorDerivBuffer := nil;
+  FInputPreparedBuffer := nil;
+  FWeightDeltaBuffer := nil;
+  FPrepared := false;
+end;
+
+destructor TConvBackpropSharedKernel.Destroy();
+begin
+  UnprepareForCompute();
+  if Assigned(FBackpropKernel) then clReleaseKernel(FBackpropKernel);
+  inherited Destroy();
+end;
+
+procedure TConvBackpropSharedKernel.UnprepareForCompute();
+begin
+  if Assigned(FErrorDerivBuffer) then clReleaseMemObject(FErrorDerivBuffer);
+  if Assigned(FInputPreparedBuffer) then clReleaseMemObject(FInputPreparedBuffer);
+  if Assigned(FWeightDeltaBuffer) then clReleaseMemObject(FWeightDeltaBuffer);
+
+  FErrorDerivBuffer := nil;
+  FInputPreparedBuffer := nil;
+  FWeightDeltaBuffer := nil;
+  FPrepared := false;
+end;
+
+function TConvBackpropSharedKernel.PrepareForCompute(NumNeurons, VectorSize, NumPositions: longint): integer;
+var
+  DeltaSize: longint;
+begin
+  UnprepareForCompute();
+  FNumNeurons := NumNeurons;
+  FVectorSize := VectorSize;
+  FNumPositions := NumPositions;
+  DeltaSize := NumNeurons * VectorSize * SizeOf(TNeuralFloat);
+
+  // Create buffers
+  FErrorDerivBuffer := FDotProductKernel.CreateInputBuffer(NumPositions * NumNeurons * SizeOf(TNeuralFloat));
+  FInputPreparedBuffer := FDotProductKernel.CreateInputBuffer(NumPositions * VectorSize * SizeOf(TNeuralFloat));
+  FWeightDeltaBuffer := FDotProductKernel.CreateBuffer(DeltaSize);
+
+  FPrepared := true;
+  Result := CL_SUCCESS;
+end;
+
+procedure TConvBackpropSharedKernel.ComputeBatch(ErrorDeriv, InputPrepared: TNNetVolume;
+  LearningRate: TNeuralFloat; NewErrorDeriv: boolean; NewInputPrepared: boolean);
+var
+  err: integer;
+  localLearningRate: TNeuralFloat;
+begin
+  if not FPrepared then
+  begin
+    ErrorProc('TConvBackpropSharedKernel.ComputeBatch: Not prepared for compute');
+    Exit;
+  end;
+
+  localLearningRate := -LearningRate; // Negate for gradient descent
+
+  // Set kernel arguments
+  err := clSetKernelArg(FBackpropKernel, 0, SizeOf(longint), @FNumNeurons);
+  err := err or clSetKernelArg(FBackpropKernel, 1, SizeOf(longint), @FVectorSize);
+  err := err or clSetKernelArg(FBackpropKernel, 2, SizeOf(longint), @FNumPositions);
+  err := err or clSetKernelArg(FBackpropKernel, 3, SizeOf(TNeuralFloat), @localLearningRate);
+  err := err or clSetKernelArg(FBackpropKernel, 4, SizeOf(cl_mem), @FErrorDerivBuffer);
+  err := err or clSetKernelArg(FBackpropKernel, 5, SizeOf(cl_mem), @FInputPreparedBuffer);
+  err := err or clSetKernelArg(FBackpropKernel, 6, SizeOf(cl_mem), @FWeightDeltaBuffer);
+
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('TConvBackpropSharedKernel.ComputeBatch: Failed to set kernel arguments: ' + IntToStr(err));
+    Exit;
+  end;
+
+  // Write input data to GPU
+  if NewErrorDeriv then
+    FDotProductKernel.WriteBuffer(FErrorDerivBuffer, ErrorDeriv.GetMemSize(), ErrorDeriv.DataPtr);
+  if NewInputPrepared then
+    FDotProductKernel.WriteBuffer(FInputPreparedBuffer, InputPrepared.GetMemSize(), InputPrepared.DataPtr);
+
+  // Run 2D kernel: (NumNeurons, VectorSize) work items
+  FDotProductKernel.RunKernel2D(FBackpropKernel, FNumNeurons, FVectorSize);
+end;
+
+procedure TConvBackpropSharedKernel.FinishAndLoadDelta(Delta: TNNetVolume);
+var
+  err: integer;
+begin
+  if not FPrepared then Exit;
+
+  err := FDotProductKernel.ReadBuffer(FWeightDeltaBuffer, Delta);
+  if err <> CL_SUCCESS then
+    ErrorProc('TConvBackpropSharedKernel.FinishAndLoadDelta: Failed to read delta buffer: ' + IntToStr(err));
+end;
+
+procedure TConvBackpropSharedKernel.ClearDeltaBuffer();
+var
+  err: integer;
+  ZeroBuffer: TNNetVolume;
+begin
+  if not FPrepared then Exit;
+
+  ZeroBuffer := TNNetVolume.Create(FNumNeurons * FVectorSize, 1, 1);
+  try
+    ZeroBuffer.Fill(0);
+    err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, ZeroBuffer);
+    if err <> CL_SUCCESS then
+      ErrorProc('TConvBackpropSharedKernel.ClearDeltaBuffer: Failed to clear buffer: ' + IntToStr(err));
   finally
     ZeroBuffer.Free;
   end;
