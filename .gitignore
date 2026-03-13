@@ -10,5 +10,6 @@ bin/
 *.exe
 *.compiled
 *.bak
+*.lps
 backup/
 lib/
