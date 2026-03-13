@@ -12270,6 +12270,17 @@ begin
     BackpropagateCPU();
     Exit;
   end;
+  {$IFDEF Debug}
+  if localNeuron.FBackInertia.Size <> FPrevLayer.Output.Size then
+  begin
+    FErrorProc
+    (
+      'TNNetLayerFullConnect.Backpropagate should have same sizes.' +
+      'Inertia Size:' + IntToStr(localNeuron.FBackInertia.Size) +
+      ' PrevLayer Output:' + IntToStr(FPrevLayer.Output.Size)
+    );
+  end;
+  {$ENDIF}
 
   MaxNeurons := FNeurons.Count - 1;
 
