@@ -12276,7 +12276,7 @@ begin
 
   MaxNeurons := FNeurons.Count - 1;
 
-  // Step 1: Compute error derivatives on CPU (O(n) - cheap)
+  // Step 1: Compute error derivatives on CPU (O(n) - cheap, cache-friendly)
   {$IFDEF FPC}
   if FActivationFn = @RectifiedLinearUnit then
   begin
@@ -12304,7 +12304,7 @@ begin
     end;
   end;
 
-  // Step 2: Send error derivs + input to GPU, run kernel.
+  // Step 2: Send error derivs + input to GPU, run kernel (non-blocking).
   // Gradients accumulate in FWeightDeltaBuffer on the GPU across samples.
   // No GPU->CPU transfer here - deltas stay on GPU until UpdateWeights.
   FBackpropCL.ComputeBatch(FOutputErrorDeriv, FPrevLayer.FOutput, FLearningRate, true, true);
@@ -12312,7 +12312,7 @@ begin
   // Mark that GPU has pending deltas to transfer at UpdateWeights time
   FGPUDeltasPending := true;
 
-  // Step 3: Accumulate bias deltas on CPU (O(n) - cheap, no GPU needed)
+  // Step 3: Accumulate bias deltas on CPU while GPU kernel runs (free overlap)
   for NeuronCnt := 0 to MaxNeurons do
   begin
     localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];

@@ -494,6 +494,15 @@ begin
   FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
   FPreviousComputeTime := 0;
 
+  // Set constant kernel args once (they never change between calls)
+  clSetKernelArg(Kernel, 0, SizeOf(longint), @FThreadCount);
+  clSetKernelArg(Kernel, 1, SizeOf(longint), @FNumAs);
+  clSetKernelArg(Kernel, 2, SizeOf(longint), @FNumBs);
+  clSetKernelArg(Kernel, 3, SizeOf(longint), @FSize);
+  clSetKernelArg(Kernel, 5, SizeOf(cl_mem),  @FInputBufferAs);
+  clSetKernelArg(Kernel, 6, SizeOf(cl_mem),  @FInputBufferBs);
+  clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
+
   PrepareForCompute := CL_SUCCESS;
 end;
 
@@ -512,29 +521,9 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      err := clSetKernelArg(Kernel, 0, SizeOf(longint), @FThreadCount);
-      if (err <> CL_SUCCESS) then ErrorProc('0 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 1, SizeOf(longint), @FNumAs);
-      if (err <> CL_SUCCESS) then ErrorProc('1 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 2, SizeOf(longint), @FNumBs);
-      if (err <> CL_SUCCESS) then ErrorProc('2 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 3, SizeOf(longint), @FSize);
-      if (err <> CL_SUCCESS) then ErrorProc('3 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 4, SizeOf(longint), @FActFun);
+      // Only set ActFN per call (constant args set once in PrepareForCompute)
+      err := clSetKernelArg(Kernel, 4, SizeOf(longint), @FActFun);
       if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 5, SizeOf(cl_mem),  @FInputBufferAs);
-      if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 6, SizeOf(cl_mem),  @FInputBufferBs);
-      if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
-      if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       if (FHostInput) then
       begin
@@ -551,9 +540,6 @@ begin
       end;
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
-
-      err := err or clSetKernelArg(Kernel, 4, SizeOf(longint), @FActFun);
-      if (err <> CL_SUCCESS) then ErrorProc('Failed at clSetKernelArg 4:' + IntToStr(err));
 
       if err = CL_SUCCESS then
       begin
@@ -1577,6 +1563,13 @@ begin
   // Initialize the GPU delta buffer to zero
   FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, FZeroBuffer);
 
+  // Set constant kernel args once (they never change between calls)
+  clSetKernelArg(FBackpropKernel, 0, SizeOf(longint), @FNumNeurons);
+  clSetKernelArg(FBackpropKernel, 1, SizeOf(longint), @FInputSize);
+  clSetKernelArg(FBackpropKernel, 3, SizeOf(cl_mem), @FErrorDerivBuffer);
+  clSetKernelArg(FBackpropKernel, 4, SizeOf(cl_mem), @FInputBuffer);
+  clSetKernelArg(FBackpropKernel, 5, SizeOf(cl_mem), @FWeightDeltaBuffer);
+
   FPrepared := true;
   Result := CL_SUCCESS;
 end;
@@ -1603,6 +1596,14 @@ begin
   FDotProductKernel.WriteBuffer(FBackInertiaBuffer, BackInertia);
   FDotProductKernel.WriteBuffer(FWeightsBuffer, Weights);
 
+  // Set constant inertia kernel args once (they never change between calls)
+  clSetKernelArg(FBackpropInertiaKernel, 0, SizeOf(longint), @FNumNeurons);
+  clSetKernelArg(FBackpropInertiaKernel, 1, SizeOf(longint), @FInputSize);
+  clSetKernelArg(FBackpropInertiaKernel, 4, SizeOf(cl_mem), @FErrorDerivBuffer);
+  clSetKernelArg(FBackpropInertiaKernel, 5, SizeOf(cl_mem), @FInputBuffer);
+  clSetKernelArg(FBackpropInertiaKernel, 6, SizeOf(cl_mem), @FBackInertiaBuffer);
+  clSetKernelArg(FBackpropInertiaKernel, 7, SizeOf(cl_mem), @FWeightsBuffer);
+
   FInertiaModePrepared := true;
   Result := CL_SUCCESS;
 end;
@@ -1621,13 +1622,8 @@ begin
 
   localLearningRate := -LearningRate; // Negate for gradient descent
 
-  // Set kernel arguments
-  err := clSetKernelArg(FBackpropKernel, 0, SizeOf(longint), @FNumNeurons);
-  err := err or clSetKernelArg(FBackpropKernel, 1, SizeOf(longint), @FInputSize);
-  err := err or clSetKernelArg(FBackpropKernel, 2, SizeOf(TNeuralFloat), @localLearningRate);
-  err := err or clSetKernelArg(FBackpropKernel, 3, SizeOf(cl_mem), @FErrorDerivBuffer);
-  err := err or clSetKernelArg(FBackpropKernel, 4, SizeOf(cl_mem), @FInputBuffer);
-  err := err or clSetKernelArg(FBackpropKernel, 5, SizeOf(cl_mem), @FWeightDeltaBuffer);
+  // Only set the learning rate arg (constant args set once in PrepareForCompute)
+  err := clSetKernelArg(FBackpropKernel, 2, SizeOf(TNeuralFloat), @localLearningRate);
 
   if err <> CL_SUCCESS then
   begin
@@ -1659,15 +1655,9 @@ begin
 
   localLearningRate := -LearningRate; // Negate for gradient descent
 
-  // Set kernel arguments
-  err := clSetKernelArg(FBackpropInertiaKernel, 0, SizeOf(longint), @FNumNeurons);
-  err := err or clSetKernelArg(FBackpropInertiaKernel, 1, SizeOf(longint), @FInputSize);
-  err := err or clSetKernelArg(FBackpropInertiaKernel, 2, SizeOf(TNeuralFloat), @localLearningRate);
+  // Only set per-call args (constant args set once in PrepareForComputeInertia)
+  err := clSetKernelArg(FBackpropInertiaKernel, 2, SizeOf(TNeuralFloat), @localLearningRate);
   err := err or clSetKernelArg(FBackpropInertiaKernel, 3, SizeOf(TNeuralFloat), @Inertia);
-  err := err or clSetKernelArg(FBackpropInertiaKernel, 4, SizeOf(cl_mem), @FErrorDerivBuffer);
-  err := err or clSetKernelArg(FBackpropInertiaKernel, 5, SizeOf(cl_mem), @FInputBuffer);
-  err := err or clSetKernelArg(FBackpropInertiaKernel, 6, SizeOf(cl_mem), @FBackInertiaBuffer);
-  err := err or clSetKernelArg(FBackpropInertiaKernel, 7, SizeOf(cl_mem), @FWeightsBuffer);
 
   if err <> CL_SUCCESS then
   begin
