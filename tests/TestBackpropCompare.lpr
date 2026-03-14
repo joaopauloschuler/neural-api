@@ -67,17 +67,17 @@ begin
     NN_OpenCL := TNNet.Create();
     NN_CPU := TNNet.Create();
     Input := TNNetVolume.Create(128, 1, 1);
-    Target := TNNetVolume.Create(1024, 1, 1);
+    Target := TNNetVolume.Create(2048, 1, 1);
 
     try
       // Build identical network structures
       NN_OpenCL.AddLayer(TNNetInput.Create(128));
-      NN_OpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_OpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
 
       NN_CPU.AddLayer(TNNetInput.Create(128));
-      NN_CPU.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_CPU.AddLayer(TNNetFullConnectReLU.Create(2048));
 
-      WriteLn('Network: 128 inputs -> 1024 outputs');
+      WriteLn('Network: 128 inputs -> 2048 outputs');
       WriteLn;
 
       // Copy weights from OpenCL network to CPU network to ensure identical starting point
@@ -87,7 +87,7 @@ begin
       // Verify initial weights match
       OpenCLWeightSum := 0;
       CPUWeightSum := 0;
-      for i := 0 to 1023 do
+      for i := 0 to 2047 do
       begin
         OpenCLWeightSum := OpenCLWeightSum + TNNetFullConnectReLU(NN_OpenCL.Layers[1]).Neurons[i].Weights.GetSum();
         CPUWeightSum := CPUWeightSum + TNNetFullConnectReLU(NN_CPU.Layers[1]).Neurons[i].Weights.GetSum();
@@ -201,7 +201,7 @@ begin
       CPUWeightSum := 0;
       MaxDiff := 0;
 
-      for i := 0 to 1023 do
+      for i := 0 to 2047 do
       begin
         OpenCLWeightSum := OpenCLWeightSum + TNNetFullConnectReLU(NN_OpenCL.Layers[1]).Neurons[i].Weights.GetSum();
         CPUWeightSum := CPUWeightSum + TNNetFullConnectReLU(NN_CPU.Layers[1]).Neurons[i].Weights.GetSum();
@@ -299,26 +299,26 @@ begin
     NN_SpeedOpenCL := TNNet.Create();
     NN_SpeedCPU := TNNet.Create();
     SpeedInput := TNNetVolume.Create(128, 1, 1);
-    SpeedTarget := TNNetVolume.Create(1024, 1, 1);
+    SpeedTarget := TNNetVolume.Create(2048, 1, 1);
 
     try
       // Build fully connected networks (multi-layer to exercise backprop chain)
       NN_SpeedCPU.AddLayer(TNNetInput.Create(128));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(2048));
 
       NN_SpeedOpenCL.AddLayer(TNNetInput.Create(128));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
 
       // Copy weights so both start identically
       for i := 1 to NN_SpeedCPU.GetLastLayerIdx() do
         NN_SpeedOpenCL.Layers[i].LoadDataFromString(NN_SpeedCPU.Layers[i].SaveDataToString());
 
       WriteLn('Network architecture (fully connected only):');
-      WriteLn('  Input(128) -> FC(1024) -> FC(1024) -> FC(1024)');
+      WriteLn('  Input(128) -> FC(2048) -> FC(2048) -> FC(2048)');
       WriteLn;
 
       // Configure both networks
@@ -408,21 +408,21 @@ begin
     try
       // Build fully connected networks
       NN_SpeedCPU.AddLayer(TNNetInput.Create(128));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(2048));
 
       NN_SpeedOpenCL.AddLayer(TNNetInput.Create(128));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(2048));
 
       // Copy weights so both start identically
       for i := 1 to NN_SpeedCPU.GetLastLayerIdx() do
         NN_SpeedOpenCL.Layers[i].LoadDataFromString(NN_SpeedCPU.Layers[i].SaveDataToString());
 
       WriteLn('Network architecture (fully connected only):');
-      WriteLn('  Input(128) -> FC(1024) -> FC(1024) -> FC(1024)');
+      WriteLn('  Input(128) -> FC(2048) -> FC(2048) -> FC(2048)');
       WriteLn;
 
       // Configure both networks
