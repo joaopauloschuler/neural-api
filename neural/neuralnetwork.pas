@@ -12277,11 +12277,31 @@ begin
   MaxNeurons := FNeurons.Count - 1;
 
   // Step 1: Compute error derivatives on CPU (O(n) - cheap)
-  for NeuronCnt := 0 to MaxNeurons do
+  {$IFDEF FPC}
+  if FActivationFn = @RectifiedLinearUnit then
   begin
-    OutputErrorDeriv.FData[NeuronCnt] :=
-      OutputError.FData[NeuronCnt] *
-      FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      if FOutputRaw.FData[NeuronCnt] >= 0 then
+        FOutputErrorDeriv.FData[NeuronCnt] := OutputError.FData[NeuronCnt]
+      else
+        FOutputErrorDeriv.FData[NeuronCnt] := 0;
+    end;
+  end
+  else if FActivationFn = @Identity then
+  begin
+    for NeuronCnt := 0 to MaxNeurons do
+      FOutputErrorDeriv.FData[NeuronCnt] := OutputError.FData[NeuronCnt];
+  end
+  else
+  {$ENDIF}
+  begin
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      FOutputErrorDeriv.FData[NeuronCnt] :=
+        OutputError.FData[NeuronCnt] *
+        FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+    end;
   end;
 
   // Step 2: Send error derivs + input to GPU, run kernel.
@@ -12430,9 +12450,29 @@ begin
   MaxNeurons := FNeurons.Count - 1;
   for NeuronCnt := 0 to MaxNeurons do
   begin
-      OutputErrorDeriv.FData[NeuronCnt] :=
-        OutputError.FData[NeuronCnt] *
-        FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+      {$IFDEF FPC}
+      if FActivationFn = @RectifiedLinearUnit then
+      begin
+        if FOutputRaw.FData[NeuronCnt] >= 0 then
+          OutputErrorDeriv.FData[NeuronCnt] := OutputError.FData[NeuronCnt]
+        else
+          OutputErrorDeriv.FData[NeuronCnt] := 0;
+      end
+      else if FActivationFn = @Identity then
+      begin
+        OutputErrorDeriv.FData[NeuronCnt] := OutputError.FData[NeuronCnt];
+      end
+      else
+      begin
+        OutputErrorDeriv.FData[NeuronCnt] :=
+          OutputError.FData[NeuronCnt] *
+          FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+      end;
+      {$ELSE}
+        OutputErrorDeriv.FData[NeuronCnt] :=
+          OutputError.FData[NeuronCnt] *
+          FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
+      {$ENDIF}
 
       localNeuron := FArrNeurons[NeuronCnt];
       localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
