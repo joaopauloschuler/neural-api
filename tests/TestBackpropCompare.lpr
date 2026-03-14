@@ -391,6 +391,98 @@ begin
       SpeedInput.Free;
       SpeedTarget.Free;
     end;
+
+    // =====================================================================
+    // SPEED TEST: Forward Pass Only - CPU vs OpenCL (GPU)
+    // =====================================================================
+    WriteLn;
+    WriteLn('=== CPU vs OpenCL (GPU) Forward Pass Speed Comparison ===');
+    WriteLn;
+
+    SpeedIterations := 200;
+
+    NN_SpeedOpenCL := TNNet.Create();
+    NN_SpeedCPU := TNNet.Create();
+    SpeedInput := TNNetVolume.Create(128, 1, 1);
+
+    try
+      // Build fully connected networks
+      NN_SpeedCPU.AddLayer(TNNetInput.Create(128));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectReLU.Create(1024));
+
+      NN_SpeedOpenCL.AddLayer(TNNetInput.Create(128));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectReLU.Create(1024));
+
+      // Copy weights so both start identically
+      for i := 1 to NN_SpeedCPU.GetLastLayerIdx() do
+        NN_SpeedOpenCL.Layers[i].LoadDataFromString(NN_SpeedCPU.Layers[i].SaveDataToString());
+
+      WriteLn('Network architecture (fully connected only):');
+      WriteLn('  Input(128) -> FC(1024) -> FC(1024) -> FC(1024)');
+      WriteLn;
+
+      // Configure both networks
+      NN_SpeedCPU.SetBatchUpdate(true);
+      NN_SpeedCPU.SetLearningRate(0.001, 0.0);
+
+      NN_SpeedOpenCL.EnableOpenCL(EasyOpenCL.PlatformIds[0], EasyOpenCL.Devices[0]);
+      NN_SpeedOpenCL.SetBatchUpdate(true);
+      NN_SpeedOpenCL.SetLearningRate(0.001, 0.0);
+
+      // Fill input with sample data
+      for i := 0 to SpeedInput.Size - 1 do
+        SpeedInput.Raw[i] := (i mod 256) / 255.0;
+
+      // Warm-up
+      NN_SpeedCPU.Compute(SpeedInput);
+      NN_SpeedOpenCL.Compute(SpeedInput);
+
+      WriteLn('Running ', SpeedIterations, ' iterations of Compute only...');
+      WriteLn;
+
+      // --- Time CPU ---
+      StartTime := Now();
+      for i := 1 to SpeedIterations do
+        NN_SpeedCPU.Compute(SpeedInput);
+      CPUTimeSeconds := (Now() - StartTime) * 24 * 60 * 60;
+
+      // --- Time OpenCL ---
+      StartTime := Now();
+      for i := 1 to SpeedIterations do
+        NN_SpeedOpenCL.Compute(SpeedInput);
+      OpenCLTimeSeconds := (Now() - StartTime) * 24 * 60 * 60;
+
+      WriteLn('-----------------------------------------------------------');
+      WriteLn('SPEED RESULTS (Forward Pass Only):');
+      WriteLn('-----------------------------------------------------------');
+      WriteLn('  CPU    time: ', CPUTimeSeconds:0:3, ' s  (',
+              (SpeedIterations / CPUTimeSeconds):0:1, ' iterations/s)');
+      WriteLn('  OpenCL time: ', OpenCLTimeSeconds:0:3, ' s  (',
+              (SpeedIterations / OpenCLTimeSeconds):0:1, ' iterations/s)');
+      WriteLn;
+      if OpenCLTimeSeconds > 0 then
+      begin
+        if CPUTimeSeconds > OpenCLTimeSeconds then
+          WriteLn('  OpenCL (GPU) is ', (CPUTimeSeconds / OpenCLTimeSeconds):0:2,
+                  'x FASTER than CPU.')
+        else if OpenCLTimeSeconds > CPUTimeSeconds then
+          WriteLn('  CPU is ', (OpenCLTimeSeconds / CPUTimeSeconds):0:2,
+                  'x FASTER than OpenCL (GPU).')
+        else
+          WriteLn('  CPU and OpenCL have identical speed.');
+      end;
+      WriteLn('-----------------------------------------------------------');
+
+      NN_SpeedOpenCL.DisableOpenCL();
+    finally
+      NN_SpeedOpenCL.Free;
+      NN_SpeedCPU.Free;
+      SpeedInput.Free;
+    end;
   finally
     EasyOpenCL.Free;
   end;
