@@ -12,6 +12,9 @@ var
   Input, Target: TNNetVolume;
   SpeedInput, SpeedTarget: TNNetVolume;
   i, epoch: integer;
+  PlatIdx, DevIdx: integer;
+  PlatDeviceNames: TDeviceNames;
+  PlatDevices: TDevices;
   OpenCLWeightSum, CPUWeightSum, WeightDiff: TNeuralFloat;
   InitialWeightSum: TNeuralFloat;
   MaxDiff: TNeuralFloat;
@@ -32,6 +35,18 @@ begin
       WriteLn('ERROR: No OpenCL capable platform has been found.');
       Exit;
     end;
+
+    // List all platforms and their devices
+    WriteLn('=== Available OpenCL Platforms and Devices ===');
+    for PlatIdx := 0 to EasyOpenCL.GetPlatformCount() - 1 do
+    begin
+      WriteLn('Platform [', PlatIdx, ']: ', EasyOpenCL.PlatformNames[PlatIdx]);
+      EasyOpenCL.GetDevicesFromPlatform(EasyOpenCL.PlatformIds[PlatIdx],
+        PlatDeviceNames, PlatDevices);
+      for DevIdx := 0 to Length(PlatDeviceNames) - 1 do
+        WriteLn('  Device [', DevIdx, ']: ', PlatDeviceNames[DevIdx]);
+    end;
+    WriteLn;
 
     WriteLn('Found ', EasyOpenCL.GetPlatformCount(), ' OpenCL platform(s)');
     WriteLn('Using platform: ', EasyOpenCL.PlatformNames[0]);
@@ -279,33 +294,31 @@ begin
     WriteLn('=== CPU vs OpenCL (GPU) Fully Connected Speed Comparison ===');
     WriteLn;
 
-    SpeedIterations := 100;
+    SpeedIterations := 200;
 
     NN_SpeedOpenCL := TNNet.Create();
     NN_SpeedCPU := TNNet.Create();
-    SpeedInput := TNNetVolume.Create(512, 1, 1);
-    SpeedTarget := TNNetVolume.Create(256, 1, 1);
+    SpeedInput := TNNetVolume.Create(128, 1, 1);
+    SpeedTarget := TNNetVolume.Create(512, 1, 1);
 
     try
-      // Build fully connected networks
-      NN_SpeedCPU.AddLayer(TNNetInput.Create(512));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectLinear.Create(1024));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectLinear.Create(1024));
+      // Build fully connected networks (multi-layer to exercise backprop chain)
+      NN_SpeedCPU.AddLayer(TNNetInput.Create(128));
       NN_SpeedCPU.AddLayer(TNNetFullConnectLinear.Create(512));
-      NN_SpeedCPU.AddLayer(TNNetFullConnectLinear.Create(256));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectLinear.Create(512));
+      NN_SpeedCPU.AddLayer(TNNetFullConnectLinear.Create(512));
 
-      NN_SpeedOpenCL.AddLayer(TNNetInput.Create(512));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectLinear.Create(1024));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectLinear.Create(1024));
+      NN_SpeedOpenCL.AddLayer(TNNetInput.Create(128));
       NN_SpeedOpenCL.AddLayer(TNNetFullConnectLinear.Create(512));
-      NN_SpeedOpenCL.AddLayer(TNNetFullConnectLinear.Create(256));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectLinear.Create(512));
+      NN_SpeedOpenCL.AddLayer(TNNetFullConnectLinear.Create(512));
 
       // Copy weights so both start identically
       for i := 1 to NN_SpeedCPU.GetLastLayerIdx() do
         NN_SpeedOpenCL.Layers[i].LoadDataFromString(NN_SpeedCPU.Layers[i].SaveDataToString());
 
       WriteLn('Network architecture (fully connected only):');
-      WriteLn('  Input(512) -> FC(1024) -> FC(1024) -> FC(512) -> FC(256)');
+      WriteLn('  Input(128) -> FC(512) -> FC(512) -> FC(512)');
       WriteLn;
 
       // Configure both networks

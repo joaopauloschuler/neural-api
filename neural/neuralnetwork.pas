@@ -12270,19 +12270,20 @@ begin
     BackpropagateCPU();
     Exit;
   end;
+
+  MaxNeurons := FNeurons.Count - 1;
+
   {$IFDEF Debug}
-  if localNeuron.FBackInertia.Size <> FPrevLayer.Output.Size then
+  if FArrNeurons[0].FBackInertia.Size <> FPrevLayer.Output.Size then
   begin
     FErrorProc
     (
-      'TNNetLayerFullConnect.Backpropagate should have same sizes.' +
-      'Inertia Size:' + IntToStr(localNeuron.FBackInertia.Size) +
+      'TNNetLayerFullConnect.BackpropagateOpenCL should have same sizes.' +
+      'Inertia Size:' + IntToStr(FArrNeurons[0].FBackInertia.Size) +
       ' PrevLayer Output:' + IntToStr(FPrevLayer.Output.Size)
     );
   end;
   {$ENDIF}
-
-  MaxNeurons := FNeurons.Count - 1;
 
   // WriteLn('Hello from OpenCL BackpropagateOpenCL');
 

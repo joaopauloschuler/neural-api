@@ -1708,7 +1708,11 @@ begin
   ZeroBuffer := TNNetVolume.Create(FNumNeurons * FInputSize, 1, 1);
   try
     ZeroBuffer.Fill(0);
-    err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, ZeroBuffer);
+    // Must use blocking write (CL_TRUE) because ZeroBuffer is freed
+    // immediately after this call. With non-blocking write (CL_FALSE),
+    // the source memory may be freed before the GPU reads it, causing
+    // the delta buffer to contain garbage instead of zeros.
+    err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, ZeroBuffer, CL_TRUE);
     if err <> CL_SUCCESS then
       ErrorProc('TFCBackpropSharedKernel.ClearDeltaBuffer: Failed to clear buffer: ' + IntToStr(err));
   finally
