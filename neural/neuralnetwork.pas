@@ -1147,6 +1147,7 @@ type
       FConcatedDelta: TNNetVolume;       // Interleaved weight deltas for batch mode
       FConcatedInertia: TNNetVolume;     // Interleaved inertia for non-batch mode
       FBackpropCLPrepared: boolean;
+      FGPUDeltasPending: boolean;       // True when GPU has untransferred deltas
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputePreviousLayerError(); override;
@@ -1159,11 +1160,15 @@ type
       procedure Backpropagate(); override;
       procedure BackpropagateCPU(); virtual;
       destructor Destroy(); override;
+      procedure UpdateWeights(); override;
+      procedure CalcAdamDelta(); override;
+      procedure UpdateWeightsAdam(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
       procedure DisableOpenCL(); override;
       procedure ComputeOpenCL(); virtual;
       procedure BackpropagateOpenCL(); virtual;
+      procedure TransferGPUDeltasToNeurons();
       {$ENDIF}
   end;
 
@@ -12143,6 +12148,7 @@ begin
   FConcatedDelta := nil;
   FConcatedInertia := nil;
   FBackpropCLPrepared := false;
+  FGPUDeltasPending := false;
   {$ENDIF}
 end;
 
@@ -12257,37 +12263,20 @@ end;
 
 procedure TNNetFullConnect.BackpropagateOpenCL();
 var
-  MaxNeurons, NeuronCnt, InputCnt: integer;
+  MaxNeurons, NeuronCnt: integer;
   localLearErrorDeriv: TNeuralFloat;
-  localNeuron: TNNetNeuron;
-  WeightIdx: integer;
 begin
   // Check if backprop kernel is prepared and we're in batch mode
   // For non-batch mode, fall back to CPU due to transfer overhead
   if (not FBackpropCLPrepared) or (not Assigned(FBackpropCL)) or (not FBatchUpdate) then
   begin
-    // Fall back to CPU implementation
     BackpropagateCPU();
     Exit;
   end;
 
   MaxNeurons := FNeurons.Count - 1;
 
-  {$IFDEF Debug}
-  if FArrNeurons[0].FBackInertia.Size <> FPrevLayer.Output.Size then
-  begin
-    FErrorProc
-    (
-      'TNNetLayerFullConnect.BackpropagateOpenCL should have same sizes.' +
-      'Inertia Size:' + IntToStr(FArrNeurons[0].FBackInertia.Size) +
-      ' PrevLayer Output:' + IntToStr(FPrevLayer.Output.Size)
-    );
-  end;
-  {$ENDIF}
-
-  // WriteLn('Hello from OpenCL BackpropagateOpenCL');
-
-  // Step 1: Compute error derivatives on CPU (O(n) - simple operation)
+  // Step 1: Compute error derivatives on CPU (O(n) - cheap)
   for NeuronCnt := 0 to MaxNeurons do
   begin
     OutputErrorDeriv.FData[NeuronCnt] :=
@@ -12295,25 +12284,41 @@ begin
       FActivationFnDerivative(FOutputRaw.FData[NeuronCnt]);
   end;
 
-  // Step 2: Use OpenCL for weight gradient computation (O(n*m) - expensive operation)
-  // The kernel computes: Delta[n][i] += -LearningRate * ErrorDeriv[n] * Input[i]
+  // Step 2: Send error derivs + input to GPU, run kernel.
+  // Gradients accumulate in FWeightDeltaBuffer on the GPU across samples.
+  // No GPU->CPU transfer here - deltas stay on GPU until UpdateWeights.
   FBackpropCL.ComputeBatch(FOutputErrorDeriv, FPrevLayer.FOutput, FLearningRate, true, true);
 
-  // Step 3: Transfer deltas back from GPU and scatter to neurons
+  // Mark that GPU has pending deltas to transfer at UpdateWeights time
+  FGPUDeltasPending := true;
+
+  // Step 3: Accumulate bias deltas on CPU (O(n) - cheap, no GPU needed)
+  for NeuronCnt := 0 to MaxNeurons do
+  begin
+    localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
+    if localLearErrorDeriv <> 0.0 then
+      FArrNeurons[NeuronCnt].FBiasDelta := FArrNeurons[NeuronCnt].FBiasDelta + localLearErrorDeriv;
+  end;
+end;
+
+procedure TNNetFullConnect.TransferGPUDeltasToNeurons();
+var
+  NeuronCnt, InputCnt, WeightIdx: integer;
+  MaxNeurons: integer;
+  localNeuron: TNNetNeuron;
+begin
+  if (not FBackpropCLPrepared) or (not Assigned(FBackpropCL)) then Exit;
+  if not FGPUDeltasPending then Exit; // Already transferred (e.g., CalcAdamDelta before UpdateWeightsAdam)
+  FGPUDeltasPending := false;
+
+  // Read accumulated deltas from GPU (single transfer for entire batch)
   FBackpropCL.FinishAndLoadDelta(FConcatedDelta);
 
-  // Scatter interleaved deltas to per-neuron delta volumes and update biases
+  // Scatter interleaved deltas to per-neuron delta volumes
+  MaxNeurons := FNeurons.Count - 1;
   for NeuronCnt := 0 to MaxNeurons do
   begin
     localNeuron := FArrNeurons[NeuronCnt];
-    localLearErrorDeriv := -FLearningRate * FOutputErrorDeriv.FData[NeuronCnt];
-
-    // Update bias delta on CPU
-    if localLearErrorDeriv <> 0.0 then
-      localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
-
-    // Add GPU-computed weight deltas to neuron deltas
-    // Interleaved layout: delta[neuron + input * num_neurons]
     for InputCnt := 0 to FVectorSize - 1 do
     begin
       WeightIdx := NeuronCnt + InputCnt * FNeurons.Count;
@@ -12322,7 +12327,7 @@ begin
     end;
   end;
 
-  // Clear the GPU delta buffer for next batch sample
+  // Clear GPU delta buffer for next batch
   FBackpropCL.ClearDeltaBuffer();
 end;
 
@@ -12469,6 +12474,33 @@ begin
       end;
   end;
   if not FBatchUpdate then AfterWeightUpdate();
+end;
+
+procedure TNNetFullConnect.UpdateWeights();
+begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and FBatchUpdate then
+    TransferGPUDeltasToNeurons();
+  {$ENDIF}
+  inherited UpdateWeights();
+end;
+
+procedure TNNetFullConnect.CalcAdamDelta();
+begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and FBatchUpdate then
+    TransferGPUDeltasToNeurons();
+  {$ENDIF}
+  inherited CalcAdamDelta();
+end;
+
+procedure TNNetFullConnect.UpdateWeightsAdam();
+begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and FBatchUpdate then
+    TransferGPUDeltasToNeurons();
+  {$ENDIF}
+  inherited UpdateWeightsAdam();
 end;
 
 destructor TNNetFullConnect.Destroy();

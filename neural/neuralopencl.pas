@@ -276,6 +276,9 @@ type
       FBackInertiaBuffer: cl_mem;
       FWeightsBuffer: cl_mem;
 
+      // Pre-allocated zero buffer for clearing delta buffer
+      FZeroBuffer: TNNetVolume;
+
       // Parameters
       FNumNeurons: longint;
       FInputSize: longint;
@@ -1516,6 +1519,7 @@ begin
   FWeightDeltaBuffer := nil;
   FBackInertiaBuffer := nil;
   FWeightsBuffer := nil;
+  FZeroBuffer := nil;
   FPrepared := false;
   FInertiaModePrepared := false;
 end;
@@ -1523,6 +1527,7 @@ end;
 destructor TFCBackpropSharedKernel.Destroy();
 begin
   UnprepareForCompute();
+  if Assigned(FZeroBuffer) then FZeroBuffer.Free;
   if Assigned(FBackpropKernel) then clReleaseKernel(FBackpropKernel);
   if Assigned(FBackpropInertiaKernel) then clReleaseKernel(FBackpropInertiaKernel);
   inherited Destroy();
@@ -1563,6 +1568,14 @@ begin
   FErrorDerivBuffer := FDotProductKernel.CreateInputBuffer(NumNeurons * SizeOf(TNeuralFloat));
   FInputBuffer := FDotProductKernel.CreateInputBuffer(InputSize * SizeOf(TNeuralFloat));
   FWeightDeltaBuffer := FDotProductKernel.CreateBuffer(DeltaSize);
+
+  // Pre-allocate zero buffer for ClearDeltaBuffer (avoids alloc/free per call)
+  if Assigned(FZeroBuffer) then FZeroBuffer.Free;
+  FZeroBuffer := TNNetVolume.Create(NumNeurons * InputSize, 1, 1);
+  FZeroBuffer.Fill(0);
+
+  // Initialize the GPU delta buffer to zero
+  FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, FZeroBuffer);
 
   FPrepared := true;
   Result := CL_SUCCESS;
@@ -1701,23 +1714,14 @@ end;
 procedure TFCBackpropSharedKernel.ClearDeltaBuffer();
 var
   err: integer;
-  ZeroBuffer: TNNetVolume;
 begin
   if not FPrepared then Exit;
 
-  ZeroBuffer := TNNetVolume.Create(FNumNeurons * FInputSize, 1, 1);
-  try
-    ZeroBuffer.Fill(0);
-    // Must use blocking write (CL_TRUE) because ZeroBuffer is freed
-    // immediately after this call. With non-blocking write (CL_FALSE),
-    // the source memory may be freed before the GPU reads it, causing
-    // the delta buffer to contain garbage instead of zeros.
-    err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, ZeroBuffer, CL_TRUE);
-    if err <> CL_SUCCESS then
-      ErrorProc('TFCBackpropSharedKernel.ClearDeltaBuffer: Failed to clear buffer: ' + IntToStr(err));
-  finally
-    ZeroBuffer.Free;
-  end;
+  // Use pre-allocated zero buffer (no alloc/free per call).
+  // Non-blocking write is safe here because FZeroBuffer persists.
+  err := FDotProductKernel.WriteBuffer(FWeightDeltaBuffer, FZeroBuffer);
+  if err <> CL_SUCCESS then
+    ErrorProc('TFCBackpropSharedKernel.ClearDeltaBuffer: Failed to clear buffer: ' + IntToStr(err));
 end;
 
 { TConvBackpropSharedKernel }
