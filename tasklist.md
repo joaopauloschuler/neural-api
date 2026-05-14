@@ -5,7 +5,7 @@
 - [x] TNNetLayerNorm — proper layer normalization
 - [ ] TNNetRotaryEmbedding (RoPE)
 - [ ] TNNetGEGLU / TNNetSwiGLU gated activations
-- [ ] TNNetGroupNorm
+- [x] TNNetGroupNorm
 - [ ] TNNetDropPath (stochastic depth)
 - [ ] Sparse / mixture-of-experts routing layer
 
