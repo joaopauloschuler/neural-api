@@ -31,3 +31,27 @@
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
 - [ ] Auto-generated layer API reference from doc comments
+
+## Added ideas (Claude, 2026-05-14)
+
+### Normalization layers (broken down for easy implementation)
+- [ ] TNNetLayerNorm — per-sample layer normalization over all elements, with
+      learnable scale/bias. Add to LoadFromString/CreateLayer dispatch. Add
+      forward + numerical-gradient tests in TestNeuralNumerical.pas.
+- [ ] TNNetGroupNorm — normalize within channel groups (configurable group
+      count). Reuse the channel-iteration patterns from
+      TNNetChannelStdNormalization. Add tests in TestNeuralNumerical.pas.
+
+### Test coverage
+- [ ] Numerical-gradient checks for activation layers currently lacking them
+      (TNNetSwish, TNNetHardSwish, TNNetGELU already done, TNNetMish already
+      done — audit and cover the gaps: e.g. TNNetSELU, TNNetLeakyReLU,
+      TNNetHardSigmoid). Add to TestNeuralNumerical.pas.
+
+### Smaller follow-up ideas
+- [ ] TNNetRMSNorm — root-mean-square layer norm (no mean subtraction); cheaper
+      transformer-friendly variant once TNNetLayerNorm lands.
+- [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
+      counting task) that trains in well under a minute on CPU.
+- [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
+      regressions are visible without OpenCL/AVX hardware differences.
