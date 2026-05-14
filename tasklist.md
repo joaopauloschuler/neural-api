@@ -43,7 +43,7 @@
       TNNetChannelStdNormalization. Add tests in TestNeuralNumerical.pas.
 
 ### Test coverage
-- [ ] Numerical-gradient checks for activation layers currently lacking them
+- [x] Numerical-gradient checks for activation layers currently lacking them
       (TNNetSwish, TNNetHardSwish, TNNetGELU already done, TNNetMish already
       done — audit and cover the gaps: e.g. TNNetSELU, TNNetLeakyReLU,
       TNNetHardSigmoid). Add to TestNeuralNumerical.pas.
