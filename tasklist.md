@@ -2,7 +2,7 @@
 
 ## New layer types
 - [ ] TNNetMultiHeadSelfAttention + full transformer encoder/decoder blocks
-- [ ] TNNetLayerNorm — proper layer normalization
+- [x] TNNetLayerNorm — proper layer normalization
 - [ ] TNNetRotaryEmbedding (RoPE)
 - [ ] TNNetGEGLU / TNNetSwiGLU gated activations
 - [ ] TNNetGroupNorm
