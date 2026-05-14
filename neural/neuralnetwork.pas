@@ -863,6 +863,29 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// This layer does group normalization. The input channels (Depth) are
+  // split into Groups contiguous groups; each group is normalized
+  // independently over (SizeX * SizeY * channels-in-group) to zero mean and
+  // unit variance, then a learnable per-element scale (gamma) and bias (beta)
+  // are applied over the full output volume. Output has the same shape as the
+  // input. Depth must be divisible by Groups; otherwise it falls back to a
+  // single group.
+  TNNetGroupNorm = class(TNNetIdentityWithoutL2)
+    private
+      FGroupNormEpsilon: TNeuralFloat;
+      FGroups: integer;
+      FChannelsPerGroup: integer;
+      FInvStdDev: array of TNeuralFloat;
+      FNormalized: TNNetVolume;
+    public
+      constructor Create(Groups: integer); overload;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// This layer does zero centering and standard normalization with trainable
   // parameters.
   TNNetMovingStdNormalization = class(TNNetIdentityWithoutL2AndOptimizer)
@@ -6646,6 +6669,160 @@ begin
 end;
 
 procedure TNNetLayerNorm.InitDefault();
+begin
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  FNeurons[0].FWeights.Fill(1); // gamma
+  FNeurons[1].FWeights.Fill(0); // beta
+  AfterWeightUpdate();
+end;
+
+{ TNNetGroupNorm }
+constructor TNNetGroupNorm.Create(Groups: integer);
+begin
+  inherited Create();
+  if Groups < 1 then Groups := 1;
+  FGroups := Groups;
+  FStruct[0] := Groups;
+  FGroupNormEpsilon := 1e-5;
+  FChannelsPerGroup := 0;
+  FNormalized := TNNetVolume.Create();
+end;
+
+destructor TNNetGroupNorm.Destroy();
+begin
+  SetLength(FInvStdDev, 0);
+  FNormalized.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetGroupNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Fall back to a single group when Depth is not divisible by Groups.
+  if (FGroups < 1) or (FOutput.Depth mod FGroups <> 0) then FGroups := 1;
+  FChannelsPerGroup := FOutput.Depth div FGroups;
+  SetLength(FInvStdDev, FGroups);
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  // FNeurons[0] holds gamma (scale), FNeurons[1] holds beta (bias).
+  SetNumWeightsForAllNeurons(FOutput);
+  FNormalized.ReSize(FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetGroupNorm.Compute();
+var
+  StartTime: double;
+  Mean, Variance: TNeuralFloat;
+  GroupCnt, GroupSize: integer;
+  CntX, CntY, CntD, DStart, DEnd: integer;
+begin
+  StartTime := Now();
+  inherited Compute;
+  GroupSize := FOutput.SizeX * FOutput.SizeY * FChannelsPerGroup;
+  for GroupCnt := 0 to FGroups - 1 do
+  begin
+    DStart := GroupCnt * FChannelsPerGroup;
+    DEnd := DStart + FChannelsPerGroup - 1;
+    // Mean of this group.
+    Mean := 0;
+    for CntX := 0 to FOutput.SizeX - 1 do
+      for CntY := 0 to FOutput.SizeY - 1 do
+        for CntD := DStart to DEnd do
+          Mean := Mean + FOutput[CntX, CntY, CntD];
+    Mean := Mean / GroupSize;
+    // Subtract the mean and accumulate the variance.
+    Variance := 0;
+    for CntX := 0 to FOutput.SizeX - 1 do
+      for CntY := 0 to FOutput.SizeY - 1 do
+        for CntD := DStart to DEnd do
+        begin
+          FOutput[CntX, CntY, CntD] := FOutput[CntX, CntY, CntD] - Mean;
+          Variance := Variance + FOutput[CntX, CntY, CntD] * FOutput[CntX, CntY, CntD];
+        end;
+    Variance := Variance / GroupSize;
+    FInvStdDev[GroupCnt] := 1 / Sqrt(Variance + FGroupNormEpsilon);
+    for CntX := 0 to FOutput.SizeX - 1 do
+      for CntY := 0 to FOutput.SizeY - 1 do
+        for CntD := DStart to DEnd do
+          FOutput[CntX, CntY, CntD] := FOutput[CntX, CntY, CntD] * FInvStdDev[GroupCnt];
+  end;
+  // Keep the normalized values for the backward pass.
+  FNormalized.Copy(FOutput);
+  // Apply learnable per-element scale (gamma) and bias (beta).
+  FOutput.Mul(FNeurons[0].FWeights);
+  FOutput.Add(FNeurons[1].FWeights);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGroupNorm.Backpropagate();
+var
+  StartTime: double;
+  GroupCnt, GroupSize: integer;
+  CntX, CntY, CntD, DStart, DEnd, RawPos: integer;
+  SumDxHat, SumDxHatXHat, FloatGroupSize, DxHat: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // Gradients with respect to gamma and beta (accumulated into deltas).
+  // d(gamma) = sum of ( OutputError * normalized )
+  // d(beta)  = sum of ( OutputError )
+  FOutputErrorDeriv.Copy(FOutputError);
+  FOutputErrorDeriv.Mul(FNormalized);
+  FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputErrorDeriv);
+  FNeurons[1].FDelta.MulAdd(-FLearningRate, FOutputError);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    GroupSize := FOutput.SizeX * FOutput.SizeY * FChannelsPerGroup;
+    FloatGroupSize := GroupSize;
+    // dxhat = OutputError * gamma
+    // dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
+    // computed independently per group.
+    for GroupCnt := 0 to FGroups - 1 do
+    begin
+      DStart := GroupCnt * FChannelsPerGroup;
+      DEnd := DStart + FChannelsPerGroup - 1;
+      SumDxHat := 0;
+      SumDxHatXHat := 0;
+      for CntX := 0 to FOutput.SizeX - 1 do
+        for CntY := 0 to FOutput.SizeY - 1 do
+          for CntD := DStart to DEnd do
+          begin
+            RawPos := FOutput.GetRawPos(CntX, CntY, CntD);
+            DxHat := FOutputError.FData[RawPos] * FNeurons[0].FWeights.FData[RawPos];
+            FOutputErrorDeriv.FData[RawPos] := DxHat;
+            SumDxHat := SumDxHat + DxHat;
+            SumDxHatXHat := SumDxHatXHat + DxHat * FNormalized.FData[RawPos];
+          end;
+      SumDxHat := SumDxHat / FloatGroupSize;
+      SumDxHatXHat := SumDxHatXHat / FloatGroupSize;
+      for CntX := 0 to FOutput.SizeX - 1 do
+        for CntY := 0 to FOutput.SizeY - 1 do
+          for CntD := DStart to DEnd do
+          begin
+            RawPos := FOutput.GetRawPos(CntX, CntY, CntD);
+            FPrevLayer.FOutputError.FData[RawPos] :=
+              FPrevLayer.FOutputError.FData[RawPos] +
+              FInvStdDev[GroupCnt] * ( FOutputErrorDeriv.FData[RawPos] - SumDxHat -
+                FNormalized.FData[RawPos] * SumDxHatXHat );
+          end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetGroupNorm.InitDefault();
 begin
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   FNeurons[0].FWeights.Fill(1); // gamma
@@ -12904,6 +13081,7 @@ begin
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
+      'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetChannelNorm':           Result := TNNetChannelNorm.Create();
@@ -13018,6 +13196,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
+      if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelNorm' then Result := TNNetChannelNorm.Create() else
