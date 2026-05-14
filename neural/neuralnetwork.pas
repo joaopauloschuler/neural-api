@@ -5162,7 +5162,7 @@ begin
       end
       else
       begin
-        FOutput.FData[OutputCnt] := FOutput.FData[OutputCnt] * FAlpha;
+        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FAlpha;
         FOutputErrorDeriv.FData[OutputCnt] := FAlpha;
       end;
     end;
@@ -5178,7 +5178,7 @@ begin
       end
       else
       begin
-        FOutput.FData[OutputCnt] := FOutput.FData[OutputCnt] * FAlpha;
+        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FAlpha;
       end;
     end;
   end;
@@ -6059,7 +6059,11 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
 
+  // ComputeErrorDeriv() fills FOutputErrorDeriv with FOutputError * f'(rawInput).
+  // BackpropagateNoTest() propagates FOutputError to the previous layer, so the
+  // activation derivative must be folded into FOutputError here.
   ComputeErrorDeriv();
+  FOutputError.Copy(FOutputErrorDeriv);
   BackpropagateNoTest();
 end;
 

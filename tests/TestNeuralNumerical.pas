@@ -38,7 +38,16 @@ type
     procedure TestMishNumericalValues;
     procedure TestGELUGradientCheck;
     procedure TestMishGradientCheck;
-    
+    procedure TestSwishGradientCheck;
+    procedure TestSwish6GradientCheck;
+    procedure TestHardSwishGradientCheck;
+    procedure TestSELUGradientCheck;
+    procedure TestLeakyReLUGradientCheck;
+    procedure TestVeryLeakyReLUGradientCheck;
+    procedure TestReLU6GradientCheck;
+    procedure TestSigmoidGradientCheck;
+    procedure TestHyperbolicTangentGradientCheck;
+
     // Depthwise convolution numerical tests
     procedure TestDepthwiseConvNumerical;
     procedure TestPointwiseConvNumerical;
@@ -963,6 +972,192 @@ begin
     InputPlus.Free;
     InputMinus.Free;
   end;
+end;
+
+// Generic central finite-difference gradient check for an activation layer.
+// AInputs holds the input values to probe; each must be away from any
+// non-differentiable kink of the activation under test.
+procedure ActivationGradientCheck(ATestCase: TTestCase;
+  ALayer: TNNetLayer; const AName: string; const AInputs: array of TNeuralFloat;
+  ATolerance: TNeuralFloat);
+var
+  NN: TNNet;
+  Input, InputPlus, InputMinus: TNNetVolume;
+  epsilon: TNeuralFloat;
+  numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+begin
+  n := Length(AInputs);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(n, 1, 1);
+  InputPlus := TNNetVolume.Create(n, 1, 1);
+  InputMinus := TNNetVolume.Create(n, 1, 1);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(n, 1, 1, 1)); // pError=1 resizes error volumes
+    NN.AddLayer(ALayer);
+
+    for i := 0 to n - 1 do
+      Input.Raw[i] := AInputs[i];
+
+    NN.Compute(Input);
+
+    for i := 0 to n - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      NN.Compute(InputPlus);
+      numericalGrad := NN.GetLastLayer.Output.Raw[i];
+
+      InputMinus.Copy(Input);
+      InputMinus.Raw[i] := Input.Raw[i] - epsilon;
+      NN.Compute(InputMinus);
+      numericalGrad := (numericalGrad - NN.GetLastLayer.Output.Raw[i]) / (2 * epsilon);
+
+      NN.Compute(Input);
+      analyticalGrad := NN.GetLastLayer.OutputErrorDeriv.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < ATolerance);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    InputMinus.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSwishGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetSwish.Create(), 'Swish',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSwish6GradientCheck;
+begin
+  // Stay clear of the upper saturation kink at 6.
+  ActivationGradientCheck(Self, TNNetSwish6.Create(), 'Swish6',
+    [0.5, -0.5, 1.0, -2.0, 3.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestHardSwishGradientCheck;
+begin
+  // Avoid the non-differentiable kinks at x = -3 and x = 3.
+  ActivationGradientCheck(Self, TNNetHardSwish.Create(), 'HardSwish',
+    [0.5, -0.5, 1.0, -2.0, 2.0, 4.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSELUGradientCheck;
+begin
+  // Avoid the kink at x = 0.
+  ActivationGradientCheck(Self, TNNetSELU.Create(), 'SELU',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLeakyReLUGradientCheck;
+begin
+  // Avoid the kink at x = 0.
+  ActivationGradientCheck(Self, TNNetLeakyReLU.Create(), 'LeakyReLU',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestVeryLeakyReLUGradientCheck;
+begin
+  // Avoid the kink at x = 0.
+  ActivationGradientCheck(Self, TNNetVeryLeakyReLU.Create(), 'VeryLeakyReLU',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReLU6GradientCheck;
+begin
+  // Avoid the kinks at x = 0 and x = 6.
+  ActivationGradientCheck(Self, TNNetReLU6.Create(), 'ReLU6',
+    [1.0, -1.0, 3.0, -2.0, 7.0], 0.01);
+end;
+
+// TNNetSigmoid / TNNetHyperbolicTangent compute their error derivative inside
+// Backpropagate (not Compute), so this check drives a real backward pass with
+// a known per-element output error and compares against central differences.
+procedure ActivationGradientCheckViaBackprop(ATestCase: TTestCase;
+  ALayer: TNNetLayer; const AName: string; const AInputs: array of TNeuralFloat;
+  ATolerance: TNeuralFloat);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  n := Length(AInputs);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(n, 1, 1);
+  InputPlus := TNNetVolume.Create(n, 1, 1);
+  Desired := TNNetVolume.Create(n, 1, 1);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(n, 1, 1, 1)); // pError=1 resizes error volumes
+    NN.AddLayer(ALayer);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to n - 1 do
+    begin
+      Input.Raw[i] := AInputs[i];
+      Desired.Raw[i] := Cos(i * 0.5);
+    end;
+
+    for i := 0 to n - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < ATolerance);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSigmoidGradientCheck;
+begin
+  ActivationGradientCheckViaBackprop(Self, TNNetSigmoid.Create(), 'Sigmoid',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicTangentGradientCheck;
+begin
+  ActivationGradientCheckViaBackprop(Self, TNNetHyperbolicTangent.Create(), 'HyperbolicTangent',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestDepthwiseConvNumerical;
