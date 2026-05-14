@@ -48,6 +48,8 @@ type
     procedure TestLayerNormNumericalMean;
     procedure TestLayerNormNumericalStd;
     procedure TestMaxNormNumericalRange;
+    procedure TestLayerNormForward;
+    procedure TestLayerNormGradientCheck;
     
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -1141,6 +1143,160 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLayerNormForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LNorm: TNNetLayerNorm;
+  Mean, Variance, diff: TNeuralFloat;
+  i: integer;
+begin
+  // With default gamma=1 and beta=0, TNNetLayerNorm output must have
+  // ~zero mean and ~unit variance over the whole sample.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2));
+    LNorm := TNNetLayerNorm.Create();
+    NN.AddLayer(LNorm);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.5 - 3.0;
+
+    NN.Compute(Input);
+
+    Mean := NN.GetLastLayer.Output.GetAvg();
+    Variance := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[i] - Mean;
+      Variance := Variance + diff * diff;
+    end;
+    Variance := Variance / NN.GetLastLayer.Output.Size;
+
+    AssertEquals('LayerNorm output mean should be ~0', 0.0, Mean, 0.001);
+    AssertEquals('LayerNorm output variance should be ~1', 1.0, Variance, 0.001);
+
+    // Now test with non-trivial learnable gamma and beta.
+    LNorm.Neurons[0].Weights.Fill(3.0); // gamma
+    LNorm.Neurons[1].Weights.Fill(2.0); // beta
+    NN.Compute(Input);
+    Mean := NN.GetLastLayer.Output.GetAvg();
+    Variance := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[i] - Mean;
+      Variance := Variance + diff * diff;
+    end;
+    Variance := Variance / NN.GetLastLayer.Output.Size;
+    // mean = beta, variance = gamma^2
+    AssertEquals('LayerNorm output mean should be ~beta', 2.0, Mean, 0.001);
+    AssertEquals('LayerNorm output variance should be ~gamma^2', 9.0, Variance, 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLayerNormGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LNorm: TNNetLayerNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, j: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    LNorm := TNNetLayerNorm.Create();
+    NN.AddLayer(LNorm);
+    // Learning rate 1, batch update on: deltas accumulate -1*gradient and
+    // weights are NOT modified, so finite-difference checks stay valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial learnable parameters.
+    for i := 0 to LNorm.Neurons[0].Weights.Size - 1 do
+    begin
+      LNorm.Neurons[0].Weights.Raw[i] := 1.0 + i * 0.1; // gamma
+      LNorm.Neurons[1].Weights.Raw[i] := i * 0.05 - 0.1; // beta
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('LayerNorm input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. gamma and beta ----
+    for j := 0 to 1 do // 0 = gamma, 1 = beta
+      for i := 0 to LNorm.Neurons[j].Weights.Size - 1 do
+      begin
+        LNorm.Neurons[j].Weights.Raw[i] := LNorm.Neurons[j].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LNorm.Neurons[j].Weights.Raw[i] := LNorm.Neurons[j].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LNorm.Neurons[j].Weights.Raw[i] := LNorm.Neurons[j].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LNorm.Neurons[j].ClearDelta;
+        NN.Backpropagate(Desired);
+        // Backprop accumulates Delta := Delta - LearningRate*gradient.
+        // With LearningRate = 1, analytical gradient = -Delta.
+        analyticalGrad := -LNorm.Neurons[j].Delta.Raw[i];
+
+        AssertTrue('LayerNorm weight gradient check (' + IntToStr(j) + ',' + IntToStr(i) +
+          ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 
