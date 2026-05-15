@@ -1,1 +1,4 @@
 backup
+*.o
+*.ppu
+tests/RunTests
