@@ -2838,3 +2838,166 @@ couple of examples that would exercise recently-landed primitives.
       LeakyReLU, GELU, Swish, Mish, SwiGLU as the only changed
       layer, log curves. Useful for the README activation table
       to cite real numbers.
+
+
+### Lucky-day batch — 2026-05-15 (seed 995227)
+
+Drew 995227 as my lucky number. With TNNetAbs, TNNetSquare,
+TNNetReverseXY and the TNNetSoftPlus negative-x derivative guard
+all freshly landed in the last few commits (1821cdb, 134e7ea,
+e9f7f60), the natural next bites are the small-layer siblings of
+those (FlipX/FlipY/Clamp/Sign), the still-open MHSA breakdown, and
+some test/example tasks that exercise what already shipped. Before
+adding anything I grep-confirmed each name is absent from the
+dispatch tables in `neural/neuralnetwork.pas`.
+
+#### Layers I'd enjoy building (each a 1-commit landing)
+
+- [ ] TNNetFlipX — horizontal flip layer (mirror along width).
+      Involution, parameter-free; can sit inside the net as a
+      training-time augmentation rather than only as preprocessing.
+      Reuses the TNNetReverseXY / TNNetReverseChannels four-test
+      scaffolding (forward / numerical-gradient / involution /
+      SerializationRoundTrip). Verified absent from dispatch.
+- [ ] TNNetFlipY — vertical flip sibling of TNNetFlipX. Same
+      four-test shape; landing them as one PR pair keeps the
+      "involution layers" README subsection ready to write in a
+      single pass. Verified absent from dispatch.
+- [ ] TNNetClamp(MinValue, MaxValue) — elementwise clamp with
+      sub-gradient passthrough on the active region (zero outside
+      `[MinValue, MaxValue]`). Two scalar params stored in
+      FFloatSt[0..1]. Tests: forward saturation at both ends,
+      numerical-gradient inside the active region (skip sampling
+      near the kinks), SerializationRoundTrip. Verified absent.
+- [ ] TNNetSign — elementwise `sign(x)` with straight-through-
+      estimator backward (pass gradient through unchanged on the
+      active region, zero exactly at x=0). Useful for binarized-
+      net experiments. Tests: forward sign correctness, STE
+      passthrough check, an intentional-mismatch comment in the
+      test where the analytic STE differs from the central-
+      difference derivative. Verified absent.
+- [ ] TNNetBias — bias-only "add a learnable per-channel offset"
+      layer (re-pinning from seed 993208 because nothing has
+      landed it yet, and I'd genuinely enjoy writing it). The
+      gradient on the bias param is just the channel-summed
+      output gradient; the input-gradient path is identity. Tests:
+      forward additive shape, input-grad passthrough, weight-grad
+      central-difference check, SerializationRoundTrip. Verified
+      absent from dispatch.
+- [ ] TNNetReciprocal — elementwise `1/x` with a small-epsilon
+      guard (`x = sign(x) * max(|x|, eps)` before the divide).
+      Derivative is `-1/x^2`. Niche but pairs naturally with
+      TNNetSquare for "compute Euclidean-norm reciprocal" toy
+      heads. Tests: forward, eps-guard saturation at x=0,
+      numerical-grad away from zero, SerializationRoundTrip.
+- [ ] TNNetExp — elementwise `exp(x)` with an overflow guard
+      (clamp x to ≤ 30 before exp), to round out the
+      Square/Abs/SoftPlus elementwise family. Derivative is the
+      output itself, so the backward path is a one-liner.
+- [ ] TNNetLog — elementwise `log(max(x, eps))` companion to
+      TNNetExp; derivative `1/max(x, eps)`. Tests pin the eps
+      behavior. Together with TNNetExp gives a clean Log/Exp
+      pair for any future probabilistic-output work.
+
+#### Composite blocks / examples I'd enjoy writing
+
+- [ ] `examples/InvolutionDemo/` — tiny illustration that
+      composing two involutions (`TNNetReverseChannels` twice,
+      or `TNNetReverseXY` twice, or `TNNetFlipX` twice) acts as
+      identity within fp tolerance. Five-screen example that
+      doubles as documentation for the new "involution layers"
+      README subsection already pinned in the previous batch.
+- [ ] `examples/AbsSquareEnergy/` — tiny demo using TNNetAbs and
+      TNNetSquare as the headline "energy" feature heads on a
+      synthetic regression target `y = ||x||_1` and `y = ||x||_2^2`.
+      Both layers landed but neither has an example showing the
+      training shape they were designed for.
+- [ ] `examples/ReverseXYAugmentation/` — toy 2-class dataset
+      where class label depends on spatial orientation; show
+      that training with TNNetReverseXY as a random augmentation
+      forces a rotation-invariant classifier, while a baseline
+      net memorizes orientation. Concrete use-case for the
+      just-landed layer.
+
+#### Tests / correctness audit I'd enjoy
+
+- [ ] Numerical-gradient test for TNNetSoftPlus at the freshly-
+      guarded x < -30 region. The e9f7f60 fix added the
+      `x < -30 ⇒ deriv := Exp(x)` branch; pin it with a test that
+      feeds `x = -1e3` and asserts (a) no EOverflow, (b) finite
+      input gradient, (c) gradient magnitude ≈ exp(x) at machine
+      precision. Closes the "Surfaced (not fixed)" loop for real.
+- [ ] Coverage matrix at the top of TestNeuralNumerical.pas: a
+      comment block enumerating every TNNet* class and a
+      `[grad] [serialize]` column per class, written by a small
+      script. Mechanical, but it makes the next audit batch
+      pick itself.
+- [ ] TNNetAbs near-zero gradient handling: write the test that
+      explicitly skips x = 0 sampling (the derivative kink is
+      undefined there) and pins the convention used for the
+      derivative-at-zero (currently `sign(0) = 0`, i.e. zero
+      gradient). Documents the choice in the test, not just code.
+- [ ] TNNetSquare gradient-magnitude sanity test at large |x|:
+      derivative `2x` grows linearly, so finite-difference eps
+      must shrink relative to |x|. Use this layer to pin the
+      relative-error tolerance convention for layers whose
+      Jacobian scales with the input.
+- [ ] Re-pin the property-based gradient harness — even a v0 that
+      only randomizes input shape (keeping layer type fixed) for
+      the 6 most recently landed layers would catch a lot of
+      shape-edge bugs. Already in the list; I want to take it.
+- [ ] All-checked-in `[x]` audit: parse the file for every `[x]`
+      line that names a `TNNet*` class and assert each name is
+      present in either `neural/neuralnetwork.pas`'s dispatch or
+      a `Test*` method in `tests/TestNeuralNumerical.pas`. Sister
+      tool to `scripts/audit_tasklist.sh` for catching the
+      reverse failure mode (claimed-landed but actually missing).
+
+#### Experiments I'm curious about
+
+- [ ] Abs vs Square as the L1-vs-L2 head: train the same small
+      regressor with `Sum(TNNetAbs(x))` vs `Sum(TNNetSquare(x))`
+      as the final feature on a synthetic noisy-regression task.
+      Print loss curves and the implied robust-vs-MSE behavior.
+      Concrete teaching artifact for "why L1 is robust to outliers".
+- [ ] Flip-augmentation efficacy sweep: with TNNetFlipX (when it
+      lands), train a small classifier on a 2-class synthetic
+      orientation task with augmentation probability sweeping
+      `p ∈ {0.0, 0.25, 0.5, 0.75, 1.0}`. Chart final accuracy.
+      Companion to the existing ReverseChannels augmentation
+      example pinned above.
+- [ ] Activation menagerie unification: with TNNetAbs and
+      TNNetSquare now landed, the activation A/B item can be
+      extended to include them as the "non-monotone weirdo"
+      column. Single chart, one extra config each. Re-pinning
+      the bake-off item explicitly with this column added.
+
+#### Infrastructure / tooling
+
+- [ ] `scripts/audit_tasklist.sh --strict` mode flagged in the
+      previous batch's follow-ups. Only match lines that begin
+      with the canonical `- [ ] TNNet… — …` re-pin pattern, so
+      the 73-hit false-positive rate from context-references
+      drops to something a human can review in one sitting.
+- [ ] Companion script `scripts/audit_landed.sh` that does the
+      reverse direction of `audit_tasklist.sh`: every line with
+      `[x]` claiming a `TNNet*` landed must point at a real
+      class in the dispatch and a `Test*` in the test file.
+      Catches the failure mode where the tick is wishful.
+- [ ] Tiny CLI `bin/layer_bench <ClassName> <SizeX> <SizeY> <Depth>`
+      that builds a 1-layer net and reports ns/op for forward
+      and backward. Subsumes the perpetually-re-pinned Volume
+      micro-benchmark and extends it to the layer level.
+
+#### Documentation
+
+- [ ] "Elementwise activation layer authoring" mini-guide: with
+      Abs/Square/SoftPlus/SquaredReLU all recently landed, capture
+      the recurring 4-step pattern (Compute override, Backpropagate
+      override using FOutputErrorDeriv, dispatch entry, four-test
+      shape) into a short doc. Cheaper than the full layer-authoring
+      checklist already pinned and is the most common landing type.
+- [ ] Activation reference table: add rows for TNNetAbs, TNNetSquare,
+      and TNNetSoftPlus's "stable on both tails" note (once the
+      negative-x derivative test above lands). Pure README pass.
+
