@@ -12,3 +12,4 @@ bin/
 *.bak
 backup/
 lib/
+tests/RunTests
