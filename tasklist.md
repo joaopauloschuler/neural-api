@@ -1427,4 +1427,149 @@ Natural follow-ups (non-bug):
       with TanhShrink/HardTanh/MaxOut in the menu; whoever picks up the
       bake-off should include the three new activations.
 
+### Lucky-day batch — 2026-05-15 (seed 38154, second pass)
+
+A grab-bag of things I'd personally enjoy building. Each is scoped to
+land in one sitting and pairs with a numerical-gradient test or an
+end-to-end smoke check.
+
+#### Bug-fix follow-through I'd take first
+- [ ] **Fix TNNetDeMaxPool gradient (see bug entry above).** Concrete
+      plan: delete the `FOutputError.Divi(floatPoolSize)` line at
+      `neuralnetwork.pas:11552` (the sum-of-block backward matches the
+      pure-replication forward without any scaling). Re-add
+      `TestDeMaxPoolGradientCheck` from the reverted audit, plus a
+      shape/replication forward test, plus `TestDeAvgPoolGradientCheck`
+      (TNNetDeAvgPool inherits the same buggy backward today). Audit
+      every in-tree call site of TNNetDeMaxPool / TNNetDeAvgPool before
+      shipping — the only known one is around `neuralnetwork.pas:10561`
+      in an example. If TNNetDeAvgPool semantics should AVERAGE rather
+      than REPLICATE, change the forward instead of the backward.
+
+#### Small activations I'd enjoy adding
+- [ ] TNNetSoftPlus — `y = ln(1 + exp(x))`, the smooth ReLU. Stable
+      implementation: for `x > 20` return `x`, for `x < -20` return
+      `exp(x)`. Numerical-gradient test on a range that exercises both
+      stable branches. Companion to TanhShrink/HardTanh — descend from
+      TNNetReLUBase, plug into both CreateLayer dispatches.
+- [ ] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
+      alpha (default 1.0). Backward reuses the cached output via
+      `dy/dx = 1 if x>0 else y + alpha`. Numerical-gradient test plus
+      a constructor round-trip via SaveToString/LoadFromString.
+- [ ] TNNetCELU — continuously differentiable ELU variant, `y = max(0,x)
+      + min(0, alpha*(exp(x/alpha)-1))`. Same harness as TNNetELU; the
+      difference is one extra division. Cheap, complete the family.
+- [ ] TNNetReLU6 — `y = clamp(x, 0, 6)`, the MobileNet activation. Tiny;
+      forward is one min/max, backward is a 0/1 mask. Numerical-gradient
+      test plus a saturation-at-extreme-inputs check (mirror the
+      TNNetSoftCapping pattern).
+- [ ] TNNetSquaredReLU — `y = max(0,x)^2`, the Primer-paper activation.
+      Backward `dy/dx = 2*max(0,x)`. Worth landing because the squaring
+      changes gradient magnitude in a way numerical-gradient tests
+      should catch if a future refactor breaks it.
+- [ ] TNNetSiLU — alias / synonym for Swish with beta=1, registered so
+      LoadFromString accepts the canonical name. One-liner; documents
+      the equivalence in code rather than only in comments.
+
+#### Pooling / shape layers I'd enjoy adding
+- [ ] TNNetGlobalMaxPool — companion to the existing GlobalAvgPool. One
+      output cell per channel = max over the (X,Y) plane. Argmax cached
+      for backward (gradient passes through the single argmax cell).
+      Numerical-gradient test on a small random input.
+- [ ] TNNetPixelShuffle / sub-pixel convolution — output spatial size
+      = input * r, output channels = input / (r*r). The standard
+      super-resolution upsample. Forward is a deterministic index
+      permutation; backward is its inverse. Shape test + numerical-
+      gradient test. Useful for the SuperResolution example.
+- [ ] TNNetSpaceToDepth + TNNetDepthToSpace — inverse pair, both
+      deterministic permutations. Numerical-gradient tests are trivial
+      because the forward is linear, but landing them gives us the
+      Vision Transformer "patchify" step as a one-line layer.
+- [ ] TNNetLpPool — generalized pooling `(mean(|x|^p))^(1/p)` with
+      configurable p (p=1 is L1, p=2 is L2, p→∞ approximates max).
+      Backward via the chain rule on `|x|^p`. Numerical-gradient test
+      at p=2 (the most useful setting in practice).
+
+#### Test coverage I'd enjoy filling in
+- [ ] Continue the Backpropagate audit on the still-uncovered families
+      called out above: upsampling/deconvolution (TNNetDeconvolution,
+      TNNetDeMaxPool, TNNetDeAvgPool, TNNetUpsample — partial coverage)
+      and recurrent-style layers. Add one family per sitting. Companion
+      to the DeMaxPool bug fix above.
+- [ ] TNNetUpsampleNearest backward consistency: assert that summing
+      the per-block output errors equals the input error (mirrors the
+      pure-replication invariant the DeMaxPool fix should restore).
+- [ ] Numerical-gradient cross-check helper: a single function in
+      TestNeuralNumerical.pas that takes a layer factory + an input
+      shape and runs both the input-gradient and (where applicable)
+      weight-gradient central-difference checks. Removes ~10 lines of
+      boilerplate from every new activation/normalization test.
+- [ ] Deterministic-seed smoke test: build a small net (Conv → ReLU →
+      Pool → Dense), train for 50 steps on a fixed-seed random dataset,
+      assert the final loss matches a recorded value to 1e-4. Catches
+      cross-platform numerical drift that the unit tests miss.
+
+#### Training utilities I'd enjoy adding
+- [ ] Cosine-annealing LR schedule helper (callable each epoch, takes
+      `epoch`, `total_epochs`, `lr_max`, `lr_min`, returns the current
+      LR). Tiny pure-math function; pairs naturally with an example
+      that demonstrates the schedule on a CIFAR run.
+- [ ] Linear warmup + cosine decay schedule — the standard transformer
+      LR curve. Same shape as above; one extra parameter (warmup
+      steps). Document in the README alongside the existing LR helpers.
+- [ ] Label-smoothing helper: takes a one-hot target volume and a
+      smoothing factor `eps`, returns the smoothed target volume that
+      can be fed into the existing softmax-cross-entropy fit path.
+      Standard regularization missing from the toolbox.
+- [ ] Mixup data augmentation helper: takes two (input, target) pairs
+      and a lambda from a Beta distribution, returns the convex
+      combination. One short function; demonstrates with a CIFAR run.
+
+#### Examples I'd enjoy writing
+- [ ] "Smallest possible MaxOut net": one-layer MaxOut(K=2) on a 2D
+      toy classification problem with two interleaved spirals.
+      Visualises the piecewise-linear decision boundary as PGM. Tiny
+      teaching artifact for the new layer.
+- [ ] "Activation menagerie demo" mini-example: same fixed seed, same
+      tiny CIFAR-stub net, swap the activation each run, print
+      (final loss, wall-clock) into one table. Cheap qualitative
+      bake-off — narrower than the full bake-off task, can land
+      separately.
+- [ ] "Sub-pixel super-res toy": once TNNetPixelShuffle lands, wire
+      it into a 3-layer net that learns to 2x-upsample 8x8 random
+      checkerboards to 16x16. Smallest possible end-to-end use of
+      the new layer.
+
+#### Tooling / dev experience
+- [ ] `scripts/grep_layer.sh <TNNet...>` — print the declaration,
+      Compute, Backpropagate, and every test that mentions the class.
+      Listed multiple times across the lucky-day batches; I'd take
+      it on the first DeMaxPool audit so it pays for itself
+      immediately.
+- [ ] `scripts/list_activations.sh` — emit the list of TNNetReLUBase
+      descendants and which ones have a corresponding `Test*Gradient`
+      check in TestNeuralNumerical.pas. Two-line grep + comm.
+- [ ] `scripts/new_activation.sh <Name>` scaffolder — drop in a
+      forward/backward skeleton (override Compute + Backpropagate
+      with `Self.FOutput.CopyFrom(pPrevLayer.Output);`), a
+      LoadFromString/CreateLayer registration line, and a
+      numerical-gradient test stub. Encodes the
+      "add a new activation" checklist.
+
+#### Documentation
+- [ ] "Activation layers in this repo" reference page: one table,
+      one row per activation, columns = formula, derivative, range,
+      typical use, file:line of the Compute method. Naturally
+      grows as the small-activations batch above lands.
+- [ ] "How to add a new layer" walkthrough — anchor it to one of
+      the recent landings (TNNetTanhShrink is the smallest worked
+      example). Companion to the scaffolder script above.
+- [ ] "Gradient-check failure triage protocol" note: when a new
+      numerical-gradient test fails, the bug is almost always in
+      the layer under test, not the test harness. Document the
+      DeMaxPool case as the canonical worked example of "audit
+      first, revert the failing test, file the bug, fix
+      separately." This is the audit-bug protocol the recent
+      commits keep referencing — worth writing down.
+
 
