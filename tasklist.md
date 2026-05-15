@@ -5730,3 +5730,378 @@ a single SetPrevLayer + a one-line Compute + a short Backpropagate.
 The shared `LayerInputAndWeightGradientCheck` test helper pinned
 multiple times earlier in this file would now save four tests' worth
 of duplication per landing — calling that out one more time.
+
+### Lucky-day batch — 2026-05-15 (seed 97846)
+
+Coming in fresh after the Bias / ReZero / TokenShift trio. The batches
+above keep re-pinning TNNetMul, TNNetGatedResidual, TNNetDyT, and the
+shared `LayerInputAndWeightGradientCheck` helper — I'd genuinely enjoy
+closing those threads. Below: a fresh wave of ideas I'd like to take
+on, scoped for a single commit each, and double-checked against the
+existing source tree so none duplicate a layer that already ships.
+
+Verified absent in `neural/neuralnetwork.pas` at the time of writing:
+TNNetMul (the multiplicative twin of TNNetBias), TNNetGatedResidual,
+TNNetCausalConv1D, TNNetDyT, TNNetMixtureOfExperts, TNNetPixelShuffle,
+TNNetSpaceToDepth / TNNetDepthToSpace, TNNetSwitchableNorm, TNNetGRN,
+TNNetReversibleBlock, TNNetStochasticPool, TNNetTalkingHeads,
+TNNetSinkAttention, TNNetCosineSimilarityAttention,
+TNNetMultiHeadSelfAttention, TNNetCrossAttention,
+TNNetRMSNormGated, TNNetBitLinear, TNNetPolynomialActivation,
+TNNetHuberLoss / TNNetSmoothL1Loss / TNNetFocalLoss /
+TNNetLabelSmoothingLoss. (TNNetCosineSimilarity *does* exist as a
+similarity-score layer; the attention variant is distinct.)
+
+#### Quick wins I'd take first
+
+- [ ] TNNetMul — multiplicative per-channel learnable scale, the twin of
+      the just-landed TNNetBias. Forward `y[x,y,c] = w[c] * x[x,y,c]`;
+      backward `dL/dW[c] = sum_pix(dy[x,y,c] * x_prev[x,y,c])` and
+      `dL/dx_prev[x,y,c] = w[c] * dy[x,y,c]`. Mirror TNNetBias' four
+      tests (forward, input grad, weight grad, LoadFromString round-trip)
+      and wire both CreateLayer dispatches. Smallest non-trivial
+      learnable-weight layer left on the list; together with TNNetBias
+      it spells out the affine decomposition that TNNetLayerScale
+      fuses.
+
+- [ ] TNNetAffineBlock builder helper — once TNNetMul ships, expose
+      `TNNet.AddAffine(Depth)` that wires `TNNetMul -> TNNetBias` so
+      callers don't have to spell out the pair. One-line builder
+      mirroring the existing `AddGroupedFullConnect` style; a single
+      end-to-end "AddAffine matches Mul+Bias" test pins the
+      composition.
+
+- [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)`
+      helper in `tests/TestNeuralNumerical.pas`. The TNNetBias /
+      TNNetReZero / TNNetTokenShift landings each duplicated a ~50-line
+      block; calling this out one more time and committing to actually
+      ship the helper before the next learnable-weight layer lands.
+      Three-line tests instead of copy-pasted scaffolding. Should
+      handle both the input and weight central-difference checks, with
+      a `Tolerance` parameter (default 1e-2) so the DeMaxPool-style
+      Double-precision SSE accumulator can be opted into per-test.
+
+#### Layers I'd enjoy building (no MHA dependency)
+
+- [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
+      `y = x + alpha[c] * Sublayer(x)` (the ReZero-with-channel-dim
+      variant). The just-landed TNNetReZero is the scalar template;
+      grow alpha from a scalar to a Depth-sized vector. Pins line
+      717–720 of this file once it lands. Same four tests as TNNetBias
+      / TNNetReZero.
+
+- [ ] TNNetDyT (Dynamic Tanh) — `y = gamma[c] * tanh(alpha * x) + beta[c]`,
+      the Liu-et-al-2025 LayerNorm replacement. Per-layer learnable
+      scalar `alpha` plus per-channel `gamma` and `beta`. Backward is
+      one closed-form `(1 - tanh^2)` chain. Template-wise it's a
+      LayerNorm body with the norm bookkeeping deleted and a tanh in
+      the middle. Numerical-gradient test on a tiny input.
+
+- [ ] TNNetCausalConv1D — 1D convolution with left-only padding so the
+      output at position t depends only on positions ≤ t. Wraps the
+      existing TNNetConvolution with a TNNetPadXY in front and a crop
+      on the back, OR (cleaner) a small dedicated layer that skips the
+      future-side multiplications entirely. Backward is the same
+      convolution backward minus the masked-future part. Pairs with
+      TNNetTokenShift and unblocks the attention-free baseline
+      experiments listed several batches above.
+
+- [ ] TNNetReversibleBlock (RevNet additive coupling): given an even
+      split of the input depth into `x1 | x2`, forward computes
+      `y1 = x1 + F(x2); y2 = x2 + G(y1)` and concatenates. Backward is
+      derived from the forward by inverse algebra (`x2 = y2 − G(y1);
+      x1 = y1 − F(x2)`), so a forward-then-inverse round-trip test is
+      a stronger correctness signal than any numerical-gradient check.
+      F and G are user-supplied sub-nets — accept them as constructed
+      TNNet instances in the constructor.
+
+- [ ] TNNetGRN (Global Response Normalization from ConvNeXt-V2):
+      `y[c] = gamma[c] * (x[c] * ||x[c]||_2 / mean_c(||x[c]||_2)) + beta[c] + x[c]`.
+      Per-channel L2 norm computed across (SizeX,SizeY), then divided
+      by the across-channel mean and rescaled. Cheap, transformer-
+      and conv-friendly, two learnable params per channel. Numerical-
+      gradient test plus a "constant-input → identity-ish" sanity check.
+
+- [ ] TNNetSwitchableNorm — single layer that learns a 2-way softmax
+      `w` over `LayerNorm` and `RMSNorm` outputs:
+      `y = w[0] * LayerNorm(x) + w[1] * RMSNorm(x)`. Two learnable
+      scalars summed via softmax (so initial gradient is well-defined).
+      Tiny, fun, and a concrete "let the network pick its normalizer"
+      experiment without dragging in any new norm math.
+
+- [ ] TNNetStochasticPool — sample one cell per pooling window weighted
+      by its activation (softmax of activations over the window) at
+      training, take the expectation (`sum(p_i * x_i)`) at inference.
+      Backward: gradient flows to the sampled cell only (training) or
+      to all cells weighted by `p_i` (inference). Seeded RNG in the
+      test (mirrors DropPath's pattern).
+
+- [ ] TNNetPixelShuffle (sub-pixel convolution) — output spatial size
+      = input * r, output channels = input / (r*r). Deterministic
+      index permutation; backward is its inverse. Numerical-gradient
+      test is trivial because the operation is linear; pairs naturally
+      with the SuperResolution example for an end-to-end demo
+      (also pinned earlier).
+
+- [ ] TNNetSpaceToDepth + TNNetDepthToSpace — inverse permutation pair.
+      Same shape as PixelShuffle's forward/backward but configured for
+      the ViT patchify step (`SpaceToDepth(P) on a (P*Hp, P*Wp, C)
+      input → (Hp, Wp, P*P*C)`). Two new test cases, one per direction;
+      a third asserts `DepthToSpace(SpaceToDepth(x)) == x` (analytic
+      identity).
+
+- [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — forward
+      uses `sign(W) * mean(|W|)`; backward keeps the full-precision
+      shadow weights via the straight-through estimator (gradient
+      flows straight through the sign step). Self-contained quantization-
+      aware-training experiment, no new infra. Numerical-gradient
+      test on the STE path will need a tolerance loosened to ~1e-1
+      (standard for STE checks); document the choice in the test.
+
+- [ ] TNNetCosineSimilarityAttention — variant of TNNetScaledDotProductAttention
+      that replaces `Q·Kᵀ / √d` with `(Q/||Q||)·(K/||K||)ᵀ * scale`,
+      where `scale` is either fixed (default 1.0) or learnable. The
+      bounded-by-1 logits remove the need for TNNetSoftCapping in the
+      attention head. Reuses the existing SDPA softmax-Jacobian
+      backward; the only new derivative is the L2-normalisation chain.
+      Numerical-gradient test on the same SeqLen=3, d=4 shape as SDPA.
+
+- [ ] TNNetPolynomialActivation — per-channel learnable
+      `a[c]*x^2 + b[c]*x + c[c]`. Three learnable params per channel,
+      smooth analytic gradient. The "what if the activation were
+      learned" experiment that pairs cleanly with the activation
+      bake-off. Numerical-gradient test plus a "degrades to identity
+      at init" sanity check (b=1, a=c=0).
+
+#### Loss-function layer family — pinned at the very top of the file
+under "Huber/SmoothL1/Focal/LabelSmoothing losses" but no entries
+exist yet in `neuralnetwork.pas`. Sized for one commit each.
+
+- [ ] TNNetHuberLoss — smooth-L1 / L2 piecewise loss, `delta`
+      configurable (default 1.0). Outputs the scalar loss, backward
+      writes `(y - target)` clipped to `[-delta, +delta]`. Used as
+      the output layer for the TimeSeriesForecast example pinned
+      earlier in the file. Numerical-gradient test on the input
+      gradient at three regions: well below delta, near delta,
+      well above.
+
+- [ ] TNNetSmoothL1Loss — the `delta=1` special case of Huber, kept as
+      a separate class for callsite readability (mirrors how
+      TNNetReLU6 is a kept-separate special case of TNNetReLUL).
+
+- [ ] TNNetFocalLoss — for class-imbalanced classification:
+      `FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)`, with `alpha`
+      and `gamma` configurable. Wraps the existing softmax-cross-entropy
+      path; gradient is the cross-entropy gradient pre-multiplied by
+      the modulating factor. Numerical-gradient test with `gamma=2`.
+
+- [ ] TNNetLabelSmoothingLoss / helper — convert a one-hot target
+      volume into `(1 - eps) * one_hot + eps / NumClasses`. Pure target-
+      side transformation; no gradient code needed. Pairs with a tiny
+      CIFAR-stub training run that prints the convergence delta.
+
+#### Attention / sequence-model layers I'd enjoy
+
+- [ ] TNNetSinkAttention — prepend K learnable "attention sink" key/value
+      slots that every query can attend to regardless of the causal
+      mask. Implementation-wise: extend the K|V depth axis by K, mask
+      everything but those K slots in the upper triangle. Helps long-
+      context stability and is a ~30-line addition on top of SDPA.
+
+- [ ] TNNetTalkingHeads — pre/post-softmax linear mix across heads
+      (Shazeer et al.). A tiny learnable HxH multiply applied to
+      attention logits along the head axis. Drops into the eventual
+      MHA helper; standalone test on H=4, SeqLen=3.
+
+- [ ] TNNetMultiHeadSelfAttention (taking the MHA-a/b/c thread closed
+      a few batches ago and committing to ship it). Compose
+      TNNetSplitChannels(H) → per-head TNNetScaledDotProductAttention
+      → TNNetDeepConcat → TNNetFullConnectLinear(d_model) inside a
+      single `TNNet.AddMultiHeadSelfAttention(d_model, heads)` builder.
+      Numerical-gradient test on H=2, d_k=4, SeqLen=3 — every internal
+      piece is already individually gradient-checked, so the new test
+      pins the composition.
+
+- [ ] TNNetCrossAttention — same SDPA core but with separate Q vs K|V
+      input branches so encoder-decoder is reachable. Likely shape:
+      take two prior layers explicitly via a constructor list, project
+      Q from one and K|V from the other, then run SDPA on the
+      concatenated depth slab. Forward + numerical-gradient on a tiny
+      shape.
+
+#### Composite / builder helpers I'd ship next
+
+- [ ] TNNetPreNormResidual builder — listed many times now, treating
+      that as universe pressure. `TNNet.AddPreNormResidual(Sublayer)`
+      wires `Out = x + Sublayer(LayerNorm(x))` in one line. Concrete
+      proposal: take the sublayer as a TNNet builder closure (Pascal
+      flavor: a procedure-of-object that adds layers to a passed-in
+      net). Tested via a "wrap an Identity sublayer ⇒ y == x" smoke
+      test plus a numerical-gradient check on `Sublayer := TNNetMul`.
+
+- [ ] TNNetGLUFeedForward block — `LayerNorm → Dense → GLU → Dense`,
+      no attention dependency. Ship today using the existing TNNetGLU
+      that already landed; once SwiGLU FFN ships it becomes a one-line
+      variant. Concrete short example test on (d_model=8, d_ff=16).
+
+- [ ] TNNetSwiGLUFeedForward block — same shape as above but with
+      TNNetSwiGLU. Companion to the GLU variant; pinned multiple
+      times. Once both ship, swap one for the other in a future
+      transformer encoder block builder.
+
+#### Examples I'd love to actually write
+
+- [ ] `examples/BiasOnlyTuning/` — pinned earlier in the file under
+      the seed-758266 batch. Freeze every learnable layer except a
+      few inserted TNNetBias layers and fine-tune only those. ~80
+      lines on top of an existing pre-trained CIFAR-10 model.
+      Demonstrates the modern "bias-only adapter" fine-tuning pattern
+      end-to-end and exercises TNNetBias on a realistic task. Verified
+      no `examples/BiasOnlyTuning` directory exists yet.
+
+- [ ] `examples/AffineFineTune/` — once TNNetMul + TNNetAffineBlock
+      land above, the same pattern but freezing everything except
+      the inserted Affine blocks. A teaching contrast to BiasOnlyTuning:
+      "does the multiplicative half pay for the extra parameters?"
+      Single chart artifact in the example's README.
+
+- [ ] `examples/TokenShiftBaseline/` — train a tiny next-token char
+      model with `TNNetEmbedding → TNNetTokenShift → MLP` and compare
+      against the eventual MHA-based version on the same data. The
+      "how much of attention is really just mixing-along-time?"
+      experiment pinned earlier; now fully unblocked thanks to the
+      TokenShift landing. ~120 lines.
+
+- [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP
+      with and without TNNetReZero on each residual branch on a
+      regression toy (the hypotenuse function is the natural fit).
+      Print loss curves for both side by side. Concrete visualisation
+      of why ReZero stabilises deep stacks at zero compute cost.
+      Pure CPU, finishes in seconds. (`examples/Hypotenuse` already
+      exists as a starting template; this would not duplicate it.)
+
+- [ ] `examples/SubPixelSuperRes/` — once TNNetPixelShuffle lands,
+      drop it into a 3-layer net that learns to 2x-upsample 8x8
+      random checkerboards to 16x16. Smallest possible end-to-end
+      use of the new layer; complements (does not replace) the
+      existing `examples/SuperResolution/`.
+
+#### Experiments I'd enjoy running
+
+- [ ] TNNetBias-vs-TNNetMul ablation: train a small classifier four
+      ways — (a) no affine, (b) bias only, (c) mul only, (d) both
+      (the eventual AffineBlock) — print final accuracy and number
+      of learnable params per variant. Concrete data point on whether
+      the multiplicative half is worth its parameter count at toy
+      scale.
+
+- [ ] DyT-vs-LayerNorm bake-off (depends on TNNetDyT above). Re-pinned
+      from earlier batches; once DyT lands this is a 30-line swap in
+      the existing normalization bake-off harness.
+
+- [ ] Causal-conv vs token-shift vs SDPA on the same toy next-token
+      task. Once TNNetCausalConv1D ships, this becomes a three-bar
+      chart that frames the "what's the simplest mixer that solves
+      this?" question. Pure CPU.
+
+- [ ] GRN-as-drop-in: take the existing CIFAR SimpleImage example,
+      swap each `TNNetMovingStdNormalization` for a `TNNetGRN` and
+      chart accuracy. ConvNeXt-V2's headline claim, reproduced at
+      toy scale.
+
+- [ ] Loss-family bake-off: same regression task (hypotenuse extended
+      to noisy targets), four output layers — MSE / TNNetHuberLoss
+      / TNNetSmoothL1Loss / robust median (existing utility) — print
+      final test loss under increasing outlier ratios. Direct
+      motivation for the Huber/SmoothL1 landings.
+
+#### Correctness / audit work I'd take next
+
+- [ ] TNNetDeconvolution numerical-gradient test (input + weight
+      paths). Last remaining member of the upsample/deconv family
+      and the most interesting because of the weight-gradient path.
+      Likely needs the Double-precision SSE accumulator helper from
+      the DeMaxPool fix (called out multiple times above).
+
+- [ ] TNNetEmbedding weight-gradient test. The sparse-update pattern
+      (only the embedded indices receive gradient) is the easiest
+      place for a silent broadcast/reduction bug to hide. Add a
+      central-difference check on a tiny vocab=4, dim=3 embedding.
+
+- [ ] Argmax-tie behaviour test for TNNetGlobalMaxPool (already pinned
+      at line ~5530). Cheap, and the documented tie-break ("first
+      wins") deserves a pinning test before a future parallel-pool
+      refactor silently changes it.
+
+- [ ] LoadFromString round-trip for the entire activation menagerie.
+      One parameterised test that walks every TNNetReLUBase descendant,
+      builds a default instance, serialises and reloads, asserts
+      Compute matches. Would catch dispatch-table gaps for any
+      activation added in a hurry.
+
+- [ ] Property-based gradient harness v0 — randomise only input shape
+      across a frozen list of the six most recently landed layers
+      (TNNetMul, TNNetGatedResidual, TNNetTokenShift, TNNetReZero,
+      TNNetBias, TNNetChannelShuffle) and run the existing gradient
+      check on each. Catches shape-edge bugs the hand-written tests
+      miss; pinned multiple times already.
+
+#### Tooling / dev experience
+
+- [ ] `scripts/grep_layer.sh <TNNet...>` — pinned in at least five
+      batches now. Print the class declaration with context, the
+      Compute and Backpropagate method bodies, and every
+      `tests/Test*` method mentioning the class. ~40 lines of bash;
+      saves the first 30 seconds of every audit.
+
+- [ ] `scripts/list_activations.sh` — enumerate every TNNetReLUBase
+      descendant and cross-reference against `Test*Gradient` methods.
+      Two-line grep + comm. Output is the actionable TODO list for
+      the next activation-test batch.
+
+- [ ] `scripts/new_layer.sh <Name>` scaffolder — pinned multiple times.
+      Drops a Compute/Backpropagate skeleton into the right spot in
+      neuralnetwork.pas plus a numerical-gradient test stub.
+
+- [ ] `tests/SmokeTest.lpr` — five fastest gradient checks, exits in
+      under a second. Pinned earlier; revisiting because the CI shim
+      idea now feels close enough to land that a sub-second smoke
+      target would justify pinning the GitHub Actions workflow YAML.
+
+- [ ] `neural-bench` tiny CLI: time forward + backward for a chosen
+      layer at a chosen shape, print ns/op. Subsumes the long-pinned
+      volume-unit micro-benchmark idea and extends it to whole
+      layers. CSV output so future regressions are visible.
+
+#### Documentation I'd enjoy writing
+
+- [ ] One-pager "loss layers in this repo" — once Huber/SmoothL1/Focal/
+      LabelSmoothing land, table them alongside the existing softmax-
+      cross-entropy and L2-regression paths. Becomes the index entry
+      every new contributor needs to pick the right output layer.
+
+- [ ] "What landed in the lucky-day batches" CHANGELOG entry — pinned
+      multiple times. Five-plus lucky-day batches now without a
+      compact public-facing summary. One bullet per landed layer with
+      date + commit short SHA closes this thread for good.
+
+- [ ] "Building a residual transformer block in this repo" walkthrough
+      — once MHA and the FFN blocks above land, the encoder-block
+      builder is one short page. Companion to the eventual Tiny GPT
+      example.
+
+- [ ] Inline shape annotations on TNNetScaledDotProductAttention's
+      Compute and Backpropagate (pinned several batches above). Most
+      algorithmically dense layer in the repo; deserves the comments
+      pass even before the formal walkthrough doc.
+
+#### Meta — what I'd most enjoy taking first
+
+If forced to pick one task for this lucky-day session, it would be
+TNNetMul + the `LayerInputAndWeightGradientCheck` helper, taken
+together: TNNetMul is the smallest non-trivial learnable-weight layer
+left, and shipping the helper alongside it pays dividends on every
+subsequent learnable-weight landing (TNNetGatedResidual, TNNetDyT,
+TNNetCausalConv1D, TNNetPolynomialActivation, the loss-layer family).
+That single pair of changes unblocks roughly half of the layer ideas
+in this batch.
