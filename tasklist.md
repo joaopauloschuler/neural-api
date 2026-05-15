@@ -4,7 +4,7 @@
 - [ ] TNNetMultiHeadSelfAttention + full transformer encoder/decoder blocks
 - [x] TNNetLayerNorm — proper layer normalization
 - [ ] TNNetRotaryEmbedding (RoPE)
-- [ ] TNNetGEGLU / TNNetSwiGLU gated activations
+- [x] TNNetGEGLU / TNNetSwiGLU gated activations
 - [x] TNNetGroupNorm
 - [ ] TNNetDropPath (stochastic depth)
 - [ ] Sparse / mixture-of-experts routing layer
@@ -83,3 +83,67 @@
 - [ ] TNNetRMSNorm has now landed (neural/neuralnetwork.pas +
       TestNeuralNumerical.pas) and is, alongside TNNetLayerNorm, a ready
       template for any further normalization-layer variants.
+
+### Added ideas (Claude, 2026-05-14, lucky day — random number 71754)
+
+#### Layers I'd enjoy building
+- [ ] TNNetScaledDotProductAttention — the single-head core (Q·Kᵀ / √d → softmax
+      → ·V) as a standalone, fully gradient-checked layer. Building block for the
+      multi-head attention already on the list, but small enough to land and test
+      on its own first.
+- [ ] TNNetDropPath (stochastic depth) — already listed above; I'd like to take
+      it. Identity at inference, whole-sample drop at training. Pairs well with
+      a numerical-gradient test that fixes the RNG seed.
+- [x] TNNetGEGLU / TNNetSwiGLU gated activations — split input in half, gate one
+      half with GELU/Swish of the other. Cheap, transformer-relevant, easy to
+      gradient-check. Landed: both layers split along the depth axis (output
+      depth = input depth / 2), no learnable weights, with forward +
+      numerical-gradient tests in TestNeuralNumerical.pas.
+- [x] TNNetLearnableScale / TNNetLayerScale — per-channel learnable multiplier
+      (the "γ" trick from CaiT/ConvNeXt) that stabilizes deep residual nets.
+      Landed as TNNetLayerScale (with TNNetLearnableScale type alias);
+      constructor-configurable initial scale, gradient-checked for both input
+      and learnable-weight gradients.
+- [x] TNNetSoftPlus and TNNetGaussianActivation — round out the activation
+      family; both have clean closed-form derivatives for the test. Landed
+      with forward + numerical-gradient tests; TNNetSoftPlus uses a
+      numerically stable formulation for large x.
+
+#### Correctness / audit work I find rewarding
+- [ ] Implement the exact softmax Jacobian for TNNetPointwiseSoftMax.Backpropagate
+      (replacing the diagonal-only x*(1-x) approximation) and add a numerical-
+      gradient test proving it. This is the unfinished thread from the second
+      pass above — I'd like to actually close it.
+- [ ] Continue the Backpropagate audit into the upsampling/deconvolution family
+      (TNNetUpsample, TNNetDeconvolution, TNNetDeMaxPool) — one numerical-
+      gradient test per layer, looking for bugs the way the activation audit did.
+- [ ] Add a shared numerical-gradient helper in TestNeuralNumerical.pas so each
+      new layer test is ~3 lines instead of a copy-pasted block. Reduces the
+      friction of every future test task.
+
+#### Experiments I'm curious about
+- [ ] Activation-function bake-off: train the same small MLP on a fixed toy
+      dataset with ReLU / GELU / Swish / Mish / SELU and print a comparison
+      table of final loss and epochs-to-converge. Pure-CPU, runs in seconds.
+- [ ] Normalization bake-off: same idea, comparing no-norm / LayerNorm /
+      RMSNorm / GroupNorm on a small net, showing convergence-speed differences.
+      Uses the layers that just landed.
+- [ ] Weight-initialization sensitivity demo: show how a deep-ish net's
+      first-epoch gradient magnitudes change across the available init schemes.
+- [ ] Tiny "learns to add two binary numbers" sequence example — a fun, fast,
+      self-contained demo of the library on a task with an obvious right answer.
+
+#### Documentation
+- [ ] Write a short "how numerical gradient testing works in this repo" note so
+      contributors can add layer tests confidently — it's the project's main
+      correctness safety net but isn't explained anywhere.
+
+### Added ideas (Claude, 2026-05-14, third pass — follow-ups from the lucky-day batch)
+- [ ] Document the newly-landed layers in README.md: TNNetLayerScale /
+      TNNetLearnableScale, TNNetSoftPlus, TNNetGaussianActivation, TNNetGEGLU
+      and TNNetSwiGLU. Each needs a one-line description plus a short usage
+      snippet, matching the existing layer-reference style.
+- [ ] TNNetSwiGLU/TNNetGEGLU are the gating half of a transformer FFN — a
+      natural next step is a TNNetSwiGLUFeedForward example or block that
+      pairs them with the dense projections, ready for the transformer-encoder
+      task at the top of the list.
