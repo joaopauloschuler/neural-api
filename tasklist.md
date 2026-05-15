@@ -6546,4 +6546,214 @@ Full test suite (503/503) green after each commit.
       epochs-to-converge. Concrete payoff for the Mishlike
       landing.
 
+### Lucky-day batch — 2026-05-15 (seed 110681)
+
+Fresh batch picked after auditing the file and the source for prior
+mentions. Verified absent from both `neural/neuralnetwork.pas` and
+the existing tasklist.md at the time of writing: TNNetArcSinh /
+TNNetAsinh, TNNetSparsemax, TNNetSoftMaxOne (softmax with a +1 in
+the denominator — "attention sink" alternative), TNNetLeCunTanh
+(`1.7159 * tanh(2/3 * x)`), TNNetCharbonnierLoss, TNNetTanhGLU
+(the missing tanh sibling of GLU/ReGLU/GEGLU/SwiGLU — GLU exists
+with sigmoid, ReGLU exists with ReLU, GEGLU exists with GELU,
+SwiGLU exists with Swish, but no tanh-gated variant ships),
+TNNetLogCoshActivation (activation form — the LogCosh *loss* is
+already pinned several batches up, the activation form is not).
+
+#### Activations I'd enjoy building
+
+- [ ] TNNetArcSinh — `y = arcsinh(x) = ln(x + sqrt(x^2 + 1))`,
+      derivative `1 / sqrt(x^2 + 1)`. Monotonic, smooth, unbounded,
+      but grows like `ln|x|` for large |x| — a tanh sibling that
+      never saturates and a sinh sibling that never explodes.
+      Element-wise activation under TNNetReLUBase; cache the
+      derivative into FOutputErrorDeriv mirroring the existing
+      sinh/cos/sin pattern. Numerical-gradient test only (no
+      weights). Pairs naturally with the hyperbolic-family bake-off
+      pinned in the seed-732439 batch above.
+
+- [ ] TNNetLeCunTanh — `y = 1.7159 * tanh(2/3 * x)`, the
+      classical scaled-tanh activation from LeCun et al.'s
+      "Efficient Backprop" tuned so f(±1)=±1 and f'(0)≈1.14.
+      Cheap follow-on to TNNetHyperbolicTangent that just plugs
+      the scale constants into Compute/Backpropagate. Forward +
+      numerical-gradient test plus a value-at-1 pin
+      (asserts f(1) ≈ 1.0 within 1e-3).
+
+- [ ] TNNetLogCoshActivation — `y = log(cosh(x))`, derivative
+      `tanh(x)`. Smooth, symmetric, ≈ x²/2 near 0 and ≈ |x| for
+      large |x| — a smooth-L1 *activation* (the loss variant is
+      already pinned). Element-wise under TNNetReLUBase; needs a
+      numerically stable formulation for large |x| (use
+      `|x| + log1p(exp(-2|x|)) - log(2)` mirroring the
+      stable-softplus trick in TNNetSoftPlus / TNNetMish / TNNetSerf).
+      One forward + numerical-gradient test plus a stability test
+      at x = ±30.
+
+- [ ] TNNetTanhGLU — the missing tanh sibling of the existing
+      GLU/ReGLU/GEGLU/SwiGLU family. Splits input along the depth
+      axis into A | B, outputs `A * tanh(B)`, output depth =
+      input depth / 2. Parameter-free; numerical-gradient test
+      mirroring the existing TNNetGLU one with a one-line swap
+      of the gating function.
+
+#### Probability projections I'd enjoy building
+
+- [ ] TNNetSparsemax — Martins & Astudillo's exact-sparse
+      alternative to softmax: `y = max(x - tau, 0)` where `tau`
+      is chosen per-sample so the output sums to 1. Yields true
+      zeros (not just small numbers) and is the natural softmax
+      drop-in for sparse attention. Forward uses the O(d log d)
+      sort-based algorithm from the paper (the O(d) randomized
+      version is a follow-up); backward is the closed-form
+      Jacobian `dy = ds - (sum(ds[support]) / |support|)` on the
+      support set (zero elsewhere). Numerical-gradient test on a
+      (Depth=8, 1, 1) volume with a deliberately sparse support.
+
+- [ ] TNNetSoftMaxOne — `y_i = exp(x_i) / (1 + sum_j exp(x_j))`,
+      i.e. softmax with a constant +1 in the denominator. Outputs
+      do not sum to 1 by design — the model can "attend to
+      nothing" (Miller, 2023). Cheaper alternative to
+      TNNetSinkAttention pinned above: same anti-attention-spike
+      property, no new attention-side plumbing. Forward is one
+      line off existing softmax; backward is the same Jacobian
+      computation with the modified denominator. Numerical-
+      gradient test on a Depth=4 volume and a "y.Sum() < 1" pin.
+
+#### Losses I'd enjoy building
+
+- [ ] TNNetCharbonnierLoss — `sqrt((output - target)^2 + eps^2) -
+      eps`, the "smooth-L1" loss favored in super-resolution
+      papers. Drops straight into the existing
+      `examples/SuperResolution` as a one-line swap from MSE.
+      Lands as a TNNetHuberLoss-style passthrough output layer
+      that clips/reshapes the framework-seeded `(output - target)`
+      gradient before propagating: gradient is
+      `(output - target) / sqrt((output - target)^2 + eps^2)` —
+      always bounded in [-1, 1] regardless of residual size, so
+      it's a robust regression head without Huber's piecewise
+      knee. `eps` defaults to 1e-3; stored in FFloatSt[0]. Tests:
+      passthrough forward, gradient sanity at three residual
+      scales, Save/Load round-trip.
+
+#### Examples I'd love to actually write
+
+- [ ] `examples/HyperbolicActivationBakeOff/` — train the same
+      tiny MLP on the existing hypotenuse toy with each of
+      TNNetHyperbolicTangent / TNNetSinhAct / TNNetArcSinh /
+      TNNetLisht / TNNetBentIdentity / TNNetTanhExp /
+      TNNetLogCoshActivation. Print final loss and
+      epochs-to-converge as a one-table CSV. Concrete payoff for
+      the just-landed sinh + erf activations and the new arcsinh /
+      logcosh entries above. Pure-CPU, runs in seconds. Verified
+      no `examples/HyperbolicActivationBakeOff` directory exists.
+
+- [ ] `examples/CharbonnierSR/` — minimal variant of the existing
+      `examples/SuperResolution` that swaps the MSE head for
+      TNNetCharbonnierLoss and prints the before/after PSNR on
+      the same eval split. The headline use case for the loss;
+      one new short main + a shared training helper between the
+      two examples. Verified no `examples/CharbonnierSR` directory
+      exists.
+
+- [ ] `examples/SparseAttentionDemo/` — toy
+      "predict the next character of a periodic sequence" task
+      using TNNetSparsemax in place of softmax over a tiny K|V
+      bank. Print the attention-weight histogram per step and
+      confirm the sparsity (≥ half of the weights exactly zero).
+      Visible demonstration of why "exact zeros" matter for
+      attention interpretability. Verified no
+      `examples/SparseAttentionDemo` directory exists.
+
+#### Experiments I'd enjoy running
+
+- [ ] Softmax-vs-SoftmaxOne-vs-Sparsemax bake-off on the same
+      tiny SDPA test: same Q,K,V tensors, three output
+      distributions, print the entropy and max-weight of each.
+      No training loop needed — pure forward-pass comparison.
+      Lands the moment SoftMaxOne and Sparsemax do.
+
+- [ ] LeCun-tanh-vs-tanh ablation: same tiny MLP on the existing
+      hypotenuse toy, two runs differing only in the output-of-
+      hidden activation. Reproduces the "scaled tanh trains
+      faster than plain tanh" claim from "Efficient Backprop"
+      at toy scale. ~30 lines on top of the existing example.
+
+- [ ] Charbonnier-vs-Huber-vs-MSE-vs-LogCosh head-to-head on the
+      noisy-hypotenuse harness already pinned in the loss-family
+      bake-off above. Adds Charbonnier as a fourth row; nothing
+      else changes. Closes the smooth-L1 family comparison
+      thread once and for all.
+
+#### Correctness / audit work I'd take
+
+- [ ] TNNetMaxOut numerical-gradient test (input + weight paths).
+      The class exists at line 992 of `neuralnetwork.pas`,
+      stores `FMaxPosArray` for the backward route, and lacks
+      gradient coverage in `TestNeuralNumerical.pas` (verified
+      by grep). Exactly the kind of "max-position cache" path
+      where a silent off-by-one would not surface in forward
+      tests. Tiny Depth=4, Units=2 test mirrors the
+      TNNetGlobalMaxPool tie-break test pattern.
+
+- [ ] TNNetDigital forward-equality test — round every input
+      cell to 0 or 1 against a fixed threshold; pin the
+      threshold and the output for three inputs straddling it.
+      Pure forward; no gradient (it's non-differentiable). The
+      layer ships at line 529 with no coverage I can find.
+
+- [ ] TNNetReZero "starts as identity" forward test — at
+      initialization the per-channel scale is zero, so
+      `Out = x + 0 * Sublayer(x)` should equal `x` exactly. Pin
+      the invariant before any future init-policy change can
+      silently break it. The layer ships at line 1741.
+
+#### Tooling / dev experience
+
+- [ ] `scripts/plot_activation.sh <TNNet...>` — sample the named
+      activation at 41 points in `[-5, +5]`, print the forward
+      values and numerical derivative as a tiny side-by-side
+      ASCII chart. Quick visual sanity for any newly added
+      activation; pairs with the activation-family taxonomy
+      doc below. ~60 lines of bash + a one-shot Pascal helper
+      that takes the class name on argv.
+
+- [ ] `tests/TestActivationMenagerie.pas` smoke test — one
+      parameterless test that walks every TNNetReLUBase
+      descendant (the list comes from `scripts/list_activations.sh`
+      pinned several batches above) and confirms forward returns
+      finite values on a (-5, +5)-spanning input. Sub-second;
+      lands the moment the activation list helper does.
+
+#### Documentation I'd enjoy writing
+
+- [ ] `docs/activation_taxonomy.md` — organise the ~50
+      activations now in the repo by mathematical family
+      (rectified linear / smooth-rectified / saturating /
+      hyperbolic / trig / polynomial / gated / learnable),
+      with the closed-form expression and derivative for each.
+      One page, becomes the index entry every new contributor
+      needs. The flat README list is becoming hard to navigate
+      now that the family is this large.
+
+- [ ] README one-line entries for the just-landed TNNetSinhAct
+      and TNNetSerf (commits b6dd73a, 81d8676) in the activation
+      reference, matching the existing one-line + snippet style.
+      Pinned-without-batch follow-up the moment the doc commit
+      becomes the priority.
+
+#### Meta — what I'd most enjoy taking first
+
+If I had to pick one task this lucky-day session it would be
+TNNetArcSinh + the `examples/HyperbolicActivationBakeOff/` demo,
+taken together. The activation is ~15 lines of new code that
+follows the just-landed TNNetSinhAct pattern exactly (FOutputErrorDeriv
+cache of `1/sqrt(x^2+1)`, no weights, one numerical-gradient
+test). The example then includes it as one row in a table that
+also re-uses TNNetSinhAct + TNNetSerf — a single short commit
+that lands a new activation and closes the hyperbolic-family
+bake-off pinned in the seed-732439 batch above. Two small commits,
+one visible artifact, follow-on payoff for both prior lucky-day
+landings.
+
 
