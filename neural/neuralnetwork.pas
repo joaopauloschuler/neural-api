@@ -957,6 +957,40 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Spatial dropout (2D). Drops entire feature-map channels rather than
+  // individual elements. With probability p (FFloatSt[0]) each channel
+  // (depth slice covering the full SizeX*SizeY spatial extent) is zeroed;
+  // surviving channels are scaled by 1/(1-p) (inverted dropout). At
+  // inference (FEnabled = false) the layer is the identity. The same
+  // per-channel mask is reused on the backward pass. No trainable params.
+  TNNetSpatialDropout2D = class(TNNetAddNoiseBase)
+    protected
+      FChannelMask: TNNetVolume; // length = Depth, each entry 0 or 1/(1-p)
+    public
+      constructor Create(pDropProb: TNeuralFloat = 0.1); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      property ChannelMask: TNNetVolume read FChannelMask;
+  end;
+
+  /// Spatial dropout (1D). Same per-channel masking semantics as
+  // TNNetSpatialDropout2D. Channels are along Depth and the sequence
+  // length is SizeX (SizeY is expected to be 1, but the implementation
+  // treats the full SizeX*SizeY slice per channel uniformly so it also
+  // works for any volume; the "1D" name documents the intended usage on
+  // sequence-shaped inputs (SizeX=seq_len, SizeY=1, Depth=channels)).
+  TNNetSpatialDropout1D = class(TNNetAddNoiseBase)
+    protected
+      FChannelMask: TNNetVolume; // length = Depth, each entry 0 or 1/(1-p)
+    public
+      constructor Create(pDropProb: TNeuralFloat = 0.1); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      property ChannelMask: TNNetVolume read FChannelMask;
+  end;
+
   /// This layer adds a random addition (or bias) and amplifies (multiplies)
   // randomly. Parameter 10 means changes with up to 1%. Parameter 1
   // means 0.1% and 0 means no change. This layer was create to prevent
@@ -10976,6 +11010,138 @@ begin
   BackpropagateNoTest();
 end;
 
+{ TNNetSpatialDropout2D }
+constructor TNNetSpatialDropout2D.Create(pDropProb: TNeuralFloat);
+begin
+  inherited Create();
+  if pDropProb < 0 then pDropProb := 0;
+  if pDropProb >= 1 then pDropProb := 0.99;
+  FFloatSt[0] := pDropProb;
+  FChannelMask := TNNetVolume.Create(1, 1, 1);
+  if pDropProb > 0 then FEnabled := true;
+end;
+
+destructor TNNetSpatialDropout2D.Destroy();
+begin
+  FChannelMask.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSpatialDropout2D.Compute();
+var
+  StartTime: double;
+  P, Keep, InvKeep: TNeuralFloat;
+  d: integer;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  P := FFloatSt[0];
+  // Resize the per-channel mask to match Depth.
+  if FChannelMask.Size <> FOutput.Depth then
+    FChannelMask.ReSize(1, 1, FOutput.Depth);
+  if FEnabled and (P > 0) then
+  begin
+    Keep := 1 - P;
+    if Keep <= 0 then Keep := 1e-6;
+    InvKeep := 1.0 / Keep;
+    for d := 0 to FOutput.Depth - 1 do
+    begin
+      if Random < P then
+        FChannelMask.Raw[d] := 0
+      else
+        FChannelMask.Raw[d] := InvKeep;
+    end;
+    FOutput.MulChannels(FChannelMask);
+  end
+  else
+  begin
+    // Identity at inference: fill mask with 1 so backward is a no-op.
+    for d := 0 to FOutput.Depth - 1 do
+      FChannelMask.Raw[d] := 1;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSpatialDropout2D.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FEnabled and (FOutputError.Size = FOutput.Size) and
+     (FChannelMask.Size = FOutput.Depth) then
+    FOutputError.MulChannels(FChannelMask);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
+{ TNNetSpatialDropout1D }
+constructor TNNetSpatialDropout1D.Create(pDropProb: TNeuralFloat);
+begin
+  inherited Create();
+  if pDropProb < 0 then pDropProb := 0;
+  if pDropProb >= 1 then pDropProb := 0.99;
+  FFloatSt[0] := pDropProb;
+  FChannelMask := TNNetVolume.Create(1, 1, 1);
+  if pDropProb > 0 then FEnabled := true;
+end;
+
+destructor TNNetSpatialDropout1D.Destroy();
+begin
+  FChannelMask.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSpatialDropout1D.Compute();
+var
+  StartTime: double;
+  P, Keep, InvKeep: TNeuralFloat;
+  d: integer;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  P := FFloatSt[0];
+  if FChannelMask.Size <> FOutput.Depth then
+    FChannelMask.ReSize(1, 1, FOutput.Depth);
+  if FEnabled and (P > 0) then
+  begin
+    Keep := 1 - P;
+    if Keep <= 0 then Keep := 1e-6;
+    InvKeep := 1.0 / Keep;
+    for d := 0 to FOutput.Depth - 1 do
+    begin
+      if Random < P then
+        FChannelMask.Raw[d] := 0
+      else
+        FChannelMask.Raw[d] := InvKeep;
+    end;
+    FOutput.MulChannels(FChannelMask);
+  end
+  else
+  begin
+    for d := 0 to FOutput.Depth - 1 do
+      FChannelMask.Raw[d] := 1;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSpatialDropout1D.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FEnabled and (FOutputError.Size = FOutput.Size) and
+     (FChannelMask.Size = FOutput.Depth) then
+    FOutputError.MulChannels(FChannelMask);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
 procedure TNNetAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -14260,6 +14426,8 @@ begin
       'TNNetHyperbolicTangent' :    Result := TNNetHyperbolicTangent.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
+      'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
+      'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnect' :          Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
@@ -14388,6 +14556,8 @@ begin
       if S[0] = 'TNNetHyperbolicTangent' then Result := TNNetHyperbolicTangent.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
+      if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
+      if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else

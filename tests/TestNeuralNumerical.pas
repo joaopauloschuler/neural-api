@@ -112,6 +112,14 @@ type
     procedure TestRotaryEmbeddingSerializationRoundTrip;
     procedure TestMaskedFillSerializationRoundTrip;
     procedure TestScaledDotProductAttentionSerializationRoundTrip;
+    procedure TestSpatialDropout1DInferenceIdentity;
+    procedure TestSpatialDropout1DTrainingMaskShape;
+    procedure TestSpatialDropout1DGradientCheck;
+    procedure TestSpatialDropout1DSerializationRoundTrip;
+    procedure TestSpatialDropout2DInferenceIdentity;
+    procedure TestSpatialDropout2DTrainingMaskShape;
+    procedure TestSpatialDropout2DGradientCheck;
+    procedure TestSpatialDropout2DSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -4465,6 +4473,432 @@ begin
   // d_k = 4, non-causal. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetScaledDotProductAttention.Create(4, false),
     'SDPA', 3, 1, 12, 1e-5);
+end;
+
+// ---------------------------------------------------------------------------
+// Spatial dropout tests. Both layers descend from TNNetAddNoiseBase so they
+// honor TNNet.EnableDropouts(). The defining property versus standard
+// dropout is that the per-element Bernoulli mask is replaced by one mask
+// value per channel (Depth slice). For both layers, channels are along
+// Depth; SpatialDropout1D treats SizeX as the sequence length (SizeY=1)
+// while SpatialDropout2D operates on the full SizeX*SizeY spatial extent.
+// The expectation tested here: every element within a kept-or-dropped
+// channel is consistently scaled by the same factor (0 or 1/(1-p)).
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestSpatialDropout1DInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 4, 1));
+    NN.AddLayer(TNNetSpatialDropout1D.Create(0.5));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('SpatialDropout1D inference identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout1DTrainingMaskShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, d, i: integer;
+  P, InvKeep, Ratio, Expected: TNeuralFloat;
+  KeptObserved, DroppedObserved: boolean;
+begin
+  // For each channel we expect every (x, 0, d) element to be either all
+  // zero (dropped) or all input*1/(1-p) (kept). Iterate enough trials with
+  // a fixed seed to observe both outcomes.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 6);
+  P := 0.5;
+  InvKeep := 1.0 / (1 - P);
+  KeptObserved := false;
+  DroppedObserved := false;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 6, 1));
+    NN.AddLayer(TNNetSpatialDropout1D.Create(P));
+    NN.EnableDropouts(true);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+
+    RandSeed := 9001;
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      for d := 0 to Input.Depth - 1 do
+      begin
+        // Inspect first element of channel d to determine kept vs dropped.
+        if Abs(NN.GetLastLayer.Output[0, 0, d]) < 1e-6 then
+        begin
+          DroppedObserved := true;
+          for x := 0 to Input.SizeX - 1 do
+            AssertEquals('SD1D dropped channel ' + IntToStr(d) +
+              ' x=' + IntToStr(x),
+              0.0, NN.GetLastLayer.Output[x, 0, d], 1e-5);
+        end
+        else
+        begin
+          KeptObserved := true;
+          Ratio := NN.GetLastLayer.Output[0, 0, d] / Input[0, 0, d];
+          AssertTrue('SD1D kept channel scale ~ 1/(1-p): got ' +
+            FloatToStr(Ratio), Abs(Ratio - InvKeep) < 1e-3);
+          for x := 0 to Input.SizeX - 1 do
+          begin
+            Expected := Input[x, 0, d] * InvKeep;
+            AssertEquals('SD1D kept channel ' + IntToStr(d) +
+              ' x=' + IntToStr(x),
+              Expected, NN.GetLastLayer.Output[x, 0, d], 1e-4);
+          end;
+        end;
+      end;
+    end;
+    AssertTrue('SD1D should observe at least one kept channel', KeptObserved);
+    AssertTrue('SD1D should observe at least one dropped channel', DroppedObserved);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout1DGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, k: integer;
+  diff: TNeuralFloat;
+  Seed: longint;
+
+  function ComputeLossSeeded(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    d: TNeuralFloat;
+  begin
+    RandSeed := Seed;
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      d := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * d * d;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create();
+  epsilon := 0.0001;
+  Seed := 4242;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetSpatialDropout1D.Create(0.3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.5);
+
+    // Find a seed under which at least one channel is kept so the gradient
+    // is informative (otherwise all gradients are zero and the test is vacuous).
+    while True do
+    begin
+      RandSeed := Seed;
+      NN.Compute(Input);
+      diff := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+        diff := diff + Abs(NN.GetLastLayer.Output.Raw[k]);
+      if diff > 1e-3 then break;
+      Inc(Seed);
+    end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLossSeeded(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLossSeeded(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      RandSeed := Seed;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SD1D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout1DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  // At inference (dropouts disabled) both nets must produce identity output.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetSpatialDropout1D.Create(0.25));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.EnableDropouts(false);
+      NN2.Compute(Input);
+      AssertEquals('SD1D round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SD1D round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout2DInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 4, 1));
+    NN.AddLayer(TNNetSpatialDropout2D.Create(0.5));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('SpatialDropout2D inference identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout2DTrainingMaskShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, y, d, i: integer;
+  P, InvKeep, Ratio, Expected: TNeuralFloat;
+  KeptObserved, DroppedObserved: boolean;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 5);
+  P := 0.5;
+  InvKeep := 1.0 / (1 - P);
+  KeptObserved := false;
+  DroppedObserved := false;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 5, 1));
+    NN.AddLayer(TNNetSpatialDropout2D.Create(P));
+    NN.EnableDropouts(true);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+
+    RandSeed := 9002;
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      for d := 0 to Input.Depth - 1 do
+      begin
+        if Abs(NN.GetLastLayer.Output[0, 0, d]) < 1e-6 then
+        begin
+          DroppedObserved := true;
+          for y := 0 to Input.SizeY - 1 do
+            for x := 0 to Input.SizeX - 1 do
+              AssertEquals('SD2D dropped ch ' + IntToStr(d) +
+                ' (' + IntToStr(x) + ',' + IntToStr(y) + ')',
+                0.0, NN.GetLastLayer.Output[x, y, d], 1e-5);
+        end
+        else
+        begin
+          KeptObserved := true;
+          Ratio := NN.GetLastLayer.Output[0, 0, d] / Input[0, 0, d];
+          AssertTrue('SD2D kept channel scale ~ 1/(1-p): got ' +
+            FloatToStr(Ratio), Abs(Ratio - InvKeep) < 1e-3);
+          for y := 0 to Input.SizeY - 1 do
+            for x := 0 to Input.SizeX - 1 do
+            begin
+              Expected := Input[x, y, d] * InvKeep;
+              AssertEquals('SD2D kept ch ' + IntToStr(d) +
+                ' (' + IntToStr(x) + ',' + IntToStr(y) + ')',
+                Expected, NN.GetLastLayer.Output[x, y, d], 1e-4);
+            end;
+        end;
+      end;
+    end;
+    AssertTrue('SD2D should observe at least one kept channel', KeptObserved);
+    AssertTrue('SD2D should observe at least one dropped channel', DroppedObserved);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout2DGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, k: integer;
+  diff: TNeuralFloat;
+  Seed: longint;
+
+  function ComputeLossSeeded(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    d: TNeuralFloat;
+  begin
+    RandSeed := Seed;
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      d := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * d * d;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  InputPlus := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create();
+  epsilon := 0.0001;
+  Seed := 4242;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetSpatialDropout2D.Create(0.3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.5);
+
+    while True do
+    begin
+      RandSeed := Seed;
+      NN.Compute(Input);
+      diff := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+        diff := diff + Abs(NN.GetLastLayer.Output.Raw[k]);
+      if diff > 1e-3 then break;
+      Inc(Seed);
+    end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLossSeeded(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLossSeeded(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      RandSeed := Seed;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SD2D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialDropout2DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 4, 1));
+    NN.AddLayer(TNNetSpatialDropout2D.Create(0.25));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.EnableDropouts(false);
+      NN2.Compute(Input);
+      AssertEquals('SD2D round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SD2D round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 initialization
