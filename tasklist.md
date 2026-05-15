@@ -3336,3 +3336,247 @@ heads", and other tiny-but-useful composed primitives.
       x=-1e3 assert no exception (eps clamp), for Sqrt at
       x=-1e3 assert no exception (eps clamp). Closes the
       coverage gap on the new layers.
+
+
+### Lucky-day batch — 2026-05-15 (seed 747583)
+
+Fresh draw on a lucky day. With Sqrt/Exp/Log just landed completing
+the transcendental elementwise trio, this batch focuses on the
+remaining gaps the previous batch's "natural follow-ups" pointed at,
+plus a few small layers I'd personally enjoy authoring. Every TNNet*
+name below was grep-verified absent from `neural/neuralnetwork.pas`
+before listing (the one exception, TNNetGaussianActivation, is
+explicitly already-landed and is referenced only for context).
+
+#### Closing the Sqrt/Exp/Log follow-up loop
+- [ ] TNNetReciprocal — `y = 1 / (sign(x) * max(|x|, eps))`, eps in
+      FFloatSt[0] (default 1e-6). Derivative `-1 / (sign(x) *
+      max(|x|, eps))^2 = -y^2 * sign(x) / sign(x) = -y * y * sign(x)`
+      (cache the output, multiply-and-negate in backward). Four-test
+      shape: forward at typical inputs, eps-guard saturation at x=0,
+      central-difference gradient away from zero, SerializationRoundTrip.
+      Pairs with TNNetSquare/TNNetSqrt to give a hand-rolled
+      "Euclidean-norm reciprocal" head as `Reciprocal(Sqrt(Square(x)))`.
+- [ ] Exp/Log compose-as-identity test: `Log(Exp(x))` should
+      reconstruct `x` to within fp tolerance on a small bounded input
+      (say `|x| <= 5` to stay well clear of the eps and overflow
+      clamps). Three-line test on top of the existing layers; mirrors
+      the TanhShrink+Tanh composition test pattern.
+- [ ] Sqrt/Exp/Log saturation tests at ±extreme inputs (mirrors
+      HardTanh/SoftCapping/Clamp): Exp at x=1e3 must not overflow
+      (clamp at 30 triggers, output ≈ exp(30)); Log at x=-1e3 must
+      not raise (eps clamp triggers, output ≈ ln(1e-8)); Sqrt at
+      x=-1e3 must not raise (eps clamp). Three tiny tests, one per
+      layer, closes the coverage gap flagged at the bottom of the
+      previous batch.
+- [ ] README activation-table rows for TNNetSqrt, TNNetExp, TNNetLog
+      in the "Created with ..." style. One row each; bring the
+      reference table back in sync with the dispatch.
+
+#### Tiny elementwise layers I'd enjoy adding
+- [ ] TNNetNeg — `y = -x`. Trivial Compute / Backpropagate
+      (`prev.err -= self.err`), but plays nicely as a connective in
+      residual-subtraction blocks (`x - F(x)` patterns) and as a
+      smoke test for the involution-via-double-negate property.
+      Four-test shape (forward / gradient / involution-twice /
+      SerializationRoundTrip). Verified absent.
+- [ ] TNNetBias — bias-only "add a learnable per-channel offset"
+      (re-pinning explicitly: this is the fourth batch in a row
+      where it shows up unimplemented, so promoting it to a
+      take-it-next item). Bias-gradient is the channel-summed
+      output gradient, input-grad is identity. Four-test shape
+      (forward additive correctness, input-grad passthrough,
+      weight-grad central-difference, SerializationRoundTrip).
+      Useful for BitFit-style fine-tuning experiments.
+- [ ] TNNetMul — multiplicative companion: learnable per-channel
+      scale (no bias). Input gradient `dy * scale`; weight gradient
+      `sum_pix(dy * x)` per channel. Together with TNNetBias gives
+      a hand-rolled separable affine transform (TNNetAffineBlock
+      builder, also pinned). Verified absent.
+- [ ] TNNetIdentityScale — fixed (non-learnable) per-tensor scalar
+      multiplier in FFloatSt[0]. Useful for the "warm-up scaling"
+      trick where a residual branch is damped by a constant. Tiny
+      but explicit about non-learnability — contrasts with
+      TNNetLayerScale which is learnable.
+
+#### Normalization layers I'd enjoy adding
+- [ ] TNNetL2Normalize — divide by `sqrt(sum(x^2) + eps)` per
+      sample, configurable reduction axis via FStruct[0] (0 = full
+      volume, 1 = per-channel over spatial, 2 = per-position over
+      depth). Parameter-free; backward is the unit-norm Jacobian
+      shared with TNNetPixelNorm (which reduces over depth only).
+      Tests: forward unit-norm assertion, central-difference
+      gradient, axis-config round-trip. Verified absent.
+- [ ] TNNetZScore — `(x - mean) / std` per sample with no
+      learnable scale/bias — the unparameterised core of LayerNorm.
+      Useful as a normalization primitive that doesn't add weights
+      (e.g. when normalization sits inside a frozen feature
+      extractor). Tests: forward zero-mean unit-std, gradient
+      check, SerializationRoundTrip. Verified absent.
+- [ ] TNNetMinMaxNorm — `(x - min(x)) / (max(x) - min(x) + eps)`
+      per sample. Non-differentiable at the argmin/argmax cells;
+      backward routes the gradient through the in-range slope
+      with zero at the active endpoints. A small, fun test bed
+      for the "discontinuous Jacobian" failure mode. Verified
+      absent.
+
+#### Reduction / shape layers I'd enjoy adding
+- [ ] TNNetCumSum — cumulative sum along a configurable axis
+      (FStruct[0] ∈ {0, 1, 2}). Linear, so backward is the reverse
+      cumulative sum along the same axis. Useful for any
+      sequence-position-dependent feature you want without
+      RoPE-style trigonometry, and a clean test bed for the
+      reverse-cumsum identity. Verified absent.
+- [ ] TNNetTopK — keep only the top-K activations per spatial
+      cell along the depth axis, zeroing the rest. K in
+      FStruct[0]. Argmax-style routing of the gradient (only
+      the top-K positions receive incoming error). Useful for
+      sparse-attention experiments and as a tiny stepping stone
+      toward MoE routing. Tests: forward sparsity count,
+      seeded numerical-gradient at typical inputs, round-trip.
+      Verified absent.
+- [ ] TNNetRoll — circular shift along a chosen axis (FStruct[0]
+      axis, FStruct[1] offset). Parameter-free, deterministic
+      permutation; backward is the inverse roll. Pairs naturally
+      with the involution-layer family (a single roll is not an
+      involution, but a roll(+k) followed by roll(-k) is). Tests:
+      forward shift correctness, inverse-roll round-trip,
+      gradient check, SerializationRoundTrip. Verified absent.
+
+#### Activation completists
+- [ ] TNNetSnake — `y = x + (1/alpha) * sin(alpha * x)^2`. The
+      Ziyin 2020 periodic activation. Configurable alpha in
+      FFloatSt[0] (default 1.0). Closed-form derivative
+      `1 + sin(2 * alpha * x)`. Niche but slots cleanly into the
+      activation menagerie bake-off and exercises a non-monotone
+      activation path. Verified absent.
+- [ ] TNNetSwish-with-learnable-beta — current TNNetSwish has a
+      fixed beta=1 (which is TNNetSiLU's whole point). A version
+      with a single learnable scalar beta exercises the
+      learnable-scalar-on-an-activation path and is fun for an
+      ablation study. Tests follow the LayerScale template.
+- [ ] TNNetMish-stable — current TNNetMish uses the standard
+      `x * tanh(softplus(x))` form. A "stable on both tails"
+      variant using the softplus stable-branch trick from the
+      recent TNNetSoftPlus negative-x guard would close the
+      symmetric-stability story. Pairs with a regression test at
+      x = -1e3 and x = +1e3.
+
+#### Composite block helpers I'd enjoy shipping
+- [ ] TNNetAffineBlock — once TNNetBias and TNNetMul land,
+      ship `AddAffineBlock(NN)` builder that wires
+      `Mul → Bias` (or `Bias → Mul`, pick a convention) as a
+      learnable per-channel affine without cross-channel mixing.
+      Concrete user-facing payoff for the two new primitives.
+- [ ] TNNetSwiGLUFeedForward — re-pinning for the seventh+ time.
+      With SwiGLU + LayerNorm + dense layers all in tree, this
+      is a 10-line `AddSwiGLUFeedForward(NN, d_model, d_ff)`
+      builder. Treating the repeated re-pinning as universe
+      pressure to actually ship it on the next lucky day.
+- [ ] TNNetPreNormResidual — re-pinning. `y = x + Sublayer(LayerNorm(x))`
+      one-liner builder. Sister to the SwiGLUFeedForward task.
+
+#### Tests / numerical-gradient audit
+- [ ] Run `scripts/audit_tasklist.sh` (landed in 15a6de1) on
+      the current tasklist and triage the resulting hit list.
+      A focused "tasklist hygiene" sitting — the inverse of a
+      normal lucky-day batch. The previous batch added new
+      entries; this one would prune stale ones.
+- [ ] Coverage matrix at the top of TestNeuralNumerical.pas:
+      enumerate every TNNet* class with a `[grad] [serialize]`
+      column. Mechanical to generate; would let the next batch
+      pick its targets by reading the comment instead of
+      grep-ing the dispatch. Re-pinning across multiple batches.
+- [ ] Numerical-gradient check for TNNetMinPool (the sibling of
+      MaxPool/AvgPool that the transform/reshape/pooling audit
+      didn't reach). Pure coverage gap. Re-pinning from seed 176582.
+- [ ] Numerical-gradient check for TNNetMinChannel (the
+      global-min-pool sibling of TNNetAvgChannel/MaxChannel).
+      Mirrors the existing TestAvgChannel pattern.
+- [ ] Property-based gradient harness v0 — even a version that
+      only randomizes input shape (keeping layer type fixed) for
+      the 6 most recently landed layers would catch a lot of
+      shape-edge bugs. Re-pinning across many batches; I want
+      to take it.
+
+#### Experiments I'm curious about
+- [ ] Euclidean-norm reciprocal head composition test: once
+      TNNetReciprocal lands, build `Reciprocal(Sqrt(Square(x)))`
+      as a 3-layer "compute 1/||x||" head, train a tiny regressor
+      to fit a known target, and confirm training works end-to-end
+      through three elementwise transcendental layers. Headline
+      use case for the new Sqrt/Exp/Log/Reciprocal family.
+- [ ] CumSum + AddPositionalEmbedding comparison: with TNNetCumSum
+      landed, the integer-position-encoding family becomes
+      composable. Train a tiny next-token model with sinusoidal
+      AddPositionalEmbedding vs a CumSum-based learned position
+      encoding (CumSum applied to a constant ones tensor gives
+      a linear position feature). One-chart, two-config experiment.
+- [ ] TopK sparsity sweep: with TNNetTopK landed, train the same
+      tiny autoencoder bottleneck with K ∈ {1, 2, 4, 8, 16, full},
+      chart reconstruction loss vs sparsity. Concrete companion
+      to the HardShrink/SoftShrink sparsity experiments already
+      pinned.
+- [ ] L2Normalize vs PixelNorm head comparison on a tiny
+      generator-shaped net. PixelNorm reduces over depth only;
+      L2Normalize over the full volume. Bake-off shows whether
+      the StyleGAN choice of depth-only is doing real work.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/EuclideanNormHead/` — once TNNetReciprocal lands,
+      tiny demo showing `Reciprocal(Sqrt(Square(x)))` composed as
+      a Euclidean-norm-reciprocal head. The headline use case for
+      the elementwise family's 2026-05-15 batch.
+- [ ] `examples/BiasOnlyTuning/` — once TNNetBias lands, freeze a
+      pretrained classifier and fine-tune only the TNNetBias
+      layers on a new task. BitFit demonstration in <100 lines.
+      Already pinned in seed 995227 batch; re-pinning because
+      TNNetBias still hasn't landed.
+- [ ] `examples/CumSumPositionEncoding/` — tiny char-level demo
+      using CumSum on a constant input as a learned linear
+      position feature. Compares to AddPositionalEmbedding on the
+      same toy task. Companion to the CumSum experiment above.
+
+#### Tooling / dev experience
+- [ ] `scripts/audit_landed.sh` — companion to audit_tasklist.sh
+      (re-pinned several batches now). Every `[x]` line claiming
+      a TNNet* landed must point at a real class in the dispatch
+      AND at least one Test* method in the test files. Catches
+      the wishful-tick failure mode the audit_tasklist.sh script
+      can't see.
+- [ ] `scripts/audit_tasklist.sh --strict` — re-pinned. Match
+      only lines beginning with the canonical
+      `- [ ] TNNet… — …` re-pin shape. Two-line awk change in
+      practice, trims the 73-hit false-positive rate.
+- [ ] `bin/layer_bench <ClassName> <SizeX> <SizeY> <Depth>` —
+      tiny CLI that builds a 1-layer net and reports ns/op for
+      forward + backward. Re-pinned across multiple batches;
+      subsumes the perpetually-re-pinned Volume micro-benchmark.
+
+#### Documentation
+- [ ] README "elementwise transcendental layers" subsection
+      covering TNNetSqrt / TNNetExp / TNNetLog (just landed),
+      TNNetAbs / TNNetSquare (recently landed) and the planned
+      TNNetReciprocal. One paragraph on the eps-guard convention
+      shared across the family, plus a tiny snippet showing the
+      Euclidean-norm-reciprocal composition. Becomes the natural
+      home for the "compute a norm without FullConnect" pattern.
+- [ ] "Saturation activations cheat sheet" in `docs/saturation.md`
+      (re-pinned from seed 176582). One-pager covering Clamp /
+      HardTanh / SoftCapping / ReLU6 / SoftSign / Tanh /
+      HardSigmoid: formula, range, kink count, typical use.
+- [ ] "Elementwise activation layer authoring" mini-guide
+      (re-pinned from seed 995227). With Abs/Square/Sqrt/Exp/Log/
+      SoftPlus/Clamp all recently landed, the recurring four-step
+      pattern is well-established and worth capturing as a short
+      doc, with TNNetSqrt or TNNetExp as the worked example
+      (the smallest non-trivial elementwise landings on record).
+
+#### Stretch / ambitious (re-pinned for visibility)
+- [ ] TNNetMultiHeadSelfAttention — still the headline blocker
+      for TinyGPT. The SDPA + RoPE + MaskedFill + ALiBi pieces
+      are all in tree; MHSA is the final missing layer.
+- [ ] Tiny GPT char-level example on CPU — pinned across every
+      lucky-day batch. Once MHSA lands, all the pieces exist.
+- [ ] Mixture-of-Experts routing — pinned multiple batches.
+      Best done after MHSA so it has a real host architecture.
