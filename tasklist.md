@@ -4012,3 +4012,167 @@ Test suite: 431 → 437, all passing.
       `docs/numerical-gradient.md` — STE is the first layer in tree
       where central-difference is provably wrong, so the direct
       backward-equality test pattern deserves a short callout.
+
+### Lucky-day batch — 2026-05-15 (seed 554877)
+
+Random seed 554877 (Python `random.randint(100000,999999)`) on a
+self-described lucky day. Before pinning, every TNNet* candidate name
+below was grep-verified absent from `neural/neuralnetwork.pas`, and
+the existing tasklist was scanned for prior pins. Skipped from the
+initial brainstorm because they already exist in tree: TNNetClamp,
+TNNetAbs, TNNetSquare, TNNetPower, TNNetGlobalAvgPool,
+TNNetGlobalMaxPool, TNNetCELU, TNNetELU, TNNetThreshold, TNNetHardTanh,
+TNNetTanhShrink, TNNetSquaredReLU. Skipped because already pinned in a
+previous batch: TNNetErf, TNNetTopK, TNNetGumbelSoftmax, TNNetCumSum,
+TNNetRoll, TNNetL2Normalize, TNNetMishLearnable, TNNetSpaceToDepth /
+TNNetDepthToSpace.
+
+#### Layers I'd enjoy authoring
+- [ ] TNNetSinc — `y = sin(x)/x` with the `x→0` limit `y=1` handled
+      analytically. Derivative `(cos(x) - sin(x)/x) / x` (with the
+      `x→0` limit `0`). Pairs with the existing Sin/Cos/Snake periodic
+      family; closed-form derivative makes it gradient-checkable.
+      Cache `dy/dx` into FOutputErrorDeriv to match the elementwise
+      activation pattern. Three tests: forward at known points
+      (including `x=0`), gradient check, serialization round-trip.
+- [ ] TNNetBentIdentity — `y = (sqrt(x²+1) - 1)/2 + x`, derivative
+      `x / (2·sqrt(x²+1)) + 1`. Always-positive-slope smooth ReLU
+      alternative; one of the cleanest activations not yet in tree.
+      Same TNNetReLUBase template as TNNetSoftPlus.
+- [ ] TNNetLisht — `y = x · tanh(x)`, derivative
+      `tanh(x) + x · (1 - tanh(x)²)`. Symmetric, unbounded-positive
+      activation from the LiSHT paper. Cheap to implement, tanh-cache
+      friendly.
+- [ ] TNNetESwish — `y = β · x · sigmoid(x)` with configurable β via
+      FFloatSt[0] (default 1.25, the paper's recommended value).
+      Generalizes Swish; β=1 reduces to Swish. Same template as
+      TNNetSwish; the only change is multiplying forward and
+      derivative by β. Three tests including a β=1 equivalence-with-
+      Swish check.
+- [ ] TNNetHardshrink / TNNetSoftshrink — companions to the already-
+      landed TNNetTanhShrink. Hardshrink: zero inside `[-λ, λ]`,
+      identity outside (non-smooth, STE-like backward through the
+      gate). Softshrink: subtract `λ·sign(x)` outside the band, zero
+      inside. λ configurable via FFloatSt[0] (default 0.5). Both are
+      standard PyTorch activations and complete the "shrink" family.
+- [ ] TNNetLogSoftmax — log of softmax with the standard
+      max-subtraction trick for numerical stability. Backward is
+      `dL/dy_i - softmax_i · sum_j dL/dy_j` (cheaper Jacobian than
+      the exact-softmax version that already landed). Pairs naturally
+      with NLL loss; the numerically stable form avoids the
+      `log(softmax)` underflow that several training paths quietly
+      eat today. Add per-(X,Y) and global variants matching the
+      TNNetPointwiseSoftMax / TNNetSoftMax split.
+- [ ] TNNetSign — `y = sign(x)` with a straight-through-estimator
+      backward (gradient passes unchanged on `|x| ≤ 1`, zero
+      otherwise — the "saturated STE" used in BinaryConnect). Builds
+      directly on the TNNetStraightThroughEstimator pattern from the
+      seed 769362 batch; share the direct-backward-equality test
+      style since central-difference is provably wrong here too.
+- [ ] TNNetGlobalSumPool — companion to TNNetGlobalAvgPool /
+      TNNetGlobalMaxPool. Sum reduction over the (X, Y) plane per
+      channel; equals AvgPool · (SizeX·SizeY) so the implementation
+      and gradient mirror AvgChannel almost line-for-line. Adds the
+      missing third reduction; shows up in attention-pooling and
+      set-encoder architectures.
+- [ ] TNNetMinMaxNorm — per-sample affine rescale of the volume to
+      `[0, 1]` (or to a configurable `[a, b]` via FFloatSt[0..1]).
+      Forward `y = (x - min) / (max - min + eps)`; backward needs
+      careful handling of the min/max gradient routing
+      (subgradient: 1/range to all elements except the argmin/argmax,
+      which carry the residual). A focused gradient-check test would
+      pin the routing.
+
+#### Composite block builders I'd enjoy authoring
+- [ ] AddSqueezeExciteBlock(NN, Reduction) — channel-attention block
+      (GlobalAvgPool → FullConnectReLU(C/r) → FullConnect(C) →
+      Sigmoid → channel-wise multiply). Needs a fresh
+      TNNetChannelMul layer if one is not already in tree (verify
+      before authoring). Pairs naturally with the existing
+      ConvolutionReLU stems; one short builder test on a tiny
+      volume + a Conv-stem-with-SE example.
+- [ ] AddPostActivationDenseBlock(NN, GrowthRate, Layers) — a tiny
+      DenseNet-style builder around the existing TNNetDeepConcat;
+      lets the README transformer-builder family grow a CNN sibling
+      without an entire new architecture file.
+
+#### Correctness / audit work
+- [ ] Activation derivative-cache invariants sweep (re-pin from seed
+      231116 batch, narrowed to a concrete test plan): one
+      parameterized helper that, for each activation in the cache-
+      using set, runs `Compute(A); Compute(B);` and asserts
+      `FOutputErrorDeriv` matches a fresh recomputation against `B`.
+      Catches the Sigmoid-class stale-cache bug pattern across the
+      whole family in a single ~30-line test.
+- [ ] Random-architecture forward/backward fuzz — generate ~50 random
+      stacks (input → mix of Dense/Conv/LayerNorm/SwiGLU/GEGLU/
+      DropPath/RMSNorm/SDPA → linear head), seed-controlled, and
+      assert (a) forward produces no NaN/Inf, (b) backward produces
+      no NaN/Inf, (c) parameter gradients are finite. Runs in seconds,
+      catches integration bugs that per-layer tests miss.
+- [ ] Gradient flow through three normalization layouts: build the
+      same tiny block under PreNorm, PostNorm, and RMSNormResidual
+      (once those builders land) and assert the input gradient
+      magnitude ratio across the three matches the well-known PreNorm
+      stability ordering. Doubles as a regression pin on the builder
+      semantics.
+
+#### Experiments I'm curious about
+- [ ] "Activation zoo" loss-landscape figure — train the same 3-layer
+      MLP on the existing Hypotenuse task with each activation in the
+      shrink/periodic/gated/transcendental families (~20 configs),
+      log final loss + epochs-to-converge, dump a CSV. The data point
+      the codebase has been quietly accumulating for several batches
+      but never plotted in one place.
+- [ ] Sinc vs Sin head-to-head on the SIREN-flavored
+      `f(x) = sin(8x) + sin(3x)` fit pinned in the seed 186808 batch —
+      Sinc's amplitude decay is a real inductive bias for bounded
+      regression targets; the two-line config switch is worth the
+      data point.
+- [ ] STE bit-width sweep follow-on to the pinned MNIST QAT demo:
+      same network, vary `step ∈ {1.0, 0.5, 0.25, 0.125, 0.0625}`
+      (effectively 1, 2, 3, 4, 5 bits over a fixed range), plot
+      accuracy vs bit-width. Builds directly on the seed 769362
+      STE landing.
+- [ ] Tanh saturation visualization — feed a wide range of inputs
+      through TNNetTanh, plot input vs output and input vs gradient,
+      save as a small PNG via the existing image utilities. Cheap
+      teaching artifact; the kind of figure the README's activation
+      table would benefit from.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/SqueezeExciteCifar10/` — minimum-viable SE-augmented
+      CIFAR-10 classifier; one chart of with-SE vs without-SE
+      validation accuracy at matched epoch count. Headline use case
+      for the SE builder above.
+- [ ] `examples/ActivationGallery/` — a tiny program that constructs
+      a single-layer net per activation in the library, sweeps inputs
+      `x ∈ [-5, 5]`, prints `(x, y, dy/dx)` columns to stdout. Doubles
+      as documentation and as a smoke test that every activation's
+      forward + cached derivative agree with their textbook formula.
+- [ ] `examples/QuantizationAwareMnist/` — the STE-MNIST demo pinned
+      in the seed 769362 batch, fleshed out: train baseline, train
+      with STE on the penultimate activation, compare test accuracy
+      and final-weight histograms. Gives the STE landing a
+      first-class home in the examples tree.
+
+#### Documentation
+- [ ] "Shrink family" README subsection covering TNNetTanhShrink and
+      (once landed) TNNetHardshrink / TNNetSoftshrink — short table
+      with thresholds, output behavior in/out of band, and the
+      sub-gradient note for the non-smooth pair.
+- [ ] "Reduction layers" README subsection grouping the three global
+      pools (Avg/Max/Sum once it lands) with one usage line each;
+      the existing per-layer entries are scattered.
+- [ ] Top-of-file lucky-day index — small markdown table of the
+      `Lucky-day batch — YYYY-MM-DD (seed N)` headers with their
+      landed-layer summary, so the file's growing batch history is
+      navigable without scrolling. Re-pin from seed 231116 batch,
+      narrowed: just an index, not a rewrite.
+
+#### Stretch / re-pinned for visibility
+- [ ] TNNetMultiHeadSelfAttention wrapper around the landed SDPA —
+      still the headline blocker for Tiny GPT; re-pinned every batch
+      for a reason.
+- [ ] Tiny GPT char-level CPU example — unblocked the moment MHSA
+      lands.
