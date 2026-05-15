@@ -230,6 +230,9 @@ type
     procedure TestSqrtForward;
     procedure TestSqrtGradientCheck;
     procedure TestSqrtSerializationRoundTrip;
+    procedure TestExpForward;
+    procedure TestExpGradientCheck;
+    procedure TestExpSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -7928,6 +7931,49 @@ procedure TTestNeuralNumerical.TestSqrtSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSqrt.Create(),
     'Sqrt', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestExpForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetExp.Create());
+
+    Input.Raw[0] :=  0.0;
+    Input.Raw[1] :=  1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] :=  2.0;
+    Input.Raw[4] := -2.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('Exp(0)',  Exp( 0.0), NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Exp(1)',  Exp( 1.0), NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('Exp(-1)', Exp(-1.0), NN.GetLastLayer.Output.Raw[2], 1e-5);
+    AssertEquals('Exp(2)',  Exp( 2.0), NN.GetLastLayer.Output.Raw[3], 1e-5);
+    AssertEquals('Exp(-2)', Exp(-2.0), NN.GetLastLayer.Output.Raw[4], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpGradientCheck;
+begin
+  // Exp is smooth; pick moderate inputs well away from the 30-clip.
+  ActivationGradientCheck(Self, TNNetExp.Create(), 'Exp',
+    [0.5, -0.5, 1.0, -1.0, 0.25, -0.25], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestExpSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetExp.Create(),
+    'Exp', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

@@ -695,6 +695,16 @@ type
     procedure Compute(); override;
   end;
 
+  /// Exp activation function.
+  // Exp(x) = exp(min(x, 30)). The 30 cap guards against FP32 overflow
+  // (exp(30) ~ 1.07e13 is still finite). Parameter-free. Derivative is
+  // the output itself (dy/dx = y); cached into FOutputErrorDeriv so
+  // TNNetReLUBase handles the backward chain rule with one multiply.
+  TNNetExp = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5368,6 +5378,47 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x < SQRT_EPS then x := SQRT_EPS;
       FOutput.FData[OutputCnt] := Sqrt(x);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetExp }
+
+procedure TNNetExp.Compute();
+const
+  EXP_CLIP: TNeuralFloat = 30.0;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, y: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Exp(x) = exp(min(x, 30)); derivative is y itself.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > EXP_CLIP then x := EXP_CLIP;
+      y := Exp(x);
+      FOutput.FData[OutputCnt] := y;
+      FOutputErrorDeriv.FData[OutputCnt] := y;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > EXP_CLIP then x := EXP_CLIP;
+      FOutput.FData[OutputCnt] := Exp(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16244,6 +16295,7 @@ begin
       'TNNetAbs' :                  Result := TNNetAbs.Create();
       'TNNetSquare' :               Result := TNNetSquare.Create();
       'TNNetSqrt' :                 Result := TNNetSqrt.Create();
+      'TNNetExp' :                  Result := TNNetExp.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16402,6 +16454,7 @@ begin
       if S[0] = 'TNNetAbs' then Result := TNNetAbs.Create() else
       if S[0] = 'TNNetSquare' then Result := TNNetSquare.Create() else
       if S[0] = 'TNNetSqrt' then Result := TNNetSqrt.Create() else
+      if S[0] = 'TNNetExp' then Result := TNNetExp.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
