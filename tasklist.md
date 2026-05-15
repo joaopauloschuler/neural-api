@@ -460,7 +460,7 @@ Tiny correctness follow-ups:
 - [x] SoftCapping saturation test on extreme inputs (±1e6) — assert
       output stays within ±c and `Backpropagate` doesn't produce NaNs.
       Done: TestSoftCappingExtremeInputSaturation in TestNeuralNumerical.pas.
-- [ ] DropPath determinism test: with a fixed `RandSeed`, two Compute
+- [x] DropPath determinism test: with a fixed `RandSeed`, two Compute
       calls produce identical masks/outputs across runs. Pin the
       RNG-reset behavior so future refactors can't silently break it.
 - [x] RoPE odd-depth guard test: assert constructing+wiring a
@@ -665,10 +665,11 @@ is sized to fit in a single focused commit.
       drop the existing tolerance-based check. Smallest non-trivial
       correctness fix on the list with a ready test to extend. Landed:
       see the "Bugs / quirks" entry above.
-- [ ] DropPath determinism test (the open follow-up flagged above):
+- [x] DropPath determinism test (the open follow-up flagged above):
       with a fixed `RandSeed`, two consecutive Compute calls in
       training mode produce identical masks/outputs. Add as
       `TestDropPathDeterminismFixedSeed` next to the existing tests.
+      Done: see TestDropPathDeterminismFixedSeed in TestNeuralNumerical.pas.
 
 #### Layers I'd enjoy building (no MHA dependency)
 - [ ] TNNetALiBi — same entry as the previous two batches. The fact that

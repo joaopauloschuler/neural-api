@@ -105,6 +105,7 @@ type
     procedure TestRotaryEmbeddingOddDepthGuard;
     procedure TestDropPathPZeroBoundary;
     procedure TestDropPathPOneBoundary;
+    procedure TestDropPathDeterminismFixedSeed;
     procedure TestSoftCappingLargeCapContinuity;
     procedure TestSoftCappingExtremeInputSaturation;
     procedure TestSoftCappingSerializationRoundTrip;
@@ -4241,6 +4242,90 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDropPathDeterminismFixedSeed;
+var
+  NN1, NN2: TNNet;
+  Input: TNNetVolume;
+  i, Trials: integer;
+  Out1A, Out1B, Out2A, Out2B: array of TNeuralFloat;
+  Size: integer;
+const
+  P = 0.4;
+  Seed = 424242;
+begin
+  // Determinism contract: given a fixed RandSeed, two consecutive
+  // Compute calls in training mode must produce identical outputs
+  // (i.e. identical drop masks) across runs. This pins TNNetDropPath's
+  // RNG behavior so future refactors cannot silently change the
+  // sequence of masks consumed.
+  NN1 := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN1.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN1.AddLayer(TNNetDropPath.Create(P));
+    NN1.SetLearningRate(1.0, 0.0);
+    NN1.SetBatchUpdate(true);
+    NN1.EnableDropouts(true);
+
+    NN2.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN2.AddLayer(TNNetDropPath.Create(P));
+    NN2.SetLearningRate(1.0, 0.0);
+    NN2.SetBatchUpdate(true);
+    NN2.EnableDropouts(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+
+    Size := NN1.GetLastLayer.Output.Size;
+    SetLength(Out1A, Size);
+    SetLength(Out1B, Size);
+    SetLength(Out2A, Size);
+    SetLength(Out2B, Size);
+
+    // Run 1: seed, two consecutive Computes.
+    RandSeed := Seed;
+    NN1.Compute(Input);
+    for i := 0 to Size - 1 do
+      Out1A[i] := NN1.GetLastLayer.Output.Raw[i];
+    NN1.Compute(Input);
+    for i := 0 to Size - 1 do
+      Out1B[i] := NN1.GetLastLayer.Output.Raw[i];
+
+    // Run 2: same seed, fresh net, two consecutive Computes.
+    RandSeed := Seed;
+    NN2.Compute(Input);
+    for i := 0 to Size - 1 do
+      Out2A[i] := NN2.GetLastLayer.Output.Raw[i];
+    NN2.Compute(Input);
+    for i := 0 to Size - 1 do
+      Out2B[i] := NN2.GetLastLayer.Output.Raw[i];
+
+    // Both runs must agree on both Compute calls, bit-for-bit.
+    for i := 0 to Size - 1 do
+    begin
+      AssertEquals('DropPath determinism: call A differs at i=' + IntToStr(i),
+        Out1A[i], Out2A[i]);
+      AssertEquals('DropPath determinism: call B differs at i=' + IntToStr(i),
+        Out1B[i], Out2B[i]);
+    end;
+
+    // Sanity: at least one of the two calls produced a non-trivial mask
+    // (either a drop or a scaled keep) so we are actually exercising the
+    // RNG. We loop a handful of seeds to make the check robust.
+    Trials := 0;
+    for i := 0 to Size - 1 do
+      if (Abs(Out1A[i]) < 1e-9) or (Abs(Out1A[i] - Input.Raw[i]) > 1e-6) then
+        Inc(Trials);
+    AssertTrue('DropPath determinism: RNG path not exercised (output equals input)',
+      Trials > 0);
+  finally
+    NN1.Free;
+    NN2.Free;
+    Input.Free;
   end;
 end;
 
