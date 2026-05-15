@@ -5074,19 +5074,17 @@ duplicate finished work (cross-checked against `examples/`,
       `dL/dx_i = dL/dy_i - sum_j(dL/dy_j) * softmax(x)_i`. Full
       numerical-gradient test in TestNeuralNumerical.pas.
 
-- [ ] TNNetReGLU — the ReLU-gated sibling of TNNetGLU / TNNetGEGLU /
+- [x] TNNetReGLU — the ReLU-gated sibling of TNNetGLU / TNNetGEGLU /
       TNNetSwiGLU: split input in half along depth, gate one half with
-      ReLU of the other. Cheapest member of the GLU family, useful as
-      a control for the gated-FFN bake-off. Forward +
-      numerical-gradient test, registered in both CreateLayer
+      ReLU of the other. Landed: forward + numerical-gradient test in
+      tests/TestNeuralNumerical.pas; registered in both CreateLayer
       dispatches.
 
-- [ ] TNNetSinusoidalPositionalEmbedding — parameter-free, additive
-      sin/cos position table along the X axis. Complements the
-      learnable TNNetAddPositionalEmbedding already in the repo and
-      gives the transformer demo a fixed-table alternative. Backward
-      is identity (no params); forward unit test asserts the well-known
-      `sin(pos / 10000^(2i/d))` pattern.
+- [x] TNNetSinusoidalPositionalEmbedding — parameter-free, additive
+      sin/cos position table along the X axis. Landed: reuses
+      TVolume.PositionalEncoding (Vaswani formula), configurable `base`
+      (default 10000), table built once in SetPrevLayer. Forward,
+      identity gradient-check, and LoadFromString round-trip tests.
 
 - [ ] TNNetSnake activation — `x + sin(x)^2 / alpha` with a
       configurable scalar alpha. Periodic activation popular for
