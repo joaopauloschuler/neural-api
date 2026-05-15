@@ -6310,10 +6310,13 @@ exists but no Lipschitz / spectral-norm wrapper.
 
 #### Activations
 
-- [ ] TNNetSinhAct — `y = sinh(x)`, backward `cosh(x) * dy`. Trivial
+- [x] TNNetSinhAct — `y = sinh(x)`, backward `cosh(x) * dy`. Trivial
       element-wise activation; rounds out the trig/hyperbolic family
       alongside the existing TNNetSin/TNNetCos and TNNetHyperbolicTangent.
       Numerical-gradient test only (no weights).
+      Landed: TNNetSinhAct subclasses TNNetReLUBase, caches Cosh(x) into
+      FOutputErrorDeriv mirroring TNNetSin/TNNetCos, registered in both
+      CreateLayer dispatch tables, covered by TestSinhActGradientCheck.
 
 - [ ] TNNetSplineActivation — per-channel learnable piecewise-linear
       activation defined by K+1 control points at fixed knots

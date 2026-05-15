@@ -806,6 +806,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// Sinh activation function.
+  // SinhAct(x) = sinh(x). Parameter-free. Derivative is cosh(x); cached into
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule with
+  // one multiply. Rounds out the trig/hyperbolic family alongside TNNetSin,
+  // TNNetCos and TNNetHyperbolicTangent. Note: grows exponentially, so it is
+  // only appropriate for layers whose inputs are bounded.
+  TNNetSinhAct = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Snake activation function.
   // Snake(x) = x + (1/alpha) * sin(alpha*x)^2. Derivative is
   // 1 + sin(2*alpha*x). Parameter-free w.r.t. learning but alpha is a
@@ -6753,6 +6764,39 @@ begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := Cos(LocalPrevOutput.FData[OutputCnt]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSinhAct }
+
+procedure TNNetSinhAct.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // SinhAct(x) = sinh(x). Derivative is cosh(x).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Sinh(x);
+      FOutputErrorDeriv.FData[OutputCnt] := Cosh(x);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := Sinh(LocalPrevOutput.FData[OutputCnt]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -18459,6 +18503,7 @@ begin
       'TNNetNeg' :                  Result := TNNetNeg.Create();
       'TNNetSin' :                  Result := TNNetSin.Create();
       'TNNetCos' :                  Result := TNNetCos.Create();
+      'TNNetSinhAct' :              Result := TNNetSinhAct.Create();
       'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
       'TNNetSinc' :                 Result := TNNetSinc.Create();
       'TNNetBentIdentity' :         Result := TNNetBentIdentity.Create();
@@ -18646,6 +18691,7 @@ begin
       if S[0] = 'TNNetNeg' then Result := TNNetNeg.Create() else
       if S[0] = 'TNNetSin' then Result := TNNetSin.Create() else
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
+      if S[0] = 'TNNetSinhAct' then Result := TNNetSinhAct.Create() else
       if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
       if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
       if S[0] = 'TNNetBentIdentity' then Result := TNNetBentIdentity.Create() else

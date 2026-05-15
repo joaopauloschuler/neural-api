@@ -317,6 +317,7 @@ type
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
+    procedure TestSinhActGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
     procedure TestBentIdentitySerializationRoundTrip;
@@ -9611,6 +9612,16 @@ procedure TTestNeuralNumerical.TestSincSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSinc.Create(),
     'Sinc', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSinhActGradientCheck;
+begin
+  // sinh grows exponentially, so cosh(x) (the analytic derivative) blows up
+  // for |x| > ~2 and central differences pick up O(eps^2 * sinh(x)) error.
+  // Pin inputs to |x| <= 1 where ActivationGradientCheck's 0.01 tolerance
+  // is comfortable.
+  ActivationGradientCheck(Self, TNNetSinhAct.Create(), 'SinhAct',
+    [0.5, -0.5, 1.0, -1.0, 0.25, -0.25], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestBentIdentityForward;
