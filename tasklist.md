@@ -3588,3 +3588,52 @@ explicitly already-landed and is referenced only for context).
       lucky-day batch. Once MHSA lands, all the pieces exist.
 - [ ] Mixture-of-Experts routing — pinned multiple batches.
       Best done after MHSA so it has a real host architecture.
+
+
+### Lucky-day batch — 2026-05-15 (seed 602689, post Reciprocal + Sqrt/Exp/Log-saturation batch)
+
+Two serial opus agents dispatched on a lucky day. Landed:
+
+- `08914d9` — TNNetReciprocal: `y = 1/(sign(x) * max(|x|, eps))`, eps=1e-6.
+  Parameter-free TNNetReLUBase descendant (chose to match the Sqrt/Exp/Log
+  family convention rather than the FFloatSt[0]-configurable spec the
+  tasklist suggested). Four new tests: Forward, EpsGuard (x=0 -> 1e6),
+  GradientCheck (inputs biased away from zero), SerializationRoundTrip.
+- `becaf13` — Sqrt/Exp/Log saturation + Exp/Log compose-as-identity tests.
+  Four new tests: TestSqrtExtremeNegativeInputSaturation,
+  TestExpExtremeInputSaturation, TestLogExtremeNegativeInputSaturation,
+  TestExpLogComposeAsIdentity.
+
+Test suite: 411 -> 419, all passing. No bugs surfaced.
+
+#### Surprises / clarifications
+
+- **TNNetReciprocal derivative spec correction.** The tasklist (and most
+  textbooks) wrote the derivative as `-y^2 * sign(x)`. In the unclamped
+  region `sign(x) * |x| = x` exactly, so `y = 1/x` and `dy/dx = -1/x^2 = -y^2`
+  — the sign factor cancels. Using `-y*y*sign(x)` would flip the gradient
+  on negative inputs and fail the central-difference check. The landed
+  implementation uses `-y*y` and the doc comment notes the cancellation.
+  Future Reciprocal-style layers should be checked for the same trap.
+- **exp(-1e3) underflows cleanly to 0.0 in FP32**, no NaN/Inf — so
+  TNNetExp's one-sided positive-only clamp at 30 is sufficient. A
+  symmetric negative-side clamp is NOT needed and should not be added
+  (would break the cached-output backward path on tiny inputs).
+- **ln(1e-8) ≈ -18.420680... is exactly representable in FP32** to
+  within ~1e-7, so the saturation test's 1e-3 tolerance is comfortably
+  over-spec.
+
+#### Natural follow-ups
+
+- [ ] TNNetReciprocal README activation-table row (matching the
+      "Created with ..." style used for the recently-landed activations).
+- [ ] Euclidean-norm reciprocal head example
+      (`examples/EuclideanNormHead/`) — now buildable: compose
+      `Reciprocal(Sqrt(Square(x)))` on a tiny regression target. Pinned
+      multiple batches; the final missing primitive (Reciprocal) is
+      now in tree.
+- [ ] TNNetReciprocal gradient-magnitude sanity check at small |x|
+      (where `|dy/dx| = 1/x^2` blows up): mirror the TNNetSquare
+      "Jacobian scales with input" relative-tolerance test pinned in
+      seed 995227. Pins the central-difference noise floor for this
+      family.
