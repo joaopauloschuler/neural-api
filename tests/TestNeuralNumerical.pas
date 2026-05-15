@@ -279,6 +279,9 @@ type
     procedure TestPenalizedTanhAsymmetry;
     procedure TestPenalizedTanhGradientCheck;
     procedure TestPenalizedTanhSerializationRoundTrip;
+    procedure TestL2NormalizeUnitNorm;
+    procedure TestL2NormalizeGradientCheck;
+    procedure TestL2NormalizeSerializationRoundTrip;
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
@@ -9117,6 +9120,79 @@ procedure TTestNeuralNumerical.TestPenalizedTanhSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetPenalizedTanh.Create(),
     'PenalizedTanh', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizeUnitNorm;
+const
+  SizeX = 3;
+  SizeY = 2;
+  Depth = 5;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD, StartPos: integer;
+  Sum: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetL2Normalize.Create());
+    RandSeed := 12345;
+    for CntD := 0 to Input.Size - 1 do
+      Input.Raw[CntD] := Sin(CntD * 0.37) * 2.5 + 0.4;
+    NN.Compute(Input);
+    for CntX := 0 to SizeX - 1 do
+      for CntY := 0 to SizeY - 1 do
+      begin
+        StartPos := NN.GetLastLayer.Output.GetRawPos(CntX, CntY, 0);
+        Sum := 0;
+        for CntD := 0 to Depth - 1 do
+          Sum := Sum + NN.GetLastLayer.Output.FData[StartPos + CntD] *
+                       NN.GetLastLayer.Output.FData[StartPos + CntD];
+        AssertEquals('L2Normalize ||y||^2=1 at (' + IntToStr(CntX) + ',' +
+          IntToStr(CntY) + ')', 1.0, Sum, 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizeGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetL2Normalize.Create(),
+    'L2Normalize', 2, 1, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizeSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // Verify that a non-default epsilon round-trips through Save/Load.
+  SerializationRoundTrip(Self, TNNetL2Normalize.Create(1e-5),
+    'L2Normalize', 3, 1, 4, 1e-5);
+  // Also assert the structure string (which encodes FFloatSt[0]) survives.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetL2Normalize.Create(2.5e-4));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('L2Normalize round-trip class name',
+        'TNNetL2Normalize', NN2.GetLastLayer.ClassName);
+      AssertEquals('L2Normalize round-trip structure preserves epsilon',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestSincForward;

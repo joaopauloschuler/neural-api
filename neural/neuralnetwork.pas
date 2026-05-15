@@ -1102,6 +1102,25 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Per-sample L2 normalization across the depth axis.
+  // For each spatial position (X,Y), treats the depth-axis vector v of length
+  // Depth as a unit vector: y_i = x_i / sqrt(sum_j x_j^2 + eps). Output shape
+  // equals input shape and no trainable parameters. The epsilon stabilizer is
+  // stored in FFloatSt[0] (default 1e-8) and round-trips via Save/Load. The
+  // exact backward applies the full Jacobian (I - y y^T) / n per spatial
+  // position; the reciprocal 1/n is cached on the forward pass.
+  TNNetL2Normalize = class(TNNetIdentity)
+  protected
+    FInvNorms: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pEpsilon: TNeuralFloat); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Clamp activation: y = clamp(x, MinValue, MaxValue).
   // Element-wise hard saturation between MinValue and MaxValue. Sub-gradient
   // is 1 strictly inside (MinValue, MaxValue) and 0 outside. MinValue is
@@ -5110,6 +5129,111 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetL2Normalize }
+
+constructor TNNetL2Normalize.Create();
+begin
+  Create(1e-8);
+end;
+
+constructor TNNetL2Normalize.Create(pEpsilon: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pEpsilon;
+  FInvNorms := TNNetVolume.Create();
+end;
+
+destructor TNNetL2Normalize.Destroy();
+begin
+  FInvNorms.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetL2Normalize.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInvNorms.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+end;
+
+procedure TNNetL2Normalize.Compute();
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  LocalPrevOutput: TNNetVolume;
+  SumSq, InvN, Eps, Xi: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.FOutput;
+  Eps := FFloatSt[0];
+  if Eps <= 0 then Eps := 1e-8;
+  MaxX := LocalPrevOutput.SizeX - 1;
+  MaxY := LocalPrevOutput.SizeY - 1;
+  MaxD := LocalPrevOutput.Depth - 1;
+  for CntX := 0 to MaxX do
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      StartPos := LocalPrevOutput.GetRawPos(CntX, CntY, 0);
+      SumSq := 0;
+      for CntD := 0 to MaxD do
+      begin
+        Xi := LocalPrevOutput.FData[StartPos + CntD];
+        SumSq := SumSq + Xi * Xi;
+      end;
+      InvN := 1.0 / Sqrt(SumSq + Eps);
+      FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)] := InvN;
+      for CntD := 0 to MaxD do
+        FOutput.FData[StartPos + CntD] :=
+          LocalPrevOutput.FData[StartPos + CntD] * InvN;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetL2Normalize.Backpropagate();
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  Dot, Yi, InvN: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    // Per spatial position (X,Y), apply the L2-normalize Jacobian along Depth:
+    //   dL/dx_i = (1/n) * (dL/dy_i - y_i * sum_j y_j * dL/dy_j)
+    // which is the (I - y y^T) / n form (||y||=1 after the forward pass).
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+        InvN := FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)];
+        Dot := 0;
+        for CntD := 0 to MaxD do
+          Dot := Dot + FOutput.FData[StartPos + CntD] *
+            FOutputError.FData[StartPos + CntD];
+        for CntD := 0 to MaxD do
+        begin
+          Yi := FOutput.FData[StartPos + CntD];
+          FPrevLayer.OutputError.FData[StartPos + CntD] :=
+            FPrevLayer.OutputError.FData[StartPos + CntD] +
+            InvN * (FOutputError.FData[StartPos + CntD] - Yi * Dot);
+        end;
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
 end;
 
 { TNNetClamp }
@@ -17301,6 +17425,7 @@ begin
       'TNNetStraightThroughEstimator' : Result := TNNetStraightThroughEstimator.Create(Ft[0]);
       'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
+      'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -17476,6 +17601,7 @@ begin
       if S[0] = 'TNNetStraightThroughEstimator' then Result := TNNetStraightThroughEstimator.Create(Ft[0]) else
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
+      if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
