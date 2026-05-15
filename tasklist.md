@@ -803,3 +803,154 @@ Natural follow-ups:
       it to TNNetChannelStdNormalization and TNNetLocalResponseNorm2D
       (the older normalization layers that predate the audit) — same
       shared helper, two-line additions.
+
+### Ideas added on 2026-05-15 (lucky seed 726151)
+
+Coming in fresh after the DropPath-fix + ChannelShuffle + Norm-roundtrip
+batch. MHA is still the headline next step, but several small,
+self-contained items below would be a genuine pleasure to land. Each is
+sized to fit in a single commit.
+
+#### Quick wins I'd take first
+- [ ] TNNetChannelShuffle inverse property test (already listed above):
+      assert that ChannelShuffle(G) composed with ChannelShuffle(C/G)
+      is the identity over a random tensor. A one-screen test that
+      pins the most surprising algebraic property of the new layer.
+- [ ] Extend the norm round-trip suite to TNNetChannelStdNormalization
+      and TNNetLocalResponseNorm2D (also already listed): I want to
+      actually ship the two-line additions and close the open thread.
+- [ ] Filter + file:line patch for `scripts/list_untested_layers.sh`
+      (the two follow-ups listed in the previous batch) — bundle them
+      into one v1 of the script. Two-line awk change; would make
+      every future audit task start with a sharper actionable list.
+
+#### Layers I'd enjoy building (no MHA dependency)
+- [ ] TNNetALiBi — fourth time on the list. Treating its repeated
+      appearance as a personal commitment device. Per-head deterministic
+      slopes (`slope[h] = 2^(-8h/H)`), parameter-free, gradient check
+      mirrors TNNetMaskedFill. The smallest "alternative to RoPE" task
+      we have, and it slots straight into the eventual MHA helper.
+- [ ] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
+      saved/loaded via FFloatSt[0]. Useful for the eventual tiny-GPT
+      sampling demo. Already listed once; would enjoy taking it next.
+- [ ] TNNetGatedResidual (ReZero gating) — already listed. The
+      zero-init learnable gate is a tiny variation on LayerScale and
+      provides a second lever for stabilizing deep residual stacks.
+- [ ] TNNetBitLinear — the BitNet "ternary weight" experiment:
+      forward uses sign(W)*scale, backward keeps full-precision
+      shadow weights via the straight-through estimator. Tiny, fun,
+      and a clean self-contained way to explore quantization-aware
+      training without dragging in any new infra.
+- [ ] TNNetDyT (Dynamic Tanh) — the Liu-et-al 2025 drop-in replacement
+      for LayerNorm: `gamma * tanh(alpha * x) + beta`, with `alpha`
+      a per-layer learnable scalar. Cheap, transformer-relevant, and
+      a one-evening implementation given the existing LayerNorm/LayerScale
+      templates. Numerical gradient check is straightforward.
+- [ ] TNNetMaxOut — the classic Goodfellow MaxOut activation: take K
+      linear projections and reduce by max along the K axis. Easy to
+      gradient-check (argmax is piecewise-constant), and a nostalgic
+      addition that rounds out the activation menagerie.
+- [ ] TNNetPolynomialActivation — per-channel learnable degree-2
+      polynomial `a*x^2 + b*x + c`. Three learnable params per channel,
+      smooth analytic gradient. Fun "what if the activation were
+      learned" experiment that pairs with the activation bake-off.
+
+#### Composite blocks / examples
+- [ ] TNNetPreNormResidual helper — already listed three times. Bundle
+      it with TNNetGLUFeedForward (also listed) into a tiny
+      "minimal-transformer-without-attention" example so the
+      pre-norm-residual + GLU-FFN combo can be exercised end-to-end
+      while MHA is still pending.
+- [ ] Tiny "memorize a sentence" demo: train a 1-layer SDPA+RoPE
+      model to perfectly memorize a 32-token sequence, print the
+      training loss curve and the reconstructed sample. End-to-end
+      exercise of the transformer layers that landed, no full MHA
+      required (single head is fine for memorization).
+- [ ] ShuffleNet-flavored CIFAR block example: 1x1 conv -> ReLU ->
+      ChannelShuffle -> depthwise 3x3 conv -> 1x1 conv, swapped into
+      one of the existing SimpleImage examples. Concrete end-to-end
+      use of the new permutation layer (already listed above; I want
+      to actually take it).
+
+#### Experiments I'm curious about
+- [ ] "Softmax temperature × generation quality" sweep (depends on
+      TNNetSoftmaxTemperature above): generate samples from a tiny
+      trained char model with `T ∈ {0.5, 0.8, 1.0, 1.2, 1.5}` and
+      print the resulting strings. Concrete visualization of what
+      temperature actually does.
+- [ ] DyT vs LayerNorm bake-off (depends on TNNetDyT above): same
+      tiny encoder block, swap the LayerNorm for DyT, chart final
+      loss and wall-clock. Reproduces the headline claim of the
+      DyT paper at toy scale.
+- [ ] ChannelShuffle group-count sweep: with the inverse property
+      test in hand, train the same tiny conv net with
+      `groups ∈ {1, 2, 4, 8}` and chart accuracy. Pure-CPU
+      illustration of the ShuffleNet group/accuracy trade-off.
+- [ ] "Why bother with LayerScale?" experiment: train two deep MLPs
+      (one with TNNetLayerScale, one without) on a toy regression
+      task and chart per-layer gradient norms over training. Shows
+      the γ trick doing its job at toy scale.
+- [ ] First-batch gradient-norm heatmap across (depth, width, init):
+      enumerate a small grid, print one number per cell. The
+      cheapest possible "make the vanishing-gradient problem
+      concrete" diagram, and a natural artifact for the eventual
+      numerical-gradient testing doc.
+
+#### Correctness / audit work
+- [ ] SDPA all-masked-row policy: still open after three batches. I'd
+      like to take the concrete proposal already on the list (detect
+      the all-masked row in Compute, output a zero row, skip the
+      softmax for it), document the choice in code, and add the
+      pinning test. Close the open thread.
+- [ ] Upsample/deconv Backpropagate audit (already listed) — TNNetUpsample
+      first because it's the simplest, then TNNetDeconvolution, then
+      TNNetDeMaxPool. One numerical-gradient test per layer, the
+      same way the activation audit caught real bugs.
+- [ ] LoadFromString round-trip for TNNetChannelShuffle — the new
+      layer carries a Groups parameter in FStruct[0]; the
+      norm-roundtrip pass found zero bugs but we should still pin
+      the dispatch for the just-landed layer before it has a chance
+      to drift.
+- [ ] Property-based gradient harness v0 (already listed): even a
+      version that only randomizes input shape for the six most
+      recently landed layers is enough to start catching shape-edge
+      bugs. I want to commit to actually shipping the v0.
+
+#### Tooling / dev experience
+- [ ] `scripts/grep_layer.sh <TNNet...>` helper (already listed): print
+      the class declaration, its Compute, its Backpropagate, and any
+      test methods referencing it. Captures the "first 30 seconds
+      after picking a layer to audit" workflow.
+- [ ] Tiny `tests/SmokeTest.lpr` that builds + runs the five fastest
+      gradient checks and exits in under a second (already listed).
+      Lets the eventual CI shim start with a real signal even before
+      RunAll.sh is wired in.
+- [ ] `--quick` flag on the test runner (already listed twice): skip
+      any test whose name contains `Slow` / `Large` / `LongSeq`
+      markers, controlled by a single switch. Pairs with the existing
+      RunAll.sh `--quick` idea.
+- [ ] One-shot `scripts/audit_one_layer.sh <TNNet...>` that runs
+      grep_layer.sh, list_untested_layers.sh, and the existing
+      numerical-gradient test runner filtered to tests that mention
+      the layer. Bundles the audit workflow into a single command.
+
+#### Documentation
+- [ ] "How numerical gradient testing works in this repo" note (already
+      listed multiple times). I'd like to actually write it, since
+      every audit task in this file relies on it. Cover the eps
+      choice, central-differences math, tolerance picking, and the
+      AssertGradientCheck helper pattern.
+- [ ] One-pager "transformer building blocks landed in this repo"
+      (already listed): table of LayerNorm / MaskedFill / SDPA / RoPE /
+      SoftCapping / DropPath / GEGLU / SwiGLU / GLU / SquaredReLU /
+      LayerScale / AddPositionalEmbedding / ChannelShuffle, one-line
+      "what it is" + "use it when" per layer. Becomes the index entry
+      into the eventual MHA + encoder-block helpers.
+- [ ] Inline-comment cleanup pass on TNNetScaledDotProductAttention
+      (already listed) — shape annotations on every loop, named
+      strides, link to the planned annotated walkthrough. Pure
+      readability win, no behavior change.
+- [ ] "Picking a tolerance" mini-guide for numerical-gradient tests
+      (already listed). Companion piece to the testing note above.
+      Cover when 1e-2 is fine, when to tighten to 1e-3, and when the
+      right move is to shrink eps instead of loosening the tolerance.
