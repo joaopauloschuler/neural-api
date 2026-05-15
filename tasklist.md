@@ -5843,12 +5843,14 @@ similarity-score layer; the attention variant is distinct.)
       with the SuperResolution example for an end-to-end demo
       (also pinned earlier).
 
-- [ ] TNNetSpaceToDepth + TNNetDepthToSpace — inverse permutation pair.
+- [x] TNNetSpaceToDepth + TNNetDepthToSpace — inverse permutation pair.
       Same shape as PixelShuffle's forward/backward but configured for
       the ViT patchify step (`SpaceToDepth(P) on a (P*Hp, P*Wp, C)
-      input → (Hp, Wp, P*P*C)`). Two new test cases, one per direction;
-      a third asserts `DepthToSpace(SpaceToDepth(x)) == x` (analytic
-      identity).
+      input → (Hp, Wp, P*P*C)`). Landed: parameter-free pair descending
+      from TNNetIdentity with divisibility validation, registered in both
+      CreateLayer dispatch sites. 5 tests in TestNeuralNumerical.pas
+      (forward each direction, analytic-identity round trip, and
+      central-difference gradient check for each).
 
 - [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — forward
       uses `sign(W) * mean(|W|)`; backward keeps the full-precision
@@ -5866,28 +5868,33 @@ similarity-score layer; the attention variant is distinct.)
       backward; the only new derivative is the L2-normalisation chain.
       Numerical-gradient test on the same SeqLen=3, d=4 shape as SDPA.
 
-- [ ] TNNetPolynomialActivation — per-channel learnable
-      `a[c]*x^2 + b[c]*x + c[c]`. Three learnable params per channel,
-      smooth analytic gradient. The "what if the activation were
-      learned" experiment that pairs cleanly with the activation
-      bake-off. Numerical-gradient test plus a "degrades to identity
-      at init" sanity check (b=1, a=c=0).
+- [x] TNNetPolynomialActivation — per-channel learnable
+      `a[c]*x^2 + b[c]*x + c[c]`. Landed: three Depth-long learnable
+      vectors (FNeurons[0..2]); default init a=0/b=1/c0=0 so it
+      degrades to identity. Analytic input + weight gradients;
+      registered in both CreateLayer dispatch sites. Tests:
+      identity-at-init, forward formula, central-difference input
+      and weight gradient checks in TestNeuralNumerical.pas.
 
 #### Loss-function layer family — pinned at the very top of the file
 under "Huber/SmoothL1/Focal/LabelSmoothing losses" but no entries
 exist yet in `neuralnetwork.pas`. Sized for one commit each.
 
-- [ ] TNNetHuberLoss — smooth-L1 / L2 piecewise loss, `delta`
-      configurable (default 1.0). Outputs the scalar loss, backward
-      writes `(y - target)` clipped to `[-delta, +delta]`. Used as
-      the output layer for the TimeSeriesForecast example pinned
-      earlier in the file. Numerical-gradient test on the input
-      gradient at three regions: well below delta, near delta,
-      well above.
+- [x] TNNetHuberLoss — smooth-L1 / L2 piecewise loss, `delta`
+      configurable (default 1.0). Landed as an identity-passthrough
+      output layer (Compute copies input to output so inference still
+      works) whose Backpropagate clips the framework-seeded
+      `(output - target)` gradient elementwise to `[-delta, +delta]`
+      before propagating. delta stored in FFloatSt[0]; registered in
+      both CreateLayer dispatch sites. Tests: passthrough forward,
+      element-wise clipping (delta in {1.0, 0.5}, samples at well
+      below / near / above the knee), Save/Load round-trip.
 
-- [ ] TNNetSmoothL1Loss — the `delta=1` special case of Huber, kept as
-      a separate class for callsite readability (mirrors how
-      TNNetReLU6 is a kept-separate special case of TNNetReLUL).
+- [x] TNNetSmoothL1Loss — the `delta=1` special case of Huber, kept as
+      a separate class for callsite readability. Landed as a
+      TNNetHuberLoss subclass with parameterless `Create` that calls
+      `inherited Create(1.0)`. Defaults-match test confirms its
+      clipping is identical to TNNetHuberLoss(1.0).
 
 - [ ] TNNetFocalLoss — for class-imbalanced classification:
       `FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)`, with `alpha`
@@ -6105,3 +6112,46 @@ subsequent learnable-weight landing (TNNetGatedResidual, TNNetDyT,
 TNNetCausalConv1D, TNNetPolynomialActivation, the loss-layer family).
 That single pair of changes unblocks roughly half of the layer ideas
 in this batch.
+
+### Lucky-day batch seed 845826 — landed
+Three features shipped on this lucky-day session (suite 488 → 501,
+0 failures):
+- [x] TNNetSpaceToDepth + TNNetDepthToSpace (commit 30c3a11)
+- [x] TNNetHuberLoss + TNNetSmoothL1Loss (commit 907657d)
+- [x] TNNetPolynomialActivation (commit 79928ec)
+
+Sized-for-one-commit follow-ups now unblocked or made easier by the
+above:
+- [ ] TNNetFocalLoss — wraps the same softmax-CE path the Huber/SmoothL1
+      heads now establish a passthrough+clip pattern for; can reuse the
+      identity-passthrough output-layer pattern from TNNetHuberLoss.
+      Constructor params (alpha, gamma) in FFloatSt[0..1]. Adds the
+      `gamma=2` numerical-gradient test pinned multiple times.
+- [ ] TNNetLabelSmoothingLoss helper — pure target-side `(1 - eps) *
+      one_hot + eps / NumClasses`; no gradient code. Pairs naturally
+      with a Focal-loss test that re-uses it.
+- [ ] TNNetPixelShuffle — companion of the SpaceToDepth/DepthToSpace
+      pair that just landed; reuse the same divisibility-check and
+      inverse-permutation pattern in neuralnetwork.pas. Numerical-
+      gradient test is one line of variation away from the
+      SpaceToDepth one.
+- [ ] examples/SubPixelSuperRes — drop the new TNNetPixelShuffle (or,
+      provisionally, DepthToSpace) into a 3-layer net that learns to
+      2x-upsample 8x8 random checkerboards to 16x16. Smallest possible
+      end-to-end use of the inverse-permutation layers.
+- [ ] Polynomial-activation bake-off micro-experiment: swap each
+      TNNetReLU in a small MLP for a TNNetPolynomialActivation,
+      compare final loss on the existing hypotenuse toy. Concrete
+      "is a learned activation worth its 3*Depth params?" data point.
+- [ ] Loss-family bake-off (re-pinned, now actionable): hypotenuse
+      with added outliers, four heads — MSE / TNNetHuberLoss(delta=1)
+      / TNNetSmoothL1Loss / robust median — print final test loss
+      under increasing outlier ratios. Direct motivation for the
+      Huber/SmoothL1 landings.
+- [ ] Document the three newly-landed layers in README.md (matching
+      the existing one-line + snippet style): TNNetSpaceToDepth /
+      TNNetDepthToSpace under a new "Shape / Reshape" or
+      "Patchify" subsection; TNNetHuberLoss / TNNetSmoothL1Loss
+      under a "Robust regression losses" entry; TNNetPolynomialActivation
+      under the activation reference. ~30 lines total.
+
