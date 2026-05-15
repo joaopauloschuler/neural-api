@@ -768,6 +768,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// Sinc activation function.
+  // Sinc(x) = sin(x)/x with analytic x->0 limit y = 1. Parameter-free.
+  // Derivative is (x*cos(x) - sin(x))/x^2 with analytic x->0 limit 0;
+  // cached into FOutputErrorDeriv so TNNetReLUBase handles the backward
+  // chain rule with one multiply. A small epsilon guards the |x|->0
+  // branch to avoid division-by-zero.
+  TNNetSinc = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5775,6 +5786,59 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       SinAx := Sin(Alpha * x);
       FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSinc }
+
+procedure TNNetSinc.Compute();
+const
+  SINC_EPS: TNeuralFloat = 1e-6;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, SinX, CosX, SincVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Sinc(x) = sin(x)/x with analytic limit Sinc(0) = 1.
+  // Derivative is (x*cos(x) - sin(x))/x^2 with analytic limit 0 at x=0.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if Abs(x) < SINC_EPS then
+      begin
+        FOutput.FData[OutputCnt] := 1.0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+      end
+      else
+      begin
+        SinX := Sin(x);
+        CosX := Cos(x);
+        SincVal := SinX / x;
+        FOutput.FData[OutputCnt] := SincVal;
+        FOutputErrorDeriv.FData[OutputCnt] := (CosX - SincVal) / x;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if Abs(x) < SINC_EPS then
+        FOutput.FData[OutputCnt] := 1.0
+      else
+        FOutput.FData[OutputCnt] := Sin(x) / x;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16658,6 +16722,7 @@ begin
       'TNNetSin' :                  Result := TNNetSin.Create();
       'TNNetCos' :                  Result := TNNetCos.Create();
       'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
+      'TNNetSinc' :                 Result := TNNetSinc.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16824,6 +16889,7 @@ begin
       if S[0] = 'TNNetSin' then Result := TNNetSin.Create() else
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
       if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
+      if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else

@@ -262,6 +262,9 @@ type
     procedure TestSnakeForward;
     procedure TestSnakeGradientCheck;
     procedure TestSnakeSerializationRoundTrip;
+    procedure TestSincForward;
+    procedure TestSincGradientCheck;
+    procedure TestSincSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8662,6 +8665,54 @@ begin
   // Also verify output equivalence with a non-default alpha.
   SerializationRoundTrip(Self, TNNetSnake.Create(2.5),
     'Snake', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSincForward;
+const
+  PI_VAL: TNeuralFloat = 3.14159265358979323846;
+  HALF_PI: TNeuralFloat = 0.5 * 3.14159265358979323846;
+  TWO_OVER_PI: TNeuralFloat = 2.0 / 3.14159265358979323846;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Hand-checked anchors:
+  //   Sinc(0)    = 1            (analytic limit)
+  //   Sinc(pi)   = sin(pi)/pi   = 0
+  //   Sinc(pi/2) = 1/(pi/2)     = 2/pi
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetSinc.Create());
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := PI_VAL;
+    Input.Raw[2] := HALF_PI;
+    NN.Compute(Input);
+    AssertEquals('Sinc(0)',
+      1.0, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Sinc(pi)',
+      0.0, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('Sinc(pi/2)',
+      TWO_OVER_PI, NN.GetLastLayer.Output.Raw[2], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSincGradientCheck;
+begin
+  // Standard helper seeds the input with Sin(i*0.7)*2 + 0.3, which keeps
+  // values comfortably away from 0 where central differences would be noisy.
+  LayerInputGradientCheck(Self, TNNetSinc.Create(),
+    'Sinc', 3, 3, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSincSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSinc.Create(),
+    'Sinc', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
