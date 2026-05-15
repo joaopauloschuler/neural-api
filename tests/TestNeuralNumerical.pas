@@ -92,6 +92,11 @@ type
     procedure TestPadXYGradientCheck;
     procedure TestCropGradientCheck;
     procedure TestInterleaveChannelsGradientCheck;
+    procedure TestSpaceToDepthForward;
+    procedure TestDepthToSpaceForward;
+    procedure TestDepthToSpaceOfSpaceToDepth;
+    procedure TestSpaceToDepthGradientCheck;
+    procedure TestDepthToSpaceGradientCheck;
     procedure TestGEGLUForward;
     procedure TestGEGLUGradientCheck;
     procedure TestSwiGLUForward;
@@ -3435,6 +3440,126 @@ begin
     'InterleaveChannels', 2, 2, 4, 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestSpaceToDepthForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  P, C, ox, oy, sx, sy, ic: integer;
+  expected: TNeuralFloat;
+begin
+  // Input (P*Hp, P*Wp, C) = (4, 4, 2), P=2 -> Output (2, 2, 8).
+  // Output[ox, oy, (sx*P+sy)*C + ic] == Input[ox*P+sx, oy*P+sy, ic].
+  P := 2;
+  C := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, C);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, C, 1));
+    NN.AddLayer(TNNetSpaceToDepth.Create(P));
+    for ox := 0 to Input.Size - 1 do
+      Input.Raw[ox] := Sin(ox * 0.31) + 0.1 * ox;
+
+    NN.Compute(Input);
+
+    AssertEquals('SpaceToDepth output SizeX', 2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('SpaceToDepth output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('SpaceToDepth output Depth', C * P * P, NN.GetLastLayer.Output.Depth);
+
+    for ox := 0 to 1 do
+      for oy := 0 to 1 do
+        for sx := 0 to P - 1 do
+          for sy := 0 to P - 1 do
+            for ic := 0 to C - 1 do
+            begin
+              expected := Input[ox * P + sx, oy * P + sy, ic];
+              AssertEquals('SpaceToDepth mapping (' + IntToStr(ox) + ',' + IntToStr(oy) +
+                ',sx=' + IntToStr(sx) + ',sy=' + IntToStr(sy) + ',ic=' + IntToStr(ic) + ')',
+                expected,
+                NN.GetLastLayer.Output[ox, oy, (sx * P + sy) * C + ic], 0.0);
+            end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDepthToSpaceForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  P, C, ix, iy, sx, sy, ic, i: integer;
+  expected: TNeuralFloat;
+begin
+  // Input (Hp, Wp, P*P*C) = (2, 2, 8), P=2, C=2 -> Output (4, 4, 2).
+  // Output[ix*P+sx, iy*P+sy, ic] == Input[ix, iy, (sx*P+sy)*C+ic].
+  P := 2;
+  C := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, P * P * C);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, P * P * C, 1));
+    NN.AddLayer(TNNetDepthToSpace.Create(P));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Cos(i * 0.27) - 0.05 * i;
+
+    NN.Compute(Input);
+
+    AssertEquals('DepthToSpace output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('DepthToSpace output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('DepthToSpace output Depth', C, NN.GetLastLayer.Output.Depth);
+
+    for ix := 0 to 1 do
+      for iy := 0 to 1 do
+        for sx := 0 to P - 1 do
+          for sy := 0 to P - 1 do
+            for ic := 0 to C - 1 do
+            begin
+              expected := Input[ix, iy, (sx * P + sy) * C + ic];
+              AssertEquals('DepthToSpace mapping (' + IntToStr(ix) + ',' + IntToStr(iy) +
+                ',sx=' + IntToStr(sx) + ',sy=' + IntToStr(sy) + ',ic=' + IntToStr(ic) + ')',
+                expected,
+                NN.GetLastLayer.Output[ix * P + sx, iy * P + sy, ic], 0.0);
+            end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDepthToSpaceOfSpaceToDepth;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Analytic identity: DepthToSpace(BlockSize) o SpaceToDepth(BlockSize) == Id.
+  // Use P=3 with input (6, 9, 5) so divisibility is non-trivial.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 9, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 9, 5, 1));
+    NN.AddLayer(TNNetSpaceToDepth.Create(3));
+    NN.AddLayer(TNNetDepthToSpace.Create(3));
+
+    RandSeed := 424242;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Random - 0.5) * 4.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('Round-trip SizeX', Input.SizeX, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Round-trip SizeY', Input.SizeY, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Round-trip Depth', Input.Depth, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Round-trip at raw index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+
 procedure TTestNeuralNumerical.TestAvgPoolGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetAvgPool.Create(2), 'AvgPool', 4, 4, 2, 0.01);
@@ -3524,6 +3649,24 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestSpaceToDepthGradientCheck;
+begin
+  // P=2 on (4, 4, 2). Pure permutation; gradients are an identity routing
+  // back to the input. Use the Double-precision loss helper so the
+  // perturbation-induced delta survives Single accumulation across
+  // the 32-cell sum-of-squares.
+  DeMaxPoolFamilyGradientCheck(Self, TNNetSpaceToDepth.Create(2),
+    'SpaceToDepth', 4, 4, 2, 0.001);
+end;
+
+procedure TTestNeuralNumerical.TestDepthToSpaceGradientCheck;
+begin
+  // P=2 on (2, 2, 8): depth divisible by P*P. Inverse permutation of
+  // SpaceToDepth. Double-precision loss helper for the same reason.
+  DeMaxPoolFamilyGradientCheck(Self, TNNetDepthToSpace.Create(2),
+    'DepthToSpace', 2, 2, 8, 0.001);
 end;
 
 procedure TTestNeuralNumerical.TestDeMaxPoolGradientCheck;

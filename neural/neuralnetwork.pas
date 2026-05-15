@@ -1883,6 +1883,35 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Parameter-free permutation layer that reshapes spatial blocks into the
+  // channel axis. With BlockSize=P, an input shape of (P*Hp, P*Wp, C) becomes
+  // (Hp, Wp, P*P*C). The mapping used is
+  //   Output[ox, oy, (sx*P + sy)*C + ic] := Input[ox*P + sx, oy*P + sy, ic]
+  // where 0<=sx,sy<P. This is the ViT "patchify" step. Backward applies the
+  // inverse permutation (accumulating into FPrevLayer.OutputError).
+  TNNetSpaceToDepth = class(TNNetIdentity)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(BlockSize: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// Parameter-free permutation layer that is the inverse of TNNetSpaceToDepth.
+  // With BlockSize=P, an input shape of (Hp, Wp, P*P*C) becomes
+  // (P*Hp, P*Wp, C) via the inverse of the SpaceToDepth mapping:
+  //   Output[ix*P + sx, iy*P + sy, ic] := Input[ix, iy, (sx*P + sy)*C + ic].
+  // Backward applies SpaceToDepth on OutputError.
+  TNNetDepthToSpace = class(TNNetIdentity)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(BlockSize: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -7321,6 +7350,186 @@ begin
         for CntX := 0 to MaxX do
           FPrevLayer.OutputError.Add(CntX, CntY, CntD,
             FOutputError[CntX, MaxY - CntY, CntD]);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetSpaceToDepth }
+
+constructor TNNetSpaceToDepth.Create(BlockSize: integer);
+begin
+  inherited Create();
+  FStruct[0] := BlockSize;
+end;
+
+procedure TNNetSpaceToDepth.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  P: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  P := FStruct[0];
+  if P <= 0 then
+  begin
+    FErrorProc('TNNetSpaceToDepth requires BlockSize>0, got ' + IntToStr(P));
+    Exit;
+  end;
+  if (pPrevLayer.Output.SizeX mod P) <> 0 then
+  begin
+    FErrorProc('TNNetSpaceToDepth requires SizeX divisible by BlockSize, got SizeX=' +
+      IntToStr(pPrevLayer.Output.SizeX) + ' BlockSize=' + IntToStr(P));
+    Exit;
+  end;
+  if (pPrevLayer.Output.SizeY mod P) <> 0 then
+  begin
+    FErrorProc('TNNetSpaceToDepth requires SizeY divisible by BlockSize, got SizeY=' +
+      IntToStr(pPrevLayer.Output.SizeY) + ' BlockSize=' + IntToStr(P));
+    Exit;
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX div P,
+                 pPrevLayer.Output.SizeY div P,
+                 pPrevLayer.Output.Depth * P * P);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetSpaceToDepth.Compute();
+var
+  P, C: integer;
+  OX, OY, SX, SY, IC: integer;
+  MaxOX, MaxOY, MaxC: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  P := FStruct[0];
+  C := FPrevLayer.Output.Depth;
+  MaxOX := FOutput.SizeX - 1;
+  MaxOY := FOutput.SizeY - 1;
+  MaxC := C - 1;
+  for OX := 0 to MaxOX do
+    for OY := 0 to MaxOY do
+      for SX := 0 to P - 1 do
+        for SY := 0 to P - 1 do
+          for IC := 0 to MaxC do
+            FOutput[OX, OY, (SX * P + SY) * C + IC] :=
+              FPrevLayer.FOutput[OX * P + SX, OY * P + SY, IC];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSpaceToDepth.Backpropagate();
+var
+  P, C: integer;
+  OX, OY, SX, SY, IC: integer;
+  MaxOX, MaxOY, MaxC: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutputError.Size > 0) and
+     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
+  begin
+    P := FStruct[0];
+    C := FPrevLayer.Output.Depth;
+    MaxOX := FOutput.SizeX - 1;
+    MaxOY := FOutput.SizeY - 1;
+    MaxC := C - 1;
+    for OX := 0 to MaxOX do
+      for OY := 0 to MaxOY do
+        for SX := 0 to P - 1 do
+          for SY := 0 to P - 1 do
+            for IC := 0 to MaxC do
+              FPrevLayer.OutputError.Add(OX * P + SX, OY * P + SY, IC,
+                FOutputError[OX, OY, (SX * P + SY) * C + IC]);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetDepthToSpace }
+
+constructor TNNetDepthToSpace.Create(BlockSize: integer);
+begin
+  inherited Create();
+  FStruct[0] := BlockSize;
+end;
+
+procedure TNNetDepthToSpace.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  P: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  P := FStruct[0];
+  if P <= 0 then
+  begin
+    FErrorProc('TNNetDepthToSpace requires BlockSize>0, got ' + IntToStr(P));
+    Exit;
+  end;
+  if (pPrevLayer.Output.Depth mod (P * P)) <> 0 then
+  begin
+    FErrorProc('TNNetDepthToSpace requires Depth divisible by BlockSize*BlockSize, got Depth=' +
+      IntToStr(pPrevLayer.Output.Depth) + ' BlockSize=' + IntToStr(P));
+    Exit;
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * P,
+                 pPrevLayer.Output.SizeY * P,
+                 pPrevLayer.Output.Depth div (P * P));
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetDepthToSpace.Compute();
+var
+  P, C: integer;
+  IX, IY, SX, SY, IC: integer;
+  MaxIX, MaxIY, MaxC: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  P := FStruct[0];
+  C := FOutput.Depth;
+  MaxIX := FPrevLayer.Output.SizeX - 1;
+  MaxIY := FPrevLayer.Output.SizeY - 1;
+  MaxC := C - 1;
+  for IX := 0 to MaxIX do
+    for IY := 0 to MaxIY do
+      for SX := 0 to P - 1 do
+        for SY := 0 to P - 1 do
+          for IC := 0 to MaxC do
+            FOutput[IX * P + SX, IY * P + SY, IC] :=
+              FPrevLayer.FOutput[IX, IY, (SX * P + SY) * C + IC];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDepthToSpace.Backpropagate();
+var
+  P, C: integer;
+  IX, IY, SX, SY, IC: integer;
+  MaxIX, MaxIY, MaxC: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutputError.Size > 0) and
+     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
+  begin
+    P := FStruct[0];
+    C := FOutput.Depth;
+    MaxIX := FPrevLayer.Output.SizeX - 1;
+    MaxIY := FPrevLayer.Output.SizeY - 1;
+    MaxC := C - 1;
+    for IX := 0 to MaxIX do
+      for IY := 0 to MaxIY do
+        for SX := 0 to P - 1 do
+          for SY := 0 to P - 1 do
+            for IC := 0 to MaxC do
+              FPrevLayer.OutputError.Add(IX, IY, (SX * P + SY) * C + IC,
+                FOutputError[IX * P + SX, IY * P + SY, IC]);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -18126,6 +18335,8 @@ begin
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
+      'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
+      'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
@@ -18307,6 +18518,8 @@ begin
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
+      if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
+      if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else
