@@ -274,6 +274,9 @@ type
     procedure TestLishtForward;
     procedure TestLishtGradientCheck;
     procedure TestLishtSerializationRoundTrip;
+    procedure TestSincTimesXEqualsSin;
+    procedure TestLishtSymmetry;
+    procedure TestSnakeDerivativeTrigIdentity;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8910,6 +8913,124 @@ procedure TTestNeuralNumerical.TestLishtSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetLisht.Create(),
     'Lisht', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSincTimesXEqualsSin;
+const
+  N = 6;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Vals: array[0..N - 1] of TNeuralFloat;
+  i: integer;
+  Product: TNeuralFloat;
+begin
+  // Identity: Sinc(x) * x = sin(x) / x * x = sin(x), for x <> 0.
+  // Avoid x ~= 0 because TNNetSinc defines Sinc(0) = 1 via analytic limit.
+  Vals[0] := -3.0;
+  Vals[1] := -1.7;
+  Vals[2] := -0.5;
+  Vals[3] :=  0.5;
+  Vals[4] :=  1.7;
+  Vals[5] :=  3.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    NN.AddLayer(TNNetSinc.Create());
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Vals[i];
+    NN.Compute(Input);
+    for i := 0 to N - 1 do
+    begin
+      Product := NN.GetLastLayer.Output.Raw[i] * Vals[i];
+      AssertEquals('Sinc(x)*x = sin(x) at i=' + IntToStr(i),
+        Sin(Vals[i]), Product, 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLishtSymmetry;
+const
+  N = 5;
+var
+  NN, NNNeg: TNNet;
+  Input, InputNeg: TNNetVolume;
+  Vals: array[0..N - 1] of TNeuralFloat;
+  i: integer;
+begin
+  // LiSHT(x) = x * tanh(x) is even: LiSHT(-x) = (-x)*tanh(-x) = x*tanh(x).
+  Vals[0] := -2.3;
+  Vals[1] := -0.8;
+  Vals[2] :=  0.15;
+  Vals[3] :=  1.1;
+  Vals[4] :=  2.7;
+  NN := TNNet.Create();
+  NNNeg := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputNeg := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    NN.AddLayer(TNNetLisht.Create());
+    NNNeg.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    NNNeg.AddLayer(TNNetLisht.Create());
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Vals[i];
+      InputNeg.Raw[i] := -Vals[i];
+    end;
+    NN.Compute(Input);
+    NNNeg.Compute(InputNeg);
+    for i := 0 to N - 1 do
+      AssertEquals('LiSHT(-x) = LiSHT(x) at i=' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i],
+        NNNeg.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    NNNeg.Free;
+    Input.Free;
+    InputNeg.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSnakeDerivativeTrigIdentity;
+const
+  N = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Vals: array[0..N - 1] of TNeuralFloat;
+  i: integer;
+  Expected: TNeuralFloat;
+begin
+  // Snake'(x) at alpha=1 is 1 + sin(2x), which also equals
+  // 1 + 2*sin(x)*cos(x). FOutputErrorDeriv is filled during Compute
+  // when the layer has a properly sized error volume (pError=1 below).
+  Vals[0] := -1.0;
+  Vals[1] := -0.3;
+  Vals[2] :=  0.4;
+  Vals[3] :=  1.2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1)); // pError=1 sizes error volumes
+    NN.AddLayer(TNNetSnake.Create(1.0));
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Vals[i];
+    NN.Compute(Input);
+    for i := 0 to N - 1 do
+    begin
+      Expected := 1.0 + 2.0 * Sin(Vals[i]) * Cos(Vals[i]);
+      AssertEquals('Snake''(x, alpha=1) = 1 + 2*sin(x)*cos(x) at i=' + IntToStr(i),
+        Expected, NN.GetLastLayer.OutputErrorDeriv.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
