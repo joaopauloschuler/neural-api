@@ -777,3 +777,29 @@ is sized to fit in a single focused commit.
       on every loop, name the strides, and link to the planned
       annotated walkthrough doc. Pure readability win, no behavior
       change.
+
+### Ideas added on 2026-05-15 (post DropPath-fix + ChannelShuffle + Norm-roundtrip batch)
+
+This batch landed: TNNetDropPath p>=1 strict-drop fix + determinism test,
+TNNetChannelShuffle (ShuffleNet permutation) with full test set, and
+LayerNorm/RMSNorm/GroupNorm LoadFromString round-trip coverage. No bugs
+surfaced in the norm-serialization audit — gamma/beta and the GroupNorm
+FStruct[0]=Groups all round-trip cleanly through the generic dispatch.
+
+Natural follow-ups:
+
+- [ ] TNNetChannelShuffle CIFAR/ImageNet-style integration example —
+      drop it into one of the existing conv examples (e.g. SimpleImage)
+      as a ShuffleNet-flavored block (1x1 conv -> ChannelShuffle ->
+      depthwise conv). Visible end-to-end use of the new layer.
+- [ ] TNNetChannelShuffle inverse property test: ChannelShuffle(G)
+      composed with ChannelShuffle(C/G) is the identity. Cute one-line
+      property check on top of the existing forward test.
+- [ ] Now that DropPath p=1 is strict-drop, add a tiny experiment that
+      confirms a deep residual net with p=1 DropPath after every block
+      collapses to the identity path (loss curve matches a no-residual
+      baseline). Cheap teaching artifact for the fix.
+- [ ] Now that the norm round-trip suite covers Layer/RMS/Group, extend
+      it to TNNetChannelStdNormalization and TNNetLocalResponseNorm2D
+      (the older normalization layers that predate the audit) — same
+      shared helper, two-line additions.
