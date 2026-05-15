@@ -1718,10 +1718,13 @@ hitting the same wall.**
       output channel before the forward pass. Pairs especially well
       with TNNetGroupNorm. Gradient check via the existing
       LayerWeightGradientCheck helper.
-- [ ] TNNetInstanceNorm — per-sample, per-channel normalization
+- [x] TNNetInstanceNorm — per-sample, per-channel normalization
       (the GroupNorm limit at G=C). The TNNetGroupNorm code is the
       ready template; this is essentially a one-line constructor
       override plus a dedicated test in TestNeuralNumerical.pas.
+      Landed: subclass of TNNetGroupNorm; SetPrevLayer sets
+      Groups := Depth so each channel is its own group. Forward /
+      gradient-check / serialization round-trip tests.
 
 #### Attention / transformer building blocks
 - [ ] TNNetMultiHeadSelfAttention — wrap the existing
@@ -1855,12 +1858,15 @@ have landed recently.
 - [ ] TNNetLogSigmoid — `y = log(sigmoid(x)) = -softplus(-x)`. Useful
       in losses and the numerically stable log-likelihood path.
       Derivative is `sigmoid(-x)`.
-- [ ] TNNetHardShrink — `y = x if |x| > lambda else 0`. The L1-prox
+- [x] TNNetHardShrink — `y = x if |x| > lambda else 0`. The L1-prox
       activation. Trivial forward; derivative is the indicator on
-      `|x| > lambda`.
-- [ ] TNNetSoftShrink — `y = x - lambda*sign(x) if |x| > lambda else 0`.
+      `|x| > lambda`. Landed: lambda in FFloatSt[0] (default 0.5),
+      cached indicator derivative, three tests (forward / gradient /
+      round-trip) in TestNeuralNumerical.pas.
+- [x] TNNetSoftShrink — `y = x - lambda*sign(x) if |x| > lambda else 0`.
       The L1-prox cousin of HardShrink; smooth-ish flavor of the same
-      sparsity-inducing activation.
+      sparsity-inducing activation. Landed alongside TNNetHardShrink,
+      same harness shape.
 
 #### Permutation / reshape primitives I'd enjoy writing
 - [ ] TNNetSpaceToDepth + TNNetDepthToSpace pair (already on the list
@@ -1874,9 +1880,10 @@ have landed recently.
       a great smoke test for the LoadFromString round-trip harness.
 
 #### Normalization follow-ups
-- [ ] TNNetInstanceNorm — per-sample, per-channel normalization (the
+- [x] TNNetInstanceNorm — per-sample, per-channel normalization (the
       GroupNorm limit at G=C). One-line constructor override on
-      TNNetGroupNorm plus a dedicated grad-check.
+      TNNetGroupNorm plus a dedicated grad-check. Landed (see earlier
+      TNNetInstanceNorm entry).
 - [ ] TNNetWeightStandardization wrapper — normalize a Conv/Dense
       layer's weights to zero-mean / unit-variance per output channel
       before the forward pass. Pairs especially well with GroupNorm.
@@ -2010,11 +2017,14 @@ to land in a single focused session.
       bake-off; configurable alpha via FFloatSt[0].
 - [ ] TNNetGaussianActivation — `y = exp(-x^2)`. RBF-style activation;
       useful for the saturating-activation bake-off entry above.
-- [ ] TNNetLogSoftMax — exact log-softmax with numerically stable
+- [x] TNNetLogSoftMax — exact log-softmax with numerically stable
       `x - max - log(sum(exp(x-max)))`. Pairs with NLL-style loss paths
       and avoids the log(softmax) trick at training time. Backward is
       `dy - softmax(x) * sum(dy)` over the depth axis. Numerical-grad
-      test required.
+      test required. Landed: per-(X,Y) over depth, parameter-free,
+      backward simplifies to `prev.err[d] += dy[d] - exp(out[d])*sum_d dy[d]`.
+      Forward / gradient-check / serialization round-trip tests in
+      TestNeuralNumerical.pas.
 
 #### Composite blocks I'd enjoy building
 - [ ] TNNetPreNormTransformerBlock helper — convenience builder
@@ -2096,3 +2106,55 @@ to land in a single focused session.
       auxiliary loss. Stretch but well-scoped if the SDPA / transformer
       pieces are in place.
 
+
+### Lucky-day batch — 2026-05-15 (post LogSoftMax + InstanceNorm + Shrink batch)
+
+This batch landed:
+- TNNetLogSoftMax (exact, stable per-(X,Y) log-softmax over depth).
+  Forward, gradient-check, and serialization round-trip tests.
+- TNNetInstanceNorm (TNNetGroupNorm with Groups := Depth at SetPrevLayer).
+  Forward / gradient-check / serialization round-trip tests.
+- TNNetHardShrink + TNNetSoftShrink L1-prox activations, lambda in
+  FFloatSt[0] (default 0.5). Six new tests (forward / gradient /
+  round-trip per layer).
+
+Natural follow-ups (each commit-sized):
+
+- [ ] TNNetLogSoftMax + cross-entropy training-loss smoke example:
+      replace `TNNetSoftMax` + cross-entropy with `TNNetLogSoftMax` +
+      NLL on a tiny classifier and confirm matching convergence. The
+      log-domain path is the whole reason this layer landed.
+- [ ] TNNetLogSoftMax stability test on a huge logit vector
+      (e.g. `x = [1000, 0, 0, ...]`): assert finite output, exp(out)
+      sums to 1, gradient is finite. Pairs with the softmax stability
+      micro-test already on the list.
+- [ ] TNNetLogSoftMax "global vs pointwise" question: confirm whether
+      the per-(X,Y) over-depth axis is the right default vs a global
+      variant matching the existing TNNetSoftMax. If both are useful,
+      add a global sibling using TNNetSoftMax's axis convention.
+- [ ] TNNetInstanceNorm vs TNNetGroupNorm bake-off on a tiny conv
+      example — single chart, single seed, demonstrates the
+      per-channel limit case.
+- [ ] TNNetInstanceNorm CIFAR-style integration example (a simple
+      SimpleImage path with InstanceNorm replacing the existing
+      ChannelStdNorm) — a real end-to-end use of the new layer.
+- [ ] TNNetHardShrink / TNNetSoftShrink kink-region gradient test:
+      currently the gradient checks bias inputs away from `±lambda`
+      to avoid finite-difference noise. A dedicated test that
+      asserts the derivative is exactly the indicator on `|x| > lambda`
+      at hand-picked inputs (no central differences) would close the
+      coverage gap at the kink.
+- [ ] TNNetHardShrink / TNNetSoftShrink sparsity micro-experiment:
+      train a tiny autoencoder with each as the bottleneck activation
+      and print the fraction of zero activations vs reconstruction
+      loss. Concrete demonstration of the L1-prox sparsity claim.
+- [ ] TNNetLogSigmoid (`y = log(sigmoid(x)) = -softplus(-x)`) — the
+      natural companion to TNNetLogSoftMax for the BCE-style loss
+      path. Standard stable form; derivative is `sigmoid(-x)`.
+- [ ] TNNetThreshold (`y = x if x > theta else value`) — still open
+      from the seed-401988 batch; generalizes ReLU. Two FFloatSt
+      params (theta, value), indicator derivative.
+- [ ] README activation/normalization reference: TNNetLogSoftMax,
+      TNNetInstanceNorm, TNNetHardShrink, TNNetSoftShrink each need a
+      one-line description + tiny usage snippet next to their
+      siblings (TNNetSoftMax / TNNetGroupNorm / TNNetTanhShrink).
