@@ -180,6 +180,10 @@ type
     procedure TestReverseChannelsGradientCheck;
     procedure TestReverseChannelsInvolution;
     procedure TestReverseChannelsSerializationRoundTrip;
+    procedure TestReverseXYForward;
+    procedure TestReverseXYGradientCheck;
+    procedure TestReverseXYInvolution;
+    procedure TestReverseXYSerializationRoundTrip;
     procedure TestLayerNormSerializationRoundTrip;
     procedure TestRMSNormSerializationRoundTrip;
     procedure TestGroupNormSerializationRoundTrip;
@@ -6298,6 +6302,76 @@ begin
   // SaveToString -> LoadFromString cycle.
   SerializationRoundTrip(Self, TNNetReverseChannels.Create(),
     'ReverseChannels', 2, 2, 5, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestReverseXYForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, y, d: integer;
+begin
+  // 3x3x2: output[x, y, d] = input[2 - x, 2 - y, d].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetReverseXY.Create());
+    RandSeed := 424242;
+    for x := 0 to Input.Size - 1 do
+      Input.Raw[x] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for d := 0 to 1 do
+      for y := 0 to 2 do
+        for x := 0 to 2 do
+          AssertEquals('ReverseXY output (' + IntToStr(x) + ',' + IntToStr(y)
+            + ',' + IntToStr(d) + ')',
+            Input[2 - x, 2 - y, d],
+            NN.GetLastLayer.Output[x, y, d], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReverseXYGradientCheck;
+begin
+  // Parameter-free permutation; backward is the same involution.
+  LayerInputGradientCheck(Self, TNNetReverseXY.Create(),
+    'ReverseXY', 2, 2, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReverseXYInvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Applying ReverseXY twice must return the identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 5, 1));
+    NN.AddLayer(TNNetReverseXY.Create());
+    NN.AddLayer(TNNetReverseXY.Create());
+    RandSeed := 242424;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ReverseXY involution at index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReverseXYSerializationRoundTrip;
+begin
+  // Parameter-free, so only element-wise output parity matters after the
+  // SaveToString -> LoadFromString cycle.
+  SerializationRoundTrip(Self, TNNetReverseXY.Create(),
+    'ReverseXY', 3, 3, 4, 1e-5);
 end;
 
 // Generic helper for the *Norm family: after the layer is wired by AddLayer,
