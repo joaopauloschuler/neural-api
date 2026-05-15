@@ -4615,24 +4615,27 @@ without yet pinning concrete chunks.
 
 #### Layers I'd enjoy authoring
 
-- [ ] TNNetL2Normalize — per-sample L2 normalize across the depth axis
-      (or a configurable axis flag in FFloatSt) with epsilon for
-      numerical stability. The natural input stage for cosine-similarity
-      heads, contrastive losses, and triplet/embedding networks. Forward
-      is `x / sqrt(sum(x²) + eps)`; backward is the standard
-      `(I - ŷŷᵀ) / ||x||` Jacobian. Two tests (unit-norm forward,
-      central-difference gradient). Pairs with the already-pinned
-      TNNetCosineSimilarity and TNNetCosineEmbeddingLoss.
+- [x] TNNetL2Normalize — per-sample L2 normalize across the depth axis
+      with epsilon for numerical stability. Landed (commit 9c11107):
+      descends from TNNetIdentity, eps in FFloatSt[0] (default 1e-8),
+      full `(I - ŷŷᵀ) / n` Jacobian backward with per-(x,y) `1/n`
+      cached in FInvNorms. Three tests (unit-norm forward, gradient
+      check, serialization round-trip). Note: existing
+      TNNetPointwiseNorm has an approximate scalar-only backward;
+      TNNetL2Normalize is the exact-Jacobian replacement to prefer.
 
-- [ ] TNNetPenalizedTanh — `y = tanh(x) if x>0 else 0.25·tanh(x)`. The
-      asymmetric-tanh trick from "Revise Saturated Activations for
-      Deep Networks". Sister to the LeakyReLU pattern but on tanh.
-      Three tests (asymmetry across zero, gradient check, serialization).
+- [x] TNNetPenalizedTanh — `y = tanh(x) if x>0 else 0.25·tanh(x)`.
+      Landed (commit 362af6d): TNNetReLUBase descendant, derivative
+      cached in FOutputErrorDeriv so the inherited Backpropagate just
+      works. Three tests (asymmetry across zero, gradient check,
+      serialization round-trip).
 
-- [ ] TNNetSoftMin — `softmax(-x)`, the natural sibling of TNNetSoftMax
-      that often shows up in attention-style weighting where lower
-      scores should win. Same exact-Jacobian backward path as
-      TNNetSoftMax. One central-difference test.
+- [x] TNNetSoftMin — `softmax(-x)`, the natural sibling of TNNetSoftMax.
+      Landed (commit 3e99e06): descends from TNNetPointwiseSoftMax,
+      Compute negates a working copy then calls SoftMax; Backpropagate
+      uses the same O(N) softmax-Jacobian form but subtracts (sign
+      flip from d(-x)/dx = -1). Three tests (sums-to-one,
+      softmax(-x) equivalence, gradient check).
 
 - [ ] TNNetGumbelSoftmax — straight-through estimator with temperature
       `τ` (FFloatSt[0]). Forward draws `g_i = -log(-log(U_i))` and
@@ -4778,3 +4781,47 @@ without yet pinning concrete chunks.
       / Attention / Loss / Shape / Regularization). The layer count is
       past 200 and discoverability has degraded; a single appendix
       table doubles as the contributor-side checklist for new layers.
+
+### Lucky-day batch — 2026-05-15 (seed 422331)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Theme: "small, self-contained layers from the seed-491990 wishlist
+that are unblocked today." Landed:
+
+- `3e99e06` — TNNetSoftMin (softmax(-x)) as TNNetPointwiseSoftMax
+  descendant. Compute negates a working copy then SoftMax; Backpropagate
+  uses the O(N) softmax-Jacobian form and subtracts the result from
+  the previous-layer gradient (sign flip from d(-x)/dx = -1). Three
+  tests (sums-to-one, equivalence to softmax(-x), central-difference
+  gradient check).
+- `362af6d` — TNNetPenalizedTanh, asymmetric tanh from "Revise
+  Saturated Activations for Deep Networks". TNNetReLUBase descendant,
+  derivative cached in FOutputErrorDeriv so the inherited Backpropagate
+  multiplies through. Three tests (asymmetry exploiting
+  `y(-x) = -0.25·y(x)`, gradient check, serialization round-trip).
+- `9c11107` — TNNetL2Normalize, per-sample L2 normalization over the
+  depth axis. TNNetIdentity descendant, epsilon in FFloatSt[0]
+  (default 1e-8), full `(I - ŷŷᵀ) / n` Jacobian backward with per-(x,y)
+  `1/n` cached in FInvNorms. Three tests (unit-norm forward, gradient
+  check, serialization round-trip including non-default eps).
+
+Test suite: 460 → 469 (+9), all passing.
+
+#### Natural follow-ups
+- [ ] TNNetCosineSimilarity now has a clean partner in TNNetL2Normalize
+      — building cosine similarity on top of normalized inputs is the
+      obvious next-step embedding-head layer.
+- [ ] Deprecation note for TNNetPointwiseNorm: its backward is the
+      scalar-only `Mul(1/n)` approximation; TNNetL2Normalize implements
+      the exact Jacobian. Either redirect Backpropagate or add a
+      "prefer TNNetL2Normalize" comment to the older layer.
+- [ ] TNNetSoftMin saturation test on extreme inputs (mirroring the
+      SoftCapping pattern) — assert forward outputs stay in [0,1] and
+      sum to 1, and backward doesn't NaN, when the most-negative entry
+      dominates.
+- [ ] PenalizedTanh activation bake-off slot — pair it with the
+      existing activation bake-off entry; the 0.25 negative slope is
+      a hyperparameter worth surveying (0.1 / 0.25 / 0.5).
+- [ ] README activation-table rows for TNNetSoftMin, TNNetPenalizedTanh,
+      and TNNetL2Normalize. Follows the pattern just used for
+      TNNetSinc / TNNetBentIdentity / TNNetLisht / TNNetESwish.
