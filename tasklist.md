@@ -6155,3 +6155,352 @@ above:
       under a "Robust regression losses" entry; TNNetPolynomialActivation
       under the activation reference. ~30 lines total.
 
+### Lucky-day batch — 2026-05-15 (seed 488161)
+
+Fresh wave. The recent batches keep pinning attention/MHA, FFN
+builders, the loss-layer family, and the shared gradient-check
+helper — those are well-covered above and I won't re-pin them. Below
+are ideas I'd actually enjoy taking that don't already appear on the
+list and that I verified absent from `neural/neuralnetwork.pas` at
+the time of writing.
+
+Verified absent as of seed 488161: TNNetSEBlock /
+TNNetSqueezeExcitation, TNNetCBAM, TNNetFiLM, TNNetCoordConv,
+TNNetMaxBlurPool, TNNetSpectralNorm (as a wrapper layer),
+TNNetShakeShake, TNNetShakeDrop, TNNetSinhAct / TNNetCosh,
+TNNetGumbelSoftmax, TNNetSinusoidalTimeEmbedding (the diffusion-style
+1D timestep encoder — distinct from the existing sequence-axis
+TNNetSinusoidalPositionalEmbedding), TNNetCenterLoss, TNNetTripletLoss,
+TNNetContrastiveLoss / InfoNCE, TNNetVectorQuantizer / VQ-VAE bottleneck,
+TNNetEntropyRegularizer, TNNetHopfieldUpdate (modern Hopfield retrieve),
+TNNetInvertedResidual / MBConv builder, TNNetGhostModule,
+TNNetSplineActivation (a tiny KAN-flavored learnable activation),
+TNNetMaxBlurPool, TNNetAntiAliasedPool. The closest near-collisions
+I double-checked and confirmed are *different*: TNNetCosineSimilarity
+exists as a similarity-score layer but no SE/CBAM channel-attention
+block exists; TNNetSinusoidalPositionalEmbedding exists for sequence
+positions but no scalar-timestep variant; TNNetSqrt / TNNetSquare /
+TNNetSign-ish activations exist but no sinh/cosh; TNNetSoftCapping
+exists but no Lipschitz / spectral-norm wrapper.
+
+#### Layers I'd enjoy building (channel-attention / conditioning)
+
+- [ ] TNNetSEBlock (Squeeze-and-Excitation) — global-avg-pool over
+      (SizeX, SizeY), then two FullConnect layers (Depth → Depth/r →
+      Depth) with ReLU + Sigmoid producing per-channel multipliers,
+      finally broadcast-multiply against the original input. Ships as
+      a builder `TNNet.AddSqueezeExcitation(Reduction=16)` composed
+      from existing layers (TNNetGlobalAvgPool, TNNetFullConnectReLU,
+      TNNetFullConnectSigmoid, TNNetChannelMulByLayer). One end-to-end
+      numerical-gradient test on a tiny (4,4,8) input pins the
+      composition; no new low-level Compute/Backpropagate needed
+      because every constituent already has gradient coverage.
+
+- [ ] TNNetCBAM (Convolutional Block Attention Module) — the SE block
+      above plus a spatial-attention sibling: max-pool + avg-pool over
+      the channel axis, concatenate to 2 channels, 7x7 conv to 1
+      channel, sigmoid, broadcast-multiply against the input. Same
+      builder-from-existing-layers approach. Once SE lands, CBAM is a
+      ~20-line addition on top.
+
+- [ ] TNNetFiLM (Feature-wise Linear Modulation) — `y = gamma * x +
+      beta` where gamma and beta come from a separate conditioning
+      input branch (not learned per-channel weights). Constructor
+      takes two prior layers (the feature stream and the gamma|beta
+      stream); the gamma|beta stream's depth must equal 2 * feature
+      depth. Forward broadcasts the two halves over (SizeX, SizeY).
+      Backward splits the incoming gradient and forwards it to both
+      branches with the standard product/sum chain. Unblocks
+      conditional generative experiments and class-conditional batch
+      norm replacements.
+
+- [ ] TNNetCoordConv — concatenate two extra channels containing the
+      normalized X and Y coordinates of each pixel before a convolution.
+      Parameter-free helper layer; forward is a deterministic
+      coordinate fill, backward is the identity on the first Depth
+      channels and zero on the appended coordinate channels (gradient
+      doesn't flow back into the fixed coords). One numerical-gradient
+      test on the kept channels; a separate forward-equality test for
+      the coordinate-channel values at a few sample pixels.
+
+#### Regularization / pooling layers
+
+- [ ] TNNetMaxBlurPool — anti-aliased max-pool: max-pool first, then
+      blur with a fixed binomial filter (no learnable weights), then
+      stride. Improves shift-equivariance of CNNs at zero parameter
+      cost. Forward = existing TNNetMaxPool composed with a fixed
+      depthwise convolution; backward is the chain through both. Ships
+      as a builder on top of existing primitives if the fixed-weight
+      blur can be expressed as a TNNetDepthwiseConvLinear initialized
+      with the binomial kernel and L2/optimizer disabled (similar
+      pattern to the existing TNNetIdentityWithoutL2AndOptimizer).
+
+- [ ] TNNetShakeShake — for two parallel residual branches A and B,
+      forward outputs `alpha * A + (1 - alpha) * B` with `alpha` drawn
+      uniformly per-sample at training, and `0.5` at inference.
+      Backward uses an *independent* `beta ~ U[0,1]` for the gradient
+      mix (the headline trick of the paper). Seeded-RNG numerical-
+      gradient test pinned to a fixed seed.
+
+- [ ] TNNetShakeDrop — generalization of stochastic depth and
+      ShakeShake on a single residual branch: forward output is
+      `x + (bernoulli(p) + alpha * (1 - bernoulli(p))) * F(x)` with
+      uniform `alpha` and `beta` perturbations per-sample. Same RNG
+      pattern as TNNetDropPath; the new ingredient is the
+      multiplicative perturbation.
+
+- [ ] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
+      Convolution layer and divides its weight matrix by its largest
+      singular value (estimated via one power-iteration step per
+      forward pass). Stores the iterate `u` as a non-trainable buffer.
+      Backward is the standard chain through the division. Common
+      regularizer in GANs; would pair nicely with the existing
+      `examples/VisualGAN`.
+
+- [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
+      `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two
+      modes — "soft" (used by gradients) and "hard" (straight-through
+      argmax at the forward pass). Backward is the softmax-Jacobian
+      already implemented for TNNetSoftMax. Test with seeded RNG and
+      tau=1.0.
+
+#### Loss / output layers
+
+- [ ] TNNetTripletLoss — accepts a single input volume of depth
+      `3 * d_embed` interpreted as anchor | positive | negative
+      embeddings concatenated along the depth axis. Forward returns
+      the scalar `max(0, ||a-p||^2 - ||a-n||^2 + margin)`. Backward
+      is the closed-form derivative through the L2 squared norms with
+      the active-margin gate. One numerical-gradient test with the
+      margin clearly active and one with it inactive (zero-gradient
+      case).
+
+- [ ] TNNetContrastiveLoss / InfoNCE — input of depth `2 * d_embed`
+      split into query and key. Computes the InfoNCE loss against the
+      other samples in the minibatch as negatives. Tricky bit: needs
+      access to the full batch at backward, so it fits naturally as
+      a `TNNetLayer` whose Compute operates on the batched
+      `FOutputErrorDeriv` rather than per-sample. Numerical-gradient
+      test on a tiny batch of 4, d_embed=2.
+
+- [ ] TNNetCenterLoss — auxiliary loss `0.5 * ||x - c_y||^2` where
+      `c_y` is a per-class learnable centroid. Stores the centroid
+      matrix `(NumClasses x d_embed)` as a normal weight matrix.
+      Forward computes the per-sample distance to its class centroid;
+      backward updates both the embedding and the corresponding
+      centroid row. Numerical-gradient test on input + the centroid
+      weights.
+
+- [ ] TNNetEntropyRegularizer — passthrough output layer (Compute is
+      the identity) that adds `-lambda * sum(p * log(p))` of its
+      input's softmax to the gradient at Backpropagate. Encourages
+      confident outputs; the negative-lambda variant encourages
+      uncertain outputs (useful for RL exploration). One closed-form
+      gradient test.
+
+- [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors,
+      forward replaces each input vector with its nearest codebook
+      entry under the straight-through estimator (gradient flows
+      through the assignment as identity). Tracks a commitment loss
+      `beta * ||sg[ze] - e||^2` and a codebook loss
+      `||ze - sg[e]||^2` accumulated into the backward pass. Tests:
+      forward assignment correctness on a hand-rolled codebook,
+      numerical-gradient on the STE path with a loosened ~1e-1
+      tolerance (standard for STE tests).
+
+#### Activations
+
+- [ ] TNNetSinhAct — `y = sinh(x)`, backward `cosh(x) * dy`. Trivial
+      element-wise activation; rounds out the trig/hyperbolic family
+      alongside the existing TNNetSin/TNNetCos and TNNetHyperbolicTangent.
+      Numerical-gradient test only (no weights).
+
+- [ ] TNNetSplineActivation — per-channel learnable piecewise-linear
+      activation defined by K+1 control points at fixed knots
+      `[-c, -c + 2c/K, ..., +c]`. KAN-flavored but kept tiny: K
+      defaults to 4, so a Depth-channel layer has 5*Depth params.
+      Backward distributes gradient between the two knots flanking
+      each sample. Numerical-gradient test on input + weights.
+
+- [ ] TNNetMishlike / TNNetSerf — `y = x * erf(softplus(x))`, the Serf
+      activation (Nag, Bhattacharyya 2021). Drop-in for Mish with a
+      slightly smoother profile. Tiny element-wise addition to the
+      TNNetReLUBase family; numerical-gradient test as usual.
+
+#### Examples I'd love to actually write
+
+- [ ] `examples/SEBlockCifar/` — drop one SE block per stage into the
+      existing `examples/SimpleImageClassifier` CIFAR-10 net and
+      print the before/after validation accuracy delta. The smallest
+      end-to-end demonstration of channel-attention on a real task,
+      and a natural follow-on the moment TNNetSEBlock lands. Verified
+      no `examples/SEBlockCifar` directory exists yet.
+
+- [ ] `examples/FiLMConditional/` — toy "draw a digit of class C"
+      generator: a small decoder net whose first two conv blocks are
+      FiLM-conditioned on a 10-way one-hot class input. Trains in
+      well under a minute on CPU. Shows off the new TNNetFiLM layer
+      end-to-end and the way two input branches compose. Pairs with
+      the existing `examples/VisualGAN` as a teaching contrast.
+
+- [ ] `examples/TripletEmbedding/` — learn a 2D embedding of MNIST
+      digits using TNNetTripletLoss; output a PGM scatter plot of
+      the learned embeddings colored by class. Pure CPU; concrete
+      demo of the new loss + a visible result artifact.
+
+- [ ] `examples/VQAutoencoder/` — extend the existing
+      `examples/VisualAutoencoder` with a TNNetVectorQuantizer
+      bottleneck. Print before/after reconstruction PSNR and the
+      number of active codebook entries. Verified no
+      `examples/VQAutoencoder` directory exists yet.
+
+- [ ] `examples/CoordConvSpiral/` — minimal CoordConv vs plain conv
+      comparison on the "predict (x, y) from a one-hot pixel image"
+      task from the original CoordConv paper. Two-line difference
+      between the two networks, dramatic accuracy gap on a 2-minute
+      training run.
+
+- [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10
+      net once with TNNetMaxPool and once with TNNetMaxBlurPool;
+      report shift-equivariance (run inference on the validation
+      set, then on a one-pixel-shifted copy, and print the prediction
+      agreement rate). The headline claim of the MaxBlurPool paper
+      reproduced in one short artifact.
+
+#### Experiments I'd enjoy running
+
+- [ ] Channel-attention bake-off: a fixed tiny CIFAR backbone,
+      identical seed, four variants — (a) no attention, (b) SE block,
+      (c) CBAM, (d) hand-rolled "1x1 conv + sigmoid" baseline. One
+      validation-accuracy bar chart + a CSV. The point: how much of
+      SE/CBAM's gain is "any channel reweighting" vs the specific
+      bottleneck architecture?
+
+- [ ] FiLM-vs-concat conditioning bake-off: the same class-conditional
+      MNIST decoder, once with FiLM conditioning and once with
+      class-one-hot concatenated to the input. Print final
+      reconstruction loss and a side-by-side sample grid. Concrete
+      data point on whether FiLM's parameter efficiency translates
+      to a sample-quality gap at toy scale.
+
+- [ ] Activation family follow-up: the existing menagerie bake-off
+      pinned several batches above doesn't include Serf or the new
+      sinh-family activations on this batch's list. Once they land,
+      add them as two new rows to the same table — no new harness
+      needed.
+
+- [ ] VQ codebook collapse stress test: train the VQ-autoencoder
+      above with K in {16, 64, 256} and a few different commitment-loss
+      weights, print the per-run number of active codebook entries
+      after training. Reproduces the well-known "VQ-VAEs love to
+      collapse" failure mode without dragging in any heavy
+      reconstruction metric.
+
+#### Correctness / audit work I'd take
+
+- [ ] TNNetDotProducts numerical-gradient test — pinned implicitly
+      (the SDPA layer subsumes its usage) but the standalone class
+      still ships and its weight-gradient path looks like the kind of
+      place a silent bug could live. One input + one weight
+      central-difference check on a tiny (2, 1, 4) input.
+
+- [ ] TNNetLocalConnect / TNNetDeLocalConnect input + weight gradient
+      tests. Older locally-connected family that lacks numerical-
+      gradient coverage in `TestNeuralNumerical.pas`. One test pair
+      per direction; would have caught the historical bugs the
+      activation audit turned up if applied earlier.
+
+- [ ] TNNetMaxPoolWithPosition correctness check: the auxiliary
+      "position channels" it emits should round-trip through
+      TNNetDeMaxPool to exactly reconstruct the upsample pattern of
+      the forward pass. Pure forward-equality test, no gradient
+      needed. Pins an invariant that the SuperResolution example
+      already depends on but no test currently enforces.
+
+- [ ] TNNetSinusoidalPositionalEmbedding boundary test: assert that
+      the embedding values match the closed-form formula at three
+      specific (pos, dim) points. The layer ships, the gradient
+      passes through as identity, but no forward-value test currently
+      pins the formula constants — a refactor could silently change
+      them.
+
+#### Tooling / dev experience
+
+- [ ] `scripts/check_layer_dispatch.sh` — grep every
+      `TNNet... = class` line in `neural/neuralnetwork.pas`,
+      cross-reference against the two `CreateLayer` dispatch tables
+      and the `LoadFromString` cascade, and print any class that's
+      missing from any of the three. Catches the "I added a layer
+      but forgot the LoadFromString branch" bug in one line of bash.
+
+- [ ] `scripts/coverage_gradient_tests.sh` — list every layer class
+      whose Backpropagate is overridden (i.e. not `inherited`) and
+      cross-reference against `Test*Gradient*` methods in
+      `tests/TestNeuralNumerical.pas`. Output the actionable TODO list
+      for the next audit batch; pairs with the
+      `scripts/list_activations.sh` pinned earlier.
+
+- [ ] A tiny `docs/layer_taxonomy.md` auto-generator that walks the
+      class hierarchy of `TNNetLayer` in `neuralnetwork.pas` and
+      emits a tree. The current set of ~150 layers is large enough
+      that the README's flat list is hard to navigate; a tree view
+      organized by base class would land as a single CI artifact.
+
+#### Documentation
+
+- [ ] `docs/channel_attention.md` — once SE / CBAM / FiLM land, one
+      page comparing them on the same axes: what they multiply, what
+      conditioning they require, parameter cost vs depth. Becomes the
+      reference companion to the channel-attention bake-off above.
+
+- [ ] `docs/loss_layers.md` — once Huber / SmoothL1 / Focal /
+      LabelSmoothing / Triplet / Contrastive / Center / Entropy /
+      VQ losses are all available, table them on one page: input
+      shape required, scalar vs per-sample, whether the layer is a
+      drop-in for softmax-cross-entropy or an auxiliary loss. Pinned
+      under loss-family docs earlier; this batch sharpens the scope
+      to "an actual table once the family is complete".
+
+- [ ] Short note in `tests/README` (or, if absent, a new one) on
+      "how to add a numerical-gradient test in three lines" — a
+      cookbook for the shared `LayerInputAndWeightGradientCheck`
+      helper pinned multiple batches above. Lands the moment that
+      helper does.
+
+#### Stretch / ambitious
+
+- [ ] `examples/TinyDiffusion/` — a 20-step denoising-diffusion model
+      on 8x8 grayscale MNIST patches using a tiny FiLM-conditioned
+      U-Net with TNNetSinusoidalTimeEmbedding for the timestep. Pure
+      CPU, generates recognizable-ish digit shapes after a few
+      minutes. The first generative-modeling example on the project
+      that isn't a GAN; depends on FiLM + the timestep embedding
+      landings above.
+
+- [ ] `examples/HopfieldRetrieval/` — modern Hopfield network as
+      attention (Ramsauer et al.): store K patterns as the K rows of
+      a `(K, d)` matrix, retrieve via a single softmax-attention step
+      against a query. Tiny, no training loop needed (it's a
+      closed-form retrieval), and demonstrates the
+      attention-as-associative-memory framing in one short program.
+
+- [ ] Mixed-precision experiment — re-pin from earlier in this file
+      but with a concrete first step: add a `TNeuralFloat16 = packed
+      record ...` type in `neuralvolume.pas` with conversion helpers
+      to/from `TNeuralFloat`, plus a one-layer forward-only test that
+      validates the FP16 path matches FP32 to within 1e-2. Doesn't
+      require any optimizer changes yet — pure inference-side
+      groundwork.
+
+#### Meta — what I'd most enjoy taking first
+
+If I had to pick one task this lucky-day session it would be
+TNNetSEBlock as a *builder over existing layers* (no new
+Compute/Backpropagate), paired with the `examples/SEBlockCifar/`
+demo. The builder is ~15 lines of `AddLayer` calls, every constituent
+already has gradient coverage, and the example lands a visible
+accuracy delta on the most-loved existing dataset in the repo. Two
+small commits, one clear story, and unblocks both CBAM and the
+channel-attention bake-off as natural follow-ups.
+
+
