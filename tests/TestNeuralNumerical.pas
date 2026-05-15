@@ -267,6 +267,8 @@ type
     procedure TestESwishSerializationRoundTrip;
     procedure TestTanhExpGradientCheck;
     procedure TestTanhExpSerializationRoundTrip;
+    procedure TestSmishGradientCheck;
+    procedure TestSmishSerializationRoundTrip;
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
@@ -8785,6 +8787,18 @@ procedure TTestNeuralNumerical.TestTanhExpSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetTanhExp.Create(),
     'TanhExp', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSmishGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetSmish.Create(), 'Smish',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSmishSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSmish.Create(),
+    'Smish', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSincForward;

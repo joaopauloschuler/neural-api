@@ -637,6 +637,18 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Smish activation function: y = x * tanh(ln(1 + sigmoid(x))).
+  // Let s = sigmoid(x), L = ln(1 + s), t = tanh(L). Then
+  //   dL/dx = s * (1 - s) / (1 + s)
+  //   dy/dx = t + x * (1 - t^2) * dL/dx.
+  // https://arxiv.org/abs/2204.00746 ("Smish: A Novel Activation Function for
+  // Deep Learning Methods", Wang et al., 2022).
+  TNNetSmish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// TanhExp activation function: y = x * tanh(exp(x)).
   // Derivative: with u = exp(x), t = tanh(u),
   //   dy/dx = t + x * (1 - t^2) * u.
@@ -4128,6 +4140,73 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSmish }
+
+procedure TNNetSmish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, s, L, t, dL: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Smish(x) = x * tanh(ln(1 + sigmoid(x)))
+  // Let s = sigmoid(x), L = ln(1 + s), t = tanh(L)
+  //   dL/dx = s*(1-s) / (1+s)
+  //   dy/dx = t + x * (1 - t^2) * dL/dx
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerically stable sigmoid.
+      if x >= 0 then
+        s := 1 / (1 + Exp(-x))
+      else
+        s := Exp(x) / (1 + Exp(x));
+      L := Ln(1 + s);
+      t := Tanh(L);
+      FOutput.FData[OutputCnt] := x * t;
+      dL := s * (1 - s) / (1 + s);
+      FOutputErrorDeriv.FData[OutputCnt] := t + x * (1 - t * t) * dL;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x >= 0 then
+        s := 1 / (1 + Exp(-x))
+      else
+        s := Exp(x) / (1 + Exp(x));
+      FOutput.FData[OutputCnt] := x * Tanh(Ln(1 + s));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSmish.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetTanhExp }
@@ -16966,6 +17045,7 @@ begin
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetTanhExp' :              Result := TNNetTanhExp.Create();
+      'TNNetSmish' :                Result := TNNetSmish.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
@@ -17137,6 +17217,7 @@ begin
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetTanhExp' then Result := TNNetTanhExp.Create() else
+      if S[0] = 'TNNetSmish' then Result := TNNetSmish.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
