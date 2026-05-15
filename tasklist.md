@@ -3874,41 +3874,24 @@ The ideas below try to step into corners those lists do not yet cover.
 Every TNNet* name has been grep-verified absent from `neural/neuralnetwork.pas`.
 
 #### Layers I'd enjoy authoring
-- [ ] TNNetMaxOut — output channel `j` = max over a configurable group of
-      `k` input channels (`FStruct[0] = k`, output depth = input depth / k).
-      Goodfellow's original "Maxout Networks" activation; piecewise-linear
-      universal approximator with argmax-routed backward (gradient flows
-      only to the channel that achieved the max per spatial cell). Plays
-      naturally with the channel-iteration patterns already in
-      TNNetChannelStdNormalization / TNNetSplitChannels. Four-test shape:
-      forward at a hand-checked tiny case, gradient check, tie-break
-      determinism, serialization round-trip.
-- [ ] TNNetSoftSign — `y = x / (1 + |x|)`, derivative `1 / (1 + |x|)^2`.
-      Smooth bounded alternative to tanh with no exp() call; closes one
-      of the last small gaps in the bounded-activation family alongside
-      Sigmoid/Tanh/HardSigmoid/HardTanh.
-- [ ] TNNetTanhShrink — `y = x - tanh(x)`, derivative `tanh(x)^2`. The
-      "shrinkage" partner to TNNetHardShrink/TNNetSoftShrink already in
-      tree; rounds out the shrink family for a future sparsity README
-      subsection.
+- [x] TNNetMaxOut — already landed in tree (see earlier batch); the
+      seed 231116 re-pin was a stale duplicate.
+- [x] TNNetSoftSign — already landed in tree.
+- [x] TNNetTanhShrink — already landed in tree.
 - [ ] TNNetMishLearnable — TNNetMish with a single learnable α scalar
       (`y = x * tanh(softplus(α x))`). Same template as the pinned
       TNNetSwishLearnable; copy-paste with one extra term in
       Backpropagate. Weight-grad central-difference check is the
       important test.
-- [ ] TNNetChannelShuffle — ShuffleNet's depth-axis permutation
-      (`FStruct[0] = groups`). Parameter-free, deterministic; backward
-      is the inverse permutation. Cheap and self-contained; unblocks a
-      "tiny ShuffleNet block" example.
+- [x] TNNetChannelShuffle — already landed in tree.
 - [ ] TNNetSpaceToDepth / TNNetDepthToSpace — block reshape pair
       (`FStruct[0] = block_size`). Common stem layer in YOLO/SqueezeNet
       variants and the bridge between conv stems and patch-tokenizers.
       Mutual-inverse round-trip is the headline test.
-- [ ] TNNetSinusoidalPositionalEmbedding — the original Transformer
-      paper's fixed (non-learned) sin/cos positional encoding. Companion
-      to the learnable TNNetAddPositionalEmbedding already in tree;
-      parameter-free so the backward pass is identity and there is no
-      weight-gradient path to mis-implement.
+- [~] TNNetSinusoidalPositionalEmbedding — effectively already in tree:
+      TNNetAddPositionalEmbedding calls TVolume.PositionalEncoding which
+      is the fixed sin/cos formula. Open follow-up if someone wants a
+      separately-named alias and/or a "replace, don't add" variant.
 
 #### Composite block builders I'd enjoy authoring
 - [ ] AddPostNormResidual(NN, Sublayer) — the post-norm transformer
@@ -3985,3 +3968,47 @@ Every TNNet* name has been grep-verified absent from `neural/neuralnetwork.pas`.
 - [ ] Tiny GPT char-level CPU example — unblocked the moment MHSA
       lands; remains the most exciting end-to-end demo on the
       tasklist.
+
+### Lucky-day batch — 2026-05-15 (seed 769362)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Before pinning, the orchestrator grep-verified each candidate against
+`neural/neuralnetwork.pas` — three of the original seed 231116 pins
+(SoftSign, TanhShrink, MaxOut, ChannelShuffle) turned out to already
+exist in tree, and the seed 231116 list has been corrected in place.
+
+Landed:
+
+- `961f9cc` — TNNetSnake periodic activation
+  (`y = x + (1/α) · sin(αx)²`, derivative `1 + sin(2αx)`). Configurable
+  α via FFloatSt[0] with α=0 guard, descends from TNNetReLUBase with
+  derivative cached in FOutputErrorDeriv. Three tests (forward,
+  gradient check at α=1.5, serialization round-trip at α=2.5).
+- `beb40cb` — TNNetStraightThroughEstimator (STE) for
+  quantization-aware training. Forward `y = round(x/step)·step` with
+  configurable step (default 1.0, step>0 guard); backward is identity
+  via the inherited TNNetIdentity backward path. Three tests (forward
+  on/off-grid for step ∈ {1, 0.5}, direct backward-equality check
+  since the discontinuous forward defeats central-difference,
+  serialization round-trip at step=0.25).
+
+Test suite: 431 → 437, all passing.
+
+#### Natural follow-ups
+- [ ] TNNetSnake α-sweep micro-experiment — fit `f(x) = sin(8x)` with a
+      3-layer Snake MLP across α ∈ {0.5, 1, 2, 4} and chart final loss
+      vs α. Tiny, deterministic, unblocked by the Snake landing.
+- [ ] Trig identity test for Snake at α=1: derivative
+      `1 + sin(2x) = 1 + 2 sin(x) cos(x)`. Pairs naturally with the
+      existing Sin²+Cos² identity proposal from the seed 186808 batch.
+- [ ] STE quantization-aware MNIST demo — train a small classifier
+      where one hidden activation is rounded via TNNetStraightThrough
+      Estimator(step=0.25); compare test accuracy against the
+      unquantized baseline. Unblocked by the STE landing.
+- [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test — confirm the
+      constructor's FErrorProc fires for step=0 and step=-1. The runtime
+      guard exists but is not currently exercised by a test.
+- [ ] Add a "non-differentiable forward" pattern note to the future
+      `docs/numerical-gradient.md` — STE is the first layer in tree
+      where central-difference is provably wrong, so the direct
+      backward-equality test pattern deserves a short callout.
