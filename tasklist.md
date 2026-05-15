@@ -4506,16 +4506,14 @@ TODOs already present in this tasklist — none of the items below
 duplicate something already landed or already in-flight.
 
 #### Activations I'd enjoy adding
-- [ ] TNNetTanhExp — `y = x · tanh(exp(x))` from the TanhExp paper.
-      Monotone, smooth, near-identity for x<0 and near-linear for x>0;
-      a natural sibling of the Mish/Swish family that just landed.
-      Implement as a TNNetReLUBase descendant with forward +
-      numerical-gradient + serialization-round-trip tests, mirroring
-      the ESwish landing pattern.
-- [ ] TNNetSmish — `y = x · tanh(ln(1 + sigmoid(x)))`, a recent
-      self-gated activation. Slightly cheaper than Mish (one log
-      vs one softplus expansion) and tends to behave well at large
-      |x|. Same test triad as above.
+- [x] TNNetTanhExp — `y = x · tanh(exp(x))` from the TanhExp paper.
+      Landed: TNNetReLUBase descendant with FP32-safe clamping at
+      |x|>20, gradient + serialization round-trip tests in
+      TestNeuralNumerical.pas. Commit fbf1031.
+- [x] TNNetSmish — `y = x · tanh(ln(1 + sigmoid(x)))`. Landed: uses
+      two-branch sigmoid to avoid overflow, parameter-free TNNetMish-
+      style implementation, gradient + serialization round-trip tests.
+      Commit 4c627c1.
 - [ ] Saturation-safety tests for TNNetTanhExp / TNNetSmish at
       ±extreme inputs, mirroring the HardTanh/SoftCapping pattern.
       Confirms forward stays finite and backward doesn't NaN when
@@ -4534,12 +4532,12 @@ duplicate something already landed or already in-flight.
       contrastive head has to bolt on its own normalization. Full
       gradient through the two norms (one numerical-gradient test
       input-side, one against a fixed reference value).
-- [ ] TNNetTriangularCausalMask(SeqLen) — convenience layer that
-      builds its own upper-triangular `-inf` mask given the sequence
-      length and adds it to the input. Removes the boilerplate of
-      pairing TNNetMaskedFill with a constant mask volume in front
-      of every autoregressive SDPA; unblocks a cleaner Tiny GPT
-      example once MHSA lands.
+- [x] TNNetTriangularCausalMask(SeqLen) — convenience layer that
+      builds its own upper-triangular `-1e9` mask sized to the
+      previous-layer output at SetPrevLayer time and adds it during
+      forward. Identity backprop (passthrough). Forward, identity-
+      gradient, serialization round-trip and SDPA-pairing tests in
+      TestNeuralNumerical.pas. Commit 22b2b13.
 
 #### Inference & introspection
 - [ ] Inference sampling utilities — new `neuralsampling` unit (or
