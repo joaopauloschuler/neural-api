@@ -6512,4 +6512,38 @@ accuracy delta on the most-loved existing dataset in the repo. Two
 small commits, one clear story, and unblocks both CBAM and the
 channel-attention bake-off as natural follow-ups.
 
+### Lucky-day batch — 2026-05-15 (seed 732439)
+
+Landed this session:
+- TNNetSinhAct (`y = sinh(x)`, derivative cosh, cached into
+  FOutputErrorDeriv via TNNetReLUBase) — commit b6dd73a.
+- TNNetSerf / TNNetMishlike (`y = x * erf(softplus(x))`, erf via
+  Abramowitz & Stegun 7.1.26 since FPC's Math has no erf) —
+  commit 81d8676.
+
+Full test suite (503/503) green after each commit.
+
+#### Small follow-ups pinned from this batch
+
+- [ ] Hyperbolic-family bake-off micro-experiment: same toy MLP
+      trained with TNNetHyperbolicTangent / TNNetSinhAct /
+      TNNetCos / TNNetSinc / TNNetLisht / TNNetBentIdentity and a
+      one-table loss/epoch comparison. Sinh is the only unbounded
+      member of the trig/hyperbolic family in the repo, so the
+      comparison should highlight where unbounded-vs-bounded
+      matters. Pure-CPU, runs in seconds.
+
+- [ ] Promote the private `SerfErf` polynomial in
+      neural/neuralnetwork.pas to a small shared helper (probably
+      in neuralvolume.pas) so future erf-based losses or
+      activations (e.g. GELU-exact, Gaussian-loss variants) can
+      reuse it. Add a tiny accuracy regression test pinning the
+      A&S 7.1.26 |err| < 1.5e-7 bound.
+
+- [ ] TNNetSerf-vs-TNNetMish ablation: same tiny classifier
+      trained four times (ReLU / Mish / Serf / GELU) on
+      CIFAR-10 or a synthetic toy dataset, report final loss and
+      epochs-to-converge. Concrete payoff for the Mishlike
+      landing.
+
 
