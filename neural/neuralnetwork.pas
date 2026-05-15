@@ -863,6 +863,25 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// This layer does per-sample root-mean-square layer normalization. Each
+  // input sample (all elements across SizeX*SizeY*Depth) is divided by the
+  // root mean square of its elements (no mean subtraction), then a learnable
+  // per-element scale (gamma) is applied. Output has the same shape as the
+  // input. This is a cheaper, transformer-friendly variant of TNNetLayerNorm.
+  TNNetRMSNorm = class(TNNetIdentityWithoutL2)
+    private
+      FRMSNormEpsilon: TNeuralFloat;
+      FInvRMS: TNeuralFloat;
+      FNormalized: TNNetVolume;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// This layer does group normalization. The input channels (Depth) are
   // split into Groups contiguous groups; each group is normalized
   // independently over (SizeX * SizeY * channels-in-group) to zero mean and
@@ -6677,6 +6696,107 @@ begin
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   FNeurons[0].FWeights.Fill(1); // gamma
   FNeurons[1].FWeights.Fill(0); // beta
+  AfterWeightUpdate();
+end;
+
+{ TNNetRMSNorm }
+constructor TNNetRMSNorm.Create();
+begin
+  inherited Create();
+  FRMSNormEpsilon := 1e-5;
+  FInvRMS := 1;
+  FNormalized := TNNetVolume.Create();
+end;
+
+destructor TNNetRMSNorm.Destroy();
+begin
+  FNormalized.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // FNeurons[0] holds gamma (scale).
+  SetNumWeightsForAllNeurons(FOutput);
+  FNormalized.ReSize(FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetRMSNorm.Compute();
+var
+  StartTime: double;
+  MeanSqr: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  // Divide the whole sample by its root mean square (no mean subtraction).
+  MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
+  FInvRMS := 1 / Sqrt(MeanSqr + FRMSNormEpsilon);
+  FOutput.Mul(FInvRMS);
+  // Keep the normalized values for the backward pass.
+  FNormalized.Copy(FOutput);
+  // Apply learnable per-element scale (gamma).
+  FOutput.Mul(FNeurons[0].FWeights);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRMSNorm.Backpropagate();
+var
+  StartTime: double;
+  FloatSize: TNeuralFloat;
+  SumDxHatXHat: TNeuralFloat;
+  Cnt, SizeM1: integer;
+  DxHat: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  FloatSize := FOutput.Size;
+  SizeM1 := FOutput.Size - 1;
+  // Gradient with respect to gamma (accumulated into deltas).
+  // d(gamma) = sum over batch of ( OutputError * normalized )
+  FOutputErrorDeriv.Copy(FOutputError);
+  FOutputErrorDeriv.Mul(FNormalized);
+  FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputErrorDeriv);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // dxhat = OutputError * gamma
+    // dx = invRMS * ( dxhat - xhat * mean(dxhat*xhat) )
+    SumDxHatXHat := 0;
+    for Cnt := 0 to SizeM1 do
+    begin
+      DxHat := FOutputError.FData[Cnt] * FNeurons[0].FWeights.FData[Cnt];
+      FOutputErrorDeriv.FData[Cnt] := DxHat;
+      SumDxHatXHat := SumDxHatXHat + DxHat * FNormalized.FData[Cnt];
+    end;
+    SumDxHatXHat := SumDxHatXHat / FloatSize;
+    for Cnt := 0 to SizeM1 do
+    begin
+      FPrevLayer.FOutputError.FData[Cnt] :=
+        FPrevLayer.FOutputError.FData[Cnt] +
+        FInvRMS * ( FOutputErrorDeriv.FData[Cnt] -
+          FNormalized.FData[Cnt] * SumDxHatXHat );
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetRMSNorm.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  FNeurons[0].FWeights.Fill(1); // gamma
   AfterWeightUpdate();
 end;
 
@@ -13085,6 +13205,7 @@ begin
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
+      'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
@@ -13200,6 +13321,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
+      if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else

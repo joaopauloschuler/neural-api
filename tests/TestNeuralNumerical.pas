@@ -61,6 +61,8 @@ type
     procedure TestLayerNormGradientCheck;
     procedure TestGroupNormForward;
     procedure TestGroupNormGradientCheck;
+    procedure TestRMSNormForward;
+    procedure TestRMSNormGradientCheck;
     
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -1489,6 +1491,140 @@ begin
           ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
           Abs(numericalGrad - analyticalGrad) < 0.01);
       end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  RNorm: TNNetRMSNorm;
+  MeanSqr, RMS: TNeuralFloat;
+  i: integer;
+begin
+  // With default gamma=1, TNNetRMSNorm output must have ~unit root mean
+  // square over the whole sample (no mean subtraction).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2));
+    RNorm := TNNetRMSNorm.Create();
+    NN.AddLayer(RNorm);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.5 - 3.0;
+
+    NN.Compute(Input);
+
+    MeanSqr := NN.GetLastLayer.Output.GetSumSqr() / NN.GetLastLayer.Output.Size;
+    RMS := Sqrt(MeanSqr);
+    AssertEquals('RMSNorm output RMS should be ~1', 1.0, RMS, 0.001);
+
+    // Now test with non-trivial learnable gamma.
+    RNorm.Neurons[0].Weights.Fill(3.0); // gamma
+    NN.Compute(Input);
+    MeanSqr := NN.GetLastLayer.Output.GetSumSqr() / NN.GetLastLayer.Output.Size;
+    RMS := Sqrt(MeanSqr);
+    // RMS scales by gamma.
+    AssertEquals('RMSNorm output RMS should be ~gamma', 3.0, RMS, 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  RNorm: TNNetRMSNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    RNorm := TNNetRMSNorm.Create();
+    NN.AddLayer(RNorm);
+    // Learning rate 1, batch update on: deltas accumulate -1*gradient and
+    // weights are NOT modified, so finite-difference checks stay valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial learnable gamma.
+    for i := 0 to RNorm.Neurons[0].Weights.Size - 1 do
+      RNorm.Neurons[0].Weights.Raw[i] := 1.0 + i * 0.1; // gamma
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('RMSNorm input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. gamma ----
+    for i := 0 to RNorm.Neurons[0].Weights.Size - 1 do
+    begin
+      RNorm.Neurons[0].Weights.Raw[i] := RNorm.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      RNorm.Neurons[0].Weights.Raw[i] := RNorm.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      RNorm.Neurons[0].Weights.Raw[i] := RNorm.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      RNorm.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // Backprop accumulates Delta := Delta - LearningRate*gradient.
+      // With LearningRate = 1, analytical gradient = -Delta.
+      analyticalGrad := -RNorm.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('RMSNorm weight gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
   finally
     NN.Free;
     Input.Free;

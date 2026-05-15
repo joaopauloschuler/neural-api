@@ -49,7 +49,7 @@
       TNNetHardSigmoid). Add to TestNeuralNumerical.pas.
 
 ### Smaller follow-up ideas
-- [ ] TNNetRMSNorm — root-mean-square layer norm (no mean subtraction); cheaper
+- [x] TNNetRMSNorm — root-mean-square layer norm (no mean subtraction); cheaper
       transformer-friendly variant. TNNetLayerNorm has now landed and is a ready
       template (neural/neuralnetwork.pas + TestNeuralNumerical.pas).
 - [ ] Document TNNetLayerNorm / TNNetGroupNorm in the README.md layer reference
