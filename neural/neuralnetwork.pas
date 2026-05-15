@@ -641,6 +641,20 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// TanhShrink activation function.
+  // TanhShrink(x) = x - tanh(x), derivative is tanh(x)^2.
+  TNNetTanhShrink = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
+  /// HardTanh activation function.
+  // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
+  TNNetHardTanh = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -4663,6 +4677,93 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetTanhShrink }
+
+procedure TNNetTanhShrink.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, tanhVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      tanhVal := Tanh(x);
+      FOutput.FData[OutputCnt] := x - tanhVal;
+      // d/dx (x - tanh(x)) = 1 - (1 - tanh(x)^2) = tanh(x)^2
+      FOutputErrorDeriv.FData[OutputCnt] := tanhVal * tanhVal;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x - Tanh(x);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetHardTanh }
+
+procedure TNNetHardTanh.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 1 then
+      begin
+        FOutput.FData[OutputCnt] := 1;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else if x < -1 then
+      begin
+        FOutput.FData[OutputCnt] := -1;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 1 then FOutput.FData[OutputCnt] := 1
+      else if x < -1 then FOutput.FData[OutputCnt] := -1
+      else FOutput.FData[OutputCnt] := x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetInterleaveChannels }
@@ -14696,6 +14797,8 @@ begin
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
+      'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
+      'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
@@ -14829,6 +14932,8 @@ begin
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
+      if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
+      if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else

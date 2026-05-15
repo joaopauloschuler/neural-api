@@ -82,6 +82,10 @@ type
     procedure TestGLUGradientCheck;
     procedure TestSquaredReLUForward;
     procedure TestSquaredReLUGradientCheck;
+    procedure TestTanhShrinkForward;
+    procedure TestTanhShrinkGradientCheck;
+    procedure TestHardTanhForward;
+    procedure TestHardTanhGradientCheck;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
     procedure TestALiBiForward;
@@ -3191,6 +3195,79 @@ begin
   // Stay clear of the kink at 0.
   ActivationGradientCheck(Self, TNNetSquaredReLU.Create(), 'SquaredReLU',
     [0.5, 1.0, 2.0, -1.0, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestTanhShrinkForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetTanhShrink.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+
+    NN.Compute(Input);
+
+    // TanhShrink(x) = x - tanh(x)
+    AssertEquals('TanhShrink(0)', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('TanhShrink(1)', 1.0 - Tanh(1.0), NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('TanhShrink(-1)', -1.0 - Tanh(-1.0), NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('TanhShrink(2)', 2.0 - Tanh(2.0), NN.GetLastLayer.Output.Raw[3], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTanhShrinkGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetTanhShrink.Create(), 'TanhShrink',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestHardTanhForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetHardTanh.Create());
+
+    Input.Raw[0] := 0.5;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := 2.0;
+    Input.Raw[3] := -2.0;
+    Input.Raw[4] := 0.0;
+
+    NN.Compute(Input);
+
+    // HardTanh(x) = clamp(x, -1, 1)
+    AssertEquals('HardTanh(0.5)', 0.5, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('HardTanh(-0.5)', -0.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('HardTanh(2)', 1.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('HardTanh(-2)', -1.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('HardTanh(0)', 0.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHardTanhGradientCheck;
+begin
+  // Stay clear of the kinks at +/-1.
+  ActivationGradientCheck(Self, TNNetHardTanh.Create(), 'HardTanh',
+    [0.5, -0.5, 0.25, -0.75, 2.0, -2.5], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestMaskedFillForward;

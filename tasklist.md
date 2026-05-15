@@ -1085,9 +1085,13 @@ Each is sized for a single focused commit.
       `(Q/||Q||)·(K/||K||)ᵀ * scale`. A nice small variant of SDPA that
       lets us compare numerical stability against the standard dot-product
       formulation without reaching for SoftCapping.
-- [ ] TNNetTanhShrink and TNNetHardTanh — round out the activation
+- [x] TNNetTanhShrink and TNNetHardTanh — round out the activation
       menagerie alongside the already-landed SoftPlus / GaussianActivation
       / SquaredReLU. Closed-form derivatives, easy gradient checks.
+      Landed: both classes descend from TNNetReLUBase, register in
+      both CreateLayer dispatch sites, and ship with forward +
+      numerical-gradient tests in TestNeuralNumerical (HardTanh check
+      keeps inputs away from the +/-1 kinks).
 
 #### Composite blocks / examples
 - [ ] TNNetPreNormResidual helper — listed five times now. Treating
