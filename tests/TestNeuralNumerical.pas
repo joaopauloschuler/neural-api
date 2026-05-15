@@ -87,6 +87,7 @@ type
     procedure TestALiBiForward;
     procedure TestALiBiGradientCheck;
     procedure TestALiBiSerializationRoundTrip;
+    procedure TestALiBiMaskedFillComposition;
     procedure TestSoftCappingForward;
     procedure TestSoftCappingGradientCheck;
     procedure TestDropPathInferenceIdentity;
@@ -3266,6 +3267,61 @@ begin
     'ALiBi', 3, 3, 2, 0.01);
 end;
 
+
+procedure TTestNeuralNumerical.TestALiBiMaskedFillComposition;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, H, Depth, SeqLen: integer;
+  Slope, Expected, Actual: TNeuralFloat;
+begin
+  // Stack TNNetMaskedFill on top of TNNetALiBi. Input is all zeros so
+  // ALiBi adds Slope[h] * (X - Y) per (key=X, query=Y, head=h). MaskedFill
+  // then additively shifts the strict-upper-triangle (X > Y) by -1e9.
+  // Pins the composition expected on the eventual MHA causal path.
+  Depth := 2;
+  SeqLen := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, SeqLen, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, SeqLen, Depth, 1));
+    NN.AddLayer(TNNetALiBi.Create());
+    NN.AddLayer(TNNetMaskedFill.Create()); // default mask value -1e9
+
+    Input.Fill(0.0);
+    NN.Compute(Input);
+
+    for H := 0 to Depth - 1 do
+    begin
+      Slope := Power(2, -8 * (H + 1) / Depth);
+      for Y := 0 to SeqLen - 1 do
+        for X := 0 to SeqLen - 1 do
+        begin
+          Actual := NN.GetLastLayer.Output[X, Y, H];
+          if X > Y then
+          begin
+            // Strict upper triangle: MaskedFill adds -1e9 to ALiBi bias,
+            // which dominates the small slope*(X-Y) contribution.
+            AssertTrue('ALiBi+MaskedFill upper triangle masked at H=' +
+              IntToStr(H) + ' X=' + IntToStr(X) + ' Y=' + IntToStr(Y) +
+              ' got ' + FloatToStr(Actual),
+              Actual < -1e8);
+          end
+          else
+          begin
+            // Lower triangle and diagonal: ALiBi bias only.
+            Expected := Slope * (X - Y);
+            AssertEquals('ALiBi+MaskedFill lower/diag at H=' + IntToStr(H) +
+              ' X=' + IntToStr(X) + ' Y=' + IntToStr(Y),
+              Expected, Actual, 1e-5);
+          end;
+        end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
 
 procedure TTestNeuralNumerical.TestSoftCappingForward;
 var

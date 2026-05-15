@@ -1025,13 +1025,16 @@ Each is sized for a single focused commit.
       TNNetMaskedFill on TNNetALiBi, assert upper triangle stays at
       -1e9 while the lower triangle picks up the slope contribution.
       ~30 lines in TestNeuralNumerical, pins the composition before MHA.
-- [ ] LoadFromString round-trip for TNNetSoftmaxTemperature — the new
+- [x] LoadFromString round-trip for TNNetSoftmaxTemperature — the new
       layer carries T in FFloatSt[0]; mirror the SoftCapping pattern
       and pin the dispatch before it has time to drift.
-- [ ] LoadFromString round-trip for TNNetALiBi — parameter-free but the
+      Done: TestSoftmaxTemperatureSerializationRoundTrip in
+      TestNeuralNumerical.pas.
+- [x] LoadFromString round-trip for TNNetALiBi — parameter-free but the
       cached per-head slope volume is rebuilt at SetPrevLayer; a
       round-trip test pins that the rebuild fires on the deserialized
-      layer.
+      layer. Done: TestALiBiSerializationRoundTrip in
+      TestNeuralNumerical.pas.
 
 #### Layers I'd enjoy building (no MHA dependency)
 - [ ] TNNetReZero / TNNetGatedResidual — already on the list. Per-channel
