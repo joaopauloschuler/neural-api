@@ -309,3 +309,98 @@
 - [ ] Add a `make test` / `make smoketest` shortcut that builds + runs the
       numerical-gradient test suite with one command — lowers the friction
       for every future contributor.
+
+### Ideas added on 2026-05-15 (lucky seed 9052)
+
+#### Layers I'd enjoy building next
+- [ ] TNNetRotaryEmbedding (RoPE) — the natural companion to the SDPA layer
+      that just landed. Parameter-free rotation of Q/K pairs of channels by
+      position-dependent angles. Backward = inverse rotation, so the
+      numerical-gradient test is short. Should accept an optional base
+      frequency (default 10000) and operate in-place across the depth axis.
+- [ ] TNNetALiBi positional bias — alternative to RoPE: add a static
+      slope * (j - i) bias to attention scores. Pairs with TNNetMaskedFill
+      and gives a second option for position handling in the eventual MHA.
+- [ ] TNNetSoftCapping — `c * tanh(x / c)` logit-capping layer used by
+      Gemma-style models. Parameter-free, single closed-form derivative,
+      cheap stabilizer for attention scores and final logits.
+- [ ] TNNetMixtureOfExperts (top-k gating) — even a tiny CPU-friendly
+      version is fun: a softmax gate over E experts, top-1 routing, route
+      each sample through one expert FullConnect. Numerical gradient
+      becomes interesting because the routing is non-differentiable;
+      document and test the straight-through approximation.
+- [ ] TNNetReversibleBlock — i.e. a RevNet-style additive coupling
+      (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Lets the test prove that
+      forward + inverse round-trips to within fp tolerance, on top of the
+      usual gradient check.
+
+#### Composite helpers / blocks
+- [ ] TNNetSwiGLUFeedForward block helper — wrap LayerNorm → dense projection
+      → SwiGLU → dense out-projection into one builder. Already half-listed
+      above; I'd like to actually ship it once MHA lands so the transformer
+      example becomes a few lines.
+- [ ] TNNetTransformerEncoderBlock helper — LayerNorm → MHA → residual →
+      LayerNorm → SwiGLU FFN → residual. Single call, configurable
+      d_model / heads / d_ff. Companion numerical-gradient test on a tiny
+      shape (d_model=8, heads=2, seq=3).
+- [ ] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
+      front of self-attention and an optional cross-attention sub-block.
+      Built on top of the encoder helper above to avoid duplication.
+
+#### Experiments I'm curious about
+- [ ] Attention-pattern visualizer: after training the tiny GPT proof-of-life,
+      dump the softmax attention matrix to a PGM image so the diagonal /
+      induction-head patterns are visible. Small, satisfying, and a great
+      teaching artifact.
+- [ ] Position-encoding bake-off: same tiny seq model trained with (a) no
+      position info, (b) sinusoidal AddPositionalEmbedding, (c) RoPE,
+      (d) ALiBi, printing final loss and a sample generation per scheme.
+      Becomes possible once RoPE + ALiBi land.
+- [ ] Causal-mask leak test: deliberately remove TNNetMaskedFill from a
+      next-token model and show that validation loss drops to ~0 while
+      sampled completions are garbage. A reproducible cautionary tale.
+- [ ] "Lottery-ticket"-flavored experiment: train a small dense net,
+      magnitude-prune the bottom X% of weights, retrain from the original
+      init, and compare. Pure CPU, finishes in seconds, fun to watch.
+- [ ] Init-scheme × depth heatmap: for depths {2, 4, 8, 16} and inits
+      {Glorot, He, LeCun, plain N(0, 0.01)}, plot first-step gradient norm
+      at the deepest layer. Concrete visualization of vanishing gradients.
+
+#### Correctness / audit work
+- [ ] Property-based numerical-gradient harness: write a small generator that
+      yields random (shape, layer-type, hyperparams) tuples and runs the
+      gradient check on each. Already half-listed above — I want to commit
+      to actually shipping it as a new test program under tests/.
+- [ ] Determinism audit: with a fixed RNG seed and the OpenCL path disabled,
+      assert that a tiny model produces bit-identical loss across 3 runs.
+      Add as a smoketest so future PRs can't silently introduce nondeterminism.
+- [ ] SDPA edge-case tests: SeqLen=1 (degenerate softmax), all-masked rows
+      (the row where every key is masked — currently softmax produces NaN;
+      decide policy and add a test pinning the chosen behavior).
+- [ ] LoadFromString / SaveToString round-trip property test: for every
+      registered layer type, build a default instance, serialize, deserialize,
+      and assert the rebuilt layer reports the same Compute output on a
+      fixed random input. Catches dispatch-table gaps the moment they appear.
+
+#### Tooling / dev experience
+- [ ] Tiny CLI `neural-bench` that times forward + backward for a chosen
+      layer at a chosen shape and prints ns/op. Subsumes the volume-unit
+      micro-benchmark idea above and extends it to whole layers.
+- [ ] Coverage script: parse the test programs and report which `TNNet*`
+      classes lack at least one Compute test and at least one numerical-
+      gradient test. Generates the next batch of audit tasks automatically.
+- [ ] `scripts/new_layer.sh <Name>` scaffolder that drops a Compute /
+      Backpropagate skeleton into neuralnetwork.pas and a matching
+      numerical-gradient test stub into TestNeuralNumerical.pas. Captures
+      the "layer authoring checklist" doc as executable form.
+
+#### Documentation
+- [ ] "Reading a numerical-gradient failure" mini-guide — when the harness
+      reports a mismatch, what does the magnitude tell you (analytic-bug
+      vs. tolerance-too-tight vs. discontinuity-near-the-eps-step)? A
+      page-long companion to the testing note already on the list.
+- [ ] Annotated SDPA walkthrough: the new TNNetScaledDotProductAttention is
+      the most algorithmically dense layer in the repo — a short doc
+      stepping through Compute and Backpropagate (with shapes and the
+      softmax-Jacobian derivation) would lower the barrier for the next
+      contributor touching attention code.
