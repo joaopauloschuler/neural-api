@@ -318,6 +318,7 @@ type
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
     procedure TestSinhActGradientCheck;
+    procedure TestArcSinhGradientCheck;
     procedure TestSerfGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
@@ -9623,6 +9624,14 @@ begin
   // is comfortable.
   ActivationGradientCheck(Self, TNNetSinhAct.Create(), 'SinhAct',
     [0.5, -0.5, 1.0, -1.0, 0.25, -0.25], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestArcSinhGradientCheck;
+begin
+  // ArcSinh is smooth everywhere with a derivative bounded by 1, so a wide
+  // sample range is comfortable under ActivationGradientCheck's 0.01 tolerance.
+  ActivationGradientCheck(Self, TNNetArcSinh.Create(), 'ArcSinh',
+    [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.25, -0.25, 0.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSerfGradientCheck;

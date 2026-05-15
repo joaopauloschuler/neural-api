@@ -832,6 +832,18 @@ type
     procedure Compute(); override;
   end;
 
+  /// ArcSinh (inverse hyperbolic sine) activation function.
+  // ArcSinh(x) = ln(x + sqrt(x^2 + 1)). Parameter-free. Derivative is
+  // 1 / sqrt(x^2 + 1), cached into FOutputErrorDeriv so TNNetReLUBase handles
+  // the backward chain rule with one multiply. Monotonic, smooth, unbounded;
+  // grows like ln|x| for large |x|. A tanh sibling that never saturates and
+  // a sinh sibling that never explodes. Sqrt argument is always >= 1, so no
+  // special-case handling needed.
+  TNNetArcSinh = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Snake activation function.
   // Snake(x) = x + (1/alpha) * sin(alpha*x)^2. Derivative is
   // 1 + sin(2*alpha*x). Parameter-free w.r.t. learning but alpha is a
@@ -6915,6 +6927,44 @@ begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := Sinh(LocalPrevOutput.FData[OutputCnt]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetArcSinh }
+
+procedure TNNetArcSinh.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, SqrtVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // ArcSinh(x) = ln(x + sqrt(x^2 + 1)). Derivative is 1/sqrt(x^2 + 1).
+  // Always smooth, no branches: sqrt argument is always >= 1.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      SqrtVal := Sqrt(x * x + 1.0);
+      FOutput.FData[OutputCnt] := Ln(x + SqrtVal);
+      FOutputErrorDeriv.FData[OutputCnt] := 1.0 / SqrtVal;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Ln(x + Sqrt(x * x + 1.0));
+    end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -18623,6 +18673,7 @@ begin
       'TNNetSin' :                  Result := TNNetSin.Create();
       'TNNetCos' :                  Result := TNNetCos.Create();
       'TNNetSinhAct' :              Result := TNNetSinhAct.Create();
+      'TNNetArcSinh' :              Result := TNNetArcSinh.Create();
       'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
       'TNNetSinc' :                 Result := TNNetSinc.Create();
       'TNNetBentIdentity' :         Result := TNNetBentIdentity.Create();
@@ -18812,6 +18863,7 @@ begin
       if S[0] = 'TNNetSin' then Result := TNNetSin.Create() else
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
       if S[0] = 'TNNetSinhAct' then Result := TNNetSinhAct.Create() else
+      if S[0] = 'TNNetArcSinh' then Result := TNNetArcSinh.Create() else
       if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
       if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
       if S[0] = 'TNNetBentIdentity' then Result := TNNetBentIdentity.Create() else
