@@ -102,6 +102,10 @@ type
     procedure TestSoftShrinkForward;
     procedure TestSoftShrinkGradientCheck;
     procedure TestSoftShrinkSerializationRoundTrip;
+    procedure TestThresholdForward;
+    procedure TestThresholdReLUEquivalence;
+    procedure TestThresholdGradientCheck;
+    procedure TestThresholdSerializationRoundTrip;
     procedure TestReLU6Forward;
     procedure TestReLU6ExtremeInputSaturation;
     procedure TestGlobalMaxPoolForward;
@@ -3827,6 +3831,81 @@ begin
     [1.0, -1.0, 1.5, -2.0, 0.25, -0.3], 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestThresholdForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetThreshold.Create(1.0, -0.5));
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 0.5;
+    Input.Raw[2] := 1.0;
+    Input.Raw[3] := 1.5;
+    Input.Raw[4] := 2.0;
+
+    NN.Compute(Input);
+
+    // Threshold(x; theta=1.0, value=-0.5) = x if x > 1.0 else -0.5
+    AssertEquals('Threshold(0)', -0.5, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Threshold(0.5)', -0.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('Threshold(1.0)', -0.5, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('Threshold(1.5)', 1.5, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('Threshold(2.0)', 2.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestThresholdReLUEquivalence;
+var
+  NN, NNReLU: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  NNReLU := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 7);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 7, 1));
+    NN.AddLayer(TNNetThreshold.Create()); // defaults: theta=0, value=0
+    NNReLU.AddLayer(TNNetInput.Create(1, 1, 7, 1));
+    NNReLU.AddLayer(TNNetReLU.Create());
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := -0.1;
+    Input.Raw[3] := 0.0;
+    Input.Raw[4] := 0.1;
+    Input.Raw[5] := 0.5;
+    Input.Raw[6] := 2.0;
+
+    NN.Compute(Input);
+    NNReLU.Compute(Input);
+
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Threshold defaults == ReLU at ' + IntToStr(i),
+        NNReLU.GetLastLayer.Output.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    NNReLU.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestThresholdGradientCheck;
+begin
+  // theta=0.5 is the kink; bias inputs clear of x=0.5.
+  ActivationGradientCheck(Self, TNNetThreshold.Create(0.5, 0.0), 'Threshold',
+    [1.0, -1.0, 1.5, -2.0, 0.9, -0.25], 0.01);
+end;
+
 procedure TTestNeuralNumerical.TestReLU6Forward;
 var
   NN: TNNet;
@@ -5388,6 +5467,12 @@ procedure TTestNeuralNumerical.TestSoftShrinkSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSoftShrink.Create(0.3),
     'SoftShrink', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestThresholdSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetThreshold.Create(0.7, -0.25),
+    'Threshold', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestDropPathSerializationRoundTrip;
