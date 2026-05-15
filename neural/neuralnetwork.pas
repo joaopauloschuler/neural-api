@@ -675,6 +675,22 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Goodfellow MaxOut activation.
+  // Splits the input depth into K equal groups (K = pUnits) and outputs the
+  // elementwise maximum across the groups. Output depth = input depth / K.
+  // This layer has no trainable parameter. Input depth must be divisible by K.
+  // https://arxiv.org/abs/1302.4389
+  TNNetMaxOut = class(TNNetLayer)
+  private
+    FMaxPosArray: array of integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pUnits: integer); reintroduce;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// SwiGLU gated activation - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * Swish(B), where Swish(x) = x * sigmoid(x).
@@ -3879,6 +3895,111 @@ begin
           err := FOutputError[X, Y, D];
           FPrevLayer.FOutputError.Add(X, Y, D, err * geluVal);
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * geluDeriv);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMaxOut }
+
+constructor TNNetMaxOut.Create(pUnits: integer);
+begin
+  inherited Create();
+  if pUnits < 1 then
+  begin
+    FErrorProc('TNNetMaxOut requires pUnits >= 1. pUnits=' + IntToStr(pUnits));
+    pUnits := 1;
+  end;
+  FStruct[0] := pUnits;
+end;
+
+destructor TNNetMaxOut.Destroy();
+begin
+  SetLength(FMaxPosArray, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetMaxOut.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  K, OutDepth: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  K := FStruct[0];
+  if K < 1 then K := 1;
+  if (pPrevLayer.FOutput.Depth mod K) <> 0 then
+  begin
+    FErrorProc('TNNetMaxOut requires input depth divisible by K=' +
+      IntToStr(K) + '. Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  OutDepth := pPrevLayer.FOutput.Depth div K;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, OutDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  SetLength(FMaxPosArray, FOutput.Size);
+end;
+
+procedure TNNetMaxOut.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, K, k_idx, OutDepth, argmax, flatOutIdx: integer;
+  v, best: TNeuralFloat;
+begin
+  StartTime := Now();
+  K := FStruct[0];
+  OutDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := OutDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        best := FPrevLayer.FOutput[X, Y, D];
+        argmax := 0;
+        for k_idx := 1 to K - 1 do
+        begin
+          v := FPrevLayer.FOutput[X, Y, k_idx * OutDepth + D];
+          if v > best then
+          begin
+            best := v;
+            argmax := k_idx;
+          end;
+        end;
+        FOutput[X, Y, D] := best;
+        flatOutIdx := FOutput.GetRawPos(X, Y, D);
+        FMaxPosArray[flatOutIdx] := argmax;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMaxOut.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, OutDepth, argmax, flatOutIdx: integer;
+  err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    OutDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := OutDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          flatOutIdx := FOutput.GetRawPos(X, Y, D);
+          argmax := FMaxPosArray[flatOutIdx];
+          err := FOutputError[X, Y, D];
+          FPrevLayer.FOutputError.Add(X, Y, argmax * OutDepth + D, err);
         end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -14804,6 +14925,7 @@ begin
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
+      'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
       'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
@@ -14939,6 +15061,7 @@ begin
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
+      if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else

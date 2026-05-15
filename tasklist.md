@@ -871,10 +871,14 @@ sized to fit in a single commit.
       a per-layer learnable scalar. Cheap, transformer-relevant, and
       a one-evening implementation given the existing LayerNorm/LayerScale
       templates. Numerical gradient check is straightforward.
-- [ ] TNNetMaxOut — the classic Goodfellow MaxOut activation: take K
+- [x] TNNetMaxOut — the classic Goodfellow MaxOut activation: take K
       linear projections and reduce by max along the K axis. Easy to
       gradient-check (argmax is piecewise-constant), and a nostalgic
       addition that rounds out the activation menagerie.
+      Landed: depth-grouped MaxOut layer (input depth = K * out depth),
+      forward caches argmax per output cell, backward routes the
+      gradient to the winning slab. Forward, numerical-gradient, and
+      serialization round-trip tests in TestNeuralNumerical.
 - [ ] TNNetPolynomialActivation — per-channel learnable degree-2
       polynomial `a*x^2 + b*x + c`. Three learnable params per channel,
       smooth analytic gradient. Fun "what if the activation were
@@ -1246,9 +1250,11 @@ LayerScale, DropPath, exact softmax Jacobian).
 - [ ] TNNetTalkingHeads — pre/post softmax linear mix across heads (the
       "Talking-Heads Attention" trick). Worth a tiny standalone test
       before it ever lands inside MHA.
-- [ ] TNNetMaxOut — k-way max of linear projections. Classical, easy
+- [x] TNNetMaxOut — k-way max of linear projections. Classical, easy
       gradient (route to argmax), nice teaching example for the
       activation menagerie.
+      Landed: see earlier TNNetMaxOut entry (depth-grouped variant,
+      forward + numerical-gradient + round-trip tests).
 - [ ] TNNetMishExact — current Mish uses the standard formulation, but a
       stable formulation for large |x| using softplus's stable form
       would parallel what the SoftPlus landing did. Pure correctness /

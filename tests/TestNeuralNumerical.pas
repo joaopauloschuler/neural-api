@@ -146,6 +146,9 @@ type
     procedure TestGroupNormSerializationRoundTrip;
     procedure TestChannelStdNormalizationSerializationRoundTrip;
     procedure TestLocalResponseNorm2DSerializationRoundTrip;
+    procedure TestMaxOutForward;
+    procedure TestMaxOutGradientCheck;
+    procedure TestMaxOutSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -5412,6 +5415,96 @@ begin
   // Parameter-free, but the window size (FStruct[0]) must survive dispatch.
   SerializationRoundTrip(Self, TNNetLocalResponseNorm2D.Create(3),
     'LocalResponseNorm2D', 4, 4, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestMaxOutForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, kIdx, OutDepth: integer;
+  best, v: TNeuralFloat;
+const
+  MaxOutK = 2;
+begin
+  // Input 2x2x4, K=2 -> output 2x2x2. Each output cell is the max of two
+  // channels separated by OutDepth (=2).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetMaxOut.Create(MaxOutK));
+
+    // Fill with a distinctive pattern to make argmax unambiguous.
+    Input[0, 0, 0] :=  0.1;  Input[0, 0, 1] :=  0.2;
+    Input[0, 0, 2] :=  0.5;  Input[0, 0, 3] := -0.4;  // expect [0.5, 0.2]
+    Input[1, 0, 0] := -1.0;  Input[1, 0, 1] :=  0.7;
+    Input[1, 0, 2] :=  0.3;  Input[1, 0, 3] :=  0.0;  // expect [0.3, 0.7]
+    Input[0, 1, 0] :=  0.6;  Input[0, 1, 1] := -0.2;
+    Input[0, 1, 2] :=  0.1;  Input[0, 1, 3] :=  0.4;  // expect [0.6, 0.4]
+    Input[1, 1, 0] := -0.7;  Input[1, 1, 1] :=  1.1;
+    Input[1, 1, 2] := -0.9;  Input[1, 1, 3] :=  0.8;  // expect [-0.7, 1.1]
+
+    NN.Compute(Input);
+
+    AssertEquals('MaxOut output SizeX', 2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MaxOut output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MaxOut output Depth', 2, NN.GetLastLayer.Output.Depth);
+
+    OutDepth := NN.GetLastLayer.Output.Depth;
+    for X := 0 to 1 do
+      for Y := 0 to 1 do
+        for D := 0 to OutDepth - 1 do
+        begin
+          best := Input[X, Y, D];
+          for kIdx := 1 to MaxOutK - 1 do
+          begin
+            v := Input[X, Y, kIdx * OutDepth + D];
+            if v > best then best := v;
+          end;
+          AssertEquals(
+            'MaxOut [' + IntToStr(X) + ',' + IntToStr(Y) + ',' + IntToStr(D) + ']',
+            best, NN.GetLastLayer.Output[X, Y, D], 1e-6);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaxOutGradientCheck;
+begin
+  // Depth 4 with K=2 -> output depth 2. Inputs come from a deterministic
+  // sinusoid (Sin(i*0.7)*2 + 0.3) so no pair lies on the argmax kink.
+  LayerInputGradientCheck(Self, TNNetMaxOut.Create(2), 'MaxOut', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestMaxOutSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+begin
+  // Round-trip: K survives via FStruct[0] and outputs match on a fixed input.
+  SerializationRoundTrip(Self, TNNetMaxOut.Create(2),
+    'MaxOut', 2, 2, 4, 1e-6);
+
+  // Also pin: the structure string (encodes FStruct[0]=K) round-trips.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetMaxOut.Create(2));
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(NN.SaveToString());
+      AssertEquals('MaxOut round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      AssertEquals('MaxOut output depth after reload', 2,
+        NN2.GetLastLayer.Output.Depth);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestSoftmaxTemperatureMatchesSoftMaxAtOne;
