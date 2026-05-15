@@ -2756,7 +2756,7 @@ couple of examples that would exercise recently-landed primitives.
       just-landed TNNetReverseChannels but along X and Y). Involution,
       parameter-free, same four-test shape (forward / gradient check /
       involution / serialization round-trip).
-- [ ] TNNetFlipX and TNNetFlipY — horizontal and vertical flip
+- [x] TNNetFlipX and TNNetFlipY — horizontal and vertical flip
       layers. Used as training-time augmentation modules inside a
       net rather than only as preprocessing. Each is an involution
       and re-uses the ReverseChannels test scaffolding.
@@ -2853,13 +2853,13 @@ dispatch tables in `neural/neuralnetwork.pas`.
 
 #### Layers I'd enjoy building (each a 1-commit landing)
 
-- [ ] TNNetFlipX — horizontal flip layer (mirror along width).
+- [x] TNNetFlipX — horizontal flip layer (mirror along width).
       Involution, parameter-free; can sit inside the net as a
       training-time augmentation rather than only as preprocessing.
       Reuses the TNNetReverseXY / TNNetReverseChannels four-test
       scaffolding (forward / numerical-gradient / involution /
       SerializationRoundTrip). Verified absent from dispatch.
-- [ ] TNNetFlipY — vertical flip sibling of TNNetFlipX. Same
+- [x] TNNetFlipY — vertical flip sibling of TNNetFlipX. Same
       four-test shape; landing them as one PR pair keeps the
       "involution layers" README subsection ready to write in a
       single pass. Verified absent from dispatch.

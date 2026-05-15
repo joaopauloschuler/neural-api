@@ -184,6 +184,14 @@ type
     procedure TestReverseXYGradientCheck;
     procedure TestReverseXYInvolution;
     procedure TestReverseXYSerializationRoundTrip;
+    procedure TestFlipXForward;
+    procedure TestFlipXGradientCheck;
+    procedure TestFlipXInvolution;
+    procedure TestFlipXSerializationRoundTrip;
+    procedure TestFlipYForward;
+    procedure TestFlipYGradientCheck;
+    procedure TestFlipYInvolution;
+    procedure TestFlipYSerializationRoundTrip;
     procedure TestLayerNormSerializationRoundTrip;
     procedure TestRMSNormSerializationRoundTrip;
     procedure TestGroupNormSerializationRoundTrip;
@@ -6378,6 +6386,146 @@ begin
   // SaveToString -> LoadFromString cycle.
   SerializationRoundTrip(Self, TNNetReverseXY.Create(),
     'ReverseXY', 3, 3, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestFlipXForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, y, d: integer;
+begin
+  // 3x3x2: output[x, y, d] = input[2 - x, y, d].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetFlipX.Create());
+    RandSeed := 424242;
+    for x := 0 to Input.Size - 1 do
+      Input.Raw[x] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for d := 0 to 1 do
+      for y := 0 to 2 do
+        for x := 0 to 2 do
+          AssertEquals('FlipX output (' + IntToStr(x) + ',' + IntToStr(y)
+            + ',' + IntToStr(d) + ')',
+            Input[2 - x, y, d],
+            NN.GetLastLayer.Output[x, y, d], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlipXGradientCheck;
+begin
+  // Parameter-free permutation; backward is the same involution.
+  LayerInputGradientCheck(Self, TNNetFlipX.Create(),
+    'FlipX', 2, 2, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestFlipXInvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Applying FlipX twice must return the identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 5, 1));
+    NN.AddLayer(TNNetFlipX.Create());
+    NN.AddLayer(TNNetFlipX.Create());
+    RandSeed := 242424;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('FlipX involution at index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlipXSerializationRoundTrip;
+begin
+  // Parameter-free, so only element-wise output parity matters after the
+  // SaveToString -> LoadFromString cycle.
+  SerializationRoundTrip(Self, TNNetFlipX.Create(),
+    'FlipX', 3, 3, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestFlipYForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, y, d: integer;
+begin
+  // 3x3x2: output[x, y, d] = input[x, 2 - y, d].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetFlipY.Create());
+    RandSeed := 424242;
+    for x := 0 to Input.Size - 1 do
+      Input.Raw[x] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for d := 0 to 1 do
+      for y := 0 to 2 do
+        for x := 0 to 2 do
+          AssertEquals('FlipY output (' + IntToStr(x) + ',' + IntToStr(y)
+            + ',' + IntToStr(d) + ')',
+            Input[x, 2 - y, d],
+            NN.GetLastLayer.Output[x, y, d], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlipYGradientCheck;
+begin
+  // Parameter-free permutation; backward is the same involution.
+  LayerInputGradientCheck(Self, TNNetFlipY.Create(),
+    'FlipY', 2, 2, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestFlipYInvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Applying FlipY twice must return the identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 5, 1));
+    NN.AddLayer(TNNetFlipY.Create());
+    NN.AddLayer(TNNetFlipY.Create());
+    RandSeed := 242424;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('FlipY involution at index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlipYSerializationRoundTrip;
+begin
+  // Parameter-free, so only element-wise output parity matters after the
+  // SaveToString -> LoadFromString cycle.
+  SerializationRoundTrip(Self, TNNetFlipY.Create(),
+    'FlipY', 3, 3, 4, 1e-5);
 end;
 
 // Generic helper for the *Norm family: after the layer is wired by AddLayer,

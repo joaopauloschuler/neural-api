@@ -1517,6 +1517,24 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Tiny parameter-free permutation layer that mirrors the width (X)
+  // axis: Output[x, y, d] := Input[SizeX - 1 - x, y, d]. Backward applies
+  // the same involution to OutputError.
+  TNNetFlipX = class(TNNetIdentity)
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// Tiny parameter-free permutation layer that mirrors the height (Y)
+  // axis: Output[x, y, d] := Input[x, SizeY - 1 - y, d]. Backward applies
+  // the same involution to OutputError.
+  TNNetFlipY = class(TNNetIdentity)
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -5635,6 +5653,98 @@ begin
         for CntX := 0 to MaxX do
           FPrevLayer.OutputError.Add(CntX, CntY, CntD,
             FOutputError[MaxX - CntX, MaxY - CntY, CntD]);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetFlipX }
+
+procedure TNNetFlipX.Compute();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for CntD := 0 to MaxD do
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
+        FOutput[CntX, CntY, CntD] :=
+          FPrevLayer.FOutput[MaxX - CntX, CntY, CntD];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFlipX.Backpropagate();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    // Involution: applying the same horizontal flip backwards routes the
+    // gradient for output (x, y) into source (MaxX - x, y).
+    for CntD := 0 to MaxD do
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
+          FPrevLayer.OutputError.Add(CntX, CntY, CntD,
+            FOutputError[MaxX - CntX, CntY, CntD]);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetFlipY }
+
+procedure TNNetFlipY.Compute();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for CntD := 0 to MaxD do
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
+        FOutput[CntX, CntY, CntD] :=
+          FPrevLayer.FOutput[CntX, MaxY - CntY, CntD];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFlipY.Backpropagate();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    // Involution: applying the same vertical flip backwards routes the
+    // gradient for output (x, y) into source (x, MaxY - y).
+    for CntD := 0 to MaxD do
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
+          FPrevLayer.OutputError.Add(CntX, CntY, CntD,
+            FOutputError[CntX, MaxY - CntY, CntD]);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -16091,6 +16201,8 @@ begin
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
+      'TNNetFlipX' :                Result := TNNetFlipX.Create();
+      'TNNetFlipY' :                Result := TNNetFlipY.Create();
       'TNNetSum' :                  Result := TNNetSum.Create(aL);
       'TNNetSplitChannels' :        Result := TNNetSplitChannels.Create(aIdx);
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
@@ -16244,6 +16356,8 @@ begin
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else
+      if S[0] = 'TNNetFlipX' then Result := TNNetFlipX.Create() else
+      if S[0] = 'TNNetFlipY' then Result := TNNetFlipY.Create() else
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else
