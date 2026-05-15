@@ -1680,6 +1680,24 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// ReZero: single learnable scalar alpha (init 0) scaling the entire input.
+  // Output[x,y,d] = alpha * Input[x,y,d]. Composing with a skip connection
+  // (e.g. TNNetSum) yields the ReZero residual y = x + alpha * Branch(x);
+  // this layer is just the scalar multiplier and does NOT add the skip.
+  // Backward pass produces gradients for both the input and the scalar
+  // weight (sum over all positions of OutputError * Input).
+  TNNetReZero = class(TNNetChannelTransformBase)
+    private
+      FInitialAlpha: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialAlpha: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   // This is an experimental class. Do not use it.
   TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
     private
@@ -9988,6 +10006,91 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetReZero }
+constructor TNNetReZero.Create();
+begin
+  Create(0.0);
+end;
+
+constructor TNNetReZero.Create(pInitialAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialAlpha := pInitialAlpha;
+  FFloatSt[0] := pInitialAlpha;
+  InitDefault();
+end;
+
+procedure TNNetReZero.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Override the base which allocates Depth weights: ReZero has exactly
+  // one learnable scalar.
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetReZero.Compute();
+var
+  StartTime: double;
+  alpha: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> 1 then
+  begin
+    FErrorProc('Neuron weight count must be 1 at TNNetReZero.');
+  end;
+  {$ENDIF}
+  // Output[x,y,d] = alpha * Input[x,y,d]
+  alpha := FNeurons[0].FWeights.Raw[0];
+  FOutput.Mul(alpha);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetReZero.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  gradAlpha, alpha: TNeuralFloat;
+  i: integer;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  // Gradient w.r.t. the scalar alpha:
+  // d(alpha) = sum over x,y,d of OutputError[x,y,d] * Input[x,y,d].
+  gradAlpha := 0;
+  for i := 0 to FOutputError.Size - 1 do
+    gradAlpha := gradAlpha + FOutputError.Raw[i] * FPrevLayer.Output.Raw[i];
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
+    (-FLearningRate) * gradAlpha;
+  alpha := localNeuron.FWeights.Raw[0];
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Gradient w.r.t. the input: dInput[x,y,d] = OutputError[x,y,d] * alpha.
+    FOutputError.Mul(alpha);
+    FPrevLayer.FOutputError.Add(FOutputError);
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetReZero.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialAlpha);
+  AfterWeightUpdate();
+end;
+
 { TNNetCellMul }
 
 procedure TNNetCellMul.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -17907,6 +18010,7 @@ begin
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetLayerScale':            Result := TNNetLayerScale.Create(Ft[0]);
       'TNNetBias':                  Result := TNNetBias.Create();
+      'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
@@ -18087,6 +18191,7 @@ begin
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetLayerScale' then Result := TNNetLayerScale.Create(Ft[0]) else
       if S[0] = 'TNNetBias' then Result := TNNetBias.Create() else
+      if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else

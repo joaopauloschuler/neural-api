@@ -79,6 +79,10 @@ type
     procedure TestBiasGradientCheck;
     procedure TestBiasWeightGradientCheck;
     procedure TestBiasSerializationRoundTrip;
+    procedure TestReZeroForward;
+    procedure TestReZeroGradientCheck;
+    procedure TestReZeroWeightGradientCheck;
+    procedure TestReZeroSerializationRoundTrip;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -10022,6 +10026,191 @@ begin
   // exercises a non-trivial bias vector.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetBias.Create(), 'Bias', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestReZeroForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LReZero: TNNetReZero;
+  i: integer;
+  alpha: TNeuralFloat;
+begin
+  // TNNetReZero multiplies the whole input by a single learnable scalar.
+  // Output[x,y,d] = alpha * Input[x,y,d]. Default alpha = 0 -> zero output.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3));
+    LReZero := TNNetReZero.Create();
+    NN.AddLayer(LReZero);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.7 + 0.4;
+
+    // Default alpha = 0 must zero the output.
+    AssertEquals('ReZero default alpha is 0', 0.0,
+      LReZero.Neurons[0].Weights.Raw[0], 1e-7);
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ReZero alpha=0 -> output 0 at ' + IntToStr(i),
+        0.0, NN.GetLastLayer.Output.Raw[i], 1e-6);
+
+    // Now set a non-trivial scalar alpha and check exact scaling.
+    alpha := 0.75;
+    LReZero.Neurons[0].Weights.Raw[0] := alpha;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ReZero scalar mul at ' + IntToStr(i),
+        alpha * Input.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReZeroGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LReZero: TNNetReZero;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    LReZero := TNNetReZero.Create(0.6);
+    NN.AddLayer(LReZero);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Input-gradient check: analytical = alpha * dL/dOutput.
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('ReZero input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReZeroWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LReZero: TNNetReZero;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    // Non-zero initial alpha so the numerical perturbation samples a
+    // meaningful slope (the gradient itself does not depend on alpha,
+    // but starting at 0 would still work; pick a non-trivial value).
+    LReZero := TNNetReZero.Create(0.4);
+    NN.AddLayer(LReZero);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3);
+
+    // Numerical gradient w.r.t. the single scalar weight.
+    LReZero.Neurons[0].Weights.Raw[0] := LReZero.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    LReZero.Neurons[0].Weights.Raw[0] := LReZero.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    LReZero.Neurons[0].Weights.Raw[0] := LReZero.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    LReZero.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    // With LearningRate = 1 and batch update on, analytical = -Delta.
+    analyticalGrad := -LReZero.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('ReZero weight gradient check num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReZeroSerializationRoundTrip;
+begin
+  // TNNetReZero has a single learnable scalar; the perturbed-weights
+  // helper pushes it away from the constructor value so the round-trip
+  // exercises a non-trivial alpha. Use a non-default initial alpha (0.5)
+  // so the FFloatSt[0] dispatch path is also covered.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetReZero.Create(0.5), 'ReZero', 2, 2, 4, 1e-5);
 end;
 
 initialization
