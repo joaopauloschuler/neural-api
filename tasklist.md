@@ -721,7 +721,7 @@ is sized to fit in a single focused commit.
       mixing-along-time.
 
 #### Correctness / audit follow-ups
-- [ ] LoadFromString round-trip for the SpatialDropout pair — the
+- [x] LoadFromString round-trip for the SpatialDropout pair — the
       existing round-trip tests cover SoftCapping/DropPath/RoPE/
       MaskedFill/SDPA but not the just-landed 1D/2D spatial dropouts.
       Add `TestSpatialDropout{1D,2D}SerializationRoundTrip` mirroring
