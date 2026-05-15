@@ -493,14 +493,24 @@ Normalization layers may offer:
 The available normalization techniques are:
 * Zero-centering (`TNNetChannelZeroCenter`).
 * Standard deviation normalization (`TNNetMovingStdNormalization`, `TNNetChannelStdNormalization`).
+* Per-sample layer normalization (`TNNetLayerNorm`, `TNNetRMSNorm`, `TNNetGroupNorm`).
 
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetChannelZeroCenter`     | 1D, 2D, or 3D               | Trainable zero-centering normalization.                                                              |
 | `TNNetMovingStdNormalization`| 1D, 2D, or 3D               | Trainable standard deviation normalization.                                                          |
 | `TNNetChannelStdNormalization`| 1D, 2D, or 3D              | Trainable per-channel standard deviation normalization.                                              |
+| `TNNetLayerNorm`             | 1D, 2D, or 3D               | Per-sample layer normalization (zero mean, unit variance) with learnable per-element scale and bias. |
+| `TNNetRMSNorm`               | 1D, 2D, or 3D               | Per-sample root-mean-square normalization (no mean subtraction) with learnable per-element scale.    |
+| `TNNetGroupNorm`             | 1D, 2D, or 3D               | Normalizes within `Groups` contiguous channel groups, with learnable per-element scale and bias.     |
 | `TNNet.AddMovingNorm`        | 1D, 2D, or 3D               | Possible replacement for batch normalization.                                                        |
 | `TNNet.AddChannelMovingNorm` | 1D, 2D, or 3D               | Possible replacement for batch normalization, applied per channel.                                   |
+
+`TNNetLayerNorm` normalizes each input sample over all its elements (`SizeX*SizeY*Depth`) to zero mean and unit variance, then applies a learnable per-element scale (gamma) and bias (beta). Unlike batch normalization it does not depend on batch statistics, which makes it well suited to transformers and recurrent models. Add it with `NN.AddLayer(TNNetLayerNorm.Create());`.
+
+`TNNetRMSNorm` is a cheaper, transformer-friendly variant that divides each sample by the root mean square of its elements (no mean subtraction) and applies a learnable per-element scale. Add it with `NN.AddLayer(TNNetRMSNorm.Create());`.
+
+`TNNetGroupNorm` splits the input channels (`Depth`) into `Groups` contiguous groups and normalizes each group independently, then applies a learnable per-element scale and bias. `Depth` must be divisible by `Groups`; otherwise it falls back to a single group. Pass the group count to the constructor, e.g. `NN.AddLayer(TNNetGroupNorm.Create(8));`.
 
 ### Non Trainable and per Sample Normalization Layers
 Normalization layers (`TNNetLayerMaxNormalization`, `TNNetLayerStdNormalization`, `TNNetLocalResponseNorm2D`, `TNNetLocalResponseNormDepth`) help stabilize training and can improve model performance by managing the scale and distribution of activations. They are particularly useful in deep networks where the scale of values can change dramatically between layers.

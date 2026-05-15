@@ -52,7 +52,7 @@
 - [x] TNNetRMSNorm — root-mean-square layer norm (no mean subtraction); cheaper
       transformer-friendly variant. TNNetLayerNorm has now landed and is a ready
       template (neural/neuralnetwork.pas + TestNeuralNumerical.pas).
-- [ ] Document TNNetLayerNorm / TNNetGroupNorm in the README.md layer reference
+- [x] Document TNNetLayerNorm / TNNetGroupNorm in the README.md layer reference
       with a short usage snippet.
 - [ ] Audit other layers that override Backpropagate but lack a numerical
       gradient test — the activation-layer audit uncovered two real bugs
