@@ -87,6 +87,7 @@ type
     procedure TestSquaredReLUGradientCheck;
     procedure TestTanhShrinkForward;
     procedure TestTanhShrinkGradientCheck;
+    procedure TestTanhShrinkSerializationRoundTrip;
     procedure TestLogSigmoidForward;
     procedure TestLogSigmoidGradientCheck;
     procedure TestLogSigmoidSerializationRoundTrip;
@@ -96,6 +97,7 @@ type
     procedure TestShiftedReLUSerializationRoundTrip;
     procedure TestHardTanhForward;
     procedure TestHardTanhGradientCheck;
+    procedure TestHardTanhSerializationRoundTrip;
     procedure TestHardShrinkForward;
     procedure TestHardShrinkGradientCheck;
     procedure TestHardShrinkSerializationRoundTrip;
@@ -5461,6 +5463,18 @@ procedure TTestNeuralNumerical.TestShiftedReLUSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetShiftedReLU.Create(),
     'ShiftedReLU', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestTanhShrinkSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetTanhShrink.Create(),
+    'TanhShrink', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestHardTanhSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetHardTanh.Create(),
+    'HardTanh', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSoftShrinkSerializationRoundTrip;
