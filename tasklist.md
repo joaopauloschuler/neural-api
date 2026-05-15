@@ -4222,3 +4222,243 @@ Test suite: 437 → 446, all passing. No bugs surfaced.
 - [ ] LiSHT symmetry test: `Lisht(-x) = Lisht(x)` to within fp
       tolerance on a random vector. Pins the symmetric-output property
       that the forward test only spot-checks at x=±1.
+
+### Lucky-day batch — 2026-05-15 (seed 896318)
+
+Python `random.randint(1, 1000000)` rolled 896318 on a self-described
+lucky day. Before pinning, every TNNet* candidate name below was
+grep-verified absent from `neural/neuralnetwork.pas` and the existing
+tasklist was scanned for prior pins (see the seed 554877, 769362,
+758867 batches above). The theme of this batch is "the missing
+plumbing": loss functions, regularization-as-layers, schedulers, and
+introspection — categories the file has accumulated many ideas about
+but only a handful of landings in.
+
+#### Layers I'd enjoy authoring
+
+- [ ] TNNetLogCoshLoss — smooth Huber-like regression loss
+      `L = mean(log(cosh(y - ŷ)))` with derivative `tanh(y - ŷ) / N`.
+      Numerically stable form: `log(cosh(z)) = |z| + log1p(exp(-2|z|)) -
+      log(2)` to avoid overflow for large `|z|`. Pairs naturally with
+      the pinned TNNetHuberLoss / TNNetSmoothL1Loss family. Two tests:
+      direct backward-equality (closed form is exact) and a
+      central-difference check on a small batch.
+
+- [ ] TNNetRReLU — Randomized Leaky ReLU. Slope sampled uniformly from
+      `[lower, upper]` per neuron per forward pass during training
+      (FFloatSt[0..1], defaults 1/8 and 1/3 per the paper), fixed to
+      `(lower + upper) / 2` at inference. Backward uses the slope drawn
+      on the matching forward. Same template as TNNetLeakyReLU; the
+      training-vs-inference branch is the new wrinkle. Three tests
+      including a determinism-given-seed test and a slope-average-at-
+      inference test.
+
+- [ ] TNNetThresholdedReLU — `y = x if x > θ else 0`, configurable θ
+      via FFloatSt[0] (default 1.0). Subgradient zero at the step;
+      derivative cached in FOutputErrorDeriv. Classic but missing.
+      Three tests (forward across the threshold, central-difference
+      gradient check away from the step, serialization round-trip).
+
+- [ ] TNNetISRU / TNNetISRLU — Inverse-Square-Root (Linear) Unit.
+      ISRU: `y = x / sqrt(1 + α·x²)`, ISRLU: piecewise (ISRU for x<0,
+      identity for x≥0). Derivatives are clean: ISRU's is
+      `(1 + α·x²)^(-3/2)`. Bounded smooth alternative to tanh that
+      cheaper to compute than tanh on float32. α via FFloatSt[0].
+
+- [ ] TNNetGaussianNoise — adds N(0, σ²) noise per element during
+      training, identity at inference. σ via FFloatSt[0]. Backward
+      is pass-through (additive noise has zero expected gradient).
+      Test the training/inference toggle and the seeded-determinism
+      property. Pairs naturally with the dropout family.
+
+- [ ] TNNetGaussianDropout — multiplicative N(1, σ²) noise during
+      training, identity at inference. Approximate equivalence to
+      standard dropout for matched `σ² = p/(1-p)`. Same plumbing as
+      TNNetGaussianNoise; one extra test that asserts the
+      input-equivalence at inference.
+
+- [ ] TNNetSerf — `y = x · erf(softplus(x))`. Self-regularized
+      smooth activation; sister to Mish (`x · tanh(softplus(x))`).
+      Useful data point for the activation-zoo experiment already
+      pinned. Erf is available via the existing erf landing pattern;
+      the derivative chains cleanly through softplus.
+
+- [ ] TNNetSoftPlusBeta — generalized SoftPlus with learnable-or-fixed
+      β: `y = (1/β) · log(1 + exp(β·x))` with the standard `β·x > 20`
+      identity shortcut for numerical stability. β via FFloatSt[0]
+      (default 1.0 reduces to the existing TNNetSoftPlus). One test
+      that asserts β=1 matches TNNetSoftPlus to fp tolerance.
+
+- [ ] TNNetSoftExponential — `y = (exp(α·x) - 1)/α + α` for α>0,
+      identity for α=0, `-log(1 - α·(x + α))/α` for α<0. The single
+      activation that smoothly interpolates between log, linear, and
+      exponential families as α varies. α via FFloatSt[0]. Documenting
+      the three regimes in a single comment block is half the value.
+
+- [ ] TNNetCenteredSoftmax — softmax preceded by per-sample mean
+      subtraction. The "centering trick" sometimes used in
+      contrastive heads. Cheap to add; pairs with the exact-Jacobian
+      softmax that already landed.
+
+#### Loss layers I'd enjoy authoring
+
+- [ ] TNNetCosineEmbeddingLoss — `1 - cos(y, ŷ)` for the positive
+      pair and `max(0, cos(y, ŷ) - margin)` for the negative pair.
+      Standard contrastive-head loss; pairs naturally with the
+      pinned TNNetCosineSimilarityAttention.
+
+- [ ] TNNetKLDivergence — `sum(p · log(p/q))` with numerical-stability
+      clamps on `q`. Backward is `(log(p/q) + 1) · dp/dq` style; the
+      direct closed form avoids any softmax-Jacobian pitfalls.
+      Useful for distillation experiments.
+
+- [ ] TNNetDiceLoss — `1 - 2·sum(p·q + ε) / (sum(p²) + sum(q²) + ε)`,
+      the IoU-flavored segmentation loss. Cheap addition; one
+      gradient-check test on a small (4, 4, 1) volume.
+
+#### Training infrastructure (the "missing plumbing")
+
+- [ ] TNeuralLRScheduler — small interface (`function NextLR(Epoch,
+      Step: integer): TNeuralFloat;`) with three concrete
+      implementations: TStepLR (multiply by γ every N epochs),
+      TCosineAnnealingLR (`η_min + (η_max - η_min) · 0.5 ·
+      (1 + cos(π · t / T))`), TWarmupCosineLR (linear warmup for
+      W epochs then cosine to η_min). Hooks into the existing
+      neuralfit loop in one place. Unblocks the half-dozen
+      scheduler ideas already pinned without committing to a
+      framework rewrite.
+
+- [ ] StochasticWeightAveraging helper — a TNNet wrapper that
+      maintains a running average of the live network's weights
+      every N steps after epoch W. Call `nn.UpdateBatchNormStats(...)`
+      once before evaluation. Two-screen implementation; consistent
+      ~0.5–1% test-accuracy bump on the existing CIFAR examples
+      would be a great data point.
+
+- [ ] PolyLR scheduler — `η · (1 - t/T)^p`, the standard
+      segmentation-paper schedule. Folds in once the
+      TNeuralLRScheduler interface above lands.
+
+- [ ] GradientClipping options on TNeuralFit — both `clip_norm`
+      (global) and `clip_value` (element-wise) variants. Currently
+      every example that needs it open-codes the same loop. A
+      single property toggle would clean up several of them.
+
+#### Introspection / debugging tools
+
+- [ ] TNNet.PrintSummary — Keras-style layer-by-layer table
+      (`Layer name | Output shape | Param count | Trainable`) printed
+      to stdout. Computes total/trainable param counts. The single
+      piece of introspection users ask for most often when they
+      hit a layer-shape mismatch.
+
+- [ ] TNNet.CountFLOPsPerLayer — forward-pass FLOP estimate per
+      layer (Conv: `2·Cin·Cout·K²·H·W`; Dense: `2·In·Out`; element-
+      wise: `H·W·C`; etc). Printed in the same table as PrintSummary
+      via an optional flag. Useful for the bench-suite idea already
+      pinned and for the model-zoo loader.
+
+- [ ] WeightHistogramDump — given a TNNet, write one CSV per
+      trainable layer with 64-bin histograms of the weight values.
+      Cheap implementation, immediately useful for the QAT/STE
+      experiments and for the "did my init explode" debugging
+      pattern.
+
+- [ ] DeadNeuronReport — for each ReLU-family activation in a
+      trained net, report the fraction of neurons whose activation
+      is zero across a validation batch. One short utility, one
+      data point that informs Leaky/ELU/RReLU experiments.
+
+- [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer
+      DAG (concat / branch / skip edges included). Static images
+      plus the README-level documentation benefit. The TNNet
+      already tracks predecessors; the export is mechanical.
+
+#### Examples I'd enjoy writing
+
+- [ ] `examples/ModelSummaryDemo/` — three networks (tiny MLP, small
+      CNN, a transformer-flavored stack once MHSA lands) printed
+      via PrintSummary. Doubles as a smoke test for the summary
+      output format.
+
+- [ ] `examples/SchedulerCompare/` — same network trained four times
+      with constant LR, StepLR, CosineLR, WarmupCosineLR; one chart
+      of validation accuracy vs epoch. Lands the scheduler suite's
+      headline use case.
+
+- [ ] `examples/SWADemo/` — CIFAR-10 baseline vs the same network
+      with SWA enabled from epoch 75% on. One chart of final
+      test accuracy across three seeds.
+
+- [ ] `examples/LossLandscapeCompare/` — MSE vs LogCosh vs Huber
+      vs MAE on the existing Hypotenuse task with a fixed
+      handful of outliers injected into training. Highlights why
+      smooth-Huber-flavored losses earn their place in the box.
+
+#### Correctness / audit work
+
+- [ ] Loss-layer gradient-check helper — a parameterized helper that
+      takes `(LossLayer, BatchSize, Shape)` and runs a single
+      central-difference check on the input. Six lines per loss;
+      catches all three of the new loss-layer landings at once.
+
+- [ ] Scheduler unit tests — given seed and schedule parameters,
+      `NextLR(epoch, step)` must produce a deterministic, finite,
+      monotonically-correct sequence. One test per concrete schedule.
+
+- [ ] PrintSummary smoke test — build five canonical networks (the
+      ones the README already shows code for), capture the summary
+      output, assert the row count and the total-parameter line.
+      Pin the format so future changes are deliberate.
+
+#### Experiments I'm curious about
+
+- [ ] RReLU vs LeakyReLU vs PReLU on a tiny CIFAR stub: which one
+      wins at matched param count? One chart. The randomized variant
+      is the only one of the three not yet measured in the
+      codebase's experimental record.
+
+- [ ] LogCosh vs MSE on noisy Hypotenuse — inject 5% label noise,
+      train both, compare final test loss. The kind of one-figure
+      result that earns the loss its place in the docs.
+
+- [ ] Cosine-LR vs constant-LR on the existing SimpleImageClassifier
+      example, three seeds each. The headline benchmark for
+      whether the scheduler infrastructure earns its keep.
+
+- [ ] SWA effect-size sweep: vary the SWA start-epoch fraction
+      ∈ {0.5, 0.6, 0.7, 0.8, 0.9} and chart final test accuracy.
+      Cheap experiment, useful default-tuning data point.
+
+- [ ] "Activation cost" microbenchmark — for each activation in the
+      library, measure forward+backward ns/op on a fixed 64x64x32
+      volume. Pairs naturally with the Volume microbench already
+      pinned; lets users pick activations by speed when accuracy
+      is tied.
+
+#### Documentation
+
+- [ ] "Loss functions" README subsection grouping MSE, MAE, CE,
+      and (once landed) Huber/SmoothL1/LogCosh/Dice/KL/Focal/
+      LabelSmoothingCE/CosineEmbedding into a single short table
+      with use-case notes. The README currently mentions losses
+      only inline in examples.
+
+- [ ] "Learning-rate schedulers" README subsection — one paragraph
+      per schedule with a snippet showing how to wire it into
+      TNeuralImageFit. Folds in once the scheduler interface lands.
+
+- [ ] "Introspection" README subsection — `CountLayers`,
+      `CountNeurons`, `CountWeights` are already shown in the quick-
+      start; group them with the new PrintSummary / FLOPs /
+      WeightHistogram / DeadNeuronReport utilities into a single
+      subsection so users discover them.
+
+#### Stretch / re-pinned for visibility
+
+- [ ] TNNetMultiHeadSelfAttention wrapper around the landed SDPA —
+      still the headline blocker for Tiny GPT. Re-pinned every
+      batch for a reason.
+
+- [ ] Tiny GPT char-level CPU example — unblocked the moment MHSA
+      lands; the headline end-to-end demo on this entire tasklist.
