@@ -211,3 +211,79 @@
 - [ ] Integrate with float32 functions from https://github.com/joaopauloschuler/pas-core-math
       for faster and more precise math.
 - [ ] More image generative examples and or experiments.
+
+### Ideas added on 2026-05-15 (lucky seed 623999)
+
+#### Layers I'd enjoy building next
+- [ ] TNNetScaledDotProductAttention — the single-head attention core
+      (Q·Kᵀ / √d → softmax → ·V) as a standalone, gradient-checked layer.
+      Highest-leverage missing transformer block now that TNNetMaskedFill,
+      TNNetLayerNorm, TNNetRMSNorm and the gated activations have all landed.
+      Should pair cleanly with TNNetMaskedFill for causal attention.
+- [ ] TNNetRotaryEmbedding (RoPE) — parameter-free rotation applied to Q/K.
+      Backward pass is just the inverse rotation, so the numerical-gradient
+      test is straightforward. Companion piece to ScaledDotProductAttention.
+- [ ] TNNetMultiHeadSelfAttention — once SDPA + RoPE land, compose them into
+      a real multi-head block (split-heads → SDPA per head → concat → out
+      projection). Add a numerical-gradient test on a tiny 2-head example.
+- [ ] TNNetDropPath (stochastic depth) — identity at inference, whole-sample
+      drop at training. Use a fixed RNG seed in the test so the masked
+      forward/backward is deterministic.
+- [ ] TNNetMishExact / TNNetGELUExact audit — confirm whether the current
+      implementations use the approximation or the exact tanh/erf form, and
+      document the choice in the code.
+
+#### Experiments I'm curious about
+- [ ] Tiny GPT proof-of-life: once SDPA + RoPE + MultiHeadSelfAttention land,
+      train a 2-layer char-level transformer on a short text snippet (e.g.
+      Tiny Shakespeare excerpt or repeated arithmetic patterns) and print
+      generated samples. End-to-end demo of the new transformer stack.
+- [ ] Causal-mask sanity experiment: train a tiny attention model on next-token
+      prediction WITH and WITHOUT TNNetMaskedFill, and show the unmasked one
+      cheats (near-zero loss but useless at generation). A concrete teaching
+      example of why causal masking exists.
+- [ ] Gradient-magnitude visualizer: print per-layer gradient norms across
+      training steps for a deep MLP, with and without LayerNorm/RMSNorm, to
+      visualize the vanishing/exploding-gradient story. Builds on the
+      normalization bake-off already in the list.
+- [ ] Numerical-precision study: re-run the activation bake-off using FP32 vs
+      a simulated-FP16 path (round-trip volumes through fewer mantissa bits)
+      and report the convergence-quality gap. Useful baseline for any future
+      mixed-precision work.
+
+#### Correctness / audit work I'd enjoy
+- [ ] Continue the Backpropagate audit into the concat/split/branch family
+      (TNNetConcat, TNNetDeepConcat, TNNetSplitChannels, TNNetSum) — one
+      numerical-gradient test per layer. Listed above; I want to take it.
+- [ ] Numerical-gradient test for TNNetAddPositionalEmbedding's learnable
+      weight path — already listed; the learnable-weight branch is the
+      easiest place for a silent bug to hide.
+- [ ] Add a shared `AssertLayerGradient(layer, inputShape)` helper in
+      TestNeuralNumerical.pas so each new layer test becomes ~3 lines instead
+      of a copy-pasted block. Big quality-of-life win for the audit work.
+- [ ] Property-based-style test: pick N random small layer configurations,
+      build a 1-layer net, run a numerical-gradient check on each. Catches
+      shape-edge-case bugs the hand-written tests miss.
+
+#### Documentation
+- [ ] Write the "how numerical gradient testing works in this repo" note
+      promised above — it's the project's main correctness safety net but
+      isn't explained anywhere. Should cover the eps choice, central
+      differences, tolerance picking, and where to add new tests.
+- [ ] Write the "layer authoring checklist" note also promised above —
+      constructor, LoadFromString round-trip, CreateLayer dispatch,
+      Compute/Backpropagate, numerical-gradient test. Captures the recurring
+      pattern every new-layer task in this file actually follows.
+- [ ] Short "transformer-from-scratch in Pascal" walkthrough that wires up
+      LayerNorm + MaskedFill + SDPA + RoPE + MHA + GEGLU into a working
+      encoder block, once those layers land. Companion to the Tiny GPT
+      example at the top of the file.
+
+#### Infrastructure niceties
+- [ ] Add `tests/RunTests` and other fpc build artifacts to .gitignore
+      (already listed above; small, satisfying cleanup).
+- [ ] Volume-unit micro-benchmark printing ns/op for Add, Mul, DotProduct
+      (already listed; would enjoy actually shipping it).
+- [ ] Add a `make test` / `make smoketest` shortcut that builds + runs the
+      numerical-gradient test suite with one command — lowers the friction
+      for every future contributor.
