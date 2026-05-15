@@ -101,6 +101,17 @@ type
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
+    procedure TestRotaryEmbeddingInverseSeqLen5;
+    procedure TestRotaryEmbeddingOddDepthGuard;
+    procedure TestDropPathPZeroBoundary;
+    procedure TestDropPathPOneBoundary;
+    procedure TestSoftCappingLargeCapContinuity;
+    procedure TestSoftCappingExtremeInputSaturation;
+    procedure TestSoftCappingSerializationRoundTrip;
+    procedure TestDropPathSerializationRoundTrip;
+    procedure TestRotaryEmbeddingSerializationRoundTrip;
+    procedure TestMaskedFillSerializationRoundTrip;
+    procedure TestScaledDotProductAttentionSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -4007,6 +4018,453 @@ begin
     Input.Free;
     Zero.Free;
   end;
+end;
+
+// Helper used by TestRotaryEmbeddingOddDepthGuard. The layers' FErrorProc is a
+// method pointer (TGetStrProc = procedure(const S: string) of object), so we
+// need an object to capture the error message into.
+type
+  TErrorCapture = class
+  public
+    Triggered: boolean;
+    Message: string;
+    procedure Capture(const S: string);
+  end;
+
+procedure TErrorCapture.Capture(const S: string);
+begin
+  Triggered := true;
+  Message := S;
+end;
+
+procedure TTestNeuralNumerical.TestRotaryEmbeddingInverseSeqLen5;
+var
+  NN: TNNet;
+  Input, Zero: TNNetVolume;
+  SeqLen, Depth, pos, d: integer;
+  OutNormSq, GradNormSq: TNeuralFloat;
+begin
+  // Same property as TestRotaryEmbeddingInverse, but at a non-trivial sequence
+  // length. Forward then "inverse" (R^T applied via Backpropagate with upstream
+  // gradient = output) must round-trip to within fp tolerance for every
+  // position, exercising the full set of position-dependent angles.
+  SeqLen := 5;
+  Depth := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  Zero := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NN.AddLayer(TNNetRotaryEmbedding.Create(10000.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.29) * 1.5 - 0.4;
+    Zero.Fill(0);
+
+    NN.Compute(Input);
+
+    OutNormSq := 0;
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        OutNormSq := OutNormSq + Sqr(NN.GetLastLayer.Output[pos, 0, d]);
+    AssertEquals('RoPE SeqLen=5 preserves norm', Input.GetSumSqr(), OutNormSq, 1e-4);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Zero);
+
+    GradNormSq := 0;
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        GradNormSq := GradNormSq + Sqr(NN.Layers[0].OutputError[pos, 0, d]);
+    AssertEquals('RoPE SeqLen=5 inverse norm', Input.GetSumSqr(), GradNormSq, 1e-4);
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        AssertEquals('RoPE SeqLen=5 round-trip pos=' + IntToStr(pos) +
+          ' d=' + IntToStr(d),
+          Input[pos, 0, d], NN.Layers[0].OutputError[pos, 0, d], 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+    Zero.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRotaryEmbeddingOddDepthGuard;
+var
+  NN: TNNet;
+  Rope: TNNetRotaryEmbedding;
+  Capture: TErrorCapture;
+begin
+  // SetPrevLayer of TNNetRotaryEmbedding routes a hard precondition violation
+  // through FErrorProc when the previous layer's depth is odd. Hook a custom
+  // capture method onto the layer and assert that it fires with a message
+  // that mentions the offending depth.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 3, 1)); // odd Depth = 3
+    Rope := TNNetRotaryEmbedding.Create(10000.0);
+    Rope.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(Rope);
+    AssertTrue('RoPE odd-Depth guard must fire FErrorProc', Capture.Triggered);
+    AssertTrue('RoPE odd-Depth message must mention "even Depth"',
+      Pos('even Depth', Capture.Message) > 0);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDropPathPZeroBoundary;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  v: TNeuralFloat;
+begin
+  // p=0 in training mode must be the identity: forward output = input,
+  // backward gradient = upstream gradient, no NaN.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetDropPath.Create(0.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    // Upstream gradient = output - desired. With desired = 0 the upstream
+    // gradient equals the (identity) output, which equals the input.
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('DropPath p=0 forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertEquals('DropPath p=0 forward identity at ' + IntToStr(i),
+        Input.Raw[i], v, 1e-6);
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('DropPath p=0 grad NaN at ' + IntToStr(i), IsNan(v));
+      AssertEquals('DropPath p=0 grad passthrough at ' + IntToStr(i),
+        Input.Raw[i], v, 1e-6);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDropPathPOneBoundary;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i, Trials, ZeroTrials: integer;
+  v: TNeuralFloat;
+  AnyZero, AnyKept: boolean;
+begin
+  // p=1 boundary safety net. The constructor of TNNetDropPath deliberately
+  // clamps any pDropProb >= 1 to 0.99 to avoid div-by-zero in the
+  // inverted-dropout 1/(1-p) scaling. As a consequence, requesting p=1 does
+  // NOT mean "always drop": ~99% of samples are zeroed, and the remaining
+  // ~1% are scaled by ~100x. This is documented in code (see
+  // TNNetDropPath.Create) but is surprising relative to the textbook
+  // semantics of stochastic depth. This test pins down the actual behavior:
+  //   - no NaN/Inf in either the forward or backward pass
+  //   - output magnitude is bounded (no runaway)
+  //   - the dropped branch (output==0) is taken often enough to be the
+  //     dominant outcome (sanity check on the clamped p)
+  // FINDING: if the contract should be "p=1 means always drop", the
+  // constructor should special-case p>=1 to set both Keep and InvKeep paths
+  // to zero, instead of clamping to 0.99.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create();
+  AnyZero := false;
+  AnyKept := false;
+  ZeroTrials := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetDropPath.Create(1.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0;
+
+    RandSeed := 7777;
+    for Trials := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      if Abs(NN.GetLastLayer.Output.Raw[0]) < 1e-6 then
+      begin
+        AnyZero := true;
+        Inc(ZeroTrials);
+      end
+      else
+        AnyKept := true;
+      for i := 0 to Input.Size - 1 do
+      begin
+        v := NN.GetLastLayer.Output.Raw[i];
+        AssertFalse('DropPath p=1 forward NaN at trial ' + IntToStr(Trials) +
+          ' i=' + IntToStr(i), IsNan(v));
+        AssertFalse('DropPath p=1 forward Inf at trial ' + IntToStr(Trials) +
+          ' i=' + IntToStr(i), IsInfinite(v));
+      end;
+
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      for i := 0 to Input.Size - 1 do
+      begin
+        v := NN.Layers[0].OutputError.Raw[i];
+        AssertFalse('DropPath p=1 grad NaN at trial ' + IntToStr(Trials) +
+          ' i=' + IntToStr(i), IsNan(v));
+        AssertFalse('DropPath p=1 grad Inf at trial ' + IntToStr(Trials) +
+          ' i=' + IntToStr(i), IsInfinite(v));
+      end;
+    end;
+    AssertTrue('DropPath p=1 must drop most samples (clamped to 0.99)', AnyZero);
+    // With p clamped to 0.99 and 200 trials we expect ~198 drops; require at
+    // least 150 to keep the test robust to RNG fluctuations.
+    AssertTrue('DropPath p=1 dropped at least 150/200 (got ' +
+      IntToStr(ZeroTrials) + ')', ZeroTrials >= 150);
+    // Document that the kept branch DOES still occur due to the clamp.
+    AssertTrue('DropPath p=1 also keeps ~1% of samples (clamp side-effect)',
+      AnyKept);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftCappingLargeCapContinuity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Cap, v, expected, rel: TNeuralFloat;
+  i: integer;
+begin
+  // y = c * tanh(x/c). As c -> infinity, y -> x for any bounded x. With a
+  // moderate input range and c = 1e6 the layer must be effectively the
+  // identity within tight fp tolerance.
+  Cap := 1e6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddLayer(TNNetSoftCapping.Create(Cap));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.31) * 10.0; // values in roughly +/-10
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      expected := Input.Raw[i];
+      AssertFalse('SoftCapping large-cap NaN at ' + IntToStr(i), IsNan(v));
+      // Relative tolerance 1e-3, with absolute floor for near-zero values.
+      if Abs(expected) < 1e-3 then
+        rel := Abs(v - expected)
+      else
+        rel := Abs(v - expected) / Abs(expected);
+      AssertTrue('SoftCapping c->inf identity at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v) + ' expected=' + FloatToStr(expected) +
+        ' rel=' + FloatToStr(rel), rel < 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftCappingExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Cap, v, g: TNeuralFloat;
+  i: integer;
+begin
+  // Drive the layer with extreme magnitudes (+/-1e6) and a small cap (5).
+  // Every output element must lie inside [-c, +c], no NaN/Inf in either the
+  // forward or the backward pass.
+  Cap := 5.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddLayer(TNNetSoftCapping.Create(Cap));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+    begin
+      if (i mod 2) = 0 then Input.Raw[i] := 1e6
+      else Input.Raw[i] := -1e6;
+    end;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.2);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('SoftCapping saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftCapping saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('SoftCapping saturation in [-c, c] at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v),
+        (v >= -Cap - 1e-4) and (v <= Cap + 1e-4));
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('SoftCapping saturation grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('SoftCapping saturation grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// Generic helper: build a tiny net with ALayer wired after a single input
+// layer of the given shape, drive Compute on a fixed deterministic input,
+// then SaveToString / LoadFromString into a fresh net and verify the output
+// matches element-wise within tolerance. ALayer is owned by the original net.
+procedure SerializationRoundTrip(ATestCase: TTestCase; ALayer: TNNetLayer;
+  const AName: string; ASizeX, ASizeY, ASizeD: integer;
+  ATolerance: TNeuralFloat);
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  try
+    NN.AddLayer(TNNetInput.Create(ASizeX, ASizeY, ASizeD, 1));
+    NN.AddLayer(ALayer);
+
+    RandSeed := 31337;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ATestCase.AssertEquals(AName + ' round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        ATestCase.AssertEquals(AName + ' round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], ATolerance);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftCappingSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSoftCapping.Create(),
+    'SoftCapping', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestDropPathSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  // DropPath at inference (default: dropouts disabled) is the identity, so
+  // both the original and the reloaded net must produce input == output.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetDropPath.Create()); // default p
+    NN.EnableDropouts(false);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.EnableDropouts(false);
+      NN2.Compute(Input);
+      AssertEquals('DropPath round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('DropPath round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRotaryEmbeddingSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetRotaryEmbedding.Create(),
+    'RotaryEmbedding', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestMaskedFillSerializationRoundTrip;
+begin
+  // Use a small mask value to keep float32 precision intact when comparing.
+  SerializationRoundTrip(Self, TNNetMaskedFill.Create(-0.5),
+    'MaskedFill', 3, 3, 2, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionSerializationRoundTrip;
+begin
+  // d_k = 4, non-causal. Input depth must be 3*d_k = 12.
+  SerializationRoundTrip(Self, TNNetScaledDotProductAttention.Create(4, false),
+    'SDPA', 3, 1, 12, 1e-5);
 end;
 
 initialization
