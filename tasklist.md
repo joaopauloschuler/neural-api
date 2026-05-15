@@ -1691,7 +1691,7 @@ hitting the same wall.**
       large-x linearization (`x` when `x>20`) to avoid overflow.
       Backward = sigmoid(x). Numerical-gradient test, plus an
       identity-vs-Swish unit-test confirming SoftPlus(0)=ln(2).
-- [ ] TNNetSoftSign — `y = x / (1 + |x|)`. Cheap, smooth, no exp.
+- [x] TNNetSoftSign — `y = x / (1 + |x|)`. Cheap, smooth, no exp.
       Backward = `1 / (1+|x|)^2`. Add to the activation gradient-
       check sweep alongside the SELU/HardSigmoid additions.
 

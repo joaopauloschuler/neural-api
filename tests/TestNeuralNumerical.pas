@@ -163,6 +163,9 @@ type
     procedure TestELUGradientCheck;
     procedure TestELUSerializationRoundTrip;
     procedure TestSiLUMatchesSwish;
+    procedure TestSoftSignForward;
+    procedure TestSoftSignGradientCheck;
+    procedure TestSoftSignSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -6203,6 +6206,82 @@ begin
   finally
     SwishNN.Free;
     SiLUNN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftSignForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetSoftSign.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('SoftSign(0)', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('SoftSign(1)', 0.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('SoftSign(-1)', -0.5, NN.GetLastLayer.Output.Raw[2], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftSignGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetSoftSign.Create(), 'SoftSign',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftSignSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+  ReloadedLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetSoftSign.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ReloadedLayer := NN2.GetLastLayer;
+      AssertEquals('SoftSign round-trip class name', 'TNNetSoftSign', ReloadedLayer.ClassName);
+      AssertEquals('SoftSign round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+      AssertEquals('SoftSign round-trip output size',
+        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SoftSign round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          ReloadedLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
     Input.Free;
   end;
 end;

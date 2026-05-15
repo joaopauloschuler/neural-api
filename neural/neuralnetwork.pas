@@ -681,6 +681,13 @@ type
   TNNetSiLU = class(TNNetSwish)
   end;
 
+  /// SoftSign activation function.
+  // y = x / (1 + |x|). Derivative is 1 / (1 + |x|)^2. Parameter-free.
+  TNNetSoftSign = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// GEGLU gated activation - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * GELU(B). Output depth = input depth / 2.
@@ -6636,6 +6643,41 @@ begin
       if PrevValue > 0
         then FOutput.FData[OutputCnt] := PrevValue
         else FOutput.FData[OutputCnt] := FAlpha * (Exp(PrevValue) - 1);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSoftSign }
+
+procedure TNNetSoftSign.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue, Denom: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      Denom := 1 + Abs(PrevValue);
+      FOutput.FData[OutputCnt] := PrevValue / Denom;
+      FOutputErrorDeriv.FData[OutputCnt] := 1 / (Denom * Denom);
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := PrevValue / (1 + Abs(PrevValue));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15114,6 +15156,7 @@ begin
       'TNNetSELU' :                 Result := TNNetSELU.Create();
       'TNNetELU' :                  Result := TNNetELU.Create(Ft[0]);
       'TNNetSiLU' :                 Result := TNNetSiLU.Create();
+      'TNNetSoftSign' :             Result := TNNetSoftSign.Create();
       'TNNetSignedSquareRoot' :     Result := TNNetSignedSquareRoot.Create();
       'TNNetSignedSquareRoot1' :    Result := TNNetSignedSquareRoot1.Create();
       'TNNetSignedSquareRootN' :    Result := TNNetSignedSquareRootN.Create(Ft[0]);
@@ -15253,6 +15296,7 @@ begin
       if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
       if S[0] = 'TNNetELU' then Result := TNNetELU.Create(Ft[0]) else
       if S[0] = 'TNNetSiLU' then Result := TNNetSiLU.Create() else
+      if S[0] = 'TNNetSoftSign' then Result := TNNetSoftSign.Create() else
       if S[0] = 'TNNetSignedSquareRoot' then Result := TNNetSignedSquareRoot.Create() else
       if S[0] = 'TNNetSignedSquareRoot1' then Result := TNNetSignedSquareRoot1.Create() else
       if S[0] = 'TNNetSignedSquareRootN' then Result := TNNetSignedSquareRootN.Create(Ft[0]) else
