@@ -87,6 +87,10 @@ type
     procedure TestTokenShiftGradientCheck;
     procedure TestTokenShiftWeightGradientCheck;
     procedure TestTokenShiftSerializationRoundTrip;
+    procedure TestPolynomialActivationIdentityAtInit;
+    procedure TestPolynomialActivationForward;
+    procedure TestPolynomialActivationInputGradientCheck;
+    procedure TestPolynomialActivationWeightGradientCheck;
     procedure TestHuberLossForwardPassthrough;
     procedure TestHuberLossGradientClipping;
     procedure TestSmoothL1LossDefaults;
@@ -10585,6 +10589,238 @@ begin
   // layout requirement) and SizeX = 4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetTokenShift.Create(), 'TokenShift', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPolynomialActivationIdentityAtInit;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LPoly: TNNetPolynomialActivation;
+  i: integer;
+begin
+  // Default init is a=0, b=1, c0=0, so the layer must be bitwise identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    LPoly := TNNetPolynomialActivation.Create();
+    NN.AddLayer(LPoly);
+
+    AssertEquals('PolynomialActivation default a is 0',
+      0.0, LPoly.Neurons[0].Weights.GetSumAbs(), 0);
+    AssertEquals('PolynomialActivation default b sums to Depth',
+      TNeuralFloat(LPoly.Neurons[1].Weights.Size), LPoly.Neurons[1].Weights.GetSum(), 1e-7);
+    AssertEquals('PolynomialActivation default c0 is 0',
+      0.0, LPoly.Neurons[2].Weights.GetSumAbs(), 0);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 1.7 - 0.5;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('PolynomialActivation identity at init pos ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPolynomialActivationForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LPoly: TNNetPolynomialActivation;
+  x_, y_, d_: integer;
+  xv, expected: TNeuralFloat;
+  a_d, b_d, c_d: TNeuralFloat;
+begin
+  // Set a/b/c0 to known per-channel values and verify the formula.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 3, 1));
+    LPoly := TNNetPolynomialActivation.Create();
+    NN.AddLayer(LPoly);
+
+    // Per-channel coefficients.
+    LPoly.Neurons[0].Weights.Raw[0] := 0.5;   LPoly.Neurons[0].Weights.Raw[1] := -0.3; LPoly.Neurons[0].Weights.Raw[2] := 1.2;
+    LPoly.Neurons[1].Weights.Raw[0] := 1.0;   LPoly.Neurons[1].Weights.Raw[1] := 2.5;  LPoly.Neurons[1].Weights.Raw[2] := -0.7;
+    LPoly.Neurons[2].Weights.Raw[0] := -0.4;  LPoly.Neurons[2].Weights.Raw[1] := 0.1;  LPoly.Neurons[2].Weights.Raw[2] := 0.8;
+
+    for x_ := 0 to Input.Size - 1 do
+      Input.Raw[x_] := Cos(x_ * 0.31) * 1.4 + 0.2;
+    NN.Compute(Input);
+
+    for d_ := 0 to 2 do
+    begin
+      a_d := LPoly.Neurons[0].Weights.Raw[d_];
+      b_d := LPoly.Neurons[1].Weights.Raw[d_];
+      c_d := LPoly.Neurons[2].Weights.Raw[d_];
+      for x_ := 0 to Input.SizeX - 1 do
+        for y_ := 0 to Input.SizeY - 1 do
+        begin
+          xv := Input[x_, y_, d_];
+          expected := a_d * xv * xv + b_d * xv + c_d;
+          AssertEquals('PolynomialActivation forward (' + IntToStr(x_) + ',' +
+            IntToStr(y_) + ',' + IntToStr(d_) + ')',
+            expected, NN.GetLastLayer.Output[x_, y_, d_], 1e-5);
+        end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPolynomialActivationInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LPoly: TNNetPolynomialActivation;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  InputPlus := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    LPoly := TNNetPolynomialActivation.Create();
+    NN.AddLayer(LPoly);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    LPoly.Neurons[0].Weights.Raw[0] := 0.4;
+    LPoly.Neurons[0].Weights.Raw[1] := -0.25;
+    LPoly.Neurons[1].Weights.Raw[0] := 0.8;
+    LPoly.Neurons[1].Weights.Raw[1] := 1.3;
+    LPoly.Neurons[2].Weights.Raw[0] := -0.2;
+    LPoly.Neurons[2].Weights.Raw[1] := 0.35;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PolynomialActivation input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPolynomialActivationWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LPoly: TNNetPolynomialActivation;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..2] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  Names[0] := 'a';
+  Names[1] := 'b';
+  Names[2] := 'c0';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    LPoly := TNNetPolynomialActivation.Create();
+    NN.AddLayer(LPoly);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    LPoly.Neurons[0].Weights.Raw[0] := 0.4;
+    LPoly.Neurons[0].Weights.Raw[1] := -0.25;
+    LPoly.Neurons[1].Weights.Raw[0] := 0.8;
+    LPoly.Neurons[1].Weights.Raw[1] := 1.3;
+    LPoly.Neurons[2].Weights.Raw[0] := -0.2;
+    LPoly.Neurons[2].Weights.Raw[1] := 0.35;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    for n := 0 to 2 do
+      for i := 0 to LPoly.Neurons[n].Weights.Size - 1 do
+      begin
+        LPoly.Neurons[n].Weights.Raw[i] := LPoly.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LPoly.Neurons[n].Weights.Raw[i] := LPoly.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LPoly.Neurons[n].Weights.Raw[i] := LPoly.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LPoly.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LPoly.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('PolynomialActivation weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestHuberLossForwardPassthrough;

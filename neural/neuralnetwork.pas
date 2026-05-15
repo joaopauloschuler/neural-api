@@ -1741,6 +1741,28 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetPolynomialActivation: per-channel learnable quadratic activation.
+  // For each channel c:
+  //   y[x,y,c] = a[c] * Input[x,y,c]^2 + b[c] * Input[x,y,c] + c0[c].
+  // Three learnable per-channel vectors of length Depth:
+  //   FNeurons[0].Weights = a   (init 0)
+  //   FNeurons[1].Weights = b   (init 1)
+  //   FNeurons[2].Weights = c0  (init 0)
+  // With the default initialization the layer degrades to the identity, so
+  // it can be dropped into an existing network without disturbing training
+  // dynamics. The analytic input gradient is dL/dx = dL/dy * (2*a*x + b)
+  // and the weight gradients are the obvious finite-degree polynomial
+  // moments summed over (x,y) and the batch.
+  TNNetPolynomialActivation = class(TNNetChannelTransformBase)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   // This is an experimental class. Do not use it.
   TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
     private
@@ -10519,6 +10541,133 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetPolynomialActivation }
+constructor TNNetPolynomialActivation.Create();
+begin
+  inherited Create();
+  // Depth-dependent weight buffers are allocated in SetPrevLayer.
+  InitDefault();
+end;
+
+procedure TNNetPolynomialActivation.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base class allocates FNeurons[0] with Depth weights. We also need
+  // FNeurons[1] (linear coefficient b) and FNeurons[2] (constant term c0),
+  // each a Depth-long learnable vector.
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetPolynomialActivation.Compute();
+var
+  StartTime: double;
+  Wa, Wb, Wc: TNNetVolume;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  xv: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (which copies the input into FOutput); we
+  // compute the polynomial directly from FPrevLayer.FOutput.
+  Prev := FPrevLayer.FOutput;
+  Wa := FNeurons[0].FWeights;
+  Wb := FNeurons[1].FWeights;
+  Wc := FNeurons[2].FWeights;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if (Wa.Size <> Depth) or (Wb.Size <> Depth) or (Wc.Size <> Depth) then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetPolynomialActivation.');
+  {$ENDIF}
+  for x := 0 to SizeX - 1 do
+    for y := 0 to SizeY - 1 do
+      for d := 0 to Depth - 1 do
+      begin
+        xv := Prev[x, y, d];
+        FOutput[x, y, d] := Wa.Raw[d] * xv * xv + Wb.Raw[d] * xv + Wc.Raw[d];
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPolynomialActivation.Backpropagate();
+var
+  StartTime: double;
+  Na, Nb, Nc: TNNetNeuron;
+  Wa, Wb: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  xv, gy, gradA, gradB, gradC, a_d, b_d: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Na := FNeurons[0];
+  Nb := FNeurons[1];
+  Nc := FNeurons[2];
+  Wa := Na.FWeights;
+  Wb := Nb.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  // dL/da[c] += dL/dy * x^2
+  // dL/db[c] += dL/dy * x
+  // dL/dc0[c] += dL/dy
+  // dL/dx[x,y,c] = dL/dy[x,y,c] * (2*a[c]*x + b[c])
+  for d := 0 to Depth - 1 do
+  begin
+    a_d := Wa.Raw[d];
+    b_d := Wb.Raw[d];
+    gradA := 0;
+    gradB := 0;
+    gradC := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        gradA := gradA + gy * xv * xv;
+        gradB := gradB + gy * xv;
+        gradC := gradC + gy;
+        if hasInputGrad then
+          PrevErr[x, y, d] := PrevErr[x, y, d] +
+            gy * (2 * a_d * xv + b_d);
+      end;
+    Na.FDelta.Raw[d] := Na.FDelta.Raw[d] + (-FLearningRate) * gradA;
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * gradB;
+    Nc.FDelta.Raw[d] := Nc.FDelta.Raw[d] + (-FLearningRate) * gradC;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    Na.UpdateWeights(FInertia);
+    Nb.UpdateWeights(FInertia);
+    Nc.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetPolynomialActivation.InitDefault();
+begin
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  // Default: a = 0, b = 1, c0 = 0  ->  y = x  (identity at init).
+  FNeurons[0].FWeights.Fill(0);
+  FNeurons[1].FWeights.Fill(1);
+  FNeurons[2].FWeights.Fill(0);
+  AfterWeightUpdate();
+end;
+
 { TNNetCellMul }
 
 procedure TNNetCellMul.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -18444,6 +18593,7 @@ begin
       'TNNetBias':                  Result := TNNetBias.Create();
       'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
+      'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
@@ -18630,6 +18780,7 @@ begin
       if S[0] = 'TNNetBias' then Result := TNNetBias.Create() else
       if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
+      if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
