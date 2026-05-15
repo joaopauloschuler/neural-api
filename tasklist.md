@@ -906,7 +906,7 @@ sized to fit in a single commit.
       first because it's the simplest, then TNNetDeconvolution, then
       TNNetDeMaxPool. One numerical-gradient test per layer, the
       same way the activation audit caught real bugs.
-- [ ] LoadFromString round-trip for TNNetChannelShuffle — the new
+- [x] LoadFromString round-trip for TNNetChannelShuffle — the new
       layer carries a Groups parameter in FStruct[0]; the
       norm-roundtrip pass found zero bugs but we should still pin
       the dispatch for the just-landed layer before it has a chance

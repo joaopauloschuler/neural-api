@@ -5011,9 +5011,41 @@ begin
 end;
 
 procedure TTestNeuralNumerical.TestChannelShuffleSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
 begin
-  SerializationRoundTrip(Self, TNNetChannelShuffle.Create(2),
-    'ChannelShuffle', 2, 2, 4, 1e-5);
+  // Pin the Groups hyperparameter (FStruct[0]) survives the dispatch in
+  // addition to the element-wise output parity exercised by the helper.
+  SerializationRoundTrip(Self, TNNetChannelShuffle.Create(3),
+    'ChannelShuffle', 2, 2, 6, 1e-5);
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 6, 1));
+    NN.AddLayer(TNNetChannelShuffle.Create(3));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      // SaveStructureToString embeds FStruct[0] (Groups); equality here
+      // pins the Groups hyperparameter through the CreateLayer dispatch.
+      AssertEquals('ChannelShuffle round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestChannelShuffleIndivisibleGuard;
