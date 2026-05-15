@@ -68,3 +68,18 @@
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
       regressions are visible without OpenCL/AVX hardware differences.
+
+### Added ideas (Claude, 2026-05-14, second pass)
+- [ ] Investigate TNNetPointwiseSoftMax.Backpropagate: it uses the diagonal-only
+      x*(1-x) approximation instead of the full softmax Jacobian. Decide whether
+      to implement the exact Jacobian (and add a numerical-gradient test) or
+      document the approximation explicitly in the code/README.
+- [ ] Continue the Backpropagate audit: the transform/reshape/pooling/element-
+      wise families are now covered (TNNetPadXY, TNNetCrop,
+      TNNetInterleaveChannels, TNNetAvgPool, TNNetCellBias, TNNetCellMul).
+      Remaining uncovered families to check next: upsampling/deconvolution
+      layers, concat/split/branch layers, and recurrent-style layers. Add
+      numerical-gradient checks in TestNeuralNumerical.pas, one family at a time.
+- [ ] TNNetRMSNorm has now landed (neural/neuralnetwork.pas +
+      TestNeuralNumerical.pas) and is, alongside TNNetLayerNorm, a ready
+      template for any further normalization-layer variants.
