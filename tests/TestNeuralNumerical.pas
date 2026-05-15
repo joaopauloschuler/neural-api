@@ -87,6 +87,9 @@ type
     procedure TestAvgPoolGradientCheck;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
+    procedure TestAddPositionalEmbeddingForward;
+    procedure TestAddPositionalEmbeddingGradientCheck;
+    procedure TestAddPositionalEmbeddingEmbeddingIsConstant;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -2974,6 +2977,158 @@ end;
 procedure TTestNeuralNumerical.TestCellMulGradientCheck;
 begin
   CellLayerGradientCheck(Self, TNNetCellMul.Create(), 'CellMul');
+end;
+
+procedure TTestNeuralNumerical.TestAddPositionalEmbeddingForward;
+var
+  NN: TNNet;
+  ZeroInput, NonZeroInput, Encoding: TNNetVolume;
+  PE: TNNetAddPositionalEmbedding;
+  i: integer;
+  anyDiff: boolean;
+begin
+  NN := TNNet.Create();
+  ZeroInput := TNNetVolume.Create(4, 1, 8);
+  NonZeroInput := TNNetVolume.Create(4, 1, 8);
+  Encoding := TNNetVolume.Create(4, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 8));
+    PE := TNNetAddPositionalEmbedding.Create();
+    NN.AddLayer(PE);
+
+    ZeroInput.Fill(0);
+    NN.Compute(ZeroInput);
+    Encoding.Copy(NN.GetLastLayer.Output);
+
+    anyDiff := False;
+    for i := 0 to Encoding.Size - 1 do
+      if Abs(Encoding.Raw[i]) > 1e-6 then anyDiff := True;
+    AssertTrue('AddPositionalEmbedding must produce nonzero encoding', anyDiff);
+
+    for i := 0 to NonZeroInput.Size - 1 do
+      NonZeroInput.Raw[i] := Sin(i * 0.3) * 1.5;
+    NN.Compute(NonZeroInput);
+    for i := 0 to NonZeroInput.Size - 1 do
+      AssertEquals('AddPositionalEmbedding output = input + encoding at ' + IntToStr(i),
+        NonZeroInput.Raw[i] + Encoding.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 0.0001);
+  finally
+    NN.Free;
+    ZeroInput.Free;
+    NonZeroInput.Free;
+    Encoding.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddPositionalEmbeddingGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  PE: TNNetAddPositionalEmbedding;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 8);
+  InputPlus := TNNetVolume.Create(4, 1, 8);
+  Desired := TNNetVolume.Create(4, 1, 8);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 8, 1));
+    PE := TNNetAddPositionalEmbedding.Create();
+    NN.AddLayer(PE);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('AddPositionalEmbedding input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddPositionalEmbeddingEmbeddingIsConstant;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  PE: TNNetAddPositionalEmbedding;
+  BeforeOutput: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 8);
+  Desired := TNNetVolume.Create(4, 1, 8);
+  BeforeOutput := TNNetVolume.Create(4, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 8, 1));
+    PE := TNNetAddPositionalEmbedding.Create();
+    NN.AddLayer(PE);
+    NN.SetLearningRate(1.0, 0.0);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) + 5;
+
+    NN.Compute(Input);
+    BeforeOutput.Copy(NN.GetLastLayer.Output);
+
+    for i := 1 to 5 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      NN.UpdateWeights();
+    end;
+
+    NN.Compute(Input);
+    for i := 0 to BeforeOutput.Size - 1 do
+      AssertEquals('AddPositionalEmbedding encoding must stay constant at ' + IntToStr(i),
+        BeforeOutput.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+    BeforeOutput.Free;
+  end;
 end;
 
 initialization

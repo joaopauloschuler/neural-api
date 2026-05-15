@@ -167,9 +167,13 @@
       (TNNetConcat, TNNetDeepConcat, TNNetSplitChannels, TNNetSum) — one
       numerical-gradient test per layer, hunting for bugs the activation audit
       style turned up before.
-- [ ] Add a numerical-gradient test for TNNetAddPositionalEmbedding (and any
+- [x] Add a numerical-gradient test for TNNetAddPositionalEmbedding (and any
       other layer carrying learnable weights that lacks one) — the learnable-
       weight gradient path is the easiest place for a silent bug to hide.
+      (Done: forward + input-gradient + constant-encoding regression tests.
+      Note: this layer has no learnable weights; FPositionalEmbedding is a
+      fixed sinusoidal encoding per Vaswani et al., so the "learnable-weight"
+      branch does not exist here.)
 
 #### Experiments I'm curious about
 - [ ] Optimizer bake-off: train the same small MLP with SGD / SGD+momentum /
@@ -255,9 +259,10 @@
 - [ ] Continue the Backpropagate audit into the concat/split/branch family
       (TNNetConcat, TNNetDeepConcat, TNNetSplitChannels, TNNetSum) — one
       numerical-gradient test per layer. Listed above; I want to take it.
-- [ ] Numerical-gradient test for TNNetAddPositionalEmbedding's learnable
+- [x] Numerical-gradient test for TNNetAddPositionalEmbedding's learnable
       weight path — already listed; the learnable-weight branch is the
-      easiest place for a silent bug to hide.
+      easiest place for a silent bug to hide. (Done: see above. The layer
+      has no learnable weights, so only the input-gradient path applies.)
 - [ ] Add a shared `AssertLayerGradient(layer, inputShape)` helper in
       TestNeuralNumerical.pas so each new layer test becomes ~3 lines instead
       of a copy-pasted block. Big quality-of-life win for the audit work.
