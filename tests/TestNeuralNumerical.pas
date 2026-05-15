@@ -4183,30 +4183,19 @@ procedure TTestNeuralNumerical.TestDropPathPOneBoundary;
 var
   NN: TNNet;
   Input, Desired: TNNetVolume;
-  i, Trials, ZeroTrials: integer;
+  i, Trials: integer;
   v: TNeuralFloat;
-  AnyZero, AnyKept: boolean;
 begin
-  // p=1 boundary safety net. The constructor of TNNetDropPath deliberately
-  // clamps any pDropProb >= 1 to 0.99 to avoid div-by-zero in the
-  // inverted-dropout 1/(1-p) scaling. As a consequence, requesting p=1 does
-  // NOT mean "always drop": ~99% of samples are zeroed, and the remaining
-  // ~1% are scaled by ~100x. This is documented in code (see
-  // TNNetDropPath.Create) but is surprising relative to the textbook
-  // semantics of stochastic depth. This test pins down the actual behavior:
-  //   - no NaN/Inf in either the forward or backward pass
-  //   - output magnitude is bounded (no runaway)
-  //   - the dropped branch (output==0) is taken often enough to be the
-  //     dominant outcome (sanity check on the clamped p)
-  // FINDING: if the contract should be "p=1 means always drop", the
-  // constructor should special-case p>=1 to set both Keep and InvKeep paths
-  // to zero, instead of clamping to 0.99.
+  // p=1 boundary safety net. TNNetDropPath special-cases pDropProb >= 1
+  // (the "always drop" case) so that every sample is zeroed and the
+  // inverted-dropout 1/(1-p) scaling is bypassed. This test pins that
+  // contract STRICTLY:
+  //   - forward output is exactly zero for every sample, every trial
+  //   - backward gradient w.r.t. the input is exactly zero
+  //   - no NaN/Inf anywhere
   NN := TNNet.Create();
   Input := TNNetVolume.Create(3, 2, 2);
   Desired := TNNetVolume.Create();
-  AnyZero := false;
-  AnyKept := false;
-  ZeroTrials := 0;
   try
     NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
     NN.AddLayer(TNNetDropPath.Create(1.0));
@@ -4224,13 +4213,6 @@ begin
     for Trials := 0 to 199 do
     begin
       NN.Compute(Input);
-      if Abs(NN.GetLastLayer.Output.Raw[0]) < 1e-6 then
-      begin
-        AnyZero := true;
-        Inc(ZeroTrials);
-      end
-      else
-        AnyKept := true;
       for i := 0 to Input.Size - 1 do
       begin
         v := NN.GetLastLayer.Output.Raw[i];
@@ -4238,6 +4220,8 @@ begin
           ' i=' + IntToStr(i), IsNan(v));
         AssertFalse('DropPath p=1 forward Inf at trial ' + IntToStr(Trials) +
           ' i=' + IntToStr(i), IsInfinite(v));
+        AssertEquals('DropPath p=1 forward must be exactly zero at trial ' +
+          IntToStr(Trials) + ' i=' + IntToStr(i), 0.0, v);
       end;
 
       NN.Layers[0].OutputError.Fill(0);
@@ -4249,16 +4233,10 @@ begin
           ' i=' + IntToStr(i), IsNan(v));
         AssertFalse('DropPath p=1 grad Inf at trial ' + IntToStr(Trials) +
           ' i=' + IntToStr(i), IsInfinite(v));
+        AssertEquals('DropPath p=1 grad must be exactly zero at trial ' +
+          IntToStr(Trials) + ' i=' + IntToStr(i), 0.0, v);
       end;
     end;
-    AssertTrue('DropPath p=1 must drop most samples (clamped to 0.99)', AnyZero);
-    // With p clamped to 0.99 and 200 trials we expect ~198 drops; require at
-    // least 150 to keep the test robust to RNG fluctuations.
-    AssertTrue('DropPath p=1 dropped at least 150/200 (got ' +
-      IntToStr(ZeroTrials) + ')', ZeroTrials >= 150);
-    // Document that the kept branch DOES still occur due to the clamp.
-    AssertTrue('DropPath p=1 also keeps ~1% of samples (clamp side-effect)',
-      AnyKept);
   finally
     NN.Free;
     Input.Free;

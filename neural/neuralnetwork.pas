@@ -10957,7 +10957,10 @@ constructor TNNetDropPath.Create(pDropProb: TNeuralFloat);
 begin
   inherited Create();
   if pDropProb < 0 then pDropProb := 0;
-  if pDropProb >= 1 then pDropProb := 0.99;
+  // Note: pDropProb >= 1 is preserved verbatim so that "p=1" means
+  // "always drop". TNNetDropPath.Compute special-cases this case
+  // (kept-sample scale := 0, output := 0) instead of using the
+  // inverted-dropout 1/(1-p) scaling which would divide by zero.
   FFloatSt[0] := pDropProb;
   FScale := 1;
   if pDropProb > 0 then FEnabled := true;
@@ -10974,19 +10977,27 @@ begin
   P := FFloatSt[0];
   if FEnabled and (P > 0) then
   begin
-    Keep := 1 - P;
-    if Keep <= 0 then Keep := 1e-6;
-    InvKeep := 1.0 / Keep;
-    R := Random; // uniform [0,1)
-    if R < P then
+    if P >= 1 then
     begin
+      // "Always drop" semantics: no inverted-dropout scaling, just zero out.
       FOutput.Fill(0);
       FScale := 0;
     end
     else
     begin
-      FOutput.Mul(InvKeep);
-      FScale := InvKeep;
+      Keep := 1 - P;
+      InvKeep := 1.0 / Keep;
+      R := Random; // uniform [0,1)
+      if R < P then
+      begin
+        FOutput.Fill(0);
+        FScale := 0;
+      end
+      else
+      begin
+        FOutput.Mul(InvKeep);
+        FScale := InvKeep;
+      end;
     end;
   end
   else

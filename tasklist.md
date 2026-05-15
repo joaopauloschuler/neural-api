@@ -611,13 +611,16 @@ tasks before MHA lands, or as parallel tracks while it does.
 ### Ideas added on 2026-05-15 (post SpatialDropout + safety-net + devx batch)
 
 #### Bugs / quirks surfaced by the new safety nets
-- [ ] TNNetDropPath.Create silently clamps `pDropProb >= 1` to 0.99 to
+- [x] TNNetDropPath.Create silently clamps `pDropProb >= 1` to 0.99 to
       avoid a div-by-zero in the inverted-dropout `1/(1-p)` scaling.
       Consequence: `p=1` does NOT mean "always drop" — about 1% of samples
       survive and are amplified ~100x. Fix: special-case `pDropProb >= 1`
       in the constructor to set `Scale := 0` (and skip the division)
       instead of clamping the probability. Then tighten
       `TestDropPathPOneBoundary` to assert strict all-zero output.
+      Done: TNNetDropPath.Compute now special-cases `P >= 1` (output := 0,
+      Scale := 0); constructor preserves p verbatim; TestDropPathPOneBoundary
+      asserts strict zero outputs and gradients.
 
 #### Layers I'd enjoy building next (warm-up before MHA)
 - [ ] TNNetSpatialDropout1D/2D follow-ups now that they have landed:
@@ -655,12 +658,13 @@ tasks I'd personally enjoy landing while it incubates. Everything below
 is sized to fit in a single focused commit.
 
 #### Quick wins I'd enjoy taking first
-- [ ] Fix TNNetDropPath `p=1` clamping (already flagged above as a bug):
+- [x] Fix TNNetDropPath `p=1` clamping (already flagged above as a bug):
       special-case `pDropProb >= 1` in the constructor so Scale := 0
       instead of silently clamping probability to 0.99. Then tighten
       `TestDropPathPOneBoundary` to assert strict all-zero output and
       drop the existing tolerance-based check. Smallest non-trivial
-      correctness fix on the list with a ready test to extend.
+      correctness fix on the list with a ready test to extend. Landed:
+      see the "Bugs / quirks" entry above.
 - [ ] DropPath determinism test (the open follow-up flagged above):
       with a fixed `RandSeed`, two consecutive Compute calls in
       training mode produce identical masks/outputs. Add as
