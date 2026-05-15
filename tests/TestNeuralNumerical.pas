@@ -159,6 +159,10 @@ type
     procedure TestHardTanhExtremeInputSaturation;
     procedure TestTanhShrinkTanhComposition;
     procedure TestMaxOutDepthNotDivisibleByKGuard;
+    procedure TestELUForward;
+    procedure TestELUGradientCheck;
+    procedure TestELUSerializationRoundTrip;
+    procedure TestSiLUMatchesSwish;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -6075,6 +6079,132 @@ begin
   // check would fail with the old approximation.
   LayerInputGradientCheck(Self, TNNetSoftMax.Create(),
     'SoftMax', 1, 1, 6, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestELUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Alpha: TNeuralFloat;
+begin
+  Alpha := 1.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetELU.Create()); // default alpha = 1.0
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.5;
+    Input.Raw[2] := -0.5;
+    Input.Raw[3] := -2.0;
+    Input.Raw[4] := 3.0;
+
+    NN.Compute(Input);
+
+    // ELU(0) = 0
+    AssertEquals('ELU(0)', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    // Positive side is identity.
+    AssertEquals('ELU(1.5)', 1.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('ELU(3)', 3.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+    // Negative side: alpha*(exp(x)-1).
+    AssertEquals('ELU(-0.5)', Alpha * (Exp(-0.5) - 1),
+      NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('ELU(-2)', Alpha * (Exp(-2.0) - 1),
+      NN.GetLastLayer.Output.Raw[3], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestELUGradientCheck;
+begin
+  // Avoid the kink at x = 0.
+  ActivationGradientCheck(Self, TNNetELU.Create(), 'ELU',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestELUSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+  ReloadedLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetELU.Create(0.75));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ReloadedLayer := NN2.GetLastLayer;
+      AssertEquals('ELU round-trip class name', 'TNNetELU', ReloadedLayer.ClassName);
+      // alpha lives in FFloatSt[0] and must survive serialization. The base
+      // SaveStructureToString emits "ClassName:struct::float0;float1;..." so
+      // re-saving the reloaded layer must reproduce the original alpha.
+      AssertEquals('ELU round-trip structure preserves alpha',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+      AssertEquals('ELU round-trip output size',
+        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ELU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          ReloadedLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSiLUMatchesSwish;
+var
+  SwishNN, SiLUNN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  SwishNN := TNNet.Create();
+  SiLUNN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 8);
+  try
+    SwishNN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    SwishNN.AddLayer(TNNetSwish.Create());
+    SiLUNN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    SiLUNN.AddLayer(TNNetSiLU.Create());
+
+    RandSeed := 4242;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 2.5 - 0.4;
+
+    SwishNN.Compute(Input);
+    SiLUNN.Compute(Input);
+
+    AssertEquals('SiLU vs Swish output size',
+      SwishNN.GetLastLayer.Output.Size, SiLUNN.GetLastLayer.Output.Size);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('SiLU(x) == Swish(x) at ' + IntToStr(i),
+        SwishNN.GetLastLayer.Output.Raw[i],
+        SiLUNN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    SwishNN.Free;
+    SiLUNN.Free;
+    Input.Free;
+  end;
 end;
 
 initialization

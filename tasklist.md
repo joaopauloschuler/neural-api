@@ -1454,7 +1454,7 @@ end-to-end smoke check.
       `exp(x)`. Numerical-gradient test on a range that exercises both
       stable branches. Companion to TanhShrink/HardTanh — descend from
       TNNetReLUBase, plug into both CreateLayer dispatches.
-- [ ] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
+- [x] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
       alpha (default 1.0). Backward reuses the cached output via
       `dy/dx = 1 if x>0 else y + alpha`. Numerical-gradient test plus
       a constructor round-trip via SaveToString/LoadFromString.
@@ -1469,7 +1469,7 @@ end-to-end smoke check.
       Backward `dy/dx = 2*max(0,x)`. Worth landing because the squaring
       changes gradient magnitude in a way numerical-gradient tests
       should catch if a future refactor breaks it.
-- [ ] TNNetSiLU — alias / synonym for Swish with beta=1, registered so
+- [x] TNNetSiLU — alias / synonym for Swish with beta=1, registered so
       LoadFromString accepts the canonical name. One-liner; documents
       the equivalence in code rather than only in comments.
 
@@ -1627,12 +1627,12 @@ hitting the same wall.**
       - CIFAR-style example replacing a TNNetGlobalAvgPool head with
         TNNetGlobalMaxPool on one of the SimpleImage runs — small
         empirical "does it matter?" data point.
-- [ ] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
+- [x] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
       alpha. Backward via cached output. Sits next to the TNNetReLU6
       coverage just added; same harness shape.
 - [ ] TNNetCELU — continuously differentiable ELU variant. One line
       different from TNNetELU; rounds out the family.
-- [ ] TNNetSiLU alias for Swish(beta=1). One-line LoadFromString
+- [x] TNNetSiLU alias for Swish(beta=1). One-line LoadFromString
       registration so the canonical name parses. Pure naming cleanup.
 - [ ] TNNetPixelShuffle (sub-pixel convolution). Forward = deterministic
       index permutation; backward = inverse. Useful for the
@@ -1677,14 +1677,14 @@ hitting the same wall.**
 ## Lucky-day batch (seed 927654) — ideas I'd enjoy taking on
 
 #### Activation layers I'd like to add (small, gradient-checkable)
-- [ ] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
+- [x] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
       alpha (default 1.0). Backward via cached output: `dy/dx = 1`
       when `x>0`, else `y + alpha`. Mirrors the TNNetReLU6 harness
       shape; add LoadFromString registration and a numerical-gradient
       test in TestNeuralNumerical.pas.
 - [ ] TNNetCELU — continuously differentiable ELU; `y = max(0,x) +
       min(0, alpha*(exp(x/alpha)-1))`. One-line variant of TNNetELU.
-- [ ] TNNetSiLU — pure-naming alias for Swish(beta=1). Just a
+- [x] TNNetSiLU — pure-naming alias for Swish(beta=1). Just a
       LoadFromString registration so the canonical PyTorch/JAX name
       parses without surprising the user. Document the equivalence.
 - [ ] TNNetSoftPlus — `y = ln(1+exp(x))` with the standard

@@ -661,6 +661,26 @@ type
     procedure Compute(); override;
   end;
 
+  /// Exponential Linear Unit (ELU) activation function.
+  // ELU(x) = x for x > 0, else alpha*(exp(x) - 1). Derivative is 1 for x > 0,
+  // else y + alpha (cached output). alpha is configurable, default 1.0,
+  // and is stored in FFloatSt[0] for serialization.
+  // https://arxiv.org/abs/1511.07289
+  TNNetELU = class(TNNetReLUBase)
+  private
+    FAlpha: TNeuralFloat;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pAlpha: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
+  /// Sigmoid Linear Unit (SiLU) activation. This is a naming alias for
+  // Swish with beta=1. Implemented as a thin subclass so the class name
+  // round-trips through SaveToString / LoadFromString.
+  TNNetSiLU = class(TNNetSwish)
+  end;
+
   /// GEGLU gated activation - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * GELU(B). Output depth = input depth / 2.
@@ -6556,6 +6576,66 @@ begin
       begin
         FOutput.FData[OutputCnt] := FScaleAlpha * Exp(LocalPrevOutput.FData[OutputCnt]) - FScaleAlpha;
       end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetELU }
+
+constructor TNNetELU.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetELU.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FAlpha := pAlpha;
+  FFloatSt[0] := pAlpha;
+end;
+
+procedure TNNetELU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue, OutputValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
+  FAlpha := FFloatSt[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue > 0 then
+      begin
+        FOutput.FData[OutputCnt] := PrevValue;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        OutputValue := FAlpha * (Exp(PrevValue) - 1);
+        FOutput.FData[OutputCnt] := OutputValue;
+        FOutputErrorDeriv.FData[OutputCnt] := OutputValue + FAlpha;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue > 0
+        then FOutput.FData[OutputCnt] := PrevValue
+        else FOutput.FData[OutputCnt] := FAlpha * (Exp(PrevValue) - 1);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15032,6 +15112,8 @@ begin
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
       'TNNetPower' :                Result := TNNetPower.Create(St[0]);
       'TNNetSELU' :                 Result := TNNetSELU.Create();
+      'TNNetELU' :                  Result := TNNetELU.Create(Ft[0]);
+      'TNNetSiLU' :                 Result := TNNetSiLU.Create();
       'TNNetSignedSquareRoot' :     Result := TNNetSignedSquareRoot.Create();
       'TNNetSignedSquareRoot1' :    Result := TNNetSignedSquareRoot1.Create();
       'TNNetSignedSquareRootN' :    Result := TNNetSignedSquareRootN.Create(Ft[0]);
@@ -15169,6 +15251,8 @@ begin
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
       if S[0] = 'TNNetPower' then Result := TNNetPower.Create(St[0]) else
       if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
+      if S[0] = 'TNNetELU' then Result := TNNetELU.Create(Ft[0]) else
+      if S[0] = 'TNNetSiLU' then Result := TNNetSiLU.Create() else
       if S[0] = 'TNNetSignedSquareRoot' then Result := TNNetSignedSquareRoot.Create() else
       if S[0] = 'TNNetSignedSquareRoot1' then Result := TNNetSignedSquareRoot1.Create() else
       if S[0] = 'TNNetSignedSquareRootN' then Result := TNNetSignedSquareRootN.Create(Ft[0]) else
