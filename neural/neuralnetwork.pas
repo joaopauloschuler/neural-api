@@ -589,6 +589,19 @@ type
     procedure Compute(); override;
   end;
 
+  /// E-Swish activation function: y = beta * x * sigmoid(beta * x).
+  // Derivative: beta * sigmoid(beta*x) * (1 + beta*x * (1 - sigmoid(beta*x))).
+  // beta is user-configurable (stored in FFloatSt[0] for serialization);
+  // default 1.25 is the paper's recommended value.
+  // https://arxiv.org/abs/1801.07145 ("E-swish: Adjusting Activations to
+  // Different Network Depths", Alcaide, 2018).
+  TNNetESwish = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pBeta: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Squared ReLU activation function: relu(x)^2.
   // Derivative: 2*relu(x) for x>0, else 0.
   // https://arxiv.org/abs/2109.08668 (Primer)
@@ -4043,6 +4056,61 @@ begin
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := PrevValue / ( 1 + Exp(-PrevValue) );
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetESwish }
+
+constructor TNNetESwish.Create();
+begin
+  Create(1.25);
+end;
+
+constructor TNNetESwish.Create(pBeta: TNeuralFloat);
+begin
+  inherited Create();
+  if pBeta <= 0 then
+    FErrorProc('TNNetESwish requires beta > 0.');
+  FFloatSt[0] := pBeta;
+end;
+
+procedure TNNetESwish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue, Beta, BetaX, SigmoidValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Beta := FFloatSt[0];
+
+  // ESwish(x) = beta * x * sigmoid(beta*x).
+  // d/dx = beta * sigmoid(beta*x) * (1 + beta*x * (1 - sigmoid(beta*x))).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      BetaX := Beta * PrevValue;
+      SigmoidValue := 1 / ( 1 + Exp(-BetaX) );
+      FOutput.FData[OutputCnt] := Beta * PrevValue * SigmoidValue;
+      FOutputErrorDeriv.FData[OutputCnt] :=
+        Beta * SigmoidValue * (1 + BetaX * (1 - SigmoidValue));
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      BetaX := Beta * PrevValue;
+      FOutput.FData[OutputCnt] := Beta * PrevValue / ( 1 + Exp(-BetaX) );
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16803,6 +16871,7 @@ begin
       'TNNetReLU' :                 Result := TNNetReLU.Create();
       'TNNetReLUP' :                Result := TNNetReLUP.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
+      'TNNetESwish' :               Result := TNNetESwish.Create(Ft[0]);
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
@@ -16972,6 +17041,7 @@ begin
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
       if S[0] = 'TNNetReLUP' then Result := TNNetReLUP.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
+      if S[0] = 'TNNetESwish' then Result := TNNetESwish.Create(Ft[0]) else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else

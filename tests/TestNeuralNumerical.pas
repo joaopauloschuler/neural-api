@@ -262,6 +262,9 @@ type
     procedure TestSnakeForward;
     procedure TestSnakeGradientCheck;
     procedure TestSnakeSerializationRoundTrip;
+    procedure TestESwishForward;
+    procedure TestESwishGradientCheck;
+    procedure TestESwishSerializationRoundTrip;
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
@@ -8671,6 +8674,99 @@ begin
   // Also verify output equivalence with a non-default alpha.
   SerializationRoundTrip(Self, TNNetSnake.Create(2.5),
     'Snake', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestESwishForward;
+var
+  NN, NNRef: TNNet;
+  Input, InputRef: TNNetVolume;
+  i: integer;
+  Vals: array[0..4] of TNeuralFloat;
+begin
+  // At beta=1, ESwish(x) = x*sigmoid(x) = Swish(x) exactly.
+  Vals[0] := -2.0;
+  Vals[1] := -0.5;
+  Vals[2] := 0.0;
+  Vals[3] := 0.75;
+  Vals[4] := 1.5;
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  InputRef := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetESwish.Create(1.0));
+    NNRef.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NNRef.AddLayer(TNNetSwish.Create());
+    for i := 0 to 4 do
+    begin
+      Input.Raw[i] := Vals[i];
+      InputRef.Raw[i] := Vals[i];
+    end;
+    NN.Compute(Input);
+    NNRef.Compute(InputRef);
+    for i := 0 to 4 do
+      AssertEquals('ESwish(beta=1) matches Swish at i=' + IntToStr(i),
+        NNRef.GetLastLayer.Output.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    NNRef.Free;
+    Input.Free;
+    InputRef.Free;
+  end;
+
+  // ESwish(0, beta=1.25) = 1.25 * 0 * sigmoid(0) = 0.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NN.AddLayer(TNNetESwish.Create(1.25));
+    Input.Raw[0] := 0.0;
+    NN.Compute(Input);
+    AssertEquals('ESwish(0, beta=1.25)',
+      0.0, NN.GetLastLayer.Output.Raw[0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestESwishGradientCheck;
+begin
+  // Non-default beta exercises the FFloatSt[0] code path.
+  LayerInputGradientCheck(Self, TNNetESwish.Create(1.5),
+    'ESwish', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestESwishSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // beta lives in FFloatSt[0] and must survive serialization.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetESwish.Create(2.5));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('ESwish round-trip class name',
+        'TNNetESwish', NN2.GetLastLayer.ClassName);
+      AssertEquals('ESwish round-trip structure preserves beta',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+  // Also verify output equivalence with a non-default beta.
+  SerializationRoundTrip(Self, TNNetESwish.Create(2.5),
+    'ESwish', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSincForward;
