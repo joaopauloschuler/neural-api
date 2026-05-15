@@ -1813,7 +1813,7 @@ global-avg-pool role is filled by `TNNetAvgChannel`. The earlier
 TNNetAvgChannel; this is now covered.
 
 #### Small follow-ups
-- [ ] Add a `TNNetGlobalAvgPool = TNNetAvgChannel` type alias (mirroring
+- [X] Add a `TNNetGlobalAvgPool = TNNetAvgChannel` type alias (mirroring
       `TNNetGlobalMaxPool` naming) so the LoadFromString dispatch and
       future docs match the canonical Keras/PyTorch name. One-line type
       decl + dispatch registration + a round-trip test.
@@ -1926,7 +1926,7 @@ have landed recently.
       real corpus. Would lean on the recently-landed SDPA layer.
 
 #### Tooling / quality of life
-- [ ] One-line type alias: `TNNetGlobalAvgPool = class(TNNetAvgChannel)`
+- [X] One-line type alias: `TNNetGlobalAvgPool = class(TNNetAvgChannel)`
       (called out at line 1816) so the canonical Keras/PyTorch name
       resolves. Dispatch entry + round-trip test.
 - [ ] Helper proc `WriteLayerTimings(NN: TNNet; Sample: TNNetVolume)`

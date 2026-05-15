@@ -2014,6 +2014,12 @@ type
     constructor Create(); override;
   end;
 
+  /// Global Average Pooling: companion to TNNetGlobalMaxPool. Thin
+  // subclass of TNNetAvgChannel so the canonical Keras/PyTorch name
+  // round-trips through SaveToString / LoadFromString.
+  TNNetGlobalAvgPool = class(TNNetAvgChannel)
+  end;
+
   /// Global Max Pooling: reduces each (X, Y) plane to a single scalar by
   // taking the maximum. Output shape is 1 x 1 x Depth. The argmax (X, Y)
   // index is cached per channel; backward routes the channel's output
@@ -15287,6 +15293,7 @@ begin
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
+      'TNNetGlobalAvgPool':         Result := TNNetGlobalAvgPool.Create();
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalMaxPool':         Result := TNNetGlobalMaxPool.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
@@ -15428,6 +15435,7 @@ begin
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
+      if S[0] = 'TNNetGlobalAvgPool' then Result := TNNetGlobalAvgPool.Create() else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalMaxPool' then Result := TNNetGlobalMaxPool.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else

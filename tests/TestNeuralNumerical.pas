@@ -172,6 +172,7 @@ type
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
+    procedure TestGlobalAvgPoolSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -6467,6 +6468,51 @@ begin
         NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('GlobalMaxPool round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          ReloadedLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGlobalAvgPoolSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+  ReloadedLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetGlobalAvgPool.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ReloadedLayer := NN2.GetLastLayer;
+      AssertEquals('GlobalAvgPool round-trip class name',
+        'TNNetGlobalAvgPool', ReloadedLayer.ClassName);
+      AssertEquals('GlobalAvgPool round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+      AssertEquals('GlobalAvgPool round-trip output size',
+        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GlobalAvgPool round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           ReloadedLayer.Output.Raw[i], 1e-5);
     finally
