@@ -726,7 +726,7 @@ is sized to fit in a single focused commit.
       MaskedFill/SDPA but not the just-landed 1D/2D spatial dropouts.
       Add `TestSpatialDropout{1D,2D}SerializationRoundTrip` mirroring
       the existing pattern.
-- [ ] LayerNorm / RMSNorm / GroupNorm round-trip via LoadFromString —
+- [x] LayerNorm / RMSNorm / GroupNorm round-trip via LoadFromString —
       these three landed earlier and I'd bet have at least one
       learnable-scale dispatch quirk hiding. Add to the existing
       round-trip suite.

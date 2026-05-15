@@ -125,6 +125,9 @@ type
     procedure TestChannelShuffleGradientCheck;
     procedure TestChannelShuffleSerializationRoundTrip;
     procedure TestChannelShuffleIndivisibleGuard;
+    procedure TestLayerNormSerializationRoundTrip;
+    procedure TestRMSNormSerializationRoundTrip;
+    procedure TestGroupNormSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -5034,6 +5037,99 @@ begin
     NN.Free;
     Capture.Free;
   end;
+end;
+
+// Generic helper for the *Norm family: after the layer is wired by AddLayer,
+// perturb every learnable weight (gamma / beta) with deterministic noise so
+// the round-trip is not a trivial identity (gamma=1, beta=0). Then verify
+// SaveToString / LoadFromString reproduce Compute element-wise.
+procedure NormSerializationRoundTripWithPerturbedWeights(ATestCase: TTestCase;
+  ALayer: TNNetLayer; const AName: string;
+  ASizeX, ASizeY, ASizeD: integer; ATolerance: TNeuralFloat);
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i, NCnt, WCnt: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  try
+    NN.AddLayer(TNNetInput.Create(ASizeX, ASizeY, ASizeD, 1));
+    NN.AddLayer(ALayer);
+
+    // Perturb each learnable-weight tensor with deterministic noise so the
+    // round-trip exercises a non-trivial gamma/beta. We poke FWeights
+    // directly (the public Weights accessor returns the same tensor).
+    for NCnt := 0 to ALayer.Neurons.Count - 1 do
+      for WCnt := 0 to ALayer.Neurons[NCnt].Weights.Size - 1 do
+        ALayer.Neurons[NCnt].Weights.Raw[WCnt] :=
+          ALayer.Neurons[NCnt].Weights.Raw[WCnt]
+          + Sin(NCnt * 7.3 + WCnt * 0.31) * 0.25;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ATestCase.AssertEquals(AName + ' round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      // Hyperparameter / structure parity via SaveStructureToString.
+      ATestCase.AssertEquals(AName + ' round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      // Learnable-weight parity: gamma / beta survive the round-trip.
+      ATestCase.AssertEquals(AName + ' round-trip neuron count',
+        NN.GetLastLayer.Neurons.Count, NN2.GetLastLayer.Neurons.Count);
+      for NCnt := 0 to NN.GetLastLayer.Neurons.Count - 1 do
+      begin
+        ATestCase.AssertEquals(AName + ' round-trip weight size n=' +
+          IntToStr(NCnt),
+          NN.GetLastLayer.Neurons[NCnt].Weights.Size,
+          NN2.GetLastLayer.Neurons[NCnt].Weights.Size);
+        for WCnt := 0 to NN.GetLastLayer.Neurons[NCnt].Weights.Size - 1 do
+          ATestCase.AssertEquals(AName + ' round-trip weight n=' +
+            IntToStr(NCnt) + ' w=' + IntToStr(WCnt),
+            NN.GetLastLayer.Neurons[NCnt].Weights.Raw[WCnt],
+            NN2.GetLastLayer.Neurons[NCnt].Weights.Raw[WCnt], ATolerance);
+      end;
+      // Compute parity.
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        ATestCase.AssertEquals(AName + ' round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], ATolerance);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLayerNormSerializationRoundTrip;
+begin
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLayerNorm.Create(), 'LayerNorm', 3, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormSerializationRoundTrip;
+begin
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetRMSNorm.Create(), 'RMSNorm', 3, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestGroupNormSerializationRoundTrip;
+begin
+  // Depth=6 with Groups=3 -> 2 channels per group, exercises the
+  // non-default group hyperparameter through the CreateLayer dispatch.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetGroupNorm.Create(3), 'GroupNorm', 2, 2, 6, 1e-5);
 end;
 
 initialization
