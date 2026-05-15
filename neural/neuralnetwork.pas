@@ -1529,6 +1529,15 @@ type
       procedure Compute(); override;
   end;
 
+  /// Softmax with a configurable temperature T: y = softmax(x / T).
+  /// T is stored in FFloatSt[0]. Useful for sampling demos.
+  TNNetSoftmaxTemperature = class(TNNetSoftMax)
+    public
+      constructor Create(pTemperature: TNeuralFloat = 1.0); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -12018,6 +12027,64 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+{ TNNetSoftmaxTemperature }
+constructor TNNetSoftmaxTemperature.Create(pTemperature: TNeuralFloat);
+begin
+  inherited Create();
+  if pTemperature = 0 then
+    FErrorProc('TNNetSoftmaxTemperature temperature can not be zero.');
+  FFloatSt[0] := pTemperature;
+end;
+
+procedure TNNetSoftmaxTemperature.Compute;
+var
+  StartTime: double;
+  T: TNeuralFloat;
+begin
+  StartTime := Now();
+  T := FFloatSt[0];
+  if T = 0 then T := 1.0;
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  if T <> 1.0 then FOutput.Mul(1.0 / T);
+  FSoftTotalSum := FOutput.SoftMax();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftmaxTemperature.Backpropagate;
+var
+  StartTime: double;
+  T, InvT, Dot, Yi: TNeuralFloat;
+  i, SizeM1: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  T := FFloatSt[0];
+  if T = 0 then T := 1.0;
+  InvT := 1.0 / T;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
+    (FOutput.Size = FOutputError.Size) then
+  begin
+    // Full softmax Jacobian with temperature:
+    //   y = softmax(x/T) -> dL/dx_i = (1/T) * y_i * (dL/dy_i - sum_j dL/dy_j y_j)
+    SizeM1 := FOutput.Size - 1;
+    Dot := 0;
+    for i := 0 to SizeM1 do
+      Dot := Dot + FOutputError.FData[i] * FOutput.FData[i];
+    for i := 0 to SizeM1 do
+    begin
+      Yi := FOutput.FData[i];
+      FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i] +
+        InvT * Yi * (FOutputError.FData[i] - Dot);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetConvolutionReLU }
 constructor TNNetConvolutionReLU.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -14545,6 +14612,7 @@ begin
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create(St[0]);
+      'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -14676,6 +14744,7 @@ begin
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create(St[0]) else
+      if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else

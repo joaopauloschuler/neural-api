@@ -686,7 +686,7 @@ is sized to fit in a single focused commit.
       gradient is the inverse permutation, easy numerical check.
       Slots cleanly into the existing channel-manipulation family
       (TNNetInterleaveChannels, TNNetSplitChannels, etc.).
-- [ ] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
+- [x] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
       saved/loaded via FFloatSt[0]. Useful for the eventual tiny-GPT
       sampling demo and a clean small layer. Backprop is the standard
       softmax Jacobian scaled by 1/T.
@@ -830,7 +830,7 @@ sized to fit in a single commit.
       slopes (`slope[h] = 2^(-8h/H)`), parameter-free, gradient check
       mirrors TNNetMaskedFill. The smallest "alternative to RoPE" task
       we have, and it slots straight into the eventual MHA helper.
-- [ ] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
+- [x] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
       saved/loaded via FFloatSt[0]. Useful for the eventual tiny-GPT
       sampling demo. Already listed once; would enjoy taking it next.
 - [ ] TNNetGatedResidual (ReZero gating) — already listed. The

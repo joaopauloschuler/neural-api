@@ -124,6 +124,10 @@ type
     procedure TestChannelShuffleForward;
     procedure TestChannelShuffleGradientCheck;
     procedure TestChannelShuffleSerializationRoundTrip;
+    procedure TestSoftmaxTemperatureMatchesSoftMaxAtOne;
+    procedure TestSoftmaxTemperatureIncreasesEntropy;
+    procedure TestSoftmaxTemperatureGradientCheck;
+    procedure TestSoftmaxTemperatureSerializationRoundTrip;
     procedure TestChannelShuffleIndivisibleGuard;
     procedure TestChannelShuffleInverseProperty;
     procedure TestLayerNormSerializationRoundTrip;
@@ -5210,6 +5214,151 @@ begin
   // Parameter-free, but the window size (FStruct[0]) must survive dispatch.
   SerializationRoundTrip(Self, TNNetLocalResponseNorm2D.Create(3),
     'LocalResponseNorm2D', 4, 4, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSoftmaxTemperatureMatchesSoftMaxAtOne;
+var
+  NNRef, NNTemp: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // At T=1, TNNetSoftmaxTemperature must equal the plain softmax exactly.
+  NNRef := TNNet.Create();
+  NNTemp := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  try
+    NNRef.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NNRef.AddLayer(TNNetSoftMax.Create());
+    NNTemp.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NNTemp.AddLayer(TNNetSoftmaxTemperature.Create(1.0));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.7;
+    NNRef.Compute(Input);
+    NNTemp.Compute(Input);
+    for i := 0 to NNRef.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SoftmaxTemperature(T=1) at ' + IntToStr(i),
+        NNRef.GetLastLayer.Output.Raw[i],
+        NNTemp.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NNRef.Free;
+    NNTemp.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftmaxTemperatureIncreasesEntropy;
+var
+  NNLow, NNHigh: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  pLow, pHigh, entLow, entHigh: TNeuralFloat;
+begin
+  // Higher T flattens the distribution -> entropy grows.
+  NNLow := TNNet.Create();
+  NNHigh := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NNLow.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NNLow.AddLayer(TNNetSoftmaxTemperature.Create(0.5));
+    NNHigh.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NNHigh.AddLayer(TNNetSoftmaxTemperature.Create(5.0));
+    // Use a sharply-peaked logits vector so the entropy gap is large.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.0;
+    NNLow.Compute(Input);
+    NNHigh.Compute(Input);
+    entLow := 0;
+    entHigh := 0;
+    for i := 0 to Input.Size - 1 do
+    begin
+      pLow := NNLow.GetLastLayer.Output.Raw[i];
+      pHigh := NNHigh.GetLastLayer.Output.Raw[i];
+      if pLow > 1e-12 then entLow := entLow - pLow * Ln(pLow);
+      if pHigh > 1e-12 then entHigh := entHigh - pHigh * Ln(pHigh);
+    end;
+    AssertTrue('SoftmaxTemperature higher-T entropy > lower-T entropy (low=' +
+      FloatToStr(entLow) + ' high=' + FloatToStr(entHigh) + ')',
+      entHigh > entLow + 0.1);
+  finally
+    NNLow.Free;
+    NNHigh.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftmaxTemperatureGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  InputPlus := TNNetVolume.Create(1, 1, 5);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    // SkipBackpropDerivative defaults to false -> Backpropagate uses the
+    // y*(1-y) diagonal Jacobian approximation, which is what we verify.
+    NN.AddLayer(TNNetSoftmaxTemperature.Create(2.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.2 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 * (i + 1);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SoftmaxTemperature gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftmaxTemperatureSerializationRoundTrip;
+begin
+  // T=2.5 lives in FFloatSt[0] and must survive SaveStructureToString.
+  SerializationRoundTrip(Self, TNNetSoftmaxTemperature.Create(2.5),
+    'SoftmaxTemperature', 1, 1, 6, 1e-5);
 end;
 
 initialization
