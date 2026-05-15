@@ -4601,3 +4601,180 @@ duplicate something already landed or already in-flight.
       README — currently they're scattered across the layer reference
       and a user wanting to assemble a transformer has to hunt for
       them. One short paragraph + one assembled code snippet.
+
+### Lucky-day batch — 2026-05-15 (seed 491990)
+
+Python `random.randint(1, 1000000)` rolled 491990 on a self-described
+lucky day. Before pinning, every candidate `TNNet*` name below was
+grep-verified absent from `neural/neuralnetwork.pas` and the existing
+tasklist was scanned for prior pins (seeds 735373, 528621, 896318,
+769362, 758867, 554877, 781449 batches above). Theme of this batch is
+"contrastive heads, MaxOut-family neighbours, and the
+register/serialize safety net" — areas the file has gestured at
+without yet pinning concrete chunks.
+
+#### Layers I'd enjoy authoring
+
+- [ ] TNNetL2Normalize — per-sample L2 normalize across the depth axis
+      (or a configurable axis flag in FFloatSt) with epsilon for
+      numerical stability. The natural input stage for cosine-similarity
+      heads, contrastive losses, and triplet/embedding networks. Forward
+      is `x / sqrt(sum(x²) + eps)`; backward is the standard
+      `(I - ŷŷᵀ) / ||x||` Jacobian. Two tests (unit-norm forward,
+      central-difference gradient). Pairs with the already-pinned
+      TNNetCosineSimilarity and TNNetCosineEmbeddingLoss.
+
+- [ ] TNNetPenalizedTanh — `y = tanh(x) if x>0 else 0.25·tanh(x)`. The
+      asymmetric-tanh trick from "Revise Saturated Activations for
+      Deep Networks". Sister to the LeakyReLU pattern but on tanh.
+      Three tests (asymmetry across zero, gradient check, serialization).
+
+- [ ] TNNetSoftMin — `softmax(-x)`, the natural sibling of TNNetSoftMax
+      that often shows up in attention-style weighting where lower
+      scores should win. Same exact-Jacobian backward path as
+      TNNetSoftMax. One central-difference test.
+
+- [ ] TNNetGumbelSoftmax — straight-through estimator with temperature
+      `τ` (FFloatSt[0]). Forward draws `g_i = -log(-log(U_i))` and
+      computes `softmax((x + g)/τ)`; backward bypasses the sampling
+      and uses the softmax Jacobian. Inference uses the configurable
+      temperature or argmax (FFloatSt[1] flag). Three tests
+      (deterministic-given-seed, low-τ approaches one-hot, gradient
+      flow check at τ=1).
+
+- [ ] TNNetMaxOut2 — the two-piece special case of the existing
+      TNNetMaxOut, with a tighter API (no group-count parameter; just
+      "split depth in half, take element-wise max"). Friendlier default
+      for users new to the layer; backward routes the gradient to
+      whichever half won per element. One forward, one gradient check.
+
+- [ ] TNNetMaxBlurPool — "Making Convolutional Networks Shift-Invariant
+      Again" max-pool followed by a fixed (non-trainable) anti-aliasing
+      blur. Cheap drop-in over TNNetMaxPool that measurably improves
+      shift-equivariance on CIFAR-style nets. Forward composes the two
+      ops; backward composes their adjoints. One gradient-check test
+      and one shift-equivariance smoke test on a synthetic input.
+
+- [ ] TNNetSqueezeExcitation — channel-attention block: GlobalAvgPool →
+      Dense(C/r) → ReLU → Dense(C) → Sigmoid → channel-wise multiply.
+      The single most-cited "free 0.5–1% accuracy" architectural trick
+      missing from the layer set. Composite layer that owns its inner
+      dense weights so users don't have to wire five layers manually.
+
+- [ ] TNNetUnitNormConstraint — projection layer that L2-normalizes
+      the *weights* of the previous trainable layer after each step
+      (sister of TNNetL2Normalize on activations). Useful for matrix-
+      factorization heads and stabilizing GAN discriminators.
+
+#### Loss layers I'd enjoy authoring
+
+- [ ] TNNetFocalLoss — `-(1-p)^γ · log(p)` with α/γ via FFloatSt[0..1]
+      (defaults α=0.25, γ=2.0 per the RetinaNet paper). The single
+      most-requested loss for class-imbalanced detection/segmentation
+      heads. Closed-form backward is `(1-p)^γ · (γ·p·log(p) + p - 1)`,
+      so the gradient check is exact.
+
+- [ ] TNNetTripletLoss — `max(0, ||a-p||² - ||a-n||² + margin)`. Input
+      depth is split into three equal anchor/positive/negative chunks
+      along depth (or sample axis with a flag). Pairs with the pinned
+      TNNetL2Normalize and the cosine-head family. Two tests
+      (closed-form margin satisfaction, gradient check on small batch).
+
+- [ ] TNNetTverskyLoss — generalized Dice with separate FP and FN
+      weights `α, β` (FFloatSt[0..1]). When `α=β=0.5` reduces to the
+      pinned TNNetDiceLoss. The standard segmentation-imbalance loss;
+      one short closed-form backward; one central-difference test.
+
+- [ ] TNNetWingLoss — facial-landmark-style regression loss with a
+      log-shaped "wing" near zero and a linear tail, parameters
+      `(w, ε)` from the paper. Underused but well-suited to keypoint
+      regression — the only loss in the family that is finite-tail
+      *and* sub-quadratic near zero.
+
+#### Inference / training infrastructure
+
+- [ ] Lookahead optimizer wrapper — every `k` inner SGD steps, set the
+      "slow" weights `φ ← φ + α·(θ - φ)` and rewind the fast weights
+      to `φ`. Two-screen wrapper around the existing optimizer; one
+      test that confirms determinism given seed and one that confirms
+      the slow-weight average converges. Sister to the SWA helper
+      pinned in the seed-896318 batch.
+
+- [ ] NaN/Inf guard hook for TNeuralFit — optional "abort training and
+      print the offending layer" check after each forward+backward
+      pass. Currently a NaN silently propagates through the loss and
+      contaminates weights; the user only finds out when validation
+      acc collapses. One short utility, immediately useful for the
+      QAT/GAN/transformer experiments already pinned.
+
+- [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field
+      (default 1.0) that the optimizer respects. Unlocks discriminative
+      fine-tuning ("freeze backbone, train head at 10×") without the
+      current pattern of zeroing weights or doing two-pass training.
+
+- [ ] Deterministic-seed reproducibility test — train one of the
+      existing examples twice with the same seed, assert bit-for-bit
+      weight equality after N steps. The CI-level safety net that
+      catches future "hidden RNG draw" bugs in any layer or optimizer
+      change. Sister to the SaveToString fuzz pinned above.
+
+#### Correctness / audit work
+
+- [ ] Layer-registry round-trip audit — for every concrete `TNNet*` in
+      the LoadFromString/CreateLayer dispatch table, instantiate with
+      defaults, save, load, save again, assert bit-for-bit string
+      equality. The cheapest possible safety net against the silent
+      "added a layer but forgot to register it in CreateLayer" bug —
+      the layer count is past 200, so this is the highest-leverage
+      single test on the file.
+
+- [ ] Shape-inference smoke test — instantiate every concrete layer at
+      a small canonical input shape, assert the declared output shape
+      matches the actually-produced output shape. The second-cheapest
+      safety net; catches "forgot to call FOutput.ReSize" regressions.
+
+- [ ] Backward-pass sign-correlation test — for every layer that
+      overrides Backpropagate, perturb input by `+ε` and `-ε`, assert
+      that the gradient direction agrees with the loss-difference
+      direction more than 90% of the time across a small grid. A
+      coarse-but-fast complement to the per-layer gradient checks;
+      catches sign-flip bugs in seconds rather than minutes.
+
+#### Examples I'd enjoy writing
+
+- [ ] `examples/EmbeddingVisualization/` — train a tiny contrastive
+      head on a 4-class toy 2D dataset, dump the learned embeddings
+      to CSV, and include a one-screen README showing how to plot
+      them. End-to-end demo of the L2Normalize + Cosine* +
+      TripletLoss layers above.
+
+- [ ] `examples/AutoencoderReconstructionGrid/` — train the existing
+      VisualAutoencoder on MNIST and emit a single PNG showing
+      `[input | reconstruction]` rows for 16 random samples each
+      epoch. The "is it actually learning?" sanity check that every
+      autoencoder tutorial has but this repo doesn't.
+
+- [ ] `examples/SqueezeExciteCifar/` — a SimpleImageClassifier-sized
+      net with and without TNNetSqueezeExcitation, three seeds each,
+      one chart of test accuracy vs epoch. The headline benchmark for
+      whether the SE block above earns its keep on this codebase's
+      reference task.
+
+- [ ] `examples/SeededReproducibility/` — runs one of the smallest
+      examples twice with the same seed and prints PASS/FAIL on
+      bit-for-bit weight equality. Doubles as the in-repo home of the
+      reproducibility test pinned above.
+
+#### Documentation
+
+- [ ] "Embedding heads" README subsection — group TNNetL2Normalize,
+      TNNetCosineSimilarity, TNNetCosineEmbeddingLoss, TNNetTripletLoss
+      into one short subsection with a one-paragraph "how to build a
+      contrastive head" recipe. Currently embedding-style heads are
+      not mentioned anywhere in the README.
+
+- [ ] "Layer index by family" README appendix — alphabetical-within-
+      family table (Convolution / Pooling / Activation / Normalization
+      / Attention / Loss / Shape / Regularization). The layer count is
+      past 200 and discoverability has degraded; a single appendix
+      table doubles as the contributor-side checklist for new layers.
