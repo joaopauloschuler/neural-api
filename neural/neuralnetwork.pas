@@ -1017,6 +1017,25 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Pairwise cosine similarity along the depth-half-split.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // a and b (each of depth D/2) and produces, per (X, Y) cell, the scalar
+  // cos(a, b) = (a . b) / (||a|| * ||b|| + eps). Output shape is
+  // (SizeX, SizeY, 1). The layer has no trainable parameters. The input
+  // depth must be even and >= 2. The backward pass is the standard
+  // cosine-similarity Jacobian:
+  //   dcos/da_i = b_i/(na*nb) - c * a_i/na^2
+  //   dcos/db_i = a_i/(na*nb) - c * b_i/nb^2
+  // with a small eps added to the denominators for numerical safety.
+  TNNetCosineSimilarity = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   //Does a ReLU followed by a Square Root
   TNNetReLUSqrt = class(TNNetReLUBase)
     public
@@ -5049,6 +5068,120 @@ begin
           // dL/db = ReLU(a) * dL/dy
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * reluA);
         end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCosineSimilarity }
+
+constructor TNNetCosineSimilarity.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetCosineSimilarity.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth < 2) or
+     ((pPrevLayer.FOutput.Depth mod 2) <> 0) then
+  begin
+    FErrorProc('TNNetCosineSimilarity requires an even input depth >= 2.' +
+      ' Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetCosineSimilarity.Compute();
+const
+  cEps: TNeuralFloat = 1e-12;
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, dot, sa, sb, na, nb: TNeuralFloat;
+begin
+  StartTime := Now();
+  HalfDepth := FPrevLayer.FOutput.Depth div 2;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      dot := 0;
+      sa := 0;
+      sb := 0;
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        dot := dot + a * b;
+        sa := sa + a * a;
+        sb := sb + b * b;
+      end;
+      na := Sqrt(sa + cEps);
+      nb := Sqrt(sb + cEps);
+      FOutput[X, Y, 0] := dot / (na * nb + cEps);
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCosineSimilarity.Backpropagate();
+const
+  cEps: TNeuralFloat = 1e-12;
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, dot, sa, sb, na, nb, c, err, invNaNb, invNa2, invNb2: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FPrevLayer.FOutput.Depth div 2;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+      begin
+        dot := 0;
+        sa := 0;
+        sb := 0;
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          dot := dot + a * b;
+          sa := sa + a * a;
+          sb := sb + b * b;
+        end;
+        na := Sqrt(sa + cEps);
+        nb := Sqrt(sb + cEps);
+        invNaNb := 1.0 / (na * nb + cEps);
+        c := dot * invNaNb;
+        invNa2 := 1.0 / (sa + cEps);
+        invNb2 := 1.0 / (sb + cEps);
+        err := FOutputError[X, Y, 0];
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          // dL/da_i = err * (b_i/(na*nb) - c * a_i/na^2)
+          FPrevLayer.FOutputError.Add(X, Y, D,
+            err * (b * invNaNb - c * a * invNa2));
+          // dL/db_i = err * (a_i/(na*nb) - c * b_i/nb^2)
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth,
+            err * (a * invNaNb - c * b * invNb2));
+        end;
+      end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -17591,6 +17724,7 @@ begin
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetReGLU' :                Result := TNNetReGLU.Create();
+      'TNNetCosineSimilarity' :     Result := TNNetCosineSimilarity.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
@@ -17769,6 +17903,7 @@ begin
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
+      if S[0] = 'TNNetCosineSimilarity' then Result := TNNetCosineSimilarity.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else

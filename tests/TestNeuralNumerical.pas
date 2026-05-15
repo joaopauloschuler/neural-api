@@ -88,6 +88,8 @@ type
     procedure TestGLUGradientCheck;
     procedure TestReGLUForward;
     procedure TestReGLUGradientCheck;
+    procedure TestCosineSimilarityForward;
+    procedure TestCosineSimilarityGradientCheck;
     procedure TestSquaredReLUForward;
     procedure TestSquaredReLUGradientCheck;
     procedure TestTanhShrinkForward;
@@ -3758,6 +3760,67 @@ end;
 procedure TTestNeuralNumerical.TestReGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetReGLU.Create(), 'ReGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Input depth = 4. First two channels are a, last two channels are b.
+  // Case 1: a=[1,0], b=[0,1]  -> cos = 0
+  // Case 2: a=b=[1,2]         -> cos ~ 1
+  // Case 3: a=[1,2], b=[-1,-2] -> cos ~ -1
+  // Output shape is (SizeX, SizeY, 1) = (1, 1, 1).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetCosineSimilarity.Create());
+
+    AssertEquals('CosineSimilarity output SizeX', 1,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('CosineSimilarity output SizeY', 1,
+      NN.GetLastLayer.Output.SizeY);
+    AssertEquals('CosineSimilarity output Depth', 1,
+      NN.GetLastLayer.Output.Depth);
+
+    // Case 1: orthogonal
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 0.0;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := 1.0;
+    NN.Compute(Input);
+    AssertEquals('CosineSimilarity orthogonal', 0.0,
+      NN.GetLastLayer.Output.Raw[0], 1e-5);
+
+    // Case 2: identical
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 2.0;
+    Input.Raw[2] := 1.0;
+    Input.Raw[3] := 2.0;
+    NN.Compute(Input);
+    AssertEquals('CosineSimilarity identical', 1.0,
+      NN.GetLastLayer.Output.Raw[0], 1e-4);
+
+    // Case 3: anti-parallel
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 2.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := -2.0;
+    NN.Compute(Input);
+    AssertEquals('CosineSimilarity anti-parallel', -1.0,
+      NN.GetLastLayer.Output.Raw[0], 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetCosineSimilarity.Create(),
+    'CosineSimilarity', 2, 2, 4, 1e-2);
 end;
 
 procedure TTestNeuralNumerical.TestSquaredReLUForward;

@@ -5116,7 +5116,7 @@ duplicate finished work (cross-checked against `examples/`,
       existing layers rather than a monolithic layer, with a
       gradient-check test on the full composed graph.
 
-- [ ] TNNetCosineSimilarity — split input in half along depth, return
+- [x] TNNetCosineSimilarity — split input in half along depth, return
       `cos(a, b) = a·b / (|a||b|)` per (X,Y) cell. The missing piece
       of the embedding-heads recipe alongside TNNetL2Normalize.
       Full forward + numerical-gradient test; the backward is a small
