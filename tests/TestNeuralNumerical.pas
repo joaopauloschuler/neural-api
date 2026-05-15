@@ -70,6 +70,9 @@ type
     procedure TestInstanceNormSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
+    procedure TestPixelNormForward;
+    procedure TestPixelNormGradientCheck;
+    procedure TestPixelNormSerializationRoundTrip;
     procedure TestLayerScaleForward;
     procedure TestLayerScaleGradientCheck;
 
@@ -1843,6 +1846,109 @@ begin
 
       AssertTrue('RMSNorm weight gradient check (' + IntToStr(i) +
         ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPixelNormForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  PNorm: TNNetPixelNorm;
+  Output: TNNetVolume;
+  x, y, c, i: integer;
+  SumSqr, RMS: TNeuralFloat;
+begin
+  // TNNetPixelNorm: for every (x,y) pixel, the depth-vector RMS must be ~1.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4));
+    PNorm := TNNetPixelNorm.Create();
+    NN.AddLayer(PNorm);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.55) * 2.0 + 0.3;
+
+    NN.Compute(Input);
+    Output := NN.GetLastLayer.Output;
+
+    for x := 0 to Output.SizeX - 1 do
+      for y := 0 to Output.SizeY - 1 do
+      begin
+        SumSqr := 0;
+        for c := 0 to Output.Depth - 1 do
+          SumSqr := SumSqr + Output[x, y, c] * Output[x, y, c];
+        RMS := Sqrt(SumSqr / Output.Depth);
+        AssertEquals('PixelNorm per-pixel RMS at (' + IntToStr(x) + ',' +
+          IntToStr(y) + ') should be ~1', 1.0, RMS, 0.001);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPixelNormGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetPixelNorm.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.5 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PixelNorm input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
   finally
@@ -6202,6 +6308,14 @@ procedure TTestNeuralNumerical.TestRMSNormSerializationRoundTrip;
 begin
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetRMSNorm.Create(), 'RMSNorm', 3, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPixelNormSerializationRoundTrip;
+begin
+  // TNNetPixelNorm has no learnable parameters; the helper still exercises
+  // CreateLayer/LoadFromString dispatch + element-wise output parity.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetPixelNorm.Create(), 'PixelNorm', 2, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGroupNormSerializationRoundTrip;

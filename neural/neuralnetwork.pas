@@ -1220,6 +1220,24 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// StyleGAN-style per-pixel feature-vector normalization. For each (x, y)
+  // position the Depth-dimensional feature vector is divided by its root
+  // mean square over the depth axis, giving each pixel a unit-RMS feature
+  // vector. Parameter-free (no learnable gamma/beta). Output has the same
+  // shape as the input.
+  TNNetPixelNorm = class(TNNetIdentityWithoutL2)
+    private
+      FPixelNormEpsilon: TNeuralFloat;
+      FInvRMS: array of TNeuralFloat; // one InvRMS per (x,y) pixel
+      FNormalized: TNNetVolume;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer does group normalization. The input channels (Depth) are
   // split into Groups contiguous groups; each group is normalized
   // independently over (SizeX * SizeY * channels-in-group) to zero mean and
@@ -8855,6 +8873,110 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetPixelNorm }
+constructor TNNetPixelNorm.Create();
+begin
+  inherited Create();
+  FPixelNormEpsilon := 1e-8;
+  FNormalized := TNNetVolume.Create();
+end;
+
+destructor TNNetPixelNorm.Destroy();
+begin
+  FNormalized.Free;
+  SetLength(FInvRMS, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetPixelNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FNormalized.ReSize(FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  SetLength(FInvRMS, FOutput.SizeX * FOutput.SizeY);
+end;
+
+procedure TNNetPixelNorm.Compute();
+var
+  StartTime: double;
+  x, y, c, BaseIdx, PixelIdx, Depth: integer;
+  SumSqr, InvRMS: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  // For each (x,y) pixel, normalize the depth vector to unit RMS:
+  // y_{x,y,c} = x_{x,y,c} / sqrt( mean_c(x^2) + eps )
+  Depth := FOutput.Depth;
+  if Depth < 1 then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    Exit;
+  end;
+  PixelIdx := 0;
+  for y := 0 to FOutput.SizeY - 1 do
+  begin
+    for x := 0 to FOutput.SizeX - 1 do
+    begin
+      BaseIdx := FOutput.GetRawPos(x, y, 0);
+      SumSqr := 0;
+      for c := 0 to Depth - 1 do
+        SumSqr := SumSqr + FOutput.FData[BaseIdx + c] * FOutput.FData[BaseIdx + c];
+      InvRMS := 1 / Sqrt(SumSqr / Depth + FPixelNormEpsilon);
+      FInvRMS[PixelIdx] := InvRMS;
+      for c := 0 to Depth - 1 do
+        FOutput.FData[BaseIdx + c] := FOutput.FData[BaseIdx + c] * InvRMS;
+      Inc(PixelIdx);
+    end;
+  end;
+  // Cache the normalized values for the backward pass.
+  FNormalized.Copy(FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPixelNorm.Backpropagate();
+var
+  StartTime: double;
+  x, y, c, BaseIdx, PixelIdx, Depth: integer;
+  SumDyY, InvRMS, DepthF: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Depth := FOutput.Depth;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) and
+    (Depth > 0) then
+  begin
+    // For unit-RMS normalization over depth at fixed (x,y):
+    //   dL/dx_i = invRMS * ( dL/dy_i - (1/Depth) * y_i * sum_j( y_j * dL/dy_j ) )
+    DepthF := Depth;
+    PixelIdx := 0;
+    for y := 0 to FOutput.SizeY - 1 do
+    begin
+      for x := 0 to FOutput.SizeX - 1 do
+      begin
+        BaseIdx := FOutput.GetRawPos(x, y, 0);
+        InvRMS := FInvRMS[PixelIdx];
+        SumDyY := 0;
+        for c := 0 to Depth - 1 do
+          SumDyY := SumDyY +
+            FOutputError.FData[BaseIdx + c] * FNormalized.FData[BaseIdx + c];
+        SumDyY := SumDyY / DepthF;
+        for c := 0 to Depth - 1 do
+          FPrevLayer.FOutputError.FData[BaseIdx + c] :=
+            FPrevLayer.FOutputError.FData[BaseIdx + c] +
+            InvRMS * ( FOutputError.FData[BaseIdx + c] -
+              FNormalized.FData[BaseIdx + c] * SumDyY );
+        Inc(PixelIdx);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetGroupNorm }
 constructor TNNetGroupNorm.Create(Groups: integer);
 begin
@@ -15767,6 +15889,7 @@ begin
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
+      'TNNetPixelNorm':             Result := TNNetPixelNorm.Create();
       'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
       'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create();
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
@@ -15916,6 +16039,7 @@ begin
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
+      if S[0] = 'TNNetPixelNorm' then Result := TNNetPixelNorm.Create() else
       if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
       if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create() else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
