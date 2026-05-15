@@ -1298,6 +1298,30 @@ type
     procedure Compute(); override;
   end;
 
+  { TNNetSinusoidalPositionalEmbedding }
+  // Parameter-free additive sinusoidal positional encoding per Vaswani et al.
+  // (Attention Is All You Need, https://arxiv.org/abs/1706.03762).
+  // Position runs along the X axis (0..SizeX-1) and encoding depth is the
+  // Depth axis (0..Depth-1):
+  //   even i : PE(pos, i) = sin(pos / base^( i      / Depth))
+  //   odd  i : PE(pos, i) = cos(pos / base^((i - 1) / Depth))
+  // The fixed encoding table is precomputed in SetPrevLayer (lazily, once the
+  // input dimensions are known) and ADDED to the layer input. Backward pass
+  // is identity (no trainable parameters), so input gradients pass through
+  // unchanged. The "base" hyper-parameter (default 10000) is serialized via
+  // FStruct[0], mirroring TNNetAddPositionalEmbedding.
+  TNNetSinusoidalPositionalEmbedding = class(TNNetIdentity)
+  private
+    FPositionalEmbedding: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload;
+    constructor Create(base: TNeuralFloat); overload;
+    destructor Destroy(); override;
+
+    procedure Compute(); override;
+  end;
+
   { TNNetEmbedding }
   TNNetEmbedding = class(TNNetLayer)
   private
@@ -3522,6 +3546,50 @@ end;
 
 procedure TNNetAddPositionalEmbedding.Compute;
 begin
+  inherited Compute;
+  FOutput.Add(FPositionalEmbedding);
+end;
+
+{ TNNetSinusoidalPositionalEmbedding }
+procedure TNNetSinusoidalPositionalEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Base: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Lazily allocate the encoding table at the input shape and fill it once.
+  // TVolume.PositionalEncoding implements the Vaswani sin/cos formula above:
+  // even depth -> sin, odd depth -> cos, with denominator base^((2*(i div 2))/Depth).
+  FPositionalEmbedding.ReSize(FOutput);
+  Base := Round(FStruct[0]);
+  if Base <= 0 then Base := 10000;
+  FPositionalEmbedding.PositionalEncoding(Base);
+end;
+
+constructor TNNetSinusoidalPositionalEmbedding.Create();
+begin
+  Create(10000);
+end;
+
+constructor TNNetSinusoidalPositionalEmbedding.Create(base: TNeuralFloat);
+begin
+  inherited Create();
+  if base <= 0 then
+    FErrorProc('TNNetSinusoidalPositionalEmbedding base must be positive. Got base=' +
+      FloatToStr(base));
+  FPositionalEmbedding := TNNetVolume.Create;
+  FStruct[0] := Round(base);
+end;
+
+destructor TNNetSinusoidalPositionalEmbedding.Destroy();
+begin
+  FPositionalEmbedding.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetSinusoidalPositionalEmbedding.Compute();
+begin
+  // Forward = identity + fixed sinusoidal table. Backpropagate is inherited
+  // from TNNetIdentity, which simply passes the gradient through (no params).
   inherited Compute;
   FOutput.Add(FPositionalEmbedding);
 end;
@@ -17647,6 +17715,7 @@ begin
       'TNNetLocalResponseNormDepth':Result := TNNetLocalResponseNormDepth.Create(St[0]);
       'TNNetAddAndDiv'             :Result := TNNetAddAndDiv.Create(St[0], St[1]);
       'TNNetAddPositionalEmbedding':Result := TNNetAddPositionalEmbedding.Create(St[0]);
+      'TNNetSinusoidalPositionalEmbedding': Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]);
       'TNNetEmbedding':             Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetTokenAndPositionalEmbedding':Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]);
     else
@@ -17824,6 +17893,7 @@ begin
       if S[0] = 'TNNetLocalResponseNormDepth' then Result := TNNetLocalResponseNormDepth.Create(St[0]) else
       if S[0] = 'TNNetAddAndDiv' then Result := TNNetAddAndDiv.Create(St[0], St[1]) else
       if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
+      if S[0] = 'TNNetSinusoidalPositionalEmbedding' then Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]) else
       if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetTokenAndPositionalEmbedding' then Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]) else
       raise Exception.create(strData + ' not allowed in CreateLayer.');

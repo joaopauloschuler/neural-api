@@ -146,6 +146,9 @@ type
     procedure TestAddPositionalEmbeddingForward;
     procedure TestAddPositionalEmbeddingGradientCheck;
     procedure TestAddPositionalEmbeddingEmbeddingIsConstant;
+    procedure TestSinusoidalPositionalEmbeddingForward;
+    procedure TestSinusoidalPositionalEmbeddingGradientCheck;
+    procedure TestSinusoidalPositionalEmbeddingSerializationRoundTrip;
     procedure TestScaledDotProductAttentionForward;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
@@ -5103,6 +5106,93 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// TNNetSinusoidalPositionalEmbedding: parameter-free additive sin/cos table.
+// (a) Forward asserts the encoding equals the Vaswani et al. formula at a
+//     handful of hand-computed (pos, i) cells (with the input zeroed so the
+//     output IS the encoding).
+// (b) Gradient check: backward is identity, so d(loss)/d(input) computed by
+//     backprop must match central finite differences cell-by-cell.
+// (c) Serialization round-trip confirms the base hyper-parameter survives
+//     SaveToString/LoadFromString and the reconstructed network reproduces
+//     the same encoding.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestSinusoidalPositionalEmbeddingForward;
+var
+  NN: TNNet;
+  ZeroInput, NonZeroInput: TNNetVolume;
+  SeqLen, Depth, pos, i: integer;
+  Base, denom, expected: TNeuralFloat;
+begin
+  SeqLen := 4;
+  Depth := 8;
+  Base := 10000;
+  NN := TNNet.Create();
+  ZeroInput := TNNetVolume.Create(SeqLen, 1, Depth);
+  NonZeroInput := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NN.AddLayer(TNNetSinusoidalPositionalEmbedding.Create(Base));
+
+    // Zero input -> output is exactly the fixed encoding table.
+    ZeroInput.Fill(0);
+    NN.Compute(ZeroInput);
+
+    // Spot-check several (pos, i) cells against the closed-form formula.
+    // Even i -> sin; odd i -> cos. denom = base^( (2*(i div 2)) / Depth ).
+    for pos := 0 to SeqLen - 1 do
+      for i := 0 to Depth - 1 do
+      begin
+        denom := Power(Base, (2 * (i div 2)) / Depth);
+        if (i mod 2) = 0 then
+          expected := Sin(pos / denom)
+        else
+          expected := Cos(pos / denom);
+        AssertEquals('SinusoidalPE(pos=' + IntToStr(pos) + ', i=' + IntToStr(i) + ')',
+          expected, NN.GetLastLayer.Output[pos, 0, i], 1e-5);
+      end;
+
+    // pos=0 must yield exactly (sin(0), cos(0), sin(0), cos(0), ...) = (0, 1, 0, 1, ...).
+    for i := 0 to Depth - 1 do
+      if (i mod 2) = 0 then
+        AssertEquals('SinusoidalPE pos=0 even i=' + IntToStr(i) + ' must be 0',
+          0.0, NN.GetLastLayer.Output[0, 0, i], 1e-6)
+      else
+        AssertEquals('SinusoidalPE pos=0 odd i=' + IntToStr(i) + ' must be 1',
+          1.0, NN.GetLastLayer.Output[0, 0, i], 1e-6);
+
+    // Non-zero input -> output = input + (cached) encoding.
+    for i := 0 to NonZeroInput.Size - 1 do
+      NonZeroInput.Raw[i] := Sin(i * 0.31) * 1.3 - 0.4;
+    NN.Compute(NonZeroInput);
+    for pos := 0 to SeqLen - 1 do
+      for i := 0 to Depth - 1 do
+      begin
+        denom := Power(Base, (2 * (i div 2)) / Depth);
+        if (i mod 2) = 0 then
+          expected := Sin(pos / denom)
+        else
+          expected := Cos(pos / denom);
+        AssertEquals('SinusoidalPE additive at pos=' + IntToStr(pos) + ' i=' + IntToStr(i),
+          NonZeroInput[pos, 0, i] + expected,
+          NN.GetLastLayer.Output[pos, 0, i], 1e-5);
+      end;
+  finally
+    NN.Free;
+    ZeroInput.Free;
+    NonZeroInput.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinusoidalPositionalEmbeddingGradientCheck;
+begin
+  // Backward is identity (no parameters); central-difference grad must match
+  // the analytical input gradient to ~1e-2.
+  LayerInputGradientCheck(Self, TNNetSinusoidalPositionalEmbedding.Create(10000.0),
+    'SinusoidalPositionalEmbedding', 3, 1, 4, 0.01);
+end;
+
 procedure TTestNeuralNumerical.TestScaledDotProductAttentionForward;
 var
   NN: TNNet;
@@ -5868,6 +5958,13 @@ procedure TTestNeuralNumerical.TestSoftCappingSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSoftCapping.Create(),
     'SoftCapping', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSinusoidalPositionalEmbeddingSerializationRoundTrip;
+begin
+  // Use a non-default base to confirm Struct[0] survives Save/Load.
+  SerializationRoundTrip(Self, TNNetSinusoidalPositionalEmbedding.Create(5000),
+    'SinusoidalPositionalEmbedding', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestClampForward;
