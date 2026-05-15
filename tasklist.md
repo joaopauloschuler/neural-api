@@ -1834,3 +1834,117 @@ TNNetAvgChannel; this is now covered.
       saturation tests; closes the "extreme inputs" coverage gap for
       the new layer.
 
+### Lucky-day batch — 2026-05-15 (seed 401988)
+
+Ideas I'd enjoy tackling next. Mix of bite-sized layer additions,
+audit follow-ups, and small experiments that exercise the layers that
+have landed recently.
+
+#### Tiny new layers (each ~one-method + one numerical-gradient test)
+- [ ] TNNetCELU — continuously differentiable ELU
+      (`y = max(0,x) + min(0, alpha*(exp(x/alpha)-1))`). With TNNetELU
+      now landed, this is a one-method variant; reuse the ELU test
+      harness shape. (Duplicated up from the previous batch because
+      it's the highest-ROI next layer in the activation family.)
+- [ ] TNNetTanhShrink — `y = x - tanh(x)`. Parameter-free, derivative
+      is `tanh(x)^2`. Pairs naturally with TNNetSoftSign as another
+      "centered around zero" activation in the family.
+- [ ] TNNetThreshold — `y = x if x > theta else value`. Generalizes
+      ReLU (`theta=0, value=0`). Useful as a building block for
+      sparsity experiments; gradient is the indicator function.
+- [ ] TNNetLogSigmoid — `y = log(sigmoid(x)) = -softplus(-x)`. Useful
+      in losses and the numerically stable log-likelihood path.
+      Derivative is `sigmoid(-x)`.
+- [ ] TNNetHardShrink — `y = x if |x| > lambda else 0`. The L1-prox
+      activation. Trivial forward; derivative is the indicator on
+      `|x| > lambda`.
+- [ ] TNNetSoftShrink — `y = x - lambda*sign(x) if |x| > lambda else 0`.
+      The L1-prox cousin of HardShrink; smooth-ish flavor of the same
+      sparsity-inducing activation.
+
+#### Permutation / reshape primitives I'd enjoy writing
+- [ ] TNNetSpaceToDepth + TNNetDepthToSpace pair (already on the list
+      higher up — calling it out again because the round-trip test is
+      a fun ~30-line job and unblocks the ViT-style patchify
+      one-liner).
+- [ ] TNNetChannelShuffle — ShuffleNet primitive. Pure permutation,
+      mirror-image gathers for forward/backward. One grad-check + one
+      "compose twice with same G returns identity" sanity check.
+- [ ] TNNetReverseChannels — flips the channel axis. Silly, tiny, but
+      a great smoke test for the LoadFromString round-trip harness.
+
+#### Normalization follow-ups
+- [ ] TNNetInstanceNorm — per-sample, per-channel normalization (the
+      GroupNorm limit at G=C). One-line constructor override on
+      TNNetGroupNorm plus a dedicated grad-check.
+- [ ] TNNetWeightStandardization wrapper — normalize a Conv/Dense
+      layer's weights to zero-mean / unit-variance per output channel
+      before the forward pass. Pairs especially well with GroupNorm.
+- [ ] Numerical-gradient test that confirms TNNetRMSNorm matches the
+      analytical gradient under non-trivial input distributions
+      (mean != 0, variance != 1). The current test passes; a second
+      one with shifted/scaled input pins the gradient path harder.
+
+#### Audit follow-ups (extending the Backpropagate sweep)
+- [ ] Upsampling / deconvolution family numerical-gradient checks —
+      called out around line 88 as the next uncovered family. Pick
+      one layer (e.g. TNNetUpsample) and add an input-gradient test
+      mirroring the AvgPool / GlobalMaxPool harnesses.
+- [ ] Recurrent-style layer numerical-gradient checks — the second
+      family flagged uncovered. Identify the simplest recurrent layer
+      in neuralnetwork.pas, add a single input-gradient test, and
+      pin whatever shape it expects.
+- [ ] Argmax-tie behaviour test for TNNetGlobalMaxPool: when two
+      cells share the max, the deterministic tie-break should be
+      documented in code and pinned with a tiny test (called out at
+      line 1759; cheap and easy).
+
+#### LoadFromString round-trip sweep (continuation of line 1827)
+- [ ] TNNetSwiGLU LoadFromString round-trip test.
+- [ ] TNNetGEGLU LoadFromString round-trip test.
+- [ ] TNNetLayerScale LoadFromString round-trip test.
+- [ ] TNNetRMSNorm LoadFromString round-trip test.
+- [ ] TNNetDropPath LoadFromString round-trip test (forward in inference
+      mode must be the identity; pin that too).
+
+#### Small experiments / examples I'd enjoy
+- [ ] Activation bake-off on a tiny CIFAR-10 net: ReLU vs ReLU6 vs
+      GELU vs Swish vs Mish vs ELU vs SiLU vs SoftSign. Single seed,
+      few epochs, markdown table with final val-accuracy + wall-clock
+      per epoch. Cheap, high-signal answer to "does the new family
+      actually matter."
+- [ ] Normalization bake-off on the same tiny CIFAR-10 net:
+      ChannelStdNorm vs LayerNorm vs GroupNorm(G=4) vs RMSNorm.
+      Same format; pin which one wins at this scale.
+- [ ] Saturating-activation bake-off: SoftSign vs Tanh vs HardTanh
+      on a deep stack (8+ layers) — does SoftSign's slower saturation
+      actually help gradient flow vs Tanh in practice? One small chart
+      in an examples/<dir>/README.md is plenty.
+- [ ] Tiny "hello attention" toy task (already on the list at line
+      1777) — copy-task or reverse-string solved by 1-layer SDPA + MLP.
+      Demonstrates the full attention pipeline end-to-end without a
+      real corpus. Would lean on the recently-landed SDPA layer.
+
+#### Tooling / quality of life
+- [ ] One-line type alias: `TNNetGlobalAvgPool = class(TNNetAvgChannel)`
+      (called out at line 1816) so the canonical Keras/PyTorch name
+      resolves. Dispatch entry + round-trip test.
+- [ ] Helper proc `WriteLayerTimings(NN: TNNet; Sample: TNNetVolume)`
+      that runs one forward pass and prints per-layer wall-clock to
+      stdout. Pure additive; no behaviour change. Lets users spot the
+      slow layer without an external profiler.
+- [ ] Tiny `bin/` micro-benchmark that prints ns/op for Add, Mul,
+      DotProduct and for the LayerNorm / RMSNorm / GroupNorm forward
+      pass. Writes a CSV so future regressions are visible at a glance.
+- [ ] Volume invariant assertion helper: `AssertNoNaN(V: TNNetVolume)`
+      that loops once and raises if any element is NaN/Inf. Sprinkle
+      into the activation saturation tests so a regression to NaN is
+      caught immediately instead of as a downstream gradient mismatch.
+
+#### Documentation
+- [ ] README activation-family table — one row per activation with
+      formula, derivative, "saturating?" flag, and a 5-word use-case
+      hint. The family has grown enough (ELU, SiLU, SoftSign, ReLU6,
+      Swish, Mish, GELU, HardSwish, SELU, LeakyReLU, HardSigmoid,
+      HardTanh, SoftCapping) that a table beats prose.
+
