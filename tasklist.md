@@ -2561,3 +2561,107 @@ draw.
       newer "Created with ..." style; older table rows omit that
       suffix. Small cleanup task: backfill the older entries (or
       strip the suffix from the newer ones) for consistency.
+
+
+### Lucky-day batch — 2026-05-15 (seed 993208)
+
+Fresh draw on a lucky day. Before adding anything, a sanity check:
+the "Tasklist staleness sweep" item from the previous pass is still
+unchecked, so several entries below were chosen by first grep-ing
+their target out of `neural/neuralnetwork.pas` to avoid the
+re-pinning trap noted in the previous batch's meta-observation.
+
+#### Layers I'd enjoy building
+- [ ] TNNetSoftPlus — `log(1 + exp(x))` activation, with the
+      standard `x > threshold ? x : log1p(exp(x))` numerical guard
+      to avoid overflow on positive inputs. Parameter-free, smooth
+      ReLU sibling. Single-file change in `neural/neuralnetwork.pas`
+      + dispatch entry + a Compute / kink-region / numerical-grad
+      triplet in `TestNeuralNumerical.pas`. Verified absent from
+      the dispatch table.
+- [ ] TNNetMultiHeadSelfAttention — the headline blocker for
+      TinyGPT. Now that `TNNetScaledDotProductAttention` has landed
+      as the single-head core, the MHSA wrapper is a depth-reshape
+      around H copies of it plus a final projection. I'd enjoy
+      writing it as a thin composition layer that internally builds
+      and owns H SDPA sub-layers rather than a brand-new
+      monolithic Backpropagate — keeps the gradient path
+      auditable. Verified absent.
+- [ ] TNNetBias — bias-only "add a learnable per-channel offset"
+      layer. Surprisingly missing as a standalone primitive; today
+      bias only ships fused into Dense/Conv. Useful for residual
+      towers that want a bias on the skip path. Verified absent.
+- [ ] TNNetMaxOut — Goodfellow-style maxout with K linear pieces;
+      pairs well with the activation menagerie bake-off below.
+
+#### Experiments I'd enjoy running
+- [ ] PixelNorm Jacobian-blow-up empirical test: feed the layer
+      inputs at `||x|| ∈ {1, 1e-2, 1e-4, 1e-6, 1e-8, 1e-10}` and
+      record the central-difference vs analytic-gradient relative
+      error. Output a Markdown table under `docs/experiments/`.
+      Concretely answers whether `eps=1e-8` is well-chosen or
+      should be tightened/loosened. Pairs with the PixelNorm
+      eps-sensitivity follow-up pinned above.
+- [ ] "Does dispatch round-trip everything?" census: enumerate all
+      `TNNet*` subclasses, instantiate each via the layer-name
+      dispatch, SaveToString → LoadFromString, assert equality of
+      the serialized form. A single test binary; would have caught
+      historical "forgot to add the dispatch entry" bugs in a
+      single CI run. Same intent as the existing "Layer-name
+      registry self-check" entry but spelled out as the concrete
+      test plan.
+- [ ] Optimizer bake-off on the same tiny CNN used in the
+      activation/norm bake-offs: SGD vs SGD+momentum vs Adam vs
+      AdamW. Plot train loss + final test acc. Reuses the
+      bake-off harness if/when it lands.
+
+#### Tests / numerical-gradient audit
+- [ ] Mirror the "Backpropagate audit" pattern for the activation
+      family one more time: explicitly enumerate every activation
+      layer (LeakyReLU, SELU, HardSigmoid, HardTanh, TanhShrink,
+      LogSigmoid, ShiftedReLU, Threshold, SoftSign, SquaredReLU,
+      CELU, Mish, Swish, HardSwish, GELU, PixelNorm) and assert each
+      has at least one numerical-gradient test by greping
+      `TestNeuralNumerical.pas`. Output a coverage matrix as a
+      comment block at the top of that file. Cheap, mechanical,
+      catches drift.
+- [ ] Add a small `TestRMSNormVsLayerNorm` equivalence test:
+      under inputs with zero empirical mean, `TNNetRMSNorm` and
+      `TNNetLayerNorm` should produce identical outputs (modulo
+      learnable scale/bias). Doubles as a sanity test for both
+      layers.
+- [ ] Determinism CI test re-pin: this keeps appearing across
+      lucky-day batches; concretely it's a 20-line test binary
+      under `tests/` that builds a 3-layer net, seeds, runs one
+      forward+backward, dumps the gradient vector, repeats, and
+      `assert(equal)`. Worth doing on its own pass.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/SoftPlusVsReLU/` — micro-experiment showing that
+      SoftPlus and ReLU train to similar test acc on a tiny MNIST
+      subset, with SoftPlus's smoother loss curve visible in the
+      per-epoch log. Lands alongside the SoftPlus layer above.
+- [ ] `examples/AttentionCopyTask/` — single-head SDPA learns to
+      copy a 16-token input to its output. Smallest possible
+      end-to-end attention training demo; uses the existing SDPA
+      layer with no MHSA dependency. Would close the "we have
+      SDPA but no public example" gap.
+
+#### Infrastructure / tooling
+- [ ] Implement `scripts/audit_tasklist.sh` from the previous
+      pass's follow-ups — picking it up explicitly here so the
+      next lucky-day pass can grep this tasklist itself for stale
+      entries before dispatching. ~30 lines of bash; reads
+      `tasklist.md`, extracts unchecked TNNet* names, greps the
+      dispatch tables in `neural/neuralnetwork.pas`, flags hits.
+- [ ] `bin/` Volume micro-benchmark (third re-pin). I would
+      genuinely enjoy writing this on a future lucky day —
+      pinning it again so it stays visible.
+
+#### Documentation
+- [ ] `docs/lucky_day_log.md` — short rolling changelog of what
+      each lucky-day batch shipped (one row per batch: date,
+      seed, landed-items, surprise). Today the record lives only
+      in the bottom of `tasklist.md`; a separate file would let
+      `tasklist.md` itself be pruned of historical batches once
+      they're fully landed.
