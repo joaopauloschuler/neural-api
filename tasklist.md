@@ -1852,12 +1852,14 @@ have landed recently.
 - [ ] TNNetTanhShrink — `y = x - tanh(x)`. Parameter-free, derivative
       is `tanh(x)^2`. Pairs naturally with TNNetSoftSign as another
       "centered around zero" activation in the family.
-- [ ] TNNetThreshold — `y = x if x > theta else value`. Generalizes
+- [x] TNNetThreshold — `y = x if x > theta else value`. Generalizes
       ReLU (`theta=0, value=0`). Useful as a building block for
       sparsity experiments; gradient is the indicator function.
-- [ ] TNNetLogSigmoid — `y = log(sigmoid(x)) = -softplus(-x)`. Useful
+      Landed: see TNNetThreshold entry in the post-lucky-day batch
+      at the bottom of this file (commit 1f8d555).
+- [x] TNNetLogSigmoid — `y = log(sigmoid(x)) = -softplus(-x)`. Useful
       in losses and the numerically stable log-likelihood path.
-      Derivative is `sigmoid(-x)`.
+      Derivative is `sigmoid(-x)`. Landed in commit 59c9b93.
 - [x] TNNetHardShrink — `y = x if |x| > lambda else 0`. The L1-prox
       activation. Trivial forward; derivative is the indicator on
       `|x| > lambda`. Landed: lambda in FFloatSt[0] (default 0.5),
@@ -2008,9 +2010,13 @@ to land in a single focused session.
       2021 as a drop-in replacement that often improves transformer
       perplexity. Trivial Compute + ChainDeriv override, single-line
       derivative `2*max(0,x)`. Mirrors the TNNetReLU template exactly.
-- [ ] TNNetShiftedReLU — `y = max(-1, x)`. Tiny but useful: keeps a
+- [x] TNNetShiftedReLU — `y = max(-1, x)`. Tiny but useful: keeps a
       small negative range without ELU's exp cost. Good template for
-      future "shifted activation" experiments.
+      future "shifted activation" experiments. Landed: parameter-free
+      subclass of TNNetReLUBase; cached `{0,1}` indicator in
+      FOutputErrorDeriv. Forward / gradient (inputs biased away from
+      the x=-1 kink) / serialization round-trip tests in
+      TestNeuralNumerical.pas.
 - [ ] TNNetSnake — `y = x + (1/alpha) * sin(alpha*x)^2`. Periodic
       activation from "Neural Networks Fail to Learn Periodic Functions"
       (Ziyin 2020). Niche but slots cleanly into the activation
@@ -2148,12 +2154,17 @@ Natural follow-ups (each commit-sized):
       train a tiny autoencoder with each as the bottleneck activation
       and print the fraction of zero activations vs reconstruction
       loss. Concrete demonstration of the L1-prox sparsity claim.
-- [ ] TNNetLogSigmoid (`y = log(sigmoid(x)) = -softplus(-x)`) — the
+- [x] TNNetLogSigmoid (`y = log(sigmoid(x)) = -softplus(-x)`) — the
       natural companion to TNNetLogSoftMax for the BCE-style loss
-      path. Standard stable form; derivative is `sigmoid(-x)`.
-- [ ] TNNetThreshold (`y = x if x > theta else value`) — still open
+      path. Standard stable form; derivative is `sigmoid(-x)`. Landed
+      in commit 59c9b93 — see TNNetLogSigmoid entry below.
+- [x] TNNetThreshold (`y = x if x > theta else value`) — still open
       from the seed-401988 batch; generalizes ReLU. Two FFloatSt
-      params (theta, value), indicator derivative.
+      params (theta, value), indicator derivative. Landed in commit
+      1f8d555: TWO-float variant via FFloatSt[0]=theta, FFloatSt[1]=value
+      (pattern verified against existing TNNetMovingScale dispatch).
+      Four tests: forward, ReLU equivalence at defaults, gradient
+      check (inputs biased away from theta), serialization round-trip.
 - [ ] README activation/normalization reference: TNNetLogSoftMax,
       TNNetInstanceNorm, TNNetHardShrink, TNNetSoftShrink each need a
       one-line description + tiny usage snippet next to their
@@ -2167,10 +2178,14 @@ Most are one-commit-sized and pair naturally with layers/tests already in
 the tree. Anything stretchy is called out explicitly.
 
 #### New activations (tiny, ReLUBase-style)
-- [ ] TNNetLogSigmoid (`y = log(sigmoid(x)) = -softplus(-x)`) — already
+- [x] TNNetLogSigmoid (`y = log(sigmoid(x)) = -softplus(-x)`) — already
       hinted at in the previous batch; standard stable form, derivative
       is `sigmoid(-x)`. Companion to TNNetLogSoftMax for BCE-with-logits.
       Forward / numerical-gradient / serialization round-trip tests.
+      Landed: parameter-free subclass of TNNetReLUBase with branched
+      stable formulation (x>=0: `y=-ln(1+exp(-x))`, x<0: `y=x-ln(1+exp(x))`).
+      Derivative `sigmoid(-x)` cached in FOutputErrorDeriv. Four tests
+      in TestNeuralNumerical.pas including ±1e6 saturation test.
 - [ ] TNNetSquaredReLU (`y = max(0, x)^2`) — the Primer/Pythia
       activation. Cheap, derivative is `2 * max(0, x)`. A single Compute
       / ChainDeriv pair plus three tests.
@@ -2296,3 +2311,46 @@ the tree. Anything stretchy is called out explicitly.
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
+
+
+### Lucky-day batch — 2026-05-15 (post LogSigmoid + ShiftedReLU + Threshold batch)
+
+This batch landed three small activations dispatched serially to opus
+sub-agents on a self-described "lucky day":
+
+- TNNetLogSigmoid (commit 59c9b93) — `y = log(sigmoid(x)) = -softplus(-x)`,
+  branched stable formulation. Derivative `sigmoid(-x)` cached in
+  FOutputErrorDeriv. Four tests including a ±1e6 saturation check.
+- TNNetShiftedReLU (commit aa50051) — `y = max(-1, x)`, parameter-free
+  subclass of TNNetReLUBase with `{0,1}` indicator derivative.
+- TNNetThreshold (commit 1f8d555) — `y = x if x > theta else value`,
+  TWO-float dispatch (theta in FFloatSt[0], value in FFloatSt[1]).
+  First in-repo activation with two configurable floats; the
+  TNNetMovingScale dispatch pattern was the precedent. Generalizes
+  ReLU at the defaults theta=value=0.
+
+Test suite grew from 360 → 367 tests, all passing. No bugs surfaced.
+
+#### Natural follow-ups
+- [ ] README activation reference: TNNetLogSigmoid, TNNetShiftedReLU,
+      and TNNetThreshold each need a one-line description + tiny
+      snippet next to their siblings in the activation table.
+- [ ] LogSigmoid + BCE-with-logits training-loss smoke example: pair
+      TNNetLogSigmoid with a tiny binary classifier and confirm
+      matching convergence vs a sigmoid + BCE baseline.
+- [ ] Threshold-as-sparsifier micro-experiment: use TNNetThreshold
+      with theta>0 as a hidden-layer activation, sweep theta over
+      `{0.0, 0.1, 0.5, 1.0}` on a tiny autoencoder, report
+      (sparsity %, recon loss). Demonstrates the indicator-gradient
+      flavor of sparsification without the L1-prox shrink layers.
+- [ ] Activation menagerie bake-off (already on the list) is now
+      sweeter with LogSigmoid / ShiftedReLU / Threshold in the menu.
+- [ ] LogSigmoid kink-region test: at x near the `x=0` branch
+      crossover, confirm the two branches join smoothly (continuity
+      of both y and dy/dx) to within fp tolerance. Closes a small
+      gap the saturation test does not cover.
+- [ ] Threshold "kink at theta" test: at hand-picked x exactly equal
+      to theta, document the chosen convention (currently: x > theta,
+      so x=theta routes to the `else` branch). Pin with a tiny
+      no-central-differences test, mirroring the open HardShrink/
+      SoftShrink kink-region entry above.
