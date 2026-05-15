@@ -646,3 +646,129 @@ tasks before MHA lands, or as parallel tracks while it does.
 - [ ] CI shim: a tiny GitHub Actions workflow that runs
       `tests/RunAll.sh` on push. The script already has the right
       exit semantics — the workflow is ~15 lines.
+
+### Ideas added on 2026-05-15 (lucky seed 51855)
+
+Picking up where the post-SpatialDropout batch left off — MHA is still
+the headline next step, but there are several small, self-contained
+tasks I'd personally enjoy landing while it incubates. Everything below
+is sized to fit in a single focused commit.
+
+#### Quick wins I'd enjoy taking first
+- [ ] Fix TNNetDropPath `p=1` clamping (already flagged above as a bug):
+      special-case `pDropProb >= 1` in the constructor so Scale := 0
+      instead of silently clamping probability to 0.99. Then tighten
+      `TestDropPathPOneBoundary` to assert strict all-zero output and
+      drop the existing tolerance-based check. Smallest non-trivial
+      correctness fix on the list with a ready test to extend.
+- [ ] DropPath determinism test (the open follow-up flagged above):
+      with a fixed `RandSeed`, two consecutive Compute calls in
+      training mode produce identical masks/outputs. Add as
+      `TestDropPathDeterminismFixedSeed` next to the existing tests.
+
+#### Layers I'd enjoy building (no MHA dependency)
+- [ ] TNNetALiBi — same entry as the previous two batches. The fact that
+      it has been listed three times now is the universe telling me to
+      take it. Per-head deterministic slopes (`slope[h] = 2^(-8h/H)`),
+      adds `slope * (key_pos - query_pos)` into the attention score map
+      before softmax. Parameter-free, gradient check mirrors MaskedFill.
+- [ ] TNNetSwitchableNorm — a tiny learnable convex combination of
+      LayerNorm and RMSNorm outputs (two learnable scalars summed via
+      softmax). Cute, parameter-cheap experiment in "let the network
+      pick its own normalizer". All ingredients already exist.
+- [ ] TNNetChannelShuffle — the ShuffleNet operation: reshape `(C)` to
+      `(groups, C/groups)`, transpose, flatten back. Parameter-free,
+      gradient is the inverse permutation, easy numerical check.
+      Slots cleanly into the existing channel-manipulation family
+      (TNNetInterleaveChannels, TNNetSplitChannels, etc.).
+- [ ] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
+      saved/loaded via FFloatSt[0]. Useful for the eventual tiny-GPT
+      sampling demo and a clean small layer. Backprop is the standard
+      softmax Jacobian scaled by 1/T.
+- [ ] TNNetGatedResidual — `y = x + gate * Sublayer(x)` with a per-
+      channel learnable gate initialized at zero (the "ReZero" trick).
+      A different lever than LayerScale; pairs well with the
+      PreNormResidual helper already listed above.
+
+#### Composite blocks I'd enjoy shipping
+- [ ] TNNetPreNormResidual helper (already listed above) — concrete
+      commitment to actually ship the one-liner `y = x + Sublayer(LN(x))`
+      builder so the eventual transformer-block helpers can use it.
+- [ ] TNNetGLUFeedForward block (already listed) — same: I'd like to
+      actually ship the plain-GLU FFN today rather than wait on SwiGLU
+      to be the gating choice.
+
+#### Experiments I'm curious about
+- [ ] Train-time vs inference-time delta sweep for the noise layers
+      (TNNetDropout, TNNetDropPath, the new TNNetSpatialDropout1D/2D):
+      same tiny classifier, sweep `p ∈ {0.0, 0.1, 0.2, 0.4}`, chart
+      train loss vs val loss. Concrete demonstration of which
+      regularizers actually help at toy scale and which are noise.
+- [ ] "Which init wins per activation" matrix: cross-product of init
+      schemes × activation functions on a fixed tiny MLP, report
+      epochs-to-converge. Sits between the activation bake-off and
+      init-sensitivity demo already listed, and surfaces the
+      Glorot-with-tanh / He-with-ReLU folklore on real numbers.
+- [ ] Token-shift ablation (depends on TNNetTokenShift above): does a
+      single token-shift layer in front of an MLP solve the next-
+      token-prediction toy task without any attention? A cheap, fun
+      data point about how much of "transformers" is really just
+      mixing-along-time.
+
+#### Correctness / audit follow-ups
+- [ ] LoadFromString round-trip for the SpatialDropout pair — the
+      existing round-trip tests cover SoftCapping/DropPath/RoPE/
+      MaskedFill/SDPA but not the just-landed 1D/2D spatial dropouts.
+      Add `TestSpatialDropout{1D,2D}SerializationRoundTrip` mirroring
+      the existing pattern.
+- [ ] LayerNorm / RMSNorm / GroupNorm round-trip via LoadFromString —
+      these three landed earlier and I'd bet have at least one
+      learnable-scale dispatch quirk hiding. Add to the existing
+      round-trip suite.
+- [ ] Backpropagate audit, upsample/deconv family (already listed):
+      I'll take TNNetUpsample first because it's the simplest of the
+      three and the rest will follow the same recipe.
+- [ ] SDPA all-masked-row policy decision (already listed). Concrete
+      proposal: detect the all-masked row in Compute, output a zero
+      row, and skip the softmax for that row entirely (this is what
+      JAX/Flax MHA does). Document the choice in code, add the
+      pinning test, close the open thread.
+
+#### Tooling / dev experience
+- [ ] Implement the `--quick` filter on the test runner that pairs
+      with the `--quick` flag idea already listed for RunAll.sh.
+      Concrete proposal: skip any test whose name ends in
+      `_Slow` or contains `Large` / `SeqLen>4` markers, controlled
+      by a `--quick` switch on the existing test runner.
+- [ ] Filter + line-numbers patch for `scripts/list_untested_layers.sh`
+      (the two follow-up entries already listed) — bundle them into
+      one v1 of the script that drops base/abstract classes and
+      reports `file:line` for each surviving entry. Two-line awk
+      change in practice.
+- [ ] `scripts/grep_layer.sh <TNNet...>` helper that prints the
+      class declaration, its Compute, its Backpropagate, and any
+      test methods referencing it. Captures the "first 30 seconds
+      after picking a layer to audit" workflow I keep doing by hand.
+- [ ] Tiny `tests/SmokeTest.lpr` that builds + runs the five fastest
+      gradient checks and exits in under a second. Lets the eventual
+      CI shim above start with a real signal even before RunAll.sh
+      is wired in.
+
+#### Documentation
+- [ ] Three-paragraph "what landed this month" entry pinned at the
+      top of the README: SDPA, RoPE, MaskedFill, SoftCapping,
+      DropPath, GEGLU/SwiGLU/GLU, SquaredReLU, LayerScale, the
+      SpatialDropouts. One line each plus the layer-reference link.
+      Becomes the public-facing landing page for the transformer
+      push that's been happening across these task batches.
+- [ ] Short "where the test suite lives" map: tests/TestNeuralNumerical
+      vs the older `tests/*` programs, how RunAll.sh orchestrates
+      them, and what a contributor should add when they ship a new
+      layer. Sits next to the numerical-gradient testing note
+      already on the list — companion piece, not a replacement.
+- [ ] Inline-comment cleanup pass on TNNetScaledDotProductAttention:
+      the layer now has six tests pinning its behavior and is the
+      most algorithmically dense in the repo. Add shape annotations
+      on every loop, name the strides, and link to the planned
+      annotated walkthrough doc. Pure readability win, no behavior
+      change.
