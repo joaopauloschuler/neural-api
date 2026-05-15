@@ -230,12 +230,16 @@ type
     procedure TestSqrtForward;
     procedure TestSqrtGradientCheck;
     procedure TestSqrtSerializationRoundTrip;
+    procedure TestSqrtExtremeNegativeInputSaturation;
     procedure TestExpForward;
     procedure TestExpGradientCheck;
     procedure TestExpSerializationRoundTrip;
+    procedure TestExpExtremeInputSaturation;
     procedure TestLogForward;
     procedure TestLogGradientCheck;
     procedure TestLogSerializationRoundTrip;
+    procedure TestLogExtremeNegativeInputSaturation;
+    procedure TestExpLogComposeAsIdentity;
     procedure TestReciprocalForward;
     procedure TestReciprocalEpsGuard;
     procedure TestReciprocalGradientCheck;
@@ -8022,6 +8026,172 @@ procedure TTestNeuralNumerical.TestLogSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetLog.Create(),
     'Log', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSqrtExtremeNegativeInputSaturation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  v: TNeuralFloat;
+  i: integer;
+begin
+  // Drive Sqrt with extreme magnitudes (+/-1e3). Negative inputs must trigger
+  // the 1e-6 eps clamp (output sqrt(1e-6) = 1e-3); large positive inputs must
+  // produce sqrt(1e3) ~ 31.62. No NaN/Inf anywhere.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetSqrt.Create());
+
+    Input.Raw[0] := -1e3;
+    Input.Raw[1] := -1e6;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] :=  0.0;
+    Input.Raw[4] :=  1e3;
+    Input.Raw[5] :=  1e6;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('Sqrt saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('Sqrt saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+    end;
+    // Negative / zero inputs are eps-clamped to 1e-6, so sqrt = 1e-3.
+    AssertEquals('Sqrt(-1e3) eps-clamped', 1e-3, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Sqrt(-1e6) eps-clamped', 1e-3, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('Sqrt(-1)   eps-clamped', 1e-3, NN.GetLastLayer.Output.Raw[2], 1e-5);
+    AssertEquals('Sqrt(0)    eps-clamped', 1e-3, NN.GetLastLayer.Output.Raw[3], 1e-5);
+    // Positive: ordinary sqrt.
+    AssertEquals('Sqrt(1e3)',  Sqrt(1e3), NN.GetLastLayer.Output.Raw[4], 1e-3);
+    AssertEquals('Sqrt(1e6)',  Sqrt(1e6), NN.GetLastLayer.Output.Raw[5], 1e-1);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  v: TNeuralFloat;
+  i: integer;
+begin
+  // Drive Exp with x=+/-1e3. Large positive input triggers the 30-clamp,
+  // so output ~ exp(30) ~ 1.068e13 and must be finite. Large negative input
+  // does not need clamping (exp(-1e3) underflows cleanly to 0 in fp32).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetExp.Create());
+
+    Input.Raw[0] :=  1e3;
+    Input.Raw[1] := -1e3;
+    Input.Raw[2] :=  1e6;
+    Input.Raw[3] := -1e6;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('Exp saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('Exp saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+    end;
+    // Positive overflow path: clamp at 30 yields exp(30).
+    AssertEquals('Exp(+1e3) clamped to exp(30)',
+      Exp(30.0), NN.GetLastLayer.Output.Raw[0], 1e9);
+    AssertEquals('Exp(+1e6) clamped to exp(30)',
+      Exp(30.0), NN.GetLastLayer.Output.Raw[2], 1e9);
+    // Negative underflow path: exp(-1e3) ~= 0.
+    AssertEquals('Exp(-1e3) underflows to 0', 0.0, NN.GetLastLayer.Output.Raw[1], 1e-30);
+    AssertEquals('Exp(-1e6) underflows to 0', 0.0, NN.GetLastLayer.Output.Raw[3], 1e-30);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogExtremeNegativeInputSaturation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  v, expected: TNeuralFloat;
+  i: integer;
+begin
+  // Drive Log with x = -1e3 / -1e6 / 0. All three trip the 1e-8 eps clamp,
+  // so output ~ ln(1e-8) ~ -18.420680743. Must be finite, no exception.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetLog.Create());
+
+    Input.Raw[0] := -1e3;
+    Input.Raw[1] := -1e6;
+    Input.Raw[2] :=  0.0;
+    Input.Raw[3] :=  1.0;       // sanity: Log(1) = 0
+    Input.Raw[4] :=  2.718281828; // sanity: Log(e) ~ 1
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('Log saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('Log saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+    end;
+    expected := Ln(1e-8);
+    AssertEquals('Log(-1e3) eps-clamped to ln(1e-8)',
+      expected, NN.GetLastLayer.Output.Raw[0], 1e-3);
+    AssertEquals('Log(-1e6) eps-clamped to ln(1e-8)',
+      expected, NN.GetLastLayer.Output.Raw[1], 1e-3);
+    AssertEquals('Log(0)    eps-clamped to ln(1e-8)',
+      expected, NN.GetLastLayer.Output.Raw[2], 1e-3);
+    AssertEquals('Log(1) = 0',
+      0.0, NN.GetLastLayer.Output.Raw[3], 1e-5);
+    AssertEquals('Log(e) ~ 1',
+      1.0, NN.GetLastLayer.Output.Raw[4], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpLogComposeAsIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  reconstructed: TNeuralFloat;
+begin
+  // Property: Log(Exp(x)) = x by definition, on a bounded input range that
+  // stays well clear of both the 30-clip in Exp and the 1e-8 floor in Log.
+  // We pick values in [-5, 5]: Exp(x) lies in [~0.0067, ~148.4], so Log()
+  // sees inputs nowhere near the eps clamp.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetExp.Create());
+    NN.AddLayer(TNNetLog.Create());
+
+    RandSeed := 4242;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.71) * 4.5 - 0.3; // values in roughly [-4.8, 4.2]
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      reconstructed := NN.GetLastLayer.Output.Raw[i];
+      AssertEquals('Log(Exp(x)) = x at ' + IntToStr(i),
+        Input.Raw[i], reconstructed, 1e-4);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestReciprocalForward;
