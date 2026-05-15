@@ -4497,3 +4497,109 @@ Test suite: 446 → 452, all passing.
       large |x|), so finite-difference eps must scale with input
       magnitude. A focused relative-tolerance test would pin the
       convention for this family.
+
+### Lucky-day batch — 2026-05-15 (seed 528621)
+
+Self-picked wishlist of features I'd enjoy authoring. Verified against
+the current layer registry in neural/neuralnetwork.pas and the pinned
+TODOs already present in this tasklist — none of the items below
+duplicate something already landed or already in-flight.
+
+#### Activations I'd enjoy adding
+- [ ] TNNetTanhExp — `y = x · tanh(exp(x))` from the TanhExp paper.
+      Monotone, smooth, near-identity for x<0 and near-linear for x>0;
+      a natural sibling of the Mish/Swish family that just landed.
+      Implement as a TNNetReLUBase descendant with forward +
+      numerical-gradient + serialization-round-trip tests, mirroring
+      the ESwish landing pattern.
+- [ ] TNNetSmish — `y = x · tanh(ln(1 + sigmoid(x)))`, a recent
+      self-gated activation. Slightly cheaper than Mish (one log
+      vs one softplus expansion) and tends to behave well at large
+      |x|. Same test triad as above.
+- [ ] Saturation-safety tests for TNNetTanhExp / TNNetSmish at
+      ±extreme inputs, mirroring the HardTanh/SoftCapping pattern.
+      Confirms forward stays finite and backward doesn't NaN when
+      exp(x) overflows or sigmoid(x) underflows to 0.
+
+#### Layers I'd enjoy adding
+- [ ] TNNetSqueeze and TNNetExpandDims — numpy-style single-axis
+      shape helpers. Less error-prone than open-coding TNNetReshape
+      for the sequence-model code that the pinned Tiny GPT and
+      transformer-encoder work will need. Pure shape ops, identity
+      forward, identity backward — easiest possible gradient check.
+- [ ] TNNetCosineSimilarity — pairwise output layer that splits its
+      input in half along the depth axis and produces per-sample
+      `cos(x, y) = (x·y) / (||x||·||y||)`. The natural partner for
+      the already-pinned TNNetCosineEmbeddingLoss; without it, every
+      contrastive head has to bolt on its own normalization. Full
+      gradient through the two norms (one numerical-gradient test
+      input-side, one against a fixed reference value).
+- [ ] TNNetTriangularCausalMask(SeqLen) — convenience layer that
+      builds its own upper-triangular `-inf` mask given the sequence
+      length and adds it to the input. Removes the boilerplate of
+      pairing TNNetMaskedFill with a constant mask volume in front
+      of every autoregressive SDPA; unblocks a cleaner Tiny GPT
+      example once MHSA lands.
+
+#### Inference & introspection
+- [ ] Inference sampling utilities — new `neuralsampling` unit (or
+      additions to neuralvolume) with `Argmax`, `TopKSample`,
+      `TopPSample`, `TemperatureScale` operating on a TNNetVolume's
+      probability row. Seeded RNG, exhaustively unit-tested. The
+      missing inference primitives for the pinned Tiny GPT example;
+      landable independently with their own tests today.
+- [ ] TNNetEMAWrapper / SetEmaShadow — exponential moving average
+      of network weights for inference, sibling to the pinned SWA
+      helper. Two-screen implementation (one EMA buffer per
+      trainable layer, update each step with `θ_ema ← α·θ_ema +
+      (1−α)·θ`, swap in for evaluation). Worth a separate landing
+      from SWA so they can be compared head-to-head.
+
+#### Correctness / audit work
+- [ ] Activation golden-values regression test — for every
+      registered activation layer, evaluate forward (and backward
+      where the layer overrides Backpropagate) on a pinned input
+      vector at fixed seed and assert against pinned outputs within
+      1e-5. Catches silent numerical regressions across
+      compilers / AVX paths / future optimization passes. One
+      ~20-line table-driven test in TestNeuralNumerical.pas.
+- [ ] Per-activation derivative-sign sanity test — for each
+      strictly monotone activation (ReLU family, Swish, GELU, Mish,
+      ELU, SELU, CELU, Sigmoid, Tanh, SoftPlus, …), assert
+      FOutputErrorDeriv has the expected sign on a grid of inputs.
+      Cheap audit that "monotone" claims in the README activation
+      table survive future edits.
+- [ ] TNNet.SaveToString round-trip fuzz — extend the existing
+      round-trip sweep to randomly-shaped tiny networks built from
+      the full layer-class registry, asserting bit-for-bit weight
+      equality after Save → Load → Save. Catches serialization
+      gaps in newly-added layers automatically — the project's
+      biggest silent-bug hotspot now that the layer count is
+      approaching 150.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/TinyTransformerFFN/` — train a SwiGLU + RMSNorm +
+      residual FFN block on a toy denoising or autoregressive-bit
+      task. Already unblocked today (no MHSA needed); demonstrates
+      four recently-landed layers (TNNetSwiGLU, TNNetRMSNorm,
+      TNNetLayerScale, TNNetDropPath) working together as the
+      transformer-FFN half-block that the pinned MHSA task will
+      eventually plug into.
+- [ ] `examples/ActivationPlayground/` — a tiny program that prints
+      one CSV row per activation: name, forward ns/op, backward
+      ns/op, output range on `[-8, 8]`, derivative range, and a
+      cheap "is monotone?" check. Doubles as the data source for
+      the already-pinned activation-cost microbench and as a
+      smoke test that every activation in the registry can at
+      least round-trip a forward pass.
+
+#### Documentation
+- [ ] Group the gated-activation / normalization / attention
+      transformer-building-block layers (TNNetGEGLU, TNNetSwiGLU,
+      TNNetGLU, TNNetLayerNorm, TNNetRMSNorm, TNNetGroupNorm,
+      TNNetRotaryEmbedding, TNNetMaskedFill,
+      TNNetScaledDotProductAttention, TNNetLayerScale, TNNetDropPath)
+      into a single "Building a transformer block" subsection of the
+      README — currently they're scattered across the layer reference
+      and a user wanting to assemble a transformer has to hunt for
+      them. One short paragraph + one assembled code snippet.
