@@ -1187,6 +1187,15 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Instance normalization: per-sample, per-channel normalization. This is
+  // the TNNetGroupNorm limit at Groups = Depth (one channel per group). The
+  // group count is resolved at SetPrevLayer time from the input depth.
+  TNNetInstanceNorm = class(TNNetGroupNorm)
+    public
+      constructor Create(); overload;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  end;
+
   /// This layer does zero centering and standard normalization with trainable
   // parameters.
   TNNetMovingStdNormalization = class(TNNetIdentityWithoutL2AndOptimizer)
@@ -8664,6 +8673,21 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetInstanceNorm }
+constructor TNNetInstanceNorm.Create();
+begin
+  // Placeholder Groups=1; the real value is bound at SetPrevLayer once Depth
+  // is known (one group per channel).
+  inherited Create(1);
+end;
+
+procedure TNNetInstanceNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  FGroups := pPrevLayer.Output.Depth;
+  FStruct[0] := FGroups;
+  inherited SetPrevLayer(pPrevLayer);
+end;
+
 { TNNetMovingStdNormalization }
 constructor TNNetMovingStdNormalization.Create();
 begin
@@ -15403,6 +15427,7 @@ begin
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
+      'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create();
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetChannelNorm':           Result := TNNetChannelNorm.Create();
@@ -15546,6 +15571,7 @@ begin
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
+      if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create() else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelNorm' then Result := TNNetChannelNorm.Create() else

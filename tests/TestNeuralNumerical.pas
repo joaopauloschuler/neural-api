@@ -65,6 +65,9 @@ type
     procedure TestLayerNormGradientCheck;
     procedure TestGroupNormForward;
     procedure TestGroupNormGradientCheck;
+    procedure TestInstanceNormForward;
+    procedure TestInstanceNormGradientCheck;
+    procedure TestInstanceNormSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
     procedure TestLayerScaleForward;
@@ -2140,6 +2143,150 @@ begin
         analyticalGrad := -GNorm.Neurons[j].Delta.Raw[i];
 
         AssertTrue('GroupNorm weight gradient check (' + IntToStr(j) + ',' + IntToStr(i) +
+          ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInstanceNormForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  INorm: TNNetInstanceNorm;
+  Mean, Variance, diff: TNeuralFloat;
+  ChannelSize: integer;
+  x, y, d: integer;
+begin
+  // InstanceNorm = GroupNorm with Groups=Depth: each channel of each sample
+  // is independently normalized to zero mean and unit variance.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3));
+    INorm := TNNetInstanceNorm.Create();
+    NN.AddLayer(INorm);
+
+    RandSeed := 131313;
+    for x := 0 to Input.Size - 1 do
+      Input.Raw[x] := Random() * 4 - 2;
+
+    NN.Compute(Input);
+
+    ChannelSize := Input.SizeX * Input.SizeY;
+    for d := 0 to Input.Depth - 1 do
+    begin
+      Mean := 0;
+      for x := 0 to Input.SizeX - 1 do
+        for y := 0 to Input.SizeY - 1 do
+          Mean := Mean + NN.GetLastLayer.Output[x, y, d];
+      Mean := Mean / ChannelSize;
+      Variance := 0;
+      for x := 0 to Input.SizeX - 1 do
+        for y := 0 to Input.SizeY - 1 do
+        begin
+          diff := NN.GetLastLayer.Output[x, y, d] - Mean;
+          Variance := Variance + diff * diff;
+        end;
+      Variance := Variance / ChannelSize;
+      AssertEquals('InstanceNorm channel ' + IntToStr(d) + ' mean should be ~0',
+        0.0, Mean, 0.001);
+      AssertEquals('InstanceNorm channel ' + IntToStr(d) + ' variance should be ~1',
+        1.0, Variance, 0.001);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInstanceNormGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  INorm: TNNetInstanceNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, j: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  // 3x1 spatial, 3 channels -> InstanceNorm uses Groups=3 (one per channel).
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    INorm := TNNetInstanceNorm.Create();
+    NN.AddLayer(INorm);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to INorm.Neurons[0].Weights.Size - 1 do
+    begin
+      INorm.Neurons[0].Weights.Raw[i] := 1.0 + i * 0.1;
+      INorm.Neurons[1].Weights.Raw[i] := i * 0.05 - 0.1;
+    end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('InstanceNorm input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    for j := 0 to 1 do
+      for i := 0 to INorm.Neurons[j].Weights.Size - 1 do
+      begin
+        INorm.Neurons[j].Weights.Raw[i] := INorm.Neurons[j].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        INorm.Neurons[j].Weights.Raw[i] := INorm.Neurons[j].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        INorm.Neurons[j].Weights.Raw[i] := INorm.Neurons[j].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        INorm.Neurons[j].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -INorm.Neurons[j].Delta.Raw[i];
+
+        AssertTrue('InstanceNorm weight gradient check (' + IntToStr(j) + ',' + IntToStr(i) +
           ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
           Abs(numericalGrad - analyticalGrad) < 0.01);
       end;
@@ -5710,6 +5857,12 @@ begin
   // non-default group hyperparameter through the CreateLayer dispatch.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetGroupNorm.Create(3), 'GroupNorm', 2, 2, 6, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestInstanceNormSerializationRoundTrip;
+begin
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetInstanceNorm.Create(), 'InstanceNorm', 2, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestChannelStdNormalizationSerializationRoundTrip;
