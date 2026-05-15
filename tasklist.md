@@ -202,14 +202,13 @@
       new-layer task in this file actually follows.
 
 ### Added ideas
-- [ ] Add `tests/RunTests` (and any other fpc build artifacts under tests/) to
-      .gitignore — the build leaves an untracked binary behind after each test
-      run, which clutters `git status` for every future agent.
-- [ ] Now that TNNetMaskedFill and the gated-activation family have landed, the
+- [x] Add `tests/RunTests` (and any other fpc build artifacts under tests/) to
+      .gitignore — already present in .gitignore (line "tests/RunTests").
+- [x] Now that TNNetMaskedFill and the gated-activation family have landed, the
       remaining transformer building blocks are TNNetScaledDotProductAttention
-      and TNNetRotaryEmbedding (RoPE) — both already listed above. With masking
-      done, ScaledDotProductAttention is the highest-leverage next layer for
-      the Tiny GPT example.
+      and TNNetRotaryEmbedding (RoPE). SDPA has now landed too; with masking and
+      SDPA done, the highest-leverage next layer is TNNetRotaryEmbedding (RoPE)
+      or going directly to TNNetMultiHeadSelfAttention composed on top of SDPA.
 - [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
       pattern. Consider a follow-up that allows masking the lower triangle or a
       configurable offset, if a non-causal masking use case shows up.
@@ -234,9 +233,18 @@
 - [ ] TNNetRotaryEmbedding (RoPE) — parameter-free rotation applied to Q/K.
       Backward pass is just the inverse rotation, so the numerical-gradient
       test is straightforward. Companion piece to ScaledDotProductAttention.
-- [ ] TNNetMultiHeadSelfAttention — once SDPA + RoPE land, compose them into
-      a real multi-head block (split-heads → SDPA per head → concat → out
-      projection). Add a numerical-gradient test on a tiny 2-head example.
+- [ ] TNNetMultiHeadSelfAttention — SDPA has now landed, so this is unblocked
+      (RoPE is optional / additive). Compose split-heads → SDPA per head →
+      concat → out projection. Suggested breakdown:
+      (a) head-split helper: a TNNetSplitChannels-based wiring example that
+          carves a (3*d_model) Q|K|V input into H per-head (3*d_k) slices.
+      (b) per-head SDPA: just instantiate TNNetScaledDotProductAttention(d_k)
+          on each slice — already tested.
+      (c) head-concat: TNNetDeepConcat across the H heads back to depth d_model.
+      (d) output projection: a TNNetFullConnectLinear(d_model).
+      (e) wrap it all in a TNNetMultiHeadSelfAttention helper class or a
+          builder function on TNNet. Add a numerical-gradient test on a tiny
+          H=2, d_k=4, SeqLen=3 example.
 - [ ] TNNetDropPath (stochastic depth) — identity at inference, whole-sample
       drop at training. Use a fixed RNG seed in the test so the masked
       forward/backward is deterministic.
