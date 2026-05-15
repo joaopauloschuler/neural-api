@@ -1674,3 +1674,123 @@ hitting the same wall.**
       future audits at the DeMaxPool case and the Double-precision
       workaround. Useful even before the helper itself is upgraded.
 
+## Lucky-day batch (seed 927654) — ideas I'd enjoy taking on
+
+#### Activation layers I'd like to add (small, gradient-checkable)
+- [ ] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
+      alpha (default 1.0). Backward via cached output: `dy/dx = 1`
+      when `x>0`, else `y + alpha`. Mirrors the TNNetReLU6 harness
+      shape; add LoadFromString registration and a numerical-gradient
+      test in TestNeuralNumerical.pas.
+- [ ] TNNetCELU — continuously differentiable ELU; `y = max(0,x) +
+      min(0, alpha*(exp(x/alpha)-1))`. One-line variant of TNNetELU.
+- [ ] TNNetSiLU — pure-naming alias for Swish(beta=1). Just a
+      LoadFromString registration so the canonical PyTorch/JAX name
+      parses without surprising the user. Document the equivalence.
+- [ ] TNNetSoftPlus — `y = ln(1+exp(x))` with the standard
+      large-x linearization (`x` when `x>20`) to avoid overflow.
+      Backward = sigmoid(x). Numerical-gradient test, plus an
+      identity-vs-Swish unit-test confirming SoftPlus(0)=ln(2).
+- [ ] TNNetSoftSign — `y = x / (1 + |x|)`. Cheap, smooth, no exp.
+      Backward = `1 / (1+|x|)^2`. Add to the activation gradient-
+      check sweep alongside the SELU/HardSigmoid additions.
+
+#### Permutation/reshape layers (deterministic, easy to land)
+- [ ] TNNetPixelShuffle (sub-pixel convolution). Forward is a pure
+      index permutation: `(C*r*r, H, W)` → `(C, H*r, W*r)`. Backward
+      is the inverse permutation. Useful for the SuperResolution
+      example as a faster Upsample alternative. Gradient check is
+      trivial since the forward is linear.
+- [ ] TNNetSpaceToDepth + TNNetDepthToSpace pair (inverse
+      permutations). `(C, H, W)` ↔ `(C*r*r, H/r, W/r)`. Tiny,
+      deterministic, and unlocks the ViT "patchify" step as a
+      one-line layer. Add a round-trip test that composes both and
+      confirms the identity at the volume level.
+- [ ] TNNetChannelShuffle — the ShuffleNet primitive. Splits
+      channels into G groups and interleaves them. Pure permutation;
+      forward and backward are mirror-image gathers. One numerical-
+      gradient test plus a small "compose twice with same G returns
+      identity-ish" sanity check.
+
+#### Normalization follow-ups
+- [ ] TNNetWeightStandardization — wrapper that normalizes a
+      Conv/Dense layer's weights to zero-mean / unit-variance per
+      output channel before the forward pass. Pairs especially well
+      with TNNetGroupNorm. Gradient check via the existing
+      LayerWeightGradientCheck helper.
+- [ ] TNNetInstanceNorm — per-sample, per-channel normalization
+      (the GroupNorm limit at G=C). The TNNetGroupNorm code is the
+      ready template; this is essentially a one-line constructor
+      override plus a dedicated test in TestNeuralNumerical.pas.
+
+#### Attention / transformer building blocks
+- [ ] TNNetMultiHeadSelfAttention — wrap the existing
+      TNNetScaledDotProductAttention with a head-split / head-concat
+      reshape pair. Parameter-free layer (the Q/K/V projections stay
+      external Dense layers, mirroring the SDPA convention). Add a
+      forward sanity test plus a small grad-check on a 2-head, d_k=4
+      shape so the test stays fast.
+- [ ] TNNetCausalMask helper — pure forward layer that adds a
+      causal additive mask of `-1e9` to the upper triangle. Lets
+      users build masked attention without baking the flag into
+      SDPA. Trivial to test (forward only).
+- [ ] Tiny char-level transformer example using LayerNorm + RoPE +
+      SDPA + GEGLU + LayerScale, all of which already landed. Train
+      on a tiny corpus (Shakespeare snippet or the bin/ examples'
+      built-in text) for a small number of steps to demonstrate the
+      stack composes end-to-end. Print sample completions.
+
+#### Tests & audit follow-ups
+- [ ] TNNetGlobalAvgPool numerical-gradient test (companion to the
+      new TNNetGlobalMaxPool test). Same shape transformation;
+      forward is even simpler than the max variant. Worth pinning
+      while the GlobalMaxPool harness is still fresh.
+- [ ] LoadFromString round-trip tests for the recently-landed
+      activation/pooling additions: TNNetReLU6, TNNetGlobalMaxPool,
+      TNNetSwiGLU, TNNetGEGLU, TNNetLayerScale, TNNetRMSNorm,
+      TNNetDropPath. Mirror the SoftCapping pattern. One small
+      TestSuite entry that builds, serializes, deserializes, and
+      checks the layer class survives the round-trip.
+- [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
+      accumulator into the shared LayerInputGradientCheck /
+      LayerWeightGradientCheck helpers (see also the bug-class
+      follow-up above). Listed again here because it would unblock
+      every audit in this batch.
+- [ ] Argmax-tie behaviour test for TNNetGlobalMaxPool: when two
+      cells share the max, the deterministic tie-break (likely
+      "first wins") should be documented in code and pinned with a
+      tiny test.
+
+#### Examples / experiments I'm curious about
+- [ ] GlobalMaxPool vs GlobalAvgPool head bake-off on one of the
+      SimpleImage CIFAR examples — same net, swap the head, chart
+      validation accuracy across a few seeds. Cheap, visible data
+      point on whether the new pooling head matters in practice.
+- [ ] Activation bake-off mini-experiment: same small CIFAR net,
+      swap ReLU → ReLU6 → GELU → Swish → Mish → SwiGLU-as-block
+      one at a time. Report final accuracy and wall-clock per epoch
+      in a markdown table at examples/<dir>/README.md.
+- [ ] LayerScale ablation on a deep residual stack — turn the
+      learnable γ on/off, confirm the deeper net trains stably
+      with it and diverges (or trains slower) without it. Single
+      numeric data point in the README is enough.
+- [ ] Tiny "hello attention" toy task: copy-task or reverse-string
+      task that a 1-layer SDPA + small MLP solves perfectly.
+      Demonstrates the attention layer pipeline end-to-end without
+      needing a real corpus.
+
+#### Tooling / dev experience
+- [ ] Volume unit micro-benchmark printing ns/op for Add, Mul,
+      DotProduct, and the new normalization layers (LayerNorm,
+      RMSNorm, GroupNorm). One small bin/ entry that runs without
+      OpenCL/AVX hardware differences and writes a CSV so future
+      regressions are visible.
+- [ ] Layer-by-layer forward-pass timing helper: a debug method on
+      TNNet that prints per-layer wall-clock for one inference,
+      so users can spot the slow layer without an external profiler.
+      Pure additive, no behaviour change.
+- [ ] README "supported layers" table auto-generated from the
+      LoadFromString dispatch — single source of truth so newly
+      registered layers always show up in docs. Could start as a
+      Pascal helper that emits markdown to stdout.
+
