@@ -4825,3 +4825,368 @@ Test suite: 460 → 469 (+9), all passing.
 - [ ] README activation-table rows for TNNetSoftMin, TNNetPenalizedTanh,
       and TNNetL2Normalize. Follows the pattern just used for
       TNNetSinc / TNNetBentIdentity / TNNetLisht / TNNetESwish.
+
+### Lucky-day batch — 2026-05-15 (seed 755169)
+
+Python `random.randint(1, 1000000)` rolled 755169. Every candidate
+`TNNet*` name below was grep-verified absent from
+`neural/neuralnetwork.pas`. Theme: "embedding heads + metric-learning
+losses + a few audit nets the file keeps gesturing at." None of these
+duplicate finished work (cross-checked against `examples/`,
+`tests/Test*.pas`, and prior lucky-day batches 422331, 491990, 623999,
+735373, 528621, 896318, 769362, 758867, 554877, 781449).
+
+#### Layers I'd enjoy authoring
+
+- [ ] TNNetCosineSimilarity — pairwise cosine similarity between two
+      equal-depth halves of the input volume (split along depth).
+      Sister to the freshly-landed TNNetL2Normalize: compose
+      L2Normalize → CosineSimilarity for a numerically-stable cosine
+      head. Forward: per-(x,y) dot(a,b)/(|a||b|+ε). Backward: the
+      symmetric Jacobian `(b - cos·â)/|a|` for the a-half (mirrored
+      for b). Three tests (closed-form vs hand-computed, gradient
+      check, equivalence to dot product after L2Normalize).
+
+- [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
+      loss layer, sample-label flag in FIntArr[0]. Pairs with
+      TNNetCosineSimilarity above. One gradient check + one
+      sign-correctness test (positive pairs pull closer, negatives
+      push past margin).
+
+- [ ] TNNetArcFace — additive angular-margin softmax: replaces the
+      final FullConnect+SoftMax with the L2-normalized weight ·
+      L2-normalized feature dot product, with margin `m` added to the
+      target class's angle before scaling by `s`. The single
+      most-cited face/embedding-recognition head not yet represented.
+      Constructor takes `(NumClasses, s, m)`. Gradient check at small
+      class count.
+
+- [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-
+      updated class centers `c_y`. Centers stored in the layer's
+      weight tensor and updated in Backpropagate with the
+      configurable momentum. Two tests: gradient w.r.t. features and
+      a "centers converge to class means" smoke test on a toy mixture.
+
+- [ ] TNNetSqueezeExcitation — channel-attention block: GlobalAvgPool
+      → Dense(C/r) → ReLU → Dense(C) → Sigmoid → channel-wise
+      multiply. Composite layer owning its inner dense weights so
+      users don't wire five layers manually. (Listed in the
+      seed-491990 batch under loss-layer follow-ups; pinning here as
+      a standalone task because the SE block is the highest-leverage
+      single missing architectural primitive.)
+
+- [ ] TNNetFocalLoss — `-α·(1-p_t)^γ·log(p_t)` classification loss
+      for class-imbalanced detection/segmentation. α/γ in
+      FFloatSt[0..1] (defaults 0.25 / 2.0 per the RetinaNet paper).
+      Closed-form backward is exact so the gradient check is clean.
+      (Cross-referenced from the seed-491990 batch.)
+
+- [ ] TNNetHuberLoss / TNNetSmoothL1Loss — robust regression loss:
+      quadratic near zero (`|err|<δ`), linear in the tail. Single
+      δ parameter in FFloatSt[0]. Forward + closed-form backward +
+      gradient check + "matches MSE for small δ, matches L1 for
+      large δ" boundary test.
+
+- [ ] TNNetGumbelSoftmax — straight-through estimator with
+      temperature `τ`. Forward draws `g_i = -log(-log(U_i))` and
+      returns `softmax((x+g)/τ)`; backward bypasses the sampling and
+      uses the softmax Jacobian. Inference mode (FIntArr[0]) selects
+      between the temperature-softmax path and argmax. (Already on
+      the seed-491990 wishlist; pinning here so the next pass has a
+      ready home.)
+
+- [ ] TNNetMaxBlurPool — anti-aliased max-pool from "Making
+      Convolutional Networks Shift-Invariant Again": max-pool
+      followed by a fixed (non-trainable) blur filter. Composes the
+      forward of TNNetMaxPool + a fixed-kernel convolution; backward
+      composes the adjoints. Shift-equivariance smoke test on a
+      synthetic input.
+
+- [ ] TNNetSReLU — S-shaped ReLU with four learnable knee
+      parameters per channel `(t_l, a_l, t_r, a_r)`. Piecewise-linear
+      so gradient is exact and trivially checkable. Slots in next to
+      TNNetVeryLeakyReLU / TNNetReLUL in the family.
+
+- [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x)
+      + p2·x` with channel-wise learnable `(p1, p2, β)`. Generalizes
+      Swish and is a drop-in for any ReLU. Adds a learnable-weight
+      gradient-check path that the activation family otherwise lacks.
+
+- [ ] TNNetPhish — `x · tanh(softplus(x))` (the Mish sibling that
+      uses softplus inside tanh instead of outside). Pure activation,
+      closed-form derivative, fits into the activation bake-off slot
+      already pinned.
+
+- [ ] TNNetErf — Gaussian error function as a standalone activation,
+      shared by exact-GELU and CDF-based heads. The cleanest way to
+      enable an "exact GELU" path without breaking the existing
+      approximate TNNetGELU.
+
+#### Examples I'd enjoy writing
+
+- [ ] `examples/TinyGPT/` — char-level transformer end-to-end demo on
+      a short text snippet (Tiny Shakespeare or repeated arithmetic
+      patterns) once TNNetMultiHeadSelfAttention lands. The
+      highest-value example missing from the repo and the natural
+      capstone for the transformer-building-blocks line of work.
+
+- [ ] `examples/BinaryAdder/` — tiny "learns to add two binary
+      numbers" sequence example. Self-contained, fast, deterministic
+      right answer; an instructive bridge between the XOR example
+      and the transformer demos. (Already gestured at in earlier
+      lucky-day batches; pinning here with the directory name.)
+
+- [ ] `examples/DeadReLUDiagnostic/` — train a small ReLU net on
+      MNIST and print the per-epoch fraction of units that never
+      fire; repeat with LeakyReLU/GELU/Swish for comparison. A fun
+      teaching example tied to the activation bake-off entries.
+
+- [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
+      digit "0", evaluate reconstruction error on all 10 digits,
+      print AUROC. The smallest possible "on-device anomaly
+      detection" demo — a feature the top of the file has asked for.
+
+- [ ] `examples/SpokenDigitKWS/` — 1D-conv keyword-spotting on the
+      free-spoken-digit dataset (FSDD): MFCCs → 1D conv stack →
+      classification. Closes the "audio: 1D-conv keyword spotting"
+      bullet at the top of the file.
+
+- [ ] `examples/TimeSeriesForecast/` — a one-screen forecasting demo
+      on a synthetic seasonal+trend series (no external dataset
+      needed) with a 1D-conv or tiny attention model. Closes the
+      time-series bullet at the top of the file.
+
+- [ ] `examples/GradientFlowVisualizer/` — train a deep MLP with and
+      without LayerNorm/RMSNorm and print per-layer gradient-norm
+      tables across steps. Concrete teaching example of the
+      vanishing-gradient story; reuses landed norm layers.
+
+- [ ] `examples/ActivationBakeoff/` — pure-CPU bake-off of ReLU /
+      GELU / Swish / Mish / SELU / SoftPlus / SquaredReLU /
+      PenalizedTanh / SoftMin on a fixed small MLP and dataset; one
+      table of final loss and epochs-to-converge. Closes the
+      activation-bake-off bullet that has lingered since multiple
+      earlier batches.
+
+- [ ] `examples/NormalizationBakeoff/` — same idea, comparing no-norm
+      / BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm on
+      a small net with a convergence-speed chart. The natural sibling
+      to the activation bake-off; both depend only on landed layers.
+
+- [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam /
+      RMSProp on a fixed toy dataset with a loss-vs-epoch table.
+      Pure-CPU. Closes the optimizer-bake-off bullet from earlier
+      batches.
+
+#### Correctness / audit work
+
+- [ ] Layer-registry round-trip audit — for every concrete `TNNet*`
+      in the LoadFromString/CreateLayer dispatch table, instantiate
+      with defaults, save, load, save again, assert bit-for-bit
+      string equality. The cheapest possible safety net for the
+      "added a layer but forgot to register it" bug; the layer count
+      is past 200 so a one-time test like this prevents the entire
+      class of regression. (Listed in the seed-491990 batch — pinning
+      again here because it is the single highest-leverage missing
+      test on the file.)
+
+- [ ] Shape-inference smoke test — instantiate every concrete layer
+      at a small canonical input shape, assert the declared output
+      shape matches the actually-produced output shape. Catches
+      "forgot to call FOutput.ReSize" regressions in seconds.
+
+- [ ] Backward audit for TNNetPointwiseNorm — note in the seed-422331
+      follow-ups says its backward is the scalar-only `Mul(1/n)`
+      approximation. Either replace with the exact L2-normalize
+      Jacobian (now that TNNetL2Normalize implements it) or
+      explicitly document the approximation with a deprecation
+      comment pointing to TNNetL2Normalize.
+
+- [ ] Audit TNNetSoftCapping behaviour under extreme inputs and add
+      a saturation test — same shape of test as the TNNetSoftMin
+      follow-up already pinned. Together these two cover the
+      "saturating-output layer NaN safety" risk that the
+      transformer/QAT examples will eventually exercise.
+
+- [ ] Continue the Backpropagate audit into upsampling/deconvolution
+      (TNNetUpsample, TNNetDeconvolution, TNNetDeMaxPool,
+      TNNetDeAvgPool, TNNetDeLocalConnect, TNNetDeLocalConnectReLU).
+      One numerical-gradient test per layer in TestNeuralNumerical.pas;
+      the activation audit found two real bugs in this style of pass.
+
+- [ ] Shared numerical-gradient helper in TestNeuralNumerical.pas —
+      already pinned in earlier batches; pinning again because every
+      new test in this batch would benefit from it. ~3 lines of test
+      per layer instead of a copy-pasted block.
+
+#### Documentation
+
+- [ ] "Building a transformer block" README subsection — pull the
+      TNNetMaskedFill / TNNetScaledDotProductAttention /
+      TNNetRotaryEmbedding / TNNetGEGLU / TNNetSwiGLU /
+      TNNetLayerNorm / TNNetRMSNorm references into one walkthrough
+      with a single assembled code snippet. (Listed in the
+      seed-781449 batch; re-pinning here because it is now blocked
+      only on TNNetMultiHeadSelfAttention.)
+
+- [ ] "Embedding heads" README subsection — group TNNetL2Normalize,
+      the proposed TNNetCosineSimilarity, the proposed
+      TNNetCosineEmbeddingLoss, the proposed TNNetTripletLoss, and
+      TNNetArcFace into one short subsection with a "how to build a
+      contrastive head" recipe. (Cross-referenced from seed-491990;
+      stays relevant once those layers land.)
+
+- [ ] "Layer authoring checklist" one-pager — constructor +
+      LoadFromString round-trip, CreateLayer dispatch entry,
+      Compute/Backpropagate, and the mandatory numerical-gradient
+      test. Captures the recurring pattern every new-layer task in
+      this file actually follows.
+
+- [ ] "How numerical-gradient testing works in this repo" short note
+      for contributors — the project's main correctness safety net
+      isn't explained anywhere outside the test file itself.
+
+#### Experiments I'm curious about
+
+- [ ] Weight-initialization sensitivity sweep — for a fixed
+      deep-ish MLP, plot first-epoch gradient magnitudes across all
+      available init schemes. Visualizes why init matters; reuses
+      the planned gradient-flow visualizer.
+
+- [ ] Label-smoothing sweep — train SimpleImageClassifier with
+      label smoothing `ε ∈ {0, 0.05, 0.1, 0.2}` and tabulate test
+      accuracy. A single-knob ablation that beginners always ask
+      about and the repo has no concrete answer for.
+
+- [ ] Quick-look NaN-injection test — deliberately inject a NaN
+      mid-batch and confirm the NaN/Inf guard hook proposed in the
+      seed-491990 batch catches it at the right layer. The minimum
+      regression test that hook would need.
+
+### Lucky-day batch — seed 959987
+
+#### Layers I'd enjoy building
+
+- [ ] TNNetLogSoftMax — numerically stable log-softmax along depth.
+      Pairs naturally with negative-log-likelihood training and avoids
+      the log(softmax(x)) underflow path that several examples emulate
+      by hand. Forward uses the log-sum-exp trick; backward is
+      `dL/dx_i = dL/dy_i - sum_j(dL/dy_j) * softmax(x)_i`. Full
+      numerical-gradient test in TestNeuralNumerical.pas.
+
+- [ ] TNNetReGLU — the ReLU-gated sibling of TNNetGLU / TNNetGEGLU /
+      TNNetSwiGLU: split input in half along depth, gate one half with
+      ReLU of the other. Cheapest member of the GLU family, useful as
+      a control for the gated-FFN bake-off. Forward +
+      numerical-gradient test, registered in both CreateLayer
+      dispatches.
+
+- [ ] TNNetSinusoidalPositionalEmbedding — parameter-free, additive
+      sin/cos position table along the X axis. Complements the
+      learnable TNNetAddPositionalEmbedding already in the repo and
+      gives the transformer demo a fixed-table alternative. Backward
+      is identity (no params); forward unit test asserts the well-known
+      `sin(pos / 10000^(2i/d))` pattern.
+
+- [ ] TNNetSnake activation — `x + sin(x)^2 / alpha` with a
+      configurable scalar alpha. Periodic activation popular for
+      signal/time-series tasks, closed-form derivative, fits next to
+      TNNetGaussianActivation in the activation family.
+
+- [ ] TNNetHardTanh and TNNetTanhShrink — two cheap activations that
+      round out the tanh family (clip-to-[-1,1] and `x - tanh(x)`
+      respectively). Closed-form derivatives, trivial gradient checks,
+      good filler for the planned activation bake-off table.
+
+- [ ] TNNetCELU — continuously-differentiable ELU,
+      `max(0,x) + min(0, alpha*(exp(x/alpha) - 1))`. Differs from the
+      existing TNNetELU at the elbow; useful as a comparison point in
+      the activation bake-off and a one-line change from the ELU
+      implementation.
+
+- [ ] TNNetSpatialDropout2D — drop *whole channels* at train time
+      (vs. per-element TNNetDropout). The convolution-friendly dropout
+      variant; descend from TNNetAddNoiseBase like TNNetDropPath so
+      `TNNet.EnableDropouts` toggles it. Seeded numerical-gradient
+      test asserting masked channels' gradients are zero.
+
+- [ ] TNNetSqueezeExcitation — channel-wise attention block (global
+      avg pool → 1x1 dense → ReLU → 1x1 dense → sigmoid → broadcast
+      multiply). Probably best built as a small composer helper using
+      existing layers rather than a monolithic layer, with a
+      gradient-check test on the full composed graph.
+
+- [ ] TNNetCosineSimilarity — split input in half along depth, return
+      `cos(a, b) = a·b / (|a||b|)` per (X,Y) cell. The missing piece
+      of the embedding-heads recipe alongside TNNetL2Normalize.
+      Full forward + numerical-gradient test; the backward is a small
+      but standard expression that benefits from a dedicated check.
+
+- [ ] TNNetGumbelSoftmax — softmax with Gumbel-noise temperature
+      annealing for differentiable discrete sampling. Reuses the new
+      exact softmax Jacobian; seeded forward test plus
+      central-difference gradient check at fixed temperature.
+
+#### Examples I'd enjoy writing
+
+- [ ] `examples/CharTokenizer/` — minimal in-memory char tokenizer +
+      trainable embedding lookup, with a t-SNE-free nearest-neighbor
+      printout ("nearest 5 chars to 'q'"). Closes the
+      "tokenizer + trainable embeddings" bullet at the top of the file
+      without needing the full transformer.
+
+- [ ] `examples/EmbeddingHeadDemo/` — train a small net to learn an
+      embedding space on a toy 3-class dataset using TNNetL2Normalize
+      + a hand-rolled triplet loss, and print the per-class
+      cosine-similarity matrix at the end. Concrete payoff for the
+      L2Normalize / cosine-similarity layers.
+
+- [ ] `examples/MixUpAblation/` — train SimpleImageClassifier with
+      and without MixUp data augmentation on CIFAR-10 and report the
+      delta. A small, self-contained answer to "does MixUp actually
+      help in this codebase".
+
+#### Correctness / audit work
+
+- [ ] TestExtensions check: every layer that declares
+      `FStruct[k]` constructor parameters should be tested for
+      LoadFromString round-trip with non-default values, not just
+      defaults. The existing register-audit (already pinned)
+      catches "did you register the layer"; this catches "did you
+      serialize every constructor argument". One table-driven test
+      covers them all.
+
+- [ ] TNNetAddPositionalEmbedding scale-factor backward check —
+      verify the gradient w.r.t. the learnable positional table
+      matches central differences when the input shape is rectangular
+      (X≠Y). Square-shape inputs can hide off-by-one indexing bugs.
+
+- [ ] Gradient-flow regression test — train a 12-layer ReLU MLP on a
+      tiny synthetic dataset for one epoch with and without a single
+      TNNetLayerNorm/RMSNorm inserted at the midpoint; assert that the
+      per-layer gradient norms with the norm layer are uniformly
+      bounded above the no-norm case. Encodes the "norms fix vanishing
+      gradients" promise as a CI check.
+
+#### Experiments I'm curious about
+
+- [ ] Periodic-activation toy benchmark — fit `y = sin(3x) + 0.3 sin(11x)`
+      with the proposed TNNetSnake vs. ReLU/GELU/Tanh MLPs of equal
+      width/depth. Single-knob comparison that highlights when
+      periodic activations matter, and gives Snake an out-of-the-box
+      success story.
+
+- [ ] Dropout-vs-DropPath head-to-head — train the same small CIFAR
+      model with element-wise TNNetDropout and whole-sample
+      TNNetDropPath at matched effective drop rates, report final
+      test accuracy. Concrete payoff for the recently-landed
+      TNNetDropPath layer.
+
+#### Documentation
+
+- [ ] "Choosing an activation" one-paragraph cheat-sheet in the
+      README — for each landed activation, one sentence on when to
+      prefer it (e.g. "GELU: transformer FFNs", "SoftPlus: when you
+      need a positive smooth output", "PenalizedTanh: dead-ReLU
+      hedge"). Cross-references the activation bake-off when it
+      lands.
