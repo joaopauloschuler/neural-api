@@ -5376,22 +5376,27 @@ in the dispatch tables today.
 
 #### Layers I'd enjoy building (each one commit-sized)
 
-- [ ] TNNetBias — bias-only "add a learnable per-channel offset" layer.
-      Today bias only ships fused into Dense/Conv. Useful as a building
-      block for residual stacks that pair a bias-free Conv with a
-      standalone bias-shift (e.g. norm-before-bias patterns) and for
-      the eventual TNNetWeightStandardization wrapper that needs to
-      restore a learnable per-channel offset after weight normalization.
-      One learnable vector of size Depth, forward = broadcast-add over
-      (X,Y), backward = `dL/dW[c] = sum_{x,y} dL/dy[x,y,c]`. Forward +
-      input-grad + weight-grad + LoadFromString round-trip tests.
+- [x] TNNetBias — bias-only "add a learnable per-channel offset" layer.
+      Landed (seed-758266 batch, commit b1394cd): descends from
+      TNNetChannelTransformBase next to TNNetLayerScale, single neuron
+      with a Depth-sized weight vector, Compute uses
+      FOutput.AddToChannels, Backpropagate accumulates the true
+      per-channel sum into the delta and passes the input gradient
+      through unchanged. Registered in both CreateLayer dispatches.
+      Four tests: TestBiasForward / TestBiasGradientCheck /
+      TestBiasWeightGradientCheck / TestBiasSerializationRoundTrip.
 
-- [ ] TNNetReZero — single learnable scalar `alpha` (init 0), forward
-      `y = alpha * x`. Re-pinned from seed 689126; calling it out again
-      because the scalar variant is genuinely different from the
-      already-landed per-channel TNNetLayerScale and would close one of
-      the open "stabilizer family" entries. One-scalar weight, three
-      tests (forward, input grad, weight grad).
+- [x] TNNetReZero — single learnable scalar `alpha` (init 0), forward
+      `y = alpha * x`. Landed (seed-758266 batch, commit 18281db):
+      descends from TNNetChannelTransformBase, SetPrevLayer forces
+      SetNumWeightsForAllNeurons(1,1,1) so the parameter is a true
+      scalar, Compute is FOutput.Mul(alpha), Backpropagate uses the
+      scalar dot-product sum(OutputError * PrevOutput) for the alpha
+      delta and OutputError*alpha for the input gradient. Registered
+      via Ft[0] in both CreateLayer dispatches. Four tests:
+      TestReZeroForward (default alpha=0 zeroes output) /
+      TestReZeroGradientCheck / TestReZeroWeightGradientCheck /
+      TestReZeroSerializationRoundTrip.
 
 - [ ] TNNetGatedResidual / TNNetGatedSkip — `y = x + gate * Sublayer(x)`
       where `gate` is a per-channel learnable initialized to zero (the
@@ -5428,12 +5433,20 @@ in the dispatch tables today.
       the owned sub-layers, so Backpropagate has no new math. One
       gradient-check test at d_model=8, n_heads=2, SeqLen=4.
 
-- [ ] TNNetTokenShift — the RWKV-style time-mixing primitive:
+- [x] TNNetTokenShift — the RWKV-style time-mixing primitive:
       `y[t] = mix * x[t] + (1 - mix) * x[t-1]` with a per-channel
-      learnable `mix`. Cheap sequence-aware layer that does not need
-      attention; pairs with the "attention-free toy transformer"
-      example already on the list. One learnable vector, simple
-      backward, easy gradient check on a SeqLen=4 input.
+      learnable `mix`. Landed (seed-758266 batch, commit b61c9a4):
+      descends from TNNetChannelTransformBase, parameter-free Create()
+      with mix initialized to 0.5 per channel, SetPrevLayer validates
+      SizeY=1 (1D-sequence convention shared with the rest of the
+      transformer-block layers). Forward: y[0,c]=mix[c]*x[0,c];
+      y[t,c]=mix[c]*x[t,c]+(1-mix[c])*x[t-1,c]. Backward: per-channel
+      dL/dmix[c] = sum_t gy[t,c]*(x[t,c]-x[t-1,c]); input gradient
+      scatters gy[t,c]*mix[c] to position t and gy[t,c]*(1-mix[c]) to
+      position t-1. Four tests: TestTokenShiftForward (mix=1 identity,
+      mix=0 strict right-shift, per-channel mid mix hand-computed) /
+      TestTokenShiftGradientCheck / TestTokenShiftWeightGradientCheck /
+      TestTokenShiftSerializationRoundTrip.
 
 - [ ] TNNetCausalConv1D — depth-axis 1D causal convolution (i.e. the
       kernel sees only `t-k..t`, never `t+1..t+k`). Useful for
@@ -5636,3 +5649,84 @@ in the dispatch tables today.
       in `onnxruntime`. Document which layers are out-of-scope for
       v1. Closes the "I trained it, now what?" gap for non-Pascal
       downstream users.
+
+### Lucky-day batch — 2026-05-15 (seed 758266)
+
+This batch landed three "stabilizer-family" / sequence layers:
+TNNetBias (per-channel learnable offset, commit b1394cd),
+TNNetReZero (single learnable scalar, commit 18281db) and
+TNNetTokenShift (RWKV-style per-channel time-mixing, commit b61c9a4).
+Each ships with four tests (forward, input grad, weight grad,
+LoadFromString round-trip) and both CreateLayer dispatches are wired.
+`tests/RunAll.sh` is green at 488 tests / 0 failures.
+
+#### Doable follow-ups directly unblocked by the new layers
+
+- [ ] TNNetMul — multiplicative companion to TNNetBias: learnable
+      per-channel multiplier with closed-form gradient
+      `dL/dW[c] = sum_pix(dy[x,y,c] * x[x,y,c])`. Same structural shape
+      as the just-landed TNNetBias; together they spell out the
+      affine `y = Mul * x + Bias` decomposition that TNNetLayerScale
+      gives you fused. One commit, four tests modeled on TestBias*.
+
+- [ ] TNNetAffineBlock helper — once TNNetMul ships, expose a builder
+      `AddAffine(Depth)` that wires `TNNetMul -> TNNetBias` so callers
+      don't have to spell out the pair. Same shape as the existing
+      `AddPreNormResidual` family discussed earlier in the file.
+
+- [ ] TNNetGatedResidual — the per-channel-gate twin of the new
+      TNNetReZero. Same single-neuron pattern but with a Depth-sized
+      weight vector and a different forward (`y = x + gate * x`-style
+      composition with a sub-net). The scalar TNNetReZero is now a
+      ready template — copy SetPrevLayer / Compute / Backpropagate
+      and grow the weight to Depth. Mark line 717-720 of this file
+      `[x]` once it lands.
+
+- [ ] `examples/BiasOnlyTuning/` — when fine-tuning, freeze every
+      learnable layer except inserted TNNetBias layers and train only
+      those. Demonstrates the "bias-only adapter" pattern from
+      modern fine-tuning literature and exercises the new layer
+      end-to-end. ~80 lines; pairs with the existing Hypotenuse-style
+      examples.
+
+- [ ] Token-shift micro-experiment: train a tiny next-token model
+      with and without a single TNNetTokenShift in front of an MLP.
+      Already pinned earlier in the file (line 741); now fully
+      unblocked. Concrete data point on "how much of attention is
+      really just mixing-along-time" — fits in one short example.
+
+- [ ] ReZero deep-MLP convergence demo: train a 16-layer residual
+      MLP with and without TNNetReZero on the residual branch
+      (alpha=0 init means the network starts as the identity).
+      Concrete visualization of why the trick stabilizes deep
+      stacks. Pure CPU, finishes in seconds.
+
+#### Tiny correctness / audit follow-ups
+
+- [ ] LoadFromString round-trip for non-default ctor values: the
+      three new layers' serialization tests use either default or
+      perturbed-weight harnesses. Add an explicit case that constructs
+      TNNetReZero(0.5), serializes, and re-loads, asserting the
+      preserved alpha. Same idea for TNNetBias initialized via
+      direct weight write.
+
+- [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer raises
+      the documented error when SizeY > 1 (mirrors the
+      TNNetRotaryEmbedding odd-depth guard test pattern).
+
+- [ ] Two-layer TokenShift composition test: stack TNNetTokenShift
+      twice with different mix values and verify analytical
+      vs. numerical gradient through both layers (catches any subtle
+      double-pass bug in the t-1 / t+1 input-gradient scatter).
+
+#### Meta-observation for the next batch
+
+TNNetBias / TNNetReZero / TNNetTokenShift share the same
+"per-channel (or scalar) learnable weight" skeleton. With three
+sibling templates now landed, the next learnable-weight layer
+(TNNetMul, TNNetGatedResidual, TNNetCausalConv1D's bias path,
+TNNetDyT's alpha) should drop from a copy-pasted 40-line block to
+a single SetPrevLayer + a one-line Compute + a short Backpropagate.
+The shared `LayerInputAndWeightGradientCheck` test helper pinned
+multiple times earlier in this file would now save four tests' worth
+of duplication per landing — calling that out one more time.
