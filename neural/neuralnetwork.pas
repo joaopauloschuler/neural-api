@@ -655,6 +655,29 @@ type
     procedure Compute(); override;
   end;
 
+  /// HardShrink activation function.
+  // HardShrink(x) = x if |x| > lambda, else 0. The L1-prox activation.
+  // Derivative is 1 for |x| > lambda, else 0. lambda is configurable,
+  // default 0.5, and is stored in FFloatSt[0] for serialization.
+  TNNetHardShrink = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pLambda: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
+  /// SoftShrink activation function.
+  // SoftShrink(x) = x - lambda if x > lambda, x + lambda if x < -lambda,
+  // else 0. L1-prox cousin of HardShrink. Derivative is 1 for |x| > lambda,
+  // else 0. lambda is configurable, default 0.5, and is stored in
+  // FFloatSt[0] for serialization.
+  TNNetSoftShrink = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pLambda: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -4963,6 +4986,124 @@ begin
       if x > 1 then FOutput.FData[OutputCnt] := 1
       else if x < -1 then FOutput.FData[OutputCnt] := -1
       else FOutput.FData[OutputCnt] := x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetHardShrink }
+
+constructor TNNetHardShrink.Create();
+begin
+  Create(0.5);
+end;
+
+constructor TNNetHardShrink.Create(pLambda: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pLambda;
+end;
+
+procedure TNNetHardShrink.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, Lambda: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Lambda := FFloatSt[0];
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if (x > Lambda) or (x < -Lambda) then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if (x > Lambda) or (x < -Lambda) then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := 0;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSoftShrink }
+
+constructor TNNetSoftShrink.Create();
+begin
+  Create(0.5);
+end;
+
+constructor TNNetSoftShrink.Create(pLambda: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pLambda;
+end;
+
+procedure TNNetSoftShrink.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, Lambda: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Lambda := FFloatSt[0];
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > Lambda then
+      begin
+        FOutput.FData[OutputCnt] := x - Lambda;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else if x < -Lambda then
+      begin
+        FOutput.FData[OutputCnt] := x + Lambda;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > Lambda then FOutput.FData[OutputCnt] := x - Lambda
+      else if x < -Lambda then FOutput.FData[OutputCnt] := x + Lambda
+      else FOutput.FData[OutputCnt] := 0;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15328,6 +15469,8 @@ begin
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
+      'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
+      'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
@@ -15472,6 +15615,8 @@ begin
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
+      if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
+      if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else

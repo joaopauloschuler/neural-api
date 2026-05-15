@@ -89,6 +89,12 @@ type
     procedure TestTanhShrinkGradientCheck;
     procedure TestHardTanhForward;
     procedure TestHardTanhGradientCheck;
+    procedure TestHardShrinkForward;
+    procedure TestHardShrinkGradientCheck;
+    procedure TestHardShrinkSerializationRoundTrip;
+    procedure TestSoftShrinkForward;
+    procedure TestSoftShrinkGradientCheck;
+    procedure TestSoftShrinkSerializationRoundTrip;
     procedure TestReLU6Forward;
     procedure TestReLU6ExtremeInputSaturation;
     procedure TestGlobalMaxPoolForward;
@@ -3597,6 +3603,82 @@ begin
     [0.5, -0.5, 0.25, -0.75, 2.0, -2.5], 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestHardShrinkForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetHardShrink.Create());
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := -0.3;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := 0.3;
+    Input.Raw[4] := 2.0;
+
+    NN.Compute(Input);
+
+    // HardShrink(x) = x if |x| > 0.5, else 0
+    AssertEquals('HardShrink(-2)', -2.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('HardShrink(-0.3)', 0.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('HardShrink(0)', 0.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('HardShrink(0.3)', 0.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('HardShrink(2)', 2.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHardShrinkGradientCheck;
+begin
+  // Stay clear of the kink at +/-lambda (lambda=0.5).
+  ActivationGradientCheck(Self, TNNetHardShrink.Create(), 'HardShrink',
+    [1.0, -1.0, 1.5, -2.0, 0.25, -0.3], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftShrinkForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetSoftShrink.Create());
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := -0.3;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := 0.3;
+    Input.Raw[4] := 2.0;
+
+    NN.Compute(Input);
+
+    // SoftShrink(x) = x - lambda if x>lambda, x+lambda if x<-lambda, else 0
+    AssertEquals('SoftShrink(-2)', -1.5, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('SoftShrink(-0.3)', 0.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('SoftShrink(0)', 0.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('SoftShrink(0.3)', 0.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('SoftShrink(2)', 1.5, NN.GetLastLayer.Output.Raw[4], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftShrinkGradientCheck;
+begin
+  // Stay clear of the kink at +/-lambda (lambda=0.5).
+  ActivationGradientCheck(Self, TNNetSoftShrink.Create(), 'SoftShrink',
+    [1.0, -1.0, 1.5, -2.0, 0.25, -0.3], 0.01);
+end;
+
 procedure TTestNeuralNumerical.TestReLU6Forward;
 var
   NN: TNNet;
@@ -5134,6 +5216,18 @@ procedure TTestNeuralNumerical.TestSoftCappingSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSoftCapping.Create(),
     'SoftCapping', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestHardShrinkSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetHardShrink.Create(0.3),
+    'HardShrink', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSoftShrinkSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSoftShrink.Create(0.3),
+    'SoftShrink', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestDropPathSerializationRoundTrip;
