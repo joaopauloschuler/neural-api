@@ -63,6 +63,8 @@ type
     procedure TestGroupNormGradientCheck;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
+    procedure TestLayerScaleForward;
+    procedure TestLayerScaleGradientCheck;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -1630,6 +1632,143 @@ begin
       analyticalGrad := -RNorm.Neurons[0].Delta.Raw[i];
 
       AssertTrue('RMSNorm weight gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLayerScaleForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LScale: TNNetLayerScale;
+  x, y, d, i: integer;
+begin
+  // TNNetLayerScale applies a per-channel learnable multiplier.
+  // Output[x,y,d] = Input[x,y,d] * Scale[d].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3));
+    // Default initial scale is 1.0 -> output must equal input.
+    LScale := TNNetLayerScale.Create();
+    NN.AddLayer(LScale);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 2.5 + 1.3;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('LayerScale default scale=1 keeps input', Input.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 0.0001);
+
+    // Now set a non-trivial per-channel scale.
+    LScale.Neurons[0].Weights.Raw[0] := 2.0;
+    LScale.Neurons[0].Weights.Raw[1] := -1.5;
+    LScale.Neurons[0].Weights.Raw[2] := 0.25;
+    NN.Compute(Input);
+    for x := 0 to Input.SizeX - 1 do
+      for y := 0 to Input.SizeY - 1 do
+        for d := 0 to Input.Depth - 1 do
+          AssertEquals('LayerScale per-channel multiply',
+            Input[x, y, d] * LScale.Neurons[0].Weights.Raw[d],
+            NN.GetLastLayer.Output[x, y, d], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLayerScaleGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LScale: TNNetLayerScale;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    LScale := TNNetLayerScale.Create(0.5);
+    NN.AddLayer(LScale);
+    // Learning rate 1, batch update on: deltas accumulate -1*gradient and
+    // weights are NOT modified, so finite-difference checks stay valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial per-channel scale.
+    for i := 0 to LScale.Neurons[0].Weights.Size - 1 do
+      LScale.Neurons[0].Weights.Raw[i] := 0.7 + i * 0.3;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('LayerScale input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the learnable scale weights ----
+    for i := 0 to LScale.Neurons[0].Weights.Size - 1 do
+    begin
+      LScale.Neurons[0].Weights.Raw[i] := LScale.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      LScale.Neurons[0].Weights.Raw[i] := LScale.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      LScale.Neurons[0].Weights.Raw[i] := LScale.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LScale.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // Backprop accumulates Delta := Delta - LearningRate*gradient.
+      // With LearningRate = 1, analytical gradient = -Delta.
+      analyticalGrad := -LScale.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('LayerScale weight gradient check (' + IntToStr(i) +
         ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;

@@ -966,6 +966,25 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// LayerScale: the per-channel learnable multiplier ("gamma trick") from
+  // CaiT / ConvNeXt. Output[x,y,d] = Input[x,y,d] * Scale[d], where Scale is a
+  // learnable vector of length = channel count (Depth). The initial scale value
+  // is constructor-configurable (default 1.0). The backward pass propagates the
+  // gradient to both the input and the learnable scale weights.
+  TNNetLayerScale = class(TNNetChannelTransformBase)
+    private
+      FInitialScale: TNeuralFloat;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialScale: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
+  /// Alias for TNNetLayerScale.
+  TNNetLearnableScale = TNNetLayerScale;
+
   // This is an experimental class. Do not use it.
   TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
     private
@@ -5993,6 +6012,86 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
   FNeurons[0].Weights.Fill(1);
+  AfterWeightUpdate();
+end;
+
+{ TNNetLayerScale }
+constructor TNNetLayerScale.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetLayerScale.Create(pInitialScale: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialScale := pInitialScale;
+  FFloatSt[0] := pInitialScale;
+  InitDefault();
+end;
+
+procedure TNNetLayerScale.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> FOutput.Depth then
+  begin
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetLayerScale.');
+  end;
+  {$ENDIF}
+  // Output[x,y,d] = Input[x,y,d] * Scale[d]
+  FOutput.MulChannels(FNeurons[0].FWeights);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLayerScale.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  // Gradient w.r.t. the learnable scale:
+  // d(Scale[d]) = sum over x,y of ( OutputError[x,y,d] * Input[x,y,d] ).
+  FOutputErrorDeriv.Fill(0);
+  FOutputErrorDeriv.MulAdd(-FLearningRate, FOutputError);
+  FOutputErrorDeriv.Mul(FPrevLayer.Output);
+  FAuxDepth.Fill(0);
+  FAuxDepth.AddSumChannel(FOutputErrorDeriv);
+  {$IFDEF Debug}
+  if localNeuron.Delta.Size <> FAuxDepth.Size then
+  begin
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetLayerScale backprop.');
+  end;
+  {$ENDIF}
+  localNeuron.Delta.Add(FAuxDepth);
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Gradient w.r.t. the input: dInput[x,y,d] = OutputError[x,y,d] * Scale[d].
+    FOutputError.MulChannels(localNeuron.FWeights);
+    FPrevLayer.FOutputError.Add(FOutputError);
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetLayerScale.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialScale);
   AfterWeightUpdate();
 end;
 
@@ -13213,6 +13312,7 @@ begin
       'TNNetScaleLearning' :        Result := TNNetScaleLearning.Create();
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
+      'TNNetLayerScale':            Result := TNNetLayerScale.Create(Ft[0]);
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
@@ -13329,6 +13429,7 @@ begin
       if S[0] = 'TNNetScaleLearning' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
+      if S[0] = 'TNNetLayerScale' then Result := TNNetLayerScale.Create(Ft[0]) else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
