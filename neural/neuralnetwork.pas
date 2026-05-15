@@ -754,6 +754,20 @@ type
     procedure Compute(); override;
   end;
 
+  /// Snake activation function.
+  // Snake(x) = x + (1/alpha) * sin(alpha*x)^2. Derivative is
+  // 1 + sin(2*alpha*x). Parameter-free w.r.t. learning but alpha is a
+  // user-configurable frequency hyperparameter stored in FFloatSt[0]
+  // for serialization. From "Neural Networks Fail to Learn Periodic
+  // Functions and How to Fix It" (Ziyin et al., 2020); models periodic
+  // inductive bias while preserving monotonic identity-like behavior.
+  TNNetSnake = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pAlpha: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5654,6 +5668,60 @@ begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := Cos(LocalPrevOutput.FData[OutputCnt]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSnake }
+
+constructor TNNetSnake.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetSnake.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha = 0 then
+    FErrorProc('TNNetSnake requires alpha <> 0.');
+  FFloatSt[0] := pAlpha;
+end;
+
+procedure TNNetSnake.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, Alpha, InvAlpha, SinAx: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Alpha := FFloatSt[0];
+  InvAlpha := 1.0 / Alpha;
+
+  // Snake(x) = x + (1/alpha) * sin(alpha*x)^2.
+  // Derivative is 1 + sin(2*alpha*x).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      SinAx := Sin(Alpha * x);
+      FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
+      FOutputErrorDeriv.FData[OutputCnt] := 1.0 + Sin(2.0 * Alpha * x);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      SinAx := Sin(Alpha * x);
+      FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
+    end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -16535,6 +16603,7 @@ begin
       'TNNetNeg' :                  Result := TNNetNeg.Create();
       'TNNetSin' :                  Result := TNNetSin.Create();
       'TNNetCos' :                  Result := TNNetCos.Create();
+      'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16699,6 +16768,7 @@ begin
       if S[0] = 'TNNetNeg' then Result := TNNetNeg.Create() else
       if S[0] = 'TNNetSin' then Result := TNNetSin.Create() else
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
+      if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else

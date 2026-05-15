@@ -256,6 +256,9 @@ type
     procedure TestCosGradientCheck;
     procedure TestCosPhaseShiftFromSin;
     procedure TestCosSerializationRoundTrip;
+    procedure TestSnakeForward;
+    procedure TestSnakeGradientCheck;
+    procedure TestSnakeSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8487,6 +8490,73 @@ procedure TTestNeuralNumerical.TestCosSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetCos.Create(),
     'Cos', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSnakeForward;
+const
+  HALF_PI: TNeuralFloat = 0.5 * 3.14159265358979323846;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Hand-checked anchors with alpha=1:
+  //   Snake(0)    = 0 + sin(0)^2 = 0
+  //   Snake(pi/2) = pi/2 + sin(pi/2)^2 = pi/2 + 1
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+    NN.AddLayer(TNNetSnake.Create(1.0));
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := HALF_PI;
+    NN.Compute(Input);
+    AssertEquals('Snake(0, alpha=1)',
+      0.0, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Snake(pi/2, alpha=1)',
+      HALF_PI + 1.0, NN.GetLastLayer.Output.Raw[1], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSnakeGradientCheck;
+begin
+  // Non-default alpha exercises the FFloatSt[0] code path.
+  LayerInputGradientCheck(Self, TNNetSnake.Create(1.5),
+    'Snake', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSnakeSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // alpha lives in FFloatSt[0] and must survive serialization. The base
+  // SaveStructureToString emits "ClassName:struct::float0;float1;..." so
+  // re-saving the reloaded layer must reproduce the original alpha.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetSnake.Create(2.5));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('Snake round-trip class name',
+        'TNNetSnake', NN2.GetLastLayer.ClassName);
+      AssertEquals('Snake round-trip structure preserves alpha',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+  // Also verify output equivalence with a non-default alpha.
+  SerializationRoundTrip(Self, TNNetSnake.Create(2.5),
+    'Snake', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
