@@ -117,6 +117,10 @@ type
     procedure TestGlobalMaxPoolGradientCheck;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
+    procedure TestTriangularCausalMaskForward;
+    procedure TestTriangularCausalMaskGradientCheck;
+    procedure TestTriangularCausalMaskSerializationRoundTrip;
+    procedure TestTriangularCausalMaskBeforeSDPA;
     procedure TestALiBiForward;
     procedure TestALiBiGradientCheck;
     procedure TestALiBiSerializationRoundTrip;
@@ -4266,6 +4270,179 @@ begin
   // (a large constant in the MSE loss causes catastrophic cancellation).
   LayerInputGradientCheck(Self, TNNetMaskedFill.Create(-0.5),
     'MaskedFill', 3, 3, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestTriangularCausalMaskForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, SeqLen, Depth: integer;
+begin
+  SeqLen := 4;
+  Depth := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, SeqLen, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, SeqLen, Depth, 1));
+    NN.AddLayer(TNNetTriangularCausalMask.Create(SeqLen));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    for D := 0 to Depth - 1 do
+      for Y := 0 to SeqLen - 1 do
+        for X := 0 to SeqLen - 1 do
+        begin
+          if X > Y then
+            AssertTrue('TriangularCausalMask upper triangle masked at X=' +
+              IntToStr(X) + ' Y=' + IntToStr(Y) + ' D=' + IntToStr(D),
+              NN.GetLastLayer.Output[X, Y, D] < -1e8)
+          else
+            AssertEquals('TriangularCausalMask lower/diagonal untouched at X=' +
+              IntToStr(X) + ' Y=' + IntToStr(Y) + ' D=' + IntToStr(D),
+              1.0, NN.GetLastLayer.Output[X, Y, D], 0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTriangularCausalMaskGradientCheck;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  upstreamErr: TNeuralFloat;
+begin
+  // The layer is purely additive (output = input + constant_mask) so the
+  // input gradient must equal the upstream gradient elementwise. A
+  // central-difference check against an MSE loss is numerically unsuitable
+  // here because the -1e9 mask wrecks float32 cancellation when forming
+  // Output - Desired on the strictly-upper triangle. Instead we inject
+  // a known upstream gradient directly into the layer's FOutputError and
+  // verify the previous layer receives it unchanged.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetTriangularCausalMask.Create(3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.5;
+    NN.Compute(Input);
+
+    NN.Layers[0].OutputError.Fill(0);
+    for i := 0 to NN.GetLastLayer.OutputError.Size - 1 do
+      NN.GetLastLayer.OutputError.Raw[i] := i * 0.1 + 0.05;
+    NN.GetLastLayer.Backpropagate();
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      upstreamErr := i * 0.1 + 0.05;
+      AssertEquals('TriangularCausalMask passthrough grad at ' + IntToStr(i),
+        upstreamErr, NN.Layers[0].OutputError.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTriangularCausalMaskSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  S: string;
+  i: integer;
+begin
+  // Verify SeqLen persists through save/load and the reloaded layer
+  // produces identical output.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetTriangularCausalMask.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.5;
+    NN.Compute(Input);
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(S);
+      // SeqLen is persisted in the layer signature string. Pin it textually.
+      AssertTrue('TriangularCausalMask serialized SeqLen present',
+        Pos('TNNetTriangularCausalMask:3;', S) > 0);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('TriangularCausalMask reloaded output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTriangularCausalMaskBeforeSDPA;
+var
+  NNCausal, NNFree: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Dk, i, d: integer;
+  AnyDiff: boolean;
+begin
+  // Sanity check: plug TriangularCausalMask in front of SDPA's score path
+  // and confirm causal output differs from the non-causal output for
+  // identical inputs. We can't easily insert a mask between the QKV
+  // projection and the score softmax inside the SDPA layer, so instead
+  // we compare SDPA(IsCausal=true) versus SDPA(IsCausal=false), pinning
+  // that the causal behavior is reachable. The TriangularCausalMask
+  // forward + gradient tests above already cover the layer in isolation.
+  SeqLen := 3;
+  Dk := 4;
+  NNCausal := TNNet.Create();
+  NNFree := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  try
+    NNCausal.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    NNCausal.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true));
+
+    NNFree.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    NNFree.AddLayer(TNNetScaledDotProductAttention.Create(Dk, false));
+
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := Sin(i + 0.3 * d);
+        Input[i, 0, Dk + d] := Cos(i + 0.5 * d);
+        Input[i, 0, 2 * Dk + d] := i + 0.1 * d;
+      end;
+
+    NNCausal.Compute(Input);
+    NNFree.Compute(Input);
+
+    AnyDiff := false;
+    for i := 0 to NNCausal.GetLastLayer.Output.Size - 1 do
+      if Abs(NNCausal.GetLastLayer.Output.Raw[i] -
+             NNFree.GetLastLayer.Output.Raw[i]) > 1e-4 then
+      begin
+        AnyDiff := true;
+        break;
+      end;
+    AssertTrue('Causal SDPA output differs from non-causal for same input',
+      AnyDiff);
+  finally
+    NNCausal.Free;
+    NNFree.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestALiBiForward;

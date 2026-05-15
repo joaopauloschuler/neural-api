@@ -1014,6 +1014,29 @@ type
     procedure Compute(); override;
   end;
 
+  /// Triangular causal mask (convenience wrapper over TNNetMaskedFill).
+  // Constructed with a sequence length, the layer builds its own strictly
+  // upper-triangular additive mask volume (size SeqLen x SeqLen x Depth,
+  // where Depth is inferred from the previous layer at SetPrevLayer time)
+  // and adds it to the input. Positions where the column index (X) is
+  // strictly greater than the row index (Y) get a large negative constant
+  // (-1e9, matching TNNetMaskedFill); the lower triangle and diagonal are
+  // left unchanged. Removes the boilerplate of pairing TNNetMaskedFill
+  // with a precomputed external mask volume — useful in front of
+  // TNNetScaledDotProductAttention for causal self-attention. No
+  // trainable parameters; backward pass is a pure gradient passthrough
+  // (inherited from TNNetIdentity).
+  TNNetTriangularCausalMask = class(TNNetIdentity)
+  private
+    FMask: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload;
+    constructor Create(pSeqLen: integer); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+  end;
+
   /// Straight-Through Estimator (STE) layer.
   // Forward: y = round(x / step) * step, where step is a configurable
   // quantization grid step stored in FFloatSt[0] (default 1.0, which gives
@@ -4801,6 +4824,68 @@ begin
     for X := Y + 1 to MaxX do
       for D := 0 to MaxD do
         FOutput.Add(X, Y, D, MaskValue);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetTriangularCausalMask }
+
+constructor TNNetTriangularCausalMask.Create();
+begin
+  Create(0);
+end;
+
+constructor TNNetTriangularCausalMask.Create(pSeqLen: integer);
+begin
+  inherited Create();
+  if pSeqLen < 0 then
+  begin
+    FErrorProc('TNNetTriangularCausalMask requires SeqLen >= 0. SeqLen=' +
+      IntToStr(pSeqLen));
+    pSeqLen := 0;
+  end;
+  FStruct[0] := pSeqLen;
+  FMask := TNNetVolume.Create();
+end;
+
+destructor TNNetTriangularCausalMask.Destroy();
+begin
+  FMask.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetTriangularCausalMask.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen, MaxX, MaxY, MaxD: integer;
+  X, Y, D: integer;
+  MaskValue: TNeuralFloat;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SeqLen := FStruct[0];
+  // If SeqLen was unset (e.g. parameterless Create), fall back to the
+  // input's X size so the mask still covers the score map.
+  if SeqLen <= 0 then SeqLen := pPrevLayer.FOutput.SizeX;
+  FMask.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth);
+  FMask.Fill(0);
+  MaskValue := -1e9;
+  MaxX := FMask.SizeX - 1;
+  if SeqLen - 1 < MaxX then MaxX := SeqLen - 1;
+  MaxY := FMask.SizeY - 1;
+  if SeqLen - 1 < MaxY then MaxY := SeqLen - 1;
+  MaxD := FMask.Depth - 1;
+  for Y := 0 to MaxY do
+    for X := Y + 1 to MaxX do
+      for D := 0 to MaxD do
+        FMask.Add(X, Y, D, MaskValue);
+end;
+
+procedure TNNetTriangularCausalMask.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  FOutput.Add(FMask);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -17075,6 +17160,7 @@ begin
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
+      'TNNetTriangularCausalMask' : Result := TNNetTriangularCausalMask.Create(St[0]);
       'TNNetStraightThroughEstimator' : Result := TNNetStraightThroughEstimator.Create(Ft[0]);
       'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
@@ -17247,6 +17333,7 @@ begin
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
+      if S[0] = 'TNNetTriangularCausalMask' then Result := TNNetTriangularCausalMask.Create(St[0]) else
       if S[0] = 'TNNetStraightThroughEstimator' then Result := TNNetStraightThroughEstimator.Create(Ft[0]) else
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
