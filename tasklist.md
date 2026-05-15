@@ -421,3 +421,47 @@
       stepping through Compute and Backpropagate (with shapes and the
       softmax-Jacobian derivation) would lower the barrier for the next
       contributor touching attention code.
+
+### Ideas added on 2026-05-15 (post SoftCapping + DropPath + RoPE landings)
+
+With TNNetSoftCapping, TNNetDropPath and TNNetRotaryEmbedding now landed,
+the highest-leverage next layer is clearly TNNetMultiHeadSelfAttention
+(SDPA + RoPE + MaskedFill are all in place). Suggested doable breakdown
+for the next contributor — each step is its own commit-sized task:
+
+- [ ] (MHA-a) Add a small `TNNetSplitChannels`-based helper or example that
+      carves a (3*d_model) Q|K|V depth slab into H per-head (3*d_k) slices,
+      with a sanity test on H=2, d_model=8.
+- [ ] (MHA-b) Add a wiring helper or example that runs one
+      `TNNetScaledDotProductAttention(d_k)` per head slice and concats
+      the H outputs via `TNNetDeepConcat` back to depth d_model. Test on
+      a tiny (H=2, d_k=4, SeqLen=3) shape, numerical-gradient through.
+- [ ] (MHA-c) Wrap (a)+(b)+a `TNNetFullConnectLinear(d_model)` out-projection
+      into a `TNNetMultiHeadSelfAttention` helper class or builder function.
+      Add a numerical-gradient test on the same tiny shape; mark line 4 of
+      this file `[x]` once it lands.
+
+Bake-off / experiment follow-ups for the layers that just landed:
+
+- [ ] SoftCapping logit-stability micro-experiment: train a tiny classifier
+      with and without a `TNNetSoftCapping(c)` before the final softmax,
+      and print the rate of NaN/overflow events under an aggressive
+      learning rate. Tiny, CPU-fast, illustrative.
+- [ ] DropPath ablation: train a small ResNet-style net on a tiny synthetic
+      task with `TNNetDropPath(p)` after each residual block, sweeping
+      `p ∈ {0.0, 0.1, 0.2}` and printing final loss. Shows the regularizer
+      doing something even at toy scale.
+- [ ] RoPE vs sinusoidal `TNNetAddPositionalEmbedding` mini-comparison on
+      a tiny next-token task — pair with the existing position-encoding
+      bake-off entry above (now unblocked since RoPE landed).
+
+Tiny correctness follow-ups:
+
+- [ ] SoftCapping saturation test on extreme inputs (±1e6) — assert
+      output stays within ±c and `Backpropagate` doesn't produce NaNs.
+- [ ] DropPath determinism test: with a fixed `RandSeed`, two Compute
+      calls produce identical masks/outputs across runs. Pin the
+      RNG-reset behavior so future refactors can't silently break it.
+- [ ] RoPE odd-depth guard test: assert constructing+wiring a
+      `TNNetRotaryEmbedding` after a layer with odd Depth raises the
+      expected error (validates the even-Depth precondition).
