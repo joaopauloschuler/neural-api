@@ -1823,10 +1823,12 @@ TNNetAvgChannel; this is now covered.
 - [X] TNNetCELU — continuously differentiable ELU (`y = max(0,x) +
       min(0, alpha*(exp(x/alpha)-1))`). With TNNetELU now landed, this
       is a one-method variant; reuse the ELU test harness shape.
-- [ ] TNNetSoftPlus identity-vs-Swish unit test: confirm
+- [x] TNNetSoftPlus identity-vs-Swish unit test: confirm
       `SoftPlus(0) = ln(2)` and that the large-x linearization branch
       kicks in correctly. The layer already exists; this is a tiny
-      coverage gap.
+      coverage gap. Landed: TestSoftPlusIdentityAtZero,
+      TestSoftPlusLargeXLinearization and TestSoftPlusExtremeInputSaturation
+      in TestNeuralNumerical.pas (suite 376 -> 379).
 - [X] Continue the LoadFromString round-trip sweep called out around
       line 1748: TNNetSwiGLU, TNNetGEGLU, TNNetLayerScale, TNNetRMSNorm,
       TNNetDropPath. TNNetReLU6 and TNNetGlobalMaxPool are now done; the
@@ -1878,8 +1880,12 @@ have landed recently.
 - [ ] TNNetChannelShuffle — ShuffleNet primitive. Pure permutation,
       mirror-image gathers for forward/backward. One grad-check + one
       "compose twice with same G returns identity" sanity check.
-- [ ] TNNetReverseChannels — flips the channel axis. Silly, tiny, but
+- [x] TNNetReverseChannels — flips the channel axis. Silly, tiny, but
       a great smoke test for the LoadFromString round-trip harness.
+      Landed: parameter-free TNNetIdentity descendant, involution
+      backward = forward, four tests in TestNeuralNumerical.pas
+      (forward, gradient check, involution property, serialization
+      round-trip).
 
 #### Normalization follow-ups
 - [x] TNNetInstanceNorm — per-sample, per-channel normalization (the
@@ -2543,11 +2549,12 @@ draw.
 
 #### Follow-ups added by this pass
 
-- [ ] Tasklist staleness sweep: write a small `scripts/audit_tasklist.sh`
+- [x] Tasklist staleness sweep: write a small `scripts/audit_tasklist.sh`
       (or similar) that greps each unchecked `TNNet*` mentioned in
       tasklist.md against `neural/neuralnetwork.pas` and flags any
       name already present in the dispatch tables. Would have caught
       the four stale entries above before they hit an agent.
+      Landed: scripts/audit_tasklist.sh — see entry in seed 993208 batch.
 - [ ] PixelNorm follow-ups now that it has landed:
   - [ ] PixelNorm + StyleGAN-flavored generator micro-example (the
         layer's headline use case; pairs with the existing VisualGAN).
@@ -2648,12 +2655,20 @@ re-pinning trap noted in the previous batch's meta-observation.
       SDPA but no public example" gap.
 
 #### Infrastructure / tooling
-- [ ] Implement `scripts/audit_tasklist.sh` from the previous
+- [x] Implement `scripts/audit_tasklist.sh` from the previous
       pass's follow-ups — picking it up explicitly here so the
       next lucky-day pass can grep this tasklist itself for stale
       entries before dispatching. ~30 lines of bash; reads
       `tasklist.md`, extracts unchecked TNNet* names, greps the
       dispatch tables in `neural/neuralnetwork.pas`, flags hits.
+      Landed: scripts/audit_tasklist.sh (50 lines). Two-pass grep
+      using a sorted known-names set built from every TNNet* token
+      in neuralnetwork.pas (covers both class decls and dispatch
+      literals). First run surfaces 73 stale occurrences — some
+      duplicates (e.g. TNNetScaledDotProductAttention x3,
+      TNNetMaskedFill x3), confirming the re-pin pattern; many
+      hits are also context-references rather than re-pins, so
+      a contributor still needs to judge.
 - [ ] `bin/` Volume micro-benchmark (third re-pin). I would
       genuinely enjoy writing this on a future lucky day —
       pinning it again so it stays visible.
@@ -2665,3 +2680,46 @@ re-pinning trap noted in the previous batch's meta-observation.
       in the bottom of `tasklist.md`; a separate file would let
       `tasklist.md` itself be pruned of historical batches once
       they're fully landed.
+
+
+### Lucky-day batch — 2026-05-15 (post ReverseChannels + SoftPlus-tests + audit_tasklist)
+
+Three serial opus agents dispatched on a lucky day:
+
+- `307335c` — TNNetReverseChannels (channel-axis flip). Parameter-free
+  TNNetIdentity descendant; involution so backward == forward. Four
+  tests (forward, gradient check, involution, serialization round-trip).
+- `a5568ce` — TNNetSoftPlus coverage tests (3 new): identity at zero
+  (`SoftPlus(0)=ln(2)`), large-x linearization branch (x>30 returns x),
+  and ±extreme-input saturation.
+- `15a6de1` — `scripts/audit_tasklist.sh` staleness sweep. First run
+  surfaced 73 TNNet* occurrences in unchecked entries, many duplicated.
+
+Test suite: 372 -> 379, all passing. No new bugs in landed layers.
+
+#### Surfaced (not fixed)
+
+- [ ] TNNetSoftPlus derivative-path overflow on very negative x:
+      `TNNetSoftPlus.Compute`'s derivative is `1/(1+Exp(-x))`, which raises
+      `EOverflow` when `-x` is large (e.g. x=-1e3 → Exp(1e3)). The forward
+      output path has the `x>30 ⇒ x` stable branch, but the derivative
+      path is not symmetrically guarded. Fix is one extra branch
+      (`x < -30 ⇒ deriv := Exp(x)` ≈ 0) and a regression test feeding
+      x=-1e3 through Backpropagate asserting no exception and a finite
+      input gradient.
+
+#### Follow-ups
+
+- [ ] Triage the audit_tasklist.sh output: 73 hits include both genuine
+      re-pins (TNNetScaledDotProductAttention x3, TNNetMaskedFill x3) and
+      mere context-references (e.g. "ALiBi-with-MaskedFill composition
+      test" — the test is open, not the layer). A `--strict` mode that
+      only flags lines starting with the canonical "TNNet… — …" pattern
+      (the way a re-pin reads) would cut the false-positive rate.
+- [ ] CIFAR/segmentation example using TNNetReverseChannels — its
+      headline use case (channel-flip data augmentation or a residual
+      branch with reversed channel order) — would give the new layer
+      an end-to-end home rather than only living in the test suite.
+- [ ] README activation reference: TNNetSoftPlus already has rows in
+      the activation table; once the negative-x derivative guard above
+      lands, add a "stable on both tails" note next to its entry.
