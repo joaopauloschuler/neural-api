@@ -91,6 +91,9 @@ type
     procedure TestLogSigmoidGradientCheck;
     procedure TestLogSigmoidSerializationRoundTrip;
     procedure TestLogSigmoidExtremeInputSaturation;
+    procedure TestShiftedReLUForward;
+    procedure TestShiftedReLUGradientCheck;
+    procedure TestShiftedReLUSerializationRoundTrip;
     procedure TestHardTanhForward;
     procedure TestHardTanhGradientCheck;
     procedure TestHardShrinkForward;
@@ -3675,6 +3678,41 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestShiftedReLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetShiftedReLU.Create());
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := -1.0;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := 2.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('ShiftedReLU(-2)', -1.0, NN.GetLastLayer.Output.Raw[0], 1e-6);
+    AssertEquals('ShiftedReLU(-1)', -1.0, NN.GetLastLayer.Output.Raw[1], 1e-6);
+    AssertEquals('ShiftedReLU(0)',   0.0, NN.GetLastLayer.Output.Raw[2], 1e-6);
+    AssertEquals('ShiftedReLU(2)',   2.0, NN.GetLastLayer.Output.Raw[3], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestShiftedReLUGradientCheck;
+begin
+  // Stay clear of the kink at x = -1.
+  ActivationGradientCheck(Self, TNNetShiftedReLU.Create(), 'ShiftedReLU',
+    [0.5, -0.5, 1.0, -0.25, 2.0, -2.5], 0.01);
+end;
+
 procedure TTestNeuralNumerical.TestHardTanhForward;
 var
   NN: TNNet;
@@ -5338,6 +5376,12 @@ procedure TTestNeuralNumerical.TestLogSigmoidSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetLogSigmoid.Create(),
     'LogSigmoid', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestShiftedReLUSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetShiftedReLU.Create(),
+    'ShiftedReLU', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSoftShrinkSerializationRoundTrip;

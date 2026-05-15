@@ -659,6 +659,15 @@ type
     procedure Compute(); override;
   end;
 
+  /// ShiftedReLU activation function.
+  // ShiftedReLU(x) = max(-1, x). Parameter-free. Derivative is 1 for x > -1,
+  // else 0. Cached in FOutputErrorDeriv so TNNetReLUBase handles the
+  // backward chain rule.
+  TNNetShiftedReLU = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5001,6 +5010,53 @@ begin
         FOutput.FData[OutputCnt] := -Ln(1 + Exp(-x))
       else
         FOutput.FData[OutputCnt] := x - Ln(1 + Exp(x));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetShiftedReLU }
+
+procedure TNNetShiftedReLU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // ShiftedReLU(x) = max(-1, x); derivative is 1 if x > -1 else 0.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > -1 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := -1;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > -1 then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := -1;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15534,6 +15590,7 @@ begin
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
       'TNNetLogSigmoid' :           Result := TNNetLogSigmoid.Create();
+      'TNNetShiftedReLU' :          Result := TNNetShiftedReLU.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -15681,6 +15738,7 @@ begin
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
       if S[0] = 'TNNetLogSigmoid' then Result := TNNetLogSigmoid.Create() else
+      if S[0] = 'TNNetShiftedReLU' then Result := TNNetShiftedReLU.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
