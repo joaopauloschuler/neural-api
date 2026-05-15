@@ -465,3 +465,126 @@ Tiny correctness follow-ups:
 - [ ] RoPE odd-depth guard test: assert constructing+wiring a
       `TNNetRotaryEmbedding` after a layer with odd Depth raises the
       expected error (validates the even-Depth precondition).
+
+### Ideas added on 2026-05-15 (lucky seed 164520)
+
+The MHA breakdown (MHA-a/b/c) above is the headline next step. The ideas
+below are things I would personally enjoy taking on either as warm-up
+tasks before MHA lands, or as parallel tracks while it does.
+
+#### Layers I'd enjoy building
+- [ ] TNNetALiBi — finally pick up the position-bias entry above. It is
+      the smallest possible "alternative to RoPE": precompute a single
+      `slope[h]` per head and add `slope * (key_pos - query_pos)` into
+      the attention score map before softmax. Parameter-free (slopes are
+      deterministic from head count, per the paper), so the gradient
+      check is the same shape as TNNetMaskedFill's.
+- [ ] TNNetSinkAttention — small, fun variant: prepend K "attention sink"
+      key/value slots that every query can attend to. Helps long-context
+      stability and is a 30-line addition on top of SDPA once the per-row
+      mask/key-padding plumbing exists.
+- [ ] TNNetTalkingHeadsProjection — the cross-head mixing matrix from
+      Shazeer et al. A tiny learnable HxH multiply applied to attention
+      logits across heads. Drops into the eventual MHA helper, parameter
+      count is trivial, gradient check is a straight matmul backward.
+- [ ] TNNetTokenShift — the Lite-RWKV / time-mixing trick: blend each
+      token with the previous token via a learnable per-channel mix.
+      Cheap, useful for the eventual tiny-GPT story, and a clean
+      sequence-aware layer that does not need attention to be done.
+- [ ] TNNetSpatialDropout1D / TNNetSpatialDropout2D — drop entire
+      channels/feature-maps instead of individual elements; common in
+      conv and seq nets. Tiny variant on the existing Dropout but worth
+      its own gradient-check entry.
+- [ ] TNNetStochasticPool — the stochastic-pooling alternative to MaxPool
+      (sample one cell per window weighted by its activation). Cute,
+      parameter-free, RNG-seeded test similar to DropPath's.
+
+#### Composite blocks / examples
+- [ ] TNNetPreNormResidual helper — `y = x + Sublayer(LayerNorm(x))`
+      single-line builder. Once MHA + SwiGLU FFN land, this is the
+      shortest path to a "real" transformer block.
+- [ ] TNNetGLUFeedForward block — same shape as the SwiGLU FFN entry
+      above but using the plain TNNetGLU that already landed; gives a
+      working FFN to test the pre-norm-residual builder against today,
+      no waiting on new gating layers.
+- [ ] Tiny "induction-heads" demo: train a 2-layer attention-only model
+      on a repeat-the-pattern toy task and show the second layer's
+      attention diagonal jumps to the previous-occurrence position.
+      Lovely small experiment that exercises SDPA + MaskedFill + RoPE
+      end-to-end and produces a publishable PGM artifact.
+
+#### Experiments I'm curious about
+- [ ] Causal-mask + SoftCapping interaction study: with logits clipped
+      via `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a
+      tiny next-token task and chart loss + max-logit-norm. Pairs the
+      two stabilizers that just landed.
+- [ ] DropPath schedule study: linearly increasing drop probability with
+      depth (the Stochastic-Depth schedule from the paper) vs constant
+      `p`. Train a small residual stack on a toy task and chart final
+      loss for both schedules. Concrete demonstration of why the
+      schedule matters.
+- [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
+      `base ∈ {1e2, 1e3, 1e4, 1e5}`, chart loss and qualitative sample
+      quality. Tiny knowledge-building experiment about a number that
+      gets cargo-culted as "10000".
+- [ ] "Surgery" experiment: train a small classifier, then zero out the
+      top-K most-active hidden units and chart accuracy degradation
+      vs K. Cheap, fun, teaches "redundancy in representations".
+- [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
+      gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and
+      print max-error vs eps. Produces the canonical curve we should
+      reference when picking a tolerance for new tests.
+
+#### Correctness / audit work I'd enjoy
+- [ ] SDPA all-masked-row policy decision and test: currently a row
+      where every key is masked produces NaN (softmax of all -inf).
+      Decide between "row outputs zeros" or "row passes through V mean"
+      or "raise an error", document the choice in the code, and add the
+      test pinning the behavior. Already flagged above; I want to close it.
+- [ ] DropPath p=0 / p=1 boundary tests: p=0 must be exact identity
+      (including in training mode), p=1 must zero the sample but still
+      produce gradient zeros without NaNs. Two tiny tests pinning the
+      degenerate endpoints.
+- [ ] SoftCapping `c → ∞` continuity test: as `c` grows the layer should
+      approach identity. Assert that `Compute(input)` with `c = 1e6`
+      matches the input within fp tolerance. Cheap regression guard.
+- [ ] RoPE forward-then-inverse round-trip test at SeqLen > 1 — extend
+      the existing inverse-rotation test to a non-trivial sequence
+      length to catch position-indexing bugs.
+- [ ] LoadFromString round-trip for the recent landings: explicitly
+      cover TNNetSoftCapping, TNNetDropPath, TNNetRotaryEmbedding,
+      TNNetMaskedFill, TNNetScaledDotProductAttention. Each one is a
+      ~5-line test; subsumes a slice of the broader round-trip property
+      test idea above.
+- [ ] Property-based gradient harness (kickoff): even a v0 that only
+      randomizes input shape (keeping layer type fixed) for the 6 most
+      recently landed layers is enough to start catching shape-edge
+      bugs and lays the groundwork for the full version listed above.
+
+#### Tooling / dev experience
+- [ ] `tests/RunAll.sh` that builds + runs every test program in tests/
+      with a single command and a non-zero exit on any failure. Tiny
+      thing, removes "which test am I supposed to run" friction.
+- [ ] Add a `--quick` flag to the numerical-gradient test runner that
+      skips the heavier `SeqLen > 4` cases — useful for local
+      iterate-fast loops while audits are in flight.
+- [ ] Tiny `scripts/list_untested_layers.sh` that greps neuralnetwork.pas
+      for `TNNet*` class declarations and reports which ones never appear
+      in any test file. A v0 of the coverage-script idea above; one
+      shell pipeline, immediately actionable output.
+
+#### Documentation
+- [ ] Annotated walkthrough of the SDPA Compute + Backpropagate pair —
+      the softmax-Jacobian derivation, shape annotations on every line,
+      and a worked tiny example (d_k=2, SeqLen=2). Most algorithmically
+      dense layer in the repo; deserves the longest doc.
+- [ ] "Picking a tolerance" doc for numerical-gradient tests — when is
+      1e-2 fine, when do you need 1e-3, when should you tighten the eps
+      instead of loosening the tolerance. Companion to the eps-sweep
+      experiment above.
+- [ ] One-pager "transformer building blocks landed in this repo" —
+      a table of LayerNorm / MaskedFill / SDPA / RoPE / SoftCapping /
+      DropPath / GEGLU / SwiGLU / GLU / SquaredReLU / LayerScale /
+      AddPositionalEmbedding with a one-line "what it is" + "use it
+      when". Becomes the index entry into the eventual MHA + encoder
+      block helpers.
