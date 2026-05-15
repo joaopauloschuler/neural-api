@@ -663,6 +663,19 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// PenalizedTanh activation function.
+  // Asymmetric tanh that scales the negative branch by 0.25:
+  //   y =        tanh(x)   if x >  0
+  //   y = 0.25 * tanh(x)   if x <= 0
+  // Derivative: (1 - tanh(x)^2) for x > 0, 0.25*(1 - tanh(x)^2) for x <= 0.
+  // Cached in FOutputErrorDeriv so TNNetReLUBase handles the backward chain
+  // rule with one multiply.
+  // Xu et al., "Revise Saturated Activations for Deep Networks" (2016).
+  TNNetPenalizedTanh = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// SoftPlus activation function - This is an experimental layer. Do not use it.
   // A smooth approximation of ReLU.
   // SoftPlus(x) = ln(1 + exp(x)), derivative is the sigmoid function.
@@ -4317,6 +4330,58 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetPenalizedTanh }
+
+procedure TNNetPenalizedTanh.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, tanhVal, sech2: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // PenalizedTanh(x):
+  //   x >  0: y =        tanh(x), dy/dx =        (1 - tanh(x)^2)
+  //   x <= 0: y = 0.25 * tanh(x), dy/dx = 0.25 * (1 - tanh(x)^2)
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      tanhVal := Tanh(x);
+      sech2 := 1 - tanhVal * tanhVal;
+      if x > 0 then
+      begin
+        FOutput.FData[OutputCnt] := tanhVal;
+        FOutputErrorDeriv.FData[OutputCnt] := sech2;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0.25 * tanhVal;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.25 * sech2;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      tanhVal := Tanh(x);
+      if x > 0 then
+        FOutput.FData[OutputCnt] := tanhVal
+      else
+        FOutput.FData[OutputCnt] := 0.25 * tanhVal;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetSquaredReLU }
@@ -17202,6 +17267,7 @@ begin
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetTanhExp' :              Result := TNNetTanhExp.Create();
       'TNNetSmish' :                Result := TNNetSmish.Create();
+      'TNNetPenalizedTanh' :        Result := TNNetPenalizedTanh.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
@@ -17376,6 +17442,7 @@ begin
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetTanhExp' then Result := TNNetTanhExp.Create() else
       if S[0] = 'TNNetSmish' then Result := TNNetSmish.Create() else
+      if S[0] = 'TNNetPenalizedTanh' then Result := TNNetPenalizedTanh.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else

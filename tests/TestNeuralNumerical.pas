@@ -276,6 +276,9 @@ type
     procedure TestTanhExpSerializationRoundTrip;
     procedure TestSmishGradientCheck;
     procedure TestSmishSerializationRoundTrip;
+    procedure TestPenalizedTanhAsymmetry;
+    procedure TestPenalizedTanhGradientCheck;
+    procedure TestPenalizedTanhSerializationRoundTrip;
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
@@ -9061,6 +9064,59 @@ procedure TTestNeuralNumerical.TestSmishSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSmish.Create(),
     'Smish', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPenalizedTanhAsymmetry;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  Xs: array[0..3] of TNeuralFloat;
+  PosY, NegY: TNeuralFloat;
+begin
+  // y(x>0) = tanh(x); y(x<0) = 0.25*tanh(x) = -0.25*tanh(|x|).
+  // Hence for positive x: y(-x) = -0.25 * y(x).
+  Xs[0] := 0.25;
+  Xs[1] := 0.75;
+  Xs[2] := 1.5;
+  Xs[3] := 3.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    NN.AddLayer(TNNetPenalizedTanh.Create());
+    for i := 0 to 3 do
+    begin
+      Input.Raw[i] := Xs[i];
+      Input.Raw[4 + i] := -Xs[i];
+    end;
+    NN.Compute(Input);
+    for i := 0 to 3 do
+    begin
+      PosY := NN.GetLastLayer.Output.Raw[i];
+      NegY := NN.GetLastLayer.Output.Raw[4 + i];
+      AssertEquals('PenalizedTanh positive branch = tanh(x)',
+        Tanh(Xs[i]), PosY, 1e-5);
+      AssertEquals('PenalizedTanh negative branch = -0.25 * positive',
+        -0.25 * PosY, NegY, 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPenalizedTanhGradientCheck;
+begin
+  // Probe both branches; x=0 falls in the x<=0 branch by definition.
+  ActivationGradientCheck(Self, TNNetPenalizedTanh.Create(), 'PenalizedTanh',
+    [0.5, -0.5, 1.0, -2.0, 1.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestPenalizedTanhSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetPenalizedTanh.Create(),
+    'PenalizedTanh', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSincForward;
