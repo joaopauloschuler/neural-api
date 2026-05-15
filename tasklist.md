@@ -457,14 +457,17 @@ Bake-off / experiment follow-ups for the layers that just landed:
 
 Tiny correctness follow-ups:
 
-- [ ] SoftCapping saturation test on extreme inputs (±1e6) — assert
+- [x] SoftCapping saturation test on extreme inputs (±1e6) — assert
       output stays within ±c and `Backpropagate` doesn't produce NaNs.
+      Done: TestSoftCappingExtremeInputSaturation in TestNeuralNumerical.pas.
 - [ ] DropPath determinism test: with a fixed `RandSeed`, two Compute
       calls produce identical masks/outputs across runs. Pin the
       RNG-reset behavior so future refactors can't silently break it.
-- [ ] RoPE odd-depth guard test: assert constructing+wiring a
+- [x] RoPE odd-depth guard test: assert constructing+wiring a
       `TNNetRotaryEmbedding` after a layer with odd Depth raises the
       expected error (validates the even-Depth precondition).
+      Done: TestRotaryEmbeddingOddDepthGuard via the FErrorProc capture
+      pattern in TestNeuralNumerical.pas.
 
 ### Ideas added on 2026-05-15 (lucky seed 164520)
 
@@ -491,10 +494,18 @@ tasks before MHA lands, or as parallel tracks while it does.
       token with the previous token via a learnable per-channel mix.
       Cheap, useful for the eventual tiny-GPT story, and a clean
       sequence-aware layer that does not need attention to be done.
-- [ ] TNNetSpatialDropout1D / TNNetSpatialDropout2D — drop entire
+- [x] TNNetSpatialDropout1D / TNNetSpatialDropout2D — drop entire
       channels/feature-maps instead of individual elements; common in
-      conv and seq nets. Tiny variant on the existing Dropout but worth
-      its own gradient-check entry.
+      conv and seq nets. Landed: both descend from TNNetAddNoiseBase,
+      keep_prob in FFloatSt[0], use TNNetVolume.MulChannels for the
+      per-channel mask, registered in both CreateLayer dispatches.
+      Forward identity (inference), per-channel mask shape, seeded
+      gradient check, and SaveToString round-trip tests for each
+      (TestSpatialDropout{1D,2D}{InferenceIdentity,TrainingMaskShape,
+      GradientCheck,SerializationRoundTrip}) in TestNeuralNumerical.pas.
+      1D and 2D share the same Compute (mask along Depth, broadcast over
+      SizeX*SizeY by MulChannels) — the split is a Keras/PyTorch-style
+      naming convention.
 - [ ] TNNetStochasticPool — the stochastic-pooling alternative to MaxPool
       (sample one cell per window weighted by its activation). Cute,
       parameter-free, RNG-seeded test similar to DropPath's.
@@ -541,37 +552,45 @@ tasks before MHA lands, or as parallel tracks while it does.
       Decide between "row outputs zeros" or "row passes through V mean"
       or "raise an error", document the choice in the code, and add the
       test pinning the behavior. Already flagged above; I want to close it.
-- [ ] DropPath p=0 / p=1 boundary tests: p=0 must be exact identity
+- [x] DropPath p=0 / p=1 boundary tests: p=0 must be exact identity
       (including in training mode), p=1 must zero the sample but still
-      produce gradient zeros without NaNs. Two tiny tests pinning the
-      degenerate endpoints.
-- [ ] SoftCapping `c → ∞` continuity test: as `c` grows the layer should
-      approach identity. Assert that `Compute(input)` with `c = 1e6`
-      matches the input within fp tolerance. Cheap regression guard.
-- [ ] RoPE forward-then-inverse round-trip test at SeqLen > 1 — extend
+      produce gradient zeros without NaNs. Done: TestDropPathPZeroBoundary
+      and TestDropPathPOneBoundary. The p=1 test surfaced that
+      TNNetDropPath.Create silently clamps `pDropProb >= 1` to 0.99
+      (inverted-dropout div-by-zero guard) — see follow-up below.
+- [x] SoftCapping `c → ∞` continuity test: as `c` grows the layer should
+      approach identity. Done: TestSoftCappingLargeCapContinuity (c=1e6).
+- [x] RoPE forward-then-inverse round-trip test at SeqLen > 1 — extend
       the existing inverse-rotation test to a non-trivial sequence
-      length to catch position-indexing bugs.
-- [ ] LoadFromString round-trip for the recent landings: explicitly
+      length to catch position-indexing bugs. Done:
+      TestRotaryEmbeddingInverseSeqLen5.
+- [x] LoadFromString round-trip for the recent landings: explicitly
       cover TNNetSoftCapping, TNNetDropPath, TNNetRotaryEmbedding,
-      TNNetMaskedFill, TNNetScaledDotProductAttention. Each one is a
-      ~5-line test; subsumes a slice of the broader round-trip property
-      test idea above.
+      TNNetMaskedFill, TNNetScaledDotProductAttention. Done: five
+      Test*SerializationRoundTrip methods sharing a SerializationRoundTrip
+      helper in TestNeuralNumerical.pas.
 - [ ] Property-based gradient harness (kickoff): even a v0 that only
       randomizes input shape (keeping layer type fixed) for the 6 most
       recently landed layers is enough to start catching shape-edge
       bugs and lays the groundwork for the full version listed above.
 
 #### Tooling / dev experience
-- [ ] `tests/RunAll.sh` that builds + runs every test program in tests/
-      with a single command and a non-zero exit on any failure. Tiny
-      thing, removes "which test am I supposed to run" friction.
+- [x] `tests/RunAll.sh` that builds + runs every test program in tests/
+      with a single command and a non-zero exit on any failure. Landed:
+      uses `set -euo pipefail`, cd's via BASH_SOURCE so it works from any
+      cwd, honors `LAZUTILS_PATH` env override, errors clearly if the
+      lazarus path is missing, execs `./RunTests -a -p` so the runner's
+      exit code propagates.
 - [ ] Add a `--quick` flag to the numerical-gradient test runner that
       skips the heavier `SeqLen > 4` cases — useful for local
       iterate-fast loops while audits are in flight.
-- [ ] Tiny `scripts/list_untested_layers.sh` that greps neuralnetwork.pas
+- [x] Tiny `scripts/list_untested_layers.sh` that greps neuralnetwork.pas
       for `TNNet*` class declarations and reports which ones never appear
-      in any test file. A v0 of the coverage-script idea above; one
-      shell pipeline, immediately actionable output.
+      in any test file. Landed: v0 reports 53 untested classes (mix of
+      genuinely-untested layers like TNNetMaxPoolWithPosition and
+      base/abstract classes like TNNetReLUBase / TNNetPoolBase /
+      TNNetConcatBase that don't need direct tests). Natural follow-ups
+      below.
 
 #### Documentation
 - [ ] Annotated walkthrough of the SDPA Compute + Backpropagate pair —
@@ -588,3 +607,42 @@ tasks before MHA lands, or as parallel tracks while it does.
       AddPositionalEmbedding with a one-line "what it is" + "use it
       when". Becomes the index entry into the eventual MHA + encoder
       block helpers.
+
+### Ideas added on 2026-05-15 (post SpatialDropout + safety-net + devx batch)
+
+#### Bugs / quirks surfaced by the new safety nets
+- [ ] TNNetDropPath.Create silently clamps `pDropProb >= 1` to 0.99 to
+      avoid a div-by-zero in the inverted-dropout `1/(1-p)` scaling.
+      Consequence: `p=1` does NOT mean "always drop" — about 1% of samples
+      survive and are amplified ~100x. Fix: special-case `pDropProb >= 1`
+      in the constructor to set `Scale := 0` (and skip the division)
+      instead of clamping the probability. Then tighten
+      `TestDropPathPOneBoundary` to assert strict all-zero output.
+
+#### Layers I'd enjoy building next (warm-up before MHA)
+- [ ] TNNetSpatialDropout1D/2D follow-ups now that they have landed:
+      - A schedule-aware variant (e.g. linearly-increasing channel-drop
+        probability with depth) for the eventual ResNet/ConvNeXt examples.
+      - Wire one of them into an existing CIFAR-10 example as an opt-in
+        regularizer, with a one-line README mention.
+- [ ] TNNetALiBi positional bias — still the smallest "alternative to
+      RoPE" task on the list and now the most isolated next layer (no
+      MHA dependency). Parameter-free, gradient check shape mirrors
+      TNNetMaskedFill, and it slots into the eventual MHA helper.
+
+#### Tooling follow-ups now that the v0 scripts shipped
+- [ ] Filter `scripts/list_untested_layers.sh` to skip obvious base/
+      abstract classes (names ending in `Base`, `Class`, or `Abstract`,
+      plus a small explicit allowlist) so the report shows only the
+      ~25-ish concrete-but-untested layers worth auditing. The current
+      53-line output is still actionable but mixes signal with noise.
+- [ ] Extend `scripts/list_untested_layers.sh` to also report each
+      reported class's source file:line (from the `class(...)` declaration)
+      so a contributor can jump straight to it.
+- [ ] Add a `--quick` flag to RunAll.sh that passes through to a
+      yet-to-be-added test-runner option to skip the slow numerical-
+      gradient cases (pairs with the `--quick` flag idea already on
+      the list).
+- [ ] CI shim: a tiny GitHub Actions workflow that runs
+      `tests/RunAll.sh` on push. The script already has the right
+      exit semantics — the workflow is ~15 lines.
