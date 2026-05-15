@@ -3637,3 +3637,174 @@ Test suite: 411 -> 419, all passing. No bugs surfaced.
       "Jacobian scales with input" relative-tolerance test pinned in
       seed 995227. Pins the central-difference noise floor for this
       family.
+
+### Lucky-day batch — 2026-05-15 (seed 141347)
+
+Fresh draw on a lucky day. The elementwise transcendental family
+(Sqrt / Exp / Log / Reciprocal) just completed in earlier batches; this
+draw deliberately steps away from that family to look at the periodic /
+parametric / sparsity-routing corners of the layer space, plus a couple
+of small composite-block builders that are unblocked by all the recent
+landings. Every TNNet* name below was grep-verified absent from
+`neural/neuralnetwork.pas` before listing.
+
+#### Periodic activations I'd enjoy authoring
+- [ ] TNNetSin — `y = sin(x)`, derivative `cos(x)`. The SIREN paper's
+      core ingredient; pairs naturally with a tiny SIREN-flavored
+      regression example fitting a 1D function with three Sin-activated
+      dense layers. Parameter-free, four-test shape (forward at typical
+      inputs, gradient check, periodicity-as-property
+      `Compute(x) == Compute(x + 2π)` to within fp tol,
+      SerializationRoundTrip). Verified absent.
+- [ ] TNNetCos — `y = cos(x)`, derivative `-sin(x)`. Sibling of TNNetSin;
+      composed as a phase-shifted Sin in tests (`cos(x) ≈ sin(x + π/2)`).
+      Verified absent.
+- [ ] TNNetSnake — `y = x + (1/α) * sin(α x)^2`, derivative
+      `1 + sin(2 α x)`. α in FFloatSt[0] default 1.0. The Ziyin 2020
+      periodic activation that learns periodic functions without an
+      explicit SIREN frequency. Already pinned earlier but worth
+      re-pinning alongside Sin/Cos — the three form a coherent
+      "periodic activation menagerie" mini-batch.
+- [ ] TNNetErf — `y = erf(x)`, derivative `(2/√π) exp(-x^2)`. The
+      closed-form GELU partner (GELU uses an erf-based form internally;
+      exposing the bare erf makes the relation legible and is a fun
+      isolated layer). Verified absent. Caveat: FPC `math.erf` exists
+      on recent versions; check before claiming portability.
+
+#### Parametric activations I'd enjoy authoring
+- [ ] TNNetPReLU — parametric ReLU with a single learnable negative-slope
+      scalar (broadcast across the volume). Slope lives as the layer's
+      one neuron weight, gradient is `sum_neg(dy * x)` summed across all
+      negative-side input cells, input-grad is the LeakyReLU forward
+      derivative with the learned slope. Four-test shape including a
+      weight-grad central-difference check (the easiest place for a
+      bug). Verified absent.
+- [ ] TNNetPReLUChannel — per-channel PReLU. Same as above but one
+      learnable slope per output depth channel (matches the original
+      He 2015 paper). Builds on the TNNetChannelBias channel-iteration
+      pattern. Verified absent.
+- [ ] TNNetSwishLearnable — TNNetSwish with a single learnable β
+      (`y = x * sigmoid(β x)`). Exercises the
+      "learnable-scalar-on-an-activation" path that the TNNetLayerScale
+      template already covers; mostly a copy-paste with one extra term
+      in Backpropagate. Pinned in an earlier batch as
+      "Swish-with-learnable-beta"; re-pinning under the canonical name.
+
+#### Sparsity / routing layers I'd enjoy authoring
+- [ ] TNNetTopK — keep only the top-K activations per spatial cell along
+      the depth axis, zeroing the rest. K in FStruct[0]. Argmax-style
+      routing of the gradient (only top-K positions receive incoming
+      error). Useful for sparse-attention stubs and a stepping stone
+      toward MoE routing. Re-pinning from a previous batch.
+- [ ] TNNetStraightThroughEstimator — forward `y = round(x)` (or a
+      configurable quantization step in FFloatSt[0]), backward passes
+      the gradient through unchanged ("identity STE"). The standard
+      trick for training through non-differentiable quantizers; one
+      tiny layer that opens the door to integer-quantization
+      experiments. Verified absent.
+- [ ] TNNetGumbelSoftmax — softmax over depth with added Gumbel noise
+      at training time and temperature in FFloatSt[0]. Inference path
+      degenerates to plain softmax. Useful for any "differentiable
+      categorical sample" experiment (the Concrete distribution).
+      Verified absent. Test plan: training-vs-inference branch
+      coverage, temperature → 0 limit collapses to argmax, gradient
+      flows through the noise.
+
+#### Reduction / shape layers I'd enjoy authoring
+- [ ] TNNetCumSum — cumulative sum along a configurable axis
+      (FStruct[0] ∈ {0,1,2}). Linear, so backward is the reverse
+      cumulative sum along the same axis. Re-pinned for visibility;
+      the "CumSum as a learned linear position feature" experiment
+      already pinned in an earlier batch needs this layer.
+- [ ] TNNetRoll — circular shift along a chosen axis (FStruct[0] axis,
+      FStruct[1] offset). Parameter-free, deterministic permutation;
+      backward is the inverse roll. Re-pinned for visibility.
+- [ ] TNNetL2Normalize — divide by `sqrt(sum(x^2) + eps)`, reduction
+      axis via FStruct[0] (0 = full volume, 1 = per-channel over
+      spatial, 2 = per-position over depth). Re-pinned for visibility.
+
+#### Composite block builders unblocked by recent landings
+- [ ] AddPreNormResidual(NN, Sublayer) — one-liner builder wiring
+      `LayerNorm → Sublayer → residual add`. The transformer
+      pre-norm pattern. All pieces (TNNetLayerNorm, TNNetSum) are in
+      tree. Re-pinned multiple batches; with LayerNorm and Sum both
+      gradient-checked, the block itself can ship as a small builder
+      test.
+- [ ] AddRMSNormResidual(NN, Sublayer) — companion builder using
+      RMSNorm in place of LayerNorm (matches LLaMA-style blocks).
+      Two-line variant of the PreNorm builder.
+- [ ] AddSwiGLUFeedForward(NN, d_model, d_ff) — wires
+      `Dense(d_model → 2*d_ff) → SwiGLU → Dense(d_ff → d_model)`.
+      With SwiGLU + Dense in tree, this is ~10 lines of builder code
+      and one composite-block test. Re-pinned across batches; the
+      headline "ready next step" item from the existing tasklist.
+
+#### Tests I'd enjoy adding
+- [ ] TNNetReciprocal small-|x| gradient-magnitude sanity check (was
+      flagged as a follow-up in the previous lucky-day batch and is
+      still open). Mirror TNNetSquare's "Jacobian scales with input"
+      relative-tolerance test.
+- [ ] Test that `TNNetNegate.Compose(TNNetNegate)` round-trips to
+      identity within fp tolerance on a random volume. Cheap
+      involution check; doubles as the smoke test for the
+      involution-via-double-negate property already pinned in the
+      InvolutionDemo example.
+- [ ] Numerical-gradient checks for the deconvolution / upsampling
+      family (TNNetUpsample, TNNetDeconvolution, TNNetDeMaxPool,
+      TNNetDeAvgPool, TNNetDeLocalConnect) — the family is still
+      uncovered after the activation / pooling / concat audits.
+      Already pinned in earlier batches; re-pinning here because
+      this is the next coherent audit unit.
+
+#### Experiments I'm curious about
+- [ ] SIREN-flavored 1D function fit: train a 3-layer TNNetSin MLP to
+      fit `f(x) = sin(8x) + sin(3x)` on `x ∈ [-π, π]`, compare to a
+      ReLU MLP of equal width. One chart, two configs; demonstrates
+      the periodic-activation payoff. Unblocked by TNNetSin landing.
+- [ ] PReLU vs LeakyReLU vs ReLU on a tiny CIFAR stub: same model
+      depth, same epochs, three activations; show whether the learned
+      negative slope of PReLU actually wins. Unblocked by TNNetPReLU.
+- [ ] TopK bottleneck sparsity sweep (re-pinned): train the same tiny
+      autoencoder with K ∈ {1, 2, 4, 8, 16, full} and chart
+      reconstruction loss vs sparsity. Unblocked by TNNetTopK.
+- [ ] Straight-through quantization demo: train a small classifier
+      where one hidden layer's outputs are passed through a
+      TNNetStraightThroughEstimator quantizer; compare accuracy
+      against the unquantized baseline. Unblocked by
+      TNNetStraightThroughEstimator.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin
+      (unblocked by the Sin landing above). 50-line self-contained
+      demo with a tiny matplotlib-free ASCII chart of the fit.
+- [ ] `examples/PReLUvsLeakyReLU/` — three-config bake-off described
+      in the experiment above. Doubles as the headline use case for
+      the PReLU landing.
+
+#### Documentation I'd enjoy writing
+- [ ] "Periodic activations" README subsection covering TNNetSin,
+      TNNetCos, TNNetSnake (and TNNetGaussianActivation as the
+      non-periodic-but-related smooth-bump partner). One paragraph
+      on when periodicity helps, one tiny SIREN snippet.
+- [ ] "Sparsity & routing" README subsection covering TNNetTopK,
+      TNNetHardShrink, TNNetSoftShrink and TNNetThreshold once
+      TopK lands — the four together form the "make activations
+      sparse" toolkit and deserve a single home in the layer
+      reference.
+- [ ] `docs/numerical-gradient.md` — short note on how the project's
+      central-difference gradient checks work and how to add one
+      for a new layer. Already pinned as "how numerical gradient
+      testing works in this repo"; re-pinned because the
+      `TestNeuralNumerical.pas` patterns are now mature enough that
+      the note essentially writes itself.
+
+#### Stretch / ambitious (re-pinned for visibility)
+- [ ] TNNetMultiHeadSelfAttention — still the headline blocker for
+      Tiny GPT. With SDPA + RoPE + MaskedFill + ALiBi + LayerNorm +
+      SwiGLU all in tree, the missing piece is the H-head wrapper
+      with Q/K/V projections and an output projection.
+- [ ] Tiny GPT char-level example on CPU — pinned across every
+      lucky-day batch. Unblocked the moment MHSA lands.
+- [ ] Mixture-of-Experts routing layer — best done after MHSA so it
+      has a real host architecture; TNNetTopK above is the
+      sub-primitive that needs to land first either way.
