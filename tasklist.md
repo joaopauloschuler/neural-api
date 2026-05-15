@@ -1794,3 +1794,43 @@ hitting the same wall.**
       registered layers always show up in docs. Could start as a
       Pascal helper that emits markdown to stdout.
 
+### Lucky-day batch — 2026-05-15 (post ELU/SiLU/SoftSign + GlobalAvgPool-grad landings)
+
+This batch landed:
+- TNNetELU (configurable alpha, cached-output backward) + TNNetSiLU alias
+  for Swish(beta=1). Forward / gradient / serialization round-trip tests
+  in TestNeuralNumerical.pas.
+- TNNetSoftSign (`y = x/(1+|x|)`), parameter-free, cached
+  `1/(1+|x|)^2` derivative for a single-multiply backward. Forward /
+  gradient / serialization round-trip tests.
+- Numerical-gradient test for TNNetAvgChannel (the existing
+  global-avg-pool implementation) and serialization round-trip tests for
+  TNNetReLU6 and TNNetGlobalMaxPool.
+
+Notable finding: there is no `TNNetGlobalAvgPool` class — the
+global-avg-pool role is filled by `TNNetAvgChannel`. The earlier
+"GlobalAvgPool numerical-gradient test" entries actually target
+TNNetAvgChannel; this is now covered.
+
+#### Small follow-ups
+- [ ] Add a `TNNetGlobalAvgPool = TNNetAvgChannel` type alias (mirroring
+      `TNNetGlobalMaxPool` naming) so the LoadFromString dispatch and
+      future docs match the canonical Keras/PyTorch name. One-line type
+      decl + dispatch registration + a round-trip test.
+- [ ] TNNetCELU — continuously differentiable ELU (`y = max(0,x) +
+      min(0, alpha*(exp(x/alpha)-1))`). With TNNetELU now landed, this
+      is a one-method variant; reuse the ELU test harness shape.
+- [ ] TNNetSoftPlus identity-vs-Swish unit test: confirm
+      `SoftPlus(0) = ln(2)` and that the large-x linearization branch
+      kicks in correctly. The layer already exists; this is a tiny
+      coverage gap.
+- [ ] Continue the LoadFromString round-trip sweep called out around
+      line 1748: TNNetSwiGLU, TNNetGEGLU, TNNetLayerScale, TNNetRMSNorm,
+      TNNetDropPath. TNNetReLU6 and TNNetGlobalMaxPool are now done; the
+      remaining five share the same harness shape and can land as one
+      commit each (or one bundled commit).
+- [ ] TNNetSoftSign saturation test on ±1e6: assert `|y| < 1` and
+      Backpropagate doesn't NaN. Mirrors the HardTanh / SoftCapping
+      saturation tests; closes the "extreme inputs" coverage gap for
+      the new layer.
+
