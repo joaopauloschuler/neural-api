@@ -6,7 +6,7 @@
 - [ ] TNNetRotaryEmbedding (RoPE)
 - [x] TNNetGEGLU / TNNetSwiGLU gated activations
 - [x] TNNetGroupNorm
-- [ ] TNNetDropPath (stochastic depth)
+- [x] TNNetDropPath (stochastic depth)
 - [ ] Sparse / mixture-of-experts routing layer
 
 ## Interesting applications / examples
@@ -92,9 +92,15 @@
       causal mask flag, full backward pass through the softmax Jacobian, and three
       numerical-gradient tests (forward sanity, non-causal grad check, causal grad
       check) in TestNeuralNumerical.pas.
-- [ ] TNNetDropPath (stochastic depth) — already listed above; I'd like to take
+- [x] TNNetDropPath (stochastic depth) — already listed above; I'd like to take
       it. Identity at inference, whole-sample drop at training. Pairs well with
-      a numerical-gradient test that fixes the RNG seed.
+      a numerical-gradient test that fixes the RNG seed. Landed: parameter-free
+      layer descended from TNNetAddNoiseBase (so TNNet.EnableDropouts toggles
+      training/inference), inverted-dropout scaling 1/(1-p) on kept samples
+      with backward pass reusing the stored scalar, registered in both
+      CreateLayer dispatches, and three tests in TestNeuralNumerical.pas
+      (inference identity, training scaling + grad mirror, seeded
+      central-difference gradient check).
 - [x] TNNetGEGLU / TNNetSwiGLU gated activations — split input in half, gate one
       half with GELU/Swish of the other. Cheap, transformer-relevant, easy to
       gradient-check. Landed: both layers split along the depth axis (output
@@ -245,9 +251,9 @@
       (e) wrap it all in a TNNetMultiHeadSelfAttention helper class or a
           builder function on TNNet. Add a numerical-gradient test on a tiny
           H=2, d_k=4, SeqLen=3 example.
-- [ ] TNNetDropPath (stochastic depth) — identity at inference, whole-sample
+- [x] TNNetDropPath (stochastic depth) — identity at inference, whole-sample
       drop at training. Use a fixed RNG seed in the test so the masked
-      forward/backward is deterministic.
+      forward/backward is deterministic. Landed: see TNNetDropPath entry above.
 - [ ] TNNetMishExact / TNNetGELUExact audit — confirm whether the current
       implementations use the approximation or the exact tanh/erf form, and
       document the choice in the code.

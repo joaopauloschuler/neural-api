@@ -921,6 +921,20 @@ type
       property DropoutMask: TNNetVolume read FDropoutMask;
   end;
 
+  /// Stochastic depth (DropPath) layer. At training time, with probability p
+  // (stored in FFloatSt[0]) the entire sample output is zeroed; otherwise the
+  // input is scaled by 1/(1-p) ("inverted dropout" so the expected magnitude
+  // is preserved). At inference (FEnabled = false), the layer is the identity.
+  // No trainable parameters. Used by stochastic-depth ResNets and ConvNeXt.
+  TNNetDropPath = class(TNNetAddNoiseBase)
+    protected
+      FScale: TNeuralFloat; // 0 if dropped, else 1/(1-p). Used by Backpropagate.
+    public
+      constructor Create(pDropProb: TNeuralFloat = 0.1); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer adds a random addition (or bias) and amplifies (multiplies)
   // randomly. Parameter 10 means changes with up to 1%. Parameter 1
   // means 0.1% and 0 means no change. This layer was create to prevent
@@ -10779,6 +10793,64 @@ begin
   // Dropout mask debug: WriteLn('Dropoutmask sum is:', FDropoutMask.GetSum():6:2, ' Size:', MaxOutput + 1);
 end;
 
+{ TNNetDropPath }
+constructor TNNetDropPath.Create(pDropProb: TNeuralFloat);
+begin
+  inherited Create();
+  if pDropProb < 0 then pDropProb := 0;
+  if pDropProb >= 1 then pDropProb := 0.99;
+  FFloatSt[0] := pDropProb;
+  FScale := 1;
+  if pDropProb > 0 then FEnabled := true;
+end;
+
+procedure TNNetDropPath.Compute();
+var
+  StartTime: double;
+  P, Keep, InvKeep, R: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Default: identity copy (used at inference and as the base path).
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  P := FFloatSt[0];
+  if FEnabled and (P > 0) then
+  begin
+    Keep := 1 - P;
+    if Keep <= 0 then Keep := 1e-6;
+    InvKeep := 1.0 / Keep;
+    R := Random; // uniform [0,1)
+    if R < P then
+    begin
+      FOutput.Fill(0);
+      FScale := 0;
+    end
+    else
+    begin
+      FOutput.Mul(InvKeep);
+      FScale := InvKeep;
+    end;
+  end
+  else
+  begin
+    FScale := 1;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDropPath.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FOutputError.Size = FOutput.Size) and (FScale <> 1) then
+    FOutputError.Mul(FScale);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
 procedure TNNetAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -14061,6 +14133,7 @@ begin
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
       'TNNetHyperbolicTangent' :    Result := TNNetHyperbolicTangent.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
+      'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnect' :          Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
@@ -14187,6 +14260,7 @@ begin
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
       if S[0] = 'TNNetHyperbolicTangent' then Result := TNNetHyperbolicTangent.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
+      if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else

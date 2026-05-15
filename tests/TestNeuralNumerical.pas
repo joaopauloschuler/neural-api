@@ -86,6 +86,9 @@ type
     procedure TestMaskedFillGradientCheck;
     procedure TestSoftCappingForward;
     procedure TestSoftCappingGradientCheck;
+    procedure TestDropPathInferenceIdentity;
+    procedure TestDropPathTrainingScaling;
+    procedure TestDropPathGradientCheck;
     procedure TestAvgPoolGradientCheck;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
@@ -3242,6 +3245,191 @@ begin
   // and the saturating tails for a meaningful derivative check.
   LayerInputGradientCheck(Self, TNNetSoftCapping.Create(3.0),
     'SoftCapping', 3, 1, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestDropPathInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetDropPath.Create(0.5));
+    // Inference mode: dropouts disabled => identity.
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('DropPath inference is identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDropPathTrainingScaling;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i, Trials: integer;
+  P, InvKeep: TNeuralFloat;
+  KeptObserved, DroppedObserved: boolean;
+  Out0, Err0: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create();
+  P := 0.4;
+  InvKeep := 1.0 / (1 - P);
+  KeptObserved := false;
+  DroppedObserved := false;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetDropPath.Create(P));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0; // upstream gradient = output - desired = output itself
+
+    RandSeed := 12345;
+    for Trials := 0 to 19 do
+    begin
+      NN.Compute(Input);
+      Out0 := NN.GetLastLayer.Output.Raw[0];
+      // Check forward: either zero, or input/(1-p).
+      if Abs(Out0) < 1e-6 then
+      begin
+        DroppedObserved := true;
+        for i := 0 to Input.Size - 1 do
+          AssertEquals('DropPath dropped sample zero at ' + IntToStr(i),
+            0.0, NN.GetLastLayer.Output.Raw[i], 0.0001);
+        // Backprop: gradient scaled by 0 -> input layer gets zero.
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        for i := 0 to Input.Size - 1 do
+          AssertEquals('DropPath dropped grad zero at ' + IntToStr(i),
+            0.0, NN.Layers[0].OutputError.Raw[i], 0.0001);
+      end
+      else
+      begin
+        KeptObserved := true;
+        for i := 0 to Input.Size - 1 do
+          AssertEquals('DropPath kept sample scaled at ' + IntToStr(i),
+            Input.Raw[i] * InvKeep, NN.GetLastLayer.Output.Raw[i], 0.0001);
+        // Backprop: upstream grad = output - 0 = output, then scaled by 1/(1-p).
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        // Input layer error should equal output * (1/(1-p)) = input * (1/(1-p))^2.
+        for i := 0 to Input.Size - 1 do
+        begin
+          Err0 := Input.Raw[i] * InvKeep * InvKeep;
+          AssertEquals('DropPath kept grad scaled at ' + IntToStr(i),
+            Err0, NN.Layers[0].OutputError.Raw[i], 0.001);
+        end;
+      end;
+    end;
+    AssertTrue('DropPath should observe at least one kept sample', KeptObserved);
+    AssertTrue('DropPath should observe at least one dropped sample', DroppedObserved);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDropPathGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, k: integer;
+  diff: TNeuralFloat;
+  Seed: longint;
+
+  function ComputeLossSeeded(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    d: TNeuralFloat;
+  begin
+    RandSeed := Seed;
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      d := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * d * d;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  InputPlus := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create();
+  epsilon := 0.0001;
+  Seed := 4242;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetDropPath.Create(0.3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.5);
+
+    // Pick a seed that yields a "kept" forward so the gradient is nonzero
+    // and the central-difference check is informative. If the first try
+    // happens to drop the sample, advance to the next seed that keeps it.
+    while True do
+    begin
+      RandSeed := Seed;
+      NN.Compute(Input);
+      diff := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+        diff := diff + Abs(NN.GetLastLayer.Output.Raw[k]);
+      if diff > 1e-3 then break;
+      Inc(Seed);
+    end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLossSeeded(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLossSeeded(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      RandSeed := Seed;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('DropPath input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
 end;
 
 // CellBias / CellMul carry learnable per-cell weights; check both the input
