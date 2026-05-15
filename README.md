@@ -644,6 +644,8 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetThreshold`             | 1D, 2D, or 3D               | Threshold     | Threshold activation: `y = x if x > theta else value`. Generalizes ReLU; useful as a sparsifier when `theta > 0`. Created with `TNNetThreshold.Create(theta, value)` (both default to 0). |
 | `TNNetLogSigmoid`            | 1D, 2D, or 3D               | LogSigmoid    | Stable log-sigmoid activation: `y = log(sigmoid(x)) = -softplus(-x)`. Pairs with binary cross-entropy with logits. Created with `TNNetLogSigmoid.Create()`. |
 | `TNNetSoftPlus`              | 1D, 2D, or 3D               | SoftPlus      | SoftPlus activation, a smooth approximation of ReLU: `ln(1 + exp(x))`. Created with `TNNetSoftPlus.Create()`. |
+| `TNNetBentIdentity`          | 1D, 2D, or 3D               | BentIdentity  | Bent Identity activation: `y = (sqrt(x^2 + 1) - 1)/2 + x`. Smooth, with always-positive slope. Created with `TNNetBentIdentity.Create()`. |
+| `TNNetLisht`                 | 1D, 2D, or 3D               | LiSHT         | Linearly Scaled Hyperbolic Tangent: `y = x * tanh(x)`. Non-monotonic smooth ReLU alternative. Created with `TNNetLisht.Create()`. |
 | `TNNetGaussianActivation`    | 1D, 2D, or 3D               | Gaussian      | Gaussian activation: `exp(-x^2)`. Created with `TNNetGaussianActivation.Create()`. |
 | `TNNetSqrt`                  | 1D, 2D, or 3D               | Sqrt          | Eps-clamped square root: `y = sqrt(max(x, 1e-6))`. Created with `TNNetSqrt.Create()`. |
 | `TNNetExp`                   | 1D, 2D, or 3D               | Exp           | Overflow-clamped exponential: `y = exp(min(x, 30))`. Created with `TNNetExp.Create()`. |
@@ -658,9 +660,11 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSwish`                 | 1D, 2D, or 3D               | Swish         | Swish activation function.                                                                             |
 | `TNNetSwish6`                | 1D, 2D, or 3D               | Swish 6       | Swish activation clipped at 6.                                                                         |
 | `TNNetHardSwish`             | 1D, 2D, or 3D               | Hard Swish    | Hard version of Swish activation.                                                                      |
+| `TNNetESwish`                | 1D, 2D, or 3D               | ESwish        | Beta-generalized Swish: `y = beta * x * sigmoid(beta * x)`. Created with `TNNetESwish.Create(beta)` (default `beta = 1.25`). |
 | `TNNetHyperbolicTangent`     | 1D, 2D, or 3D               | tanh          | Hyperbolic tangent activation function.                                                                |
 | `TNNetSin`                   | 1D, 2D, or 3D               | Sin           | Periodic activation: `y = sin(x)`. Useful as a SIREN-style coordinate activation. Created with `TNNetSin.Create()`. |
 | `TNNetCos`                   | 1D, 2D, or 3D               | Cos           | Periodic activation: `y = cos(x)`. Phase-shifted partner to `TNNetSin`. Created with `TNNetCos.Create()`. |
+| `TNNetSinc`                  | 1D, 2D, or 3D               | Sinc          | Normalized sinc activation: `y = sin(x)/x`, with analytic limit `y = 1` at `x = 0`. Created with `TNNetSinc.Create()`. |
 | `TNNetNeg`                   | 1D, 2D, or 3D               | Neg           | Elementwise negation: `y = -x`. Created with `TNNetNeg.Create()`. |
 | `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
 | `TNNetMulByConstant`         | 1D, 2D, or 3D               | * C           | Multiplies the output by a constant.                                                                   |
