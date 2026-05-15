@@ -3349,7 +3349,7 @@ before listing (the one exception, TNNetGaussianActivation, is
 explicitly already-landed and is referenced only for context).
 
 #### Closing the Sqrt/Exp/Log follow-up loop
-- [ ] TNNetReciprocal — `y = 1 / (sign(x) * max(|x|, eps))`, eps in
+- [x] TNNetReciprocal — `y = 1 / (sign(x) * max(|x|, eps))`, eps in
       FFloatSt[0] (default 1e-6). Derivative `-1 / (sign(x) *
       max(|x|, eps))^2 = -y^2 * sign(x) / sign(x) = -y * y * sign(x)`
       (cache the output, multiply-and-negate in backward). Four-test
@@ -3357,6 +3357,9 @@ explicitly already-landed and is referenced only for context).
       central-difference gradient away from zero, SerializationRoundTrip.
       Pairs with TNNetSquare/TNNetSqrt to give a hand-rolled
       "Euclidean-norm reciprocal" head as `Reciprocal(Sqrt(Square(x)))`.
+      Landed parameter-free (matching the Sqrt/Exp/Log family decision)
+      in 08914d9; derivative simplifies to -y*y in the unclamped region
+      because s*|x| = x, so the sign factor cancels.
 - [ ] Exp/Log compose-as-identity test: `Log(Exp(x))` should
       reconstruct `x` to within fp tolerance on a small bounded input
       (say `|x| <= 5` to stay well clear of the eps and overflow
