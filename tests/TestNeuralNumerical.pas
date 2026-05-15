@@ -86,6 +86,8 @@ type
     procedure TestSwiGLUGradientCheck;
     procedure TestGLUForward;
     procedure TestGLUGradientCheck;
+    procedure TestReGLUForward;
+    procedure TestReGLUGradientCheck;
     procedure TestSquaredReLUForward;
     procedure TestSquaredReLUGradientCheck;
     procedure TestTanhShrinkForward;
@@ -3708,6 +3710,51 @@ end;
 procedure TTestNeuralNumerical.TestGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetGLU.Create(), 'GLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReGLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  a, b, reluA, expected: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetReGLU.Create());
+
+    // First half = A (gate), second half = B.
+    Input.Raw[0] := 2.0;   // A[0]
+    Input.Raw[1] := -1.5;  // A[1]
+    Input.Raw[2] := 1.0;   // B[0]
+    Input.Raw[3] := -0.5;  // B[1]
+
+    NN.Compute(Input);
+
+    AssertEquals('ReGLU output depth = input depth / 2', 2,
+      NN.GetLastLayer.Output.Depth);
+
+    // output[0] = ReLU(A[0]) * B[0]
+    a := 2.0; b := 1.0;
+    if a > 0 then reluA := a else reluA := 0;
+    expected := reluA * b;
+    AssertEquals('ReGLU output[0]', expected, NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    // output[1] = ReLU(A[1]) * B[1] = ReLU(-1.5) * -0.5 = 0
+    a := -1.5; b := -0.5;
+    if a > 0 then reluA := a else reluA := 0;
+    expected := reluA * b;
+    AssertEquals('ReGLU output[1]', expected, NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReGLUGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetReGLU.Create(), 'ReGLU', 2, 2, 4, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSquaredReLUForward;

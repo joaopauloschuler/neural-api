@@ -1003,6 +1003,20 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// ReGLU gated activation - This is an experimental layer.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A and B and outputs ReLU(A) * B. Output depth = input depth / 2.
+  // This layer has no trainable parameter. The input depth must be even.
+  // https://arxiv.org/abs/2002.05202
+  TNNetReGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   //Does a ReLU followed by a Square Root
   TNNetReLUSqrt = class(TNNetReLUBase)
     public
@@ -4876,6 +4890,96 @@ begin
           err := FOutputError[X, Y, D];
           FPrevLayer.FOutputError.Add(X, Y, D, err * sigmoidVal);
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * sigmoidDeriv);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetReGLU }
+
+constructor TNNetReGLU.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetReGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetReGLU requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetReGLU.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, reluA: TNeuralFloat;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        if a > 0 then reluA := a else reluA := 0;
+        FOutput[X, Y, D] := reluA * b;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetReGLU.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, reluA, reluDeriv, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          if a > 0 then
+          begin
+            reluA := a;
+            reluDeriv := 1;
+          end
+          else
+          begin
+            reluA := 0;
+            reluDeriv := 0;
+          end;
+          err := FOutputError[X, Y, D];
+          // dL/da = reluDeriv * b * dL/dy
+          FPrevLayer.FOutputError.Add(X, Y, D, err * reluDeriv * b);
+          // dL/db = ReLU(a) * dL/dy
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * reluA);
         end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -17418,6 +17522,7 @@ begin
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetGLU' :                  Result := TNNetGLU.Create();
+      'TNNetReGLU' :                Result := TNNetReGLU.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
@@ -17594,6 +17699,7 @@ begin
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
+      if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
