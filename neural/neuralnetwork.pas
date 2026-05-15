@@ -1667,6 +1667,19 @@ type
   /// Alias for TNNetLayerScale.
   TNNetLearnableScale = TNNetLayerScale;
 
+  /// TNNetBias: bias-only standalone primitive that adds a learnable
+  // per-channel offset. Output[x,y,d] = Input[x,y,d] + Bias[d], where Bias
+  // is a learnable vector of length = Depth (initialized to 0). The bias
+  // weight gradient is the channel-summed output gradient (true sum, no
+  // averaging) and the input gradient is identity passthrough.
+  TNNetBias = class(TNNetChannelTransformBase)
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   // This is an experimental class. Do not use it.
   TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
     private
@@ -9920,6 +9933,61 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetBias }
+constructor TNNetBias.Create();
+begin
+  inherited Create();
+  InitDefault();
+end;
+
+procedure TNNetBias.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> FOutput.Depth then
+  begin
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetBias.');
+  end;
+  {$ENDIF}
+  // Output[x,y,d] = Input[x,y,d] + Bias[d]
+  FOutput.AddToChannels(FNeurons[0].FWeights);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBias.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // Gradient w.r.t. the bias[d] = sum over x,y of OutputError[x,y,d].
+  FAuxDepth.Fill(0);
+  FAuxDepth.AddSumChannel(FOutputError);
+  FNeurons[0].FDelta.MulAdd(-FLearningRate, FAuxDepth);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Input gradient is identity passthrough.
+  BackpropagateNoTest();
+end;
+
+procedure TNNetBias.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(0);
+  AfterWeightUpdate();
+end;
+
 { TNNetCellMul }
 
 procedure TNNetCellMul.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -17838,6 +17906,7 @@ begin
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetLayerScale':            Result := TNNetLayerScale.Create(Ft[0]);
+      'TNNetBias':                  Result := TNNetBias.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
@@ -18017,6 +18086,7 @@ begin
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetLayerScale' then Result := TNNetLayerScale.Create(Ft[0]) else
+      if S[0] = 'TNNetBias' then Result := TNNetBias.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else

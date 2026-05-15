@@ -75,6 +75,10 @@ type
     procedure TestPixelNormSerializationRoundTrip;
     procedure TestLayerScaleForward;
     procedure TestLayerScaleGradientCheck;
+    procedure TestBiasForward;
+    procedure TestBiasGradientCheck;
+    procedure TestBiasWeightGradientCheck;
+    procedure TestBiasSerializationRoundTrip;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -9828,6 +9832,196 @@ begin
   // scale (0.5) so the FFloatSt[0] dispatch path is also covered.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetLayerScale.Create(0.5), 'LayerScale', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestBiasForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LBias: TNNetBias;
+  x, y, d, i: integer;
+begin
+  // TNNetBias adds a learnable per-channel offset.
+  // Output[x,y,d] = Input[x,y,d] + Bias[d].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3));
+    // Default bias is 0 -> output must equal input.
+    LBias := TNNetBias.Create();
+    NN.AddLayer(LBias);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 2.5 + 1.3;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Bias default=0 keeps input', Input.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 0.0001);
+
+    // Now set a non-trivial per-channel bias.
+    LBias.Neurons[0].Weights.Raw[0] := 2.0;
+    LBias.Neurons[0].Weights.Raw[1] := -1.5;
+    LBias.Neurons[0].Weights.Raw[2] := 0.25;
+    NN.Compute(Input);
+    for x := 0 to Input.SizeX - 1 do
+      for y := 0 to Input.SizeY - 1 do
+        for d := 0 to Input.Depth - 1 do
+          AssertEquals('Bias per-channel add',
+            Input[x, y, d] + LBias.Neurons[0].Weights.Raw[d],
+            NN.GetLastLayer.Output[x, y, d], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBiasGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LBias: TNNetBias;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    LBias := TNNetBias.Create();
+    NN.AddLayer(LBias);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial bias values.
+    for i := 0 to LBias.Neurons[0].Weights.Size - 1 do
+      LBias.Neurons[0].Weights.Raw[i] := 0.7 + i * 0.3;
+
+    // Input-gradient check (should be exact passthrough).
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Bias input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBiasWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LBias: TNNetBias;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    LBias := TNNetBias.Create();
+    NN.AddLayer(LBias);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3);
+
+    for i := 0 to LBias.Neurons[0].Weights.Size - 1 do
+      LBias.Neurons[0].Weights.Raw[i] := 0.4 + i * 0.2;
+
+    for i := 0 to LBias.Neurons[0].Weights.Size - 1 do
+    begin
+      LBias.Neurons[0].Weights.Raw[i] := LBias.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      LBias.Neurons[0].Weights.Raw[i] := LBias.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      LBias.Neurons[0].Weights.Raw[i] := LBias.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LBias.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // With LearningRate = 1 and batch update on, analytical = -Delta.
+      analyticalGrad := -LBias.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('Bias weight gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBiasSerializationRoundTrip;
+begin
+  // TNNetBias has one learnable per-channel bias tensor; the perturbed-
+  // weights helper pushes it away from the default 0 so the round-trip
+  // exercises a non-trivial bias vector.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetBias.Create(), 'Bias', 2, 2, 4, 1e-5);
 end;
 
 initialization
