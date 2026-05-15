@@ -3001,3 +3001,48 @@ dispatch tables in `neural/neuralnetwork.pas`.
       and TNNetSoftPlus's "stable on both tails" note (once the
       negative-x derivative test above lands). Pure README pass.
 
+
+### Lucky-day batch — 2026-05-15 (post FlipX/FlipY + Clamp batch)
+
+Two serial opus agents dispatched on a lucky day (seed 921753).
+Landed:
+
+- `1c86823` — TNNetFlipX (horizontal / SizeX mirror) and TNNetFlipY
+  (vertical / SizeY mirror) as sibling involution layers. Parameter-free
+  TNNetIdentity descendants modeled after TNNetReverseXY. Backward
+  reuses the same index map as forward. Both registered in both
+  CreateLayer dispatch sites. Eight new tests (four per layer:
+  Forward / GradientCheck / Involution / SerializationRoundTrip).
+- `c375c1c` — TNNetClamp(MinValue, MaxValue) elementwise saturation,
+  TNNetReLUBase descendant. Two-float serialization via
+  FFloatSt[0]=MinValue, FFloatSt[1]=MaxValue (precedent: TNNetThreshold).
+  Cached in-range indicator in FOutputErrorDeriv so Backpropagate is
+  a single multiply. Four new tests
+  (Forward / GradientCheck / ExtremeInputSaturation / SerializationRoundTrip).
+
+Test suite: 390 → 402, all passing. No bugs surfaced.
+
+#### Natural follow-ups
+
+- [ ] README "involution layers" subsection (already pinned earlier):
+      with TNNetReverseChannels + TNNetReverseXY + TNNetFlipX +
+      TNNetFlipY all landed, the four-layer family is finally complete
+      and the subsection can be written in one pass.
+- [ ] Flip-augmentation example using TNNetFlipX/TNNetFlipY as
+      training-time augmentation modules inside the net (rather than
+      preprocessing). Pairs with the existing ReverseXYAugmentation /
+      ReverseChannels-augmentation example ideas.
+- [ ] TNNetClamp README activation-table row — add next to TNNetSoftCapping
+      (the closest existing entry; both saturate, Clamp is the
+      hard-edged sibling). One-line description + tiny snippet.
+- [ ] TNNetClamp vs TNNetReLU6 vs TNNetHardTanh comparison: all three
+      are bounded-output activations with subgradient passthrough.
+      Worth a short note in the eventual activation cheat sheet
+      clarifying when to pick each (Clamp = arbitrary bounds, ReLU6
+      = MobileNet quantization, HardTanh = standard ±1).
+- [ ] TNNetClamp kink-region test: at hand-picked x exactly equal to
+      MinValue and MaxValue, document the convention chosen by the
+      indicator (currently: derivative=0 at the exact boundary, since
+      the in-range indicator is a strict-inequality check). Pin with
+      a tiny no-central-differences test mirroring the open HardShrink
+      kink test entry.
