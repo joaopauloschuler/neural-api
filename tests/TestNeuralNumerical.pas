@@ -244,6 +244,10 @@ type
     procedure TestReciprocalEpsGuard;
     procedure TestReciprocalGradientCheck;
     procedure TestReciprocalSerializationRoundTrip;
+    procedure TestNegForward;
+    procedure TestNegGradientCheck;
+    procedure TestNegInvolution;
+    procedure TestNegSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8259,6 +8263,70 @@ procedure TTestNeuralNumerical.TestReciprocalSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetReciprocal.Create(),
     'Reciprocal', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestNegForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetNeg.Create());
+    RandSeed := 271828;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 4 - 2;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Neg at index ' + IntToStr(i),
+        -Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNegGradientCheck;
+begin
+  // Parameter-free, constant derivative; central differences should match
+  // the analytic gradient tightly on a small random volume.
+  LayerInputGradientCheck(Self, TNNetNeg.Create(),
+    'Neg', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestNegInvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Applying Neg twice must return the identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 5, 1));
+    NN.AddLayer(TNNetNeg.Create());
+    NN.AddLayer(TNNetNeg.Create());
+    RandSeed := 141347;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Neg involution at index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNegSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetNeg.Create(),
+    'Neg', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

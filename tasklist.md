@@ -3066,10 +3066,12 @@ absent from `neural/neuralnetwork.pas` dispatch before listing.
       Forward, STE-vs-numerical mismatch test (documenting the
       intentional gap), serialization round-trip. Building block
       for binarized-net experiments. Verified absent from dispatch.
-- [ ] TNNetNeg — `y = -x`. Trivial, but plays well as a connective
+- [x] TNNetNeg — `y = -x`. Trivial, but plays well as a connective
       in residual-subtraction blocks (`x - F(x)` patterns). Backward
       is identity-negated. Four-test shape (forward / gradient /
-      involution-via-double-negate / round-trip).
+      involution-via-double-negate / round-trip). Landed: TNNetReLUBase
+      descendant caching -1 in FOutputErrorDeriv, registered in both
+      CreateLayer dispatch tables, four numerical tests added.
 - [ ] TNNetReciprocal — `y = 1 / sign(x) * max(|x|, eps)`, eps in
       FFloatSt[0] (default 1e-6). Derivative `-1/x^2`. Tests pin
       the eps-guard saturation at x=0 and the numerical gradient
@@ -3382,12 +3384,12 @@ explicitly already-landed and is referenced only for context).
       reference table back in sync with the dispatch.
 
 #### Tiny elementwise layers I'd enjoy adding
-- [ ] TNNetNeg — `y = -x`. Trivial Compute / Backpropagate
+- [x] TNNetNeg — `y = -x`. Trivial Compute / Backpropagate
       (`prev.err -= self.err`), but plays nicely as a connective in
       residual-subtraction blocks (`x - F(x)` patterns) and as a
       smoke test for the involution-via-double-negate property.
       Four-test shape (forward / gradient / involution-twice /
-      SerializationRoundTrip). Verified absent.
+      SerializationRoundTrip). Landed as TNNetReLUBase descendant.
 - [ ] TNNetBias — bias-only "add a learnable per-channel offset"
       (re-pinning explicitly: this is the fourth batch in a row
       where it shows up unimplemented, so promoting it to a

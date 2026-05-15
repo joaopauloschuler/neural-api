@@ -726,6 +726,16 @@ type
     procedure Compute(); override;
   end;
 
+  /// Neg activation function.
+  // Neg(x) = -x. Parameter-free. Derivative is -1; cached into
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
+  // with one multiply. Plays well as a connective in residual-subtraction
+  // blocks (x - F(x)).
+  TNNetNeg = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5530,6 +5540,36 @@ begin
       if ax < RECIP_EPS then ax := RECIP_EPS;
       FOutput.FData[OutputCnt] := 1.0 / (s * ax);
     end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetNeg }
+
+procedure TNNetNeg.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Neg(x) = -x. Derivative is constant -1.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      FOutput.FData[OutputCnt] := -LocalPrevOutput.FData[OutputCnt];
+      FOutputErrorDeriv.FData[OutputCnt] := -1.0;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := -LocalPrevOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -16408,6 +16448,7 @@ begin
       'TNNetExp' :                  Result := TNNetExp.Create();
       'TNNetLog' :                  Result := TNNetLog.Create();
       'TNNetReciprocal' :           Result := TNNetReciprocal.Create();
+      'TNNetNeg' :                  Result := TNNetNeg.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16569,6 +16610,7 @@ begin
       if S[0] = 'TNNetExp' then Result := TNNetExp.Create() else
       if S[0] = 'TNNetLog' then Result := TNNetLog.Create() else
       if S[0] = 'TNNetReciprocal' then Result := TNNetReciprocal.Create() else
+      if S[0] = 'TNNetNeg' then Result := TNNetNeg.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
