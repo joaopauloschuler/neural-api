@@ -1406,10 +1406,10 @@ Notable finding (NOT fixed, flagged for triage):
 
 Natural follow-ups (non-bug):
 
-- [ ] HardTanh saturation test on extreme inputs (±1e6) — assert
+- [x] HardTanh saturation test on extreme inputs (±1e6) — assert
       output stays within ±1 and `Backpropagate` doesn't produce NaNs
       (mirroring the TNNetSoftCapping saturation test pattern).
-- [ ] TanhShrink × Tanh composition sanity: `TanhShrink(x) + tanh(x)`
+- [x] TanhShrink × Tanh composition sanity: `TanhShrink(x) + tanh(x)`
       should reconstruct `x` to within fp tolerance, on a tiny random
       input. One-liner check on top of the existing primitives.
 - [ ] TNNetMaxOut serialization-after-wire test: build a small net
@@ -1418,7 +1418,7 @@ Natural follow-ups (non-bug):
       and assert Compute matches end-to-end. The existing
       `TestMaxOutSerializationRoundTrip` only round-trips the single
       layer, not the net.
-- [ ] MaxOut "depth not divisible by K" guard test: assert that wiring
+- [x] MaxOut "depth not divisible by K" guard test: assert that wiring
       a `TNNetMaxOut(K)` after a layer whose Depth is not a multiple of
       K raises the expected error (validates the divisibility
       precondition, mirroring the RoPE odd-depth guard test pattern).
