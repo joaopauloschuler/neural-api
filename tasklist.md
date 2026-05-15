@@ -799,7 +799,7 @@ Natural follow-ups:
       confirms a deep residual net with p=1 DropPath after every block
       collapses to the identity path (loss curve matches a no-residual
       baseline). Cheap teaching artifact for the fix.
-- [ ] Now that the norm round-trip suite covers Layer/RMS/Group, extend
+- [x] Now that the norm round-trip suite covers Layer/RMS/Group, extend
       it to TNNetChannelStdNormalization and TNNetLocalResponseNorm2D
       (the older normalization layers that predate the audit) — same
       shared helper, two-line additions.
@@ -816,7 +816,7 @@ sized to fit in a single commit.
       assert that ChannelShuffle(G) composed with ChannelShuffle(C/G)
       is the identity over a random tensor. A one-screen test that
       pins the most surprising algebraic property of the new layer.
-- [ ] Extend the norm round-trip suite to TNNetChannelStdNormalization
+- [x] Extend the norm round-trip suite to TNNetChannelStdNormalization
       and TNNetLocalResponseNorm2D (also already listed): I want to
       actually ship the two-line additions and close the open thread.
 - [ ] Filter + file:line patch for `scripts/list_untested_layers.sh`

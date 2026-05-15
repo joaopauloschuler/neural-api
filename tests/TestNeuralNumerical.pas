@@ -129,6 +129,8 @@ type
     procedure TestLayerNormSerializationRoundTrip;
     procedure TestRMSNormSerializationRoundTrip;
     procedure TestGroupNormSerializationRoundTrip;
+    procedure TestChannelStdNormalizationSerializationRoundTrip;
+    procedure TestLocalResponseNorm2DSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -5191,6 +5193,23 @@ begin
   // non-default group hyperparameter through the CreateLayer dispatch.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetGroupNorm.Create(3), 'GroupNorm', 2, 2, 6, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestChannelStdNormalizationSerializationRoundTrip;
+begin
+  // Per-channel mean (FNeurons[0]) and std-scale (FNeurons[1]) survive the
+  // round-trip; perturbed-weight helper pushes them away from the default
+  // mean=0 / scale=1 identity so the check is non-trivial.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetChannelStdNormalization.Create(), 'ChannelStdNormalization',
+    2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLocalResponseNorm2DSerializationRoundTrip;
+begin
+  // Parameter-free, but the window size (FStruct[0]) must survive dispatch.
+  SerializationRoundTrip(Self, TNNetLocalResponseNorm2D.Create(3),
+    'LocalResponseNorm2D', 4, 4, 3, 1e-5);
 end;
 
 initialization
