@@ -248,6 +248,14 @@ type
     procedure TestNegGradientCheck;
     procedure TestNegInvolution;
     procedure TestNegSerializationRoundTrip;
+    procedure TestSinForward;
+    procedure TestSinGradientCheck;
+    procedure TestSinPeriodicity;
+    procedure TestSinSerializationRoundTrip;
+    procedure TestCosForward;
+    procedure TestCosGradientCheck;
+    procedure TestCosPhaseShiftFromSin;
+    procedure TestCosSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8327,6 +8335,158 @@ procedure TTestNeuralNumerical.TestNegSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetNeg.Create(),
     'Neg', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSinForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetSin.Create());
+    RandSeed := 141347;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 4 - 2;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Sin at index ' + IntToStr(i),
+        Sin(Input.Raw[i]), NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinGradientCheck;
+begin
+  // Bounded inputs keep finite-difference noise manageable on the
+  // smooth periodic cos derivative.
+  LayerInputGradientCheck(Self, TNNetSin.Create(),
+    'Sin', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSinPeriodicity;
+const
+  TWO_PI: TNeuralFloat = 2.0 * 3.14159265358979323846;
+var
+  NN1, NN2: TNNet;
+  Input1, Input2: TNNetVolume;
+  i: integer;
+begin
+  // sin(x) must equal sin(x + 2*pi) to within fp tol.
+  NN1 := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input1 := TNNetVolume.Create(1, 1, 6);
+  Input2 := TNNetVolume.Create(1, 1, 6);
+  try
+    NN1.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN1.AddLayer(TNNetSin.Create());
+    NN2.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN2.AddLayer(TNNetSin.Create());
+    RandSeed := 271828;
+    for i := 0 to Input1.Size - 1 do
+    begin
+      Input1.Raw[i] := Random() * 4 - 2;
+      Input2.Raw[i] := Input1.Raw[i] + TWO_PI;
+    end;
+    NN1.Compute(Input1);
+    NN2.Compute(Input2);
+    for i := 0 to Input1.Size - 1 do
+      AssertEquals('Sin periodicity at index ' + IntToStr(i),
+        NN1.GetLastLayer.Output.Raw[i],
+        NN2.GetLastLayer.Output.Raw[i], 1e-4);
+  finally
+    NN1.Free;
+    NN2.Free;
+    Input1.Free;
+    Input2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSin.Create(),
+    'Sin', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestCosForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetCos.Create());
+    RandSeed := 141347;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 4 - 2;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Cos at index ' + IntToStr(i),
+        Cos(Input.Raw[i]), NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosGradientCheck;
+begin
+  // Bounded inputs keep finite-difference noise manageable on the
+  // smooth periodic -sin derivative.
+  LayerInputGradientCheck(Self, TNNetCos.Create(),
+    'Cos', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestCosPhaseShiftFromSin;
+const
+  HALF_PI: TNeuralFloat = 0.5 * 3.14159265358979323846;
+var
+  NNSin, NNCos: TNNet;
+  InputSin, InputCos: TNNetVolume;
+  i: integer;
+begin
+  // cos(x) = sin(x + pi/2). Feed Sin layer x+pi/2 and Cos layer x, compare.
+  NNSin := TNNet.Create();
+  NNCos := TNNet.Create();
+  InputSin := TNNetVolume.Create(1, 1, 6);
+  InputCos := TNNetVolume.Create(1, 1, 6);
+  try
+    NNSin.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NNSin.AddLayer(TNNetSin.Create());
+    NNCos.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NNCos.AddLayer(TNNetCos.Create());
+    RandSeed := 602689;
+    for i := 0 to InputCos.Size - 1 do
+    begin
+      InputCos.Raw[i] := Random() * 4 - 2;
+      InputSin.Raw[i] := InputCos.Raw[i] + HALF_PI;
+    end;
+    NNSin.Compute(InputSin);
+    NNCos.Compute(InputCos);
+    for i := 0 to InputCos.Size - 1 do
+      AssertEquals('Cos phase shift at index ' + IntToStr(i),
+        NNSin.GetLastLayer.Output.Raw[i],
+        NNCos.GetLastLayer.Output.Raw[i], 1e-4);
+  finally
+    NNSin.Free;
+    NNCos.Free;
+    InputSin.Free;
+    InputCos.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetCos.Create(),
+    'Cos', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

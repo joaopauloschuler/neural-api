@@ -736,6 +736,24 @@ type
     procedure Compute(); override;
   end;
 
+  /// Sin activation function.
+  // Sin(x) = sin(x). Parameter-free. Derivative is cos(x); cached into
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
+  // with one multiply. The SIREN paper's core periodic activation.
+  TNNetSin = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
+  /// Cos activation function.
+  // Cos(x) = cos(x). Parameter-free. Derivative is -sin(x); cached into
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
+  // with one multiply. Sibling of TNNetSin (cos(x) = sin(x + pi/2)).
+  TNNetCos = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5570,6 +5588,72 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := -LocalPrevOutput.FData[OutputCnt];
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSin }
+
+procedure TNNetSin.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Sin(x) = sin(x). Derivative is cos(x).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Sin(x);
+      FOutputErrorDeriv.FData[OutputCnt] := Cos(x);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := Sin(LocalPrevOutput.FData[OutputCnt]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetCos }
+
+procedure TNNetCos.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Cos(x) = cos(x). Derivative is -sin(x).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Cos(x);
+      FOutputErrorDeriv.FData[OutputCnt] := -Sin(x);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := Cos(LocalPrevOutput.FData[OutputCnt]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -16449,6 +16533,8 @@ begin
       'TNNetLog' :                  Result := TNNetLog.Create();
       'TNNetReciprocal' :           Result := TNNetReciprocal.Create();
       'TNNetNeg' :                  Result := TNNetNeg.Create();
+      'TNNetSin' :                  Result := TNNetSin.Create();
+      'TNNetCos' :                  Result := TNNetCos.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16611,6 +16697,8 @@ begin
       if S[0] = 'TNNetLog' then Result := TNNetLog.Create() else
       if S[0] = 'TNNetReciprocal' then Result := TNNetReciprocal.Create() else
       if S[0] = 'TNNetNeg' then Result := TNNetNeg.Create() else
+      if S[0] = 'TNNetSin' then Result := TNNetSin.Create() else
+      if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else

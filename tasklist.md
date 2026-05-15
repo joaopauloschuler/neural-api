@@ -3651,16 +3651,20 @@ landings. Every TNNet* name below was grep-verified absent from
 `neural/neuralnetwork.pas` before listing.
 
 #### Periodic activations I'd enjoy authoring
-- [ ] TNNetSin — `y = sin(x)`, derivative `cos(x)`. The SIREN paper's
+- [x] TNNetSin — `y = sin(x)`, derivative `cos(x)`. The SIREN paper's
       core ingredient; pairs naturally with a tiny SIREN-flavored
       regression example fitting a 1D function with three Sin-activated
       dense layers. Parameter-free, four-test shape (forward at typical
       inputs, gradient check, periodicity-as-property
       `Compute(x) == Compute(x + 2π)` to within fp tol,
       SerializationRoundTrip). Verified absent.
-- [ ] TNNetCos — `y = cos(x)`, derivative `-sin(x)`. Sibling of TNNetSin;
+      Landed: TNNetReLUBase descendant caching cos(x) into FOutputErrorDeriv;
+      four tests (forward, gradient check, periodicity, serialization).
+- [x] TNNetCos — `y = cos(x)`, derivative `-sin(x)`. Sibling of TNNetSin;
       composed as a phase-shifted Sin in tests (`cos(x) ≈ sin(x + π/2)`).
       Verified absent.
+      Landed: TNNetReLUBase descendant caching -sin(x) into FOutputErrorDeriv;
+      four tests (forward, gradient check, phase-shift-from-Sin, serialization).
 - [ ] TNNetSnake — `y = x + (1/α) * sin(α x)^2`, derivative
       `1 + sin(2 α x)`. α in FFloatSt[0] default 1.0. The Ziyin 2020
       periodic activation that learns periodic functions without an
