@@ -147,3 +147,49 @@
       natural next step is a TNNetSwiGLUFeedForward example or block that
       pairs them with the dense projections, ready for the transformer-encoder
       task at the top of the list.
+
+### Added ideas (Claude, 2026-05-14, lucky day — random number 593031)
+
+#### Layers I'd enjoy building
+- [ ] TNNetRotaryEmbedding (RoPE) — apply rotary position encoding to a
+      Q/K projection. Listed at the top of the file; I'd like to take it as a
+      standalone, gradient-checked layer (the rotation is a fixed, parameter-free
+      transform so the backward pass is just the transpose rotation).
+- [ ] TNNetMaskedFill / causal-mask layer — add -inf to the upper triangle of an
+      attention-score map before softmax. Tiny, parameter-free, and a required
+      piece for the Tiny GPT example. Gradient-check it by confirming masked
+      positions pass zero gradient.
+- [ ] TNNetGLU (plain gated linear unit) — the ungated-activation sibling of the
+      GEGLU/SwiGLU pair that just landed: split in half, gate one half with a
+      plain sigmoid of the other. Rounds out the gated-activation family and is
+      a 20-minute job given the SwiGLU template.
+- [ ] TNNetSquaredReLU — relu(x)^2, the activation from the Primer paper. Trivial
+      closed-form derivative, easy numerical-gradient test, and a nice cheap
+      experiment subject for the activation bake-off.
+
+#### Correctness / audit work I find rewarding
+- [ ] Continue the Backpropagate audit into the concat/split/branch family
+      (TNNetConcat, TNNetDeepConcat, TNNetSplitChannels, TNNetSum) — one
+      numerical-gradient test per layer, hunting for bugs the activation audit
+      style turned up before.
+- [ ] Add a numerical-gradient test for TNNetAddPositionalEmbedding (and any
+      other layer carrying learnable weights that lacks one) — the learnable-
+      weight gradient path is the easiest place for a silent bug to hide.
+
+#### Experiments I'm curious about
+- [ ] Optimizer bake-off: train the same small MLP with SGD / SGD+momentum /
+      Adam / RMSProp on a fixed toy dataset and print a loss-vs-epoch table.
+      Pure-CPU, runs in seconds, and complements the activation/normalization
+      bake-offs already on the list.
+- [ ] Batch-size sweep demo: same net and data, vary the batch size, and print
+      how wall-clock-per-epoch and epochs-to-converge trade off. A concrete,
+      visible illustration of a tuning knob beginners always ask about.
+- [ ] Dead-ReLU diagnostic: train a small ReLU net and print the fraction of
+      units that never fire across an epoch, then repeat with LeakyReLU/GELU to
+      show the difference. A fun, instructive correctness-adjacent experiment.
+
+#### Documentation
+- [ ] Write a one-page "layer authoring checklist" — constructor + LoadFromString
+      round-trip, CreateLayer dispatch entry, Compute/Backpropagate, and the
+      mandatory numerical-gradient test. Captures the recurring steps every
+      new-layer task in this file actually follows.
