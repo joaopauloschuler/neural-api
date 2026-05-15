@@ -1985,3 +1985,114 @@ This batch landed:
       from TNNetReLUBase so the dispatch is generic, but a one-line
       test would close the audit-coverage gap).
 
+### Lucky-day batch — 2026-05-15 (seed 708478)
+
+Today's lucky-number-driven batch. These are things I would genuinely
+enjoy building, in roughly increasing order of size. Each one is sized
+to land in a single focused session.
+
+#### Tiny, high-signal layers
+- [ ] TNNetMaxOut — output is max over k linear branches per unit.
+      Classic Goodfellow 2013 piecewise-linear activation that subsumes
+      ReLU/leaky-ReLU. Parameterise k via FStruct[0]. Forward, numerical
+      gradient, and round-trip tests. Cheap given the existing
+      multi-branch infrastructure.
+- [ ] TNNetSquaredReLU — `y = max(0,x)^2`. Used in Primer / So et al.
+      2021 as a drop-in replacement that often improves transformer
+      perplexity. Trivial Compute + ChainDeriv override, single-line
+      derivative `2*max(0,x)`. Mirrors the TNNetReLU template exactly.
+- [ ] TNNetShiftedReLU — `y = max(-1, x)`. Tiny but useful: keeps a
+      small negative range without ELU's exp cost. Good template for
+      future "shifted activation" experiments.
+- [ ] TNNetSnake — `y = x + (1/alpha) * sin(alpha*x)^2`. Periodic
+      activation from "Neural Networks Fail to Learn Periodic Functions"
+      (Ziyin 2020). Niche but slots cleanly into the activation
+      bake-off; configurable alpha via FFloatSt[0].
+- [ ] TNNetGaussianActivation — `y = exp(-x^2)`. RBF-style activation;
+      useful for the saturating-activation bake-off entry above.
+- [ ] TNNetLogSoftMax — exact log-softmax with numerically stable
+      `x - max - log(sum(exp(x-max)))`. Pairs with NLL-style loss paths
+      and avoids the log(softmax) trick at training time. Backward is
+      `dy - softmax(x) * sum(dy)` over the depth axis. Numerical-grad
+      test required.
+
+#### Composite blocks I'd enjoy building
+- [ ] TNNetPreNormTransformerBlock helper — convenience builder
+      `AddPreNormTransformerBlock(NN; d_model; n_heads; d_ff)` that
+      stacks LayerNorm → SDPA → residual → LayerNorm → SwiGLU MLP →
+      residual. Pure additive sugar over the existing primitives; saves
+      ~20 lines per use site. No new layer types.
+- [ ] TNNetSEBlock — Squeeze-and-Excitation channel-attention block as
+      a builder helper. Already feasible with GlobalAvgPool + FullConnect
+      + ReLU + FullConnect + Sigmoid + CellMul. Worth packaging because
+      every modern CNN paper uses it.
+- [ ] TNNetCBAMChannelAttention — Channel + spatial attention from
+      Woo et al. 2018. Builder over existing pool/conv primitives.
+
+#### Numerical hygiene
+- [ ] AssertFinite(V: TNNetVolume; const Where: string) — global helper
+      that scans for NaN/Inf and raises with a labelled message. Sprinkle
+      into the activation-saturation tests and the new SDPA softmax
+      path so a regression points at a layer name, not a "gradient
+      mismatch" line 200 lines later.
+- [ ] Numerical-gradient harness extension: opt-in central-difference
+      check at fp64 internally even when the network is fp32. Cuts
+      false-positive failures when a layer is correct but cancellation
+      noise drives the diff over the threshold.
+- [ ] Softmax stability micro-test: feed a deliberately huge logit
+      vector (`x = [1000, 0, 0, ...]`) through TNNetSoftMax and
+      TNNetLogSoftMax (once it lands); assert finite output, finite
+      gradient, and sum-to-one within 1e-6. Pins the
+      subtract-the-max-before-exp invariant.
+
+#### Tiny experiments I'd enjoy running
+- [ ] Activation derivative-at-zero study: plot Compute + ChainDeriv
+      output around x=0 for ReLU, GELU, Swish, Mish, CELU, ELU on a
+      [-2,2] grid; dump CSV. One-screen visual of which activations
+      are genuinely smooth at zero vs only "approximately" smooth.
+      Pairs naturally with [[lucky-day-celu-vs-elu]] alpha sweep.
+- [ ] Width vs depth at fixed parameter budget on a tiny MNIST-shaped
+      task: 4 widths × 4 depths matched to the same param count, plot
+      val-loss heatmap. Cheap, surprisingly informative on which regime
+      a given activation/normalization combo prefers.
+- [ ] Gradient-flow sanity sweep: 16-layer MLP with ReLU, GELU, Swish,
+      Mish, CELU; log per-layer gradient L2 norms after one backward
+      pass on random input. Visualises vanishing/exploding gradient
+      behaviour without needing a real training loop.
+- [ ] Normalization-position study (Pre-LN vs Post-LN) on a 4-layer
+      transformer stack solving the copy-task — does Pre-LN really
+      train more stably at this scale? Single chart, single seed.
+
+#### Round-trip & dispatch audit follow-through
+- [ ] Sweep every layer registered in CreateLayer for an explicit
+      LoadFromString round-trip test. The CELU/SwiGLU/GEGLU/LayerScale/
+      DropPath/RMSNorm batch closed obvious gaps; finish the audit by
+      generating a one-line "for each registered class, build with
+      defaults → save → load → assert structural equality" test driven
+      by the dispatch table itself, so newly-added layers are
+      automatically covered.
+- [ ] TNNetTanhShrink + TNNetHardTanh explicit round-trip tests (the
+      open item directly above this batch). Tiny, two-line tests.
+
+#### Documentation
+- [ ] One-page "activations cheat sheet" in docs/activations.md:
+      formula, derivative, saturating-or-not, smooth-at-zero-or-not,
+      typical use case. Lands the same content the README table entry
+      proposes, but in a dedicated page that can grow without bloating
+      the README.
+- [ ] Short README section: "How to add a new activation in ~30 lines"
+      walking through the TNNetReLUBase template with TNNetCELU as the
+      worked example. Lowers the activation-contribution barrier
+      meaningfully.
+
+#### Stretch / ambitious
+- [ ] TNNetMultiHeadSelfAttention as a true layer (not a builder),
+      wrapping num_heads parallel SDPA cores with Q/K/V projection and
+      output projection. The single-head SDPA core is already gradient-
+      checked; this is "stack and project". Would finally close the
+      transformer-encoder-block top-line item at the head of this file.
+- [ ] Mixture-of-Experts routing layer (also at the top of this file):
+      top-k softmax gate over N expert sub-networks, with load-balancing
+      auxiliary loss. Stretch but well-scoped if the SDPA / transformer
+      pieces are in place.
+
