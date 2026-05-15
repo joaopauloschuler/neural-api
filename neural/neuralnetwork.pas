@@ -714,6 +714,24 @@ type
     procedure Compute(); override;
   end;
 
+  /// ALiBi (Attention with Linear Biases) positional bias.
+  // Treats the input as a (SizeX, SizeY) attention score matrix replicated
+  // over Depth heads. SizeX indexes the key position, SizeY indexes the
+  // query position. For each head h the layer adds slope[h] * (X - Y) to
+  // every score where slope[h] = 2^(-8 * (h + 1) / Depth). Slopes are
+  // precomputed at SetPrevLayer time. No trainable parameters. Backward
+  // pass is a pure gradient passthrough since the bias is constant w.r.t.
+  // the input.
+  TNNetALiBi = class(TNNetIdentity)
+  private
+    FSlopes: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+  end;
+
   /// Soft capping activation: y = c * tanh(x / c).
   // Element-wise smooth logit-capping stabilizer used by Gemma-style models.
   // The cap value c is stored in FFloatSt[0] (default 30.0) and there are no
@@ -4037,6 +4055,53 @@ begin
     for X := Y + 1 to MaxX do
       for D := 0 to MaxD do
         FOutput.Add(X, Y, D, MaskValue);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetALiBi }
+
+constructor TNNetALiBi.Create();
+begin
+  inherited Create();
+  FSlopes := TNNetVolume.Create();
+end;
+
+destructor TNNetALiBi.Destroy();
+begin
+  FSlopes.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetALiBi.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  H, Depth: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Depth := FOutput.Depth;
+  FSlopes.ReSize(1, 1, Depth);
+  for H := 0 to Depth - 1 do
+    FSlopes.Raw[H] := Power(2, -8 * (H + 1) / Depth);
+end;
+
+procedure TNNetALiBi.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D: integer;
+  Slope: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for D := 0 to MaxD do
+  begin
+    Slope := FSlopes.Raw[D];
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+        FOutput.Add(X, Y, D, Slope * (X - Y));
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -14576,6 +14641,7 @@ begin
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
+      'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -14708,6 +14774,7 @@ begin
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
+      if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else

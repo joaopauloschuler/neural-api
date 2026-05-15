@@ -329,9 +329,18 @@
       numerical-gradient test is short. Should accept an optional base
       frequency (default 10000) and operate in-place across the depth axis.
       Landed: Create(pBase=10000.0), validates even Depth at SetPrevLayer.
-- [ ] TNNetALiBi positional bias — alternative to RoPE: add a static
+- [x] TNNetALiBi positional bias — alternative to RoPE: add a static
       slope * (j - i) bias to attention scores. Pairs with TNNetMaskedFill
       and gives a second option for position handling in the eventual MHA.
+      Landed: descends from TNNetIdentity, no constructor params, per-head
+      slopes `slope[h] = 2^(-8*(h+1)/Depth)` precomputed at SetPrevLayer
+      into a cached TNNetVolume freed in Destroy. Layout convention:
+      SizeX = key position, SizeY = query position, Depth = head index;
+      forward adds `slope[h] * (X - Y)` to every position; backward is
+      the inherited TNNetIdentity gradient passthrough. Dispatched from
+      both CreateLayer sites with no extra fields. Forward, central-
+      difference gradient, and SerializationRoundTrip tests added to
+      TestNeuralNumerical.
 - [x] TNNetSoftCapping — `c * tanh(x / c)` logit-capping layer used by
       Gemma-style models. Parameter-free, single closed-form derivative,
       cheap stabilizer for attention scores and final logits.
@@ -476,12 +485,14 @@ below are things I would personally enjoy taking on either as warm-up
 tasks before MHA lands, or as parallel tracks while it does.
 
 #### Layers I'd enjoy building
-- [ ] TNNetALiBi — finally pick up the position-bias entry above. It is
+- [x] TNNetALiBi — finally pick up the position-bias entry above. It is
       the smallest possible "alternative to RoPE": precompute a single
       `slope[h]` per head and add `slope * (key_pos - query_pos)` into
       the attention score map before softmax. Parameter-free (slopes are
       deterministic from head count, per the paper), so the gradient
       check is the same shape as TNNetMaskedFill's.
+      Landed: see the main TNNetALiBi entry above for details (layout
+      `SizeX=key`, `SizeY=query`, `Depth=head`).
 - [ ] TNNetSinkAttention — small, fun variant: prepend K "attention sink"
       key/value slots that every query can attend to. Helps long-context
       stability and is a 30-line addition on top of SDPA once the per-row
@@ -628,10 +639,11 @@ tasks before MHA lands, or as parallel tracks while it does.
         probability with depth) for the eventual ResNet/ConvNeXt examples.
       - Wire one of them into an existing CIFAR-10 example as an opt-in
         regularizer, with a one-line README mention.
-- [ ] TNNetALiBi positional bias — still the smallest "alternative to
+- [x] TNNetALiBi positional bias — still the smallest "alternative to
       RoPE" task on the list and now the most isolated next layer (no
       MHA dependency). Parameter-free, gradient check shape mirrors
       TNNetMaskedFill, and it slots into the eventual MHA helper.
+      Landed: see the main TNNetALiBi entry near the top of this file.
 
 #### Tooling follow-ups now that the v0 scripts shipped
 - [ ] Filter `scripts/list_untested_layers.sh` to skip obvious base/
@@ -672,11 +684,12 @@ is sized to fit in a single focused commit.
       Done: see TestDropPathDeterminismFixedSeed in TestNeuralNumerical.pas.
 
 #### Layers I'd enjoy building (no MHA dependency)
-- [ ] TNNetALiBi — same entry as the previous two batches. The fact that
+- [x] TNNetALiBi — same entry as the previous two batches. The fact that
       it has been listed three times now is the universe telling me to
       take it. Per-head deterministic slopes (`slope[h] = 2^(-8h/H)`),
       adds `slope * (key_pos - query_pos)` into the attention score map
       before softmax. Parameter-free, gradient check mirrors MaskedFill.
+      Landed: see the main TNNetALiBi entry near the top of this file.
 - [ ] TNNetSwitchableNorm — a tiny learnable convex combination of
       LayerNorm and RMSNorm outputs (two learnable scalars summed via
       softmax). Cute, parameter-cheap experiment in "let the network
@@ -825,11 +838,12 @@ sized to fit in a single commit.
       every future audit task start with a sharper actionable list.
 
 #### Layers I'd enjoy building (no MHA dependency)
-- [ ] TNNetALiBi — fourth time on the list. Treating its repeated
+- [x] TNNetALiBi — fourth time on the list. Treating its repeated
       appearance as a personal commitment device. Per-head deterministic
       slopes (`slope[h] = 2^(-8h/H)`), parameter-free, gradient check
       mirrors TNNetMaskedFill. The smallest "alternative to RoPE" task
       we have, and it slots straight into the eventual MHA helper.
+      Landed: see the main TNNetALiBi entry near the top of this file.
 - [x] TNNetSoftmaxTemperature — `softmax(x / T)` with configurable T,
       saved/loaded via FFloatSt[0]. Useful for the eventual tiny-GPT
       sampling demo. Already listed once; would enjoy taking it next.

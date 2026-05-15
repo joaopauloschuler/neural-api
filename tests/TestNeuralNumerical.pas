@@ -84,6 +84,9 @@ type
     procedure TestSquaredReLUGradientCheck;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
+    procedure TestALiBiForward;
+    procedure TestALiBiGradientCheck;
+    procedure TestALiBiSerializationRoundTrip;
     procedure TestSoftCappingForward;
     procedure TestSoftCappingGradientCheck;
     procedure TestDropPathInferenceIdentity;
@@ -3220,6 +3223,50 @@ begin
     'MaskedFill', 3, 3, 2, 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestALiBiForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, H, Depth: integer;
+  Slope, Expected: TNeuralFloat;
+begin
+  // SeqLen=3, Depth=2. Input is zero, so output equals the bias map per head.
+  Depth := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, Depth, 1));
+    NN.AddLayer(TNNetALiBi.Create());
+
+    Input.Fill(0.0);
+    NN.Compute(Input);
+
+    for H := 0 to Depth - 1 do
+    begin
+      Slope := Power(2, -8 * (H + 1) / Depth);
+      for Y := 0 to 2 do
+        for X := 0 to 2 do
+        begin
+          Expected := Slope * (X - Y);
+          AssertEquals('ALiBi bias at H=' + IntToStr(H) +
+            ' X=' + IntToStr(X) + ' Y=' + IntToStr(Y),
+            Expected, NN.GetLastLayer.Output[X, Y, H], 1e-6);
+        end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALiBiGradientCheck;
+begin
+  // Adding a position-dependent constant has identity gradient passthrough.
+  LayerInputGradientCheck(Self, TNNetALiBi.Create(),
+    'ALiBi', 3, 3, 2, 0.01);
+end;
+
+
 procedure TTestNeuralNumerical.TestSoftCappingForward;
 var
   NN, NN2: TNNet;
@@ -4543,6 +4590,12 @@ begin
   // Use a small mask value to keep float32 precision intact when comparing.
   SerializationRoundTrip(Self, TNNetMaskedFill.Create(-0.5),
     'MaskedFill', 3, 3, 2, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestALiBiSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetALiBi.Create(),
+    'ALiBi', 3, 3, 2, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestScaledDotProductAttentionSerializationRoundTrip;
