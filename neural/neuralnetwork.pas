@@ -616,6 +616,23 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// SoftPlus activation function - This is an experimental layer. Do not use it.
+  // A smooth approximation of ReLU.
+  // SoftPlus(x) = ln(1 + exp(x)), derivative is the sigmoid function.
+  TNNetSoftPlus = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Gaussian activation function - This is an experimental layer. Do not use it.
+  // Gaussian(x) = exp(-x^2), derivative is -2*x*exp(-x^2).
+  TNNetGaussianActivation = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -3559,6 +3576,123 @@ begin
 end;
 
 procedure TNNetMish.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetSoftPlus }
+
+procedure TNNetSoftPlus.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+  softplusVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerically stable softplus: for large x, ln(1+exp(x)) ~= x
+      if x > 30 then
+        softplusVal := x
+      else
+        softplusVal := Ln(1 + Exp(x));
+      FOutput.FData[OutputCnt] := softplusVal;
+      // Derivative of softplus is the sigmoid function.
+      FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + Exp(-x));
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := Ln(1 + Exp(x));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftPlus.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetGaussianActivation }
+
+procedure TNNetGaussianActivation.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+  gaussVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      gaussVal := Exp(-x * x);
+      FOutput.FData[OutputCnt] := gaussVal;
+      // Derivative: -2*x*exp(-x^2)
+      FOutputErrorDeriv.FData[OutputCnt] := -2 * x * gaussVal;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Exp(-x * x);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGaussianActivation.Backpropagate();
 var
   StartTime: double;
 begin
@@ -13229,6 +13363,8 @@ begin
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
+      'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
+      'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -13346,6 +13482,8 @@ begin
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
+      if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
+      if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else

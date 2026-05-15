@@ -36,8 +36,12 @@ type
     procedure TestHardSwishNumericalValues;
     procedure TestGELUNumericalValues;
     procedure TestMishNumericalValues;
+    procedure TestSoftPlusNumericalValues;
+    procedure TestGaussianActivationNumericalValues;
     procedure TestGELUGradientCheck;
     procedure TestMishGradientCheck;
+    procedure TestSoftPlusGradientCheck;
+    procedure TestGaussianActivationGradientCheck;
     procedure TestSwishGradientCheck;
     procedure TestSwish6GradientCheck;
     procedure TestHardSwishGradientCheck;
@@ -725,6 +729,72 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestSoftPlusNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4));
+    NN.AddLayer(TNNetSoftPlus.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 40.0;
+
+    NN.Compute(Input);
+
+    // SoftPlus(x) = ln(1 + exp(x))
+    // SoftPlus(0) = ln(2) ~ 0.6931
+    AssertEquals('SoftPlus(0) ~ 0.6931', 0.6931, NN.GetLastLayer.Output.Raw[0], 0.001);
+    // SoftPlus(1) = ln(1+e) ~ 1.3133
+    AssertEquals('SoftPlus(1) ~ 1.3133', 1.3133, NN.GetLastLayer.Output.Raw[1], 0.001);
+    // SoftPlus(-1) = ln(1+e^-1) ~ 0.3133
+    AssertEquals('SoftPlus(-1) ~ 0.3133', 0.3133, NN.GetLastLayer.Output.Raw[2], 0.001);
+    // SoftPlus(40) ~ 40 (numerically stable for large x)
+    AssertEquals('SoftPlus(40) ~ 40', 40.0, NN.GetLastLayer.Output.Raw[3], 0.001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianActivationNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4));
+    NN.AddLayer(TNNetGaussianActivation.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+
+    NN.Compute(Input);
+
+    // Gaussian(x) = exp(-x^2)
+    // Gaussian(0) = 1
+    AssertEquals('Gaussian(0) = 1', 1.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    // Gaussian(1) = exp(-1) ~ 0.3679
+    AssertEquals('Gaussian(1) ~ 0.3679', 0.3679, NN.GetLastLayer.Output.Raw[1], 0.001);
+    // Gaussian(-1) = exp(-1) ~ 0.3679
+    AssertEquals('Gaussian(-1) ~ 0.3679', 0.3679, NN.GetLastLayer.Output.Raw[2], 0.001);
+    // Gaussian(2) = exp(-4) ~ 0.0183
+    AssertEquals('Gaussian(2) ~ 0.0183', 0.0183, NN.GetLastLayer.Output.Raw[3], 0.001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestHardSwishNumericalValues;
 var
   NN: TNNet;
@@ -1059,6 +1129,18 @@ begin
   // Avoid the non-differentiable kinks at x = -3 and x = 3.
   ActivationGradientCheck(Self, TNNetHardSwish.Create(), 'HardSwish',
     [0.5, -0.5, 1.0, -2.0, 2.0, 4.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetSoftPlus.Create(), 'SoftPlus',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGaussianActivationGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetGaussianActivation.Create(), 'GaussianActivation',
+    [0.5, -0.5, 1.0, -1.5, 2.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSELUGradientCheck;
