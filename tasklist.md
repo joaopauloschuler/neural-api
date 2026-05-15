@@ -3820,3 +3820,41 @@ landings. Every TNNet* name below was grep-verified absent from
 - [ ] Mixture-of-Experts routing layer — best done after MHSA so it
       has a real host architecture; TNNetTopK above is the
       sub-primitive that needs to land first either way.
+
+
+### Lucky-day batch — 2026-05-15 (seed 186808, post Neg + Sin/Cos + README batch)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Landed:
+
+- `a4f6109` — TNNetNeg (`y = -x`): parameter-free TNNetReLUBase
+  descendant, derivative `-1` cached in FOutputErrorDeriv. Four tests
+  (forward, gradient check, involution-via-double-negate, serialization
+  round-trip).
+- `270f7a8` — TNNetSin and TNNetCos periodic activations. Both
+  parameter-free TNNetReLUBase descendants. TNNetSin caches `cos(x)`,
+  TNNetCos caches `-sin(x)` into FOutputErrorDeriv. Eight tests (four
+  per layer): forward, gradient check, periodicity (Sin) / phase-shift-
+  from-Sin (Cos), serialization round-trip.
+- `d80b449` — README activation-table rows for the recently-landed
+  transcendental + periodic + negation layers: TNNetSqrt, TNNetExp,
+  TNNetLog, TNNetReciprocal, TNNetNeg, TNNetSin, TNNetCos. Closes
+  several open README follow-up entries from previous batches.
+
+Test suite: 419 -> 431, all passing in ~1.0s. No bugs surfaced. The
+Sqrt/Exp/Log/Reciprocal/Neg/Sin/Cos elementwise family is now complete
+and uniformly documented.
+
+#### Natural follow-ups
+- [ ] TNNetSnake (`y = x + (1/α) sin(αx)^2`) — completes the periodic
+      activation trio (Sin + Cos + Snake). Configurable α via
+      FFloatSt[0]; closed-form derivative `1 + sin(2αx)`. Re-pinned
+      from seed 141347 batch.
+- [ ] TNNetErf — closed-form GELU partner. Verify FPC math.erf exists
+      on the supported FPC versions before claiming portability.
+- [ ] SIREN-flavored 1D function fit example unblocked by TNNetSin
+      landing: train 3-layer Sin MLP on `f(x) = sin(8x) + sin(3x)`
+      and compare to a ReLU MLP of equal width. One chart, two configs.
+- [ ] Trig identity composition test: `Sin(x)^2 + Cos(x)^2 = 1` to
+      within fp tolerance on a random input — pairs naturally with the
+      already-landed periodicity and phase-shift tests.
