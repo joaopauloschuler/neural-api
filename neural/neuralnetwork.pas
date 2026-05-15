@@ -11771,7 +11771,11 @@ begin
   begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    if (FSpacing=0) then FOutputError.Divi(floatPoolSize);
+    // Forward (FSpacing=0) replicates each input cell into a PoolSize x PoolSize
+    // output block, so the correct input gradient is the SUM of the block's
+    // output errors. The accumulating loop below already performs that sum,
+    // and any pre-scaling by PoolSize is incorrect (previously this divided by
+    // PoolSize, which made the gradient off by a factor of PoolSize).
     for CntY := 0 to MaxY do
     begin
       PrevPosY := CntY div FPoolSize;

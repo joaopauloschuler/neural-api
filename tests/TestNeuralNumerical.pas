@@ -99,6 +99,9 @@ type
     procedure TestDropPathGradientCheck;
     procedure TestAvgPoolGradientCheck;
     procedure TestUpsampleGradientCheck;
+    procedure TestDeMaxPoolGradientCheck;
+    procedure TestDeAvgPoolGradientCheck;
+    procedure TestDeMaxPoolForwardReplication;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
     procedure TestAddPositionalEmbeddingForward;
@@ -3029,6 +3032,153 @@ begin
   // input cells into output positions, so gradients are an identity
   // permutation on OutputError.
   LayerInputGradientCheck(Self, TNNetUpsample.Create(), 'Upsample', 2, 2, 4, 0.01);
+end;
+
+// Local gradient check that accumulates the loss in Double precision. The
+// generic LayerInputGradientCheck helper accumulates loss in TNeuralFloat
+// (Single), which catastrophically cancels for layers whose forward
+// replicates large values into many output cells (e.g. DeMaxPool/DeAvgPool):
+// the sum-of-squares is large but the perturbation-induced delta is tiny.
+procedure DeMaxPoolFamilyGradientCheck(ATestCase: TTestCase;
+  ALayer: TNNetLayer; const AName: string;
+  ASizeX, ASizeY, ASizeD: integer; ATolerance: TNeuralFloat);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon: TNeuralFloat;
+  lossPlus, lossMinus, numericalGrad: Double;
+  analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): Double;
+  var
+    k: integer;
+    diff: Double;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := Double(NN.GetLastLayer.Output.Raw[k]) - Double(Desired.Raw[k]);
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  InputPlus := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(ASizeX, ASizeY, ASizeD, 1));
+    NN.AddLayer(ALayer);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    // Small magnitudes keep the sum-of-squares loss small enough that the
+    // perturbation-induced delta survives Single precision when accumulated.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.1;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < ATolerance);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeMaxPoolGradientCheck;
+begin
+  // TNNetDeMaxPool replicates each input cell into a PoolSize x PoolSize
+  // output block. The correct input gradient is therefore the SUM of the
+  // block's output errors (no scaling). This guards the historical off-by-
+  // PoolSize bug where ComputePreviousLayerError divided the output error
+  // by PoolSize before accumulating.
+  DeMaxPoolFamilyGradientCheck(Self, TNNetDeMaxPool.Create(2), 'DeMaxPool',
+    2, 2, 2, 0.001);
+end;
+
+procedure TTestNeuralNumerical.TestDeAvgPoolGradientCheck;
+begin
+  // TNNetDeAvgPool = class(TNNetDeMaxPool) inherits both forward (pure
+  // replication into a PoolSize x PoolSize block) and backward, so its
+  // input gradient must also be the sum of the block's output errors.
+  DeMaxPoolFamilyGradientCheck(Self, TNNetDeAvgPool.Create(2), 'DeAvgPool',
+    2, 2, 2, 0.001);
+end;
+
+procedure TTestNeuralNumerical.TestDeMaxPoolForwardReplication;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD, BlockX, BlockY: integer;
+  Expected: TNeuralFloat;
+begin
+  // Verify the forward pass replicates each input cell into a PoolSize x
+  // PoolSize block (FSpacing = 0 default).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2));
+    NN.AddLayer(TNNetDeMaxPool.Create(2));
+
+    // Distinct values per (x, y, d).
+    for CntD := 0 to 1 do
+      for CntY := 0 to 1 do
+        for CntX := 0 to 1 do
+          Input[CntX, CntY, CntD] := 1.0 + CntX + 10 * CntY + 100 * CntD;
+
+    NN.Compute(Input);
+
+    AssertEquals('DeMaxPool output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('DeMaxPool output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('DeMaxPool output Depth', 2, NN.GetLastLayer.Output.Depth);
+
+    // Each input cell (CntX, CntY, CntD) must appear in every output position
+    // inside its 2x2 block.
+    for CntD := 0 to 1 do
+      for CntY := 0 to 1 do
+        for CntX := 0 to 1 do
+        begin
+          Expected := Input[CntX, CntY, CntD];
+          for BlockY := 0 to 1 do
+            for BlockX := 0 to 1 do
+              AssertEquals('DeMaxPool replication at (' +
+                IntToStr(CntX * 2 + BlockX) + ',' +
+                IntToStr(CntY * 2 + BlockY) + ',' + IntToStr(CntD) + ')',
+                Expected,
+                NN.GetLastLayer.Output[CntX * 2 + BlockX,
+                                       CntY * 2 + BlockY, CntD],
+                0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestGEGLUForward;
