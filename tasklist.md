@@ -1004,3 +1004,134 @@ Natural follow-ups:
       SoftmaxTemperature implementation is effectively a working template
       for what the fix should look like. Closing this would let
       TNNetSoftmaxTemperature drop its override and inherit cleanly.
+
+### Ideas added on 2026-05-15 (lucky seed 55717)
+
+Coming in after the ALiBi + SoftmaxTemperature + ChannelShuffle-audit
+batch. MHA remains the headline; the items below are things I would
+personally enjoy taking on either as warm-ups or as parallel tracks.
+Each is sized for a single focused commit.
+
+#### Quick wins I'd take first
+- [ ] Exact softmax Jacobian for TNNetPointwiseSoftMax (the open TODO at
+      line ~120 and the explicit follow-up at the end of the previous
+      batch). TNNetSoftmaxTemperature.Backpropagate is now a ready
+      template: copy the full-Jacobian inner loop, drop the 1/T scaling,
+      and add a numerical-gradient test that the diagonal-only
+      approximation currently fails. Let TNNetSoftmaxTemperature drop
+      its override and inherit cleanly afterwards.
+- [ ] ALiBi-with-MaskedFill composition test (listed at the end of the
+      previous batch): I want to actually take it. Stack
+      TNNetMaskedFill on TNNetALiBi, assert upper triangle stays at
+      -1e9 while the lower triangle picks up the slope contribution.
+      ~30 lines in TestNeuralNumerical, pins the composition before MHA.
+- [ ] LoadFromString round-trip for TNNetSoftmaxTemperature — the new
+      layer carries T in FFloatSt[0]; mirror the SoftCapping pattern
+      and pin the dispatch before it has time to drift.
+- [ ] LoadFromString round-trip for TNNetALiBi — parameter-free but the
+      cached per-head slope volume is rebuilt at SetPrevLayer; a
+      round-trip test pins that the rebuild fires on the deserialized
+      layer.
+
+#### Layers I'd enjoy building (no MHA dependency)
+- [ ] TNNetReZero / TNNetGatedResidual — already on the list. Per-channel
+      zero-initialized learnable gate `y = x + alpha * Sublayer(x)`.
+      Tiny variation on LayerScale, complements PreNormResidual, and
+      gives a second concrete stabilizer to bake-off against.
+- [ ] TNNetDyT (Dynamic Tanh) — already listed under lucky seed 726151.
+      `gamma * tanh(alpha * x) + beta`, per-layer learnable alpha plus
+      per-channel gamma/beta. One-evening implementation given the
+      LayerNorm + LayerScale templates already in tree. Numerical
+      gradient test is straightforward.
+- [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
+      sigmoid gate. Cheap "RMSNorm-with-attention-to-which-channels-matter"
+      that pairs naturally with the eventual transformer FFN.
+- [ ] TNNetGRN (Global Response Normalization, from ConvNeXt-V2): channel-
+      wise contrast normalization with learnable scale/bias. Pure-CPU
+      friendly, small, and an interesting alternative normalizer for
+      the existing CIFAR conv examples.
+- [ ] TNNetCosineSimilarityAttention — replace `Q·Kᵀ / √d` with
+      `(Q/||Q||)·(K/||K||)ᵀ * scale`. A nice small variant of SDPA that
+      lets us compare numerical stability against the standard dot-product
+      formulation without reaching for SoftCapping.
+- [ ] TNNetTanhShrink and TNNetHardTanh — round out the activation
+      menagerie alongside the already-landed SoftPlus / GaussianActivation
+      / SquaredReLU. Closed-form derivatives, easy gradient checks.
+
+#### Composite blocks / examples
+- [ ] TNNetPreNormResidual helper — listed five times now. Treating
+      that as universe pressure to actually ship the one-liner
+      `y = x + Sublayer(LayerNorm(x))` builder.
+- [ ] "Attention-free toy transformer" example: PreNormResidual +
+      TokenShift (when it lands) + GLUFeedForward, no SDPA. A useful
+      baseline to compare against the eventual MHA-based variant on
+      the same toy next-token task.
+- [ ] Tiny "echo the previous token" SDPA demo: train a single SDPA +
+      RoPE layer with SeqLen=4 to output input[t-1] at position t.
+      Smallest possible end-to-end test that attention is actually
+      learning to look at the right key position. Produces a single
+      attention-matrix PGM as artifact.
+
+#### Experiments I'm curious about
+- [ ] SoftmaxTemperature × diagonal-vs-exact-Jacobian study: train a
+      tiny classifier with TNNetSoftmaxTemperature in the head, swap
+      between the (current) exact Jacobian and the diagonal y*(1-y)
+      approximation, and chart the convergence-quality gap. Concrete
+      motivation for the open exact-Jacobian TODO.
+- [ ] ALiBi slope-base sweep: vary the slope formula from the canonical
+      `2^(-8h/H)` to `2^(-kh/H)` for `k ∈ {4, 6, 8, 12}` on a tiny
+      next-token task and chart loss. Empirical check of the cargo-culted
+      "8" constant in the paper.
+- [ ] Position-encoding bake-off (now fully unblocked, listed in the
+      previous batch): I'd genuinely enjoy taking this one. Four
+      training runs, one figure, big teaching value.
+- [ ] "Does ChannelShuffle help small models?" experiment: take the
+      existing SimpleImage CIFAR example, drop in a 1x1 -> shuffle ->
+      depthwise -> 1x1 block, and chart accuracy vs the baseline at
+      matched parameter count. Honest empirical answer at toy scale.
+- [ ] Activation-saturation visualizer: train a tiny net with Sigmoid /
+      Tanh / HardSigmoid and print the fraction of saturated units per
+      layer per epoch. A concrete picture of why ReLU/GELU win in
+      practice, using only layers already in tree.
+
+#### Correctness / audit work
+- [ ] TNNetUpsample numerical-gradient test (already listed twice as
+      the kickoff for the upsample/deconv audit). Smallest of the
+      three, would unblock the rest.
+- [ ] Audit which TNNet* classes still override Backpropagate but lack
+      a numerical-gradient test, after the activation / concat-split /
+      transform-pooling audits already done. Produce a fresh TODO list
+      so the next contributor has actionable targets.
+- [ ] Add an "attention numerical-gradient stress test" that runs the
+      SDPA grad check across SeqLen ∈ {1, 2, 3, 5, 8} and asserts the
+      max error vs tolerance at each. Pins shape-edge behavior the
+      existing single-shape test can't see.
+
+#### Tooling / dev experience
+- [ ] `scripts/grep_layer.sh <TNNet...>` — listed three times now. Print
+      the class declaration, Compute, Backpropagate, and any tests that
+      mention the class. Captures the first 30 seconds of every audit
+      I keep doing by hand.
+- [ ] Filter + file:line patch for `scripts/list_untested_layers.sh`:
+      drop names ending in Base/Class/Abstract, and emit a
+      `file:line` pointer for every surviving entry. Two-line awk
+      change in practice; would sharpen every future audit task.
+- [ ] `scripts/new_layer.sh <Name>` scaffolder (already listed): drop a
+      Compute/Backpropagate skeleton into neuralnetwork.pas plus a
+      matching numerical-gradient test stub. Captures the layer-authoring
+      checklist as executable form.
+
+#### Documentation
+- [ ] "How to add a new layer" cookbook: a single page walking through
+      a real recent landing (e.g. TNNetSoftmaxTemperature), step by
+      step, from constructor declaration through CreateLayer dispatch
+      to the numerical-gradient test. Companion to the testing note.
+- [ ] Annotated TNNetSoftmaxTemperature.Backpropagate walkthrough: the
+      full softmax-Jacobian derivation with shapes on every line.
+      Doubles as the template for the eventual exact-Jacobian fix on
+      TNNetPointwiseSoftMax.
+- [ ] Short "position encodings in this repo" comparison page covering
+      sinusoidal AddPositionalEmbedding, RoPE, and ALiBi: when each is
+      the right pick, what the layer expects on input, and a tiny
+      code snippet for each. Becomes the natural companion to the
+      bake-off experiment above.
