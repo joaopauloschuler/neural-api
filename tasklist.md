@@ -968,3 +968,39 @@ sized to fit in a single commit.
       (already listed). Companion piece to the testing note above.
       Cover when 1e-2 is fine, when to tighten to 1e-3, and when the
       right move is to shrink eps instead of loosening the tolerance.
+
+### Ideas added on 2026-05-15 (post ALiBi + SoftmaxTemperature + ChannelShuffle-audit batch)
+
+This batch landed: TNNetALiBi (parameter-free per-head positional bias,
+SizeX=key / SizeY=query / Depth=head layout, slopes = 2^(-8(h+1)/H)),
+TNNetSoftmaxTemperature (softmax(x/T) with full softmax-Jacobian backprop
+overriding the diagonal y*(1-y) approximation inherited from
+TNNetSoftMax), TNNetChannelShuffle inverse-property + strengthened
+round-trip tests, and norm round-trip extension to
+TNNetChannelStdNormalization and TNNetLocalResponseNorm2D.
+
+Notable finding: TNNetSoftmaxTemperature had to override Backpropagate
+with the full softmax Jacobian because TNNetSoftMax/TNNetPointwiseSoftMax
+use the diagonal y*(1-y) approximation (valid only when paired with
+cross-entropy). This reinforces the still-open TODO at line 120
+("implement exact softmax Jacobian for TNNetPointwiseSoftMax").
+
+Natural follow-ups:
+
+- [ ] Position-encoding bake-off now unblocked: with RoPE, ALiBi and
+      sinusoidal AddPositionalEmbedding all landed, the bake-off entry
+      higher up in the file is finally fully unblocked. Same tiny seq
+      model trained with (a) no position info, (b) sinusoidal, (c) RoPE,
+      (d) ALiBi, printing final loss and a sample generation per scheme.
+- [ ] ALiBi-with-MaskedFill composition test: stack TNNetMaskedFill on
+      top of TNNetALiBi on a tiny SeqLen=4, Depth=2 input and assert the
+      causal upper-triangle stays at -1e9 while the lower triangle picks
+      up the ALiBi slope contribution. Pins the composition for the
+      eventual MHA path.
+- [ ] SoftmaxTemperature × generation experiment (already listed under
+      lucky seed 51855): now actually buildable since the layer landed.
+      Train a tiny char model, generate at T ∈ {0.5, 0.8, 1.0, 1.2, 1.5}.
+- [ ] Re-open exact-softmax-Jacobian work on TNNetPointwiseSoftMax: the
+      SoftmaxTemperature implementation is effectively a working template
+      for what the fix should look like. Closing this would let
+      TNNetSoftmaxTemperature drop its override and inherit cleanly.
