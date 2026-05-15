@@ -715,6 +715,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// Reciprocal activation function.
+  // Reciprocal(x) = 1 / (sign(x) * max(|x|, eps)) with eps = 1e-6 and
+  // sign(0) := 1 (so x = 0 yields 1/eps). Parameter-free. Within the
+  // unclamped region this is just y = 1/x, so dy/dx = -y*y; cached into
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
+  // with one multiply.
+  TNNetReciprocal = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5469,6 +5480,55 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x < LOG_EPS then g := LOG_EPS else g := x;
       FOutput.FData[OutputCnt] := Ln(g);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetReciprocal }
+
+procedure TNNetReciprocal.Compute();
+const
+  RECIP_EPS: TNeuralFloat = 1e-6;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, ax, s, denom, y: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Reciprocal(x) = 1 / (sign(x) * max(|x|, eps)); sign(0) := 1.
+  // Derivative is -y*y*sign(x).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x < 0 then s := -1 else s := 1;
+      ax := Abs(x);
+      if ax < RECIP_EPS then ax := RECIP_EPS;
+      denom := s * ax;
+      y := 1.0 / denom;
+      FOutput.FData[OutputCnt] := y;
+      // Within the unclamped region (|x|>=eps) we have y = 1/x exactly,
+      // so dy/dx = -1/x^2 = -y^2 (the sign cancels because s*|x| = x).
+      FOutputErrorDeriv.FData[OutputCnt] := -y * y;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x < 0 then s := -1 else s := 1;
+      ax := Abs(x);
+      if ax < RECIP_EPS then ax := RECIP_EPS;
+      FOutput.FData[OutputCnt] := 1.0 / (s * ax);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16347,6 +16407,7 @@ begin
       'TNNetSqrt' :                 Result := TNNetSqrt.Create();
       'TNNetExp' :                  Result := TNNetExp.Create();
       'TNNetLog' :                  Result := TNNetLog.Create();
+      'TNNetReciprocal' :           Result := TNNetReciprocal.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16507,6 +16568,7 @@ begin
       if S[0] = 'TNNetSqrt' then Result := TNNetSqrt.Create() else
       if S[0] = 'TNNetExp' then Result := TNNetExp.Create() else
       if S[0] = 'TNNetLog' then Result := TNNetLog.Create() else
+      if S[0] = 'TNNetReciprocal' then Result := TNNetReciprocal.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else

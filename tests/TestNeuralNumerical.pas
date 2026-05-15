@@ -236,6 +236,10 @@ type
     procedure TestLogForward;
     procedure TestLogGradientCheck;
     procedure TestLogSerializationRoundTrip;
+    procedure TestReciprocalForward;
+    procedure TestReciprocalEpsGuard;
+    procedure TestReciprocalGradientCheck;
+    procedure TestReciprocalSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8018,6 +8022,73 @@ procedure TTestNeuralNumerical.TestLogSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetLog.Create(),
     'Log', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestReciprocalForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetReciprocal.Create());
+
+    Input.Raw[0] :=  2.0;
+    Input.Raw[1] := -4.0;
+    Input.Raw[2] :=  0.5;
+    Input.Raw[3] := -0.25;
+
+    NN.Compute(Input);
+
+    AssertEquals('Reciprocal(2)',     0.5,  NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Reciprocal(-4)',   -0.25, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('Reciprocal(0.5)',   2.0,  NN.GetLastLayer.Output.Raw[2], 1e-5);
+    AssertEquals('Reciprocal(-0.25)', -4.0, NN.GetLastLayer.Output.Raw[3], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReciprocalEpsGuard;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  y: TNeuralFloat;
+begin
+  // At x = 0 the eps guard clamps |x| to 1e-6 and sign(0) := 1,
+  // so the output should be a large but finite 1e6.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NN.AddLayer(TNNetReciprocal.Create());
+
+    Input.Raw[0] := 0.0;
+    NN.Compute(Input);
+
+    y := NN.GetLastLayer.Output.Raw[0];
+    AssertEquals('Reciprocal(0) saturates at 1/eps', 1e6, y, 1.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReciprocalGradientCheck;
+begin
+  // Bias inputs strongly away from 0 so the eps clamp never triggers
+  // and dy/dx = -1/x^2 is well-defined and bounded.
+  ActivationGradientCheck(Self, TNNetReciprocal.Create(), 'Reciprocal',
+    [0.5, 1.0, 1.5, 2.5, -0.5, -1.0, -1.5, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReciprocalSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetReciprocal.Create(),
+    'Reciprocal', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
