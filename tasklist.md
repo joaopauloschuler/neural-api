@@ -68,10 +68,17 @@
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
       regressions are visible without OpenCL/AVX hardware differences.
-- [ ] Investigate TNNetPointwiseSoftMax.Backpropagate: it uses the diagonal-only
+- [x] Investigate TNNetPointwiseSoftMax.Backpropagate: it uses the diagonal-only
       x*(1-x) approximation instead of the full softmax Jacobian. Decide whether
       to implement the exact Jacobian (and add a numerical-gradient test) or
       document the approximation explicitly in the code/README.
+      Done: replaced the diagonal y*(1-y) with the exact softmax Jacobian
+      (per-(X,Y) over depth for TNNetPointwiseSoftMax; new global override
+      for TNNetSoftMax). Added TestPointwiseSoftMaxExactJacobianGradientCheck
+      and TestSoftMaxExactJacobianGradientCheck — both pass at 1e-2 against
+      the central-difference check that the old approximation would have
+      failed. Cross-entropy training paths should opt into
+      SkipBackpropDerivative=1 (already the pattern in several examples).
 - [ ] Continue the Backpropagate audit: the transform/reshape/pooling/element-
       wise families are now covered (TNNetPadXY, TNNetCrop,
       TNNetInterleaveChannels, TNNetAvgPool, TNNetCellBias, TNNetCellMul).
@@ -117,10 +124,14 @@
       numerically stable formulation for large x.
 
 #### Correctness / audit work I find rewarding
-- [ ] Implement the exact softmax Jacobian for TNNetPointwiseSoftMax.Backpropagate
+- [x] Implement the exact softmax Jacobian for TNNetPointwiseSoftMax.Backpropagate
       (replacing the diagonal-only x*(1-x) approximation) and add a numerical-
       gradient test proving it. This is the unfinished thread from the second
       pass above — I'd like to actually close it.
+      Done: TNNetPointwiseSoftMax.Backpropagate uses the O(N) per-group form
+      y_i * (dL/dy_i - sum_j y_j * dL/dy_j) and TNNetSoftMax adds a global
+      override using the same formula over the entire volume. Two new
+      gradient-check tests in TestNeuralNumerical.pas pass at 1e-2.
 - [ ] Continue the Backpropagate audit into the upsampling/deconvolution family
       (TNNetUpsample, TNNetDeconvolution, TNNetDeMaxPool) — one numerical-
       gradient test per layer, looking for bugs the way the activation audit did.
@@ -984,6 +995,8 @@ with the full softmax Jacobian because TNNetSoftMax/TNNetPointwiseSoftMax
 use the diagonal y*(1-y) approximation (valid only when paired with
 cross-entropy). This reinforces the still-open TODO at line 120
 ("implement exact softmax Jacobian for TNNetPointwiseSoftMax").
+Done (post-batch): the TODO is now closed — TNNetPointwiseSoftMax and
+TNNetSoftMax both use the full softmax Jacobian, gradient-checked.
 
 Natural follow-ups:
 
@@ -1000,10 +1013,17 @@ Natural follow-ups:
 - [ ] SoftmaxTemperature × generation experiment (already listed under
       lucky seed 51855): now actually buildable since the layer landed.
       Train a tiny char model, generate at T ∈ {0.5, 0.8, 1.0, 1.2, 1.5}.
-- [ ] Re-open exact-softmax-Jacobian work on TNNetPointwiseSoftMax: the
+- [x] Re-open exact-softmax-Jacobian work on TNNetPointwiseSoftMax: the
       SoftmaxTemperature implementation is effectively a working template
       for what the fix should look like. Closing this would let
       TNNetSoftmaxTemperature drop its override and inherit cleanly.
+      Done: the Jacobian work landed. TNNetSoftmaxTemperature still keeps
+      its own Backpropagate override because the 1/T chain-rule factor
+      must scale only the layer's contribution to FPrevLayer.OutputError
+      (which is additive), not the accumulated total — calling inherited
+      and post-scaling would corrupt other branches' gradients. The
+      override now reads as a near-copy of TNNetSoftMax.Backpropagate
+      with an InvT multiplier; that small duplication is acceptable.
 
 ### Ideas added on 2026-05-15 (lucky seed 55717)
 
@@ -1013,13 +1033,21 @@ personally enjoy taking on either as warm-ups or as parallel tracks.
 Each is sized for a single focused commit.
 
 #### Quick wins I'd take first
-- [ ] Exact softmax Jacobian for TNNetPointwiseSoftMax (the open TODO at
+- [x] Exact softmax Jacobian for TNNetPointwiseSoftMax (the open TODO at
       line ~120 and the explicit follow-up at the end of the previous
       batch). TNNetSoftmaxTemperature.Backpropagate is now a ready
       template: copy the full-Jacobian inner loop, drop the 1/T scaling,
       and add a numerical-gradient test that the diagonal-only
       approximation currently fails. Let TNNetSoftmaxTemperature drop
       its override and inherit cleanly afterwards.
+      Done: TNNetPointwiseSoftMax.Backpropagate now uses the exact
+      Jacobian per-(X,Y) over depth, and a new TNNetSoftMax.Backpropagate
+      override applies the same formula globally (matching its global
+      softmax forward). TestPointwiseSoftMaxExactJacobianGradientCheck
+      and TestSoftMaxExactJacobianGradientCheck pin the result at the
+      standard 1e-2 tolerance. TNNetSoftmaxTemperature keeps its
+      override (the 1/T factor must scale only the layer's contribution
+      to FPrevLayer.OutputError, which is additive across branches).
 - [ ] ALiBi-with-MaskedFill composition test (listed at the end of the
       previous batch): I want to actually take it. Stack
       TNNetMaskedFill on TNNetALiBi, assert upper triangle stays at

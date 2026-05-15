@@ -1545,6 +1545,7 @@ type
       FSoftTotalSum: TNeuralFloat;
     public
       procedure Compute(); override;
+      procedure Backpropagate(); override;
   end;
 
   /// Softmax with a configurable temperature T: y = softmax(x / T).
@@ -2899,9 +2900,8 @@ end;
 procedure TNNetPointwiseSoftMax.Backpropagate;
 var
   StartTime: double;
-  {$IFDEF Debug}
-  Min, Max: TNeuralFloat;
-  {$ENDIF}
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  Dot, Yi: TNeuralFloat;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -2921,19 +2921,36 @@ begin
     end
     else
     begin
-      // derivative is: x*(1-x)
-      // https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
-      // https://github.com/neuroph/neuroph/blob/master/neuroph-2.9/Contrib/src/main/java/org/neuroph/contrib/learning/SoftMax.java
-      FOutputErrorDeriv.Fill(1);
-      FOutputErrorDeriv.Sub(FOutput);
-      FOutputErrorDeriv.Mul(FOutput);
-      FPrevLayer.OutputError.MulAdd(FOutputError, FOutputErrorDeriv);
-      {$IFDEF Debug}
-      Min := FOutputErrorDeriv.GetMin();
-      Max := FOutputErrorDeriv.GetMax();
-      if Min < 0 then FErrorProc('Softmax derivative is negative: '+FloatToStrF(Min,ffFixed,6,4));
-      if Max > 0.25 then FErrorProc('Softmax derivative is bigger than 0.25: '+FloatToStrF(Max,ffFixed,6,4));
-      {$ENDIF}
+      // Full softmax Jacobian, applied per spatial position (X,Y) over the
+      // depth axis (which is the axis PointwiseSoftMax normalizes over in
+      // the forward pass). For y_i = softmax(x_i) within a group:
+      //   dL/dx_i = y_i * (dL/dy_i - sum_j y_j * dL/dy_j)
+      // This is the O(N) form of the (diag(y) - y*y^T) Jacobian product.
+      // The previous implementation used the diagonal-only y*(1-y)
+      // approximation, which is only exact when paired with cross-entropy
+      // loss (the off-diagonal terms cancel against the loss derivative);
+      // it is incorrect for any other downstream usage.
+      MaxX := FOutput.SizeX - 1;
+      MaxY := FOutput.SizeY - 1;
+      MaxD := FOutput.Depth - 1;
+      for CntX := 0 to MaxX do
+      begin
+        for CntY := 0 to MaxY do
+        begin
+          StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+          Dot := 0;
+          for CntD := 0 to MaxD do
+            Dot := Dot + FOutput.FData[StartPos + CntD] *
+              FOutputError.FData[StartPos + CntD];
+          for CntD := 0 to MaxD do
+          begin
+            Yi := FOutput.FData[StartPos + CntD];
+            FPrevLayer.OutputError.FData[StartPos + CntD] :=
+              FPrevLayer.OutputError.FData[StartPos + CntD] +
+              Yi * (FOutputError.FData[StartPos + CntD] - Dot);
+          end;
+        end;
+      end;
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -12090,6 +12107,50 @@ begin
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FSoftTotalSum := FOutput.SoftMax();
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftMax.Backpropagate;
+var
+  StartTime: double;
+  Dot, Yi: TNeuralFloat;
+  i, SizeM1: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    if FSkipBackpropDerivative then
+    begin
+      if FNoForward then
+      begin
+        FOutputError.Mul(FOutputErrorDeriv);
+      end;
+      FPrevLayer.OutputError.Add(FOutputError);
+    end
+    else if FOutput.Size = FOutputError.Size then
+    begin
+      // Full softmax Jacobian for the global softmax (TNNetSoftMax normalizes
+      // over the whole volume, not per spatial position):
+      //   dL/dx_i = y_i * (dL/dy_i - sum_j y_j * dL/dy_j)
+      // Single O(N) dot product over the entire output.
+      SizeM1 := FOutput.Size - 1;
+      Dot := 0;
+      for i := 0 to SizeM1 do
+        Dot := Dot + FOutput.FData[i] * FOutputError.FData[i];
+      for i := 0 to SizeM1 do
+      begin
+        Yi := FOutput.FData[i];
+        FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i] +
+          Yi * (FOutputError.FData[i] - Dot);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
 end;
 
 { TNNetSoftmaxTemperature }

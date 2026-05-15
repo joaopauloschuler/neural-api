@@ -133,6 +133,8 @@ type
     procedure TestSoftmaxTemperatureIncreasesEntropy;
     procedure TestSoftmaxTemperatureGradientCheck;
     procedure TestSoftmaxTemperatureSerializationRoundTrip;
+    procedure TestPointwiseSoftMaxExactJacobianGradientCheck;
+    procedure TestSoftMaxExactJacobianGradientCheck;
     procedure TestChannelShuffleIndivisibleGuard;
     procedure TestChannelShuffleInverseProperty;
     procedure TestLayerNormSerializationRoundTrip;
@@ -5478,6 +5480,27 @@ begin
   // T=2.5 lives in FFloatSt[0] and must survive SaveStructureToString.
   SerializationRoundTrip(Self, TNNetSoftmaxTemperature.Create(2.5),
     'SoftmaxTemperature', 1, 1, 6, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPointwiseSoftMaxExactJacobianGradientCheck;
+begin
+  // TNNetPointwiseSoftMax now uses the full softmax Jacobian (per spatial
+  // position, over depth) instead of the diagonal-only y*(1-y)
+  // approximation. With MSE loss, the off-diagonal cross terms matter, so
+  // the previous approximation would fail this central-difference check;
+  // the exact Jacobian passes at the standard 1e-2 tolerance.
+  LayerInputGradientCheck(Self, TNNetPointwiseSoftMax.Create(),
+    'PointwiseSoftMax', 2, 2, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestSoftMaxExactJacobianGradientCheck;
+begin
+  // TNNetSoftMax normalizes over the entire volume; its Backpropagate now
+  // applies the full softmax Jacobian (single global dot product) instead
+  // of the diagonal-only y*(1-y) approximation. This central-difference
+  // check would fail with the old approximation.
+  LayerInputGradientCheck(Self, TNNetSoftMax.Create(),
+    'SoftMax', 1, 1, 6, 1e-2);
 end;
 
 initialization
