@@ -750,6 +750,28 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Rotary Positional Embedding (RoPE, Su et al. 2021).
+  // Parameter-free, applies a fixed position-dependent 2D rotation to
+  // consecutive pairs of channels.
+  // Input layout: SizeY = 1, SizeX = sequence length, Depth = d (must be even).
+  // For each position pos = X and each pair k (channels 2k, 2k+1):
+  //   angle = pos * base^(-2k/d)
+  //   y0    =  cos(angle)*x0 - sin(angle)*x1
+  //   y1    =  sin(angle)*x0 + cos(angle)*x1
+  // Backward is the transpose (inverse) rotation:
+  //   gx0   =  cos(angle)*gy0 + sin(angle)*gy1
+  //   gx1   = -sin(angle)*gy0 + cos(angle)*gy1
+  // No trainable parameters. Output shape equals input shape.
+  TNNetRotaryEmbedding = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload;
+    constructor Create(pBase: TNeuralFloat); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
   TNNetPower = class(TNNetReLUBase)
     private
@@ -4178,6 +4200,109 @@ begin
             PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
           end;
         end;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetRotaryEmbedding }
+
+constructor TNNetRotaryEmbedding.Create();
+begin
+  Create(10000.0);
+end;
+
+constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat);
+begin
+  inherited Create();
+  if pBase <= 0 then
+    FErrorProc('TNNetRotaryEmbedding base must be positive. Got base=' +
+      FloatToStr(pBase));
+  FFloatSt[0] := pBase;
+end;
+
+procedure TNNetRotaryEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FFloatSt[0] <= 0 then FFloatSt[0] := 10000.0;
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+    FErrorProc('TNNetRotaryEmbedding requires even Depth, got ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetRotaryEmbedding requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+end;
+
+procedure TNNetRotaryEmbedding.Compute();
+var
+  StartTime: double;
+  SeqLen, Depth, HalfD: integer;
+  pos, k: integer;
+  Base, InvD, Angle, c, s, x0, x1: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Depth := Prev.Depth;
+  HalfD := Depth div 2;
+  Base := FFloatSt[0];
+  if Base <= 0 then Base := 10000.0;
+  InvD := 1.0 / Depth;
+  for pos := 0 to SeqLen - 1 do
+  begin
+    for k := 0 to HalfD - 1 do
+    begin
+      Angle := pos * Exp(-2.0 * k * InvD * Ln(Base));
+      c := Cos(Angle);
+      s := Sin(Angle);
+      x0 := Prev[pos, 0, 2 * k];
+      x1 := Prev[pos, 0, 2 * k + 1];
+      FOutput[pos, 0, 2 * k]     := c * x0 - s * x1;
+      FOutput[pos, 0, 2 * k + 1] := s * x0 + c * x1;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRotaryEmbedding.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, Depth, HalfD: integer;
+  pos, k: integer;
+  Base, InvD, Angle, c, s, gy0, gy1: TNeuralFloat;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    StartTime := Now();
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := FOutput.SizeX;
+    Depth := FOutput.Depth;
+    HalfD := Depth div 2;
+    Base := FFloatSt[0];
+    if Base <= 0 then Base := 10000.0;
+    InvD := 1.0 / Depth;
+    for pos := 0 to SeqLen - 1 do
+    begin
+      for k := 0 to HalfD - 1 do
+      begin
+        Angle := pos * Exp(-2.0 * k * InvD * Ln(Base));
+        c := Cos(Angle);
+        s := Sin(Angle);
+        gy0 := FOutputError[pos, 0, 2 * k];
+        gy1 := FOutputError[pos, 0, 2 * k + 1];
+        // Transpose rotation: gx0 =  c*gy0 + s*gy1
+        //                     gx1 = -s*gy0 + c*gy1
+        PrevErr.Add(pos, 0, 2 * k,      c * gy0 + s * gy1);
+        PrevErr.Add(pos, 0, 2 * k + 1, -s * gy0 + c * gy1);
       end;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -14120,6 +14245,7 @@ begin
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
+      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -14247,6 +14373,7 @@ begin
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
+      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else

@@ -3,7 +3,7 @@
 ## New layer types
 - [ ] TNNetMultiHeadSelfAttention + full transformer encoder/decoder blocks
 - [x] TNNetLayerNorm — proper layer normalization
-- [ ] TNNetRotaryEmbedding (RoPE)
+- [x] TNNetRotaryEmbedding (RoPE)
 - [x] TNNetGEGLU / TNNetSwiGLU gated activations
 - [x] TNNetGroupNorm
 - [x] TNNetDropPath (stochastic depth)
@@ -158,10 +158,13 @@
       task at the top of the list.
 
 #### Layers I'd enjoy building
-- [ ] TNNetRotaryEmbedding (RoPE) — apply rotary position encoding to a
+- [x] TNNetRotaryEmbedding (RoPE) — apply rotary position encoding to a
       Q/K projection. Listed at the top of the file; I'd like to take it as a
       standalone, gradient-checked layer (the rotation is a fixed, parameter-free
       transform so the backward pass is just the transpose rotation).
+      Landed: parameter-free layer derived from TNNetIdentity; Create() defaults
+      base=10000. Forward + numerical-gradient + inverse-rotation tests in
+      TestNeuralNumerical.pas.
 - [x] TNNetMaskedFill / causal-mask layer — add -inf to the upper triangle of an
       attention-score map before softmax. Landed as a parameter-free layer
       derived from TNNetIdentity; Create() defaults to -1e9, Create(value)
@@ -236,9 +239,10 @@
       (Q·Kᵀ / √d → softmax → ·V) as a standalone, gradient-checked layer.
       Landed: parameter-free layer takes Q|K|V concatenated along the depth axis
       and supports an optional causal mask. Pairs cleanly with TNNetMaskedFill.
-- [ ] TNNetRotaryEmbedding (RoPE) — parameter-free rotation applied to Q/K.
+- [x] TNNetRotaryEmbedding (RoPE) — parameter-free rotation applied to Q/K.
       Backward pass is just the inverse rotation, so the numerical-gradient
       test is straightforward. Companion piece to ScaledDotProductAttention.
+      Landed: with forward, numerical-gradient and inverse-rotation tests.
 - [ ] TNNetMultiHeadSelfAttention — SDPA has now landed, so this is unblocked
       (RoPE is optional / additive). Compose split-heads → SDPA per head →
       concat → out projection. Suggested breakdown:
@@ -319,11 +323,12 @@
 ### Ideas added on 2026-05-15 (lucky seed 9052)
 
 #### Layers I'd enjoy building next
-- [ ] TNNetRotaryEmbedding (RoPE) — the natural companion to the SDPA layer
+- [x] TNNetRotaryEmbedding (RoPE) — the natural companion to the SDPA layer
       that just landed. Parameter-free rotation of Q/K pairs of channels by
       position-dependent angles. Backward = inverse rotation, so the
       numerical-gradient test is short. Should accept an optional base
       frequency (default 10000) and operate in-place across the depth axis.
+      Landed: Create(pBase=10000.0), validates even Depth at SetPrevLayer.
 - [ ] TNNetALiBi positional bias — alternative to RoPE: add a static
       slope * (j - i) bias to attention scores. Pairs with TNNetMaskedFill
       and gives a second option for position handling in the eventual MHA.

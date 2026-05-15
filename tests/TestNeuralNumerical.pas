@@ -98,6 +98,9 @@ type
     procedure TestScaledDotProductAttentionForward;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
+    procedure TestRotaryEmbeddingForward;
+    procedure TestRotaryEmbeddingGradientCheck;
+    procedure TestRotaryEmbeddingInverse;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -3868,6 +3871,141 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRotaryEmbeddingForward;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, HalfD, pos, k, d: integer;
+  Base, theta0, theta1, angle, c, s, x0, x1, ey0, ey1: TNeuralFloat;
+  Saved: string;
+begin
+  SeqLen := 3;
+  Depth := 4;
+  HalfD := Depth div 2;
+  Base := 10000.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NN.AddLayer(TNNetRotaryEmbedding.Create(Base));
+
+    // Deterministic input.
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.41) * 0.8 - 0.2;
+
+    NN.Compute(Input);
+
+    // pos = 0 must be identity (angle = 0 -> cos=1, sin=0).
+    for d := 0 to Depth - 1 do
+      AssertEquals('RoPE pos=0 identity at d=' + IntToStr(d),
+        Input[0, 0, d], NN.GetLastLayer.Output[0, 0, d], 1e-5);
+
+    // pos = 1 / pos = 2: check hand-computed rotation for each pair k.
+    theta0 := Exp(-2.0 * 0 / Depth * Ln(Base)); // = 1
+    theta1 := Exp(-2.0 * 1 / Depth * Ln(Base)); // = 1 / sqrt(base) = 1/100
+    for pos := 1 to SeqLen - 1 do
+    begin
+      for k := 0 to HalfD - 1 do
+      begin
+        if k = 0 then angle := pos * theta0 else angle := pos * theta1;
+        c := Cos(angle);
+        s := Sin(angle);
+        x0 := Input[pos, 0, 2 * k];
+        x1 := Input[pos, 0, 2 * k + 1];
+        ey0 := c * x0 - s * x1;
+        ey1 := s * x0 + c * x1;
+        AssertEquals('RoPE forward pos=' + IntToStr(pos) + ' k=' + IntToStr(k) + ' y0',
+          ey0, NN.GetLastLayer.Output[pos, 0, 2 * k], 1e-5);
+        AssertEquals('RoPE forward pos=' + IntToStr(pos) + ' k=' + IntToStr(k) + ' y1',
+          ey1, NN.GetLastLayer.Output[pos, 0, 2 * k + 1], 1e-5);
+      end;
+    end;
+
+    // SaveToString / LoadFromString round-trip preserves the base.
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      for pos := 0 to SeqLen - 1 do
+        for d := 0 to Depth - 1 do
+          AssertEquals('RoPE round-trip pos=' + IntToStr(pos) + ' d=' + IntToStr(d),
+            NN.GetLastLayer.Output[pos, 0, d],
+            NN2.GetLastLayer.Output[pos, 0, d], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRotaryEmbeddingGradientCheck;
+begin
+  // Standard central-difference gradient check. RoPE backward is the
+  // transpose rotation; if signs are correct this must match to ~1e-2.
+  LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0),
+    'RotaryEmbedding', 3, 1, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestRotaryEmbeddingInverse;
+var
+  NN: TNNet;
+  Input, Zero: TNNetVolume;
+  SeqLen, Depth, pos, d: integer;
+  OutNormSq, GradNormSq: TNeuralFloat;
+begin
+  SeqLen := 3;
+  Depth := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  Zero := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NN.AddLayer(TNNetRotaryEmbedding.Create(10000.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.37) * 1.2 + 0.1;
+    Zero.Fill(0);
+
+    NN.Compute(Input);
+
+    // Rotation is orthogonal so |x|^2 must equal |y|^2.
+    OutNormSq := 0;
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        OutNormSq := OutNormSq + Sqr(NN.GetLastLayer.Output[pos, 0, d]);
+    AssertEquals('RoPE preserves norm', Input.GetSumSqr(), OutNormSq, 1e-4);
+
+    // With Desired = 0, OutputError = Output - 0 = Output. The analytic
+    // input gradient is then R^T * R * x = x (rotation is orthogonal).
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Zero);
+
+    GradNormSq := 0;
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        GradNormSq := GradNormSq + Sqr(NN.Layers[0].OutputError[pos, 0, d]);
+
+    AssertEquals('RoPE inverse: |gx|^2 = |x|^2', Input.GetSumSqr(), GradNormSq, 1e-4);
+
+    // And the recovered gradient should equal the original input element-wise.
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        AssertEquals('RoPE inverse pos=' + IntToStr(pos) + ' d=' + IntToStr(d),
+          Input[pos, 0, d], NN.Layers[0].OutputError[pos, 0, d], 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+    Zero.Free;
   end;
 end;
 
