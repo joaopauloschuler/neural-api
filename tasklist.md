@@ -86,10 +86,12 @@
       template for any further normalization-layer variants.
 
 #### Layers I'd enjoy building
-- [ ] TNNetScaledDotProductAttention — the single-head core (Q·Kᵀ / √d → softmax
-      → ·V) as a standalone, fully gradient-checked layer. Building block for the
-      multi-head attention already on the list, but small enough to land and test
-      on its own first.
+- [x] TNNetScaledDotProductAttention — the single-head core (Q·Kᵀ / √d → softmax
+      → ·V) as a standalone, fully gradient-checked layer. Landed: parameter-free
+      layer with input depth = 3*d_k (Q|K|V split along the depth axis), optional
+      causal mask flag, full backward pass through the softmax Jacobian, and three
+      numerical-gradient tests (forward sanity, non-causal grad check, causal grad
+      check) in TestNeuralNumerical.pas.
 - [ ] TNNetDropPath (stochastic depth) — already listed above; I'd like to take
       it. Identity at inference, whole-sample drop at training. Pairs well with
       a numerical-gradient test that fixes the RNG seed.
@@ -225,11 +227,10 @@
 ### Ideas added on 2026-05-15 (lucky seed 623999)
 
 #### Layers I'd enjoy building next
-- [ ] TNNetScaledDotProductAttention — the single-head attention core
+- [x] TNNetScaledDotProductAttention — the single-head attention core
       (Q·Kᵀ / √d → softmax → ·V) as a standalone, gradient-checked layer.
-      Highest-leverage missing transformer block now that TNNetMaskedFill,
-      TNNetLayerNorm, TNNetRMSNorm and the gated activations have all landed.
-      Should pair cleanly with TNNetMaskedFill for causal attention.
+      Landed: parameter-free layer takes Q|K|V concatenated along the depth axis
+      and supports an optional causal mask. Pairs cleanly with TNNetMaskedFill.
 - [ ] TNNetRotaryEmbedding (RoPE) — parameter-free rotation applied to Q/K.
       Backward pass is just the inverse rotation, so the numerical-gradient
       test is straightforward. Companion piece to ScaledDotProductAttention.

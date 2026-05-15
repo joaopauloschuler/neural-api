@@ -714,6 +714,29 @@ type
     procedure Compute(); override;
   end;
 
+  /// Scaled Dot-Product Attention (single head, parameter-free).
+  // Input layout: SizeY = 1, SizeX = sequence length, Depth = 3 * d_k
+  // where the depth axis is the concatenation Q | K | V, each of size d_k.
+  // For every query position i:
+  //   scores[i,j] = dot(Q[i], K[j]) / sqrt(d_k)
+  //   (if CausalMask: scores[i,j] := -1e9 for j > i)
+  //   attn[i,:]   = softmax(scores[i,:])
+  //   out[i]      = sum_j attn[i,j] * V[j]
+  // Output shape: SizeX x 1 x d_k. No trainable parameters.
+  TNNetScaledDotProductAttention = class(TNNetLayer)
+  private
+    FDk: integer;
+    FInvSqrtDk: TNeuralFloat;
+    FCausal: boolean;
+    FAttn: TNNetVolume; // attention weights [SizeX, SizeX, 1] (rows=queries)
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; CausalMask: boolean = false); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
   TNNetPower = class(TNNetReLUBase)
     private
@@ -3906,6 +3929,166 @@ begin
       for D := 0 to MaxD do
         FOutput.Add(X, Y, D, MaskValue);
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetScaledDotProductAttention }
+
+constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean);
+begin
+  inherited Create();
+  FDk := d_k;
+  FCausal := CausalMask;
+  if FDk < 1 then
+    FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  FInvSqrtDk := 1.0 / Sqrt(FDk);
+  FStruct[0] := FDk;
+  if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
+  FAttn := TNNetVolume.Create();
+end;
+
+destructor TNNetScaledDotProductAttention.Destroy();
+begin
+  FAttn.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetScaledDotProductAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetScaledDotProductAttention requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> 3 * FDk then
+    FErrorProc('TNNetScaledDotProductAttention requires input depth = 3*d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // Attention weights: rows = queries (i), cols = keys (j). Use X=key, Y=query.
+  FAttn.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+end;
+
+procedure TNNetScaledDotProductAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp, AccVal: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // For each query row i: compute scores, softmax, then weighted sum of V.
+  for i := 0 to SeqLen - 1 do
+  begin
+    // 1) Scaled scores into FAttn[*, i, 0].
+    MaxScore := -1e30;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := 0;
+        for d := 0 to FDk - 1 do
+          Score := Score + Prev[i, 0, d] * Prev[j, 0, FDk + d];
+        Score := Score * FInvSqrtDk;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    // 2) Softmax (numerically stable).
+    SumExp := 0;
+    for j := 0 to SeqLen - 1 do
+    begin
+      Score := Exp(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    // 3) Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d].
+    for d := 0 to FDk - 1 do
+    begin
+      AccVal := 0;
+      for j := 0 to SeqLen - 1 do
+        AccVal := AccVal + FAttn[j, i, 0] * Prev[j, 0, 2 * FDk + d];
+      FOutput[i, 0, d] := AccVal;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetScaledDotProductAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, k, d: integer;
+  Prev, PrevErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS: TNeuralFloat;
+  OutErr: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := Prev.SizeX;
+    SetLength(dAttn, SeqLen);
+    SetLength(dScore, SeqLen);
+    for i := 0 to SeqLen - 1 do
+    begin
+      // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
+      // dV[j,d] += Attn[i,j] * dOut[i,d]
+      // dAttn[j] = sum_d dOut[i,d] * V[j,d]
+      for j := 0 to SeqLen - 1 do
+      begin
+        dAttn[j] := 0;
+        A := FAttn[j, i, 0];
+        for d := 0 to FDk - 1 do
+        begin
+          OutErr := FOutputError[i, 0, d];
+          PrevErr.Add(j, 0, 2 * FDk + d, A * OutErr);
+          dAttn[j] := dAttn[j] + OutErr * Prev[j, 0, 2 * FDk + d];
+        end;
+      end;
+      // ---- Softmax Jacobian: dScore[j] = Attn[j] * (dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
+      SumDAttnAttn := 0;
+      for k := 0 to SeqLen - 1 do
+        SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
+      for j := 0 to SeqLen - 1 do
+        dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+      // For causal masked positions (j > i) the score was forced to -1e9 so
+      // the corresponding attn ~ 0; the multiplication above already zeros
+      // dScore[j], so no special handling needed.
+      // ---- Gradients w.r.t Q[i] and K[j] ----
+      // score[i,j] = invSqrtDk * sum_d Q[i,d]*K[j,d]
+      // dQ[i,d] += invSqrtDk * sum_j dScore[j] * K[j,d]
+      // dK[j,d] += invSqrtDk * dScore[j] * Q[i,d]
+      for j := 0 to SeqLen - 1 do
+      begin
+        dS := dScore[j] * FInvSqrtDk;
+        if dS <> 0 then
+        begin
+          for d := 0 to FDk - 1 do
+          begin
+            PrevErr.Add(i, 0, d, dS * Prev[j, 0, FDk + d]);
+            PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
+          end;
+        end;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetMish }
@@ -13783,6 +13966,7 @@ begin
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
+      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -13907,6 +14091,7 @@ begin
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
+      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else

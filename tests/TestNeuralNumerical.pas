@@ -90,6 +90,9 @@ type
     procedure TestAddPositionalEmbeddingForward;
     procedure TestAddPositionalEmbeddingGradientCheck;
     procedure TestAddPositionalEmbeddingEmbeddingIsConstant;
+    procedure TestScaledDotProductAttentionForward;
+    procedure TestScaledDotProductAttentionGradientCheck;
+    procedure TestScaledDotProductAttentionCausalGradientCheck;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -3426,6 +3429,191 @@ begin
     Input.Free;
     Desired.Free;
     BeforeOutput.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Dk, i, d: integer;
+  Attn: TNNetScaledDotProductAttention;
+  ExpectedAvg, Sum: TNeuralFloat;
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk, false);
+    NN.AddLayer(Attn);
+
+    // Uniform Q and K (all zeros) -> equal scores -> uniform attention 1/SeqLen.
+    // Use distinct V values per position so the output = average of V across positions.
+    for i := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := 0;            // Q[i,d]
+        Input[i, 0, Dk + d] := 0;       // K[i,d]
+        Input[i, 0, 2 * Dk + d] := i + 0.1 * d; // V[i,d]
+      end;
+    end;
+
+    NN.Compute(Input);
+    AssertEquals('Output SizeX', SeqLen, Attn.Output.SizeX);
+    AssertEquals('Output SizeY', 1, Attn.Output.SizeY);
+    AssertEquals('Output Depth', Dk, Attn.Output.Depth);
+
+    // Each output row should equal the column-wise mean of V.
+    for d := 0 to Dk - 1 do
+    begin
+      Sum := 0;
+      for i := 0 to SeqLen - 1 do
+        Sum := Sum + Input[i, 0, 2 * Dk + d];
+      ExpectedAvg := Sum / SeqLen;
+      for i := 0 to SeqLen - 1 do
+        AssertEquals('Uniform attn output [i=' + IntToStr(i) + ',d=' + IntToStr(d) + ']',
+          ExpectedAvg, Attn.Output[i, 0, d], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk, false);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SDPA input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionCausalGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk, true);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SDPA causal input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 
