@@ -233,6 +233,9 @@ type
     procedure TestExpForward;
     procedure TestExpGradientCheck;
     procedure TestExpSerializationRoundTrip;
+    procedure TestLogForward;
+    procedure TestLogGradientCheck;
+    procedure TestLogSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -7974,6 +7977,47 @@ procedure TTestNeuralNumerical.TestExpSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetExp.Create(),
     'Exp', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLogForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetLog.Create());
+
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 2.718281828;
+    Input.Raw[2] := 0.5;
+    Input.Raw[3] := 4.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('Log(1)',   Ln(1.0),          NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Log(E)',   Ln(2.718281828),  NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('Log(0.5)', Ln(0.5),          NN.GetLastLayer.Output.Raw[2], 1e-5);
+    AssertEquals('Log(4)',   Ln(4.0),          NN.GetLastLayer.Output.Raw[3], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogGradientCheck;
+begin
+  // All inputs strictly positive and well above the 1e-8 eps floor.
+  ActivationGradientCheck(Self, TNNetLog.Create(), 'Log',
+    [0.5, 1.0, 0.25, 2.0, 1.5, 0.75], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLogSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetLog.Create(),
+    'Log', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
