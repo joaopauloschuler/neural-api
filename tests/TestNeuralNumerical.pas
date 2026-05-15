@@ -318,6 +318,7 @@ type
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
     procedure TestSinhActGradientCheck;
+    procedure TestSerfGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
     procedure TestBentIdentitySerializationRoundTrip;
@@ -9622,6 +9623,13 @@ begin
   // is comfortable.
   ActivationGradientCheck(Self, TNNetSinhAct.Create(), 'SinhAct',
     [0.5, -0.5, 1.0, -1.0, 0.25, -0.25], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSerfGradientCheck;
+begin
+  // Serf is smooth everywhere; sample a moderate range around the bend.
+  ActivationGradientCheck(Self, TNNetSerf.Create(), 'Serf',
+    [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestBentIdentityForward;

@@ -6325,10 +6325,16 @@ exists but no Lipschitz / spectral-norm wrapper.
       Backward distributes gradient between the two knots flanking
       each sample. Numerical-gradient test on input + weights.
 
-- [ ] TNNetMishlike / TNNetSerf — `y = x * erf(softplus(x))`, the Serf
+- [x] TNNetMishlike / TNNetSerf — `y = x * erf(softplus(x))`, the Serf
       activation (Nag, Bhattacharyya 2021). Drop-in for Mish with a
       slightly smoother profile. Tiny element-wise addition to the
       TNNetReLUBase family; numerical-gradient test as usual.
+      Landed as TNNetSerf: caches derivative
+      `erf(sp) + x * (2/sqrt(pi)) * exp(-sp^2) * sigmoid(x)` into
+      FOutputErrorDeriv with stable-softplus guards mirroring
+      TNNetSoftPlus / TNNetMish; erf via Abramowitz & Stegun 7.1.26
+      since FPC's Math unit ships no erf. Registered in both CreateLayer
+      dispatch tables, covered by TestSerfGradientCheck.
 
 #### Examples I'd love to actually write
 

@@ -637,6 +637,21 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Serf (a.k.a. Mishlike) activation function.
+  // Serf(x) = x * erf(softplus(x)) where softplus(x) = ln(1 + exp(x)).
+  // Smooth drop-in replacement for Mish. Derivative (with sp = softplus(x)):
+  //   dy/dx = erf(sp) + x * (2/sqrt(pi)) * exp(-sp^2) * sigmoid(x)
+  // since d/dx softplus(x) = sigmoid(x). erf is computed via the standard
+  // Abramowitz & Stegun 7.1.26 polynomial approximation (|err| < 1.5e-7);
+  // FreePascal's Math unit does not ship erf. Cached into FOutputErrorDeriv
+  // so TNNetReLUBase's backward handles the chain rule with one multiply.
+  // Nag, Bhattacharyya (2021).
+  TNNetSerf = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Smish activation function: y = x * tanh(ln(1 + sigmoid(x))).
   // Let s = sigmoid(x), L = ln(1 + s), t = tanh(L). Then
   //   dL/dx = s * (1 - s) / (1 + s)
@@ -6134,6 +6149,109 @@ begin
 end;
 
 procedure TNNetMish.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetSerf }
+
+// Abramowitz & Stegun 7.1.26 polynomial approximation to erf(x);
+// |abs error| < 1.5e-7 over the entire real line. FreePascal's Math
+// unit does not export erf.
+function SerfErf(x: TNeuralFloat): TNeuralFloat;
+const
+  a1 =  0.254829592;
+  a2 = -0.284496736;
+  a3 =  1.421413741;
+  a4 = -1.453152027;
+  a5 =  1.061405429;
+  p  =  0.3275911;
+var
+  sign: TNeuralFloat;
+  ax, t, y: TNeuralFloat;
+begin
+  if x < 0 then sign := -1.0 else sign := 1.0;
+  ax := Abs(x);
+  t := 1.0 / (1.0 + p * ax);
+  y := 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Exp(-ax * ax);
+  Result := sign * y;
+end;
+
+procedure TNNetSerf.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, sp, sig, erfSp, twoOverSqrtPi: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  twoOverSqrtPi := 2.0 / Sqrt(Pi);
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerically-stable softplus and sigmoid, matching TNNetSoftPlus.
+      if x > 30 then
+      begin
+        // softplus(x) ~= x grows linearly; erf(sp) saturates to 1; the
+        // exp(-sp^2) factor in the derivative is ~0, so dy/dx ~= 1.
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
+      else if x < -30 then
+      begin
+        // softplus(x) ~= 0; erf(0) = 0; output and derivative collapse to 0.
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        sp := Ln(1 + Exp(x));
+        sig := 1.0 / (1.0 + Exp(-x));
+        erfSp := SerfErf(sp);
+        FOutput.FData[OutputCnt] := x * erfSp;
+        // dy/dx = erf(sp) + x * (2/sqrt(pi)) * exp(-sp^2) * sigmoid(x)
+        FOutputErrorDeriv.FData[OutputCnt] :=
+          erfSp + x * twoOverSqrtPi * Exp(-sp * sp) * sig;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        sp := x
+      else if x < -30 then
+        sp := Exp(x)
+      else
+        sp := Ln(1 + Exp(x));
+      FOutput.FData[OutputCnt] := x * SerfErf(sp);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSerf.Backpropagate();
 var
   StartTime: double;
 begin
@@ -18486,6 +18604,7 @@ begin
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
+      'TNNetSerf' :                 Result := TNNetSerf.Create();
       'TNNetTanhExp' :              Result := TNNetTanhExp.Create();
       'TNNetSmish' :                Result := TNNetSmish.Create();
       'TNNetPenalizedTanh' :        Result := TNNetPenalizedTanh.Create();
@@ -18674,6 +18793,7 @@ begin
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
+      if S[0] = 'TNNetSerf' then Result := TNNetSerf.Create() else
       if S[0] = 'TNNetTanhExp' then Result := TNNetTanhExp.Create() else
       if S[0] = 'TNNetSmish' then Result := TNNetSmish.Create() else
       if S[0] = 'TNNetPenalizedTanh' then Result := TNNetPenalizedTanh.Create() else
