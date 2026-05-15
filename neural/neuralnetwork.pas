@@ -637,6 +637,20 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// TanhExp activation function: y = x * tanh(exp(x)).
+  // Derivative: with u = exp(x), t = tanh(u),
+  //   dy/dx = t + x * (1 - t^2) * u.
+  // For numerical stability the exponent input is clamped (x > ~20 returns the
+  // saturation limit y ~= x, dy/dx ~= 1; x very negative returns y ~= 0).
+  // https://arxiv.org/abs/2003.09855 ("TanhExp: A Smooth Activation Function
+  // with High Convergence Speed for Lightweight Neural Networks", Liu &
+  // Di, 2020).
+  TNNetTanhExp = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// SoftPlus activation function - This is an experimental layer. Do not use it.
   // A smooth approximation of ReLU.
   // SoftPlus(x) = ln(1 + exp(x)), derivative is the sigmoid function.
@@ -4114,6 +4128,82 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetTanhExp }
+
+procedure TNNetTanhExp.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, expX, tanhExpX: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // TanhExp(x) = x * tanh(exp(x))
+  // d/dx = tanh(exp(x)) + x * (1 - tanh(exp(x))^2) * exp(x)
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 20 then
+      begin
+        // exp(x) huge, tanh saturates at 1, derivative tail vanishes.
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
+      else if x < -20 then
+      begin
+        // exp(x) ~ 0, tanh(0) = 0 -> y = 0; derivative -> 0.
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        expX := Exp(x);
+        tanhExpX := Tanh(expX);
+        FOutput.FData[OutputCnt] := x * tanhExpX;
+        FOutputErrorDeriv.FData[OutputCnt] :=
+          tanhExpX + x * (1 - tanhExpX * tanhExpX) * expX;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else if x < -20 then
+        FOutput.FData[OutputCnt] := 0
+      else
+        FOutput.FData[OutputCnt] := x * Tanh(Exp(x));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTanhExp.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetSquaredReLU }
@@ -16875,6 +16965,7 @@ begin
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
+      'TNNetTanhExp' :              Result := TNNetTanhExp.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
@@ -17045,6 +17136,7 @@ begin
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
+      if S[0] = 'TNNetTanhExp' then Result := TNNetTanhExp.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else

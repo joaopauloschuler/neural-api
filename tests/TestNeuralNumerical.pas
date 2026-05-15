@@ -265,6 +265,8 @@ type
     procedure TestESwishForward;
     procedure TestESwishGradientCheck;
     procedure TestESwishSerializationRoundTrip;
+    procedure TestTanhExpGradientCheck;
+    procedure TestTanhExpSerializationRoundTrip;
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
@@ -8770,6 +8772,19 @@ begin
   // Also verify output equivalence with a non-default beta.
   SerializationRoundTrip(Self, TNNetESwish.Create(2.5),
     'ESwish', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestTanhExpGradientCheck;
+begin
+  // Stay clear of the very-large-x clamp (x > 20).
+  ActivationGradientCheck(Self, TNNetTanhExp.Create(), 'TanhExp',
+    [0.5, -0.5, 1.0, -2.0, 1.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestTanhExpSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetTanhExp.Create(),
+    'TanhExp', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSincForward;
