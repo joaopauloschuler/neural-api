@@ -2205,10 +2205,12 @@ the tree. Anything stretchy is called out explicitly.
       spatial). Pairs with GroupNorm in the literature; cheap forward,
       gradient flows through the standardization (auto-diff via
       Backpropagate override). Test as a wrapper around TNNetConvolution.
-- [ ] TNNetPixelNorm (StyleGAN-style: normalize each (X,Y) pixel across
-      the depth channels to unit norm, no learnable scale/bias). Trivial
-      forward, exact backward via the unit-norm Jacobian. Slot into the
-      existing channel-iteration patterns.
+- [x] TNNetPixelNorm — landed 2026-05-15 (commit 2b62787). StyleGAN-style
+      per-pixel L2 normalization across the depth axis with eps=1e-8;
+      parameter-free, exact backward via the unit-norm Jacobian (depth-
+      reduced, dividing by Depth to match the `mean` forward). Forward,
+      central-difference gradient, and SerializationRoundTrip tests in
+      TestNeuralNumerical.pas.
 - [ ] TNNetSpectralNormHook — power-iteration weight spectral norm
       tracked as a non-trainable buffer on TNNetFullConnect /
       TNNetConvolution. Stretch: makes GAN-style examples honest.
@@ -2332,9 +2334,14 @@ sub-agents on a self-described "lucky day":
 Test suite grew from 360 → 367 tests, all passing. No bugs surfaced.
 
 #### Natural follow-ups
-- [ ] README activation reference: TNNetLogSigmoid, TNNetShiftedReLU,
+- [x] README activation reference: TNNetLogSigmoid, TNNetShiftedReLU,
       and TNNetThreshold each need a one-line description + tiny
       snippet next to their siblings in the activation table.
+      Done 2026-05-15 (commit bc39126): three rows added to README.md
+      §"Layers with Activation Functions and no Trainable Parameter"
+      right after TNNetSquaredReLU. Matched the newer "Created with ..."
+      style. Minor pre-existing inconsistency noted: older rows in the
+      same table omit that suffix.
 - [ ] LogSigmoid + BCE-with-logits training-loss smoke example: pair
       TNNetLogSigmoid with a tiny binary classifier and confirm
       matching convergence vs a sigmoid + BCE baseline.
@@ -2363,20 +2370,17 @@ mood, then ideas that I would genuinely enjoy building. Bias: small,
 mergeable, gradient-checkable, with a real punchline.
 
 #### Activations I'd enjoy adding
-- [ ] TNNetSquaredReLU — `y = max(0, x)^2`, derivative `2*max(0, x)`.
-      One-liner activation used by Primer/So et al. for transformer
-      FFNs; subclasses TNNetReLUBase cleanly. Pair with a numerical-
-      gradient test and the kink test at x=0.
-- [ ] TNNetCELU — `y = max(0, x) + min(0, alpha*(exp(x/alpha)-1))`.
-      Continuously-differentiable ELU variant; single float param.
-      Good candidate for the "how to add a new activation in 30 lines"
-      walkthrough already on the docs list.
-- [ ] TNNetTanhShrink — `y = x - tanh(x)`. Parameter-free, smooth,
-      saturating-from-below activation. Trivial to implement, useful
-      for the "residual-of-tanh" intuition in tiny autoencoders.
-- [ ] TNNetSoftSign — `y = x / (1 + |x|)`. Cheap, bounded, smooth
-      alternative to tanh with a fatter linear region. Derivative is
-      `1 / (1 + |x|)^2` — easy to cache in FOutputErrorDeriv.
+- [x] TNNetSquaredReLU — already landed in earlier batch (see line 186).
+      Lucky-day re-pin from seed 135518 was stale.
+- [x] TNNetCELU — already landed; class at neuralnetwork.pas:740,
+      constructor takes optional `alpha`. Lucky-day re-pin was stale.
+- [x] TNNetTanhShrink — already landed; class at neuralnetwork.pas:646,
+      derivative cached in FOutputErrorDeriv. Lucky-day re-pin was stale.
+      Serialization round-trip test added 2026-05-15 (commit 942bb52)
+      to close a small gap; same commit added TNNetHardTanh round-trip.
+- [x] TNNetSoftSign — already landed; class at neuralnetwork.pas:757,
+      forward + grad-check + round-trip tests all present. Lucky-day
+      re-pin was stale.
 - [ ] TNNetAPL (Adaptive Piecewise Linear) — sum of hinge functions
       `y = max(0, x) + sum_s a_s * max(0, -x + b_s)`. Per-channel
       learnable knees and slopes; stretch but very fun. Would also be
@@ -2505,3 +2509,55 @@ mergeable, gradient-checkable, with a real punchline.
       external Python script could load into onnxruntime. Doc which
       layers are out-of-scope for v1. Solves the "I trained it,
       now what?" gap for non-Pascal downstream users.
+
+
+### Lucky-day batch — 2026-05-15 (post PixelNorm + README-activations pass)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Landed:
+
+- `942bb52` — TanhShrink/HardTanh serialization round-trip tests
+  (agent #1 found its assigned target TNNetTanhShrink was already
+  fully implemented; pivoted to closing the round-trip-test gap
+  flagged in this file at line 2090).
+- `2b62787` — TNNetPixelNorm StyleGAN-style per-pixel L2 norm across
+  the depth axis. Parameter-free; depth-reduced unit-norm Jacobian.
+  Three new tests (forward unit-RMS, central-difference gradient,
+  serialization round-trip).
+- `bc39126` — README activation reference: TNNetLogSigmoid,
+  TNNetShiftedReLU, TNNetThreshold each get a row in the
+  "Layers with Activation Functions and no Trainable Parameter"
+  table.
+
+Test suite: 367 → 372, all passing. No bugs surfaced.
+
+#### Surprise / meta-observation
+
+The lucky-day batch at seed 135518 (above) re-pinned several
+activations that were *already implemented* on this branch:
+TNNetSquaredReLU, TNNetCELU, TNNetTanhShrink, TNNetSoftSign all
+landed in earlier passes but were re-listed as if open. Two of the
+three agents in this pass had to grep their target out of the code
+before pivoting. This costs orchestration budget on every lucky-day
+draw.
+
+#### Follow-ups added by this pass
+
+- [ ] Tasklist staleness sweep: write a small `scripts/audit_tasklist.sh`
+      (or similar) that greps each unchecked `TNNet*` mentioned in
+      tasklist.md against `neural/neuralnetwork.pas` and flags any
+      name already present in the dispatch tables. Would have caught
+      the four stale entries above before they hit an agent.
+- [ ] PixelNorm follow-ups now that it has landed:
+  - [ ] PixelNorm + StyleGAN-flavored generator micro-example (the
+        layer's headline use case; pairs with the existing VisualGAN).
+  - [ ] PixelNorm vs InstanceNorm vs no-norm bake-off on a tiny
+        generator-shaped net — concrete demonstration of why per-pixel
+        norm is the chosen StyleGAN trick.
+  - [ ] Numerical-gradient eps sensitivity check specifically for
+        PixelNorm at small inputs (where `||x||` approaches eps and
+        the Jacobian blows up). Pins the chosen eps=1e-8.
+- [ ] LogSigmoid/ShiftedReLU/Threshold README rows landed using the
+      newer "Created with ..." style; older table rows omit that
+      suffix. Small cleanup task: backfill the older entries (or
+      strip the suffix from the newer ones) for consistency.
