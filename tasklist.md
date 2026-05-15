@@ -2158,3 +2158,141 @@ Natural follow-ups (each commit-sized):
       TNNetInstanceNorm, TNNetHardShrink, TNNetSoftShrink each need a
       one-line description + tiny usage snippet next to their
       siblings (TNNetSoftMax / TNNetGroupNorm / TNNetTanhShrink).
+
+
+### Lucky-day batch — 2026-05-15 (seed 286083)
+
+A fresh batch of small, well-scoped ideas I'd genuinely enjoy taking on.
+Most are one-commit-sized and pair naturally with layers/tests already in
+the tree. Anything stretchy is called out explicitly.
+
+#### New activations (tiny, ReLUBase-style)
+- [ ] TNNetLogSigmoid (`y = log(sigmoid(x)) = -softplus(-x)`) — already
+      hinted at in the previous batch; standard stable form, derivative
+      is `sigmoid(-x)`. Companion to TNNetLogSoftMax for BCE-with-logits.
+      Forward / numerical-gradient / serialization round-trip tests.
+- [ ] TNNetSquaredReLU (`y = max(0, x)^2`) — the Primer/Pythia
+      activation. Cheap, derivative is `2 * max(0, x)`. A single Compute
+      / ChainDeriv pair plus three tests.
+- [ ] TNNetReLU6 (`y = min(max(0, x), 6)`) — MobileNet-style bounded
+      ReLU. Indicator-style derivative on `(0, 6)`. Useful for
+      quantization-friendly experiments later on.
+- [ ] TNNetSoftSign (`y = x / (1 + |x|)`) — bounded smooth saturating
+      activation, derivative `1 / (1 + |x|)^2`. Sibling to Tanh,
+      computationally cheaper.
+- [ ] TNNetMaxout (k=2 fixed first cut) — per-position max over k linear
+      pieces of the input depth. Larger commit; clean fit for the
+      element-wise family if depth-grouping is added carefully.
+
+#### New normalization variants
+- [ ] TNNetWeightStandardization — normalize convolution weights per
+      output channel (zero-mean, unit-variance over input-channel ×
+      spatial). Pairs with GroupNorm in the literature; cheap forward,
+      gradient flows through the standardization (auto-diff via
+      Backpropagate override). Test as a wrapper around TNNetConvolution.
+- [ ] TNNetPixelNorm (StyleGAN-style: normalize each (X,Y) pixel across
+      the depth channels to unit norm, no learnable scale/bias). Trivial
+      forward, exact backward via the unit-norm Jacobian. Slot into the
+      existing channel-iteration patterns.
+- [ ] TNNetSpectralNormHook — power-iteration weight spectral norm
+      tracked as a non-trainable buffer on TNNetFullConnect /
+      TNNetConvolution. Stretch: makes GAN-style examples honest.
+
+#### Attention follow-through
+- [ ] TNNetMultiHeadSelfAttention as an actual layer (not a builder).
+      Wraps `num_heads` parallel TNNetScaledDotProductAttention cores +
+      Q/K/V projections + output projection. Single-head SDPA core is
+      already gradient-checked, so this is "stack and project + test".
+      Would finally close the top-of-file transformer-encoder-block
+      open item. (Echoes the existing stretch entry; keeping a copy in
+      this batch so the new lucky-day pass picks it up too.)
+- [ ] TNNetCausalMask — extract the causal-mask flag from
+      TNNetScaledDotProductAttention into a reusable depth-axis mask
+      layer so non-attention experiments can reuse it. Trivial forward,
+      identity backward except for masked positions.
+- [ ] Attention-pattern visualization helper: dump the post-softmax
+      attention matrix (B, H, T, T) to PGM/CSV for a trained tiny model.
+      Pure offline utility; no test infra needed.
+
+#### Loss layers / objectives
+- [ ] TNNetNLLLoss companion to TNNetLogSoftMax: NLL over (X,Y,Depth)
+      with class index targets. Closes the "log-softmax + NLL" pairing
+      and is the natural way to demonstrate the new log-domain path.
+- [ ] TNNetFocalLoss (`(1 - p_t)^gamma * CE`) — class-imbalance loss,
+      gamma in `FFloatSt[0]` (default 2.0). One forward, one backward,
+      one gradient-check.
+- [ ] TNNetLabelSmoothingCE — cross-entropy with epsilon smoothing
+      (default 0.1). One float param, identical Jacobian to standard CE
+      after the smoothing transform on targets.
+- [ ] TNNetHuberLoss / TNNetSmoothL1Loss — delta in `FFloatSt[0]`.
+      Useful for the time-series forecasting example already on the
+      ideas list.
+
+#### Tiny experiments I'd enjoy running
+- [ ] LogSoftMax+NLL vs SoftMax+CE convergence parity test: same seed,
+      same tiny classifier, plot val-loss curves. Pins the claim that
+      the log-domain path is numerically equivalent (and demonstrates
+      the new TNNetLogSoftMax in anger).
+- [ ] InstanceNorm vs GroupNorm vs LayerNorm vs ChannelStdNorm
+      single-seed bake-off on a 3-layer CIFAR-ish conv stack. One chart,
+      one CSV, reuses the existing SimpleImage example skeleton.
+- [ ] Shrink-activation sparsity sweep: train a tiny autoencoder with
+      ReLU / SoftShrink / HardShrink as the bottleneck; sweep lambda
+      over `{0.1, 0.25, 0.5, 1.0}`; report (sparsity %, recon loss).
+      Concrete demonstration of the L1-prox claim. (Pairs with the
+      existing shrink-sparsity entry; this version pins the sweep grid.)
+- [ ] Activation "kink at zero" finite-difference noise audit:
+      generate central-difference gradient errors for every activation
+      on a `[-0.05, 0.05]` window stepping by 1e-3; identify which
+      activations need the inputs biased away from zero in tests, and
+      which are genuinely smooth. Direct follow-up to the shrink test
+      kink-region gap.
+- [ ] Numerical-gradient epsilon study: replicate one existing test
+      with `epsilon ∈ {1e-2, 1e-3, 1e-4, 1e-5}` and tabulate the
+      observed max abs error. Quantifies the central-difference noise
+      floor; informs future test thresholds.
+
+#### Test coverage / hygiene
+- [ ] Auto-generated "every registered layer round-trips through
+      LoadFromString" test (already on the list; re-pinning it because
+      it would catch the next dispatch regression for free). Drive it
+      off the CreateLayer dispatch table directly.
+- [ ] Numerical-gradient checks for the remaining uncovered families
+      flagged earlier: upsampling/deconvolution and recurrent-style
+      layers. One family per commit.
+- [ ] TNNetLogSoftMax stability micro-test (huge logits, e.g.
+      `x = [1000, 0, 0, ...]`): assert finite output, `exp(out).sum() ≈
+      1`, finite gradient. Pairs with the existing softmax stability
+      entry.
+- [ ] Determinism test: same seed → bit-identical forward+backward
+      across two runs of the same tiny net. Tiny but catches future
+      nondeterminism regressions (e.g. parallel reductions reordered).
+
+#### Documentation
+- [ ] One-page "activations cheat sheet" in `docs/activations.md`:
+      formula, derivative, saturating-or-not, smooth-at-zero, typical
+      use case. (Echoing the earlier batch — re-pinning because the
+      activation roster has grown meaningfully since.)
+- [ ] One-page "normalization cheat sheet" in `docs/normalization.md`:
+      LayerNorm vs RMSNorm vs GroupNorm vs InstanceNorm vs
+      ChannelStdNorm — what axes each one reduces over, learnable
+      params, typical use case. The roster is now big enough to need
+      a map.
+- [ ] "How to add a new activation in ~30 lines" walkthrough — reuses
+      TNNetReLUBase, with TNNetCELU or TNNetSquaredReLU as the worked
+      example. Lowers the contribution barrier.
+
+#### Stretch / ambitious
+- [ ] Tiny GPT char-level example end-to-end in Pascal on CPU. Now
+      well-scoped given LayerNorm + RoPE + SDPA + Shrinks + LogSoftMax
+      all landed; the remaining gap is mostly MultiHeadSelfAttention
+      and a tokenizer wrapper. Same top-of-file item, but lucky-day
+      version: just `tinyshakespeare.txt`, a 2-layer model, and
+      generation that produces non-trivial text.
+- [ ] Mixture-of-Experts routing layer (also at the top of this file):
+      top-k softmax gate over N expert sub-networks with load-balancing
+      auxiliary loss. Stretch but well-scoped once MHSA lands.
+- [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
+      forward-only graph for the currently-supported subset of layers,
+      enough to run inference in onnxruntime. Doc which layers are
+      out-of-scope for v1.
