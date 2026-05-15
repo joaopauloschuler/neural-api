@@ -146,6 +146,9 @@ type
     procedure TestSoftmaxTemperatureSerializationRoundTrip;
     procedure TestPointwiseSoftMaxExactJacobianGradientCheck;
     procedure TestSoftMaxExactJacobianGradientCheck;
+    procedure TestLogSoftMaxForward;
+    procedure TestLogSoftMaxGradientCheck;
+    procedure TestLogSoftMaxSerializationRoundTrip;
     procedure TestChannelShuffleIndivisibleGuard;
     procedure TestChannelShuffleInverseProperty;
     procedure TestLayerNormSerializationRoundTrip;
@@ -6100,6 +6103,152 @@ begin
   // check would fail with the old approximation.
   LayerInputGradientCheck(Self, TNNetSoftMax.Create(),
     'SoftMax', 1, 1, 6, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestLogSoftMaxForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SizeX, SizeY, SizeD, x, y, d, StartPos: integer;
+  SumExp, OutVal: TNeuralFloat;
+begin
+  SizeX := 2;
+  SizeY := 2;
+  SizeD := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, SizeD);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, SizeD, 1));
+    NN.AddLayer(TNNetLogSoftMax.Create());
+
+    // First (X=0,Y=0) group: ordinary scale logits.
+    Input[0, 0, 0] := 0.5;
+    Input[0, 0, 1] := -1.0;
+    Input[0, 0, 2] := 2.0;
+    Input[0, 0, 3] := 0.0;
+    // Second (X=1,Y=0): extreme logits that would overflow exp() naively.
+    Input[1, 0, 0] := 1000.0;
+    Input[1, 0, 1] := 999.0;
+    Input[1, 0, 2] := 1001.0;
+    Input[1, 0, 3] := 998.0;
+    // Third (X=0,Y=1): all equal -> uniform log-softmax.
+    Input[0, 1, 0] := 3.0;
+    Input[0, 1, 1] := 3.0;
+    Input[0, 1, 2] := 3.0;
+    Input[0, 1, 3] := 3.0;
+    // Fourth (X=1,Y=1): negative range.
+    Input[1, 1, 0] := -2.0;
+    Input[1, 1, 1] := -5.0;
+    Input[1, 1, 2] := -1.0;
+    Input[1, 1, 3] := -3.0;
+
+    NN.Compute(Input);
+
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        StartPos := NN.GetLastLayer.Output.GetRawPos(x, y, 0);
+        SumExp := 0;
+        for d := 0 to SizeD - 1 do
+        begin
+          OutVal := NN.GetLastLayer.Output.FData[StartPos + d];
+          AssertTrue('LogSoftMax output is finite at (' + IntToStr(x) + ',' +
+            IntToStr(y) + ',' + IntToStr(d) + ') val=' + FloatToStr(OutVal),
+            (OutVal = OutVal) and (Abs(OutVal) < 1e6));
+          // log-softmax outputs must be <= 0.
+          AssertTrue('LogSoftMax output non-positive at (' + IntToStr(x) + ',' +
+            IntToStr(y) + ',' + IntToStr(d) + ')', OutVal <= 1e-5);
+          SumExp := SumExp + Exp(OutVal);
+        end;
+        AssertEquals('LogSoftMax exp(output) sums to 1 at (' + IntToStr(x) + ',' +
+          IntToStr(y) + ')', 1.0, SumExp, 1e-4);
+      end;
+
+    // Uniform-logit group must produce log(1/SizeD) in every channel.
+    StartPos := NN.GetLastLayer.Output.GetRawPos(0, 1, 0);
+    for d := 0 to SizeD - 1 do
+      AssertEquals('LogSoftMax uniform group at d=' + IntToStr(d),
+        Ln(1.0 / SizeD), NN.GetLastLayer.Output.FData[StartPos + d], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogSoftMaxGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // LogSoftMax forward uses exp() and ln(); float32 round-off in the
+  // central-difference numerator is sensitive to the input magnitude, so we
+  // scale inputs/desired down compared to the generic LayerInputGradientCheck
+  // helper while keeping the standard 1e-2 tolerance.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetLogSoftMax.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3 - 0.2;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('LogSoftMax input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogSoftMaxSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetLogSoftMax.Create(),
+    'LogSoftMax', 2, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestELUForward;

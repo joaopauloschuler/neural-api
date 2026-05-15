@@ -1629,6 +1629,16 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Numerically stable log-softmax over the depth axis at each (X,Y).
+  /// out[d] = (x[d] - max_d x) - log(sum_d exp(x - max_d x)).
+  /// Backward simplifies to: dx[d] = dy[d] - softmax(x)[d] * sum_d dy[d],
+  /// where softmax(x)[d] = exp(out[d]).
+  TNNetLogSoftMax = class(TNNetIdentity)
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -12732,6 +12742,81 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetLogSoftMax }
+procedure TNNetLogSoftMax.Compute;
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  MaxVal, SumExp, LogSumExp: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for CntX := 0 to MaxX do
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+      MaxVal := FOutput.FData[StartPos];
+      for CntD := 1 to MaxD do
+        if FOutput.FData[StartPos + CntD] > MaxVal then
+          MaxVal := FOutput.FData[StartPos + CntD];
+      SumExp := 0;
+      for CntD := 0 to MaxD do
+        SumExp := SumExp + Exp(FOutput.FData[StartPos + CntD] - MaxVal);
+      LogSumExp := Ln(SumExp);
+      for CntD := 0 to MaxD do
+        FOutput.FData[StartPos + CntD] :=
+          (FOutput.FData[StartPos + CntD] - MaxVal) - LogSumExp;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLogSoftMax.Backpropagate;
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  SumDy, Yi: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
+    (FOutput.Size = FOutputError.Size) then
+  begin
+    // dx[d] = dy[d] - softmax(x)[d] * sum_d dy[d], with softmax(x)[d] = exp(out[d])
+    // because out = log-softmax(x). Applied per (X,Y) over the depth axis.
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+        SumDy := 0;
+        for CntD := 0 to MaxD do
+          SumDy := SumDy + FOutputError.FData[StartPos + CntD];
+        for CntD := 0 to MaxD do
+        begin
+          Yi := Exp(FOutput.FData[StartPos + CntD]);
+          FPrevLayer.OutputError.FData[StartPos + CntD] :=
+            FPrevLayer.OutputError.FData[StartPos + CntD] +
+            FOutputError.FData[StartPos + CntD] - Yi * SumDy;
+        end;
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetConvolutionReLU }
 constructor TNNetConvolutionReLU.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -15269,6 +15354,7 @@ begin
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create(St[0]);
       'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
+      'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -15411,6 +15497,7 @@ begin
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create(St[0]) else
       if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
+      if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
