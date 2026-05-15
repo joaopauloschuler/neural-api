@@ -648,6 +648,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// LogSigmoid activation function.
+  // LogSigmoid(x) = log(sigmoid(x)) = -softplus(-x). Numerically stable form:
+  //   x >= 0: y = -ln(1+exp(-x))
+  //   x <  0: y =  x - ln(1+exp(x))
+  // Derivative is sigmoid(-x) = 1 - sigmoid(x), cached in FOutputErrorDeriv
+  // so the TNNetReLUBase backward chain rule applies.
+  TNNetLogSigmoid = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -4936,6 +4947,60 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := x - Tanh(x);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetLogSigmoid }
+
+procedure TNNetLogSigmoid.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, expNegAbsX, denom: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // LogSigmoid(x) = log(sigmoid(x)) = -softplus(-x).
+  // Stable branches:
+  //   x >= 0:  y = -ln(1+exp(-x)),       deriv = exp(-x)/(1+exp(-x))
+  //   x <  0:  y =  x - ln(1+exp(x)),    deriv = 1/(1+exp(x))
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x >= 0 then
+      begin
+        expNegAbsX := Exp(-x);
+        denom := 1 + expNegAbsX;
+        FOutput.FData[OutputCnt] := -Ln(denom);
+        FOutputErrorDeriv.FData[OutputCnt] := expNegAbsX / denom;
+      end
+      else
+      begin
+        expNegAbsX := Exp(x);
+        denom := 1 + expNegAbsX;
+        FOutput.FData[OutputCnt] := x - Ln(denom);
+        FOutputErrorDeriv.FData[OutputCnt] := 1 / denom;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x >= 0 then
+        FOutput.FData[OutputCnt] := -Ln(1 + Exp(-x))
+      else
+        FOutput.FData[OutputCnt] := x - Ln(1 + Exp(x));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15468,6 +15533,7 @@ begin
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
+      'TNNetLogSigmoid' :           Result := TNNetLogSigmoid.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -15614,6 +15680,7 @@ begin
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
+      if S[0] = 'TNNetLogSigmoid' then Result := TNNetLogSigmoid.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else

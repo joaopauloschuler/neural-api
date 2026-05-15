@@ -87,6 +87,10 @@ type
     procedure TestSquaredReLUGradientCheck;
     procedure TestTanhShrinkForward;
     procedure TestTanhShrinkGradientCheck;
+    procedure TestLogSigmoidForward;
+    procedure TestLogSigmoidGradientCheck;
+    procedure TestLogSigmoidSerializationRoundTrip;
+    procedure TestLogSigmoidExtremeInputSaturation;
     procedure TestHardTanhForward;
     procedure TestHardTanhGradientCheck;
     procedure TestHardShrinkForward;
@@ -3565,6 +3569,112 @@ begin
     [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestLogSigmoidForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  function LogSigmoidRef(x: TNeuralFloat): TNeuralFloat;
+  begin
+    if x >= 0 then
+      Result := -Ln(1 + Exp(-x))
+    else
+      Result := x - Ln(1 + Exp(x));
+  end;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetLogSigmoid.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    Input.Raw[3] := 2.0;
+    Input.Raw[4] := -3.0;
+
+    NN.Compute(Input);
+
+    // LogSigmoid(0) = -ln(2) ~= -0.6931472
+    AssertEquals('LogSigmoid(0)', -Ln(2.0), NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('LogSigmoid(1)', LogSigmoidRef(1.0), NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('LogSigmoid(-1)', LogSigmoidRef(-1.0), NN.GetLastLayer.Output.Raw[2], 1e-5);
+    AssertEquals('LogSigmoid(2)', LogSigmoidRef(2.0), NN.GetLastLayer.Output.Raw[3], 1e-5);
+    AssertEquals('LogSigmoid(-3)', LogSigmoidRef(-3.0), NN.GetLastLayer.Output.Raw[4], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogSigmoidGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetLogSigmoid.Create(), 'LogSigmoid',
+    [0.5, -0.5, 1.0, -1.0, 2.0, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLogSigmoidExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  v, g: TNeuralFloat;
+  i: integer;
+begin
+  // Drive LogSigmoid with extreme magnitudes (+/-1e6 and others). The stable
+  // formulation must produce no NaN/Inf in either forward or backward, and
+  // outputs should be <= 0 (since sigmoid(x) in (0,1] => log <= 0).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetLogSigmoid.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Input.Raw[0] := 1e6;
+    Input.Raw[1] := -1e6;
+    Input.Raw[2] := 1e30;
+    Input.Raw[3] := -1e30;
+    Input.Raw[4] := 1e3;
+    Input.Raw[5] := -1e3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.3);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('LogSigmoid saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('LogSigmoid saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('LogSigmoid saturation output <= small epsilon at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v), v <= 1e-4);
+    end;
+    // Specific check: x = +1e6 should saturate to ~0 (sigmoid -> 1, log -> 0)
+    AssertEquals('LogSigmoid(+1e6) ~ 0', 0.0, NN.GetLastLayer.Output.Raw[0], 1e-4);
+    // x = -1e6 should be ~ x (since log(sigmoid(x)) -> x for very negative x)
+    AssertTrue('LogSigmoid(-1e6) finite and very negative',
+      NN.GetLastLayer.Output.Raw[1] < -1e5);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.OutputError.Raw[i];
+      AssertFalse('LogSigmoid saturation output-grad NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('LogSigmoid saturation output-grad Inf at ' + IntToStr(i), IsInfinite(v));
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('LogSigmoid saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('LogSigmoid saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestHardTanhForward;
 var
   NN: TNNet;
@@ -5222,6 +5332,12 @@ procedure TTestNeuralNumerical.TestHardShrinkSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetHardShrink.Create(0.3),
     'HardShrink', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLogSigmoidSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetLogSigmoid.Create(),
+    'LogSigmoid', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSoftShrinkSerializationRoundTrip;
