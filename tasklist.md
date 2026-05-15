@@ -75,9 +75,12 @@
 - [ ] Continue the Backpropagate audit: the transform/reshape/pooling/element-
       wise families are now covered (TNNetPadXY, TNNetCrop,
       TNNetInterleaveChannels, TNNetAvgPool, TNNetCellBias, TNNetCellMul).
-      Remaining uncovered families to check next: upsampling/deconvolution
-      layers, concat/split/branch layers, and recurrent-style layers. Add
-      numerical-gradient checks in TestNeuralNumerical.pas, one family at a time.
+      The concat/split/branch family is now also covered: TNNetConcat,
+      TNNetDeepConcat, TNNetSplitChannels, TNNetSum each have a numerical-
+      gradient test in TestNeuralNumerical.pas. Remaining uncovered families
+      to check next: upsampling/deconvolution layers and recurrent-style
+      layers. Add numerical-gradient checks in TestNeuralNumerical.pas, one
+      family at a time.
 - [ ] TNNetRMSNorm has now landed (neural/neuralnetwork.pas +
       TestNeuralNumerical.pas) and is, alongside TNNetLayerNorm, a ready
       template for any further normalization-layer variants.
@@ -163,10 +166,13 @@
       numerical-gradient tests.
 
 #### Correctness / audit work I find rewarding
-- [ ] Continue the Backpropagate audit into the concat/split/branch family
+- [x] Continue the Backpropagate audit into the concat/split/branch family
       (TNNetConcat, TNNetDeepConcat, TNNetSplitChannels, TNNetSum) — one
       numerical-gradient test per layer, hunting for bugs the activation audit
-      style turned up before.
+      style turned up before. (Done: TestConcatGradientCheck,
+      TestDeepConcatGradientCheck, TestSplitChannelsGradientCheck,
+      TestSumGradientCheck in TestNeuralNumerical.pas. No bugs found; all four
+      layers' input-gradient paths match finite differences within 1e-2.)
 - [x] Add a numerical-gradient test for TNNetAddPositionalEmbedding (and any
       other layer carrying learnable weights that lacks one) — the learnable-
       weight gradient path is the easiest place for a silent bug to hide.
@@ -256,9 +262,11 @@
       mixed-precision work.
 
 #### Correctness / audit work I'd enjoy
-- [ ] Continue the Backpropagate audit into the concat/split/branch family
+- [x] Continue the Backpropagate audit into the concat/split/branch family
       (TNNetConcat, TNNetDeepConcat, TNNetSplitChannels, TNNetSum) — one
       numerical-gradient test per layer. Listed above; I want to take it.
+      (Done: see TestConcatGradientCheck / TestDeepConcatGradientCheck /
+      TestSplitChannelsGradientCheck / TestSumGradientCheck. No bugs found.)
 - [x] Numerical-gradient test for TNNetAddPositionalEmbedding's learnable
       weight path — already listed; the learnable-weight branch is the
       easiest place for a silent bug to hide. (Done: see above. The layer

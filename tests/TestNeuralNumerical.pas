@@ -94,6 +94,10 @@ type
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
     procedure TestSumNumericalValues;
+    procedure TestConcatGradientCheck;
+    procedure TestDeepConcatGradientCheck;
+    procedure TestSplitChannelsGradientCheck;
+    procedure TestSumGradientCheck;
     
     // Network composition tests
     procedure TestSimpleNetworkNumerical;
@@ -2114,6 +2118,300 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConcatGradientCheck;
+// Numerical gradient check for TNNetConcat (flat concat).
+// Two branches (MulByConstant) fan out from the input layer, then are
+// concatenated flat. Verifies the input-error path accumulates correctly
+// from both branches.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  InputLayer, Branch1, Branch2: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 2);
+  InputPlus := TNNetVolume.Create(2, 1, 2);
+  epsilon := 0.001;
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 1, 2, 1));
+    Branch1 := NN.AddLayer(TNNetMulByConstant.Create(1.5));
+    Branch2 := NN.AddLayerAfter(TNNetMulByConstant.Create(-0.7), InputLayer);
+    NN.AddLayer(TNNetConcat.Create([Branch1, Branch2]));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+                                  NN.GetLastLayer.Output.SizeY,
+                                  NN.GetLastLayer.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) - 0.1;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Concat input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeepConcatGradientCheck;
+// Numerical gradient check for TNNetDeepConcat. Two branches with different
+// transforms are stacked along the depth axis.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  InputLayer, Branch1, Branch2: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  InputPlus := TNNetVolume.Create(2, 2, 2);
+  epsilon := 0.001;
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 2, 2, 1));
+    Branch1 := NN.AddLayer(TNNetMulByConstant.Create(2.0));
+    Branch2 := NN.AddLayerAfter(TNNetMulByConstant.Create(0.5), InputLayer);
+    NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2]));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+                                  NN.GetLastLayer.Output.SizeY,
+                                  NN.GetLastLayer.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('DeepConcat input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSplitChannelsGradientCheck;
+// Numerical gradient check for TNNetSplitChannels. Two splits feed a
+// DeepConcat so every input channel reaches the loss; this exercises the
+// SplitChannels backprop path on multiple channel selections.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  InputLayer, SplitA, SplitB: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  // 4 channels: SplitA takes channels [1] (single), SplitB takes [0,2,3].
+  // Reordered concat exercises both contiguous and non-contiguous picks.
+  Input := TNNetVolume.Create(2, 1, 4);
+  InputPlus := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.001;
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    SplitA := NN.AddLayer(TNNetSplitChannels.Create([1]));
+    SplitB := NN.AddLayerAfter(TNNetSplitChannels.Create([0, 2, 3]), InputLayer);
+    NN.AddLayer(TNNetDeepConcat.Create([SplitA, SplitB]));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+                                  NN.GetLastLayer.Output.SizeY,
+                                  NN.GetLastLayer.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.55) * 1.3 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.45) * 0.4;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SplitChannels input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSumGradientCheck;
+// Numerical gradient check for TNNetSum (residual-style add). Two branches
+// with different scalar multipliers feed a sum; each branch contributes its
+// full gradient back to the shared input.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  InputLayer, Branch1, Branch2: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  InputPlus := TNNetVolume.Create(2, 2, 2);
+  epsilon := 0.001;
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 2, 2, 1));
+    Branch1 := NN.AddLayer(TNNetMulByConstant.Create(1.0));
+    Branch2 := NN.AddLayerAfter(TNNetMulByConstant.Create(-0.5), InputLayer);
+    NN.AddLayer(TNNetSum.Create([Branch1, Branch2]));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+                                  NN.GetLastLayer.Output.SizeY,
+                                  NN.GetLastLayer.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.1 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.6 - 0.1;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Sum input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 
