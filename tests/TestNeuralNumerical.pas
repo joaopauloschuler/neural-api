@@ -156,6 +156,9 @@ type
     procedure TestMaxOutForward;
     procedure TestMaxOutGradientCheck;
     procedure TestMaxOutSerializationRoundTrip;
+    procedure TestHardTanhExtremeInputSaturation;
+    procedure TestTanhShrinkTanhComposition;
+    procedure TestMaxOutDepthNotDivisibleByKGuard;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -5785,6 +5788,126 @@ begin
     end;
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHardTanhExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  v, g: TNeuralFloat;
+  i: integer;
+begin
+  // Drive HardTanh with extreme magnitudes (+/-1e6 and a few other extremes).
+  // HardTanh(x) = clamp(x, -1, 1), so every output must lie inside [-1, +1]
+  // and neither forward nor backward must produce NaN/Inf.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetHardTanh.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Input.Raw[0] := 1e6;
+    Input.Raw[1] := -1e6;
+    Input.Raw[2] := 1e30;
+    Input.Raw[3] := -1e30;
+    Input.Raw[4] := 1e3;
+    Input.Raw[5] := -1e3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.3);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('HardTanh saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('HardTanh saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('HardTanh saturation in [-1, 1] at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v),
+        (v >= -1.0 - 1e-4) and (v <= 1.0 + 1e-4));
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.OutputError.Raw[i];
+      AssertFalse('HardTanh saturation output-grad NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('HardTanh saturation output-grad Inf at ' + IntToStr(i), IsInfinite(v));
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('HardTanh saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('HardTanh saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTanhShrinkTanhComposition;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  shrinkOut, tanhX, reconstructed: TNeuralFloat;
+begin
+  // Property: TanhShrink(x) + tanh(x) = x by definition (TanhShrink(x) = x - tanh(x)).
+  // Use a tiny random input volume, compute the TanhShrink output, then add tanh(x)
+  // back per-element and assert the sum reconstructs x within fp tolerance.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetTanhShrink.Create());
+
+    RandSeed := 4242;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.71) * 1.7 - 0.3;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      shrinkOut := NN.GetLastLayer.Output.Raw[i];
+      tanhX := Tanh(Input.Raw[i]);
+      reconstructed := shrinkOut + tanhX;
+      AssertEquals('TanhShrink(x) + tanh(x) = x at ' + IntToStr(i),
+        Input.Raw[i], reconstructed, 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaxOutDepthNotDivisibleByKGuard;
+var
+  NN: TNNet;
+  MaxOut: TNNetMaxOut;
+  Capture: TErrorCapture;
+begin
+  // SetPrevLayer of TNNetMaxOut routes a hard precondition violation through
+  // FErrorProc when the input depth is not a multiple of K. Hook a custom
+  // capture method onto the layer and assert it fires with a message that
+  // mentions divisibility.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 5, 1)); // Depth=5, K=2 -> not divisible
+    MaxOut := TNNetMaxOut.Create(2);
+    MaxOut.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(MaxOut);
+    AssertTrue('MaxOut depth-not-divisible-by-K guard must fire FErrorProc',
+      Capture.Triggered);
+    AssertTrue('MaxOut guard message must mention "divisible"',
+      Pos('divisible', Capture.Message) > 0);
+  finally
+    NN.Free;
+    Capture.Free;
   end;
 end;
 
