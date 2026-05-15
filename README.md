@@ -639,6 +639,9 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetLeakyReLU`             | 1D, 2D, or 3D               | Leaky ReLU    | Applies a leaky ReLU activation function.                                                              |
 | `TNNetVeryLeakyReLU`         | 1D, 2D, or 3D               | Very Leaky ReLU| Applies a very leaky ReLU activation function.                                                        |
 | `TNNetReLUSqrt`              | 1D, 2D, or 3D               | ReLU Sqrt     | ReLU activation function with square root scaling.                                                     |
+| `TNNetSquaredReLU`           | 1D, 2D, or 3D               | Squared ReLU  | Squared ReLU activation: `relu(x)^2`. From the Primer paper (https://arxiv.org/abs/2109.08668). Created with `TNNetSquaredReLU.Create()`. |
+| `TNNetSoftPlus`              | 1D, 2D, or 3D               | SoftPlus      | SoftPlus activation, a smooth approximation of ReLU: `ln(1 + exp(x))`. Created with `TNNetSoftPlus.Create()`. |
+| `TNNetGaussianActivation`    | 1D, 2D, or 3D               | Gaussian      | Gaussian activation: `exp(-x^2)`. Created with `TNNetGaussianActivation.Create()`. |
 | `TNNetSELU`                  | 1D, 2D, or 3D               | SELU          | Self-normalizing activation function.                                                                  |
 | `TNNetSigmoid`               | 1D, 2D, or 3D               | Sigmoid       | Sigmoid activation function.                                                                           |
 | `TNNetSoftMax`               | 1D, 2D, or 3D               | SoftMax       | SoftMax activation function.                                                                           |
@@ -657,6 +660,20 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSignedSquareRootN`     | 1D, 2D, or 3D               | SSRN          | If `Abs(x) < N` then `y = x`, otherwise, `y = Sign(x) * Sqrt(Abs(x)-N+1)+N-1`.                         |
 
 
+### Gated Linear Units
+Gated Linear Units split the input along the channel (depth) axis into two equal halves `A` and `B`, and output `A` multiplied by a gating activation applied to `B`. The output depth is therefore half of the input depth, and the input depth must be even. These layers have no trainable parameters. They are commonly used inside transformer feed-forward blocks (https://arxiv.org/abs/2002.05202).
+
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetGLU`                   | 1D, 2D, or 3D (even depth)  | Gated Linear Unit: outputs `A * sigmoid(B)` (https://arxiv.org/abs/1612.08083). Created with `TNNetGLU.Create()`. |
+| `TNNetGEGLU`                 | 1D, 2D, or 3D (even depth)  | GELU-gated linear unit: outputs `A * GELU(B)`. Created with `TNNetGEGLU.Create()`. |
+| `TNNetSwiGLU`                | 1D, 2D, or 3D (even depth)  | Swish-gated linear unit: outputs `A * Swish(B)`, where `Swish(x) = x * sigmoid(x)`. Created with `TNNetSwiGLU.Create()`. |
+
+### Attention Masking
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetMaskedFill`            | 2D or 3D                    | Causal (upper-triangle) mask for self-attention score maps. Adds a large negative constant to positions where the column index (X) is greater than the row index (Y), so they contribute (almost) zero attention after a softmax. No trainable parameter; the backward pass is a straight passthrough. Created with `TNNetMaskedFill.Create()` or `TNNetMaskedFill.Create(MaskValue)`. |
+
 ### Trainable Bias (Shift) and Multiplication (Scaling) per Cell or Channel Allowing Faster Learning and Convergence
 When `TNNetCellBias` is added after convolutional layers, it introduces a trainable bias to each output cell of the convolutional layer. This can have several effects on the neural network:
 
@@ -673,6 +690,7 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 | `TNNetCellMul`               | 1D, 2D, or 3D               | Trainable multiplication (scaling) for each cell.                                                     |
 | `TNNetChannelBias`           | 1D, 2D, or 3D               | Trainable bias (shift) for each channel.                                                              |
 | `TNNetChannelMul`            | 1D, 2D, or 3D               | Trainable multiplication (scaling) for each channel.                                                  |
+| `TNNetLayerScale`            | 1D, 2D, or 3D               | LayerScale: per-channel learnable multiplier (the "γ trick" from CaiT / ConvNeXt). `Output[x,y,d] = Input[x,y,d] * Scale[d]`, where `Scale` is a learnable vector of length = channel count. Created with `TNNetLayerScale.Create()` or `TNNetLayerScale.Create(InitialScale)` (default initial scale 1.0). `TNNetLearnableScale` is an alias. |
 
 ### Embedding Layers
 `TNNetEmbedding` is designed to convert input tokens (usually represented as integers) into dense vector representations (embedding vectors). `TNNetTokenAndPositionalEmbedding` extends `TNNetEmbedding` by adding positional information to the token embeddings. This is crucial for transformer models that don't have an inherent notion of sequence order. Both layers are crucial for modern NLP tasks, especially when working with transformer-based models. They allow the network to work with text data by converting tokens into rich, informative vector representations that capture both semantic meaning and positional information. By using `TNNetTokenAndPositionalEmbedding`, you're equipping your model with the fundamental building blocks needed for advanced NLP tasks as it provides both embedding and positional encoding.
