@@ -1360,4 +1360,71 @@ LayerScale, DropPath, exact softmax Jacobian).
       exact Jacobian. Naturally companions the existing
       "position encodings in this repo" doc idea above.
 
+### Lucky-day batch — 2026-05-15 (post MaxOut + TanhShrink/HardTanh + DeMaxPool-bug)
+
+This batch landed:
+- TNNetTanhShrink (`y = x - tanh(x)`) and TNNetHardTanh (`y = clamp(x,-1,1)`),
+  both as activation layers descending from TNNetReLUBase, with forward +
+  numerical-gradient tests in TestNeuralNumerical.pas.
+- TNNetMaxOut (Goodfellow K-way max): depth-grouped variant — input depth D
+  must be divisible by K, output depth = D/K, output is the elementwise max
+  across the K depth slabs. Argmax cached per output cell for backward.
+  Forward, numerical-gradient, and serialization round-trip tests.
+
+Notable finding (NOT fixed, flagged for triage):
+
+- [ ] **BUG: TNNetDeMaxPool.ComputePreviousLayerError gradient is off by a
+      factor of FPoolSize.** Forward replicates each input cell into a
+      `PoolSize x PoolSize` output block (`neuralnetwork.pas:11471-11487`),
+      so the correct input gradient is the SUM of the block's output errors.
+      Current code (`neuralnetwork.pas:11552`) does
+      `if (FSpacing=0) then FOutputError.Divi(floatPoolSize);` before the
+      accumulating loop — dividing by `PoolSize`, not `PoolSize*PoolSize`,
+      and arguably it should not divide at all for a pure-replication
+      forward. Audit attempt added `TestDeMaxPoolGradientCheck` and it
+      failed at PoolSize=2 with numerical=4.90 vs analytical=2.45
+      (exactly 2x off). The failing test was reverted (not committed)
+      per the audit-bug protocol. TNNetUpsample inherits from
+      TNNetDeMaxPool but overrides both Compute and
+      ComputePreviousLayerError, so its existing
+      `TestUpsampleGradientCheck` is unaffected. TNNetDeAvgPool DOES
+      inherit the buggy backward.
+      Follow-up plan:
+      (a) Decide the correct backward (likely: remove the `Divi` call
+          entirely so the sum-of-block matches the pure-replication
+          forward).
+      (b) Check whether any in-tree example/training relies on the
+          current scaling. `TNNetDeMaxPool` is used at
+          neuralnetwork.pas:10561 in at least one example. TNNetDeAvgPool
+          semantics (if it should average rather than replicate) may
+          warrant a different forward instead.
+      (c) Apply the fix, re-add `TestDeMaxPoolGradientCheck`, and
+          additionally add a forward shape/replication test plus
+          `TestDeAvgPoolGradientCheck`.
+
+Natural follow-ups (non-bug):
+
+- [ ] HardTanh saturation test on extreme inputs (±1e6) — assert
+      output stays within ±1 and `Backpropagate` doesn't produce NaNs
+      (mirroring the TNNetSoftCapping saturation test pattern).
+- [ ] TanhShrink × Tanh composition sanity: `TanhShrink(x) + tanh(x)`
+      should reconstruct `x` to within fp tolerance, on a tiny random
+      input. One-liner check on top of the existing primitives.
+- [ ] TNNetMaxOut serialization-after-wire test: build a small net
+      with MaxOut in the middle (so SetPrevLayer fires post-load),
+      save/load the whole net via `TNNet.SaveToString`/`LoadFromString`,
+      and assert Compute matches end-to-end. The existing
+      `TestMaxOutSerializationRoundTrip` only round-trips the single
+      layer, not the net.
+- [ ] MaxOut "depth not divisible by K" guard test: assert that wiring
+      a `TNNetMaxOut(K)` after a layer whose Depth is not a multiple of
+      K raises the expected error (validates the divisibility
+      precondition, mirroring the RoPE odd-depth guard test pattern).
+- [ ] TNNetMaxOut CIFAR-style example wired into one of the existing
+      SimpleImage paths — a real end-to-end use of the new activation,
+      similar to the still-open ChannelShuffle integration task.
+- [ ] Activation menagerie bake-off (already on the list) is now sweeter
+      with TanhShrink/HardTanh/MaxOut in the menu; whoever picks up the
+      bake-off should include the three new activations.
+
 
