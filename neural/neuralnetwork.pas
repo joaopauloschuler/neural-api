@@ -855,6 +855,20 @@ type
     procedure Compute(); override;
   end;
 
+  /// Log-Cosh activation function.
+  // y = log(cosh(x)). Smooth, symmetric, parameter-free. Behaves like
+  // x^2 / 2 near zero and like |x| - ln(2) for large |x|, making it a
+  // smooth-L1 style activation. Derivative is tanh(x), cached into
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
+  // with one multiply. Computed via the numerically stable identity
+  // log(cosh(x)) = |x| + log1p(exp(-2*|x|)) - ln(2) to avoid overflow
+  // at large |x|, mirroring the stable-softplus trick used in
+  // TNNetSoftPlus / TNNetSerf.
+  TNNetLogCoshActivation = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Snake activation function.
   // Snake(x) = x + (1/alpha) * sin(alpha*x)^2. Derivative is
   // 1 + sin(2*alpha*x). Parameter-free w.r.t. learning but alpha is a
@@ -6975,6 +6989,64 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := Ln(x + Sqrt(x * x + 1.0));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetLogCoshActivation }
+
+procedure TNNetLogCoshActivation.Compute();
+const
+  cLn2: TNeuralFloat = 0.6931471805599453;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, absX, logCoshVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Numerically stable: log(cosh(x)) = |x| + ln(1 + exp(-2*|x|)) - ln(2).
+  // For |x| > 15, the exp term underflows to 0 and the result is |x| - ln(2),
+  // which avoids EOverflow when cosh(x) itself would explode.
+  // Derivative is tanh(x); for |x| > 15 we saturate to +/-1.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      absX := Abs(x);
+      if absX > 15 then
+      begin
+        logCoshVal := absX - cLn2;
+        if x >= 0 then
+          FOutputErrorDeriv.FData[OutputCnt] := 1.0
+        else
+          FOutputErrorDeriv.FData[OutputCnt] := -1.0;
+      end
+      else
+      begin
+        logCoshVal := absX + Ln(1.0 + Exp(-2.0 * absX)) - cLn2;
+        FOutputErrorDeriv.FData[OutputCnt] := Tanh(x);
+      end;
+      FOutput.FData[OutputCnt] := logCoshVal;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      absX := Abs(x);
+      if absX > 15 then
+        FOutput.FData[OutputCnt] := absX - cLn2
+      else
+        FOutput.FData[OutputCnt] := absX + Ln(1.0 + Exp(-2.0 * absX)) - cLn2;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -18771,6 +18843,7 @@ begin
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
       'TNNetHyperbolicTangent' :    Result := TNNetHyperbolicTangent.Create();
       'TNNetLeCunTanh' :            Result := TNNetLeCunTanh.Create();
+      'TNNetLogCoshActivation' :    Result := TNNetLogCoshActivation.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
@@ -18962,6 +19035,7 @@ begin
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
       if S[0] = 'TNNetHyperbolicTangent' then Result := TNNetHyperbolicTangent.Create() else
       if S[0] = 'TNNetLeCunTanh' then Result := TNNetLeCunTanh.Create() else
+      if S[0] = 'TNNetLogCoshActivation' then Result := TNNetLogCoshActivation.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else

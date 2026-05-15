@@ -321,6 +321,8 @@ type
     procedure TestArcSinhGradientCheck;
     procedure TestLeCunTanhGradientCheck;
     procedure TestLeCunTanhForward;
+    procedure TestLogCoshActivationGradientCheck;
+    procedure TestLogCoshActivationStability;
     procedure TestSerfGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
@@ -9671,6 +9673,43 @@ begin
       ExpectedAtOne, NN.GetLastLayer.Output.Raw[1], 1e-5);
     AssertEquals('LeCunTanh(-1) exact',
       -ExpectedAtOne, NN.GetLastLayer.Output.Raw[2], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogCoshActivationGradientCheck;
+begin
+  // log(cosh(x)) is smooth everywhere with derivative tanh(x) bounded by 1.
+  ActivationGradientCheck(Self, TNNetLogCoshActivation.Create(), 'LogCoshActivation',
+    [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.25, -0.25, 0.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLogCoshActivationStability;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Ln2: TNeuralFloat;
+begin
+  // The whole point of the stable formulation is that log(cosh(x)) does NOT
+  // overflow at large |x|. For |x| >> 1, log(cosh(x)) ~= |x| - ln(2).
+  Ln2 := Ln(2.0);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetLogCoshActivation.Create());
+    Input.Raw[0] := 30.0;
+    Input.Raw[1] := -30.0;
+    Input.Raw[2] := 0.0;
+    NN.Compute(Input);
+    AssertEquals('LogCosh(30) ~= 30 - ln(2)',
+      30.0 - Ln2, NN.GetLastLayer.Output.Raw[0], 1e-3);
+    AssertEquals('LogCosh(-30) ~= 30 - ln(2)',
+      30.0 - Ln2, NN.GetLastLayer.Output.Raw[1], 1e-3);
+    AssertEquals('LogCosh(0) = 0',
+      0.0, NN.GetLastLayer.Output.Raw[2], 1e-6);
   finally
     NN.Free;
     Input.Free;
