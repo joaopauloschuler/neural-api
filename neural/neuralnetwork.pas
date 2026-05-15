@@ -639,6 +639,35 @@ type
     procedure Compute(); override;
   end;
 
+  /// GEGLU gated activation - This is an experimental layer.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A and B and outputs A * GELU(B). Output depth = input depth / 2.
+  // This layer has no trainable parameter. The input depth must be even.
+  // https://arxiv.org/abs/2002.05202
+  TNNetGEGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// SwiGLU gated activation - This is an experimental layer.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A and B and outputs A * Swish(B), where Swish(x) = x * sigmoid(x).
+  // Output depth = input depth / 2.
+  // This layer has no trainable parameter. The input depth must be even.
+  // https://arxiv.org/abs/2002.05202
+  TNNetSwiGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   //Does a ReLU followed by a Square Root
   TNNetReLUSqrt = class(TNNetReLUBase)
     public
@@ -3494,6 +3523,183 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetGEGLU }
+
+constructor TNNetGEGLU.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetGEGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetGEGLU requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGEGLU.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, b3, tanhArg, tanhVal, cdf: TNeuralFloat;
+const
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        b3 := b * b * b;
+        tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
+        tanhVal := Tanh(tanhArg);
+        cdf := 0.5 * (1 + tanhVal);
+        FOutput[X, Y, D] := a * (b * cdf);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGEGLU.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, b3, tanhArg, tanhVal, cdf, geluVal, geluDeriv, err: TNeuralFloat;
+const
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          b3 := b * b * b;
+          tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
+          tanhVal := Tanh(tanhArg);
+          cdf := 0.5 * (1 + tanhVal);
+          geluVal := b * cdf;
+          geluDeriv := cdf + 0.5 * b * (1 - tanhVal * tanhVal) *
+            SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * b * b);
+          err := FOutputError[X, Y, D];
+          FPrevLayer.FOutputError.Add(X, Y, D, err * geluVal);
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * geluDeriv);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetSwiGLU }
+
+constructor TNNetSwiGLU.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetSwiGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetSwiGLU requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetSwiGLU.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, sigmoidVal, swishVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        sigmoidVal := 1 / (1 + Exp(-b));
+        swishVal := b * sigmoidVal;
+        FOutput[X, Y, D] := a * swishVal;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSwiGLU.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, sigmoidVal, swishVal, swishDeriv, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          sigmoidVal := 1 / (1 + Exp(-b));
+          swishVal := b * sigmoidVal;
+          // Swish'(b) = swish + sigmoid * (1 - swish)
+          swishDeriv := swishVal + sigmoidVal * (1 - swishVal);
+          err := FOutputError[X, Y, D];
+          FPrevLayer.FOutputError.Add(X, Y, D, err * swishVal);
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * swishDeriv);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetMish }
@@ -13366,6 +13572,8 @@ begin
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
+      'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
+      'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -13485,6 +13693,8 @@ begin
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
+      if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
+      if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else

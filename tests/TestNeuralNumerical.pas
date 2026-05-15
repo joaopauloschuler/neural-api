@@ -74,6 +74,10 @@ type
     procedure TestPadXYGradientCheck;
     procedure TestCropGradientCheck;
     procedure TestInterleaveChannelsGradientCheck;
+    procedure TestGEGLUForward;
+    procedure TestGEGLUGradientCheck;
+    procedure TestSwiGLUForward;
+    procedure TestSwiGLUGradientCheck;
     procedure TestAvgPoolGradientCheck;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
@@ -2650,6 +2654,98 @@ end;
 procedure TTestNeuralNumerical.TestAvgPoolGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetAvgPool.Create(2), 'AvgPool', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGEGLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  a, b, b3, tanhArg, expected: TNeuralFloat;
+const
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGEGLU.Create());
+
+    // First half = A, second half = B.
+    Input.Raw[0] := 2.0;   // A[0]
+    Input.Raw[1] := -1.5;  // A[1]
+    Input.Raw[2] := 1.0;   // B[0]
+    Input.Raw[3] := -0.5;  // B[1]
+
+    NN.Compute(Input);
+
+    AssertEquals('GEGLU output depth = input depth / 2', 2,
+      NN.GetLastLayer.Output.Depth);
+
+    // output[0] = A[0] * GELU(B[0])
+    a := 2.0; b := 1.0;
+    b3 := b * b * b;
+    tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
+    expected := a * (0.5 * b * (1 + Tanh(tanhArg)));
+    AssertEquals('GEGLU output[0]', expected, NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    // output[1] = A[1] * GELU(B[1])
+    a := -1.5; b := -0.5;
+    b3 := b * b * b;
+    tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
+    expected := a * (0.5 * b * (1 + Tanh(tanhArg)));
+    AssertEquals('GEGLU output[1]', expected, NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGEGLUGradientCheck;
+begin
+  // Depth 4 -> output depth 2; gradient flows to both input halves.
+  LayerInputGradientCheck(Self, TNNetGEGLU.Create(), 'GEGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSwiGLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  a, b, expected: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetSwiGLU.Create());
+
+    Input.Raw[0] := 2.0;   // A[0]
+    Input.Raw[1] := -1.5;  // A[1]
+    Input.Raw[2] := 1.0;   // B[0]
+    Input.Raw[3] := -0.5;  // B[1]
+
+    NN.Compute(Input);
+
+    AssertEquals('SwiGLU output depth = input depth / 2', 2,
+      NN.GetLastLayer.Output.Depth);
+
+    // output[0] = A[0] * Swish(B[0]); Swish(x) = x * sigmoid(x)
+    a := 2.0; b := 1.0;
+    expected := a * (b * (1 / (1 + Exp(-b))));
+    AssertEquals('SwiGLU output[0]', expected, NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    a := -1.5; b := -0.5;
+    expected := a * (b * (1 / (1 + Exp(-b))));
+    AssertEquals('SwiGLU output[1]', expected, NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSwiGLUGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetSwiGLU.Create(), 'SwiGLU', 2, 2, 4, 0.01);
 end;
 
 // CellBias / CellMul carry learnable per-cell weights; check both the input
