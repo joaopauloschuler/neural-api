@@ -1698,6 +1698,23 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetTokenShift: RWKV-style per-channel time-mixing primitive.
+  // For each channel c and position t along SizeX (treated as the time axis,
+  // with x[-1,c]=0 zero-padding on the left):
+  //   y[t,c] = mix[c] * x[t,c] + (1 - mix[c]) * x[t-1,c]
+  // The single neuron stores a Depth-long learnable mix vector (init 0.5,
+  // a neutral midpoint). Requires SizeY = 1 (1D sequence layout matching
+  // TNNetRotaryEmbedding / TNNetSinusoidalPositionalEmbedding).
+  TNNetTokenShift = class(TNNetChannelTransformBase)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   // This is an experimental class. Do not use it.
   TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
     private
@@ -10091,6 +10108,136 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetTokenShift }
+constructor TNNetTokenShift.Create();
+begin
+  inherited Create();
+  InitDefault();
+end;
+
+procedure TNNetTokenShift.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetTokenShift requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  // The base class already calls SetNumWeightsForAllNeurons(1,1,Depth)
+  // and InitDefault().
+end;
+
+procedure TNNetTokenShift.Compute();
+var
+  StartTime: double;
+  SeqLen, Depth, t, d: integer;
+  Prev: TNNetVolume;
+  mix, one_minus_mix, xt, xtm1: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Depth := Prev.Depth;
+  W := FNeurons[0].FWeights;
+  {$IFDEF Debug}
+  if W.Size <> Depth then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetTokenShift.');
+  {$ENDIF}
+  // t = 0: previous token treated as zero -> y[0,c] = mix[c] * x[0,c].
+  for d := 0 to Depth - 1 do
+  begin
+    mix := W.Raw[d];
+    FOutput[0, 0, d] := mix * Prev[0, 0, d];
+  end;
+  for t := 1 to SeqLen - 1 do
+  begin
+    for d := 0 to Depth - 1 do
+    begin
+      mix := W.Raw[d];
+      one_minus_mix := 1.0 - mix;
+      xt := Prev[t, 0, d];
+      xtm1 := Prev[t - 1, 0, d];
+      FOutput[t, 0, d] := mix * xt + one_minus_mix * xtm1;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTokenShift.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  SeqLen, Depth, t, d: integer;
+  Prev, PrevErr: TNNetVolume;
+  W: TNNetVolume;
+  mix, one_minus_mix, gy, xt, xtm1, gradMixD: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  W := localNeuron.FWeights;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+
+  // Accumulate per-channel mix gradient and the input gradient.
+  // dL/dmix[c] = sum_t OutputError[t,c] * (Input[t,c] - Input[t-1,c]),
+  //   with Input[-1,c] = 0.
+  // dL/dInput[t,c] = OutputError[t,c]*mix[c]
+  //                + (if t+1<SeqLen) OutputError[t+1,c]*(1-mix[c]).
+  for d := 0 to Depth - 1 do
+  begin
+    mix := W.Raw[d];
+    one_minus_mix := 1.0 - mix;
+    gradMixD := 0;
+    // t = 0: xtm1 = 0
+    gy := FOutputError[0, 0, d];
+    xt := Prev[0, 0, d];
+    gradMixD := gradMixD + gy * xt;
+    if hasInputGrad then
+      PrevErr[0, 0, d] := PrevErr[0, 0, d] + gy * mix;
+    for t := 1 to SeqLen - 1 do
+    begin
+      gy := FOutputError[t, 0, d];
+      xt := Prev[t, 0, d];
+      xtm1 := Prev[t - 1, 0, d];
+      gradMixD := gradMixD + gy * (xt - xtm1);
+      if hasInputGrad then
+      begin
+        // dInput[t,c] += OutputError[t,c]*mix[c]
+        PrevErr[t, 0, d]     := PrevErr[t, 0, d]     + gy * mix;
+        // dInput[t-1,c] += OutputError[t,c]*(1-mix[c])
+        PrevErr[t - 1, 0, d] := PrevErr[t - 1, 0, d] + gy * one_minus_mix;
+      end;
+    end;
+    localNeuron.FDelta.Raw[d] := localNeuron.FDelta.Raw[d] +
+      (-FLearningRate) * gradMixD;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetTokenShift.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  // Neutral starting point: equal weight on current and previous token.
+  FNeurons[0].Weights.Fill(0.5);
+  AfterWeightUpdate();
+end;
+
 { TNNetCellMul }
 
 procedure TNNetCellMul.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -18011,6 +18158,7 @@ begin
       'TNNetLayerScale':            Result := TNNetLayerScale.Create(Ft[0]);
       'TNNetBias':                  Result := TNNetBias.Create();
       'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
+      'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
@@ -18192,6 +18340,7 @@ begin
       if S[0] = 'TNNetLayerScale' then Result := TNNetLayerScale.Create(Ft[0]) else
       if S[0] = 'TNNetBias' then Result := TNNetBias.Create() else
       if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
+      if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else

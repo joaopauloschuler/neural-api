@@ -83,6 +83,10 @@ type
     procedure TestReZeroGradientCheck;
     procedure TestReZeroWeightGradientCheck;
     procedure TestReZeroSerializationRoundTrip;
+    procedure TestTokenShiftForward;
+    procedure TestTokenShiftGradientCheck;
+    procedure TestTokenShiftWeightGradientCheck;
+    procedure TestTokenShiftSerializationRoundTrip;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -10211,6 +10215,229 @@ begin
   // so the FFloatSt[0] dispatch path is also covered.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetReZero.Create(0.5), 'ReZero', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestTokenShiftForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LShift: TNNetTokenShift;
+  SeqLen, Depth, t, d: integer;
+  expected, mix, xt, xtm1: TNeuralFloat;
+begin
+  // TNNetTokenShift: y[t,c] = mix[c]*x[t,c] + (1 - mix[c])*x[t-1,c],
+  // with x[-1,c] = 0 zero-padding. Layout: SizeX=time, SizeY=1, Depth=channels.
+  SeqLen := 5;
+  Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    LShift := TNNetTokenShift.Create();
+    NN.AddLayer(LShift);
+
+    // Fill input with a non-trivial distinguishable pattern.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[t, 0, d] := Sin(t * 0.7 + d * 1.3) * 1.5 + 0.4;
+
+    // --- Case 1: mix = 1 -> identity ---
+    for d := 0 to Depth - 1 do
+      LShift.Neurons[0].Weights.Raw[d] := 1.0;
+    NN.Compute(Input);
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        AssertEquals('TokenShift mix=1 identity at (' + IntToStr(t) +
+          ',' + IntToStr(d) + ')',
+          Input[t, 0, d], NN.GetLastLayer.Output[t, 0, d], 1e-5);
+
+    // --- Case 2: mix = 0 -> strict right shift, output[0]=0, output[t]=input[t-1] ---
+    for d := 0 to Depth - 1 do
+      LShift.Neurons[0].Weights.Raw[d] := 0.0;
+    NN.Compute(Input);
+    for d := 0 to Depth - 1 do
+      AssertEquals('TokenShift mix=0 output[0]=0 channel ' + IntToStr(d),
+        0.0, NN.GetLastLayer.Output[0, 0, d], 1e-6);
+    for t := 1 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        AssertEquals('TokenShift mix=0 right-shift at (' + IntToStr(t) +
+          ',' + IntToStr(d) + ')',
+          Input[t - 1, 0, d], NN.GetLastLayer.Output[t, 0, d], 1e-5);
+
+    // --- Case 3: hand-computed non-trivial per-channel mix ---
+    LShift.Neurons[0].Weights.Raw[0] := 0.3;
+    LShift.Neurons[0].Weights.Raw[1] := 0.7;
+    LShift.Neurons[0].Weights.Raw[2] := 0.5;
+    NN.Compute(Input);
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+      begin
+        mix := LShift.Neurons[0].Weights.Raw[d];
+        xt := Input[t, 0, d];
+        if t = 0 then xtm1 := 0.0 else xtm1 := Input[t - 1, 0, d];
+        expected := mix * xt + (1.0 - mix) * xtm1;
+        AssertEquals('TokenShift mid mix at (' + IntToStr(t) +
+          ',' + IntToStr(d) + ')',
+          expected, NN.GetLastLayer.Output[t, 0, d], 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenShiftGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LShift: TNNetTokenShift;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  // SeqLen=4, Depth=3 as required.
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LShift := TNNetTokenShift.Create();
+    NN.AddLayer(LShift);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+
+    // Non-trivial per-channel mix values so the gradient is meaningful.
+    LShift.Neurons[0].Weights.Raw[0] := 0.25;
+    LShift.Neurons[0].Weights.Raw[1] := 0.6;
+    LShift.Neurons[0].Weights.Raw[2] := 0.85;
+
+    // Input-gradient check.
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('TokenShift input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenShiftWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LShift: TNNetTokenShift;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LShift := TNNetTokenShift.Create();
+    NN.AddLayer(LShift);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+
+    LShift.Neurons[0].Weights.Raw[0] := 0.2;
+    LShift.Neurons[0].Weights.Raw[1] := 0.55;
+    LShift.Neurons[0].Weights.Raw[2] := 0.9;
+
+    for i := 0 to LShift.Neurons[0].Weights.Size - 1 do
+    begin
+      LShift.Neurons[0].Weights.Raw[i] := LShift.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      LShift.Neurons[0].Weights.Raw[i] := LShift.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      LShift.Neurons[0].Weights.Raw[i] := LShift.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LShift.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // With LearningRate = 1 and batch update on, analytical = -Delta.
+      analyticalGrad := -LShift.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('TokenShift weight gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenShiftSerializationRoundTrip;
+begin
+  // TNNetTokenShift stores a per-channel learnable mix vector (init 0.5);
+  // the perturbed-weights helper pushes it away from the default so the
+  // round-trip exercises a non-trivial mix vector. Use SizeY = 1 (sequence
+  // layout requirement) and SizeX = 4 as the time axis.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetTokenShift.Create(), 'TokenShift', 4, 1, 3, 1e-5);
 end;
 
 initialization
