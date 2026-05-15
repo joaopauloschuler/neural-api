@@ -3858,3 +3858,130 @@ and uniformly documented.
 - [ ] Trig identity composition test: `Sin(x)^2 + Cos(x)^2 = 1` to
       within fp tolerance on a random input — pairs naturally with the
       already-landed periodicity and phase-shift tests.
+
+### Lucky-day batch — 2026-05-15 (seed 231116)
+
+A fresh draw on a self-described lucky day. Before pinning, I scanned the
+existing tasklist for what is already implemented (Sin, Cos, Neg, Sqrt,
+Exp, Log, Reciprocal, RoPE, MaskedFill, SDPA, LayerNorm, RMSNorm,
+GroupNorm, DropPath, GLU/GEGLU/SwiGLU, LayerScale, SoftPlus, Gaussian,
+SquaredReLU, AddPositionalEmbedding, Concat/Split/Sum gradient audits,
+exact SoftMax Jacobian) and what is already pinned but unbuilt (Snake,
+Erf, PReLU/PReLUChannel/SwishLearnable, TopK, STE, GumbelSoftmax,
+CumSum, Roll, L2Normalize, MHSA, Tiny GPT, MoE, SwiGLU FFN builder,
+PreNorm/RMSNormResidual builders, deconv/upsample audit, SIREN demo).
+The ideas below try to step into corners those lists do not yet cover.
+Every TNNet* name has been grep-verified absent from `neural/neuralnetwork.pas`.
+
+#### Layers I'd enjoy authoring
+- [ ] TNNetMaxOut — output channel `j` = max over a configurable group of
+      `k` input channels (`FStruct[0] = k`, output depth = input depth / k).
+      Goodfellow's original "Maxout Networks" activation; piecewise-linear
+      universal approximator with argmax-routed backward (gradient flows
+      only to the channel that achieved the max per spatial cell). Plays
+      naturally with the channel-iteration patterns already in
+      TNNetChannelStdNormalization / TNNetSplitChannels. Four-test shape:
+      forward at a hand-checked tiny case, gradient check, tie-break
+      determinism, serialization round-trip.
+- [ ] TNNetSoftSign — `y = x / (1 + |x|)`, derivative `1 / (1 + |x|)^2`.
+      Smooth bounded alternative to tanh with no exp() call; closes one
+      of the last small gaps in the bounded-activation family alongside
+      Sigmoid/Tanh/HardSigmoid/HardTanh.
+- [ ] TNNetTanhShrink — `y = x - tanh(x)`, derivative `tanh(x)^2`. The
+      "shrinkage" partner to TNNetHardShrink/TNNetSoftShrink already in
+      tree; rounds out the shrink family for a future sparsity README
+      subsection.
+- [ ] TNNetMishLearnable — TNNetMish with a single learnable α scalar
+      (`y = x * tanh(softplus(α x))`). Same template as the pinned
+      TNNetSwishLearnable; copy-paste with one extra term in
+      Backpropagate. Weight-grad central-difference check is the
+      important test.
+- [ ] TNNetChannelShuffle — ShuffleNet's depth-axis permutation
+      (`FStruct[0] = groups`). Parameter-free, deterministic; backward
+      is the inverse permutation. Cheap and self-contained; unblocks a
+      "tiny ShuffleNet block" example.
+- [ ] TNNetSpaceToDepth / TNNetDepthToSpace — block reshape pair
+      (`FStruct[0] = block_size`). Common stem layer in YOLO/SqueezeNet
+      variants and the bridge between conv stems and patch-tokenizers.
+      Mutual-inverse round-trip is the headline test.
+- [ ] TNNetSinusoidalPositionalEmbedding — the original Transformer
+      paper's fixed (non-learned) sin/cos positional encoding. Companion
+      to the learnable TNNetAddPositionalEmbedding already in tree;
+      parameter-free so the backward pass is identity and there is no
+      weight-gradient path to mis-implement.
+
+#### Composite block builders I'd enjoy authoring
+- [ ] AddPostNormResidual(NN, Sublayer) — the post-norm transformer
+      pattern (`Sublayer → residual add → LayerNorm`), companion to the
+      already-pinned PreNorm and RMSNormResidual builders. One small
+      builder test on a random volume; together the three cover the
+      common transformer-block normalization placements.
+- [ ] AddGEGLUFeedForward(NN, d_model, d_ff) — the GEGLU twin of the
+      pinned SwiGLU FFN builder. Same shape, GELU in place of Swish.
+      Both will share an internal helper.
+
+#### Correctness / audit work
+- [ ] Numerical-gradient checks for the recurrent-style layers
+      (TNNetEmbedding, TNNetTokenAndPositionalEmbedding,
+      TNNetMaxChannelPool, TNNetMinChannelPool, TNNetMinPool) — the
+      recurrent / token-embedding family is the last big uncovered
+      audit unit after deconv/upsample. One test per layer in
+      TestNeuralNumerical.pas.
+- [ ] Cross-layer composition gradient test: build a 3-layer stack
+      (LayerNorm → SwiGLU → Dense) and run a single end-to-end
+      central-difference check on the input. Sanity-checks that the
+      gradient handoff between layers in a real transformer block is
+      still tight — the per-layer tests do not see inter-layer
+      bookkeeping bugs.
+- [ ] Determinism test for the dropout/DropPath family: with the same
+      seed, two forward passes on the same input must produce
+      bit-identical outputs. Cheap to add; pins the "seeded reproduction"
+      property the gradient checks already rely on.
+
+#### Experiments I'm curious about
+- [ ] Maxout vs ReLU width-trade study: at matched parameter count
+      (Maxout-k=2 with width N vs ReLU with width 2N), is final loss
+      meaningfully different on a tiny MLP? One chart, deterministic.
+      Unblocked by the Maxout landing above.
+- [ ] Sinusoidal vs learned positional embedding head-to-head on a tiny
+      sequence task (the binary-addition idea pinned earlier): which
+      converges faster, which generalizes to longer sequences? Pure-CPU,
+      seconds per run.
+- [ ] "Activation derivative cache invariants" sweep: for every
+      activation that caches a derivative into FOutputErrorDeriv
+      (ReLU, Swish, Mish, GELU, Sin, Cos, Neg, Sqrt, Exp, Log,
+      Reciprocal, SquaredReLU, GLU, GEGLU, SwiGLU, SoftPlus, Gaussian,
+      LayerScale), assert that running Compute() twice in a row leaves
+      the cache consistent with the second input — guards against the
+      Sigmoid/LeakyReLU class of bug the audits already turned up.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a
+      tiny-MNIST subset (or a synthetic 2D classification task to
+      stay CPU-fast). Doubles as the headline use case for the
+      Maxout landing.
+- [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv
+      stem replacing a stride-2 conv on a tiny CIFAR stub; one chart
+      of param count and first-epoch loss.
+- [ ] `examples/PreNormVsPostNorm/` — toy sequence task with the
+      same sublayer wired through PreNorm vs PostNorm builders;
+      shows the stability gap that motivates pre-norm in practice.
+
+#### Documentation
+- [ ] "Bounded activations" README subsection covering Sigmoid, Tanh,
+      HardSigmoid, HardTanh, SoftSign — the bounded counterparts to
+      the periodic and gated families already documented. One short
+      table with output ranges and derivative notes.
+- [ ] Top-of-tasklist "implemented vs pinned" index — the file is now
+      large enough that the same idea has been re-pinned several
+      times across batches. A small header table (layer name → status
+      → batch landed) would cut that down without rewriting history.
+
+#### Stretch / re-pinned for visibility
+- [ ] TNNetMultiHeadSelfAttention wrapper around the landed SDPA — the
+      headline blocker for Tiny GPT. Re-pinned because every batch
+      depends on it and it remains the single highest-leverage open
+      layer.
+- [ ] Tiny GPT char-level CPU example — unblocked the moment MHSA
+      lands; remains the most exciting end-to-end demo on the
+      tasklist.
