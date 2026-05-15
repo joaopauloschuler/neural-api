@@ -2354,3 +2354,154 @@ Test suite grew from 360 → 367 tests, all passing. No bugs surfaced.
       so x=theta routes to the `else` branch). Pin with a tiny
       no-central-differences test, mirroring the open HardShrink/
       SoftShrink kink-region entry above.
+
+
+### Lucky-day batch — 2026-05-15 (seed 135518)
+
+A fresh draw on a lucky day. Random number printed first to set the
+mood, then ideas that I would genuinely enjoy building. Bias: small,
+mergeable, gradient-checkable, with a real punchline.
+
+#### Activations I'd enjoy adding
+- [ ] TNNetSquaredReLU — `y = max(0, x)^2`, derivative `2*max(0, x)`.
+      One-liner activation used by Primer/So et al. for transformer
+      FFNs; subclasses TNNetReLUBase cleanly. Pair with a numerical-
+      gradient test and the kink test at x=0.
+- [ ] TNNetCELU — `y = max(0, x) + min(0, alpha*(exp(x/alpha)-1))`.
+      Continuously-differentiable ELU variant; single float param.
+      Good candidate for the "how to add a new activation in 30 lines"
+      walkthrough already on the docs list.
+- [ ] TNNetTanhShrink — `y = x - tanh(x)`. Parameter-free, smooth,
+      saturating-from-below activation. Trivial to implement, useful
+      for the "residual-of-tanh" intuition in tiny autoencoders.
+- [ ] TNNetSoftSign — `y = x / (1 + |x|)`. Cheap, bounded, smooth
+      alternative to tanh with a fatter linear region. Derivative is
+      `1 / (1 + |x|)^2` — easy to cache in FOutputErrorDeriv.
+- [ ] TNNetAPL (Adaptive Piecewise Linear) — sum of hinge functions
+      `y = max(0, x) + sum_s a_s * max(0, -x + b_s)`. Per-channel
+      learnable knees and slopes; stretch but very fun. Would also be
+      the first activation in the repo with vector-valued learnable
+      parameters beyond a scalar.
+
+#### Layers I'd enjoy building
+- [ ] TNNetMultiHeadSelfAttention — finally close the headline gap.
+      Built on TNNetScaledDotProductAttention (already landed) plus
+      per-head Q/K/V projections and a concat+output projection.
+      Causal-mask flag, full numerical-gradient test on a tiny
+      d_model=8, n_heads=2 config. Unblocks Tiny GPT.
+- [ ] TNNetALiBiBias — additive linear position bias to attention
+      scores, alternative to RoPE. Parameter-free per slope schedule,
+      so the test surface is small. Pairs with the SDPA layer.
+- [ ] TNNetMaskedMean / TNNetMaskedMax — pooling over a variable-
+      length sequence given a {0,1} mask channel. Useful for
+      sequence-classification examples and avoids the existing
+      "pad with zeros and hope average is small" workaround.
+- [ ] TNNetStochasticDepth wrapper that randomly skips a residual
+      branch at train time (à la DropPath but at the block level
+      rather than per-token). DropPath has landed; this is the
+      coarser sibling and is one parameter.
+
+#### Tests / numerical-gradient audit
+- [ ] Continue the Backpropagate audit on the upsampling /
+      deconvolution family next (TNNetUpsample, TNNetDeMaxPool,
+      TNNetDeAvgPool, any TNNet*Deconvolution*). One numerical-
+      gradient test per layer in TestNeuralNumerical.pas, mirroring
+      the pattern already used for TNNetPadXY / TNNetCrop.
+- [ ] Recurrent-style layer audit: identify any RNN/GRU/LSTM-shaped
+      layers in the repo and add numerical-gradient tests if missing,
+      treating per-timestep state as a normal tensor input.
+- [ ] Threshold + ShiftedReLU + LogSigmoid kink-region tests
+      consolidated into a single parametric helper in
+      TestNeuralNumerical.pas. Reduces copy-paste and makes adding a
+      new activation's kink test a 3-line addition.
+- [ ] Determinism CI test (echoing earlier entry): same seed → bit-
+      identical forward + backward across two runs of a 3-layer net.
+      Catches future nondeterminism regressions from parallel
+      reductions or hash-map iteration order changes.
+
+#### Experiments I'd enjoy running
+- [ ] Activation menagerie bake-off on CIFAR-10-tiny: train the same
+      small CNN with ReLU, GELU, Swish, Mish, SquaredReLU, CELU,
+      SoftSign — report train loss curve + final test accuracy in a
+      single Markdown table under `docs/experiments/`. The roster
+      is now big enough to justify an in-repo comparison.
+- [ ] Norm-layer bake-off: same tiny CNN with no-norm vs BatchNorm
+      vs LayerNorm vs RMSNorm vs GroupNorm. Tabulated convergence
+      speed + final accuracy. Would settle a recurring intuition
+      question and ship a reusable benchmark harness.
+- [ ] Threshold-as-sparsifier sweep (already pinned in the previous
+      batch). I'd enjoy actually running it: theta ∈ {0, 0.1, 0.5,
+      1.0}, report (active-units %, recon loss) on a 64-unit
+      autoencoder.
+- [ ] "Smallest net that can learn parity-N" study — sweep N ∈
+      {2, 4, 6, 8} and report the smallest hidden-width that fits
+      cleanly with a fixed budget. Tiny, reproducible, and a nice
+      teaching artifact.
+- [ ] Initialization scheme sweep: He vs Xavier vs orthogonal vs
+      identity-on-residual on a 6-block residual tower. Plot final
+      train loss vs init.
+
+#### Examples I'd enjoy writing
+- [ ] `examples/TinySequence/` — char-level next-token model on
+      `tinyshakespeare.txt` using TNNetScaledDotProductAttention plus
+      a hand-rolled token embedding lookup. Stays single-head until
+      MHSA lands; runs in well under a minute on CPU.
+- [ ] `examples/AutoencoderMNIST/` — tiniest possible MNIST
+      autoencoder demonstrating the encode/decode split using
+      TNNetUpsample. Doubles as a regression target for the
+      upsampling-family numerical-gradient tests above.
+- [ ] `examples/AttentionViz/` — visualize attention weights for the
+      single-head SDPA layer on a toy copy task. Dump per-head
+      weight matrices as PGM/PPM so no plotting dependency.
+- [ ] `examples/SineRegression/` — 1D function-fitting toy
+      (`y = sin(2πx) + noise`). Two-layer MLP, prints train loss per
+      epoch. Smallest possible "does the library still train?" demo
+      for the README quick-start.
+
+#### Infrastructure / tooling
+- [ ] Volume unit micro-benchmark (already pinned): I'd enjoy
+      writing it — print ns/op for Add, Mul, DotProduct, AddArea,
+      InterleaveSplit. Single binary under `bin/`, no OpenCL
+      required, table-formatted output.
+- [ ] `scripts/run_all_tests.sh` wrapper that builds and runs every
+      test binary in `tests/` and prints a pass/fail summary. Today
+      the canonical command is buried in CI; surface it.
+- [ ] Layer-name registry self-check: enumerate every TNNetLayer
+      subclass via the dispatch table and assert each one round-trips
+      through SaveToString → LoadFromString unchanged. Catches
+      "added a layer, forgot the dispatch entry" regressions —
+      a real category of past bugs.
+- [ ] `docs/CONTRIBUTING.md` "anatomy of a layer" section: walk
+      through TNNetShiftedReLU as the canonical 50-line activation
+      example, showing Compute, Backpropagate, dispatch entry, and
+      the numerical-gradient test stub. Lowers the contribution
+      barrier dramatically.
+
+#### Documentation
+- [ ] Activations cheat sheet in `docs/activations.md` — re-pinned
+      again; with LogSigmoid / ShiftedReLU / Threshold now in the
+      menu, the roster has crossed the "needs a map" threshold.
+      One row per activation: formula, derivative, bounded?,
+      smooth-at-zero?, typical use.
+- [ ] Normalization cheat sheet in `docs/normalization.md` — same
+      story for norm layers. LayerNorm vs RMSNorm vs GroupNorm vs
+      InstanceNorm vs ChannelStdNorm in a single table.
+- [ ] `docs/numerical_gradient.md` — short tutorial: why central
+      differences, how the existing TestNumericalGradient helper
+      works, how to add a test for a new layer in five lines.
+      Useful onboarding doc and points at the contribution path.
+
+#### Stretch / ambitious
+- [ ] Tiny GPT end-to-end (re-pinned, again). The remaining gap is
+      MHSA + a tokenizer wrapper. Once MHSA above lands, this is the
+      logical next item. Lucky-day flavor: ship `tinyshakespeare.txt`
+      under `examples/TinyGPT/data/`, 2-layer model, generation that
+      produces recognizably Shakespeare-flavored output.
+- [ ] Mixture-of-Experts routing layer (re-pinned). Top-k softmax
+      gate over N expert sub-networks plus a load-balancing
+      auxiliary loss. Best done after MHSA so it has a real host
+      architecture to slot into.
+- [ ] Minimal JSON model export — forward-only graph dump that an
+      external Python script could load into onnxruntime. Doc which
+      layers are out-of-scope for v1. Solves the "I trained it,
+      now what?" gap for non-Pascal downstream users.
