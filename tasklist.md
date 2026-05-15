@@ -54,10 +54,16 @@
       template (neural/neuralnetwork.pas + TestNeuralNumerical.pas).
 - [x] Document TNNetLayerNorm / TNNetGroupNorm in the README.md layer reference
       with a short usage snippet.
-- [ ] Audit other layers that override Backpropagate but lack a numerical
+- [x] Audit other layers that override Backpropagate but lack a numerical
       gradient test — the activation-layer audit uncovered two real bugs
       (TNNetLeakyReLU.Compute and TNNetSigmoid.Backpropagate), so other layer
-      families may hide similar issues.
+      families may hide similar issues. Audited the transform/reshape/pooling/
+      element-wise families; added numerical-gradient checks for TNNetPadXY,
+      TNNetCrop, TNNetInterleaveChannels, TNNetAvgPool, TNNetCellBias and
+      TNNetCellMul (input + weight gradients). No new bugs found in those
+      layers. Note: TNNetPointwiseSoftMax.Backpropagate uses the diagonal-only
+      x*(1-x) approximation rather than the full softmax Jacobian — left as a
+      known approximation, not added as a failing test.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so

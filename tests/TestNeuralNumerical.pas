@@ -63,7 +63,15 @@ type
     procedure TestGroupNormGradientCheck;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
-    
+
+    // Transform / reshaping / element-wise layer gradient checks
+    procedure TestPadXYGradientCheck;
+    procedure TestCropGradientCheck;
+    procedure TestInterleaveChannelsGradientCheck;
+    procedure TestAvgPoolGradientCheck;
+    procedure TestCellBiasGradientCheck;
+    procedure TestCellMulGradientCheck;
+
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
     procedure TestSumNumericalValues;
@@ -2331,6 +2339,198 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+// Generic input-gradient check: builds a 1-layer net (Input -> ALayer), drives a
+// real backward pass with a known per-element output error and compares the
+// input error against central finite differences. ALayer is owned by the net.
+procedure LayerInputGradientCheck(ATestCase: TTestCase; ALayer: TNNetLayer;
+  const AName: string; ASizeX, ASizeY, ASizeD: integer; ATolerance: TNeuralFloat);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  InputPlus := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(ASizeX, ASizeY, ASizeD, 1));
+    NN.AddLayer(ALayer);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < ATolerance);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPadXYGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetPadXY.Create(1, 1), 'PadXY', 3, 2, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestCropGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetCrop.Create(1, 1, 2, 2), 'Crop', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestInterleaveChannelsGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetInterleaveChannels.Create(2),
+    'InterleaveChannels', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestAvgPoolGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetAvgPool.Create(2), 'AvgPool', 4, 4, 2, 0.01);
+end;
+
+// CellBias / CellMul carry learnable per-cell weights; check both the input
+// gradient and the weight (Delta) gradient against central differences.
+procedure CellLayerGradientCheck(ATestCase: TTestCase; ALayer: TNNetLayer;
+  const AName: string);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  InputPlus := TNNetVolume.Create(2, 2, 2);
+  Desired := TNNetVolume.Create(2, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2, 1));
+    NN.AddLayer(ALayer);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+    // Non-trivial learnable weights.
+    for i := 0 to ALayer.Neurons[0].Weights.Size - 1 do
+      ALayer.Neurons[0].Weights.Raw[i] := 0.5 + i * 0.13;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the learnable weights ----
+    for i := 0 to ALayer.Neurons[0].Weights.Size - 1 do
+    begin
+      ALayer.Neurons[0].Weights.Raw[i] := ALayer.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      ALayer.Neurons[0].Weights.Raw[i] := ALayer.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      ALayer.Neurons[0].Weights.Raw[i] := ALayer.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      ALayer.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // Backprop accumulates Delta := Delta - LearningRate*gradient.
+      analyticalGrad := -ALayer.Neurons[0].Delta.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' weight gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCellBiasGradientCheck;
+begin
+  CellLayerGradientCheck(Self, TNNetCellBias.Create(), 'CellBias');
+end;
+
+procedure TTestNeuralNumerical.TestCellMulGradientCheck;
+begin
+  CellLayerGradientCheck(Self, TNNetCellMul.Create(), 'CellMul');
 end;
 
 initialization
