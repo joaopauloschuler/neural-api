@@ -176,6 +176,10 @@ type
     procedure TestLogSoftMaxSerializationRoundTrip;
     procedure TestChannelShuffleIndivisibleGuard;
     procedure TestChannelShuffleInverseProperty;
+    procedure TestReverseChannelsForward;
+    procedure TestReverseChannelsGradientCheck;
+    procedure TestReverseChannelsInvolution;
+    procedure TestReverseChannelsSerializationRoundTrip;
     procedure TestLayerNormSerializationRoundTrip;
     procedure TestRMSNormSerializationRoundTrip;
     procedure TestGroupNormSerializationRoundTrip;
@@ -6223,6 +6227,73 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestReverseChannelsForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  c: integer;
+begin
+  // Depth=4: channel c maps to (Depth - 1 - c).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetReverseChannels.Create());
+    Input.Raw[0] := 10.0;
+    Input.Raw[1] := 20.0;
+    Input.Raw[2] := 30.0;
+    Input.Raw[3] := 40.0;
+    NN.Compute(Input);
+    for c := 0 to 3 do
+      AssertEquals('ReverseChannels output channel ' + IntToStr(c),
+        Input.Raw[3 - c], NN.GetLastLayer.Output.Raw[c], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReverseChannelsGradientCheck;
+begin
+  // Parameter-free permutation; backward is the same involution.
+  LayerInputGradientCheck(Self, TNNetReverseChannels.Create(),
+    'ReverseChannels', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReverseChannelsInvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Applying ReverseChannels twice must return the identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 7);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 7, 1));
+    NN.AddLayer(TNNetReverseChannels.Create());
+    NN.AddLayer(TNNetReverseChannels.Create());
+    RandSeed := 131313;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ReverseChannels involution at index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReverseChannelsSerializationRoundTrip;
+begin
+  // Parameter-free, so only element-wise output parity matters after the
+  // SaveToString -> LoadFromString cycle.
+  SerializationRoundTrip(Self, TNNetReverseChannels.Create(),
+    'ReverseChannels', 2, 2, 5, 1e-5);
 end;
 
 // Generic helper for the *Norm family: after the layer is wired by AddLayer,

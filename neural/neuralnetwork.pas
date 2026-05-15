@@ -1482,6 +1482,15 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Tiny parameter-free permutation layer that flips the channel (Depth)
+  // axis: Output[X, Y, d] := Input[X, Y, Depth - 1 - d]. Backward applies
+  // the same involution to OutputError.
+  TNNetReverseChannels = class(TNNetIdentity)
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -5458,6 +5467,42 @@ begin
     // the output channel ToChannels[c].
     for CntDepth := 0 to MaxDepth do
       FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, ToChannels[CntDepth], CntDepth);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetReverseChannels }
+
+procedure TNNetReverseChannels.Compute();
+var
+  CntDepth, MaxDepth: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxDepth := FOutput.Depth - 1;
+  for CntDepth := 0 to MaxDepth do
+    FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, MaxDepth - CntDepth);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetReverseChannels.Backpropagate();
+var
+  CntDepth, MaxDepth: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxDepth := FOutput.Depth - 1;
+    // Involution: applying the same flip backwards routes the gradient
+    // for output channel d into source channel Depth - 1 - d.
+    for CntDepth := 0 to MaxDepth do
+      FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, CntDepth, MaxDepth - CntDepth);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -15874,6 +15919,7 @@ begin
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
+      'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetSum' :                  Result := TNNetSum.Create(aL);
       'TNNetSplitChannels' :        Result := TNNetSplitChannels.Create(aIdx);
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
@@ -16023,6 +16069,7 @@ begin
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
+      if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else
