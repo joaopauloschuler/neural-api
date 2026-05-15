@@ -1126,9 +1126,13 @@ Each is sized for a single focused commit.
       practice, using only layers already in tree.
 
 #### Correctness / audit work
-- [ ] TNNetUpsample numerical-gradient test (already listed twice as
+- [x] TNNetUpsample numerical-gradient test (already listed twice as
       the kickoff for the upsample/deconv audit). Smallest of the
-      three, would unblock the rest.
+      three, would unblock the rest. Done: TestUpsampleGradientCheck
+      in TestNeuralNumerical.pas on a 2x2x4 input shape (becomes 4x4x1
+      after depth_to_space). No bugs found —
+      TNNetUpsample.ComputePreviousLayerError correctly inverts the
+      forward permutation.
 - [ ] Audit which TNNet* classes still override Backpropagate but lack
       a numerical-gradient test, after the activation / concat-split /
       transform-pooling audits already done. Produce a fresh TODO list
@@ -1166,3 +1170,48 @@ Each is sized for a single focused commit.
       the right pick, what the layer expects on input, and a tiny
       code snippet for each. Becomes the natural companion to the
       bake-off experiment above.
+
+### Ideas added on 2026-05-15 (post Upsample-grad + ALiBi-MaskedFill + exact-softmax-Jacobian batch)
+
+This batch landed:
+- TestALiBiMaskedFillComposition pinning the MaskedFill + ALiBi stack
+  for the eventual MHA path.
+- TestUpsampleGradientCheck — first entry in the upsample/deconv audit.
+  No bugs found.
+- Exact softmax Jacobian in both TNNetPointwiseSoftMax.Backpropagate
+  AND TNNetSoftMax.Backpropagate (the latter newly overrides the
+  inherited approximation). TNNetSoftmaxTemperature was kept as-is
+  because its 1/T factor must scale only this layer's additive
+  contribution to FPrevLayer.OutputError — a `inherited + post-scale`
+  pattern would corrupt accumulated gradients from sibling branches.
+
+Natural follow-ups:
+
+- [ ] Continue the upsample/deconv audit: next up is TNNetDeMaxPool
+      (the parent of TNNetUpsample — its ComputePreviousLayerError is
+      what TNNetUpsample reuses indirectly). Same recipe as the
+      Upsample test: tiny shape, LayerInputGradientCheck. Then
+      TNNetDeconvolution to close out the family.
+- [ ] TNNetSoftmaxTemperature cleanup attempt: prove (or disprove) that
+      a shared softmax-Jacobian helper extracted from TNNetSoftMax /
+      TNNetPointwiseSoftMax / TNNetSoftmaxTemperature would let all
+      three reduce to one Backpropagate body parameterised by axis +
+      inv-temperature. Pure refactor, gradient tests pin the behavior.
+- [ ] Cross-entropy vs exact-Jacobian regression-style check: confirm
+      that the existing classification examples (e.g. SimpleImage CIFAR)
+      converge to the same loss curve they did before the
+      TNNetSoftMax.Backpropagate change. The cross-entropy loss layer
+      should be the path that benefits most from the exact Jacobian
+      cancelling cleanly to `(y - target)` — verify no regression on
+      a fast example.
+- [ ] Now that the exact-Jacobian template exists in three places,
+      audit any remaining TNNet* layers that compute a softmax-like
+      normalization (search for "Exp(" near a normalization loop in
+      neuralnetwork.pas) to confirm none still ship the diagonal-only
+      approximation under another name.
+- [ ] Numerical-gradient stress test for TNNetSoftMax / TNNetPointwiseSoftMax
+      across SeqLen / Depth / SizeX combinations (pairs with the
+      already-listed SDPA stress test idea) — pins the new exact-Jacobian
+      code path across shape edge cases.
+
+
