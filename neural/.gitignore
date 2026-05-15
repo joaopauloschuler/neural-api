@@ -2,3 +2,4 @@ backup
 *.o
 *.ppu
 tests/RunTests
+*.exe
