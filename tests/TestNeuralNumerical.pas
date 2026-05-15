@@ -82,6 +82,8 @@ type
     procedure TestGLUGradientCheck;
     procedure TestSquaredReLUForward;
     procedure TestSquaredReLUGradientCheck;
+    procedure TestMaskedFillForward;
+    procedure TestMaskedFillGradientCheck;
     procedure TestAvgPoolGradientCheck;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
@@ -2827,6 +2829,49 @@ begin
   // Stay clear of the kink at 0.
   ActivationGradientCheck(Self, TNNetSquaredReLU.Create(), 'SquaredReLU',
     [0.5, 1.0, 2.0, -1.0, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestMaskedFillForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y: integer;
+begin
+  NN := TNNet.Create();
+  // 3x3 score map, single depth slice.
+  Input := TNNetVolume.Create(3, 3, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    for Y := 0 to 2 do
+      for X := 0 to 2 do
+      begin
+        if X > Y then
+          AssertTrue('MaskedFill upper triangle masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y),
+            NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('MaskedFill lower/diagonal untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedFillGradientCheck;
+begin
+  // Adding a constant has identity gradient passthrough. A small mask
+  // value keeps float32 precision intact for the central-difference check
+  // (a large constant in the MSE loss causes catastrophic cancellation).
+  LayerInputGradientCheck(Self, TNNetMaskedFill.Create(-0.5),
+    'MaskedFill', 3, 3, 2, 0.01);
 end;
 
 // CellBias / CellMul carry learnable per-cell weights; check both the input

@@ -696,6 +696,24 @@ type
       procedure Compute(); override;
   end;
 
+  /// Causal (masked-fill) layer for self-attention score maps.
+  // Treats the input as a 2D score matrix over the X (key/column) and
+  // Y (query/row) axes. Positions where the column index (X) is greater
+  // than the row index (Y) get a large negative constant added so that,
+  // after a softmax, those positions contribute (almost) zero attention.
+  // All other positions (lower triangle and diagonal) pass through
+  // unchanged. The transform is applied independently for each depth slice.
+  // This layer has no trainable parameter. As it only adds a constant,
+  // the backward pass is a straight gradient passthrough.
+  TNNetMaskedFill = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload;
+    constructor Create(pMaskValue: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
   TNNetPower = class(TNNetReLUBase)
     private
@@ -3848,6 +3866,46 @@ begin
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMaskedFill }
+
+constructor TNNetMaskedFill.Create();
+begin
+  Create(-1e9);
+end;
+
+constructor TNNetMaskedFill.Create(pMaskValue: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pMaskValue;
+end;
+
+procedure TNNetMaskedFill.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FFloatSt[0] = 0 then FFloatSt[0] := -1e9;
+end;
+
+procedure TNNetMaskedFill.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D: integer;
+  MaskValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  MaskValue := FFloatSt[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  // Mask the upper triangle: column index (X) greater than row index (Y).
+  for Y := 0 to MaxY do
+    for X := Y + 1 to MaxX do
+      for D := 0 to MaxD do
+        FOutput.Add(X, Y, D, MaskValue);
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetMish }
@@ -13724,6 +13782,7 @@ begin
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
+      'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -13847,6 +13906,7 @@ begin
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
+      if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
