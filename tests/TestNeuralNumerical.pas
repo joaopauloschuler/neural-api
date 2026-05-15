@@ -173,6 +173,9 @@ type
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
     procedure TestGlobalAvgPoolSerializationRoundTrip;
+    procedure TestSwiGLUSerializationRoundTrip;
+    procedure TestGEGLUSerializationRoundTrip;
+    procedure TestLayerScaleSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -5003,6 +5006,10 @@ begin
       Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
 
     NN.Compute(Input);
+    // In inference mode the forward must be exactly the identity.
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('DropPath inference forward is identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-7);
     Saved := NN.SaveToString();
 
     NN2 := TNNet.Create();
@@ -5016,6 +5023,10 @@ begin
         AssertEquals('DropPath round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
+      // Also pin: the reloaded layer is still the identity at inference.
+      for i := 0 to Input.Size - 1 do
+        AssertEquals('DropPath reloaded forward is identity at ' + IntToStr(i),
+          Input.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-7);
     finally
       NN2.Free;
     end;
@@ -6522,6 +6533,30 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestSwiGLUSerializationRoundTrip;
+begin
+  // SwiGLU halves the channel depth, so the input depth must be even.
+  SerializationRoundTrip(Self, TNNetSwiGLU.Create(),
+    'SwiGLU', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestGEGLUSerializationRoundTrip;
+begin
+  // GEGLU halves the channel depth, so the input depth must be even.
+  SerializationRoundTrip(Self, TNNetGEGLU.Create(),
+    'GEGLU', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLayerScaleSerializationRoundTrip;
+begin
+  // LayerScale has one learnable per-channel scale tensor; the perturbed-
+  // weights helper pushes it away from the default constant so the
+  // round-trip exercises a non-trivial scale. Use a non-default initial
+  // scale (0.5) so the FFloatSt[0] dispatch path is also covered.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLayerScale.Create(0.5), 'LayerScale', 2, 2, 4, 1e-5);
 end;
 
 initialization

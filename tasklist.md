@@ -1745,7 +1745,7 @@ hitting the same wall.**
       new TNNetGlobalMaxPool test). Same shape transformation;
       forward is even simpler than the max variant. Worth pinning
       while the GlobalMaxPool harness is still fresh.
-- [ ] LoadFromString round-trip tests for the recently-landed
+- [X] LoadFromString round-trip tests for the recently-landed
       activation/pooling additions: TNNetReLU6, TNNetGlobalMaxPool,
       TNNetSwiGLU, TNNetGEGLU, TNNetLayerScale, TNNetRMSNorm,
       TNNetDropPath. Mirror the SoftCapping pattern. One small
@@ -1824,7 +1824,7 @@ TNNetAvgChannel; this is now covered.
       `SoftPlus(0) = ln(2)` and that the large-x linearization branch
       kicks in correctly. The layer already exists; this is a tiny
       coverage gap.
-- [ ] Continue the LoadFromString round-trip sweep called out around
+- [X] Continue the LoadFromString round-trip sweep called out around
       line 1748: TNNetSwiGLU, TNNetGEGLU, TNNetLayerScale, TNNetRMSNorm,
       TNNetDropPath. TNNetReLU6 and TNNetGlobalMaxPool are now done; the
       remaining five share the same harness shape and can land as one
@@ -1900,11 +1900,11 @@ have landed recently.
       line 1759; cheap and easy).
 
 #### LoadFromString round-trip sweep (continuation of line 1827)
-- [ ] TNNetSwiGLU LoadFromString round-trip test.
-- [ ] TNNetGEGLU LoadFromString round-trip test.
-- [ ] TNNetLayerScale LoadFromString round-trip test.
-- [ ] TNNetRMSNorm LoadFromString round-trip test.
-- [ ] TNNetDropPath LoadFromString round-trip test (forward in inference
+- [X] TNNetSwiGLU LoadFromString round-trip test.
+- [X] TNNetGEGLU LoadFromString round-trip test.
+- [X] TNNetLayerScale LoadFromString round-trip test.
+- [X] TNNetRMSNorm LoadFromString round-trip test.
+- [X] TNNetDropPath LoadFromString round-trip test (forward in inference
       mode must be the identity; pin that too).
 
 #### Small experiments / examples I'd enjoy
