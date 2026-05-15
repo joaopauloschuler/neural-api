@@ -139,10 +139,12 @@
       correctness safety net but isn't explained anywhere.
 
 ### Added ideas (Claude, 2026-05-14, third pass — follow-ups from the lucky-day batch)
-- [ ] Document the newly-landed layers in README.md: TNNetLayerScale /
+- [x] Document the newly-landed layers in README.md: TNNetLayerScale /
       TNNetLearnableScale, TNNetSoftPlus, TNNetGaussianActivation, TNNetGEGLU
       and TNNetSwiGLU. Each needs a one-line description plus a short usage
-      snippet, matching the existing layer-reference style.
+      snippet, matching the existing layer-reference style. Done — also
+      documented TNNetGLU, TNNetSquaredReLU and TNNetMaskedFill in the same
+      pass (new "Gated Linear Units" and "Attention Masking" subsections).
 - [ ] TNNetSwiGLU/TNNetGEGLU are the gating half of a transformer FFN — a
       natural next step is a TNNetSwiGLUFeedForward example or block that
       pairs them with the dense projections, ready for the transformer-encoder
@@ -155,17 +157,16 @@
       Q/K projection. Listed at the top of the file; I'd like to take it as a
       standalone, gradient-checked layer (the rotation is a fixed, parameter-free
       transform so the backward pass is just the transpose rotation).
-- [ ] TNNetMaskedFill / causal-mask layer — add -inf to the upper triangle of an
-      attention-score map before softmax. Tiny, parameter-free, and a required
-      piece for the Tiny GPT example. Gradient-check it by confirming masked
-      positions pass zero gradient.
-- [ ] TNNetGLU (plain gated linear unit) — the ungated-activation sibling of the
+- [x] TNNetMaskedFill / causal-mask layer — add -inf to the upper triangle of an
+      attention-score map before softmax. Landed as a parameter-free layer
+      derived from TNNetIdentity; Create() defaults to -1e9, Create(value)
+      configurable. Forward + numerical-gradient tests in TestNeuralNumerical.pas.
+- [x] TNNetGLU (plain gated linear unit) — the ungated-activation sibling of the
       GEGLU/SwiGLU pair that just landed: split in half, gate one half with a
-      plain sigmoid of the other. Rounds out the gated-activation family and is
-      a 20-minute job given the SwiGLU template.
-- [ ] TNNetSquaredReLU — relu(x)^2, the activation from the Primer paper. Trivial
-      closed-form derivative, easy numerical-gradient test, and a nice cheap
-      experiment subject for the activation bake-off.
+      plain sigmoid of the other. Landed with forward + numerical-gradient tests.
+- [x] TNNetSquaredReLU — relu(x)^2, the activation from the Primer paper. Landed
+      as an activation layer (descends from TNNetReLUBase) with forward +
+      numerical-gradient tests.
 
 #### Correctness / audit work I find rewarding
 - [ ] Continue the Backpropagate audit into the concat/split/branch family
@@ -193,3 +194,16 @@
       round-trip, CreateLayer dispatch entry, Compute/Backpropagate, and the
       mandatory numerical-gradient test. Captures the recurring steps every
       new-layer task in this file actually follows.
+
+### Added ideas (Claude, 2026-05-14, fourth pass — follow-ups after the GLU/MaskedFill batch)
+- [ ] Add `tests/RunTests` (and any other fpc build artifacts under tests/) to
+      .gitignore — the build leaves an untracked binary behind after each test
+      run, which clutters `git status` for every future agent.
+- [ ] Now that TNNetMaskedFill and the gated-activation family have landed, the
+      remaining transformer building blocks are TNNetScaledDotProductAttention
+      and TNNetRotaryEmbedding (RoPE) — both already listed above. With masking
+      done, ScaledDotProductAttention is the highest-leverage next layer for
+      the Tiny GPT example.
+- [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
+      pattern. Consider a follow-up that allows masking the lower triangle or a
+      configurable offset, if a non-causal masking use case shows up.
