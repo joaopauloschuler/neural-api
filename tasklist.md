@@ -1214,4 +1214,140 @@ Natural follow-ups:
       already-listed SDPA stress test idea) — pins the new exact-Jacobian
       code path across shape edge cases.
 
+### Lucky-day batch — 2026-05-15 (seed 35900)
+
+A fresh wave of ideas I'd personally enjoy working on, organised by how
+much fun-vs-effort each looks like. Skewed toward "complete the
+transformer story" since so many of the building blocks are now in tree
+(SDPA, RoPE, MaskedFill, ALiBi, RMSNorm, LayerNorm, GEGLU/SwiGLU,
+LayerScale, DropPath, exact softmax Jacobian).
+
+#### Layers I'd enjoy building next
+- [ ] TNNetMultiHeadSelfAttention — assemble the existing SDPA + RoPE +
+      MaskedFill + dense projections into a real MHA block. Forward +
+      numerical-gradient test on a small (SeqLen=4, Heads=2, d_k=4)
+      shape. Top-level transformer task on the list; the per-piece
+      gradient tests already pin every internal layer.
+- [ ] TNNetTransformerEncoderBlock helper that wires
+      MHA → residual+LayerNorm → SwiGLU-FFN → residual+LayerNorm.
+      Pre-norm and post-norm variants behind a flag. Single
+      numerical-gradient test against the composed block.
+- [ ] TNNetCrossAttention — same SDPA core but with separate Q vs K|V
+      input branches (so encoder-decoder is reachable). Forward +
+      gradient-check on a tiny shape.
+- [ ] TNNetSinkAttention / attention sinks — keep K positions 0..s-1
+      always unmasked, mask the rest causally. Tiny variant on the
+      existing MaskedFill that unlocks streaming-LLM experiments
+      cheaply. Gradient-checked.
+- [ ] TNNetTalkingHeads — pre/post softmax linear mix across heads (the
+      "Talking-Heads Attention" trick). Worth a tiny standalone test
+      before it ever lands inside MHA.
+- [ ] TNNetMaxOut — k-way max of linear projections. Classical, easy
+      gradient (route to argmax), nice teaching example for the
+      activation menagerie.
+- [ ] TNNetMishExact — current Mish uses the standard formulation, but a
+      stable formulation for large |x| using softplus's stable form
+      would parallel what the SoftPlus landing did. Pure correctness /
+      numerical-stability win, drop-in.
+
+#### Correctness / audit work I'd take next
+- [ ] TNNetDeMaxPool numerical-gradient test (next entry in the
+      upsample/deconv audit per the line above). Smallest of the
+      remaining two, would unblock TNNetDeconvolution.
+- [ ] TNNetDeconvolution numerical-gradient test — closes the
+      upsample/deconv family audit. Input AND weight gradients
+      (the weight path is the more interesting one).
+- [ ] Recurrent-style layer audit: TNNetEmbedding's weight-gradient
+      path and any of the "previous-layer-output as state" patterns —
+      list the offenders first, then test one at a time.
+- [ ] Shared `LayerInputAndWeightGradientCheck` helper in
+      TestNeuralNumerical.pas (companion to the
+      LayerInputGradientCheck helper idea already in the list).
+      Three-line tests instead of copy-pasted blocks; would have
+      saved time on the LayerScale + CellBias + CellMul landings.
+- [ ] Find-or-falsify pass: scan neuralnetwork.pas for any
+      `Backpropagate` override whose body is just
+      `inherited;` plus a tiny tweak — flag the candidates for
+      gradient-check coverage. The exact-softmax-Jacobian story
+      teaches us how silent the diagonal-only bug class can be.
+
+#### Experiments I'm curious about
+- [ ] Position-encoding bake-off (now fully unblocked since
+      RoPE/ALiBi/MaskedFill/AddPositionalEmbedding all exist):
+      same toy next-token task, four runs, one chart. Already in
+      the list — I'd happily take it.
+- [ ] DropPath ablation: drop the existing tiny CNN/MLP example into
+      a deeper-than-needed stack with DropPath probabilities
+      {0.0, 0.1, 0.2}, chart final accuracy and training-time
+      variance. Empirical case for the layer that just landed.
+- [ ] "Does exact-softmax-Jacobian matter?" controlled experiment:
+      run the same classification example twice — once with the
+      new exact Jacobian (current master), once with the old
+      diagonal approximation restored on a branch. Chart the
+      convergence-quality gap. Concrete evidence for the change.
+- [ ] LayerNorm vs RMSNorm convergence-speed table on a tiny
+      transformer-shaped MLP. RMSNorm is the cheaper sibling; the
+      experiment justifies (or disproves) the cost saving at this
+      scale. Pairs cleanly with the normalization bake-off above.
+- [ ] Activation-function bake-off (already in the list): I'd take
+      it next-to-RMSNorm-experiment since both use the same harness
+      and produce one chart each.
+- [ ] Attention-pattern visualiser: train the "echo previous token"
+      SDPA demo from the previous batch, dump the full SeqLen×SeqLen
+      attention matrix as PGM at each epoch, watch the diagonal
+      shift one column. Tiny artifact, big teaching value.
+
+#### Examples I'd enjoy writing
+- [ ] Tiny GPT char-level transformer (already at the top of the
+      list — every building block now exists). Train on a few
+      kilobytes of text; print a sampled continuation. Single
+      ~150-line example showing the library can stand up a real
+      transformer end-to-end on CPU.
+- [ ] "Learn to copy" toy: SeqLen=8 input → output the same
+      sequence, trained with the encoder block above. Smallest
+      end-to-end transformer task with an obvious right answer.
+- [ ] "Learn to reverse" toy: same shape, output reversed. One
+      bit harder than copy — needs full self-attention, not just
+      identity. Pairs with the copy example for a teaching arc.
+- [ ] "Learn binary addition" example (already in the list as a
+      sequence task). I'd take it specifically because the right
+      answer is exact, so any divergence is a real bug rather
+      than a stochastic miss.
+- [ ] Tokenizer + embedding-NN visualisation (already in the list):
+      I'd enjoy the embedding-cluster bit specifically — print
+      nearest neighbours of a handful of tokens, no plotting
+      required.
+
+#### Tooling / dev experience
+- [ ] `scripts/grep_layer.sh <TNNet...>` — listed multiple times,
+      I'd actually write it now. Print the declaration, Compute,
+      Backpropagate, and any tests that mention the class. Saves
+      the first 30 seconds of every audit.
+- [ ] `scripts/list_untested_layers.sh` filter pass already in the
+      list: drop Base/Class/Abstract names, emit file:line for
+      surviving entries. Two-line awk change.
+- [ ] `scripts/new_layer.sh <Name>` scaffolder (listed three+ times):
+      Compute/Backpropagate skeleton into neuralnetwork.pas plus a
+      numerical-gradient test stub. Encodes the checklist as
+      executable form.
+- [ ] Tiny benchmark microharness for Backpropagate cost across
+      the softmax family — three layers, three shapes, one
+      printed table. Validates that the exact-Jacobian change
+      didn't tank performance on the common shapes.
+
+#### Documentation
+- [ ] "How numerical gradient testing works in this repo" note
+      (already in the list as the missing safety-net doc). Single
+      page; I'd anchor it to the recent TNNetMaskedFill landing
+      as the worked example.
+- [ ] "Building a transformer in this repo, layer by layer" — once
+      the MHA + encoder-block tasks above land, write the
+      walkthrough that strings every existing layer together into
+      one teaching artifact. Complement to the "Tiny GPT" example.
+- [ ] Short "softmax variants in this repo" note: TNNetSoftMax,
+      TNNetPointwiseSoftMax, TNNetSoftmaxTemperature — when to
+      pick each, what axis each operates on, which now use the
+      exact Jacobian. Naturally companions the existing
+      "position encodings in this repo" doc idea above.
+
 
