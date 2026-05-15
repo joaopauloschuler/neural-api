@@ -4874,7 +4874,15 @@ begin
         softplusVal := Ln(1 + Exp(x));
       FOutput.FData[OutputCnt] := softplusVal;
       // Derivative of softplus is the sigmoid function.
-      FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + Exp(-x));
+      // Numerically stable: for very large x, sigmoid(x) ~= 1; for very
+      // negative x, sigmoid(x) = 1/(1+exp(-x)) ~= exp(x). Guards against
+      // EOverflow when exp(-x) would overflow (e.g. x = -1e3).
+      if x > 30 then
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0
+      else if x < -30 then
+        FOutputErrorDeriv.FData[OutputCnt] := Exp(x)
+      else
+        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + Exp(-x));
     end;
   end
   else

@@ -194,6 +194,7 @@ type
     procedure TestSoftPlusIdentityAtZero;
     procedure TestSoftPlusLargeXLinearization;
     procedure TestSoftPlusExtremeInputSaturation;
+    procedure TestSoftPlusNegativeXDerivativeStability;
     procedure TestELUForward;
     procedure TestELUGradientCheck;
     procedure TestELUSerializationRoundTrip;
@@ -6762,6 +6763,59 @@ begin
       g := NN.Layers[0].OutputError.Raw[i];
       AssertFalse('SoftPlus saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
       AssertFalse('SoftPlus saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusNegativeXDerivativeStability;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  v, g: TNeuralFloat;
+  i: integer;
+begin
+  // Regression: previously, TNNetSoftPlus.Compute computed the derivative as
+  // 1/(1+Exp(-x)) unconditionally, which raises EOverflow for very-negative x
+  // (e.g. x = -1e3 makes Exp(-x) = Exp(1000) overflow). The stable form uses
+  // deriv := Exp(x) when x < -30. This test drives several very-negative
+  // inputs and asserts no exception is raised and gradients stay finite.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetSoftPlus.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Input.Raw[0] := -1e3;
+    Input.Raw[1] := -1e6;
+    Input.Raw[2] := -1e30;
+    Input.Raw[3] := -100.0;
+    Input.Raw[4] := -31.0;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 1.0;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('SoftPlus negative-x forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftPlus negative-x forward Inf at ' + IntToStr(i), IsInfinite(v));
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('SoftPlus negative-x input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('SoftPlus negative-x input-grad Inf at ' + IntToStr(i), IsInfinite(g));
     end;
   finally
     NN.Free;
