@@ -87,6 +87,10 @@ type
     procedure TestTokenShiftGradientCheck;
     procedure TestTokenShiftWeightGradientCheck;
     procedure TestTokenShiftSerializationRoundTrip;
+    procedure TestHuberLossForwardPassthrough;
+    procedure TestHuberLossGradientClipping;
+    procedure TestSmoothL1LossDefaults;
+    procedure TestHuberLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -10581,6 +10585,222 @@ begin
   // layout requirement) and SizeX = 4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetTokenShift.Create(), 'TokenShift', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestHuberLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetHuberLoss must be an identity passthrough on forward so that
+  // Net.Compute returns the regression head's raw predictions at inference.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetHuberLoss.Create(1.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 4.0 - 0.5;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('HuberLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHuberLossGradientClipping;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Delta, V, Expected: TNeuralFloat;
+  Vals: array[0..5] of TNeuralFloat;
+  i, CaseIdx: integer;
+begin
+  // Two cases: delta=1.0 and delta=0.5. The middle layer is a plain
+  // TNNetIdentity whose OutputError we inspect after Backpropagate. The
+  // framework seeds the last layer's OutputError with (output - target).
+  // Since TNNetHuberLoss is an identity passthrough on forward we have
+  // output[i] = input[i], so Target[i] := Input[i] - Vals[i] produces a
+  // seed of exactly Vals[i] in the loss layer. The Huber backward must
+  // then clip each element to [-delta, +delta] before propagating into
+  // LMid.OutputError.
+  Vals[0] :=  0.0;     // zero
+  Vals[1] :=  0.25;    // well below delta
+  Vals[2] := -0.7;     // mid-magnitude
+  Vals[3] :=  3.0;     // well above delta
+  Vals[4] := -2.5;     // well below -delta
+  Vals[5] :=  0.5;     // boundary for delta=0.5
+
+  for CaseIdx := 0 to 1 do
+  begin
+    if CaseIdx = 0 then Delta := 1.0 else Delta := 0.5;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 1, 1);
+    Target := TNNetVolume.Create(6, 1, 1);
+    try
+      NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetHuberLoss.Create(Delta));
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.5 + CaseIdx) * 2.0;
+      // Identity forward => output equals input. Target[i] = output[i] - Vals[i]
+      // makes the framework seed (output - target) = Vals[i].
+      for i := 0 to Input.Size - 1 do
+        Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      for i := 0 to LMid.OutputError.Size - 1 do
+      begin
+        V := Vals[i];
+        if V >  Delta then Expected :=  Delta
+        else if V < -Delta then Expected := -Delta
+        else Expected := V;
+        AssertEquals('HuberLoss clip delta=' + FloatToStr(Delta) +
+          ' at ' + IntToStr(i),
+          Expected, LMid.OutputError.Raw[i], 0.00001);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSmoothL1LossDefaults;
+var
+  NN, NNHuber: TNNet;
+  Input, Target: TNNetVolume;
+  LMidS, LMidH: TNNetIdentity;
+  Vals: array[0..4] of TNeuralFloat;
+  Expected: TNeuralFloat;
+  i: integer;
+begin
+  // TNNetSmoothL1Loss must default delta to 1.0 and produce the same
+  // backward clipping as TNNetHuberLoss(1.0). The forward is identity, so
+  // Target := Input - Vals seeds the framework's (output - target) signal
+  // with exactly Vals on the loss layer.
+  Vals[0] :=  0.1;
+  Vals[1] := -0.4;
+  Vals[2] :=  2.5;
+  Vals[3] := -3.0;
+  Vals[4] :=  1.0;
+
+  NN := TNNet.Create();
+  NNHuber := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Target := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    LMidS := TNNetIdentity.Create();
+    NN.AddLayer(LMidS);
+    NN.AddLayer(TNNetSmoothL1Loss.Create());
+
+    NNHuber.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    LMidH := TNNetIdentity.Create();
+    NNHuber.AddLayer(LMidH);
+    NNHuber.AddLayer(TNNetHuberLoss.Create(1.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Cos(i * 0.45) * 1.7;
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+    NNHuber.Compute(Input);
+    NNHuber.Backpropagate(Target);
+
+    // 1) SmoothL1 default delta = 1.0 (verified behaviorally: |Vals[i]| <= 1
+    //    passes through; |Vals[i]| > 1 saturates to +/-1).
+    for i := 0 to LMidS.OutputError.Size - 1 do
+    begin
+      if Vals[i] >  1.0 then Expected :=  1.0
+      else if Vals[i] < -1.0 then Expected := -1.0
+      else Expected := Vals[i];
+      AssertEquals('SmoothL1 default delta=1 clip at ' + IntToStr(i),
+        Expected, LMidS.OutputError.Raw[i], 0.00001);
+    end;
+
+    // 2) SmoothL1 backward equals Huber(1.0) backward element-wise.
+    for i := 0 to LMidS.OutputError.Size - 1 do
+      AssertEquals('SmoothL1 matches Huber(1.0) clip at ' + IntToStr(i),
+        LMidH.OutputError.Raw[i], LMidS.OutputError.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    NNHuber.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHuberLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  i: integer;
+  Vals: array[0..3] of TNeuralFloat;
+  Expected: TNeuralFloat;
+begin
+  // Save/Load round-trip must preserve the delta hyperparameter (FFloatSt[0]).
+  // Validated behaviorally: values above the original delta must still be
+  // clipped to that delta after the round trip.
+  Vals[0] :=  0.3;   // below delta=0.75
+  Vals[1] := -0.5;   // below
+  Vals[2] :=  1.4;   // above
+  Vals[3] := -2.0;   // above
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetHuberLoss.Create(0.75));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetHuberLoss',
+      NN2.GetLastLayer is TNNetHuberLoss);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) + 0.2;
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if Vals[i] >  0.75 then Expected :=  0.75
+      else if Vals[i] < -0.75 then Expected := -0.75
+      else Expected := Vals[i];
+      AssertEquals('HuberLoss delta round-trip clip at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
 end;
 
 initialization
