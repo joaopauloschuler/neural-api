@@ -268,6 +268,9 @@ type
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
     procedure TestBentIdentitySerializationRoundTrip;
+    procedure TestLishtForward;
+    procedure TestLishtGradientCheck;
+    procedure TestLishtSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8764,6 +8767,53 @@ procedure TTestNeuralNumerical.TestBentIdentitySerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetBentIdentity.Create(),
     'BentIdentity', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLishtForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  TanhOne: TNeuralFloat;
+begin
+  // Hand-checked anchors:
+  //   LiSHT(0)  = 0 * tanh(0) = 0
+  //   LiSHT(1)  = 1 * tanh(1)  ~= 0.7616
+  //   LiSHT(-1) = -1 * tanh(-1) = tanh(1) ~= 0.7616 (symmetric)
+  TanhOne := Tanh(1.0);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetLisht.Create());
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    NN.Compute(Input);
+    AssertEquals('LiSHT(0)',
+      0.0, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('LiSHT(1)',
+      TanhOne, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('LiSHT(-1)',
+      TanhOne, NN.GetLastLayer.Output.Raw[2], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLishtGradientCheck;
+begin
+  // LiSHT(x) = x*tanh(x) is C-infinity smooth, so central differences
+  // match the analytic gradient cleanly with the standard
+  // Sin(i*0.7)*2 + 0.3 input pattern on a (2,2,3) shape.
+  LayerInputGradientCheck(Self, TNNetLisht.Create(),
+    'Lisht', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLishtSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetLisht.Create(),
+    'Lisht', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

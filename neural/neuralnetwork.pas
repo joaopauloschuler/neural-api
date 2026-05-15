@@ -790,6 +790,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// LiSHT (Linearly Scaled Hyperbolic Tangent) activation function.
+  // LiSHT(x) = x * tanh(x). Parameter-free. Symmetric (LiSHT(-x) = LiSHT(x))
+  // and unbounded-positive (y >= 0, zero only at x=0). Derivative is
+  // tanh(x) + x * (1 - tanh(x)^2), cached into FOutputErrorDeriv so
+  // TNNetReLUBase handles the backward chain rule with one multiply.
+  // tanh(x) is computed once per element and reused for forward + derivative.
+  TNNetLisht = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5889,6 +5900,44 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       SqrtVal := Sqrt(x * x + 1.0);
       FOutput.FData[OutputCnt] := (SqrtVal - 1.0) * 0.5 + x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetLisht }
+
+procedure TNNetLisht.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, t: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // LiSHT(x) = x * tanh(x). Derivative is tanh(x) + x * (1 - tanh(x)^2).
+  // tanh(x) is computed once per element and reused for both.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      t := Tanh(x);
+      FOutput.FData[OutputCnt] := x * t;
+      FOutputErrorDeriv.FData[OutputCnt] := t + x * (1.0 - t * t);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * Tanh(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16774,6 +16823,7 @@ begin
       'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
       'TNNetSinc' :                 Result := TNNetSinc.Create();
       'TNNetBentIdentity' :         Result := TNNetBentIdentity.Create();
+      'TNNetLisht' :                Result := TNNetLisht.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16942,6 +16992,7 @@ begin
       if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
       if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
       if S[0] = 'TNNetBentIdentity' then Result := TNNetBentIdentity.Create() else
+      if S[0] = 'TNNetLisht' then Result := TNNetLisht.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
