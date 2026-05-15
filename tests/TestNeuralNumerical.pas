@@ -209,6 +209,12 @@ type
     procedure TestSoftSignForward;
     procedure TestSoftSignGradientCheck;
     procedure TestSoftSignSerializationRoundTrip;
+    procedure TestAbsForward;
+    procedure TestAbsGradientCheck;
+    procedure TestAbsSerializationRoundTrip;
+    procedure TestSquareForward;
+    procedure TestSquareGradientCheck;
+    procedure TestSquareSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -7498,6 +7504,92 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestAbsForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetAbs.Create());
+
+    Input.Raw[0] := -3.0;
+    Input.Raw[1] := 2.0;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := -0.5;
+    Input.Raw[4] := 1.25;
+
+    NN.Compute(Input);
+
+    AssertEquals('Abs(-3)', 3.0, NN.GetLastLayer.Output.Raw[0], 1e-6);
+    AssertEquals('Abs(2)',  2.0, NN.GetLastLayer.Output.Raw[1], 1e-6);
+    AssertEquals('Abs(0)',  0.0, NN.GetLastLayer.Output.Raw[2], 1e-6);
+    AssertEquals('Abs(-0.5)', 0.5, NN.GetLastLayer.Output.Raw[3], 1e-6);
+    AssertEquals('Abs(1.25)', 1.25, NN.GetLastLayer.Output.Raw[4], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAbsGradientCheck;
+begin
+  // Stay clear of the kink at x = 0 (|x| has no derivative there).
+  ActivationGradientCheck(Self, TNNetAbs.Create(), 'Abs',
+    [0.5, 1.0, 0.25, 2.0, 1.5, 0.75], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestAbsSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetAbs.Create(),
+    'Abs', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSquareForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetSquare.Create());
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := 3.0;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := 0.5;
+    Input.Raw[4] := -1.5;
+
+    NN.Compute(Input);
+
+    AssertEquals('Square(-2)', 4.0, NN.GetLastLayer.Output.Raw[0], 1e-6);
+    AssertEquals('Square(3)',  9.0, NN.GetLastLayer.Output.Raw[1], 1e-6);
+    AssertEquals('Square(0)',  0.0, NN.GetLastLayer.Output.Raw[2], 1e-6);
+    AssertEquals('Square(0.5)', 0.25, NN.GetLastLayer.Output.Raw[3], 1e-6);
+    AssertEquals('Square(-1.5)', 2.25, NN.GetLastLayer.Output.Raw[4], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSquareGradientCheck;
+begin
+  // Square is smooth everywhere; pick a mix of positive and negative inputs.
+  ActivationGradientCheck(Self, TNNetSquare.Create(), 'Square',
+    [0.5, -0.5, 1.0, -1.5, 2.0, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSquareSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSquare.Create(),
+    'Square', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

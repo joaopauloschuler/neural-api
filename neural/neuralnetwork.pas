@@ -668,6 +668,23 @@ type
     procedure Compute(); override;
   end;
 
+  /// Abs activation function.
+  // Abs(x) = |x|. Parameter-free. Derivative is sign(x): +1 for x > 0,
+  // -1 for x < 0, 0 at x = 0. Cached in FOutputErrorDeriv so
+  // TNNetReLUBase handles the backward chain rule.
+  TNNetAbs = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
+  /// Square activation function.
+  // Square(x) = x * x. Parameter-free. Derivative is 2*x. Cached in
+  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule.
+  TNNetSquare = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5114,6 +5131,94 @@ begin
         FOutput.FData[OutputCnt] := x
       else
         FOutput.FData[OutputCnt] := -1;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetAbs }
+
+procedure TNNetAbs.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Abs(x) = |x|; derivative is sign(x), 0 at x = 0.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 0 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
+      else if x < 0 then
+      begin
+        FOutput.FData[OutputCnt] := -x;
+        FOutputErrorDeriv.FData[OutputCnt] := -1.0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x >= 0 then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := -x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSquare }
+
+procedure TNNetSquare.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Square(x) = x*x; derivative is 2*x.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * x;
+      FOutputErrorDeriv.FData[OutputCnt] := 2.0 * x;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * x;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15895,6 +16000,8 @@ begin
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
       'TNNetLogSigmoid' :           Result := TNNetLogSigmoid.Create();
       'TNNetShiftedReLU' :          Result := TNNetShiftedReLU.Create();
+      'TNNetAbs' :                  Result := TNNetAbs.Create();
+      'TNNetSquare' :               Result := TNNetSquare.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16047,6 +16154,8 @@ begin
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
       if S[0] = 'TNNetLogSigmoid' then Result := TNNetLogSigmoid.Create() else
       if S[0] = 'TNNetShiftedReLU' then Result := TNNetShiftedReLU.Create() else
+      if S[0] = 'TNNetAbs' then Result := TNNetAbs.Create() else
+      if S[0] = 'TNNetSquare' then Result := TNNetSquare.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
