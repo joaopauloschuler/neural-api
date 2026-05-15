@@ -714,6 +714,19 @@ type
     procedure Compute(); override;
   end;
 
+  /// Soft capping activation: y = c * tanh(x / c).
+  // Element-wise smooth logit-capping stabilizer used by Gemma-style models.
+  // The cap value c is stored in FFloatSt[0] (default 30.0) and there are no
+  // trainable parameters. Output shape equals input shape. The derivative is
+  // dy/dx = 1 - tanh(x/c)^2 = 1 - (y/c)^2.
+  TNNetSoftCapping = class(TNNetIdentity)
+  public
+    constructor Create(); overload;
+    constructor Create(pCap: TNeuralFloat); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Scaled Dot-Product Attention (single head, parameter-free).
   // Input layout: SizeY = 1, SizeX = sequence length, Depth = 3 * d_k
   // where the depth axis is the concatenation Q | K | V, each of size d_k.
@@ -3929,6 +3942,73 @@ begin
       for D := 0 to MaxD do
         FOutput.Add(X, Y, D, MaskValue);
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSoftCapping }
+
+constructor TNNetSoftCapping.Create();
+begin
+  Create(30.0);
+end;
+
+constructor TNNetSoftCapping.Create(pCap: TNeuralFloat);
+begin
+  inherited Create();
+  if pCap = 0 then
+    FErrorProc('TNNetSoftCapping cap value can not be zero.');
+  FFloatSt[0] := pCap;
+end;
+
+procedure TNNetSoftCapping.Compute();
+var
+  StartTime: double;
+  SizeM1, OutputCnt: integer;
+  LocalPrevOutput: TNNetVolume;
+  Cap, InvCap, TanhVal, OutVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.FOutput;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Cap := FFloatSt[0];
+  if Cap = 0 then Cap := 30.0;
+  InvCap := 1.0 / Cap;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      TanhVal := Tanh(LocalPrevOutput.FData[OutputCnt] * InvCap);
+      OutVal := Cap * TanhVal;
+      FOutput.FData[OutputCnt] := OutVal;
+      // dy/dx = 1 - tanh(x/c)^2
+      FOutputErrorDeriv.FData[OutputCnt] := 1 - TanhVal * TanhVal;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      TanhVal := Tanh(LocalPrevOutput.FData[OutputCnt] * InvCap);
+      FOutput.FData[OutputCnt] := Cap * TanhVal;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftCapping.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetScaledDotProductAttention }
@@ -13966,6 +14046,7 @@ begin
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
+      'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -14091,6 +14172,7 @@ begin
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
+      if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else

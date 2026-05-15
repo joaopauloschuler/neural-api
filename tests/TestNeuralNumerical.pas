@@ -84,6 +84,8 @@ type
     procedure TestSquaredReLUGradientCheck;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
+    procedure TestSoftCappingForward;
+    procedure TestSoftCappingGradientCheck;
     procedure TestAvgPoolGradientCheck;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
@@ -3176,6 +3178,70 @@ begin
   // (a large constant in the MSE loss causes catastrophic cancellation).
   LayerInputGradientCheck(Self, TNNetMaskedFill.Create(-0.5),
     'MaskedFill', 3, 3, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftCappingForward;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Cap, Expected: TNeuralFloat;
+  Saved: string;
+  i: integer;
+  InputValues: array[0..3] of TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    Cap := 5.0;
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetSoftCapping.Create(Cap));
+
+    // A few non-saturating values plus one strongly saturating value.
+    InputValues[0] := 0.0;
+    InputValues[1] := 1.0;
+    InputValues[2] := -2.5;
+    InputValues[3] := 50.0; // strongly saturating: c*tanh(10) ~= c
+    for i := 0 to 3 do Input.Raw[i] := InputValues[i];
+    // Fill the rest with deterministic values.
+    for i := 4 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.3) * 4.0;
+
+    NN.Compute(Input);
+
+    for i := 0 to 3 do
+    begin
+      Expected := Cap * Tanh(InputValues[i] / Cap);
+      AssertEquals('SoftCapping output[' + IntToStr(i) + ']',
+        Expected, NN.GetLastLayer.Output.Raw[i], 0.0001);
+    end;
+    // Sanity: saturating value approaches the cap.
+    AssertTrue('SoftCapping saturates toward cap',
+      Abs(NN.GetLastLayer.Output.Raw[3] - Cap) < 0.001);
+
+    // Round-trip SaveToString / LoadFromString preserves the cap value.
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      for i := 0 to Input.Size - 1 do
+        AssertEquals('SoftCapping round-trip output[' + IntToStr(i) + ']',
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 0.0001);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftCappingGradientCheck;
+begin
+  // Cap chosen small enough that the inputs span both the near-linear region
+  // and the saturating tails for a meaningful derivative check.
+  LayerInputGradientCheck(Self, TNNetSoftCapping.Create(3.0),
+    'SoftCapping', 3, 1, 4, 0.01);
 end;
 
 // CellBias / CellMul carry learnable per-cell weights; check both the input

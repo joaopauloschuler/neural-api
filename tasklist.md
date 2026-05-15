@@ -321,9 +321,15 @@
 - [ ] TNNetALiBi positional bias — alternative to RoPE: add a static
       slope * (j - i) bias to attention scores. Pairs with TNNetMaskedFill
       and gives a second option for position handling in the eventual MHA.
-- [ ] TNNetSoftCapping — `c * tanh(x / c)` logit-capping layer used by
+- [x] TNNetSoftCapping — `c * tanh(x / c)` logit-capping layer used by
       Gemma-style models. Parameter-free, single closed-form derivative,
       cheap stabilizer for attention scores and final logits.
+      Landed: descends from TNNetIdentity, stores the cap in FFloatSt[0]
+      (default 30.0), caches `1 - tanh(x/c)^2` in FOutputErrorDeriv so
+      Backpropagate is a single elementwise multiply. Save/Load
+      round-trip wired through both dispatch tables, with forward,
+      saturation, round-trip, and central-difference gradient tests
+      in TestNeuralNumerical.
 - [ ] TNNetMixtureOfExperts (top-k gating) — even a tiny CPU-friendly
       version is fun: a softmax gate over E experts, top-1 routing, route
       each sample through one expert FullConnect. Numerical gradient
