@@ -32,7 +32,7 @@
 - [ ] Interactive "build your first transformer in Pascal" tutorial
 - [ ] Auto-generated layer API reference from doc comments
 
-## Added ideas (Claude, 2026-05-14)
+## Added ideas
 
 ### Normalization layers (broken down for easy implementation)
 - [x] TNNetLayerNorm — per-sample layer normalization over all elements, with
@@ -68,8 +68,6 @@
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
       regressions are visible without OpenCL/AVX hardware differences.
-
-### Added ideas (Claude, 2026-05-14, second pass)
 - [ ] Investigate TNNetPointwiseSoftMax.Backpropagate: it uses the diagonal-only
       x*(1-x) approximation instead of the full softmax Jacobian. Decide whether
       to implement the exact Jacobian (and add a numerical-gradient test) or
@@ -83,8 +81,6 @@
 - [ ] TNNetRMSNorm has now landed (neural/neuralnetwork.pas +
       TestNeuralNumerical.pas) and is, alongside TNNetLayerNorm, a ready
       template for any further normalization-layer variants.
-
-### Added ideas (Claude, 2026-05-14, lucky day — random number 71754)
 
 #### Layers I'd enjoy building
 - [ ] TNNetScaledDotProductAttention — the single-head core (Q·Kᵀ / √d → softmax
@@ -138,7 +134,7 @@
       contributors can add layer tests confidently — it's the project's main
       correctness safety net but isn't explained anywhere.
 
-### Added ideas (Claude, 2026-05-14, third pass — follow-ups from the lucky-day batch)
+### Added ideas
 - [x] Document the newly-landed layers in README.md: TNNetLayerScale /
       TNNetLearnableScale, TNNetSoftPlus, TNNetGaussianActivation, TNNetGEGLU
       and TNNetSwiGLU. Each needs a one-line description plus a short usage
@@ -149,8 +145,6 @@
       natural next step is a TNNetSwiGLUFeedForward example or block that
       pairs them with the dense projections, ready for the transformer-encoder
       task at the top of the list.
-
-### Added ideas (Claude, 2026-05-14, lucky day — random number 593031)
 
 #### Layers I'd enjoy building
 - [ ] TNNetRotaryEmbedding (RoPE) — apply rotary position encoding to a
@@ -195,7 +189,7 @@
       mandatory numerical-gradient test. Captures the recurring steps every
       new-layer task in this file actually follows.
 
-### Added ideas (Claude, 2026-05-14, fourth pass — follow-ups after the GLU/MaskedFill batch)
+### Added ideas
 - [ ] Add `tests/RunTests` (and any other fpc build artifacts under tests/) to
       .gitignore — the build leaves an untracked binary behind after each test
       run, which clutters `git status` for every future agent.
@@ -207,3 +201,13 @@
 - [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
       pattern. Consider a follow-up that allows masking the lower triangle or a
       configurable offset, if a non-causal masking use case shows up.
+
+### Ideas from JP
+- [ ] Better integrate TBytePredictionViaNNet and TEasyBytePredictionViaNNet with
+      TNNet. Find a way to backpropagate. May open a new class of problem solving.
+      This is very interesting.
+- [ ] Use TBytePredictionViaNNet and TEasyBytePredictionViaNNet as inspiration for
+      new float32 based layers. This is also curious and interesting.
+- [ ] Integrate with float32 functions from https://github.com/joaopauloschuler/pas-core-math
+      for faster and more precise math.
+- [ ] More image generative examples and or experiments.
