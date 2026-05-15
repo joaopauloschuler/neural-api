@@ -681,7 +681,7 @@ is sized to fit in a single focused commit.
       LayerNorm and RMSNorm outputs (two learnable scalars summed via
       softmax). Cute, parameter-cheap experiment in "let the network
       pick its own normalizer". All ingredients already exist.
-- [ ] TNNetChannelShuffle — the ShuffleNet operation: reshape `(C)` to
+- [x] TNNetChannelShuffle — the ShuffleNet operation: reshape `(C)` to
       `(groups, C/groups)`, transpose, flatten back. Parameter-free,
       gradient is the inverse permutation, easy numerical check.
       Slots cleanly into the existing channel-manipulation family

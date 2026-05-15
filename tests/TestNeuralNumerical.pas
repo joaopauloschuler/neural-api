@@ -121,6 +121,10 @@ type
     procedure TestSpatialDropout2DTrainingMaskShape;
     procedure TestSpatialDropout2DGradientCheck;
     procedure TestSpatialDropout2DSerializationRoundTrip;
+    procedure TestChannelShuffleForward;
+    procedure TestChannelShuffleGradientCheck;
+    procedure TestChannelShuffleSerializationRoundTrip;
+    procedure TestChannelShuffleIndivisibleGuard;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -4961,6 +4965,74 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestChannelShuffleForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  c: integer;
+  Expected: array[0..3] of integer;
+begin
+  // Depth=4, Groups=2 -> per-group=2.
+  // Channel c maps to (c mod G) * (C/G) + (c div G):
+  //   0 -> 0, 1 -> 2, 2 -> 1, 3 -> 3.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetChannelShuffle.Create(2));
+    Input.Raw[0] := 10.0;
+    Input.Raw[1] := 20.0;
+    Input.Raw[2] := 30.0;
+    Input.Raw[3] := 40.0;
+    NN.Compute(Input);
+    Expected[0] := 0; Expected[1] := 2; Expected[2] := 1; Expected[3] := 3;
+    for c := 0 to 3 do
+      AssertEquals('ChannelShuffle output channel ' + IntToStr(Expected[c]),
+        Input.Raw[c], NN.GetLastLayer.Output.Raw[Expected[c]], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestChannelShuffleGradientCheck;
+begin
+  // Depth=4, Groups=2: matches the InterleaveChannels gradient-check shape;
+  // the permutation is parameter-free so backprop is the inverse permutation.
+  LayerInputGradientCheck(Self, TNNetChannelShuffle.Create(2),
+    'ChannelShuffle', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestChannelShuffleSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetChannelShuffle.Create(2),
+    'ChannelShuffle', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestChannelShuffleIndivisibleGuard;
+var
+  NN: TNNet;
+  Shuf: TNNetChannelShuffle;
+  Capture: TErrorCapture;
+begin
+  // Depth=5 is not divisible by Groups=2; SetPrevLayer must fire FErrorProc.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    Shuf := TNNetChannelShuffle.Create(2);
+    Shuf.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(Shuf);
+    AssertTrue('ChannelShuffle indivisible-depth guard must fire FErrorProc',
+      Capture.Triggered);
+    AssertTrue('ChannelShuffle indivisible-depth message must mention "divisible"',
+      Pos('divisible', Capture.Message) > 0);
+  finally
+    NN.Free;
+    Capture.Free;
   end;
 end;
 

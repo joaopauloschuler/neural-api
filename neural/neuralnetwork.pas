@@ -1292,6 +1292,23 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// ShuffleNet channel-shuffle layer. Parameter-free permutation across the
+  // channel axis: reshape Depth=C as (Groups, C/Groups), transpose to
+  // (C/Groups, Groups), flatten. Channel c maps to
+  //   (c mod Groups) * (C div Groups) + (c div Groups).
+  // Backward applies the inverse permutation to OutputError.
+  TNNetChannelShuffle = class(TNNetIdentity)
+    private
+      ToChannels: TNeuralIntegerArray;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pGroups: integer); overload;
+      destructor Destroy(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -4622,6 +4639,78 @@ begin
     end;
   end;
 
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetChannelShuffle }
+
+procedure TNNetChannelShuffle.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  CntDepth, MaxDepth, Groups, PerGroup: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Groups := FStruct[0];
+  if Groups <= 0 then
+  begin
+    FErrorProc('TNNetChannelShuffle requires Groups>0, got ' + IntToStr(Groups));
+    Exit;
+  end;
+  if (FOutput.Depth mod Groups) <> 0 then
+  begin
+    FErrorProc('TNNetChannelShuffle requires Depth divisible by Groups, got Depth=' +
+      IntToStr(FOutput.Depth) + ' Groups=' + IntToStr(Groups));
+    Exit;
+  end;
+  PerGroup := FOutput.Depth div Groups;
+  MaxDepth := FOutput.Depth - 1;
+  SetLength(ToChannels, FOutput.Depth);
+  for CntDepth := 0 to MaxDepth do
+    ToChannels[CntDepth] := (CntDepth mod Groups) * PerGroup + (CntDepth div Groups);
+end;
+
+constructor TNNetChannelShuffle.Create(pGroups: integer);
+begin
+  inherited Create();
+  FStruct[0] := pGroups;
+end;
+
+destructor TNNetChannelShuffle.Destroy();
+begin
+  SetLength(ToChannels, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetChannelShuffle.Compute();
+var
+  CntDepth, MaxDepth: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxDepth := FOutput.Depth - 1;
+  for CntDepth := 0 to MaxDepth do
+    FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, ToChannels[CntDepth]);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetChannelShuffle.Backpropagate();
+var
+  CntDepth, MaxDepth: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxDepth := FOutput.Depth - 1;
+    // Inverse permutation: gradient on source channel c comes from
+    // the output channel ToChannels[c].
+    for CntDepth := 0 to MaxDepth do
+      FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, ToChannels[CntDepth], CntDepth);
+  end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -14486,6 +14575,7 @@ begin
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
+      'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetSum' :                  Result := TNNetSum.Create(aL);
       'TNNetSplitChannels' :        Result := TNNetSplitChannels.Create(aIdx);
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
@@ -14615,6 +14705,7 @@ begin
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
+      if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else
