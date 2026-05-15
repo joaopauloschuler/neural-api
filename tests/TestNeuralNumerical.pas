@@ -162,6 +162,9 @@ type
     procedure TestELUForward;
     procedure TestELUGradientCheck;
     procedure TestELUSerializationRoundTrip;
+    procedure TestCELUForward;
+    procedure TestCELUGradientCheck;
+    procedure TestCELUSerializationRoundTrip;
     procedure TestSiLUMatchesSwish;
     procedure TestSoftSignForward;
     procedure TestSoftSignGradientCheck;
@@ -6167,6 +6170,94 @@ begin
         NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('ELU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          ReloadedLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCELUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Alpha: TNeuralFloat;
+begin
+  Alpha := 1.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetCELU.Create()); // default alpha = 1.0
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.5;
+    Input.Raw[2] := -0.5;
+    Input.Raw[3] := -2.0;
+    Input.Raw[4] := 3.0;
+
+    NN.Compute(Input);
+
+    // CELU(0) = 0
+    AssertEquals('CELU(0)', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    // Positive side is identity.
+    AssertEquals('CELU(1.5)', 1.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('CELU(3)', 3.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+    // Negative side: alpha*(exp(x/alpha)-1). At alpha=1 this matches ELU.
+    AssertEquals('CELU(-0.5)', Alpha * (Exp(-0.5 / Alpha) - 1),
+      NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('CELU(-2)', Alpha * (Exp(-2.0 / Alpha) - 1),
+      NN.GetLastLayer.Output.Raw[3], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCELUGradientCheck;
+begin
+  // Avoid the kink at x = 0.
+  ActivationGradientCheck(Self, TNNetCELU.Create(), 'CELU',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestCELUSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+  ReloadedLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetCELU.Create(0.75));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ReloadedLayer := NN2.GetLastLayer;
+      AssertEquals('CELU round-trip class name', 'TNNetCELU', ReloadedLayer.ClassName);
+      AssertEquals('CELU round-trip structure preserves alpha',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+      AssertEquals('CELU round-trip output size',
+        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CELU round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           ReloadedLayer.Output.Raw[i], 1e-5);
     finally

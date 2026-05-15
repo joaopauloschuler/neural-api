@@ -675,6 +675,21 @@ type
     procedure Compute(); override;
   end;
 
+  /// Continuously Differentiable Exponential Linear Unit (CELU) activation.
+  // CELU(x) = max(0, x) + min(0, alpha * (exp(x/alpha) - 1)).
+  // Unlike ELU, CELU is continuously differentiable at x = 0 for any alpha.
+  // Derivative is 1 for x > 0, else exp(x/alpha). alpha is configurable,
+  // default 1.0, and is stored in FFloatSt[0] for serialization.
+  // https://arxiv.org/abs/1704.07483
+  TNNetCELU = class(TNNetReLUBase)
+  private
+    FAlpha: TNeuralFloat;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pAlpha: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Sigmoid Linear Unit (SiLU) activation. This is a naming alias for
   // Swish with beta=1. Implemented as a thin subclass so the class name
   // round-trips through SaveToString / LoadFromString.
@@ -6643,6 +6658,66 @@ begin
       if PrevValue > 0
         then FOutput.FData[OutputCnt] := PrevValue
         else FOutput.FData[OutputCnt] := FAlpha * (Exp(PrevValue) - 1);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetCELU }
+
+constructor TNNetCELU.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetCELU.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FAlpha := pAlpha;
+  FFloatSt[0] := pAlpha;
+end;
+
+procedure TNNetCELU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue, ExpVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
+  FAlpha := FFloatSt[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue > 0 then
+      begin
+        FOutput.FData[OutputCnt] := PrevValue;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        ExpVal := Exp(PrevValue / FAlpha);
+        FOutput.FData[OutputCnt] := FAlpha * (ExpVal - 1);
+        FOutputErrorDeriv.FData[OutputCnt] := ExpVal;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue > 0
+        then FOutput.FData[OutputCnt] := PrevValue
+        else FOutput.FData[OutputCnt] := FAlpha * (Exp(PrevValue / FAlpha) - 1);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -15155,6 +15230,7 @@ begin
       'TNNetPower' :                Result := TNNetPower.Create(St[0]);
       'TNNetSELU' :                 Result := TNNetSELU.Create();
       'TNNetELU' :                  Result := TNNetELU.Create(Ft[0]);
+      'TNNetCELU' :                 Result := TNNetCELU.Create(Ft[0]);
       'TNNetSiLU' :                 Result := TNNetSiLU.Create();
       'TNNetSoftSign' :             Result := TNNetSoftSign.Create();
       'TNNetSignedSquareRoot' :     Result := TNNetSignedSquareRoot.Create();
@@ -15295,6 +15371,7 @@ begin
       if S[0] = 'TNNetPower' then Result := TNNetPower.Create(St[0]) else
       if S[0] = 'TNNetSELU' then Result := TNNetSELU.Create() else
       if S[0] = 'TNNetELU' then Result := TNNetELU.Create(Ft[0]) else
+      if S[0] = 'TNNetCELU' then Result := TNNetCELU.Create(Ft[0]) else
       if S[0] = 'TNNetSiLU' then Result := TNNetSiLU.Create() else
       if S[0] = 'TNNetSoftSign' then Result := TNNetSoftSign.Create() else
       if S[0] = 'TNNetSignedSquareRoot' then Result := TNNetSignedSquareRoot.Create() else

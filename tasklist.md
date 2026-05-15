@@ -1458,7 +1458,7 @@ end-to-end smoke check.
       alpha (default 1.0). Backward reuses the cached output via
       `dy/dx = 1 if x>0 else y + alpha`. Numerical-gradient test plus
       a constructor round-trip via SaveToString/LoadFromString.
-- [ ] TNNetCELU — continuously differentiable ELU variant, `y = max(0,x)
+- [X] TNNetCELU — continuously differentiable ELU variant, `y = max(0,x)
       + min(0, alpha*(exp(x/alpha)-1))`. Same harness as TNNetELU; the
       difference is one extra division. Cheap, complete the family.
 - [x] TNNetReLU6 — `y = clamp(x, 0, 6)`, the MobileNet activation. Tiny;
@@ -1630,7 +1630,7 @@ hitting the same wall.**
 - [x] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
       alpha. Backward via cached output. Sits next to the TNNetReLU6
       coverage just added; same harness shape.
-- [ ] TNNetCELU — continuously differentiable ELU variant. One line
+- [X] TNNetCELU — continuously differentiable ELU variant. One line
       different from TNNetELU; rounds out the family.
 - [x] TNNetSiLU alias for Swish(beta=1). One-line LoadFromString
       registration so the canonical name parses. Pure naming cleanup.
@@ -1682,7 +1682,7 @@ hitting the same wall.**
       when `x>0`, else `y + alpha`. Mirrors the TNNetReLU6 harness
       shape; add LoadFromString registration and a numerical-gradient
       test in TestNeuralNumerical.pas.
-- [ ] TNNetCELU — continuously differentiable ELU; `y = max(0,x) +
+- [X] TNNetCELU — continuously differentiable ELU; `y = max(0,x) +
       min(0, alpha*(exp(x/alpha)-1))`. One-line variant of TNNetELU.
 - [x] TNNetSiLU — pure-naming alias for Swish(beta=1). Just a
       LoadFromString registration so the canonical PyTorch/JAX name
@@ -1817,7 +1817,7 @@ TNNetAvgChannel; this is now covered.
       `TNNetGlobalMaxPool` naming) so the LoadFromString dispatch and
       future docs match the canonical Keras/PyTorch name. One-line type
       decl + dispatch registration + a round-trip test.
-- [ ] TNNetCELU — continuously differentiable ELU (`y = max(0,x) +
+- [X] TNNetCELU — continuously differentiable ELU (`y = max(0,x) +
       min(0, alpha*(exp(x/alpha)-1))`). With TNNetELU now landed, this
       is a one-method variant; reuse the ELU test harness shape.
 - [ ] TNNetSoftPlus identity-vs-Swish unit test: confirm
@@ -1841,7 +1841,7 @@ audit follow-ups, and small experiments that exercise the layers that
 have landed recently.
 
 #### Tiny new layers (each ~one-method + one numerical-gradient test)
-- [ ] TNNetCELU — continuously differentiable ELU
+- [X] TNNetCELU — continuously differentiable ELU
       (`y = max(0,x) + min(0, alpha*(exp(x/alpha)-1))`). With TNNetELU
       now landed, this is a one-method variant; reuse the ELU test
       harness shape. (Duplicated up from the previous batch because
