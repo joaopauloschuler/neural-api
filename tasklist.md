@@ -1461,7 +1461,7 @@ end-to-end smoke check.
 - [ ] TNNetCELU — continuously differentiable ELU variant, `y = max(0,x)
       + min(0, alpha*(exp(x/alpha)-1))`. Same harness as TNNetELU; the
       difference is one extra division. Cheap, complete the family.
-- [ ] TNNetReLU6 — `y = clamp(x, 0, 6)`, the MobileNet activation. Tiny;
+- [x] TNNetReLU6 — `y = clamp(x, 0, 6)`, the MobileNet activation. Tiny;
       forward is one min/max, backward is a 0/1 mask. Numerical-gradient
       test plus a saturation-at-extreme-inputs check (mirror the
       TNNetSoftCapping pattern).

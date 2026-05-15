@@ -86,6 +86,8 @@ type
     procedure TestTanhShrinkGradientCheck;
     procedure TestHardTanhForward;
     procedure TestHardTanhGradientCheck;
+    procedure TestReLU6Forward;
+    procedure TestReLU6ExtremeInputSaturation;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
     procedure TestALiBiForward;
@@ -3421,6 +3423,88 @@ begin
   // Stay clear of the kinks at +/-1.
   ActivationGradientCheck(Self, TNNetHardTanh.Create(), 'HardTanh',
     [0.5, -0.5, 0.25, -0.75, 2.0, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReLU6Forward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetReLU6.Create());
+
+    Input.Raw[0] := -1.0;
+    Input.Raw[1] := 0.5;
+    Input.Raw[2] := 3.0;
+    Input.Raw[3] := 7.5;
+    Input.Raw[4] := 0.0;
+
+    NN.Compute(Input);
+
+    // ReLU6(x) = clamp(x, 0, 6)
+    AssertEquals('ReLU6(-1)', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('ReLU6(0.5)', 0.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('ReLU6(3)', 3.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('ReLU6(7.5)', 6.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('ReLU6(0)', 0.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReLU6ExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  v, g: TNeuralFloat;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddLayer(TNNetReLU6.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+    begin
+      if (i mod 2) = 0 then Input.Raw[i] := 1e6
+      else Input.Raw[i] := -1e6;
+    end;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.2);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('ReLU6 saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('ReLU6 saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('ReLU6 saturation in [0, 6] at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v),
+        (v >= -1e-4) and (v <= 6.0 + 1e-4));
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('ReLU6 saturation grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('ReLU6 saturation grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestMaskedFillForward;
