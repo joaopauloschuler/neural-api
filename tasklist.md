@@ -1373,8 +1373,10 @@ This batch landed:
 
 Notable finding (NOT fixed, flagged for triage):
 
-- [ ] **BUG: TNNetDeMaxPool.ComputePreviousLayerError gradient is off by a
-      factor of FPoolSize.** Forward replicates each input cell into a
+- [x] **BUG: TNNetDeMaxPool.ComputePreviousLayerError gradient is off by a
+      factor of FPoolSize.** FIXED: removed the `FOutputError.Divi(floatPoolSize)`
+      pre-scaling. Added `TestDeMaxPoolGradientCheck`, `TestDeAvgPoolGradientCheck`,
+      and `TestDeMaxPoolForwardReplication` in `tests/TestNeuralNumerical.pas`. Forward replicates each input cell into a
       `PoolSize x PoolSize` output block (`neuralnetwork.pas:11471-11487`),
       so the correct input gradient is the SUM of the block's output errors.
       Current code (`neuralnetwork.pas:11552`) does
@@ -1434,7 +1436,7 @@ land in one sitting and pairs with a numerical-gradient test or an
 end-to-end smoke check.
 
 #### Bug-fix follow-through I'd take first
-- [ ] **Fix TNNetDeMaxPool gradient (see bug entry above).** Concrete
+- [x] **Fix TNNetDeMaxPool gradient (see bug entry above).** Concrete
       plan: delete the `FOutputError.Divi(floatPoolSize)` line at
       `neuralnetwork.pas:11552` (the sum-of-block backward matches the
       pure-replication forward without any scaling). Re-add
