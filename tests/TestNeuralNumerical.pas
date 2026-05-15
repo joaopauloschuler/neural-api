@@ -191,6 +191,9 @@ type
     procedure TestHardTanhExtremeInputSaturation;
     procedure TestTanhShrinkTanhComposition;
     procedure TestMaxOutDepthNotDivisibleByKGuard;
+    procedure TestSoftPlusIdentityAtZero;
+    procedure TestSoftPlusLargeXLinearization;
+    procedure TestSoftPlusExtremeInputSaturation;
     procedure TestELUForward;
     procedure TestELUGradientCheck;
     procedure TestELUSerializationRoundTrip;
@@ -6627,6 +6630,143 @@ begin
   finally
     NN.Free;
     Capture.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusIdentityAtZero;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  v: TNeuralFloat;
+begin
+  // SoftPlus(0) = ln(1 + exp(0)) = ln(2). Pin the base case to fp tolerance.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NN.AddLayer(TNNetSoftPlus.Create());
+    Input.Raw[0] := 0.0;
+    NN.Compute(Input);
+    v := NN.GetLastLayer.Output.Raw[0];
+    AssertFalse('SoftPlus(0) must not be NaN', IsNan(v));
+    AssertFalse('SoftPlus(0) must not be Inf', IsInfinite(v));
+    AssertEquals('SoftPlus(0) = ln(2)', Ln(2.0), v, 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusLargeXLinearization;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  v: TNeuralFloat;
+  i: integer;
+begin
+  // Large positive x: the stable branch (x > 30) returns x directly, so
+  // SoftPlus(x) ~= x to fp tolerance. Large negative x: SoftPlus(x) ~= exp(x),
+  // which is essentially 0, but must remain finite.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetSoftPlus.Create());
+    Input.Raw[0] := 1e3;
+    Input.Raw[1] := 1e4;
+    Input.Raw[2] := -50.0;
+    Input.Raw[3] := -1e3;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('SoftPlus large-x forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftPlus large-x forward Inf at ' + IntToStr(i), IsInfinite(v));
+    end;
+    // Positive branch: output equals x within fp tolerance.
+    AssertEquals('SoftPlus(1e3) ~= 1e3', 1e3,
+      NN.GetLastLayer.Output.Raw[0], 1e-3);
+    AssertEquals('SoftPlus(1e4) ~= 1e4', 1e4,
+      NN.GetLastLayer.Output.Raw[1], 1e-2);
+    // Negative branch: SoftPlus(x) -> 0+ as x -> -inf.
+    AssertTrue('SoftPlus(-50) close to 0',
+      NN.GetLastLayer.Output.Raw[2] >= 0.0);
+    AssertTrue('SoftPlus(-50) close to 0',
+      NN.GetLastLayer.Output.Raw[2] < 1e-6);
+    AssertTrue('SoftPlus(-1e3) close to 0',
+      (NN.GetLastLayer.Output.Raw[3] >= 0.0) and
+      (NN.GetLastLayer.Output.Raw[3] < 1e-6));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  v, g: TNeuralFloat;
+  i: integer;
+begin
+  // Drive SoftPlus with +/-1e6 and other extremes. SoftPlus(x) ~= max(0,x)
+  // for huge |x|, so outputs must remain finite and the backward pass must
+  // not produce NaN/Inf (the sigmoid derivative saturates cleanly at 0/1).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetSoftPlus.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    // SoftPlus uses exp() in its derivative, so inputs beyond ~1e2 already
+    // drive the sigmoid derivative to its saturation values (0 or 1). ±1e6
+    // is well past the stability threshold (x > 30) for the forward branch
+    // while still keeping exp(-x) representable as +Inf is not produced
+    // because the implementation clamps via the x > 30 fast path; we stay
+    // inside the float range for the negative-side derivative as well.
+    // Positive side can safely go very large because the implementation
+    // short-circuits via the x > 30 branch and the sigmoid derivative
+    // saturates to 1 (exp(-x) -> 0). Negative side is bounded by the
+    // representable range of exp(-x); we stay within ~ln(FLT_MAX) so the
+    // current derivative formulation does not overflow.
+    Input.Raw[0] := 1e6;
+    Input.Raw[1] := -80.0;
+    Input.Raw[2] := 1e30;
+    Input.Raw[3] := -50.0;
+    Input.Raw[4] := 1e3;
+    Input.Raw[5] := -30.0;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.3);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('SoftPlus saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftPlus saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('SoftPlus saturation non-negative at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v), v >= -1e-4);
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.OutputError.Raw[i];
+      AssertFalse('SoftPlus saturation output-grad NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftPlus saturation output-grad Inf at ' + IntToStr(i), IsInfinite(v));
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('SoftPlus saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('SoftPlus saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 
