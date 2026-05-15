@@ -227,6 +227,9 @@ type
     procedure TestSquareForward;
     procedure TestSquareGradientCheck;
     procedure TestSquareSerializationRoundTrip;
+    procedure TestSqrtForward;
+    procedure TestSqrtGradientCheck;
+    procedure TestSqrtSerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -7884,6 +7887,47 @@ procedure TTestNeuralNumerical.TestSquareSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSquare.Create(),
     'Square', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSqrtForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetSqrt.Create());
+
+    Input.Raw[0] := 4.0;
+    Input.Raw[1] := 9.0;
+    Input.Raw[2] := 0.25;
+    Input.Raw[3] := 1.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('Sqrt(4)',    2.0, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('Sqrt(9)',    3.0, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('Sqrt(0.25)', 0.5, NN.GetLastLayer.Output.Raw[2], 1e-5);
+    AssertEquals('Sqrt(1)',    1.0, NN.GetLastLayer.Output.Raw[3], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSqrtGradientCheck;
+begin
+  // Sqrt is smooth for x > eps; pick positive inputs well above the eps guard.
+  ActivationGradientCheck(Self, TNNetSqrt.Create(), 'Sqrt',
+    [0.5, 1.0, 0.25, 2.0, 1.5, 0.75], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSqrtSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSqrt.Create(),
+    'Sqrt', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

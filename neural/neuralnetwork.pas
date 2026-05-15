@@ -685,6 +685,16 @@ type
     procedure Compute(); override;
   end;
 
+  /// Sqrt activation function.
+  // Sqrt(x) = sqrt(max(x, eps)) with eps = 1e-6. Parameter-free.
+  // Derivative is 1/(2*y) where y is the cached output, so backward
+  // is a single multiply. Cached in FOutputErrorDeriv so TNNetReLUBase
+  // handles the backward chain rule.
+  TNNetSqrt = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5317,6 +5327,47 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := x * x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSqrt }
+
+procedure TNNetSqrt.Compute();
+const
+  SQRT_EPS: TNeuralFloat = 1e-6;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, y: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Sqrt(x) = sqrt(max(x, eps)); derivative is 1/(2*y).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x < SQRT_EPS then x := SQRT_EPS;
+      y := Sqrt(x);
+      FOutput.FData[OutputCnt] := y;
+      FOutputErrorDeriv.FData[OutputCnt] := 0.5 / y;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x < SQRT_EPS then x := SQRT_EPS;
+      FOutput.FData[OutputCnt] := Sqrt(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16192,6 +16243,7 @@ begin
       'TNNetShiftedReLU' :          Result := TNNetShiftedReLU.Create();
       'TNNetAbs' :                  Result := TNNetAbs.Create();
       'TNNetSquare' :               Result := TNNetSquare.Create();
+      'TNNetSqrt' :                 Result := TNNetSqrt.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16349,6 +16401,7 @@ begin
       if S[0] = 'TNNetShiftedReLU' then Result := TNNetShiftedReLU.Create() else
       if S[0] = 'TNNetAbs' then Result := TNNetAbs.Create() else
       if S[0] = 'TNNetSquare' then Result := TNNetSquare.Create() else
+      if S[0] = 'TNNetSqrt' then Result := TNNetSqrt.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
