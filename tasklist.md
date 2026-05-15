@@ -4041,12 +4041,14 @@ TNNetDepthToSpace.
       `tanh(x) + x · (1 - tanh(x)²)`. Landed (9685af1): parameter-free
       TNNetReLUBase descendant; tanh evaluation shared between forward
       and derivative; three tests in TestNeuralNumerical.pas.
-- [ ] TNNetESwish — `y = β · x · sigmoid(x)` with configurable β via
+- [x] TNNetESwish — `y = β · x · sigmoid(β · x)` with configurable β via
       FFloatSt[0] (default 1.25, the paper's recommended value).
-      Generalizes Swish; β=1 reduces to Swish. Same template as
-      TNNetSwish; the only change is multiplying forward and
-      derivative by β. Three tests including a β=1 equivalence-with-
-      Swish check.
+      Generalizes Swish; β=1 reduces to Swish. Landed in commit 51daaac:
+      parameter-free TNNetReLUBase descendant, derivative cached in
+      FOutputErrorDeriv, β>0 guard via FErrorProc, registered in both
+      CreateLayer dispatch sites. Three tests in TestNeuralNumerical.pas
+      (forward equivalence to Swish at β=1; gradient check at β=1.5;
+      β=2.5 serialization round-trip).
 - [ ] TNNetHardshrink / TNNetSoftshrink — companions to the already-
       landed TNNetTanhShrink. Hardshrink: zero inside `[-λ, λ]`,
       identity outside (non-smooth, STE-like backward through the
@@ -4211,17 +4213,18 @@ Test suite: 437 → 446, all passing. No bugs surfaced.
 - [ ] LiSHT vs Mish vs Swish bake-off on a tiny MLP — all three are
       smooth, self-gated-ish; matched-width comparison feeds straight
       into the already-pinned activation bake-off CSV experiment.
-- [ ] README activation-table rows for the three new layers (Sinc,
-      BentIdentity, LiSHT) plus a one-line entry each in the relevant
-      subsection. The "periodic activations" subsection should pick
-      up Sinc; BentIdentity and LiSHT belong with the smooth
-      ReLU-alternatives (SoftPlus, GELU, Swish, Mish).
-- [ ] Trig-identity micro-test: `Sinc(x) · x = Sin(x)` to within fp
-      tolerance on a random non-zero input vector. Cheap pin on the
-      analytic-limit branch's transition region.
-- [ ] LiSHT symmetry test: `Lisht(-x) = Lisht(x)` to within fp
-      tolerance on a random vector. Pins the symmetric-output property
-      that the forward test only spot-checks at x=±1.
+- [x] README activation-table rows for the three new layers (Sinc,
+      BentIdentity, LiSHT) plus TNNetESwish. Landed in commit 2293de5:
+      Sinc placed after Cos (periodic), BentIdentity and LiSHT after
+      SoftPlus (smooth ReLU alternatives), ESwish after HardSwish.
+- [x] Trig-identity micro-test: `Sinc(x) · x = Sin(x)` to within fp
+      tolerance on a random non-zero input vector. Landed in commit
+      18d8d16 as TestSincTimesXEqualsSin.
+- [x] LiSHT symmetry test: `Lisht(-x) = Lisht(x)` to within fp
+      tolerance on a random vector. Landed in commit 18d8d16 as
+      TestLishtSymmetry. Same commit also adds
+      TestSnakeDerivativeTrigIdentity pinning the α=1 derivative
+      identity `1 + 2·sin(x)·cos(x)`.
 
 ### Lucky-day batch — 2026-05-15 (seed 896318)
 
@@ -4462,3 +4465,35 @@ but only a handful of landings in.
 
 - [ ] Tiny GPT char-level CPU example — unblocked the moment MHSA
       lands; the headline end-to-end demo on this entire tasklist.
+
+### Lucky-day batch — 2026-05-15 (seed 735373, post ESwish + identity-tests + README batch)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Landed:
+
+- `51daaac` — TNNetESwish (`y = β·x·sigmoid(β·x)`), parameter-free
+  TNNetReLUBase descendant. β in FFloatSt[0], default 1.25, β>0 guard.
+  Three tests (Swish-equivalence at β=1, gradient check at β=1.5,
+  serialization round-trip at β=2.5).
+- `18d8d16` — Identity micro-tests for the just-landed periodic /
+  smooth activations: `Sinc(x)·x == sin(x)`, `Lisht(-x) == Lisht(x)`
+  (evenness), and Snake α=1 derivative trig identity
+  `1 + 2·sin(x)·cos(x)` against FOutputErrorDeriv.
+- `2293de5` — README activation-table rows for TNNetSinc /
+  TNNetBentIdentity / TNNetLisht / TNNetESwish, placed alongside
+  their natural siblings.
+
+Test suite: 446 → 452, all passing.
+
+#### Natural follow-ups
+- [ ] ESwish vs Swish bake-off on a tiny task: same MLP, β∈{1.0, 1.25,
+      1.5, 2.0}, chart final loss. The β=1.25 default is folklore; pin
+      whether it actually wins at toy scale.
+- [ ] TNNetESwish saturation test at ±extreme inputs (mirroring the
+      HardTanh/SoftCapping pattern). Confirms backward doesn't NaN
+      when sigmoid(βx) underflows to 0 or saturates to 1.
+- [ ] LiSHT/BentIdentity gradient-magnitude sanity at large |x| —
+      both grow unboundedly (LiSHT ≈ |x|, BentIdentity ≈ 1.5·x for
+      large |x|), so finite-difference eps must scale with input
+      magnitude. A focused relative-tolerance test would pin the
+      convention for this family.
