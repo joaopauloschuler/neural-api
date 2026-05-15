@@ -1946,5 +1946,42 @@ have landed recently.
       formula, derivative, "saturating?" flag, and a 5-word use-case
       hint. The family has grown enough (ELU, SiLU, SoftSign, ReLU6,
       Swish, Mish, GELU, HardSwish, SELU, LeakyReLU, HardSigmoid,
-      HardTanh, SoftCapping) that a table beats prose.
+      HardTanh, SoftCapping, CELU) that a table beats prose.
+
+### Lucky-day batch — 2026-05-15 (post CELU + GlobalAvgPool + round-trip-sweep)
+
+This batch landed:
+- TNNetCELU (continuously differentiable ELU):
+  `y = max(0,x) + min(0, alpha*(exp(x/alpha)-1))` with configurable
+  alpha in FFloatSt[0]. Follows the TNNetELU template — overrides
+  Compute only (cached derivative path inherited from TNNetReLUBase).
+  Forward, numerical-gradient, and serialization round-trip tests in
+  TestNeuralNumerical.pas; registered in both CreateLayer dispatch sites.
+- TNNetGlobalAvgPool: parameter-less subclass of TNNetAvgChannel so the
+  canonical Keras/PyTorch name resolves via LoadFromString. Mirrors
+  TNNetGlobalMaxPool's naming. Both dispatch sites updated;
+  serialization round-trip test added.
+- LoadFromString round-trip sweep follow-through: new round-trip tests
+  for TNNetSwiGLU, TNNetGEGLU, and TNNetLayerScale; TNNetDropPath's
+  existing round-trip strengthened to pin inference-mode identity
+  before AND after round-trip. RMSNorm and DropPath round-trips
+  were already covered (NormSerializationRoundTripWithPerturbedWeights
+  / TestDropPathSerializationRoundTrip). No dispatch bugs surfaced.
+
+#### Natural follow-ups
+- [ ] TNNetCELU CIFAR-style smoke example wired into one of the
+      SimpleImage paths — pairs with the still-open activation
+      bake-off entry. CELU should sit in the same comparison table as
+      ELU/ReLU6/SiLU.
+- [ ] CELU vs ELU alpha-sensitivity micro-experiment: tiny classifier,
+      sweep `alpha in {0.1, 0.5, 1.0, 2.0}` for both, chart final
+      loss. Visualises the "continuous-derivative-at-zero" claim
+      concretely without leaving the existing test harness.
+- [ ] Add TNNetCELU and TNNetGlobalAvgPool to the README layer
+      reference once the activation-family table (above) lands.
+- [ ] LoadFromString round-trip for the remaining activation-family
+      additions that lack one (e.g. confirm TNNetTanhShrink and
+      TNNetHardTanh have explicit round-trip coverage; both descend
+      from TNNetReLUBase so the dispatch is generic, but a one-line
+      test would close the audit-coverage gap).
 
