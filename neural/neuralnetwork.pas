@@ -890,6 +890,18 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Clamp activation: y = clamp(x, MinValue, MaxValue).
+  // Element-wise hard saturation between MinValue and MaxValue. Sub-gradient
+  // is 1 strictly inside (MinValue, MaxValue) and 0 outside. MinValue is
+  // stored in FFloatSt[0] and MaxValue in FFloatSt[1] for serialization,
+  // defaulting to -1 and +1 respectively. No trainable parameters.
+  TNNetClamp = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pMinValue, pMaxValue: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Scaled Dot-Product Attention (single head, parameter-free).
   // Input layout: SizeY = 1, SizeX = sequence length, Depth = 3 * d_k
   // where the depth axis is the concatenation Q | K | V, each of size d_k.
@@ -4530,6 +4542,74 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetClamp }
+
+constructor TNNetClamp.Create();
+begin
+  Create(-1, 1);
+end;
+
+constructor TNNetClamp.Create(pMinValue, pMaxValue: TNeuralFloat);
+begin
+  inherited Create();
+  if pMinValue > pMaxValue then
+    FErrorProc('TNNetClamp MinValue must not exceed MaxValue. MinValue=' +
+      FloatToStr(pMinValue) + ' MaxValue=' + FloatToStr(pMaxValue));
+  FFloatSt[0] := pMinValue;
+  FFloatSt[1] := pMaxValue;
+end;
+
+procedure TNNetClamp.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, MinV, MaxV: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  MinV := FFloatSt[0];
+  MaxV := FFloatSt[1];
+
+  // y = clamp(x, MinV, MaxV); derivative is 1 strictly inside, else 0.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x <= MinV then
+      begin
+        FOutput.FData[OutputCnt] := MinV;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+      end
+      else if x >= MaxV then
+      begin
+        FOutput.FData[OutputCnt] := MaxV;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x <= MinV then FOutput.FData[OutputCnt] := MinV
+      else if x >= MaxV then FOutput.FData[OutputCnt] := MaxV
+      else FOutput.FData[OutputCnt] := x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetScaledDotProductAttention }
@@ -16125,6 +16205,7 @@ begin
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
       'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
+      'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
@@ -16281,6 +16362,7 @@ begin
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
+      if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else

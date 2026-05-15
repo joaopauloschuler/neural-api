@@ -2770,7 +2770,7 @@ couple of examples that would exercise recently-landed primitives.
       backward (pass gradient through unchanged). Useful for
       binarized-net experiments; add an STE-vs-numerical-gradient
       test that documents the intentional mismatch.
-- [ ] TNNetClamp — elementwise clamp to [min,max] with subgradient
+- [x] TNNetClamp — elementwise clamp to [min,max] with subgradient
       passthrough on the active region. Two scalar parameters
       stored in NeuronWeights[0].FData[0..1] (or via Struct[]).
       Serialization round-trip test included.
@@ -2863,7 +2863,7 @@ dispatch tables in `neural/neuralnetwork.pas`.
       four-test shape; landing them as one PR pair keeps the
       "involution layers" README subsection ready to write in a
       single pass. Verified absent from dispatch.
-- [ ] TNNetClamp(MinValue, MaxValue) — elementwise clamp with
+- [x] TNNetClamp(MinValue, MaxValue) — elementwise clamp with
       sub-gradient passthrough on the active region (zero outside
       `[MinValue, MaxValue]`). Two scalar params stored in
       FFloatSt[0..1]. Tests: forward saturation at both ends,

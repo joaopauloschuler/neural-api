@@ -123,6 +123,10 @@ type
     procedure TestALiBiMaskedFillComposition;
     procedure TestSoftCappingForward;
     procedure TestSoftCappingGradientCheck;
+    procedure TestClampForward;
+    procedure TestClampGradientCheck;
+    procedure TestClampExtremeInputSaturation;
+    procedure TestClampSerializationRoundTrip;
     procedure TestDropPathInferenceIdentity;
     procedure TestDropPathTrainingScaling;
     procedure TestDropPathGradientCheck;
@@ -5577,6 +5581,148 @@ procedure TTestNeuralNumerical.TestSoftCappingSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSoftCapping.Create(),
     'SoftCapping', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestClampForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetClamp.Create(-0.5, 1.5));
+
+    Input.Raw[0] := -10.0; // well below MinValue
+    Input.Raw[1] := -0.5;  // at MinValue
+    Input.Raw[2] :=  0.0;  // in range
+    Input.Raw[3] :=  1.0;  // in range
+    Input.Raw[4] :=  1.5;  // at MaxValue
+    Input.Raw[5] := 10.0;  // well above MaxValue
+
+    NN.Compute(Input);
+
+    AssertEquals('Clamp(-10)', -0.5, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Clamp(-0.5)', -0.5, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('Clamp(0)',     0.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('Clamp(1)',     1.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('Clamp(1.5)',   1.5, NN.GetLastLayer.Output.Raw[4], 0.0001);
+    AssertEquals('Clamp(10)',    1.5, NN.GetLastLayer.Output.Raw[5], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestClampGradientCheck;
+begin
+  // MinValue=-1, MaxValue=+1 — keep inputs clear of the kinks at +/-1.
+  ActivationGradientCheck(Self, TNNetClamp.Create(-1.0, 1.0), 'Clamp',
+    [0.0, 0.3, -0.4, 0.7, -0.8, 0.25], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestClampExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  MinV, MaxV, v, g: TNeuralFloat;
+  i: integer;
+begin
+  // Drive the layer with extreme magnitudes (+/-1e6). Every output must be
+  // within [MinV, MaxV], no NaN/Inf in either pass.
+  MinV := -2.0;
+  MaxV :=  3.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddLayer(TNNetClamp.Create(MinV, MaxV));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+    begin
+      if (i mod 2) = 0 then Input.Raw[i] := 1e6
+      else Input.Raw[i] := -1e6;
+    end;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.2);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('Clamp saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('Clamp saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('Clamp saturation in [MinV, MaxV] at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v),
+        (v >= MinV - 1e-4) and (v <= MaxV + 1e-4));
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('Clamp saturation grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('Clamp saturation grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestClampSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  ReloadedLayer: TNNetLayer;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetClamp.Create(-0.6, 0.9));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.2 + 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      ReloadedLayer := NN2.GetLastLayer();
+      AssertEquals('Clamp round-trip class name', 'TNNetClamp', ReloadedLayer.ClassName);
+      // MinValue lives in FFloatSt[0] and MaxValue in FFloatSt[1]; the base
+      // SaveStructureToString emits "ClassName:struct::float0;float1;..." so
+      // re-saving the reloaded layer must reproduce the originals.
+      AssertEquals('Clamp round-trip structure preserves MinValue/MaxValue',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+
+      NN2.Compute(Input);
+      AssertEquals('Clamp round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Clamp round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestHardShrinkSerializationRoundTrip;
