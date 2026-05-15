@@ -3360,18 +3360,23 @@ explicitly already-landed and is referenced only for context).
       Landed parameter-free (matching the Sqrt/Exp/Log family decision)
       in 08914d9; derivative simplifies to -y*y in the unclamped region
       because s*|x| = x, so the sign factor cancels.
-- [ ] Exp/Log compose-as-identity test: `Log(Exp(x))` should
+- [x] Exp/Log compose-as-identity test: `Log(Exp(x))` should
       reconstruct `x` to within fp tolerance on a small bounded input
       (say `|x| <= 5` to stay well clear of the eps and overflow
       clamps). Three-line test on top of the existing layers; mirrors
       the TanhShrink+Tanh composition test pattern.
-- [ ] Sqrt/Exp/Log saturation tests at ±extreme inputs (mirrors
+      Landed in becaf13 as TestExpLogComposeAsIdentity (1e-4 tol on
+      values ~[-4.8, 4.2]).
+- [x] Sqrt/Exp/Log saturation tests at ±extreme inputs (mirrors
       HardTanh/SoftCapping/Clamp): Exp at x=1e3 must not overflow
       (clamp at 30 triggers, output ≈ exp(30)); Log at x=-1e3 must
       not raise (eps clamp triggers, output ≈ ln(1e-8)); Sqrt at
       x=-1e3 must not raise (eps clamp). Three tiny tests, one per
       layer, closes the coverage gap flagged at the bottom of the
       previous batch.
+      Landed in becaf13 as Test{Sqrt,Exp,Log}ExtremeInputSaturation;
+      exp(-1e3) underflows cleanly to 0 in fp32 (no clamp needed on
+      the negative side).
 - [ ] README activation-table rows for TNNetSqrt, TNNetExp, TNNetLog
       in the "Created with ..." style. One row each; bring the
       reference table back in sync with the dispatch.
