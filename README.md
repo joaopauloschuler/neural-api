@@ -640,6 +640,9 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetVeryLeakyReLU`         | 1D, 2D, or 3D               | Very Leaky ReLU| Applies a very leaky ReLU activation function.                                                        |
 | `TNNetReLUSqrt`              | 1D, 2D, or 3D               | ReLU Sqrt     | ReLU activation function with square root scaling.                                                     |
 | `TNNetSquaredReLU`           | 1D, 2D, or 3D               | Squared ReLU  | Squared ReLU activation: `relu(x)^2`. From the Primer paper (https://arxiv.org/abs/2109.08668). Created with `TNNetSquaredReLU.Create()`. |
+| `TNNetShiftedReLU`           | 1D, 2D, or 3D               | Shifted ReLU  | Parameter-free ReLU variant `y = max(-1, x)` allowing a small negative range without saturating. Created with `TNNetShiftedReLU.Create()`. |
+| `TNNetThreshold`             | 1D, 2D, or 3D               | Threshold     | Threshold activation: `y = x if x > theta else value`. Generalizes ReLU; useful as a sparsifier when `theta > 0`. Created with `TNNetThreshold.Create(theta, value)` (both default to 0). |
+| `TNNetLogSigmoid`            | 1D, 2D, or 3D               | LogSigmoid    | Stable log-sigmoid activation: `y = log(sigmoid(x)) = -softplus(-x)`. Pairs with binary cross-entropy with logits. Created with `TNNetLogSigmoid.Create()`. |
 | `TNNetSoftPlus`              | 1D, 2D, or 3D               | SoftPlus      | SoftPlus activation, a smooth approximation of ReLU: `ln(1 + exp(x))`. Created with `TNNetSoftPlus.Create()`. |
 | `TNNetGaussianActivation`    | 1D, 2D, or 3D               | Gaussian      | Gaussian activation: `exp(-x^2)`. Created with `TNNetGaussianActivation.Create()`. |
 | `TNNetSELU`                  | 1D, 2D, or 3D               | SELU          | Self-normalizing activation function.                                                                  |
