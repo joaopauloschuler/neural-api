@@ -94,6 +94,7 @@ type
     procedure TestDropPathTrainingScaling;
     procedure TestDropPathGradientCheck;
     procedure TestAvgPoolGradientCheck;
+    procedure TestUpsampleGradientCheck;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
     procedure TestAddPositionalEmbeddingForward;
@@ -3010,6 +3011,15 @@ end;
 procedure TTestNeuralNumerical.TestAvgPoolGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetAvgPool.Create(2), 'AvgPool', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestUpsampleGradientCheck;
+begin
+  // TNNetUpsample (depth_to_space): input depth must be a multiple of 4.
+  // 2x2x4 -> 4x4x1 keeps the check tiny. Layer is a pure reshuffle of
+  // input cells into output positions, so gradients are an identity
+  // permutation on OutputError.
+  LayerInputGradientCheck(Self, TNNetUpsample.Create(), 'Upsample', 2, 2, 4, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestGEGLUForward;
