@@ -792,7 +792,7 @@ Natural follow-ups:
       drop it into one of the existing conv examples (e.g. SimpleImage)
       as a ShuffleNet-flavored block (1x1 conv -> ChannelShuffle ->
       depthwise conv). Visible end-to-end use of the new layer.
-- [ ] TNNetChannelShuffle inverse property test: ChannelShuffle(G)
+- [x] TNNetChannelShuffle inverse property test: ChannelShuffle(G)
       composed with ChannelShuffle(C/G) is the identity. Cute one-line
       property check on top of the existing forward test.
 - [ ] Now that DropPath p=1 is strict-drop, add a tiny experiment that
@@ -812,7 +812,7 @@ self-contained items below would be a genuine pleasure to land. Each is
 sized to fit in a single commit.
 
 #### Quick wins I'd take first
-- [ ] TNNetChannelShuffle inverse property test (already listed above):
+- [x] TNNetChannelShuffle inverse property test (already listed above):
       assert that ChannelShuffle(G) composed with ChannelShuffle(C/G)
       is the identity over a random tensor. A one-screen test that
       pins the most surprising algebraic property of the new layer.

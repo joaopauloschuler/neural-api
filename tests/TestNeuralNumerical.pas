@@ -125,6 +125,7 @@ type
     procedure TestChannelShuffleGradientCheck;
     procedure TestChannelShuffleSerializationRoundTrip;
     procedure TestChannelShuffleIndivisibleGuard;
+    procedure TestChannelShuffleInverseProperty;
     procedure TestLayerNormSerializationRoundTrip;
     procedure TestRMSNormSerializationRoundTrip;
     procedure TestGroupNormSerializationRoundTrip;
@@ -5036,6 +5037,34 @@ begin
   finally
     NN.Free;
     Capture.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestChannelShuffleInverseProperty;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // ChannelShuffle(G) composed with ChannelShuffle(C/G) is the identity.
+  // The forward permutation is c -> (c mod G) * (C/G) + (c div G); applying it
+  // again with G' = C/G inverts that map. Use C=12, G=3, C/G=4.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 12, 1));
+    NN.AddLayer(TNNetChannelShuffle.Create(3));
+    NN.AddLayer(TNNetChannelShuffle.Create(4));
+    RandSeed := 424242;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ChannelShuffle inverse at channel ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
