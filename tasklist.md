@@ -6562,7 +6562,7 @@ already pinned several batches up, the activation form is not).
 
 #### Activations I'd enjoy building
 
-- [ ] TNNetArcSinh — `y = arcsinh(x) = ln(x + sqrt(x^2 + 1))`,
+- [x] TNNetArcSinh — `y = arcsinh(x) = ln(x + sqrt(x^2 + 1))`,
       derivative `1 / sqrt(x^2 + 1)`. Monotonic, smooth, unbounded,
       but grows like `ln|x|` for large |x| — a tanh sibling that
       never saturates and a sinh sibling that never explodes.
@@ -6572,7 +6572,7 @@ already pinned several batches up, the activation form is not).
       weights). Pairs naturally with the hyperbolic-family bake-off
       pinned in the seed-732439 batch above.
 
-- [ ] TNNetLeCunTanh — `y = 1.7159 * tanh(2/3 * x)`, the
+- [x] TNNetLeCunTanh — `y = 1.7159 * tanh(2/3 * x)`, the
       classical scaled-tanh activation from LeCun et al.'s
       "Efficient Backprop" tuned so f(±1)=±1 and f'(0)≈1.14.
       Cheap follow-on to TNNetHyperbolicTangent that just plugs
@@ -6580,7 +6580,7 @@ already pinned several batches up, the activation form is not).
       numerical-gradient test plus a value-at-1 pin
       (asserts f(1) ≈ 1.0 within 1e-3).
 
-- [ ] TNNetLogCoshActivation — `y = log(cosh(x))`, derivative
+- [x] TNNetLogCoshActivation — `y = log(cosh(x))`, derivative
       `tanh(x)`. Smooth, symmetric, ≈ x²/2 near 0 and ≈ |x| for
       large |x| — a smooth-L1 *activation* (the loss variant is
       already pinned). Element-wise under TNNetReLUBase; needs a
@@ -6757,3 +6757,45 @@ one visible artifact, follow-on payoff for both prior lucky-day
 landings.
 
 
+
+### Lucky-day batch — 2026-05-15 (seed 623401)
+
+Landed this session (three serial opus agents, three commits):
+- TNNetArcSinh (`y = arcsinh(x)`, derivative `1/sqrt(x^2+1)`) — commit 10533e2.
+- TNNetLeCunTanh (`y = 1.7159 * tanh(2/3 * x)`, classical
+  scaled-tanh from LeCun's "Efficient Backprop") — commit 4fb1de1.
+- TNNetLogCoshActivation (`y = log(cosh(x))`, stable formulation
+  `|x| + log1p(exp(-2|x|)) - ln(2)`, derivative `tanh(x)`) —
+  commit 3fbff4d.
+
+Test suite grew from 503 to 508/508 green (one gradient test each
+plus a value-at-1 pin for LeCunTanh and a |x|=30 stability pin for
+LogCoshActivation).
+
+#### Small follow-ups pinned from this batch
+
+- [ ] `examples/HyperbolicActivationBakeOff/` is now further
+      unblocked: TNNetSinhAct, TNNetSerf, TNNetArcSinh and
+      TNNetLogCoshActivation have all landed; the row set is
+      essentially complete. Picking this up is now a pure
+      examples-folder task (~one new short main + a shared
+      training helper) with no new layer work required.
+
+- [ ] README one-line entries for TNNetArcSinh, TNNetLeCunTanh and
+      TNNetLogCoshActivation in the activation reference, matching
+      the existing one-line + snippet style. Same shape as the
+      pinned TNNetSinhAct/TNNetSerf README follow-up above —
+      consider doing them together in one doc commit.
+
+- [ ] TNNetLeCunTanh-vs-TNNetHyperbolicTangent ablation on the
+      hypotenuse toy now becomes a 1-line-swap experiment — the
+      "scaled tanh trains faster than plain tanh" claim from
+      "Efficient Backprop" reproduced at toy scale. Already pinned
+      one batch up; calling it out as fully unblocked now that
+      TNNetLeCunTanh has landed.
+
+- [ ] TNNetLogCoshActivation as a hidden-layer activation vs the
+      existing TNNetLogCoshLoss as the output head: small dual
+      experiment showing the same log-cosh shape playing both
+      roles in one tiny regression net. Cute story since both
+      forms now exist in the repo.
