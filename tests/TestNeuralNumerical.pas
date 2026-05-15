@@ -265,6 +265,9 @@ type
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
+    procedure TestBentIdentityForward;
+    procedure TestBentIdentityGradientCheck;
+    procedure TestBentIdentitySerializationRoundTrip;
     procedure TestGlobalAvgPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
@@ -8713,6 +8716,54 @@ procedure TTestNeuralNumerical.TestSincSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSinc.Create(),
     'Sinc', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestBentIdentityForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ExpectedAtOne, ExpectedAtNegOne: TNeuralFloat;
+begin
+  // Hand-checked anchors:
+  //   BentIdentity(0)  = 0
+  //   BentIdentity(1)  = (sqrt(2) - 1)/2 + 1  ~= 1.2071
+  //   BentIdentity(-1) = (sqrt(2) - 1)/2 - 1  ~= -0.7929
+  ExpectedAtOne := (Sqrt(2.0) - 1.0) * 0.5 + 1.0;
+  ExpectedAtNegOne := (Sqrt(2.0) - 1.0) * 0.5 - 1.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetBentIdentity.Create());
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    NN.Compute(Input);
+    AssertEquals('BentIdentity(0)',
+      0.0, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('BentIdentity(1)',
+      ExpectedAtOne, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('BentIdentity(-1)',
+      ExpectedAtNegOne, NN.GetLastLayer.Output.Raw[2], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBentIdentityGradientCheck;
+begin
+  // BentIdentity is C-infinity smooth and has slope always >= 1/2, so
+  // central differences match the analytic gradient cleanly with the
+  // standard Sin(i*0.7)*2 + 0.3 input pattern.
+  LayerInputGradientCheck(Self, TNNetBentIdentity.Create(),
+    'BentIdentity', 2, 2, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestBentIdentitySerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetBentIdentity.Create(),
+    'BentIdentity', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;

@@ -779,6 +779,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// Bent Identity activation function.
+  // BentIdentity(x) = (sqrt(x^2 + 1) - 1)/2 + x. Parameter-free.
+  // Always smooth, always positive slope. Derivative is
+  // x/(2*sqrt(x^2+1)) + 1, cached into FOutputErrorDeriv so
+  // TNNetReLUBase handles the backward chain rule with one multiply.
+  // Sqrt argument is always >= 1, so no special-case handling needed.
+  TNNetBentIdentity = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
   TNNetHardTanh = class(TNNetReLUBase)
@@ -5839,6 +5850,45 @@ begin
         FOutput.FData[OutputCnt] := 1.0
       else
         FOutput.FData[OutputCnt] := Sin(x) / x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetBentIdentity }
+
+procedure TNNetBentIdentity.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, SqrtVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // BentIdentity(x) = (sqrt(x^2 + 1) - 1)/2 + x.
+  // Derivative is x/(2*sqrt(x^2 + 1)) + 1. Always smooth, no branches.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      SqrtVal := Sqrt(x * x + 1.0);
+      FOutput.FData[OutputCnt] := (SqrtVal - 1.0) * 0.5 + x;
+      FOutputErrorDeriv.FData[OutputCnt] := x / (2.0 * SqrtVal) + 1.0;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      SqrtVal := Sqrt(x * x + 1.0);
+      FOutput.FData[OutputCnt] := (SqrtVal - 1.0) * 0.5 + x;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16723,6 +16773,7 @@ begin
       'TNNetCos' :                  Result := TNNetCos.Create();
       'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
       'TNNetSinc' :                 Result := TNNetSinc.Create();
+      'TNNetBentIdentity' :         Result := TNNetBentIdentity.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
@@ -16890,6 +16941,7 @@ begin
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
       if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
       if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
+      if S[0] = 'TNNetBentIdentity' then Result := TNNetBentIdentity.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
