@@ -1474,7 +1474,7 @@ end-to-end smoke check.
       the equivalence in code rather than only in comments.
 
 #### Pooling / shape layers I'd enjoy adding
-- [ ] TNNetGlobalMaxPool — companion to the existing GlobalAvgPool. One
+- [x] TNNetGlobalMaxPool — companion to the existing GlobalAvgPool. One
       output cell per channel = max over the (X,Y) plane. Argmax cached
       for backward (gradient passes through the single argmax cell).
       Numerical-gradient test on a small random input.
