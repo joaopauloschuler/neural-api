@@ -2894,7 +2894,7 @@ dispatch tables in `neural/neuralnetwork.pas`.
       (clamp x to ≤ 30 before exp), to round out the
       Square/Abs/SoftPlus elementwise family. Derivative is the
       output itself, so the backward path is a one-liner.
-- [ ] TNNetLog — elementwise `log(max(x, eps))` companion to
+- [x] TNNetLog — elementwise `log(max(x, eps))` companion to
       TNNetExp; derivative `1/max(x, eps)`. Tests pin the eps
       behavior. Together with TNNetExp gives a clean Log/Exp
       pair for any future probabilistic-output work.
@@ -3075,14 +3075,14 @@ absent from `neural/neuralnetwork.pas` dispatch before listing.
       the eps-guard saturation at x=0 and the numerical gradient
       away from zero. Pairs naturally with TNNetSquare for "compute
       Euclidean-norm reciprocal" toy heads.
-- [ ] TNNetExp — `y = exp(min(x, 30))` with the symmetric overflow
+- [x] TNNetExp — `y = exp(min(x, 30))` with the symmetric overflow
       guard, derivative is the output itself (one-line Backpropagate
       via FOutputErrorDeriv := FOutput).
-- [ ] TNNetLog — `y = log(max(x, eps))` companion to TNNetExp, eps
+- [x] TNNetLog — `y = log(max(x, eps))` companion to TNNetExp, eps
       in FFloatSt[0] (default 1e-8). Derivative `1/max(x, eps)`.
       Tests pin the eps-region behavior plus the standard
       gradient check away from the floor.
-- [ ] TNNetSqrt — `y = sqrt(max(x, eps))`. Derivative `1/(2*y)`
+- [x] TNNetSqrt — `y = sqrt(max(x, eps))`. Derivative `1/(2*y)`
       reuses the cached output, so backward is a single multiply.
       Sister to TNNetSquare; together they let "energy" heads be
       composed both ways.
@@ -3290,3 +3290,49 @@ absent from `neural/neuralnetwork.pas` dispatch before listing.
 - [ ] Mixture-of-Experts routing layer (pinned multiple batches).
       Top-k softmax gate over N experts with load-balancing
       auxiliary loss. Best done after MHSA.
+
+
+### Lucky-day batch — 2026-05-15 (seed 64793, post Sqrt+Exp+Log batch)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Landed (each its own commit):
+
+- `37b24f0` — TNNetSqrt: `y = sqrt(max(x, 1e-6))`, parameter-free
+  TNNetReLUBase descendant. Derivative `0.5/y` cached in
+  FOutputErrorDeriv. Three tests (Forward / GradientCheck /
+  SerializationRoundTrip).
+- `e830784` — TNNetExp: `y = exp(min(x, 30))`, parameter-free
+  TNNetReLUBase descendant. Derivative equals output (single
+  cache write into FOutputErrorDeriv). Three tests.
+- `3f55c84` — TNNetLog: `y = ln(max(x, 1e-8))`, parameter-free
+  (hard-coded eps to keep the Sqrt/Exp four-test shape; the
+  earlier tasklist entry called for FFloatSt[0] but the
+  parameter-free shape was preferred for consistency).
+  Derivative `1/max(x, 1e-8)`. Three tests.
+
+Test suite: 402 -> 411, zero failures. No bugs surfaced.
+
+The elementwise transcendental family (Sqrt / Exp / Log) now
+complements the just-landed Abs / Square / Clamp elementwise
+landings. Together they cover the common building blocks for
+"compute Euclidean-norm reciprocal", "log-domain probability
+heads", and other tiny-but-useful composed primitives.
+
+#### Natural follow-ups
+
+- [ ] TNNetReciprocal — `y = 1/sign(x) * max(|x|, eps)`. The
+      remaining open elementwise from the seed 176582 batch.
+      Pairs with TNNetSquare to give a hand-rolled
+      `Reciprocal(Sqrt(Square))` Euclidean-norm-reciprocal head.
+- [ ] Exp/Log compose-as-identity test: `Log(Exp(x))` should
+      reconstruct x to within fp tolerance on a small input
+      range. One-line property check on top of the new layers.
+- [ ] Activation reference table rows in README for TNNetSqrt,
+      TNNetExp, TNNetLog matching the "Created with ..." style
+      already used for the recently-landed activations.
+- [ ] Sqrt/Exp/Log saturation tests at extreme inputs (mirroring
+      the HardTanh / SoftCapping / Clamp pattern): for Exp at
+      x=1e3 assert no overflow (clamp triggers), for Log at
+      x=-1e3 assert no exception (eps clamp), for Sqrt at
+      x=-1e3 assert no exception (eps clamp). Closes the
+      coverage gap on the new layers.
