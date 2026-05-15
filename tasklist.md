@@ -2723,3 +2723,118 @@ Test suite: 372 -> 379, all passing. No new bugs in landed layers.
 - [ ] README activation reference: TNNetSoftPlus already has rows in
       the activation table; once the negative-x derivative guard above
       lands, add a "stable on both tails" note next to its entry.
+
+
+### Lucky-day batch — 2026-05-15 (seed 566186)
+
+Ideas I'd personally enjoy taking on. Mix of bite-sized fixes,
+new layers small enough to land cleanly, test/audit work, and a
+couple of examples that would exercise recently-landed primitives.
+
+#### Bug-shaped fixes (small, satisfying)
+
+- [ ] Fix TNNetSoftPlus derivative overflow on very-negative x. Add
+      the symmetric `x < -30 ⇒ deriv := Exp(x)` branch in
+      `TNNetSoftPlus.Compute`/Backpropagate path and a regression
+      test in TestNeuralNumerical.pas feeding x=-1e3 through
+      Backpropagate (no EOverflow, finite input gradient). This is
+      the item already surfaced in the previous lucky-day batch —
+      worth closing the loop.
+- [ ] Audit TNNetSigmoid and TNNetHardSigmoid for the same negative-x
+      / positive-x symmetric-stability question as SoftPlus. If
+      Exp(-x) can blow up for x ≪ 0 anywhere along the
+      forward/backward path, add a guarded branch + test.
+- [ ] TNNetPointwiseSoftMax: now that the exact Jacobian lives in
+      Backpropagate, opt the cross-entropy training paths into the
+      cheap (y - target) shortcut explicitly, and add a regression
+      test that checks the shortcut and the full-Jacobian path agree
+      to 1e-5 on a small random batch.
+
+#### Small new layers (each a 1-commit landing)
+
+- [ ] TNNetReverseXY — spatial 180° flip layer (analogue of the
+      just-landed TNNetReverseChannels but along X and Y). Involution,
+      parameter-free, same four-test shape (forward / gradient check /
+      involution / serialization round-trip).
+- [ ] TNNetFlipX and TNNetFlipY — horizontal and vertical flip
+      layers. Used as training-time augmentation modules inside a
+      net rather than only as preprocessing. Each is an involution
+      and re-uses the ReverseChannels test scaffolding.
+- [ ] TNNetAbs — elementwise `|x|` activation. Tiny, but its
+      derivative discontinuity at 0 makes it a nice unit-test
+      target for the numerical-gradient harness (skip x=0 sampling).
+- [ ] TNNetSquare — elementwise `x^2`. Pairs naturally with TNNetAbs
+      for "energy"-style heads; derivative is `2*x` so the gradient
+      check is cleanly satisfied.
+- [ ] TNNetSign — elementwise sign, with straight-through-estimator
+      backward (pass gradient through unchanged). Useful for
+      binarized-net experiments; add an STE-vs-numerical-gradient
+      test that documents the intentional mismatch.
+- [ ] TNNetClamp — elementwise clamp to [min,max] with subgradient
+      passthrough on the active region. Two scalar parameters
+      stored in NeuronWeights[0].FData[0..1] (or via Struct[]).
+      Serialization round-trip test included.
+- [ ] TNNetChannelShuffle — ShuffleNet-style channel permutation
+      with a `groups` parameter. Parameter-free; permutation chosen
+      by group count. Tests: forward shape, inverse-permutation
+      identity when called twice with matching group counts,
+      gradient check.
+
+#### Test coverage / audit
+
+- [ ] Numerical-gradient checks for any pooling layer that still
+      lacks one. The previous audit covered TNNetAvgPool — sweep
+      TNNetMaxPool, TNNetMinPool (if it exists), TNNetAvgChannel,
+      TNNetMaxChannel, and add the missing ones.
+- [ ] Numerical-gradient check for TNNetEmbedding's weight gradient
+      (input gradient is undefined for integer indices; weight side
+      should pass). Add to TestNeuralNumerical.pas.
+- [ ] Extend `scripts/audit_tasklist.sh` with the `--strict` mode
+      flagged in the previous batch: only complain when a line
+      matches the canonical "TNNet… — …" re-pin pattern, so the
+      false-positive rate from context-references drops.
+- [ ] CI-friendly summary mode for the test runner: print a single
+      "N passed / M failed" line plus the failing-test names to
+      stderr, so a grep-based CI check has a stable contract.
+
+#### Examples (small, runnable, < 1 min CPU)
+
+- [ ] Tiny char-level sequence example (the "quick-start" already
+      open in the list). Train on a hand-coded 200-char string,
+      predict next char, print loss every epoch — finishes well
+      under a minute. Uses TNNetEmbedding + a single
+      TNNetFullConnectReLU + TNNetSoftMax. Lands as
+      `examples/char_quickstart/`.
+- [ ] Channel-flip augmentation example using TNNetReverseChannels:
+      train a small CIFAR-ish toy on a 32×32×3 synthetic 2-class
+      dataset where the class is encoded in channel ordering, and
+      show that a net *with* TNNetReverseChannels as a random
+      augmentation generalizes while one without it overfits.
+- [ ] Volume micro-benchmark example printing ns/op for
+      `TVolume.Add`, `Mul`, `DotProduct`, and `MulAdd` across a
+      handful of sizes (already in the open list — promote it to a
+      tiny example under `examples/volume_microbench/` so it lives
+      alongside other runnable demos).
+
+#### Documentation / polish
+
+- [ ] README: short "involution layers" subsection grouping
+      TNNetReverseChannels (landed), TNNetReverseXY (planned),
+      TNNetFlipX/Y (planned). One paragraph on what "involution"
+      means here and why you'd compose two of them as identity.
+- [ ] Doc-comment pass on the activation layers added in the last
+      few batches (GEGLU, SwiGLU, DropPath, RotaryEmbedding) so the
+      auto-generated layer reference idea (already on the list)
+      has clean source to pull from when someone picks it up.
+
+#### Experiments (research-shaped, longer)
+
+- [ ] Compare LayerNorm vs RMSNorm vs GroupNorm on the existing
+      CIFAR baseline — same net, swap only the norm layer, log
+      validation accuracy and wall-clock. One short markdown
+      report under `docs/experiments/`. Should reuse the
+      benchmarking scaffolding planned in the open infra item.
+- [ ] Activation A/B: re-run the CIFAR baseline with ReLU,
+      LeakyReLU, GELU, Swish, Mish, SwiGLU as the only changed
+      layer, log curves. Useful for the README activation table
+      to cite real numbers.
