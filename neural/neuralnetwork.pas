@@ -942,6 +942,27 @@ type
     procedure Compute(); override;
   end;
 
+  /// Straight-Through Estimator (STE) layer.
+  // Forward: y = round(x / step) * step, where step is a configurable
+  // quantization grid step stored in FFloatSt[0] (default 1.0, which gives
+  // y = round(x)). Backward: identity passthrough — the gradient flows
+  // through unchanged, ignoring the (zero almost-everywhere, undefined
+  // on grid boundaries) derivative of the rounding op. This is the
+  // canonical trick from Bengio et al. (2013) "Estimating or Propagating
+  // Gradients Through Stochastic Neurons" for training networks with
+  // non-differentiable rounding/quantization in the forward path. The
+  // identity backward is inherited directly from TNNetIdentity, which
+  // adds FOutputError into FPrevLayer.FOutputError unmodified.
+  // Parameter-free (no learnable weights). Useful for quantization-aware
+  // training, binarization, and discrete bottlenecks (e.g. VQ-VAE-style
+  // codebook lookups).
+  TNNetStraightThroughEstimator = class(TNNetIdentity)
+  public
+    constructor Create(); overload;
+    constructor Create(pStep: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// ALiBi (Attention with Linear Biases) positional bias.
   // Treats the input as a (SizeX, SizeY) attention score matrix replicated
   // over Depth heads. SizeX indexes the key position, SizeY indexes the
@@ -4510,6 +4531,39 @@ begin
     for X := Y + 1 to MaxX do
       for D := 0 to MaxD do
         FOutput.Add(X, Y, D, MaskValue);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetStraightThroughEstimator }
+
+constructor TNNetStraightThroughEstimator.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetStraightThroughEstimator.Create(pStep: TNeuralFloat);
+begin
+  inherited Create();
+  if pStep <= 0 then
+    FErrorProc('TNNetStraightThroughEstimator step must be > 0. Got: '
+      + FloatToStr(pStep));
+  FFloatSt[0] := pStep;
+end;
+
+procedure TNNetStraightThroughEstimator.Compute();
+var
+  StartTime: double;
+  Step, InvStep: TNeuralFloat;
+  I, MaxI: integer;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Step := FFloatSt[0];
+  if Step <= 0 then Step := 1.0;
+  InvStep := 1.0 / Step;
+  MaxI := FOutput.Size - 1;
+  for I := 0 to MaxI do
+    FOutput.FData[I] := Round(FOutput.FData[I] * InvStep) * Step;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -16615,6 +16669,7 @@ begin
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
+      'TNNetStraightThroughEstimator' : Result := TNNetStraightThroughEstimator.Create(Ft[0]);
       'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
@@ -16780,6 +16835,7 @@ begin
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
+      if S[0] = 'TNNetStraightThroughEstimator' then Result := TNNetStraightThroughEstimator.Create(Ft[0]) else
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else

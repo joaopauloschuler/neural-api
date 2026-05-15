@@ -248,6 +248,9 @@ type
     procedure TestNegGradientCheck;
     procedure TestNegInvolution;
     procedure TestNegSerializationRoundTrip;
+    procedure TestStraightThroughEstimatorForward;
+    procedure TestStraightThroughEstimatorBackward;
+    procedure TestStraightThroughEstimatorSerializationRoundTrip;
     procedure TestSinForward;
     procedure TestSinGradientCheck;
     procedure TestSinPeriodicity;
@@ -8338,6 +8341,108 @@ procedure TTestNeuralNumerical.TestNegSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetNeg.Create(),
     'Neg', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestStraightThroughEstimatorForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Output: TNNetVolume;
+begin
+  // Hand-checked rounding values, including a sub-unit step grid.
+  // Default step (1.0): STE(0.4)=0, STE(0.6)=1, STE(-1.3)=-1.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetStraightThroughEstimator.Create()); // default step=1.0
+    Input.Raw[0] := 0.4;
+    Input.Raw[1] := 0.6;
+    Input.Raw[2] := -1.3;
+    NN.Compute(Input);
+    Output := NN.GetLastLayer.Output;
+    AssertEquals('STE(0.4) with step=1', 0.0, Output.Raw[0], 1e-6);
+    AssertEquals('STE(0.6) with step=1', 1.0, Output.Raw[1], 1e-6);
+    AssertEquals('STE(-1.3) with step=1', -1.0, Output.Raw[2], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // step=0.5 grid: STE(2.5) already on grid => 2.5;
+  // STE(2.7) rounds to nearest 0.5 multiple => 2.5.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+    NN.AddLayer(TNNetStraightThroughEstimator.Create(0.5));
+    Input.Raw[0] := 2.5;
+    Input.Raw[1] := 2.7;
+    NN.Compute(Input);
+    Output := NN.GetLastLayer.Output;
+    AssertEquals('STE(2.5) with step=0.5', 2.5, Output.Raw[0], 1e-6);
+    AssertEquals('STE(2.7) with step=0.5', 2.5, Output.Raw[1], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestStraightThroughEstimatorBackward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  STELayer, PrevLayer: TNNetLayer;
+  ExpectedError: TNNetVolume;
+  I: integer;
+begin
+  // STE backward pass: gradient flows through unchanged. We set a known
+  // FOutputError on the STE layer, call Backpropagate, and assert the
+  // previous layer's FOutputError matches it elementwise. This is the
+  // appropriate test for STE since the forward op is discontinuous and
+  // central differences would not be meaningful.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  ExpectedError := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    STELayer := NN.AddLayer(TNNetStraightThroughEstimator.Create(0.25));
+    RandSeed := 919191;
+    for I := 0 to Input.Size - 1 do
+      Input.Raw[I] := Random() * 4 - 2;
+    NN.Compute(Input);
+
+    PrevLayer := STELayer.PrevLayer;
+    PrevLayer.OutputError.Fill(0);
+    for I := 0 to STELayer.OutputError.Size - 1 do
+    begin
+      ExpectedError.Raw[I] := Sin(I * 0.37) * 0.5 - 0.1;
+      STELayer.OutputError.Raw[I] := ExpectedError.Raw[I];
+    end;
+
+    // Manually bump FDepartingBranchesCnt so the assertion inside
+    // Backpropagate doesn't log a (non-fatal) warning when invoked
+    // directly outside the normal full-network backward pass.
+    STELayer.IncDepartingBranchesCnt();
+    STELayer.Backpropagate();
+
+    AssertEquals('STE backward prev error size',
+      ExpectedError.Size, PrevLayer.OutputError.Size);
+    for I := 0 to ExpectedError.Size - 1 do
+      AssertEquals('STE backward identity at index ' + IntToStr(I),
+        ExpectedError.Raw[I], PrevLayer.OutputError.Raw[I], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    ExpectedError.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestStraightThroughEstimatorSerializationRoundTrip;
+begin
+  // step=0.25 must survive save+load cycle (stored in FFloatSt[0]).
+  SerializationRoundTrip(Self, TNNetStraightThroughEstimator.Create(0.25),
+    'StraightThroughEstimator', 3, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSinForward;
