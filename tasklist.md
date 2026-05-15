@@ -4028,21 +4028,19 @@ TNNetRoll, TNNetL2Normalize, TNNetMishLearnable, TNNetSpaceToDepth /
 TNNetDepthToSpace.
 
 #### Layers I'd enjoy authoring
-- [ ] TNNetSinc — `y = sin(x)/x` with the `x→0` limit `y=1` handled
+- [x] TNNetSinc — `y = sin(x)/x` with the `x→0` limit `y=1` handled
       analytically. Derivative `(cos(x) - sin(x)/x) / x` (with the
-      `x→0` limit `0`). Pairs with the existing Sin/Cos/Snake periodic
-      family; closed-form derivative makes it gradient-checkable.
-      Cache `dy/dx` into FOutputErrorDeriv to match the elementwise
-      activation pattern. Three tests: forward at known points
-      (including `x=0`), gradient check, serialization round-trip.
-- [ ] TNNetBentIdentity — `y = (sqrt(x²+1) - 1)/2 + x`, derivative
-      `x / (2·sqrt(x²+1)) + 1`. Always-positive-slope smooth ReLU
-      alternative; one of the cleanest activations not yet in tree.
-      Same TNNetReLUBase template as TNNetSoftPlus.
-- [ ] TNNetLisht — `y = x · tanh(x)`, derivative
-      `tanh(x) + x · (1 - tanh(x)²)`. Symmetric, unbounded-positive
-      activation from the LiSHT paper. Cheap to implement, tanh-cache
-      friendly.
+      `x→0` limit `0`). Landed (774d04b): parameter-free TNNetReLUBase
+      descendant with `Abs(x) < 1e-6` guard; three tests in
+      TestNeuralNumerical.pas (forward at known points incl. x=0,
+      central-difference gradient check, serialization round-trip).
+- [x] TNNetBentIdentity — `y = (sqrt(x²+1) - 1)/2 + x`, derivative
+      `x / (2·sqrt(x²+1)) + 1`. Landed (9dc8726): parameter-free
+      TNNetReLUBase descendant; three tests in TestNeuralNumerical.pas.
+- [x] TNNetLisht — `y = x · tanh(x)`, derivative
+      `tanh(x) + x · (1 - tanh(x)²)`. Landed (9685af1): parameter-free
+      TNNetReLUBase descendant; tanh evaluation shared between forward
+      and derivative; three tests in TestNeuralNumerical.pas.
 - [ ] TNNetESwish — `y = β · x · sigmoid(x)` with configurable β via
       FFloatSt[0] (default 1.25, the paper's recommended value).
       Generalizes Swish; β=1 reduces to Swish. Same template as
@@ -4176,3 +4174,51 @@ TNNetDepthToSpace.
       for a reason.
 - [ ] Tiny GPT char-level CPU example — unblocked the moment MHSA
       lands.
+
+### Lucky-day batch — 2026-05-15 (seed 758867)
+
+Three serial opus agents dispatched on a self-described lucky day.
+Each landed a small parameter-free elementwise activation following
+the TNNetSnake / TNNetSquaredReLU / TNNetSin template (TNNetReLUBase
+descendant, derivative cached in FOutputErrorDeriv, dispatch entry in
+both CreateLayer tables, three tests: forward at known points,
+central-difference gradient check, serialization round-trip).
+
+Landed:
+
+- `774d04b` — TNNetSinc (`y = sin(x)/x`, derivative `(cos(x) -
+  sin(x)/x)/x`). Analytic `x→0` limits (`y=1`, `dy=0`) guarded by
+  `Abs(x) < 1e-6`.
+- `9dc8726` — TNNetBentIdentity (`y = (sqrt(x²+1) - 1)/2 + x`,
+  derivative `x/(2·sqrt(x²+1)) + 1`). Always-smooth, always-positive-
+  slope. The agent rediscovered the float32 cancellation noise that
+  bites elementwise gradient checks at large shapes — settled on the
+  `(2, 2, 3)` shape Snake also uses.
+- `9685af1` — TNNetLisht (`y = x · tanh(x)`, derivative `tanh(x) +
+  x · (1 - tanh(x)²)`). `tanh(x)` shared between forward and
+  derivative.
+
+Test suite: 437 → 446, all passing. No bugs surfaced.
+
+#### Natural follow-ups (small, doable next batch)
+- [ ] TNNetSinc-as-SIREN-activation experiment: rerun the pinned
+      `f(x) = sin(8x) + sin(3x)` SIREN fit using TNNetSinc in place of
+      TNNetSin and compare convergence + bounded-output behaviour.
+      Two-line config switch on the existing experiment idea.
+- [ ] TNNetBentIdentity vs SoftPlus head-to-head on the existing
+      Hypotenuse task — both are smooth, always-positive-slope; one
+      chart of loss-vs-epoch. Tiny, deterministic.
+- [ ] LiSHT vs Mish vs Swish bake-off on a tiny MLP — all three are
+      smooth, self-gated-ish; matched-width comparison feeds straight
+      into the already-pinned activation bake-off CSV experiment.
+- [ ] README activation-table rows for the three new layers (Sinc,
+      BentIdentity, LiSHT) plus a one-line entry each in the relevant
+      subsection. The "periodic activations" subsection should pick
+      up Sinc; BentIdentity and LiSHT belong with the smooth
+      ReLU-alternatives (SoftPlus, GELU, Swish, Mish).
+- [ ] Trig-identity micro-test: `Sinc(x) · x = Sin(x)` to within fp
+      tolerance on a random non-zero input vector. Cheap pin on the
+      analytic-limit branch's transition region.
+- [ ] LiSHT symmetry test: `Lisht(-x) = Lisht(x)` to within fp
+      tolerance on a random vector. Pins the symmetric-output property
+      that the forward test only spot-checks at x=±1.
