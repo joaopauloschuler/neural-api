@@ -179,6 +179,9 @@ type
     procedure TestSoftmaxTemperatureSerializationRoundTrip;
     procedure TestPointwiseSoftMaxExactJacobianGradientCheck;
     procedure TestSoftMaxExactJacobianGradientCheck;
+    procedure TestSoftMinSumsToOne;
+    procedure TestSoftMinEquivalence;
+    procedure TestSoftMinGradientCheck;
     procedure TestLogSoftMaxForward;
     procedure TestLogSoftMaxGradientCheck;
     procedure TestLogSoftMaxSerializationRoundTrip;
@@ -7593,6 +7596,88 @@ begin
   // check would fail with the old approximation.
   LayerInputGradientCheck(Self, TNNetSoftMax.Create(),
     'SoftMax', 1, 1, 6, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestSoftMinSumsToOne;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Sum: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetSoftMin.Create());
+
+    Input.Raw[0] := -1.0;
+    Input.Raw[1] := 0.5;
+    Input.Raw[2] := 2.0;
+    Input.Raw[3] := 3.5;
+    Input.Raw[4] := -2.5;
+
+    NN.Compute(Input);
+
+    Sum := NN.GetLastLayer.Output.GetSum();
+    AssertEquals('SoftMin sum should be 1', 1.0, Sum, 0.001);
+    AssertTrue('All SoftMin values should be >= 0',
+      NN.GetLastLayer.Output.GetMin() >= 0);
+    AssertTrue('All SoftMin values should be <= 1',
+      NN.GetLastLayer.Output.GetMax() <= 1);
+    // Smallest input must receive the largest probability mass.
+    AssertTrue('Smallest input should have largest SoftMin probability',
+      NN.GetLastLayer.Output.Raw[4] > NN.GetLastLayer.Output.Raw[3]);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMinEquivalence;
+var
+  NNMin, NNMax: TNNet;
+  InMin, InMax: TNNetVolume;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NNMin := TNNet.Create();
+  NNMax := TNNet.Create();
+  InMin := TNNetVolume.Create(6, 1, 1);
+  InMax := TNNetVolume.Create(6, 1, 1);
+  try
+    NNMin.AddLayer(TNNetInput.Create(6));
+    NNMin.AddLayer(TNNetSoftMin.Create());
+    NNMax.AddLayer(TNNetInput.Create(6));
+    NNMax.AddLayer(TNNetSoftMax.Create());
+
+    for i := 0 to 5 do
+    begin
+      InMin.Raw[i] := (Random - 0.5) * 4.0;
+      InMax.Raw[i] := -InMin.Raw[i];
+    end;
+
+    NNMin.Compute(InMin);
+    NNMax.Compute(InMax);
+
+    for i := 0 to 5 do
+      AssertEquals('SoftMin(x)[' + IntToStr(i) + '] = SoftMax(-x)[' +
+        IntToStr(i) + ']',
+        NNMax.GetLastLayer.Output.Raw[i],
+        NNMin.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NNMin.Free;
+    NNMax.Free;
+    InMin.Free;
+    InMax.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMinGradientCheck;
+begin
+  // Same normalization scope as TNNetSoftMax (whole volume); the central
+  // difference check is run with the same 1e-2 tolerance.
+  LayerInputGradientCheck(Self, TNNetSoftMin.Create(),
+    'SoftMin', 1, 1, 6, 1e-2);
 end;
 
 procedure TTestNeuralNumerical.TestLogSoftMaxForward;

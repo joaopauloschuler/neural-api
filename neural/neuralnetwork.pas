@@ -1976,6 +1976,17 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Softmin layer: y = softmax(-x). Lower input scores receive higher
+  /// probability mass. Output shape matches input; outputs sum to 1 over the
+  /// whole volume (same normalization scope as TNNetSoftMax).
+  TNNetSoftMin = class(TNNetPointwiseSoftMax)
+    protected
+      FSoftTotalSum: TNeuralFloat;
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Numerically stable log-softmax over the depth axis at each (X,Y).
   /// out[d] = (x[d] - max_d x) - log(sum_d exp(x - max_d x)).
   /// Backward simplifies to: dx[d] = dy[d] - softmax(x)[d] * sum_d dy[d],
@@ -14512,6 +14523,66 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetSoftMin }
+procedure TNNetSoftMin.Compute;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  // y = softmax(-x): copy input, negate, then apply softmax in place.
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  FOutput.Mul(-1);
+  FSoftTotalSum := FOutput.SoftMax();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftMin.Backpropagate;
+var
+  StartTime: double;
+  Dot, Yi: TNeuralFloat;
+  i, SizeM1: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    if FSkipBackpropDerivative then
+    begin
+      if FNoForward then
+      begin
+        FOutputError.Mul(FOutputErrorDeriv);
+      end;
+      // d(-x)/dx = -1 so the upstream gradient flips sign.
+      SizeM1 := FOutputError.Size - 1;
+      for i := 0 to SizeM1 do
+        FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i]
+          - FOutputError.FData[i];
+    end
+    else if FOutput.Size = FOutputError.Size then
+    begin
+      // y = softmax(u) where u = -x. Standard softmax Jacobian gives
+      //   dL/du_i = y_i * (dL/dy_i - sum_j y_j * dL/dy_j)
+      // and dL/dx_i = -dL/du_i since du/dx = -1.
+      SizeM1 := FOutput.Size - 1;
+      Dot := 0;
+      for i := 0 to SizeM1 do
+        Dot := Dot + FOutput.FData[i] * FOutputError.FData[i];
+      for i := 0 to SizeM1 do
+      begin
+        Yi := FOutput.FData[i];
+        FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i] -
+          Yi * (FOutputError.FData[i] - Dot);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetSoftmaxTemperature }
 constructor TNNetSoftmaxTemperature.Create(pTemperature: TNeuralFloat);
 begin
@@ -17204,6 +17275,7 @@ begin
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create(St[0]);
+      'TNNetSoftMin' :              Result := TNNetSoftMin.Create(St[0]);
       'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
@@ -17377,6 +17449,7 @@ begin
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create(St[0]) else
+      if S[0] = 'TNNetSoftMin' then Result := TNNetSoftMin.Create(St[0]) else
       if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
