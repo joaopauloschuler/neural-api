@@ -1574,4 +1574,103 @@ end-to-end smoke check.
       separately." This is the audit-bug protocol the recent
       commits keep referencing — worth writing down.
 
+### Lucky-day batch — 2026-05-15 (post DeMaxPool-fix + ReLU6/GlobalMaxPool + small-correctness batch)
+
+This batch landed:
+- TNNetDeMaxPool gradient bug fixed: removed the spurious
+  `FOutputError.Divi(floatPoolSize)` in ComputePreviousLayerError so the
+  sum-of-block backward matches the pure-replication forward. TNNetDeAvgPool
+  (which just inherits) is fixed transitively. New tests:
+  TestDeMaxPoolGradientCheck, TestDeAvgPoolGradientCheck, and
+  TestDeMaxPoolForwardReplication. Needed a Double-precision local SSE
+  accumulator (DeMaxPoolFamilyGradientCheck) because the generic helper
+  suffered catastrophic single-precision cancellation when many output
+  cells receive the same large value.
+- TNNetReLU6 coverage: discovered the layer already existed (as a
+  TNNetReLUL subclass with leakiness=0). Added the missing
+  TestReLU6Forward and TestReLU6ExtremeInputSaturation tests.
+- TNNetGlobalMaxPool (new layer): per-channel max over (SizeX,SizeY),
+  argmax cached for backward. Forward and gradient tests landed.
+- TestHardTanhExtremeInputSaturation, TestTanhShrinkTanhComposition
+  (`TanhShrink(x) + tanh(x) == x`), and TestMaxOutDepthNotDivisibleByKGuard.
+
+Notable lesson — the **single-precision SSE accumulator pitfall**: the
+generic LayerInputGradientCheck sums per-cell squared errors in
+TNeuralFloat. For the DeMaxPool family the replication step makes many
+output cells share the same large value, and the squared loss exceeds the
+FP32 mantissa's accumulation precision long before the central-difference
+step matters. The DeMaxPool tests work around it with a Double-precision
+local helper. **Generalising this fix into the shared gradient-check
+helper would prevent every future replication/upsample layer audit from
+hitting the same wall.**
+
+#### Bug-class follow-ups I'd take first
+- [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
+      accumulator into the shared gradient-check helper in
+      TestNeuralNumerical.pas (LayerInputGradientCheck and the
+      weight-gradient variant). Sum the SSE in Double; the eps and
+      tolerance stay TNeuralFloat. Once landed, drop the DeMaxPool-
+      specific helper and confirm the DeMaxPool/DeAvgPool tests still
+      pass. Future audits of upsampling/deconvolution/replication
+      layers will not silently fail from FP32 cancellation.
+- [ ] Close the upsample/deconv audit: TNNetDeconvolution numerical-
+      gradient test (input AND weight gradients). Last entry in the
+      family — DeMaxPool, DeAvgPool, Upsample all now have coverage.
+      Likely benefits from the Double-precision helper above.
+
+#### Layers I'd enjoy building next
+- [ ] TNNetGlobalMaxPool follow-ups, now that the layer landed:
+      - Serialization round-trip test (mirror the SoftCapping pattern).
+      - Argmax-tie behaviour test: when two cells share the max value,
+        the deterministic tie-break (likely "first wins") should be
+        documented in code and pinned with a tiny test.
+      - CIFAR-style example replacing a TNNetGlobalAvgPool head with
+        TNNetGlobalMaxPool on one of the SimpleImage runs — small
+        empirical "does it matter?" data point.
+- [ ] TNNetELU — `y = x if x>0 else alpha*(exp(x)-1)`, configurable
+      alpha. Backward via cached output. Sits next to the TNNetReLU6
+      coverage just added; same harness shape.
+- [ ] TNNetCELU — continuously differentiable ELU variant. One line
+      different from TNNetELU; rounds out the family.
+- [ ] TNNetSiLU alias for Swish(beta=1). One-line LoadFromString
+      registration so the canonical name parses. Pure naming cleanup.
+- [ ] TNNetPixelShuffle (sub-pixel convolution). Forward = deterministic
+      index permutation; backward = inverse. Useful for the
+      SuperResolution example. Gradient check is trivial since the
+      forward is linear.
+- [ ] TNNetSpaceToDepth + TNNetDepthToSpace pair (inverse permutations).
+      Tiny, deterministic, and unlocks the ViT "patchify" step as a
+      one-line layer.
+
+#### Correctness / audit work
+- [ ] Re-validate the in-tree examples that use TNNetDeMaxPool /
+      TNNetDeAvgPool after the gradient fix: the DenseNet helper at
+      neuralnetwork.pas:~9383, examples/VisualGAN, examples/SuperResolution.
+      The fix increases backward magnitude by `PoolSize` (=2 in practice),
+      so the existing learning rates may be off by 2x. Run each example
+      for a handful of epochs and confirm it still converges; flag any
+      that need an LR retune.
+- [ ] LoadFromString round-trip for TNNetReLU6 and TNNetGlobalMaxPool —
+      mirror the existing round-trip pattern (TNNetReLU6 is actually a
+      TNNetReLUL with `Threshold=6, Leakiness=0`, so the round-trip
+      mostly verifies the registration dispatch returns the right class).
+- [ ] TNNetGlobalAvgPool numerical-gradient test (companion to the
+      new TNNetGlobalMaxPool test). Both share the shape transformation;
+      the AvgPool variant is simpler and worth pinning while the
+      GlobalMaxPool harness is fresh.
+
+#### Experiments I'm curious about
+- [ ] GlobalMaxPool vs GlobalAvgPool head bake-off on one of the
+      SimpleImage CIFAR examples — same net, swap the head, chart
+      validation accuracy. Cheap, visible data point.
+- [ ] DeMaxPool fix regression check: train one of the affected
+      examples (VisualGAN or SuperResolution) for a handful of epochs
+      pre- and post-fix and chart the loss curve. Confirms the
+      correctness fix doesn't tank training in practice.
+
+#### Tooling / dev experience
+- [ ] Add a "FP32 SSE accumulator warning" comment near
+      LayerInputGradientCheck in TestNeuralNumerical.pas that points
+      future audits at the DeMaxPool case and the Double-precision
+      workaround. Useful even before the helper itself is upgraded.
 
