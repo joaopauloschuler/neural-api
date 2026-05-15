@@ -844,6 +844,17 @@ type
     procedure Compute(); override;
   end;
 
+  /// LeCun scaled hyperbolic tangent activation function.
+  // y = 1.7159 * tanh((2/3) * x). Classical scaled-tanh from LeCun et al.,
+  // "Efficient Backprop" (1998), tuned so f(+/-1) ~= +/-1 and f'(0) ~= 1.14.
+  // Parameter-free. Derivative is (2/3) * (1.7159 - y^2 / 1.7159), cached
+  // into FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
+  // with one multiply. Element-wise, smooth, bounded by +/-1.7159.
+  TNNetLeCunTanh = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Snake activation function.
   // Snake(x) = x + (1/alpha) * sin(alpha*x)^2. Derivative is
   // 1 + sin(2*alpha*x). Parameter-free w.r.t. learning but alpha is a
@@ -6964,6 +6975,48 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := Ln(x + Sqrt(x * x + 1.0));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetLeCunTanh }
+
+procedure TNNetLeCunTanh.Compute();
+const
+  cScale: TNeuralFloat = 1.7159;
+  cInvScale: TNeuralFloat = 1.0 / 1.7159;
+  cTwoThirds: TNeuralFloat = 2.0 / 3.0;
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, y: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // y = 1.7159 * tanh((2/3) * x). Derivative is (2/3) * (1.7159 - y^2/1.7159),
+  // which avoids re-evaluating tanh in the backward pass.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      y := cScale * Tanh(cTwoThirds * x);
+      FOutput.FData[OutputCnt] := y;
+      FOutputErrorDeriv.FData[OutputCnt] := cTwoThirds * (cScale - y * y * cInvScale);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := cScale * Tanh(cTwoThirds * x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -18717,6 +18770,7 @@ begin
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
       'TNNetHyperbolicTangent' :    Result := TNNetHyperbolicTangent.Create();
+      'TNNetLeCunTanh' :            Result := TNNetLeCunTanh.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
@@ -18907,6 +18961,7 @@ begin
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
       if S[0] = 'TNNetHyperbolicTangent' then Result := TNNetHyperbolicTangent.Create() else
+      if S[0] = 'TNNetLeCunTanh' then Result := TNNetLeCunTanh.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else

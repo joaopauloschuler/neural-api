@@ -319,6 +319,8 @@ type
     procedure TestSincSerializationRoundTrip;
     procedure TestSinhActGradientCheck;
     procedure TestArcSinhGradientCheck;
+    procedure TestLeCunTanhGradientCheck;
+    procedure TestLeCunTanhForward;
     procedure TestSerfGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
@@ -9632,6 +9634,47 @@ begin
   // sample range is comfortable under ActivationGradientCheck's 0.01 tolerance.
   ActivationGradientCheck(Self, TNNetArcSinh.Create(), 'ArcSinh',
     [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.25, -0.25, 0.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLeCunTanhGradientCheck;
+begin
+  // LeCun scaled tanh: y = 1.7159 * tanh((2/3) * x). Smooth everywhere with
+  // derivative bounded by ~1.14, comfortable under the 0.01 tolerance for a
+  // wide sample range.
+  ActivationGradientCheck(Self, TNNetLeCunTanh.Create(), 'LeCunTanh',
+    [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.25, -0.25, 0.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLeCunTanhForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ExpectedAtOne: TNeuralFloat;
+begin
+  // The whole point of the scaling constants 1.7159 and (2/3) is that
+  // f(1) ~= 1 and f(-1) ~= -1. Pin those numerically.
+  ExpectedAtOne := 1.7159 * Tanh(2.0 / 3.0);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetLeCunTanh.Create());
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 1.0;
+    Input.Raw[2] := -1.0;
+    NN.Compute(Input);
+    AssertEquals('LeCunTanh(0)',
+      0.0, NN.GetLastLayer.Output.Raw[0], 1e-5);
+    AssertEquals('LeCunTanh(1) ~= 1',
+      1.0, NN.GetLastLayer.Output.Raw[1], 1e-3);
+    AssertEquals('LeCunTanh(1) exact',
+      ExpectedAtOne, NN.GetLastLayer.Output.Raw[1], 1e-5);
+    AssertEquals('LeCunTanh(-1) exact',
+      -ExpectedAtOne, NN.GetLastLayer.Output.Raw[2], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestSerfGradientCheck;
