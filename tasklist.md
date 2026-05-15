@@ -3329,9 +3329,12 @@ heads", and other tiny-but-useful composed primitives.
 - [ ] Exp/Log compose-as-identity test: `Log(Exp(x))` should
       reconstruct x to within fp tolerance on a small input
       range. One-line property check on top of the new layers.
-- [ ] Activation reference table rows in README for TNNetSqrt,
+- [x] Activation reference table rows in README for TNNetSqrt,
       TNNetExp, TNNetLog matching the "Created with ..." style
       already used for the recently-landed activations.
+      Landed alongside Reciprocal/Neg/Sin/Cos rows in the
+      "docs: README activation-table rows for transcendentals
+      + Neg/Sin/Cos" commit.
 - [ ] Sqrt/Exp/Log saturation tests at extreme inputs (mirroring
       the HardTanh / SoftCapping / Clamp pattern): for Exp at
       x=1e3 assert no overflow (clamp triggers), for Log at
@@ -3627,8 +3630,11 @@ Test suite: 411 -> 419, all passing. No bugs surfaced.
 
 #### Natural follow-ups
 
-- [ ] TNNetReciprocal README activation-table row (matching the
+- [x] TNNetReciprocal README activation-table row (matching the
       "Created with ..." style used for the recently-landed activations).
+      Landed alongside Sqrt/Exp/Log/Neg/Sin/Cos rows in the
+      "docs: README activation-table rows for transcendentals
+      + Neg/Sin/Cos" commit.
 - [ ] Euclidean-norm reciprocal head example
       (`examples/EuclideanNormHead/`) — now buildable: compose
       `Reciprocal(Sqrt(Square(x)))` on a tiny regression target. Pinned
