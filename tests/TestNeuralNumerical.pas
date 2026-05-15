@@ -166,6 +166,9 @@ type
     procedure TestSoftSignForward;
     procedure TestSoftSignGradientCheck;
     procedure TestSoftSignSerializationRoundTrip;
+    procedure TestGlobalAvgPoolGradientCheck;
+    procedure TestReLU6SerializationRoundTrip;
+    procedure TestGlobalMaxPoolSerializationRoundTrip;
 
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -6275,6 +6278,104 @@ begin
         NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SoftSign round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          ReloadedLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
+begin
+  // Tiny 4 x 4 x 3 input. GlobalAvgPool (TNNetAvgChannel) is a smooth
+  // (linear) per-channel reduction so central differences should match
+  // the analytic gradient tightly.
+  LayerInputGradientCheck(Self, TNNetAvgChannel.Create(),
+    'GlobalAvgPool', 4, 4, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReLU6SerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+  ReloadedLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetReLU6.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 4.0 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ReloadedLayer := NN2.GetLastLayer;
+      AssertEquals('ReLU6 round-trip class name', 'TNNetReLU6', ReloadedLayer.ClassName);
+      AssertEquals('ReLU6 round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+      AssertEquals('ReLU6 round-trip output size',
+        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ReLU6 round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          ReloadedLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGlobalMaxPoolSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+  ReloadedLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetGlobalMaxPool.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      ReloadedLayer := NN2.GetLastLayer;
+      AssertEquals('GlobalMaxPool round-trip class name',
+        'TNNetGlobalMaxPool', ReloadedLayer.ClassName);
+      AssertEquals('GlobalMaxPool round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        ReloadedLayer.SaveStructureToString());
+      AssertEquals('GlobalMaxPool round-trip output size',
+        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GlobalMaxPool round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           ReloadedLayer.Output.Raw[i], 1e-5);
     finally

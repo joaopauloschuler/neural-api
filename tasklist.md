@@ -1650,11 +1650,11 @@ hitting the same wall.**
       so the existing learning rates may be off by 2x. Run each example
       for a handful of epochs and confirm it still converges; flag any
       that need an LR retune.
-- [ ] LoadFromString round-trip for TNNetReLU6 and TNNetGlobalMaxPool —
+- [x] LoadFromString round-trip for TNNetReLU6 and TNNetGlobalMaxPool —
       mirror the existing round-trip pattern (TNNetReLU6 is actually a
       TNNetReLUL with `Threshold=6, Leakiness=0`, so the round-trip
       mostly verifies the registration dispatch returns the right class).
-- [ ] TNNetGlobalAvgPool numerical-gradient test (companion to the
+- [x] TNNetGlobalAvgPool numerical-gradient test (companion to the
       new TNNetGlobalMaxPool test). Both share the shape transformation;
       the AvgPool variant is simpler and worth pinning while the
       GlobalMaxPool harness is fresh.
@@ -1741,7 +1741,7 @@ hitting the same wall.**
       stack composes end-to-end. Print sample completions.
 
 #### Tests & audit follow-ups
-- [ ] TNNetGlobalAvgPool numerical-gradient test (companion to the
+- [x] TNNetGlobalAvgPool numerical-gradient test (companion to the
       new TNNetGlobalMaxPool test). Same shape transformation;
       forward is even simpler than the max variant. Worth pinning
       while the GlobalMaxPool harness is still fresh.
