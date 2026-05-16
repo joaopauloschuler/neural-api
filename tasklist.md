@@ -32,6 +32,16 @@
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
 - [ ] Auto-generated layer API reference from doc comments
+- [ ] Improve source-code comments for TNNetChannelShuffle and
+      TNNetInterleaveChannels in neural/neuralnetwork.pas. Both are
+      parameter-free channel-permutation layers and are easily confused.
+      The doc comments should make the distinction explicit: spell out
+      the permutation formula each one computes, the meaning of the
+      constructor parameter (Groups vs StepSize), any constraints
+      (ChannelShuffle requires Depth mod Groups = 0; InterleaveChannels
+      has no divisibility constraint), and a one-line note on the
+      typical use case (ShuffleNet-style group mixing vs generic
+      stride-based interleaving after grouped/parallel convs).
 
 ## Added ideas
 
