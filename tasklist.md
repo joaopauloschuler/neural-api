@@ -379,6 +379,15 @@ breakdown:
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
 - [X] TNNetGlobalSumPool — sum reduction over (X, Y) plane per channel.
+- [ ] TNNetGlobalMinPool — min reduction over (X, Y) plane per channel,
+      completing the GlobalMax/GlobalAvg/GlobalSum family. Forward picks the
+      minimum activation per channel (with a recorded argmin index per
+      channel); Backpropagate routes the per-channel output gradient to the
+      single argmin cell (tie-break: first-wins, mirroring the existing
+      GlobalMaxPool convention). Pairs with a numerical-gradient test in
+      TestNeuralNumerical.pas (skipping ties by seeding distinct inputs) and
+      an argmin-tie pinning test analogous to the GlobalMaxPool item already
+      on the list.
 - [ ] TNNetCumSum — cumulative sum along a configurable axis. Backward is
       a reverse cumulative sum.
 - [ ] TNNetRoll — circular shift along a chosen axis. Parameter-free
