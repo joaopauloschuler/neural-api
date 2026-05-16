@@ -5697,3 +5697,23 @@ TNNetIdentity).
       codes the softmax variant, so this needs either a flag on
       SDPA or a small standalone wiring instead of a parameter
       swap.
+
+- [ ] Model-calibration / reliability-diagram tool — a small unit
+      (e.g. `neuralcalibration.pas`) that takes a trained
+      classifier, a validation set, and a bin count, and reports
+      Expected Calibration Error (ECE), Maximum Calibration Error
+      (MCE), and Brier score, plus dumps a reliability diagram as
+      a PGM (per-bin accuracy vs. confidence, with a y=x reference
+      line). Pair it with a tiny example on top of one of the
+      existing classifiers (SimpleImageClassifier or SimpleMNist)
+      that prints the metrics before and after a one-parameter
+      temperature-scaling fit on the logits — concretely showing
+      that modern ReLU/softmax nets are systematically over-
+      confident and that a single scalar fixes most of it. This
+      is the most-requested-in-the-wild piece of post-training
+      introspection that the repo currently does not have, it
+      needs no new layers (just access to pre-softmax logits,
+      which the existing softmax layers already expose), runs in
+      seconds on CPU, and gives a satisfying visual artifact in
+      the same PGM family the SuperResolution / GradientAscent
+      examples already produce.
