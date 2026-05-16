@@ -311,8 +311,6 @@ breakdown:
       TNNetBias. Smallest non-trivial learnable-weight layer left.
 - [ ] TNNetIdentityScale — fixed (non-learnable) per-tensor scalar
       multiplier in FFloatSt[0]. Useful for the "warm-up scaling" trick.
-- [X] TNNetSign — `y = sign(x)` with straight-through-estimator backward
-      (saturated STE on `|x| ≤ 1`). Useful for binarized-net experiments.
 - [ ] TNNetPReLU — parametric ReLU with a single learnable negative-slope
       scalar.
 - [ ] TNNetPReLUChannel — per-channel PReLU (matches He 2015).
@@ -378,7 +376,6 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [X] TNNetGlobalSumPool — sum reduction over (X, Y) plane per channel.
 - [ ] TNNetGlobalMinPool — min reduction over (X, Y) plane per channel,
       completing the GlobalMax/GlobalAvg/GlobalSum family. Forward picks the
       minimum activation per channel (with a recorded argmin index per
@@ -624,8 +621,6 @@ breakdown:
       parameterised test walking every TNNetReLUBase descendant.
 
 ### Tooling / dev experience
-- [X] `scripts/list_activations.sh` — enumerate every TNNetReLUBase
-      descendant and cross-reference against `Test*Gradient` methods.
 - [ ] `scripts/new_layer.sh <Name>` scaffolder — drops a Compute/Backpropagate
       skeleton into neuralnetwork.pas plus a numerical-gradient test stub.
 - [ ] `scripts/new_activation.sh <Name>` scaffolder — narrower version for
@@ -633,8 +628,6 @@ breakdown:
 - [ ] `scripts/check_layer_dispatch.sh` — grep every `TNNet... = class`
       line, cross-reference against the two CreateLayer dispatch tables
       and the LoadFromString cascade, print any missing class.
-- [X] `scripts/coverage_gradient_tests.sh` — list layers whose Backpropagate
-      is overridden but lack `Test*Gradient*` methods.
 - [ ] `scripts/audit_landed.sh` — companion to `audit_tasklist.sh`. Every
       `[x]` line claiming a TNNet* landed must point at a real class in
       the dispatch AND at least one Test* method.
