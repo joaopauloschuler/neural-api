@@ -802,16 +802,6 @@ type
     procedure Compute(); override;
   end;
 
-  /// Neg activation function.
-  // Neg(x) = -x. Parameter-free. Derivative is -1; cached into
-  // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
-  // with one multiply. Plays well as a connective in residual-subtraction
-  // blocks (x - F(x)).
-  TNNetNeg = class(TNNetReLUBase)
-  public
-    procedure Compute(); override;
-  end;
-
   /// Sin activation function.
   // Sin(x) = sin(x). Parameter-free. Derivative is cos(x); cached into
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
@@ -7133,36 +7123,6 @@ begin
       if ax < RECIP_EPS then ax := RECIP_EPS;
       FOutput.FData[OutputCnt] := 1.0 / (s * ax);
     end;
-  end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-{ TNNetNeg }
-
-procedure TNNetNeg.Compute();
-var
-  SizeM1: integer;
-  LocalPrevOutput: TNNetVolume;
-  OutputCnt: integer;
-  StartTime: double;
-begin
-  StartTime := Now();
-  LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
-
-  // Neg(x) = -x. Derivative is constant -1.
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
-  begin
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      FOutput.FData[OutputCnt] := -LocalPrevOutput.FData[OutputCnt];
-      FOutputErrorDeriv.FData[OutputCnt] := -1.0;
-    end;
-  end
-  else
-  begin
-    for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := -LocalPrevOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -19430,7 +19390,6 @@ begin
       'TNNetExp' :                  Result := TNNetExp.Create();
       'TNNetLog' :                  Result := TNNetLog.Create();
       'TNNetReciprocal' :           Result := TNNetReciprocal.Create();
-      'TNNetNeg' :                  Result := TNNetNeg.Create();
       'TNNetSin' :                  Result := TNNetSin.Create();
       'TNNetCos' :                  Result := TNNetCos.Create();
       'TNNetSinhAct' :              Result := TNNetSinhAct.Create();
@@ -19631,7 +19590,6 @@ begin
       if S[0] = 'TNNetExp' then Result := TNNetExp.Create() else
       if S[0] = 'TNNetLog' then Result := TNNetLog.Create() else
       if S[0] = 'TNNetReciprocal' then Result := TNNetReciprocal.Create() else
-      if S[0] = 'TNNetNeg' then Result := TNNetNeg.Create() else
       if S[0] = 'TNNetSin' then Result := TNNetSin.Create() else
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
       if S[0] = 'TNNetSinhAct' then Result := TNNetSinhAct.Create() else

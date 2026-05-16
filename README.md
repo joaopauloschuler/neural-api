@@ -682,7 +682,6 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSin`                   | 1D, 2D, or 3D               | Sin           | Periodic activation: `y = sin(x)`. Useful as a SIREN-style coordinate activation. Created with `TNNetSin.Create()`. |
 | `TNNetCos`                   | 1D, 2D, or 3D               | Cos           | Periodic activation: `y = cos(x)`. Phase-shifted partner to `TNNetSin`. Created with `TNNetCos.Create()`. |
 | `TNNetSinc`                  | 1D, 2D, or 3D               | Sinc          | Normalized sinc activation: `y = sin(x)/x`, with analytic limit `y = 1` at `x = 0`. Created with `TNNetSinc.Create()`. |
-| `TNNetNeg`                   | 1D, 2D, or 3D               | Neg           | Elementwise negation: `y = -x`. Created with `TNNetNeg.Create()`. |
 | `TNNetPower`                 | 1D, 2D, or 3D               | Power         | Applies a power activation function.                                                                   |
 | `TNNetMulByConstant`         | 1D, 2D, or 3D               | * C           | Multiplies the output by a constant.                                                                   |
 | `TNNetNegate`                | 1D, 2D, or 3D               | * -1          | Multiplies the previous output by -1.                                                                  |

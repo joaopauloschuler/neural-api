@@ -8,6 +8,8 @@ duplicated the forward pass of existing layers:
 - `TNNetBias` — duplicate of `TNNetChannelBias` (forward pass).
 - `TNNetLayerScale` (and its alias `TNNetLearnableScale`) — duplicate of
   `TNNetChannelMul` (forward pass).
+- `TNNetNeg` — duplicate of `TNNetNegate` (which is itself just
+  `TNNetMulByConstant.Create(-1)`). Use `TNNetNegate` for `y = -x`.
 
 Do NOT add them back under any name. The minor differences they had
 (true-sum vs spatial-mean weight-gradient scaling; constructor-
