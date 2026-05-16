@@ -282,6 +282,8 @@ type
     procedure TestAbsForward;
     procedure TestAbsGradientCheck;
     procedure TestAbsSerializationRoundTrip;
+    procedure TestSignForwardAndSTEBackward;
+    procedure TestSignSerializationRoundTrip;
     procedure TestSquareForward;
     procedure TestSquareGradientCheck;
     procedure TestSquareSerializationRoundTrip;
@@ -8835,6 +8837,70 @@ procedure TTestNeuralNumerical.TestAbsSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetAbs.Create(),
     'Abs', 3, 1, 4, 1e-5);
+end;
+
+// Sign is non-differentiable, so we pin both forward and the saturated STE
+// backward against hand-picked values rather than running a numerical-gradient
+// check (central differences would compare a {-1,0,+1} step function against
+// a smooth surrogate and is meaningless here).
+procedure TTestNeuralNumerical.TestSignForwardAndSTEBackward;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  SignLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    SignLayer := NN.AddLayer(TNNetSign.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := -0.5;
+    Input.Raw[2] := 0.0;
+    Input.Raw[3] := 0.5;
+    Input.Raw[4] := 2.0;
+
+    // Forward pin: sign(x) over {-2, -0.5, 0, 0.5, 2}.
+    NN.Compute(Input);
+    AssertEquals('Sign(-2)',   -1.0, SignLayer.Output.Raw[0], 1e-6);
+    AssertEquals('Sign(-0.5)', -1.0, SignLayer.Output.Raw[1], 1e-6);
+    AssertEquals('Sign(0)',     0.0, SignLayer.Output.Raw[2], 1e-6);
+    AssertEquals('Sign(0.5)',   1.0, SignLayer.Output.Raw[3], 1e-6);
+    AssertEquals('Sign(2)',     1.0, SignLayer.Output.Raw[4], 1e-6);
+
+    // Backward pin: MSE loss derivative is (output - desired). Choose
+    // Desired = output - 1 so the upstream gradient entering Sign is
+    // all-1s. Saturated STE then zeroes the gradient where |x| > 1, so
+    // the input layer should receive {0, 1, 1, 1, 0}.
+    Desired.Raw[0] := SignLayer.Output.Raw[0] - 1.0;
+    Desired.Raw[1] := SignLayer.Output.Raw[1] - 1.0;
+    Desired.Raw[2] := SignLayer.Output.Raw[2] - 1.0;
+    Desired.Raw[3] := SignLayer.Output.Raw[3] - 1.0;
+    Desired.Raw[4] := SignLayer.Output.Raw[4] - 1.0;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    AssertEquals('STE grad at x=-2 (saturated)', 0.0, NN.Layers[0].OutputError.Raw[0], 1e-6);
+    AssertEquals('STE grad at x=-0.5',           1.0, NN.Layers[0].OutputError.Raw[1], 1e-6);
+    AssertEquals('STE grad at x=0',              1.0, NN.Layers[0].OutputError.Raw[2], 1e-6);
+    AssertEquals('STE grad at x=0.5',            1.0, NN.Layers[0].OutputError.Raw[3], 1e-6);
+    AssertEquals('STE grad at x=2 (saturated)',  0.0, NN.Layers[0].OutputError.Raw[4], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSignSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSign.Create(),
+    'Sign', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSquareForward;

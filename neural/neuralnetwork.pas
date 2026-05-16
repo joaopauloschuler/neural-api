@@ -744,6 +744,15 @@ type
     procedure Compute(); override;
   end;
 
+  /// Sign activation function with saturated straight-through estimator.
+  // Forward: sign(x) = +1 if x > 0, -1 if x < 0, 0 if x = 0.
+  // Backward (saturated STE): pass gradient through only where |x| <= 1.
+  // Cached in FOutputErrorDeriv so TNNetReLUBase handles the chain rule.
+  TNNetSign = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Square activation function.
   // Square(x) = x * x. Parameter-free. Derivative is 2*x. Cached in
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule.
@@ -6851,6 +6860,55 @@ begin
         FOutput.FData[OutputCnt] := x
       else
         FOutput.FData[OutputCnt] := -x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSign }
+
+procedure TNNetSign.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // sign(x) with saturated STE: derivative is 1 if |x| <= 1 else 0.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 0 then
+        FOutput.FData[OutputCnt] := 1
+      else if x < 0 then
+        FOutput.FData[OutputCnt] := -1
+      else
+        FOutput.FData[OutputCnt] := 0;
+      if Abs(x) <= 1 then
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0
+      else
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 0 then
+        FOutput.FData[OutputCnt] := 1
+      else if x < 0 then
+        FOutput.FData[OutputCnt] := -1
+      else
+        FOutput.FData[OutputCnt] := 0;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -19266,6 +19324,7 @@ begin
       'TNNetLogSigmoid' :           Result := TNNetLogSigmoid.Create();
       'TNNetShiftedReLU' :          Result := TNNetShiftedReLU.Create();
       'TNNetAbs' :                  Result := TNNetAbs.Create();
+      'TNNetSign' :                 Result := TNNetSign.Create();
       'TNNetSquare' :               Result := TNNetSquare.Create();
       'TNNetSqrt' :                 Result := TNNetSqrt.Create();
       'TNNetExp' :                  Result := TNNetExp.Create();
@@ -19465,6 +19524,7 @@ begin
       if S[0] = 'TNNetLogSigmoid' then Result := TNNetLogSigmoid.Create() else
       if S[0] = 'TNNetShiftedReLU' then Result := TNNetShiftedReLU.Create() else
       if S[0] = 'TNNetAbs' then Result := TNNetAbs.Create() else
+      if S[0] = 'TNNetSign' then Result := TNNetSign.Create() else
       if S[0] = 'TNNetSquare' then Result := TNNetSquare.Create() else
       if S[0] = 'TNNetSqrt' then Result := TNNetSqrt.Create() else
       if S[0] = 'TNNetExp' then Result := TNNetExp.Create() else
