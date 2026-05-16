@@ -1224,6 +1224,33 @@ type
     constructor Create(); override;
   end;
 
+  /// Log-Cosh loss output layer.
+  // Forward is an identity passthrough (so Net.Compute returns the raw
+  // regression head). Training relies on the framework seeding the last
+  // layer's FOutputError with (output - target); Backpropagate replaces
+  // each element V with tanh(V) before propagating. This is the gradient
+  // of L = sum( log(cosh(output - target)) ): smooth everywhere and
+  // bounded in [-1, 1]. No constructor parameter and no trainable state.
+  TNNetLogCoshLoss = class(TNNetIdentity)
+  public
+    constructor Create(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Charbonnier loss output layer (a.k.a. pseudo-Huber).
+  // Forward is identity passthrough. Backpropagate replaces each element
+  // V of FOutputError with V / sqrt(V*V + eps*eps) before propagating.
+  // This is the derivative of L = sum( sqrt(r^2 + eps^2) - eps ): smooth
+  // everywhere and bounded in [-1, 1] regardless of residual magnitude.
+  // The eps hyperparameter is stored in FFloatSt[0] (default 1e-3) and
+  // round-trips via Save/Load.
+  TNNetCharbonnierLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pEpsilon: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Per-sample L2 normalization across the depth axis.
   // For each spatial position (X,Y), treats the depth-axis vector v of length
   // Depth as a unit vector: y_i = x_i / sqrt(sum_j x_j^2 + eps). Output shape
@@ -5668,6 +5695,71 @@ end;
 constructor TNNetSmoothL1Loss.Create();
 begin
   inherited Create(1.0);
+end;
+
+{ TNNetLogCoshLoss }
+
+constructor TNNetLogCoshLoss.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetLogCoshLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  V: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    V := FOutputError.FData[Idx];
+    FOutputError.FData[Idx] := Tanh(V);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetCharbonnierLoss }
+
+constructor TNNetCharbonnierLoss.Create();
+begin
+  Create(0.001);
+end;
+
+constructor TNNetCharbonnierLoss.Create(pEpsilon: TNeuralFloat);
+begin
+  inherited Create();
+  if pEpsilon <= 0 then
+    FErrorProc('TNNetCharbonnierLoss epsilon must be > 0.');
+  FFloatSt[0] := pEpsilon;
+end;
+
+procedure TNNetCharbonnierLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Eps, EpsSq, V: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Eps := FFloatSt[0];
+  if Eps <= 0 then Eps := 0.001;
+  EpsSq := Eps * Eps;
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    V := FOutputError.FData[Idx];
+    FOutputError.FData[Idx] := V / Sqrt(V * V + EpsSq);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetL2Normalize }
@@ -18822,6 +18914,8 @@ begin
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetHuberLoss' :            Result := TNNetHuberLoss.Create(Ft[0]);
       'TNNetSmoothL1Loss' :         Result := TNNetSmoothL1Loss.Create();
+      'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
+      'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
@@ -19014,6 +19108,8 @@ begin
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetHuberLoss' then Result := TNNetHuberLoss.Create(Ft[0]) else
       if S[0] = 'TNNetSmoothL1Loss' then Result := TNNetSmoothL1Loss.Create() else
+      if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
+      if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else

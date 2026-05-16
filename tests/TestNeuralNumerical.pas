@@ -95,6 +95,12 @@ type
     procedure TestHuberLossGradientClipping;
     procedure TestSmoothL1LossDefaults;
     procedure TestHuberLossLoadFromString;
+    procedure TestLogCoshLossForwardPassthrough;
+    procedure TestLogCoshLossGradient;
+    procedure TestLogCoshLossLoadFromString;
+    procedure TestCharbonnierLossForwardPassthrough;
+    procedure TestCharbonnierLossGradient;
+    procedure TestCharbonnierLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -11139,6 +11145,265 @@ begin
       else if Vals[i] < -0.75 then Expected := -0.75
       else Expected := Vals[i];
       AssertEquals('HuberLoss delta round-trip clip at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogCoshLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetLogCoshLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetLogCoshLoss.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 4.0 - 0.5;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('LogCoshLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogCoshLossGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Vals: array[0..5] of TNeuralFloat;
+  i: integer;
+  Expected: TNeuralFloat;
+begin
+  // The framework seeds the last layer's OutputError with (output - target).
+  // TNNetLogCoshLoss is identity on forward, so Target := Input - Vals seeds
+  // exactly Vals into the loss layer. The backward must apply tanh.
+  Vals[0] :=  0.0;
+  Vals[1] :=  0.1;
+  Vals[2] := -0.1;
+  Vals[3] :=  1.0;
+  Vals[4] := -1.0;
+  Vals[5] :=  3.0;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Target := TNNetVolume.Create(6, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetLogCoshLoss.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) * 2.0;
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      Expected := Tanh(Vals[i]);
+      AssertEquals('LogCoshLoss tanh gradient at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogCoshLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  Vals: array[0..3] of TNeuralFloat;
+  Expected: TNeuralFloat;
+  i: integer;
+begin
+  Vals[0] :=  0.2;
+  Vals[1] := -0.6;
+  Vals[2] :=  1.5;
+  Vals[3] := -2.0;
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetLogCoshLoss.Create());
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetLogCoshLoss',
+      NN2.GetLastLayer is TNNetLogCoshLoss);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) + 0.2;
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      Expected := Tanh(Vals[i]);
+      AssertEquals('LogCoshLoss round-trip tanh at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCharbonnierLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetCharbonnierLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetCharbonnierLoss.Create(0.001));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 4.0 - 0.5;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('CharbonnierLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCharbonnierLossGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Vals: array[0..5] of TNeuralFloat;
+  Eps, Expected: TNeuralFloat;
+  i, CaseIdx: integer;
+begin
+  Vals[0] :=  0.0;
+  Vals[1] :=  0.1;
+  Vals[2] := -0.1;
+  Vals[3] :=  1.0;
+  Vals[4] := -1.0;
+  Vals[5] :=  3.0;
+
+  for CaseIdx := 0 to 1 do
+  begin
+    if CaseIdx = 0 then Eps := 0.001 else Eps := 0.5;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 1, 1);
+    Target := TNNetVolume.Create(6, 1, 1);
+    try
+      NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetCharbonnierLoss.Create(Eps));
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.5 + CaseIdx) * 2.0;
+      for i := 0 to Input.Size - 1 do
+        Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      for i := 0 to LMid.OutputError.Size - 1 do
+      begin
+        Expected := Vals[i] / Sqrt(Vals[i] * Vals[i] + Eps * Eps);
+        AssertEquals('CharbonnierLoss eps=' + FloatToStr(Eps) +
+          ' grad at ' + IntToStr(i),
+          Expected, LMid.OutputError.Raw[i], 0.00001);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCharbonnierLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  Vals: array[0..3] of TNeuralFloat;
+  Eps, Expected: TNeuralFloat;
+  i: integer;
+begin
+  Eps := 0.25;
+  Vals[0] :=  0.3;
+  Vals[1] := -0.5;
+  Vals[2] :=  1.4;
+  Vals[3] := -2.0;
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetCharbonnierLoss.Create(Eps));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetCharbonnierLoss',
+      NN2.GetLastLayer is TNNetCharbonnierLoss);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) + 0.2;
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      Expected := Vals[i] / Sqrt(Vals[i] * Vals[i] + Eps * Eps);
+      AssertEquals('CharbonnierLoss eps round-trip at ' + IntToStr(i),
         Expected, LMid.OutputError.Raw[i], 0.00001);
     end;
   finally
