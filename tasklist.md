@@ -376,7 +376,7 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [ ] TNNetGlobalMinPool — min reduction over (X, Y) plane per channel,
+- [X] TNNetGlobalMinPool — min reduction over (X, Y) plane per channel,
       completing the GlobalMax/GlobalAvg/GlobalSum family. Forward picks the
       minimum activation per channel (with a recorded argmin index per
       channel); Backpropagate routes the per-channel output gradient to the

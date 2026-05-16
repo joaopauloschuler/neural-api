@@ -155,6 +155,8 @@ type
     procedure TestReLU6ExtremeInputSaturation;
     procedure TestGlobalMaxPoolForward;
     procedure TestGlobalMaxPoolGradientCheck;
+    procedure TestGlobalMinPoolForward;
+    procedure TestGlobalMinPoolGradientCheck;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
     procedure TestTriangularCausalMaskForward;
@@ -4572,6 +4574,51 @@ begin
   // epsilon=1e-4 perturbation.
   LayerInputGradientCheck(Self, TNNetGlobalMaxPool.Create(),
     'GlobalMaxPool', 3, 3, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGlobalMinPoolForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  // 2 x 2 x 3 input; expect 1 x 1 x 3 output containing per-channel min.
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetGlobalMinPool.Create());
+
+    // Channel 0: min = 1.0 at (0,0)
+    Input[0, 0, 0] := 1.0;  Input[1, 0, 0] := 4.0;
+    Input[0, 1, 0] := 2.0;  Input[1, 1, 0] := 3.0;
+    // Channel 1: min = -2.0 at (1,0)
+    Input[0, 0, 1] := -1.0; Input[1, 0, 1] := -2.0;
+    Input[0, 1, 1] :=  0.5; Input[1, 1, 1] := -0.5;
+    // Channel 2: min = 6.0 at (0,1)
+    Input[0, 0, 2] := 7.0;  Input[1, 0, 2] := 8.0;
+    Input[0, 1, 2] := 6.0;  Input[1, 1, 2] := 9.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('GlobalMinPool ch0', 1.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    AssertEquals('GlobalMinPool ch1', -2.0, NN.GetLastLayer.Output[0, 0, 1], 0.0001);
+    AssertEquals('GlobalMinPool ch2', 6.0, NN.GetLastLayer.Output[0, 0, 2], 0.0001);
+    AssertEquals('GlobalMinPool output SizeX', 1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GlobalMinPool output SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('GlobalMinPool output Depth', 3, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGlobalMinPoolGradientCheck;
+begin
+  // 3 x 3 x 2 input. The Sin(i*0.7)*2.0+0.3 pattern from the helper
+  // generates distinct values, so the argmin stays stable under the
+  // epsilon=1e-4 perturbation.
+  LayerInputGradientCheck(Self, TNNetGlobalMinPool.Create(),
+    'GlobalMinPool', 3, 3, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestReLU6ExtremeInputSaturation;
