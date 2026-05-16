@@ -220,6 +220,10 @@ type
     procedure TestSoftMinSumsToOne;
     procedure TestSoftMinEquivalence;
     procedure TestSoftMinGradientCheck;
+    procedure TestSoftMaxOneForward;
+    procedure TestSoftMaxOneInvariantUnderShift;
+    procedure TestSoftMaxOneGradientCheck;
+    procedure TestSoftMaxOneLoadFromString;
     procedure TestLogSoftMaxForward;
     procedure TestLogSoftMaxGradientCheck;
     procedure TestLogSoftMaxSerializationRoundTrip;
@@ -11411,6 +11415,206 @@ begin
     NN2.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMaxOneForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X: array[0..3] of TNeuralFloat;
+  Denom, Sum: TNeuralFloat;
+  Expected: array[0..3] of TNeuralFloat;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4));
+    NN.AddLayer(TNNetSoftMaxOne.Create());
+
+    X[0] :=  1.0;
+    X[1] :=  2.0;
+    X[2] :=  0.5;
+    X[3] := -1.0;
+    for i := 0 to 3 do
+      Input.Raw[i] := X[i];
+
+    NN.Compute(Input);
+
+    Denom := 1.0;
+    for i := 0 to 3 do
+      Denom := Denom + Exp(X[i]);
+    for i := 0 to 3 do
+      Expected[i] := Exp(X[i]) / Denom;
+
+    Sum := 0;
+    for i := 0 to 3 do
+    begin
+      AssertEquals('SoftMaxOne y[' + IntToStr(i) + ']',
+        Expected[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+      Sum := Sum + NN.GetLastLayer.Output.Raw[i];
+    end;
+    AssertTrue('SoftMaxOne sum should be strictly less than 1 (sum=' +
+      FloatToStr(Sum) + ')', Sum < 1.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMaxOneInvariantUnderShift;
+var
+  NN: TNNet;
+  Input, Shifted: TNNetVolume;
+  Out0, Out1: array[0..3] of TNeuralFloat;
+  i: integer;
+  Differs: boolean;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  Shifted := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4));
+    NN.AddLayer(TNNetSoftMaxOne.Create());
+
+    Input.Raw[0] :=  1.0;
+    Input.Raw[1] :=  2.0;
+    Input.Raw[2] :=  0.5;
+    Input.Raw[3] := -1.0;
+    for i := 0 to 3 do
+      Shifted.Raw[i] := Input.Raw[i] + 10.0;
+
+    NN.Compute(Input);
+    for i := 0 to 3 do
+      Out0[i] := NN.GetLastLayer.Output.Raw[i];
+
+    NN.Compute(Shifted);
+    for i := 0 to 3 do
+      Out1[i] := NN.GetLastLayer.Output.Raw[i];
+
+    Differs := false;
+    for i := 0 to 3 do
+      if Abs(Out0[i] - Out1[i]) > 1e-4 then Differs := true;
+    AssertTrue('SoftMaxOne must NOT be shift-invariant (the +1 breaks symmetry)',
+      Differs);
+  finally
+    NN.Free;
+    Input.Free;
+    Shifted.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMaxOneGradientCheck;
+var
+  NN: TNNet;
+  Input, InputEps: TNNetVolume;
+  Seed: array[0..3] of TNeuralFloat;
+  AnaGrad, NumGrad, LossP, LossM, OldX: TNeuralFloat;
+  epsilon: TNeuralFloat;
+  i, k: integer;
+  SoftLayer: TNNetLayer;
+
+  function LossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j: integer;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for j := 0 to NN.GetLastLayer.Output.Size - 1 do
+      Result := Result + Seed[j] * NN.GetLastLayer.Output.Raw[j];
+  end;
+
+begin
+  epsilon := 1e-3;
+  Seed[0] :=  0.3;
+  Seed[1] := -0.7;
+  Seed[2] :=  0.2;
+  Seed[3] :=  1.1;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  InputEps := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    SoftLayer := NN.AddLayer(TNNetSoftMaxOne.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Input.Raw[0] :=  0.4;
+    Input.Raw[1] := -0.2;
+    Input.Raw[2] :=  1.1;
+    Input.Raw[3] :=  0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputEps.Copy(Input);
+      OldX := Input.Raw[i];
+      InputEps.Raw[i] := OldX + epsilon;
+      LossP := LossAt(InputEps);
+      InputEps.Raw[i] := OldX - epsilon;
+      LossM := LossAt(InputEps);
+      NumGrad := (LossP - LossM) / (2 * epsilon);
+
+      // Analytical: forward on Input, reset (clears OutputError), then seed
+      // SoftMaxOne's FOutputError and backprop. The seeded gradient is the
+      // partial derivative of loss = sum_j seed_j * y_j w.r.t. each output y.
+      NN.Compute(Input);
+      NN.ResetBackpropCallCurrCnt();
+      for k := 0 to SoftLayer.OutputError.Size - 1 do
+        SoftLayer.OutputError.Raw[k] := Seed[k];
+      SoftLayer.Backpropagate();
+      AnaGrad := NN.Layers[1].OutputError.Raw[i];
+
+      AssertTrue('SoftMaxOne grad check at ' + IntToStr(i) + ' (num=' +
+        FloatToStr(NumGrad) + ' ana=' + FloatToStr(AnaGrad) + ')',
+        Abs(NumGrad - AnaGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputEps.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMaxOneLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  S: string;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetSoftMaxOne.Create());
+
+    Input.Raw[0] :=  0.6;
+    Input.Raw[1] := -0.3;
+    Input.Raw[2] :=  1.4;
+    Input.Raw[3] :=  0.1;
+
+    NN.Compute(Input);
+
+    S := NN.SaveToString();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded last layer is TNNetSoftMaxOne',
+      NN2.GetLastLayer is TNNetSoftMaxOne);
+
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SoftMaxOne reload output[' + IntToStr(i) + ']',
+        NN.GetLastLayer.Output.Raw[i],
+        NN2.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
   end;
 end;
 
