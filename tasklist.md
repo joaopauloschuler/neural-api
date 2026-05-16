@@ -5463,12 +5463,13 @@ already pinned several batches up, the activation form is not).
 
 #### Activations I'd enjoy building
 
-- [ ] TNNetTanhGLU — the missing tanh sibling of the existing
+- [x] TNNetTanhGLU — the missing tanh sibling of the existing
       GLU/ReGLU/GEGLU/SwiGLU family. Splits input along the depth
       axis into A | B, outputs `A * tanh(B)`, output depth =
       input depth / 2. Parameter-free; numerical-gradient test
       mirroring the existing TNNetGLU one with a one-line swap
-      of the gating function.
+      of the gating function. *Landed commit ba8d2fc with forward,
+      gradient and serialization round-trip tests; README row added.*
 
 #### Probability projections I'd enjoy building
 
@@ -5668,14 +5669,17 @@ TNNetIdentity).
       the same eval split. Now genuinely unblocked: the loss
       layer ships and round-trips via Save/Load.
 
-- [ ] Log-cosh-vs-log-cosh dual experiment on the hypotenuse toy:
+- [x] Log-cosh-vs-log-cosh dual experiment on the hypotenuse toy:
       one run with TNNetLogCoshActivation in the hidden layer and
       a plain MSE head; another with the same activation plus a
-      TNNetLogCoshLoss head. ~30 lines on top of the existing
-      Hypotenuse example. The activation alone already landed
-      late in the HyperbolicActivationBakeOff (crosses MSE<5 at
-      epoch 148); pairing it with the matching loss is the
-      natural follow-up.
+      TNNetLogCoshLoss head. *Landed at examples/LogCoshDualExperiment/
+      (commit b2ea708). 50 epochs each, ~113s wall-clock total.
+      Findings: at 50 epochs both heads land in the same ballpark
+      (~22-24 MSE); the LogCoshLoss head's bounded `tanh(residual)`
+      gradient trades raw convergence speed for outlier robustness,
+      visible as slightly slower early descent. Neither config
+      crosses MSE<5 in 50 epochs — a longer-horizon follow-up
+      (200+ epochs, multi-seed) would tell a cleaner story.*
 
 - [ ] Softmax-vs-SoftmaxOne(-vs-Sparsemax) bake-off as a pure-
       forward-pass comparison: same Q,K,V tensors, print entropy
@@ -5717,3 +5721,40 @@ TNNetIdentity).
       seconds on CPU, and gives a satisfying visual artifact in
       the same PGM family the SuperResolution / GradientAscent
       examples already produce.
+
+### Lucky-day batch — 2026-05-15 (seed 81175)
+
+Landed this session (two serial opus agents, two commits):
+- TNNetTanhGLU (`y = A * tanh(B)`, output depth = input depth / 2,
+  parameter-free) — commit ba8d2fc. Three new tests in
+  TestNeuralNumerical.pas (forward, gradient, serialization
+  round-trip) plus a README gating-layer table row. Test suite
+  grew from 518 to 521/521 green.
+- `examples/LogCoshDualExperiment/` — pairs TNNetLogCoshActivation
+  (hidden) with TNNetLogCoshLoss (head) vs. plain MSE head on the
+  hypotenuse toy. Two configurations, fixed seed=42, 50 epochs each.
+  Commit b2ea708. Wall-clock ~113s. Examples-index row in top-level
+  README updated.
+
+Test suite remains green at 521/521.
+
+#### Small follow-ups pinned from this batch
+
+- [ ] TanhGLU vs SwiGLU vs GEGLU vs GLU vs ReGLU bake-off: same
+      tiny seq model, swap the gating layer, chart final loss
+      and wall-clock. Now genuinely unblocked since all five
+      gating variants exist. ~50 lines.
+
+- [ ] LogCoshDualExperiment longer-horizon follow-up: extend the
+      run to 200-300 epochs and 5 seeds (mean ± std reporting),
+      so the bounded-gradient vs. unbounded-gradient story can
+      actually be observed crossing the MSE<5 threshold. Current
+      50-epoch budget is too short for the LogCoshLoss head to
+      catch up to MSE.
+
+- [ ] Plain-Tanh vs TanhGLU FFN ablation: same minimal-
+      transformer-without-attention skeleton (pre-norm-residual +
+      gated FFN), swap the gating layer between plain TNNetGLU
+      and TNNetTanhGLU. Cheapest possible "does tanh-gating beat
+      sigmoid-gating in practice?" data point now that the layer
+      ships.
