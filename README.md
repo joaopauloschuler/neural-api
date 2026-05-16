@@ -67,6 +67,7 @@ You can learn more about how to build and train simple neural networks at the fo
 * [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
 * [Hyperbolic activation bake-off on the hypotenuse toy](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HyperbolicActivationBakeOff) — compares 8 hyperbolic-family activations (`TNNetHyperbolicTangent`, `TNNetLeCunTanh`, `TNNetSinhAct`, `TNNetArcSinh`, `TNNetLisht`, `TNNetBentIdentity`, `TNNetTanhExp`, `TNNetLogCoshActivation`) on the same tiny MLP / RNG seed and prints a CSV of final MSE and epochs-to-converge.
 * [LogCosh dual experiment](https://github.com/joaopauloschuler/neural-api/tree/master/examples/LogCoshDualExperiment) — pairs `TNNetLogCoshActivation` (hidden) with `TNNetLogCoshLoss` (output head) vs. a plain MSE head on the hypotenuse toy task; prints a CSV comparing final validation MSE and epochs-to-converge.
+* [Learning-rate range test](https://github.com/joaopauloschuler/neural-api/tree/master/examples/LearningRateFinder) — Leslie Smith's LR-range-test in pure Pascal: trains a tiny MLP for ~100 mini-batches sweeping LR exponentially from 1e-6 to 1e+1, prints a 1-column ASCII chart of `log10(LR)` vs smoothed loss with the steepest-descent row marked, and writes a CSV side-output for downstream tooling.
 
 ### Loading and Saving Neural Networks
 Loading is very easy:
@@ -533,6 +534,8 @@ Random layers (`TNNetRandomMulAdd`, `TNNetChannelRandomMulAdd`) serve as powerfu
 | `TNNetLocalResponseNormDepth`| 2D or 3D                    | Non-trainable local response normalization with depth normalization.                                 |
 | `TNNetRandomMulAdd`          | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift).                                                  |
 | `TNNetChannelRandomMulAdd`   | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift) per channel.                                      |
+| `TNNetGaussianNoise`         | 1D, 2D, or 3D               | Additive `N(0, σ²)` noise at training, identity at inference. σ stored in `FFloatSt[0]`.            |
+| `TNNetGaussianDropout`       | 1D, 2D, or 3D               | Multiplicative `N(1, σ²)` noise at training, identity at inference. σ stored in `FFloatSt[0]`.      |
 
 These layers provide various tools for normalization, regularization, and introducing controlled variability in neural networks. The choice of which layers to use and where to place them in your network architecture depends on the specific problem you're trying to solve, the characteristics of your data, and the behavior you want to encourage in your model.
 
