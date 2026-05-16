@@ -1,5 +1,23 @@
 # Task List — Feature & Enhancement Ideas
 
+## DO NOT REINTRODUCE — removed by intent
+
+The following layer types were intentionally removed because they
+duplicated the forward pass of existing layers:
+
+- `TNNetBias` — duplicate of `TNNetChannelBias` (forward pass).
+- `TNNetLayerScale` (and its alias `TNNetLearnableScale`) — duplicate of
+  `TNNetChannelMul` (forward pass).
+
+Do NOT add them back under any name. The minor differences they had
+(true-sum vs spatial-mean weight-gradient scaling; constructor-
+configurable initial scale) are not worth the code duplication. If a
+true-sum gradient or a configurable initial multiplier is genuinely
+needed, extend `TNNetChannelBias` / `TNNetChannelMul` with an option
+flag instead of forking a new layer class. Any task entry below that
+references these removed layers is obsolete and should be ignored
+rather than acted on.
+
 ## New layer types
 - [ ] TNNetMultiHeadSelfAttention + full transformer encoder/decoder blocks
 - [ ] Sparse / mixture-of-experts routing layer
@@ -32,20 +50,6 @@
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
 - [ ] Auto-generated layer API reference from doc comments
-- [ ] Improve source-code comments for TNNetBias and TNNetChannelBias
-      in neural/neuralnetwork.pas. Both add a learnable per-channel
-      offset Bias[d] with identical forward pass
-      (Output[x,y,d] = Input[x,y,d] + Bias[d]) and identity input
-      gradient, so they look interchangeable at first glance. The doc
-      comments should spell out the one real difference: the bias
-      weight-gradient scaling in Backpropagate. TNNetBias uses the
-      true channel-summed gradient (-LearningRate * sum_{x,y} dY),
-      while TNNetChannelBias divides by SizeX*SizeY
-      (-LearningRate/FOutputChannelSize * sum_{x,y} dY), i.e. uses
-      the spatial-mean gradient so the effective bias LR is
-      independent of spatial resolution. Add a one-line guidance note
-      on when to pick which (standalone bias primitive vs companion
-      to normalization stacks like AddMovingNorm).
 - [ ] Improve source-code comments for TNNetChannelShuffle and
       TNNetInterleaveChannels in neural/neuralnetwork.pas. Both are
       parameter-free channel-permutation layers and are easily confused.
@@ -318,8 +322,6 @@ breakdown:
       fixed (non-trainable) binomial blur filter.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-- [ ] TNNetMul — multiplicative per-channel learnable scale, the twin of
-      TNNetBias. Smallest non-trivial learnable-weight layer left.
 - [ ] TNNetIdentityScale — fixed (non-learnable) per-tensor scalar
       multiplier in FFloatSt[0]. Useful for the "warm-up scaling" trick.
 - [ ] TNNetPReLU — parametric ReLU with a single learnable negative-slope
@@ -582,7 +584,7 @@ breakdown:
       sampling and pin the convention (currently `sign(0) = 0`).
 - [ ] TNNetSquare gradient-magnitude sanity test at large |x|.
 - [ ] TNNetReciprocal small-|x| gradient-magnitude sanity check.
-- [ ] TNNetReZero / TNNetBias non-default ctor LoadFromString round-trip:
+- [ ] TNNetReZero non-default ctor LoadFromString round-trip:
       construct with non-default values, serialize, reload, assert preserved.
 - [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer raises the
       documented error when SizeY > 1.
@@ -731,11 +733,11 @@ breakdown:
 - [ ] `examples/SubPixelSuperRes/` — once TNNetPixelShuffle lands, a
       3-layer net that learns to 2x-upsample 8x8 random checkerboards.
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
-      fine-tune only inserted TNNetBias layers on a new task (BitFit-style
-      cheap adaptation).
-- [ ] `examples/AffineFineTune/` — once TNNetMul + TNNetAffineBlock land,
-      same pattern but freezing everything except the inserted Affine
-      blocks.
+      fine-tune only inserted TNNetChannelBias layers on a new task
+      (BitFit-style cheap adaptation).
+- [ ] `examples/AffineFineTune/` — once TNNetAffineBlock lands, same
+      pattern but freezing everything except the inserted Affine blocks
+      (built on TNNetChannelBias + TNNetChannelMul).
 - [ ] `examples/TokenShiftBaseline/` — train a tiny next-token char model
       with `TNNetEmbedding → TNNetTokenShift → MLP` and compare against
       the eventual MHA-based version.
@@ -843,9 +845,9 @@ breakdown:
 - [ ] Causal-conv vs token-shift vs SDPA on the same toy next-token task.
 - [ ] GRN-as-drop-in: take SimpleImage CIFAR, swap each
       TNNetMovingStdNormalization for TNNetGRN and chart accuracy.
-- [ ] TNNetBias-vs-TNNetMul ablation: train a small classifier four ways
-      — (a) no affine, (b) bias only, (c) mul only, (d) both — print
-      final accuracy and learnable params per variant.
+- [ ] TNNetChannelBias-vs-TNNetChannelMul ablation: train a small
+      classifier four ways — (a) no affine, (b) bias only, (c) mul only,
+      (d) both — print final accuracy and learnable params per variant.
 - [ ] Maxout vs ReLU width-trade study at matched parameter count.
 - [ ] Sinusoidal vs learned positional embedding head-to-head on the
       binary-addition task.
@@ -949,8 +951,9 @@ breakdown:
       `groups ∈ {1, 2, 4, 8}` and chart accuracy.
 - [ ] "Does ChannelShuffle help small models?" experiment on SimpleImage
       CIFAR at matched parameter count.
-- [ ] "Why bother with LayerScale?" experiment: train two deep MLPs (one
-      with TNNetLayerScale, one without) on a toy regression task; chart
+- [ ] "Why bother with a learnable per-channel scale?" experiment: train
+      two deep MLPs (one with a small-init TNNetChannelMul on each
+      residual branch, one without) on a toy regression task; chart
       per-layer gradient norms.
 - [ ] DropPath-strict-drop teaching artifact: confirm a deep residual net
       with p=1 DropPath after every block collapses to the identity-path
