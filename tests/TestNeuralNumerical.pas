@@ -70,6 +70,8 @@ type
     procedure TestInstanceNormSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
+    procedure TestZScoreForward;
+    procedure TestZScoreGradientCheck;
     procedure TestPixelNormForward;
     procedure TestPixelNormGradientCheck;
     procedure TestPixelNormSerializationRoundTrip;
@@ -2019,6 +2021,45 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestZScoreForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ZNorm: TNNetZScore;
+  Mean, Variance, diff: TNeuralFloat;
+  i: integer;
+begin
+  // TNNetZScore is parameter-free: output must have ~zero mean and ~unit
+  // variance over the whole sample.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2));
+    ZNorm := TNNetZScore.Create();
+    NN.AddLayer(ZNorm);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.5 - 3.0;
+
+    NN.Compute(Input);
+
+    Mean := NN.GetLastLayer.Output.GetAvg();
+    Variance := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[i] - Mean;
+      Variance := Variance + diff * diff;
+    end;
+    Variance := Variance / NN.GetLastLayer.Output.Size;
+
+    AssertEquals('ZScore output mean should be ~0', 0.0, Mean, 1e-5);
+    AssertEquals('ZScore output variance should be ~1', 1.0, Variance, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestPixelNormForward;
 var
   NN: TNNet;
@@ -3464,6 +3505,14 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestZScoreGradientCheck;
+begin
+  // Seed inputs with non-trivial distribution (mean != 0, var != 1) inside
+  // LayerInputGradientCheck so eps perturbations exercise the full Jacobian.
+  LayerInputGradientCheck(Self, TNNetZScore.Create(),
+    'ZScore', 3, 2, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestPadXYGradientCheck;

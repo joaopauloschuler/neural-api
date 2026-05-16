@@ -366,7 +366,7 @@ breakdown:
 - [ ] TNNetUnitNorm — alias for L2Normalize on the full volume (Keras name).
 - [ ] TNNetMinMaxNorm — `(x - min(x)) / (max(x) - min(x) + eps)` per sample,
       with subgradient routing for the argmin/argmax cells.
-- [ ] TNNetZScore — `(x - mean) / std` per sample (no learnable scale/bias)
+- [X] TNNetZScore — `(x - mean) / std` per sample (no learnable scale/bias)
       — the unparameterised core of LayerNorm.
 - [ ] TNNetUnitNormConstraint — projection layer that L2-normalizes the
       *weights* of the previous trainable layer after each step.

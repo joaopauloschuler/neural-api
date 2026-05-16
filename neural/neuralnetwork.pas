@@ -1715,6 +1715,27 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Unparameterised per-sample z-score normalization — the core of
+  // TNNetLayerNorm without the learnable gamma/beta. Each input sample
+  // (all elements across SizeX*SizeY*Depth) is shifted to zero mean and
+  // scaled to unit variance: y = (x - mean) / sqrt(var + eps). Output has
+  // the same shape as the input. Backward applies the exact LayerNorm-style
+  // Jacobian without affine:
+  //   dX = (1/sigma) * (dY - mean(dY) - x_hat * mean(dY * x_hat))
+  // where x_hat is the normalized forward activation.
+  TNNetZScore = class(TNNetIdentityWithoutL2)
+    private
+      FZScoreEpsilon: TNeuralFloat;
+      FInvStdDev: TNeuralFloat;
+      FNormalized: TNNetVolume;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// StyleGAN-style per-pixel feature-vector normalization. For each (x, y)
   // position the Depth-dimensional feature vector is divided by its root
   // mean square over the depth axis, giving each pixel a unit-RMS feature
@@ -12189,6 +12210,88 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetZScore }
+constructor TNNetZScore.Create();
+begin
+  inherited Create();
+  FZScoreEpsilon := 1e-8;
+  FInvStdDev := 1;
+  FNormalized := TNNetVolume.Create();
+end;
+
+destructor TNNetZScore.Destroy();
+begin
+  FNormalized.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetZScore.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FNormalized.ReSize(FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetZScore.Compute();
+var
+  StartTime: double;
+  Mean, Variance: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  // Normalize the whole sample to zero mean and unit variance.
+  Mean := FOutput.GetAvg();
+  FOutput.Sub(Mean);
+  Variance := FOutput.GetSumSqr() / FOutput.Size;
+  FInvStdDev := 1 / Sqrt(Variance + FZScoreEpsilon);
+  FOutput.Mul(FInvStdDev);
+  // Keep the normalized values for the backward pass.
+  FNormalized.Copy(FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetZScore.Backpropagate();
+var
+  StartTime: double;
+  FloatSize: TNeuralFloat;
+  SumDy, SumDyXHat: TNeuralFloat;
+  Cnt, SizeM1: integer;
+  Dy: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  FloatSize := FOutput.Size;
+  SizeM1 := FOutput.Size - 1;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // No affine: dxhat = dY directly.
+    // dx = invStdDev * ( dY - mean(dY) - xhat * mean(dY*xhat) )
+    SumDy := 0;
+    SumDyXHat := 0;
+    for Cnt := 0 to SizeM1 do
+    begin
+      Dy := FOutputError.FData[Cnt];
+      SumDy := SumDy + Dy;
+      SumDyXHat := SumDyXHat + Dy * FNormalized.FData[Cnt];
+    end;
+    SumDy := SumDy / FloatSize;
+    SumDyXHat := SumDyXHat / FloatSize;
+    for Cnt := 0 to SizeM1 do
+    begin
+      FPrevLayer.FOutputError.FData[Cnt] :=
+        FPrevLayer.FOutputError.FData[Cnt] +
+        FInvStdDev * ( FOutputError.FData[Cnt] - SumDy -
+          FNormalized.FData[Cnt] * SumDyXHat );
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetPixelNorm }
 constructor TNNetPixelNorm.Create();
 begin
@@ -19631,6 +19734,7 @@ begin
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
+      'TNNetZScore':                Result := TNNetZScore.Create();
       'TNNetPixelNorm':             Result := TNNetPixelNorm.Create();
       'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
       'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create();
@@ -19833,6 +19937,7 @@ begin
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
+      if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
       if S[0] = 'TNNetPixelNorm' then Result := TNNetPixelNorm.Create() else
       if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
       if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create() else
