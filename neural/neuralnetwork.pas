@@ -968,6 +968,18 @@ type
     procedure Compute(); override;
   end;
 
+  /// ThresholdedReLU activation function.
+  // ThresholdedReLU(x) = x if x > theta else 0. Equivalent to TNNetThreshold
+  // with value fixed at 0, and a default theta of 1.0. Derivative is 1 for
+  // x > theta, else 0 (indicator function with a non-differentiable kink at
+  // x = theta). theta is stored in FFloatSt[0] for serialization.
+  TNNetThresholdedReLU = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(Threshold: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -7796,6 +7808,65 @@ begin
         FOutput.FData[OutputCnt] := x
       else
         FOutput.FData[OutputCnt] := ValueBelow;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetThresholdedReLU }
+
+constructor TNNetThresholdedReLU.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetThresholdedReLU.Create(Threshold: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := Threshold;
+end;
+
+procedure TNNetThresholdedReLU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, Theta: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Theta := FFloatSt[0];
+
+  // ThresholdedReLU(x) = x if x > theta else 0; derivative is 1 if x > theta else 0.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > Theta then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > Theta then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := 0;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -19343,6 +19414,7 @@ begin
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
       'TNNetThreshold' :            Result := TNNetThreshold.Create(Ft[0], Ft[1]);
+      'TNNetThresholdedReLU' :      Result := TNNetThresholdedReLU.Create(Ft[0]);
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
@@ -19543,6 +19615,7 @@ begin
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
       if S[0] = 'TNNetThreshold' then Result := TNNetThreshold.Create(Ft[0], Ft[1]) else
+      if S[0] = 'TNNetThresholdedReLU' then Result := TNNetThresholdedReLU.Create(Ft[0]) else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else

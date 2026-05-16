@@ -321,7 +321,7 @@ breakdown:
       derivative guard).
 - [ ] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
       neuron per forward pass during training, fixed at average at inference.
-- [ ] TNNetThresholdedReLU — `y = x if x > θ else 0`, θ in FFloatSt[0]
+- [X] TNNetThresholdedReLU — `y = x if x > θ else 0`, θ in FFloatSt[0]
       (default 1.0).
 - [ ] TNNetISRU / TNNetISRLU — Inverse-Square-Root (Linear) Unit.
       `y = x / sqrt(1 + α·x²)`.
