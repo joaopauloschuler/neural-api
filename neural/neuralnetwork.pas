@@ -1080,6 +1080,20 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Tanh-gated linear unit - This is an experimental layer.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A and B and outputs A * tanh(B). Output depth = input depth / 2.
+  // Parameter-free; the input depth must be even. Mirrors TNNetGLU with
+  // the sigmoid gate swapped for tanh; tanh'(b) = 1 - tanh^2(b).
+  TNNetTanhGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Pairwise cosine similarity along the depth-half-split.
   // Splits the input along the channel (depth) axis into two equal halves
   // a and b (each of depth D/2) and produces, per (X, Y) cell, the scalar
@@ -5293,6 +5307,87 @@ begin
           FPrevLayer.FOutputError.Add(X, Y, D, err * reluDeriv * b);
           // dL/db = ReLU(a) * dL/dy
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * reluA);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetTanhGLU }
+
+constructor TNNetTanhGLU.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetTanhGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetTanhGLU requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetTanhGLU.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, tanhVal: TNeuralFloat;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        tanhVal := Tanh(b);
+        FOutput[X, Y, D] := a * tanhVal;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTanhGLU.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, tanhVal, tanhDeriv, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          tanhVal := Tanh(b);
+          // tanh'(b) = 1 - tanh^2(b)
+          tanhDeriv := 1 - tanhVal * tanhVal;
+          err := FOutputError[X, Y, D];
+          FPrevLayer.FOutputError.Add(X, Y, D, err * tanhVal);
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * tanhDeriv);
         end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -18997,6 +19092,7 @@ begin
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetReGLU' :                Result := TNNetReGLU.Create();
+      'TNNetTanhGLU' :              Result := TNNetTanhGLU.Create();
       'TNNetCosineSimilarity' :     Result := TNNetCosineSimilarity.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
@@ -19192,6 +19288,7 @@ begin
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
+      if S[0] = 'TNNetTanhGLU' then Result := TNNetTanhGLU.Create() else
       if S[0] = 'TNNetCosineSimilarity' then Result := TNNetCosineSimilarity.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else

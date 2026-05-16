@@ -692,6 +692,7 @@ Gated Linear Units split the input along the channel (depth) axis into two equal
 | `TNNetGLU`                   | 1D, 2D, or 3D (even depth)  | Gated Linear Unit: outputs `A * sigmoid(B)` (https://arxiv.org/abs/1612.08083). Created with `TNNetGLU.Create()`. |
 | `TNNetGEGLU`                 | 1D, 2D, or 3D (even depth)  | GELU-gated linear unit: outputs `A * GELU(B)`. Created with `TNNetGEGLU.Create()`. |
 | `TNNetSwiGLU`                | 1D, 2D, or 3D (even depth)  | Swish-gated linear unit: outputs `A * Swish(B)`, where `Swish(x) = x * sigmoid(x)`. Created with `TNNetSwiGLU.Create()`. |
+| `TNNetTanhGLU`               | 1D, 2D, or 3D (even depth)  | Tanh-gated linear unit: outputs `A * tanh(B)`. Parameter-free; mirrors `TNNetGLU` with the sigmoid gate swapped for tanh. Created with `TNNetTanhGLU.Create()`. |
 
 ### Attention Masking
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |

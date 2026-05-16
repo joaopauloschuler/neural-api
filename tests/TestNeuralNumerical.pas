@@ -117,6 +117,9 @@ type
     procedure TestSwiGLUGradientCheck;
     procedure TestGLUForward;
     procedure TestGLUGradientCheck;
+    procedure TestTanhGLUForward;
+    procedure TestTanhGLUGradientCheck;
+    procedure TestTanhGLUSerializationRoundTrip;
     procedure TestReGLUForward;
     procedure TestReGLUGradientCheck;
     procedure TestCosineSimilarityForward;
@@ -349,6 +352,7 @@ type
     procedure TestGlobalAvgPoolSerializationRoundTrip;
     procedure TestSwiGLUSerializationRoundTrip;
     procedure TestGEGLUSerializationRoundTrip;
+    // (TestTanhGLUSerializationRoundTrip published alongside TestTanhGLU* above)
     procedure TestLayerScaleSerializationRoundTrip;
 
     // Concat and sum numerical tests
@@ -3895,6 +3899,47 @@ end;
 procedure TTestNeuralNumerical.TestGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetGLU.Create(), 'GLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestTanhGLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  a, b, expected: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetTanhGLU.Create());
+
+    Input.Raw[0] := 2.0;   // A[0]
+    Input.Raw[1] := -1.5;  // A[1]
+    Input.Raw[2] := 1.0;   // B[0]
+    Input.Raw[3] := -0.5;  // B[1]
+
+    NN.Compute(Input);
+
+    AssertEquals('TanhGLU output depth = input depth / 2', 2,
+      NN.GetLastLayer.Output.Depth);
+
+    // output[0] = A[0] * tanh(B[0])
+    a := 2.0; b := 1.0;
+    expected := a * Tanh(b);
+    AssertEquals('TanhGLU output[0]', expected, NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    a := -1.5; b := -0.5;
+    expected := a * Tanh(b);
+    AssertEquals('TanhGLU output[1]', expected, NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTanhGLUGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetTanhGLU.Create(), 'TanhGLU', 2, 2, 4, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestReGLUForward;
@@ -10101,6 +10146,13 @@ begin
   // GEGLU halves the channel depth, so the input depth must be even.
   SerializationRoundTrip(Self, TNNetGEGLU.Create(),
     'GEGLU', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestTanhGLUSerializationRoundTrip;
+begin
+  // TanhGLU halves the channel depth, so the input depth must be even.
+  SerializationRoundTrip(Self, TNNetTanhGLU.Create(),
+    'TanhGLU', 2, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestLayerScaleSerializationRoundTrip;
