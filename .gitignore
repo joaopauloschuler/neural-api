@@ -13,3 +13,5 @@ bin/
 backup/
 lib/
 tests/RunTests
+autosave.csv
+autosave.nn
