@@ -211,6 +211,12 @@ type
     procedure TestSpatialDropout2DTrainingMaskShape;
     procedure TestSpatialDropout2DGradientCheck;
     procedure TestSpatialDropout2DSerializationRoundTrip;
+    procedure TestGaussianNoiseInferenceIdentity;
+    procedure TestGaussianNoiseGradient;
+    procedure TestGaussianNoiseSerializationRoundTrip;
+    procedure TestGaussianDropoutInferenceIdentity;
+    procedure TestGaussianDropoutGradient;
+    procedure TestGaussianDropoutSerializationRoundTrip;
     procedure TestChannelShuffleForward;
     procedure TestChannelShuffleGradientCheck;
     procedure TestChannelShuffleSerializationRoundTrip;
@@ -6938,6 +6944,239 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetGaussianNoise / TNNetGaussianDropout. Both layers must be the identity
+// at inference (FEnabled=false). With FEnabled=true, TNNetGaussianNoise adds
+// N(0,sigma^2) per-element and backprops as identity (noise independent of x);
+// TNNetGaussianDropout multiplies by N(1,sigma^2) and backprops scaling
+// gradients by the captured multipliers. Gradient checks run with FEnabled=false
+// so the central-difference probe is deterministic.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestGaussianNoiseInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetGaussianNoise.Create(0.5));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('GaussianNoise inference identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianNoiseGradient;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, k: integer;
+  d: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create();
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetGaussianNoise.Create(0.25));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(false); // identity forward/backward for numerical check
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      NN.Compute(InputPlus);
+      lossPlus := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        d := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+        lossPlus := lossPlus + 0.5 * d * d;
+      end;
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      NN.Compute(InputPlus);
+      lossMinus := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        d := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+        lossMinus := lossMinus + 0.5 * d * d;
+      end;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GaussianNoise input grad at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianNoiseSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  S1, S2: string;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetGaussianNoise.Create(0.25));
+    S1 := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(S1);
+      S2 := NN2.SaveToString();
+      AssertEquals('GaussianNoise round-trip SaveToString equality', S1, S2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianDropoutInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetGaussianDropout.Create(0.5));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('GaussianDropout inference identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianDropoutGradient;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, k: integer;
+  d: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create();
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetGaussianDropout.Create(0.25));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(false); // identity forward/backward for numerical check
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      NN.Compute(InputPlus);
+      lossPlus := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        d := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+        lossPlus := lossPlus + 0.5 * d * d;
+      end;
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      NN.Compute(InputPlus);
+      lossMinus := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        d := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+        lossMinus := lossMinus + 0.5 * d * d;
+      end;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GaussianDropout input grad at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianDropoutSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  S1, S2: string;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetGaussianDropout.Create(0.25));
+    S1 := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(S1);
+      S2 := NN2.SaveToString();
+      AssertEquals('GaussianDropout round-trip SaveToString equality', S1, S2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
   end;
 end;
 

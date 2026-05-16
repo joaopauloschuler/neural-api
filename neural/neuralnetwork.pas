@@ -1584,6 +1584,33 @@ type
       property ChannelMask: TNNetVolume read FChannelMask;
   end;
 
+  /// Additive Gaussian noise. At training (FEnabled = true), forward adds
+  // N(0, sigma^2) noise per element: y = x + n. At inference (FEnabled = false)
+  // the layer is the identity. Backward is identity (dL/dx = dL/dy) since
+  // noise is independent of x. Sigma is stored in FFloatSt[0].
+  TNNetGaussianNoise = class(TNNetAddNoiseBase)
+  public
+    constructor Create(pSigma: TNeuralFloat = 0.1); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Multiplicative Gaussian noise (a.k.a. Gaussian dropout). At training
+  // (FEnabled = true), forward multiplies elementwise by N(1, sigma^2):
+  // y = x * m. At inference (FEnabled = false) the layer is the identity.
+  // The per-element multipliers are captured for the backward pass so that
+  // dL/dx = m * dL/dy. Sigma is stored in FFloatSt[0].
+  TNNetGaussianDropout = class(TNNetAddNoiseBase)
+  protected
+    FNoiseMask: TNNetVolume;
+  public
+    constructor Create(pSigma: TNeuralFloat = 0.1); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property NoiseMask: TNNetVolume read FNoiseMask;
+  end;
+
   /// This layer adds a random addition (or bias) and amplifies (multiplies)
   // randomly. Parameter 10 means changes with up to 1%. Parameter 1
   // means 0.1% and 0 means no change. This layer was create to prevent
@@ -15476,6 +15503,101 @@ begin
   BackpropagateNoTest();
 end;
 
+{ TNNetGaussianNoise }
+constructor TNNetGaussianNoise.Create(pSigma: TNeuralFloat);
+begin
+  inherited Create();
+  if pSigma < 0 then pSigma := 0;
+  FFloatSt[0] := pSigma;
+  if pSigma > 0 then FEnabled := true;
+end;
+
+procedure TNNetGaussianNoise.Compute();
+var
+  StartTime: double;
+  Sigma: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Sigma := FFloatSt[0];
+  if FEnabled and (Sigma > 0) then
+    FOutput.AddGaussianNoise(Sigma);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGaussianNoise.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Identity backward: dL/dx = dL/dy.
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
+{ TNNetGaussianDropout }
+constructor TNNetGaussianDropout.Create(pSigma: TNeuralFloat);
+begin
+  inherited Create();
+  if pSigma < 0 then pSigma := 0;
+  FFloatSt[0] := pSigma;
+  FNoiseMask := TNNetVolume.Create();
+  if pSigma > 0 then FEnabled := true;
+end;
+
+destructor TNNetGaussianDropout.Destroy();
+begin
+  FNoiseMask.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetGaussianDropout.Compute();
+var
+  StartTime: double;
+  Sigma: TNeuralFloat;
+  CntOut, MaxOutput: integer;
+  M: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Sigma := FFloatSt[0];
+  if FNoiseMask.Size <> FOutput.Size then
+    FNoiseMask.ReSize(FOutput);
+  if FEnabled and (Sigma > 0) then
+  begin
+    MaxOutput := FOutput.Size - 1;
+    for CntOut := 0 to MaxOutput do
+    begin
+      M := 1 + FNoiseMask.RandomGaussianValue() * Sigma;
+      FNoiseMask.FData[CntOut] := M;
+      FOutput.FData[CntOut] := FOutput.FData[CntOut] * M;
+    end;
+  end
+  else
+  begin
+    FNoiseMask.Fill(1);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGaussianDropout.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FEnabled and (FOutputError.Size = FOutput.Size) and
+     (FNoiseMask.Size = FOutput.Size) then
+    FOutputError.Mul(FNoiseMask);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
 procedure TNNetAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -19131,6 +19253,8 @@ begin
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
       'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
+      'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
+      'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnect' :          Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
@@ -19327,6 +19451,8 @@ begin
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
+      if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
+      if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
