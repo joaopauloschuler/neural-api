@@ -276,11 +276,6 @@ breakdown:
 - [ ] TNNetStochasticPool — sample one cell per pooling window weighted by
       its activation (softmax of activations over the window) at training,
       take the expectation at inference.
-- [x] TNNetGaussianNoise — adds N(0, σ²) noise per element at training,
-      identity at inference. Pairs with the dropout family. *Landed
-      commit 6550a00.*
-- [x] TNNetGaussianDropout — multiplicative N(1, σ²) noise during training,
-      identity at inference. *Landed commit 6550a00.*
 - [ ] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
       its single-branch ShakeDrop generalization.
 
@@ -606,9 +601,6 @@ breakdown:
       parameterised test walking every TNNetReLUBase descendant.
 
 ### Tooling / dev experience
-- [x] `scripts/grep_layer.sh <TNNet...>` — print the class declaration with
-      context, Compute and Backpropagate bodies, and every Test* method
-      mentioning the class. *Landed commit c5b7ccc.*
 - [ ] `scripts/list_activations.sh` — enumerate every TNNetReLUBase
       descendant and cross-reference against `Test*Gradient` methods.
 - [ ] `scripts/new_layer.sh <Name>` scaffolder — drops a Compute/Backpropagate
@@ -805,8 +797,6 @@ breakdown:
 - [ ] Dropout-vs-DropPath head-to-head — same small CIFAR model with
       element-wise TNNetDropout and whole-sample TNNetDropPath at matched
       effective drop rates.
-- [ ] Hyperbolic-family bake-off micro-experiment with TNNetHyperbolicTangent
-      / TNNetSinhAct / TNNetCos / TNNetSinc / TNNetLisht / TNNetBentIdentity.
 - [ ] LeCunTanh-vs-Tanh ablation reproduction with a small seed/LR sweep
       on top of examples/HyperbolicActivationBakeOff/. Average over 5 seeds
       and report mean+std.
@@ -1081,18 +1071,3 @@ breakdown:
       with a y=x reference line). Pair with a tiny example on top of an
       existing classifier that prints metrics before and after a one-parameter
       temperature-scaling fit on the logits.
-
-### Lucky-day pick (seed 56851)
-- [x] `examples/LearningRateFinder/` — Leslie Smith's LR-range-test in
-      Pascal. Train a tiny MLP for ~100 mini-batches sweeping LR
-      exponentially from 1e-6 to 1e+1, record loss per step, and print
-      a 1-column ASCII chart of `log10(LR)` vs smoothed loss so the
-      "steepest-descent" LR is visually obvious. CSV side-output for
-      downstream tooling. *Landed at examples/LearningRateFinder/
-      (commit 20f23a1).*
-
-### Recently-landed follow-ups still open
-- [x] Log-cosh-vs-log-cosh dual experiment on the hypotenuse toy. *Landed
-      at examples/LogCoshDualExperiment/ (commit b2ea708).*
-- [x] TNNetTanhGLU — missing tanh sibling of the GLU/ReGLU/GEGLU/SwiGLU
-      family. *Landed commit ba8d2fc.*
