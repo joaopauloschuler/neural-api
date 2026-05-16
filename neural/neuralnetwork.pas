@@ -2744,6 +2744,17 @@ type
   TNNetGlobalAvgPool = class(TNNetAvgChannel)
   end;
 
+  /// Global Sum Pooling: parameter-free per-channel sum reduction over
+  // (X, Y). Output shape is 1 x 1 x Depth. Backward broadcasts the
+  // per-channel output error to every (X, Y) cell of that channel.
+  TNNetGlobalSumPool = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Global Max Pooling: reduces each (X, Y) plane to a single scalar by
   // taking the maximum. Output shape is 1 x 1 x Depth. The argmax (X, Y)
   // index is cached per channel; backward routes the channel's output
@@ -12778,6 +12789,70 @@ begin
   inherited Create(2);
 end;
 
+{ TNNetGlobalSumPool }
+
+procedure TNNetGlobalSumPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(1, 1, pPrevLayer.Output.Depth);
+  FOutputError.ReSize(1, 1, pPrevLayer.Output.Depth);
+  FOutputErrorDeriv.ReSize(1, 1, pPrevLayer.Output.Depth);
+end;
+
+procedure TNNetGlobalSumPool.Compute();
+var
+  StartTime: double;
+  D, X, Y, MaxD, MaxX, MaxY: integer;
+  Sum: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  MaxD := Prev.Depth - 1;
+  MaxX := Prev.SizeX - 1;
+  MaxY := Prev.SizeY - 1;
+  for D := 0 to MaxD do
+  begin
+    Sum := 0;
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+        Sum := Sum + Prev[X, Y, D];
+    FOutput[0, 0, D] := Sum;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGlobalSumPool.Backpropagate();
+var
+  StartTime: double;
+  D, X, Y, MaxD, MaxX, MaxY: integer;
+  PrevErr: TNNetVolume;
+  Err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    MaxD := FOutput.Depth - 1;
+    MaxX := PrevErr.SizeX - 1;
+    MaxY := PrevErr.SizeY - 1;
+    for D := 0 to MaxD do
+    begin
+      Err := FOutputError.FData[D];
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
+          PrevErr.Add(X, Y, D, Err);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetGlobalMaxPool }
 
 procedure TNNetGlobalMaxPool.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -19304,6 +19379,7 @@ begin
       'TNNetGlobalAvgPool':         Result := TNNetGlobalAvgPool.Create();
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalMaxPool':         Result := TNNetGlobalMaxPool.Create();
+      'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
@@ -19502,6 +19578,7 @@ begin
       if S[0] = 'TNNetGlobalAvgPool' then Result := TNNetGlobalAvgPool.Create() else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalMaxPool' then Result := TNNetGlobalMaxPool.Create() else
+      if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else

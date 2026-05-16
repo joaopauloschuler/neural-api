@@ -353,6 +353,7 @@ type
     procedure TestLishtSymmetry;
     procedure TestSnakeDerivativeTrigIdentity;
     procedure TestGlobalAvgPoolGradientCheck;
+    procedure TestGlobalSumPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
     procedure TestGlobalMaxPoolSerializationRoundTrip;
     procedure TestGlobalAvgPoolSerializationRoundTrip;
@@ -10237,6 +10238,14 @@ begin
   // the analytic gradient tightly.
   LayerInputGradientCheck(Self, TNNetAvgChannel.Create(),
     'GlobalAvgPool', 4, 4, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGlobalSumPoolGradientCheck;
+begin
+  // Tiny 3 x 3 x 2 input. GlobalSumPool is a linear per-channel sum
+  // reduction; central differences match the analytic gradient tightly.
+  LayerInputGradientCheck(Self, TNNetGlobalSumPool.Create(),
+    'GlobalSumPool', 3, 3, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestReLU6SerializationRoundTrip;
