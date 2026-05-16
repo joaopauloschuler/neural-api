@@ -656,6 +656,7 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetBentIdentity`          | 1D, 2D, or 3D               | BentIdentity  | Bent Identity activation: `y = (sqrt(x^2 + 1) - 1)/2 + x`. Smooth, with always-positive slope. Created with `TNNetBentIdentity.Create()`. |
 | `TNNetLisht`                 | 1D, 2D, or 3D               | LiSHT         | Linearly Scaled Hyperbolic Tangent: `y = x * tanh(x)`. Non-monotonic smooth ReLU alternative. Created with `TNNetLisht.Create()`. |
 | `TNNetGaussianActivation`    | 1D, 2D, or 3D               | Gaussian      | Gaussian activation: `exp(-x^2)`. Created with `TNNetGaussianActivation.Create()`. |
+| `TNNetSign`                  | 1D, 2D, or 3D               | Sign          | Sign activation: `y = sign(x)`. Saturated straight-through-estimator backward (gradient passes through only on `|x| <= 1`). Useful for binarized-network experiments. Created with `TNNetSign.Create()`. |
 | `TNNetSqrt`                  | 1D, 2D, or 3D               | Sqrt          | Eps-clamped square root: `y = sqrt(max(x, 1e-6))`. Created with `TNNetSqrt.Create()`. |
 | `TNNetExp`                   | 1D, 2D, or 3D               | Exp           | Overflow-clamped exponential: `y = exp(min(x, 30))`. Created with `TNNetExp.Create()`. |
 | `TNNetLog`                   | 1D, 2D, or 3D               | Log           | Eps-clamped natural log: `y = ln(max(x, 1e-8))`. Created with `TNNetLog.Create()`. |
@@ -798,6 +799,7 @@ NEURAL                      | Keras                                 | PyTorch
 `TNNet.AddAvgMaxPool`       |                                       |              
 `TNNetAvgChannel`           | `layers.GlobalAveragePooling2D`       | `nn.AvgPool2d`
 `TNNetMaxChannel`           | `layers.GlobalMaxPool2D`              | `nn.MaxPool2d`
+`TNNetGlobalSumPool`        |                                       |              
 `TNNetMinChannel`           |                                       |           
 `TNNet.AddMinMaxChannel`      |                                       |           
 `TNNet.AddAvgMaxChannel`      | [cai.layers.GlobalAverageMaxPooling2D](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) |  
