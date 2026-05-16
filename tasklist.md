@@ -6610,31 +6610,31 @@ already pinned several batches up, the activation form is not).
       support set (zero elsewhere). Numerical-gradient test on a
       (Depth=8, 1, 1) volume with a deliberately sparse support.
 
-- [ ] TNNetSoftMaxOne — `y_i = exp(x_i) / (1 + sum_j exp(x_j))`,
+- [x] TNNetSoftMaxOne — `y_i = exp(x_i) / (1 + sum_j exp(x_j))`,
       i.e. softmax with a constant +1 in the denominator. Outputs
       do not sum to 1 by design — the model can "attend to
-      nothing" (Miller, 2023). Cheaper alternative to
-      TNNetSinkAttention pinned above: same anti-attention-spike
-      property, no new attention-side plumbing. Forward is one
-      line off existing softmax; backward is the same Jacobian
-      computation with the modified denominator. Numerical-
-      gradient test on a Depth=4 volume and a "y.Sum() < 1" pin.
+      nothing" (Miller, 2023). Landed (commit 9b9fe41): numerically-
+      stable max-shift forward, full softmax-Jacobian backward
+      (the +1 has zero partial derivative so the backward is
+      identical to TNNetSoftMax). Four tests in
+      TestNeuralNumerical.pas: known-value forward, shift-variance
+      pin (guards against accidental `FOutput.SoftMax()`),
+      central-difference gradient check, LoadFromString round-trip.
 
 #### Losses I'd enjoy building
 
-- [ ] TNNetCharbonnierLoss — `sqrt((output - target)^2 + eps^2) -
+- [x] TNNetCharbonnierLoss — `sqrt((output - target)^2 + eps^2) -
       eps`, the "smooth-L1" loss favored in super-resolution
-      papers. Drops straight into the existing
-      `examples/SuperResolution` as a one-line swap from MSE.
-      Lands as a TNNetHuberLoss-style passthrough output layer
-      that clips/reshapes the framework-seeded `(output - target)`
-      gradient before propagating: gradient is
-      `(output - target) / sqrt((output - target)^2 + eps^2)` —
-      always bounded in [-1, 1] regardless of residual size, so
-      it's a robust regression head without Huber's piecewise
-      knee. `eps` defaults to 1e-3; stored in FFloatSt[0]. Tests:
-      passthrough forward, gradient sanity at three residual
-      scales, Save/Load round-trip.
+      papers. Landed (commit 295676a) as a TNNetHuberLoss-style
+      passthrough output layer; backward replaces seeded
+      `(output - target)` with `V / sqrt(V^2 + eps^2)` (bounded in
+      [-1, 1]). `eps` defaults to 1e-3, configurable via
+      `Create(pEpsilon)`, round-trips via FFloatSt[0]. Three tests
+      in TestNeuralNumerical.pas: forward passthrough, gradient
+      sanity at three residual scales (eps=1e-3 and eps=0.5),
+      LoadFromString round-trip with non-default eps=0.25.
+      `examples/CharbonnierSR/` (one-line swap on top of
+      `examples/SuperResolution`) is now unblocked.
 
 #### Examples I'd love to actually write
 
@@ -6794,16 +6794,16 @@ LogCoshActivation).
       particular harness/seed. Worth re-running with a sweep over
       seeds and learning rate before drawing a conclusion.
 
-- [ ] TNNetLogCoshActivation as a hidden-layer activation vs a
-      log-cosh loss as the output head: blocked — TNNetLogCoshLoss
-      does NOT exist in the repo yet (grep finds only
-      TNNetLogCoshActivation). To unblock: add a TNNetLogCoshLoss
-      output layer in the TNNetHuberLoss-shape (forward
-      passthrough, backward clipped gradient `tanh(output-target)`),
-      mirror TNNetHuberLoss's Save/Load + LoadFromString dispatch,
-      and add a passthrough test + 3-residual-scale gradient
-      sanity test. Then the dual experiment becomes a one-line
-      swap on top of the existing Hypotenuse example.
+- [x] TNNetLogCoshActivation as a hidden-layer activation vs a
+      log-cosh loss as the output head: TNNetLogCoshLoss landed
+      (commit 295676a) as a TNNetHuberLoss-style passthrough
+      output layer; backward replaces the seeded
+      `(output - target)` with `tanh(V)`. Three tests in
+      TestNeuralNumerical.pas: forward passthrough, gradient
+      sanity at three residual scales, LoadFromString round-trip.
+      The "log-cosh activation + log-cosh loss" dual experiment
+      on top of the existing Hypotenuse example is now a
+      one-line swap and is the natural follow-up.
 
 ### Lucky-day batch — 2026-05-15 (seed 431337)
 
@@ -6823,12 +6823,9 @@ code or existing tests.
 
 #### Small follow-ups pinned from this batch
 
-- [ ] Add TNNetLogCoshLoss as a TNNetHuberLoss-style output head
-      (see blocked dual-experiment item above for the shape) so
-      the log-cosh-vs-log-cosh dual experiment is unblocked.
-      Also makes log-cosh available as a robust regression loss
-      paired with the recently-landed TNNetLogCoshActivation
-      hidden-layer form.
+- [x] Add TNNetLogCoshLoss as a TNNetHuberLoss-style output head.
+      Landed in commit 295676a alongside TNNetCharbonnierLoss; see
+      the unblocked dual-experiment item above.
 
 - [ ] Reproduce the LeCunTanh-vs-Tanh ablation with a small
       seed/LR sweep on top of `examples/HyperbolicActivationBakeOff/`
@@ -6843,3 +6840,68 @@ code or existing tests.
       example — currently disabled there because they corrupt
       pure-regression data; document the reason inline so future
       copy-pasters don't re-enable them by accident.
+
+### Lucky-day batch — 2026-05-15 (seed 18406)
+
+Landed this session (two serial opus agents, two commits):
+- TNNetLogCoshLoss and TNNetCharbonnierLoss (commit 295676a). Both
+  are TNNetHuberLoss-style passthrough output heads. LogCosh
+  backward replaces `(output - target)` with `tanh(V)`; Charbonnier
+  with `V / sqrt(V^2 + eps^2)` (configurable `eps`, default 1e-3,
+  round-tripped via FFloatSt[0]). Six new tests in
+  TestNeuralNumerical.pas: passthrough forwards, gradient sanity
+  at three residual scales, LoadFromString round-trips.
+- TNNetSoftMaxOne (commit 9b9fe41). "Off by one" softmax:
+  `y_i = exp(x_i) / (1 + sum_j exp(x_j))`. Outputs do NOT sum
+  to 1 — the leftover mass lets attention attend to nothing
+  without an explicit sink token. Numerically-stable max-shift
+  forward; full softmax-Jacobian backward (the +1 has zero
+  partial derivative so the backward matches TNNetSoftMax). Four
+  tests in TestNeuralNumerical.pas including a shift-variance pin
+  guarding against accidental `FOutput.SoftMax()` reuse.
+
+Test suite: 518/518 green after both commits (was 508/508 at the
+start of the batch).
+
+README updated with reference rows for all three new layers
+(TNNetSoftMaxOne in the activation table; TNNetLogCoshLoss and
+TNNetCharbonnierLoss in the structural/output-layer table next to
+TNNetIdentity).
+
+#### Small follow-ups pinned from this batch
+
+- [ ] `examples/CharbonnierSR/` — minimal variant of
+      `examples/SuperResolution` that swaps the MSE head for
+      TNNetCharbonnierLoss and prints the before/after PSNR on
+      the same eval split. Now genuinely unblocked: the loss
+      layer ships and round-trips via Save/Load.
+
+- [ ] Log-cosh-vs-log-cosh dual experiment on the hypotenuse toy:
+      one run with TNNetLogCoshActivation in the hidden layer and
+      a plain MSE head; another with the same activation plus a
+      TNNetLogCoshLoss head. ~30 lines on top of the existing
+      Hypotenuse example. The activation alone already landed
+      late in the HyperbolicActivationBakeOff (crosses MSE<5 at
+      epoch 148); pairing it with the matching loss is the
+      natural follow-up.
+
+- [ ] Softmax-vs-SoftmaxOne(-vs-Sparsemax) bake-off as a pure-
+      forward-pass comparison: same Q,K,V tensors, print entropy
+      and max-weight of each distribution. SoftMaxOne side now
+      ships; only the optional Sparsemax row remains blocked on
+      TNNetSparsemax further up this file.
+
+- [ ] Loss-family bake-off (re-pinned from earlier batches, now
+      fully unblocked on the heads side): hypotenuse toy with
+      MSE / Huber / SmoothL1 / Charbonnier / LogCosh, printing
+      final MSE and epochs-to-converge. All five output heads
+      exist; the experiment is a ~50-line example.
+
+- [ ] SDPA + TNNetSoftMaxOne micro-experiment: replace the
+      softmax inside `TNNetScaledDotProductAttention` with
+      SoftMaxOne and check whether attention-mass on a deliberate
+      "all-keys-irrelevant" probe sequence drops toward zero (the
+      headline anti-attention-spike claim). SDPA currently hard-
+      codes the softmax variant, so this needs either a flag on
+      SDPA or a small standalone wiring instead of a parameter
+      swap.
