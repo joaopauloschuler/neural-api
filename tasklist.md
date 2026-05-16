@@ -1072,6 +1072,15 @@ breakdown:
       existing classifier that prints metrics before and after a one-parameter
       temperature-scaling fit on the logits.
 
+### Lucky-day pick (seed 56851)
+- [ ] `examples/LearningRateFinder/` — Leslie Smith's LR-range-test in
+      Pascal. Train a tiny MLP for ~100 mini-batches sweeping LR
+      exponentially from 1e-6 to 1e+1, record loss per step, and print
+      a 1-column ASCII chart of `log10(LR)` vs smoothed loss so the
+      "steepest-descent" LR is visually obvious. CSV side-output for
+      downstream tooling. Pure-CPU, finishes in seconds, complements
+      the upcoming scheduler interface and the optimizer bake-off.
+
 ### Recently-landed follow-ups still open
 - [x] Log-cosh-vs-log-cosh dual experiment on the hypotenuse toy. *Landed
       at examples/LogCoshDualExperiment/ (commit b2ea708).*
