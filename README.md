@@ -65,6 +65,7 @@ You can learn more about how to build and train simple neural networks at the fo
 * [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
 * [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+* [Hyperbolic activation bake-off on the hypotenuse toy](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HyperbolicActivationBakeOff) — compares 8 hyperbolic-family activations (`TNNetHyperbolicTangent`, `TNNetLeCunTanh`, `TNNetSinhAct`, `TNNetArcSinh`, `TNNetLisht`, `TNNetBentIdentity`, `TNNetTanhExp`, `TNNetLogCoshActivation`) on the same tiny MLP / RNG seed and prints a CSV of final MSE and epochs-to-converge.
 
 ### Loading and Saving Neural Networks
 Loading is very easy:

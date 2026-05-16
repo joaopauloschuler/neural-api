@@ -6638,15 +6638,17 @@ already pinned several batches up, the activation form is not).
 
 #### Examples I'd love to actually write
 
-- [ ] `examples/HyperbolicActivationBakeOff/` — train the same
-      tiny MLP on the existing hypotenuse toy with each of
-      TNNetHyperbolicTangent / TNNetSinhAct / TNNetArcSinh /
-      TNNetLisht / TNNetBentIdentity / TNNetTanhExp /
-      TNNetLogCoshActivation. Print final loss and
-      epochs-to-converge as a one-table CSV. Concrete payoff for
-      the just-landed sinh + erf activations and the new arcsinh /
-      logcosh entries above. Pure-CPU, runs in seconds. Verified
-      no `examples/HyperbolicActivationBakeOff` directory exists.
+- [x] `examples/HyperbolicActivationBakeOff/` — landed (commit bc50efc).
+      Trains a tiny `2 -> 32 -> 1` MLP on the hypotenuse toy with each
+      of TNNetHyperbolicTangent / TNNetLeCunTanh / TNNetSinhAct /
+      TNNetArcSinh / TNNetLisht / TNNetBentIdentity / TNNetTanhExp /
+      TNNetLogCoshActivation and prints a CSV of final MSE (in
+      original target units) and epochs-to-converge. Inputs/targets
+      normalized to `[0,1]` so TNNetSinhAct does not overflow.
+      Sample run: TNNetLisht wins (1.70 MSE, converged epoch 32),
+      TNNetTanhExp second (2.26, epoch 85), TNNetLogCoshActivation
+      crosses the threshold late (5.08, epoch 148), saturating tanh
+      family stalls. Full run ~42 s on CPU.
 
 - [ ] `examples/CharbonnierSR/` — minimal variant of the existing
       `examples/SuperResolution` that swaps the MSE head for
@@ -6736,11 +6738,11 @@ already pinned several batches up, the activation form is not).
       needs. The flat README list is becoming hard to navigate
       now that the family is this large.
 
-- [ ] README one-line entries for the just-landed TNNetSinhAct
+- [x] README one-line entries for the just-landed TNNetSinhAct
       and TNNetSerf (commits b6dd73a, 81d8676) in the activation
-      reference, matching the existing one-line + snippet style.
-      Pinned-without-batch follow-up the moment the doc commit
-      becomes the priority.
+      reference. Done in commit 01c595e together with the seed-623401
+      batch (TNNetArcSinh, TNNetLeCunTanh, TNNetLogCoshActivation)
+      and TNNetTanhExp — six rows added in one doc pass.
 
 #### Meta — what I'd most enjoy taking first
 
@@ -6774,28 +6776,70 @@ LogCoshActivation).
 
 #### Small follow-ups pinned from this batch
 
-- [ ] `examples/HyperbolicActivationBakeOff/` is now further
-      unblocked: TNNetSinhAct, TNNetSerf, TNNetArcSinh and
-      TNNetLogCoshActivation have all landed; the row set is
-      essentially complete. Picking this up is now a pure
-      examples-folder task (~one new short main + a shared
-      training helper) with no new layer work required.
+- [x] `examples/HyperbolicActivationBakeOff/` — landed in commit
+      bc50efc (see entry above).
 
-- [ ] README one-line entries for TNNetArcSinh, TNNetLeCunTanh and
-      TNNetLogCoshActivation in the activation reference, matching
-      the existing one-line + snippet style. Same shape as the
-      pinned TNNetSinhAct/TNNetSerf README follow-up above —
-      consider doing them together in one doc commit.
+- [x] README one-line entries for TNNetArcSinh, TNNetLeCunTanh and
+      TNNetLogCoshActivation in the activation reference — landed
+      in commit 01c595e alongside TNNetSinhAct, TNNetSerf and
+      TNNetTanhExp.
 
-- [ ] TNNetLeCunTanh-vs-TNNetHyperbolicTangent ablation on the
-      hypotenuse toy now becomes a 1-line-swap experiment — the
-      "scaled tanh trains faster than plain tanh" claim from
-      "Efficient Backprop" reproduced at toy scale. Already pinned
-      one batch up; calling it out as fully unblocked now that
-      TNNetLeCunTanh has landed.
+- [x] TNNetLeCunTanh-vs-TNNetHyperbolicTangent ablation on the
+      hypotenuse toy — now subsumed by the
+      `examples/HyperbolicActivationBakeOff/` table, which includes
+      both as rows trained on the same data with the same seed.
+      On the published 150-epoch run, plain Tanh finishes at MSE
+      35.67 and LeCunTanh at 50.07; both fail to converge, so the
+      "scaled tanh trains faster" claim is NOT reproduced on this
+      particular harness/seed. Worth re-running with a sweep over
+      seeds and learning rate before drawing a conclusion.
 
-- [ ] TNNetLogCoshActivation as a hidden-layer activation vs the
-      existing TNNetLogCoshLoss as the output head: small dual
-      experiment showing the same log-cosh shape playing both
-      roles in one tiny regression net. Cute story since both
-      forms now exist in the repo.
+- [ ] TNNetLogCoshActivation as a hidden-layer activation vs a
+      log-cosh loss as the output head: blocked — TNNetLogCoshLoss
+      does NOT exist in the repo yet (grep finds only
+      TNNetLogCoshActivation). To unblock: add a TNNetLogCoshLoss
+      output layer in the TNNetHuberLoss-shape (forward
+      passthrough, backward clipped gradient `tanh(output-target)`),
+      mirror TNNetHuberLoss's Save/Load + LoadFromString dispatch,
+      and add a passthrough test + 3-residual-scale gradient
+      sanity test. Then the dual experiment becomes a one-line
+      swap on top of the existing Hypotenuse example.
+
+### Lucky-day batch — 2026-05-15 (seed 431337)
+
+Landed this session (two serial opus agents, two commits):
+- README activation-reference rows for TNNetArcSinh, TNNetLeCunTanh,
+  TNNetLogCoshActivation, TNNetSinhAct, TNNetSerf and TNNetTanhExp —
+  commit 01c595e.
+- `examples/HyperbolicActivationBakeOff/` — 8-activation bake-off on
+  the hypotenuse toy with normalized inputs, fixed `RandSeed=42`,
+  150 epochs at LR=0.01, prints CSV of MSE in original target units
+  and first epoch each activation crosses MSE<5. Total ~42 s on CPU.
+  Sample table copied into the example's README.md. Commit bc50efc.
+
+Test suite remains green at 508/508 — both commits are
+pure-additions (docs + a new example) with no changes to library
+code or existing tests.
+
+#### Small follow-ups pinned from this batch
+
+- [ ] Add TNNetLogCoshLoss as a TNNetHuberLoss-style output head
+      (see blocked dual-experiment item above for the shape) so
+      the log-cosh-vs-log-cosh dual experiment is unblocked.
+      Also makes log-cosh available as a robust regression loss
+      paired with the recently-landed TNNetLogCoshActivation
+      hidden-layer form.
+
+- [ ] Reproduce the LeCunTanh-vs-Tanh ablation with a small
+      seed/LR sweep on top of `examples/HyperbolicActivationBakeOff/`
+      — current 150-epoch / LR=0.01 / seed=42 run does not show
+      the scaled-tanh advantage and both stall. Either the toy is
+      too easy (linear regression bites both into the same basin)
+      or the LR is wrong for the saturating regime; worth a
+      one-screen follow-up that averages over 5 seeds and reports
+      mean+std for each row.
+
+- [ ] Consider a `HasFlipX`/`HasFlipY` audit on the bake-off
+      example — currently disabled there because they corrupt
+      pure-regression data; document the reason inline so future
+      copy-pasters don't re-enable them by accident.
