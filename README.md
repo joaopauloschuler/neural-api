@@ -506,6 +506,7 @@ The available normalization techniques are:
 | `TNNetLayerNorm`             | 1D, 2D, or 3D               | Per-sample layer normalization (zero mean, unit variance) with learnable per-element scale and bias. |
 | `TNNetRMSNorm`               | 1D, 2D, or 3D               | Per-sample root-mean-square normalization (no mean subtraction) with learnable per-element scale.    |
 | `TNNetGroupNorm`             | 1D, 2D, or 3D               | Normalizes within `Groups` contiguous channel groups, with learnable per-element scale and bias.     |
+| `TNNetZScore`                | 1D, 2D, or 3D               | Per-sample z-score normalization: `y = (x - mean) / sqrt(var + eps)`. No learnable parameters; the unparameterised core of `TNNetLayerNorm`. |
 | `TNNet.AddMovingNorm`        | 1D, 2D, or 3D               | Possible replacement for batch normalization.                                                        |
 | `TNNet.AddChannelMovingNorm` | 1D, 2D, or 3D               | Possible replacement for batch normalization, applied per channel.                                   |
 
@@ -649,6 +650,7 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSquaredReLU`           | 1D, 2D, or 3D               | Squared ReLU  | Squared ReLU activation: `relu(x)^2`. From the Primer paper (https://arxiv.org/abs/2109.08668). Created with `TNNetSquaredReLU.Create()`. |
 | `TNNetShiftedReLU`           | 1D, 2D, or 3D               | Shifted ReLU  | Parameter-free ReLU variant `y = max(-1, x)` allowing a small negative range without saturating. Created with `TNNetShiftedReLU.Create()`. |
 | `TNNetThreshold`             | 1D, 2D, or 3D               | Threshold     | Threshold activation: `y = x if x > theta else value`. Generalizes ReLU; useful as a sparsifier when `theta > 0`. Created with `TNNetThreshold.Create(theta, value)` (both default to 0). |
+| `TNNetThresholdedReLU`       | 1D, 2D, or 3D               | Thresholded ReLU | `y = x if x > theta else 0`, with `theta` defaulting to 1.0. Sparsifier variant of ReLU that zeros inputs below the threshold. Created with `TNNetThresholdedReLU.Create()` or `TNNetThresholdedReLU.Create(theta)`. |
 | `TNNetLogSigmoid`            | 1D, 2D, or 3D               | LogSigmoid    | Stable log-sigmoid activation: `y = log(sigmoid(x)) = -softplus(-x)`. Pairs with binary cross-entropy with logits. Created with `TNNetLogSigmoid.Create()`. |
 | `TNNetSoftPlus`              | 1D, 2D, or 3D               | SoftPlus      | SoftPlus activation, a smooth approximation of ReLU: `ln(1 + exp(x))`. Created with `TNNetSoftPlus.Create()`. |
 | `TNNetSerf`                  | 1D, 2D, or 3D               | Serf          | Search-of-erf activation: `y = x * erf(softplus(x))`. Smooth Mish-like drop-in (https://arxiv.org/abs/2108.09598). Created with `TNNetSerf.Create()`. |
@@ -800,6 +802,7 @@ NEURAL                      | Keras                                 | PyTorch
 `TNNetAvgChannel`           | `layers.GlobalAveragePooling2D`       | `nn.AvgPool2d`
 `TNNetMaxChannel`           | `layers.GlobalMaxPool2D`              | `nn.MaxPool2d`
 `TNNetGlobalSumPool`        |                                       |              
+`TNNetGlobalMinPool`        |                                       |              
 `TNNetMinChannel`           |                                       |           
 `TNNet.AddMinMaxChannel`      |                                       |           
 `TNNet.AddAvgMaxChannel`      | [cai.layers.GlobalAverageMaxPooling2D](https://github.com/joaopauloschuler/k-neural-api/blob/master/cai/layers.py) |  

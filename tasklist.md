@@ -60,6 +60,17 @@
 ## Added ideas
 
 ### Smaller follow-up ideas
+- [ ] TNNetThresholdedReLU LoadFromString round-trip test with non-default
+      theta (e.g. theta=0.25): construct, serialize, reload, assert preserved
+      and forward matches.
+- [ ] TNNetGlobalMinPool argmin-tie pinning test — assert first-wins tie-break
+      on a hand-crafted (X,Y,Depth) input where two cells per channel share the
+      minimum, mirroring the GlobalMaxPool argmax-tie pinning task already
+      on the list.
+- [ ] TNNetZScore vs TNNetLayerNorm equivalence test: with LayerNorm's gamma
+      pinned to 1 and beta to 0, forward outputs must match TNNetZScore to
+      within ~1e-5 across a few seeded inputs. Pins the "ZScore is the
+      unparameterised core of LayerNorm" claim.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
