@@ -1062,6 +1062,26 @@ breakdown:
       one-layer forward-only test validating FP16 matches FP32 to within
       1e-2.
 
+### OOD / overconfidence regularization
+- [ ] TNNetLogitNormalize — pre-softmax regularizer that divides logits
+      by their per-sample L2 norm scaled by a (fixed or learnable)
+      temperature `tau`, i.e. `y = x / (tau * ||x||_2 + eps)` along the
+      depth axis (Wei et al. 2022, "Mitigating Neural Network
+      Overconfidence with Logit Normalization"). Helps calibration and
+      out-of-distribution detection by keeping logit magnitudes bounded
+      during training. Compute is a per-(x,y) L2 reduce-then-divide
+      (mirrors the in-tree TNNetL2Normalize structure). Backpropagate is
+      the exact L2-normalize Jacobian — `dy_i/dx_j = (delta_ij*||x|| -
+      x_i*x_j/||x||) / (tau * ||x||^2)` — so it shares the same gradient
+      pattern as the recently-landed L2Normalize fix and is a natural
+      next test for the Jacobian-blow-up empirical study already on the
+      list. Ships as a TNNetIdentity-shaped layer (no learnable weights
+      when tau is fixed) with a numerical-gradient test in
+      TestNeuralNumerical.pas and a one-screen
+      `examples/LogitNormCalibration/` demo printing ECE before/after on
+      a small classifier (which pairs with the Model-calibration /
+      reliability-diagram task below).
+
 ### Model calibration / reliability
 - [ ] Model-calibration / reliability-diagram tool — a small unit
       (`neuralcalibration.pas`) that takes a trained classifier, a
