@@ -78,7 +78,7 @@ rather than acted on.
 - [ ] CumSumPositionEncoding follow-up: actually train a tiny position-
       dependent model with and without the CumSum feature concatenated and
       chart loss delta. Forward-only demo landed; the bake-off is still open.
-- [ ] SwiGLU FFN follow-up: package the `Dense(2*D) → SwiGLU → Dense(D_out)`
+- [X] SwiGLU FFN follow-up: package the `Dense(2*D) → SwiGLU → Dense(D_out)`
       pattern as `TNNet.AddSwiGLUFeedForward(D_in, D_hidden, D_out)` builder
       so the example becomes one line. Companion of the
       [[TNNetSwiGLUFeedForward]] block helper task below.
@@ -701,9 +701,6 @@ breakdown:
       report (sparsity %, recon loss).
 - [ ] Activation "kink at zero" finite-difference noise audit on every
       activation on a `[-0.05, 0.05]` window stepping by 1e-3.
-- [ ] Numerical-gradient epsilon study on an existing test with
-      `epsilon ∈ {1e-2, 1e-3, 1e-4, 1e-5}` tabulating observed max abs
-      error.
 - [ ] Periodic-activation toy benchmark — fit `y = sin(3x) + 0.3 sin(11x)`
       with TNNetSnake vs ReLU/GELU/Tanh MLPs of equal width/depth.
 - [ ] Sinc-vs-Sin head-to-head on the SIREN-flavored fit.
@@ -1088,6 +1085,44 @@ breakdown:
       (iii) a small attention stack so reviewers can eyeball how the
       shape of the bottleneck shifts across model families (parameter-
       heavy MLP vs activation-heavy conv vs both-heavy attention).
+
+### Layer sensitivity
+- [ ] TNNet.LayerSensitivityReport — given a probe batch (and an optional
+      target volume), multiplicatively perturb each trainable layer's
+      weights by small Gaussian noise (`W *= 1 + eta`, `eta ~ N(0,
+      sigma^2)`, default sigma=0.01, N=8 trials per layer with fresh
+      seeds, weights restored between trials), measure the resulting
+      change to (i) the forward output L2 and (ii) the loss if a target
+      is supplied, and report per trainable layer:
+      (a) mean and max output-delta L2 (sensitivity to small weight noise),
+      (b) mean loss-delta (objective-level impact),
+      (c) sensitivity normalised by parameter count so naturally-large
+          layers don't dominate the ranking,
+      (d) a 10-bin ASCII histogram of per-layer sensitivity across the
+          network so the impact distribution is visible at a glance,
+      (e) a flag list: "high-impact" layers (top 10% — natural
+          keep-precision / don't-prune candidates) and "low-impact"
+          layers (bottom 10% — natural prune / quantize / LoRA candidates),
+      (f) a one-line "fragility verdict": ratio of max-layer-sensitivity
+          to median-layer-sensitivity (high ratio = a few layers carry
+          the model, low ratio = sensitivity is spread out).
+      Pure forward-only with deterministic weight save/restore between
+      trials — no training-time changes, no backward pass needed.
+      Distinct from [[WeightSpectrumReport]] (weight geometry, not
+      output impact), [[GradientNormReport]] (backward magnitudes per
+      layer, gives "how much would training move this layer" rather
+      than "how much would the output move if this layer was perturbed"),
+      [[WeightHistogramReport]] (value distribution, not perturbation
+      response), [[SaliencyReport]] (input attribution, not layer
+      attribution), and [[MemoryFootprintReport]] (byte footprint, not
+      output impact). The output is the natural input for any future
+      pruning, quantization, or LoRA-target-selection work — you need
+      to know which layers carry the model before you can decide which
+      ones to compress. Companion `examples/LayerSensitivityReport/`
+      runs it on (i) a tiny MLP, (ii) a small CIFAR conv stack, and
+      (iii) a small attention stack so reviewers can eyeball how
+      fragility shifts across model families (often-uniform MLP vs
+      stem-heavy conv vs attention-heavy transformer).
 
 ### Weight-matrix spectrum
 - [ ] TNNet.WeightSpectrumReport — for every trainable layer in a network,
