@@ -1109,3 +1109,25 @@ breakdown:
       Distinct from the calibration tool above (which summarises
       confidence quality across the whole set) — this one localises
       *which samples* the model is least sure about.
+- [ ] TNNet.AttentionEntropyReport — for every TNNetScaledDotProductAttention
+      layer in a trained network, run a forward pass over a small probe batch
+      and report the per-row softmax entropy of the attention weights,
+      summarised per layer as `mean ± std` and a 10-bin ASCII histogram, plus
+      flag "dead heads" (rows whose entropy is within `eps` of `log(SeqLen)`
+      — i.e. nearly-uniform attention, contributing no routing) and "spike
+      heads" (rows whose entropy is below a small threshold — attending to
+      essentially one key). Distinct from [[DeadNeuronReport]] (activation
+      sparsity on ReLU-family units, not attention weights) and from
+      [[WeightDriftReport]] (weight deltas, not live attention). Implementable
+      without modifying SDPA: a transient `TNNetAttentionEntropyProbe` layer
+      can be inserted immediately after SDPA to read its `Output` (post-
+      softmax attention map already lives there for the Backpropagate path)
+      and accumulate entropies; the report iterates the layer list, swaps in
+      the probe, runs forward on the probe batch, harvests, and removes it.
+      Pure-CPU, finishes in one forward pass. Companion
+      `examples/AttentionEntropyReport/` trains the existing
+      AttentionCopyTask-style tiny SDPA model briefly and prints the report,
+      pinning a format reviewers can eyeball. Natural follow-up to the
+      already-listed AttentionViz example — that one looks at a single map
+      qualitatively; this one quantifies the whole stack and gives a single
+      number per layer to track across training runs.
