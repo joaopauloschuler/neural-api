@@ -528,6 +528,7 @@ The available normalization techniques are:
 | `TNNetLayerNorm`             | 1D, 2D, or 3D               | Per-sample layer normalization (zero mean, unit variance) with learnable per-element scale and bias. |
 | `TNNetRMSNorm`               | 1D, 2D, or 3D               | Per-sample root-mean-square normalization (no mean subtraction) with learnable per-element scale.    |
 | `TNNetGroupNorm`             | 1D, 2D, or 3D               | Normalizes within `Groups` contiguous channel groups, with learnable per-element scale and bias.     |
+| `TNNetGRN`                   | 2D or 3D                    | Global Response Normalization (ConvNeXt-V2, Woo et al. 2023). Channel-wise contrast normalization with learnable per-channel `gamma` and `beta` (both init 0, so identity at start): `Y = gamma * (X * Nx) + beta + X`, where `Nx[c] = ||X[:,:,c]||_2 / mean_c(||X[:,:,c']||_2)`. |
 | `TNNetZScore`                | 1D, 2D, or 3D               | Per-sample z-score normalization: `y = (x - mean) / sqrt(var + eps)`. No learnable parameters; the unparameterised core of `TNNetLayerNorm`. |
 | `TNNet.AddMovingNorm`        | 1D, 2D, or 3D               | Possible replacement for batch normalization.                                                        |
 | `TNNet.AddChannelMovingNorm` | 1D, 2D, or 3D               | Possible replacement for batch normalization, applied per channel.                                   |
@@ -602,6 +603,9 @@ By using these layers creatively, developers can build highly customized and eff
 | `TNNetReshape`               | 1D, 2D, or 3D               | Reshapes the input into a different dimension.                                                         |
 | `TNNetSum`                   | 1D, 2D, or 3D               | Sums the outputs from previous layers, useful for ResNet-style networks.                               |
 | `TNNetUpsample`              | 3D                          | Upsamples channels (depth) into spatial data, converting depth into spatial resolution. For example, a 128x128x256 activation map will be converted to 256x256x64. The number of channels is always divided by 4 while the resolution increases.|
+| `TNNetPixelShuffle`          | 3D                          | Sub-pixel convolution (Shi et al. 2016). Parameter-free depth-to-space rearrangement with a configurable upscale factor `r`: input `(W, H, C)` with `C mod (r*r) = 0` becomes `(W*r, H*r, C / (r*r))`. Created with `TNNetPixelShuffle.Create(r)` (default `r=2`). The backward pass is the exact inverse gather, so the layer round-trips cleanly. |
+| `TNNetMaskedMean`            | 3D (output: `(1, SizeY, D-1)`) | Mean over the SizeX (sequence) axis with the last input channel acting as a `{0,1}` validity mask. Positions where mask ≤ 0.5 are excluded from the average; rows whose mask is entirely zero produce a zero output and zero gradient. Parameter-free. |
+| `TNNetMaskedMax`             | 3D (output: `(1, SizeY, D-1)`) | Max over the SizeX (sequence) axis with the last input channel acting as a `{0,1}` validity mask. Masked-out positions are treated as `-infinity`; rows whose mask is entirely zero produce a zero output and zero gradient. Parameter-free. |
 
 ### Split Channels
 `TNNetSplitChannels` and `TNNetSplitChannelEvery` are specialized layer types in the CAI Neural API that allow for selective channel manipulation within neural networks.
