@@ -3016,6 +3016,14 @@ type
       // SaveStructureToString-style string. Handy for diffing against a
       // pinned golden architecture.
       function DiffArchitectureFromString(const StructureStr: string): string;
+      // Per-trainable-layer weight-drift report comparing two
+      // TNNet.SaveToString snapshots. For each layer with weights, prints
+      // L2 distance ||W_B - W_A||_2, relative drift
+      // ||W_B - W_A||_2 / (||W_A||_2 + eps), and the fraction of weights
+      // that moved by less than 1e-6. Useful for spotting frozen layers
+      // (vanishing gradient or LR=0) and exploding ones. Returns an
+      // error message if the two snapshots have different architectures.
+      class function WeightDriftReport(const SnapshotA, SnapshotB: string): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -19152,6 +19160,100 @@ begin
     Result := DiffArchitecture(Other);
   finally
     Other.Free;
+  end;
+end;
+
+class function TNNet.WeightDriftReport(const SnapshotA, SnapshotB: string): string;
+const
+  cFrozenThreshold = 1e-6;
+  cRelEps = 1e-12;
+var
+  NA, NB: TNNet;
+  Lines: TStringList;
+  LayerIdx, NeuronIdx, K: integer;
+  LayerA, LayerB: TNNetLayer;
+  NeuronA, NeuronB: TNNetNeuron;
+  L2Diff, L2A, Diff, FracFrozen, RelDrift: TNeuralFloat;
+  TotalWeights, FrozenCount: integer;
+  TrainableLayers: integer;
+  DiffStr: string;
+begin
+  Result := '';
+  NA := TNNet.Create();
+  NB := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    NA.LoadFromString(SnapshotA);
+    NB.LoadFromString(SnapshotB);
+
+    DiffStr := NA.DiffArchitecture(NB);
+    if DiffStr <> '' then
+    begin
+      Result := 'WeightDriftReport: snapshots have different ' +
+        'architectures. Call TNNet.DiffArchitecture for details.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    Lines.Add(Format('%-5s %-32s %12s %14s %14s %14s',
+      ['Idx', 'Layer', 'Params', 'L2 Drift', 'Rel Drift', 'Frac Frozen']));
+    Lines.Add(StringOfChar('-', 96));
+
+    TrainableLayers := 0;
+    for LayerIdx := 0 to NA.GetLastLayerIdx() do
+    begin
+      LayerA := NA.Layers[LayerIdx];
+      LayerB := NB.Layers[LayerIdx];
+      if LayerA.CountWeights() = 0 then Continue;
+      if LayerA.Neurons.Count = 0 then Continue;
+      if LayerA.Neurons.Count <> LayerB.Neurons.Count then Continue;
+
+      Inc(TrainableLayers);
+      L2Diff := 0;
+      L2A := 0;
+      TotalWeights := 0;
+      FrozenCount := 0;
+      for NeuronIdx := 0 to LayerA.Neurons.Count - 1 do
+      begin
+        NeuronA := LayerA.Neurons[NeuronIdx];
+        NeuronB := LayerB.Neurons[NeuronIdx];
+        if NeuronA.Weights.Size <> NeuronB.Weights.Size then Continue;
+        for K := 0 to NeuronA.Weights.Size - 1 do
+        begin
+          Diff := NeuronB.Weights.FData[K] - NeuronA.Weights.FData[K];
+          L2Diff := L2Diff + Diff * Diff;
+          L2A := L2A + NeuronA.Weights.FData[K] * NeuronA.Weights.FData[K];
+          if Abs(Diff) < cFrozenThreshold then Inc(FrozenCount);
+          Inc(TotalWeights);
+        end;
+        Diff := NeuronB.FBiasWeight - NeuronA.FBiasWeight;
+        L2Diff := L2Diff + Diff * Diff;
+        L2A := L2A + NeuronA.FBiasWeight * NeuronA.FBiasWeight;
+        if Abs(Diff) < cFrozenThreshold then Inc(FrozenCount);
+        Inc(TotalWeights);
+      end;
+
+      L2Diff := Sqrt(L2Diff);
+      L2A := Sqrt(L2A);
+      RelDrift := L2Diff / (L2A + cRelEps);
+      if TotalWeights > 0 then
+        FracFrozen := FrozenCount / TotalWeights
+      else
+        FracFrozen := 0;
+
+      Lines.Add(Format('%-5d %-32s %12d %14.6e %14.6e %14.4f',
+        [LayerIdx, LayerA.ClassName, TotalWeights,
+         L2Diff, RelDrift, FracFrozen]));
+    end;
+
+    Lines.Add(StringOfChar('-', 96));
+    Lines.Add(Format('Totals: %d trainable layers (of %d), frozen threshold=%g',
+      [TrainableLayers, NA.CountLayers(), cFrozenThreshold]));
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+    NB.Free;
+    NA.Free;
   end;
 end;
 

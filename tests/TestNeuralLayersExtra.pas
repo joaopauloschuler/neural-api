@@ -77,6 +77,8 @@ type
     procedure TestDiffArchitectureSelfIsEmpty;
     procedure TestDiffArchitectureSwappedLayer;
     procedure TestDiffArchitectureFromString;
+    procedure TestWeightDriftReportFrozenLayer;
+    procedure TestWeightDriftReportArchMismatch;
   end;
 
 implementation
@@ -1138,6 +1140,112 @@ begin
     Diff := A.DiffArchitectureFromString(GoldenStr);
     AssertEquals('DiffArchitectureFromString against matching golden ' +
       'should be empty', '', Diff);
+  finally
+    A.Free;
+    B.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestWeightDriftReportFrozenLayer;
+var
+  NN: TNNet;
+  SnapA, SnapB, Report: string;
+  Lines: TStringList;
+  TargetLayer, OtherLayer: TNNetLayer;
+  N, K: integer;
+  Layer1Line, Layer2Line, Layer3Line: string;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectReLU.Create(5));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.InitWeights();
+
+    SnapA := NN.SaveToString();
+
+    OtherLayer := NN.Layers[2];
+    for N := 0 to OtherLayer.Neurons.Count - 1 do
+    begin
+      for K := 0 to OtherLayer.Neurons[N].Weights.Size - 1 do
+        OtherLayer.Neurons[N].Weights.FData[K] :=
+          OtherLayer.Neurons[N].Weights.FData[K] + 0.5;
+    end;
+
+    TargetLayer := NN.Layers[3];
+    for N := 0 to TargetLayer.Neurons.Count - 1 do
+    begin
+      for K := 0 to TargetLayer.Neurons[N].Weights.Size - 1 do
+        TargetLayer.Neurons[N].Weights.FData[K] :=
+          TargetLayer.Neurons[N].Weights.FData[K] + 0.1;
+    end;
+
+    SnapB := NN.SaveToString();
+
+    Report := TNNet.WeightDriftReport(SnapA, SnapB);
+    AssertTrue('Report should be non-empty', Length(Report) > 0);
+
+    Lines.Text := Report;
+    Layer1Line := '';
+    Layer2Line := '';
+    Layer3Line := '';
+    for I := 0 to Lines.Count - 1 do
+    begin
+      if Pos('1     TNNetFullConnectReLU', Lines[I]) = 1 then
+        Layer1Line := Lines[I]
+      else if Pos('2     TNNetFullConnectReLU', Lines[I]) = 1 then
+        Layer2Line := Lines[I]
+      else if Pos('3     TNNetFullConnectLinear', Lines[I]) = 1 then
+        Layer3Line := Lines[I];
+    end;
+
+    AssertTrue('Layer 1 row present', Layer1Line <> '');
+    AssertTrue('Layer 2 row present', Layer2Line <> '');
+    AssertTrue('Layer 3 row present', Layer3Line <> '');
+
+    AssertTrue('Frozen layer 1 should have ~1.0 frac frozen',
+      Pos('1.0000', Layer1Line) > 0);
+    AssertTrue('Frozen layer 1 should have ~0 L2 drift',
+      Pos('0.00000E+000', Layer1Line) > 0);
+    AssertTrue('Touched layer 2 should have non-zero L2 drift',
+      Pos('0.00000E+000', Layer2Line) = 0);
+    AssertTrue('Touched layer 3 should have non-zero L2 drift',
+      Pos('0.00000E+000', Layer3Line) = 0);
+  finally
+    Lines.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestWeightDriftReportArchMismatch;
+var
+  A, B: TNNet;
+  SnapA, SnapB, Report: string;
+begin
+  A := TNNet.Create();
+  B := TNNet.Create();
+  try
+    A.AddLayer(TNNetInput.Create(4, 1, 1));
+    A.AddLayer(TNNetFullConnectReLU.Create(6));
+    A.AddLayer(TNNetFullConnectLinear.Create(2));
+    A.InitWeights();
+
+    B.AddLayer(TNNetInput.Create(4, 1, 1));
+    B.AddLayer(TNNetFullConnectSigmoid.Create(6));
+    B.AddLayer(TNNetFullConnectLinear.Create(2));
+    B.InitWeights();
+
+    SnapA := A.SaveToString();
+    SnapB := B.SaveToString();
+
+    Report := TNNet.WeightDriftReport(SnapA, SnapB);
+    AssertTrue('Mismatch report should mention DiffArchitecture',
+      Pos('DiffArchitecture', Report) > 0);
+    AssertTrue('Mismatch report should mention different architectures',
+      Pos('different', Report) > 0);
   finally
     A.Free;
     B.Free;
