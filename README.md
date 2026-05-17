@@ -72,7 +72,9 @@ You can learn more about how to build and train simple neural networks at the fo
 * [Binary adder](https://github.com/joaopauloschuler/neural-api/tree/master/examples/BinaryAdder) — tiny "learns to add two binary numbers" demo: a small MLP learns 4-bit + 4-bit addition over all 256 input combinations (5-bit sigmoid output for carry), trains in a few seconds, reaches 100% exact-bit accuracy, and prints sample additions in binary.
 * [Involution demo](https://github.com/joaopauloschuler/neural-api/tree/master/examples/InvolutionDemo) — shows that `TNNetReverseChannels`, `TNNetReverseXY`, `TNNetFlipX`, and `TNNetFlipY` are involutions: applying each twice round-trips to the input exactly (per-element).
 
-You can introspect a network's architecture with `TNNet.PrintSummary` (Keras-style table of layer index, class, output shape `(X,Y,D)`, param count, and neuron count, ending with totals). Use `SummaryString` if you want the table as a string instead of writing to stdout.
+* [Architecture diff](https://github.com/joaopauloschuler/neural-api/tree/master/examples/ArchitectureDiff) — demonstrates `TNNet.DiffArchitecture(OtherNet)` by building two near-identical classifier variants (one with an extra `TNNetChannelStdNormalization`, one with a swapped activation) and printing a unified-diff-style report so refactors of builder helpers are easy to verify.
+
+You can introspect a network's architecture with `TNNet.PrintSummary` (Keras-style table of layer index, class, output shape `(X,Y,D)`, param count, and neuron count, ending with totals). Use `SummaryString` if you want the table as a string instead of writing to stdout. `TNNet.DiffArchitecture(OtherNet)` / `DiffArchitectureFromString(s)` produce a unified-diff-style report of architectural differences between two networks (LCS-aligned so single inserts/removes don't cascade).
 
 ### Loading and Saving Neural Networks
 Loading is very easy:

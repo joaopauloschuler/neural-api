@@ -109,8 +109,9 @@ rather than acted on.
       RMSNorm / GroupNorm on a small net, showing convergence-speed differences.
 - [ ] Weight-initialization sensitivity demo: show how a deep-ish net's
       first-epoch gradient magnitudes change across the available init schemes.
-- [ ] Tiny "learns to add two binary numbers" sequence example — a fun, fast,
+- [X] Tiny "learns to add two binary numbers" sequence example — a fun, fast,
       self-contained demo of the library on a task with an obvious right answer.
+      Shipped as `examples/BinaryAdder/` (4-bit + 4-bit, 100% exact-bit accuracy).
 
 #### Documentation
 - [ ] Write a short "how numerical gradient testing works in this repo" note so
@@ -645,7 +646,7 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-- [ ] `examples/BinaryAdder/` — tiny "learns to add two binary numbers"
+- [X] `examples/BinaryAdder/` — tiny "learns to add two binary numbers"
       sequence example. Self-contained, fast, deterministic right answer.
 - [ ] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
       and print the per-epoch fraction of units that never fire; repeat
