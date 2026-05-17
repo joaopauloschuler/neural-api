@@ -247,7 +247,7 @@ breakdown:
       + beta[c]`. Per-layer learnable alpha plus per-channel gamma/beta.
 - [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
       sigmoid gate.
-- [ ] TNNetGRN (Global Response Normalization, ConvNeXt-V2) — channel-wise
+- [X] TNNetGRN (Global Response Normalization, ConvNeXt-V2) — channel-wise
       contrast normalization with learnable scale/bias.
 - [ ] TNNetSwitchableNorm — learnable softmax-weighted combination of
       LayerNorm and RMSNorm outputs.

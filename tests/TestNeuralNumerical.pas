@@ -83,6 +83,10 @@ type
     procedure TestReZeroGradientCheck;
     procedure TestReZeroWeightGradientCheck;
     procedure TestReZeroSerializationRoundTrip;
+    procedure TestGRNForward;
+    procedure TestGRNGradientCheck;
+    procedure TestGRNWeightGradientCheck;
+    procedure TestGRNSerializationRoundTrip;
     procedure TestEntropyRegularizerGradientCheck;
     procedure TestGradientReversalGradientCheck;
     procedure TestGradientReversalSerializationRoundTrip;
@@ -11096,6 +11100,211 @@ begin
   // so the FFloatSt[0] dispatch path is also covered.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetReZero.Create(0.5), 'ReZero', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestGRNForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LGRN: TNNetGRN;
+  i: integer;
+begin
+  // ConvNeXt-V2 init: gamma = 0, beta = 0  ->  layer is identity at init
+  // because of the +X residual in Y = gamma*(X*Nx) + beta + X.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3));
+    LGRN := TNNetGRN.Create();
+    NN.AddLayer(LGRN);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.7 + 0.4;
+
+    AssertEquals('GRN default gamma is 0', 0.0,
+      LGRN.Neurons[0].Weights.Raw[0], 1e-7);
+    AssertEquals('GRN default beta is 0', 0.0,
+      LGRN.Neurons[1].Weights.Raw[0], 1e-7);
+
+    NN.Compute(Input);
+    // Identity at init.
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('GRN identity at init pos ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGRNGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LGRN: TNNetGRN;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, c: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    LGRN := TNNetGRN.Create();
+    NN.AddLayer(LGRN);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Non-trivial gamma and beta so the channel-coupled chain term is
+    // exercised (at gamma=0 the residual makes the gradient trivially 1).
+    for c := 0 to LGRN.Neurons[0].Weights.Size - 1 do
+    begin
+      LGRN.Neurons[0].Weights.Raw[c] := 0.3 + 0.1 * c;  // gamma
+      LGRN.Neurons[1].Weights.Raw[c] := 0.05 * c;       // beta
+    end;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      // GRN couples all channel positions through sqrt and a mean ratio,
+      // which amplifies single-precision finite-difference noise; allow
+      // a slightly looser tolerance than the 0.01 used by simpler layers.
+      AssertTrue('GRN input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.02);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGRNWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LGRN: TNNetGRN;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, c, neuronIdx: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure CheckWeight(ANeuron: integer; ACh: integer; const ALabel: string);
+  var
+    w0: TNeuralFloat;
+  begin
+    w0 := LGRN.Neurons[ANeuron].Weights.Raw[ACh];
+    LGRN.Neurons[ANeuron].Weights.Raw[ACh] := w0 + epsilon;
+    lossPlus := ComputeLoss(Input);
+    LGRN.Neurons[ANeuron].Weights.Raw[ACh] := w0 - epsilon;
+    lossMinus := ComputeLoss(Input);
+    LGRN.Neurons[ANeuron].Weights.Raw[ACh] := w0;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    LGRN.Neurons[0].ClearDelta;
+    LGRN.Neurons[1].ClearDelta;
+    NN.Backpropagate(Desired);
+    // With LearningRate = 1 and batch update on, analytical = -Delta.
+    analyticalGrad := -LGRN.Neurons[ANeuron].Delta.Raw[ACh];
+
+    AssertTrue(ALabel + ' num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 3);
+  Desired := TNNetVolume.Create(3, 2, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 3, 1));
+    LGRN := TNNetGRN.Create();
+    NN.AddLayer(LGRN);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Non-zero gamma/beta so the perturbation samples a meaningful slope.
+    for c := 0 to LGRN.Neurons[0].Weights.Size - 1 do
+    begin
+      LGRN.Neurons[0].Weights.Raw[c] := 0.35 - 0.1 * c;
+      LGRN.Neurons[1].Weights.Raw[c] := 0.12 + 0.05 * c;
+    end;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3);
+
+    // Check gamma (Neurons[0]) and beta (Neurons[1]) at a few channels.
+    for neuronIdx := 0 to 1 do
+      for c := 0 to LGRN.Neurons[0].Weights.Size - 1 do
+        CheckWeight(neuronIdx, c,
+          'GRN weight grad neuron=' + IntToStr(neuronIdx) +
+          ' ch=' + IntToStr(c));
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGRNSerializationRoundTrip;
+begin
+  // TNNetGRN stores 2*Depth learnable values (gamma and beta). The
+  // perturbed-weights helper pushes them away from the ConvNeXt-V2 init
+  // (zeros) so the round-trip exercises a non-trivial layer.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetGRN.Create(), 'GRN', 2, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestEntropyRegularizerGradientCheck;
