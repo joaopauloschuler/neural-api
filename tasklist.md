@@ -1016,55 +1016,6 @@ breakdown:
       Distinct from the calibration tool above (which summarises
       confidence quality across the whole set) — this one localises
       *which samples* the model is least sure about.
-- [X] TNNet.AttentionEntropyReport — for every TNNetScaledDotProductAttention
-      layer in a trained network, run a forward pass over a small probe batch
-      and report the per-row softmax entropy of the attention weights,
-      summarised per layer as `mean ± std` and a 10-bin ASCII histogram, plus
-      flag "dead heads" (rows whose entropy is within `eps` of `log(SeqLen)`
-      — i.e. nearly-uniform attention, contributing no routing) and "spike
-      heads" (rows whose entropy is below a small threshold — attending to
-      essentially one key). Distinct from [[DeadNeuronReport]] (activation
-      sparsity on ReLU-family units, not attention weights) and from
-      [[WeightDriftReport]] (weight deltas, not live attention). Implementable
-      without modifying SDPA: a transient `TNNetAttentionEntropyProbe` layer
-      can be inserted immediately after SDPA to read its `Output` (post-
-      softmax attention map already lives there for the Backpropagate path)
-      and accumulate entropies; the report iterates the layer list, swaps in
-      the probe, runs forward on the probe batch, harvests, and removes it.
-      Pure-CPU, finishes in one forward pass. Companion
-      `examples/AttentionEntropyReport/` trains the existing
-      AttentionCopyTask-style tiny SDPA model briefly and prints the report,
-      pinning a format reviewers can eyeball. Natural follow-up to the
-      already-listed AttentionViz example — that one looks at a single map
-      qualitatively; this one quantifies the whole stack and gives a single
-      number per layer to track across training runs.
-### Language-model evaluation
-- [X] TNNet.PerplexityReport — generic next-token-prediction evaluator that,
-      given a trained sequence model whose final layer is a softmax-family
-      head (TNNetSoftMax / TNNetPointwiseSoftMax / TNNetLogSoftMax) over a
-      vocabulary of size V and a held-out token stream of length N, reports:
-      (a) per-token mean cross-entropy in nats and bits,
-      (b) perplexity `exp(mean_CE)`,
-      (c) bits-per-character (BPC) — same as bits-per-token when the
-          vocabulary is character-level, otherwise weighted by the
-          char-length of each token,
-      (d) top-1 and top-5 accuracy over the stream,
-      (e) a 10-bin ASCII histogram of per-token bits (a long right tail
-          flags rare-token spikes — a useful sanity signal),
-      (f) the K worst-predicted positions (token, context window, bits)
-          for qualitative inspection.
-      Auto-detects log-space vs probability-space output by sniffing the
-      final layer class; clamps probabilities with `eps` before `log` only
-      on the probability-space path. Pure forward-pass, no training-time
-      changes, no new layer types. Companion `examples/PerplexityEval/`
-      runs it against the existing SimpleNLP-style char model and the
-      external ../gpt-3-for-pascal downstream so both have a single shared
-      pinned metric to track across model revisions. Distinct from the
-      already-listed AttentionEntropyReport (attention-map quality, not
-      output-distribution quality) and the Top-logit-margin report
-      (classifier-style confidence on a fixed-label task, not next-token
-      prediction).
-
 ### Weight-matrix spectrum
 - [ ] TNNet.WeightSpectrumReport — for every trainable layer in a network,
       estimate the top singular value `sigma_1(W)` of its weight matrix via
@@ -1096,35 +1047,3 @@ breakdown:
       net (baseline) and (ii) the same architecture after a short training
       run, so reviewers can eyeball how training pushes the spectrum away
       from the init baseline.
-
-### Generalization diagnostics
-- [X] TNNet.LossLandscapeProbe — given a trained network, a small
-      validation batch, and a step count K, sample the loss along a random
-      1D direction `d` in weight space at offsets
-      `alpha in {-r, ..., +r}` (K samples, default K=21, r=1.0), restoring
-      the original weights at the end. Direction `d` is drawn by sampling
-      each trainable layer's weight tensor from N(0, 1) and then
-      *filter-normalising* it (Li et al. 2018: rescale per-filter so
-      `||d_filter|| = ||W_filter||`), which is the standard fix that makes
-      cross-architecture sharpness comparisons meaningful — without it,
-      ReLU scale-invariance makes the raw loss curve depend on weight
-      magnitude rather than landscape geometry. Reports:
-      (a) the K loss values (printed as a one-line ASCII curve over
-          [alpha_min, alpha_max]),
-      (b) a single "sharpness" scalar — the second central difference
-          `(L(+h) - 2*L(0) + L(-h)) / h^2` at a small `h` — as a cheap
-          proxy for local curvature,
-      (c) the alpha at which loss first exceeds `2 * L(0)` in either
-          direction (the "loss-doubling radius" — a robust width estimate
-          that doesn't depend on Hessian eigenvalues).
-      Pure forward-pass, no autograd / Hessian work, no new layer types;
-      iterates the layer list to read/write FNeurons[*].Weights with the
-      existing accessors. Distinct from the already-listed
-      [[WeightDriftReport]] (training-time weight deltas, not a probe
-      around the final point) and [[GradientNormReport]] (training-time
-      backward magnitudes, not forward-only landscape geometry). Companion
-      `examples/LossLandscapeProbe/` runs it against a small SimpleImage
-      CIFAR baseline trained with two different optimisers (e.g. SGD vs
-      Adam at matched final accuracy) and prints the two curves side by
-      side, so the format is pinned and the "flat-minima generalise
-      better" folklore becomes empirically inspectable on this library.
