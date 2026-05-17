@@ -2004,6 +2004,29 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Swish-beta with a SINGLE learnable scalar beta (shared across all
+  // elements). Forward:  y = x * sigmoid(beta * x).
+  // Input gradient:  dy/dx     = sigmoid(beta*x) +
+  //                              x * beta * sigmoid(beta*x) * (1 - sigmoid(beta*x)).
+  // Parameter grad:  dy/dbeta  = x^2 * sigmoid(beta*x) * (1 - sigmoid(beta*x)).
+  // beta is initialised to 1.0, so an untrained TNNetSwishLearnable matches
+  // the ordinary TNNetSwish exactly. Mirrors TNNetPReLU's single-scalar
+  // trainable pattern (descends from TNNetChannelTransformBase because the
+  // weightless TNNetReLUBase activation hierarchy cannot store gradients).
+  // Ramachandran, Zoph, Le 2017 - "Searching for Activation Functions",
+  // https://arxiv.org/abs/1710.05941.
+  TNNetSwishLearnable = class(TNNetChannelTransformBase)
+    private
+      FInitialBeta: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialBeta: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Per-channel Parametric ReLU (He et al. 2015): y[c] = max(0, x[c]) +
   // alpha[c] * min(0, x[c]) with one learnable alpha PER channel stored in
   // FNeurons[0].Weights (length = Depth). Default initial alpha is 0.25
@@ -5068,6 +5091,131 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSwishLearnable }
+
+constructor TNNetSwishLearnable.Create();
+begin
+  // Initial beta = 1.0 reproduces ordinary TNNetSwish exactly.
+  Create(1.0);
+end;
+
+constructor TNNetSwishLearnable.Create(pInitialBeta: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialBeta := pInitialBeta;
+  FFloatSt[0] := pInitialBeta;
+  InitDefault();
+end;
+
+procedure TNNetSwishLearnable.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Override the base which allocates Depth weights: a single shared scalar.
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetSwishLearnable.Compute();
+var
+  StartTime: double;
+  beta, x, betaX, sig: TNeuralFloat;
+  i, SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  HasDeriv: boolean;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> 1 then
+  begin
+    FErrorProc('Neuron weight count must be 1 at TNNetSwishLearnable.');
+  end;
+  {$ENDIF}
+  beta := FNeurons[0].FWeights.Raw[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
+  if HasDeriv then
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      betaX := beta * x;
+      sig := 1 / (1 + Exp(-betaX));
+      FOutput.FData[i] := x * sig;
+      // dy/dx = sigmoid(beta*x) + x*beta*sigmoid(beta*x)*(1 - sigmoid(beta*x)).
+      FOutputErrorDeriv.FData[i] := sig + x * beta * sig * (1 - sig);
+    end;
+  end
+  else
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      FOutput.FData[i] := x / (1 + Exp(-beta * x));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSwishLearnable.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  gradBeta, beta, x, betaX, sig: TNeuralFloat;
+  i: integer;
+  LocalPrevOutput: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  beta := localNeuron.FWeights.Raw[0];
+  // Gradient w.r.t. the scalar beta:
+  // d(beta) = sum_i OutputError[i] * x_i^2 * sigmoid(beta*x_i) * (1 - sigmoid(beta*x_i)).
+  gradBeta := 0;
+  for i := 0 to FOutputError.Size - 1 do
+  begin
+    x := LocalPrevOutput.Raw[i];
+    betaX := beta * x;
+    sig := 1 / (1 + Exp(-betaX));
+    gradBeta := gradBeta + FOutputError.Raw[i] * x * x * sig * (1 - sig);
+  end;
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
+    (-FLearningRate) * gradBeta;
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Gradient w.r.t. the input:
+    // dInput[i] = OutputError[i] * (sig + x * beta * sig * (1 - sig)).
+    for i := 0 to FOutputError.Size - 1 do
+    begin
+      x := LocalPrevOutput.Raw[i];
+      betaX := beta * x;
+      sig := 1 / (1 + Exp(-betaX));
+      FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
+        FOutputError.Raw[i] * (sig + x * beta * sig * (1 - sig));
+    end;
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetSwishLearnable.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialBeta);
+  AfterWeightUpdate();
 end;
 
 { TNNetISRU }
@@ -23379,6 +23527,7 @@ begin
       'TNNetReLUP' :                Result := TNNetReLUP.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
       'TNNetESwish' :               Result := TNNetESwish.Create(Ft[0]);
+      'TNNetSwishLearnable' :       Result := TNNetSwishLearnable.Create(Ft[0]);
       'TNNetISRU' :                 Result := TNNetISRU.Create(Ft[0]);
       'TNNetISRLU' :                Result := TNNetISRLU.Create(Ft[0]);
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
@@ -23591,6 +23740,7 @@ begin
       if S[0] = 'TNNetReLUP' then Result := TNNetReLUP.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
       if S[0] = 'TNNetESwish' then Result := TNNetESwish.Create(Ft[0]) else
+      if S[0] = 'TNNetSwishLearnable' then Result := TNNetSwishLearnable.Create(Ft[0]) else
       if S[0] = 'TNNetISRU' then Result := TNNetISRU.Create(Ft[0]) else
       if S[0] = 'TNNetISRLU' then Result := TNNetISRLU.Create(Ft[0]) else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
