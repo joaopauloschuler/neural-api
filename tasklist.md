@@ -577,9 +577,6 @@ breakdown:
       without MixUp on CIFAR-10 and report the delta.
 - [ ] `examples/AttentionViz/` — load a tiny trained SDPA model and dump
       the per-head attention matrix as a PGM image.
-- [ ] `examples/PositionalEncodingDemo/` — visualize (ASCII heatmap) the
-      sin/cos table built by TNNetSinusoidalPositionalEmbedding vs the
-      learnable TNNetAddPositionalEmbedding table after a few epochs.
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
@@ -602,7 +599,6 @@ breakdown:
 - [ ] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
       Square(x)))` as a Euclidean-norm-reciprocal head.
 - [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin.
-- [ ] `examples/PReLUvsLeakyReLU/` — three-config bake-off.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
       replacing a stride-2 conv on a tiny CIFAR stub.
 - [ ] `examples/PreNormVsPostNorm/` — toy sequence task with the same
