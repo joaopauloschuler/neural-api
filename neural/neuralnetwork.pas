@@ -602,6 +602,36 @@ type
     procedure Compute(); override;
   end;
 
+  /// Inverse Square Root Unit (ISRU) activation function:
+  // y = x / sqrt(1 + alpha * x^2). Smooth everywhere.
+  // Derivative: dy/dx = (1 / sqrt(1 + alpha*x^2))^3 = 1 / (1 + alpha*x^2)^(3/2).
+  // alpha is user-configurable (stored in FFloatSt[0] for serialization);
+  // default 1.0. Requires alpha > 0.
+  // https://arxiv.org/abs/1710.09967 (Carlile, Delamarter, Kinney, Marti,
+  // Whitney, 2017 - "Improving Deep Learning by Inverse Square Root Linear
+  // Units (ISRLUs)").
+  TNNetISRU = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pAlpha: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
+  /// Inverse Square Root Linear Unit (ISRLU) activation function:
+  // y = x for x >= 0, else x / sqrt(1 + alpha * x^2).
+  // Derivative: 1 for x >= 0, else (1 / sqrt(1 + alpha*x^2))^3.
+  // alpha is user-configurable (stored in FFloatSt[0] for serialization);
+  // default 1.0. Requires alpha > 0.
+  // https://arxiv.org/abs/1710.09967 (Carlile, Delamarter, Kinney, Marti,
+  // Whitney, 2017 - "Improving Deep Learning by Inverse Square Root Linear
+  // Units (ISRLUs)").
+  TNNetISRLU = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pAlpha: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Squared ReLU activation function: relu(x)^2.
   // Derivative: 2*relu(x) for x>0, else 0.
   // https://arxiv.org/abs/2109.08668 (Primer)
@@ -5008,6 +5038,121 @@ begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       BetaX := Beta * PrevValue;
       FOutput.FData[OutputCnt] := Beta * PrevValue / ( 1 + Exp(-BetaX) );
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetISRU }
+
+constructor TNNetISRU.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetISRU.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha <= 0 then
+    FErrorProc('TNNetISRU requires alpha > 0.');
+  FFloatSt[0] := pAlpha;
+end;
+
+procedure TNNetISRU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue, Alpha, InvSqrt: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Alpha := FFloatSt[0];
+
+  // ISRU(x) = x / sqrt(1 + alpha * x^2).
+  // dy/dx = (1 / sqrt(1 + alpha*x^2))^3.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
+      FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
+      FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] :=
+        PrevValue / Sqrt(1 + Alpha * PrevValue * PrevValue);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetISRLU }
+
+constructor TNNetISRLU.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetISRLU.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha <= 0 then
+    FErrorProc('TNNetISRLU requires alpha > 0.');
+  FFloatSt[0] := pAlpha;
+end;
+
+procedure TNNetISRLU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  PrevValue, Alpha, InvSqrt: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Alpha := FFloatSt[0];
+
+  // ISRLU(x) = x for x >= 0, else x / sqrt(1 + alpha * x^2).
+  // dy/dx     = 1 for x >= 0, else (1 / sqrt(1 + alpha*x^2))^3.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue >= 0 then
+      begin
+        FOutput.FData[OutputCnt] := PrevValue;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
+        FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
+        FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
+      end;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      PrevValue := LocalPrevOutput.FData[OutputCnt];
+      if PrevValue >= 0 then
+        FOutput.FData[OutputCnt] := PrevValue
+      else
+        FOutput.FData[OutputCnt] :=
+          PrevValue / Sqrt(1 + Alpha * PrevValue * PrevValue);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -23134,6 +23279,8 @@ begin
       'TNNetReLUP' :                Result := TNNetReLUP.Create();
       'TNNetSwish' :                Result := TNNetSwish.Create();
       'TNNetESwish' :               Result := TNNetESwish.Create(Ft[0]);
+      'TNNetISRU' :                 Result := TNNetISRU.Create(Ft[0]);
+      'TNNetISRLU' :                Result := TNNetISRLU.Create(Ft[0]);
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
@@ -23342,6 +23489,8 @@ begin
       if S[0] = 'TNNetReLUP' then Result := TNNetReLUP.Create() else
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
       if S[0] = 'TNNetESwish' then Result := TNNetESwish.Create(Ft[0]) else
+      if S[0] = 'TNNetISRU' then Result := TNNetISRU.Create(Ft[0]) else
+      if S[0] = 'TNNetISRLU' then Result := TNNetISRLU.Create(Ft[0]) else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else

@@ -358,6 +358,11 @@ type
     procedure TestTanhExpSerializationRoundTrip;
     procedure TestSmishGradientCheck;
     procedure TestSmishSerializationRoundTrip;
+    procedure TestISRUGradientCheck;
+    procedure TestISRUSerializationRoundTrip;
+    procedure TestISRLUGradientCheck;
+    procedure TestISRLUSerializationRoundTrip;
+    procedure TestISRLUNonDefaultAlpha;
     procedure TestPhishGradientCheck;
     procedure TestPhishSerializationRoundTrip;
     procedure TestPenalizedTanhAsymmetry;
@@ -10086,6 +10091,61 @@ procedure TTestNeuralNumerical.TestSmishSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSmish.Create(),
     'Smish', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestISRUGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetISRU.Create(), 'ISRU',
+    [0.5, -0.5, 1.0, -2.0, 2.5, -3.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestISRUSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetISRU.Create(),
+    'ISRU', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestISRLUGradientCheck;
+begin
+  // Inputs cover both sides of zero so we hit the identity and ISRU branches.
+  ActivationGradientCheck(Self, TNNetISRLU.Create(), 'ISRLU',
+    [0.5, -0.5, 1.0, -2.0, 2.5, -3.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestISRLUSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetISRLU.Create(),
+    'ISRLU', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestISRLUNonDefaultAlpha;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // alpha lives in FFloatSt[0] and must survive serialization.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetISRLU.Create(2.5));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('ISRLU round-trip class name',
+        'TNNetISRLU', NN2.GetLastLayer.ClassName);
+      AssertEquals('ISRLU round-trip structure preserves alpha=2.5',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+  // Also verify output equivalence with a non-default alpha.
+  SerializationRoundTrip(Self, TNNetISRLU.Create(2.5),
+    'ISRLU', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPhishGradientCheck;
