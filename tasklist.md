@@ -39,12 +39,7 @@ rather than acted on.
 - [ ] Sparse / mixture-of-experts routing layer
 
 ## Interesting applications / examples
-- [ ] Tiny GPT — char-level transformer trained end-to-end in Pascal on CPU
-- [ ] Tokenizer + trainable word embeddings example with nearest-neighbor visualization
-- [ ] Audio: 1D-conv keyword-spotting example (spoken digit recognition)
-- [ ] Time series forecasting example (energy load / weather)
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
-- [ ] On-device anomaly detection autoencoder
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 
 ## Infrastructure / dev experience
@@ -58,9 +53,6 @@ rather than acted on.
       out-of-scope for v1.
 - [ ] CI-friendly headless test runner with coverage reporting
 - [ ] Expand layer test coverage — numerical-gradient checks for layers that lack them
-- [ ] CI shim: a tiny GitHub Actions workflow that runs
-      `tests/RunAll.sh` on push. The script already has the right
-      exit semantics — the workflow is ~15 lines.
 
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
@@ -84,11 +76,6 @@ rather than acted on.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
       regressions are visible without OpenCL/AVX hardware differences.
 #### Experiments I'm curious about
-- [ ] Activation-function bake-off: train the same small MLP on a fixed toy
-      dataset with ReLU / GELU / Swish / Mish / SELU and print a comparison
-      table of final loss and epochs-to-converge. Pure-CPU, runs in seconds.
-- [ ] Normalization bake-off: same idea, comparing no-norm / LayerNorm /
-      RMSNorm / GroupNorm on a small net, showing convergence-speed differences.
 - [ ] Weight-initialization sensitivity demo: show how a deep-ish net's
       first-epoch gradient magnitudes change across the available init schemes.
 #### Documentation
@@ -115,16 +102,9 @@ rather than acted on.
       task at the top of the list.
 
 #### Experiments I'm curious about
-- [ ] Optimizer bake-off: train the same small MLP with SGD / SGD+momentum /
-      Adam / RMSProp on a fixed toy dataset and print a loss-vs-epoch table.
-      Pure-CPU, runs in seconds, and complements the activation/normalization
-      bake-offs already on the list.
 - [ ] Batch-size sweep demo: same net and data, vary the batch size, and print
       how wall-clock-per-epoch and epochs-to-converge trade off. A concrete,
       visible illustration of a tuning knob beginners always ask about.
-- [ ] Dead-ReLU diagnostic: train a small ReLU net and print the fraction of
-      units that never fire across an epoch, then repeat with LeakyReLU/GELU to
-      show the difference. A fun, instructive correctness-adjacent experiment.
 
 ### Added ideas
 - [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
@@ -197,9 +177,6 @@ breakdown:
 - [ ] Causal-mask sanity experiment: train a tiny attention model on
       next-token prediction WITH and WITHOUT TNNetMaskedFill, and show
       the unmasked one cheats (near-zero loss but useless at generation).
-- [ ] Gradient-magnitude visualizer: print per-layer gradient norms across
-      training steps for a deep MLP, with and without LayerNorm/RMSNorm,
-      to visualize the vanishing/exploding-gradient story.
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
