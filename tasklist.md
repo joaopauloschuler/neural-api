@@ -1081,6 +1081,26 @@ breakdown:
       temperature-scaling fit on the logits.
 
 ### Introspection (added)
+- [ ] TNNet.WeightDriftReport(SnapshotA, SnapshotB) — given two snapshots
+      of a network's trainable weights captured at different points in
+      training (e.g., after epoch N and epoch N+K), report per-trainable-
+      layer the L2 distance `||W_B - W_A||_2`, the relative drift
+      `||W_B - W_A||_2 / (||W_A||_2 + eps)`, and the fraction of weights
+      that moved by less than a small threshold (e.g., 1e-6). Surfaces
+      "frozen" layers (vanishing-gradient bottom of a deep stack, or a
+      pretrained block left at LR=0) and "exploding" layers (relative
+      drift orders of magnitude above the rest) without having to wire
+      a custom logger. Snapshots are just `TNNet.SaveToString` blobs
+      held in memory, so the API is `WeightDriftReport(const A, B:
+      string): string` and composes naturally with the existing
+      serialization path — no new file format, no live-pointer
+      coupling. Distinct from [[DeadNeuronReport]] (activations, not
+      weights) and from `WeightHistogramDump` (single point in time,
+      no delta). Pure-CPU, runs in milliseconds. Companion
+      `examples/WeightDriftReport/` trains a deep ReLU MLP for a few
+      epochs with one layer's LR multiplier deliberately set to 0 and
+      prints the report, pinning that the frozen layer shows ~0 drift
+      while its neighbors do not.
 - [X] TNNet.DiffArchitecture(OtherNet) — companion to the recently-shipped
       PrintSummary. Walks both networks layer-by-layer and prints a
       unified-diff-style report of architectural differences: matching
