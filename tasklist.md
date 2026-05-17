@@ -281,7 +281,7 @@ breakdown:
       multiply; the "Learning" part of its parent class doesn't engage
       unless wired up). Do NOT add a separate class — use
       TNNetMulByConstant for the warm-up-scaling trick.
-- [ ] TNNetPReLUChannel — per-channel PReLU (matches He 2015).
+- [X] TNNetPReLUChannel — per-channel PReLU (matches He 2015).
 - [ ] TNNetSwishLearnable — TNNetSwish with a single learnable β.
 - [ ] TNNetMishLearnable — TNNetMish with a single learnable α.
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
@@ -317,7 +317,7 @@ breakdown:
 #### Probability projections / sparsity
 - [ ] TNNetSparsemax — Martins & Astudillo's exact-sparse alternative to
       softmax. Yields true zeros; natural drop-in for sparse attention.
-- [ ] TNNetTopK — keep only the top-K activations per spatial cell along
+- [X] TNNetTopK — keep only the top-K activations per spatial cell along
       the depth axis, zeroing the rest. K in FStruct[0].
 - [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
@@ -617,7 +617,7 @@ breakdown:
       without MixUp on CIFAR-10 and report the delta.
 - [ ] `examples/AttentionViz/` — load a tiny trained SDPA model and dump
       the per-head attention matrix as a PGM image.
-- [ ] `examples/AttentionCopyTask/` — single-head SDPA learns to copy a
+- [X] `examples/AttentionCopyTask/` — single-head SDPA learns to copy a
       16-token input to its output. Smallest possible end-to-end attention
       training demo using existing SDPA (no MHSA dependency).
 - [ ] `examples/PositionalEncodingDemo/` — visualize (ASCII heatmap) the
@@ -880,7 +880,7 @@ breakdown:
 - [ ] "Periodic activations" README subsection covering TNNetSin, TNNetCos,
       TNNetSnake, TNNetGaussianActivation.
 - [ ] "Sparsity & routing" README subsection covering TNNetTopK,
-      TNNetHardShrink, TNNetSoftShrink, TNNetThreshold (once TopK lands).
+      TNNetHardShrink, TNNetSoftShrink, TNNetThreshold (TopK has landed).
 - [ ] "Elementwise transcendental layers" README subsection covering
       TNNetSqrt / TNNetExp / TNNetLog / TNNetReciprocal / TNNetAbs /
       TNNetSquare. Common eps-guard convention plus a tiny Euclidean-norm-
