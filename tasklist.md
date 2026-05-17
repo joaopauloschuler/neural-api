@@ -79,7 +79,7 @@ rather than acted on.
 ## Added ideas
 
 ### Smaller follow-up ideas
-- [ ] TNNetZScore vs TNNetLayerNorm equivalence test: with LayerNorm's gamma
+- [x] TNNetZScore vs TNNetLayerNorm equivalence test: with LayerNorm's gamma
       pinned to 1 and beta to 0, forward outputs must match TNNetZScore to
       within ~1e-5 across a few seeded inputs. Pins the "ZScore is the
       unparameterised core of LayerNorm" claim.
@@ -941,7 +941,7 @@ breakdown:
 - [ ] TNNetMaxOut CIFAR-style example wired into one of the SimpleImage
       paths.
 - [ ] TNNetCELU CIFAR-style smoke example.
-- [ ] RMSNorm vs LayerNorm equivalence test under zero-empirical-mean
+- [x] RMSNorm vs LayerNorm equivalence test under zero-empirical-mean
       inputs (modulo learnable scale/bias).
 - [ ] Numerical-gradient test confirming TNNetRMSNorm matches the analytical
       gradient under non-trivial input distributions (mean ≠ 0, var ≠ 1).

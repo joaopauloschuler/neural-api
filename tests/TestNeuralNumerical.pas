@@ -72,6 +72,8 @@ type
     procedure TestRMSNormGradientCheck;
     procedure TestZScoreForward;
     procedure TestZScoreGradientCheck;
+    procedure TestZScoreVsLayerNormEquivalence;
+    procedure TestRMSNormVsLayerNormEquivalenceZeroMean;
     procedure TestPixelNormForward;
     procedure TestPixelNormGradientCheck;
     procedure TestPixelNormSerializationRoundTrip;
@@ -2036,6 +2038,141 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestZScoreVsLayerNormEquivalence;
+var
+  NetLN, NetZS: TNNet;
+  Input: TNNetVolume;
+  LNorm: TNNetLayerNorm;
+  OutLN, OutZS: TNNetVolume;
+  Trial, i: integer;
+  Seeds: array[0..2] of integer;
+  MaxDiff, Diff: TNeuralFloat;
+begin
+  // Pin LayerNorm's gamma to 1 and beta to 0 -> it should match TNNetZScore
+  // (the unparameterised core of LayerNorm) within tight tolerance for any
+  // input. The two layers use slightly different epsilons (1e-5 vs 1e-8),
+  // so the residual error is bounded by ~eps/2 in normalized space.
+  Seeds[0] := 1337;
+  Seeds[1] := 4242;
+  Seeds[2] := 90210;
+  NetLN := TNNet.Create();
+  NetZS := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 4);
+  OutLN := TNNetVolume.Create();
+  OutZS := TNNetVolume.Create();
+  try
+    NetLN.AddLayer(TNNetInput.Create(3, 3, 4));
+    LNorm := TNNetLayerNorm.Create();
+    NetLN.AddLayer(LNorm);
+
+    NetZS.AddLayer(TNNetInput.Create(3, 3, 4));
+    NetZS.AddLayer(TNNetZScore.Create());
+
+    // Pin gamma=1, beta=0 explicitly (InitDefault already does this, but
+    // we re-pin to make the equivalence test self-documenting).
+    LNorm.Neurons[0].Weights.Fill(1.0); // gamma
+    LNorm.Neurons[1].Weights.Fill(0.0); // beta
+
+    for Trial := 0 to High(Seeds) do
+    begin
+      RandSeed := Seeds[Trial];
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := (Random - 0.5) * 4.0; // roughly unit variance
+
+      NetLN.Compute(Input);
+      OutLN.Copy(NetLN.GetLastLayer.Output);
+      NetZS.Compute(Input);
+      OutZS.Copy(NetZS.GetLastLayer.Output);
+
+      MaxDiff := 0;
+      for i := 0 to OutLN.Size - 1 do
+      begin
+        Diff := Abs(OutLN.Raw[i] - OutZS.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('LayerNorm(gamma=1,beta=0) vs ZScore trial ' + IntToStr(Trial) +
+        ' max abs diff ' + FloatToStr(MaxDiff) + ' exceeds 1e-5',
+        MaxDiff < 1e-5);
+    end;
+  finally
+    NetLN.Free;
+    NetZS.Free;
+    Input.Free;
+    OutLN.Free;
+    OutZS.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormVsLayerNormEquivalenceZeroMean;
+var
+  NetLN, NetRM: TNNet;
+  Input: TNNetVolume;
+  LNorm: TNNetLayerNorm;
+  RNorm: TNNetRMSNorm;
+  OutLN, OutRM: TNNetVolume;
+  Trial, i: integer;
+  Seeds: array[0..2] of integer;
+  Mean, MaxDiff, Diff: TNeuralFloat;
+begin
+  // RMSNorm == LayerNorm when (a) inputs already have zero mean, so the
+  // mean-subtract step in LayerNorm is a no-op, and (b) LayerNorm gamma=1,
+  // beta=0, and RMSNorm scale=1. Both layers reduce over the whole sample
+  // (SizeX*SizeY*Depth) and use eps=1e-5.
+  Seeds[0] := 24;
+  Seeds[1] := 7;
+  Seeds[2] := 1971;
+  NetLN := TNNet.Create();
+  NetRM := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 5);
+  OutLN := TNNetVolume.Create();
+  OutRM := TNNetVolume.Create();
+  try
+    NetLN.AddLayer(TNNetInput.Create(2, 2, 5));
+    LNorm := TNNetLayerNorm.Create();
+    NetLN.AddLayer(LNorm);
+
+    NetRM.AddLayer(TNNetInput.Create(2, 2, 5));
+    RNorm := TNNetRMSNorm.Create();
+    NetRM.AddLayer(RNorm);
+
+    LNorm.Neurons[0].Weights.Fill(1.0); // gamma
+    LNorm.Neurons[1].Weights.Fill(0.0); // beta
+    RNorm.Neurons[0].Weights.Fill(1.0); // gamma (per-element scale)
+
+    for Trial := 0 to High(Seeds) do
+    begin
+      RandSeed := Seeds[Trial];
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := (Random - 0.5) * 4.0;
+      // Subtract sample mean -> zero empirical mean over the whole sample,
+      // matching the axis both norm layers reduce over.
+      Mean := Input.GetAvg();
+      Input.Sub(Mean);
+
+      NetLN.Compute(Input);
+      OutLN.Copy(NetLN.GetLastLayer.Output);
+      NetRM.Compute(Input);
+      OutRM.Copy(NetRM.GetLastLayer.Output);
+
+      MaxDiff := 0;
+      for i := 0 to OutLN.Size - 1 do
+      begin
+        Diff := Abs(OutLN.Raw[i] - OutRM.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('LayerNorm vs RMSNorm under zero-mean input trial ' +
+        IntToStr(Trial) + ' max abs diff ' + FloatToStr(MaxDiff) +
+        ' exceeds 1e-5', MaxDiff < 1e-5);
+    end;
+  finally
+    NetLN.Free;
+    NetRM.Free;
+    Input.Free;
+    OutLN.Free;
+    OutRM.Free;
   end;
 end;
 
