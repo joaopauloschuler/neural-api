@@ -1065,6 +1065,38 @@ breakdown:
       (classifier-style confidence on a fixed-label task, not next-token
       prediction).
 
+### Weight-matrix spectrum
+- [ ] TNNet.WeightSpectrumReport — for every trainable layer in a network,
+      estimate the top singular value `sigma_1(W)` of its weight matrix via
+      a handful of power-iteration steps (default 10), and report per layer:
+      (a) `sigma_1`,
+      (b) `||W||_F` (Frobenius norm, cheap exact),
+      (c) the ratio `sigma_1 / ||W||_F` — a stable-rank-flavoured signal
+          where values near 1 hint at rank-1 collapse (one direction
+          dominates) and values near `1/sqrt(min(in, out))` hint at a
+          well-spread spectrum,
+      (d) `sigma_1` divided by a Marchenko-Pastur baseline
+          `(sqrt(in) + sqrt(out)) * std(W)` — a one-number "is this layer's
+          top mode larger than what a Gaussian init of matching std would
+          produce?" check,
+      (e) a 10-bin ASCII histogram of per-layer `sigma_1 / fan_in_baseline`
+          across the network,
+      (f) a flag list: "spectral-norm > threshold" layers (Lipschitz risk)
+          and "stable-rank ≈ 1" layers (representation collapse risk).
+      Pure forward-only on the weight tensors — no training-time changes,
+      no probe batch needed (a probe-batch variant could land later as
+      `JacobianSpectrumReport` if it proves worth the extra knob).
+      Distinct from [[WeightDriftReport]] (deltas across training, not a
+      snapshot), [[GradientNormReport]] (backward magnitudes, not weight
+      geometry), and [[LossLandscapeProbe]] (forward loss along a random
+      direction, not weight spectrum). The shared spectral-norm helper
+      this would introduce is reusable by the already-listed
+      [[TNNetSpectralNorm]] wrapper task. Companion
+      `examples/WeightSpectrumReport/` runs it on (i) a freshly-initialised
+      net (baseline) and (ii) the same architecture after a short training
+      run, so reviewers can eyeball how training pushes the spectrum away
+      from the init baseline.
+
 ### Generalization diagnostics
 - [X] TNNet.LossLandscapeProbe — given a trained network, a small
       validation batch, and a step count K, sample the loss along a random
