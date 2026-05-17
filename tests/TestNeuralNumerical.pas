@@ -254,7 +254,10 @@ type
     procedure TestReverseChannelsSerializationRoundTrip;
     procedure TestCumSumForward;
     procedure TestCumSumGradientCheck;
+    procedure TestCumSumGradientCheckAxisX;
+    procedure TestCumSumGradientCheckAxisY;
     procedure TestCumSumSerializationRoundTrip;
+    procedure TestCumSumAxisSerializationRoundTrip;
     procedure TestRollForward;
     procedure TestRollGradientCheck;
     procedure TestRollInvolution;
@@ -7511,6 +7514,24 @@ begin
     'CumSum', 2, 2, 4, 0.05);
 end;
 
+procedure TTestNeuralNumerical.TestCumSumGradientCheckAxisX;
+begin
+  // Cumulative sum along the X axis (axis = 0). Non-square shape (4 x 3 x 2)
+  // exercises an off-by-one along SizeX. Tolerance is relaxed as for the
+  // default-axis test because cumulative accumulation amplifies finite-
+  // difference noise in Single precision.
+  LayerInputGradientCheck(Self, TNNetCumSum.Create(0),
+    'CumSumAxisX', 4, 3, 2, 0.05);
+end;
+
+procedure TTestNeuralNumerical.TestCumSumGradientCheckAxisY;
+begin
+  // Cumulative sum along the Y axis (axis = 1). Non-square shape (3 x 4 x 2)
+  // exercises an off-by-one along SizeY.
+  LayerInputGradientCheck(Self, TNNetCumSum.Create(1),
+    'CumSumAxisY', 3, 4, 2, 0.05);
+end;
+
 procedure TTestNeuralNumerical.TestCumSumSerializationRoundTrip;
 var
   NN, NN2: TNNet;
@@ -7537,6 +7558,55 @@ begin
     end;
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCumSumAxisSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+  Reloaded: TNNetLayer;
+  Input: TNNetVolume;
+  ExpectedXY: array[0..2, 0..1] of TNeuralFloat;
+  x, y: integer;
+begin
+  // Round-trip a non-default axis (X = 0) through SaveToString -> LoadFromString
+  // and confirm the reloaded layer still cumulates along X (not the default
+  // depth axis) by comparing a forward pass to the expected prefix sums.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 1, 1));
+    NN.AddLayer(TNNetCumSum.Create(0));
+    // Input rows along X:
+    //   y=0: [1, 2, 3] -> cumX -> [1, 3, 6]
+    //   y=1: [4, 5, 6] -> cumX -> [4, 9, 15]
+    Input[0, 0, 0] := 1.0; Input[1, 0, 0] := 2.0; Input[2, 0, 0] := 3.0;
+    Input[0, 1, 0] := 4.0; Input[1, 1, 0] := 5.0; Input[2, 1, 0] := 6.0;
+    ExpectedXY[0, 0] := 1.0; ExpectedXY[1, 0] := 3.0; ExpectedXY[2, 0] := 6.0;
+    ExpectedXY[0, 1] := 4.0; ExpectedXY[1, 1] := 9.0; ExpectedXY[2, 1] := 15.0;
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Reloaded := NN2.GetLastLayer;
+      AssertEquals('CumSum axis reloaded class name',
+        'TNNetCumSum', Reloaded.ClassName);
+      AssertTrue('CumSum axis reloaded class equality',
+        Reloaded.ClassType = TNNetCumSum);
+      NN2.Compute(Input);
+      for y := 0 to 1 do
+        for x := 0 to 2 do
+          AssertEquals(
+            'CumSum axis=X reloaded forward (' + IntToStr(x) + ',' + IntToStr(y) + ')',
+            ExpectedXY[x, y],
+            Reloaded.Output[x, y, 0], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

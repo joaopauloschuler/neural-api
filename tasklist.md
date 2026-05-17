@@ -333,7 +333,7 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [ ] TNNetCumSum follow-up: configurable axis (X / Y / Depth) via
+- [x] TNNetCumSum follow-up: configurable axis (X / Y / Depth) via
       FStruct[0]. Depth-only version already landed.
 - [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
       version with Shift in FStruct[0] already landed.

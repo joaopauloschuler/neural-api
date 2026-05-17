@@ -2124,12 +2124,20 @@ type
   end;
 
   /// Tiny parameter-free shape layer that computes the cumulative sum along
-  // the depth (channel) axis: Output[x, y, c] := sum_{k=0..c} Input[x, y, k].
+  // a configurable axis. The axis is selected by the constructor parameter
+  // pAxis stored in FStruct[0]: 0 = X (cumulate along SizeX),
+  // 1 = Y (cumulate along SizeY), 2 = Depth (cumulate along Depth, default).
+  // For the depth axis: Output[x, y, c] := sum_{k=0..c} Input[x, y, k].
   // Backward routes the upstream gradient by reverse-cumsum along the same
-  // axis: dL/dInput[x, y, c] := sum_{k=c..Depth-1} OutputError[x, y, k];
-  // contributions are accumulated into the previous layer's OutputError.
+  // axis: dL/dInput[..., i] := sum_{j>=i} OutputError[..., j]; contributions
+  // are accumulated into the previous layer's OutputError. The parameterless
+  // Create() defaults to the depth axis and is bit-identical to prior
+  // behaviour.
   TNNetCumSum = class(TNNetIdentity)
     public
+      constructor Create(); overload;
+      constructor Create(pAxis: integer); reintroduce; overload;
+
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -8825,9 +8833,21 @@ end;
 
 { TNNetCumSum }
 
+constructor TNNetCumSum.Create();
+begin
+  // Backwards-compatible default: cumulative sum along the depth axis.
+  Create(2);
+end;
+
+constructor TNNetCumSum.Create(pAxis: integer);
+begin
+  inherited Create();
+  FStruct[0] := pAxis;
+end;
+
 procedure TNNetCumSum.Compute();
 var
-  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, Axis: integer;
   Acc: TNeuralFloat;
   StartTime: double;
 begin
@@ -8835,22 +8855,51 @@ begin
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
-  for CntY := 0 to MaxY do
-    for CntX := 0 to MaxX do
-    begin
-      Acc := 0;
+  Axis := FStruct[0];
+  case Axis of
+    0:
+      // Cumulate along X.
       for CntD := 0 to MaxD do
+        for CntY := 0 to MaxY do
+        begin
+          Acc := 0;
+          for CntX := 0 to MaxX do
+          begin
+            Acc := Acc + FPrevLayer.FOutput[CntX, CntY, CntD];
+            FOutput[CntX, CntY, CntD] := Acc;
+          end;
+        end;
+    1:
+      // Cumulate along Y.
+      for CntD := 0 to MaxD do
+        for CntX := 0 to MaxX do
+        begin
+          Acc := 0;
+          for CntY := 0 to MaxY do
+          begin
+            Acc := Acc + FPrevLayer.FOutput[CntX, CntY, CntD];
+            FOutput[CntX, CntY, CntD] := Acc;
+          end;
+        end;
+  else
+    // Default: cumulate along Depth (axis = 2).
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
       begin
-        Acc := Acc + FPrevLayer.FOutput[CntX, CntY, CntD];
-        FOutput[CntX, CntY, CntD] := Acc;
+        Acc := 0;
+        for CntD := 0 to MaxD do
+        begin
+          Acc := Acc + FPrevLayer.FOutput[CntX, CntY, CntD];
+          FOutput[CntX, CntY, CntD] := Acc;
+        end;
       end;
-    end;
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetCumSum.Backpropagate();
 var
-  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, Axis: integer;
   Acc: TNeuralFloat;
   StartTime, LocalNow: double;
 begin
@@ -8863,19 +8912,45 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := FOutput.Depth - 1;
-    // Reverse-cumsum along depth: gradient at input channel c is the sum of
-    // upstream errors at channels c..MaxD. Accumulate (add) so this composes
-    // with branches that share the previous layer's error tensor.
-    for CntY := 0 to MaxY do
-      for CntX := 0 to MaxX do
-      begin
-        Acc := 0;
-        for CntD := MaxD downto 0 do
+    Axis := FStruct[0];
+    // Reverse-cumsum along the chosen axis: gradient at input index i is the
+    // sum of upstream errors at indices j >= i. Accumulate (add) so this
+    // composes with branches that share the previous layer's error tensor.
+    case Axis of
+      0:
+        for CntD := 0 to MaxD do
+          for CntY := 0 to MaxY do
+          begin
+            Acc := 0;
+            for CntX := MaxX downto 0 do
+            begin
+              Acc := Acc + FOutputError[CntX, CntY, CntD];
+              FPrevLayer.FOutputError.Add(CntX, CntY, CntD, Acc);
+            end;
+          end;
+      1:
+        for CntD := 0 to MaxD do
+          for CntX := 0 to MaxX do
+          begin
+            Acc := 0;
+            for CntY := MaxY downto 0 do
+            begin
+              Acc := Acc + FOutputError[CntX, CntY, CntD];
+              FPrevLayer.FOutputError.Add(CntX, CntY, CntD, Acc);
+            end;
+          end;
+    else
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
         begin
-          Acc := Acc + FOutputError[CntX, CntY, CntD];
-          FPrevLayer.FOutputError.Add(CntX, CntY, CntD, Acc);
+          Acc := 0;
+          for CntD := MaxD downto 0 do
+          begin
+            Acc := Acc + FOutputError[CntX, CntY, CntD];
+            FPrevLayer.FOutputError.Add(CntX, CntY, CntD, Acc);
+          end;
         end;
-      end;
+    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -22821,7 +22896,7 @@ begin
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
-      'TNNetCumSum' :               Result := TNNetCumSum.Create();
+      'TNNetCumSum' :               Result := TNNetCumSum.Create(St[0]);
       'TNNetRoll' :                 Result := TNNetRoll.Create(St[0]);
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
       'TNNetFlipX' :                Result := TNNetFlipX.Create();
@@ -23024,7 +23099,7 @@ begin
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
-      if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create() else
+      if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create(St[0]) else
       if S[0] = 'TNNetRoll' then Result := TNNetRoll.Create(St[0]) else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else
       if S[0] = 'TNNetFlipX' then Result := TNNetFlipX.Create() else
