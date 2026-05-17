@@ -354,8 +354,6 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [x] TNNetCumSum follow-up: configurable axis (X / Y / Depth) via
-      FStruct[0]. Depth-only version already landed.
 - [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
       version with Shift in FStruct[0] already landed.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
@@ -387,8 +385,6 @@ breakdown:
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
       recognition heads.
-- [x] TNNetEntropyRegularizer — passthrough layer adding
-      `-λ * sum(p * log(p))` to the gradient.
 - [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
       straight-through assignment plus commitment/codebook losses.
 
@@ -617,9 +613,6 @@ breakdown:
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm.
 - [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
       on a fixed toy dataset with a loss-vs-epoch table.
-- [x] `examples/CharTokenizer/` — minimal in-memory char tokenizer +
-      trainable embedding lookup, with a nearest-neighbor printout
-      ("nearest 5 chars to 'q'").
 - [ ] `examples/EmbeddingHeadDemo/` — train a small net to learn an
       embedding space on a toy 3-class dataset using TNNetL2Normalize +
       a hand-rolled triplet loss, print the per-class cosine-similarity
