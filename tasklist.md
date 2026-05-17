@@ -1143,3 +1143,47 @@ breakdown:
       trained with `TNNetRandomFlipX` augmentation (expected: invariance
       error collapses), making the augmentation's effect visible as a
       single number rather than a wall of accuracy digits.
+
+### Test-time augmentation evaluator
+- [ ] TNeuralTTAEvaluator — given a trained classifier, a validation set,
+      and a configurable list of input-side transforms (default menu reuses
+      the existing in-tree augmentations: identity, `TNNetFlipX`,
+      `TNNetFlipY`, `TNNetReverseChannels`, and a 1-pixel `Roll(X=+1)`),
+      run a forward pass per transform, average the resulting logits (and,
+      optionally, the post-softmax probabilities — both modes selectable via
+      a flag so the linear-vs-geometric-mean question is empirically
+      checkable), and report:
+      (a) baseline top-1 accuracy on the untransformed inputs,
+      (b) per-transform top-1 accuracy (each transform applied alone — a
+          built-in correctness check for the augmentation; a healthy model
+          shouldn't lose much accuracy under any single near-invariant
+          transform),
+      (c) full-ensemble TTA top-1 accuracy (all transforms averaged
+          together) and the delta vs baseline,
+      (d) per-class accuracy delta so classes that *lose* under TTA (a
+          sign of a non-equivariant decision boundary for that class) are
+          visible,
+      (e) per-sample agreement rate `mean(argmax(avg_logits) ==
+          argmax(baseline_logits))` — high agreement + small accuracy lift
+          means TTA mostly confirms existing decisions; low agreement +
+          large lift means TTA is genuinely flipping borderline samples,
+      (f) a one-line verdict: "TTA helps" / "TTA neutral" / "TTA hurts"
+          based on a configurable threshold.
+      Pure forward-only — no training-time changes, no backward pass.
+      Distinct from [[EquivarianceReport]] (measures how *output* reacts
+      to transforms in isolation, without using a label or computing
+      accuracy — answers "is the model invariant?" not "does averaging
+      under transforms improve val accuracy?"), from [[SaliencyReport]]
+      (per-sample input attribution, not aggregate accuracy lift), and
+      from the calibration / margin-report tools (those summarise
+      confidence quality on the untransformed set, no ensembling). The
+      output is the natural input for any future "should we ship TTA at
+      inference?" decision — you need to know which transforms actually
+      help before paying their inference cost. Companion
+      `examples/TestTimeAugmentation/` runs it on the SimpleImageClassifier
+      CIFAR baseline so the per-transform table and ensemble delta can be
+      eyeballed; the example also runs against a model trained *with*
+      `TNNetRandomFlipX` augmentation so reviewers can see the expected
+      pattern (TTA gains shrink when the model has already learned the
+      invariance during training — TTA and train-time augmentation are
+      substitutes, not complements).
