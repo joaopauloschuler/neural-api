@@ -1066,6 +1066,42 @@ breakdown:
       and (ii) the same architecture after a short training run, so reviewers
       can eyeball how training reshapes the activation distribution.
 
+### Memory footprint
+- [ ] TNNet.MemoryFootprintReport — given a network (and implicitly the
+      configured input shape from `TNNetInput`), walk every layer and report:
+      (a) per-layer activation tensor size in elements and MiB
+          (`SizeX * SizeY * Depth * sizeof(TNeuralFloat)`),
+      (b) per-layer parameter tensor size in elements and MiB (weights +
+          biases, zero for parameter-free layers),
+      (c) per-layer error/gradient tensor size in MiB (mirrors activation;
+          flagged as "transient — recoverable via checkpointing"),
+      (d) running totals plus the "peak forward residency" (sum of
+          activations that must be kept alive for backward) and the
+          "parameters + optimizer-state" baseline (1x for SGD, 2x for
+          momentum, 3x for Adam — configurable via a `OptimizerKind` flag),
+      (e) a 10-bin ASCII histogram of per-layer activation MiB so the
+          memory-hot layers jump out at a glance,
+      (f) a flag list: "activation-heavy" layers (>10% of the activation
+          total — natural gradient-checkpointing candidates) and
+          "parameter-heavy" layers (>10% of the parameter total — natural
+          LoRA / quantization candidates),
+      (g) a one-line "would-fit-in" verdict against a configurable budget
+          (default: 2 GiB) for `forward-only`, `train-SGD`, `train-Adam`.
+      Pure structure inspection — no probe batch, no forward pass needed
+      (sizes come from the existing `Output.Size` / weight metadata).
+      Distinct from [[FLOPsReport]] (compute, not memory),
+      [[WeightHistogramReport]] (weight value distribution, not byte
+      footprint), [[WeightSpectrumReport]] (weight geometry), and the
+      already-listed `Gradient checkpointing` infrastructure task (this
+      one *measures*; that one *acts*). The output is the natural input
+      for any future checkpointing or mixed-precision work — you need
+      to know which layers cost what before you can decide where to
+      trade compute for memory. Companion `examples/MemoryFootprintReport/`
+      runs it on (i) a tiny MLP, (ii) a small CIFAR conv stack, and
+      (iii) a small attention stack so reviewers can eyeball how the
+      shape of the bottleneck shifts across model families (parameter-
+      heavy MLP vs activation-heavy conv vs both-heavy attention).
+
 ### Weight-matrix spectrum
 - [ ] TNNet.WeightSpectrumReport — for every trainable layer in a network,
       estimate the top singular value `sigma_1(W)` of its weight matrix via
