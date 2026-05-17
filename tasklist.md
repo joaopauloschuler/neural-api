@@ -308,8 +308,12 @@ breakdown:
       fixed (non-trainable) binomial blur filter.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-- [ ] TNNetIdentityScale — fixed (non-learnable) per-tensor scalar
-      multiplier in FFloatSt[0]. Useful for the "warm-up scaling" trick.
+- [ ] ~~TNNetIdentityScale~~ — fixed scalar multiplier is already covered
+      by the in-tree `TNNetMulByConstant(c)` (constructor stores the
+      multiplier in FFloatSt[0] and the forward pass is a pure scalar
+      multiply; the "Learning" part of its parent class doesn't engage
+      unless wired up). Do NOT add a separate class — use
+      TNNetMulByConstant for the warm-up-scaling trick.
 - [ ] TNNetPReLUChannel — per-channel PReLU (matches He 2015).
 - [ ] TNNetSwishLearnable — TNNetSwish with a single learnable β.
 - [ ] TNNetMishLearnable — TNNetMish with a single learnable α.
@@ -369,10 +373,12 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [ ] TNNetCumSum — cumulative sum along a configurable axis. Backward is
-      a reverse cumulative sum.
-- [ ] TNNetRoll — circular shift along a chosen axis. Parameter-free
-      deterministic permutation; backward is the inverse roll.
+- [X] TNNetCumSum — cumulative sum along the depth axis (first version).
+      Backward is reverse cumulative sum. Landed parameter-free, depth-only.
+      Follow-up: configurable axis (X / Y / Depth) via FStruct[0].
+- [X] TNNetRoll — circular shift along the depth axis with constructor int
+      Shift stored in FStruct[0]; backward is the inverse roll. Landed.
+      Follow-up: configurable axis selector.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetSqueeze / TNNetExpandDims — numpy-style single-axis shape
       helpers, less error-prone than open-coding TNNetReshape.
@@ -439,8 +445,10 @@ breakdown:
 - [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
-- [ ] AssertFinite(V: TNNetVolume; const Where: string) — global helper
-      scanning for NaN/Inf and raising with a labelled message.
+- [X] AssertFinite(V: TNNetVolume; const Where: string) — global helper
+      scanning for NaN/Inf and raising a labelled exception. Landed in
+      neuralvolume.pas with NaN/Inf/nil-volume cases covered by
+      TestNeuralVolume.pas.
 
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper

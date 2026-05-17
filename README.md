@@ -621,6 +621,8 @@ These layers could be particularly useful in scenarios where:
 | `TNNetSplitChannels`         | 2D or 3D                   | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |
 | `TNNetSplitChannelEvery`     | 2D or 3D                   | Splits channels from the input every few channels. As example, this layer allows getting  half (GetChannelEvery=2) or a third (GetChannelEvery=3) of the input channels.|
 | `TNNetInterleaveChannels`    | 2D or 3D                   | If you're using grouped convolutions in your network, `TNNetInterleaveChannels` could be particularly useful. It can help mix information between groups, allowing for more interaction between different feature groups.|
+| `TNNetCumSum`                | 2D or 3D                   | Parameter-free cumulative sum along the depth axis: `Output[x, y, c] = sum_{k=0..c} Input[x, y, k]`. Output shape equals input shape. Useful as a learned linear position feature on a constant input. |
+| `TNNetRoll`                  | 2D or 3D                   | Circular shift along the depth axis by `Shift` (integer, can be negative): `Output[x, y, c] = Input[x, y, (c - Shift) mod Depth]`. Parameter-free deterministic permutation; `TNNetRoll.Create(K)` followed by `TNNetRoll.Create(-K)` round-trips to the identity. |
 
 
 ### Transposing Layers
