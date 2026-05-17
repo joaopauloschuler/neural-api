@@ -1095,3 +1095,26 @@ breakdown:
       already-listed AttentionViz example — that one looks at a single map
       qualitatively; this one quantifies the whole stack and gives a single
       number per layer to track across training runs.
+- [ ] TNNet.GradientNormReport — reusable introspection helper that, after a
+      single forward + backward pass on a probe batch, walks every trainable
+      layer and reports (a) the L2 norm of the input-error tensor entering
+      the layer (`||dL/dx_in||`), (b) the L2 norm of the weight-gradient
+      tensor (`||dL/dW||`), and (c) the ratio between consecutive layers'
+      input-error norms (the per-step "gradient amplification factor"). Output
+      is a single table plus a 10-bin ASCII histogram across layers, with
+      "vanishing" (norm < eps_v) and "exploding" (norm > eps_e or ratio
+      outside `[1/k, k]`) layers flagged. Distinct from [[WeightDriftReport]]
+      (weight delta across training time — needs two snapshots), from
+      [[DeadNeuronReport]] (per-unit activation sparsity on ReLU-family
+      layers), and from [[AttentionEntropyReport]] (post-softmax attention
+      maps only). Distinct from the already-listed "Gradient-magnitude
+      visualizer" *experiment* — that one is a one-off bake-off script;
+      this is a reusable TNNet method usable from any training loop or
+      example, mirroring the WeightDriftReport API shape. Pure-CPU, no new
+      layer types, no API churn outside one new method. Companion
+      `examples/GradientNormReport/` runs it on a deep ReLU MLP with and
+      without a midpoint LayerNorm and pins the output format, doubling as
+      the implementation of the existing "Gradient-flow regression test"
+      task. Natural next step: a `GradientNormReport`-driven NaN/Inf guard
+      hook for TNeuralFit (which is also already on the list — this helper
+      provides the shared scanning primitive that guard would call).
