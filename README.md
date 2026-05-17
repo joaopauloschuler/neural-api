@@ -68,6 +68,10 @@ You can learn more about how to build and train simple neural networks at the fo
 * [Hyperbolic activation bake-off on the hypotenuse toy](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HyperbolicActivationBakeOff) — compares 8 hyperbolic-family activations (`TNNetHyperbolicTangent`, `TNNetLeCunTanh`, `TNNetSinhAct`, `TNNetArcSinh`, `TNNetLisht`, `TNNetBentIdentity`, `TNNetTanhExp`, `TNNetLogCoshActivation`) on the same tiny MLP / RNG seed and prints a CSV of final MSE and epochs-to-converge.
 * [LogCosh dual experiment](https://github.com/joaopauloschuler/neural-api/tree/master/examples/LogCoshDualExperiment) — pairs `TNNetLogCoshActivation` (hidden) with `TNNetLogCoshLoss` (output head) vs. a plain MSE head on the hypotenuse toy task; prints a CSV comparing final validation MSE and epochs-to-converge.
 * [Learning-rate range test](https://github.com/joaopauloschuler/neural-api/tree/master/examples/LearningRateFinder) — Leslie Smith's LR-range-test in pure Pascal: trains a tiny MLP for ~100 mini-batches sweeping LR exponentially from 1e-6 to 1e+1, prints a 1-column ASCII chart of `log10(LR)` vs smoothed loss with the steepest-descent row marked, and writes a CSV side-output for downstream tooling.
+* [Sine regression](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SineRegression) — smallest possible "does the library still train?" demo: a two-layer MLP fits `y = sin(pi*x)` on `x in [-1, 1]` with hand-rolled mini-batch SGD; prints periodic MSE and an 11-point predicted-vs-truth table.
+* [Involution demo](https://github.com/joaopauloschuler/neural-api/tree/master/examples/InvolutionDemo) — shows that `TNNetReverseChannels`, `TNNetReverseXY`, `TNNetFlipX`, and `TNNetFlipY` are involutions: applying each twice round-trips to the input exactly (per-element).
+
+You can introspect a network's architecture with `TNNet.PrintSummary` (Keras-style table of layer index, class, output shape `(X,Y,D)`, param count, and neuron count, ending with totals). Use `SummaryString` if you want the table as a string instead of writing to stdout.
 
 ### Loading and Saving Neural Networks
 Loading is very easy:
