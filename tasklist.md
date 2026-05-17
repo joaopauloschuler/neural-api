@@ -1066,7 +1066,7 @@ breakdown:
       prediction).
 
 ### Generalization diagnostics
-- [ ] TNNet.LossLandscapeProbe — given a trained network, a small
+- [X] TNNet.LossLandscapeProbe — given a trained network, a small
       validation batch, and a step count K, sample the loss along a random
       1D direction `d` in weight space at offsets
       `alpha in {-r, ..., +r}` (K samples, default K=21, r=1.0), restoring

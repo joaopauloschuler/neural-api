@@ -403,6 +403,7 @@ type
     procedure TestGradientNormReportSmoke;
     procedure TestPerplexityReportSmoke;
     procedure TestAttentionEntropyReportSmoke;
+    procedure TestLossLandscapeProbeSmoke;
   end;
 
 implementation
@@ -12702,6 +12703,110 @@ begin
   finally
     Lines.Free;
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLossLandscapeProbeSmoke;
+// Smoke test for TNNet.LossLandscapeProbe: builds a tiny 3-layer regression
+// MLP, fills a small pair list with synthetic samples, runs the probe with
+// K=11, R=0.5, and asserts:
+//   (a) the report contains the expected sections (alpha/loss table,
+//       ASCII curve, sharpness scalar, doubling radius);
+//   (b) all weights are restored bit-for-bit after the probe returns,
+//       verifying the snapshot/restore contract.
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  Inp, Tgt: TNNetVolume;
+  Report: string;
+  I, LIdx, NIdx, WIdx, MismatchCount: integer;
+  PreW: array of array of array of TNeuralFloat;
+  PreB: array of array of TNeuralFloat;
+  Layer: TNNetLayer;
+begin
+  RandSeed := 11;
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(1));
+    NN.SetLearningRate(0.01, 0.9);
+
+    // Synthetic samples.
+    for I := 0 to 5 do
+    begin
+      Inp := TNNetVolume.Create(4, 1, 1);
+      Tgt := TNNetVolume.Create(1, 1, 1);
+      Inp.FData[0] := 0.1 * I;
+      Inp.FData[1] := 0.2 * I;
+      Inp.FData[2] := 0.3;
+      Inp.FData[3] := 0.4;
+      Tgt.FData[0] := 0.5 + 0.05 * I;
+      Samples.Add(TNNetVolumePair.Create(Inp, Tgt));
+    end;
+
+    // Pre-snapshot every weight and bias.
+    SetLength(PreW, NN.CountLayers());
+    SetLength(PreB, NN.CountLayers());
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      SetLength(PreW[LIdx], Layer.Neurons.Count);
+      SetLength(PreB[LIdx], Layer.Neurons.Count);
+      for NIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        if (Layer.Neurons[NIdx].Weights <> nil) and
+           (Layer.Neurons[NIdx].Weights.Size > 0) then
+        begin
+          SetLength(PreW[LIdx][NIdx], Layer.Neurons[NIdx].Weights.Size);
+          for WIdx := 0 to Layer.Neurons[NIdx].Weights.Size - 1 do
+            PreW[LIdx][NIdx][WIdx] := Layer.Neurons[NIdx].Weights.FData[WIdx];
+        end;
+        PreB[LIdx][NIdx] := Layer.Neurons[NIdx].Bias;
+      end;
+    end;
+
+    Report := TNNet.LossLandscapeProbe(NN, Samples, 11, 0.5, 0, 42);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Report mentions sharpness',
+      Pos('sharpness', Report) > 0);
+    AssertTrue('Report mentions doubling',
+      Pos('doubling', Report) > 0);
+    AssertTrue('Report mentions alpha',
+      Pos('alpha', Report) > 0);
+    AssertTrue('Report mentions ASCII curve',
+      Pos('ASCII curve', Report) > 0);
+    AssertTrue('Report has no NaN tokens', Pos('NaN', Report) = 0);
+    AssertTrue('Report has no Inf tokens', Pos('Inf', Report) = 0);
+
+    // Bit-for-bit weight restore check.
+    MismatchCount := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      for NIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        if (Layer.Neurons[NIdx].Weights <> nil) and
+           (Layer.Neurons[NIdx].Weights.Size > 0) then
+        begin
+          for WIdx := 0 to Layer.Neurons[NIdx].Weights.Size - 1 do
+            if Layer.Neurons[NIdx].Weights.FData[WIdx] <>
+               PreW[LIdx][NIdx][WIdx] then
+              Inc(MismatchCount);
+        end;
+        if Layer.Neurons[NIdx].Bias <> PreB[LIdx][NIdx] then
+          Inc(MismatchCount);
+      end;
+    end;
+    AssertTrue(
+      Format('All weights restored bit-for-bit (mismatches=%d)',
+        [MismatchCount]),
+      MismatchCount = 0);
+  finally
+    Samples.Free;
     NN.Free;
   end;
 end;

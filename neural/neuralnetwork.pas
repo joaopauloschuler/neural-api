@@ -3146,6 +3146,38 @@ type
         ExplodingThreshold: TNeuralFloat = 1e3;
         RatioFlagFactor: TNeuralFloat = 10.0
       ): string;
+      // Filter-normalised 1D loss-landscape probe around the trained weights.
+      // Given a trained NN, a small validation batch (Samples) and a step
+      // count K, samples the loss along a random direction d in weight space
+      // at K offsets in [-R, +R] and restores the original weights at the
+      // end (try/finally protected). The direction is drawn N(0,1) per
+      // weight tensor and then *filter-normalised* per neuron so that
+      // ||d_neuron|| = ||W_neuron|| (Li et al. 2018), which neutralises ReLU
+      // scale-invariance and makes the curve a geometric property of the
+      // landscape rather than a function of weight magnitude. Reports:
+      // (a) the K loss values L(alpha_i) as a one-line ASCII curve over
+      //     [-R, +R];
+      // (b) the central-difference sharpness scalar
+      //     (L(+h) - 2*L(0) + L(-h)) / h^2 at the smallest |alpha| step;
+      // (c) the loss-doubling radius: smallest |alpha| where L(alpha) >
+      //     2*L(0). Reports ">R" if never exceeded inside [-R, +R].
+      // LossKind: 0 = mean-squared error between final-layer Output and
+      // the per-sample Target volume (default; works for both regression
+      // and one-hot classification heads). 1 = cross-entropy against
+      // one-hot targets, clamping the softmax-family output to [eps, 1].
+      // Seed = 0 leaves the global RandSeed alone; non-zero seeds it for
+      // reproducible direction draws.
+      // K must be odd and >= 3 — even K is bumped to K+1 internally so 0
+      // is always centred. Pure forward pass; no autograd / Hessian work;
+      // no new layer types.
+      class function LossLandscapeProbe(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        K: integer = 21;
+        R: TNeuralFloat = 1.0;
+        LossKind: integer = 0;
+        Seed: longint = 0
+      ): string;
       // Classifier diagnostic helper. Given a trained classifier NN, a labeled
       // validation set Samples (input volume + one-hot target), and the
       // class count NumClasses, runs a single forward pass and reports:
@@ -20151,6 +20183,370 @@ begin
 
     Result := Lines.Text;
   finally
+    Lines.Free;
+  end;
+end;
+
+// Filter-normalised 1D loss-landscape probe. See interface declaration for
+// a full description of inputs and outputs.
+class function TNNet.LossLandscapeProbe(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  K: integer = 21;
+  R: TNeuralFloat = 1.0;
+  LossKind: integer = 0;
+  Seed: longint = 0
+): string;
+const
+  cEps = 1e-12;
+  cCurveWidth = 60;
+var
+  Lines: TStringList;
+  TrainableIdxs: array of integer;
+  // Per-trainable-layer snapshots and direction tensors.
+  SnapW: array of array of TNNetVolume;     // [layer][neuron] -> weights copy
+  SnapB: array of array of TNeuralFloat;    // [layer][neuron] -> bias copy
+  DirW:  array of array of TNNetVolume;     // [layer][neuron] -> direction
+  DirB:  array of array of TNeuralFloat;    // [layer][neuron] -> bias dir
+  Layer: TNNetLayer;
+  Losses: array of TNeuralFloat;
+  Alphas: array of TNeuralFloat;
+  CenterIdx, T, N, LIdx, NIdx, WIdx, I: integer;
+  Alpha, L0, H, Sharpness, WNorm, DNorm, Scale, DoublingRadius: TNeuralFloat;
+  SumLoss, SampleLoss, MinL, MaxL, P, Tgt: TNeuralFloat;
+  Output: TNNetVolume;
+  Pair: TNNetVolumePair;
+  Restored: boolean;
+  CurveLine: string;
+  Pos1, BarLen, MaxBarWidth: integer;
+  DoublingFound: boolean;
+  RangeStr: string;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Restored := false;
+  SetLength(TrainableIdxs, 0);
+  SetLength(SnapW, 0);
+  SetLength(SnapB, 0);
+  SetLength(DirW, 0);
+  SetLength(DirB, 0);
+  try
+    if NN = nil then
+    begin
+      Result := 'LossLandscapeProbe: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'LossLandscapeProbe: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if K < 3 then
+    begin
+      Result := 'LossLandscapeProbe: K must be >= 3.' + sLineBreak;
+      Exit;
+    end;
+    if (K mod 2) = 0 then
+    begin
+      Lines.Add(Format(
+        'LossLandscapeProbe: K=%d is even; bumping to %d so alpha=0 is centred.',
+        [K, K + 1]));
+      K := K + 1;
+    end;
+    if R <= 0 then
+    begin
+      Result := 'LossLandscapeProbe: R must be > 0.' + sLineBreak;
+      Exit;
+    end;
+    if Seed <> 0 then RandSeed := Seed;
+
+    // Collect trainable layers (any layer with neurons that own a non-empty
+    // weight tensor).
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      SetLength(TrainableIdxs, Length(TrainableIdxs) + 1);
+      TrainableIdxs[High(TrainableIdxs)] := LIdx;
+    end;
+
+    if Length(TrainableIdxs) = 0 then
+    begin
+      Result := 'LossLandscapeProbe: no trainable layers found.' + sLineBreak;
+      Exit;
+    end;
+
+    T := Length(TrainableIdxs);
+    SetLength(SnapW, T);
+    SetLength(SnapB, T);
+    SetLength(DirW, T);
+    SetLength(DirB, T);
+
+    // Snapshot original weights/biases and draw filter-normalised direction.
+    for I := 0 to T - 1 do
+    begin
+      Layer := NN.Layers[TrainableIdxs[I]];
+      N := Layer.Neurons.Count;
+      SetLength(SnapW[I], N);
+      SetLength(SnapB[I], N);
+      SetLength(DirW[I], N);
+      SetLength(DirB[I], N);
+      for NIdx := 0 to N - 1 do
+      begin
+        // Snapshot
+        SnapW[I][NIdx] := TNNetVolume.Create();
+        SnapW[I][NIdx].Copy(Layer.Neurons[NIdx].Weights);
+        SnapB[I][NIdx] := Layer.Neurons[NIdx].FBiasWeight;
+
+        // Direction: N(0,1) same shape, then filter-normalise so
+        // ||d|| == ||W|| per neuron. Zero-magnitude filters stay zero.
+        DirW[I][NIdx] := TNNetVolume.Create();
+        DirW[I][NIdx].ReSize(Layer.Neurons[NIdx].Weights);
+        DirW[I][NIdx].RandomizeGaussian(1.0);
+        WNorm := SnapW[I][NIdx].GetMagnitude();
+        DNorm := DirW[I][NIdx].GetMagnitude();
+        if (WNorm > cEps) and (DNorm > cEps) then
+        begin
+          Scale := WNorm / DNorm;
+          for WIdx := 0 to DirW[I][NIdx].Size - 1 do
+            DirW[I][NIdx].FData[WIdx] := DirW[I][NIdx].FData[WIdx] * Scale;
+        end
+        else
+        begin
+          DirW[I][NIdx].Fill(0);
+        end;
+        // Bias direction: separate N(0,1) scaled to |b| (rank-0 filter).
+        DirB[I][NIdx] := DirW[I][NIdx].RandomGaussianValue();
+        if Abs(SnapB[I][NIdx]) > cEps then
+          DirB[I][NIdx] := DirB[I][NIdx] *
+            (Abs(SnapB[I][NIdx]) / (Abs(DirB[I][NIdx]) + cEps))
+        else
+          DirB[I][NIdx] := 0;
+      end;
+    end;
+
+    // Build alpha grid: K linearly-spaced points spanning [-R, +R] with
+    // 0 at index K div 2.
+    SetLength(Alphas, K);
+    SetLength(Losses, K);
+    CenterIdx := K div 2;
+    for I := 0 to K - 1 do
+      Alphas[I] := -R + (2 * R) * I / (K - 1);
+    // Force exact zero at centre.
+    Alphas[CenterIdx] := 0;
+
+    // Sweep alpha. For each, write W := W0 + alpha*d, then accumulate
+    // mean loss across all samples.
+    for I := 0 to K - 1 do
+    begin
+      Alpha := Alphas[I];
+      for LIdx := 0 to T - 1 do
+      begin
+        Layer := NN.Layers[TrainableIdxs[LIdx]];
+        for NIdx := 0 to Layer.Neurons.Count - 1 do
+        begin
+          for WIdx := 0 to Layer.Neurons[NIdx].Weights.Size - 1 do
+            Layer.Neurons[NIdx].Weights.FData[WIdx] :=
+              SnapW[LIdx][NIdx].FData[WIdx] +
+              Alpha * DirW[LIdx][NIdx].FData[WIdx];
+          Layer.Neurons[NIdx].FBiasWeight :=
+            SnapB[LIdx][NIdx] + Alpha * DirB[LIdx][NIdx];
+        end;
+        // Some layers (TNNetFullConnect, TNNetConvolution) cache an
+        // aggregate weight array — keep it in sync if present.
+        Layer.AfterWeightUpdate();
+      end;
+
+      SumLoss := 0;
+      for N := 0 to Samples.Count - 1 do
+      begin
+        Pair := Samples[N];
+        if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+        NN.Compute(Pair.I);
+        Output := NN.GetLastLayer().Output;
+        SampleLoss := 0;
+        case LossKind of
+          1: // Cross-entropy on (clamped) softmax-family output vs one-hot.
+            begin
+              for WIdx := 0 to Output.Size - 1 do
+              begin
+                Tgt := 0;
+                if WIdx < Pair.O.Size then Tgt := Pair.O.FData[WIdx];
+                if Tgt > 0 then
+                begin
+                  P := Output.FData[WIdx];
+                  if P < cEps then P := cEps;
+                  if P > 1 then P := 1;
+                  SampleLoss := SampleLoss - Tgt * Ln(P);
+                end;
+              end;
+            end;
+        else
+          // MSE: 0.5 * mean (Output - Target)^2.
+          for WIdx := 0 to Output.Size - 1 do
+          begin
+            Tgt := 0;
+            if WIdx < Pair.O.Size then Tgt := Pair.O.FData[WIdx];
+            SampleLoss := SampleLoss +
+              (Output.FData[WIdx] - Tgt) * (Output.FData[WIdx] - Tgt);
+          end;
+          if Output.Size > 0 then
+            SampleLoss := 0.5 * SampleLoss / Output.Size;
+        end;
+        SumLoss := SumLoss + SampleLoss;
+      end;
+      if Samples.Count > 0 then
+        Losses[I] := SumLoss / Samples.Count
+      else
+        Losses[I] := 0;
+    end;
+
+    // Restore original weights before reporting.
+    for LIdx := 0 to T - 1 do
+    begin
+      Layer := NN.Layers[TrainableIdxs[LIdx]];
+      for NIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        for WIdx := 0 to Layer.Neurons[NIdx].Weights.Size - 1 do
+          Layer.Neurons[NIdx].Weights.FData[WIdx] :=
+            SnapW[LIdx][NIdx].FData[WIdx];
+        Layer.Neurons[NIdx].FBiasWeight := SnapB[LIdx][NIdx];
+      end;
+      Layer.AfterWeightUpdate();
+    end;
+    Restored := true;
+
+    L0 := Losses[CenterIdx];
+
+    // Sharpness via central difference at the smallest |alpha| step.
+    H := Alphas[CenterIdx + 1] - Alphas[CenterIdx];
+    if H <= 0 then H := 1e-9;
+    Sharpness := (Losses[CenterIdx + 1] - 2 * L0 +
+                  Losses[CenterIdx - 1]) / (H * H);
+
+    // Loss-doubling radius: scan outward from centre symmetrically.
+    DoublingFound := false;
+    DoublingRadius := 0;
+    for I := 1 to CenterIdx do
+    begin
+      if (CenterIdx + I <= K - 1) and (Losses[CenterIdx + I] > 2 * L0) then
+      begin
+        DoublingFound := true;
+        DoublingRadius := Alphas[CenterIdx + I];
+        Break;
+      end;
+      if (CenterIdx - I >= 0) and (Losses[CenterIdx - I] > 2 * L0) then
+      begin
+        DoublingFound := true;
+        DoublingRadius := -Alphas[CenterIdx - I]; // report |alpha|
+        Break;
+      end;
+    end;
+    if DoublingFound and (DoublingRadius < 0) then
+      DoublingRadius := -DoublingRadius;
+
+    // Report
+    Lines.Add(Format(
+      'LossLandscapeProbe: K=%d, R=%.4f, samples=%d, trainable layers=%d, ' +
+      'LossKind=%d (%s).',
+      [K, R, Samples.Count, T, LossKind,
+       BoolToStr(LossKind = 1, 'cross-entropy', 'MSE')]));
+    Lines.Add('');
+    Lines.Add(Format('%-7s %14s', ['alpha', 'loss']));
+    Lines.Add(StringOfChar('-', 24));
+    for I := 0 to K - 1 do
+      Lines.Add(Format('%7.4f %14.6e', [Alphas[I], Losses[I]]));
+    Lines.Add(StringOfChar('-', 24));
+
+    // ASCII curve. cCurveWidth chars wide, '*' for centre, '#' for sample,
+    // '.' baseline, '!' minimum.
+    Lines.Add('');
+    Lines.Add(Format('ASCII curve over alpha in [%.3f, %.3f]:',
+      [-R, R]));
+    MinL := Losses[0];
+    MaxL := Losses[0];
+    for I := 1 to K - 1 do
+    begin
+      if Losses[I] < MinL then MinL := Losses[I];
+      if Losses[I] > MaxL then MaxL := Losses[I];
+    end;
+    if (MaxL - MinL) < 1e-12 then MaxL := MinL + 1e-12;
+    MaxBarWidth := cCurveWidth;
+    CurveLine := StringOfChar('.', cCurveWidth);
+    for I := 0 to K - 1 do
+    begin
+      Pos1 := Round((Alphas[I] - (-R)) / (2 * R) * (cCurveWidth - 1)) + 1;
+      if Pos1 < 1 then Pos1 := 1;
+      if Pos1 > cCurveWidth then Pos1 := cCurveWidth;
+      if I = CenterIdx then
+        CurveLine[Pos1] := '*'
+      else if Losses[I] = MinL then
+        CurveLine[Pos1] := '!'
+      else
+        CurveLine[Pos1] := '#';
+    end;
+    Lines.Add('  |' + CurveLine + '|');
+    Lines.Add(Format(
+      '  alpha: %-8.3f%s%8.3f', [-R,
+      StringOfChar(' ', cCurveWidth - 16), R]));
+    // Bar plot per alpha showing loss magnitude.
+    Lines.Add('');
+    Lines.Add('per-alpha loss bars (relative to [min,max]):');
+    for I := 0 to K - 1 do
+    begin
+      BarLen := Round(((Losses[I] - MinL) / (MaxL - MinL)) * MaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > MaxBarWidth then BarLen := MaxBarWidth;
+      Lines.Add(Format('  %7.4f  %12.6e  %s',
+        [Alphas[I], Losses[I], StringOfChar('#', BarLen)]));
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format('L(0) = %.6e', [L0]));
+    Lines.Add(Format('sharpness (2nd central diff at h=%.4f) = %.6e',
+      [H, Sharpness]));
+    if DoublingFound then
+      RangeStr := Format('%.4f', [DoublingRadius])
+    else
+      RangeStr := Format('>%.4f', [R]);
+    Lines.Add(Format(
+      'loss-doubling radius (smallest |alpha| with L>2*L(0)) = %s', [RangeStr]));
+
+    Result := Lines.Text;
+  finally
+    // Defensive: if we exited before the explicit restore loop, restore now.
+    if not Restored then
+    begin
+      for LIdx := 0 to High(SnapW) do
+      begin
+        if LIdx > High(TrainableIdxs) then Break;
+        Layer := NN.Layers[TrainableIdxs[LIdx]];
+        for NIdx := 0 to High(SnapW[LIdx]) do
+        begin
+          if SnapW[LIdx][NIdx] <> nil then
+          begin
+            for WIdx := 0 to Layer.Neurons[NIdx].Weights.Size - 1 do
+              Layer.Neurons[NIdx].Weights.FData[WIdx] :=
+                SnapW[LIdx][NIdx].FData[WIdx];
+            Layer.Neurons[NIdx].FBiasWeight := SnapB[LIdx][NIdx];
+          end;
+        end;
+        Layer.AfterWeightUpdate();
+      end;
+    end;
+    // Free snapshot/direction tensors.
+    for LIdx := 0 to High(SnapW) do
+    begin
+      for NIdx := 0 to High(SnapW[LIdx]) do
+      begin
+        if SnapW[LIdx][NIdx] <> nil then SnapW[LIdx][NIdx].Free;
+        if (LIdx <= High(DirW)) and (NIdx <= High(DirW[LIdx])) and
+           (DirW[LIdx][NIdx] <> nil) then
+          DirW[LIdx][NIdx].Free;
+      end;
+    end;
     Lines.Free;
   end;
 end;
