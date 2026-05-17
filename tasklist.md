@@ -653,7 +653,7 @@ breakdown:
       the transformer-building-blocks line of work.
 - [ ] `examples/BinaryAdder/` — tiny "learns to add two binary numbers"
       sequence example. Self-contained, fast, deterministic right answer.
-- [ ] `examples/SineRegression/` — 1D function-fitting toy
+- [x] `examples/SineRegression/` — 1D function-fitting toy
       `y = sin(2πx) + noise` with a two-layer MLP. Smallest possible
       "does the library still train?" demo for the README quick-start.
 - [ ] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
@@ -715,7 +715,7 @@ breakdown:
       the eventual MHA-based version.
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
-- [ ] `examples/InvolutionDemo/` — demonstrate that composing any of
+- [x] `examples/InvolutionDemo/` — demonstrate that composing any of
       TNNetReverseChannels / TNNetReverseXY / TNNetFlipX / TNNetFlipY
       twice acts as identity within fp tolerance. Pairs with a README
       "involution layers" subsection.
