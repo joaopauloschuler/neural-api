@@ -1171,3 +1171,53 @@ breakdown:
       pattern (TTA gains shrink when the model has already learned the
       invariance during training — TTA and train-time augmentation are
       substitutes, not complements).
+
+### Intra-layer redundancy
+- [ ] TNNet.NeuronCorrelationReport — given a probe batch, for every
+      trainable layer with a flat (channel/neuron) output axis, walk the
+      per-sample activations and report intra-layer redundancy along the
+      *neuron* axis (not the sample axis):
+      (a) the layer's pairwise Pearson-correlation matrix of neuron
+          activations across the probe batch (mean-centered, std-normalised
+          per neuron; constant neurons treated as `corr = 0` after a
+          near-zero-std flag),
+      (b) a 10-bin ASCII histogram of `|rho_ij|` for `i < j` so the
+          redundancy distribution is visible at a glance,
+      (c) the top-K most-correlated neuron pairs `(i, j, rho_ij)` per
+          layer (default K=5) — a ready-made "merge or prune one of each
+          pair" candidate list,
+      (d) a single-number "effective neuron count" per layer:
+          `sum_i 1 / sum_j rho_ij^2` (participation-ratio of the
+          correlation matrix) — natural pruning-budget signal,
+      (e) per-layer flags: "near-duplicate pair present" (any
+          `|rho_ij| > 0.95`), "collapsed layer" (effective neuron count
+          < 25% of nominal width), and "constant neurons" (count of
+          neurons whose std on the probe batch is below `1e-6`).
+      Pure forward-only — no training-time changes, no backward pass,
+      no weight perturbation. The probe batch is the only required
+      input; default to the first N samples of whatever volume list the
+      caller passes (default N=128, configurable for memory).
+      Distinct from [[DeadNeuronReport]] (per-neuron zero-fraction on
+      ReLU-family layers only — answers "did this neuron ever fire?",
+      not "are these two neurons firing in lockstep?"),
+      [[ActivationStatsReport]] (per-layer marginal distribution
+      statistics across all neurons pooled together — loses the neuron-
+      to-neuron co-firing structure entirely),
+      [[WeightSpectrumReport]] (singular values of the *weight* matrix,
+      a geometry-of-W signal; correlations of *realised* activations
+      under nonlinearities are a different — and often tighter —
+      redundancy signal),
+      [[WeightHistogramReport]] (weight values, not activation
+      structure), and [[LayerSensitivityReport]] (output response to
+      weight perturbation, not within-layer redundancy). Effective
+      neuron count is the natural input for any future "decide a
+      per-layer prune ratio" or "decide a per-layer LoRA rank" work —
+      you need to know how many independent directions each layer is
+      actually using before you can decide how much to compress.
+      Companion `examples/NeuronCorrelationReport/` runs it on (i) a
+      fresh-init MLP (expected: near-zero off-diagonal correlations —
+      neurons start independent) and (ii) the same architecture after a
+      short training run (expected: a heavier `|rho|` tail emerges as
+      neurons specialise into coordinated feature detectors), so
+      reviewers can eyeball how training reshapes intra-layer
+      redundancy.
