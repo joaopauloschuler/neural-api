@@ -1087,3 +1087,35 @@ breakdown:
       output-distribution quality) and the Top-logit-margin report
       (classifier-style confidence on a fixed-label task, not next-token
       prediction).
+
+### Generalization diagnostics
+- [ ] TNNet.LossLandscapeProbe — given a trained network, a small
+      validation batch, and a step count K, sample the loss along a random
+      1D direction `d` in weight space at offsets
+      `alpha in {-r, ..., +r}` (K samples, default K=21, r=1.0), restoring
+      the original weights at the end. Direction `d` is drawn by sampling
+      each trainable layer's weight tensor from N(0, 1) and then
+      *filter-normalising* it (Li et al. 2018: rescale per-filter so
+      `||d_filter|| = ||W_filter||`), which is the standard fix that makes
+      cross-architecture sharpness comparisons meaningful — without it,
+      ReLU scale-invariance makes the raw loss curve depend on weight
+      magnitude rather than landscape geometry. Reports:
+      (a) the K loss values (printed as a one-line ASCII curve over
+          [alpha_min, alpha_max]),
+      (b) a single "sharpness" scalar — the second central difference
+          `(L(+h) - 2*L(0) + L(-h)) / h^2` at a small `h` — as a cheap
+          proxy for local curvature,
+      (c) the alpha at which loss first exceeds `2 * L(0)` in either
+          direction (the "loss-doubling radius" — a robust width estimate
+          that doesn't depend on Hessian eigenvalues).
+      Pure forward-pass, no autograd / Hessian work, no new layer types;
+      iterates the layer list to read/write FNeurons[*].Weights with the
+      existing accessors. Distinct from the already-listed
+      [[WeightDriftReport]] (training-time weight deltas, not a probe
+      around the final point) and [[GradientNormReport]] (training-time
+      backward magnitudes, not forward-only landscape geometry). Companion
+      `examples/LossLandscapeProbe/` runs it against a small SimpleImage
+      CIFAR baseline trained with two different optimisers (e.g. SGD vs
+      Adam at matched final accuracy) and prints the two curves side by
+      side, so the format is pinned and the "flat-minima generalise
+      better" folklore becomes empirically inspectable on this library.
