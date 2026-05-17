@@ -236,7 +236,7 @@ breakdown:
       position t depends only on positions ≤ t. Backward is the standard
       conv backward minus the masked-future part. Pairs with TNNetTokenShift
       and unblocks attention-free baseline experiments. (Already possible with existing layers?)
-- [ ] TNNetMaskedMean / TNNetMaskedMax — pooling over a variable-length
+- [X] TNNetMaskedMean / TNNetMaskedMax — pooling over a variable-length
       sequence with a {0,1} mask supplied as an extra depth channel.
       Replaces the "pad with zeros and hope average is small" workaround.
 

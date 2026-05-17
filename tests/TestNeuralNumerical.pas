@@ -382,6 +382,14 @@ type
     procedure TestSwishLearnableGradientCheck;
     procedure TestSwishLearnableWeightGradientCheck;
     procedure TestSwishLearnableSerializationRoundTrip;
+    procedure TestMaskedMeanForward;
+    procedure TestMaskedMeanGradientCheck;
+    procedure TestMaskedMeanAllMasked;
+    procedure TestMaskedMeanSerializationRoundTrip;
+    procedure TestMaskedMaxForward;
+    procedure TestMaskedMaxBackward;
+    procedure TestMaskedMaxAllMasked;
+    procedure TestMaskedMaxSerializationRoundTrip;
     procedure TestErfGradientCheck;
     procedure TestErfSerializationRoundTrip;
     procedure TestPenalizedTanhAsymmetry;
@@ -14658,6 +14666,329 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+// -----------------------------------------------------------------------
+// TNNetMaskedMean / TNNetMaskedMax: pool over the SizeX axis honoring a
+// {0,1} mask placed in the last input channel.
+// -----------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestMaskedMeanForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out0, Out1: TNeuralFloat;
+begin
+  // Input shape (4, 1, 3): channels 0..1 are data, channel 2 is mask.
+  // mask = [1, 1, 0, 1] -> average over x=0,1,3.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3));
+    NN.AddLayer(TNNetMaskedMean.Create());
+
+    // Channel 0
+    Input[0, 0, 0] := 1.0;
+    Input[1, 0, 0] := 2.0;
+    Input[2, 0, 0] := 99.0; // masked out -> must be ignored
+    Input[3, 0, 0] := 3.0;
+    // Channel 1
+    Input[0, 0, 1] := 4.0;
+    Input[1, 0, 1] := 6.0;
+    Input[2, 0, 1] := -50.0; // masked out -> must be ignored
+    Input[3, 0, 1] := 8.0;
+    // Mask
+    Input[0, 0, 2] := 1.0;
+    Input[1, 0, 2] := 1.0;
+    Input[2, 0, 2] := 0.0;
+    Input[3, 0, 2] := 1.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('MaskedMean output SizeX',  1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MaskedMean output SizeY',  1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MaskedMean output Depth',  2, NN.GetLastLayer.Output.Depth);
+
+    Out0 := NN.GetLastLayer.Output[0, 0, 0];
+    Out1 := NN.GetLastLayer.Output[0, 0, 1];
+    AssertEquals('MaskedMean channel 0', (1.0 + 2.0 + 3.0) / 3.0, Out0, 1e-5);
+    AssertEquals('MaskedMean channel 1', (4.0 + 6.0 + 8.0) / 3.0, Out1, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMeanGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, x, c: integer;
+  isMaskChan: boolean;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input (3, 1, 3): channels 0..1 data, channel 2 mask = [1, 0, 1].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(1, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    NN.AddLayer(TNNetMaskedMean.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for c := 0 to 1 do
+      for x := 0 to 2 do
+        Input[x, 0, c] := Sin((x + c * 3) * 0.7) * 1.5 + 0.2;
+    // Mask
+    Input[0, 0, 2] := 1.0;
+    Input[1, 0, 2] := 0.0;
+    Input[2, 0, 2] := 1.0;
+
+    Desired.Raw[0] := 0.13;
+    Desired.Raw[1] := -0.25;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      // Raw index layout for (SizeX=3, SizeY=1, Depth=3): i = x*3 + c.
+      c := i mod 3;
+      x := i div 3;
+      isMaskChan := (c = 2);
+      // Skip the mask channel itself and the masked-out positions.
+      if isMaskChan then continue;
+      if Input[x, 0, 2] < 0.5 then continue;
+
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('MaskedMean input gradient at i=' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMeanAllMasked;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(1, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    NN.AddLayer(TNNetMaskedMean.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Arbitrary data, mask all zero.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.7;
+    Input[0, 0, 2] := 0.0;
+    Input[1, 0, 2] := 0.0;
+    Input[2, 0, 2] := 0.0;
+
+    Desired.Raw[0] := 1.0;
+    Desired.Raw[1] := -1.0;
+
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('MaskedMean all-masked output ' + IntToStr(i),
+        0.0, NN.GetLastLayer.Output.Raw[i], 1e-7);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    // No data-channel gradient should flow back when nothing is valid.
+    // Layout: i = x*3 + c with c in {0,1} for data, c=2 for mask.
+    for i := 0 to Input.Size - 1 do
+      if (i mod 3) < 2 then
+        AssertEquals('MaskedMean all-masked input grad ' + IntToStr(i),
+          0.0, NN.Layers[0].OutputError.Raw[i], 1e-7);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMeanSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetMaskedMean.Create(),
+    'MaskedMean', 3, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMaxForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Input (4, 1, 2): channel 0 data = [1, 5, 9, 3], mask = [1, 1, 0, 1].
+  // x=2 holds the largest value (9) but is masked out, so max is 5.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2));
+    NN.AddLayer(TNNetMaskedMax.Create());
+
+    Input[0, 0, 0] := 1.0;
+    Input[1, 0, 0] := 5.0;
+    Input[2, 0, 0] := 9.0;
+    Input[3, 0, 0] := 3.0;
+    Input[0, 0, 1] := 1.0;
+    Input[1, 0, 1] := 1.0;
+    Input[2, 0, 1] := 0.0;
+    Input[3, 0, 1] := 1.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('MaskedMax output SizeX',  1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MaskedMax output SizeY',  1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MaskedMax output Depth',  1, NN.GetLastLayer.Output.Depth);
+    AssertEquals('MaskedMax value', 5.0,
+      NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMaxBackward;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LMax: TNNetMaskedMax;
+  i: integer;
+  errVal: TNeuralFloat;
+begin
+  // Input (4, 1, 2). Channel 0 = [1, 5, 9, 3]; mask = [1, 1, 0, 1].
+  // Forward picks x=1 (value 5). With Desired = output - 1, dL/dOut = 1
+  // at the single output cell, so backward must push exactly +1 onto
+  // input position (x=1, c=0) and zero everywhere else (including the
+  // mask channel).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    LMax := TNNetMaskedMax.Create();
+    NN.AddLayer(LMax);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Input[0, 0, 0] := 1.0;
+    Input[1, 0, 0] := 5.0;
+    Input[2, 0, 0] := 9.0;
+    Input[3, 0, 0] := 3.0;
+    Input[0, 0, 1] := 1.0;
+    Input[1, 0, 1] := 1.0;
+    Input[2, 0, 1] := 0.0;
+    Input[3, 0, 1] := 1.0;
+
+    NN.Compute(Input);
+    // Loss = 0.5 * (out - desired)^2, with desired = out - 1, dL/dOut = 1.
+    Desired.Raw[0] := LMax.Output[0, 0, 0] - 1.0;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    // Raw index layout for (SizeX=4, SizeY=1, Depth=2): i = x*2 + c.
+    // Argmax is at (x=1, c=0) -> Raw index 2.
+    for i := 0 to Input.Size - 1 do
+    begin
+      errVal := NN.Layers[0].OutputError.Raw[i];
+      if i = 2 then
+        AssertEquals('MaskedMax grad at argmax', 1.0, errVal, 1e-5)
+      else
+        AssertEquals('MaskedMax grad zero at i=' + IntToStr(i),
+          0.0, errVal, 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMaxAllMasked;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    NN.AddLayer(TNNetMaskedMax.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Input[0, 0, 0] := 0.4;
+    Input[1, 0, 0] := -0.2;
+    Input[2, 0, 0] := 1.1;
+    Input[0, 0, 1] := 0.0;
+    Input[1, 0, 1] := 0.0;
+    Input[2, 0, 1] := 0.0;
+
+    Desired.Raw[0] := 0.9;
+
+    NN.Compute(Input);
+    AssertEquals('MaskedMax all-masked output 0', 0.0,
+      NN.GetLastLayer.Output[0, 0, 0], 1e-7);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    // Layout for (3,1,2): i = x*2 + c; data is c=0 -> even indices.
+    for i := 0 to Input.Size - 1 do
+      if (i mod 2) = 0 then
+        AssertEquals('MaskedMax all-masked input grad ' + IntToStr(i),
+          0.0, NN.Layers[0].OutputError.Raw[i], 1e-7);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedMaxSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetMaskedMax.Create(),
+    'MaskedMax', 3, 1, 3, 1e-5);
 end;
 
 initialization

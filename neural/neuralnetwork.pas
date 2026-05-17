@@ -3095,6 +3095,37 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Mask-aware mean pooling over the SizeX (sequence) axis.
+  // Convention: the last input channel (index Depth-1) is a {0,1} mask.
+  // Positions with mask <= 0.5 are excluded from the average. Output
+  // shape is (1, SizeY, Depth-1). If a row is fully masked-out, the
+  // output is 0 and no gradient flows back through that row. The mask
+  // channel itself receives zero gradient.
+  TNNetMaskedMean = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Mask-aware max pooling over the SizeX (sequence) axis.
+  // Convention: the last input channel (index Depth-1) is a {0,1} mask.
+  // Positions with mask <= 0.5 are excluded from the max. Output shape
+  // is (1, SizeY, Depth-1). If a row is fully masked-out, the output is
+  // 0 and no gradient flows back through that row. The mask channel
+  // itself receives zero gradient.
+  TNNetMaskedMax = class(TNNetLayer)
+  private
+    FMaxIdx: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   { TNNetDeMaxPool }
   TNNetDeMaxPool = class(TNNetMaxPool)
     private
@@ -15022,6 +15053,201 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetMaskedMean }
+
+procedure TNNetMaskedMean.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.Output.Depth < 2 then
+  begin
+    FErrorProc('TNNetMaskedMean requires prev layer depth >= 2 (data + mask), got ' +
+      IntToStr(pPrevLayer.Output.Depth));
+  end;
+  FOutput.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+  FOutputError.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+  FOutputErrorDeriv.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+end;
+
+procedure TNNetMaskedMean.Compute();
+var
+  StartTime: double;
+  X, Y, C, MaxX, MaxY, MaxC, MaskIdx, Count: integer;
+  Sum: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  MaxX := Prev.SizeX - 1;
+  MaxY := Prev.SizeY - 1;
+  MaxC := Prev.Depth - 2; // last data channel index (mask is Depth-1)
+  MaskIdx := Prev.Depth - 1;
+  for Y := 0 to MaxY do
+  begin
+    Count := 0;
+    for X := 0 to MaxX do
+      if Prev[X, Y, MaskIdx] > 0.5 then Inc(Count);
+    for C := 0 to MaxC do
+    begin
+      Sum := 0;
+      if Count > 0 then
+      begin
+        for X := 0 to MaxX do
+          if Prev[X, Y, MaskIdx] > 0.5 then
+            Sum := Sum + Prev[X, Y, C];
+        FOutput[0, Y, C] := Sum / Count;
+      end
+      else
+      begin
+        FOutput[0, Y, C] := 0;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMaskedMean.Backpropagate();
+var
+  StartTime: double;
+  X, Y, C, MaxX, MaxY, MaxC, MaskIdx, Count: integer;
+  PrevOut, PrevErr: TNNetVolume;
+  Grad: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevOut := FPrevLayer.Output;
+    PrevErr := FPrevLayer.OutputError;
+    MaxX := PrevOut.SizeX - 1;
+    MaxY := PrevOut.SizeY - 1;
+    MaxC := PrevOut.Depth - 2;
+    MaskIdx := PrevOut.Depth - 1;
+    for Y := 0 to MaxY do
+    begin
+      Count := 0;
+      for X := 0 to MaxX do
+        if PrevOut[X, Y, MaskIdx] > 0.5 then Inc(Count);
+      if Count = 0 then continue;
+      for C := 0 to MaxC do
+      begin
+        Grad := FOutputError[0, Y, C] / Count;
+        for X := 0 to MaxX do
+          if PrevOut[X, Y, MaskIdx] > 0.5 then
+            PrevErr.Add(X, Y, C, Grad);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMaskedMax }
+
+constructor TNNetMaskedMax.Create();
+begin
+  inherited Create();
+  FMaxIdx := TNNetVolume.Create(1, 1, 1);
+end;
+
+destructor TNNetMaskedMax.Destroy();
+begin
+  FMaxIdx.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetMaskedMax.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.Output.Depth < 2 then
+  begin
+    FErrorProc('TNNetMaskedMax requires prev layer depth >= 2 (data + mask), got ' +
+      IntToStr(pPrevLayer.Output.Depth));
+  end;
+  FOutput.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+  FOutputError.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+  FOutputErrorDeriv.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+  FMaxIdx.ReSize(1, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth - 1);
+end;
+
+procedure TNNetMaskedMax.Compute();
+var
+  StartTime: double;
+  X, Y, C, MaxX, MaxY, MaxC, MaskIdx, ArgMaxX: integer;
+  BestVal, V: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  MaxX := Prev.SizeX - 1;
+  MaxY := Prev.SizeY - 1;
+  MaxC := Prev.Depth - 2;
+  MaskIdx := Prev.Depth - 1;
+  for Y := 0 to MaxY do
+  begin
+    for C := 0 to MaxC do
+    begin
+      ArgMaxX := -1;
+      BestVal := 0;
+      for X := 0 to MaxX do
+      begin
+        if Prev[X, Y, MaskIdx] > 0.5 then
+        begin
+          V := Prev[X, Y, C];
+          if (ArgMaxX < 0) or (V > BestVal) then
+          begin
+            BestVal := V;
+            ArgMaxX := X;
+          end;
+        end;
+      end;
+      if ArgMaxX >= 0 then
+      begin
+        FOutput[0, Y, C] := BestVal;
+        FMaxIdx[0, Y, C] := ArgMaxX;
+      end
+      else
+      begin
+        FOutput[0, Y, C] := 0;
+        FMaxIdx[0, Y, C] := -1;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMaskedMax.Backpropagate();
+var
+  StartTime: double;
+  Y, C, MaxY, MaxC, ArgMaxX: integer;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    MaxY := FOutput.SizeY - 1;
+    MaxC := FOutput.Depth - 1;
+    for Y := 0 to MaxY do
+      for C := 0 to MaxC do
+      begin
+        ArgMaxX := Round(FMaxIdx[0, Y, C]);
+        if ArgMaxX >= 0 then
+          PrevErr.Add(ArgMaxX, Y, C, FOutputError[0, Y, C]);
+      end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetConvolutionLinear }
 
 constructor TNNetConvolutionLinear.Create(pNumFeatures, pFeatureSize,
@@ -24109,6 +24335,8 @@ begin
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
+      'TNNetMaskedMean':            Result := TNNetMaskedMean.Create();
+      'TNNetMaskedMax':             Result := TNNetMaskedMax.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
@@ -24325,6 +24553,8 @@ begin
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else
+      if S[0] = 'TNNetMaskedMean' then Result := TNNetMaskedMean.Create() else
+      if S[0] = 'TNNetMaskedMax' then Result := TNNetMaskedMax.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
