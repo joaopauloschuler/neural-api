@@ -79,10 +79,6 @@ rather than acted on.
 ## Added ideas
 
 ### Smaller follow-up ideas
-- [x] TNNetZScore vs TNNetLayerNorm equivalence test: with LayerNorm's gamma
-      pinned to 1 and beta to 0, forward outputs must match TNNetZScore to
-      within ~1e-5 across a few seeded inputs. Pins the "ZScore is the
-      unparameterised core of LayerNorm" claim.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
@@ -455,8 +451,6 @@ breakdown:
       `Argmax`, `TopKSample`, `TopPSample`, `TemperatureScale`.
 
 ### Introspection / debugging tools
-- [x] TNNet.PrintSummary — Keras-style layer-by-layer table
-      (`Layer name | Output shape | Param count | Trainable`).
 - [ ] TNNet.CountFLOPsPerLayer — forward-pass FLOP estimate per layer.
 - [ ] WeightHistogramDump — write per-trainable-layer CSV with 64-bin
       histograms of weight values.
@@ -653,9 +647,6 @@ breakdown:
       the transformer-building-blocks line of work.
 - [ ] `examples/BinaryAdder/` — tiny "learns to add two binary numbers"
       sequence example. Self-contained, fast, deterministic right answer.
-- [x] `examples/SineRegression/` — 1D function-fitting toy
-      `y = sin(2πx) + noise` with a two-layer MLP. Smallest possible
-      "does the library still train?" demo for the README quick-start.
 - [ ] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
       and print the per-epoch fraction of units that never fire; repeat
       with LeakyReLU/GELU/Swish.
@@ -715,10 +706,6 @@ breakdown:
       the eventual MHA-based version.
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
-- [x] `examples/InvolutionDemo/` — demonstrate that composing any of
-      TNNetReverseChannels / TNNetReverseXY / TNNetFlipX / TNNetFlipY
-      twice acts as identity within fp tolerance. Pairs with a README
-      "involution layers" subsection.
 - [ ] `examples/EnergyHeads/` — tiny regression demo using TNNetAbs
       (L1-energy target) and TNNetSquare (L2-energy target) as final
       feature heads, side-by-side.
@@ -941,8 +928,6 @@ breakdown:
 - [ ] TNNetMaxOut CIFAR-style example wired into one of the SimpleImage
       paths.
 - [ ] TNNetCELU CIFAR-style smoke example.
-- [x] RMSNorm vs LayerNorm equivalence test under zero-empirical-mean
-      inputs (modulo learnable scale/bias).
 - [ ] Numerical-gradient test confirming TNNetRMSNorm matches the analytical
       gradient under non-trivial input distributions (mean ≠ 0, var ≠ 1).
 - [ ] TNNetHardShrink / TNNetSoftShrink sparsity micro-experiment: train a
