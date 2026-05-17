@@ -1124,3 +1124,30 @@ breakdown:
       task. Natural next step: a `GradientNormReport`-driven NaN/Inf guard
       hook for TNeuralFit (which is also already on the list — this helper
       provides the shared scanning primitive that guard would call).
+
+### Language-model evaluation
+- [ ] TNNet.PerplexityReport — generic next-token-prediction evaluator that,
+      given a trained sequence model whose final layer is a softmax-family
+      head (TNNetSoftMax / TNNetPointwiseSoftMax / TNNetLogSoftMax) over a
+      vocabulary of size V and a held-out token stream of length N, reports:
+      (a) per-token mean cross-entropy in nats and bits,
+      (b) perplexity `exp(mean_CE)`,
+      (c) bits-per-character (BPC) — same as bits-per-token when the
+          vocabulary is character-level, otherwise weighted by the
+          char-length of each token,
+      (d) top-1 and top-5 accuracy over the stream,
+      (e) a 10-bin ASCII histogram of per-token bits (a long right tail
+          flags rare-token spikes — a useful sanity signal),
+      (f) the K worst-predicted positions (token, context window, bits)
+          for qualitative inspection.
+      Auto-detects log-space vs probability-space output by sniffing the
+      final layer class; clamps probabilities with `eps` before `log` only
+      on the probability-space path. Pure forward-pass, no training-time
+      changes, no new layer types. Companion `examples/PerplexityEval/`
+      runs it against the existing SimpleNLP-style char model and the
+      external ../gpt-3-for-pascal downstream so both have a single shared
+      pinned metric to track across model revisions. Distinct from the
+      already-listed AttentionEntropyReport (attention-map quality, not
+      output-distribution quality) and the Top-logit-margin report
+      (classifier-style confidence on a fixed-label task, not next-token
+      prediction).
