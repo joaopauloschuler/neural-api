@@ -2909,6 +2909,10 @@ type
       function AddAvgMaxPool(pPoolSize: integer; pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddMinMaxChannel(pAfterLayer: TNNetLayer = nil): TNNetLayer;
       function AddAvgMaxChannel(pMaxPoolDropout: TNeuralFloat = 0; pKeepDepth:boolean = false; pAfterLayer: TNNetLayer = nil): TNNetLayer;
+      // Squeeze-and-Excitation block. Wires existing layers in the SE pattern:
+      // input -> AvgChannel -> FCReLU(C/r) -> FCSigmoid(C) -> ChannelMulByLayer(input, gating).
+      // ReductionRatio is clamped so the bottleneck width is at least 1.
+      function AddSEBlock(InputLayer: TNNetLayer; ReductionRatio: integer = 16): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -13596,6 +13600,22 @@ begin
     {RandomAmplifier=}0
   );
   Result := AddLayer( TNNetConvolutionLinear.Create(3,1,0,0) );
+end;
+
+function TNNet.AddSEBlock(InputLayer: TNNetLayer; ReductionRatio: integer): TNNetLayer;
+var
+  Channels, Bottleneck: integer;
+  Excite: TNNetLayer;
+begin
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  Channels := InputLayer.Output.Depth;
+  if ReductionRatio < 1 then ReductionRatio := 1;
+  Bottleneck := Channels div ReductionRatio;
+  if Bottleneck < 1 then Bottleneck := 1;
+  AddLayerAfter( TNNetAvgChannel.Create(), InputLayer );
+  AddLayer( TNNetFullConnectReLU.Create(Bottleneck) );
+  Excite := AddLayer( TNNetFullConnectSigmoid.Create(Channels) );
+  Result := AddLayer( TNNetChannelMulByLayer.Create(InputLayer, Excite) );
 end;
 
 // Ported code from:

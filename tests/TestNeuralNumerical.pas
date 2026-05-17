@@ -393,6 +393,7 @@ type
     procedure TestChannelStdNormNumerical;
     procedure TestDigitalFilterNumerical;
     procedure TestCopyToChannelsNumerical;
+    procedure TestSEBlockShapeAndForward;
   end;
 
 implementation
@@ -3424,6 +3425,58 @@ begin
     // First channel should be 3.0, second channel should be 6.0
     AssertEquals('First channel should be 3.0', 3.0, NN.GetLastLayer.Output[0, 0, 0], 0.001);
     AssertEquals('Second channel should be 6.0', 6.0, NN.GetLastLayer.Output[0, 0, 1], 0.001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSEBlockShapeAndForward;
+const
+  W = 4; H = 4; C = 8; R = 4;
+var
+  NN: TNNet;
+  InputLayer, SEOut: TNNetLayer;
+  Input: TNNetVolume;
+  X, Y, D, Idx: integer;
+  GateVal, InVal, OutVal, Expected: TNeuralFloat;
+begin
+  RandSeed := 1234;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, C);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(W, H, C));
+    SEOut := NN.AddSEBlock(InputLayer, R);
+
+    AssertEquals('SE output SizeX equals input', W, SEOut.Output.SizeX);
+    AssertEquals('SE output SizeY equals input', H, SEOut.Output.SizeY);
+    AssertEquals('SE output Depth equals input', C, SEOut.Output.Depth);
+
+    for Idx := 0 to Input.Size - 1 do
+      Input.FData[Idx] := (Random - 0.5) * 2.0;
+
+    NN.Compute(Input);
+
+    for Idx := 0 to SEOut.Output.Size - 1 do
+    begin
+      OutVal := SEOut.Output.FData[Idx];
+      AssertFalse('SE output contains NaN', IsNaN(OutVal));
+      AssertFalse('SE output contains Inf', IsInfinite(OutVal));
+    end;
+
+    for D := 0 to C - 1 do
+    begin
+      GateVal := NN.Layers[SEOut.LayerIdx - 1].Output.FData[D];
+      AssertTrue('Gate value in [0, 1]', (GateVal >= 0.0) and (GateVal <= 1.0));
+      for X := 0 to W - 1 do
+        for Y := 0 to H - 1 do
+        begin
+          InVal := Input[X, Y, D];
+          OutVal := SEOut.Output[X, Y, D];
+          Expected := InVal * GateVal;
+          AssertEquals('SE output equals input * gating', Expected, OutVal, 1e-5);
+        end;
+    end;
   finally
     NN.Free;
     Input.Free;
