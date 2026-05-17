@@ -78,10 +78,6 @@ rather than acted on.
 - [ ] CumSumPositionEncoding follow-up: actually train a tiny position-
       dependent model with and without the CumSum feature concatenated and
       chart loss delta. Forward-only demo landed; the bake-off is still open.
-- [X] SwiGLU FFN follow-up: package the `Dense(2*D) → SwiGLU → Dense(D_out)`
-      pattern as `TNNet.AddSwiGLUFeedForward(D_in, D_hidden, D_out)` builder
-      so the example becomes one line. Companion of the
-      [[TNNetSwiGLUFeedForward]] block helper task below.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
@@ -281,12 +277,6 @@ breakdown:
       fixed (non-trainable) binomial blur filter.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-- [ ] ~~TNNetIdentityScale~~ — fixed scalar multiplier is already covered
-      by the in-tree `TNNetMulByConstant(c)` (constructor stores the
-      multiplier in FFloatSt[0] and the forward pass is a pure scalar
-      multiply; the "Learning" part of its parent class doesn't engage
-      unless wired up). Do NOT add a separate class — use
-      TNNetMulByConstant for the warm-up-scaling trick.
 - [ ] TNNetSwishLearnable — TNNetSwish with a single learnable β.
 - [ ] TNNetMishLearnable — TNNetMish with a single learnable α.
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
@@ -1049,42 +1039,6 @@ breakdown:
       `examples/ActivationStatsReport/` runs it on (i) a fresh-init network
       and (ii) the same architecture after a short training run, so reviewers
       can eyeball how training reshapes the activation distribution.
-
-### Memory footprint
-- [X] TNNet.MemoryFootprintReport — given a network (and implicitly the
-      configured input shape from `TNNetInput`), walk every layer and report:
-      (a) per-layer activation tensor size in elements and MiB
-          (`SizeX * SizeY * Depth * sizeof(TNeuralFloat)`),
-      (b) per-layer parameter tensor size in elements and MiB (weights +
-          biases, zero for parameter-free layers),
-      (c) per-layer error/gradient tensor size in MiB (mirrors activation;
-          flagged as "transient — recoverable via checkpointing"),
-      (d) running totals plus the "peak forward residency" (sum of
-          activations that must be kept alive for backward) and the
-          "parameters + optimizer-state" baseline (1x for SGD, 2x for
-          momentum, 3x for Adam — configurable via a `OptimizerKind` flag),
-      (e) a 10-bin ASCII histogram of per-layer activation MiB so the
-          memory-hot layers jump out at a glance,
-      (f) a flag list: "activation-heavy" layers (>10% of the activation
-          total — natural gradient-checkpointing candidates) and
-          "parameter-heavy" layers (>10% of the parameter total — natural
-          LoRA / quantization candidates),
-      (g) a one-line "would-fit-in" verdict against a configurable budget
-          (default: 2 GiB) for `forward-only`, `train-SGD`, `train-Adam`.
-      Pure structure inspection — no probe batch, no forward pass needed
-      (sizes come from the existing `Output.Size` / weight metadata).
-      Distinct from [[FLOPsReport]] (compute, not memory),
-      [[WeightHistogramReport]] (weight value distribution, not byte
-      footprint), [[WeightSpectrumReport]] (weight geometry), and the
-      already-listed `Gradient checkpointing` infrastructure task (this
-      one *measures*; that one *acts*). The output is the natural input
-      for any future checkpointing or mixed-precision work — you need
-      to know which layers cost what before you can decide where to
-      trade compute for memory. Companion `examples/MemoryFootprintReport/`
-      runs it on (i) a tiny MLP, (ii) a small CIFAR conv stack, and
-      (iii) a small attention stack so reviewers can eyeball how the
-      shape of the bottleneck shifts across model families (parameter-
-      heavy MLP vs activation-heavy conv vs both-heavy attention).
 
 ### Layer sensitivity
 - [ ] TNNet.LayerSensitivityReport — given a probe batch (and an optional
