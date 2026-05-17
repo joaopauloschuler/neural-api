@@ -70,6 +70,18 @@ rather than acted on.
 ## Added ideas
 
 ### Smaller follow-up ideas
+- [ ] Multi-threaded determinism investigation: SeededReproducibility passes
+      with `MaxThreadNum := 1` but no test pins what breaks at `>1`. Add a
+      sibling demo (or extend it) that runs with `MaxThreadNum := 4` twice
+      and prints which weights diverge first — useful starting point for any
+      future "make TNeuralFit deterministic under parallelism" work.
+- [ ] CumSumPositionEncoding follow-up: actually train a tiny position-
+      dependent model with and without the CumSum feature concatenated and
+      chart loss delta. Forward-only demo landed; the bake-off is still open.
+- [ ] SwiGLU FFN follow-up: package the `Dense(2*D) → SwiGLU → Dense(D_out)`
+      pattern as `TNNet.AddSwiGLUFeedForward(D_in, D_hidden, D_out)` builder
+      so the example becomes one line. Companion of the
+      [[TNNetSwiGLUFeedForward]] block helper task below.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
@@ -617,7 +629,7 @@ breakdown:
 - [ ] `examples/PositionalEncodingDemo/` — visualize (ASCII heatmap) the
       sin/cos table built by TNNetSinusoidalPositionalEmbedding vs the
       learnable TNNetAddPositionalEmbedding table after a few epochs.
-- [ ] `examples/SwiGLUFeedForward/` — tiny FFN block `Dense → SwiGLU →
+- [x] `examples/SwiGLUFeedForward/` — tiny FFN block `Dense → SwiGLU →
       Dense` trained on a synthetic regression task.
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
@@ -640,8 +652,8 @@ breakdown:
       feature heads, side-by-side.
 - [ ] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
       Square(x)))` as a Euclidean-norm-reciprocal head.
-- [ ] `examples/CumSumPositionEncoding/` — tiny char-level demo using
-      CumSum on a constant input as a learned linear position feature.
+- [x] `examples/CumSumPositionEncoding/` — forward-only demo showing
+      that CumSum on a constant input produces a linear position ramp.
 - [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin.
 - [ ] `examples/PReLUvsLeakyReLU/` — three-config bake-off.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
@@ -678,9 +690,9 @@ breakdown:
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
       once with TNNetMaxPool and once with TNNetMaxBlurPool; report
       shift-equivariance delta.
-- [ ] `examples/SeededReproducibility/` — runs one of the smallest examples
+- [x] `examples/SeededReproducibility/` — runs one of the smallest examples
       twice with the same seed and prints PASS/FAIL on bit-for-bit weight
-      equality.
+      equality. Requires `NFit.MaxThreadNum := 1`.
 - [ ] `examples/AbsSquareEnergy/`, `examples/ReverseXYAugmentation/`,
       `examples/AutoencoderMNIST/`, `examples/AutoencoderReconstructionGrid/`
       — additional small demos.
