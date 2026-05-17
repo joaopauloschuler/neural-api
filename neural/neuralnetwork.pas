@@ -3072,6 +3072,25 @@ type
       // (vanishing gradient or LR=0) and exploding ones. Returns an
       // error message if the two snapshots have different architectures.
       class function WeightDriftReport(const SnapshotA, SnapshotB: string): string;
+      // Classifier diagnostic helper. Given a trained classifier NN, a labeled
+      // validation set Samples (input volume + one-hot target), and the
+      // class count NumClasses, runs a single forward pass and reports:
+      // (a) the full CxC confusion matrix (rows=true, cols=pred) with
+      //     row sums and a per-row recall-normalized variant;
+      // (b) per-class precision, recall, F1, plus macro and micro F1;
+      // (c) overall top-1 accuracy and balanced accuracy (mean recall);
+      // (d) the TopConfusedPairs most-confused (true_i, pred_j) pairs
+      //     sorted by off-diagonal mass;
+      // (e) optional per-class lowest-confidence sample indices (cap
+      //     HardExamplesPerClass per true class; 0 disables).
+      // Pure CPU, single forward pass, no training-time changes.
+      class function ConfusionMatrixReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        NumClasses: integer;
+        TopConfusedPairs: integer = 5;
+        HardExamplesPerClass: integer = 0
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -19572,6 +19591,329 @@ begin
     Lines.Free;
     NB.Free;
     NA.Free;
+  end;
+end;
+
+class function TNNet.ConfusionMatrixReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  NumClasses: integer;
+  TopConfusedPairs: integer = 5;
+  HardExamplesPerClass: integer = 0
+): string;
+const
+  cEps = 1e-12;
+var
+  Lines: TStringList;
+  Matrix: array of array of integer;
+  RowSum, ColSum: array of integer;
+  TruePos: array of integer;
+  Precision, Recall, F1: array of TNeuralFloat;
+  // hard-example tracking: per-true-class lists of (idx, confidence)
+  HardIdx: array of array of integer;
+  HardConf: array of array of TNeuralFloat;
+  // off-diagonal pair tracking
+  PairTrue, PairPred, PairCount: array of integer;
+  PairTotal: integer;
+  I, J, K, T, P, Total, TotalCorrect: integer;
+  Pair: TNNetVolumePair;
+  Output: TNNetVolume;
+  Conf: TNeuralFloat;
+  MacroF1, MicroF1, MicroPrec, MicroRec, Accuracy, BalancedAcc: TNeuralFloat;
+  RecallSum: TNeuralFloat;
+  SumTP, SumFP, SumFN: integer;
+  Line: string;
+  ColW: integer;
+  WorstIdx: integer;
+  WorstConf: TNeuralFloat;
+  TmpI: integer;
+  TmpF: TNeuralFloat;
+  Shown: integer;
+  RecallLoss: TNeuralFloat;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NumClasses <= 0 then
+    begin
+      Result := 'ConfusionMatrixReport: NumClasses must be > 0.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'ConfusionMatrixReport: empty sample list.' + sLineBreak;
+      Exit;
+    end;
+    if NN = nil then
+    begin
+      Result := 'ConfusionMatrixReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+
+    SetLength(Matrix, NumClasses, NumClasses);
+    SetLength(RowSum, NumClasses);
+    SetLength(ColSum, NumClasses);
+    SetLength(TruePos, NumClasses);
+    SetLength(Precision, NumClasses);
+    SetLength(Recall, NumClasses);
+    SetLength(F1, NumClasses);
+    SetLength(HardIdx, NumClasses);
+    SetLength(HardConf, NumClasses);
+    for I := 0 to NumClasses - 1 do
+    begin
+      for J := 0 to NumClasses - 1 do Matrix[I][J] := 0;
+      RowSum[I] := 0;
+      ColSum[I] := 0;
+      TruePos[I] := 0;
+      if HardExamplesPerClass > 0 then
+      begin
+        SetLength(HardIdx[I], 0);
+        SetLength(HardConf[I], 0);
+      end;
+    end;
+
+    Total := Samples.Count;
+    for I := 0 to Total - 1 do
+    begin
+      Pair := Samples[I];
+      if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+      NN.Compute(Pair.I);
+      Output := NN.GetLastLayer().Output;
+      T := Pair.O.GetClass();
+      P := Output.GetClass();
+      if (T < 0) or (T >= NumClasses) or (P < 0) or (P >= NumClasses) then Continue;
+      Inc(Matrix[T][P]);
+      Inc(RowSum[T]);
+      Inc(ColSum[P]);
+      if T = P then Inc(TruePos[T]);
+
+      if HardExamplesPerClass > 0 then
+      begin
+        if (P >= 0) and (P < Output.Size) then
+          Conf := Output.FData[P]
+        else
+          Conf := 0;
+        // Insert into HardIdx[T] / HardConf[T] keeping at most
+        // HardExamplesPerClass items with the LOWEST confidence values.
+        K := Length(HardIdx[T]);
+        if K < HardExamplesPerClass then
+        begin
+          SetLength(HardIdx[T], K + 1);
+          SetLength(HardConf[T], K + 1);
+          HardIdx[T][K] := I;
+          HardConf[T][K] := Conf;
+        end
+        else
+        begin
+          // find current max-confidence entry; replace if Conf is smaller
+          WorstIdx := 0;
+          WorstConf := HardConf[T][0];
+          for J := 1 to K - 1 do
+            if HardConf[T][J] > WorstConf then
+            begin
+              WorstConf := HardConf[T][J];
+              WorstIdx := J;
+            end;
+          if Conf < WorstConf then
+          begin
+            HardIdx[T][WorstIdx] := I;
+            HardConf[T][WorstIdx] := Conf;
+          end;
+        end;
+      end;
+    end;
+
+    // (a) Confusion matrix table (rows = true, cols = predicted)
+    ColW := 7;
+    Lines.Add('Confusion matrix (rows = true class, cols = predicted class):');
+    Line := Format('%6s', ['t\p']);
+    for J := 0 to NumClasses - 1 do
+      Line := Line + Format(' %*d', [ColW, J]);
+    Line := Line + Format(' %*s', [ColW, 'sum']);
+    Lines.Add(Line);
+    Lines.Add(StringOfChar('-', Length(Line)));
+    for I := 0 to NumClasses - 1 do
+    begin
+      Line := Format('%6d', [I]);
+      for J := 0 to NumClasses - 1 do
+        Line := Line + Format(' %*d', [ColW, Matrix[I][J]]);
+      Line := Line + Format(' %*d', [ColW, RowSum[I]]);
+      Lines.Add(Line);
+    end;
+    Lines.Add('');
+
+    // Row-normalized variant (per-row recall)
+    Lines.Add('Row-normalized (each cell = Matrix[i][j] / row_sum[i]):');
+    Line := Format('%6s', ['t\p']);
+    for J := 0 to NumClasses - 1 do
+      Line := Line + Format(' %*d', [ColW, J]);
+    Lines.Add(Line);
+    Lines.Add(StringOfChar('-', Length(Line)));
+    for I := 0 to NumClasses - 1 do
+    begin
+      Line := Format('%6d', [I]);
+      for J := 0 to NumClasses - 1 do
+      begin
+        if RowSum[I] > 0 then
+          Line := Line + Format(' %*.*f', [ColW, 3, Matrix[I][J] / RowSum[I]])
+        else
+          Line := Line + Format(' %*s', [ColW, '-']);
+      end;
+      Lines.Add(Line);
+    end;
+    Lines.Add('');
+
+    // (b) per-class precision / recall / F1
+    SumTP := 0;
+    SumFP := 0;
+    SumFN := 0;
+    RecallSum := 0;
+    for I := 0 to NumClasses - 1 do
+    begin
+      if ColSum[I] > 0 then
+        Precision[I] := TruePos[I] / ColSum[I]
+      else
+        Precision[I] := 0;
+      if RowSum[I] > 0 then
+        Recall[I] := TruePos[I] / RowSum[I]
+      else
+        Recall[I] := 0;
+      if (Precision[I] + Recall[I]) > cEps then
+        F1[I] := 2 * Precision[I] * Recall[I] / (Precision[I] + Recall[I])
+      else
+        F1[I] := 0;
+      RecallSum := RecallSum + Recall[I];
+      SumTP := SumTP + TruePos[I];
+      SumFP := SumFP + (ColSum[I] - TruePos[I]);
+      SumFN := SumFN + (RowSum[I] - TruePos[I]);
+    end;
+
+    Lines.Add(Format('%-6s %10s %10s %10s %10s',
+      ['Class', 'Precision', 'Recall', 'F1', 'Support']));
+    Lines.Add(StringOfChar('-', 50));
+    MacroF1 := 0;
+    for I := 0 to NumClasses - 1 do
+    begin
+      MacroF1 := MacroF1 + F1[I];
+      Lines.Add(Format('%-6d %10.4f %10.4f %10.4f %10d',
+        [I, Precision[I], Recall[I], F1[I], RowSum[I]]));
+    end;
+    MacroF1 := MacroF1 / NumClasses;
+
+    if (SumTP + SumFP) > 0 then
+      MicroPrec := SumTP / (SumTP + SumFP)
+    else
+      MicroPrec := 0;
+    if (SumTP + SumFN) > 0 then
+      MicroRec := SumTP / (SumTP + SumFN)
+    else
+      MicroRec := 0;
+    if (MicroPrec + MicroRec) > cEps then
+      MicroF1 := 2 * MicroPrec * MicroRec / (MicroPrec + MicroRec)
+    else
+      MicroF1 := 0;
+
+    Lines.Add(StringOfChar('-', 50));
+    Lines.Add(Format('Macro F1 = %.4f   Micro F1 = %.4f',
+      [MacroF1, MicroF1]));
+    Lines.Add('');
+
+    // (c) overall accuracy
+    TotalCorrect := SumTP;
+    if Total > 0 then
+      Accuracy := TotalCorrect / Total
+    else
+      Accuracy := 0;
+    BalancedAcc := RecallSum / NumClasses;
+    Lines.Add(Format('Top-1 accuracy   = %.4f  (%d / %d)',
+      [Accuracy, TotalCorrect, Total]));
+    Lines.Add(Format('Balanced accuracy= %.4f  (mean per-class recall)',
+      [BalancedAcc]));
+    Lines.Add('');
+
+    // (d) top K confused pairs by off-diagonal mass
+    if TopConfusedPairs > 0 then
+    begin
+      PairTotal := 0;
+      SetLength(PairTrue, NumClasses * NumClasses);
+      SetLength(PairPred, NumClasses * NumClasses);
+      SetLength(PairCount, NumClasses * NumClasses);
+      for I := 0 to NumClasses - 1 do
+        for J := 0 to NumClasses - 1 do
+          if (I <> J) and (Matrix[I][J] > 0) then
+          begin
+            PairTrue[PairTotal] := I;
+            PairPred[PairTotal] := J;
+            PairCount[PairTotal] := Matrix[I][J];
+            Inc(PairTotal);
+          end;
+      // simple selection sort: descending by count, take top K
+      Shown := TopConfusedPairs;
+      if Shown > PairTotal then Shown := PairTotal;
+      for I := 0 to Shown - 1 do
+      begin
+        WorstIdx := I;
+        for J := I + 1 to PairTotal - 1 do
+          if PairCount[J] > PairCount[WorstIdx] then WorstIdx := J;
+        if WorstIdx <> I then
+        begin
+          TmpI := PairTrue[I]; PairTrue[I] := PairTrue[WorstIdx]; PairTrue[WorstIdx] := TmpI;
+          TmpI := PairPred[I]; PairPred[I] := PairPred[WorstIdx]; PairPred[WorstIdx] := TmpI;
+          TmpI := PairCount[I]; PairCount[I] := PairCount[WorstIdx]; PairCount[WorstIdx] := TmpI;
+        end;
+      end;
+
+      Lines.Add(Format('Top %d most-confused (true, pred) pairs:',
+        [Shown]));
+      Lines.Add(Format('%-6s %-6s %10s %14s',
+        ['true', 'pred', 'count', 'recall_loss']));
+      Lines.Add(StringOfChar('-', 42));
+      for I := 0 to Shown - 1 do
+      begin
+        if RowSum[PairTrue[I]] > 0 then
+          RecallLoss := PairCount[I] / RowSum[PairTrue[I]]
+        else
+          RecallLoss := 0;
+        Lines.Add(Format('%-6d %-6d %10d %14.4f',
+          [PairTrue[I], PairPred[I], PairCount[I], RecallLoss]));
+      end;
+      Lines.Add('');
+    end;
+
+    // (e) per-class lowest-confidence sample indices
+    if HardExamplesPerClass > 0 then
+    begin
+      Lines.Add(Format('Hard examples per class (up to %d, sorted by confidence asc):',
+        [HardExamplesPerClass]));
+      for I := 0 to NumClasses - 1 do
+      begin
+        K := Length(HardIdx[I]);
+        // sort ascending by confidence (simple selection sort)
+        for J := 0 to K - 2 do
+        begin
+          WorstIdx := J;
+          for T := J + 1 to K - 1 do
+            if HardConf[I][T] < HardConf[I][WorstIdx] then WorstIdx := T;
+          if WorstIdx <> J then
+          begin
+            TmpI := HardIdx[I][J]; HardIdx[I][J] := HardIdx[I][WorstIdx]; HardIdx[I][WorstIdx] := TmpI;
+            TmpF := HardConf[I][J]; HardConf[I][J] := HardConf[I][WorstIdx]; HardConf[I][WorstIdx] := TmpF;
+          end;
+        end;
+        Line := Format('  class %d:', [I]);
+        if K = 0 then
+          Line := Line + ' (none)'
+        else
+          for J := 0 to K - 1 do
+            Line := Line + Format(' %d(%.3f)', [HardIdx[I][J], HardConf[I][J]]);
+        Lines.Add(Line);
+      end;
+      Lines.Add('');
+    end;
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
   end;
 end;
 

@@ -394,6 +394,7 @@ type
     procedure TestDigitalFilterNumerical;
     procedure TestCopyToChannelsNumerical;
     procedure TestSEBlockShapeAndForward;
+    procedure TestConfusionMatrixReportArithmetic;
   end;
 
 implementation
@@ -12080,6 +12081,86 @@ begin
     NN.Free;
     NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConfusionMatrixReportArithmetic;
+// Builds a hand-crafted 3-class prediction set using a tiny identity-style
+// network: input is a one-hot vector per sample, target is a separate
+// one-hot. By construction the ArgMax of the network output equals the
+// ArgMax of the input, so we control predictions exactly. The expected
+// confusion matrix is:
+//   t\p   0   1   2
+//    0    3   1   0
+//    1    0   2   1
+//    2    1   0   2
+// row sums: 4, 3, 3 ; col sums: 4, 3, 3
+// TP = [3, 2, 2] -> accuracy = 7/10 = 0.7
+// Recall = [3/4, 2/3, 2/3]; Precision = [3/4, 2/3, 2/3]
+// Balanced accuracy = mean(recall) = (0.75 + 0.6667 + 0.6667)/3 ~= 0.6944
+// F1[i] = 2 P R / (P + R); 0.75 for class 0, 2/3 ~= 0.6667 for classes 1,2.
+const
+  cExpected: array [0..9, 0..1] of integer = (
+    (0,0),(0,0),(0,0),(0,1),
+    (1,1),(1,1),(1,2),
+    (2,0),(2,2),(2,2));
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  I, T, P: integer;
+  Inp, Tgt: TNNetVolume;
+  Report: string;
+begin
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    // Identity-style net: input volume is depth=3, last layer is Identity so
+    // ArgMax of output = ArgMax of input.
+    NN.AddLayer(TNNetInput.Create(1, 1, 3));
+    NN.AddLayer(TNNetIdentity.Create());
+
+    for I := 0 to High(cExpected) do
+    begin
+      T := cExpected[I][0];
+      P := cExpected[I][1];
+      Inp := TNNetVolume.Create(1, 1, 3);
+      Tgt := TNNetVolume.Create(1, 1, 3);
+      Inp.Fill(0);
+      Tgt.Fill(0);
+      Inp.FData[P] := 1.0;
+      Tgt.FData[T] := 1.0;
+      Samples.Add(TNNetVolumePair.Create(Inp, Tgt));
+    end;
+
+    Report := TNNet.ConfusionMatrixReport(NN, Samples, 3, 3, 2);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Report mentions Top-1 accuracy',
+      Pos('Top-1 accuracy', Report) > 0);
+    AssertTrue('Report mentions Balanced accuracy',
+      Pos('Balanced accuracy', Report) > 0);
+    AssertTrue('Report mentions Macro F1',
+      Pos('Macro F1', Report) > 0);
+    AssertTrue('Report mentions Confusion matrix header',
+      Pos('Confusion matrix', Report) > 0);
+    AssertTrue('Report mentions Hard examples section',
+      Pos('Hard examples', Report) > 0);
+    AssertTrue('Report mentions confused-pair section',
+      Pos('most-confused', Report) > 0);
+    // Pin accuracy = 7/10 = 0.7000.
+    AssertTrue('Top-1 accuracy = 0.7000 (7/10) appears in report',
+      Pos('0.7000  (7 / 10)', Report) > 0);
+    // Pin balanced accuracy = mean(0.75, 2/3, 2/3) ~= 0.6944.
+    AssertTrue('Balanced accuracy ~= 0.6944 appears in report',
+      Pos('0.6944', Report) > 0);
+    // Pin per-class F1: P=R=0.75 -> F1=0.75 for class 0;
+    // P=R=2/3 ~= 0.6667 for classes 1 and 2.
+    AssertTrue('Class-0 F1 row 0.7500 appears',
+      Pos('0.7500     0.7500     0.7500', Report) > 0);
+    AssertTrue('Class-1/2 F1 row 0.6667 appears',
+      Pos('0.6667     0.6667     0.6667', Report) > 0);
+  finally
+    Samples.Free;
+    NN.Free;
   end;
 end;
 
