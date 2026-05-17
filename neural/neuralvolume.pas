@@ -874,6 +874,11 @@ type
   function NeuralFloatToStr(V: TNeuralFloat): string;
   function NeuralStrToFloat(V: String): TNeuralFloat;
 
+  { AssertFinite scans every element of V for NaN/Inf and raises a
+    labelled exception on the first offending value. Useful for catching
+    numerical instability in forward/backward passes. }
+  procedure AssertFinite(V: TNNetVolume; const Where: string);
+
   function GetLastChars(const InputStr: string; LenStr: Integer): string;
 
   procedure TestTNNetVolume();
@@ -1528,6 +1533,27 @@ begin
   {$IFDEF FPC} LocalFormatSettings := DefaultFormatSettings; {$ENDIF}
   LocalFormatSettings.DecimalSeparator := '.';
   Result := StrToFloat(V,LocalFormatSettings);
+end;
+
+procedure AssertFinite(V: TNNetVolume; const Where: string);
+var
+  I: integer;
+  Val: TNeuralFloat;
+begin
+  if V = nil then
+    raise Exception.Create('AssertFinite(' + Where + '): volume is nil');
+  for I := 0 to V.Size - 1 do
+  begin
+    Val := V.FData[I];
+    if IsNan(Val) then
+      raise Exception.Create('AssertFinite(' + Where +
+        '): non-finite value at index ' + IntToStr(I) +
+        ': NaN (' + FloatToStr(Val) + ')');
+    if IsInfinite(Val) then
+      raise Exception.Create('AssertFinite(' + Where +
+        '): non-finite value at index ' + IntToStr(I) +
+        ': Inf (' + FloatToStr(Val) + ')');
+  end;
 end;
 
 procedure WriteLnPassIfZero(x: TNeuralFloat; Tolerance: TNeuralFloat=0.0001);
