@@ -83,11 +83,6 @@ rather than acted on.
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
       regressions are visible without OpenCL/AVX hardware differences.
-#### Correctness / audit work I find rewarding
-- [ ] Add a shared numerical-gradient helper in TestNeuralNumerical.pas so each
-      new layer test is ~3 lines instead of a copy-pasted block. Reduces the
-      friction of every future test task.
-
 #### Experiments I'm curious about
 - [ ] Activation-function bake-off: train the same small MLP on a fixed toy
       dataset with ReLU / GELU / Swish / Mish / SELU and print a comparison
@@ -295,10 +290,6 @@ breakdown:
       its single-branch ShakeDrop generalization.
 
 #### Channel attention / conditioning
-- [ ] TNNetSEBlock (Squeeze-and-Excitation) — global-avg-pool → Dense(C/r)
-      → ReLU → Dense(C) → Sigmoid → channel-wise multiply. Ships as a
-      builder over existing layers (GlobalAvgPool, FullConnectReLU,
-      FullConnectSigmoid, ChannelMulByLayer).
 - [ ] TNNetCBAM — SE block plus a spatial-attention sibling.
 - [ ] TNNetFiLM (Feature-wise Linear Modulation) — `y = gamma * x + beta`
       with gamma/beta from a separate conditioning input branch.
@@ -714,9 +705,6 @@ breakdown:
       "predict next char of a periodic sequence" using Sparsemax in place
       of softmax over a tiny K|V bank. Print attention-weight histogram
       per step.
-- [ ] `examples/SEBlockCifar/` — drop one SE block per stage into the
-      existing SimpleImageClassifier CIFAR-10 net and print the before/after
-      validation accuracy delta.
 - [ ] `examples/FiLMConditional/` — toy "draw a digit of class C" generator
       with FiLM conditioning on a 10-way one-hot class input.
 - [ ] `examples/TripletEmbedding/` — learn a 2D embedding of MNIST digits
@@ -1024,26 +1012,6 @@ breakdown:
       record ...` in neuralvolume.pas with conversion helpers, plus a
       one-layer forward-only test validating FP16 matches FP32 to within
       1e-2.
-
-### OOD / overconfidence regularization
-- [ ] TNNetLogitNormalize — pre-softmax regularizer that divides logits
-      by their per-sample L2 norm scaled by a (fixed or learnable)
-      temperature `tau`, i.e. `y = x / (tau * ||x||_2 + eps)` along the
-      depth axis (Wei et al. 2022, "Mitigating Neural Network
-      Overconfidence with Logit Normalization"). Helps calibration and
-      out-of-distribution detection by keeping logit magnitudes bounded
-      during training. Compute is a per-(x,y) L2 reduce-then-divide
-      (mirrors the in-tree TNNetL2Normalize structure). Backpropagate is
-      the exact L2-normalize Jacobian — `dy_i/dx_j = (delta_ij*||x|| -
-      x_i*x_j/||x||) / (tau * ||x||^2)` — so it shares the same gradient
-      pattern as the recently-landed L2Normalize fix and is a natural
-      next test for the Jacobian-blow-up empirical study already on the
-      list. Ships as a TNNetIdentity-shaped layer (no learnable weights
-      when tau is fixed) with a numerical-gradient test in
-      TestNeuralNumerical.pas and a one-screen
-      `examples/LogitNormCalibration/` demo printing ECE before/after on
-      a small classifier (which pairs with the Model-calibration /
-      reliability-diagram task below).
 
 ### Model calibration / reliability
 - [ ] Model-calibration / reliability-diagram tool — a small unit
