@@ -2436,6 +2436,16 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Keep only the top-K activations per spatial cell along the depth axis,
+  /// zeroing the rest. Ties are broken by index order (first occurrence wins).
+  /// K is stored in FStruct[0]. Gradient passes through only at kept positions.
+  TNNetTopK = class(TNNetIdentity)
+    public
+      constructor Create(K: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -17388,6 +17398,87 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetTopK }
+
+constructor TNNetTopK.Create(K: integer);
+begin
+  inherited Create();
+  FStruct[0] := K;
+end;
+
+procedure TNNetTopK.Compute;
+var
+  StartTime: double;
+  CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, StartPos, K, BestIdx: integer;
+  BestVal, Val: TNeuralFloat;
+  Kept: array of boolean;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  K := FStruct[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  if K >= FOutput.Depth then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  SetLength(Kept, FOutput.Depth);
+  for CntX := 0 to MaxX do
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do Kept[CntD] := False;
+      for CntK := 1 to K do
+      begin
+        BestIdx := -1;
+        BestVal := 0;
+        for CntD := 0 to MaxD do
+        begin
+          if Kept[CntD] then continue;
+          Val := FOutput.FData[StartPos + CntD];
+          if (BestIdx = -1) or (Val > BestVal) then
+          begin
+            BestIdx := CntD;
+            BestVal := Val;
+          end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      for CntD := 0 to MaxD do
+        if not Kept[CntD] then
+          FOutput.FData[StartPos + CntD] := 0;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTopK.Backpropagate;
+var
+  StartTime: double;
+  i, SizeM1: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
+    (FOutput.Size = FOutputError.Size) then
+  begin
+    SizeM1 := FOutput.Size - 1;
+    for i := 0 to SizeM1 do
+      if FOutput.FData[i] <> 0 then
+        FPrevLayer.OutputError.FData[i] :=
+          FPrevLayer.OutputError.FData[i] + FOutputError.FData[i];
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetConvolutionReLU }
 constructor TNNetConvolutionReLU.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -22220,6 +22311,7 @@ begin
       'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
+      'TNNetTopK' :                 Result := TNNetTopK.Create(St[0]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -22421,6 +22513,7 @@ begin
       if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
+      if S[0] = 'TNNetTopK' then Result := TNNetTopK.Create(St[0]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else

@@ -240,6 +240,9 @@ type
     procedure TestLogSoftMaxForward;
     procedure TestLogSoftMaxGradientCheck;
     procedure TestLogSoftMaxSerializationRoundTrip;
+    procedure TestTopKForward;
+    procedure TestTopKGradientCheck;
+    procedure TestTopKSerializationRoundTrip;
     procedure TestChannelShuffleIndivisibleGuard;
     procedure TestChannelShuffleInverseProperty;
     procedure TestReverseChannelsForward;
@@ -12809,6 +12812,109 @@ begin
     Samples.Free;
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestTopKForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, y, d, nonzero: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 8, 1));
+    NN.AddLayer(TNNetTopK.Create(3));
+    for d := 0 to Input.Size - 1 do
+      Input.Raw[d] := Sin(d * 0.31) * 0.7 + 0.05;
+    NN.Compute(Input);
+    for x := 0 to 2 do
+      for y := 0 to 2 do
+      begin
+        nonzero := 0;
+        for d := 0 to 7 do
+          if NN.GetLastLayer.Output[x, y, d] <> 0 then Inc(nonzero);
+        AssertTrue('TopK kept count at (' + IntToStr(x) + ',' + IntToStr(y) +
+          ')=' + IntToStr(nonzero), nonzero <= 3);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTopKGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 8);
+  InputPlus := TNNetVolume.Create(3, 3, 8);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 8, 1));
+    NN.AddLayer(TNNetTopK.Create(3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    // Use input values with clear separation so small epsilon perturbations
+    // do not flip the top-K membership (which would break the local gradient).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (i mod 8) * 0.5 + 0.25;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3 - 0.2;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('TopK input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTopKSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetTopK.Create(3),
+    'TopK', 3, 3, 8, 1e-5);
 end;
 
 initialization
