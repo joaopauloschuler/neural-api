@@ -400,12 +400,20 @@ breakdown:
       the assertion fires at the right layer.
 - [ ] Mixup data augmentation helper.
 ### Introspection / debugging tools
-- [ ] TNNet.CountFLOPsPerLayer — forward-pass FLOP estimate per layer.
-- [ ] WeightHistogramDump — write per-trainable-layer CSV with 64-bin
-      histograms of weight values.
-- [ ] DeadNeuronReport — for each ReLU-family activation in a trained net,
-      report the fraction of neurons whose activation is zero across a
-      validation batch.
+- [X] TNNet.CountFLOPsPerLayer — forward-pass FLOP estimate per layer.
+      Landed: covers FullConnect / Convolution / Depthwise / Pool / SDPA /
+      LayerNorm / RMSNorm / activations / softmax with an "uncovered classes"
+      tally for unknowns. Companion `examples/FLOPsReport/`.
+- [X] TNNet.WeightHistogramReport — per-trainable-layer ASCII bar
+      histograms (default 32 bins) over `[-MaxAbs, +MaxAbs]` plus per-layer
+      min/max/mean/std/||W||2/||W||inf/near-zero%. Companion
+      `examples/WeightHistogramReport/`. (CSV-dump variant deferred —
+      add as a separate follow-up if needed.)
+- [X] TNNet.DeadNeuronReport — walks `TNNetReLUBase` descendants plus
+      fused conv/full-connect ReLU layers and reports per-layer dead-unit
+      count + percentage across a probe batch, mean per-sample zero-fraction,
+      a 10-bin dead% histogram across layers, and the worst layer.
+      Companion `examples/DeadNeuronReport/`.
 - [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
