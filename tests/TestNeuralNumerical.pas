@@ -84,6 +84,8 @@ type
     procedure TestReZeroWeightGradientCheck;
     procedure TestReZeroSerializationRoundTrip;
     procedure TestEntropyRegularizerGradientCheck;
+    procedure TestGradientReversalGradientCheck;
+    procedure TestGradientReversalSerializationRoundTrip;
     procedure TestPReLUForward;
     procedure TestPReLUGradientCheck;
     procedure TestPReLUWeightGradientCheck;
@@ -10971,6 +10973,114 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGradientReversalGradientCheck;
+// Verifies TNNetGradientReversal: identity in the forward pass and
+// dL/dInput = -lambda * upstream_grad in the backward pass. Composes
+// Input -> GradientReversal and uses an MSE loss against a fixed target;
+// central differences in input space against the analytic gradient.
+const
+  cLambda = 0.5;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  InputPlus := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create(5, 1, 1);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetGradientReversal.Create(cLambda));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.2 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 + 0.15 * i;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      // Numerical dL/dInput[i] from the FORWARD identity pass:
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      // The forward pass is identity, so dL/dInput[i] == dL/dOutput[i] = (out - desired)[i].
+      // The backward pass through GradientReversal multiplies by -lambda, so
+      // the gradient at the input layer should equal -lambda * numericalGrad.
+      AssertTrue('GradientReversal input gradient check at position ' +
+        IntToStr(i) + ' (num*-lambda=' +
+        FloatToStr(-cLambda * numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(analyticalGrad - (-cLambda * numericalGrad)) < 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGradientReversalSerializationRoundTrip;
+// Round-trip with a non-default lambda (2.0) so the FFloatSt[0] dispatch
+// path is exercised. SerializationRoundTrip checks forward parity; we
+// additionally assert SaveStructureToString preserves the parameter
+// bit-for-bit by re-saving the loaded layer.
+var
+  NN, NN2: TNNet;
+  Saved1, Saved2: string;
+begin
+  SerializationRoundTrip(Self, TNNetGradientReversal.Create(2.0),
+    'GradientReversal', 3, 1, 4, 1e-5);
+
+  // Belt-and-braces: build a tiny net, save, reload, re-save, compare.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetGradientReversal.Create(0.75));
+    Saved1 := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved1);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GradientReversal SaveToString bit-for-bit round-trip',
+        Saved1, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
   end;
 end;
 

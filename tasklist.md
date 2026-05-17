@@ -36,7 +36,7 @@ rather than acted on.
 
 ## New layer types
 - [ ] Sparse / mixture-of-experts routing layer
-- [ ] TNNetGradientReversal (Ganin et al. 2015, DANN) — identity in the
+- [x] TNNetGradientReversal (Ganin et al. 2015, DANN) — identity in the
       forward pass, multiplies the incoming gradient by `-lambda` in the
       backward pass. `lambda` lives in `FStruct[0]` (default 1.0) so the
       layer round-trips through SaveToString/LoadFromString like the other

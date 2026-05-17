@@ -1493,6 +1493,19 @@ type
       constructor Create(); override;
   end;
 
+  /// Gradient Reversal Layer (Ganin et al. 2015, https://arxiv.org/abs/1505.07818).
+  // Identity in the forward pass; the backward pass multiplies the incoming
+  // gradient by -lambda before passing it to the previous layer. Used as the
+  // hinge between a shared feature trunk and an adversarial domain head in
+  // Domain-Adversarial Neural Networks (DANN). The scalar lambda is stored
+  // in FFloatSt[0] so the layer round-trips through SaveToString /
+  // LoadFromString like other parameter-carrying layers. Default lambda = 1.0.
+  TNNetGradientReversal = class(TNNetIdentity)
+    public
+      constructor Create(Lambda: TNeuralFloat = 1.0); reintroduce; overload;
+      procedure Backpropagate(); override;
+  end;
+
   /// This is an experimental layer. Do not use it.
   TNNetAddAndDiv = class(TNNetIdentity)
   public
@@ -9473,6 +9486,30 @@ procedure TNNetMulByConstant.Compute();
 begin
   inherited Compute();
   FOutput.Mul(FFloatSt[0]);
+end;
+
+{ TNNetGradientReversal }
+constructor TNNetGradientReversal.Create(Lambda: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := Lambda;
+end;
+
+procedure TNNetGradientReversal.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Identity forward; backward multiplies the upstream gradient by -lambda
+  // before passing it down. This is the entire trick from Ganin et al. 2015:
+  // the adversary maximizes its own objective while the trunk is pushed in
+  // the opposite direction by the sign flip.
+  FOutputError.Mul(-FFloatSt[0]);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 procedure TNNetCellMulByCell.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -22854,6 +22891,7 @@ begin
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(Ft[0]);
       'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(Ft[0]);
       'TNNetNegate'  :              Result := TNNetNegate.Create();
+      'TNNetGradientReversal' :     Result := TNNetGradientReversal.Create(Ft[0]);
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
       'TNNetSoftMax' :              Result := TNNetSoftMax.Create(St[0]);
       'TNNetSoftMin' :              Result := TNNetSoftMin.Create(St[0]);
@@ -23058,6 +23096,7 @@ begin
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(Ft[0]) else
       if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(Ft[0]) else
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
+      if S[0] = 'TNNetGradientReversal' then Result := TNNetGradientReversal.Create(Ft[0]) else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
       if S[0] = 'TNNetSoftMax' then Result := TNNetSoftMax.Create(St[0]) else
       if S[0] = 'TNNetSoftMin' then Result := TNNetSoftMin.Create(St[0]) else
