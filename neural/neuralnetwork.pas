@@ -3276,6 +3276,9 @@ type
       // SwiGLU feed-forward block: FullConnectLinear(2*D_hidden) -> SwiGLU -> FullConnectLinear(D_out).
       // D_in is informational only; the first FullConnect infers its input from the previous layer.
       function AddSwiGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
+      // GEGLU feed-forward block: FullConnectLinear(2*D_hidden) -> GEGLU -> FullConnectLinear(D_out).
+      // D_in is informational only; the first FullConnect infers its input from the previous layer.
+      function AddGEGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -25132,6 +25135,16 @@ begin
   // the previous layer's output.
   AddLayer( TNNetFullConnectLinear.Create({SizeX=}1, {SizeY=}1, {Depth=}2 * D_hidden) );
   AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetFullConnectLinear.Create(D_out) );
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddGEGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
+begin
+  // D_in is informational; the FullConnect layer infers its input size from
+  // the previous layer's output.
+  AddLayer( TNNetFullConnectLinear.Create({SizeX=}1, {SizeY=}1, {Depth=}2 * D_hidden) );
+  AddLayer( TNNetGEGLU.Create() );
   AddLayer( TNNetFullConnectLinear.Create(D_out) );
   Result := GetLastLayer();
 end;

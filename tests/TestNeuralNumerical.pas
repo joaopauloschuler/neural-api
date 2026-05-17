@@ -424,6 +424,7 @@ type
     procedure TestReLU6SerializationRoundTrip;
     procedure TestSwiGLUSerializationRoundTrip;
     procedure TestGEGLUSerializationRoundTrip;
+    procedure TestAddGEGLUFeedForwardBuilder;
     // (TestTanhGLUSerializationRoundTrip published alongside TestTanhGLU* above)
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
@@ -10921,6 +10922,49 @@ begin
   // GEGLU halves the channel depth, so the input depth must be even.
   SerializationRoundTrip(Self, TNNetGEGLU.Create(),
     'GEGLU', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddGEGLUFeedForwardBuilder;
+const
+  cDIn     = 4;
+  cDHidden = 8;
+  cDOut    = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Output: TNNetVolume;
+  Cnt: integer;
+  v: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDIn);
+  Output := TNNetVolume.Create(1, 1, cDOut, 0);
+  try
+    NN.AddLayer( TNNetInput.Create(cDIn) );
+    NN.AddGEGLUFeedForward(cDIn, cDHidden, cDOut);
+
+    // Fill input with deterministic small values.
+    for Cnt := 0 to cDIn - 1 do
+      Input.Raw[Cnt] := 0.1 * (Cnt + 1);
+
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    AssertEquals('AddGEGLUFeedForward output SizeX', 1, Output.SizeX);
+    AssertEquals('AddGEGLUFeedForward output SizeY', 1, Output.SizeY);
+    AssertEquals('AddGEGLUFeedForward output Depth', cDOut, Output.Depth);
+
+    for Cnt := 0 to cDOut - 1 do
+    begin
+      v := Output.Raw[Cnt];
+      AssertTrue('AddGEGLUFeedForward output finite at ' + IntToStr(Cnt),
+        not (IsNan(v) or IsInfinite(v)));
+    end;
+  finally
+    Output.Free;
+    Input.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestTanhGLUSerializationRoundTrip;
