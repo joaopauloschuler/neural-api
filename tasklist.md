@@ -236,10 +236,6 @@ breakdown:
       position t depends only on positions ≤ t. Backward is the standard
       conv backward minus the masked-future part. Pairs with TNNetTokenShift
       and unblocks attention-free baseline experiments. (Already possible with existing layers?)
-- [X] TNNetMaskedMean / TNNetMaskedMax — pooling over a variable-length
-      sequence with a {0,1} mask supplied as an extra depth channel.
-      Replaces the "pad with zeros and hope average is small" workaround.
-
 #### Norm / regularization
 - [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
       `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
@@ -247,8 +243,6 @@ breakdown:
       + beta[c]`. Per-layer learnable alpha plus per-channel gamma/beta.
 - [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
       sigmoid gate.
-- [X] TNNetGRN (Global Response Normalization, ConvNeXt-V2) — channel-wise
-      contrast normalization with learnable scale/bias.
 - [ ] TNNetSwitchableNorm — learnable softmax-weighted combination of
       LayerNorm and RMSNorm outputs.
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
@@ -312,9 +306,6 @@ breakdown:
       *weights* of the previous trainable layer after each step.
 
 #### Reduction / shape
-- [X] TNNetPixelShuffle (sub-pixel convolution) — output spatial size =
-      input * r, output channels = input / (r*r). Deterministic index
-      permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
 - [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
       version with Shift in FStruct[0] already landed.
