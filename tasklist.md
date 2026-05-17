@@ -1216,3 +1216,57 @@ breakdown:
       neurons specialise into coordinated feature detectors), so
       reviewers can eyeball how training reshapes intra-layer
       redundancy.
+
+### Loss-landscape geometry
+- [ ] TNNet.LossLandscapeProbe — given a trained (or freshly-initialised)
+      network, a probe batch, and a target volume, sample the loss along
+      one or two random unit-norm directions in *parameter space*, with
+      directions normalised filter-wise (Li et al. 2018: scale each
+      filter's perturbation by `||W_filter|| / ||d_filter||` so depth-
+      varying filter magnitudes don't dominate the slice), and report:
+      (a) 1D slice: loss as a function of step size `alpha` over a
+          symmetric grid (default `alpha ∈ [-1, +1]` in 21 steps), with
+          weights restored to baseline between samples,
+      (b) 2D slice: loss on a grid of `(alpha, beta)` along two
+          orthogonal random directions (default 11×11) — printed as a
+          compact ASCII heatmap with 10 intensity buckets,
+      (c) one-number "flatness" verdict at the minimum: numerical
+          curvature `(L(+eps) - 2*L(0) + L(-eps)) / eps^2` averaged over
+          a handful of fresh random directions (default 5 directions,
+          eps=1e-2) — high curvature flags sharp minima (poor
+          generalisation hypothesis), low curvature flags flat basins,
+      (d) "barrier height" if a second weight checkpoint is supplied:
+          loss along the linear interpolation `(1-t)*W_a + t*W_b` for
+          `t ∈ [0, 1]` in 11 steps (the standard "mode connectivity"
+          probe — a high mid-interpolation loss flags that the two
+          checkpoints sit in different basins),
+      (e) per-direction flags: "monotone-up" (loss only ever rises from
+          the centre — confirms a local minimum), "monotone-down on one
+          side" (the optimiser stopped early in that direction), and
+          "non-convex" (loss dips back down past the centre — a saddle
+          or a nearby competing basin).
+      Pure forward-only with deterministic weight save/restore between
+      samples — no training-time changes, no backward pass needed.
+      Distinct from [[WeightSpectrumReport]] (a static geometry-of-W
+      signal — singular values of each layer's weight matrix, no probe
+      batch needed; LossLandscapeProbe answers "what does the *loss*
+      look like around the current W?" instead),
+      [[LayerSensitivityReport]] (per-layer weight perturbations
+      ranked by output impact — no loss surface sampled along a
+      direction, no curvature or barrier estimate),
+      [[GradientNormReport]] (first-order backward magnitudes, not a
+      direct sample of the forward loss surface), and
+      [[ActivationStatsReport]] (forward activation distribution at one
+      point, not the loss as a function of weight perturbation). The
+      output is the natural input for any future "is this checkpoint in
+      a flat basin?" / "did SWA actually land in a flatter region?" /
+      "are these two checkpoints mode-connected?" investigation — all
+      of which need a loss-surface sampler before they can run.
+      Companion `examples/LossLandscapeProbe/` runs it on (i) a
+      freshly-initialised tiny MLP (expected: noisy, no clear basin
+      yet) and (ii) the same architecture after a short training run
+      (expected: a visible basin in the 2D heatmap and a tighter
+      flatness number), and — if a second checkpoint from a different
+      seed is supplied — prints the linear-interpolation barrier so
+      reviewers can eyeball whether two trained models live in the
+      same basin.
