@@ -455,7 +455,7 @@ breakdown:
       `Argmax`, `TopKSample`, `TopPSample`, `TemperatureScale`.
 
 ### Introspection / debugging tools
-- [ ] TNNet.PrintSummary — Keras-style layer-by-layer table
+- [x] TNNet.PrintSummary — Keras-style layer-by-layer table
       (`Layer name | Output shape | Param count | Trainable`).
 - [ ] TNNet.CountFLOPsPerLayer — forward-pass FLOP estimate per layer.
 - [ ] WeightHistogramDump — write per-trainable-layer CSV with 64-bin
