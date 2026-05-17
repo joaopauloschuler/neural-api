@@ -1112,3 +1112,22 @@ breakdown:
       with a y=x reference line). Pair with a tiny example on top of an
       existing classifier that prints metrics before and after a one-parameter
       temperature-scaling fit on the logits.
+
+### Introspection (added)
+- [ ] Top-logit margin report — small helper in a new
+      `neuralintrospection.pas` (or extending the calibration unit above)
+      that, given a trained classifier and a validation set, computes the
+      per-sample `(top1_logit - top2_logit)` margin and prints:
+      (a) overall margin histogram (10 bins) as an ASCII bar chart,
+      (b) per-class mean+median margin (catches a class the model is
+      systematically uncertain about),
+      (c) the N lowest-margin sample indices per class (a ready-made
+      "hard examples" pool for active learning, label-noise auditing, or
+      curriculum work). Reuses the existing forward pass — no training-
+      time changes. Pure-CPU, finishes in one validation pass.
+      Companion `examples/MarginReport/` runs it against the
+      SimpleImageClassifier CIFAR baseline and prints the three sections
+      to stdout, so the output format is pinned and easy to eyeball.
+      Distinct from the calibration tool above (which summarises
+      confidence quality across the whole set) — this one localises
+      *which samples* the model is least sure about.
