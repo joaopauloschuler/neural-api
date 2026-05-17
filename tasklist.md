@@ -383,8 +383,6 @@ breakdown:
 - [ ] TNNetUnitNorm — alias for L2Normalize on the full volume (Keras name).
 - [ ] TNNetMinMaxNorm — `(x - min(x)) / (max(x) - min(x) + eps)` per sample,
       with subgradient routing for the argmin/argmax cells.
-- [X] TNNetZScore — `(x - mean) / std` per sample (no learnable scale/bias)
-      — the unparameterised core of LayerNorm.
 - [ ] TNNetUnitNormConstraint — projection layer that L2-normalizes the
       *weights* of the previous trainable layer after each step.
 
@@ -531,18 +529,11 @@ breakdown:
       on a grid of inputs.
 - [ ] Saturation-safety tests for TNNetTanhExp / TNNetSmish at ±extreme
       inputs, mirroring the HardTanh/SoftCapping pattern.
-- [ ] TNNetMaxOut numerical-gradient test (input + weight paths). Class
-      ships at neuralnetwork.pas line ~992 with no gradient coverage.
 - [ ] TNNetDigital forward-equality test — pin threshold and output for
       three inputs straddling it (non-differentiable, so forward-only).
-- [ ] TNNetReZero "starts as identity" forward test — at initialization
-      `Out = x + 0 * Sublayer(x)` should equal `x` exactly.
 - [ ] TNNetMaxPoolWithPosition correctness check — the auxiliary "position
       channels" should round-trip through TNNetDeMaxPool to exactly
       reconstruct the upsample pattern.
-- [ ] TNNetSinusoidalPositionalEmbedding boundary test — assert the
-      embedding values match the closed-form formula at three specific
-      (pos, dim) points.
 - [ ] TNNetAddPositionalEmbedding scale-factor backward check on
       rectangular (X≠Y) shapes (square inputs can hide off-by-one bugs).
 - [ ] Gradient-flow regression test — train a 12-layer ReLU MLP one epoch
@@ -563,9 +554,6 @@ breakdown:
 - [ ] TNNetClamp kink-region test at `x = MinValue` and `x = MaxValue`.
 - [ ] TNNetHardShrink / TNNetSoftShrink kink-region tests at hand-picked
       inputs (no central differences).
-- [ ] TNNetSoftPlus negative-x derivative regression test feeding x=-1e3
-      through Backpropagate (no EOverflow, finite input gradient,
-      gradient magnitude ≈ exp(x)).
 - [ ] TNNetSoftSign saturation test on ±1e6: assert `|y| < 1` and
       Backpropagate doesn't NaN.
 - [ ] TNNetESwish saturation test at ±extreme inputs.
@@ -575,17 +563,12 @@ breakdown:
 - [ ] TNNetAbs near-zero gradient handling test — explicitly skip x = 0
       sampling and pin the convention (currently `sign(0) = 0`).
 - [ ] TNNetSquare gradient-magnitude sanity test at large |x|.
-- [ ] TNNetReciprocal small-|x| gradient-magnitude sanity check.
-- [ ] TNNetReZero non-default ctor LoadFromString round-trip:
-      construct with non-default values, serialize, reload, assert preserved.
 - [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer raises the
       documented error when SizeY > 1.
 - [ ] Two-layer TokenShift composition test (catches subtle double-pass
       bugs in the t-1 / t+1 input-gradient scatter).
 - [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
 - [ ] TNNetSoftMin saturation test on extreme inputs.
-- [ ] Audit TNNetSoftCapping behaviour under extreme inputs and add a
-      saturation test.
 - [ ] Audit TNNetSigmoid and TNNetHardSigmoid for negative-x / positive-x
       symmetric-stability (same question as SoftPlus).
 - [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
@@ -663,8 +646,6 @@ breakdown:
 - [ ] `neural-bench` tiny CLI: time forward + backward for a chosen layer
       at a chosen shape, print ns/op. CSV output so future regressions
       are visible.
-- [ ] Add `tests/RunTests` and other fpc build artifacts to .gitignore.
-
 ### Examples I'd enjoy writing
 - [ ] `examples/TinyGPT/` — char-level transformer end-to-end demo on
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
