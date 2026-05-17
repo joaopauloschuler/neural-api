@@ -36,27 +36,6 @@ rather than acted on.
 
 ## New layer types
 - [ ] Sparse / mixture-of-experts routing layer
-- [x] TNNetGradientReversal (Ganin et al. 2015, DANN) — identity in the
-      forward pass, multiplies the incoming gradient by `-lambda` in the
-      backward pass. `lambda` lives in `FStruct[0]` (default 1.0) so the
-      layer round-trips through SaveToString/LoadFromString like the other
-      parameter-carrying layers. Cheap: ~30 lines in neuralnetwork.pas
-      plus a CreateLayer dispatch entry, and the numerical-gradient test
-      is genuinely informative here (central differences of the identity
-      forward must match `-lambda * upstream_grad`, so a missing sign or
-      a missing lambda scaling shows up immediately). Unlocks a real
-      class of experiments the repo can't currently express: domain-
-      adversarial training with a shared feature trunk feeding both a
-      label head and a domain-classifier head whose gradient is reversed
-      before it reaches the trunk. Companion `examples/DomainAdversarial/`
-      could train a two-domain toy (e.g. MNIST vs MNIST-with-inverted-
-      colors) and print (a) label-head accuracy on each domain and
-      (b) domain-classifier accuracy with vs without the GRL, showing
-      that the GRL drives the domain head toward chance while the label
-      head stays accurate. Distinct from existing regularizers
-      (`TNNetEntropyRegularizer` adds a term to the gradient;
-      `TNNetGradientReversal` rescales-and-flips the incoming gradient
-      without adding anything).
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
@@ -238,8 +217,6 @@ breakdown:
       max-error vs eps.
 
 ### Composite blocks / builders I'd enjoy shipping
-- [ ] TNNetSwiGLUFeedForward block helper — `LayerNorm → Dense → SwiGLU →
-      Dense out` builder. All ingredients in tree.
 - [ ] TNNetGLUFeedForward block — same shape but using the plain TNNetGLU.
       Gives a working FFN to test the pre-norm-residual builder against
       today, no waiting on new gating layers.
@@ -292,8 +269,6 @@ breakdown:
 - [ ] TNNetCBAM — SE block plus a spatial-attention sibling.
 - [ ] TNNetFiLM (Feature-wise Linear Modulation) — `y = gamma * x + beta`
       with gamma/beta from a separate conditioning input branch.
-- [x] TNNetCoordConv — concatenate two normalized X/Y coordinate channels
-      before a convolution. Parameter-free.
 - [ ] TNNetMaxBlurPool — anti-aliased max-pool: max-pool followed by a
       fixed (non-trainable) binomial blur filter.
 
@@ -331,8 +306,6 @@ breakdown:
 - [ ] TNNetCenteredSoftmax — softmax preceded by per-sample mean subtraction.
 
 #### Probability projections / sparsity
-- [x] TNNetSparsemax — Martins & Astudillo's exact-sparse alternative to
-      softmax. Yields true zeros; natural drop-in for sparse attention.
 - [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
       (soft / hard straight-through).
@@ -679,8 +652,6 @@ breakdown:
       using TNNetTripletLoss; output a PGM scatter plot.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
       TNNetVectorQuantizer bottleneck.
-- [x] `examples/CoordConvSpiral/` — minimal CoordConv vs plain conv
-      comparison on "predict (x, y) from a one-hot pixel image".
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
       once with TNNetMaxPool and once with TNNetMaxBlurPool; report
       shift-equivariance delta.
