@@ -331,7 +331,7 @@ breakdown:
 - [ ] TNNetCenteredSoftmax — softmax preceded by per-sample mean subtraction.
 
 #### Probability projections / sparsity
-- [ ] TNNetSparsemax — Martins & Astudillo's exact-sparse alternative to
+- [x] TNNetSparsemax — Martins & Astudillo's exact-sparse alternative to
       softmax. Yields true zeros; natural drop-in for sparse attention.
 - [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes

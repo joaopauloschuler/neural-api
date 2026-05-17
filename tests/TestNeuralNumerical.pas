@@ -90,6 +90,13 @@ type
     procedure TestCoordConvForwardDegenerate;
     procedure TestCoordConvGradientCheck;
     procedure TestCoordConvSerializationRoundTrip;
+    procedure TestSparsemaxForwardOnSimplex;
+    procedure TestSparsemaxForwardKnown;
+    procedure TestSparsemaxForwardUniform;
+    procedure TestSparsemaxSparsity;
+    procedure TestSparsemaxSumToOne;
+    procedure TestSparsemaxGradientCheck;
+    procedure TestSparsemaxSerializationRoundTrip;
     procedure TestPReLUForward;
     procedure TestPReLUGradientCheck;
     procedure TestPReLUWeightGradientCheck;
@@ -11254,6 +11261,247 @@ procedure TTestNeuralNumerical.TestCoordConvSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetCoordConv.Create(),
     'CoordConv', 4, 4, 3, 1e-6);
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxForwardOnSimplex;
+// Input [1, 0, 0] already lies on the probability simplex. Sparsemax
+// is a projection onto that simplex, so the output should equal the
+// input exactly.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetSparsemax.Create());
+    Input[0, 0, 0] := 1.0;
+    Input[0, 0, 1] := 0.0;
+    Input[0, 0, 2] := 0.0;
+    NN.Compute(Input);
+    AssertEquals('Sparsemax simplex [0]', 1.0, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('Sparsemax simplex [1]', 0.0, NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('Sparsemax simplex [2]', 0.0, NN.GetLastLayer.Output[0, 0, 2], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxForwardKnown;
+// Input [3, 1, 0.5]: sorted desc = [3, 1, 0.5].
+//   k=1: 1 + 1*3 = 4 > 3        -> kMax = 1
+//   k=2: 1 + 2*1 = 3 > 4        -> false
+//   k=3: 1 + 3*0.5 = 2.5 > 4.5  -> false
+// tau = (3 - 1) / 1 = 2. Output = [max(0,1), max(0,-1), max(0,-1.5)]
+//                              = [1, 0, 0]. Sums to 1, at least one zero.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  S: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetSparsemax.Create());
+    Input[0, 0, 0] := 3.0;
+    Input[0, 0, 1] := 1.0;
+    Input[0, 0, 2] := 0.5;
+    NN.Compute(Input);
+    AssertEquals('Sparsemax known [0]', 1.0, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('Sparsemax known [1]', 0.0, NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('Sparsemax known [2]', 0.0, NN.GetLastLayer.Output[0, 0, 2], 1e-6);
+    S := NN.GetLastLayer.Output[0, 0, 0] +
+         NN.GetLastLayer.Output[0, 0, 1] +
+         NN.GetLastLayer.Output[0, 0, 2];
+    AssertEquals('Sparsemax known sum', 1.0, S, 1e-5);
+    AssertTrue('Sparsemax known has zero',
+      (NN.GetLastLayer.Output[0, 0, 1] = 0) or
+      (NN.GetLastLayer.Output[0, 0, 2] = 0));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxForwardUniform;
+// All-equal input: sorted desc = [5, 5, 5].
+//   k=1: 1 + 5 = 6 > 5     -> kMax=1
+//   k=2: 1 + 10 = 11 > 10  -> kMax=2
+//   k=3: 1 + 15 = 16 > 15  -> kMax=3
+// tau = (15 - 1) / 3 = 14/3. Output = [5 - 14/3] * 3 = [1/3] * 3.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetSparsemax.Create());
+    for i := 0 to 2 do Input[0, 0, i] := 5.0;
+    NN.Compute(Input);
+    for i := 0 to 2 do
+      AssertEquals('Sparsemax uniform [' + IntToStr(i) + ']',
+        1.0 / 3.0, NN.GetLastLayer.Output[0, 0, i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxSparsity;
+// Heavily peaked input collapses to a one-hot output: a single 1 and
+// the rest exactly 0. Confirms the "true zeros" property.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetSparsemax.Create());
+    Input[0, 0, 0] := 10.0;
+    Input[0, 0, 1] := -5.0;
+    Input[0, 0, 2] := -5.0;
+    Input[0, 0, 3] := -5.0;
+    NN.Compute(Input);
+    AssertEquals('Sparsemax one-hot [0]', 1.0, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('Sparsemax one-hot [1]', 0.0, NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('Sparsemax one-hot [2]', 0.0, NN.GetLastLayer.Output[0, 0, 2], 1e-6);
+    AssertEquals('Sparsemax one-hot [3]', 0.0, NN.GetLastLayer.Output[0, 0, 3], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxSumToOne;
+// Random (3, 3, 5) input: every (x, y) position's depth vector must
+// sum to 1 within 1e-5.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, i: integer;
+  S: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 5, 1));
+    NN.AddLayer(TNNetSparsemax.Create());
+    RandSeed := 4242;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 1.3 + Cos(i * 0.11) * 0.7;
+    NN.Compute(Input);
+    for X := 0 to 2 do
+      for Y := 0 to 2 do
+      begin
+        S := 0;
+        for D := 0 to 4 do
+          S := S + NN.GetLastLayer.Output[X, Y, D];
+        AssertEquals('Sparsemax sum-to-one at (' + IntToStr(X) + ',' +
+          IntToStr(Y) + ')', 1.0, S, 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxGradientCheck;
+// Central-difference input gradient check on a (2, 2, 4) input.
+// Sparsemax is non-differentiable at kink points where the support
+// set changes. Base values [1.0, 0.7, 0.4, 0.0] put us solidly in
+// the kMax=3 regime with ~0.1 cushion to neighbouring kinks (much
+// larger than eps=1e-4), so central differences are well-defined
+// and exercise a non-trivial Jacobian (the all-one-hot kMax=1 case
+// has identically-zero gradient and is a degenerate check).
+// Tolerance 1e-2 matches the CoordConv test.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  X, Y, D, i: integer;
+  BaseVals: array [0..3] of TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetSparsemax.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Values chosen so kMax = 3 at every position with ~0.1 cushion
+    // to the nearest kink (much greater than eps), keeping the
+    // support set stable under central-difference perturbations.
+    BaseVals[0] := 1.0;
+    BaseVals[1] := 0.7;
+    BaseVals[2] := 0.4;
+    BaseVals[3] := 0.0;
+    for X := 0 to 1 do
+      for Y := 0 to 1 do
+        for D := 0 to 3 do
+          Input[X, Y, D] := BaseVals[D] + 0.05 * (X - Y);
+
+    // Arbitrary non-zero target.
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 + 0.05 * Sin(i * 0.9);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Sparsemax input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(analyticalGrad - numericalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSparsemaxSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetSparsemax.Create(),
+    'Sparsemax', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPReLUForward;

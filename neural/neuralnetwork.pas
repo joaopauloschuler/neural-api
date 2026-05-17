@@ -2252,6 +2252,31 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Sparsemax activation (Martins & Astudillo, 2016,
+  /// "From Softmax to Sparsemax: A Sparse Model of Attention and
+  /// Multi-Label Classification", https://arxiv.org/abs/1602.02068).
+  /// Euclidean projection of the input onto the probability simplex,
+  /// applied independently per spatial position (x, y) over the Depth
+  /// axis — same normalization scope as TNNetPointwiseSoftMax.
+  /// Forward: sort z descending, find the largest k with
+  ///   1 + k * z_sorted[k-1] > sum(z_sorted[0..k-1])
+  /// then tau = (sum(z_sorted[0..k-1]) - 1) / k and
+  ///   p[i] = max(0, z[i] - tau).
+  /// Unlike softmax, the output contains TRUE zeros — entries outside
+  /// the support set are exactly 0, which makes it a natural drop-in
+  /// for sparse attention.
+  /// Backward (Jacobian-vector product): for the support set
+  /// S = {i : p[i] > 0} of size k,
+  ///   grad_z[i] = grad_p[i] - mean_{j in S}(grad_p[j])   if i in S
+  ///   grad_z[i] = 0                                       otherwise.
+  /// No learnable parameters.
+  TNNetSparsemax = class(TNNetIdentity)
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -8909,6 +8934,129 @@ begin
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetSparsemax }
+
+constructor TNNetSparsemax.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetSparsemax.Compute();
+var
+  StartTime: double;
+  SX, SY, D, X, Y, CntD, StartPos, k, kMax: integer;
+  Sorted: array of TNeuralFloat;
+  CumSum, Threshold, Tau, Val: TNeuralFloat;
+  i, j: integer;
+  Tmp: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  SX := FOutput.SizeX;
+  SY := FOutput.SizeY;
+  D  := FOutput.Depth;
+  SetLength(Sorted, D);
+  for X := 0 to SX - 1 do
+  begin
+    for Y := 0 to SY - 1 do
+    begin
+      StartPos := FOutput.GetRawPos(X, Y, 0);
+      // Copy depth vector for in-place sort.
+      for CntD := 0 to D - 1 do
+        Sorted[CntD] := FOutput.FData[StartPos + CntD];
+      // Insertion sort descending (D is typically small at a single
+      // spatial position — vocabulary-sized sparsemax should use a
+      // dedicated kernel, but for attention/classification heads with
+      // tens to hundreds of channels insertion sort is fine).
+      for i := 1 to D - 1 do
+      begin
+        Tmp := Sorted[i];
+        j := i - 1;
+        while (j >= 0) and (Sorted[j] < Tmp) do
+        begin
+          Sorted[j + 1] := Sorted[j];
+          Dec(j);
+        end;
+        Sorted[j + 1] := Tmp;
+      end;
+      // Find kMax: largest k (1..D) with 1 + k*z_sorted[k-1] > cumsum_k.
+      CumSum := 0;
+      kMax := 1;
+      for k := 1 to D do
+      begin
+        CumSum := CumSum + Sorted[k - 1];
+        Threshold := 1 + k * Sorted[k - 1];
+        if Threshold > CumSum then kMax := k;
+      end;
+      // Recompute cumsum up to kMax for tau.
+      CumSum := 0;
+      for k := 0 to kMax - 1 do
+        CumSum := CumSum + Sorted[k];
+      Tau := (CumSum - 1) / kMax;
+      // Write p[i] = max(0, z[i] - tau) into FOutput (in-place).
+      for CntD := 0 to D - 1 do
+      begin
+        Val := FOutput.FData[StartPos + CntD] - Tau;
+        if Val < 0 then Val := 0;
+        FOutput.FData[StartPos + CntD] := Val;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSparsemax.Backpropagate();
+var
+  StartTime: double;
+  SX, SY, D, X, Y, CntD, StartPos, SupportCount: integer;
+  SumGrad, Mean: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    SX := FOutput.SizeX;
+    SY := FOutput.SizeY;
+    D  := FOutput.Depth;
+    for X := 0 to SX - 1 do
+    begin
+      for Y := 0 to SY - 1 do
+      begin
+        StartPos := FOutput.GetRawPos(X, Y, 0);
+        // Determine support S = {i : p[i] > 0}.
+        SupportCount := 0;
+        SumGrad := 0;
+        for CntD := 0 to D - 1 do
+        begin
+          if FOutput.FData[StartPos + CntD] > 0 then
+          begin
+            Inc(SupportCount);
+            SumGrad := SumGrad + FOutputError.FData[StartPos + CntD];
+          end;
+        end;
+        if SupportCount = 0 then continue;
+        Mean := SumGrad / SupportCount;
+        // grad_z[i] = grad_p[i] - mean for i in S, else 0.
+        for CntD := 0 to D - 1 do
+        begin
+          if FOutput.FData[StartPos + CntD] > 0 then
+          begin
+            FPrevLayer.OutputError.FData[StartPos + CntD] :=
+              FPrevLayer.OutputError.FData[StartPos + CntD] +
+              (FOutputError.FData[StartPos + CntD] - Mean);
+          end;
+        end;
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -23037,6 +23185,7 @@ begin
       'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
       'TNNetCoordConv' :            Result := TNNetCoordConv.Create();
+      'TNNetSparsemax' :            Result := TNNetSparsemax.Create();
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetCumSum' :               Result := TNNetCumSum.Create(St[0]);
@@ -23242,6 +23391,7 @@ begin
       if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
       if S[0] = 'TNNetCoordConv' then Result := TNNetCoordConv.Create() else
+      if S[0] = 'TNNetSparsemax' then Result := TNNetSparsemax.Create() else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create(St[0]) else
