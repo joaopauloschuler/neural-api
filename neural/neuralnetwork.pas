@@ -1283,6 +1283,31 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Per-sample logit normalization (Wei et al. 2022).
+  // Pre-softmax regularizer that divides logits by a tau-scaled L2 norm
+  // along the depth axis at each spatial position (X,Y):
+  //   N     = sqrt(sum_j x_j^2 + safety)
+  //   denom = tau * N + eps
+  //   y_i   = x_i / denom
+  // Helps calibration and OOD detection by bounding logit magnitudes
+  // during training. tau is stored in FFloatSt[0] (default 1.0) and the
+  // numerical stabilizer eps in FFloatSt[1] (default 1e-8). With tau=1
+  // and eps=0 it reduces exactly to TNNetL2Normalize. No trainable
+  // parameters; the exact backward is applied per spatial position.
+  TNNetLogitNormalize = class(TNNetIdentity)
+  protected
+    FInvDenoms: TNNetVolume; // 1 / (tau * N + eps)
+    FInvNorms:  TNNetVolume; // 1 / N
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pTau: TNeuralFloat); overload;
+    constructor Create(pTau, pEpsilon: TNeuralFloat); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Clamp activation: y = clamp(x, MinValue, MaxValue).
   // Element-wise hard saturation between MinValue and MaxValue. Sub-gradient
   // is 1 strictly inside (MinValue, MaxValue) and 0 outside. MinValue is
@@ -3072,6 +3097,29 @@ type
       // (vanishing gradient or LR=0) and exploding ones. Returns an
       // error message if the two snapshots have different architectures.
       class function WeightDriftReport(const SnapshotA, SnapshotB: string): string;
+      // Gradient-magnitude introspection helper. Runs a single
+      // forward + backward pass on the given probe (Input, Target) and walks
+      // every layer to report:
+      //   (a) ||dL/dx_in||  - L2 norm of the input-error tensor entering the
+      //       layer (i.e. the L2 norm of the previous layer's OutputError),
+      //   (b) ||dL/dW||     - L2 norm of the weight-gradient tensor summed
+      //       over all neurons (computed from Neuron.Delta with the layer
+      //       LearningRate factored out),
+      //   (c) ratio         - per-step gradient-amplification factor
+      //       (||dL/dx_in|| of this layer divided by the previous trainable
+      //       layer's same norm).
+      // Flags layers whose input-error norm is < VanishingThreshold or
+      // > ExplodingThreshold, and rows whose ratio is outside
+      // [1/RatioFlagFactor, RatioFlagFactor]. Prints a 10-bin ASCII histogram
+      // of log10(||dL/dx_in||) across layers. Pure CPU, no API churn outside
+      // this one method.
+      class function GradientNormReport(
+        NN: TNNet;
+        Input, Target: TNNetVolume;
+        VanishingThreshold: TNeuralFloat = 1e-6;
+        ExplodingThreshold: TNeuralFloat = 1e3;
+        RatioFlagFactor: TNeuralFloat = 10.0
+      ): string;
       // Classifier diagnostic helper. Given a trained classifier NN, a labeled
       // validation set Samples (input volume + one-hot target), and the
       // class count NumClasses, runs a single forward pass and reports:
@@ -6061,6 +6109,134 @@ begin
           FPrevLayer.OutputError.FData[StartPos + CntD] :=
             FPrevLayer.OutputError.FData[StartPos + CntD] +
             InvN * (FOutputError.FData[StartPos + CntD] - Yi * Dot);
+        end;
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetLogitNormalize }
+
+constructor TNNetLogitNormalize.Create();
+begin
+  Create(1.0, 1e-8);
+end;
+
+constructor TNNetLogitNormalize.Create(pTau: TNeuralFloat);
+begin
+  Create(pTau, 1e-8);
+end;
+
+constructor TNNetLogitNormalize.Create(pTau, pEpsilon: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pTau;
+  FFloatSt[1] := pEpsilon;
+  FInvDenoms := TNNetVolume.Create();
+  FInvNorms  := TNNetVolume.Create();
+end;
+
+destructor TNNetLogitNormalize.Destroy();
+begin
+  FInvDenoms.Free;
+  FInvNorms.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLogitNormalize.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInvDenoms.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+  FInvNorms.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+end;
+
+procedure TNNetLogitNormalize.Compute();
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  LocalPrevOutput: TNNetVolume;
+  SumSq, N, InvN, InvDenom, Denom, Tau, Eps, Xi: TNeuralFloat;
+const
+  Safety = 1e-12;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.FOutput;
+  Tau := FFloatSt[0];
+  if Tau = 0 then Tau := 1.0;
+  Eps := FFloatSt[1];
+  if Eps < 0 then Eps := 1e-8;
+  MaxX := LocalPrevOutput.SizeX - 1;
+  MaxY := LocalPrevOutput.SizeY - 1;
+  MaxD := LocalPrevOutput.Depth - 1;
+  for CntX := 0 to MaxX do
+  begin
+    for CntY := 0 to MaxY do
+    begin
+      StartPos := LocalPrevOutput.GetRawPos(CntX, CntY, 0);
+      SumSq := 0;
+      for CntD := 0 to MaxD do
+      begin
+        Xi := LocalPrevOutput.FData[StartPos + CntD];
+        SumSq := SumSq + Xi * Xi;
+      end;
+      N := Sqrt(SumSq + Safety);
+      InvN := 1.0 / N;
+      Denom := Tau * N + Eps;
+      InvDenom := 1.0 / Denom;
+      FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)] := InvN;
+      FInvDenoms.FData[FInvDenoms.GetRawPos(CntX, CntY, 0)] := InvDenom;
+      for CntD := 0 to MaxD do
+        FOutput.FData[StartPos + CntD] :=
+          LocalPrevOutput.FData[StartPos + CntD] * InvDenom;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLogitNormalize.Backpropagate();
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  Dot, Yi, InvN, InvDenom, Tau, TauInvN: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Tau := FFloatSt[0];
+  if Tau = 0 then Tau := 1.0;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    // Per spatial position (X,Y), with denom = tau*N + eps:
+    //   dL/dx_i = InvDenom * gy_i - (tau * InvN) * y_i * Dot
+    // where Dot = sum_j y_j * gy_j. With tau=1 and eps=0 this reduces
+    // to InvN*(gy_i - y_i*Dot), matching TNNetL2Normalize.
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    for CntX := 0 to MaxX do
+    begin
+      for CntY := 0 to MaxY do
+      begin
+        StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+        InvN := FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)];
+        InvDenom := FInvDenoms.FData[FInvDenoms.GetRawPos(CntX, CntY, 0)];
+        TauInvN := Tau * InvN;
+        Dot := 0;
+        for CntD := 0 to MaxD do
+          Dot := Dot + FOutput.FData[StartPos + CntD] *
+            FOutputError.FData[StartPos + CntD];
+        for CntD := 0 to MaxD do
+        begin
+          Yi := FOutput.FData[StartPos + CntD];
+          FPrevLayer.OutputError.FData[StartPos + CntD] :=
+            FPrevLayer.OutputError.FData[StartPos + CntD] +
+            InvDenom * FOutputError.FData[StartPos + CntD] -
+            TauInvN * Yi * Dot;
         end;
       end;
     end;
@@ -19594,6 +19770,248 @@ begin
   end;
 end;
 
+class function TNNet.GradientNormReport(
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  VanishingThreshold: TNeuralFloat = 1e-6;
+  ExplodingThreshold: TNeuralFloat = 1e3;
+  RatioFlagFactor: TNeuralFloat = 10.0
+): string;
+const
+  cEps = 1e-30;
+  cBins = 10;
+var
+  Lines: TStringList;
+  LayerIdx, NeuronIdx, BinIdx: integer;
+  Layer, PrevLayer: TNNetLayer;
+  InErr, WGrad, Ratio, PrevInErr, LR: TNeuralFloat;
+  InErrs: array of TNeuralFloat;
+  WGrads: array of TNeuralFloat;
+  Ratios: array of TNeuralFloat;
+  LogVals: array of TNeuralFloat;
+  HasRow: array of boolean;
+  LayerNames: array of string;
+  LayerIdxs: array of integer;
+  Flags: array of string;
+  RowCount, ReportedTrainable: integer;
+  HistMin, HistMax, Span, V: TNeuralFloat;
+  Bins: array of integer;
+  MaxBin: integer;
+  Bar: string;
+  BarLen, MaxBarWidth: integer;
+  RowFlags: string;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'GradientNormReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Input = nil) or (Target = nil) then
+    begin
+      Result := 'GradientNormReport: Input/Target is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'GradientNormReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // Why: Delta accumulates -LR * gradient * input only when batch update is
+    // enabled; otherwise the gradient is consumed inline by FBackInertia and
+    // never lands in Delta where we can read it.
+    NN.SetBatchUpdate(true);
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    RowCount := NN.CountLayers();
+    SetLength(InErrs, RowCount);
+    SetLength(WGrads, RowCount);
+    SetLength(Ratios, RowCount);
+    SetLength(LogVals, RowCount);
+    SetLength(HasRow, RowCount);
+    SetLength(LayerNames, RowCount);
+    SetLength(LayerIdxs, RowCount);
+    SetLength(Flags, RowCount);
+
+    ReportedTrainable := 0;
+    PrevInErr := -1;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      HasRow[LayerIdx] := false;
+
+      // dL/dx_in for layer i is the OutputError of layer i-1 after
+      // backprop has populated it.
+      if LayerIdx > 0 then
+      begin
+        PrevLayer := NN.Layers[LayerIdx - 1];
+        if (PrevLayer.OutputError <> nil) and
+           (PrevLayer.OutputError.Size > 0) then
+          InErr := PrevLayer.OutputError.GetMagnitude()
+        else
+          InErr := 0;
+      end
+      else
+      begin
+        InErr := 0;
+      end;
+
+      WGrad := 0;
+      if Layer.Neurons.Count > 0 then
+      begin
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        begin
+          if Layer.Neurons[NeuronIdx].Delta.Size > 0 then
+            WGrad := WGrad +
+              Layer.Neurons[NeuronIdx].Delta.GetSumSqr();
+          WGrad := WGrad +
+            Layer.Neurons[NeuronIdx].FBiasDelta *
+            Layer.Neurons[NeuronIdx].FBiasDelta;
+        end;
+        WGrad := Sqrt(WGrad);
+        LR := Layer.LearningRate;
+        if LR > 0 then
+          WGrad := WGrad / LR;
+      end;
+
+      // Skip layers with no input error AND no weight gradient — pure
+      // structural layers (input, etc.).
+      if (LayerIdx = 0) or
+         ((InErr = 0) and (WGrad = 0) and (Layer.Neurons.Count = 0)) then
+        Continue;
+
+      HasRow[LayerIdx] := true;
+      InErrs[LayerIdx] := InErr;
+      WGrads[LayerIdx] := WGrad;
+      LayerNames[LayerIdx] := Layer.ClassName;
+      LayerIdxs[LayerIdx] := LayerIdx;
+
+      if (PrevInErr > 0) and (InErr > 0) then
+        Ratio := InErr / PrevInErr
+      else
+        Ratio := 0;
+      Ratios[LayerIdx] := Ratio;
+
+      RowFlags := '';
+      if (InErr > 0) and (InErr < VanishingThreshold) then
+        RowFlags := RowFlags + 'V';
+      if InErr > ExplodingThreshold then
+        RowFlags := RowFlags + 'E';
+      if (Ratio > 0) and (RatioFlagFactor > 0) then
+      begin
+        if (Ratio > RatioFlagFactor) or (Ratio < 1.0 / RatioFlagFactor) then
+          RowFlags := RowFlags + 'R';
+      end;
+      Flags[LayerIdx] := RowFlags;
+
+      PrevInErr := InErr;
+      Inc(ReportedTrainable);
+    end;
+
+    Lines.Add(Format('%-5s %-32s %14s %14s %12s %-6s',
+      ['Idx', 'Layer', '||dL/dx_in||', '||dL/dW||', 'ratio', 'flags']));
+    Lines.Add(StringOfChar('-', 92));
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not HasRow[LayerIdx] then Continue;
+      if Ratios[LayerIdx] > 0 then
+        Lines.Add(Format('%-5d %-32s %14.6e %14.6e %12.4f %-6s',
+          [LayerIdxs[LayerIdx], LayerNames[LayerIdx],
+           InErrs[LayerIdx], WGrads[LayerIdx],
+           Ratios[LayerIdx], Flags[LayerIdx]]))
+      else
+        Lines.Add(Format('%-5d %-32s %14.6e %14.6e %12s %-6s',
+          [LayerIdxs[LayerIdx], LayerNames[LayerIdx],
+           InErrs[LayerIdx], WGrads[LayerIdx], '-',
+           Flags[LayerIdx]]));
+    end;
+    Lines.Add(StringOfChar('-', 92));
+    Lines.Add(Format(
+      'Totals: %d reported layers (of %d). Flags: V=vanishing (<%g), ' +
+      'E=exploding (>%g), R=ratio outside [1/%g, %g].',
+      [ReportedTrainable, NN.CountLayers(),
+       VanishingThreshold, ExplodingThreshold,
+       RatioFlagFactor, RatioFlagFactor]));
+
+    // Histogram of log10(||dL/dx_in||) across reported layers.
+    Lines.Add('');
+    Lines.Add('log10(||dL/dx_in||) histogram across layers:');
+    HistMin := 0;
+    HistMax := 0;
+    MaxBin := 0;
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+
+    // Collect log values from rows with positive norm.
+    MaxBin := 0;
+    HistMin := 0;
+    HistMax := 0;
+    MaxBin := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not HasRow[LayerIdx] then Continue;
+      if InErrs[LayerIdx] <= 0 then Continue;
+      V := Log10(InErrs[LayerIdx] + cEps);
+      LogVals[LayerIdx] := V;
+      if (MaxBin = 0) then
+      begin
+        HistMin := V;
+        HistMax := V;
+        MaxBin := 1;
+      end
+      else
+      begin
+        if V < HistMin then HistMin := V;
+        if V > HistMax then HistMax := V;
+      end;
+    end;
+
+    if MaxBin = 0 then
+    begin
+      Lines.Add('  (no positive ||dL/dx_in|| values to bin)');
+    end
+    else
+    begin
+      Span := HistMax - HistMin;
+      if Span < 1e-9 then Span := 1e-9;
+      for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      begin
+        if not HasRow[LayerIdx] then Continue;
+        if InErrs[LayerIdx] <= 0 then Continue;
+        BinIdx := Trunc(((LogVals[LayerIdx] - HistMin) / Span) * cBins);
+        if BinIdx >= cBins then BinIdx := cBins - 1;
+        if BinIdx < 0 then BinIdx := 0;
+        Inc(Bins[BinIdx]);
+      end;
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+      MaxBarWidth := 40;
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        V := HistMin + (BinIdx + 0.5) * (Span / cBins);
+        if MaxBin > 0 then
+          BarLen := Round((Bins[BinIdx] / MaxBin) * MaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('  bin %2d  log10~=%8.3f  n=%3d  %s',
+          [BinIdx, V, Bins[BinIdx], Bar]));
+      end;
+    end;
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
 class function TNNet.ConfusionMatrixReport(
   NN: TNNet;
   Samples: TNNetVolumePairList;
@@ -20109,6 +20527,7 @@ begin
       'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
+      'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -20308,6 +20727,7 @@ begin
       if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
+      if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else

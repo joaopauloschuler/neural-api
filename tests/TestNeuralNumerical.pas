@@ -340,6 +340,9 @@ type
     procedure TestL2NormalizeUnitNorm;
     procedure TestL2NormalizeGradientCheck;
     procedure TestL2NormalizeSerializationRoundTrip;
+    procedure TestLogitNormalizeGradientCheck;
+    procedure TestLogitNormalizeReducesToL2WhenTauOne;
+    procedure TestLogitNormalizeSerializationRoundTrip;
     procedure TestSincForward;
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
@@ -395,6 +398,7 @@ type
     procedure TestCopyToChannelsNumerical;
     procedure TestSEBlockShapeAndForward;
     procedure TestConfusionMatrixReportArithmetic;
+    procedure TestGradientNormReportSmoke;
   end;
 
 implementation
@@ -10114,6 +10118,79 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestLogitNormalizeGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetLogitNormalize.Create(2.5),
+    'LogitNormalize', 2, 1, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestLogitNormalizeReducesToL2WhenTauOne;
+const
+  SizeX = 2;
+  SizeY = 2;
+  Depth = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD, StartPos: integer;
+  Sum: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetLogitNormalize.Create(1.0, 0.0));
+    for CntD := 0 to Input.Size - 1 do
+      Input.Raw[CntD] := Sin(CntD * 0.41) * 1.7 + 0.3;
+    NN.Compute(Input);
+    for CntX := 0 to SizeX - 1 do
+      for CntY := 0 to SizeY - 1 do
+      begin
+        StartPos := NN.GetLastLayer.Output.GetRawPos(CntX, CntY, 0);
+        Sum := 0;
+        for CntD := 0 to Depth - 1 do
+          Sum := Sum + NN.GetLastLayer.Output.FData[StartPos + CntD] *
+                       NN.GetLastLayer.Output.FData[StartPos + CntD];
+        AssertEquals('LogitNormalize tau=1 eps=0 ||y||^2=1 at (' +
+          IntToStr(CntX) + ',' + IntToStr(CntY) + ')', 1.0, Sum, 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLogitNormalizeSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+  Loaded: TNNetLayer;
+begin
+  Loaded := nil;
+  SerializationRoundTrip(Self, TNNetLogitNormalize.Create(3.0, 5e-7),
+    'LogitNormalize', 3, 1, 4, 1e-5);
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetLogitNormalize.Create(3.0, 5e-7));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Loaded := NN2.GetLastLayer;
+      AssertEquals('LogitNormalize round-trip class name',
+        'TNNetLogitNormalize', Loaded.ClassName);
+      AssertEquals('LogitNormalize round-trip structure preserves tau/eps',
+        NN.GetLastLayer.SaveStructureToString(),
+        Loaded.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestSincForward;
 const
   PI_VAL: TNeuralFloat = 3.14159265358979323846;
@@ -12086,7 +12163,7 @@ end;
 
 procedure TTestNeuralNumerical.TestConfusionMatrixReportArithmetic;
 // Builds a hand-crafted 3-class prediction set using a tiny identity-style
-// network: input is a one-hot vector per sample, target is a separate
+// network: input is a softmax-like one-hot per sample, target is a separate
 // one-hot. By construction the ArgMax of the network output equals the
 // ArgMax of the input, so we control predictions exactly. The expected
 // confusion matrix is:
@@ -12097,8 +12174,8 @@ procedure TTestNeuralNumerical.TestConfusionMatrixReportArithmetic;
 // row sums: 4, 3, 3 ; col sums: 4, 3, 3
 // TP = [3, 2, 2] -> accuracy = 7/10 = 0.7
 // Recall = [3/4, 2/3, 2/3]; Precision = [3/4, 2/3, 2/3]
-// Balanced accuracy = mean(recall) = (0.75 + 0.6667 + 0.6667)/3 ~= 0.6944
-// F1[i] = 2 P R / (P + R); 0.75 for class 0, 2/3 ~= 0.6667 for classes 1,2.
+// Balanced accuracy = mean(recall) = (0.75 + 0.6667 + 0.6667)/3
+// F1[i] = 2 P R / (P + R); same for all 3 by symmetry.
 const
   cExpected: array [0..9, 0..1] of integer = (
     (0,0),(0,0),(0,0),(0,1),
@@ -12160,6 +12237,79 @@ begin
       Pos('0.6667     0.6667     0.6667', Report) > 0);
   finally
     Samples.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGradientNormReportSmoke;
+// Smoke test for TNNet.GradientNormReport: builds a 3-layer fully-connected
+// ReLU MLP, runs one forward+backward pass on a single probe sample, and
+// asserts the report is non-empty, contains the expected header/section
+// strings, and pins the per-trainable-layer row count (3 rows: two
+// FullConnectReLU + one FullConnectLinear).
+var
+  NN: TNNet;
+  Inp, Tgt: TNNetVolume;
+  Report: string;
+  LineCount, I, RowCount: integer;
+  Lines: TStringList;
+  Line: string;
+begin
+  RandSeed := 7;
+  NN := TNNet.Create();
+  Inp := TNNetVolume.Create(4, 1, 1);
+  Tgt := TNNetVolume.Create(1, 1, 1);
+  Lines := TStringList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(1));
+    NN.SetLearningRate(0.01, 0.9);
+
+    Inp.FData[0] := 0.10;
+    Inp.FData[1] := 0.20;
+    Inp.FData[2] := 0.30;
+    Inp.FData[3] := 0.40;
+    Tgt.FData[0] := 0.50;
+
+    Report := TNNet.GradientNormReport(NN, Inp, Tgt);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Report has ||dL/dx_in|| header',
+      Pos('||dL/dx_in||', Report) > 0);
+    AssertTrue('Report has ||dL/dW|| header',
+      Pos('||dL/dW||', Report) > 0);
+    AssertTrue('Report has flags legend',
+      Pos('vanishing', Report) > 0);
+    AssertTrue('Report has histogram section',
+      Pos('histogram', Report) > 0);
+    AssertTrue('Report has no NaN tokens',
+      Pos('NaN', Report) = 0);
+    AssertTrue('Report has no Inf tokens',
+      Pos('Inf', Report) = 0);
+
+    // Pin reported-row count: 3 trainable layers should appear as data rows
+    // (indices 1, 2, 3). Count lines starting with '1 ', '2 ', '3 '.
+    Lines.Text := Report;
+    RowCount := 0;
+    for I := 0 to Lines.Count - 1 do
+    begin
+      Line := Trim(Lines[I]);
+      if (Pos('1 ', Line) = 1) or
+         (Pos('2 ', Line) = 1) or
+         (Pos('3 ', Line) = 1) then
+        Inc(RowCount);
+    end;
+    AssertTrue(
+      Format('Expected 3 trainable-layer rows, found %d', [RowCount]),
+      RowCount = 3);
+
+    LineCount := Lines.Count;
+    AssertTrue('Report has many lines', LineCount > 10);
+  finally
+    Lines.Free;
+    Tgt.Free;
+    Inp.Free;
     NN.Free;
   end;
 end;
