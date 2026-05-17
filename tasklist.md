@@ -373,12 +373,10 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [X] TNNetCumSum — cumulative sum along the depth axis (first version).
-      Backward is reverse cumulative sum. Landed parameter-free, depth-only.
-      Follow-up: configurable axis (X / Y / Depth) via FStruct[0].
-- [X] TNNetRoll — circular shift along the depth axis with constructor int
-      Shift stored in FStruct[0]; backward is the inverse roll. Landed.
-      Follow-up: configurable axis selector.
+- [ ] TNNetCumSum follow-up: configurable axis (X / Y / Depth) via
+      FStruct[0]. Depth-only version already landed.
+- [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
+      version with Shift in FStruct[0] already landed.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetSqueeze / TNNetExpandDims — numpy-style single-axis shape
       helpers, less error-prone than open-coding TNNetReshape.
@@ -445,10 +443,6 @@ breakdown:
 - [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
-- [X] AssertFinite(V: TNNetVolume; const Where: string) — global helper
-      scanning for NaN/Inf and raising a labelled exception. Landed in
-      neuralvolume.pas with NaN/Inf/nil-volume cases covered by
-      TestNeuralVolume.pas.
 
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
