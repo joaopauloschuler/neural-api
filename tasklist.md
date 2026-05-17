@@ -1024,6 +1024,26 @@ breakdown:
       Distinct from the calibration tool above (which summarises
       confidence quality across the whole set) — this one localises
       *which samples* the model is least sure about.
+### Activation distribution
+- [ ] TNNet.ActivationStatsReport — given a probe batch, walk every layer's
+      forward output and print a per-layer table of
+      `mean / std / min / max / |median| / |skew| / kurtosis` plus
+      `pct_saturated_low` and `pct_saturated_high` (configurable thresholds,
+      default ±0.99·OutputRange for bounded activations, |x|>6 for unbounded),
+      `pct_negative`, `pct_near_zero` (|x| < 1e-6), and a compact 16-bin ASCII
+      histogram over `[-MaxAbs, +MaxAbs]`. End with a flag list:
+      "near-collapsed layers" (std < 1e-4), "saturating layers" (>50%
+      saturated either side), and a 10-bin ASCII histogram of per-layer std
+      across the network so vanishing/exploding activation patterns jump out
+      at a glance. Pure forward-only — no training-time changes. Distinct
+      from [[DeadNeuronReport]] (zero-fraction on ReLU-family layers only),
+      [[WeightHistogramReport]] (weights, not activations),
+      [[GradientNormReport]] (backward magnitudes), and
+      [[AttentionEntropyReport]] (attention-weights only). Companion
+      `examples/ActivationStatsReport/` runs it on (i) a fresh-init network
+      and (ii) the same architecture after a short training run, so reviewers
+      can eyeball how training reshapes the activation distribution.
+
 ### Weight-matrix spectrum
 - [ ] TNNet.WeightSpectrumReport — for every trainable layer in a network,
       estimate the top singular value `sigma_1(W)` of its weight matrix via
