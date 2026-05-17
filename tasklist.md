@@ -1095,6 +1095,30 @@ breakdown:
       temperature-scaling fit on the logits.
 
 ### Introspection (added)
+- [ ] TNNet.DiffArchitecture(OtherNet) — companion to the recently-shipped
+      PrintSummary. Walks both networks layer-by-layer and prints a
+      unified-diff-style report of architectural differences: matching
+      layers as ` ` lines (class name + output shape + param count),
+      layers only in self as `-` lines, layers only in other as `+`
+      lines, and structural mismatches (same index, different class or
+      different output shape) as paired `-`/`+` lines. Use a longest-
+      common-subsequence alignment on the layer-class sequence so a
+      single inserted/removed layer doesn't cascade into a sea of false
+      mismatches. Drives off SaveStructureToString rather than live
+      pointers so it composes with a `DiffArchitectureFromString(s)`
+      overload — handy for diffing a builder's output against a pinned
+      "golden" string in a regression test. Pure-CPU, no training, runs
+      in microseconds; useful when iterating on builder helpers
+      (TNNetTransformerEncoderBlock, TNNetSEBlock, etc.) to confirm
+      refactors don't silently change the produced architecture, and as
+      a review aid when a PR touches a network builder. Companion
+      `examples/ArchitectureDiff/` constructs two near-identical
+      SimpleImageClassifier variants (one with an extra BatchNorm, one
+      with a swapped activation) and prints the diff to stdout, pinning
+      the output format. Add a smoke test in TestNeuralNetworkBase.pas
+      that asserts a network diffed against itself produces an empty
+      diff, and that swapping one layer produces exactly one paired
+      `-`/`+` chunk.
 - [ ] Top-logit margin report — small helper in a new
       `neuralintrospection.pas` (or extending the calibration unit above)
       that, given a trained classifier and a validation set, computes the
