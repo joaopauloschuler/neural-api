@@ -292,7 +292,7 @@ breakdown:
 - [ ] TNNetCBAM — SE block plus a spatial-attention sibling.
 - [ ] TNNetFiLM (Feature-wise Linear Modulation) — `y = gamma * x + beta`
       with gamma/beta from a separate conditioning input branch.
-- [ ] TNNetCoordConv — concatenate two normalized X/Y coordinate channels
+- [x] TNNetCoordConv — concatenate two normalized X/Y coordinate channels
       before a convolution. Parameter-free.
 - [ ] TNNetMaxBlurPool — anti-aliased max-pool: max-pool followed by a
       fixed (non-trainable) binomial blur filter.
@@ -679,7 +679,7 @@ breakdown:
       using TNNetTripletLoss; output a PGM scatter plot.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
       TNNetVectorQuantizer bottleneck.
-- [ ] `examples/CoordConvSpiral/` — minimal CoordConv vs plain conv
+- [x] `examples/CoordConvSpiral/` — minimal CoordConv vs plain conv
       comparison on "predict (x, y) from a one-hot pixel image".
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
       once with TNNetMaxPool and once with TNNetMaxBlurPool; report

@@ -2226,6 +2226,32 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Parameter-free CoordConv layer (Liu et al. 2018,
+  // "An intriguing failing of convolutional neural networks and the
+  // CoordConv solution", https://arxiv.org/abs/1807.03247). Given an
+  // input shape of (SizeX, SizeY, Depth), the output shape is
+  // (SizeX, SizeY, Depth + 2). The first Depth channels are an exact
+  // copy of the input; the two appended channels carry normalized
+  // spatial coordinates:
+  //   Output[x, y, Depth    ] := (2*x / (SizeX-1)) - 1   (range [-1, 1])
+  //   Output[x, y, Depth + 1] := (2*y / (SizeY-1)) - 1   (range [-1, 1])
+  // When SizeX == 1 (resp. SizeY == 1) the corresponding channel is
+  // filled with 0. The coordinate channels carry no gradient — the
+  // backward pass forwards only the first Depth error channels to
+  // FPrevLayer.OutputError, the coordinate channels' error is
+  // discarded. Placing TNNetCoordConv immediately before a convolution
+  // gives that convolution direct access to absolute (x, y) position
+  // and dramatically improves performance on tasks where the response
+  // is position-dependent.
+  TNNetCoordConv = class(TNNetIdentity)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer has no trainable parameter. It does a cross channel local
   // response normalization.
   TNNetLocalResponseNormDepth = class(TNNetLocalResponseNorm2D)
@@ -8802,6 +8828,84 @@ begin
             for IC := 0 to MaxC do
               FPrevLayer.OutputError.Add(IX, IY, (SX * P + SY) * C + IC,
                 FOutputError[IX * P + SX, IY * P + SY, IC]);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCoordConv }
+
+constructor TNNetCoordConv.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetCoordConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Output adds two coordinate channels on the depth axis.
+  FOutput.ReSize(pPrevLayer.Output.SizeX,
+                 pPrevLayer.Output.SizeY,
+                 pPrevLayer.Output.Depth + 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetCoordConv.Compute();
+var
+  SX, SY, D, X, Y, IC: integer;
+  DenomX, DenomY: TNeuralFloat;
+  CoordX, CoordY: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  SX := FPrevLayer.Output.SizeX;
+  SY := FPrevLayer.Output.SizeY;
+  D  := FPrevLayer.Output.Depth;
+  // Copy the original Depth channels through unchanged.
+  for X := 0 to SX - 1 do
+    for Y := 0 to SY - 1 do
+      for IC := 0 to D - 1 do
+        FOutput[X, Y, IC] := FPrevLayer.FOutput[X, Y, IC];
+  // Fill the two appended coordinate channels.
+  if SX > 1 then DenomX := 2.0 / (SX - 1) else DenomX := 0.0;
+  if SY > 1 then DenomY := 2.0 / (SY - 1) else DenomY := 0.0;
+  for X := 0 to SX - 1 do
+  begin
+    if SX > 1 then CoordX := DenomX * X - 1.0 else CoordX := 0.0;
+    for Y := 0 to SY - 1 do
+    begin
+      if SY > 1 then CoordY := DenomY * Y - 1.0 else CoordY := 0.0;
+      FOutput[X, Y, D    ] := CoordX;
+      FOutput[X, Y, D + 1] := CoordY;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCoordConv.Backpropagate();
+var
+  SX, SY, D, X, Y, IC: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutputError.Size > 0) and
+     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
+  begin
+    SX := FPrevLayer.Output.SizeX;
+    SY := FPrevLayer.Output.SizeY;
+    D  := FPrevLayer.Output.Depth;
+    // Only the first Depth channels are real data; the two coord
+    // channels carry no gradient (they are constants of the input
+    // geometry, not learned values).
+    for X := 0 to SX - 1 do
+      for Y := 0 to SY - 1 do
+        for IC := 0 to D - 1 do
+          FPrevLayer.OutputError.Add(X, Y, IC, FOutputError[X, Y, IC]);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -22932,6 +23036,7 @@ begin
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
+      'TNNetCoordConv' :            Result := TNNetCoordConv.Create();
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetCumSum' :               Result := TNNetCumSum.Create(St[0]);
@@ -23136,6 +23241,7 @@ begin
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
+      if S[0] = 'TNNetCoordConv' then Result := TNNetCoordConv.Create() else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create(St[0]) else

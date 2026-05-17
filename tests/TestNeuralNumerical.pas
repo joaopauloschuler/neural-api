@@ -86,6 +86,10 @@ type
     procedure TestEntropyRegularizerGradientCheck;
     procedure TestGradientReversalGradientCheck;
     procedure TestGradientReversalSerializationRoundTrip;
+    procedure TestCoordConvForward;
+    procedure TestCoordConvForwardDegenerate;
+    procedure TestCoordConvGradientCheck;
+    procedure TestCoordConvSerializationRoundTrip;
     procedure TestPReLUForward;
     procedure TestPReLUGradientCheck;
     procedure TestPReLUWeightGradientCheck;
@@ -11082,6 +11086,174 @@ begin
   finally
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestCoordConvForward;
+// Feeds a known (4, 4, 1) input through TNNetCoordConv and checks the
+// two appended coordinate channels carry exactly the normalized x/y
+// ramps in [-1, 1], and that the original Depth=1 channel is passed
+// through unchanged.
+const
+  cSX = 4;
+  cSY = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y: integer;
+  ExpectedX, ExpectedY: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSX, cSY, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(cSX, cSY, 1, 1));
+    NN.AddLayer(TNNetCoordConv.Create());
+    AssertEquals('CoordConv output SizeX', cSX, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('CoordConv output SizeY', cSY, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('CoordConv output Depth (Depth + 2)', 3,
+      NN.GetLastLayer.Output.Depth);
+    // Fill input with distinct, easily-recognizable values.
+    for X := 0 to cSX - 1 do
+      for Y := 0 to cSY - 1 do
+        Input[X, Y, 0] := 100 * X + Y;
+    NN.Compute(Input);
+    for X := 0 to cSX - 1 do
+    begin
+      ExpectedX := (2.0 * X / (cSX - 1)) - 1.0;
+      for Y := 0 to cSY - 1 do
+      begin
+        ExpectedY := (2.0 * Y / (cSY - 1)) - 1.0;
+        AssertEquals('CoordConv passthrough at (' + IntToStr(X) + ',' +
+          IntToStr(Y) + ')', Input[X, Y, 0],
+          NN.GetLastLayer.Output[X, Y, 0], 1e-6);
+        AssertEquals('CoordConv X channel at (' + IntToStr(X) + ',' +
+          IntToStr(Y) + ')', ExpectedX,
+          NN.GetLastLayer.Output[X, Y, 1], 1e-6);
+        AssertEquals('CoordConv Y channel at (' + IntToStr(X) + ',' +
+          IntToStr(Y) + ')', ExpectedY,
+          NN.GetLastLayer.Output[X, Y, 2], 1e-6);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCoordConvForwardDegenerate;
+// Edge case: SizeX = 1. The X coordinate channel must be all zeros (we
+// cannot normalize a single-column input to [-1, 1]). The Y channel
+// still spans [-1, 1] because SizeY > 1.
+const
+  cSX = 1;
+  cSY = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Y: integer;
+  ExpectedY: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSX, cSY, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(cSX, cSY, 1, 1));
+    NN.AddLayer(TNNetCoordConv.Create());
+    Input.Fill(0.5);
+    NN.Compute(Input);
+    for Y := 0 to cSY - 1 do
+    begin
+      ExpectedY := (2.0 * Y / (cSY - 1)) - 1.0;
+      AssertEquals('CoordConv degenerate X at Y=' + IntToStr(Y),
+        0.0, NN.GetLastLayer.Output[0, Y, 1], 1e-6);
+      AssertEquals('CoordConv degenerate Y at Y=' + IntToStr(Y),
+        ExpectedY, NN.GetLastLayer.Output[0, Y, 2], 1e-6);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCoordConvGradientCheck;
+// Central-difference check on Input -> CoordConv. The loss only sees
+// the first Depth channels of the output (we zero the target on the
+// coordinate channels and use an MSE), so the analytical gradient at
+// the input layer must match the numerical gradient of that same MSE.
+// This both confirms the passthrough forward and the "discard coord
+// channel error" backward.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  InputPlus := TNNetVolume.Create(3, 3, 2);
+  // Output has Depth+2 = 4 channels.
+  Desired := TNNetVolume.Create(3, 3, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
+    NN.AddLayer(TNNetCoordConv.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.1 + 0.05;
+    // Set the desired output: arbitrary non-zero target on the first
+    // two channels; on the two coord channels, set Desired equal to the
+    // analytical coord values so their per-element loss contribution is
+    // zero and exactly matches the gradient discard behavior.
+    Desired.Fill(0);
+    for i := 0 to 3 * 3 * 2 - 1 do
+      Desired.Raw[i] := 0.2 + 0.1 * i;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('CoordConv input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(analyticalGrad - numericalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCoordConvSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetCoordConv.Create(),
+    'CoordConv', 4, 4, 3, 1e-6);
 end;
 
 procedure TTestNeuralNumerical.TestPReLUForward;
