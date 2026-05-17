@@ -1080,7 +1080,7 @@ breakdown:
       temperature-scaling fit on the logits.
 
 ### Introspection (added)
-- [ ] TNNet.DiffArchitecture(OtherNet) — companion to the recently-shipped
+- [X] TNNet.DiffArchitecture(OtherNet) — companion to the recently-shipped
       PrintSummary. Walks both networks layer-by-layer and prints a
       unified-diff-style report of architectural differences: matching
       layers as ` ` lines (class name + output shape + param count),

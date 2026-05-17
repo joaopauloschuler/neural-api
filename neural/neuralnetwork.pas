@@ -3003,6 +3003,19 @@ type
       function CountWeights(): integer;
       function SummaryString(): string;
       procedure PrintSummary();
+      // Unified-diff-style architecture comparison.
+      // Each row is "<sign> ClassName  OutputShape  ParamCount" where
+      // <sign> is ' ' for matching layers, '-' for layers only in Self,
+      // '+' for layers only in OtherNet. Structural mismatches at the
+      // same aligned position emit paired '-'/'+' rows. Alignment is
+      // longest-common-subsequence on the layer class-name sequence so
+      // a single insertion/removal doesn't cascade. Returns an empty
+      // string when both networks are architecturally identical.
+      function DiffArchitecture(OtherNet: TNNet): string;
+      // As above, but builds the "other" side from a
+      // SaveStructureToString-style string. Handy for diffing against a
+      // pinned golden architecture.
+      function DiffArchitectureFromString(const StructureStr: string): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -19011,6 +19024,135 @@ end;
 procedure TNNet.PrintSummary();
 begin
   WriteLn(SummaryString());
+end;
+
+function TNNet.DiffArchitecture(OtherNet: TNNet): string;
+type
+  TLayerSig = record
+    Name: string;
+    Shape: string;
+    Params: integer;
+  end;
+  TSigArray = array of TLayerSig;
+var
+  A, B: TSigArray;
+  M, N: integer;
+  LCS: array of array of integer;
+  I, J: integer;
+  Lines: TStringList;
+  Mismatches: TStringList;
+  Same: boolean;
+
+  function BuildSig(NN: TNNet): TSigArray;
+  var
+    K: integer;
+    Layer: TNNetLayer;
+  begin
+    SetLength(Result, NN.CountLayers());
+    for K := 0 to NN.CountLayers() - 1 do
+    begin
+      Layer := NN.Layers[K];
+      Result[K].Name := Layer.ClassName;
+      Result[K].Shape := Format('(%d, %d, %d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      Result[K].Params := Layer.CountWeights();
+    end;
+  end;
+
+  function FormatRow(Sign: Char; const Sig: TLayerSig): string;
+  begin
+    Result := Format('%s %-32s %-22s %12d',
+      [Sign, Sig.Name, Sig.Shape, Sig.Params]);
+  end;
+
+  function SameSig(const X, Y: TLayerSig): boolean;
+  begin
+    Result := (X.Name = Y.Name) and (X.Shape = Y.Shape) and
+      (X.Params = Y.Params);
+  end;
+
+  // Recursive emission walking back from (I, J) using the LCS table.
+  // Matches on Name only drive the alignment, but rows distinguish
+  // by full signature equality (shape/params) so a same-class layer
+  // whose shape changed still surfaces as a mismatch.
+  procedure Emit(PI, PJ: integer);
+  begin
+    if (PI > 0) and (PJ > 0) and (A[PI - 1].Name = B[PJ - 1].Name) then
+    begin
+      Emit(PI - 1, PJ - 1);
+      if SameSig(A[PI - 1], B[PJ - 1]) then
+        Lines.Add(FormatRow(' ', A[PI - 1]))
+      else
+      begin
+        Lines.Add(FormatRow('-', A[PI - 1]));
+        Lines.Add(FormatRow('+', B[PJ - 1]));
+      end;
+    end
+    else if (PJ > 0) and ((PI = 0) or (LCS[PI, PJ - 1] >= LCS[PI - 1, PJ])) then
+    begin
+      Emit(PI, PJ - 1);
+      Lines.Add(FormatRow('+', B[PJ - 1]));
+    end
+    else if (PI > 0) and ((PJ = 0) or (LCS[PI, PJ - 1] < LCS[PI - 1, PJ])) then
+    begin
+      Emit(PI - 1, PJ);
+      Lines.Add(FormatRow('-', A[PI - 1]));
+    end;
+  end;
+
+begin
+  Result := '';
+  if OtherNet = nil then Exit;
+  A := BuildSig(Self);
+  B := BuildSig(OtherNet);
+  M := Length(A);
+  N := Length(B);
+
+  // LCS over class-name sequences. Length (M+1) x (N+1).
+  SetLength(LCS, M + 1, N + 1);
+  for I := 0 to M do LCS[I, 0] := 0;
+  for J := 0 to N do LCS[0, J] := 0;
+  for I := 1 to M do
+    for J := 1 to N do
+      if A[I - 1].Name = B[J - 1].Name then
+        LCS[I, J] := LCS[I - 1, J - 1] + 1
+      else if LCS[I - 1, J] >= LCS[I, J - 1] then
+        LCS[I, J] := LCS[I - 1, J]
+      else
+        LCS[I, J] := LCS[I, J - 1];
+
+  Lines := TStringList.Create();
+  Mismatches := TStringList.Create();
+  try
+    Emit(M, N);
+    Same := True;
+    for I := 0 to Lines.Count - 1 do
+      if (Length(Lines[I]) > 0) and (Lines[I][1] <> ' ') then
+      begin
+        Same := False;
+        Break;
+      end;
+    if Same then
+      Result := ''
+    else
+      Result := Lines.Text;
+  finally
+    Mismatches.Free;
+    Lines.Free;
+  end;
+end;
+
+function TNNet.DiffArchitectureFromString(const StructureStr: string): string;
+var
+  Other: TNNet;
+begin
+  Other := TNNet.Create();
+  try
+    Other.LoadStructureFromString(StructureStr);
+    Result := DiffArchitecture(Other);
+  finally
+    Other.Free;
+  end;
 end;
 
 function TNNet.GetWeightSum(): TNeuralFloat;

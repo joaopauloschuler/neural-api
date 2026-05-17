@@ -74,6 +74,9 @@ type
 
     // Introspection
     procedure TestPrintSummary;
+    procedure TestDiffArchitectureSelfIsEmpty;
+    procedure TestDiffArchitectureSwappedLayer;
+    procedure TestDiffArchitectureFromString;
   end;
 
 implementation
@@ -1038,6 +1041,106 @@ begin
       Pos('neurons', S) > 0);
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDiffArchitectureSelfIsEmpty;
+var
+  NN: TNNet;
+  Diff: string;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+
+    Diff := NN.DiffArchitecture(NN);
+    AssertEquals('Diffing a network against itself should be empty',
+      '', Diff);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDiffArchitectureSwappedLayer;
+var
+  A, B: TNNet;
+  Diff: string;
+  Lines: TStringList;
+  I, MinusCount, PlusCount, SpaceCount: integer;
+begin
+  A := TNNet.Create();
+  B := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    A.AddLayer(TNNetInput.Create(8, 8, 3));
+    A.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    A.AddLayer(TNNetMaxPool.Create(2));
+    A.AddLayer(TNNetFullConnectReLU.Create(10));
+
+    // Swap one layer: ReLU -> Linear at position 3 (full connect)
+    B.AddLayer(TNNetInput.Create(8, 8, 3));
+    B.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    B.AddLayer(TNNetMaxPool.Create(2));
+    B.AddLayer(TNNetFullConnectLinear.Create(10));
+
+    Diff := A.DiffArchitecture(B);
+    AssertTrue('Diff should be non-empty when one layer is swapped',
+      Length(Diff) > 0);
+    Lines.Text := Diff;
+
+    MinusCount := 0;
+    PlusCount := 0;
+    SpaceCount := 0;
+    for I := 0 to Lines.Count - 1 do
+    begin
+      if Length(Lines[I]) = 0 then Continue;
+      case Lines[I][1] of
+        '-': Inc(MinusCount);
+        '+': Inc(PlusCount);
+        ' ': Inc(SpaceCount);
+      end;
+    end;
+    AssertEquals('Exactly one removed line', 1, MinusCount);
+    AssertEquals('Exactly one added line', 1, PlusCount);
+    AssertEquals('Three matching layers should still appear', 3, SpaceCount);
+    AssertTrue('Removed line mentions the original class',
+      Pos('TNNetFullConnectReLU', Diff) > 0);
+    AssertTrue('Added line mentions the swapped class',
+      Pos('TNNetFullConnectLinear', Diff) > 0);
+  finally
+    Lines.Free;
+    A.Free;
+    B.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDiffArchitectureFromString;
+var
+  A, B: TNNet;
+  GoldenStr, Diff: string;
+begin
+  A := TNNet.Create();
+  B := TNNet.Create();
+  try
+    A.AddLayer(TNNetInput.Create(4, 4, 2));
+    A.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    A.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    // Same structure -> empty diff via string.
+    B.AddLayer(TNNetInput.Create(4, 4, 2));
+    B.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    B.AddLayer(TNNetFullConnectLinear.Create(3));
+    GoldenStr := B.SaveStructureToString();
+
+    Diff := A.DiffArchitectureFromString(GoldenStr);
+    AssertEquals('DiffArchitectureFromString against matching golden ' +
+      'should be empty', '', Diff);
+  finally
+    A.Free;
+    B.Free;
   end;
 end;
 
