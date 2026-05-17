@@ -36,6 +36,27 @@ rather than acted on.
 
 ## New layer types
 - [ ] Sparse / mixture-of-experts routing layer
+- [ ] TNNetGradientReversal (Ganin et al. 2015, DANN) — identity in the
+      forward pass, multiplies the incoming gradient by `-lambda` in the
+      backward pass. `lambda` lives in `FStruct[0]` (default 1.0) so the
+      layer round-trips through SaveToString/LoadFromString like the other
+      parameter-carrying layers. Cheap: ~30 lines in neuralnetwork.pas
+      plus a CreateLayer dispatch entry, and the numerical-gradient test
+      is genuinely informative here (central differences of the identity
+      forward must match `-lambda * upstream_grad`, so a missing sign or
+      a missing lambda scaling shows up immediately). Unlocks a real
+      class of experiments the repo can't currently express: domain-
+      adversarial training with a shared feature trunk feeding both a
+      label head and a domain-classifier head whose gradient is reversed
+      before it reaches the trunk. Companion `examples/DomainAdversarial/`
+      could train a two-domain toy (e.g. MNIST vs MNIST-with-inverted-
+      colors) and print (a) label-head accuracy on each domain and
+      (b) domain-classifier accuracy with vs without the GRL, showing
+      that the GRL drives the domain head toward chance while the label
+      head stays accurate. Distinct from existing regularizers
+      (`TNNetEntropyRegularizer` adds a term to the gradient;
+      `TNNetGradientReversal` rescales-and-flips the incoming gradient
+      without adding anything).
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
