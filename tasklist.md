@@ -109,10 +109,6 @@ rather than acted on.
       RMSNorm / GroupNorm on a small net, showing convergence-speed differences.
 - [ ] Weight-initialization sensitivity demo: show how a deep-ish net's
       first-epoch gradient magnitudes change across the available init schemes.
-- [X] Tiny "learns to add two binary numbers" sequence example — a fun, fast,
-      self-contained demo of the library on a task with an obvious right answer.
-      Shipped as `examples/BinaryAdder/` (4-bit + 4-bit, 100% exact-bit accuracy).
-
 #### Documentation
 - [ ] Write a short "how numerical gradient testing works in this repo" note so
       contributors can add layer tests confidently — it's the project's main
@@ -539,9 +535,6 @@ breakdown:
       ships, weight-gradient path looks like the kind of place a silent
       bug could live.
 - [ ] TNNetLocalConnect / TNNetDeLocalConnect input + weight gradient tests.
-- [X] TNNetMinPool / TNNetMinChannel numerical-gradient tests — coverage
-      gap from before the pooling audit.
-- [X] TNNetMaxChannel numerical-gradient test (sibling of AvgChannel).
 - [ ] Kink-region test parametric helper: with Clamp / HardShrink /
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
       "no-central-difference, hand-picked kink convention" pattern
@@ -646,8 +639,6 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-- [X] `examples/BinaryAdder/` — tiny "learns to add two binary numbers"
-      sequence example. Self-contained, fast, deterministic right answer.
 - [ ] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
       and print the per-epoch fraction of units that never fire; repeat
       with LeakyReLU/GELU/Swish.
@@ -1101,30 +1092,6 @@ breakdown:
       epochs with one layer's LR multiplier deliberately set to 0 and
       prints the report, pinning that the frozen layer shows ~0 drift
       while its neighbors do not.
-- [X] TNNet.DiffArchitecture(OtherNet) — companion to the recently-shipped
-      PrintSummary. Walks both networks layer-by-layer and prints a
-      unified-diff-style report of architectural differences: matching
-      layers as ` ` lines (class name + output shape + param count),
-      layers only in self as `-` lines, layers only in other as `+`
-      lines, and structural mismatches (same index, different class or
-      different output shape) as paired `-`/`+` lines. Use a longest-
-      common-subsequence alignment on the layer-class sequence so a
-      single inserted/removed layer doesn't cascade into a sea of false
-      mismatches. Drives off SaveStructureToString rather than live
-      pointers so it composes with a `DiffArchitectureFromString(s)`
-      overload — handy for diffing a builder's output against a pinned
-      "golden" string in a regression test. Pure-CPU, no training, runs
-      in microseconds; useful when iterating on builder helpers
-      (TNNetTransformerEncoderBlock, TNNetSEBlock, etc.) to confirm
-      refactors don't silently change the produced architecture, and as
-      a review aid when a PR touches a network builder. Companion
-      `examples/ArchitectureDiff/` constructs two near-identical
-      SimpleImageClassifier variants (one with an extra BatchNorm, one
-      with a swapped activation) and prints the diff to stdout, pinning
-      the output format. Add a smoke test in TestNeuralNetworkBase.pas
-      that asserts a network diffed against itself produces an empty
-      diff, and that swapping one layer produces exactly one paired
-      `-`/`+` chunk.
 - [ ] Top-logit margin report — small helper in a new
       `neuralintrospection.pas` (or extending the calibration unit above)
       that, given a trained classifier and a validation set, computes the
