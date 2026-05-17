@@ -149,8 +149,6 @@ type
     procedure TestThresholdedReLUGradientCheck;
     procedure TestReLU6Forward;
     procedure TestReLU6ExtremeInputSaturation;
-    procedure TestGlobalMaxPoolForward;
-    procedure TestGlobalMaxPoolGradientCheck;
     procedure TestGlobalMinPoolForward;
     procedure TestGlobalMinPoolGradientCheck;
     procedure TestMaskedFillForward;
@@ -350,11 +348,8 @@ type
     procedure TestSincTimesXEqualsSin;
     procedure TestLishtSymmetry;
     procedure TestSnakeDerivativeTrigIdentity;
-    procedure TestGlobalAvgPoolGradientCheck;
     procedure TestGlobalSumPoolGradientCheck;
     procedure TestReLU6SerializationRoundTrip;
-    procedure TestGlobalMaxPoolSerializationRoundTrip;
-    procedure TestGlobalAvgPoolSerializationRoundTrip;
     procedure TestSwiGLUSerializationRoundTrip;
     procedure TestGEGLUSerializationRoundTrip;
     // (TestTanhGLUSerializationRoundTrip published alongside TestTanhGLU* above)
@@ -4431,50 +4426,6 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestGlobalMaxPoolForward;
-var
-  NN: TNNet;
-  Input: TNNetVolume;
-begin
-  NN := TNNet.Create();
-  // 2 x 2 x 3 input; expect 1 x 1 x 3 output containing per-channel max.
-  Input := TNNetVolume.Create(2, 2, 3);
-  try
-    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
-    NN.AddLayer(TNNetGlobalMaxPool.Create());
-
-    // Channel 0: max = 4.0 at (1,0)
-    Input[0, 0, 0] := 1.0;  Input[1, 0, 0] := 4.0;
-    Input[0, 1, 0] := 2.0;  Input[1, 1, 0] := 3.0;
-    // Channel 1: max = 0.5 at (0,1) (all non-positive elsewhere)
-    Input[0, 0, 1] := -1.0; Input[1, 0, 1] := -2.0;
-    Input[0, 1, 1] :=  0.5; Input[1, 1, 1] := -0.5;
-    // Channel 2: max = 9.0 at (1,1)
-    Input[0, 0, 2] := 7.0;  Input[1, 0, 2] := 8.0;
-    Input[0, 1, 2] := 6.0;  Input[1, 1, 2] := 9.0;
-
-    NN.Compute(Input);
-
-    AssertEquals('GlobalMaxPool ch0', 4.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
-    AssertEquals('GlobalMaxPool ch1', 0.5, NN.GetLastLayer.Output[0, 0, 1], 0.0001);
-    AssertEquals('GlobalMaxPool ch2', 9.0, NN.GetLastLayer.Output[0, 0, 2], 0.0001);
-    AssertEquals('GlobalMaxPool output SizeX', 1, NN.GetLastLayer.Output.SizeX);
-    AssertEquals('GlobalMaxPool output SizeY', 1, NN.GetLastLayer.Output.SizeY);
-    AssertEquals('GlobalMaxPool output Depth', 3, NN.GetLastLayer.Output.Depth);
-  finally
-    NN.Free;
-    Input.Free;
-  end;
-end;
-
-procedure TTestNeuralNumerical.TestGlobalMaxPoolGradientCheck;
-begin
-  // 3 x 3 x 2 input. The Sin(i*0.7)*2.0+0.3 pattern from the helper
-  // generates distinct values, so the argmax stays stable under the
-  // epsilon=1e-4 perturbation.
-  LayerInputGradientCheck(Self, TNNetGlobalMaxPool.Create(),
-    'GlobalMaxPool', 3, 3, 2, 0.01);
-end;
 
 procedure TTestNeuralNumerical.TestGlobalMinPoolForward;
 var
@@ -10221,14 +10172,6 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestGlobalAvgPoolGradientCheck;
-begin
-  // Tiny 4 x 4 x 3 input. GlobalAvgPool (TNNetAvgChannel) is a smooth
-  // (linear) per-channel reduction so central differences should match
-  // the analytic gradient tightly.
-  LayerInputGradientCheck(Self, TNNetAvgChannel.Create(),
-    'GlobalAvgPool', 4, 4, 3, 0.01);
-end;
 
 procedure TTestNeuralNumerical.TestGlobalSumPoolGradientCheck;
 begin
@@ -10282,95 +10225,6 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestGlobalMaxPoolSerializationRoundTrip;
-var
-  NN, NN2: TNNet;
-  Input: TNNetVolume;
-  Saved: string;
-  i: integer;
-  ReloadedLayer: TNNetLayer;
-begin
-  NN := TNNet.Create();
-  Input := TNNetVolume.Create(3, 3, 2);
-  try
-    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
-    NN.AddLayer(TNNetGlobalMaxPool.Create());
-
-    for i := 0 to Input.Size - 1 do
-      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
-
-    NN.Compute(Input);
-    Saved := NN.SaveToString();
-
-    NN2 := TNNet.Create();
-    try
-      NN2.LoadFromString(Saved);
-      NN2.Compute(Input);
-      ReloadedLayer := NN2.GetLastLayer;
-      AssertEquals('GlobalMaxPool round-trip class name',
-        'TNNetGlobalMaxPool', ReloadedLayer.ClassName);
-      AssertEquals('GlobalMaxPool round-trip structure',
-        NN.GetLastLayer.SaveStructureToString(),
-        ReloadedLayer.SaveStructureToString());
-      AssertEquals('GlobalMaxPool round-trip output size',
-        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
-      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
-        AssertEquals('GlobalMaxPool round-trip output at ' + IntToStr(i),
-          NN.GetLastLayer.Output.Raw[i],
-          ReloadedLayer.Output.Raw[i], 1e-5);
-    finally
-      NN2.Free;
-    end;
-  finally
-    NN.Free;
-    Input.Free;
-  end;
-end;
-
-procedure TTestNeuralNumerical.TestGlobalAvgPoolSerializationRoundTrip;
-var
-  NN, NN2: TNNet;
-  Input: TNNetVolume;
-  Saved: string;
-  i: integer;
-  ReloadedLayer: TNNetLayer;
-begin
-  NN := TNNet.Create();
-  Input := TNNetVolume.Create(3, 3, 2);
-  try
-    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1));
-    NN.AddLayer(TNNetGlobalAvgPool.Create());
-
-    for i := 0 to Input.Size - 1 do
-      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.2;
-
-    NN.Compute(Input);
-    Saved := NN.SaveToString();
-
-    NN2 := TNNet.Create();
-    try
-      NN2.LoadFromString(Saved);
-      NN2.Compute(Input);
-      ReloadedLayer := NN2.GetLastLayer;
-      AssertEquals('GlobalAvgPool round-trip class name',
-        'TNNetGlobalAvgPool', ReloadedLayer.ClassName);
-      AssertEquals('GlobalAvgPool round-trip structure',
-        NN.GetLastLayer.SaveStructureToString(),
-        ReloadedLayer.SaveStructureToString());
-      AssertEquals('GlobalAvgPool round-trip output size',
-        NN.GetLastLayer.Output.Size, ReloadedLayer.Output.Size);
-      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
-        AssertEquals('GlobalAvgPool round-trip output at ' + IntToStr(i),
-          NN.GetLastLayer.Output.Raw[i],
-          ReloadedLayer.Output.Raw[i], 1e-5);
-    finally
-      NN2.Free;
-    end;
-  finally
-    NN.Free;
-    Input.Free;
-  end;
-end;
 
 procedure TTestNeuralNumerical.TestSwiGLUSerializationRoundTrip;
 begin

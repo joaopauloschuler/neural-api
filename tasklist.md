@@ -10,6 +10,14 @@ duplicated the forward pass of existing layers:
   `TNNetChannelMul` (forward pass).
 - `TNNetNeg` — duplicate of `TNNetNegate` (which is itself just
   `TNNetMulByConstant.Create(-1)`). Use `TNNetNegate` for `y = -x`.
+- `TNNetGlobalAvgPool` — empty-body subclass of `TNNetAvgChannel`. Use
+  `TNNetAvgChannel` for global average pooling.
+- `TNNetGlobalMaxPool` — overlapped `TNNetMaxChannel`. Use
+  `TNNetMaxChannel` for global max pooling. Note: `TNNetMaxChannel`
+  currently assumes square feature maps (`SizeX == SizeY`); the deleted
+  `TNNetGlobalMaxPool` had a direct (X, Y) loop that also worked on
+  rectangular inputs. If you ever need global max on a non-square
+  tensor, fix `TNNetMaxChannel` rather than reintroducing this class.
 
 Do NOT add them back under any name. The minor differences they had
 (true-sum vs spatial-mean weight-gradient scaling; constructor-
@@ -544,9 +552,6 @@ breakdown:
       three inputs straddling it (non-differentiable, so forward-only).
 - [ ] TNNetReZero "starts as identity" forward test — at initialization
       `Out = x + 0 * Sublayer(x)` should equal `x` exactly.
-- [ ] Argmax-tie behaviour test for TNNetGlobalMaxPool — the tie-break
-      ("first wins") deserves a pinning test before a future parallel-pool
-      refactor silently changes it.
 - [ ] TNNetMaxPoolWithPosition correctness check — the auxiliary "position
       channels" should round-trip through TNNetDeMaxPool to exactly
       reconstruct the upsample pattern.
@@ -593,7 +598,6 @@ breakdown:
 - [ ] Two-layer TokenShift composition test (catches subtle double-pass
       bugs in the t-1 / t+1 input-gradient scatter).
 - [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
-- [ ] TNNetGlobalMaxPool serialization round-trip test.
 - [ ] TNNetSoftMin saturation test on extreme inputs.
 - [ ] Audit TNNetSoftCapping behaviour under extreme inputs and add a
       saturation test.
