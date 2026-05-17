@@ -1009,6 +1009,37 @@ breakdown:
       Distinct from the calibration tool above (which summarises
       confidence quality across the whole set) — this one localises
       *which samples* the model is least sure about.
+### Input attribution
+- [ ] TNNet.SaliencyReport — given a trained classifier and a probe sample,
+      compute three flavours of input attribution and print them side-by-side
+      as compact ASCII heatmaps over the input plane (one row per channel,
+      one cell per pixel, 10 intensity buckets):
+      (a) vanilla input-gradient saliency `|d logit_c / d x|` for the
+          predicted class c (one forward + one backward pass),
+      (b) SmoothGrad over N noisy copies of the input
+          (`x + eta`, `eta ~ N(0, sigma^2)`, default N=16, sigma=0.15 *
+          (max(x)-min(x))) — averages (a) to denoise the saliency,
+      (c) Integrated Gradients along a straight line from a zero baseline
+          to x using K steps (default K=20) — the "did this pixel
+          contribute to the decision?" measure that satisfies the
+          completeness axiom (sum of attributions ≈ logit_c(x) - logit_c(0)).
+      Also report, per channel: total attribution mass, top-K most-attributing
+      pixel coordinates, and the completeness gap for the IG variant as a
+      one-number sanity check. Pure-CPU, reuses the existing
+      forward/backward path — no training-time changes, no new layer types
+      (the input-gradient already flows through TNNetInput's backward).
+      Distinct from [[DeadNeuronReport]] / [[ActivationStatsReport]]
+      (activation statistics, not input attribution),
+      [[GradientNormReport]] (per-layer backward magnitudes summarised, not
+      per-pixel input gradients), [[AttentionEntropyReport]] (attention
+      weights inside an SDPA stack, not classifier-input attribution), and
+      [[ConfusionMatrixReport]] (aggregate label confusions, not per-sample
+      explanations). Companion `examples/SaliencyReport/` runs it on a
+      handful of SimpleImageClassifier CIFAR samples — one correctly
+      classified and one misclassified — so the three heatmaps can be
+      eyeballed against the actual image content, and the completeness gap
+      acts as a built-in regression check on the IG implementation.
+
 ### Activation distribution
 - [ ] TNNet.ActivationStatsReport — given a probe batch, walk every layer's
       forward output and print a per-layer table of
