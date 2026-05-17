@@ -958,18 +958,6 @@ type
     procedure Compute(); override;
   end;
 
-  /// ThresholdedReLU activation function.
-  // ThresholdedReLU(x) = x if x > theta else 0. Equivalent to TNNetThreshold
-  // with value fixed at 0, and a default theta of 1.0. Derivative is 1 for
-  // x > theta, else 0 (indicator function with a non-differentiable kink at
-  // x = theta). theta is stored in FFloatSt[0] for serialization.
-  TNNetThresholdedReLU = class(TNNetReLUBase)
-  public
-    constructor Create(); overload;
-    constructor Create(Threshold: TNeuralFloat); overload;
-    procedure Compute(); override;
-  end;
-
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
@@ -2743,20 +2731,6 @@ type
   // per-channel output error to every (X, Y) cell of that channel.
   TNNetGlobalSumPool = class(TNNetLayer)
   private
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-  public
-    procedure Compute(); override;
-    procedure Backpropagate(); override;
-  end;
-
-  /// Global Min Pooling: reduces each (X, Y) plane to a single scalar by
-  // taking the minimum. Output shape is 1 x 1 x Depth. The argmin (X, Y)
-  // index is cached per channel; backward routes the channel's output
-  // error to the single argmin cell. Tie-break is first-wins.
-  TNNetGlobalMinPool = class(TNNetLayer)
-  private
-    FArgMinX: array of integer;
-    FArgMinY: array of integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     procedure Compute(); override;
@@ -7751,65 +7725,6 @@ begin
         FOutput.FData[OutputCnt] := x
       else
         FOutput.FData[OutputCnt] := ValueBelow;
-    end;
-  end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-{ TNNetThresholdedReLU }
-
-constructor TNNetThresholdedReLU.Create();
-begin
-  Create(1.0);
-end;
-
-constructor TNNetThresholdedReLU.Create(Threshold: TNeuralFloat);
-begin
-  inherited Create();
-  FFloatSt[0] := Threshold;
-end;
-
-procedure TNNetThresholdedReLU.Compute();
-var
-  SizeM1: integer;
-  LocalPrevOutput: TNNetVolume;
-  OutputCnt: integer;
-  StartTime: double;
-  x, Theta: TNeuralFloat;
-begin
-  StartTime := Now();
-  LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
-  Theta := FFloatSt[0];
-
-  // ThresholdedReLU(x) = x if x > theta else 0; derivative is 1 if x > theta else 0.
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
-  begin
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      if x > Theta then
-      begin
-        FOutput.FData[OutputCnt] := x;
-        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
-      end
-      else
-      begin
-        FOutput.FData[OutputCnt] := 0;
-        FOutputErrorDeriv.FData[OutputCnt] := 0.0;
-      end;
-    end;
-  end
-  else
-  begin
-    // can't calculate error on input layers.
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      if x > Theta then
-        FOutput.FData[OutputCnt] := x
-      else
-        FOutput.FData[OutputCnt] := 0;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -12866,84 +12781,6 @@ begin
       for Y := 0 to MaxY do
         for X := 0 to MaxX do
           PrevErr.Add(X, Y, D, Err);
-    end;
-  end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  FPrevLayer.Backpropagate();
-end;
-
-{ TNNetGlobalMinPool }
-
-procedure TNNetGlobalMinPool.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  FOutput.ReSize(1, 1, pPrevLayer.Output.Depth);
-  FOutputError.ReSize(1, 1, pPrevLayer.Output.Depth);
-  FOutputErrorDeriv.ReSize(1, 1, pPrevLayer.Output.Depth);
-  SetLength(FArgMinX, pPrevLayer.Output.Depth);
-  SetLength(FArgMinY, pPrevLayer.Output.Depth);
-end;
-
-procedure TNNetGlobalMinPool.Compute();
-var
-  StartTime: double;
-  D, X, Y: integer;
-  MaxD, MaxX, MaxY: integer;
-  V, BestV: TNeuralFloat;
-  Prev: TNNetVolume;
-begin
-  StartTime := Now();
-  Prev := FPrevLayer.Output;
-  MaxD := Prev.Depth - 1;
-  MaxX := Prev.SizeX - 1;
-  MaxY := Prev.SizeY - 1;
-  for D := 0 to MaxD do
-  begin
-    BestV := Prev[0, 0, D];
-    FArgMinX[D] := 0;
-    FArgMinY[D] := 0;
-    for Y := 0 to MaxY do
-      for X := 0 to MaxX do
-      begin
-        V := Prev[X, Y, D];
-        if V < BestV then
-        begin
-          BestV := V;
-          FArgMinX[D] := X;
-          FArgMinY[D] := Y;
-        end;
-      end;
-    FOutput[0, 0, D] := BestV;
-  end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-procedure TNNetGlobalMinPool.Backpropagate();
-var
-  StartTime: double;
-  D, MaxD: integer;
-  PrevErr: TNNetVolume;
-  PrevRawPos: integer;
-begin
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  StartTime := Now();
-  if Assigned(FPrevLayer) and
-    (FPrevLayer.OutputError.Size > 0) and
-    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
-  begin
-    PrevErr := FPrevLayer.OutputError;
-    MaxD := FOutput.Depth - 1;
-    for D := 0 to MaxD do
-    begin
-      PrevRawPos := PrevErr.GetRawPos(FArgMinX[D], FArgMinY[D], D);
-      {$IFDEF FPC}
-      PrevErr.FData[PrevRawPos] += FOutputError.FData[D];
-      {$ELSE}
-      PrevErr.FData[PrevRawPos] :=
-        PrevErr.FData[PrevRawPos] + FOutputError.FData[D];
-      {$ENDIF}
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -19303,7 +19140,6 @@ begin
       'TNNetHardShrink' :           Result := TNNetHardShrink.Create(Ft[0]);
       'TNNetSoftShrink' :           Result := TNNetSoftShrink.Create(Ft[0]);
       'TNNetThreshold' :            Result := TNNetThreshold.Create(Ft[0], Ft[1]);
-      'TNNetThresholdedReLU' :      Result := TNNetThresholdedReLU.Create(Ft[0]);
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
@@ -19397,7 +19233,6 @@ begin
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
-      'TNNetGlobalMinPool':         Result := TNNetGlobalMinPool.Create();
       'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
@@ -19501,7 +19336,6 @@ begin
       if S[0] = 'TNNetHardShrink' then Result := TNNetHardShrink.Create(Ft[0]) else
       if S[0] = 'TNNetSoftShrink' then Result := TNNetSoftShrink.Create(Ft[0]) else
       if S[0] = 'TNNetThreshold' then Result := TNNetThreshold.Create(Ft[0], Ft[1]) else
-      if S[0] = 'TNNetThresholdedReLU' then Result := TNNetThresholdedReLU.Create(Ft[0]) else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
@@ -19595,7 +19429,6 @@ begin
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
-      if S[0] = 'TNNetGlobalMinPool' then Result := TNNetGlobalMinPool.Create() else
       if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else

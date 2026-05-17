@@ -18,6 +18,12 @@ duplicated the forward pass of existing layers:
   `TNNetGlobalMaxPool` had a direct (X, Y) loop that also worked on
   rectangular inputs. If you ever need global max on a non-square
   tensor, fix `TNNetMaxChannel` rather than reintroducing this class.
+- `TNNetGlobalMinPool` — overlapped `TNNetMinChannel`. Use
+  `TNNetMinChannel` for global min pooling. Same square-only caveat as
+  `TNNetMaxChannel` above.
+- `TNNetThresholdedReLU` — strict subset of `TNNetThreshold`.
+  `ThresholdedReLU(x; θ)` is `TNNetThreshold.Create(theta=θ, value=0)`.
+  Use `TNNetThreshold` directly.
 
 Do NOT add them back under any name. The minor differences they had
 (true-sum vs spatial-mean weight-gradient scaling; constructor-
@@ -74,13 +80,6 @@ rather than acted on.
 ## Added ideas
 
 ### Smaller follow-up ideas
-- [ ] TNNetThresholdedReLU LoadFromString round-trip test with non-default
-      theta (e.g. theta=0.25): construct, serialize, reload, assert preserved
-      and forward matches.
-- [ ] TNNetGlobalMinPool argmin-tie pinning test — assert first-wins tie-break
-      on a hand-crafted (X,Y,Depth) input where two cells per channel share the
-      minimum, mirroring the GlobalMaxPool argmax-tie pinning task already
-      on the list.
 - [ ] TNNetZScore vs TNNetLayerNorm equivalence test: with LayerNorm's gamma
       pinned to 1 and beta to 0, forward outputs must match TNNetZScore to
       within ~1e-5 across a few seeded inputs. Pins the "ZScore is the
@@ -344,8 +343,6 @@ breakdown:
       derivative guard).
 - [ ] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
       neuron per forward pass during training, fixed at average at inference.
-- [X] TNNetThresholdedReLU — `y = x if x > θ else 0`, θ in FFloatSt[0]
-      (default 1.0).
 - [ ] TNNetISRU / TNNetISRLU — Inverse-Square-Root (Linear) Unit.
       `y = x / sqrt(1 + α·x²)`.
 - [ ] TNNetSoftPlusBeta — generalized SoftPlus with learnable-or-fixed β.
@@ -399,15 +396,6 @@ breakdown:
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [X] TNNetGlobalMinPool — min reduction over (X, Y) plane per channel,
-      completing the GlobalMax/GlobalAvg/GlobalSum family. Forward picks the
-      minimum activation per channel (with a recorded argmin index per
-      channel); Backpropagate routes the per-channel output gradient to the
-      single argmin cell (tie-break: first-wins, mirroring the existing
-      GlobalMaxPool convention). Pairs with a numerical-gradient test in
-      TestNeuralNumerical.pas (skipping ties by seeding distinct inputs) and
-      an argmin-tie pinning test analogous to the GlobalMaxPool item already
-      on the list.
 - [ ] TNNetCumSum — cumulative sum along a configurable axis. Backward is
       a reverse cumulative sum.
 - [ ] TNNetRoll — circular shift along a chosen axis. Parameter-free

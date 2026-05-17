@@ -145,12 +145,8 @@ type
     procedure TestThresholdReLUEquivalence;
     procedure TestThresholdGradientCheck;
     procedure TestThresholdSerializationRoundTrip;
-    procedure TestThresholdedReLUForward;
-    procedure TestThresholdedReLUGradientCheck;
     procedure TestReLU6Forward;
     procedure TestReLU6ExtremeInputSaturation;
-    procedure TestGlobalMinPoolForward;
-    procedure TestGlobalMinPoolGradientCheck;
     procedure TestMaskedFillForward;
     procedure TestMaskedFillGradientCheck;
     procedure TestTriangularCausalMaskForward;
@@ -4357,43 +4353,6 @@ begin
     [1.0, -1.0, 1.5, -2.0, 0.9, -0.25], 0.01);
 end;
 
-procedure TTestNeuralNumerical.TestThresholdedReLUForward;
-var
-  NN: TNNet;
-  Input: TNNetVolume;
-begin
-  NN := TNNet.Create();
-  Input := TNNetVolume.Create(1, 1, 5);
-  try
-    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
-    NN.AddLayer(TNNetThresholdedReLU.Create()); // default theta=1.0
-
-    Input.Raw[0] := 0.0;
-    Input.Raw[1] := 0.5;
-    Input.Raw[2] := 1.0;
-    Input.Raw[3] := 1.5;
-    Input.Raw[4] := 2.0;
-
-    NN.Compute(Input);
-
-    // ThresholdedReLU(x; theta=1.0) = x if x > 1.0 else 0
-    AssertEquals('ThresholdedReLU(0)', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
-    AssertEquals('ThresholdedReLU(0.5)', 0.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
-    AssertEquals('ThresholdedReLU(1.0)', 0.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
-    AssertEquals('ThresholdedReLU(1.5)', 1.5, NN.GetLastLayer.Output.Raw[3], 0.0001);
-    AssertEquals('ThresholdedReLU(2.0)', 2.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
-  finally
-    NN.Free;
-    Input.Free;
-  end;
-end;
-
-procedure TTestNeuralNumerical.TestThresholdedReLUGradientCheck;
-begin
-  // theta=0.5 is the kink; keep inputs clear of x=0.5.
-  ActivationGradientCheck(Self, TNNetThresholdedReLU.Create(0.5), 'ThresholdedReLU',
-    [1.0, -1.0, 1.5, -2.0, 0.9, -0.25], 0.01);
-end;
 
 procedure TTestNeuralNumerical.TestReLU6Forward;
 var
@@ -4427,50 +4386,6 @@ begin
 end;
 
 
-procedure TTestNeuralNumerical.TestGlobalMinPoolForward;
-var
-  NN: TNNet;
-  Input: TNNetVolume;
-begin
-  NN := TNNet.Create();
-  // 2 x 2 x 3 input; expect 1 x 1 x 3 output containing per-channel min.
-  Input := TNNetVolume.Create(2, 2, 3);
-  try
-    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
-    NN.AddLayer(TNNetGlobalMinPool.Create());
-
-    // Channel 0: min = 1.0 at (0,0)
-    Input[0, 0, 0] := 1.0;  Input[1, 0, 0] := 4.0;
-    Input[0, 1, 0] := 2.0;  Input[1, 1, 0] := 3.0;
-    // Channel 1: min = -2.0 at (1,0)
-    Input[0, 0, 1] := -1.0; Input[1, 0, 1] := -2.0;
-    Input[0, 1, 1] :=  0.5; Input[1, 1, 1] := -0.5;
-    // Channel 2: min = 6.0 at (0,1)
-    Input[0, 0, 2] := 7.0;  Input[1, 0, 2] := 8.0;
-    Input[0, 1, 2] := 6.0;  Input[1, 1, 2] := 9.0;
-
-    NN.Compute(Input);
-
-    AssertEquals('GlobalMinPool ch0', 1.0, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
-    AssertEquals('GlobalMinPool ch1', -2.0, NN.GetLastLayer.Output[0, 0, 1], 0.0001);
-    AssertEquals('GlobalMinPool ch2', 6.0, NN.GetLastLayer.Output[0, 0, 2], 0.0001);
-    AssertEquals('GlobalMinPool output SizeX', 1, NN.GetLastLayer.Output.SizeX);
-    AssertEquals('GlobalMinPool output SizeY', 1, NN.GetLastLayer.Output.SizeY);
-    AssertEquals('GlobalMinPool output Depth', 3, NN.GetLastLayer.Output.Depth);
-  finally
-    NN.Free;
-    Input.Free;
-  end;
-end;
-
-procedure TTestNeuralNumerical.TestGlobalMinPoolGradientCheck;
-begin
-  // 3 x 3 x 2 input. The Sin(i*0.7)*2.0+0.3 pattern from the helper
-  // generates distinct values, so the argmin stays stable under the
-  // epsilon=1e-4 perturbation.
-  LayerInputGradientCheck(Self, TNNetGlobalMinPool.Create(),
-    'GlobalMinPool', 3, 3, 2, 0.01);
-end;
 
 procedure TTestNeuralNumerical.TestReLU6ExtremeInputSaturation;
 var
