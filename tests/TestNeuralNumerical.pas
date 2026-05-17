@@ -95,6 +95,8 @@ type
     procedure TestPolynomialActivationForward;
     procedure TestPolynomialActivationInputGradientCheck;
     procedure TestPolynomialActivationWeightGradientCheck;
+    procedure TestPReLUChannelInputGradientCheck;
+    procedure TestPReLUChannelWeightGradientCheck;
     procedure TestHuberLossForwardPassthrough;
     procedure TestHuberLossGradientClipping;
     procedure TestSmoothL1LossDefaults;
@@ -11487,6 +11489,148 @@ begin
           ' ana=' + FloatToStr(analyticalGrad),
           Abs(numericalGrad - analyticalGrad) < 0.01);
       end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPReLUChannelInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LPReLU: TNNetPReLUChannel;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LPReLU := TNNetPReLUChannel.Create();
+    NN.AddLayer(LPReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    LPReLU.Neurons[0].Weights.Raw[0] := 0.10;
+    LPReLU.Neurons[0].Weights.Raw[1] := 0.25;
+    LPReLU.Neurons[0].Weights.Raw[2] := -0.15;
+    LPReLU.Neurons[0].Weights.Raw[3] := 0.40;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.43) * 1.3 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PReLUChannel input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPReLUChannelWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LPReLU: TNNetPReLUChannel;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LPReLU := TNNetPReLUChannel.Create();
+    NN.AddLayer(LPReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    LPReLU.Neurons[0].Weights.Raw[0] := 0.10;
+    LPReLU.Neurons[0].Weights.Raw[1] := 0.25;
+    LPReLU.Neurons[0].Weights.Raw[2] := -0.15;
+    LPReLU.Neurons[0].Weights.Raw[3] := 0.40;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.43) * 1.3 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    for i := 0 to LPReLU.Neurons[0].Weights.Size - 1 do
+    begin
+      LPReLU.Neurons[0].Weights.Raw[i] := LPReLU.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LPReLU.Neurons[0].Weights.Raw[i] := LPReLU.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LPReLU.Neurons[0].Weights.Raw[i] := LPReLU.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LPReLU.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LPReLU.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('PReLUChannel weight gradient check alpha[' +
+        IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
   finally
     NN.Free;
     Input.Free;
