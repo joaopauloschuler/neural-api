@@ -1284,6 +1284,23 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Entropy regularizer (passthrough). Treats the input vector p as a
+  // probability distribution (intended to sit immediately after a softmax)
+  // and adds the term `-lambda * H(p) = lambda * sum(p * log(p))` to the
+  // training loss. With lambda > 0 this penalises high entropy (encouraging
+  // confident / peaked predictions); with lambda < 0 it encourages a more
+  // uniform output. Forward is identity (y = x). Backward adds the analytic
+  // gradient `lambda * (log(p_i) + 1)` to the upstream FOutputError before
+  // propagating to the previous layer. p_i is offset by eps = 1e-7 inside
+  // the log to avoid NaN at p = 0. lambda is stored in FFloatSt[0] (default
+  // 0.01) and round-trips via Save/Load.
+  TNNetEntropyRegularizer = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pLambda: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Per-sample L2 normalization across the depth axis.
   // For each spatial position (X,Y), treats the depth-axis vector v of length
   // Depth as a unit vector: y_i = x_i / sqrt(sum_j x_j^2 + eps). Output shape
@@ -2988,6 +3005,9 @@ type
       // input -> AvgChannel -> FCReLU(C/r) -> FCSigmoid(C) -> ChannelMulByLayer(input, gating).
       // ReductionRatio is clamped so the bottleneck width is at least 1.
       function AddSEBlock(InputLayer: TNNetLayer; ReductionRatio: integer = 16): TNNetLayer;
+      // SwiGLU feed-forward block: FullConnectLinear(2*D_hidden) -> SwiGLU -> FullConnectLinear(D_out).
+      // D_in is informational only; the first FullConnect infers its input from the previous layer.
+      function AddSwiGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -6278,6 +6298,46 @@ begin
     begin
       FOutputError.FData[Idx] := 0;
     end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetEntropyRegularizer }
+
+constructor TNNetEntropyRegularizer.Create();
+begin
+  Create(0.01);
+end;
+
+constructor TNNetEntropyRegularizer.Create(pLambda: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pLambda;
+end;
+
+procedure TNNetEntropyRegularizer.Backpropagate();
+const
+  cEntropyEps = 1e-7;
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Lambda, P: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Lambda := FFloatSt[0];
+  SizeM1 := FOutputError.Size - 1;
+  // Add the entropy-regularization gradient: d(-lambda * H(p))/dp_i =
+  // lambda * (log(p_i) + 1). Offset p_i by eps inside the log to avoid
+  // NaN when p_i is exactly zero.
+  for Idx := 0 to SizeM1 do
+  begin
+    P := FOutput.FData[Idx];
+    FOutputError.FData[Idx] := FOutputError.FData[Idx] +
+      Lambda * (Ln(P + cEntropyEps) + 1.0);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -22792,6 +22852,7 @@ begin
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
+      'TNNetEntropyRegularizer':    Result := TNNetEntropyRegularizer.Create(Ft[0]);
       'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
@@ -22995,6 +23056,7 @@ begin
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
+      if S[0] = 'TNNetEntropyRegularizer' then Result := TNNetEntropyRegularizer.Create(Ft[0]) else
       if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
@@ -23518,6 +23580,16 @@ end;
 function TNNet.AddCompression(Compression: TNeuralFloat; supressBias: integer): TNNetLayer;
 begin
   AddLayer( TNNetPointwiseConvLinear.Create(Round(GetLastLayer().Output.Depth * Compression ), supressBias) );
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddSwiGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
+begin
+  // D_in is informational; the FullConnect layer infers its input size from
+  // the previous layer's output.
+  AddLayer( TNNetFullConnectLinear.Create({SizeX=}1, {SizeY=}1, {Depth=}2 * D_hidden) );
+  AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetFullConnectLinear.Create(D_out) );
   Result := GetLastLayer();
 end;
 

@@ -366,7 +366,7 @@ breakdown:
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
       recognition heads.
-- [ ] TNNetEntropyRegularizer — passthrough layer adding
+- [x] TNNetEntropyRegularizer — passthrough layer adding
       `-λ * sum(p * log(p))` to the gradient.
 - [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
       straight-through assignment plus commitment/codebook losses.

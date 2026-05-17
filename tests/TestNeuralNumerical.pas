@@ -83,6 +83,7 @@ type
     procedure TestReZeroGradientCheck;
     procedure TestReZeroWeightGradientCheck;
     procedure TestReZeroSerializationRoundTrip;
+    procedure TestEntropyRegularizerGradientCheck;
     procedure TestPReLUForward;
     procedure TestPReLUGradientCheck;
     procedure TestPReLUWeightGradientCheck;
@@ -10823,6 +10824,84 @@ begin
   // so the FFloatSt[0] dispatch path is also covered.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetReZero.Create(0.5), 'ReZero', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestEntropyRegularizerGradientCheck;
+// Verifies the EntropyRegularizer backward adds the analytic
+// d(-lambda * H(p))/dp gradient. Composes Softmax -> EntropyRegularizer
+// and uses an augmented loss
+//   L = 0.5 * sum((p - desired)^2) + lambda * sum(p * log(p + eps))
+// (the +eps mirrors what the layer does inside the log) and central
+// differences in input space to validate dL/dInput.
+const
+  cLambda = 0.25;
+  cEps = 1e-7;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff, p: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      p := NN.GetLastLayer.Output.Raw[k];
+      diff := p - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff + cLambda * p * Ln(p + cEps);
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  InputPlus := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create(5, 1, 1);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.AddLayer(TNNetEntropyRegularizer.Create(cLambda));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.2 + 0.1;
+    // Pick desired as something other than the softmax output so the MSE
+    // term contributes a non-trivial seeded gradient.
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 + 0.15 * i;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('EntropyRegularizer input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestPReLUForward;
