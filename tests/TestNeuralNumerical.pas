@@ -368,6 +368,8 @@ type
     procedure TestISRLUNonDefaultAlpha;
     procedure TestPhishGradientCheck;
     procedure TestPhishSerializationRoundTrip;
+    procedure TestErfGradientCheck;
+    procedure TestErfSerializationRoundTrip;
     procedure TestPenalizedTanhAsymmetry;
     procedure TestPenalizedTanhGradientCheck;
     procedure TestPenalizedTanhSerializationRoundTrip;
@@ -10161,6 +10163,18 @@ procedure TTestNeuralNumerical.TestPhishSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetPhish.Create(),
     'Phish', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestErfGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetErf.Create(), 'Erf',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestErfSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetErf.Create(),
+    'Erf', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPenalizedTanhAsymmetry;

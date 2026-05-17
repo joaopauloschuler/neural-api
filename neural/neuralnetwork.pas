@@ -712,6 +712,20 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Erf activation function: y = erf(x), the Gauss error function.
+  // Closed-form GELU partner; erf(x) = (2/sqrt(pi)) * integral_0^x exp(-t^2) dt.
+  // Derivative: dy/dx = (2/sqrt(pi)) * exp(-x^2). Both saturate smoothly to
+  // +/-1 for |x| >> 0, so the derivative vanishes there. erf is evaluated via
+  // the SerfErf Abramowitz & Stegun 7.1.26 polynomial helper (|err| < 1.5e-7)
+  // because FreePascal's Math unit does not export erf. Cached into
+  // FOutputErrorDeriv so TNNetReLUBase's backward handles the chain rule with
+  // one multiply.
+  TNNetErf = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// TanhExp activation function: y = x * tanh(exp(x)).
   // Derivative: with u = exp(x), t = tanh(u),
   //   dy/dx = t + x * (1 - t^2) * u.
@@ -7405,6 +7419,60 @@ begin
 end;
 
 procedure TNNetSerf.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetErf }
+
+procedure TNNetErf.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, twoOverSqrtPi: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  twoOverSqrtPi := 2.0 / Sqrt(Pi);
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := SerfErf(x);
+      // dy/dx = (2/sqrt(pi)) * exp(-x^2).
+      FOutputErrorDeriv.FData[OutputCnt] := twoOverSqrtPi * Exp(-x * x);
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := SerfErf(x);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetErf.Backpropagate();
 var
   StartTime: double;
 begin
@@ -23318,6 +23386,7 @@ begin
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetPhish' :                Result := TNNetPhish.Create();
       'TNNetSerf' :                 Result := TNNetSerf.Create();
+      'TNNetErf' :                  Result := TNNetErf.Create();
       'TNNetTanhExp' :              Result := TNNetTanhExp.Create();
       'TNNetSmish' :                Result := TNNetSmish.Create();
       'TNNetPenalizedTanh' :        Result := TNNetPenalizedTanh.Create();
@@ -23529,6 +23598,7 @@ begin
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetPhish' then Result := TNNetPhish.Create() else
       if S[0] = 'TNNetSerf' then Result := TNNetSerf.Create() else
+      if S[0] = 'TNNetErf' then Result := TNNetErf.Create() else
       if S[0] = 'TNNetTanhExp' then Result := TNNetTanhExp.Create() else
       if S[0] = 'TNNetSmish' then Result := TNNetSmish.Create() else
       if S[0] = 'TNNetPenalizedTanh' then Result := TNNetPenalizedTanh.Create() else
