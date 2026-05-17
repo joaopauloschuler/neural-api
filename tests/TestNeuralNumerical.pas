@@ -83,6 +83,10 @@ type
     procedure TestReZeroGradientCheck;
     procedure TestReZeroWeightGradientCheck;
     procedure TestReZeroSerializationRoundTrip;
+    procedure TestPReLUForward;
+    procedure TestPReLUGradientCheck;
+    procedure TestPReLUWeightGradientCheck;
+    procedure TestPReLUSerializationRoundTrip;
     procedure TestTokenShiftForward;
     procedure TestTokenShiftGradientCheck;
     procedure TestTokenShiftWeightGradientCheck;
@@ -10503,6 +10507,222 @@ begin
   // so the FFloatSt[0] dispatch path is also covered.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetReZero.Create(0.5), 'ReZero', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPReLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LPReLU: TNNetPReLU;
+  i: integer;
+  Expected: array[0..4] of TNeuralFloat;
+  Vals: array[0..4] of TNeuralFloat;
+begin
+  // PReLU with alpha=0.25 maps [-2,-1,0,1,2] -> [-0.5,-0.25,0,1,2].
+  Vals[0] := -2; Vals[1] := -1; Vals[2] := 0; Vals[3] := 1; Vals[4] := 2;
+  Expected[0] := -0.5; Expected[1] := -0.25; Expected[2] := 0;
+  Expected[3] := 1; Expected[4] := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1));
+    LPReLU := TNNetPReLU.Create();
+    NN.AddLayer(LPReLU);
+
+    AssertEquals('PReLU default alpha=0.25', 0.25,
+      LPReLU.Neurons[0].Weights.Raw[0], 1e-7);
+
+    for i := 0 to 4 do
+      Input.Raw[i] := Vals[i];
+    NN.Compute(Input);
+    for i := 0 to 4 do
+      AssertEquals('PReLU forward at ' + IntToStr(i),
+        Expected[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPReLUGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LPReLU: TNNetPReLU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 2);
+  InputPlus := TNNetVolume.Create(4, 3, 2);
+  Desired := TNNetVolume.Create(4, 3, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 2, 1));
+    LPReLU := TNNetPReLU.Create();
+    NN.AddLayer(LPReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Mix positive and negative inputs so both branches of PReLU are
+    // exercised, and avoid sampling exactly at x=0 where the derivative
+    // is discontinuous.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.83) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.41);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PReLU input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPReLUWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LPReLU: TNNetPReLU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    LPReLU := TNNetPReLU.Create(0.3);
+    NN.AddLayer(LPReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3);
+
+    LPReLU.Neurons[0].Weights.Raw[0] := LPReLU.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    LPReLU.Neurons[0].Weights.Raw[0] := LPReLU.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    LPReLU.Neurons[0].Weights.Raw[0] := LPReLU.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    LPReLU.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -LPReLU.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('PReLU weight gradient check num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPReLUSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  LPReLU, LPReLU2: TNNetPReLU;
+  i: integer;
+begin
+  // Exercise the FFloatSt[0] dispatch path with a non-default initial alpha,
+  // and verify the single learnable weight survives the round-trip exactly.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LPReLU := TNNetPReLU.Create(0.37);
+    NN.AddLayer(LPReLU);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LPReLU2 := NN2.GetLastLayer as TNNetPReLU;
+      // The initial-alpha constructor argument is serialized via FFloatSt[0]
+      // and read back by the dispatch; the weight is then overwritten by
+      // the saved weight tensor, so both should equal 0.37 here.
+      AssertEquals('PReLU round-trip weight value',
+        LPReLU.Neurons[0].Weights.Raw[0],
+        LPReLU2.Neurons[0].Weights.Raw[0], 1e-6);
+      AssertEquals('PReLU round-trip alpha preserved',
+        0.37, LPReLU2.Neurons[0].Weights.Raw[0], 1e-5);
+      AssertEquals('PReLU round-trip weight count',
+        1, LPReLU2.Neurons[0].Weights.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('PReLU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestTokenShiftForward;

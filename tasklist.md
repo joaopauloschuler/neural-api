@@ -310,7 +310,7 @@ breakdown:
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
 - [ ] TNNetIdentityScale — fixed (non-learnable) per-tensor scalar
       multiplier in FFloatSt[0]. Useful for the "warm-up scaling" trick.
-- [ ] TNNetPReLU — parametric ReLU with a single learnable negative-slope
+- [x] TNNetPReLU — parametric ReLU with a single learnable negative-slope
       scalar.
 - [ ] TNNetPReLUChannel — per-channel PReLU (matches He 2015).
 - [ ] TNNetSwishLearnable — TNNetSwish with a single learnable β.

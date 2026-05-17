@@ -1843,6 +1843,24 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Parametric ReLU (He et al. 2015): y = max(0, x) + alpha * min(0, x),
+  // where alpha is a SINGLE learnable scalar shared across all elements
+  // (channel-shared / "PReLU-shared" variant). Default initial alpha is
+  // 0.25 matching the original paper. Mirrors TNNetReZero's single-scalar
+  // trainable pattern; descends from TNNetChannelTransformBase because the
+  // weightless TNNetReLUBase activation hierarchy cannot store gradients.
+  TNNetPReLU = class(TNNetChannelTransformBase)
+    private
+      FInitialAlpha: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialAlpha: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetTokenShift: RWKV-style per-channel time-mixing primitive.
   // For each channel c and position t along SizeX (treated as the time axis,
   // with x[-1,c]=0 zero-padding on the left):
@@ -10859,6 +10877,139 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetPReLU }
+constructor TNNetPReLU.Create();
+begin
+  // He et al. 2015 initial slope.
+  Create(0.25);
+end;
+
+constructor TNNetPReLU.Create(pInitialAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialAlpha := pInitialAlpha;
+  FFloatSt[0] := pInitialAlpha;
+  InitDefault();
+end;
+
+procedure TNNetPReLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Override the base which allocates Depth weights: PReLU (shared) has
+  // exactly one learnable scalar.
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetPReLU.Compute();
+var
+  StartTime: double;
+  alpha, x: TNeuralFloat;
+  i, SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  HasDeriv: boolean;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> 1 then
+  begin
+    FErrorProc('Neuron weight count must be 1 at TNNetPReLU.');
+  end;
+  {$ENDIF}
+  alpha := FNeurons[0].FWeights.Raw[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
+  if HasDeriv then
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      if x > 0 then
+      begin
+        FOutput.FData[i] := x;
+        FOutputErrorDeriv.FData[i] := 1;
+      end
+      else
+      begin
+        FOutput.FData[i] := alpha * x;
+        FOutputErrorDeriv.FData[i] := alpha;
+      end;
+    end;
+  end
+  else
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      if x > 0 then
+        FOutput.FData[i] := x
+      else
+        FOutput.FData[i] := alpha * x;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPReLU.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  gradAlpha, alpha, x: TNeuralFloat;
+  i: integer;
+  LocalPrevOutput: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  alpha := localNeuron.FWeights.Raw[0];
+  // Gradient w.r.t. the scalar alpha:
+  // d(alpha) = sum over elements where x <= 0 of OutputError[i] * Input[i].
+  gradAlpha := 0;
+  for i := 0 to FOutputError.Size - 1 do
+  begin
+    x := LocalPrevOutput.Raw[i];
+    if x <= 0 then
+      gradAlpha := gradAlpha + FOutputError.Raw[i] * x;
+  end;
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
+    (-FLearningRate) * gradAlpha;
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Gradient w.r.t. the input: dInput[i] = OutputError[i] * (1 if x>0 else alpha).
+    for i := 0 to FOutputError.Size - 1 do
+    begin
+      x := LocalPrevOutput.Raw[i];
+      if x > 0 then
+        FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
+          FOutputError.Raw[i]
+      else
+        FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
+          alpha * FOutputError.Raw[i];
+    end;
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetPReLU.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialAlpha);
+  AfterWeightUpdate();
+end;
+
 { TNNetTokenShift }
 constructor TNNetTokenShift.Create();
 begin
@@ -19561,6 +19712,7 @@ begin
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
+      'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
@@ -19757,6 +19909,7 @@ begin
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
+      if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
