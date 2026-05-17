@@ -312,7 +312,7 @@ breakdown:
       *weights* of the previous trainable layer after each step.
 
 #### Reduction / shape
-- [ ] TNNetPixelShuffle (sub-pixel convolution) — output spatial size =
+- [X] TNNetPixelShuffle (sub-pixel convolution) — output spatial size =
       input * r, output channels = input / (r*r). Deterministic index
       permutation; backward is its inverse.
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.

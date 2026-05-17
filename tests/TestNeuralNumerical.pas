@@ -87,6 +87,11 @@ type
     procedure TestGRNGradientCheck;
     procedure TestGRNWeightGradientCheck;
     procedure TestGRNSerializationRoundTrip;
+    procedure TestPixelShuffleForward;
+    procedure TestPixelShuffleBackward;
+    procedure TestPixelShuffleRoundTrip;
+    procedure TestPixelShuffleSerializationRoundTrip;
+    procedure TestPixelShuffleShapeError;
     procedure TestEntropyRegularizerGradientCheck;
     procedure TestGradientReversalGradientCheck;
     procedure TestGradientReversalSerializationRoundTrip;
@@ -11305,6 +11310,212 @@ begin
   // (zeros) so the round-trip exercises a non-trivial layer.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetGRN.Create(), 'GRN', 2, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPixelShuffleForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i, x, y, c, ii, jj, r: integer;
+  Expected: TNeuralFloat;
+begin
+  // Sub-pixel convolution / depth-to-space:
+  //   output[r*x+i, r*y+j, c] = input[x, y, c*r*r + i*r + j]
+  // Input shape (2, 2, 4), r=2 -> output shape (4, 4, 1).
+  r := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4));
+    NN.AddLayer(TNNetPixelShuffle.Create(r));
+
+    // Fill input with distinct, easy-to-trace values.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i + 1;
+
+    NN.Compute(Input);
+
+    AssertEquals('PixelShuffle output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('PixelShuffle output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('PixelShuffle output Depth', 1, NN.GetLastLayer.Output.Depth);
+
+    // Full mapping check.
+    for c := 0 to NN.GetLastLayer.Output.Depth - 1 do
+      for x := 0 to Input.SizeX - 1 do
+        for y := 0 to Input.SizeY - 1 do
+          for ii := 0 to r - 1 do
+            for jj := 0 to r - 1 do
+            begin
+              Expected := Input[x, y, c * r * r + ii * r + jj];
+              AssertEquals('PixelShuffle map (' + IntToStr(r*x+ii) + ',' +
+                IntToStr(r*y+jj) + ',' + IntToStr(c) + ')',
+                Expected,
+                NN.GetLastLayer.Output[r * x + ii, r * y + jj, c], 1e-6);
+            end;
+
+    // Pin specific cells for explicitness:
+    //   output[0,0,0] = input[0,0,0]  = 1
+    AssertEquals('PixelShuffle pin [0,0,0]', Input[0, 0, 0],
+      NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    //   output[1,0,0] = input[0,0,2]  (i=1,j=0 -> InD = 0*4 + 1*2 + 0 = 2)
+    AssertEquals('PixelShuffle pin [1,0,0]', Input[0, 0, 2],
+      NN.GetLastLayer.Output[1, 0, 0], 1e-6);
+    //   output[0,1,0] = input[0,0,1]  (i=0,j=1 -> InD = 0*4 + 0*2 + 1 = 1)
+    AssertEquals('PixelShuffle pin [0,1,0]', Input[0, 0, 1],
+      NN.GetLastLayer.Output[0, 1, 0], 1e-6);
+    //   output[1,1,0] = input[0,0,3]  (i=1,j=1 -> InD = 0*4 + 1*2 + 1 = 3)
+    AssertEquals('PixelShuffle pin [1,1,0]', Input[0, 0, 3],
+      NN.GetLastLayer.Output[1, 1, 0], 1e-6);
+    //   output[2,0,0] = input[1,0,0]
+    AssertEquals('PixelShuffle pin [2,0,0]', Input[1, 0, 0],
+      NN.GetLastLayer.Output[2, 0, 0], 1e-6);
+    //   output[3,3,0] = input[1,1,3]
+    AssertEquals('PixelShuffle pin [3,3,0]', Input[1, 1, 3],
+      NN.GetLastLayer.Output[3, 3, 0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPixelShuffleBackward;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Central-difference input gradient check on a (3,3,8) input with r=2
+  // -> output shape (6,6,2).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 8);
+  InputPlus := TNNetVolume.Create(3, 3, 8);
+  Desired := TNNetVolume.Create(6, 6, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 8, 1));
+    NN.AddLayer(TNNetPixelShuffle.Create(2));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.31) * 1.4 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.23) * 0.8;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PixelShuffle input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 2e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPixelShuffleRoundTrip;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Shuf: TNNetPixelShuffle;
+  i: integer;
+begin
+  // The forward is a pure permutation: each output cell maps to exactly
+  // one input cell. Set the desired output to zero so dL/dOutput = Output;
+  // backpropagation then routes those values 1-to-1 back to the input
+  // layer's OutputError, which must reproduce the original Input exactly.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 8);
+  Desired := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 8, 1));
+    Shuf := TNNetPixelShuffle.Create(2);
+    NN.AddLayer(Shuf);
+    NN.AddLayer(TNNetIdentity.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 1.7 + 0.3;
+    Desired.Fill(0);
+
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    // With Desired=0 and MSE loss baked into Backpropagate, the gradient
+    // at the last layer is (Output - 0) = Output, which equals the
+    // permuted Input. Routing it back through PixelShuffle's gather
+    // reconstructs the original Input element-by-element.
+    NN.Backpropagate(Desired);
+
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('PixelShuffle round-trip at ' + IntToStr(i),
+        Input.Raw[i], NN.Layers[0].OutputError.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPixelShuffleSerializationRoundTrip;
+begin
+  // Default r=2 -> input depth must be a multiple of 4. Use (2, 2, 8).
+  SerializationRoundTrip(Self, TNNetPixelShuffle.Create(),
+    'PixelShuffle', 2, 2, 8, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPixelShuffleShapeError;
+var
+  NN: TNNet;
+  Shuf: TNNetPixelShuffle;
+  Capture: TErrorCapture;
+begin
+  // r=3 with Depth=8: 8 mod 9 <> 0 -> SetPrevLayer must fire FErrorProc.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    Shuf := TNNetPixelShuffle.Create(3);
+    Shuf.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(Shuf);
+    AssertTrue('PixelShuffle indivisible-depth guard must fire FErrorProc',
+      Capture.Triggered);
+    AssertTrue('PixelShuffle indivisible-depth message must mention "divisible"',
+      Pos('divisible', Capture.Message) > 0);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestEntropyRegularizerGradientCheck;

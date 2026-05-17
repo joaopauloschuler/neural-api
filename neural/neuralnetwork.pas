@@ -3118,6 +3118,21 @@ type
       procedure ComputePreviousLayerError(); override;
   end;
 
+  /// Sub-pixel convolution / depth-to-space rearrangement.
+  /// Shi et al. 2016, "Real-Time Single Image and Video Super-Resolution
+  /// Using an Efficient Sub-Pixel Convolutional Neural Network".
+  /// Given upscale factor r, input (W, H, C) with C mod (r*r) = 0 is
+  /// rearranged to (W*r, H*r, C/(r*r)). Parameter-free, deterministic.
+  ///   output[r*x+i, r*y+j, c] = input[x, y, c*r*r + i*r + j]
+  TNNetPixelShuffle = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pUpscaleFactor: integer = 2); reintroduce; overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   TNNetDeAvgPool = class(TNNetDeMaxPool);
 
   /// neural network
@@ -11249,6 +11264,89 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetPixelShuffle }
+
+procedure TNNetPixelShuffle.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  r, rr: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  r := FStruct[0];
+  if r <= 0 then
+  begin
+    FErrorProc('TNNetPixelShuffle requires UpscaleFactor>0, got ' + IntToStr(r));
+    Exit;
+  end;
+  rr := r * r;
+  if (pPrevLayer.Output.Depth mod rr) <> 0 then
+  begin
+    FErrorProc('TNNetPixelShuffle requires Depth divisible by r*r, got Depth=' +
+      IntToStr(pPrevLayer.Output.Depth) + ' r=' + IntToStr(r));
+    Exit;
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * r,
+                 pPrevLayer.Output.SizeY * r,
+                 pPrevLayer.Output.Depth div rr);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+constructor TNNetPixelShuffle.Create(pUpscaleFactor: integer);
+begin
+  inherited Create();
+  FStruct[0] := pUpscaleFactor;
+end;
+
+procedure TNNetPixelShuffle.Compute();
+var
+  r, MaxX, MaxY, MaxD, x, y, c, i, j, InD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  r := FStruct[0];
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for c := 0 to MaxD do
+    for x := 0 to MaxX do
+      for y := 0 to MaxY do
+        for i := 0 to r - 1 do
+          for j := 0 to r - 1 do
+          begin
+            InD := c * r * r + i * r + j;
+            FOutput[r * x + i, r * y + j, c] :=
+              FPrevLayer.Output[x, y, InD];
+          end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPixelShuffle.Backpropagate();
+var
+  r, MaxX, MaxY, MaxD, x, y, c, i, j, InD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  r := FStruct[0];
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for c := 0 to MaxD do
+    for x := 0 to MaxX do
+      for y := 0 to MaxY do
+        for i := 0 to r - 1 do
+          for j := 0 to r - 1 do
+          begin
+            InD := c * r * r + i * r + j;
+            FPrevLayer.OutputError.Add(x, y, InD,
+              FOutputError[r * x + i, r * y + j, c]);
+          end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 constructor TNNetHyperbolicTangent.Create();
@@ -24036,6 +24134,7 @@ begin
       'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
+      'TNNetPixelShuffle' :         Result := TNNetPixelShuffle.Create(St[0]);
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
@@ -24251,6 +24350,7 @@ begin
       if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
+      if S[0] = 'TNNetPixelShuffle' then Result := TNNetPixelShuffle.Create(St[0]) else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
