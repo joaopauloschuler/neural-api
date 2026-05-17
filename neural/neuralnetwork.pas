@@ -3290,6 +3290,18 @@ type
         Samples: TNNetVolumeList;
         DeadThreshold: TNeuralFloat = 1e-6
       ): string;
+      // Per-trainable-layer weight-value histogram diagnostic. For every
+      // layer with weights (Neurons.Count > 0 and Weights.Size > 0) walks
+      // the neuron weights (biases excluded) and reports min, max, mean,
+      // population std, L2 norm, L-inf norm and sparsity (|w|<1e-6). Then
+      // emits a per-layer ASCII bar histogram of weight values across
+      // Bins bins over [-MaxAbs, +MaxAbs] (per-layer scaling) where the
+      // tallest bar is 40 characters wide. Closes with the network-wide
+      // weight count and trainable-layer count. Pure CPU, no forward pass.
+      class function WeightHistogramReport(
+        NN: TNNet;
+        Bins: integer = 32
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -21131,6 +21143,157 @@ begin
         [TotalDead, TotalUnits, (TotalDead / TotalUnits) * 100.0]))
     else
       Lines.Add('Total dead across net: 0 / 0.');
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.WeightHistogramReport(
+  NN: TNNet;
+  Bins: integer = 32
+): string;
+const
+  cZeroEps = 1e-6;
+  cMaxBarWidth = 40;
+var
+  Lines: TStringList;
+  LayerIdx, NeuronIdx, K, BinIdx: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  W, AbsW, MinW, MaxW, MaxAbs, Sum, SumSq, Mean, Std, L2, Linf: TNeuralFloat;
+  WCount, NearZero, TrainableLayers, TotalWeights, BarLen, MaxBin: integer;
+  BinCounts: array of integer;
+  Span, BinLo, BinHi: TNeuralFloat;
+  ShapeStr, Bar: string;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'WeightHistogramReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if Bins < 1 then Bins := 1;
+
+    TrainableLayers := 0;
+    TotalWeights := 0;
+
+    Lines.Add(Format(
+      'Per-trainable-layer weight histograms (%d bins, bar = ''#'', ' +
+      'max width = %d)',
+      [Bins, cMaxBarWidth]));
+    Lines.Add('');
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+
+      // First pass: stats.
+      WCount := 0;
+      MinW := 0;
+      MaxW := 0;
+      Sum := 0;
+      SumSq := 0;
+      NearZero := 0;
+      Linf := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for K := 0 to Neuron.Weights.Size - 1 do
+        begin
+          W := Neuron.Weights.FData[K];
+          if WCount = 0 then
+          begin
+            MinW := W;
+            MaxW := W;
+          end
+          else
+          begin
+            if W < MinW then MinW := W;
+            if W > MaxW then MaxW := W;
+          end;
+          Sum := Sum + W;
+          SumSq := SumSq + W * W;
+          AbsW := Abs(W);
+          if AbsW > Linf then Linf := AbsW;
+          if AbsW < cZeroEps then Inc(NearZero);
+          Inc(WCount);
+        end;
+      end;
+
+      if WCount = 0 then Continue;
+
+      Mean := Sum / WCount;
+      // Population std.
+      Std := SumSq / WCount - Mean * Mean;
+      if Std < 0 then Std := 0;
+      Std := Sqrt(Std);
+      L2 := Sqrt(SumSq);
+      MaxAbs := Linf;
+      if MaxAbs <= 0 then MaxAbs := cZeroEps;
+      Span := 2.0 * MaxAbs;
+
+      // Second pass: bin counts over [-MaxAbs, +MaxAbs].
+      SetLength(BinCounts, Bins);
+      for BinIdx := 0 to Bins - 1 do BinCounts[BinIdx] := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for K := 0 to Neuron.Weights.Size - 1 do
+        begin
+          W := Neuron.Weights.FData[K];
+          BinIdx := Trunc(((W + MaxAbs) / Span) * Bins);
+          if BinIdx < 0 then BinIdx := 0;
+          if BinIdx >= Bins then BinIdx := Bins - 1;
+          Inc(BinCounts[BinIdx]);
+        end;
+      end;
+      MaxBin := 0;
+      for BinIdx := 0 to Bins - 1 do
+        if BinCounts[BinIdx] > MaxBin then MaxBin := BinCounts[BinIdx];
+
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      Lines.Add(Format('Layer %3d  %s  Output=%s  Weights=%d',
+        [LayerIdx, Layer.ClassName, ShapeStr, WCount]));
+      Lines.Add(Format(
+        '  min=%.4f  max=%.4f  mean=%.4f  std=%.4f  ||W||2=%.4f  ' +
+        '||W||inf=%.4f',
+        [MinW, MaxW, Mean, Std, L2, Linf]));
+      Lines.Add(Format('  near-zero (|w|<%g): %d (%.2f%%)',
+        [cZeroEps, NearZero, (NearZero / WCount) * 100.0]));
+      for BinIdx := 0 to Bins - 1 do
+      begin
+        BinLo := -MaxAbs + BinIdx * (Span / Bins);
+        BinHi := -MaxAbs + (BinIdx + 1) * (Span / Bins);
+        if MaxBin > 0 then
+          BarLen := Round((BinCounts[BinIdx] / MaxBin) * cMaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        if BinIdx < Bins - 1 then
+          Lines.Add(Format('  [%8.3f, %8.3f) | %s', [BinLo, BinHi, Bar]))
+        else
+          Lines.Add(Format('  [%8.3f, %8.3f] | %s', [BinLo, BinHi, Bar]));
+      end;
+      Lines.Add('');
+
+      Inc(TrainableLayers);
+      TotalWeights := TotalWeights + WCount;
+    end;
+
+    if TrainableLayers = 0 then
+      Lines.Add('No trainable layers with weights found.')
+    else
+      Lines.Add(Format(
+        'Network total trainable weights: %d across %d layer(s). ' +
+        '(Biases excluded.)',
+        [TotalWeights, TrainableLayers]));
 
     Result := Lines.Text;
   finally
