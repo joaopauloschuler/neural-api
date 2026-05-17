@@ -106,12 +106,6 @@ rather than acted on.
       1e-2 is fine, when to tighten to 1e-3, when to shrink eps instead of
       loosening the tolerance.
 
-### Added ideas
-- [ ] TNNetSwiGLU/TNNetGEGLU are the gating half of a transformer FFN — a
-      natural next step is a TNNetSwiGLUFeedForward example or block that
-      pairs them with the dense projections, ready for the transformer-encoder
-      task at the top of the list.
-
 #### Experiments I'm curious about
 - [ ] Batch-size sweep demo: same net and data, vary the batch size, and print
       how wall-clock-per-epoch and epochs-to-converge trade off. A concrete,
@@ -629,8 +623,6 @@ breakdown:
 - [ ] `examples/PositionalEncodingDemo/` — visualize (ASCII heatmap) the
       sin/cos table built by TNNetSinusoidalPositionalEmbedding vs the
       learnable TNNetAddPositionalEmbedding table after a few epochs.
-- [x] `examples/SwiGLUFeedForward/` — tiny FFN block `Dense → SwiGLU →
-      Dense` trained on a synthetic regression task.
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
@@ -652,8 +644,6 @@ breakdown:
       feature heads, side-by-side.
 - [ ] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
       Square(x)))` as a Euclidean-norm-reciprocal head.
-- [x] `examples/CumSumPositionEncoding/` — forward-only demo showing
-      that CumSum on a constant input produces a linear position ramp.
 - [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin.
 - [ ] `examples/PReLUvsLeakyReLU/` — three-config bake-off.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
@@ -690,9 +680,6 @@ breakdown:
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
       once with TNNetMaxPool and once with TNNetMaxBlurPool; report
       shift-equivariance delta.
-- [x] `examples/SeededReproducibility/` — runs one of the smallest examples
-      twice with the same seed and prints PASS/FAIL on bit-for-bit weight
-      equality. Requires `NFit.MaxThreadNum := 1`.
 - [ ] `examples/AbsSquareEnergy/`, `examples/ReverseXYAugmentation/`,
       `examples/AutoencoderMNIST/`, `examples/AutoencoderReconstructionGrid/`
       — additional small demos.
