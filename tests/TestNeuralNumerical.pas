@@ -244,6 +244,9 @@ type
     procedure TestReverseChannelsGradientCheck;
     procedure TestReverseChannelsInvolution;
     procedure TestReverseChannelsSerializationRoundTrip;
+    procedure TestCumSumForward;
+    procedure TestCumSumGradientCheck;
+    procedure TestCumSumSerializationRoundTrip;
     procedure TestReverseXYForward;
     procedure TestReverseXYGradientCheck;
     procedure TestReverseXYInvolution;
@@ -7391,6 +7394,77 @@ begin
   // SaveToString -> LoadFromString cycle.
   SerializationRoundTrip(Self, TNNetReverseChannels.Create(),
     'ReverseChannels', 2, 2, 5, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestCumSumForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Expected: array[0..3] of TNeuralFloat;
+  c: integer;
+begin
+  // Depth=4, input [1,2,3,4] cumsum to [1,3,6,10] along the depth axis.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetCumSum.Create());
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := 2.0;
+    Input.Raw[2] := 3.0;
+    Input.Raw[3] := 4.0;
+    Expected[0] := 1.0;
+    Expected[1] := 3.0;
+    Expected[2] := 6.0;
+    Expected[3] := 10.0;
+    NN.Compute(Input);
+    for c := 0 to 3 do
+      AssertEquals('CumSum output channel ' + IntToStr(c),
+        Expected[c], NN.GetLastLayer.Output.Raw[c], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCumSumGradientCheck;
+begin
+  // Parameter-free; backward is the reverse-cumsum of OutputError along depth.
+  // Tolerance is relaxed beyond the usual 0.01 because cumulative accumulation
+  // along the depth axis amplifies Single-precision finite-difference noise:
+  // both numerical and analytical input gradients are O(Depth * input range),
+  // so the absolute error from central differences scales accordingly.
+  LayerInputGradientCheck(Self, TNNetCumSum.Create(),
+    'CumSum', 2, 2, 4, 0.05);
+end;
+
+procedure TTestNeuralNumerical.TestCumSumSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+  Reloaded: TNNetLayer;
+begin
+  // Parameter-free shape layer; just confirm the dispatch round-trips the
+  // class identity through SaveToString -> LoadFromString.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetCumSum.Create());
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Reloaded := NN2.GetLastLayer;
+      AssertEquals('CumSum reloaded class name',
+        'TNNetCumSum', Reloaded.ClassName);
+      AssertTrue('CumSum reloaded class equality',
+        Reloaded.ClassType = TNNetCumSum);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestReverseXYForward;

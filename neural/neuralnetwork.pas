@@ -2041,6 +2041,17 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Tiny parameter-free shape layer that computes the cumulative sum along
+  // the depth (channel) axis: Output[x, y, c] := sum_{k=0..c} Input[x, y, k].
+  // Backward routes the upstream gradient by reverse-cumsum along the same
+  // axis: dL/dInput[x, y, c] := sum_{k=c..Depth-1} OutputError[x, y, k];
+  // contributions are accumulated into the previous layer's OutputError.
+  TNNetCumSum = class(TNNetIdentity)
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Tiny parameter-free permutation layer that flips the spatial (X, Y)
   // axes 180°: Output[x, y, d] := Input[SizeX - 1 - x, SizeY - 1 - y, d].
   // Backward applies the same involution to OutputError.
@@ -8261,6 +8272,65 @@ begin
     // for output channel d into source channel Depth - 1 - d.
     for CntDepth := 0 to MaxDepth do
       FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, CntDepth, MaxDepth - CntDepth);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCumSum }
+
+procedure TNNetCumSum.Compute();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  Acc: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  for CntY := 0 to MaxY do
+    for CntX := 0 to MaxX do
+    begin
+      Acc := 0;
+      for CntD := 0 to MaxD do
+      begin
+        Acc := Acc + FPrevLayer.FOutput[CntX, CntY, CntD];
+        FOutput[CntX, CntY, CntD] := Acc;
+      end;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCumSum.Backpropagate();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  Acc: TNeuralFloat;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    // Reverse-cumsum along depth: gradient at input channel c is the sum of
+    // upstream errors at channels c..MaxD. Accumulate (add) so this composes
+    // with branches that share the previous layer's error tensor.
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
+      begin
+        Acc := 0;
+        for CntD := MaxD downto 0 do
+        begin
+          Acc := Acc + FOutputError[CntX, CntY, CntD];
+          FPrevLayer.FOutputError.Add(CntX, CntY, CntD, Acc);
+        end;
+      end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -19683,6 +19753,7 @@ begin
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
+      'TNNetCumSum' :               Result := TNNetCumSum.Create();
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
       'TNNetFlipX' :                Result := TNNetFlipX.Create();
       'TNNetFlipY' :                Result := TNNetFlipY.Create();
@@ -19879,6 +19950,7 @@ begin
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
+      if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create() else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else
       if S[0] = 'TNNetFlipX' then Result := TNNetFlipX.Create() else
       if S[0] = 'TNNetFlipY' then Result := TNNetFlipY.Create() else
