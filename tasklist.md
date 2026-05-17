@@ -281,7 +281,6 @@ breakdown:
       multiply; the "Learning" part of its parent class doesn't engage
       unless wired up). Do NOT add a separate class — use
       TNNetMulByConstant for the warm-up-scaling trick.
-- [X] TNNetPReLUChannel — per-channel PReLU (matches He 2015).
 - [ ] TNNetSwishLearnable — TNNetSwish with a single learnable β.
 - [ ] TNNetMishLearnable — TNNetMish with a single learnable α.
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
@@ -317,8 +316,6 @@ breakdown:
 #### Probability projections / sparsity
 - [ ] TNNetSparsemax — Martins & Astudillo's exact-sparse alternative to
       softmax. Yields true zeros; natural drop-in for sparse attention.
-- [X] TNNetTopK — keep only the top-K activations per spatial cell along
-      the depth axis, zeroing the rest. K in FStruct[0].
 - [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
       (soft / hard straight-through).
@@ -617,9 +614,6 @@ breakdown:
       without MixUp on CIFAR-10 and report the delta.
 - [ ] `examples/AttentionViz/` — load a tiny trained SDPA model and dump
       the per-head attention matrix as a PGM image.
-- [X] `examples/AttentionCopyTask/` — single-head SDPA learns to copy a
-      16-token input to its output. Smallest possible end-to-end attention
-      training demo using existing SDPA (no MHSA dependency).
 - [ ] `examples/PositionalEncodingDemo/` — visualize (ASCII heatmap) the
       sin/cos table built by TNNetSinusoidalPositionalEmbedding vs the
       learnable TNNetAddPositionalEmbedding table after a few epochs.
