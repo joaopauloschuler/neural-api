@@ -377,8 +377,6 @@ breakdown:
       per-block output errors equals the input error.
 
 ### Loss layers
-- [ ] TNNetFocalLoss — `-(1-p_t)^γ · log(p_t)` for class-imbalanced
-      classification. α/γ in FFloatSt[0..1] (defaults 0.25 / 2.0).
 - [ ] TNNetLabelSmoothingLoss helper — pure target-side transform
       `(1 - eps) * one_hot + eps / NumClasses`.
 - [ ] TNNetNLLLoss — companion to TNNetLogSoftMax. NLL over (X,Y,Depth)

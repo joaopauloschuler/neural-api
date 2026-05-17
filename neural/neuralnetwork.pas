@@ -1264,6 +1264,26 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Focal loss output layer for class-imbalanced classification.
+  // Operates on probability-space inputs (i.e. after a softmax) with one-hot
+  // targets. The per-sample loss is
+  //   L = -alpha * (1 - p_t)^gamma * log(p_t)
+  // where p_t is the predicted probability of the true class. The forward
+  // pass is an identity passthrough (so Net.Compute returns the probability
+  // head); training relies on the framework seeding FOutputError with
+  // (output - target). Backpropagate identifies the true-class position per
+  // element from the seeded residual, then replaces the residual with the
+  // analytic dL/dp_t (for non-target positions the gradient is zero).
+  // The alpha and gamma hyperparameters are stored in FFloatSt[0]/FFloatSt[1]
+  // (defaults 0.25 and 2.0) and round-trip via Save/Load. p_t is clamped to
+  // [eps, 1-eps] with eps=1e-7 to avoid log(0) / divide-by-zero.
+  TNNetFocalLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pAlpha, pGamma: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Per-sample L2 normalization across the depth axis.
   // For each spatial position (X,Y), treats the depth-axis vector v of length
   // Depth as a unit vector: y_i = x_i / sqrt(sum_j x_j^2 + eps). Output shape
@@ -6007,6 +6027,67 @@ begin
   begin
     V := FOutputError.FData[Idx];
     FOutputError.FData[Idx] := V / Sqrt(V * V + EpsSq);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetFocalLoss }
+
+constructor TNNetFocalLoss.Create();
+begin
+  Create(0.25, 2.0);
+end;
+
+constructor TNNetFocalLoss.Create(pAlpha, pGamma: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha <= 0 then
+    FErrorProc('TNNetFocalLoss alpha must be > 0.');
+  if pGamma < 0 then
+    FErrorProc('TNNetFocalLoss gamma must be >= 0.');
+  FFloatSt[0] := pAlpha;
+  FFloatSt[1] := pGamma;
+end;
+
+procedure TNNetFocalLoss.Backpropagate();
+const
+  cFocalEps = 1e-7;
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Alpha, Gamma, P, Seeded, Target, OneMinusP, Grad: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Alpha := FFloatSt[0];
+  if Alpha <= 0 then Alpha := 0.25;
+  Gamma := FFloatSt[1];
+  if Gamma < 0 then Gamma := 2.0;
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    P := FOutput.FData[Idx];
+    Seeded := FOutputError.FData[Idx];
+    // Framework seeds FOutputError := output - target. Recover target.
+    Target := P - Seeded;
+    if Target > 0.5 then
+    begin
+      // True-class position. Clamp p_t to [eps, 1-eps].
+      if P < cFocalEps then P := cFocalEps
+      else if P > 1.0 - cFocalEps then P := 1.0 - cFocalEps;
+      OneMinusP := 1.0 - P;
+      // dL/dp_t = alpha * (1-p)^(gamma-1) * [gamma * p * log(p) - (1-p)] / p
+      Grad := Alpha * Power(OneMinusP, Gamma - 1.0) *
+              (Gamma * P * Ln(P) - OneMinusP) / P;
+      FOutputError.FData[Idx] := Grad;
+    end
+    else
+    begin
+      FOutputError.FData[Idx] := 0;
+    end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -20526,6 +20607,7 @@ begin
       'TNNetSmoothL1Loss' :         Result := TNNetSmoothL1Loss.Create();
       'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
+      'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
@@ -20726,6 +20808,7 @@ begin
       if S[0] = 'TNNetSmoothL1Loss' then Result := TNNetSmoothL1Loss.Create() else
       if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
+      if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else

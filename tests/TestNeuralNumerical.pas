@@ -105,6 +105,8 @@ type
     procedure TestCharbonnierLossForwardPassthrough;
     procedure TestCharbonnierLossGradient;
     procedure TestCharbonnierLossLoadFromString;
+    procedure TestFocalLossGradient;
+    procedure TestFocalLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -11952,6 +11954,178 @@ begin
       Expected := Vals[i] / Sqrt(Vals[i] * Vals[i] + Eps * Eps);
       AssertEquals('CharbonnierLoss eps round-trip at ' + IntToStr(i),
         Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFocalLossGradient;
+const
+  cAlpha = 0.25;
+  cGamma = 2.0;
+  cEps   = 1e-4;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  TrueIdx: array[0..1] of integer; // one per "sample" / position
+  // We use a single-sample 6-element input where index TrueIdx[0] is the
+  // true class; remaining positions are non-target probabilities.
+  Probs: array[0..5] of TNeuralFloat;
+  i: integer;
+  AnaGrad, NumGrad, P, OldP, LossP, LossM: TNeuralFloat;
+
+  function FocalLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    Pt: TNeuralFloat;
+  begin
+    Pt := AInput.Raw[TrueIdx[0]];
+    if Pt < 1e-12 then Pt := 1e-12
+    else if Pt > 1.0 - 1e-12 then Pt := 1.0 - 1e-12;
+    Result := -cAlpha * Power(1.0 - Pt, cGamma) * Ln(Pt);
+  end;
+
+begin
+  TrueIdx[0] := 2;
+  TrueIdx[1] := 0; // unused, silences unused-var warnings
+  if TrueIdx[1] = -1 then Exit;
+  Probs[0] := 0.05;
+  Probs[1] := 0.10;
+  Probs[2] := 0.55; // true class
+  Probs[3] := 0.15;
+  Probs[4] := 0.10;
+  Probs[5] := 0.05;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Target := TNNetVolume.Create(6, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetFocalLoss.Create(cAlpha, cGamma));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Probs[i];
+    Target.Fill(0);
+    Target.Raw[TrueIdx[0]] := 1.0;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // Central-difference numerical gradient w.r.t. each input position.
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + cEps;
+      LossP := FocalLossAt(Input);
+      Input.Raw[i] := OldP - cEps;
+      LossM := FocalLossAt(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+
+      AssertEquals('FocalLoss gradient at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-4);
+    end;
+
+    // Probe additional p_t values for the true class to stress the formula.
+    for i := 1 to 5 do
+    begin
+      P := i * 0.15; // 0.15 .. 0.75
+      Input.Raw[TrueIdx[0]] := P;
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+      AnaGrad := LMid.OutputError.Raw[TrueIdx[0]];
+
+      OldP := Input.Raw[TrueIdx[0]];
+      Input.Raw[TrueIdx[0]] := OldP + cEps;
+      LossP := FocalLossAt(Input);
+      Input.Raw[TrueIdx[0]] := OldP - cEps;
+      LossM := FocalLossAt(Input);
+      Input.Raw[TrueIdx[0]] := OldP;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+
+      AssertEquals('FocalLoss gradient sweep p_t=' + FloatToStr(P),
+        NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFocalLossLoadFromString;
+const
+  cAlpha = 0.5;
+  cGamma = 1.0;
+  cEps   = 1e-4;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  TrueIdx, i: integer;
+  AnaGrad, NumGrad, OldP, LossP, LossM: TNeuralFloat;
+
+  function FocalLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    Pt: TNeuralFloat;
+  begin
+    Pt := AInput.Raw[TrueIdx];
+    if Pt < 1e-12 then Pt := 1e-12
+    else if Pt > 1.0 - 1e-12 then Pt := 1.0 - 1e-12;
+    Result := -cAlpha * Power(1.0 - Pt, cGamma) * Ln(Pt);
+  end;
+
+begin
+  TrueIdx := 1;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetFocalLoss.Create(cAlpha, cGamma));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetFocalLoss',
+      NN2.GetLastLayer is TNNetFocalLoss);
+
+    Input.Raw[0] := 0.20;
+    Input.Raw[1] := 0.40; // true class
+    Input.Raw[2] := 0.30;
+    Input.Raw[3] := 0.10;
+    Target.Fill(0);
+    Target.Raw[TrueIdx] := 1.0;
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + cEps;
+      LossP := FocalLossAt(Input);
+      Input.Raw[i] := OldP - cEps;
+      LossM := FocalLossAt(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+
+      AssertEquals('FocalLoss round-trip gradient at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-3);
     end;
   finally
     NN.Free;
