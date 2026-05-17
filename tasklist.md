@@ -83,20 +83,7 @@ rather than acted on.
       counting task) that trains in well under a minute on CPU.
 - [ ] Volume unit micro-benchmark printing ns/op for Add, Mul, DotProduct so
       regressions are visible without OpenCL/AVX hardware differences.
-- [ ] Continue the Backpropagate audit: the transform/reshape/pooling/element-
-      wise families are now covered (TNNetPadXY, TNNetCrop,
-      TNNetInterleaveChannels, TNNetAvgPool, TNNetCellBias, TNNetCellMul).
-      The concat/split/branch family is now also covered: TNNetConcat,
-      TNNetDeepConcat, TNNetSplitChannels, TNNetSum each have a numerical-
-      gradient test in TestNeuralNumerical.pas. Remaining uncovered families
-      to check next: upsampling/deconvolution layers and recurrent-style
-      layers. Add numerical-gradient checks in TestNeuralNumerical.pas, one
-      family at a time.
-
 #### Correctness / audit work I find rewarding
-- [ ] Continue the Backpropagate audit into the upsampling/deconvolution family
-      (TNNetUpsample, TNNetDeconvolution, TNNetDeMaxPool) — one numerical-
-      gradient test per layer, looking for bugs the way the activation audit did.
 - [ ] Add a shared numerical-gradient helper in TestNeuralNumerical.pas so each
       new layer test is ~3 lines instead of a copy-pasted block. Reduces the
       friction of every future test task.
@@ -444,9 +431,6 @@ breakdown:
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.
 - [ ] Mixup data augmentation helper.
-- [ ] Inference sampling utilities — new `neuralsampling` unit with
-      `Argmax`, `TopKSample`, `TopPSample`, `TemperatureScale`.
-
 ### Introspection / debugging tools
 - [ ] TNNet.CountFLOPsPerLayer — forward-pass FLOP estimate per layer.
 - [ ] WeightHistogramDump — write per-trainable-layer CSV with 64-bin
@@ -1072,26 +1056,6 @@ breakdown:
       temperature-scaling fit on the logits.
 
 ### Introspection (added)
-- [ ] TNNet.WeightDriftReport(SnapshotA, SnapshotB) — given two snapshots
-      of a network's trainable weights captured at different points in
-      training (e.g., after epoch N and epoch N+K), report per-trainable-
-      layer the L2 distance `||W_B - W_A||_2`, the relative drift
-      `||W_B - W_A||_2 / (||W_A||_2 + eps)`, and the fraction of weights
-      that moved by less than a small threshold (e.g., 1e-6). Surfaces
-      "frozen" layers (vanishing-gradient bottom of a deep stack, or a
-      pretrained block left at LR=0) and "exploding" layers (relative
-      drift orders of magnitude above the rest) without having to wire
-      a custom logger. Snapshots are just `TNNet.SaveToString` blobs
-      held in memory, so the API is `WeightDriftReport(const A, B:
-      string): string` and composes naturally with the existing
-      serialization path — no new file format, no live-pointer
-      coupling. Distinct from [[DeadNeuronReport]] (activations, not
-      weights) and from `WeightHistogramDump` (single point in time,
-      no delta). Pure-CPU, runs in milliseconds. Companion
-      `examples/WeightDriftReport/` trains a deep ReLU MLP for a few
-      epochs with one layer's LR multiplier deliberately set to 0 and
-      prints the report, pinning that the frozen layer shows ~0 drift
-      while its neighbors do not.
 - [ ] Top-logit margin report — small helper in a new
       `neuralintrospection.pas` (or extending the calibration unit above)
       that, given a trained classifier and a validation set, computes the
