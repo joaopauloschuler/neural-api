@@ -1054,7 +1054,7 @@ breakdown:
       can eyeball how training reshapes the activation distribution.
 
 ### Memory footprint
-- [ ] TNNet.MemoryFootprintReport — given a network (and implicitly the
+- [X] TNNet.MemoryFootprintReport — given a network (and implicitly the
       configured input shape from `TNNetInput`), walk every layer and report:
       (a) per-layer activation tensor size in elements and MiB
           (`SizeX * SizeY * Depth * sizeof(TNeuralFloat)`),

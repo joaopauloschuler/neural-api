@@ -3326,6 +3326,29 @@ type
         NN: TNNet;
         Bins: integer = 32
       ): string;
+      // Static memory-footprint estimator. Walks every layer and reports,
+      // per layer: (a) activation tensor size in elements and MiB
+      // (SizeX*SizeY*Depth*sizeof(TNeuralFloat)), (b) parameter tensor size
+      // in elements and MiB (weights + biases via Neurons[*].Weights.Size +
+      // Neurons.Count), (c) error/gradient tensor size in MiB (mirrors
+      // activation; transient — recoverable via checkpointing). Then
+      // totals: forward activation peak (sum of activations kept alive for
+      // backward) + parameters + optimizer-state baseline scaled by
+      // OptimizerKind ('sgd' = 1x params, 'momentum' = 2x, 'adam' = 3x —
+      // master copy + 1st-moment + 2nd-moment). Followed by a 10-bin
+      // ASCII histogram of per-layer activation MiB so memory-hot layers
+      // jump out at a glance, a flag list of "activation-heavy" layers
+      // (>10% of activation total — natural gradient-checkpointing
+      // candidates) and "parameter-heavy" layers (>10% of parameter
+      // total — natural LoRA / quantization candidates), and a one-line
+      // "would-fit-in" verdict against BudgetMiB (default 2048 MiB) for
+      // forward-only, train-SGD, train-Adam. Pure structure inspection —
+      // no probe batch, no forward pass needed.
+      class function MemoryFootprintReport(
+        NN: TNNet;
+        OptimizerKind: string = 'adam';
+        BudgetMiB: TNeuralFloat = 2048.0
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -21516,6 +21539,270 @@ begin
 
     Result := Lines.Text;
   finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.MemoryFootprintReport(
+  NN: TNNet;
+  OptimizerKind: string = 'adam';
+  BudgetMiB: TNeuralFloat = 2048.0
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cHeavyFraction = 0.10;
+var
+  Lines: TStringList;
+  LayerIdx, NeuronIdx, NumLayers, BinIdx, BarLen, MaxBin: integer;
+  Layer: TNNetLayer;
+  ActElements, ParamElements: Int64;
+  TotalActElements, TotalParamElements: Int64;
+  PerLayerActElements: array of Int64;
+  PerLayerParamElements: array of Int64;
+  Bins: array of integer;
+  ActMiB, ParamMiB, GradMiB, MinMiB, MaxMiB, Span, V: TNeuralFloat;
+  ParamsMiB, OptStateMiB, ActPeakMiB, ForwardOnlyMiB, TrainMiB: TNeuralFloat;
+  TrainSGDMiB, TrainAdamMiB: TNeuralFloat;
+  OptMultiplier: TNeuralFloat;
+  OptLabel, ShapeStr, Bar, KindLow: string;
+  FlagListAct, FlagListParam: TStringList;
+  BytesPerElem: integer;
+  Pct: TNeuralFloat;
+  AnyActFlag, AnyParamFlag: boolean;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  FlagListAct := TStringList.Create();
+  FlagListParam := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'MemoryFootprintReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+
+    BytesPerElem := SizeOf(TNeuralFloat);
+
+    KindLow := LowerCase(Trim(OptimizerKind));
+    if KindLow = 'sgd' then
+    begin
+      OptMultiplier := 1.0;
+      OptLabel := 'SGD (1x params)';
+    end
+    else if (KindLow = 'momentum') or (KindLow = 'sgd-momentum') or
+            (KindLow = 'nesterov') then
+    begin
+      OptMultiplier := 2.0;
+      OptLabel := 'Momentum (2x params)';
+    end
+    else
+    begin
+      // Default: Adam (params + m + v).
+      OptMultiplier := 3.0;
+      OptLabel := 'Adam (3x params)';
+      KindLow := 'adam';
+    end;
+
+    NumLayers := NN.CountLayers();
+    SetLength(PerLayerActElements, NumLayers);
+    SetLength(PerLayerParamElements, NumLayers);
+    TotalActElements := 0;
+    TotalParamElements := 0;
+
+    // Per-layer measurement pass.
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      // Activation tensor size in elements (single sample, batch=1).
+      if Layer.Output <> nil then
+        ActElements := Int64(Layer.Output.SizeX) * Layer.Output.SizeY *
+          Layer.Output.Depth
+      else
+        ActElements := 0;
+      // Parameter tensor size in elements: weights + biases.
+      // Per neuron, 1 bias is allocated (FBiasWeight) even if unused.
+      // We count it only when the neuron has weights so parameter-free
+      // layers stay at 0.
+      ParamElements := 0;
+      if Layer.Neurons.Count > 0 then
+      begin
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          ParamElements := ParamElements +
+            Layer.Neurons[NeuronIdx].Weights.Size;
+        if (ParamElements > 0) and (not Layer.LinkedNeurons) then
+          ParamElements := ParamElements + Layer.Neurons.Count;
+      end;
+      PerLayerActElements[LayerIdx] := ActElements;
+      PerLayerParamElements[LayerIdx] := ParamElements;
+      TotalActElements := TotalActElements + ActElements;
+      TotalParamElements := TotalParamElements + ParamElements;
+    end;
+
+    Lines.Add(Format(
+      'Memory footprint (single-sample, batch=1, dtype=single, %d bytes/elem)',
+      [BytesPerElem]));
+    Lines.Add(Format('Optimizer assumption: %s   Budget: %.1f MiB',
+      [OptLabel, BudgetMiB]));
+    Lines.Add('');
+    Lines.Add(Format('%-5s %-34s %-18s %12s %12s %12s',
+      ['Idx', 'Class', 'OutShape', 'ActMiB', 'ParamMiB', 'GradMiB']));
+    Lines.Add(StringOfChar('-', 98));
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      ActMiB := (PerLayerActElements[LayerIdx] * BytesPerElem) /
+        (1024.0 * 1024.0);
+      ParamMiB := (PerLayerParamElements[LayerIdx] * BytesPerElem) /
+        (1024.0 * 1024.0);
+      GradMiB := ActMiB; // mirrors activation (transient)
+      Lines.Add(Format('%-5d %-34s %-18s %12.4f %12.4f %12.4f',
+        [LayerIdx, Layer.ClassName, ShapeStr, ActMiB, ParamMiB, GradMiB]));
+    end;
+    Lines.Add(StringOfChar('-', 98));
+
+    ActPeakMiB := (TotalActElements * BytesPerElem) / (1024.0 * 1024.0);
+    ParamsMiB := (TotalParamElements * BytesPerElem) / (1024.0 * 1024.0);
+    OptStateMiB := ParamsMiB * OptMultiplier;
+
+    Lines.Add(Format(
+      'Totals:  ActElements=%d  ParamElements=%d',
+      [TotalActElements, TotalParamElements]));
+    Lines.Add(Format(
+      '  Peak forward residency (activations kept for backward): %.4f MiB',
+      [ActPeakMiB]));
+    Lines.Add(Format(
+      '  Parameters: %.4f MiB   Optimizer state baseline (%s): %.4f MiB',
+      [ParamsMiB, OptLabel, OptStateMiB]));
+    Lines.Add(Format(
+      '  Gradient tensors (mirror activations, transient): %.4f MiB',
+      [ActPeakMiB]));
+    Lines.Add('');
+
+    // 10-bin ASCII histogram of per-layer activation MiB.
+    Lines.Add(Format(
+      'Per-layer activation MiB histogram (%d bins, bar = ''#'', max width = %d)',
+      [cBins, cMaxBarWidth]));
+    MinMiB := 0;
+    MaxMiB := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      V := (PerLayerActElements[LayerIdx] * BytesPerElem) / (1024.0 * 1024.0);
+      if (LayerIdx = 0) or (V < MinMiB) then MinMiB := V;
+      if (LayerIdx = 0) or (V > MaxMiB) then MaxMiB := V;
+    end;
+    if MaxMiB <= MinMiB then MaxMiB := MinMiB + 1e-9;
+    Span := MaxMiB - MinMiB;
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      V := (PerLayerActElements[LayerIdx] * BytesPerElem) / (1024.0 * 1024.0);
+      BinIdx := Trunc(((V - MinMiB) / Span) * cBins);
+      if BinIdx < 0 then BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      Inc(Bins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      if BinIdx < cBins - 1 then
+        Lines.Add(Format('  [%8.4f, %8.4f) MiB | %4d %s',
+          [MinMiB + BinIdx * (Span / cBins),
+           MinMiB + (BinIdx + 1) * (Span / cBins),
+           Bins[BinIdx], Bar]))
+      else
+        Lines.Add(Format('  [%8.4f, %8.4f] MiB | %4d %s',
+          [MinMiB + BinIdx * (Span / cBins),
+           MinMiB + (BinIdx + 1) * (Span / cBins),
+           Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    // Flag lists.
+    AnyActFlag := False;
+    AnyParamFlag := False;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if TotalActElements > 0 then
+      begin
+        Pct := PerLayerActElements[LayerIdx] / TotalActElements;
+        if Pct > cHeavyFraction then
+        begin
+          FlagListAct.Add(Format('  Layer %3d  %s  Act=%.4f MiB (%.1f%%)',
+            [LayerIdx, Layer.ClassName,
+             (PerLayerActElements[LayerIdx] * BytesPerElem) /
+               (1024.0 * 1024.0),
+             Pct * 100.0]));
+          AnyActFlag := True;
+        end;
+      end;
+      if TotalParamElements > 0 then
+      begin
+        Pct := PerLayerParamElements[LayerIdx] / TotalParamElements;
+        if Pct > cHeavyFraction then
+        begin
+          FlagListParam.Add(Format('  Layer %3d  %s  Param=%.4f MiB (%.1f%%)',
+            [LayerIdx, Layer.ClassName,
+             (PerLayerParamElements[LayerIdx] * BytesPerElem) /
+               (1024.0 * 1024.0),
+             Pct * 100.0]));
+          AnyParamFlag := True;
+        end;
+      end;
+    end;
+
+    Lines.Add(Format(
+      'Activation-heavy layers (>%.0f%% of activation total — gradient-checkpoint candidates):',
+      [cHeavyFraction * 100.0]));
+    if AnyActFlag then
+      Lines.AddStrings(FlagListAct)
+    else
+      Lines.Add('  (none)');
+    Lines.Add('');
+    Lines.Add(Format(
+      'Parameter-heavy layers (>%.0f%% of parameter total — LoRA / quantization candidates):',
+      [cHeavyFraction * 100.0]));
+    if AnyParamFlag then
+      Lines.AddStrings(FlagListParam)
+    else
+      Lines.Add('  (none)');
+    Lines.Add('');
+
+    // Would-fit-in verdicts.
+    // Forward-only: activations (single live copy) + params.
+    // Train-SGD: peak activations (kept for backward) + grad mirror + params*1.
+    // Train-Adam: peak activations + grad mirror + params*3.
+    ForwardOnlyMiB := ActPeakMiB + ParamsMiB;
+    TrainSGDMiB    := ActPeakMiB + ActPeakMiB + ParamsMiB * 1.0;
+    TrainAdamMiB   := ActPeakMiB + ActPeakMiB + ParamsMiB * 3.0;
+    // Honour the user-requested optimizer kind as the headline scenario.
+    TrainMiB := ActPeakMiB + ActPeakMiB + OptStateMiB;
+
+    Lines.Add(Format('Would-fit-in budget (%.1f MiB):', [BudgetMiB]));
+    Lines.Add(Format('  forward-only : %10.4f MiB  -> %s',
+      [ForwardOnlyMiB, BoolToStr(ForwardOnlyMiB <= BudgetMiB, 'FITS', 'OVER')]));
+    Lines.Add(Format('  train-SGD    : %10.4f MiB  -> %s',
+      [TrainSGDMiB, BoolToStr(TrainSGDMiB <= BudgetMiB, 'FITS', 'OVER')]));
+    Lines.Add(Format('  train-Adam   : %10.4f MiB  -> %s',
+      [TrainAdamMiB, BoolToStr(TrainAdamMiB <= BudgetMiB, 'FITS', 'OVER')]));
+    Lines.Add(Format('  train-%-6s : %10.4f MiB  -> %s',
+      [KindLow, TrainMiB, BoolToStr(TrainMiB <= BudgetMiB, 'FITS', 'OVER')]));
+
+    Result := Lines.Text;
+  finally
+    FlagListParam.Free;
+    FlagListAct.Free;
     Lines.Free;
   end;
 end;
