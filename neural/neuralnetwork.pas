@@ -3271,6 +3271,25 @@ type
       // Classes not modelled are counted 0 and tallied as "uncovered" so
       // the report flags coverage gaps. Pure static walk; no forward pass.
       class function CountFLOPsPerLayer(NN: TNNet): string;
+      // Dead-neuron diagnostic for ReLU-family activation layers. Runs a
+      // forward pass on every probe in Samples and, per ReLU-family layer
+      // (subclass of TNNetReLUBase plus the fused TNNetConvolutionReLU /
+      // TNNetPointwiseConvReLU / TNNetDepthwiseConvReLU /
+      // TNNetFullConnectReLU), tracks the max |activation| per output unit
+      // across the whole probe set as well as the fraction of zero
+      // activations per sample. A unit whose max-abs-activation is
+      // <= DeadThreshold across every probe is reported as "dead" — a
+      // strong signal of bad init, LR too high, or a stuck unit. Per
+      // layer: index, class, output shape, total units, dead count,
+      // dead%, and the mean per-sample zero-activation%. Includes a
+      // 10-bin ASCII histogram of per-layer dead% and a network-level
+      // summary (total dead, worst layer). Pure CPU, no gradients,
+      // single forward pass per sample.
+      class function DeadNeuronReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        DeadThreshold: TNeuralFloat = 1e-6
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -20930,6 +20949,188 @@ begin
     Lines.Add(StringOfChar('-', 86));
     Lines.Add(Format('TOTAL FLOPs: %d   (uncovered classes: %d)',
       [TotalFLOPs, Uncovered]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.DeadNeuronReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  DeadThreshold: TNeuralFloat = 1e-6
+): string;
+const
+  cBins = 10;
+var
+  Lines: TStringList;
+  LayerIdx, SampleIdx, UnitIdx, BinIdx: integer;
+  Layer: TNNetLayer;
+  Units, DeadUnits, ZeroCount, ReluLayerCount, Reported: integer;
+  TotalDead, TotalUnits, WorstIdx: integer;
+  IsRelu: boolean;
+  MaxAbs: array of TNeuralFloat;
+  V: TNeuralFloat;
+  DeadFrac, AvgZeroFrac, WorstFrac, ZeroSum: TNeuralFloat;
+  ShapeStr, Bar, WorstName: string;
+  PerLayerDeadFrac: array of TNeuralFloat;
+  PerLayerHasData: array of boolean;
+  Bins: array of integer;
+  MaxBin, MaxBarWidth, BarLen: integer;
+  BinLo, BinHi: TNeuralFloat;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'DeadNeuronReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'DeadNeuronReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+
+    ReluLayerCount := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if (Layer is TNNetReLUBase) or
+         (Layer is TNNetConvolutionReLU) or
+         (Layer is TNNetPointwiseConvReLU) or
+         (Layer is TNNetDepthwiseConvReLU) or
+         (Layer is TNNetFullConnectReLU) then
+        Inc(ReluLayerCount);
+    end;
+    if ReluLayerCount = 0 then
+    begin
+      Result := 'DeadNeuronReport: no ReLU-family layers found in NN.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    SetLength(PerLayerDeadFrac, NN.CountLayers());
+    SetLength(PerLayerHasData, NN.CountLayers());
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      PerLayerHasData[LayerIdx] := False;
+
+    Lines.Add(Format(
+      'DeadNeuronReport: %d ReLU-family layer(s), %d probe sample(s). ' +
+      'DeadThreshold=%g.',
+      [ReluLayerCount, Samples.Count, DeadThreshold]));
+    Lines.Add(Format('%-5s %-32s %-16s %8s %8s %8s %10s',
+      ['Idx', 'Class', 'OutShape', 'Units', 'Dead', 'Dead%', 'AvgZero%']));
+    Lines.Add(StringOfChar('-', 92));
+
+    TotalDead := 0;
+    TotalUnits := 0;
+    WorstFrac := -1;
+    WorstIdx := -1;
+    WorstName := '';
+    Reported := 0;
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      IsRelu :=
+        (Layer is TNNetReLUBase) or
+        (Layer is TNNetConvolutionReLU) or
+        (Layer is TNNetPointwiseConvReLU) or
+        (Layer is TNNetDepthwiseConvReLU) or
+        (Layer is TNNetFullConnectReLU);
+      if not IsRelu then Continue;
+
+      Units := Layer.Output.Size;
+      if Units = 0 then Continue;
+
+      SetLength(MaxAbs, Units);
+      for UnitIdx := 0 to Units - 1 do MaxAbs[UnitIdx] := 0;
+      ZeroSum := 0;
+
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        NN.Compute(Samples[SampleIdx]);
+        ZeroCount := 0;
+        for UnitIdx := 0 to Units - 1 do
+        begin
+          V := Abs(Layer.Output.Raw[UnitIdx]);
+          if V > MaxAbs[UnitIdx] then MaxAbs[UnitIdx] := V;
+          if V <= DeadThreshold then Inc(ZeroCount);
+        end;
+        ZeroSum := ZeroSum + (ZeroCount / Units);
+      end;
+
+      DeadUnits := 0;
+      for UnitIdx := 0 to Units - 1 do
+        if MaxAbs[UnitIdx] <= DeadThreshold then Inc(DeadUnits);
+
+      DeadFrac := DeadUnits / Units;
+      AvgZeroFrac := ZeroSum / Samples.Count;
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+
+      Lines.Add(Format('%-5d %-32s %-16s %8d %8d %7.2f%% %9.2f%%',
+        [LayerIdx, Layer.ClassName, ShapeStr, Units, DeadUnits,
+         DeadFrac * 100.0, AvgZeroFrac * 100.0]));
+
+      PerLayerDeadFrac[LayerIdx] := DeadFrac;
+      PerLayerHasData[LayerIdx] := True;
+      TotalDead := TotalDead + DeadUnits;
+      TotalUnits := TotalUnits + Units;
+      if DeadFrac > WorstFrac then
+      begin
+        WorstFrac := DeadFrac;
+        WorstIdx := LayerIdx;
+        WorstName := Layer.ClassName;
+      end;
+      Inc(Reported);
+    end;
+
+    Lines.Add(StringOfChar('-', 92));
+
+    // 10-bin histogram of dead% across reported layers, range [0, 100].
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not PerLayerHasData[LayerIdx] then Continue;
+      BinIdx := Trunc(PerLayerDeadFrac[LayerIdx] * cBins);
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      if BinIdx < 0 then BinIdx := 0;
+      Inc(Bins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    MaxBarWidth := 40;
+    Lines.Add(Format('Histogram of dead%% across %d ReLU-family layer(s):',
+      [Reported]));
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      BinLo := BinIdx * (100.0 / cBins);
+      BinHi := (BinIdx + 1) * (100.0 / cBins);
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * MaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%5.1f-%5.1f) | n=%3d %s',
+        [BinLo, BinHi, Bins[BinIdx], Bar]));
+    end;
+
+    if WorstIdx >= 0 then
+      Lines.Add(Format('Worst layer: %d (%s) with %.2f%% dead.',
+        [WorstIdx, WorstName, WorstFrac * 100.0]))
+    else
+      Lines.Add('Worst layer: none.');
+    if TotalUnits > 0 then
+      Lines.Add(Format('Total dead across net: %d / %d (%.2f%%).',
+        [TotalDead, TotalUnits, (TotalDead / TotalUnits) * 100.0]))
+    else
+      Lines.Add('Total dead across net: 0 / 0.');
 
     Result := Lines.Text;
   finally
