@@ -2052,6 +2052,21 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Tiny parameter-free shape layer that circularly shifts values along the
+  // depth (channel) axis by a constructor-supplied integer Shift:
+  //   Output[x, y, c] := Input[x, y, ((c - Shift) mod Depth + Depth) mod Depth].
+  // Positive Shift shifts values toward higher depth indices with wrap-around.
+  // Negative Shift is supported and is the inverse roll. Backward applies the
+  // inverse roll to OutputError along the same axis and accumulates into the
+  // previous layer's OutputError. Shift is persisted in FStruct[0].
+  TNNetRoll = class(TNNetIdentity)
+    public
+      constructor Create(AShift: integer); reintroduce; overload;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Tiny parameter-free permutation layer that flips the spatial (X, Y)
   // axes 180°: Output[x, y, d] := Input[SizeX - 1 - x, SizeY - 1 - y, d].
   // Backward applies the same involution to OutputError.
@@ -8331,6 +8346,68 @@ begin
           FPrevLayer.FOutputError.Add(CntX, CntY, CntD, Acc);
         end;
       end;
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetRoll }
+
+constructor TNNetRoll.Create(AShift: integer);
+begin
+  inherited Create();
+  FStruct[0] := AShift;
+end;
+
+procedure TNNetRoll.Compute();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, Depth, Shift, SrcD: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  Depth := FOutput.Depth;
+  MaxD := Depth - 1;
+  Shift := FStruct[0];
+  for CntY := 0 to MaxY do
+    for CntX := 0 to MaxX do
+      for CntD := 0 to MaxD do
+      begin
+        // Pascal's mod can be negative for negative LHS; double-mod to wrap.
+        SrcD := ((CntD - Shift) mod Depth + Depth) mod Depth;
+        FOutput[CntX, CntY, CntD] := FPrevLayer.FOutput[CntX, CntY, SrcD];
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRoll.Backpropagate();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, Depth, Shift, SrcD: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if FPrevLayer.FOutputError.Size = FOutputError.Size then
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    Depth := FOutput.Depth;
+    MaxD := Depth - 1;
+    Shift := FStruct[0];
+    // Inverse roll on upstream error: dL/dInput[x,y,c] =
+    //   OutputError[x, y, ((c + Shift) mod Depth + Depth) mod Depth].
+    // Accumulate so it composes with branches sharing the previous error tensor.
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
+        for CntD := 0 to MaxD do
+        begin
+          SrcD := ((CntD + Shift) mod Depth + Depth) mod Depth;
+          FPrevLayer.FOutputError.Add(CntX, CntY, CntD, FOutputError[CntX, CntY, SrcD]);
+        end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -19754,6 +19831,7 @@ begin
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetCumSum' :               Result := TNNetCumSum.Create();
+      'TNNetRoll' :                 Result := TNNetRoll.Create(St[0]);
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
       'TNNetFlipX' :                Result := TNNetFlipX.Create();
       'TNNetFlipY' :                Result := TNNetFlipY.Create();
@@ -19951,6 +20029,7 @@ begin
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create() else
+      if S[0] = 'TNNetRoll' then Result := TNNetRoll.Create(St[0]) else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else
       if S[0] = 'TNNetFlipX' then Result := TNNetFlipX.Create() else
       if S[0] = 'TNNetFlipY' then Result := TNNetFlipY.Create() else

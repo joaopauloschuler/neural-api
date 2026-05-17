@@ -247,6 +247,10 @@ type
     procedure TestCumSumForward;
     procedure TestCumSumGradientCheck;
     procedure TestCumSumSerializationRoundTrip;
+    procedure TestRollForward;
+    procedure TestRollGradientCheck;
+    procedure TestRollInvolution;
+    procedure TestRollSerializationRoundTrip;
     procedure TestReverseXYForward;
     procedure TestReverseXYGradientCheck;
     procedure TestReverseXYInvolution;
@@ -7459,6 +7463,103 @@ begin
         'TNNetCumSum', Reloaded.ClassName);
       AssertTrue('CumSum reloaded class equality',
         Reloaded.ClassType = TNNetCumSum);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Expected: array[0..3] of TNeuralFloat;
+  c: integer;
+begin
+  // Depth=4, Shift=1: input [10,20,30,40] -> output [40,10,20,30].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetRoll.Create(1));
+    Input.Raw[0] := 10.0;
+    Input.Raw[1] := 20.0;
+    Input.Raw[2] := 30.0;
+    Input.Raw[3] := 40.0;
+    Expected[0] := 40.0;
+    Expected[1] := 10.0;
+    Expected[2] := 20.0;
+    Expected[3] := 30.0;
+    NN.Compute(Input);
+    for c := 0 to 3 do
+      AssertEquals('Roll output channel ' + IntToStr(c),
+        Expected[c], NN.GetLastLayer.Output.Raw[c], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollGradientCheck;
+begin
+  // Parameter-free circular shift along depth; backward is the inverse roll.
+  LayerInputGradientCheck(Self, TNNetRoll.Create(2),
+    'Roll', 2, 2, 5, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestRollInvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Roll(K) followed by Roll(-K) must return the identity.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 7);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 7, 1));
+    NN.AddLayer(TNNetRoll.Create(3));
+    NN.AddLayer(TNNetRoll.Create(-3));
+    RandSeed := 131313;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('Roll involution at index ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+  Reloaded: TNNetLayer;
+begin
+  // Confirm class identity AND Shift (FStruct[0]) survive the round-trip.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetRoll.Create(3));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Reloaded := NN2.GetLastLayer;
+      AssertEquals('Roll reloaded class name',
+        'TNNetRoll', Reloaded.ClassName);
+      AssertTrue('Roll reloaded class equality',
+        Reloaded.ClassType = TNNetRoll);
+      // SaveStructureToString embeds FStruct[0] (Shift); structural equality
+      // here pins the Shift hyperparameter through the CreateLayer dispatch.
+      AssertEquals('Roll reloaded Shift (FStruct[0])',
+        NN.GetLastLayer.SaveStructureToString(),
+        Reloaded.SaveStructureToString());
     finally
       NN2.Free;
     end;
