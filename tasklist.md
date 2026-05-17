@@ -273,7 +273,6 @@ breakdown:
       fixed (non-trainable) binomial blur filter.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-- [X] TNNetSwishLearnable — TNNetSwish with a single learnable β.
 - [ ] TNNetMishLearnable — TNNetMish with a single learnable α.
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
@@ -285,8 +284,6 @@ breakdown:
       α=0, `-log(1 - α·(x + α))/α` for α<0.
 - [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
       with channel-wise learnable `(p1, p2, β)`. Generalizes Swish.
-- [X] TNNetErf — closed-form GELU partner. Caveat: check FPC math.erf
-      portability (or reuse the SerfErf A&S polynomial helper).
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
       channel.
 - [ ] TNNetSplineActivation — KAN-flavored per-channel learnable piecewise-
@@ -295,8 +292,6 @@ breakdown:
       mean(|W|)` forward with straight-through estimator backward.
 - [ ] TNNetMaxOut2 — two-piece special case of TNNetMaxOut with a tighter
       API (no group-count parameter).
-- [X] TNNetSinusoidalTimeEmbedding — scalar-timestep encoder for diffusion
-      models (distinct from sequence-axis TNNetSinusoidalPositionalEmbedding).
 - [ ] TNNetAPL (Adaptive Piecewise Linear) — sum of hinge functions with
       per-channel learnable knees and slopes.
 #### Probability projections / sparsity
