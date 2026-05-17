@@ -1354,13 +1354,19 @@ type
     FDk: integer;
     FInvSqrtDk: TNeuralFloat;
     FCausal: boolean;
-    FAttn: TNNetVolume; // attention weights [SizeX, SizeX, 1] (rows=queries)
+    FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(d_k: integer; CausalMask: boolean = false); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    // Read-only access to the post-softmax attention map populated by
+    // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
+    // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
+    property AttentionWeights: TNNetVolume read FAttn;
+    property Dk: integer read FDk;
+    property CausalMask: boolean read FCausal;
   end;
 
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
@@ -3195,6 +3201,26 @@ type
         ContextLen: integer;
         WorstK: integer = 5
       ): string; overload;
+      // Attention-map entropy diagnostic. For every
+      // TNNetScaledDotProductAttention layer in NN, runs a forward pass over
+      // each volume in ProbeInputs and harvests the post-softmax attention
+      // map directly from the layer (read-only AttentionWeights property).
+      // For each query row computes Shannon entropy
+      //   H = -sum_j p_j * log(p_j + cEps)
+      // (natural log; max is log(K) where K is the number of unmasked keys,
+      // i.e. SeqLen for non-causal, i+1 for row i under causal masking).
+      // Per layer reports: mean +/- std of per-row entropy across all probes,
+      // count of "dead" rows (H within DeadEpsilon of the row's log(K),
+      // i.e. nearly-uniform attention) and "spike" rows (H below
+      // SpikeThreshold, i.e. attending to essentially one key), plus a
+      // 10-bin ASCII histogram of normalized entropy H/log(K). Pure CPU,
+      // one forward pass per probe per layer. No new layer types.
+      class function AttentionEntropyReport(
+        NN: TNNet;
+        ProbeInputs: TNNetVolumeList;
+        DeadEpsilon: TNeuralFloat = 0.05;
+        SpikeThreshold: TNeuralFloat = 0.1
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -20122,6 +20148,206 @@ begin
           [BinIdx, V, Bins[BinIdx], Bar]));
       end;
     end;
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+// Attention-map entropy diagnostic. Reads the post-softmax attention map
+// directly from TNNetScaledDotProductAttention.AttentionWeights (no
+// transient probe layer needed — the field already lives there for the
+// Backpropagate path).
+class function TNNet.AttentionEntropyReport(
+  NN: TNNet;
+  ProbeInputs: TNNetVolumeList;
+  DeadEpsilon: TNeuralFloat = 0.05;
+  SpikeThreshold: TNeuralFloat = 0.1
+): string;
+const
+  cEps = 1e-30;
+  cBins = 10;
+var
+  Lines: TStringList;
+  LayerIdx, ProbeIdx, i, j, SeqLen, ValidK, BinIdx: integer;
+  AttnLayer: TNNetScaledDotProductAttention;
+  AttnMap: TNNetVolume;
+  P, RowEntropy, RowMaxH, NormH, Sum, SumSq: TNeuralFloat;
+  Mean, Variance, Std, LogSeq, MaxRowH: TNeuralFloat;
+  RowCount, DeadRows, SpikeRows, AttnLayerCount, Reported: integer;
+  Bins: array of integer;
+  MaxBin, MaxBarWidth, BarLen: integer;
+  Bar: string;
+  BinCenter: TNeuralFloat;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'AttentionEntropyReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (ProbeInputs = nil) or (ProbeInputs.Count = 0) then
+    begin
+      Result := 'AttentionEntropyReport: ProbeInputs is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    AttnLayerCount := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      if NN.Layers[LayerIdx] is TNNetScaledDotProductAttention then
+        Inc(AttnLayerCount);
+
+    if AttnLayerCount = 0 then
+    begin
+      Result :=
+        'AttentionEntropyReport: no TNNetScaledDotProductAttention layers ' +
+        'found in NN.' + sLineBreak;
+      Exit;
+    end;
+
+    Lines.Add(Format(
+      'AttentionEntropyReport: %d SDPA layer(s), %d probe input(s). ' +
+      'DeadEpsilon=%g, SpikeThreshold=%g (nats).',
+      [AttnLayerCount, ProbeInputs.Count, DeadEpsilon, SpikeThreshold]));
+    Lines.Add(Format('%-5s %-10s %-7s %10s %10s %10s %8s %8s %8s',
+      ['Idx', 'Class', 'SeqLen', 'meanH', 'stdH', 'log(K)',
+       'meanH/lK', 'dead', 'spike']));
+    Lines.Add(StringOfChar('-', 92));
+
+    Reported := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not (NN.Layers[LayerIdx] is TNNetScaledDotProductAttention) then
+        Continue;
+      AttnLayer := TNNetScaledDotProductAttention(NN.Layers[LayerIdx]);
+
+      Sum := 0;
+      SumSq := 0;
+      RowCount := 0;
+      DeadRows := 0;
+      SpikeRows := 0;
+      MaxRowH := 0;
+      SetLength(Bins, cBins);
+      for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+
+      for ProbeIdx := 0 to ProbeInputs.Count - 1 do
+      begin
+        NN.Compute(ProbeInputs[ProbeIdx]);
+        AttnMap := AttnLayer.AttentionWeights;
+        if (AttnMap = nil) or (AttnMap.Size = 0) then Continue;
+        SeqLen := AttnMap.SizeY; // Y axis = queries
+        for i := 0 to SeqLen - 1 do
+        begin
+          RowEntropy := 0;
+          ValidK := 0;
+          for j := 0 to AttnMap.SizeX - 1 do
+          begin
+            P := AttnMap[j, i, 0];
+            if P > cEps then
+            begin
+              RowEntropy := RowEntropy - P * Ln(P + cEps);
+              Inc(ValidK);
+            end;
+          end;
+          // Per-row max entropy: ln of number of non-zero (i.e. unmasked)
+          // entries. For causal masking row i has i+1 keys; we use the
+          // post-softmax non-zero count as an empirical proxy.
+          if ValidK > 1 then
+            RowMaxH := Ln(ValidK)
+          else
+            RowMaxH := 0;
+
+          Sum := Sum + RowEntropy;
+          SumSq := SumSq + RowEntropy * RowEntropy;
+          Inc(RowCount);
+
+          if (RowMaxH > 0) and (RowMaxH - RowEntropy < DeadEpsilon) then
+            Inc(DeadRows);
+          if RowEntropy < SpikeThreshold then
+            Inc(SpikeRows);
+
+          if RowEntropy > MaxRowH then MaxRowH := RowEntropy;
+
+          // Normalised entropy H / log(K) in [0,1] for binning.
+          if RowMaxH > 0 then
+            NormH := RowEntropy / RowMaxH
+          else
+            NormH := 0;
+          if NormH < 0 then NormH := 0;
+          if NormH > 1 then NormH := 1;
+          BinIdx := Trunc(NormH * cBins);
+          if BinIdx >= cBins then BinIdx := cBins - 1;
+          if BinIdx < 0 then BinIdx := 0;
+          Inc(Bins[BinIdx]);
+        end;
+      end;
+
+      if RowCount = 0 then
+      begin
+        Lines.Add(Format('%-5d %-10s %-7s %10s %10s %10s %8s %8s %8s',
+          [LayerIdx, 'SDPA', '-', '-', '-', '-', '-', '-', '-']));
+        Continue;
+      end;
+
+      Mean := Sum / RowCount;
+      if RowCount > 1 then
+      begin
+        Variance := (SumSq - RowCount * Mean * Mean) / (RowCount - 1);
+        if Variance < 0 then Variance := 0;
+        Std := Sqrt(Variance);
+      end
+      else
+        Std := 0;
+
+      // Reference log(SeqLen) for the layer (non-causal max); for causal
+      // the per-row cap is tighter and is what we actually use for dead
+      // detection above.
+      AttnMap := AttnLayer.AttentionWeights;
+      SeqLen := AttnMap.SizeY;
+      if SeqLen > 1 then LogSeq := Ln(SeqLen) else LogSeq := 0;
+
+      if LogSeq > 0 then
+        Lines.Add(Format(
+          '%-5d %-10s %-7d %10.4f %10.4f %10.4f %8.4f %8d %8d',
+          [LayerIdx, 'SDPA', SeqLen, Mean, Std, LogSeq, Mean / LogSeq,
+           DeadRows, SpikeRows]))
+      else
+        Lines.Add(Format(
+          '%-5d %-10s %-7d %10.4f %10.4f %10.4f %8s %8d %8d',
+          [LayerIdx, 'SDPA', SeqLen, Mean, Std, LogSeq, '-',
+           DeadRows, SpikeRows]));
+
+      // Per-layer histogram.
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+      MaxBarWidth := 40;
+      Lines.Add(Format(
+        '  layer %d normalised-entropy (H/log(K)) histogram, %d row(s):',
+        [LayerIdx, RowCount]));
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        BinCenter := (BinIdx + 0.5) / cBins;
+        if MaxBin > 0 then
+          BarLen := Round((Bins[BinIdx] / MaxBin) * MaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('    bin %2d  c~=%5.2f  n=%4d  %s',
+          [BinIdx, BinCenter, Bins[BinIdx], Bar]));
+      end;
+      Inc(Reported);
+    end;
+
+    Lines.Add(StringOfChar('-', 92));
+    Lines.Add(Format(
+      'Totals: %d SDPA layer(s) reported. dead = H within %g of log(K) ' +
+      '(uniform attention); spike = H < %g (peaked on one key).',
+      [Reported, DeadEpsilon, SpikeThreshold]));
 
     Result := Lines.Text;
   finally

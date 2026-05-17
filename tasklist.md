@@ -1016,7 +1016,7 @@ breakdown:
       Distinct from the calibration tool above (which summarises
       confidence quality across the whole set) — this one localises
       *which samples* the model is least sure about.
-- [ ] TNNet.AttentionEntropyReport — for every TNNetScaledDotProductAttention
+- [X] TNNet.AttentionEntropyReport — for every TNNetScaledDotProductAttention
       layer in a trained network, run a forward pass over a small probe batch
       and report the per-row softmax entropy of the attention weights,
       summarised per layer as `mean ± std` and a 10-bin ASCII histogram, plus
