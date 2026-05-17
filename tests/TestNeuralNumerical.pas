@@ -401,6 +401,7 @@ type
     procedure TestSEBlockShapeAndForward;
     procedure TestConfusionMatrixReportArithmetic;
     procedure TestGradientNormReportSmoke;
+    procedure TestPerplexityReportSmoke;
   end;
 
 implementation
@@ -12484,6 +12485,119 @@ begin
     Lines.Free;
     Tgt.Free;
     Inp.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPerplexityReportSmoke;
+// Smoke test for TNNet.PerplexityReport: builds two tiny char-level models
+// (vocab=8, context=4) with identical structure except the head — one uses
+// TNNetSoftMax (probability-space), the other TNNetLogSoftMax (log-space).
+// Both auto-detection paths must produce a non-empty report containing the
+// expected section headers, with perplexity in (0, V*4] and accuracy in
+// [0, 1]. No training; we only need a forward-only smoke check.
+const
+  cV       = 8;
+  cCtx     = 4;
+  cStreamN = 32;
+var
+  NN: TNNet;
+  Tokens: array[0..cStreamN - 1] of integer;
+  CharLens: array[0..cStreamN - 1] of integer;
+  I: integer;
+  Report: string;
+  PerpPos, V1, V2: integer;
+  PerpVal: extended;
+  PerpStr: string;
+  FS: TFormatSettings;
+begin
+  RandSeed := 13;
+  for I := 0 to cStreamN - 1 do
+  begin
+    Tokens[I] := I mod cV;
+    CharLens[I] := 1;
+  end;
+
+  // === Probability-space path: TNNetSoftMax head. ===
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(cCtx, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(cV, 8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cV));
+    NN.AddLayer(TNNetSoftMax.Create());
+
+    Report := TNNet.PerplexityReport(NN, Tokens, cCtx, 3);
+    AssertTrue('Probability-space report is non-empty', Length(Report) > 0);
+    AssertTrue('Report mentions Perplexity', Pos('Perplexity', Report) > 0);
+    AssertTrue('Report mentions Top-1', Pos('Top-1', Report) > 0);
+    AssertTrue('Report mentions Top-5', Pos('Top-5', Report) > 0);
+    AssertTrue('Report mentions bits', Pos('bits', Report) > 0);
+    AssertTrue('Report mentions histogram',
+      Pos('histogram', Report) > 0);
+    AssertTrue('Report mentions Worst-3',
+      Pos('Worst-3', Report) > 0);
+    AssertTrue('Probability-space tag in header',
+      Pos('probability-space', Report) > 0);
+    AssertTrue('Report has no NaN tokens', Pos('NaN', Report) = 0);
+    AssertTrue('Report has no Inf tokens', Pos('Inf', Report) = 0);
+
+    // Extract perplexity value and assert it's in (0, V*4]. We parse the
+    // number after the colon on the Perplexity line, accepting either '.' or
+    // ',' as the decimal separator.
+    PerpPos := Pos('Perplexity          :', Report);
+    AssertTrue('Perplexity value line found', PerpPos > 0);
+    V1 := PerpPos;
+    while (V1 <= Length(Report)) and (Report[V1] <> ':') do Inc(V1);
+    AssertTrue('Perplexity line has a colon', V1 <= Length(Report));
+    V2 := V1 + 1;
+    while (V2 <= Length(Report)) and
+          (Report[V2] <> #10) and (Report[V2] <> #13) do Inc(V2);
+    PerpStr := Trim(Copy(Report, V1 + 1, V2 - V1 - 1));
+    // Normalize comma -> dot for parsing.
+    for V1 := 1 to Length(PerpStr) do
+      if PerpStr[V1] = ',' then PerpStr[V1] := '.';
+    FS := DefaultFormatSettings;
+    FS.DecimalSeparator := '.';
+    FS.ThousandSeparator := #0;
+    PerpVal := -1;
+    try
+      PerpVal := StrToFloat(PerpStr, FS);
+    except
+      PerpVal := -1;
+    end;
+    AssertTrue(Format('Perplexity parses (got "%s")', [PerpStr]),
+      PerpVal > 0);
+    AssertTrue(
+      Format('Perplexity in (0, V*4] (got %.4f, V=%d)', [PerpVal, cV]),
+      (PerpVal > 0) and (PerpVal <= cV * 4));
+
+    // Char-length overload smoke (BPC weighting path).
+    Report := TNNet.PerplexityReport(NN, Tokens, cCtx, 2, CharLens);
+    AssertTrue('Char-length overload returns non-empty report',
+      Length(Report) > 0);
+    AssertTrue('Char-length report mentions token-weighted BPC',
+      Pos('token-weighted', Report) > 0);
+  finally
+    NN.Free;
+  end;
+
+  // === Log-space path: TNNetLogSoftMax head. ===
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(cCtx, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(cV, 8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cV));
+    NN.AddLayer(TNNetLogSoftMax.Create());
+
+    Report := TNNet.PerplexityReport(NN, Tokens, cCtx, 3);
+    AssertTrue('Log-space report is non-empty', Length(Report) > 0);
+    AssertTrue('Log-space tag in header',
+      Pos('log-space', Report) > 0);
+    AssertTrue('Log-space report mentions Perplexity',
+      Pos('Perplexity', Report) > 0);
+    AssertTrue('Log-space report has no NaN', Pos('NaN', Report) = 0);
+    AssertTrue('Log-space report has no Inf', Pos('Inf', Report) = 0);
+  finally
     NN.Free;
   end;
 end;

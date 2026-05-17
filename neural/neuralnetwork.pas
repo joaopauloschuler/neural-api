@@ -3159,6 +3159,42 @@ type
         TopConfusedPairs: integer = 5;
         HardExamplesPerClass: integer = 0
       ): string;
+      // Generic next-token-prediction evaluator. Given a trained sequence
+      // model whose final layer is a softmax-family head (TNNetSoftMax /
+      // TNNetPointwiseSoftMax / TNNetLogSoftMax) over a vocabulary of size V
+      // and a held-out token stream of length N, reports:
+      //   (a) per-token mean cross-entropy in nats and bits,
+      //   (b) perplexity exp(mean_CE),
+      //   (c) bits-per-character (BPC) - same as bits-per-token when the
+      //       vocabulary is character-level, otherwise weighted by the
+      //       char-length of each token (pass TokenCharLens),
+      //   (d) top-1 and top-5 accuracy over the stream,
+      //   (e) a 10-bin ASCII histogram of per-token bits (long right tail
+      //       flags rare-token spikes),
+      //   (f) the WorstK worst-predicted positions (token id, context window,
+      //       bits) for qualitative inspection.
+      // Auto-detects log-space vs probability-space output by sniffing the
+      // final layer class (TNNetLogSoftMax -> log-space, else
+      // probability-space). Clamps probabilities with eps before log only on
+      // the probability-space path. Pure forward-pass; no training-time
+      // changes; no new layer types.
+      // The input is fed to the network as a 1-D volume of token ids of
+      // length ContextLen (compatible with TNNetEmbedding /
+      // TNNetTokenAndPositionalEmbedding). Pass TokenCharLens of length 0 to
+      // treat the vocabulary as char-level (BPC == bits-per-token).
+      class function PerplexityReport(
+        NN: TNNet;
+        const Tokens: array of integer;
+        ContextLen: integer;
+        WorstK: integer;
+        const TokenCharLens: array of integer
+      ): string; overload;
+      class function PerplexityReport(
+        NN: TNNet;
+        const Tokens: array of integer;
+        ContextLen: integer;
+        WorstK: integer = 5
+      ): string; overload;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -20414,6 +20450,359 @@ begin
   finally
     Lines.Free;
   end;
+end;
+
+class function TNNet.PerplexityReport(
+  NN: TNNet;
+  const Tokens: array of integer;
+  ContextLen: integer;
+  WorstK: integer;
+  const TokenCharLens: array of integer
+): string;
+const
+  cEps = 1e-12;
+  cBins = 10;
+var
+  Lines: TStringList;
+  Input: TNNetVolume;
+  Last: TNNetLayer;
+  IsLogSpace: boolean;
+  V, TgtTok, BinIdx: integer;
+  TotalCount, Top1Hits, Top5Hits, TotalChars: integer;
+  CharLenLocal: integer;
+  SumNats, SumBits, SumBitsForBPC, OutVal, NatsHere, BitsHere: TNeuralFloat;
+  MeanNats, MeanBits, Perplexity, BPC, Top1Acc, Top5Acc: TNeuralFloat;
+  PerTokenBits: array of TNeuralFloat;
+  PerTokenIdx: array of integer;
+  Bins: array of integer;
+  HistMin, HistMax, Span, BinCenter: TNeuralFloat;
+  MaxBin, BarLen, MaxBarWidth: integer;
+  Bar: string;
+  Output: TNNetVolume;
+  TopIdx: array[0..4] of integer;
+  TopVal: array[0..4] of TNeuralFloat;
+  d, k, ins: integer;
+  curVal: TNeuralFloat;
+  worstIdxs: array of integer;
+  worstBits: array of TNeuralFloat;
+  sortI, sortJ, tmpI: integer;
+  tmpF: TNeuralFloat;
+  N, t: integer;
+  ctxStr: string;
+  CharLensProvided: boolean;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Input := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'PerplexityReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'PerplexityReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+    if ContextLen <= 0 then
+    begin
+      Result := 'PerplexityReport: ContextLen must be > 0.' + sLineBreak;
+      Exit;
+    end;
+    N := Length(Tokens);
+    if N <= ContextLen then
+    begin
+      Result := Format(
+        'PerplexityReport: token stream too short (N=%d, ContextLen=%d).',
+        [N, ContextLen]) + sLineBreak;
+      Exit;
+    end;
+
+    Last := NN.GetLastLayer();
+    if (Last = nil) or (Last.Output = nil) or (Last.Output.Size < 2) then
+    begin
+      Result := 'PerplexityReport: last-layer output does not look like ' +
+        'a vocab vector.' + sLineBreak;
+      Exit;
+    end;
+    V := Last.Output.Size;
+
+    // Auto-detect log-space vs probability-space by sniffing the final layer.
+    IsLogSpace := (Last is TNNetLogSoftMax) or
+      (Pos('LogSoftMax', Last.ClassName) > 0);
+
+    CharLensProvided := Length(TokenCharLens) > 0;
+    if CharLensProvided and (Length(TokenCharLens) <> N) then
+    begin
+      Result := Format(
+        'PerplexityReport: TokenCharLens length (%d) must equal token ' +
+        'stream length (%d) or be 0 for char-level.',
+        [Length(TokenCharLens), N]) + sLineBreak;
+      Exit;
+    end;
+
+    if WorstK < 0 then WorstK := 0;
+    if WorstK > N - ContextLen then WorstK := N - ContextLen;
+
+    // Build a 1-D input volume of token ids of size ContextLen. This shape is
+    // consumed by TNNetEmbedding / TNNetTokenAndPositionalEmbedding, and is
+    // also a reasonable degenerate input for one-hot style models.
+    Input := TNNetVolume.Create(ContextLen, 1, 1);
+
+    TotalCount := N - ContextLen;
+    SetLength(PerTokenBits, TotalCount);
+    SetLength(PerTokenIdx, TotalCount);
+
+    SumNats := 0;
+    SumBits := 0;
+    SumBitsForBPC := 0;
+    TotalChars := 0;
+    Top1Hits := 0;
+    Top5Hits := 0;
+
+    for t := ContextLen to N - 1 do
+    begin
+      // Fill input window.
+      for d := 0 to ContextLen - 1 do
+        Input.FData[d] := Tokens[t - ContextLen + d];
+
+      NN.Compute(Input);
+      Output := NN.GetLastLayer().Output;
+      TgtTok := Tokens[t];
+      if (TgtTok < 0) or (TgtTok >= V) then
+      begin
+        // Skip out-of-vocab targets but keep going.
+        PerTokenBits[t - ContextLen] := 0;
+        PerTokenIdx[t - ContextLen] := t;
+        Continue;
+      end;
+
+      OutVal := Output.FData[TgtTok];
+      if IsLogSpace then
+        NatsHere := -OutVal
+      else
+      begin
+        if OutVal < cEps then OutVal := cEps;
+        NatsHere := -Ln(OutVal);
+      end;
+      BitsHere := NatsHere / Ln(2.0);
+      SumNats := SumNats + NatsHere;
+      SumBits := SumBits + BitsHere;
+
+      if CharLensProvided then
+        CharLenLocal := TokenCharLens[t]
+      else
+        CharLenLocal := 1;
+      if CharLenLocal < 1 then CharLenLocal := 1;
+      SumBitsForBPC := SumBitsForBPC + BitsHere;
+      TotalChars := TotalChars + CharLenLocal;
+
+      PerTokenBits[t - ContextLen] := BitsHere;
+      PerTokenIdx[t - ContextLen] := t;
+
+      // Top-5 (and Top-1) via small running heap of size 5.
+      for k := 0 to 4 do
+      begin
+        TopIdx[k] := -1;
+        TopVal[k] := -1e30;
+      end;
+      for d := 0 to V - 1 do
+      begin
+        curVal := Output.FData[d];
+        if curVal > TopVal[4] then
+        begin
+          // Insert sort into top-5.
+          ins := 4;
+          TopVal[4] := curVal;
+          TopIdx[4] := d;
+          while (ins > 0) and (TopVal[ins] > TopVal[ins - 1]) do
+          begin
+            tmpF := TopVal[ins];
+            TopVal[ins] := TopVal[ins - 1];
+            TopVal[ins - 1] := tmpF;
+            tmpI := TopIdx[ins];
+            TopIdx[ins] := TopIdx[ins - 1];
+            TopIdx[ins - 1] := tmpI;
+            Dec(ins);
+          end;
+        end;
+      end;
+      if TopIdx[0] = TgtTok then Inc(Top1Hits);
+      for k := 0 to 4 do
+        if TopIdx[k] = TgtTok then
+        begin
+          Inc(Top5Hits);
+          Break;
+        end;
+    end;
+
+    if TotalCount > 0 then
+    begin
+      MeanNats := SumNats / TotalCount;
+      MeanBits := SumBits / TotalCount;
+    end
+    else
+    begin
+      MeanNats := 0;
+      MeanBits := 0;
+    end;
+    Perplexity := Exp(MeanNats);
+    if TotalChars > 0 then
+      BPC := SumBitsForBPC / TotalChars
+    else
+      BPC := 0;
+    if TotalCount > 0 then
+    begin
+      Top1Acc := Top1Hits / TotalCount;
+      Top5Acc := Top5Hits / TotalCount;
+    end
+    else
+    begin
+      Top1Acc := 0;
+      Top5Acc := 0;
+    end;
+
+    Lines.Add('PerplexityReport');
+    Lines.Add(StringOfChar('=', 64));
+    if IsLogSpace then
+      Lines.Add(Format(
+        'Final layer: %s (log-space output detected)', [Last.ClassName]))
+    else
+      Lines.Add(Format(
+        'Final layer: %s (probability-space output, eps=%.1e)',
+        [Last.ClassName, cEps]));
+    Lines.Add(Format('Vocab size V        : %d', [V]));
+    Lines.Add(Format('Token stream length : %d', [N]));
+    Lines.Add(Format('Context length      : %d', [ContextLen]));
+    Lines.Add(Format('Predicted positions : %d', [TotalCount]));
+    Lines.Add('');
+    Lines.Add(Format('Mean cross-entropy  : %.6f nats  (%.6f bits)',
+      [MeanNats, MeanBits]));
+    Lines.Add(Format('Perplexity          : %.6f', [Perplexity]));
+    if CharLensProvided then
+      Lines.Add(Format(
+        'Bits-per-character  : %.6f  (total chars=%d, token-weighted)',
+        [BPC, TotalChars]))
+    else
+      Lines.Add(Format(
+        'Bits-per-character  : %.6f  (char-level vocabulary; == bits/token)',
+        [BPC]));
+    Lines.Add(Format('Top-1 accuracy      : %.4f  (%d / %d)',
+      [Top1Acc, Top1Hits, TotalCount]));
+    Lines.Add(Format('Top-5 accuracy      : %.4f  (%d / %d)',
+      [Top5Acc, Top5Hits, TotalCount]));
+    Lines.Add('');
+
+    // 10-bin histogram of per-token bits.
+    Lines.Add('Per-token bits histogram:');
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    if TotalCount = 0 then
+    begin
+      Lines.Add('  (no positions scored)');
+    end
+    else
+    begin
+      HistMin := PerTokenBits[0];
+      HistMax := PerTokenBits[0];
+      for t := 1 to TotalCount - 1 do
+      begin
+        if PerTokenBits[t] < HistMin then HistMin := PerTokenBits[t];
+        if PerTokenBits[t] > HistMax then HistMax := PerTokenBits[t];
+      end;
+      Span := HistMax - HistMin;
+      if Span < 1e-9 then Span := 1e-9;
+      for t := 0 to TotalCount - 1 do
+      begin
+        BinIdx := Trunc(((PerTokenBits[t] - HistMin) / Span) * cBins);
+        if BinIdx >= cBins then BinIdx := cBins - 1;
+        if BinIdx < 0 then BinIdx := 0;
+        Inc(Bins[BinIdx]);
+      end;
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+      MaxBarWidth := 40;
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        BinCenter := HistMin + (BinIdx + 0.5) * (Span / cBins);
+        if MaxBin > 0 then
+          BarLen := Round((Bins[BinIdx] / MaxBin) * MaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('  bin %2d  bits~=%8.3f  n=%5d  %s',
+          [BinIdx, BinCenter, Bins[BinIdx], Bar]));
+      end;
+    end;
+    Lines.Add('');
+
+    // Worst-K predicted positions.
+    if (WorstK > 0) and (TotalCount > 0) then
+    begin
+      Lines.Add(Format('Worst-%d predicted positions (highest bits):',
+        [WorstK]));
+      SetLength(worstIdxs, TotalCount);
+      SetLength(worstBits, TotalCount);
+      for t := 0 to TotalCount - 1 do
+      begin
+        worstIdxs[t] := PerTokenIdx[t];
+        worstBits[t] := PerTokenBits[t];
+      end;
+      // Partial selection sort, only WorstK passes.
+      for sortI := 0 to WorstK - 1 do
+      begin
+        for sortJ := sortI + 1 to TotalCount - 1 do
+        begin
+          if worstBits[sortJ] > worstBits[sortI] then
+          begin
+            tmpF := worstBits[sortI];
+            worstBits[sortI] := worstBits[sortJ];
+            worstBits[sortJ] := tmpF;
+            tmpI := worstIdxs[sortI];
+            worstIdxs[sortI] := worstIdxs[sortJ];
+            worstIdxs[sortJ] := tmpI;
+          end;
+        end;
+      end;
+      Lines.Add(Format('  %-5s %-8s %-12s %s',
+        ['rank', 'pos', 'bits', 'token_id  context_window']));
+      for sortI := 0 to WorstK - 1 do
+      begin
+        t := worstIdxs[sortI];
+        ctxStr := '[';
+        for d := 0 to ContextLen - 1 do
+        begin
+          if d > 0 then ctxStr := ctxStr + ',';
+          ctxStr := ctxStr + IntToStr(Tokens[t - ContextLen + d]);
+        end;
+        ctxStr := ctxStr + ']';
+        Lines.Add(Format('  %-5d %-8d %-12.4f %d  %s',
+          [sortI + 1, t, worstBits[sortI], Tokens[t], ctxStr]));
+      end;
+      Lines.Add('');
+    end;
+
+    Result := Lines.Text;
+  finally
+    if Input <> nil then Input.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.PerplexityReport(
+  NN: TNNet;
+  const Tokens: array of integer;
+  ContextLen: integer;
+  WorstK: integer = 5
+): string;
+var
+  Empty: array of integer;
+begin
+  SetLength(Empty, 0);
+  Result := TNNet.PerplexityReport(NN, Tokens, ContextLen, WorstK, Empty);
 end;
 
 function TNNet.GetWeightSum(): TNeuralFloat;

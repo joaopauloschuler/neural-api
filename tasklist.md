@@ -1039,7 +1039,7 @@ breakdown:
       qualitatively; this one quantifies the whole stack and gives a single
       number per layer to track across training runs.
 ### Language-model evaluation
-- [ ] TNNet.PerplexityReport — generic next-token-prediction evaluator that,
+- [X] TNNet.PerplexityReport — generic next-token-prediction evaluator that,
       given a trained sequence model whose final layer is a softmax-family
       head (TNNetSoftMax / TNNetPointwiseSoftMax / TNNetLogSoftMax) over a
       vocabulary of size V and a held-out token stream of length N, reports:
