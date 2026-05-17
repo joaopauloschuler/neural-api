@@ -1123,3 +1123,42 @@ breakdown:
       net (baseline) and (ii) the same architecture after a short training
       run, so reviewers can eyeball how training pushes the spectrum away
       from the init baseline.
+
+### Input-symmetry equivariance
+- [ ] TNNet.EquivarianceReport — given a trained (or freshly-initialised)
+      network and a probe batch, measure how the forward output reacts to
+      a fixed menu of input-side symmetry transforms and report per
+      transform:
+      (a) "invariance error" — `mean ||f(T(x)) - f(x)||_2 / ||f(x)||_2`
+          across the probe batch (zero = the model ignores the transform),
+      (b) "equivariance error" — `mean ||f(T(x)) - T'(f(x))||_2 /
+          ||f(x)||_2` for transforms with a well-defined output-side action
+          `T'` (e.g. horizontal flip of a segmentation map), zero if the
+          model commutes with `T`,
+      (c) per-class top-1 agreement rate `mean(argmax(f(T(x))) ==
+          argmax(f(x)))` for classifier-shaped outputs,
+      (d) a 10-bin ASCII histogram of per-sample invariance error across
+          the probe batch so outliers are visible,
+      (e) a one-line verdict per transform: "invariant" (err < 1e-3),
+          "approximately invariant" (err < 1e-1), "sensitive" (err >= 1e-1).
+      Default transform menu for image-shaped inputs:
+      `TNNetFlipX` (horizontal mirror), `TNNetFlipY` (vertical mirror),
+      `TNNetReverseChannels` (channel permutation), and a 1-pixel
+      `Roll(X=+1)` translation. The menu is configurable via a small
+      `TInputTransform` callback list so non-image domains (sequence
+      shifts, depth permutations) can plug in. Pure forward-only — no
+      training-time changes, no backward pass needed. Distinct from
+      [[GradientNormReport]] (backward magnitudes), [[SaliencyReport]]
+      (per-pixel input attribution for one sample), [[ConfusionMatrixReport]]
+      (label confusions on the untransformed set), and
+      [[LayerSensitivityReport]] (weight-side perturbations, not
+      input-side transforms). Natural unit-test artifact too: pairs of
+      `TNNetFlipX` round-trip to identity, so a freshly-built net wired
+      `Input -> FlipX -> Body -> FlipX` should report ~0 invariance error
+      on the FlipX probe — a built-in correctness check. Companion
+      `examples/EquivarianceReport/` runs it on (i) a plain conv
+      classifier (expected: low FlipX invariance — CNNs are translation-
+      but not flip-equivariant by default) and (ii) the same architecture
+      trained with `TNNetRandomFlipX` augmentation (expected: invariance
+      error collapses), making the augmentation's effect visible as a
+      single number rather than a wall of accuracy digits.
