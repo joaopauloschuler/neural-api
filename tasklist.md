@@ -280,21 +280,11 @@ breakdown:
       derivative guard).
 - [ ] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
       neuron per forward pass during training, fixed at average at inference.
-- [X] TNNetISRU / TNNetISRLU — Inverse-Square-Root (Linear) Unit.
-      `y = x / sqrt(1 + α·x²)`. (Landed: Carlile et al. 2017,
-      arXiv:1710.09967. Both forms, alpha in FFloatSt[0], full
-      gradient-check + non-default-alpha round-trip tests.)
 - [ ] TNNetSoftPlusBeta — generalized SoftPlus with learnable-or-fixed β.
 - [ ] TNNetSoftExponential — `(exp(α·x) - 1)/α + α` for α>0, identity for
       α=0, `-log(1 - α·(x + α))/α` for α<0.
 - [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
       with channel-wise learnable `(p1, p2, β)`. Generalizes Swish.
-- [X] TNNetPhish — published form `y = x · tanh(gelu(x))` (Naveen 2022,
-      arXiv:2208.04458). Reuses TNNetGELU's tanh-approx for the inner
-      GELU and its derivative; caches dy/dx into FOutputErrorDeriv so the
-      backward path is one Mul. (Note: tasklist originally described it
-      as "softplus inside tanh" — that formula is just Mish; the paper
-      uses GELU inside tanh.)
 - [ ] TNNetErf — closed-form GELU partner. Caveat: check FPC math.erf
       portability (or reuse the SerfErf A&S polynomial helper).
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
@@ -309,12 +299,6 @@ breakdown:
       models (distinct from sequence-axis TNNetSinusoidalPositionalEmbedding).
 - [ ] TNNetAPL (Adaptive Piecewise Linear) — sum of hinge functions with
       per-channel learnable knees and slopes.
-- [X] TNNetCenteredSoftmax — softmax preceded by per-sample mean
-      subtraction. Mathematically equivalent to TNNetSoftMax (softmax
-      is shift-invariant) so Backpropagate is inherited; differs only
-      in the numerical-stability profile of the forward exp. Equivalence
-      test pins forward + input-gradient parity to 1e-5.
-
 #### Probability projections / sparsity
 - [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
