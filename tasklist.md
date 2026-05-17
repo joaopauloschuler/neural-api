@@ -1119,6 +1119,38 @@ breakdown:
       hook for TNeuralFit (which is also already on the list — this helper
       provides the shared scanning primitive that guard would call).
 
+### Classifier diagnostics
+- [ ] TNNet.ConfusionMatrixReport — reusable introspection helper that, given
+      a trained classifier, a labeled validation set, and the class-count C,
+      runs a single forward pass over the set and reports:
+      (a) the full CxC confusion matrix as an ASCII table (rows = true class,
+          cols = predicted class), with row sums and a normalized variant
+          (per-row recall) printed underneath;
+      (b) per-class precision, recall, and F1, plus macro- and micro-averaged
+          F1 in one summary row;
+      (c) overall top-1 accuracy and balanced accuracy (mean of per-class
+          recall — different from top-1 when classes are imbalanced);
+      (d) the K most-confused class pairs `(true_i, pred_j, count, recall_loss)`
+          sorted by off-diagonal mass — a ready-made "which classes does the
+          model mix up" pointer for data-cleaning, label-noise, or
+          curriculum work;
+      (e) optional per-class lowest-confidence sample-index list (cap at K)
+          so the report doubles as a hard-example miner.
+      Distinct from [[Model-calibration / reliability-diagram tool]] (which
+      summarises confidence quality across the whole set, ignoring class
+      identity), from [[Top-logit margin report]] (which ranks samples by
+      uncertainty regardless of correctness), and from
+      [[DeadNeuronReport]]/[[AttentionEntropyReport]]/[[GradientNormReport]]
+      (which probe internal state rather than output-vs-label agreement).
+      Pure-CPU, single forward pass, no training-time changes, no new layer
+      types. Companion `examples/ConfusionMatrixReport/` runs it against the
+      SimpleImageClassifier CIFAR-10 baseline so the output format is pinned
+      and easy to eyeball; a tiny smoke test in TestNeuralNumerical.pas (or
+      a sibling test program) pins the per-class precision/recall/F1
+      arithmetic on a hand-built 3-class toy prediction set with known
+      expected values, so a future refactor cannot silently break the
+      reporting math.
+
 ### Language-model evaluation
 - [ ] TNNet.PerplexityReport — generic next-token-prediction evaluator that,
       given a trained sequence model whose final layer is a softmax-family
