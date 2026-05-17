@@ -664,6 +664,24 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Phish activation function: y = x * tanh(gelu(x)).
+  // GELU uses the tanh approximation matching TNNetGELU:
+  //   gelu(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+  // Let g = gelu(x), t = tanh(g). Then
+  //   dy/dx = t + x * (1 - t^2) * dg/dx,
+  // where dg/dx reuses the TNNetGELU derivative
+  //   dg/dx = cdf + 0.5*x*(1 - tanhArg^2)*sqrt(2/pi)*(1 + 3*0.044715*x^2),
+  // with cdf = 0.5*(1 + tanhArg) and tanhArg = tanh(sqrt(2/pi)*(x + 0.044715*x^3)).
+  // Cached into FOutputErrorDeriv so TNNetReLUBase's backward handles the
+  // chain rule with one multiply.
+  // Naveen, "Phish: A Novel Hyper-Optimizable Activation Function" (2022),
+  // https://arxiv.org/abs/2208.04458
+  TNNetPhish = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// TanhExp activation function: y = x * tanh(exp(x)).
   // Derivative: with u = exp(x), t = tanh(u),
   //   dy/dx = t + x * (1 - t^2) * u.
@@ -7067,6 +7085,73 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetPhish }
+
+procedure TNNetPhish.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, x3, tanhArg, tanhVal, cdf, g, t, dg: TNeuralFloat;
+const
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  // Phish(x) = x * tanh(gelu(x)), where gelu uses the tanh approximation.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      x3 := x * x * x;
+      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
+      tanhVal := Tanh(tanhArg);
+      cdf := 0.5 * (1 + tanhVal);
+      g := x * cdf;
+      t := Tanh(g);
+      FOutput.FData[OutputCnt] := x * t;
+      // dg/dx (same as TNNetGELU derivative).
+      dg := cdf + 0.5 * x * (1 - tanhVal * tanhVal) *
+        SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * x * x);
+      FOutputErrorDeriv.FData[OutputCnt] := t + x * (1 - t * t) * dg;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      x3 := x * x * x;
+      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
+      g := 0.5 * x * (1 + Tanh(tanhArg));
+      FOutput.FData[OutputCnt] := x * Tanh(g);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPhish.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     FOutputError.Mul(FOutputErrorDeriv);
@@ -23052,6 +23137,7 @@ begin
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
+      'TNNetPhish' :                Result := TNNetPhish.Create();
       'TNNetSerf' :                 Result := TNNetSerf.Create();
       'TNNetTanhExp' :              Result := TNNetTanhExp.Create();
       'TNNetSmish' :                Result := TNNetSmish.Create();
@@ -23259,6 +23345,7 @@ begin
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
+      if S[0] = 'TNNetPhish' then Result := TNNetPhish.Create() else
       if S[0] = 'TNNetSerf' then Result := TNNetSerf.Create() else
       if S[0] = 'TNNetTanhExp' then Result := TNNetTanhExp.Create() else
       if S[0] = 'TNNetSmish' then Result := TNNetSmish.Create() else

@@ -358,6 +358,8 @@ type
     procedure TestTanhExpSerializationRoundTrip;
     procedure TestSmishGradientCheck;
     procedure TestSmishSerializationRoundTrip;
+    procedure TestPhishGradientCheck;
+    procedure TestPhishSerializationRoundTrip;
     procedure TestPenalizedTanhAsymmetry;
     procedure TestPenalizedTanhGradientCheck;
     procedure TestPenalizedTanhSerializationRoundTrip;
@@ -10084,6 +10086,18 @@ procedure TTestNeuralNumerical.TestSmishSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSmish.Create(),
     'Smish', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPhishGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetPhish.Create(), 'Phish',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestPhishSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetPhish.Create(),
+    'Phish', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPenalizedTanhAsymmetry;
