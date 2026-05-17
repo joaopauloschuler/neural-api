@@ -1261,3 +1261,56 @@ breakdown:
       seed is supplied — prints the linear-interpolation barrier so
       reviewers can eyeball whether two trained models live in the
       same basin.
+
+### Per-layer representation quality
+- [ ] TNNet.LinearProbeReport — given a trained (or freshly-initialised)
+      classifier, a probe batch with labels, and an optional held-out
+      validation batch, train a one-epoch closed-form linear probe
+      (regularised least-squares: `W = (X^T X + lambda*I)^-1 X^T Y`,
+      default lambda=1e-2) on top of *every* intermediate layer's flat
+      activation tensor and report per layer:
+      (a) top-1 linear-probe accuracy on the probe batch,
+      (b) top-1 linear-probe accuracy on the held-out batch (if supplied)
+          — the gap flags probes that overfit the probe set vs probes
+          riding a genuinely linear-separable representation,
+      (c) mean squared error of the probe's one-hot regression target —
+          a smoother per-layer signal than top-1 accuracy,
+      (d) the per-layer probe accuracy delta `acc[k] - acc[k-1]` so the
+          layer that contributes the largest single jump in linear
+          separability is visible at a glance (the "where does the model
+          actually become a classifier?" question),
+      (e) a 10-bin ASCII bar chart of per-layer probe accuracy across the
+          network so the saturation point (after which deeper layers stop
+          adding linear separability) is visible,
+      (f) per-layer flags: "representation collapse" (probe accuracy
+          drops by more than 5 points vs the previous layer — a sign the
+          layer is destroying class-relevant structure), "saturation
+          point" (the shallowest layer within 1 point of the final
+          layer's probe accuracy — natural feature-extractor cut point
+          for transfer learning / distillation), and "near-random"
+          (probe accuracy within 5 points of `1/NumClasses` — a layer
+          whose features the linear probe can't exploit at all).
+      Pure forward-only on the network — no training-time changes to the
+      backbone, no backward pass through the network needed; the probe
+      itself is closed-form, so no SGD loop either. Distinct from
+      [[NeuronCorrelationReport]] (intra-layer redundancy of activations
+      — answers "how many independent directions is this layer using?",
+      not "how useful are those directions for the label?"),
+      [[ActivationStatsReport]] (marginal activation distribution, no
+      label involved — a layer can have healthy mean/std and still be
+      label-uninformative), [[WeightSpectrumReport]] (geometry of the
+      weight matrix, not the realised representation evaluated against a
+      target), [[LayerSensitivityReport]] (weight-perturbation impact on
+      the model's *own* output, not the layer's representation quality
+      against a fresh linear head), and [[SaliencyReport]] (per-pixel
+      input attribution for one sample, not per-layer representation
+      quality across a batch). The output is the natural input for any
+      future "where to cut for a feature extractor", "which layer to
+      attach an auxiliary head to", or "which layer's representation to
+      distill from" decision. Companion `examples/LinearProbeReport/`
+      runs it on (i) a freshly-initialised CIFAR conv stack (expected:
+      probe accuracy hovers near random at every depth) and (ii) the
+      same architecture after a short training run (expected: a
+      monotone-ish climb with a visible saturation knee a few layers
+      before the head), so reviewers can eyeball how training reshapes
+      per-layer linear separability.
