@@ -1613,6 +1613,38 @@ type
     procedure Compute(); override;
   end;
 
+  { TNNetSinusoidalTimeEmbedding }
+  // Scalar-timestep sinusoidal encoder for diffusion models
+  // (Ho et al. 2020, DDPM, https://arxiv.org/abs/2006.11239).
+  // Distinct from TNNetSinusoidalPositionalEmbedding (which is the additive
+  // sequence-axis Vaswani encoding): this layer consumes a SINGLE scalar
+  // timestep t (stored in a 1x1x1 input volume) and PRODUCES an embedding
+  // vector of length D in a 1x1xD output volume:
+  //   half = D div 2
+  //   for i in 0..half-1:
+  //     freq[i]      = exp(-ln(MaxPeriod) * i / half)   // MaxPeriod default 10000
+  //     emb[i]       = sin(t * freq[i])
+  //     emb[half+i]  = cos(t * freq[i])
+  // D must be even. EmbeddingSize and MaxPeriod are stored in FStruct[0]/[1]
+  // so SaveToString/LoadFromString round-trip. The output is deterministic
+  // given t; there are NO learnable parameters. Backpropagate is a no-op:
+  // the gradient w.r.t. the input scalar t is mathematically defined but is
+  // not propagated in this v1 (timestep is typically a fixed integer index
+  // in diffusion pipelines and no upstream signal needs the derivative).
+  TNNetSinusoidalTimeEmbedding = class(TNNetLayer)
+  private
+    FEmbeddingSize: integer;
+    FMaxPeriod: integer;
+    FFreq: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(EmbeddingSize: integer; MaxPeriod: integer = 10000);
+    destructor Destroy(); override;
+
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   { TNNetEmbedding }
   TNNetEmbedding = class(TNNetLayer)
   private
@@ -4395,6 +4427,86 @@ begin
   // from TNNetIdentity, which simply passes the gradient through (no params).
   inherited Compute;
   FOutput.Add(FPositionalEmbedding);
+end;
+
+{ TNNetSinusoidalTimeEmbedding }
+
+constructor TNNetSinusoidalTimeEmbedding.Create(EmbeddingSize: integer;
+  MaxPeriod: integer = 10000);
+begin
+  inherited Create();
+  if (EmbeddingSize <= 0) or ((EmbeddingSize mod 2) <> 0) then
+    FErrorProc('TNNetSinusoidalTimeEmbedding EmbeddingSize must be positive and even. Got: ' +
+      IntToStr(EmbeddingSize));
+  if MaxPeriod <= 1 then
+    FErrorProc('TNNetSinusoidalTimeEmbedding MaxPeriod must be > 1. Got: ' +
+      IntToStr(MaxPeriod));
+  FEmbeddingSize := EmbeddingSize;
+  FMaxPeriod := MaxPeriod;
+  FStruct[0] := EmbeddingSize;
+  FStruct[1] := MaxPeriod;
+  FOutput.ReSize(1, 1, EmbeddingSize);
+  FOutputError.ReSize(1, 1, EmbeddingSize);
+  FOutputErrorDeriv.ReSize(1, 1, EmbeddingSize);
+  FFreq := TNNetVolume.Create(1, 1, EmbeddingSize div 2);
+end;
+
+destructor TNNetSinusoidalTimeEmbedding.Destroy();
+begin
+  FFreq.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetSinusoidalTimeEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  i, Half: integer;
+  LogMax: TNeuralFloat;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Output is always 1 x 1 x EmbeddingSize regardless of upstream shape;
+  // we only consume a single scalar (FPrevLayer.Output.Raw[0]) as t.
+  FOutput.ReSize(1, 1, FEmbeddingSize);
+  FOutputError.ReSize(1, 1, FEmbeddingSize);
+  FOutputErrorDeriv.ReSize(1, 1, FEmbeddingSize);
+  // Precompute the frequency table once:
+  //   freq[i] = exp(-ln(MaxPeriod) * i / half)  for i in 0..half-1.
+  Half := FEmbeddingSize div 2;
+  LogMax := Ln(FMaxPeriod);
+  for i := 0 to Half - 1 do
+    FFreq.Raw[i] := Exp(-LogMax * i / Half);
+end;
+
+procedure TNNetSinusoidalTimeEmbedding.Compute();
+var
+  i, Half: integer;
+  t, Angle: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  t := FPrevLayer.Output.Raw[0];
+  Half := FEmbeddingSize div 2;
+  for i := 0 to Half - 1 do
+  begin
+    Angle := t * FFreq.Raw[i];
+    FOutput.Raw[i] := Sin(Angle);
+    FOutput.Raw[Half + i] := Cos(Angle);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSinusoidalTimeEmbedding.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // No learnable parameters and no input-gradient propagation in v1:
+  // timestep t is a fixed integer index in standard diffusion training
+  // (Ho et al. 2020), so no upstream signal needs d(emb)/dt.
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetTransposeYD }
@@ -23720,6 +23832,7 @@ begin
       'TNNetAddAndDiv'             :Result := TNNetAddAndDiv.Create(St[0], St[1]);
       'TNNetAddPositionalEmbedding':Result := TNNetAddPositionalEmbedding.Create(St[0]);
       'TNNetSinusoidalPositionalEmbedding': Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]);
+      'TNNetSinusoidalTimeEmbedding': Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1]);
       'TNNetEmbedding':             Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetTokenAndPositionalEmbedding':Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]);
     else
@@ -23933,6 +24046,7 @@ begin
       if S[0] = 'TNNetAddAndDiv' then Result := TNNetAddAndDiv.Create(St[0], St[1]) else
       if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
       if S[0] = 'TNNetSinusoidalPositionalEmbedding' then Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]) else
+      if S[0] = 'TNNetSinusoidalTimeEmbedding' then Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1]) else
       if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetTokenAndPositionalEmbedding' then Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]) else
       raise Exception.create(strData + ' not allowed in CreateLayer.');

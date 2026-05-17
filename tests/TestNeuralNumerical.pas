@@ -208,6 +208,8 @@ type
     procedure TestSinusoidalPositionalEmbeddingForward;
     procedure TestSinusoidalPositionalEmbeddingGradientCheck;
     procedure TestSinusoidalPositionalEmbeddingSerializationRoundTrip;
+    procedure TestSinusoidalTimeEmbeddingForward;
+    procedure TestSinusoidalTimeEmbeddingSerializationRoundTrip;
     procedure TestScaledDotProductAttentionForward;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
@@ -5610,6 +5612,99 @@ begin
   // the analytical input gradient to ~1e-2.
   LayerInputGradientCheck(Self, TNNetSinusoidalPositionalEmbedding.Create(10000.0),
     'SinusoidalPositionalEmbedding', 3, 1, 4, 0.01);
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetSinusoidalTimeEmbedding: scalar-timestep -> sin/cos embedding vector,
+// per Ho et al. 2020 (DDPM). Forward test verifies:
+//   t=0 -> sin half = 0, cos half = 1.
+//   t=5 -> matches the closed-form freq[i] = exp(-ln(MaxPeriod)*i/half).
+// ---------------------------------------------------------------------------
+procedure TTestNeuralNumerical.TestSinusoidalTimeEmbeddingForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  D, Half, i: integer;
+  MaxPeriod: integer;
+  LogMax, Freq, Angle, t: TNeuralFloat;
+begin
+  D := 8;
+  Half := D div 2;
+  MaxPeriod := 10000;
+  LogMax := Ln(MaxPeriod);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NN.AddLayer(TNNetSinusoidalTimeEmbedding.Create(D, MaxPeriod));
+
+    // t = 0 -> first Half entries are sin(0)=0, last Half are cos(0)=1.
+    Input.Raw[0] := 0.0;
+    NN.Compute(Input);
+    AssertEquals('TimeEmb output size', D, NN.GetLastLayer.Output.Size);
+    for i := 0 to Half - 1 do
+      AssertEquals('TimeEmb t=0 sin[' + IntToStr(i) + '] must be 0',
+        0.0, NN.GetLastLayer.Output.Raw[i], 1e-6);
+    for i := 0 to Half - 1 do
+      AssertEquals('TimeEmb t=0 cos[' + IntToStr(i) + '] must be 1',
+        1.0, NN.GetLastLayer.Output.Raw[Half + i], 1e-6);
+
+    // t = 5 -> match closed-form sin/cos against precomputed freqs.
+    t := 5.0;
+    Input.Raw[0] := t;
+    NN.Compute(Input);
+    for i := 0 to Half - 1 do
+    begin
+      Freq := Exp(-LogMax * i / Half);
+      Angle := t * Freq;
+      AssertEquals('TimeEmb t=5 sin[' + IntToStr(i) + ']',
+        Sin(Angle), NN.GetLastLayer.Output.Raw[i], 1e-5);
+      AssertEquals('TimeEmb t=5 cos[' + IntToStr(i) + ']',
+        Cos(Angle), NN.GetLastLayer.Output.Raw[Half + i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinusoidalTimeEmbeddingSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  D, i: integer;
+begin
+  // Non-default MaxPeriod=1000 to confirm both FStruct[0] (EmbeddingSize)
+  // and FStruct[1] (MaxPeriod) survive Save/Load.
+  D := 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NN.AddLayer(TNNetSinusoidalTimeEmbedding.Create(D, 1000));
+    Input.Raw[0] := 3.0;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      AssertEquals('TimeEmb round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      AssertEquals('TimeEmb round-trip output size = D', D, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('TimeEmb round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestScaledDotProductAttentionForward;
