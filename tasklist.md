@@ -538,9 +538,9 @@ breakdown:
       ships, weight-gradient path looks like the kind of place a silent
       bug could live.
 - [ ] TNNetLocalConnect / TNNetDeLocalConnect input + weight gradient tests.
-- [ ] TNNetMinPool / TNNetMinChannel numerical-gradient tests — coverage
+- [X] TNNetMinPool / TNNetMinChannel numerical-gradient tests — coverage
       gap from before the pooling audit.
-- [ ] TNNetMaxChannel numerical-gradient test (sibling of AvgChannel).
+- [X] TNNetMaxChannel numerical-gradient test (sibling of AvgChannel).
 - [ ] Kink-region test parametric helper: with Clamp / HardShrink /
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
       "no-central-difference, hand-picked kink convention" pattern

@@ -26,6 +26,8 @@ type
     procedure TestAvgPoolNumericalPrecision;
     procedure TestMinPoolWithNegatives;
     procedure TestPoolingWithOddDimensions;
+    procedure TestMinChannelGradientCheck;
+    procedure TestMaxChannelGradientCheck;
     
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -3484,6 +3486,25 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestMinChannelGradientCheck;
+begin
+  // TNNetMinChannel reduces (X,Y) per channel to a single min value;
+  // gradient routes to the unique argmin per channel. The default Sin-seeded
+  // inputs produce strictly unique values across each channel's (X,Y)
+  // positions for this small 4x4x3 shape, so argmin is unambiguous.
+  LayerInputGradientCheck(Self, TNNetMinChannel.Create(),
+    'MinChannel', 4, 4, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestMaxChannelGradientCheck;
+begin
+  // TNNetMaxChannel reduces (X,Y) per channel to a single max value;
+  // gradient routes to the unique argmax per channel. Same Sin-seeded
+  // input as MinChannel - no ties for a 4x4x3 volume.
+  LayerInputGradientCheck(Self, TNNetMaxChannel.Create(),
+    'MaxChannel', 4, 4, 3, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestZScoreGradientCheck;
