@@ -3253,6 +3253,24 @@ type
         DeadEpsilon: TNeuralFloat = 0.05;
         SpikeThreshold: TNeuralFloat = 0.1
       ): string;
+      // Forward-pass FLOP estimator. Walks every layer and reports estimated
+      // multiply-add count (1 FLOP per scalar op; a mul+add counts as 2) for
+      // a single sample, plus a network total. Covers precisely:
+      //   FullConnect*       : 2 * In * Out (+ Out activation for non-linear)
+      //   Convolution* / PointwiseConv*
+      //                      : 2 * Hout * Wout * Dout * (Fy * Fx * Din)
+      //   DepthwiseConv*     : 2 * Hout * Wout * Dout * Fy * Fx
+      //   Pool / Channel pool: ~InputCount (compare or add per element)
+      //   Elementwise act    : Output.Size (4x for exp/tanh-family)
+      //   LayerNorm / RMSNorm / *StdNorm / MovingStd
+      //                      : ~3 * Output.Size
+      //   Dropout / Identity / Pad / Reshape / Split / Concat / Embedding
+      //                      : 0
+      //   ScaledDotProductAttention
+      //                      : ~4 * SeqLen^2 * d_k (QK^T + softmax + PV)
+      // Classes not modelled are counted 0 and tallied as "uncovered" so
+      // the report flags coverage gaps. Pure static walk; no forward pass.
+      class function CountFLOPsPerLayer(NN: TNNet): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -20744,6 +20762,174 @@ begin
       'Totals: %d SDPA layer(s) reported. dead = H within %g of log(K) ' +
       '(uniform attention); spike = H < %g (peaked on one key).',
       [Reported, DeadEpsilon, SpikeThreshold]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.CountFLOPsPerLayer(NN: TNNet): string;
+var
+  Lines: TStringList;
+  PerLayer: array of Int64;
+  CoveredArr: array of boolean;
+  LayerIdx: integer;
+  Layer, Prev: TNNetLayer;
+  ShapeStr: string;
+  LayerFLOPs, TotalFLOPs: Int64;
+  Uncovered, OutSize, InSize, InDepth: integer;
+  Fy, Fx, OX, OY, OD, SeqLen, Dk: integer;
+  Conv: TNNetConvolutionAbstract;
+  Pool: TNNetPoolBase;
+  Pct: TNeuralFloat;
+  Covered: boolean;
+  NumLayers: integer;
+begin
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'CountFLOPsPerLayer: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+
+    NumLayers := NN.CountLayers();
+    SetLength(PerLayer, NumLayers);
+    SetLength(CoveredArr, NumLayers);
+    TotalFLOPs := 0;
+    Uncovered := 0;
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      Prev := Layer.PrevLayer;
+      LayerFLOPs := 0;
+      Covered := True;
+      OutSize := Layer.Output.Size;
+      if Prev <> nil then
+      begin
+        InSize := Prev.Output.Size;
+        InDepth := Prev.Output.Depth;
+      end
+      else
+      begin
+        InSize := 0;
+        InDepth := 0;
+      end;
+
+      if (Layer is TNNetInputBase) then
+        LayerFLOPs := 0
+      else if (Layer is TNNetConvolutionAbstract) then
+      begin
+        Conv := TNNetConvolutionAbstract(Layer);
+        Fy := Conv.FFeatureSizeY;
+        Fx := Conv.FFeatureSizeX;
+        OX := Layer.Output.SizeX;
+        OY := Layer.Output.SizeY;
+        OD := Layer.Output.Depth;
+        if Layer is TNNetDepthwiseConv then
+          LayerFLOPs := Int64(2) * OX * OY * OD * Fy * Fx
+        else
+          LayerFLOPs := Int64(2) * OX * OY * OD * Fy * Fx * InDepth;
+        // Activation cost for non-linear convolutional variants.
+        if (Layer is TNNetConvolutionReLU) or
+           (Layer is TNNetPointwiseConvReLU) or
+           (Layer is TNNetDepthwiseConvReLU) then
+          LayerFLOPs := LayerFLOPs + OutSize
+        else if (Layer is TNNetConvolutionSwish) or
+                (Layer is TNNetConvolutionHardSwish) then
+          LayerFLOPs := LayerFLOPs + Int64(4) * OutSize
+        else if Layer.ClassNameIs('TNNetConvolution') then
+          // Plain TNNetConvolution uses tanh.
+          LayerFLOPs := LayerFLOPs + Int64(4) * OutSize;
+      end
+      else if (Layer is TNNetFullConnect) then
+      begin
+        LayerFLOPs := Int64(2) * InSize * OutSize;
+        if (Layer is TNNetFullConnectReLU) then
+          LayerFLOPs := LayerFLOPs + OutSize
+        else if (Layer is TNNetFullConnectSigmoid) then
+          LayerFLOPs := LayerFLOPs + Int64(4) * OutSize
+        else if Layer.ClassNameIs('TNNetFullConnect') then
+          LayerFLOPs := LayerFLOPs + Int64(4) * OutSize;
+      end
+      else if (Layer is TNNetScaledDotProductAttention) then
+      begin
+        Dk := TNNetScaledDotProductAttention(Layer).Dk;
+        if Prev <> nil then
+          SeqLen := Prev.Output.SizeX
+        else
+          SeqLen := Layer.Output.SizeX;
+        // QK^T (2*S*S*d_k) + softmax (~5*S*S) + PV (2*S*S*d_k).
+        LayerFLOPs := Int64(4) * SeqLen * SeqLen * Dk +
+          Int64(5) * SeqLen * SeqLen;
+      end
+      else if (Layer is TNNetPoolBase) then
+      begin
+        Pool := TNNetPoolBase(Layer);
+        LayerFLOPs := Int64(Layer.Output.SizeX) * Layer.Output.SizeY *
+          Layer.Output.Depth * Pool.FPoolSize * Pool.FPoolSize;
+      end
+      else if (Layer is TNNetMaxChannel) or (Layer is TNNetAvgChannel) then
+        LayerFLOPs := InSize
+      else if (Layer is TNNetEmbedding) then
+        LayerFLOPs := 0
+      else if (Layer is TNNetDropout) then
+        LayerFLOPs := OutSize
+      else if (Layer is TNNetLayerNorm) or (Layer is TNNetRMSNorm) or
+              (Layer is TNNetChannelStdNormalization) or
+              (Layer is TNNetMovingStdNormalization) then
+        LayerFLOPs := Int64(3) * OutSize
+      else if (Layer is TNNetReLUBase) or (Layer is TNNetSigmoid) then
+      begin
+        if (Layer is TNNetSwish) or (Layer is TNNetGELU) or
+           (Layer is TNNetSigmoid) or (Layer is TNNetTanhExp) then
+          LayerFLOPs := Int64(4) * OutSize
+        else
+          LayerFLOPs := OutSize;
+      end
+      else if (Layer is TNNetPointwiseSoftMax) or
+              (Layer is TNNetLogSoftMax) then
+        // exp + per-element divide (or subtract for log-softmax) ~ 5 ops/elt.
+        LayerFLOPs := Int64(5) * OutSize
+      else if (Layer is TNNetPad) or (Layer is TNNetPadXY) or
+              (Layer is TNNetReshape) or
+              (Layer is TNNetConcatBase) or
+              (Layer is TNNetSplitChannels) then
+        LayerFLOPs := 0
+      else if (Layer is TNNetIdentity) then
+        LayerFLOPs := 0
+      else
+      begin
+        Covered := False;
+        LayerFLOPs := 0;
+      end;
+
+      PerLayer[LayerIdx] := LayerFLOPs;
+      CoveredArr[LayerIdx] := Covered;
+      if not Covered then Inc(Uncovered);
+      TotalFLOPs := TotalFLOPs + LayerFLOPs;
+    end;
+
+    Lines.Add(Format('%-5s %-34s %-18s %14s %10s',
+      ['Idx', 'Class', 'OutShape', 'FLOPs', '% total']));
+    Lines.Add(StringOfChar('-', 86));
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      if TotalFLOPs > 0 then
+        Pct := (PerLayer[LayerIdx] / TotalFLOPs) * 100.0
+      else
+        Pct := 0;
+      Lines.Add(Format('%-5d %-34s %-18s %14d %9.1f%%',
+        [LayerIdx, Layer.ClassName, ShapeStr, PerLayer[LayerIdx], Pct]));
+    end;
+    Lines.Add(StringOfChar('-', 86));
+    Lines.Add(Format('TOTAL FLOPs: %d   (uncovered classes: %d)',
+      [TotalFLOPs, Uncovered]));
 
     Result := Lines.Text;
   finally
