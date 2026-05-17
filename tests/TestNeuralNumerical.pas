@@ -97,6 +97,9 @@ type
     procedure TestSparsemaxSumToOne;
     procedure TestSparsemaxGradientCheck;
     procedure TestSparsemaxSerializationRoundTrip;
+    procedure TestCenteredSoftmaxGradientCheck;
+    procedure TestCenteredSoftmaxEquivalence;
+    procedure TestCenteredSoftmaxSerializationRoundTrip;
     procedure TestPReLUForward;
     procedure TestPReLUGradientCheck;
     procedure TestPReLUWeightGradientCheck;
@@ -11576,6 +11579,142 @@ procedure TTestNeuralNumerical.TestSparsemaxSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetSparsemax.Create(),
     'Sparsemax', 3, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestCenteredSoftmaxGradientCheck;
+// Central-difference input gradient check on a (2, 2, 3) input.
+// TNNetCenteredSoftmax is mathematically identical to TNNetSoftMax
+// (softmax is shift-invariant), so the full softmax Jacobian should
+// match the numerical gradient to within a tight tolerance.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  InputPlus := TNNetVolume.Create(2, 2, 3);
+  Desired := TNNetVolume.Create(2, 2, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetCenteredSoftmax.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    RandSeed := 31337;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 + 0.05 * Sin(i * 0.9);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('CenteredSoftmax input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(analyticalGrad - numericalGrad) < 1e-4);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCenteredSoftmaxEquivalence;
+// Headline correctness: TNNetCenteredSoftmax must match TNNetSoftMax
+// pointwise (forward output AND input gradient) for arbitrary inputs,
+// because softmax is shift-invariant under per-sample mean subtraction.
+var
+  NNSoft, NNCent: TNNet;
+  Input, Desired: TNNetVolume;
+  i, trial: integer;
+begin
+  NNSoft := TNNet.Create();
+  NNCent := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  Desired := TNNetVolume.Create(3, 2, 4);
+  try
+    NNSoft.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    NNSoft.AddLayer(TNNetSoftMax.Create());
+    NNSoft.SetLearningRate(1.0, 0.0);
+    NNSoft.SetBatchUpdate(true);
+
+    NNCent.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    NNCent.AddLayer(TNNetCenteredSoftmax.Create());
+    NNCent.SetLearningRate(1.0, 0.0);
+    NNCent.SetBatchUpdate(true);
+
+    RandSeed := 7919;
+    for trial := 0 to 4 do
+    begin
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := (Random - 0.5) * 6.0 + trial * 1.5;
+      for i := 0 to Desired.Size - 1 do
+        Desired.Raw[i] := Random * 0.3;
+
+      NNSoft.Compute(Input);
+      NNCent.Compute(Input);
+
+      for i := 0 to NNSoft.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CenteredSoftmax forward equals SoftMax at trial ' +
+          IntToStr(trial) + ' pos ' + IntToStr(i),
+          NNSoft.GetLastLayer.Output.Raw[i],
+          NNCent.GetLastLayer.Output.Raw[i], 1e-5);
+
+      NNSoft.Layers[0].OutputError.Fill(0);
+      NNCent.Layers[0].OutputError.Fill(0);
+      NNSoft.Backpropagate(Desired);
+      NNCent.Backpropagate(Desired);
+
+      for i := 0 to NNSoft.Layers[0].OutputError.Size - 1 do
+        AssertEquals('CenteredSoftmax input grad equals SoftMax at trial ' +
+          IntToStr(trial) + ' pos ' + IntToStr(i),
+          NNSoft.Layers[0].OutputError.Raw[i],
+          NNCent.Layers[0].OutputError.Raw[i], 1e-5);
+    end;
+  finally
+    NNSoft.Free;
+    NNCent.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCenteredSoftmaxSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetCenteredSoftmax.Create(),
+    'CenteredSoftmax', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPReLUForward;

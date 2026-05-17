@@ -2546,6 +2546,19 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Softmax preceded by per-sample mean subtraction:
+  ///   x' = x - mean(x), y = softmax(x').
+  /// Because softmax is shift-invariant, this layer is mathematically
+  /// identical to TNNetSoftMax (same forward output, same input gradient).
+  /// The mean-subtraction pre-step exists only to offer an alternative
+  /// numerical-stability profile (TNNetSoftMax subtracts the per-sample
+  /// max; this variant subtracts the per-sample mean). Normalization scope
+  /// matches TNNetSoftMax: the whole volume per sample.
+  TNNetCenteredSoftmax = class(TNNetSoftMax)
+    public
+      procedure Compute(); override;
+  end;
+
   /// Softmax with a configurable temperature T: y = softmax(x / T).
   /// T is stored in FFloatSt[0]. Useful for sampling demos.
   TNNetSoftmaxTemperature = class(TNNetSoftMax)
@@ -17928,6 +17941,25 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetCenteredSoftmax }
+procedure TNNetCenteredSoftmax.Compute;
+var
+  StartTime: double;
+  Mean: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Copy input, subtract per-sample mean (mean over the whole volume,
+  // matching the softmax normalization scope), then run the standard
+  // softmax. Backpropagate is inherited from TNNetSoftMax: softmax is
+  // shift-invariant, so the gradient w.r.t. x is identical to the
+  // gradient w.r.t. (x - mean(x)).
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Mean := FOutput.GetAvg();
+  if Mean <> 0 then FOutput.Sub(Mean);
+  FSoftTotalSum := FOutput.SoftMax();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetSoftMin }
 procedure TNNetSoftMin.Compute;
 var
@@ -23382,6 +23414,7 @@ begin
       'TNNetSoftMin' :              Result := TNNetSoftMin.Create(St[0]);
       'TNNetSoftMaxOne' :           Result := TNNetSoftMaxOne.Create();
       'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
+      'TNNetCenteredSoftmax' :      Result := TNNetCenteredSoftmax.Create();
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
       'TNNetTopK' :                 Result := TNNetTopK.Create(St[0]);
@@ -23592,6 +23625,7 @@ begin
       if S[0] = 'TNNetSoftMin' then Result := TNNetSoftMin.Create(St[0]) else
       if S[0] = 'TNNetSoftMaxOne' then Result := TNNetSoftMaxOne.Create() else
       if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
+      if S[0] = 'TNNetCenteredSoftmax' then Result := TNNetCenteredSoftmax.Create() else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
       if S[0] = 'TNNetTopK' then Result := TNNetTopK.Create(St[0]) else
