@@ -3001,6 +3001,8 @@ type
       function CountLayers(): integer;
       function CountNeurons(): integer;
       function CountWeights(): integer;
+      function SummaryString(): string;
+      procedure PrintSummary();
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -18965,6 +18967,50 @@ begin
       Result := Result + FLayers[LayerCnt].CountWeights();
     end;
   end;
+end;
+
+function TNNet.SummaryString(): string;
+var
+  LayerCnt: integer;
+  Layer: TNNetLayer;
+  ShapeStr, IdxStr, NameStr, ParamStr, NeuronStr: string;
+  Lines: TStringList;
+  TotalW, TotalN: integer;
+begin
+  Lines := TStringList.Create();
+  try
+    Lines.Add(Format('%-5s %-32s %-22s %12s %12s',
+      ['Idx', 'Layer', 'Output Shape', 'Params', 'Neurons']));
+    Lines.Add(StringOfChar('-', 87));
+    if FLayers.Count > 0 then
+    begin
+      for LayerCnt := 0 to GetLastLayerIdx() do
+      begin
+        Layer := FLayers[LayerCnt];
+        IdxStr := IntToStr(LayerCnt);
+        NameStr := Layer.ClassName;
+        ShapeStr := Format('(%d, %d, %d)',
+          [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+        ParamStr := IntToStr(Layer.CountWeights());
+        NeuronStr := IntToStr(Layer.CountNeurons());
+        Lines.Add(Format('%-5s %-32s %-22s %12s %12s',
+          [IdxStr, NameStr, ShapeStr, ParamStr, NeuronStr]));
+      end;
+    end;
+    Lines.Add(StringOfChar('-', 87));
+    TotalW := CountWeights();
+    TotalN := CountNeurons();
+    Lines.Add(Format('Totals: %d layers, %d weights, %d neurons',
+      [CountLayers(), TotalW, TotalN]));
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TNNet.PrintSummary();
+begin
+  WriteLn(SummaryString());
 end;
 
 function TNNet.GetWeightSum(): TNeuralFloat;

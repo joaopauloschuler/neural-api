@@ -71,6 +71,9 @@ type
     procedure TestResNetBlock;
     procedure TestDenseNetBlock;
     procedure TestMobileNetBlock;
+
+    // Introspection
+    procedure TestPrintSummary;
   end;
 
 implementation
@@ -1002,6 +1005,39 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestPrintSummary;
+var
+  NN: TNNet;
+  S: string;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+
+    S := NN.SummaryString();
+
+    AssertTrue('SummaryString should not be empty', Length(S) > 0);
+    AssertTrue('Summary should contain TNNetInput', Pos('TNNetInput', S) > 0);
+    AssertTrue('Summary should contain TNNetConvolutionReLU',
+      Pos('TNNetConvolutionReLU', S) > 0);
+    AssertTrue('Summary should contain TNNetMaxPool', Pos('TNNetMaxPool', S) > 0);
+    AssertTrue('Summary should contain TNNetFullConnectReLU',
+      Pos('TNNetFullConnectReLU', S) > 0);
+    AssertTrue('Summary should contain totals line', Pos('Totals:', S) > 0);
+    AssertTrue('Summary totals should mention layers',
+      Pos('layers', S) > 0);
+    AssertTrue('Summary totals should mention weights',
+      Pos('weights', S) > 0);
+    AssertTrue('Summary totals should mention neurons',
+      Pos('neurons', S) > 0);
+  finally
+    NN.Free;
   end;
 end;
 
