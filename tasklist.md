@@ -596,7 +596,7 @@ breakdown:
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm.
 - [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
       on a fixed toy dataset with a loss-vs-epoch table.
-- [ ] `examples/CharTokenizer/` — minimal in-memory char tokenizer +
+- [x] `examples/CharTokenizer/` — minimal in-memory char tokenizer +
       trainable embedding lookup, with a nearest-neighbor printout
       ("nearest 5 chars to 'q'").
 - [ ] `examples/EmbeddingHeadDemo/` — train a small net to learn an
