@@ -48,7 +48,6 @@ rather than acted on.
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 
 ## Infrastructure / dev experience
-- [ ] Benchmark suite reporting throughput per layer type across AVX/AVX2/AVX512/OpenCL
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] Model zoo loader that pulls pre-trained weights from the companion repo
@@ -281,13 +280,11 @@ breakdown:
 - [ ] TNNetAffineBlock — once TNNetMul lands, `Mul → Bias` builder for a
       learnable per-channel affine transform separable from FullConnect.
 
-### Layers I'd enjoy authoring (still absent from the dispatch)
-
 #### Attention / sequence
 - [ ] TNNetCausalConv1D — 1D conv with left-only padding so output at
       position t depends only on positions ≤ t. Backward is the standard
       conv backward minus the masked-future part. Pairs with TNNetTokenShift
-      and unblocks attention-free baseline experiments.
+      and unblocks attention-free baseline experiments. (Already possible with existing layers?)
 - [ ] TNNetMaskedMean / TNNetMaskedMax — pooling over a variable-length
       sequence with a {0,1} mask supplied as an extra depth channel.
       Replaces the "pad with zeros and hope average is small" workaround.
