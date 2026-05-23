@@ -35,7 +35,9 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] Sparse / mixture-of-experts routing layer
+<!-- (Sparse / mixture-of-experts routing layer removed: duplicate of the
+     concrete TNNetMixtureOfExperts entry under "Probability projections /
+     sparsity".) -->
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
@@ -365,6 +367,45 @@ breakdown:
 - [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
+- [ ] TNNet.ReceptiveFieldReport — a purely *analytical* (no probe batch,
+      no forward, no backward) walk of the layer stack that propagates the
+      standard receptive-field recurrence through every spatial layer
+      (Convolution / Deconvolution / Pool family / Padding / Upsample /
+      Stride-bearing layers) and reports per layer:
+      (a) cumulative receptive-field size `r_k` on the input plane
+          (`r_k = r_{k-1} + (kernel-1) * jump_{k-1}`),
+      (b) cumulative jump / effective stride `jump_k = jump_{k-1} * stride_k`
+          (how many input pixels one step of this layer's output moves),
+      (c) the start offset / center of the first output unit
+          (`start_k = start_{k-1} + ((kernel-1)/2 - padding) * jump_{k-1}`),
+      (d) the fraction of the input plane a single deepest-layer output
+          unit can see (`r_final / InputSize`, flagged ">100%" once the RF
+          exceeds the input — the "already global" point), and
+      (e) a flag list: the shallowest layer whose RF first covers the whole
+          input (the natural "the rest is global mixing" cut point) and any
+          layer whose RF stops growing (all-1x1 / pointwise tail).
+      Tracks X and Y independently so rectangular kernels/strides are
+      handled. Pure structural metadata read off each layer's existing
+      kernel/stride/padding fields — finishes instantly, needs no data and
+      no trained weights. Distinct from [[SaliencyReport]] (gradient-based
+      *learned* per-pixel input attribution for one sample and one class —
+      a property of the trained weights), from the empirical effective-RF
+      idea (which would measure the Gaussian-like spread of an actual
+      output-unit gradient over random inputs; this analytical version is
+      the theoretical upper bound and needs neither weights nor a batch),
+      from [[FLOPsReport]] / [[MemoryFootprintReport]] (cost accounting, not
+      spatial reach), and from [[EquivarianceReport]] (output response to
+      input transforms, not the geometric extent of influence). The output
+      is the natural design-time companion to FLOPsReport: it answers "does
+      my stem actually see enough context before the global-pool head?",
+      which CNN/ViT-stem architects ask constantly but the repo currently
+      can't answer without hand arithmetic. Add a small unit check pinning
+      the textbook closed form for a known stack (e.g. three 3x3 stride-1
+      convs → RF 7, jump 1; add a stride-2 layer and assert the jump
+      doubles). Companion `examples/ReceptiveFieldReport/` runs it on (i) a
+      plain VGG-style 3x3 stack and (ii) a stride-2-downsampling stack so
+      reviewers can eyeball how aggressively downsampling grows the RF per
+      layer.
 
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
@@ -537,9 +578,8 @@ breakdown:
       that builds a 1-layer net and reports ns/op for forward + backward.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
-- [ ] `neural-bench` tiny CLI: time forward + backward for a chosen layer
-      at a chosen shape, print ns/op. CSV output so future regressions
-      are visible.
+<!-- (`neural-bench` CLI removed: duplicate of `bin/layer_bench` above, which
+     already times forward+backward per layer at a chosen shape with CSV.) -->
 ### Examples I'd enjoy writing
 - [ ] `examples/TinyGPT/` — char-level transformer end-to-end demo on
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
@@ -692,8 +732,8 @@ breakdown:
 - [ ] Straight-through quantization demo: small classifier with one hidden
       layer's outputs passed through a TNNetStraightThroughEstimator;
       compare accuracy against unquantized baseline.
-- [ ] Lottery-ticket sanity check — train, record top-k% magnitude mask,
-      reset to original init, retrain with mask applied.
+<!-- (Lottery-ticket sanity check removed: duplicate of the "Lottery-ticket"-
+     flavored experiment under "Bake-off / experiment follow-ups".) -->
 - [ ] Sequence-length scaling micro-benchmark — TNNetScaledDotProductAttention
       at seq_len ∈ {16, 32, 64, 128, 256} with d_k fixed. Confirms O(n²)
       scaling.
