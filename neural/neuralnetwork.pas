@@ -3640,6 +3640,33 @@ type
         OptimizerKind: string = 'adam';
         BudgetMiB: TNeuralFloat = 2048.0
       ): string;
+      // Purely analytical receptive-field walk (no probe batch, no forward,
+      // no backward). For every layer it propagates the textbook
+      // receptive-field recurrence on the input plane, tracking X and Y
+      // independently so rectangular kernels/strides are handled:
+      //   r_k    = r_{k-1} + (kernel_k - 1) * jump_{k-1}
+      //   jump_k = jump_{k-1} * stride_k
+      //   start_k= start_{k-1} + ((kernel_k - 1)/2 - padding_k) * jump_{k-1}
+      // The kernel/stride/padding are read off each layer's existing
+      // geometry fields (Convolution / Deconvolution / Pool family / Pad /
+      // Upsample / DeMaxPool). Layers with no spatial kernel (FullConnect,
+      // activations, norms, ...) are treated as kernel=1, stride=1,
+      // padding=0 (pass-through). Upsample / DeMaxPool divide the jump
+      // (fractional effective stride) and the recurrence falls back to the
+      // observed Output.SizeX/Y ratio when a field is ambiguous. Per layer
+      // it reports: cumulative RF size (rx, ry), cumulative jump
+      // (jumpx, jumpy), the center/start offset of the first output unit
+      // (startx, starty) and the fraction of the input plane a single output
+      // unit of that layer can see (RF area / input area, flagged ">100%"
+      // once the RF exceeds the input — the "already global" point). Closes
+      // with a flag list: the shallowest layer whose RF first covers the
+      // whole input (the natural "the rest is global mixing" cut point) and
+      // any layer whose RF stops growing (all-1x1 / pointwise tail). Pure
+      // structural metadata — finishes instantly, needs no data and no
+      // trained weights.
+      class function ReceptiveFieldReport(
+        NN: TNNet
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -23381,6 +23408,234 @@ begin
   finally
     FlagListParam.Free;
     FlagListAct.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.ReceptiveFieldReport(
+  NN: TNNet
+): string;
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx: integer;
+  Layer, Prev: TNNetLayer;
+  Conv: TNNetConvolutionAbstract;
+  Pool: TNNetPoolBase;
+  // Per-layer geometry on the input plane.
+  KernelX, KernelY, PadX, PadY: integer;
+  StrideX, StrideY: TNeuralFloat;
+  // Cumulative recurrence state (RF size, jump, start offset) per axis.
+  RFx, RFy, JumpX, JumpY, StartX, StartY: TNeuralFloat;
+  InputX, InputY: integer;
+  CoverFrac: TNeuralFloat;
+  ShapeStr, GeomStr, FracStr: string;
+  CoverIdx: integer;
+  CoverName: string;
+  PrevRFx, PrevRFy: TNeuralFloat;
+  PoolSize: integer;
+  IsUpsample, IsPad, IsGlobal: boolean;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'ReceptiveFieldReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() = 0 then
+    begin
+      Result := 'ReceptiveFieldReport: NN has no layers.' + sLineBreak;
+      Exit;
+    end;
+
+    // Input plane = first layer's output shape.
+    InputX := NN.Layers[0].Output.SizeX;
+    InputY := NN.Layers[0].Output.SizeY;
+    if InputX < 1 then InputX := 1;
+    if InputY < 1 then InputY := 1;
+
+    // Initial state: the input plane sees exactly one pixel per unit.
+    RFx := 1; RFy := 1;
+    JumpX := 1; JumpY := 1;
+    StartX := 0.5; StartY := 0.5;
+
+    CoverIdx := -1;
+    CoverName := '';
+
+    Lines.Add(Format(
+      'ReceptiveFieldReport: analytical RF walk over %d layer(s). ' +
+      'Input plane = %dx%d.',
+      [NN.CountLayers(), InputX, InputY]));
+    Lines.Add('Recurrence: r_k = r_{k-1} + (kernel-1)*jump_{k-1}; ' +
+      'jump_k = jump_{k-1}*stride_k.');
+    Lines.Add(Format('%-5s %-30s %-14s %-13s %10s %10s %10s',
+      ['Idx', 'Class', 'OutShape', 'k/s/p(x,y)', 'RF(x,y)', 'jump(x,y)',
+       'cover%']));
+    Lines.Add(StringOfChar('-', 104));
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      Prev := Layer.PrevLayer;
+
+      // Defaults: pure pass-through (kernel=1, stride=1, padding=0).
+      KernelX := 1; KernelY := 1;
+      PadX := 0; PadY := 0;
+      StrideX := 1; StrideY := 1;
+      IsUpsample := False;
+      IsPad := False;
+      IsGlobal := False;
+
+      if (Layer is TNNetConvolutionAbstract) then
+      begin
+        Conv := TNNetConvolutionAbstract(Layer);
+        KernelX := Conv.FFeatureSizeX;
+        KernelY := Conv.FFeatureSizeY;
+        PadX := Conv.FPadding;
+        PadY := Conv.FPadding;
+        if Conv.FStride > 0 then
+        begin
+          StrideX := Conv.FStride;
+          StrideY := Conv.FStride;
+        end;
+        // Deconvolution upsamples: output grows, so the effective stride on
+        // the input plane is fractional (1/scale). Detect via size ratio.
+        if (Layer is TNNetDeconvolution) and (Prev <> nil) then
+        begin
+          if Layer.Output.SizeX > Prev.Output.SizeX then
+          begin
+            IsUpsample := True;
+            if Layer.Output.SizeX > 0 then
+              StrideX := Prev.Output.SizeX / Layer.Output.SizeX;
+            if Layer.Output.SizeY > 0 then
+              StrideY := Prev.Output.SizeY / Layer.Output.SizeY;
+          end;
+        end;
+      end
+      else if (Layer is TNNetDeMaxPool) then
+      begin
+        // Upsample / DeMaxPool / DeAvgPool: output = input * PoolSize.
+        // Kernel on the input plane is effectively 1 (replication); the
+        // jump divides by the upscale factor.
+        Pool := TNNetPoolBase(Layer);
+        PoolSize := Pool.FPoolSize;
+        if PoolSize < 1 then PoolSize := 1;
+        IsUpsample := True;
+        StrideX := 1.0 / PoolSize;
+        StrideY := 1.0 / PoolSize;
+      end
+      else if (Layer is TNNetMaxChannel) or (Layer is TNNetAvgChannel) or
+              (Layer is TNNetGlobalSumPool) then
+      begin
+        // Global channel reduction: a single output unit sees the whole
+        // input plane. Force kernel to span the current feature map.
+        IsGlobal := True;
+        if Prev <> nil then
+        begin
+          KernelX := Prev.Output.SizeX;
+          KernelY := Prev.Output.SizeY;
+        end;
+      end
+      else if (Layer is TNNetPoolBase) then
+      begin
+        Pool := TNNetPoolBase(Layer);
+        KernelX := Pool.FPoolSize;
+        KernelY := Pool.FPoolSize;
+        PadX := Pool.FPadding;
+        PadY := Pool.FPadding;
+        if Pool.FStride > 0 then
+        begin
+          StrideX := Pool.FStride;
+          StrideY := Pool.FStride;
+        end;
+      end
+      else if (Layer is TNNetPadXY) then
+      begin
+        IsPad := True;
+        PadX := TNNetPadXY(Layer).FPaddingX;
+        PadY := TNNetPadXY(Layer).FPaddingY;
+      end
+      else if (Layer is TNNetPad) then
+      begin
+        IsPad := True;
+        PadX := TNNetPad(Layer).FPadding;
+        PadY := TNNetPad(Layer).FPadding;
+      end;
+      // Everything else keeps the pass-through defaults.
+
+      // Apply the receptive-field recurrence (X and Y independent).
+      PrevRFx := RFx;
+      PrevRFy := RFy;
+      RFx := RFx + (KernelX - 1) * JumpX;
+      RFy := RFy + (KernelY - 1) * JumpY;
+      StartX := StartX + ((KernelX - 1) / 2.0 - PadX) * JumpX;
+      StartY := StartY + ((KernelY - 1) / 2.0 - PadY) * JumpY;
+      JumpX := JumpX * StrideX;
+      JumpY := JumpY * StrideY;
+
+      // RF cannot meaningfully shrink below 1 input pixel.
+      if RFx < 1 then RFx := 1;
+      if RFy < 1 then RFy := 1;
+
+      // Fraction of the input plane one deepest-style output unit sees.
+      CoverFrac := (RFx * RFy) / (InputX * InputY);
+
+      // Shallowest layer whose RF first covers the whole input plane.
+      if (CoverIdx < 0) and (RFx >= InputX) and (RFy >= InputY) then
+      begin
+        CoverIdx := LayerIdx;
+        CoverName := Layer.ClassName;
+      end;
+
+      // Flag layers whose RF stopped growing (pointwise / 1x1 tail) — only
+      // meaningful once we are past the input layer.
+      if (LayerIdx > 0) and (RFx = PrevRFx) and (RFy = PrevRFy) and
+         (not IsUpsample) and (not IsPad) and (not IsGlobal) then
+        Flags.Add(Format('  Layer %3d %s: RF unchanged (%gx%g) — pointwise/1x1.',
+          [LayerIdx, Layer.ClassName, RFx, RFy]));
+
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      GeomStr := Format('%d/%s/%d,%d/%s/%d',
+        [KernelX, FormatFloat('0.##', StrideX), PadX,
+         KernelY, FormatFloat('0.##', StrideY), PadY]);
+      if CoverFrac > 1.0 then
+        FracStr := '>100%'
+      else
+        FracStr := Format('%.1f%%', [CoverFrac * 100.0]);
+      Lines.Add(Format('%-5d %-30s %-14s %-13s %10s %10s %10s',
+        [LayerIdx, Layer.ClassName, ShapeStr, GeomStr,
+         Format('%gx%g', [RFx, RFy]),
+         Format('%gx%g', [JumpX, JumpY]),
+         FracStr]));
+    end;
+
+    Lines.Add(StringOfChar('-', 104));
+    Lines.Add(Format('Final receptive field: %g x %g on a %d x %d input.',
+      [RFx, RFy, InputX, InputY]));
+    Lines.Add(Format('Final jump (effective stride): %g x %g.',
+      [JumpX, JumpY]));
+    if CoverIdx >= 0 then
+      Lines.Add(Format(
+        'First layer whose RF covers the whole input: %d (%s) — ' +
+        'the rest is global mixing.',
+        [CoverIdx, CoverName]))
+    else
+      Lines.Add('No layer reaches a full-input receptive field ' +
+        '(RF never covers the input plane).');
+
+    Lines.Add('Flags:');
+    if Flags.Count = 0 then
+      Lines.Add('  (none)')
+    else
+      Lines.AddStrings(Flags);
+
+    Result := Lines.Text;
+  finally
+    Flags.Free;
     Lines.Free;
   end;
 end;

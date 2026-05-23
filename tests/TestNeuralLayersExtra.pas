@@ -79,6 +79,8 @@ type
     procedure TestDiffArchitectureFromString;
     procedure TestWeightDriftReportFrozenLayer;
     procedure TestWeightDriftReportArchMismatch;
+    procedure TestReceptiveFieldReportThreeConvs;
+    procedure TestReceptiveFieldReportStrideDoublesJump;
   end;
 
 implementation
@@ -1249,6 +1251,89 @@ begin
   finally
     A.Free;
     B.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestReceptiveFieldReportThreeConvs;
+var
+  NN: TNNet;
+  Report, Layer3Line: string;
+  Lines: TStringList;
+  I: integer;
+begin
+  // Textbook closed form: three stacked 3x3 stride-1 convs on a flat input
+  // give a receptive field of 7 with jump (effective stride) 1.
+  NN := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(32, 32, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+
+    Report := TNNet.ReceptiveFieldReport(NN);
+    AssertTrue('Report should be non-empty', Length(Report) > 0);
+
+    Lines.Text := Report;
+    Layer3Line := '';
+    for I := 0 to Lines.Count - 1 do
+      if Pos('3     TNNetConvolutionReLU', Lines[I]) = 1 then
+        Layer3Line := Lines[I];
+
+    AssertTrue('Layer 3 row present', Layer3Line <> '');
+    // Deepest conv: RF must be exactly 7x7.
+    AssertTrue('Three 3x3 stride-1 convs => RF 7x7',
+      Pos('7x7', Layer3Line) > 0);
+    // Jump stays at 1x1 (no downsampling).
+    AssertTrue('Stride-1 stack keeps jump at 1x1',
+      Pos('1x1', Layer3Line) > 0);
+  finally
+    Lines.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestReceptiveFieldReportStrideDoublesJump;
+var
+  NN: TNNet;
+  Report, Layer1Line, Layer2Line: string;
+  Lines: TStringList;
+  I: integer;
+begin
+  // Adding a stride-2 conv after a stride-1 conv must double the jump from
+  // 1x1 to 2x2.
+  NN := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(32, 32, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 2));
+
+    Report := TNNet.ReceptiveFieldReport(NN);
+    AssertTrue('Report should be non-empty', Length(Report) > 0);
+
+    Lines.Text := Report;
+    Layer1Line := '';
+    Layer2Line := '';
+    for I := 0 to Lines.Count - 1 do
+    begin
+      if Pos('1     TNNetConvolutionReLU', Lines[I]) = 1 then
+        Layer1Line := Lines[I]
+      else if Pos('2     TNNetConvolutionReLU', Lines[I]) = 1 then
+        Layer2Line := Lines[I];
+    end;
+
+    AssertTrue('Layer 1 row present', Layer1Line <> '');
+    AssertTrue('Layer 2 row present', Layer2Line <> '');
+    // Before the stride-2 layer the jump is still 1x1.
+    AssertTrue('Stride-1 layer keeps jump at 1x1',
+      Pos('1x1', Layer1Line) > 0);
+    // After the stride-2 layer the jump doubles to 2x2.
+    AssertTrue('Stride-2 layer doubles jump to 2x2',
+      Pos('2x2', Layer2Line) > 0);
+  finally
+    Lines.Free;
+    NN.Free;
   end;
 end;
 
