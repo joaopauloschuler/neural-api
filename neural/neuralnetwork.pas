@@ -3690,6 +3690,46 @@ type
         Samples: TNNetVolumeList;
         SaturationThreshold: TNeuralFloat = 6.0
       ): string;
+      // Estimates the top singular value sigma_1(W) of a trainable layer's
+      // weight matrix W (rows = neurons / fan-out, cols = weights-per-neuron /
+      // fan-in; biases excluded) via a handful of power-iteration steps. Starts
+      // from a deterministically-seeded random unit vector v of length fan_in,
+      // then repeats u = W v; v = W^T u; v := v/||v|| for Iters iterations and
+      // returns sigma_1 ~= ||W v||. W*v and W^T*u are plain loops over neurons /
+      // weights — no matrix type. Deterministic for a given Seed so callers
+      // (and tests) get reproducible output. Returns 0 for nil / weightless
+      // layers. This is the reusable spectral-norm helper a future
+      // TNNetSpectralNorm wrapper can share.
+      class function EstimateSpectralNorm(
+        Layer: TNNetLayer;
+        Iters: integer = 10;
+        Seed: longword = 1234567
+      ): TNeuralFloat;
+      // Purely weight-tensor (forward-only, no probe batch) spectral diagnostic.
+      // For every trainable layer (Neurons.Count > 0 and Weights.Size > 0) it
+      // treats the weights as a matrix W of shape [num_neurons (fan-out) x
+      // weights_per_neuron (fan-in)] (biases excluded, mirroring
+      // WeightHistogramReport) and reports per layer:
+      //   (a) sigma_1   — top singular value via PowerIters power-iteration
+      //       steps (EstimateSpectralNorm),
+      //   (b) ||W||_F   — Frobenius norm (cheap exact, sqrt of sum of w^2),
+      //   (c) sigma_1/||W||_F — a stable-rank-flavoured signal: ~1 hints at
+      //       rank-1 collapse (one direction dominates), ~1/sqrt(min(in,out))
+      //       hints at a well-spread spectrum,
+      //   (d) sigma_1 / ((sqrt(in)+sqrt(out)) * std(W)) — a Marchenko-Pastur
+      //       baseline ratio: "is this layer's top mode larger than what a
+      //       Gaussian init of matching std would produce?" (~1 = init-like),
+      // followed by a 10-bin ASCII histogram of the per-layer
+      // sigma_1 / fan_in baseline (sigma_1 / (sqrt(in) * std(W))) across the
+      // network, and a flag list: "spectral-norm > threshold" layers (Lipschitz
+      // risk) and "stable-rank ~= 1" layers (representation-collapse risk).
+      // Pure CPU, forward-only on the weight tensors — no training-time changes,
+      // no probe batch. Deterministic (fixed internal seed).
+      class function WeightSpectrumReport(
+        NN: TNNet;
+        PowerIters: integer = 10;
+        SpectralNormThreshold: TNeuralFloat = 2.0
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -23973,6 +24013,292 @@ begin
     Lines.Add('Flags:');
     if Flags.Count = 0 then
       Lines.Add('  (none) — no near-collapsed or saturating layers.')
+    else
+      Lines.AddStrings(Flags);
+
+    Result := Lines.Text;
+  finally
+    Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.EstimateSpectralNorm(
+  Layer: TNNetLayer;
+  Iters: integer = 10;
+  Seed: longword = 1234567
+): TNeuralFloat;
+var
+  FanOut, FanIn, N, K, Iter: integer;
+  V, U: array of TNeuralFloat;
+  Acc, NormV, Sigma: TNeuralFloat;
+  RngState: longword;
+  Neuron: TNNetNeuron;
+begin
+  Result := 0;
+  if Layer = nil then Exit;
+  if Layer.Neurons.Count = 0 then Exit;
+  if Layer.Neurons[0].Weights.Size = 0 then Exit;
+
+  FanOut := Layer.Neurons.Count;          // rows of W (one per neuron)
+  FanIn  := Layer.Neurons[0].Weights.Size; // cols of W (weights per neuron)
+  if (FanOut = 0) or (FanIn = 0) then Exit;
+  if Iters < 1 then Iters := 1;
+
+  SetLength(V, FanIn);
+  SetLength(U, FanOut);
+
+  // Deterministic LCG-seeded random unit start vector (independent of the
+  // global RandSeed so the report is fully reproducible).
+  RngState := Seed;
+  NormV := 0;
+  for K := 0 to FanIn - 1 do
+  begin
+    RngState := (RngState * 1664525 + 1013904223) and $FFFFFFFF;
+    // Map to (-1, 1).
+    V[K] := (RngState / 2147483648.0) - 1.0;
+    NormV := NormV + V[K] * V[K];
+  end;
+  NormV := Sqrt(NormV);
+  if NormV <= 1e-30 then
+  begin
+    // Degenerate start; fall back to a flat vector.
+    for K := 0 to FanIn - 1 do V[K] := 1.0;
+    NormV := Sqrt(FanIn);
+  end;
+  for K := 0 to FanIn - 1 do V[K] := V[K] / NormV;
+
+  Sigma := 0;
+  for Iter := 1 to Iters do
+  begin
+    // u = W v   (row n = Neurons[n].Weights)
+    for N := 0 to FanOut - 1 do
+    begin
+      Neuron := Layer.Neurons[N];
+      Acc := 0;
+      for K := 0 to FanIn - 1 do
+        Acc := Acc + Neuron.Weights.FData[K] * V[K];
+      U[N] := Acc;
+    end;
+
+    // sigma_1 ~= ||W v|| = ||u||
+    Sigma := 0;
+    for N := 0 to FanOut - 1 do Sigma := Sigma + U[N] * U[N];
+    Sigma := Sqrt(Sigma);
+
+    // v = W^T u
+    for K := 0 to FanIn - 1 do V[K] := 0;
+    for N := 0 to FanOut - 1 do
+    begin
+      Neuron := Layer.Neurons[N];
+      Acc := U[N];
+      for K := 0 to FanIn - 1 do
+        V[K] := V[K] + Neuron.Weights.FData[K] * Acc;
+    end;
+
+    // v := v / ||v||
+    NormV := 0;
+    for K := 0 to FanIn - 1 do NormV := NormV + V[K] * V[K];
+    NormV := Sqrt(NormV);
+    if NormV <= 1e-30 then Break; // all-zero matrix => sigma_1 = 0
+    for K := 0 to FanIn - 1 do V[K] := V[K] / NormV;
+  end;
+
+  Result := Sigma;
+end;
+
+class function TNNet.WeightSpectrumReport(
+  NN: TNNet;
+  PowerIters: integer = 10;
+  SpectralNormThreshold: TNeuralFloat = 2.0
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cStableRankCollapse = 0.95; // sigma_1/||W||_F above this ~ rank-1 collapse
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx, NeuronIdx, K, BinIdx: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  W, Sum, SumSq, Mean, Std, Frob, Sigma: TNeuralFloat;
+  FanIn, FanOut, WCount, TrainableLayers: integer;
+  StableRank, MPBaseline, MPRatio, FanInBaseline, FanInRatio: TNeuralFloat;
+  ShapeStr, Bar: string;
+  // Per-layer fan-in baseline ratios for the network histogram.
+  RatioVals: array of TNeuralFloat;
+  RatioCount: integer;
+  HistBins: array of integer;
+  MinR, MaxR, RRange, BinLo, BinHi: TNeuralFloat;
+  MaxBin, BarLen: integer;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'WeightSpectrumReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if PowerIters < 1 then PowerIters := 1;
+
+    TrainableLayers := 0;
+    RatioCount := 0;
+    SetLength(RatioVals, NN.GetLastLayerIdx() + 1);
+
+    Lines.Add(Format(
+      'WeightSpectrumReport: top singular value via %d power-iteration ' +
+      'step(s). (Biases excluded.)', [PowerIters]));
+    Lines.Add(Format(
+      '%-4s %-26s %-13s %5s %5s %10s %10s %9s %9s',
+      ['Idx', 'Class', 'Shape(o,i)', 'fout', 'fin',
+       'sigma_1', '||W||_F', 'sr-ratio', 'MP-ratio']));
+    Lines.Add(StringOfChar('-', 110));
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+
+      FanOut := Layer.Neurons.Count;
+      FanIn  := Layer.Neurons[0].Weights.Size;
+
+      // Frobenius norm + std over all weights (biases excluded).
+      WCount := 0;
+      Sum := 0;
+      SumSq := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for K := 0 to Neuron.Weights.Size - 1 do
+        begin
+          W := Neuron.Weights.FData[K];
+          Sum := Sum + W;
+          SumSq := SumSq + W * W;
+          Inc(WCount);
+        end;
+      end;
+      if WCount = 0 then Continue;
+
+      Frob := Sqrt(SumSq);
+      Mean := Sum / WCount;
+      Std := SumSq / WCount - Mean * Mean; // population variance
+      if Std < 0 then Std := 0;
+      Std := Sqrt(Std);
+
+      Sigma := TNNet.EstimateSpectralNorm(Layer, PowerIters);
+
+      // (c) stable-rank-flavoured ratio sigma_1 / ||W||_F.
+      if Frob > 1e-30 then
+        StableRank := Sigma / Frob
+      else
+        StableRank := 0;
+
+      // (d) Marchenko-Pastur baseline ratio.
+      MPBaseline := (Sqrt(FanIn) + Sqrt(FanOut)) * Std;
+      if MPBaseline > 1e-30 then
+        MPRatio := Sigma / MPBaseline
+      else
+        MPRatio := 0;
+
+      // (e) fan-in baseline ratio (for the network histogram).
+      FanInBaseline := Sqrt(FanIn) * Std;
+      if FanInBaseline > 1e-30 then
+        FanInRatio := Sigma / FanInBaseline
+      else
+        FanInRatio := 0;
+
+      ShapeStr := Format('(%d,%d)', [FanOut, FanIn]);
+      Lines.Add(Format(
+        '%-4d %-26s %-13s %5d %5d %10.4f %10.4f %9.4f %9.4f',
+        [LayerIdx, Layer.ClassName, ShapeStr, FanOut, FanIn,
+         Sigma, Frob, StableRank, MPRatio]));
+
+      RatioVals[RatioCount] := FanInRatio;
+      Inc(RatioCount);
+      Inc(TrainableLayers);
+
+      // Flags.
+      if Sigma > SpectralNormThreshold then
+        Flags.Add(Format(
+          '  Layer %3d %s: spectral-norm sigma_1=%.4f > %g (Lipschitz risk).',
+          [LayerIdx, Layer.ClassName, Sigma, SpectralNormThreshold]));
+      if StableRank >= cStableRankCollapse then
+        Flags.Add(Format(
+          '  Layer %3d %s: stable-rank ~= 1 (sigma_1/||W||_F=%.4f >= %g, ' +
+          'representation-collapse risk).',
+          [LayerIdx, Layer.ClassName, StableRank, cStableRankCollapse]));
+    end;
+
+    Lines.Add(StringOfChar('-', 110));
+
+    if TrainableLayers = 0 then
+    begin
+      Lines.Add('No trainable layers with weights found.');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    // (e) 10-bin ASCII histogram of per-layer sigma_1 / fan-in baseline.
+    MinR := RatioVals[0];
+    MaxR := RatioVals[0];
+    for BinIdx := 1 to RatioCount - 1 do
+    begin
+      if RatioVals[BinIdx] < MinR then MinR := RatioVals[BinIdx];
+      if RatioVals[BinIdx] > MaxR then MaxR := RatioVals[BinIdx];
+    end;
+    SetLength(HistBins, cBins);
+    for BinIdx := 0 to cBins - 1 do HistBins[BinIdx] := 0;
+    RRange := MaxR - MinR;
+    for BinIdx := 0 to RatioCount - 1 do
+    begin
+      if RRange > 1e-30 then
+        K := Trunc(((RatioVals[BinIdx] - MinR) / RRange) * cBins)
+      else
+        K := 0;
+      if K >= cBins then K := cBins - 1;
+      if K < 0 then K := 0;
+      Inc(HistBins[K]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if HistBins[BinIdx] > MaxBin then MaxBin := HistBins[BinIdx];
+
+    Lines.Add(Format(
+      'Per-layer sigma_1 / fan-in baseline (sigma_1 / (sqrt(in)*std)) ' +
+      'across %d layer(s) [min=%.4g, max=%.4g]:', [RatioCount, MinR, MaxR]));
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if RRange > 1e-30 then
+      begin
+        BinLo := MinR + BinIdx * (RRange / cBins);
+        BinHi := MinR + (BinIdx + 1) * (RRange / cBins);
+      end
+      else
+      begin
+        BinLo := MinR;
+        BinHi := MinR;
+      end;
+      if MaxBin > 0 then
+        BarLen := Round((HistBins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%9.4g-%9.4g) | n=%3d %s',
+        [BinLo, BinHi, HistBins[BinIdx], Bar]));
+    end;
+
+    Lines.Add(Format(
+      'Network total: %d trainable layer(s). Threshold sigma_1 > %g, ' +
+      'stable-rank collapse >= %g.',
+      [TrainableLayers, SpectralNormThreshold, cStableRankCollapse]));
+
+    Lines.Add('Flags:');
+    if Flags.Count = 0 then
+      Lines.Add('  (none) — no high-spectral-norm or rank-1-collapse layers.')
     else
       Lines.AddStrings(Flags);
 

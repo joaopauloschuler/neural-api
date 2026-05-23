@@ -83,6 +83,8 @@ type
     procedure TestReceptiveFieldReportStrideDoublesJump;
     procedure TestActivationStatsReportInputStats;
     procedure TestActivationStatsReportNearCollapsedFlag;
+    procedure TestWeightSpectrumReportRank1Matrix;
+    procedure TestWeightSpectrumReportStructureAndFlags;
   end;
 
 implementation
@@ -1427,6 +1429,117 @@ begin
     AssertTrue('Flag list present', Pos('Flags:', Report) > 0);
   finally
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestWeightSpectrumReportRank1Matrix;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  A, B: array of TNeuralFloat;
+  NormA, NormB, ExpectedSigma, Sigma: TNeuralFloat;
+  FanOut, FanIn, N, K: integer;
+  Report, SigmaStr: string;
+  Lines: TStringList;
+  I, P: integer;
+begin
+  // A rank-1 weight matrix W = a * b^T has exactly one non-zero singular value
+  // sigma_1 = ||a|| * ||b|| (all other singular values are 0). We build such a
+  // matrix by hand and check both the helper and the printed report converge
+  // to that analytic value.
+  FanOut := 5; // num neurons / rows
+  FanIn  := 4; // weights per neuron / cols
+  SetLength(A, FanOut);
+  SetLength(B, FanIn);
+  A[0] := 1.0; A[1] := -2.0; A[2] := 0.5; A[3] := 3.0; A[4] := -1.5;
+  B[0] := 2.0; B[1] := 1.0; B[2] := -1.0; B[3] := 0.5;
+
+  NormA := 0;
+  for N := 0 to FanOut - 1 do NormA := NormA + A[N] * A[N];
+  NormA := Sqrt(NormA);
+  NormB := 0;
+  for K := 0 to FanIn - 1 do NormB := NormB + B[K] * B[K];
+  NormB := Sqrt(NormB);
+  ExpectedSigma := NormA * NormB;
+
+  NN := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(FanIn, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(FanOut));
+    NN.InitWeights();
+
+    Layer := NN.Layers[1];
+    AssertTrue('FullConnect layer has the expected neuron count',
+      Layer.Neurons.Count = FanOut);
+    AssertTrue('FullConnect layer has the expected fan-in',
+      Layer.Neurons[0].Weights.Size = FanIn);
+
+    // Row n of W = a[n] * b.
+    for N := 0 to FanOut - 1 do
+      for K := 0 to FanIn - 1 do
+        Layer.Neurons[N].Weights.FData[K] := A[N] * B[K];
+
+    // (1) Helper converges to the analytic sigma_1.
+    Sigma := TNNet.EstimateSpectralNorm(Layer, 30);
+    AssertTrue(Format('EstimateSpectralNorm should be ~%.5f, got %.5f',
+      [ExpectedSigma, Sigma]), Abs(Sigma - ExpectedSigma) < 1e-3);
+
+    // (2) The report prints that sigma_1 in the layer-1 row.
+    Report := TNNet.WeightSpectrumReport(NN);
+    AssertTrue('Report should be non-empty', Length(Report) > 0);
+
+    Lines.Text := Report;
+    SigmaStr := '';
+    for I := 0 to Lines.Count - 1 do
+      if Pos('1    TNNetFullConnectLinear', Lines[I]) = 1 then
+        SigmaStr := Lines[I];
+    AssertTrue('Layer 1 row present', SigmaStr <> '');
+    // sigma_1 formats with %.4f; check the analytic value's 4-decimal text
+    // appears on the row.
+    P := Pos(FormatFloat('0.0000', ExpectedSigma), SigmaStr);
+    AssertTrue(Format('Layer row should contain sigma_1=%.4f. Row: %s',
+      [ExpectedSigma, SigmaStr]), P > 0);
+
+    // A rank-1 matrix => sigma_1/||W||_F = 1 => stable-rank collapse flag.
+    AssertTrue('Rank-1 layer flagged as stable-rank ~= 1',
+      Pos('stable-rank ~= 1', Report) > 0);
+  finally
+    Lines.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestWeightSpectrumReportStructureAndFlags;
+var
+  NN: TNNet;
+  Report, ReportB: string;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.WeightSpectrumReport(nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.InitWeights();
+
+    Report := TNNet.WeightSpectrumReport(NN);
+    AssertTrue('Header present', Pos('WeightSpectrumReport:', Report) > 0);
+    AssertTrue('sigma_1 column header present', Pos('sigma_1', Report) > 0);
+    AssertTrue('MP-ratio column header present', Pos('MP-ratio', Report) > 0);
+    AssertTrue('Fan-in baseline histogram present',
+      Pos('fan-in baseline', Report) > 0);
+    AssertTrue('Flag list present', Pos('Flags:', Report) > 0);
+    AssertTrue('Network total line present', Pos('Network total:', Report) > 0);
+
+    // Determinism: same network => identical report text.
+    ReportB := TNNet.WeightSpectrumReport(NN);
+    AssertTrue('Report is deterministic', Report = ReportB);
+  finally
     NN.Free;
   end;
 end;
