@@ -3667,6 +3667,29 @@ type
       class function ReceptiveFieldReport(
         NN: TNNet
       ): string;
+      // Forward-only activation-distribution diagnostic. For a probe batch
+      // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
+      // layer, walks the layer Output volume accumulating streaming moments so
+      // memory stays bounded (no per-activation storage). Per layer it reports
+      // mean, population std, min, max, |median| (approximated from the last
+      // probe sample to keep memory bounded), |skew|, kurtosis (excess, normal
+      // = 0), pct_saturated_low / pct_saturated_high (fraction with value
+      // < -SaturationThreshold / > +SaturationThreshold — a single configurable
+      // threshold; the spec's "±0.99·OutputRange for bounded vs |x|>6 for
+      // unbounded" distinction is simplified to one threshold defaulting to
+      // 6.0, which is the unbounded case and also flags bounded activations that
+      // crowd their limits), pct_negative, pct_near_zero (|x| < 1e-6) and a
+      // compact 16-bin ASCII histogram over [-MaxAbs, +MaxAbs] (per-layer
+      // scaling). Closes with a flag list of "near-collapsed" layers
+      // (std < 1e-4) and "saturating" layers (>50% saturated on either side),
+      // plus a 10-bin ASCII histogram of per-layer std across the network so
+      // vanishing / exploding activation patterns jump out at a glance. Pure
+      // CPU, forward-only — no gradients, no training-time changes.
+      class function ActivationStatsReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        SaturationThreshold: TNeuralFloat = 6.0
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -23630,6 +23653,326 @@ begin
     Lines.Add('Flags:');
     if Flags.Count = 0 then
       Lines.Add('  (none)')
+    else
+      Lines.AddStrings(Flags);
+
+    Result := Lines.Text;
+  finally
+    Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.ActivationStatsReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  SaturationThreshold: TNeuralFloat = 6.0
+): string;
+const
+  cHistBins = 16;
+  cStdBins = 10;
+  cNearZero = 1e-6;
+  cCollapseStd = 1e-4;
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx, SampleIdx, UnitIdx, BinIdx: integer;
+  Layer: TNNetLayer;
+  LayerCount, Units, Reported: integer;
+  V, AbsV: TNeuralFloat;
+  // Streaming accumulators (per layer, reset each layer).
+  N: int64;
+  SumV, SumSq, SumCube, SumQuad: Double;
+  MinV, MaxV, MaxAbsV: TNeuralFloat;
+  NegCount, NearZeroCount, SatLowCount, SatHighCount: int64;
+  MeanV, StdV, VarV, M2, M3, M4, Skew, Kurt, MedAbs: TNeuralFloat;
+  SatLowFrac, SatHighFrac, NegFrac, NearZeroFrac: TNeuralFloat;
+  ShapeStr, Bar, HistLine: string;
+  // Per-layer std collected for the network-level std histogram.
+  PerLayerStd: array of TNeuralFloat;
+  PerLayerHasData: array of boolean;
+  // Per-layer activation histogram bins (counts).
+  HistBins: array of int64;
+  MaxHistBin: int64;
+  // |median| approximation from the last probe sample.
+  LastVals: array of TNeuralFloat;
+  Tmp: TNeuralFloat;
+  J: integer;
+  // Network-level std histogram.
+  StdBins: array of integer;
+  MinStd, MaxStd, StdRange: TNeuralFloat;
+  MaxStdBin, BarLen: integer;
+  BinLo, BinHi: TNeuralFloat;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'ActivationStatsReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'ActivationStatsReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.GetLastLayerIdx() < 0 then
+    begin
+      Result := 'ActivationStatsReport: NN has no layers.' + sLineBreak;
+      Exit;
+    end;
+
+    LayerCount := NN.CountLayers();
+    SetLength(PerLayerStd, LayerCount);
+    SetLength(PerLayerHasData, LayerCount);
+    for LayerIdx := 0 to LayerCount - 1 do
+      PerLayerHasData[LayerIdx] := False;
+
+    Lines.Add(Format(
+      'ActivationStatsReport: %d layer(s), %d probe sample(s). ' +
+      'SaturationThreshold=%g, near-zero<%g.',
+      [LayerCount, Samples.Count, SaturationThreshold, cNearZero]));
+    Lines.Add(Format(
+      '%-4s %-26s %-13s %9s %9s %9s %9s %9s %7s %8s %6s %6s %6s %6s',
+      ['Idx', 'Class', 'OutShape', 'mean', 'std', 'min', 'max',
+       '|med|', '|skew|', 'kurt', 'sat-', 'sat+', 'neg%', '~0%']));
+    Lines.Add(StringOfChar('-', 150));
+
+    Reported := 0;
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      Units := Layer.Output.Size;
+      if Units = 0 then Continue;
+
+      // Reset streaming moments for this layer.
+      N := 0;
+      SumV := 0; SumSq := 0; SumCube := 0; SumQuad := 0;
+      MinV := 0; MaxV := 0; MaxAbsV := 0;
+      NegCount := 0; NearZeroCount := 0;
+      SatLowCount := 0; SatHighCount := 0;
+      SetLength(LastVals, Units);
+
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        NN.Compute(Samples[SampleIdx]);
+        for UnitIdx := 0 to Units - 1 do
+        begin
+          V := Layer.Output.Raw[UnitIdx];
+          AbsV := Abs(V);
+          if N = 0 then
+          begin
+            MinV := V;
+            MaxV := V;
+          end
+          else
+          begin
+            if V < MinV then MinV := V;
+            if V > MaxV then MaxV := V;
+          end;
+          SumV := SumV + V;
+          SumSq := SumSq + V * V;
+          SumCube := SumCube + V * V * V;
+          SumQuad := SumQuad + V * V * V * V;
+          if AbsV > MaxAbsV then MaxAbsV := AbsV;
+          if V < 0 then Inc(NegCount);
+          if AbsV < cNearZero then Inc(NearZeroCount);
+          if V < -SaturationThreshold then Inc(SatLowCount);
+          if V > SaturationThreshold then Inc(SatHighCount);
+          Inc(N);
+          // Keep only the last sample's values for the |median| estimate so
+          // memory stays bounded (no full-batch activation storage).
+          if SampleIdx = Samples.Count - 1 then
+            LastVals[UnitIdx] := V;
+        end;
+      end;
+
+      if N = 0 then Continue;
+
+      MeanV := SumV / N;
+      VarV := (SumSq / N) - MeanV * MeanV;
+      if VarV < 0 then VarV := 0;
+      StdV := Sqrt(VarV);
+
+      // Central moments via raw moments. M2 is the (biased) variance.
+      M2 := VarV;
+      M3 := (SumCube / N)
+            - 3.0 * MeanV * (SumSq / N)
+            + 2.0 * MeanV * MeanV * MeanV;
+      M4 := (SumQuad / N)
+            - 4.0 * MeanV * (SumCube / N)
+            + 6.0 * MeanV * MeanV * (SumSq / N)
+            - 3.0 * MeanV * MeanV * MeanV * MeanV;
+      if M2 > 1e-30 then
+      begin
+        Skew := M3 / Power(M2, 1.5);
+        Kurt := (M4 / (M2 * M2)) - 3.0; // excess kurtosis (normal = 0)
+      end
+      else
+      begin
+        Skew := 0;
+        Kurt := 0;
+      end;
+
+      // |median| from the last probe sample: simple insertion sort of the
+      // bounded Units-sized buffer (deterministic, memory-bounded).
+      for UnitIdx := 1 to Units - 1 do
+      begin
+        Tmp := LastVals[UnitIdx];
+        J := UnitIdx - 1;
+        while (J >= 0) and (LastVals[J] > Tmp) do
+        begin
+          LastVals[J + 1] := LastVals[J];
+          Dec(J);
+        end;
+        LastVals[J + 1] := Tmp;
+      end;
+      if Units mod 2 = 1 then
+        MedAbs := Abs(LastVals[Units div 2])
+      else
+        MedAbs := Abs(0.5 *
+          (LastVals[Units div 2 - 1] + LastVals[Units div 2]));
+
+      SatLowFrac := SatLowCount / N;
+      SatHighFrac := SatHighCount / N;
+      NegFrac := NegCount / N;
+      NearZeroFrac := NearZeroCount / N;
+
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      Lines.Add(Format(
+        '%-4d %-26s %-13s %9.4f %9.4f %9.4f %9.4f %9.4f %7.3f %8.3f ' +
+        '%5.1f%% %5.1f%% %5.1f%% %5.1f%%',
+        [LayerIdx, Layer.ClassName, ShapeStr, MeanV, StdV, MinV, MaxV,
+         MedAbs, Abs(Skew), Kurt,
+         SatLowFrac * 100.0, SatHighFrac * 100.0,
+         NegFrac * 100.0, NearZeroFrac * 100.0]));
+
+      // Compact 16-bin histogram over [-MaxAbs, +MaxAbs] (per-layer scaling),
+      // recomputed with one extra forward sweep would double the cost, so we
+      // bin the last sample's values we already have buffered.
+      SetLength(HistBins, cHistBins);
+      for BinIdx := 0 to cHistBins - 1 do HistBins[BinIdx] := 0;
+      if MaxAbsV > 0 then
+      begin
+        for UnitIdx := 0 to Units - 1 do
+        begin
+          BinIdx := Trunc(((LastVals[UnitIdx] + MaxAbsV) /
+            (2.0 * MaxAbsV)) * cHistBins);
+          if BinIdx >= cHistBins then BinIdx := cHistBins - 1;
+          if BinIdx < 0 then BinIdx := 0;
+          Inc(HistBins[BinIdx]);
+        end;
+      end;
+      MaxHistBin := 0;
+      for BinIdx := 0 to cHistBins - 1 do
+        if HistBins[BinIdx] > MaxHistBin then MaxHistBin := HistBins[BinIdx];
+      HistLine := '';
+      for BinIdx := 0 to cHistBins - 1 do
+      begin
+        if (MaxHistBin > 0) and (HistBins[BinIdx] > 0) then
+          BarLen := 1 + Round((HistBins[BinIdx] / MaxHistBin) * 3)
+        else
+          BarLen := 0;
+        case BarLen of
+          0: HistLine := HistLine + '.';
+          1: HistLine := HistLine + '_';
+          2: HistLine := HistLine + 'o';
+          3: HistLine := HistLine + 'O';
+        else
+          HistLine := HistLine + '#';
+        end;
+      end;
+      Lines.Add(Format('     hist[-%.3g..+%.3g] %s', [MaxAbsV, MaxAbsV, HistLine]));
+
+      PerLayerStd[LayerIdx] := StdV;
+      PerLayerHasData[LayerIdx] := True;
+      Inc(Reported);
+
+      // Flags.
+      if StdV < cCollapseStd then
+        Flags.Add(Format(
+          '  Layer %3d %s: near-collapsed (std=%.3g < %g).',
+          [LayerIdx, Layer.ClassName, StdV, cCollapseStd]));
+      if SatLowFrac > 0.5 then
+        Flags.Add(Format(
+          '  Layer %3d %s: saturating low (%.1f%% < -%g).',
+          [LayerIdx, Layer.ClassName, SatLowFrac * 100.0, SaturationThreshold]));
+      if SatHighFrac > 0.5 then
+        Flags.Add(Format(
+          '  Layer %3d %s: saturating high (%.1f%% > +%g).',
+          [LayerIdx, Layer.ClassName, SatHighFrac * 100.0, SaturationThreshold]));
+    end;
+
+    Lines.Add(StringOfChar('-', 150));
+
+    // Network-level 10-bin ASCII histogram of per-layer std.
+    MinStd := 0; MaxStd := 0;
+    Reported := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not PerLayerHasData[LayerIdx] then Continue;
+      if Reported = 0 then
+      begin
+        MinStd := PerLayerStd[LayerIdx];
+        MaxStd := PerLayerStd[LayerIdx];
+      end
+      else
+      begin
+        if PerLayerStd[LayerIdx] < MinStd then MinStd := PerLayerStd[LayerIdx];
+        if PerLayerStd[LayerIdx] > MaxStd then MaxStd := PerLayerStd[LayerIdx];
+      end;
+      Inc(Reported);
+    end;
+
+    SetLength(StdBins, cStdBins);
+    for BinIdx := 0 to cStdBins - 1 do StdBins[BinIdx] := 0;
+    StdRange := MaxStd - MinStd;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not PerLayerHasData[LayerIdx] then Continue;
+      if StdRange > 1e-30 then
+        BinIdx := Trunc(((PerLayerStd[LayerIdx] - MinStd) / StdRange) * cStdBins)
+      else
+        BinIdx := 0;
+      if BinIdx >= cStdBins then BinIdx := cStdBins - 1;
+      if BinIdx < 0 then BinIdx := 0;
+      Inc(StdBins[BinIdx]);
+    end;
+    MaxStdBin := 0;
+    for BinIdx := 0 to cStdBins - 1 do
+      if StdBins[BinIdx] > MaxStdBin then MaxStdBin := StdBins[BinIdx];
+
+    Lines.Add(Format(
+      'Per-layer std histogram across %d layer(s) [min=%.4g, max=%.4g]:',
+      [Reported, MinStd, MaxStd]));
+    for BinIdx := 0 to cStdBins - 1 do
+    begin
+      if StdRange > 1e-30 then
+      begin
+        BinLo := MinStd + BinIdx * (StdRange / cStdBins);
+        BinHi := MinStd + (BinIdx + 1) * (StdRange / cStdBins);
+      end
+      else
+      begin
+        BinLo := MinStd;
+        BinHi := MinStd;
+      end;
+      if MaxStdBin > 0 then
+        BarLen := Round((StdBins[BinIdx] / MaxStdBin) * 40)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%9.4g-%9.4g) | n=%3d %s',
+        [BinLo, BinHi, StdBins[BinIdx], Bar]));
+    end;
+
+    Lines.Add('Flags:');
+    if Flags.Count = 0 then
+      Lines.Add('  (none) — no near-collapsed or saturating layers.')
     else
       Lines.AddStrings(Flags);
 

@@ -81,6 +81,8 @@ type
     procedure TestWeightDriftReportArchMismatch;
     procedure TestReceptiveFieldReportThreeConvs;
     procedure TestReceptiveFieldReportStrideDoublesJump;
+    procedure TestActivationStatsReportInputStats;
+    procedure TestActivationStatsReportNearCollapsedFlag;
   end;
 
 implementation
@@ -1333,6 +1335,98 @@ begin
       Pos('2x2', Layer2Line) > 0);
   finally
     Lines.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestActivationStatsReportInputStats;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report, InputLine: string;
+  Lines: TStringList;
+  I: integer;
+begin
+  // A constant-valued input passed straight to the input layer yields a known
+  // mean and a near-zero std on the layer-0 (TNNetInput) row, so we can pin
+  // exact numbers in the printed table.
+  NN := TNNet.Create();
+  Lines := TStringList.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.InitWeights();
+
+    // Two identical probe samples filled with the constant 0.5.
+    V := TNNetVolume.Create(4, 1, 1);
+    V.Fill(0.5);
+    Probes.Add(V);
+    V := TNNetVolume.Create(4, 1, 1);
+    V.Fill(0.5);
+    Probes.Add(V);
+
+    Report := TNNet.ActivationStatsReport(NN, Probes);
+    AssertTrue('Report should be non-empty', Length(Report) > 0);
+
+    Lines.Text := Report;
+    InputLine := '';
+    for I := 0 to Lines.Count - 1 do
+      if Pos('0    TNNetInput', Lines[I]) = 1 then
+        InputLine := Lines[I];
+
+    AssertTrue('Input layer row present', InputLine <> '');
+    // mean must be 0.5000 and std 0.0000 for a constant 0.5 input.
+    AssertTrue('Constant 0.5 input => mean 0.5000', Pos('0.5000', InputLine) > 0);
+    AssertTrue('Constant input => std 0.0000', Pos('0.0000', InputLine) > 0);
+    // A constant input has zero spread => flagged near-collapsed.
+    AssertTrue('Constant input layer flagged near-collapsed',
+      Pos('near-collapsed', Report) > 0);
+  finally
+    Lines.Free;
+    Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestActivationStatsReportNearCollapsedFlag;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report: string;
+  K, I: integer;
+begin
+  // Empty / nil sample list must be handled gracefully (no crash, clear msg).
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.InitWeights();
+
+    Report := TNNet.ActivationStatsReport(NN, Probes);
+    AssertTrue('Empty Samples reported gracefully',
+      Pos('Samples is nil or empty', Report) > 0);
+
+    // Now add varied samples and confirm the report structure is present
+    // (header, table separator, std histogram, flag list).
+    for K := 0 to 7 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      for I := 0 to 3 do
+        V.Raw[I] := K * 0.1 + I * 0.05;
+      Probes.Add(V);
+    end;
+
+    Report := TNNet.ActivationStatsReport(NN, Probes);
+    AssertTrue('Header present', Pos('ActivationStatsReport:', Report) > 0);
+    AssertTrue('Per-layer std histogram present',
+      Pos('Per-layer std histogram', Report) > 0);
+    AssertTrue('Flag list present', Pos('Flags:', Report) > 0);
+  finally
+    Probes.Free;
     NN.Free;
   end;
 end;
