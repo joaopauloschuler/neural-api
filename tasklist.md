@@ -398,25 +398,6 @@ breakdown:
       input-output Jacobian (the entry already flags this as the natural
       next knob). Reuses the landed `TNNet.EstimateSpectralNorm` power-
       iteration helper.
-- [x] TNNet.EffectiveReceptiveFieldReport(NN, Probes) — empirical
-      (gradient-measured) counterpart to the analytical ReceptiveFieldReport.
-      Picks the centre output unit, EnableInputGradient + one-hot backward over
-      a probe batch, accumulates `|d out_centre / d input|` into a per-(x,y)
-      heatmap; reports the ASCII heatmap, effective RF radius (central 90% mass)
-      and the effective/theoretical ratio. Landed 4160440 with
-      `examples/EffectiveReceptiveField/` (3x3-stack stem 0.78 vs single-9x9
-      1.00) + TestEffectiveReceptiveFieldReportSmoke.
-- [x] TNNet.GradientConflictReport(NN, Samples, UseTrueLabel, LayerIdx) —
-      forward+backward report of pairwise per-sample weight-gradient cosine
-      similarity across a batch (frozen net: ClearDeltas + Backpropagate, never
-      UpdateWeights, snapshots g_i exactly like FisherImportanceReport). Reports
-      the 10-bin ASCII cosine histogram, conflict fraction (cos<0) plus a
-      strong-conflict tail (cos<-0.5 — the discriminating signal once a softmax
-      head's cross-class pairs sit mildly negative), mean/median, most-conflicting
-      pair, per-class-pair mean-cosine matrix, and an optional LayerIdx slab
-      restriction. Landed 860ee44 with `examples/GradientConflict/` (clean
-      cos<-0.5 = 0% vs noised 16.9%) + TestGradientConflictReportSmoke (pins
-      self-cosine diagonal = 1 and matrix symmetry).
 - [ ] GradientConflictReport follow-up: the raw `cos<0` conflict fraction is
       dominated by a softmax head's mildly-anti-correlated cross-class pairs, so
       the report falls back on a `cos<-0.5` strong-conflict tail. Add a sibling
