@@ -336,11 +336,6 @@ breakdown:
       SimpleImage path, or a tiny demo showing the same conv stack accepting
       two different input resolutions and producing a fixed-size head.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
-- [ ] TNNetLpPool follow-up: `p`-sweep bake-off experiment. Same tiny conv
-      classifier, swap the pooling for `TNNetLpPool` at `p ∈ {1, 2, 4, 8}`
-      plus an `TNNetAvgPool` (≡ p with abs, sort of) and `TNNetMaxPool`
-      (≡ p→∞) baseline, chart final loss/accuracy — shows the average↔max
-      interpolation empirically. Forward layer + gradient already landed.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 - [ ] TNNetSoftPool follow-up: add an optional `beta` temperature to the
@@ -352,10 +347,9 @@ breakdown:
       `y=sum w_i x_i`, backward `dy/dx_i = w_i*(1+x_i-y)`, beta fixed at 1).
 - [ ] Pooling bake-off example `examples/PoolingBakeoff/`: same tiny conv
       classifier, swap the pooling head across `TNNetAvgPool` / `TNNetMaxPool`
-      / `TNNetLpPool(p=2)` / `TNNetSoftPool`, chart final loss/accuracy on a
-      small CIFAR stub. Visualises the average<->max interpolation empirically
-      (subsumes the TNNetLpPool `p`-sweep follow-up above — fold them into one
-      example). All four pooling layers are in tree.
+      / `TNNetLpPool` (sweep `p ∈ {1, 2, 4, 8}`) / `TNNetSoftPool`, chart final
+      loss/accuracy on a small CIFAR stub. Visualises the average<->max
+      interpolation empirically. All four pooling layers are in tree.
 - [ ] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
       stack accepting two different input resolutions and producing a
       fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
