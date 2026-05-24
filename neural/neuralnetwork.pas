@@ -4284,6 +4284,59 @@ type
       // tensors are sized to match Output. Safe to call repeatedly. Guards a
       // nil/zero-layer net (does nothing).
       procedure EnableInputGradient();
+      // Forward+backward adversarial-robustness diagnostic. Given a trained
+      // classifier NN, a labelled probe batch (Samples, a TNNetVolumeList of
+      // input volumes, plus Labels, the matching integer class indices — NOT
+      // one-hot), and a menu of FGSM step sizes EpsList, it crafts fast
+      // gradient sign method (Goodfellow et al. 2015) perturbations
+      //   x_adv = x + eps * sign(d loss / d x)
+      // and reports how the model's accuracy degrades under worst-case
+      // input-space noise. For each sample it runs ONE forward + ONE backward
+      // pass to obtain the input gradient (reusing EnableInputGradient — the
+      // input layer's gradient is off by default), where the last-layer output
+      // error is the cross-entropy gradient (softmax_output - one_hot(label),
+      // exactly what TNNet.Backpropagate(target) produces), takes the
+      // element-wise sign, steps the input by each eps, and re-runs a CLEAN
+      // forward on the perturbed input to read the new argmax. Reports:
+      //   (a) top-1 accuracy at each eps as a degradation curve (eps=0 is the
+      //       clean baseline — a built-in sanity check that it matches a plain
+      //       evaluation pass over the same batch);
+      //   (b) the per-sample CRITICAL EPSILON (smallest eps that flips the
+      //       prediction away from the clean argmax; "survives" if no eps in
+      //       the menu flips it) as a 10-bin ASCII histogram, so the spread
+      //       between fragile and robust inputs is visible;
+      //   (c) the mean clean-confidence (max softmax probability) of the
+      //       samples that flip EARLIEST vs those that survive LONGEST — the
+      //       high-confidence-yet-fragile failure mode;
+      //   (d) per-class top-1 accuracy at a fixed (median) eps, so a class
+      //       whose decision boundary sits unusually close to its inputs
+      //       stands out;
+      //   (e) a one-line verdict "robust" / "moderately fragile" / "fragile"
+      //       from the accuracy DROP (clean - perturbed) at the median eps.
+      // FGSM perturbs the RAW input (no input clipping/normalisation is
+      // assumed). EpsList may be passed empty to use the default menu
+      // {0, 0.01, 0.02, 0.05, 0.1, 0.2}; it is sorted ascending and a leading
+      // 0 is ensured so the clean baseline is always present. The inspected
+      // network is FROZEN: ClearDeltas is used and UpdateWeights is NEVER
+      // called, so the trained weights are never modified (this is an
+      // EVALUATION of robustness, not adversarial TRAINING — only transient
+      // OutputError tensors are consumed). Distinct from SaliencyReport
+      // (per-sample input attribution for one logit — WHERE the model looks,
+      // not HOW FAR an input can be pushed before it misclassifies), from
+      // EquivarianceReport (fixed symmetry transforms, no label and no
+      // gradient — invariance, not worst-case accuracy loss), from
+      // LayerSensitivityReport (jitters WEIGHTS and measures output delta —
+      // this jitters INPUTS along the loss gradient and measures label flips)
+      // and from DecisionBoundaryReport (renders the 2-D learned function over
+      // a grid — this probes the high-D input neighbourhood of real labelled
+      // samples). Guards nil NN, an empty Samples list and a Labels-length
+      // mismatch gracefully (returns a short message; never crashes).
+      class function AdversarialRobustnessReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        const Labels: array of integer;
+        const EpsList: array of TNeuralFloat
+      ): string;
       class function SaliencyReport(
         NN: TNNet;
         Probe: TNNetVolume;
@@ -27849,6 +27902,351 @@ begin
     if Avg <> nil then Avg.Free;
     for TIdx := 0 to cTransformCount - 1 do
       if TNet[TIdx] <> nil then TNet[TIdx].Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.AdversarialRobustnessReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  const Labels: array of integer;
+  const EpsList: array of TNeuralFloat
+): string;
+var
+  Lines: TStringList;
+  N, NClasses, OutSize, NEps, MedianIdx: integer;
+  I, J, E, c: integer;
+  Eps: array of TNeuralFloat;
+  CleanArgmax: array of integer;
+  CleanConf: array of TNeuralFloat;
+  CritEps: array of TNeuralFloat;   // critical eps per sample; -1 == survived
+  CorrectAtEps: array of integer;   // top-1 hits per eps
+  Acc: array of TNeuralFloat;
+  // per-class accuracy at median eps
+  ClassTotal, ClassCorrect: array of integer;
+  Grad, Adv: TNNetVolume;
+  HaveZero: boolean;
+  Tmp: TNeuralFloat;
+  PredCls: integer;
+  AccClean, AccMedian, Drop: TNeuralFloat;
+  Verdict: string;
+  // critical-eps histogram
+  Hist: array[0..9] of integer;
+  Bin, MaxBin, BarLen, Survived, Flipped: integer;
+  MinCrit, MaxCrit, Span: TNeuralFloat;
+  // confidence of earliest-flippers vs longest-survivors
+  ConfEarly, ConfLate: TNeuralFloat;
+  CntEarly, CntLate: integer;
+  EarlyEps, LateEps: TNeuralFloat;
+
+  function SignF(v: TNeuralFloat): TNeuralFloat;
+  begin
+    if v > 0 then Result := 1.0
+    else if v < 0 then Result := -1.0
+    else Result := 0.0;
+  end;
+
+  // One forward + one backward on input X with one-hot target on TrueClass,
+  // depositing d(cross-entropy loss)/d x onto the input layer. Frozen: deltas
+  // are cleared and never applied (no UpdateWeights). The result is written
+  // into GradOut (assumed already sized to X).
+  procedure InputLossGrad(X: TNNetVolume; TrueClass: integer; GradOut: TNNetVolume);
+  var
+    Gi: integer;
+    Target: TNNetVolume;
+    InLayer: TNNetLayer;
+  begin
+    NN.ClearDeltas();
+    NN.Compute(X);
+    Target := TNNetVolume.Create(NN.GetLastLayer.Output.Size, 1, 1);
+    try
+      Target.Fill(0);
+      if (TrueClass >= 0) and (TrueClass < Target.Size) then
+        Target.Raw[TrueClass] := 1.0;
+      // TNNet.Backpropagate sets last-layer error = Output - Target (the
+      // cross-entropy gradient) and runs the backward chain.
+      NN.Backpropagate(Target);
+    finally
+      Target.Free;
+    end;
+    GradOut.Fill(0);
+    InLayer := NN.Layers[0];
+    if (InLayer.OutputError <> nil) and
+       (InLayer.OutputError.Size = GradOut.Size) then
+      for Gi := 0 to GradOut.Size - 1 do
+        GradOut.Raw[Gi] := InLayer.OutputError.Raw[Gi];
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Grad := nil; Adv := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'AdversarialRobustnessReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'AdversarialRobustnessReport: network needs at least 2 layers.'
+        + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'AdversarialRobustnessReport: Samples is nil or empty '
+        + '(no samples).' + sLineBreak;
+      Exit;
+    end;
+    N := Samples.Count;
+    if Length(Labels) <> N then
+    begin
+      Result := Format('AdversarialRobustnessReport: Labels length (%d) does '
+        + 'not match Samples count (%d).', [Length(Labels), N]) + sLineBreak;
+      Exit;
+    end;
+
+    // Build the epsilon menu: default if empty, then ensure a leading 0 and
+    // sort ascending (simple insertion sort; the menu is tiny).
+    if Length(EpsList) = 0 then
+    begin
+      SetLength(Eps, 6);
+      Eps[0] := 0;    Eps[1] := 0.01; Eps[2] := 0.02;
+      Eps[3] := 0.05; Eps[4] := 0.1;  Eps[5] := 0.2;
+    end
+    else
+    begin
+      SetLength(Eps, Length(EpsList));
+      for I := 0 to Length(EpsList) - 1 do Eps[I] := EpsList[I];
+    end;
+    HaveZero := False;
+    for I := 0 to Length(Eps) - 1 do
+      if Eps[I] = 0 then HaveZero := True;
+    if not HaveZero then
+    begin
+      SetLength(Eps, Length(Eps) + 1);
+      Eps[High(Eps)] := 0;
+    end;
+    // insertion sort ascending
+    for I := 1 to Length(Eps) - 1 do
+    begin
+      Tmp := Eps[I]; J := I - 1;
+      while (J >= 0) and (Eps[J] > Tmp) do
+      begin
+        Eps[J + 1] := Eps[J]; Dec(J);
+      end;
+      Eps[J + 1] := Tmp;
+    end;
+    NEps := Length(Eps);
+    MedianIdx := NEps div 2;  // skewed toward larger eps for an even count
+
+    // Freeze weights for the whole report.
+    NN.SetBatchUpdate(true);
+    NN.ClearDeltas();
+    NN.Compute(Samples[0]);
+    OutSize := NN.GetLastLayer.Output.Size;
+    NClasses := OutSize;
+    // Enable the input-layer gradient once the Output is sized.
+    NN.EnableInputGradient();
+
+    SetLength(CleanArgmax, N);
+    SetLength(CleanConf, N);
+    SetLength(CritEps, N);
+    SetLength(CorrectAtEps, NEps);
+    SetLength(Acc, NEps);
+    SetLength(ClassTotal, NClasses);
+    SetLength(ClassCorrect, NClasses);
+    for E := 0 to NEps - 1 do CorrectAtEps[E] := 0;
+    for c := 0 to NClasses - 1 do
+    begin
+      ClassTotal[c] := 0; ClassCorrect[c] := 0;
+    end;
+
+    Grad := TNNetVolume.Create(Samples[0]);
+    Adv := TNNetVolume.Create(Samples[0]);
+
+    for I := 0 to N - 1 do
+    begin
+      // Clean forward: record argmax and max-softmax confidence.
+      NN.Compute(Samples[I]);
+      CleanArgmax[I] := NN.GetLastLayer.Output.GetClass();
+      CleanConf[I] := NN.GetLastLayer.Output.GetMax();
+      CritEps[I] := -1;  // assume survives until proven otherwise
+
+      // Input loss gradient (one backward pass), then its sign.
+      Grad.ReSize(Samples[I]);
+      Adv.ReSize(Samples[I]);
+      InputLossGrad(Samples[I], Labels[I], Grad);
+      for J := 0 to Grad.Size - 1 do Grad.Raw[J] := SignF(Grad.Raw[J]);
+
+      for E := 0 to NEps - 1 do
+      begin
+        // x_adv = x + eps * sign(grad); eps=0 reproduces the clean input.
+        for J := 0 to Adv.Size - 1 do
+          Adv.Raw[J] := Samples[I].Raw[J] + Eps[E] * Grad.Raw[J];
+        NN.Compute(Adv);
+        PredCls := NN.GetLastLayer.Output.GetClass();
+        if PredCls = Labels[I] then Inc(CorrectAtEps[E]);
+        // critical eps = smallest eps>0 that flips away from the clean argmax.
+        if (Eps[E] > 0) and (CritEps[I] < 0) and
+           (PredCls <> CleanArgmax[I]) then
+          CritEps[I] := Eps[E];
+        // per-class accuracy at the median eps.
+        if E = MedianIdx then
+        begin
+          if (Labels[I] >= 0) and (Labels[I] < NClasses) then
+          begin
+            Inc(ClassTotal[Labels[I]]);
+            if PredCls = Labels[I] then Inc(ClassCorrect[Labels[I]]);
+          end;
+        end;
+      end;
+    end;
+
+    for E := 0 to NEps - 1 do Acc[E] := CorrectAtEps[E] / N;
+
+    // ---- Report ----
+    Lines.Add('AdversarialRobustnessReport (FGSM, frozen network)');
+    Lines.Add(Format('  samples=%d  classes=%d  eps-levels=%d',
+      [N, NClasses, NEps]));
+    Lines.Add('  FGSM: x_adv = x + eps * sign(d loss / d x); '
+      + 'weights are never updated.');
+    Lines.Add('');
+
+    // (a) accuracy degradation curve.
+    Lines.Add('(a) top-1 accuracy vs eps (eps=0 is the clean baseline):');
+    Lines.Add('      eps     accuracy   bar');
+    for E := 0 to NEps - 1 do
+    begin
+      BarLen := Round(Acc[E] * 40);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > 40 then BarLen := 40;
+      Lines.Add(Format('  %8.4f   %7.3f   %s',
+        [Eps[E], Acc[E], StringOfChar('#', BarLen)]));
+    end;
+    AccClean := Acc[0];
+    AccMedian := Acc[MedianIdx];
+    Lines.Add(Format('  clean accuracy (eps=0) = %.3f  '
+      + '(matches a plain eval pass)', [AccClean]));
+    Lines.Add('');
+
+    // (b) critical-eps histogram.
+    for Bin := 0 to 9 do Hist[Bin] := 0;
+    Survived := 0; Flipped := 0;
+    MinCrit := 1e30; MaxCrit := -1e30;
+    for I := 0 to N - 1 do
+      if CritEps[I] < 0 then Inc(Survived)
+      else
+      begin
+        Inc(Flipped);
+        if CritEps[I] < MinCrit then MinCrit := CritEps[I];
+        if CritEps[I] > MaxCrit then MaxCrit := CritEps[I];
+      end;
+    Lines.Add('(b) critical epsilon (smallest eps that flips the clean '
+      + 'argmax) histogram:');
+    if Flipped = 0 then
+      Lines.Add('  no sample flipped within the eps menu '
+        + '(all survived — robust on this batch).')
+    else
+    begin
+      Span := MaxCrit - MinCrit;
+      for I := 0 to N - 1 do
+        if CritEps[I] >= 0 then
+        begin
+          if Span <= 0 then Bin := 0
+          else
+          begin
+            Bin := Trunc((CritEps[I] - MinCrit) / Span * 10);
+            if Bin > 9 then Bin := 9;
+            if Bin < 0 then Bin := 0;
+          end;
+          Inc(Hist[Bin]);
+        end;
+      MaxBin := 1;
+      for Bin := 0 to 9 do if Hist[Bin] > MaxBin then MaxBin := Hist[Bin];
+      Lines.Add(Format('  critical-eps range [%.4f .. %.4f] over %d flipped '
+        + 'samples (%d survived):', [MinCrit, MaxCrit, Flipped, Survived]));
+      for Bin := 0 to 9 do
+      begin
+        BarLen := Round(Hist[Bin] / MaxBin * 30);
+        Lines.Add(Format('  bin %d  %4d  %s',
+          [Bin, Hist[Bin], StringOfChar('#', BarLen)]));
+      end;
+    end;
+    Lines.Add('');
+
+    // (c) clean-confidence of earliest flippers vs longest survivors.
+    Lines.Add('(c) clean-confidence (max softmax prob): earliest flippers vs '
+      + 'longest survivors:');
+    ConfEarly := 0; ConfLate := 0; CntEarly := 0; CntLate := 0;
+    if Flipped > 0 then
+    begin
+      // earliest = samples whose critical eps equals the smallest observed.
+      EarlyEps := MinCrit;
+      for I := 0 to N - 1 do
+        if (CritEps[I] >= 0) and (CritEps[I] <= EarlyEps + 1e-12) then
+        begin
+          ConfEarly := ConfEarly + CleanConf[I]; Inc(CntEarly);
+        end;
+    end;
+    // longest survivors = samples that never flipped; if none, the highest crit.
+    if Survived > 0 then
+    begin
+      for I := 0 to N - 1 do
+        if CritEps[I] < 0 then
+        begin
+          ConfLate := ConfLate + CleanConf[I]; Inc(CntLate);
+        end;
+    end
+    else if Flipped > 0 then
+    begin
+      LateEps := MaxCrit;
+      for I := 0 to N - 1 do
+        if (CritEps[I] >= 0) and (CritEps[I] >= LateEps - 1e-12) then
+        begin
+          ConfLate := ConfLate + CleanConf[I]; Inc(CntLate);
+        end;
+    end;
+    if CntEarly > 0 then
+      Lines.Add(Format('  earliest flippers (%d): mean clean-confidence = %.4f',
+        [CntEarly, ConfEarly / CntEarly]))
+    else
+      Lines.Add('  earliest flippers: none.');
+    if CntLate > 0 then
+      Lines.Add(Format('  longest survivors (%d): mean clean-confidence = %.4f',
+        [CntLate, ConfLate / CntLate]))
+    else
+      Lines.Add('  longest survivors: none.');
+    Lines.Add('');
+
+    // (d) per-class accuracy at the median eps.
+    Lines.Add(Format('(d) per-class top-1 accuracy at median eps=%.4f:',
+      [Eps[MedianIdx]]));
+    for c := 0 to NClasses - 1 do
+    begin
+      if ClassTotal[c] > 0 then
+        Lines.Add(Format('  class %3d  n=%4d  acc=%7.3f',
+          [c, ClassTotal[c], ClassCorrect[c] / ClassTotal[c]]))
+      else
+        Lines.Add(Format('  class %3d  n=   0  acc=   n/a', [c]));
+    end;
+    Lines.Add('');
+
+    // (e) verdict from the accuracy drop at the median eps.
+    Drop := AccClean - AccMedian;
+    if Drop < 0 then Drop := 0;
+    if Drop < 0.1 then Verdict := 'robust'
+    else if Drop < 0.4 then Verdict := 'moderately fragile'
+    else Verdict := 'fragile';
+    Lines.Add(Format('(e) verdict: %s  (accuracy drop at median eps=%.4f is '
+      + '%.3f: %.3f -> %.3f)',
+      [Verdict, Eps[MedianIdx], Drop, AccClean, AccMedian]));
+
+    Result := Lines.Text;
+  finally
+    if Grad <> nil then Grad.Free;
+    if Adv <> nil then Adv.Free;
     Lines.Free;
   end;
 end;

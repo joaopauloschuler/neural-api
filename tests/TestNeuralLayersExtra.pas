@@ -96,6 +96,7 @@ type
     procedure TestFisherImportanceReportSmoke;
     procedure TestLinearProbeReportSmoke;
     procedure TestEnableInputGradient;
+    procedure TestAdversarialRobustnessReportSmoke;
   end;
 
 implementation
@@ -2467,6 +2468,106 @@ begin
       GradSum > 0);
   finally
     X.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAdversarialRobustnessReportSmoke;
+var
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  X, Y: TNNetVolume;
+  Labels: array of integer;
+  Report: string;
+  C, I, K, Ep: integer;
+  Centers: array[0..1, 0..1] of TNeuralFloat = ((-1.5, -1.5), (1.5, 1.5));
+begin
+  RandSeed := 9090;
+
+  // nil NN handled gracefully (no crash, non-empty message).
+  Report := TNNet.AdversarialRobustnessReport(nil, nil, [], []);
+  AssertTrue('nil NN reported gracefully', Length(Report) > 0);
+  AssertTrue('nil NN message mentions NN', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumeList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(12));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty samples handled gracefully.
+    SetLength(Labels, 0);
+    Report := TNNet.AdversarialRobustnessReport(NN, Samples, Labels, []);
+    AssertTrue('empty samples reported gracefully', Length(Report) > 0);
+    AssertTrue('empty samples mentions empty',
+      (Pos('empty', Report) > 0) or (Pos('no samples', Report) > 0));
+
+    // Train briefly on a separable 2-cluster problem.
+    for Ep := 1 to 60 do
+      for K := 1 to 8 do
+      begin
+        C := Random(2);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(2, 1, 1);
+        try
+          X.FData[0] := Centers[C][0] + (Random - 0.5);
+          X.FData[1] := Centers[C][1] + (Random - 0.5);
+          Y.Fill(0);
+          Y.FData[C] := 1.0;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    // Build a small labelled probe batch.
+    for C := 0 to 1 do
+      for I := 1 to 6 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Samples.Add(X);
+        SetLength(Labels, Length(Labels) + 1);
+        Labels[High(Labels)] := C;
+      end;
+
+    // mismatched Labels length handled gracefully.
+    SetLength(Labels, Length(Labels) - 1);
+    Report := TNNet.AdversarialRobustnessReport(NN, Samples, Labels, []);
+    AssertTrue('mismatched labels reported gracefully', Length(Report) > 0);
+    AssertTrue('mismatched labels mentions mismatch',
+      (Pos('mismatch', Report) > 0) or (Pos('match', Report) > 0) or
+      (Pos('Labels', Report) > 0));
+    SetLength(Labels, Length(Labels) + 1);
+    Labels[High(Labels)] := 1;
+
+    // Full report (default epsilon menu via empty EpsList).
+    Report := TNNet.AdversarialRobustnessReport(NN, Samples, Labels, []);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('AdversarialRobustnessReport', Report) > 0);
+    AssertTrue('accuracy-vs-eps section present',
+      (Pos('eps', Report) > 0) and (Pos('accuracy', Report) > 0));
+    AssertTrue('critical epsilon histogram present',
+      Pos('critical epsilon', Report) > 0);
+    AssertTrue('verdict present',
+      (Pos('robust', Report) > 0) or (Pos('fragile', Report) > 0));
+
+    // Explicit eps list also works.
+    Report := TNNet.AdversarialRobustnessReport(NN, Samples, Labels,
+      [0.0, 0.05, 0.1]);
+    AssertTrue('explicit-eps report non-empty', Length(Report) > 0);
+    AssertTrue('explicit-eps header present',
+      Pos('AdversarialRobustnessReport', Report) > 0);
+  finally
+    Samples.Free;
     NN.Free;
   end;
 end;

@@ -1115,7 +1115,7 @@ breakdown:
       substitutes, not complements).
 
 ### Adversarial robustness
-- [ ] TNNet.AdversarialRobustnessReport(NN, Samples, Labels [, EpsList]) —
+- [x] TNNet.AdversarialRobustnessReport(NN, Samples, Labels [, EpsList]) —
       given a trained classifier and a labelled probe batch, craft FGSM
       (fast gradient sign method, Goodfellow et al. 2015) input
       perturbations `x_adv = x + eps * sign(d loss / d x)` at an
