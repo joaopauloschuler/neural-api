@@ -3,3 +3,5 @@ backup
 *.ppu
 tests/RunTests
 *.exe
+.claude
+.claude/*
