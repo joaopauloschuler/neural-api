@@ -421,6 +421,9 @@ type
     procedure TestL2NormalizeUnitNorm;
     procedure TestL2NormalizeGradientCheck;
     procedure TestL2NormalizeSerializationRoundTrip;
+    procedure TestMinMaxNormForward;
+    procedure TestMinMaxNormGradientCheck;
+    procedure TestMinMaxNormSerializationRoundTrip;
     procedure TestLogitNormalizeGradientCheck;
     procedure TestLogitNormalizeReducesToL2WhenTauOne;
     procedure TestLogitNormalizeSerializationRoundTrip;
@@ -10525,6 +10528,76 @@ begin
       AssertEquals('L2Normalize round-trip class name',
         'TNNetL2Normalize', NN2.GetLastLayer.ClassName);
       AssertEquals('L2Normalize round-trip structure preserves epsilon',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntE: integer;
+  OutMin, OutMax: TNeuralFloat;
+const
+  SizeX = 3; SizeY = 2; Depth = 4;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetMinMaxNorm.Create());
+    // Distinct values across the whole volume so min/max are unique.
+    for CntE := 0 to Input.Size - 1 do
+      Input.Raw[CntE] := Sin(CntE * 0.37) * 2.5 + 0.4;
+    NN.Compute(Input);
+    OutMin := NN.GetLastLayer.Output.GetMin();
+    OutMax := NN.GetLastLayer.Output.GetMax();
+    // With a default eps of 1e-7 and a non-constant volume the output spans
+    // approximately [0,1]: min ~ 0, max ~ 1.
+    AssertEquals('MinMaxNorm output min ~ 0', 0.0, OutMin, 1e-5);
+    AssertEquals('MinMaxNorm output max ~ 1', 1.0, OutMax, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormGradientCheck;
+begin
+  // Per-sample min-max norm reduces over the whole volume; the bulk gradient
+  // routes 1/denom to every element and the argmin/argmax cells receive the
+  // extra min/max-shift corrections. The Sin-seeded inputs from the helper
+  // give strictly distinct values for this 2x1x4 shape, so argmin and argmax
+  // are unique (no ties) and the documented backward is exact.
+  LayerInputGradientCheck(Self, TNNetMinMaxNorm.Create(),
+    'MinMaxNorm', 2, 1, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // Verify that a non-default epsilon round-trips through Save/Load.
+  SerializationRoundTrip(Self, TNNetMinMaxNorm.Create(1e-5),
+    'MinMaxNorm', 3, 1, 4, 1e-5);
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetMinMaxNorm.Create(2.5e-4));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('MinMaxNorm round-trip class name',
+        'TNNetMinMaxNorm', NN2.GetLastLayer.ClassName);
+      AssertEquals('MinMaxNorm round-trip structure preserves epsilon',
         NN.GetLastLayer.SaveStructureToString(),
         NN2.GetLastLayer.SaveStructureToString());
     finally

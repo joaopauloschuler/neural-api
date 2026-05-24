@@ -1499,6 +1499,42 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Per-sample min-max normalization to approximately [0,1].
+  // Rescales every element of the whole sample volume by the sample's own
+  // global minimum and maximum, reduced over ALL positions (x, y AND depth):
+  //   m     = min over the whole volume
+  //   M     = max over the whole volume
+  //   denom = (M - m) + eps          (eps stabilizes a constant/flat volume)
+  //   y_i   = (x_i - m) / denom
+  // The output range is approximately [0,1] (exactly [0,1) when eps=0 and the
+  // volume is non-constant). eps is stored in FFloatSt[0] (default 1e-7) and
+  // round-trips via Save/Load. No trainable parameters.
+  //
+  // Backward (subgradient routing through the non-differentiable min/max):
+  //   bulk:   dL/dx_i += gy_i / denom                       (every element)
+  //   argmax: dL/dx_a += -(1/denom) * sum_j gy_j * y_j      (a = argmax)
+  //   argmin: dL/dx_b += sum_j gy_j * (x_j - M - eps)/denom^2  (b = argmin)
+  // These are the exact gradients of y w.r.t. the inputs given that the
+  // argmin/argmax indices are held fixed (true on a non-degenerate volume
+  // with a unique min and max). Tie convention: when the volume is constant
+  // (M == m, so the argmin and argmax collapse), GetMin/GetMax each pick the
+  // first such index; eps keeps the forward finite and the routing well
+  // defined (a single index absorbs both the min and max corrections).
+  TNNetMinMaxNorm = class(TNNetIdentity)
+  protected
+    FArgMin: TNNetVolume;  // flat argmin index per sample (one cell)
+    FArgMax: TNNetVolume;  // flat argmax index per sample (one cell)
+    FDenoms: TNNetVolume;  // (M - m) + eps per sample (one cell)
+    FMaxVals: TNNetVolume; // M per sample (one cell)
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pEpsilon: TNeuralFloat); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Clamp activation: y = clamp(x, MinValue, MaxValue).
   // Element-wise hard saturation between MinValue and MaxValue. Sub-gradient
   // is 1 strictly inside (MinValue, MaxValue) and 0 outside. MinValue is
@@ -8235,6 +8271,135 @@ begin
         end;
       end;
     end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMinMaxNorm }
+
+constructor TNNetMinMaxNorm.Create();
+begin
+  Create(1e-7);
+end;
+
+constructor TNNetMinMaxNorm.Create(pEpsilon: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pEpsilon;
+  FArgMin  := TNNetVolume.Create();
+  FArgMax  := TNNetVolume.Create();
+  FDenoms  := TNNetVolume.Create();
+  FMaxVals := TNNetVolume.Create();
+end;
+
+destructor TNNetMinMaxNorm.Destroy();
+begin
+  FArgMin.Free;
+  FArgMax.Free;
+  FDenoms.Free;
+  FMaxVals.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetMinMaxNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // One scalar per sample (the reduction is over the whole volume).
+  FArgMin.ReSize(1, 1, 1);
+  FArgMax.ReSize(1, 1, 1);
+  FDenoms.ReSize(1, 1, 1);
+  FMaxVals.ReSize(1, 1, 1);
+end;
+
+procedure TNNetMinMaxNorm.Compute();
+var
+  StartTime: double;
+  CntE, MaxE, ArgMin, ArgMax: integer;
+  LocalPrevOutput: TNNetVolume;
+  MinV, MaxV, Denom, Eps: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.FOutput;
+  Eps := FFloatSt[0];
+  if Eps <= 0 then Eps := 1e-7;
+  // Reduce over the WHOLE volume (all x, y AND depth positions) in one scan,
+  // tracking the first argmin/argmax index for the backward routing.
+  MaxE := LocalPrevOutput.Size - 1;
+  MinV := LocalPrevOutput.FData[0];
+  MaxV := LocalPrevOutput.FData[0];
+  ArgMin := 0;
+  ArgMax := 0;
+  for CntE := 1 to MaxE do
+  begin
+    if LocalPrevOutput.FData[CntE] < MinV then
+    begin
+      MinV := LocalPrevOutput.FData[CntE];
+      ArgMin := CntE;
+    end;
+    if LocalPrevOutput.FData[CntE] > MaxV then
+    begin
+      MaxV := LocalPrevOutput.FData[CntE];
+      ArgMax := CntE;
+    end;
+  end;
+  FArgMin.FData[0] := ArgMin;
+  FArgMax.FData[0] := ArgMax;
+  Denom := (MaxV - MinV) + Eps;
+  FDenoms.FData[0] := Denom;
+  FMaxVals.FData[0] := MaxV;
+  MaxE := LocalPrevOutput.Size - 1;
+  for CntE := 0 to MaxE do
+    FOutput.FData[CntE] := (LocalPrevOutput.FData[CntE] - MinV) / Denom;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMinMaxNorm.Backpropagate();
+var
+  StartTime: double;
+  CntE, MaxE, ArgMin, ArgMax: integer;
+  Denom, InvDenom, InvDenomSq, Gi, Yi: TNeuralFloat;
+  DotGY, ArgMinExtra: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    // Min-max norm backward (argmin/argmax held fixed):
+    //   bulk:   dL/dx_i += gy_i / denom
+    //   argmax: dL/dx_a += -(1/denom) * sum_j gy_j * y_j
+    //   argmin: dL/dx_b += sum_j gy_j * (x_j - M - eps) / denom^2
+    Denom := FDenoms.FData[0];
+    InvDenom := 1.0 / Denom;
+    InvDenomSq := InvDenom * InvDenom;
+    ArgMin := Round(FArgMin.FData[0]);
+    ArgMax := Round(FArgMax.FData[0]);
+    MaxE := FOutput.Size - 1;
+    DotGY := 0;       // sum_j gy_j * y_j
+    ArgMinExtra := 0; // sum_j gy_j * (x_j - M - eps)
+    for CntE := 0 to MaxE do
+    begin
+      Gi := FOutputError.FData[CntE];
+      Yi := FOutput.FData[CntE];
+      DotGY := DotGY + Gi * Yi;
+      // x_j = Yi * Denom + MinV; (x_j - M - eps) = Yi*Denom + MinV - M - eps.
+      // Since Denom = (M - MinV) + eps => MinV - M - eps = -Denom, so
+      // (x_j - M - eps) = Yi*Denom - Denom = (Yi - 1)*Denom.
+      ArgMinExtra := ArgMinExtra + Gi * (Yi - 1.0) * Denom;
+      // bulk term
+      FPrevLayer.OutputError.FData[CntE] :=
+        FPrevLayer.OutputError.FData[CntE] + Gi * InvDenom;
+    end;
+    // argmax extra: -(1/denom) * sum_j gy_j * y_j
+    FPrevLayer.OutputError.FData[ArgMax] :=
+      FPrevLayer.OutputError.FData[ArgMax] - InvDenom * DotGY;
+    // argmin extra: (1/denom^2) * sum_j gy_j * (x_j - M - eps)
+    FPrevLayer.OutputError.FData[ArgMin] :=
+      FPrevLayer.OutputError.FData[ArgMin] + InvDenomSq * ArgMinExtra;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FPrevLayer.Backpropagate();
@@ -31791,6 +31956,7 @@ begin
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
+      'TNNetMinMaxNorm' :           Result := TNNetMinMaxNorm.Create(Ft[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
@@ -32019,6 +32185,7 @@ begin
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
+      if S[0] = 'TNNetMinMaxNorm' then Result := TNNetMinMaxNorm.Create(Ft[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
