@@ -1438,6 +1438,44 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Tversky loss output layer for image segmentation / class-imbalanced
+  // dense prediction. Operates on probability-space inputs p (typically after
+  // a sigmoid or softmax) with binary/one-hot targets g, reduced over the
+  // WHOLE volume (a set-level loss). With
+  //   TP = sum(p*g), FP = sum(p*(1-g)), FN = sum((1-p)*g)
+  // the Tversky index is
+  //   TI = (TP + s) / (TP + alpha*FP + beta*FN + s)
+  // and the loss is L = 1 - TI. The smoothing constant s avoids a zero
+  // denominator (and zero/zero) on empty masks; alpha and beta weight false
+  // positives vs false negatives (alpha = beta = 0.5 recovers Dice).
+  // The forward pass is an identity passthrough (so Net.Compute returns the
+  // probability head); training relies on the framework seeding FOutputError
+  // with (output - target). Backpropagate recovers g = p - FOutputError, then
+  // (after a first pass to accumulate TP/FP/FN) replaces each residual with
+  // the analytic dL/dp_i:
+  //   dL/dp_i = -( g_i*D - Numer*(g_i + alpha*(1-g_i) - beta*g_i) ) / D^2
+  // where Numer = TP + s and D = TP + alpha*FP + beta*FN + s. The stored grad
+  // is the +gradient so the optimizer descends the loss, matching the sign
+  // convention of the sibling loss layers. alpha/beta/s are stored in
+  // FFloatSt[0]/FFloatSt[1]/FFloatSt[2] (defaults 0.5/0.5/1.0) and round-trip
+  // via Save/Load.
+  TNNetTverskyLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pAlpha, pBeta, pSmooth: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Dice loss output layer — Tversky loss with alpha = beta = 0.5, for which
+  // the Tversky index reduces to the Dice coefficient 2TP / (2TP + FP + FN).
+  // Inherits the forward passthrough and analytic backward from
+  // TNNetTverskyLoss; the parameterless Create hardcodes alpha = beta = 0.5
+  // and the default smoothing constant 1.0.
+  TNNetDiceLoss = class(TNNetTverskyLoss)
+  public
+    constructor Create(); override;
+  end;
+
   /// Entropy regularizer (passthrough). Treats the input vector p as a
   // probability distribution (intended to sit immediately after a softmax)
   // and adds the term `-lambda * H(p) = lambda * sum(p * log(p))` to the
@@ -8553,6 +8591,84 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetTverskyLoss }
+
+constructor TNNetTverskyLoss.Create();
+begin
+  Create(0.5, 0.5, 1.0);
+end;
+
+constructor TNNetTverskyLoss.Create(pAlpha, pBeta, pSmooth: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha < 0 then
+    FErrorProc('TNNetTverskyLoss alpha must be >= 0.');
+  if pBeta < 0 then
+    FErrorProc('TNNetTverskyLoss beta must be >= 0.');
+  if pSmooth <= 0 then
+    FErrorProc('TNNetTverskyLoss smooth must be > 0.');
+  FFloatSt[0] := pAlpha;
+  FFloatSt[1] := pBeta;
+  FFloatSt[2] := pSmooth;
+end;
+
+procedure TNNetTverskyLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Alpha, Beta, Smooth: TNeuralFloat;
+  P, Seeded, G: TNeuralFloat;
+  TP, FP, FN, Numer, D, DSq, dDdp: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Alpha := FFloatSt[0];
+  if Alpha < 0 then Alpha := 0.5;
+  Beta := FFloatSt[1];
+  if Beta < 0 then Beta := 0.5;
+  Smooth := FFloatSt[2];
+  if Smooth <= 0 then Smooth := 1.0;
+  SizeM1 := FOutputError.Size - 1;
+  // First pass: accumulate set-level TP, FP, FN over the whole volume.
+  // The framework seeds FOutputError := output - target, so g = p - seeded.
+  TP := 0; FP := 0; FN := 0;
+  for Idx := 0 to SizeM1 do
+  begin
+    P := FOutput.FData[Idx];
+    Seeded := FOutputError.FData[Idx];
+    G := P - Seeded;
+    TP := TP + P * G;
+    FP := FP + P * (1.0 - G);
+    FN := FN + (1.0 - P) * G;
+  end;
+  Numer := TP + Smooth;                       // numerator of the Tversky index
+  D  := TP + Alpha * FP + Beta * FN + Smooth; // denominator
+  DSq := D * D;
+  if DSq <= 0 then DSq := 1e-12;
+  // Second pass: replace each residual with the analytic dL/dp_i.
+  // dTP/dp_i = g_i, dD/dp_i = g_i + alpha*(1-g_i) - beta*g_i, L = 1 - Nn/D.
+  // dL/dp_i = -( g_i*D - Nn*dD/dp_i ) / D^2.
+  for Idx := 0 to SizeM1 do
+  begin
+    P := FOutput.FData[Idx];
+    Seeded := FOutputError.FData[Idx];
+    G := P - Seeded;
+    dDdp := G + Alpha * (1.0 - G) - Beta * G;
+    FOutputError.FData[Idx] := -(G * D - Numer * dDdp) / DSq;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetDiceLoss }
+
+constructor TNNetDiceLoss.Create();
+begin
+  inherited Create(0.5, 0.5, 1.0);
 end;
 
 { TNNetEntropyRegularizer }
@@ -35239,6 +35355,8 @@ begin
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
+      'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
+      'TNNetDiceLoss' :             Result := TNNetDiceLoss.Create();
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
       'TNNetUnitNorm' :             Result := TNNetUnitNorm.Create();
       'TNNetMinMaxNorm' :           Result := TNNetMinMaxNorm.Create(Ft[0]);
@@ -35480,6 +35598,8 @@ begin
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
+      if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else
+      if S[0] = 'TNNetDiceLoss' then Result := TNNetDiceLoss.Create() else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetUnitNorm' then Result := TNNetUnitNorm.Create() else
       if S[0] = 'TNNetMinMaxNorm' then Result := TNNetMinMaxNorm.Create(Ft[0]) else

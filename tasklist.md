@@ -350,9 +350,9 @@ breakdown:
       train a small "student" against soft targets from a fixed "teacher"
       distribution using the landed TNNetKLDivergence head, and contrast its
       loss curve with a hard-label cross-entropy baseline.
-- [ ] TNNetDiceLoss — `1 - 2·sum(p·q + ε) / (sum(p²) + sum(q²) + ε)`,
+- [X] TNNetDiceLoss — `1 - 2·sum(p·q + ε) / (sum(p²) + sum(q²) + ε)`,
       IoU-flavored segmentation loss.
-- [ ] TNNetTverskyLoss — generalized Dice with separate FP/FN weights α, β.
+- [X] TNNetTverskyLoss — generalized Dice with separate FP/FN weights α, β.
 - [ ] TNNetWingLoss — facial-landmark regression loss with log-shaped wing
       near zero and a linear tail.
 - [ ] TNNetTripletLoss — `max(0, ||a-p||² - ||a-n||² + margin)`. Input

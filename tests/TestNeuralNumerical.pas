@@ -169,6 +169,12 @@ type
     procedure TestKLDivergenceForwardPassthrough;
     procedure TestKLDivergenceGradient;
     procedure TestKLDivergenceLoadFromString;
+    procedure TestTverskyLossForwardPassthrough;
+    procedure TestTverskyLossGradient;
+    procedure TestTverskyLossLoadFromString;
+    procedure TestDiceLossForwardPassthrough;
+    procedure TestDiceLossGradient;
+    procedure TestDiceLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -15579,6 +15585,330 @@ begin
     NN2.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTverskyLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetTverskyLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetTverskyLoss.Create(0.7, 0.3, 1.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Abs(Sin(i * 0.31));
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('TverskyLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTverskyLossGradient;
+const
+  cEps = 1e-4;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Alpha, Beta, Smooth: TNeuralFloat;
+  AnaGrad, NumGrad, OldP, LossP, LossM: TNeuralFloat;
+  i, CaseIdx: integer;
+
+  function TverskyLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j: integer;
+    TP, FP, FN, P, G, TI: TNeuralFloat;
+  begin
+    TP := 0; FP := 0; FN := 0;
+    for j := 0 to AInput.Size - 1 do
+    begin
+      P := AInput.Raw[j];
+      G := Target.Raw[j];
+      TP := TP + P * G;
+      FP := FP + P * (1.0 - G);
+      FN := FN + (1.0 - P) * G;
+    end;
+    TI := (TP + Smooth) / (TP + Alpha * FP + Beta * FN + Smooth);
+    Result := 1.0 - TI;
+  end;
+
+begin
+  for CaseIdx := 0 to 1 do
+  begin
+    if CaseIdx = 0 then
+    begin
+      Alpha := 0.5; Beta := 0.5; Smooth := 1.0;
+    end
+    else
+    begin
+      Alpha := 0.7; Beta := 0.3; Smooth := 0.5;
+    end;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 1, 1);
+    Target := TNNetVolume.Create(6, 1, 1);
+    try
+      NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetTverskyLoss.Create(Alpha, Beta, Smooth));
+
+      // Probabilities in (0,1) and a mixed binary target.
+      Input.Raw[0] := 0.10; Target.Raw[0] := 0.0;
+      Input.Raw[1] := 0.85; Target.Raw[1] := 1.0;
+      Input.Raw[2] := 0.45; Target.Raw[2] := 1.0;
+      Input.Raw[3] := 0.30; Target.Raw[3] := 0.0;
+      Input.Raw[4] := 0.60; Target.Raw[4] := 1.0;
+      Input.Raw[5] := 0.20; Target.Raw[5] := 0.0;
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      // Central-difference numerical gradient w.r.t. each input position.
+      for i := 0 to Input.Size - 1 do
+      begin
+        AnaGrad := LMid.OutputError.Raw[i];
+
+        OldP := Input.Raw[i];
+        Input.Raw[i] := OldP + cEps;
+        LossP := TverskyLossAt(Input);
+        Input.Raw[i] := OldP - cEps;
+        LossM := TverskyLossAt(Input);
+        Input.Raw[i] := OldP;
+        NumGrad := (LossP - LossM) / (2 * cEps);
+
+        AssertEquals('TverskyLoss alpha=' + FloatToStr(Alpha) +
+          ' grad at ' + IntToStr(i),
+          NumGrad, AnaGrad, 1e-3);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTverskyLossLoadFromString;
+const
+  cAlpha  = 0.7;
+  cBeta   = 0.3;
+  cSmooth = 0.5;
+  cEps    = 1e-4;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  AnaGrad, NumGrad, OldP, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  function TverskyLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j: integer;
+    TP, FP, FN, P, G, TI: TNeuralFloat;
+  begin
+    TP := 0; FP := 0; FN := 0;
+    for j := 0 to AInput.Size - 1 do
+    begin
+      P := AInput.Raw[j];
+      G := Target.Raw[j];
+      TP := TP + P * G;
+      FP := FP + P * (1.0 - G);
+      FN := FN + (1.0 - P) * G;
+    end;
+    TI := (TP + cSmooth) / (TP + cAlpha * FP + cBeta * FN + cSmooth);
+    Result := 1.0 - TI;
+  end;
+
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetTverskyLoss.Create(cAlpha, cBeta, cSmooth));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetTverskyLoss',
+      NN2.GetLastLayer is TNNetTverskyLoss);
+    // The structure string encodes the FFloatSt params; equality proves
+    // alpha/beta/smooth survived the save/load cycle. The gradient check
+    // below additionally confirms the loaded params drive the analytic grad.
+    AssertEquals('TverskyLoss round-trip structure preserves params',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+
+    Input.Raw[0] := 0.20; Target.Raw[0] := 0.0;
+    Input.Raw[1] := 0.70; Target.Raw[1] := 1.0;
+    Input.Raw[2] := 0.40; Target.Raw[2] := 1.0;
+    Input.Raw[3] := 0.10; Target.Raw[3] := 0.0;
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + cEps;
+      LossP := TverskyLossAt(Input);
+      Input.Raw[i] := OldP - cEps;
+      LossM := TverskyLossAt(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+
+      AssertEquals('TverskyLoss round-trip gradient at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDiceLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetDiceLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetDiceLoss.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Abs(Sin(i * 0.41));
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('DiceLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDiceLossGradient;
+const
+  cEps    = 1e-4;
+  cAlpha  = 0.5; // Dice = Tversky with alpha = beta = 0.5
+  cBeta   = 0.5;
+  cSmooth = 1.0;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  AnaGrad, NumGrad, OldP, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  function DiceLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j: integer;
+    TP, FP, FN, P, G, TI: TNeuralFloat;
+  begin
+    TP := 0; FP := 0; FN := 0;
+    for j := 0 to AInput.Size - 1 do
+    begin
+      P := AInput.Raw[j];
+      G := Target.Raw[j];
+      TP := TP + P * G;
+      FP := FP + P * (1.0 - G);
+      FN := FN + (1.0 - P) * G;
+    end;
+    TI := (TP + cSmooth) / (TP + cAlpha * FP + cBeta * FN + cSmooth);
+    Result := 1.0 - TI;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Target := TNNetVolume.Create(6, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetDiceLoss.Create());
+
+    Input.Raw[0] := 0.15; Target.Raw[0] := 0.0;
+    Input.Raw[1] := 0.90; Target.Raw[1] := 1.0;
+    Input.Raw[2] := 0.50; Target.Raw[2] := 1.0;
+    Input.Raw[3] := 0.25; Target.Raw[3] := 0.0;
+    Input.Raw[4] := 0.65; Target.Raw[4] := 1.0;
+    Input.Raw[5] := 0.35; Target.Raw[5] := 0.0;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + cEps;
+      LossP := DiceLossAt(Input);
+      Input.Raw[i] := OldP - cEps;
+      LossM := DiceLossAt(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+
+      AssertEquals('DiceLoss gradient at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDiceLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // Dice takes no params (Create hardcodes alpha=beta=0.5, smooth=1.0).
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetDiceLoss.Create());
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetDiceLoss',
+      NN2.GetLastLayer is TNNetDiceLoss);
+    // Structure equality proves the hardcoded alpha/beta/smooth survived.
+    AssertEquals('DiceLoss round-trip structure preserves params',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+  finally
+    NN.Free;
+    NN2.Free;
   end;
 end;
 
