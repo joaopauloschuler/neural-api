@@ -445,10 +445,15 @@ breakdown:
       reparametrization here covers the headline use case.
 
 #### Reduction / shape
-- [ ] TNNetAdaptiveAvgPool example/usage: swap a fixed global-avg head
+- [X] TNNetAdaptiveAvgPool example/usage: swap a fixed global-avg head
       (`TNNetAvgChannel`) for `TNNetAdaptiveAvgPool.Create(1)` in one
       SimpleImage path, or a tiny demo showing the same conv stack accepting
       two different input resolutions and producing a fixed-size head.
+      Landed 2026-05-24 as examples/AdaptivePoolResolution/ (together with
+      the TNNetAdaptiveMaxPool example below): one conv stack fed 16x16 and
+      24x24, fixed 1x1 and 2x2 adaptive heads, with built-in
+      Create(1)==global and Create(N)==identity degeneracy assertions and a
+      train-at-16/infer-at-24 sanity step.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
@@ -459,11 +464,13 @@ breakdown:
      the class-mean is invariant and only energy CONCENTRATION is
      discriminative: AvgPool/LpPool(p=1) sit at chance, MaxPool solves it, and
      both LpPool's p and SoftPool's beta interpolate avg→max.) -->
-- [ ] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
+- [X] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
       stack accepting two different input resolutions and producing a
       fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
       sibling to the open TNNetAdaptiveAvgPool example task above. Layer +
-      gradient/forward tests already landed.
+      gradient/forward tests already landed. Landed 2026-05-24 as
+      examples/AdaptivePoolResolution/ (same example as the AvgPool entry
+      above — both adaptive layers are exercised in one demo).
 ### Loss layers
 - [ ] TNNetCosineEmbeddingLoss follow-up (now landed): a tiny
       siamese-pair embedding micro-example — train two shared-weight MLP
