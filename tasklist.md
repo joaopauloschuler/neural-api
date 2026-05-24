@@ -285,10 +285,10 @@ breakdown:
       train a deepish residual MLP with scalar ReZero vs per-channel
       GatedResidual gates, chart whether the per-channel gate opens unevenly
       across channels.
-- [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
-      sigmoid gate.
-- [ ] TNNetSwitchableNorm — learnable softmax-weighted combination of
-      LayerNorm and RMSNorm outputs.
+- [X] (done, lucky-day 2026-05-24) TNNetRMSNormGated — RMSNorm
+      followed by a learnable per-channel sigmoid gate.
+- [ ] (in progress, lucky-day 2026-05-24) TNNetSwitchableNorm — learnable
+      softmax-weighted combination of LayerNorm and RMSNorm outputs.
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.

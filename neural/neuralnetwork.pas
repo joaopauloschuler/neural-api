@@ -2440,6 +2440,37 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Per-sample root-mean-square normalization followed by a learnable
+  // PER-CHANNEL sigmoid gate. Each input sample (all elements across
+  // SizeX*SizeY*Depth) is first divided by the root mean square of its
+  // elements (no mean subtraction, same eps and whole-sample convention as
+  // TNNetRMSNorm):  n[x,y,d] = x[x,y,d] / sqrt(mean(x^2) + eps).
+  // Then each channel is gated by a sigmoid of one learnable logit g[d]:
+  //   y[x,y,d] = n[x,y,d] * sigmoid(g[d]).
+  // The ONLY learnable parameters are the Depth gate logits g[d] (there is no
+  // per-element gamma). The logits are initialised to 0 so an untrained gate
+  // is sigmoid(0) = 0.5 (the layer halves the normalized activation at init).
+  // Output has the same shape as the input.
+  // Backward flows the input error through BOTH the per-channel scale
+  // sigmoid(g[d]) AND the shared invRMS Jacobian (the RMS term couples all
+  // elements of the sample), reusing TNNetRMSNorm's exact invRMS Jacobian
+  // structure; the gate-logit gradient is
+  //   dL/dg[d] = sum_{x,y} OutputError[x,y,d] * n[x,y,d] * s_d*(1 - s_d).
+  // Storage: FNeurons[0].Weights = gate logits g (Depth values).
+  TNNetRMSNormGated = class(TNNetChannelTransformBase)
+    private
+      FRMSNormEpsilon: TNeuralFloat;
+      FInvRMS: TNeuralFloat;
+      FNormalized: TNNetVolume;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Global Response Normalization (ConvNeXt-V2, Woo et al. 2023,
   /// https://arxiv.org/abs/2301.00808). Channel-wise contrast normalization
   /// with two learnable per-channel parameters gamma[c] and beta[c]:
@@ -18851,6 +18882,155 @@ procedure TNNetRMSNorm.InitDefault();
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   FNeurons[0].FWeights.Fill(1); // gamma
+  AfterWeightUpdate();
+end;
+
+{ TNNetRMSNormGated }
+constructor TNNetRMSNormGated.Create();
+begin
+  inherited Create();
+  FRMSNormEpsilon := 1e-5;
+  FInvRMS := 1;
+  FNormalized := TNNetVolume.Create();
+  InitDefault();
+end;
+
+destructor TNNetRMSNormGated.Destroy();
+begin
+  FNormalized.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRMSNormGated.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base allocates FNeurons[0] with Depth weights; these hold one gate
+  // logit g[d] per channel.
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  FNormalized.ReSize(FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetRMSNormGated.Compute();
+var
+  StartTime: double;
+  W: TNNetVolume;
+  MeanSqr, s: TNeuralFloat;
+  SizeX, SizeY, Depth, x, y, d: integer;
+begin
+  StartTime := Now();
+  inherited Compute;
+  // Divide the whole sample by its root mean square (no mean subtraction),
+  // exactly like TNNetRMSNorm.
+  MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
+  FInvRMS := 1 / Sqrt(MeanSqr + FRMSNormEpsilon);
+  FOutput.Mul(FInvRMS);
+  // Keep the normalized values n[x,y,d] for the backward pass.
+  FNormalized.Copy(FOutput);
+  // Apply the learnable per-channel sigmoid gate: y = n * sigmoid(g[d]).
+  W := FNeurons[0].FWeights;
+  Depth := FOutput.Depth;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  for d := 0 to Depth - 1 do
+  begin
+    s := Sigmoid(W.Raw[d]);
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+        FOutput[x, y, d] := FOutput[x, y, d] * s;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRMSNormGated.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  W: TNNetVolume;
+  FloatSize, SumDxHatXHat, s, sDeriv, g: TNeuralFloat;
+  SizeX, SizeY, Depth, x, y, d, Cnt, SizeM1: integer;
+  gradG: array of TNeuralFloat;
+  sByDepth: array of TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  W := localNeuron.FWeights;
+  Depth := FOutput.Depth;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  FloatSize := FOutput.Size;
+  SizeM1 := FOutput.Size - 1;
+
+  // Precompute per-channel sigmoid s_d once.
+  SetLength(sByDepth, Depth);
+  for d := 0 to Depth - 1 do sByDepth[d] := Sigmoid(W.Raw[d]);
+
+  // Gradient w.r.t. each gate logit g[d]:
+  //   dL/dg[d] = sum_{x,y} OutputError[x,y,d] * n[x,y,d] * s_d*(1 - s_d).
+  SetLength(gradG, Depth);
+  for d := 0 to Depth - 1 do gradG[d] := 0;
+  for x := 0 to SizeX - 1 do
+    for y := 0 to SizeY - 1 do
+      for d := 0 to Depth - 1 do
+        gradG[d] := gradG[d] +
+          FOutputError[x, y, d] * FNormalized[x, y, d];
+  for d := 0 to Depth - 1 do
+  begin
+    s := sByDepth[d];
+    sDeriv := s * (1 - s);
+    g := gradG[d] * sDeriv;
+    localNeuron.FDelta.Raw[d] := localNeuron.FDelta.Raw[d] +
+      (-FLearningRate) * g;
+  end;
+  SetLength(gradG, 0);
+
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Input gradient flows through BOTH the per-channel scale s_d AND the
+    // shared invRMS Jacobian (reuse of TNNetRMSNorm's structure):
+    //   dxhat[x,y,d] = OutputError[x,y,d] * s_d
+    //   dx = invRMS * ( dxhat - xhat * mean(dxhat * xhat) )
+    // where xhat = n (the normalized activation cached in FNormalized).
+    SumDxHatXHat := 0;
+    for d := 0 to Depth - 1 do
+    begin
+      s := sByDepth[d];
+      for x := 0 to SizeX - 1 do
+        for y := 0 to SizeY - 1 do
+          FOutputErrorDeriv[x, y, d] := FOutputError[x, y, d] * s;
+    end;
+    for Cnt := 0 to SizeM1 do
+      SumDxHatXHat := SumDxHatXHat +
+        FOutputErrorDeriv.FData[Cnt] * FNormalized.FData[Cnt];
+    SumDxHatXHat := SumDxHatXHat / FloatSize;
+    for Cnt := 0 to SizeM1 do
+      FPrevLayer.FOutputError.FData[Cnt] :=
+        FPrevLayer.FOutputError.FData[Cnt] +
+        FInvRMS * ( FOutputErrorDeriv.FData[Cnt] -
+          FNormalized.FData[Cnt] * SumDxHatXHat );
+  end;
+  SetLength(sByDepth, 0);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetRMSNormGated.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].FWeights.Fill(0); // gate logits g[d] -> sigmoid(0) = 0.5
   AfterWeightUpdate();
 end;
 
@@ -38713,6 +38893,7 @@ begin
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
+      'TNNetRMSNormGated':          Result := TNNetRMSNormGated.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
       'TNNetPixelNorm':             Result := TNNetPixelNorm.Create();
       'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
@@ -38970,6 +39151,7 @@ begin
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
+      if S[0] = 'TNNetRMSNormGated' then Result := TNNetRMSNormGated.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
       if S[0] = 'TNNetPixelNorm' then Result := TNNetPixelNorm.Create() else
       if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else

@@ -20,6 +20,7 @@ A few conventions used below:
 |---|---|---|---|---|
 | `TNNetLayerNorm.Create()` | whole sample (X, Y **and** Depth) | gamma + beta, per-element (one per X*Y*Depth) | `y = gamma * (x - mean) / sqrt(var + eps) + beta` | Transformers / RNNs; the general-purpose batch-independent norm. |
 | `TNNetRMSNorm.Create()` | whole sample (X, Y **and** Depth) | gamma only, per-element | `y = gamma * x / sqrt(mean(x^2) + eps)` | Cheaper LayerNorm for transformers; skip mean-centering. |
+| `TNNetRMSNormGated.Create()` | whole sample (X, Y **and** Depth) for the RMS; gate is per-channel | gate logit `g[c]` only, per-channel (init 0) | `y = (x / sqrt(mean(x^2) + eps)) * sigmoid(g[c])` | RMSNorm with a learnable per-channel on/off gate instead of gamma. |
 | `TNNetZScore.Create()` | whole sample (X, Y **and** Depth) | none | `y = (x - mean) / sqrt(var + eps)` | LayerNorm's normalization without the affine; fixed standardization. |
 | `TNNetGroupNorm.Create(Groups)` | each contiguous channel group, over (X, Y + channels-in-group) | gamma + beta, per-element | `y = gamma * (x - mean_g) / sqrt(var_g + eps) + beta` | Vision / small batches where BatchNorm is unstable. |
 | `TNNetInstanceNorm.Create()` | each single channel, over (X, Y) | gamma + beta, per-element | GroupNorm with `Groups = Depth` | Style transfer / generative vision; per-channel contrast. |
@@ -47,6 +48,21 @@ Constructor: `Create()`. eps = `1e-5` (fixed). Like LayerNorm but divides by the
 root-mean-square of the elements **without subtracting the mean**, then applies a
 learnable per-element `gamma` (init 1). No `beta`. Cheaper than LayerNorm and a
 common choice in modern transformer stacks.
+
+### `TNNetRMSNormGated`
+Constructor: `Create()`. eps = `1e-5` (fixed), and the RMS is taken over the
+**whole sample** with **no mean subtraction**, exactly like `TNNetRMSNorm`. The
+difference is the affine: instead of a per-element `gamma`, it applies a learnable
+**per-channel sigmoid gate** `y[x,y,c] = n[x,y,c] * sigmoid(g[c])`, where
+`n = x / sqrt(mean(x^2) + eps)` and there is **one gate logit `g[c]` per `Depth`
+channel** (the `TNNetGatedResidual` storage pattern: `FNeurons[0].Weights` holds
+the `Depth` logits). The logits are initialised to **0**, so at init every gate is
+`sigmoid(0) = 0.5` and the layer simply halves the normalized activation; channels
+then learn to open (→1) or close (→0) independently. The backward pass routes the
+input error through both the per-channel scale `sigmoid(g[c])` and the shared
+`invRMS` Jacobian (the RMS term couples all elements of the sample), reusing
+RMSNorm's exact normalization Jacobian. Pick it when you want RMSNorm but with a
+cheap, learnable per-channel gating instead of a full per-element scale.
 
 ### `TNNetZScore`
 Constructor: `Create()`. The unparameterised core of LayerNorm:

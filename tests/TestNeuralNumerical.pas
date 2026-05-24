@@ -100,6 +100,9 @@ type
     procedure TestInstanceNormSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
+    procedure TestRMSNormGatedForward;
+    procedure TestRMSNormGatedGradientCheck;
+    procedure TestRMSNormGatedSerializationRoundTrip;
     procedure TestZScoreForward;
     procedure TestZScoreGradientCheck;
     procedure TestZScoreVsLayerNormEquivalence;
@@ -2267,6 +2270,153 @@ begin
       analyticalGrad := -RNorm.Neurons[0].Delta.Raw[i];
 
       AssertTrue('RMSNorm weight gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormGatedForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  RNorm: TNNetRMSNormGated;
+  MeanSqr, RMS: TNeuralFloat;
+  i: integer;
+begin
+  // At init the gate logits g[d] are 0, so sigmoid(g)=0.5: the output is the
+  // unit-RMS normalized sample halved -> overall RMS ~ 0.5.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2));
+    RNorm := TNNetRMSNormGated.Create();
+    NN.AddLayer(RNorm);
+
+    // Default gate logits are 0 -> sigmoid 0.5.
+    for i := 0 to RNorm.Neurons[0].Weights.Size - 1 do
+      AssertEquals('RMSNormGated init logit channel ' + IntToStr(i), 0.0,
+        RNorm.Neurons[0].Weights.Raw[i], 1e-7);
+    AssertEquals('RMSNormGated weight count == Depth', 2,
+      RNorm.Neurons[0].Weights.Size);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.5 - 3.0;
+
+    NN.Compute(Input);
+    MeanSqr := NN.GetLastLayer.Output.GetSumSqr() / NN.GetLastLayer.Output.Size;
+    RMS := Sqrt(MeanSqr);
+    AssertEquals('RMSNormGated output RMS at init should be ~0.5', 0.5, RMS, 0.01);
+
+    // Push both gate logits to large positive values -> sigmoid ~ 1, so the
+    // gate becomes ~identity and the RMS rises to ~1.
+    RNorm.Neurons[0].Weights.Fill(20.0);
+    NN.Compute(Input);
+    MeanSqr := NN.GetLastLayer.Output.GetSumSqr() / NN.GetLastLayer.Output.Size;
+    RMS := Sqrt(MeanSqr);
+    AssertEquals('RMSNormGated output RMS with open gate should be ~1', 1.0,
+      RMS, 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormGatedGradientCheck;
+// Central-difference numerical gradient check for TNNetRMSNormGated. Verifies
+// (a) the input gradient (which couples all sample elements through invRMS and
+// is scaled per channel by sigmoid(g[d])) and (b) the per-channel gate-logit
+// gradients. Standard tolerance 1e-2.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  RNorm: TNNetRMSNormGated;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, w0: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    RNorm := TNNetRMSNormGated.Create();
+    NN.AddLayer(RNorm);
+    // Learning rate 1, batch update on: deltas accumulate -1*gradient and
+    // weights are NOT modified, so finite-difference checks stay valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial per-channel gate logits, pushed apart so each channel
+    // exercises a distinct sigmoid.
+    RNorm.Neurons[0].Weights.Raw[0] := 0.6;
+    RNorm.Neurons[0].Weights.Raw[1] := -0.9;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('RMSNormGated input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the per-channel gate logits g[d] ----
+    for i := 0 to RNorm.Neurons[0].Weights.Size - 1 do
+    begin
+      w0 := RNorm.Neurons[0].Weights.Raw[i];
+      RNorm.Neurons[0].Weights.Raw[i] := w0 + epsilon;
+      lossPlus := ComputeLoss(Input);
+      RNorm.Neurons[0].Weights.Raw[i] := w0 - epsilon;
+      lossMinus := ComputeLoss(Input);
+      RNorm.Neurons[0].Weights.Raw[i] := w0;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      RNorm.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // Backprop accumulates Delta := Delta - LearningRate*gradient.
+      // With LearningRate = 1, analytical gradient = -Delta.
+      analyticalGrad := -RNorm.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('RMSNormGated gate-logit gradient check (' + IntToStr(i) +
         ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
@@ -9728,6 +9878,15 @@ procedure TTestNeuralNumerical.TestRMSNormSerializationRoundTrip;
 begin
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetRMSNorm.Create(), 'RMSNorm', 3, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormGatedSerializationRoundTrip;
+begin
+  // Per-channel gate logits (FNeurons[0]) survive CreateLayer/LoadFromString;
+  // the perturbed-weight helper pushes them off the default 0 so the check is
+  // non-trivial.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetRMSNormGated.Create(), 'RMSNormGated', 3, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPixelNormSerializationRoundTrip;

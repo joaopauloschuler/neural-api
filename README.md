@@ -563,6 +563,7 @@ See the [Normalization cheat sheet](docs/normalization.md) for a side-by-side co
 | `TNNetChannelStdNormalization`| 1D, 2D, or 3D              | Trainable per-channel standard deviation normalization.                                              |
 | `TNNetLayerNorm`             | 1D, 2D, or 3D               | Per-sample layer normalization (zero mean, unit variance) with learnable per-element scale and bias. |
 | `TNNetRMSNorm`               | 1D, 2D, or 3D               | Per-sample root-mean-square normalization (no mean subtraction) with learnable per-element scale.    |
+| `TNNetRMSNormGated`          | 1D, 2D, or 3D               | Per-sample root-mean-square normalization (no mean subtraction) followed by a learnable per-channel sigmoid gate: `y[x,y,d] = (x / sqrt(mean(x^2) + eps)) * sigmoid(g[d])`. The only learnable params are the `Depth` gate logits `g[d]` (init 0, so the gate is `0.5` at start; no per-element gamma). |
 | `TNNetGroupNorm`             | 1D, 2D, or 3D               | Normalizes within `Groups` contiguous channel groups, with learnable per-element scale and bias.     |
 | `TNNetGRN`                   | 2D or 3D                    | Global Response Normalization (ConvNeXt-V2, Woo et al. 2023). Channel-wise contrast normalization with learnable per-channel `gamma` and `beta` (both init 0, so identity at start): `Y = gamma * (X * Nx) + beta + X`, where `Nx[c] = ||X[:,:,c]||_2 / mean_c(||X[:,:,c']||_2)`. |
 | `TNNetZScore`                | 1D, 2D, or 3D               | Per-sample z-score normalization: `y = (x - mean) / sqrt(var + eps)`. No learnable parameters; the unparameterised core of `TNNetLayerNorm`. |
@@ -573,6 +574,8 @@ See the [Normalization cheat sheet](docs/normalization.md) for a side-by-side co
 `TNNetLayerNorm` normalizes each input sample over all its elements (`SizeX*SizeY*Depth`) to zero mean and unit variance, then applies a learnable per-element scale (gamma) and bias (beta). Unlike batch normalization it does not depend on batch statistics, which makes it well suited to transformers and recurrent models. Add it with `NN.AddLayer(TNNetLayerNorm.Create());`.
 
 `TNNetRMSNorm` is a cheaper, transformer-friendly variant that divides each sample by the root mean square of its elements (no mean subtraction) and applies a learnable per-element scale. Add it with `NN.AddLayer(TNNetRMSNorm.Create());`.
+
+`TNNetRMSNormGated` keeps the same RMS normalization but replaces the per-element scale with a learnable per-channel sigmoid gate `sigmoid(g[d])`. The gate logits are initialised to 0, so an untrained layer halves each normalized activation (`sigmoid(0) = 0.5`) and the channels open or close independently during training. Add it with `NN.AddLayer(TNNetRMSNormGated.Create());`.
 
 `TNNetGroupNorm` splits the input channels (`Depth`) into `Groups` contiguous groups and normalizes each group independently, then applies a learnable per-element scale and bias. `Depth` must be divisible by `Groups`; otherwise it falls back to a single group. Pass the group count to the constructor, e.g. `NN.AddLayer(TNNetGroupNorm.Create(8));`.
 
