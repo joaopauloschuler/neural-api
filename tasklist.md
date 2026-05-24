@@ -1065,6 +1065,52 @@ breakdown:
       as "weak barrier" purely because the denominator is tiny. Add an
       absolute-floor term (e.g. treat barriers below an absolute epsilon as
       "connected" regardless of ratio) and re-pin the example's RUN 1 verdict.
+- [ ] TNNet.FeatureSeparabilityReport(NN, Samples, NumClasses) — a label-aware
+      **class-geometry / Neural-Collapse** diagnostic (Papyan, Han & Donoho 2020,
+      "Prevalence of neural collapse during the terminal phase of training")
+      answering a question none of the landed reports answer: *"how tightly does
+      each layer cluster the samples of a class, and how far apart are the
+      classes?"* — the geometry of the feature space, not its decodability. For
+      every trainable layer it runs one forward pass over the labelled probe
+      batch, flattens each sample's activation to a row, and computes the
+      Fisher-style scatter decomposition: per-class mean `mu_c`, the global mean
+      `mu`, the **within-class scatter** `tr(S_w) = mean_c mean_{i in c}
+      ||x_i - mu_c||^2` (cluster tightness — the Neural-Collapse "NC1" variability
+      collapse), the **between-class scatter** `tr(S_b) = mean_c ||mu_c - mu||^2`
+      (how spread the class means are), and their ratio `tr(S_b)/tr(S_w)` (the
+      Fisher discriminant ratio — higher == cleaner clusters). It also reports the
+      mean **silhouette coefficient** over the batch (cohesion-vs-separation in
+      `[-1,1]`, label-aware, no classifier fit), the class-mean pairwise-cosine
+      matrix (numeric + glyph heatmap) with the **simplex-ETF angle check** — under
+      neural collapse off-diagonal cosines converge to `-1/(NumClasses-1)`, so the
+      report prints the mean off-diagonal cosine next to that target as a built-in
+      NC2 indicator — a per-layer separability-across-depth ASCII bar chart, and
+      `C`ollapse / well-`S`eparated / near-`R`andom flags. The story to show in the
+      example: at fresh init the ratio is ~0 and silhouette ~0 (classes fully
+      overlap) and *degrades* slightly with depth; after training the ratio and
+      silhouette climb monotonically toward the penultimate layer and the off-
+      diagonal class-mean cosines approach the simplex-ETF target — the geometric
+      signature of neural collapse made visible. Built-in correctness checks:
+      `tr(S_total) == tr(S_w) + tr(S_b)` to <1e-4 per layer (the scatter
+      decomposition identity — the faithfulness check), a single-class batch makes
+      `tr(S_b)` collapse to ~0, and identical per-class samples make `tr(S_w)`
+      collapse to ~0 with silhouette -> 1. Pure forward-only; weights are never
+      touched and no backward pass is run. **Distinct from** [[LinearProbeReport]]
+      (fits a ridge classifier and reports *decodability* / accuracy — a model can
+      be linearly decodable yet have loose, barely-separated clusters; this measures
+      the cluster geometry directly with no fit), from `RepresentationSimilarityReport`
+      (CKA *between two layers*, label-free — says nothing about per-class structure),
+      from `NeuronCorrelationReport` (intra-layer neuron redundancy, no labels), and
+      from `TopLogitMarginReport` (margin on the *output* logits only, not the
+      intermediate feature geometry). Follows the introspection-report-pattern:
+      declaration + impl in neuralnetwork.pas, a `examples/FeatureSeparability/`
+      demo on a synthetic 3-class 2D-Gaussian-blob set (well-separated vs
+      deliberately-overlapped variants so the ratio/silhouette contrast is visible
+      in one run), and a smoke test in tests/ (non-empty report, expected header,
+      nil-NN graceful return, plus the scatter-decomposition identity assertion).
+      Pairs naturally with the open lottery-ticket / grokking experiments
+      ([[WeightSpectrumReport]]) — watching `tr(S_w)` collapse is the cleanest
+      single-number window into the terminal phase of training.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
       label-free model selection) was simplified to a fresh-vs-trained contrast
