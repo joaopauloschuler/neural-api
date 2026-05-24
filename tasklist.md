@@ -322,12 +322,13 @@ breakdown:
       plus a load-balancing auxiliary loss.
 
 #### Normalization primitives
-- [ ] TNNetL2Normalize follow-up: a per-channel-L2-over-spatial mode
+- [X] TNNetL2Normalize follow-up: per-channel-L2-over-spatial mode
       (axis 2 — reduce sum-of-squares over (x,y) independently per depth
-      channel), the third scope alongside the landed per-(x,y)-over-depth
-      and full-volume modes. Mirror the existing axis dispatch in
-      Compute/Backpropagate and add the matching numerical-gradient +
-      round-trip tests.
+      channel), the third scope alongside per-(x,y)-over-depth and
+      full-volume. Landed 2026-05-24 (commit 38976a6): ComputePerChannel /
+      BackpropagatePerChannel selected by `Create(2)`, FInvNorms sized
+      (1,1,Depth), forward unit-norm + axis-2 numerical-gradient + axis-2
+      serialization round-trip tests.
 - [ ] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
       spatial only, independently per depth channel) gated by a flag, mirroring
       the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
@@ -337,19 +338,26 @@ breakdown:
 
 #### Reduction / shape
 - [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
-- [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
-      version with Shift in FStruct[0] already landed.
+- [X] TNNetRoll follow-up: configurable axis selector. Landed 2026-05-24
+      (commits 6cc8df6, eac997d): `Create(AShift, AAxis)` with public
+      AAxis 0=X / 1=Y / 2=Depth; Compute/Backpropagate dispatch on a
+      backward-compatible stored encoding (FStruct[1] stored value 0=Depth
+      so legacy single-arg saves still load as depth-roll). Forward X/Y
+      correctness, axis-X/Y gradient checks, non-default-axis + legacy-depth
+      serialization round-trip tests.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetLpPool follow-up: `p`-sweep bake-off experiment. Same tiny conv
       classifier, swap the pooling for `TNNetLpPool` at `p ∈ {1, 2, 4, 8}`
       plus an `TNNetAvgPool` (≡ p with abs, sort of) and `TNNetMaxPool`
       (≡ p→∞) baseline, chart final loss/accuracy — shows the average↔max
       interpolation empirically. Forward layer + gradient already landed.
-- [ ] TNNetSqueeze follow-up: the landed version always collapses to the
-      canonical `(1,1,N)` vector. Add a `Create(pAxis)` overload that drops
-      only a SPECIFIED unit axis (asserting that axis is size 1), the exact
-      single-axis inverse of `TNNetExpandDims(pAxis)`, leaving the other two
-      axes intact. Mirror the ExpandDims axis dispatch + round-trip test.
+- [X] TNNetSqueeze follow-up: `Create(pAxis)` overload dropping only a
+      SPECIFIED unit axis (asserting the other two axes are size 1), the
+      exact single-axis inverse of `TNNetExpandDims(pAxis)`. Landed
+      2026-05-24 (commit ebe58be): mode flag in FStruct[0] + axis in
+      FStruct[1] keeps the no-arg `(1,1,N)` collapse byte-identical;
+      ExpandDims(a)->Squeeze(a) identity round-trip (a in {0,1,2}),
+      non-default-axis serialization round-trip, and gradient-check tests.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 

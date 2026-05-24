@@ -26,7 +26,7 @@ A few conventions used below:
 | `TNNetMovingStdNormalization.Create()` | whole sample (running mean/std) | 2 trainable scalars (shift, scale) | `y = (x - shift) / std` | Drop-in BatchNorm-ish standardization for the whole tensor. |
 | `TNNetChannelStdNormalization.Create()` | per channel | per-channel scale (+ inherited zero-center) | per-channel zero-center then `* scale[c]` | Per-channel std normalization (the repo's "channel std norm"). |
 | `TNNetPixelNorm.Create()` | per (X, Y) pixel, over Depth | none | `y = x / sqrt(mean_depth(x^2) + eps)` | StyleGAN-style per-pixel feature-vector norm; GAN generators. |
-| `TNNetL2Normalize.Create([axis][,eps])` | axis 0 (default): per (X, Y) over Depth; axis 1: whole sample | none | `y = x / sqrt(sum(x^2) + eps)` | Unit-length feature vectors (embeddings, cosine similarity). |
+| `TNNetL2Normalize.Create([axis][,eps])` | axis 0 (default): per (X, Y) over Depth; axis 1: whole sample; axis 2: per-channel over (X, Y) | none | `y = x / sqrt(sum(x^2) + eps)` | Unit-length feature vectors (embeddings, cosine similarity). |
 | `TNNetUnitNorm.Create()` | whole sample (flattened) | none | `y = x / sqrt(sum_all(x^2) + eps)` | Full-volume unit-L2 (Keras "UnitNorm"); alias of the line above. |
 | `TNNetMinMaxNorm.Create([eps])` | whole sample (X, Y **and** Depth) | none | `y = (x - min) / (max - min + eps)` | Rescale a whole sample to ~`[0, 1]`. |
 | `TNNetGRN.Create()` | per channel L2 over (X, Y), then across channels | gamma + beta, per-channel (both init 0) | `y = gamma[c] * (x * Nx[c]) + beta[c] + x` | ConvNeXt-V2 blocks; channel-competition contrast norm. |
@@ -104,6 +104,10 @@ eps default `1e-8`. **Selectable reduction scope** stored in `FStruct[0]`:
   This preserves the historical behavior.
 * `axis = 1` — reduce sum-of-squares over the **entire flattened sample** so the
   whole volume has unit L2 norm.
+* `axis = 2` — per **depth channel**, reduce sum-of-squares over the spatial
+  positions `(X, Y)` so each channel's feature map is independently scaled to
+  unit L2 norm (`n_d = sqrt(sum_{x,y} x[x,y,d]^2 + eps)`). The per-(X,Y)-over-depth
+  transpose of `axis = 0`.
 
 No learnable parameters; the exact `(I - y y^T)/n` Jacobian is applied on the
 backward pass over the chosen scope. Use for unit-length embeddings / cosine
