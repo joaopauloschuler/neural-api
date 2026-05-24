@@ -95,6 +95,7 @@ type
     procedure TestCalibrationReportSmoke;
     procedure TestFisherImportanceReportSmoke;
     procedure TestLinearProbeReportSmoke;
+    procedure TestEnableInputGradient;
   end;
 
 implementation
@@ -2379,6 +2380,93 @@ begin
   finally
     Samples.Free;
     ValSamples.Free;
+    NN.Free;
+  end;
+end;
+
+// Runs one forward + one backward on NN with a one-hot target on class c
+// (using the public TNNet.Backpropagate, which sets the last-layer output
+// error = Output - target and runs the backward chain; ClearDeltas keeps the
+// weights frozen here since we never call UpdateWeights), then returns the
+// sum of |OutputError| that landed on the input layer (Layers[0]). With
+// EnableInputGradient called beforehand this must be > 0; without it the input
+// gradient is silently dropped.
+function InputGradAbsSum(NN: TNNet; X: TNNetVolume; c: integer): TNeuralFloat;
+var
+  Gi: integer;
+  Y: TNNetVolume;
+  InLayer: TNNetLayer;
+begin
+  Result := 0;
+  NN.ClearDeltas();
+  NN.Compute(X);
+  Y := TNNetVolume.Create(NN.GetLastLayer.Output.Size, 1, 1);
+  try
+    Y.Fill(0);
+    if (c >= 0) and (c < Y.Size) then Y.Raw[c] := 1.0;
+    NN.Backpropagate(Y);
+  finally
+    Y.Free;
+  end;
+  InLayer := NN.Layers[0];
+  if InLayer.OutputError <> nil then
+    for Gi := 0 to InLayer.OutputError.Size - 1 do
+      Result := Result + Abs(InLayer.OutputError.Raw[Gi]);
+end;
+
+procedure TTestNeuralLayersExtra.TestEnableInputGradient;
+var
+  NN: TNNet;
+  X: TNNetVolume;
+  I: integer;
+  GradSum: TNeuralFloat;
+begin
+  RandSeed := 4242;
+
+  // (a) Conv first layer: Input(4,4,2) -> Convolution -> ... -> output.
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    NN.AddLayer(TNNetConvolutionReLU.Create(6, 3, 1, 1)); // padding>0 path
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for I := 0 to X.Size - 1 do X.Raw[I] := Random - 0.5;
+
+    // Output must be sized before enabling input gradients.
+    NN.Compute(X);
+    NN.EnableInputGradient();
+    GradSum := InputGradAbsSum(NN, X, 0);
+    AssertTrue('conv-first net: input gradient is non-zero after enable',
+      GradSum > 0);
+  finally
+    X.Free;
+    NN.Free;
+  end;
+
+  // (b) FullConnect first layer: Input(1,1,8) -> FullConnect -> output.
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(1, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for I := 0 to X.Size - 1 do X.Raw[I] := Random - 0.5;
+
+    NN.Compute(X);
+    NN.EnableInputGradient();
+    GradSum := InputGradAbsSum(NN, X, 0);
+    AssertTrue('fullconnect-first net: input gradient is non-zero after enable',
+      GradSum > 0);
+  finally
+    X.Free;
     NN.Free;
   end;
 end;

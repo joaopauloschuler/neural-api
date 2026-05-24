@@ -4257,6 +4257,33 @@ type
       // applied — only the transient error/gradient tensors are populated).
       // Guards nil NN and a nil/empty probe gracefully (returns a short
       // message; never crashes).
+      // Enables input-layer gradient flow so a backward pass can deposit the
+      // gradient d(output)/d(input) on Layers[0]. By default a network's input
+      // layer (Layers[0]) carries a 1-element OutputError tensor — the input
+      // never needs a gradient for ordinary training, so the first trainable
+      // layer's backward pass detects the size mismatch and silently skips
+      // writing the input gradient. Input-attribution / adversarial diagnostics
+      // (SaliencyReport, AdversarialRobustnessReport) DO need that gradient, so
+      // they call this helper once after the net is wired.
+      // What it does (touching ONLY transient error tensors — weights, biases
+      // and deltas are left completely untouched):
+      //   1. Resizes the input layer's OutputError and OutputErrorDeriv to match
+      //      its Output tensor (they are normally a single element) and zero-
+      //      fills them.
+      //   2. If the first trainable layer (Layers[1]) is a convolution
+      //      (TNNetConvolutionAbstract), refreshes its cached "calculate
+      //      previous-layer error" flag (convolutions cache it at wiring time,
+      //      when the input error was still 1 element) and, when that conv pads
+      //      its input, resizes its FPrevLayerErrorPadded scratch buffer to the
+      //      now-correct padded input plane so the unpad step lands the gradient
+      //      back on the input layer. A FullConnect (or any non-conv) first
+      //      layer needs only the resize+fill — no conv refresh is performed.
+      // PRECONDITION: the input layer's Output must already be SIZED — i.e. the
+      // net must have run at least one forward pass (NN.Compute) (or otherwise
+      // have its Output sized) before this is called, since the transient error
+      // tensors are sized to match Output. Safe to call repeatedly. Guards a
+      // nil/zero-layer net (does nothing).
+      procedure EnableInputGradient();
       class function SaliencyReport(
         NN: TNNet;
         Probe: TNNetVolume;
@@ -27826,6 +27853,43 @@ begin
   end;
 end;
 
+procedure TNNet.EnableInputGradient();
+var
+  InputLayer: TNNetLayer;
+  FirstConv: TNNetConvolutionAbstract;
+begin
+  if (FLayers = nil) or (CountLayers() < 1) then Exit;
+  // Enable input-gradient flow. By default a network's input layer carries a
+  // 1-element OutputError (it never needs gradients for training), so the
+  // first trainable layer's backward pass skips writing the input gradient.
+  // Resize the input layer's transient error tensors to match its Output and
+  // refresh the first layer's cached "calculate previous-layer error" flag
+  // (convolutions cache it at wiring time) so the gradient reaches the input.
+  // Only transient error tensors are touched; weights are untouched.
+  InputLayer := FLayers[0];
+  if InputLayer.OutputError.Size <> InputLayer.Output.Size then
+  begin
+    InputLayer.OutputError.ReSize(InputLayer.Output);
+    InputLayer.OutputErrorDeriv.ReSize(InputLayer.Output);
+  end;
+  InputLayer.OutputError.Fill(0);
+  InputLayer.OutputErrorDeriv.Fill(0);
+  if (CountLayers() >= 2) and (FLayers[1] is TNNetConvolutionAbstract) then
+  begin
+    FirstConv := TNNetConvolutionAbstract(FLayers[1]);
+    FirstConv.RefreshCalculatePrevLayerError();
+    // The padded previous-error scratch buffer was sized at wiring time from
+    // the (then 1-element) input OutputError; resize it to the now-correct
+    // padded input plane so the unpad step (AddArea) lands the gradient back
+    // on the input layer.
+    if FirstConv.FPadding > 0 then
+      FirstConv.FPrevLayerErrorPadded.ReSize(
+        InputLayer.Output.SizeX + FirstConv.FPadding * 2,
+        InputLayer.Output.SizeY + FirstConv.FPadding * 2,
+        InputLayer.Output.Depth);
+  end;
+end;
+
 class function TNNet.SaliencyReport(
   NN: TNNet;
   Probe: TNNetVolume;
@@ -27853,8 +27917,6 @@ var
   // scratch volumes
   Noisy, Scaled, Grad: TNNetVolume;
   Baseline: TNNetVolume;
-  InputLayer: TNNetLayer;
-  FirstConv: TNNetConvolutionAbstract;
   I, K, S, Ch, Px, Py, FlatIdx: integer;
   GapAbs, IGSum, LogitDelta, RelGap: TNeuralFloat;
   ChMassV, ChMassS, ChMassI: TNeuralFloat;
@@ -27993,35 +28055,11 @@ begin
     Scaled := TNNetVolume.Create(SizeX, SizeY, Depth);
     Baseline := TNNetVolume.Create(SizeX, SizeY, Depth);
 
-    // Enable input-gradient flow. By default a network's input layer carries a
-    // 1-element OutputError (it never needs gradients for training), so the
-    // first trainable layer's backward pass skips writing the input gradient.
-    // Resize the input layer's transient error tensors to match its Output and
-    // refresh the first layer's cached "calculate previous-layer error" flag
-    // (convolutions cache it at wiring time) so d logit_c / d x reaches the
-    // input. Only transient error tensors are touched; weights are untouched.
-    InputLayer := NN.Layers[0];
-    if InputLayer.OutputError.Size <> InputLayer.Output.Size then
-    begin
-      InputLayer.OutputError.ReSize(InputLayer.Output);
-      InputLayer.OutputErrorDeriv.ReSize(InputLayer.Output);
-    end;
-    InputLayer.OutputError.Fill(0);
-    InputLayer.OutputErrorDeriv.Fill(0);
-    if NN.Layers[1] is TNNetConvolutionAbstract then
-    begin
-      FirstConv := TNNetConvolutionAbstract(NN.Layers[1]);
-      FirstConv.RefreshCalculatePrevLayerError();
-      // The padded previous-error scratch buffer was sized at wiring time from
-      // the (then 1-element) input OutputError; resize it to the now-correct
-      // padded input plane so the unpad step (AddArea) lands the gradient back
-      // on the input layer.
-      if FirstConv.FPadding > 0 then
-        FirstConv.FPrevLayerErrorPadded.ReSize(
-          InputLayer.Output.SizeX + FirstConv.FPadding * 2,
-          InputLayer.Output.SizeY + FirstConv.FPadding * 2,
-          InputLayer.Output.Depth);
-    end;
+    // Enable input-gradient flow so the backward pass can deposit d logit_c/d x
+    // on the input layer. The clean NN.Compute(Probe) above already sized the
+    // input Output, which EnableInputGradient relies on. Only transient error
+    // tensors are touched; weights are untouched.
+    NN.EnableInputGradient();
 
     // (a) Vanilla saliency: single forward+backward, |d logit_c / d x|.
     Grad.Fill(0);
