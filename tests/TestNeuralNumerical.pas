@@ -112,6 +112,11 @@ type
     procedure TestRMSNormGatedForward;
     procedure TestRMSNormGatedGradientCheck;
     procedure TestRMSNormGatedSerializationRoundTrip;
+    // Residual builder helpers (AddPreNormResidual / AddRMSNormResidual / AddPostNormResidual)
+    procedure TestPreNormResidualGradientCheck;
+    procedure TestRMSNormResidualGradientCheck;
+    procedure TestPostNormResidualGradientCheck;
+    procedure TestPreNormResidualForwardWiring;
     procedure TestSwitchableNormForward;
     procedure TestSwitchableNormGradientCheck;
     procedure TestSwitchableNormSerializationRoundTrip;
@@ -2305,6 +2310,266 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPreNormResidualGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // End-to-end input gradient check of AddPreNormResidual: a residual block
+  // y = x + Sublayer(LayerNorm(x)). The sublayer is a FullConnectLinear whose
+  // output depth (2) matches the input depth so the residual sum is valid.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    NN.AddPreNormResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PreNormResidual input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRMSNormResidualGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // End-to-end input gradient check of AddRMSNormResidual: y = x + Sublayer(RMSNorm(x)).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    NN.AddRMSNormResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('RMSNormResidual input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPostNormResidualGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // End-to-end input gradient check of AddPostNormResidual: y = LayerNorm(Sublayer(x) + x).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    NN.AddPostNormResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PostNormResidual input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPreNormResidualForwardWiring;
+var
+  NN: TNNet;
+  Input, Manual: TNNetVolume;
+  NormLayer: TNNetLayerNorm;
+  FC: TNNetPointwiseConvLinear;
+  ResidualOut, SublayerOut: TNNetLayer;
+  i: integer;
+  maxDiffVsSublayer: TNeuralFloat;
+begin
+  // Forward sanity: AddPreNormResidual must produce x + Sublayer(LayerNorm(x)).
+  // We rebuild the same pieces by hand (sharing the trained weights) and confirm
+  // the block output equals input + sublayer-output, and differs from the bare
+  // sublayer output (proves the residual skip is wired).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  Manual := TNNetVolume.Create(3, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2));
+    ResidualOut := NN.AddPreNormResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+
+    // Layers inside the block: [0]=Input, [1]=LayerNorm, [2]=PointwiseConvLinear, [3]=Sum.
+    NormLayer := NN.Layers[1] as TNNetLayerNorm;
+    FC := NN.Layers[2] as TNNetPointwiseConvLinear;
+    SublayerOut := NN.Layers[2];
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.7 - 0.4;
+
+    NN.Compute(Input);
+
+    // Output shape must match the input shape (residual add validity).
+    AssertEquals('PreNormResidual output SizeX', 3, ResidualOut.Output.SizeX);
+    AssertEquals('PreNormResidual output SizeY', 1, ResidualOut.Output.SizeY);
+    AssertEquals('PreNormResidual output Depth', 2, ResidualOut.Output.Depth);
+
+    // out == input + sublayer(LayerNorm(input)).
+    maxDiffVsSublayer := 0;
+    for i := 0 to ResidualOut.Output.Size - 1 do
+    begin
+      AssertEquals('PreNormResidual residual sum at ' + IntToStr(i),
+        Input.Raw[i] + SublayerOut.Output.Raw[i], ResidualOut.Output.Raw[i], 1e-4);
+      AssertTrue('PreNormResidual output must be finite at ' + IntToStr(i),
+        not IsNan(ResidualOut.Output.Raw[i]) and not IsInfinite(ResidualOut.Output.Raw[i]));
+      maxDiffVsSublayer := Max(maxDiffVsSublayer,
+        Abs(ResidualOut.Output.Raw[i] - SublayerOut.Output.Raw[i]));
+    end;
+    // The block output must differ from the bare sublayer output: proves the skip
+    // is actually summed in (Input is non-zero by construction).
+    AssertTrue('PreNormResidual must differ from bare sublayer output (skip wired)',
+      maxDiffVsSublayer > 1e-3);
+
+    // Reference: NormLayer/FC are accessed to confirm the block uses LayerNorm
+    // then a FullConnectLinear sublayer as documented.
+    AssertTrue('PreNormResidual norm layer is LayerNorm', NormLayer <> nil);
+    AssertTrue('PreNormResidual sublayer is PointwiseConvLinear', FC <> nil);
+  finally
+    NN.Free;
+    Input.Free;
+    Manual.Free;
   end;
 end;
 

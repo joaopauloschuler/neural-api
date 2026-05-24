@@ -4493,6 +4493,19 @@ type
       // GLU feed-forward block: FullConnectLinear(2*D_hidden) -> GLU -> FullConnectLinear(D_out).
       // D_in is informational only; the first FullConnect infers its input from the previous layer.
       function AddGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
+      // Pre-norm residual block:  y = x + Sublayer(LayerNorm(x)).
+      // pSublayers is the caller-provided sublayer stack; its output shape MUST
+      // match the block input shape so the residual sum is valid. Returns the
+      // residual-sum layer.
+      function AddPreNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // Pre-norm residual block (LLaMA-style):  y = x + Sublayer(RMSNorm(x)).
+      // Same contract as AddPreNormResidual but uses TNNetRMSNorm. Returns the
+      // residual-sum layer.
+      function AddRMSNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // Post-norm residual block:  y = LayerNorm(Sublayer(x) + x).
+      // The sublayer runs on the raw input, the residual sum is taken, then
+      // LayerNorm is applied. Returns the final LayerNorm layer.
+      function AddPostNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -41766,6 +41779,39 @@ begin
   AddLayer( TNNetGLU.Create() );
   AddLayer( TNNetFullConnectLinear.Create(D_out) );
   Result := GetLastLayer();
+end;
+
+function TNNet.AddPreNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = x + Sublayer(LayerNorm(x))
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetLayerNorm.Create() );
+  AddLayer(pSublayers);
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddRMSNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = x + Sublayer(RMSNorm(x))  (LLaMA-style pre-norm)
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetRMSNorm.Create() );
+  AddLayer(pSublayers);
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddPostNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = LayerNorm(Sublayer(x) + x)  (post-norm)
+  BranchInput := GetLastLayer();
+  AddLayer(pSublayers);
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  Result := AddLayer( TNNetLayerNorm.Create() );
 end;
 
 function TNNet.AddGroupedCompression(Compression: TNeuralFloat;

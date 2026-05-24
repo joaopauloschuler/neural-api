@@ -257,12 +257,13 @@ breakdown:
       max-error vs eps.
 
 ### Composite blocks / builders I'd enjoy shipping
-- [ ] TNNetPreNormResidual helper — `y = x + Sublayer(LayerNorm(x))`
-      single-line builder. Take the sublayer as a TNNet builder closure.
-- [ ] AddRMSNormResidual(NN, Sublayer) — companion builder using RMSNorm
-      in place of LayerNorm (LLaMA-style blocks).
-- [ ] AddPostNormResidual(NN, Sublayer) — post-norm pattern (`Sublayer →
-      residual add → LayerNorm`), companion to PreNorm/RMSNormResidual.
+- [X] TNNetPreNormResidual helper — `y = x + Sublayer(LayerNorm(x))`
+      single-line builder. (landed: TNNet.AddPreNormResidual takes the
+      sublayer stack as `array of TNNetLayer`.)
+- [X] AddRMSNormResidual(NN, Sublayer) — companion builder using RMSNorm
+      in place of LayerNorm (LLaMA-style blocks). (landed)
+- [X] AddPostNormResidual(NN, Sublayer) — post-norm pattern (`Sublayer →
+      residual add → LayerNorm`), companion to PreNorm/RMSNormResidual. (landed)
 - [ ] TNNetAffineBlock — once TNNetMul lands, `Mul → Bias` builder for a
       learnable per-channel affine transform separable from FullConnect.
 
