@@ -903,6 +903,33 @@ breakdown:
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
+- [ ] `examples/MixtureDensityNetwork/` — Bishop (1994) mixture density
+      network on the classic INVERSE-problem toy: generate forward data
+      `x = y + 0.3*sin(2*pi*y) + noise`, then train to predict `y` from
+      `x`. Over the fold region a single `x` has THREE valid `y` values,
+      so the conditional `p(y|x)` is genuinely multimodal. Build two arms
+      sharing seed/arch/data: (a) a plain MSE regressor that — as the
+      theory predicts — collapses to the conditional MEAN and lands its
+      prediction in the LOW-density gap between modes (visibly wrong), and
+      (b) an MDN head whose net emits `3*K` outputs reshaped into `K`
+      mixture components `(pi_k, mu_k, sigma_k)` — softmax over the `pi`,
+      `exp`/softplus over the `sigma` — trained on the hand-rolled mixture
+      negative-log-likelihood `-log( sum_k pi_k * Normal(y; mu_k, sigma_k) )`
+      (manual gradient surgery in the SAM / lottery-ticket style; needs
+      `SetBatchUpdate(True)`, see [[manual-gradient-and-snapshot-gotchas]]).
+      Report: per-arm NLL/MSE, an ASCII scatter of sampled MDN predictions
+      vs ground truth showing all three branches recovered, and the learned
+      `(pi, mu, sigma)` at a few probe `x`. Built-in invariants: `K=1`
+      MDN reduces to a homoscedastic Gaussian NLL whose argmax-mu matches
+      the MSE arm, and the mixture weights sum to 1 at every `x`. This is
+      DISTINCT from `examples/MCDropoutUncertainty/` (epistemic / model
+      uncertainty via sampling) and from the existing pointwise regression
+      loss heads (`TNNetHuberLoss` / `TNNetCharbonnierLoss` /
+      `TNNetLogCoshLoss` / `TNNetWingLoss`, all UNIMODAL) — MDN is the only
+      thing in the tree that models aleatoric MULTIMODALity. README should
+      spell out that contrast. If the hand-rolled head proves clean enough
+      to generalise, a follow-up could promote it to a reusable
+      `TNNetMixtureDensityLoss` head per [[loss-layer-pattern]]. Pure CPU.
 - [ ] `examples/SubPixelSuperRes/` — once TNNetPixelShuffle lands, a
       3-layer net that learns to 2x-upsample 8x8 random checkerboards.
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
