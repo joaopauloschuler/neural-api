@@ -757,8 +757,9 @@ breakdown:
       5 seeds (mean ± std reporting).
 - [ ] Plain-Tanh vs TanhGLU FFN ablation in a minimal-transformer-without-
       attention skeleton.
-- [ ] DyT-vs-LayerNorm bake-off (depends on TNNetDyT). Once DyT lands,
-      a 30-line swap in the existing normalization bake-off harness.
+- [ ] DyT-vs-LayerNorm bake-off. TNNetDyT has now landed, so this is
+      unblocked — a 30-line swap in the existing normalization bake-off
+      harness (or a small standalone synthetic-regression A/B).
 - [ ] Causal-conv vs token-shift vs SDPA on the same toy next-token task.
 - [ ] GRN-as-drop-in: take SimpleImage CIFAR, swap each
       TNNetMovingStdNormalization for TNNetGRN and chart accuracy.
