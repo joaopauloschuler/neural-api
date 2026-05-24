@@ -960,29 +960,12 @@ breakdown:
       temperature-scaling fit on the logits.
 
 ### Introspection (added)
-- [X] Top-logit margin report — small helper in a new
-      `neuralintrospection.pas` (or extending the calibration unit above)
-      that, given a trained classifier and a validation set, computes the
-      per-sample `(top1_logit - top2_logit)` margin and prints:
-      (a) overall margin histogram (10 bins) as an ASCII bar chart,
-      (b) per-class mean+median margin (catches a class the model is
-      systematically uncertain about),
-      (c) the N lowest-margin sample indices per class (a ready-made
-      "hard examples" pool for active learning, label-noise auditing, or
-      curriculum work). Reuses the existing forward pass — no training-
-      time changes. Pure-CPU, finishes in one validation pass.
-      Companion `examples/MarginReport/` runs it against the
-      SimpleImageClassifier CIFAR baseline and prints the three sections
-      to stdout, so the output format is pinned and easy to eyeball.
-      Distinct from the calibration tool above (which summarises
-      confidence quality across the whole set) — this one localises
-      *which samples* the model is least sure about.
-      - [ ] Follow-up: the shipped `examples/MarginReport/` net ends in a
-            `TNNetSoftMax`, so its "logits" are post-softmax probabilities and
-            the margin lands in `[0, 1]`. Add a second run (or a sibling
-            example) with a raw-logit `TNNetFullConnectLinear` head so the
-            unbounded-margin case is also pinned, and document the
-            interpretation difference in the README.
+- [ ] TopLogitMarginReport follow-up: the shipped `examples/MarginReport/`
+      net ends in a `TNNetSoftMax`, so its "logits" are post-softmax
+      probabilities and the margin lands in `[0, 1]`. Add a second run (or a
+      sibling example) with a raw-logit `TNNetFullConnectLinear` head so the
+      unbounded-margin case is also pinned, and document the interpretation
+      difference in the README.
 - [ ] Shared report-smoke-test helper for the `TNNet.*Report` family. The
       per-report smoke tests (TopLogitMargin / NeuronCorrelation /
       LayerSensitivity / DeadNeuron / WeightSpectrum / ...) all repeat the
@@ -1029,44 +1012,6 @@ breakdown:
       classified and one misclassified — so the three heatmaps can be
       eyeballed against the actual image content, and the completeness gap
       acts as a built-in regression check on the IG implementation.
-
-### Layer sensitivity
-- [X] TNNet.LayerSensitivityReport — given a probe batch (and an optional
-      target volume), multiplicatively perturb each trainable layer's
-      weights by small Gaussian noise (`W *= 1 + eta`, `eta ~ N(0,
-      sigma^2)`, default sigma=0.01, N=8 trials per layer with fresh
-      seeds, weights restored between trials), measure the resulting
-      change to (i) the forward output L2 and (ii) the loss if a target
-      is supplied, and report per trainable layer:
-      (a) mean and max output-delta L2 (sensitivity to small weight noise),
-      (b) mean loss-delta (objective-level impact),
-      (c) sensitivity normalised by parameter count so naturally-large
-          layers don't dominate the ranking,
-      (d) a 10-bin ASCII histogram of per-layer sensitivity across the
-          network so the impact distribution is visible at a glance,
-      (e) a flag list: "high-impact" layers (top 10% — natural
-          keep-precision / don't-prune candidates) and "low-impact"
-          layers (bottom 10% — natural prune / quantize / LoRA candidates),
-      (f) a one-line "fragility verdict": ratio of max-layer-sensitivity
-          to median-layer-sensitivity (high ratio = a few layers carry
-          the model, low ratio = sensitivity is spread out).
-      Pure forward-only with deterministic weight save/restore between
-      trials — no training-time changes, no backward pass needed.
-      Distinct from [[WeightSpectrumReport]] (weight geometry, not
-      output impact), [[GradientNormReport]] (backward magnitudes per
-      layer, gives "how much would training move this layer" rather
-      than "how much would the output move if this layer was perturbed"),
-      [[WeightHistogramReport]] (value distribution, not perturbation
-      response), [[SaliencyReport]] (input attribution, not layer
-      attribution), and [[MemoryFootprintReport]] (byte footprint, not
-      output impact). The output is the natural input for any future
-      pruning, quantization, or LoRA-target-selection work — you need
-      to know which layers carry the model before you can decide which
-      ones to compress. Companion `examples/LayerSensitivityReport/`
-      runs it on (i) a tiny MLP, (ii) a small CIFAR conv stack, and
-      (iii) a small attention stack so reviewers can eyeball how
-      fragility shifts across model families (often-uniform MLP vs
-      stem-heavy conv vs attention-heavy transformer).
 
 ### Input-symmetry equivariance
 - [ ] TNNet.EquivarianceReport — given a trained (or freshly-initialised)
@@ -1150,56 +1095,6 @@ breakdown:
       pattern (TTA gains shrink when the model has already learned the
       invariance during training — TTA and train-time augmentation are
       substitutes, not complements).
-
-### Intra-layer redundancy
-- [X] TNNet.NeuronCorrelationReport — given a probe batch, for every
-      trainable layer with a flat (channel/neuron) output axis, walk the
-      per-sample activations and report intra-layer redundancy along the
-      *neuron* axis (not the sample axis):
-      (a) the layer's pairwise Pearson-correlation matrix of neuron
-          activations across the probe batch (mean-centered, std-normalised
-          per neuron; constant neurons treated as `corr = 0` after a
-          near-zero-std flag),
-      (b) a 10-bin ASCII histogram of `|rho_ij|` for `i < j` so the
-          redundancy distribution is visible at a glance,
-      (c) the top-K most-correlated neuron pairs `(i, j, rho_ij)` per
-          layer (default K=5) — a ready-made "merge or prune one of each
-          pair" candidate list,
-      (d) a single-number "effective neuron count" per layer:
-          `sum_i 1 / sum_j rho_ij^2` (participation-ratio of the
-          correlation matrix) — natural pruning-budget signal,
-      (e) per-layer flags: "near-duplicate pair present" (any
-          `|rho_ij| > 0.95`), "collapsed layer" (effective neuron count
-          < 25% of nominal width), and "constant neurons" (count of
-          neurons whose std on the probe batch is below `1e-6`).
-      Pure forward-only — no training-time changes, no backward pass,
-      no weight perturbation. The probe batch is the only required
-      input; default to the first N samples of whatever volume list the
-      caller passes (default N=128, configurable for memory).
-      Distinct from [[DeadNeuronReport]] (per-neuron zero-fraction on
-      ReLU-family layers only — answers "did this neuron ever fire?",
-      not "are these two neurons firing in lockstep?"),
-      [[ActivationStatsReport]] (per-layer marginal distribution
-      statistics across all neurons pooled together — loses the neuron-
-      to-neuron co-firing structure entirely),
-      [[WeightSpectrumReport]] (singular values of the *weight* matrix,
-      a geometry-of-W signal; correlations of *realised* activations
-      under nonlinearities are a different — and often tighter —
-      redundancy signal),
-      [[WeightHistogramReport]] (weight values, not activation
-      structure), and [[LayerSensitivityReport]] (output response to
-      weight perturbation, not within-layer redundancy). Effective
-      neuron count is the natural input for any future "decide a
-      per-layer prune ratio" or "decide a per-layer LoRA rank" work —
-      you need to know how many independent directions each layer is
-      actually using before you can decide how much to compress.
-      Companion `examples/NeuronCorrelationReport/` runs it on (i) a
-      fresh-init MLP (expected: near-zero off-diagonal correlations —
-      neurons start independent) and (ii) the same architecture after a
-      short training run (expected: a heavier `|rho|` tail emerges as
-      neurons specialise into coordinated feature detectors), so
-      reviewers can eyeball how training reshapes intra-layer
-      redundancy.
 
 ### Per-layer representation quality
 - [ ] TNNet.LinearProbeReport — given a trained (or freshly-initialised)
