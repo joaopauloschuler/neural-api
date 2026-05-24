@@ -180,6 +180,10 @@ type
     procedure TestSplineActivationInputGradientCheck;
     procedure TestSplineActivationWeightGradientCheck;
     procedure TestSplineActivationSerializationRoundTrip;
+    procedure TestFourierFeaturesForwardPinnedB;
+    procedure TestFourierFeaturesInputGradientCheck;
+    procedure TestFourierFeaturesSigmaZeroDegeneracy;
+    procedure TestFourierFeaturesSerializationRoundTrip;
     procedure TestAconCGradientCheck;
     procedure TestAconCSwishEquivalence;
     procedure TestAconCSerializationRoundTrip;
@@ -17043,6 +17047,230 @@ begin
         AssertEquals('Spline round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierFeaturesForwardPinnedB;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LFF: TNNetFourierFeatures;
+  x0, x1, z0, z1, TwoPi: TNeuralFloat;
+begin
+  // Forward must equal a hand-computed [cos(2*pi*z), sin(2*pi*z)] concat on a
+  // tiny PINNED B (M=2, D_in=2). z = B^T x with B stored flat as i*M + j.
+  TwoPi := 2.0 * Pi;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+    LFF := TNNetFourierFeatures.Create(2, 1.0, 123);
+    NN.AddLayer(LFF);
+
+    AssertEquals('FourierFeatures output depth = 2*M', 4, LFF.Output.Depth);
+    AssertEquals('FourierFeatures B size = D_in*M', 4, LFF.FreqMatrix.Size);
+
+    // Pin B = [ [b00 b01], [b10 b11] ] with index i*M + j.
+    LFF.FreqMatrix.Raw[0 * 2 + 0] := 0.5;   // B[0,0]
+    LFF.FreqMatrix.Raw[0 * 2 + 1] := -0.25; // B[0,1]
+    LFF.FreqMatrix.Raw[1 * 2 + 0] := 1.0;   // B[1,0]
+    LFF.FreqMatrix.Raw[1 * 2 + 1] := 0.75;  // B[1,1]
+
+    x0 := 0.3;
+    x1 := -0.4;
+    Input.Raw[0] := x0;
+    Input.Raw[1] := x1;
+    NN.Compute(Input);
+
+    z0 := 0.5 * x0 + 1.0 * x1;     // B[0,0]*x0 + B[1,0]*x1
+    z1 := -0.25 * x0 + 0.75 * x1;  // B[0,1]*x0 + B[1,1]*x1
+
+    AssertEquals('FF cos(2pi z0)', Cos(TwoPi * z0), LFF.Output.Raw[0], 1e-5);
+    AssertEquals('FF cos(2pi z1)', Cos(TwoPi * z1), LFF.Output.Raw[1], 1e-5);
+    AssertEquals('FF sin(2pi z0)', Sin(TwoPi * z0), LFF.Output.Raw[2], 1e-5);
+    AssertEquals('FF sin(2pi z1)', Sin(TwoPi * z1), LFF.Output.Raw[3], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierFeaturesInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LFF: TNNetFourierFeatures;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Central-difference input-gradient check. cos/sin are smooth everywhere
+  // (no kinks), so any small-amplitude input is fine. A small sigma keeps the
+  // 2*pi*z arguments mild so the Single-precision central difference matches
+  // the analytic gradient comfortably within the standard 1e-2 tolerance.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  InputPlus := TNNetVolume.Create(1, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    LFF := TNNetFourierFeatures.Create(4, 0.5, 7);
+    NN.AddLayer(LFF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7 + 0.2) * 0.6;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('FourierFeatures input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierFeaturesSigmaZeroDegeneracy;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LFF: TNNetFourierFeatures;
+  i: integer;
+begin
+  // sigma=0 -> B is all zeros -> z = 0 for every feature, so every output row
+  // collapses to [cos 0, sin 0] = [1, 0] (constant, input-independent) and the
+  // input gradient is exactly zero.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    LFF := TNNetFourierFeatures.Create(3, 0.0, 42);
+    NN.AddLayer(LFF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.5;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 1.1) * 2.0 + 0.7;
+    NN.Compute(Input);
+
+    // First M outputs = cos(0) = 1, next M = sin(0) = 0.
+    for i := 0 to LFF.NumFeatures - 1 do
+    begin
+      AssertEquals('FF sigma=0 cos block at ' + IntToStr(i),
+        1.0, LFF.Output.Raw[i], 1e-6);
+      AssertEquals('FF sigma=0 sin block at ' + IntToStr(i),
+        0.0, LFF.Output.Raw[LFF.NumFeatures + i], 1e-6);
+    end;
+
+    // Input gradient must be exactly zero (B = 0).
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('FF sigma=0 zero input gradient at ' + IntToStr(i),
+        0.0, NN.Layers[0].OutputError.Raw[i], 1e-7);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierFeaturesSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  LFF, LFF2: TNNetFourierFeatures;
+  i: integer;
+begin
+  // The FIXED random B must survive save -> load -> save bit-for-bit so the
+  // reloaded layer reproduces the EXACT same mapping (a fresh re-sample would
+  // silently change the function). NON-default M=5, sigma=2.5, seed=99.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    LFF := TNNetFourierFeatures.Create(5, 2.5, 99);
+    NN.AddLayer(LFF);
+
+    AssertEquals('FF output depth 2*M', 10, LFF.Output.Depth);
+    AssertEquals('FF B size D_in*M', 20, LFF.FreqMatrix.Size);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.5 - 0.1;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      LFF2 := NN2.GetLastLayer as TNNetFourierFeatures;
+      Saved2 := NN2.SaveToString();
+
+      AssertEquals('FF save->load->save string equality', Saved, Saved2);
+      AssertEquals('FF round-trip M', 5, LFF2.NumFeatures);
+      AssertEquals('FF round-trip B size', LFF.FreqMatrix.Size,
+        LFF2.FreqMatrix.Size);
+
+      // Stored B must be bit-for-bit identical after reload.
+      for i := 0 to LFF.FreqMatrix.Size - 1 do
+        AssertEquals('FF round-trip B[' + IntToStr(i) + ']',
+          LFF.FreqMatrix.Raw[i], LFF2.FreqMatrix.Raw[i], 0.0);
+
+      // Hence Compute reproduces the exact same output.
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FF round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 0.0);
     finally
       NN2.Free;
     end;

@@ -38,7 +38,7 @@ rather than acted on.
 <!-- (Sparse / mixture-of-experts routing layer removed: duplicate of the
      concrete TNNetMixtureOfExperts entry under "Probability projections /
      sparsity".) -->
-- [ ] TNNetFourierFeatures — a **fixed (non-trainable) random Fourier-feature
+- [X] TNNetFourierFeatures — a **fixed (non-trainable) random Fourier-feature
       coordinate embedding** (Rahimi & Recht 2007; the "Gaussian Fourier feature
       mapping" of Tancik et al. 2020, *Fourier Features Let Networks Learn High
       Frequency Functions*). Maps an input vector `x` (Depth = D_in, typically a

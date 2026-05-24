@@ -996,6 +996,64 @@ type
     procedure Compute(); override;
   end;
 
+  /// TNNetFourierFeatures: FIXED (non-trainable) random Fourier-feature
+  // coordinate embedding (Rahimi & Recht 2007, "Random Features for Large-Scale
+  // Kernel Machines"; Tancik et al. 2020, "Fourier Features Let Networks Learn
+  // High Frequency Functions in Low Dimensional Domains",
+  // https://arxiv.org/abs/2006.10739).
+  //
+  // Given an input coordinate vector x of length D_in (consumed flattened from
+  // the previous layer output, the typical case being Depth=D_in, SizeX=SizeY=1)
+  // it computes z = B^T x (length M) using a FIXED random Gaussian frequency
+  // matrix B ~ N(0, sigma^2) of shape D_in x M, then outputs the concatenation
+  //   FOutput[0   .. M-1  ] = cos(2*pi*z)
+  //   FOutput[M   .. 2M-1 ] = sin(2*pi*z)
+  // so the output Depth is 2*M (a 1 x 1 x 2M volume).
+  //
+  // B is sampled ONCE at construction from a SEEDED RNG and stored in a
+  // non-trainable buffer (FFreqMatrix) - it is NOT a TNNetNeuron, receives no
+  // weight gradient and is never updated. M, the seed and sigma are kept in
+  // FStruct[0], FStruct[1] and FFloatSt[0] so the layer can be reconstructed by
+  // CreateLayer/LoadFromString, and B itself is serialized verbatim in
+  // SaveDataToString / LoadDataFromString so a save/load round-trip reproduces
+  // the EXACT same mapping (re-sampling from the seed alone is fragile across
+  // RNG changes, so the matrix is pinned in the data stream).
+  //
+  // Backward: B is FROZEN, so only the INPUT gradient flows. With
+  // g_cos = dL/d cos-output and g_sin = dL/d sin-output,
+  //   dL/dz_j   = 2*pi * (-sin(2*pi*z_j)*g_cos_j + cos(2*pi*z_j)*g_sin_j)
+  //   dL/dx_i   = sum_j B[i,j] * dL/dz_j
+  // No parameter gradient is produced.
+  //
+  // Distinct from TNNetSin/TNNetCos (per-element trig, no projection, depth
+  // unchanged) and TNNetAddPositionalEmbedding / TNNetSinusoidalPositionalEmbedding
+  // (fixed deterministic sinusoids over sequence positions): the whole point
+  // here is the fixed RANDOM LINEAR lift into a 2*M-dimensional cos/sin basis.
+  TNNetFourierFeatures = class(TNNetLayer)
+  private
+    FNumFeatures: integer;     // M
+    FSigma: TNeuralFloat;      // frequency std-dev
+    FSeed: integer;            // RNG seed used to sample B
+    FFreqMatrix: TNNetVolume;  // FIXED B, stored as 1 x M x D_in (row j = column B[:,j])
+    FZ: TNNetVolume;           // cached z = B^T x (length M), reused in backward
+    procedure SampleFrequencies();
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(M: integer; pSigma: TNeuralFloat = 1.0;
+      pSeed: integer = 0);
+    destructor Destroy(); override;
+
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+
+    function SaveDataToString(): string; override;
+    procedure LoadDataFromString(strData: string); override;
+
+    property NumFeatures: integer read FNumFeatures;
+    property Sigma: TNeuralFloat read FSigma;
+    property FreqMatrix: TNNetVolume read FFreqMatrix;
+  end;
+
   /// Bent Identity activation function.
   // BentIdentity(x) = (sqrt(x^2 + 1) - 1)/2 + x. Parameter-free.
   // Always smooth, always positive slope. Derivative is
@@ -12840,6 +12898,156 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetFourierFeatures }
+
+constructor TNNetFourierFeatures.Create(M: integer; pSigma: TNeuralFloat = 1.0;
+  pSeed: integer = 0);
+begin
+  inherited Create();
+  if M <= 0 then
+    FErrorProc('TNNetFourierFeatures requires M >= 1. Got M=' + IntToStr(M));
+  if pSigma < 0 then
+    FErrorProc('TNNetFourierFeatures requires sigma >= 0. Got sigma=' +
+      FloatToStr(pSigma));
+  FNumFeatures := M;
+  FSigma := pSigma;
+  FSeed := pSeed;
+  FStruct[0] := M;
+  FStruct[1] := pSeed;
+  FFloatSt[0] := pSigma;
+  FFreqMatrix := TNNetVolume.Create(1, 1, 1);
+  FZ := TNNetVolume.Create(1, 1, M);
+  // The output is always 1 x 1 x (2*M) regardless of upstream spatial shape.
+  FOutput.ReSize(1, 1, 2 * M);
+  FOutputError.ReSize(1, 1, 2 * M);
+  FOutputErrorDeriv.ReSize(1, 1, 2 * M);
+end;
+
+destructor TNNetFourierFeatures.Destroy();
+begin
+  FZ.Free;
+  FFreqMatrix.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetFourierFeatures.SampleFrequencies();
+var
+  DInputs, i, j: integer;
+  SavedSeed: integer;
+begin
+  // B has shape D_in x M, stored flat with index i*M + j (i = input dim,
+  // j = feature). Sampled ONCE from a SEEDED RNG: B[i,j] ~ N(0, sigma^2).
+  DInputs := FPrevLayer.Output.Size;
+  FFreqMatrix.ReSize(1, 1, DInputs * FNumFeatures);
+  SavedSeed := RandSeed;
+  RandSeed := FSeed;
+  for i := 0 to DInputs - 1 do
+    for j := 0 to FNumFeatures - 1 do
+      FFreqMatrix.FData[i * FNumFeatures + j] :=
+        FFreqMatrix.RandomGaussianValue() * FSigma;
+  RandSeed := SavedSeed;
+end;
+
+procedure TNNetFourierFeatures.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(1, 1, 2 * FNumFeatures);
+  FOutputError.ReSize(1, 1, 2 * FNumFeatures);
+  FOutputErrorDeriv.ReSize(1, 1, 2 * FNumFeatures);
+  // Only (re)sample B if it has not already been loaded with the matching
+  // shape. LoadDataFromString runs AFTER SetPrevLayer and overwrites it; a
+  // re-load with the exact stored B is what pins the mapping on round-trip.
+  if FFreqMatrix.Size <> FPrevLayer.Output.Size * FNumFeatures then
+    SampleFrequencies();
+end;
+
+procedure TNNetFourierFeatures.Compute();
+var
+  LocalPrevOutput: TNNetVolume;
+  DInputs, i, j: integer;
+  Acc, TwoPi, Angle, xv: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  DInputs := LocalPrevOutput.Size;
+  TwoPi := 2.0 * Pi;
+  // z_j = sum_i B[i,j] * x_i.
+  for j := 0 to FNumFeatures - 1 do
+  begin
+    Acc := 0;
+    for i := 0 to DInputs - 1 do
+    begin
+      xv := LocalPrevOutput.FData[i];
+      Acc := Acc + FFreqMatrix.FData[i * FNumFeatures + j] * xv;
+    end;
+    FZ.FData[j] := Acc;
+    Angle := TwoPi * Acc;
+    FOutput.FData[j] := Cos(Angle);
+    FOutput.FData[FNumFeatures + j] := Sin(Angle);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFourierFeatures.Backpropagate();
+var
+  LocalPrevError: TNNetVolume;
+  DInputs, i, j: integer;
+  TwoPi, Angle, dZ, gCos, gSin: TNeuralFloat;
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // B is FROZEN: no parameter gradient. Only the INPUT gradient flows.
+  //   dL/dz_j = 2*pi * (-sin(2*pi*z_j)*g_cos_j + cos(2*pi*z_j)*g_sin_j)
+  //   dL/dx_i += sum_j B[i,j] * dL/dz_j
+  if Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+    DInputs := FPrevLayer.Output.Size;
+    TwoPi := 2.0 * Pi;
+    for j := 0 to FNumFeatures - 1 do
+    begin
+      gCos := FOutputError.FData[j];
+      gSin := FOutputError.FData[FNumFeatures + j];
+      Angle := TwoPi * FZ.FData[j];
+      dZ := TwoPi * (-Sin(Angle) * gCos + Cos(Angle) * gSin);
+      for i := 0 to DInputs - 1 do
+        LocalPrevError.FData[i] := LocalPrevError.FData[i] +
+          FFreqMatrix.FData[i * FNumFeatures + j] * dZ;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetFourierFeatures.SaveDataToString(): string;
+var
+  S: TNNetStringList;
+begin
+  // Serialize B verbatim so a save/load round-trip reproduces the EXACT same
+  // mapping. The volume string uses ';' internally; nesting it as a single
+  // token in this '[' delimited list is auto-quoted by the default quote char,
+  // matching the base SaveDataToString format (the loader dequotes it back).
+  S := CreateTokenizedStringList('[');
+  S.Add(FFreqMatrix.SaveToString());
+  Result := S.GetDelimitedTextFast();
+  S.Free;
+end;
+
+procedure TNNetFourierFeatures.LoadDataFromString(strData: string);
+var
+  S: TStringList;
+begin
+  S := CreateTokenizedStringList(strData, '[');
+  if S.Count >= 1 then
+    FFreqMatrix.LoadFromString(S[0]);
+  S.Free;
 end;
 
 { TNNetBentIdentity }
@@ -39870,6 +40078,7 @@ begin
       'TNNetArcSinh' :              Result := TNNetArcSinh.Create();
       'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
       'TNNetSinc' :                 Result := TNNetSinc.Create();
+      'TNNetFourierFeatures' :      Result := TNNetFourierFeatures.Create(St[0], Ft[0], St[1]);
       'TNNetBentIdentity' :         Result := TNNetBentIdentity.Create();
       'TNNetLisht' :                Result := TNNetLisht.Create();
       'TNNetHardTanh' :             Result := TNNetHardTanh.Create();
@@ -40131,6 +40340,7 @@ begin
       if S[0] = 'TNNetArcSinh' then Result := TNNetArcSinh.Create() else
       if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
       if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
+      if S[0] = 'TNNetFourierFeatures' then Result := TNNetFourierFeatures.Create(St[0], Ft[0], St[1]) else
       if S[0] = 'TNNetBentIdentity' then Result := TNNetBentIdentity.Create() else
       if S[0] = 'TNNetLisht' then Result := TNNetLisht.Create() else
       if S[0] = 'TNNetHardTanh' then Result := TNNetHardTanh.Create() else
