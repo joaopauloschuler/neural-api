@@ -285,10 +285,13 @@ breakdown:
       train a deepish residual MLP with scalar ReZero vs per-channel
       GatedResidual gates, chart whether the per-channel gate opens unevenly
       across channels.
-- [X] (done, lucky-day 2026-05-24) TNNetRMSNormGated — RMSNorm
-      followed by a learnable per-channel sigmoid gate.
-- [X] (done, lucky-day 2026-05-24) TNNetSwitchableNorm — learnable
-      softmax-weighted combination of LayerNorm and RMSNorm outputs.
+- [X] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
+      sigmoid gate. (lucky-day 2026-05-24, commit e8a92ea; gate init 0 so
+      sigmoid=0.5, gradient check passes at tol 1e-2.)
+- [X] TNNetSwitchableNorm — learnable softmax-weighted combination of
+      LayerNorm and RMSNorm outputs. (lucky-day 2026-05-24, commit 952182e;
+      two mixing logits init equal → 50/50 blend, no per-element affine,
+      gradient check passes at tol 1e-2.)
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
@@ -321,9 +324,15 @@ breakdown:
       data-dependent (β computed per-channel from a tiny squeeze over the
       spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
       the now-landed AconC forward/backward.
-- [ ] AconC-vs-Swish-vs-ReLU bake-off: swap each activation into a fixed
-      3-layer MLP on the hypotenuse toy, chart final loss + epochs-to-
-      converge. AconC has landed, so this is a ~30-line activation swap.
+- [X] (done, lucky-day 2026-05-24) AconC-vs-Swish-vs-ReLU bake-off:
+      landed as akAconC added to examples/ActivationBakeoff/ (commit
+      e37e33f). The harness already swept ReLU/Swish; AconC now sits beside
+      them. NOTE for the open TNNetMetaAconC follow-up above: in this fixed-LR
+      harness Swish-family activations (Swish/SiLU/AconC) do NOT converge on
+      the hypotenuse toy (final loss ~50 vs ReLU ~1.9) — untrained AconC ==
+      Swish by construction, so AconC tracks Swish exactly. A genuine
+      follow-up would add a per-activation LR or more epochs so the
+      Swish-family rows converge and the comparison is fair.
 - [ ] TNNetSplineActivation — KAN-flavored per-channel learnable piecewise-
       linear activation with K+1 control points at fixed knots.
 - [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
