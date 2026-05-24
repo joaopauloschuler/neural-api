@@ -3888,6 +3888,48 @@ type
         ZeroThreshold: TNeuralFloat = 1e-12;
         PrunableFrac: TNeuralFloat = 0.5
       ): string;
+      // Forward+backward batch-conflict diagnostic. Answers "do the samples in
+      // this batch pull the weights in compatible directions, or do they fight
+      // each other?". For each labelled sample (Samples, a TNNetVolumePairList
+      // of input + one-hot target pairs) it runs one forward + one backward on a
+      // FROZEN net (ClearDeltas before each, NEVER UpdateWeights) and snapshots
+      // that sample's full flattened per-parameter weight-gradient vector g_i -
+      // reusing exactly the per-parameter gradient tensors Backpropagate already
+      // populates (Neurons[*].Delta / FBiasDelta, divided by the layer
+      // LearningRate to undo the -LR scaling), same discipline as
+      // FisherImportanceReport (NO input-gradient enablement, unlike
+      // SaliencyReport). It then reports the pairwise gradient COSINE similarity
+      //   cos(g_i, g_j) = <g_i, g_j> / (||g_i|| ||g_j||)
+      // across the batch:
+      //   (a) an overall 10-bin ASCII histogram of the pairwise cosines over
+      //       [-1, 1] (the #-bar style of the sibling reports);
+      //   (b) the CONFLICT FRACTION: the share of pairs with cos < 0 - gradients
+      //       that actively undo each other; plus a STRONG-conflict fraction
+      //       (cos < -0.5, the genuinely-opposed tail). The cross-class pairs of
+      //       a softmax head are mildly anti-correlated by construction (the
+      //       shared head is pushed in different directions, landing around
+      //       -0.1..-0.4), so the raw cos<0 fraction is a noisy signal while the
+      //       strong tail (toward cos=-1) is what a label-noised / overlapping
+      //       batch grows and a clean batch keeps at ~0;
+      //   (c) the mean and median pairwise cosine;
+      //   (d) the MOST-CONFLICTING sample pair (lowest cosine), a "these two
+      //       examples disagree most" pointer by sample index;
+      //   (e) when class labels are decodable from the one-hot targets, a
+      //       per-class-pair MEAN-COSINE matrix so a pair of classes whose
+      //       gradients systematically oppose stands out (the diagonal is the
+      //       mean within-class cosine).
+      // LayerIdx optionally restricts the cosine to a single trainable layer's
+      // gradient slab (the conflict is often concentrated in the classifier
+      // head); the default -1 uses ALL trainable layers. Samples whose gradient
+      // vector is exactly zero (degenerate) are dropped from the pairwise stats.
+      // Weights are NEVER stepped. Built-in correctness: the self-cosine
+      // cos(g_i, g_i) = 1 on the diagonal and the cosine matrix is symmetric.
+      class function GradientConflictReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        UseTrueLabel: boolean = true;
+        LayerIdx: integer = -1
+      ): string;
       // Linear-probe (linear separability) diagnostic. Given a classifier NN
       // (trained or fresh) and a labelled probe batch Samples (input volume +
       // one-hot target pairs, a TNNetVolumePairList), trains a CLOSED-FORM
@@ -25046,6 +25088,497 @@ begin
       'P=prunable (>%.0f%% near-zero params), D=dead layer ' +
       '(whole-layer Fisher ~ 0).',
       [PrunableFrac * 100.0]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.GradientConflictReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  UseTrueLabel: boolean = true;
+  LayerIdx: integer = -1
+): string;
+const
+  cEps = 1e-30;
+  cBins = 10;
+  cMaxBarWidth = 40;
+  // Cosine below this counts as a STRONG conflict. Cross-class pairs of a
+  // softmax classifier are mildly anti-correlated by construction (the shared
+  // head is pushed in different directions, landing around -0.1..-0.4), so the
+  // raw cos<0 fraction is a noisy signal; the strong-conflict tail (genuinely
+  // opposed gradients, cos < -0.5) is what a label-noised / overlapping batch
+  // grows toward cos=-1 and a clean linearly-separable batch keeps empty.
+  cStrongConflict = -0.5;
+type
+  TFloatArray = array of TNeuralFloat;
+var
+  Lines: TStringList;
+  LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, J: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  Pair: TNNetVolumePair;
+  LastLayer: TNNetLayer;
+  LabelClass, OutSize: integer;
+  LR, G, V: TNeuralFloat;
+  Target: TNNetVolume;
+  // per-trainable-layer flat-index bookkeeping over the whole net
+  LayerHasParams: array of boolean;
+  LayerInScope: array of boolean;   // included in the cosine (LayerIdx filter)
+  FlatBase: array of integer;       // flat offset of each layer's params
+  LayerParamCnt: array of integer;
+  NetParamCnt, TrainableLayers, ScopeParamCnt: integer;
+  RestrictName: string;
+  // per-sample flattened gradient vectors (only over in-scope params)
+  Grads: array of TFloatArray;      // [usable sample] -> scope-flat gradient
+  Norms: TFloatArray;               // ||g_i||
+  SampleClass: array of integer;    // decoded class label per usable sample
+  SampleOrigIdx: array of integer;  // original index into Samples
+  ScopeMap: array of integer;       // net-flat param -> scope-flat slot (-1 if out)
+  UsableCount, ScopeFlat: integer;
+  // pairwise stats
+  Cos, Dot, Sum, SumSq: TNeuralFloat;
+  PairCount, NegCount, StrongNegCount: integer;
+  MeanCos, MedianCos, MinCos, DiagOK, SymOK: TNeuralFloat;
+  MinI, MinJ: integer;
+  CosList: TFloatArray;             // all pairwise cosines (for the median)
+  Bins: array of integer;
+  MaxBin, BarLen: integer;
+  BinLo, BinHi: TNeuralFloat;
+  Bar, LabelMode: string;
+  // per-class-pair mean cosine
+  NumClasses, CA, CB, M: integer;
+  HaveLabels: boolean;
+  ClassPairSum: array of array of TNeuralFloat;
+  ClassPairCnt: array of array of integer;
+  Glyph: char;
+  CellMean: TNeuralFloat;
+  cGlyphs: string;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'GradientConflictReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'GradientConflictReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'GradientConflictReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    SetLength(LayerHasParams, NN.CountLayers());
+    SetLength(LayerInScope, NN.CountLayers());
+    SetLength(FlatBase, NN.CountLayers());
+    SetLength(LayerParamCnt, NN.CountLayers());
+
+    NetParamCnt := 0;
+    TrainableLayers := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      LayerHasParams[LIdx] := false;
+      LayerInScope[LIdx] := false;
+      LayerParamCnt[LIdx] := 0;
+      FlatBase[LIdx] := NetParamCnt;
+      if Layer.Neurons.Count = 0 then Continue;
+      M := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        // +1 per neuron for the bias parameter.
+        M := M + Layer.Neurons[NeuronIdx].Delta.Size + 1;
+      if M = 0 then Continue;
+      LayerHasParams[LIdx] := true;
+      LayerParamCnt[LIdx] := M;
+      FlatBase[LIdx] := NetParamCnt;
+      NetParamCnt := NetParamCnt + M;
+      Inc(TrainableLayers);
+    end;
+
+    if TrainableLayers = 0 then
+    begin
+      Result := 'GradientConflictReport: no trainable layers with parameters.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Resolve the optional layer-scope filter (-1 = all trainable). ---
+    if (LayerIdx >= 0) and (LayerIdx <= NN.GetLastLayerIdx()) and
+       LayerHasParams[LayerIdx] then
+    begin
+      LayerInScope[LayerIdx] := true;
+      RestrictName := Format('layer %d (%s) only', [LayerIdx,
+        NN.Layers[LayerIdx].ClassName]);
+    end
+    else
+    begin
+      for LIdx := 0 to NN.GetLastLayerIdx() do
+        LayerInScope[LIdx] := LayerHasParams[LIdx];
+      if LayerIdx >= 0 then
+        RestrictName := Format('requested layer %d has no params; ' +
+          'falling back to all trainable layers', [LayerIdx])
+      else
+        RestrictName := 'all trainable layers';
+    end;
+
+    // Map each net-flat parameter to a scope-flat slot (-1 if out of scope).
+    SetLength(ScopeMap, NetParamCnt);
+    ScopeFlat := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LIdx] then Continue;
+      P := FlatBase[LIdx];
+      for K := 0 to LayerParamCnt[LIdx] - 1 do
+      begin
+        if LayerInScope[LIdx] then
+        begin
+          ScopeMap[P] := ScopeFlat;
+          Inc(ScopeFlat);
+        end
+        else
+          ScopeMap[P] := -1;
+        Inc(P);
+      end;
+    end;
+    ScopeParamCnt := ScopeFlat;
+
+    if ScopeParamCnt = 0 then
+    begin
+      Result := 'GradientConflictReport: no parameters in scope.' + sLineBreak;
+      Exit;
+    end;
+
+    // Why batch update: Delta accumulates -LR * gradient only with batch update
+    // on; otherwise the gradient is consumed inline and never lands in Delta.
+    // We divide back out by LR to recover the raw gradient. The network is NEVER
+    // stepped (no UpdateWeights) so the trained weights are left untouched.
+    NN.SetBatchUpdate(true);
+
+    LastLayer := NN.GetLastLayer();
+    OutSize := LastLayer.Output.Size;
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+
+    SetLength(Grads, Samples.Count);
+    SetLength(Norms, Samples.Count);
+    SetLength(SampleClass, Samples.Count);
+    SetLength(SampleOrigIdx, Samples.Count);
+    UsableCount := 0;
+    HaveLabels := true;
+
+    try
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        Pair := Samples[SampleIdx];
+        if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+
+        NN.ClearDeltas();
+        NN.Compute(Pair.I);
+
+        if UseTrueLabel then
+          LabelClass := Pair.O.GetClass()
+        else
+          LabelClass := LastLayer.Output.GetClass();
+        if (LabelClass < 0) or (LabelClass >= OutSize) then Continue;
+
+        Target.Fill(0);
+        Target.Raw[LabelClass] := 1.0;
+        NN.Backpropagate(Target);
+
+        // Flatten this sample's in-scope per-parameter gradient vector.
+        SetLength(Grads[UsableCount], ScopeParamCnt);
+        SumSq := 0;
+        for LIdx := 0 to NN.GetLastLayerIdx() do
+        begin
+          if not LayerInScope[LIdx] then Continue;
+          Layer := NN.Layers[LIdx];
+          LR := Layer.LearningRate;
+          if LR <= 0 then LR := 1.0;
+          P := FlatBase[LIdx];
+          for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          begin
+            Neuron := Layer.Neurons[NeuronIdx];
+            for K := 0 to Neuron.Delta.Size - 1 do
+            begin
+              G := Neuron.Delta.FData[K] / LR;
+              Grads[UsableCount][ScopeMap[P]] := G;
+              SumSq := SumSq + G * G;
+              Inc(P);
+            end;
+            // bias parameter
+            G := Neuron.FBiasDelta / LR;
+            Grads[UsableCount][ScopeMap[P]] := G;
+            SumSq := SumSq + G * G;
+            Inc(P);
+          end;
+        end;
+
+        // Drop degenerate (exactly-zero) gradient vectors from the pairwise set.
+        if SumSq <= cEps then
+        begin
+          Grads[UsableCount] := nil;
+          Continue;
+        end;
+        Norms[UsableCount] := Sqrt(SumSq);
+        SampleClass[UsableCount] := Pair.O.GetClass();
+        if SampleClass[UsableCount] < 0 then HaveLabels := false;
+        SampleOrigIdx[UsableCount] := SampleIdx;
+        Inc(UsableCount);
+      end;
+    finally
+      Target.Free;
+    end;
+
+    if UsableCount < 2 then
+    begin
+      Result := 'GradientConflictReport: fewer than 2 usable labelled ' +
+        'samples (need >=2 non-zero gradient vectors).' + sLineBreak;
+      Exit;
+    end;
+
+    // --- Pairwise cosine sweep (i<j). Diagonal cos(g_i,g_i)=1 is implicit. ---
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    SetLength(CosList, (UsableCount * (UsableCount - 1)) div 2);
+    PairCount := 0;
+    NegCount := 0;
+    StrongNegCount := 0;
+    Sum := 0;
+    MinCos := 2.0;
+    MinI := 0;
+    MinJ := 1;
+
+    // class-pair accumulators (only when labels are decodable)
+    NumClasses := OutSize;
+    if HaveLabels and (NumClasses > 0) then
+    begin
+      SetLength(ClassPairSum, NumClasses);
+      SetLength(ClassPairCnt, NumClasses);
+      for CA := 0 to NumClasses - 1 do
+      begin
+        SetLength(ClassPairSum[CA], NumClasses);
+        SetLength(ClassPairCnt[CA], NumClasses);
+        for CB := 0 to NumClasses - 1 do
+        begin
+          ClassPairSum[CA][CB] := 0;
+          ClassPairCnt[CA][CB] := 0;
+        end;
+      end;
+    end;
+
+    for I := 0 to UsableCount - 1 do
+      for J := I + 1 to UsableCount - 1 do
+      begin
+        Dot := 0;
+        for K := 0 to ScopeParamCnt - 1 do
+          Dot := Dot + Grads[I][K] * Grads[J][K];
+        Cos := Dot / (Norms[I] * Norms[J]);
+        if Cos > 1.0 then Cos := 1.0;
+        if Cos < -1.0 then Cos := -1.0;
+
+        CosList[PairCount] := Cos;
+        Sum := Sum + Cos;
+        if Cos < 0 then Inc(NegCount);
+        if Cos < cStrongConflict then Inc(StrongNegCount);
+        if Cos < MinCos then
+        begin
+          MinCos := Cos;
+          MinI := I;
+          MinJ := J;
+        end;
+
+        BinIdx := Trunc(((Cos + 1.0) / 2.0) * cBins);
+        if BinIdx < 0 then BinIdx := 0;
+        if BinIdx >= cBins then BinIdx := cBins - 1;
+        Inc(Bins[BinIdx]);
+
+        if HaveLabels and (NumClasses > 0) then
+        begin
+          CA := SampleClass[I];
+          CB := SampleClass[J];
+          if (CA >= 0) and (CA < NumClasses) and
+             (CB >= 0) and (CB < NumClasses) then
+          begin
+            ClassPairSum[CA][CB] := ClassPairSum[CA][CB] + Cos;
+            Inc(ClassPairCnt[CA][CB]);
+            if CA <> CB then
+            begin
+              ClassPairSum[CB][CA] := ClassPairSum[CB][CA] + Cos;
+              Inc(ClassPairCnt[CB][CA]);
+            end;
+          end;
+        end;
+        Inc(PairCount);
+      end;
+
+    MeanCos := Sum / PairCount;
+
+    // median via an in-place insertion-ordered copy (PairCount is small here).
+    for I := 1 to PairCount - 1 do
+    begin
+      V := CosList[I];
+      J := I - 1;
+      while (J >= 0) and (CosList[J] > V) do
+      begin
+        CosList[J + 1] := CosList[J];
+        Dec(J);
+      end;
+      CosList[J + 1] := V;
+    end;
+    if PairCount mod 2 = 1 then
+      MedianCos := CosList[PairCount div 2]
+    else
+      MedianCos := (CosList[PairCount div 2 - 1] +
+        CosList[PairCount div 2]) / 2.0;
+
+    // --- Built-in correctness checks: self-cosine diagonal and symmetry. ---
+    // Diagonal: max |cos(g_i,g_i) - 1| over all usable samples.
+    DiagOK := 0;
+    for I := 0 to UsableCount - 1 do
+    begin
+      Dot := 0;
+      for K := 0 to ScopeParamCnt - 1 do
+        Dot := Dot + Grads[I][K] * Grads[I][K];
+      Cos := Dot / (Norms[I] * Norms[I]);
+      if Abs(Cos - 1.0) > DiagOK then DiagOK := Abs(Cos - 1.0);
+    end;
+    // Symmetry: cos(g_i,g_j) == cos(g_j,g_i) holds by construction of the dot
+    // product; report the residual (worst-case re-evaluation) as 0 for the
+    // first few pairs as a guard.
+    SymOK := 0;
+    M := UsableCount;
+    if M > 8 then M := 8;
+    for I := 0 to M - 1 do
+      for J := 0 to M - 1 do
+        if I <> J then
+        begin
+          Dot := 0;
+          for K := 0 to ScopeParamCnt - 1 do
+            Dot := Dot + Grads[I][K] * Grads[J][K];
+          Cos := Dot / (Norms[I] * Norms[J]);
+          Dot := 0;
+          for K := 0 to ScopeParamCnt - 1 do
+            Dot := Dot + Grads[J][K] * Grads[I][K];
+          V := Dot / (Norms[J] * Norms[I]);
+          if Abs(Cos - V) > SymOK then SymOK := Abs(Cos - V);
+        end;
+
+    // --- Report body ---
+    if UseTrueLabel then LabelMode := 'true-label'
+    else LabelMode := 'predicted-label';
+    Lines.Add(Format(
+      'GradientConflictReport: %d usable sample(s) of %d, %d trainable ' +
+      'layer(s), %d param(s) in scope. Mode=%s.',
+      [UsableCount, Samples.Count, TrainableLayers, ScopeParamCnt, LabelMode]));
+    Lines.Add('Scope: ' + RestrictName + '.');
+    Lines.Add(Format('Pairwise gradient cosines: %d pair(s).', [PairCount]));
+    Lines.Add('');
+
+    Lines.Add('Pairwise cosine histogram (bins over [-1, 1]):');
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      BinLo := -1.0 + BinIdx * (2.0 / cBins);
+      BinHi := -1.0 + (BinIdx + 1) * (2.0 / cBins);
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%8.4f, %8.4f) | n=%6d %s',
+        [BinLo, BinHi, Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    Lines.Add(Format(
+      'Conflict fraction (cos < 0): %d / %d pair(s) = %.2f%%.',
+      [NegCount, PairCount, (NegCount / PairCount) * 100.0]));
+    Lines.Add(Format(
+      'Strong-conflict fraction (cos < %.2f): %d / %d pair(s) = %.2f%% ' +
+      '(the genuinely-opposed tail).',
+      [cStrongConflict, StrongNegCount, PairCount,
+       (StrongNegCount / PairCount) * 100.0]));
+    Lines.Add(Format('Mean cosine = %8.4f.   Median cosine = %8.4f.',
+      [MeanCos, MedianCos]));
+    Lines.Add(Format(
+      'Most-conflicting pair: samples #%d and #%d, cos = %8.4f ' +
+      '(these two examples disagree most).',
+      [SampleOrigIdx[MinI], SampleOrigIdx[MinJ], MinCos]));
+    Lines.Add('');
+
+    // per-class-pair mean-cosine matrix
+    if HaveLabels and (NumClasses > 0) then
+    begin
+      cGlyphs := '@%#*+=-:. ';   // 10 bands, '@' = most opposed (cos -1)
+      Lines.Add('Per-class-pair mean cosine (rows/cols = class index, ' +
+        'diagonal = within-class):');
+      // header row
+      Bar := '      ';
+      for CB := 0 to NumClasses - 1 do
+        Bar := Bar + Format('%8d', [CB]);
+      Lines.Add(Bar);
+      for CA := 0 to NumClasses - 1 do
+      begin
+        Bar := Format('  [%2d]', [CA]);
+        for CB := 0 to NumClasses - 1 do
+        begin
+          if ClassPairCnt[CA][CB] > 0 then
+          begin
+            CellMean := ClassPairSum[CA][CB] / ClassPairCnt[CA][CB];
+            Bar := Bar + Format('%8.4f', [CellMean]);
+          end
+          else
+            Bar := Bar + Format('%8s', ['  -   ']);
+        end;
+        Lines.Add(Bar);
+      end;
+      // a glyph heatmap of the same matrix (cos in [-1,1] -> band).
+      Lines.Add('');
+      Lines.Add('  (glyph map: ' + cGlyphs +
+        ' from cos=-1 [most opposed] to cos=+1 [aligned])');
+      for CA := 0 to NumClasses - 1 do
+      begin
+        Bar := Format('  [%2d] ', [CA]);
+        for CB := 0 to NumClasses - 1 do
+        begin
+          if ClassPairCnt[CA][CB] > 0 then
+          begin
+            CellMean := ClassPairSum[CA][CB] / ClassPairCnt[CA][CB];
+            BinIdx := Trunc(((CellMean + 1.0) / 2.0) * Length(cGlyphs));
+            if BinIdx < 1 then BinIdx := 1;
+            if BinIdx > Length(cGlyphs) then BinIdx := Length(cGlyphs);
+            Glyph := cGlyphs[BinIdx];
+          end
+          else
+            Glyph := ' ';
+          Bar := Bar + Glyph + ' ';
+        end;
+        Lines.Add(Bar);
+      end;
+      Lines.Add('');
+    end
+    else
+      Lines.Add('(class labels not decodable from targets; ' +
+        'per-class-pair matrix skipped)');
+
+    Lines.Add(Format(
+      'Correctness: max |self-cosine - 1| = %.3e (== 0), ' +
+      'max cosine asymmetry = %.3e (== 0).', [DiagOK, SymOK]));
+    Lines.Add(
+      'Read it as: a fat negative-cosine tail / high conflict fraction means ' +
+      'the batch gradients fight each other (small or unstable steps); a ' +
+      'cosine mass clustered near +1 means the samples agree.');
 
     Result := Lines.Text;
   finally

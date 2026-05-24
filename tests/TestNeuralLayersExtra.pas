@@ -98,6 +98,7 @@ type
     procedure TestRepresentationSimilarityReportSmoke;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
+    procedure TestGradientConflictReportSmoke;
   end;
 
 implementation
@@ -2672,6 +2673,204 @@ begin
       Pos('AdversarialRobustnessReport', Report) > 0);
   finally
     Samples.Free;
+    NN.Free;
+  end;
+end;
+
+// Parses the "Strong-conflict fraction (cos < -0.20): a / b pair(s) = P%."
+// line out of a GradientConflictReport and returns P (or -1 if not found).
+// The strong-conflict tail is the genuinely-opposed signal that separates a
+// clean batch (~0) from a label-noised / overlapping one.
+function ParseStrongConflictFraction(const Report: string): TNeuralFloat;
+var
+  S, E: integer;
+  Frac: string;
+  FS: TFormatSettings;
+begin
+  Result := -1;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  S := Pos('Strong-conflict fraction', Report);
+  if S = 0 then Exit;
+  S := PosEx('pair(s) = ', Report, S);
+  if S = 0 then Exit;
+  S := S + Length('pair(s) = ');
+  E := PosEx('%', Report, S);
+  if E <= S then Exit;
+  Frac := Trim(Copy(Report, S, E - S));
+  Result := StrToFloatDef(Frac, -1, FS);
+end;
+
+// Parses "max |self-cosine - 1| = <v> (== 0)" out of a report.
+function ParseDiagResidual(const Report: string): TNeuralFloat;
+var
+  S, E: integer;
+  Val: string;
+  FS: TFormatSettings;
+begin
+  Result := -1;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  S := Pos('max |self-cosine - 1| = ', Report);
+  if S = 0 then Exit;
+  S := S + Length('max |self-cosine - 1| = ');
+  E := PosEx(' ', Report, S);
+  if E <= S then Exit;
+  Val := Trim(Copy(Report, S, E - S));
+  Result := StrToFloatDef(Val, -1, FS);
+end;
+
+procedure TTestNeuralLayersExtra.TestGradientConflictReportSmoke;
+var
+  NN: TNNet;
+  Clean, Noisy: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  CleanReport, NoisyReport, HeadReport: string;
+  Ep, I, C, TrueCls, LabelCls: integer;
+  CleanFrac, NoisyFrac, DiagRes, SymRes: TNeuralFloat;
+  SymStart, SymEnd: integer;
+  SymStr: string;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN handled gracefully.
+  CleanReport := TNNet.GradientConflictReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', CleanReport) > 0);
+
+  NN := TNNet.Create();
+  Clean := TNNetVolumePairList.Create();
+  Noisy := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(12));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    CleanReport := TNNet.GradientConflictReport(NN, Clean);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', CleanReport) > 0);
+
+    // Train on the clean separable 3-cluster problem.
+    RandSeed := 1234;
+    for Ep := 1 to 40 do
+      for I := 1 to 90 do
+      begin
+        C := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        try
+          X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+          X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+          Y.Fill(0);
+          Y.FData[C] := 1.0;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    // Clean probe batch: tight clusters, honest labels.
+    for C := 0 to 2 do
+      for I := 1 to 16 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+        X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Clean.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Noisy probe batch: heavy overlap + 40% label corruption.
+    for C := 0 to 2 do
+      for I := 1 to 16 do
+      begin
+        TrueCls := C;
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[TrueCls][0] + (Random - 0.5) * 5.0;
+        X.FData[1] := Centers[TrueCls][1] + (Random - 0.5) * 5.0;
+        LabelCls := TrueCls;
+        if Random < 0.4 then
+          LabelCls := (TrueCls + 1 + Random(2)) mod 3;
+        Y.Fill(0);
+        Y.FData[LabelCls] := 1.0;
+        Noisy.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    CleanReport := TNNet.GradientConflictReport(NN, Clean);
+    NoisyReport := TNNet.GradientConflictReport(NN, Noisy);
+
+    AssertTrue('clean report non-empty', Length(CleanReport) > 0);
+    AssertTrue('Header present',
+      Pos('GradientConflictReport', CleanReport) > 0);
+    AssertTrue('cosine histogram present',
+      Pos('Pairwise cosine histogram', CleanReport) > 0);
+    AssertTrue('conflict-fraction line present',
+      Pos('Conflict fraction', CleanReport) > 0);
+    AssertTrue('mean/median line present',
+      Pos('Mean cosine', CleanReport) > 0);
+    AssertTrue('most-conflicting pair present',
+      Pos('Most-conflicting pair', CleanReport) > 0);
+    AssertTrue('per-class-pair matrix present',
+      Pos('Per-class-pair mean cosine', CleanReport) > 0);
+
+    // --- Built-in correctness check 1: self-cosine diagonal == 1. ---
+    DiagRes := ParseDiagResidual(CleanReport);
+    AssertTrue('self-cosine residual parsed', DiagRes >= 0);
+    AssertTrue('self-cosine diagonal == 1 within tolerance', DiagRes < 1e-3);
+
+    // --- Built-in correctness check 2: matrix symmetry residual == 0. ---
+    SymStart := Pos('max cosine asymmetry = ', CleanReport);
+    AssertTrue('asymmetry line found', SymStart > 0);
+    SymStart := SymStart + Length('max cosine asymmetry = ');
+    SymEnd := PosEx(' ', CleanReport, SymStart);
+    AssertTrue('asymmetry terminator found', SymEnd > SymStart);
+    SymStr := Trim(Copy(CleanReport, SymStart, SymEnd - SymStart));
+    SymRes := StrToFloatDef(SymStr, -1, FS);
+    AssertTrue('asymmetry residual parsed', SymRes >= 0);
+    AssertTrue('cosine matrix symmetric within tolerance', SymRes < 1e-3);
+
+    AssertTrue('strong-conflict line present',
+      Pos('Strong-conflict fraction', CleanReport) > 0);
+
+    // --- Contrast: the noisy batch must grow a strong-conflict tail that the
+    // clean linearly-separable batch keeps near zero. ---
+    CleanFrac := ParseStrongConflictFraction(CleanReport);
+    NoisyFrac := ParseStrongConflictFraction(NoisyReport);
+    AssertTrue('clean strong-conflict fraction parsed', CleanFrac >= 0);
+    AssertTrue('noisy strong-conflict fraction parsed', NoisyFrac >= 0);
+    AssertTrue('clean batch has ~0 strong-conflict tail', CleanFrac < 1.0);
+    AssertTrue('noisy batch grows a strong-conflict tail vs clean',
+      NoisyFrac > CleanFrac + 5.0);
+
+    // --- LayerIdx scope filter runs and is labelled. ---
+    HeadReport := TNNet.GradientConflictReport(NN, Noisy, True, 2);
+    AssertTrue('layer-restricted report non-empty', Length(HeadReport) > 0);
+    AssertTrue('layer-restricted scope labelled',
+      Pos('layer 2', HeadReport) > 0);
+
+    // predicted-label mode also produces a well-formed report.
+    CleanReport := TNNet.GradientConflictReport(NN, Clean, False);
+    AssertTrue('predicted-label mode non-empty', Length(CleanReport) > 0);
+    AssertTrue('predicted-label mode tagged',
+      Pos('predicted-label', CleanReport) > 0);
+  finally
+    Clean.Free;
+    Noisy.Free;
     NN.Free;
   end;
 end;
