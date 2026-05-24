@@ -152,6 +152,15 @@ breakdown:
 - [X] TNNetSinkAttention — prepend K learnable "attention sink" key/value
       slots that every query can attend to regardless of the causal mask.
       Helps long-context stability, ~30 lines on top of SDPA.
+- [ ] TNNetSinkAttention follow-up (now landed): attention-sink stability
+      micro-experiment. On a tiny causal next-token task with an "all-keys-
+      irrelevant" probe row, compare plain SDPA vs TNNetSinkAttention and
+      print the attention mass that lands on the sink slot(s) vs real keys —
+      the StreamingLLM claim is the sink absorbs the otherwise-misplaced mass.
+      Sweep K ∈ {1, 2, 4}. ~30-line wiring swap; all pieces in tree.
+- [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
+      ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
+      decoder block can opt into sinks per head behind a flag.
 - [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
       heads (Shazeer et al.). A tiny learnable HxH multiply applied to
       attention logits along the head axis.
@@ -364,7 +373,14 @@ breakdown:
       gradient/forward tests already landed.
 ### Loss layers
 - [X] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
-      loss layer.
+      loss layer. Self-contained `a|b|y` depth-split head (reads FOutput
+      directly, no external target — same pattern as TNNetTripletLoss).
+- [ ] TNNetCosineEmbeddingLoss follow-up (now landed): a tiny
+      siamese-pair embedding micro-example — train two shared-weight MLP
+      branches whose outputs are concatenated into the `a|b|y` layout, on a
+      synthetic "same vs different class" pair task, and print the learned
+      same-pair vs different-pair cosine histograms. Headline use case for
+      the landed head; pairs with [[TripletEmbedding]].
 - [ ] TNNetKLDivergence follow-up: a knowledge-distillation micro-example —
       train a small "student" against soft targets from a fixed "teacher"
       distribution using the landed TNNetKLDivergence head, and contrast its
@@ -1074,6 +1090,19 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
+- [ ] FeatureSeparabilityReport follow-up (now landed): the scatter-
+      decomposition identity `tr(Stot)=tr(Sw)+tr(Sb)` is only exact for
+      class-balanced batches (the report uses class-balanced `mean_c`
+      definitions and prints the worst residual). Add a count-weighted scatter
+      mode so the identity holds exactly for imbalanced probe batches too,
+      gated by a flag (balanced stays default). Re-pin the smoke-test
+      assertion under the weighted mode.
+- [ ] FeatureSeparabilityReport follow-up: a training-trajectory variant that
+      calls the report every N epochs on a fixed probe set and charts
+      `tr(Sw)` collapse + Fisher-ratio climb over training — the cleanest
+      single-number window into the terminal phase / neural collapse. Pairs
+      with the open grokking / lottery-ticket experiments
+      ([[WeightSpectrumReport]]).
 - [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
       separated verdict robust when the endpoint losses are near zero. As
       landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
