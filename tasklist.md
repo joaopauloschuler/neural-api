@@ -331,7 +331,7 @@ breakdown:
       *weights* of the previous trainable layer after each step.
 
 #### Reduction / shape
-- [ ] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
+- [X] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetLpPool follow-up: `p`-sweep bake-off experiment. Same tiny conv
       classifier, swap the pooling for `TNNetLpPool` at `p ∈ {1, 2, 4, 8}`

@@ -3654,6 +3654,31 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Adaptive average pooling: produces a fixed target output size
+  // (OutX, OutY) regardless of the input spatial size, like PyTorch's
+  // AdaptiveAvgPool2d. Depth is unchanged. For output index o along an
+  // axis of input length In and output length Out the adaptive window is
+  //   start(o) = floor(o * In / Out)
+  //   end(o)   = ceil((o+1) * In / Out)   (exclusive)
+  // and the forward value is the mean over that 2D window. Windows may
+  // overlap when In is not a multiple of Out. When (OutX, OutY) equals the
+  // input size this is the identity; when OutX=OutY=1 it equals global
+  // average pooling. Backward divides each output error by its window area
+  // and ACCUMULATES into the input error of every participating cell (a
+  // cell may belong to several overlapping windows). OutX and OutY are
+  // stored in FStruct[0] and FStruct[1] so they round-trip through
+  // SaveToString / LoadFromString.
+  TNNetAdaptiveAvgPool = class(TNNetLayer)
+  private
+    FOutputSizeX, FOutputSizeY: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pSize: integer); overload;
+    constructor Create(pSizeX, pSizeY: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Mask-aware mean pooling over the SizeX (sequence) axis.
   // Convention: the last input channel (index Depth-1) is a {0,1} mask.
   // Positions with mask <= 0.5 are excluded from the average. Output
@@ -18373,6 +18398,118 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FPrevLayer.Backpropagate();
+end;
+
+{ TNNetAdaptiveAvgPool }
+
+constructor TNNetAdaptiveAvgPool.Create(pSize: integer);
+begin
+  Create(pSize, pSize);
+end;
+
+constructor TNNetAdaptiveAvgPool.Create(pSizeX, pSizeY: integer);
+begin
+  inherited Create();
+  FOutputSizeX := pSizeX;
+  FOutputSizeY := pSizeY;
+  FStruct[0] := pSizeX;
+  FStruct[1] := pSizeY;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+procedure TNNetAdaptiveAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
+  FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
+end;
+
+procedure TNNetAdaptiveAvgPool.Compute();
+var
+  StartTime: double;
+  OutX, OutY, InX, InY, D, MaxD: integer;
+  StartX, EndX, StartY, EndY: integer;
+  InSizeX, InSizeY, WinArea: integer;
+  InvArea: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  InSizeX := Prev.SizeX;
+  InSizeY := Prev.SizeY;
+  MaxD := Prev.Depth - 1;
+  FOutput.Fill(0);
+  for OutX := 0 to FOutputSizeX - 1 do
+  begin
+    StartX := (OutX * InSizeX) div FOutputSizeX;
+    EndX := ((OutX + 1) * InSizeX + FOutputSizeX - 1) div FOutputSizeX; // ceil, exclusive
+    for OutY := 0 to FOutputSizeY - 1 do
+    begin
+      StartY := (OutY * InSizeY) div FOutputSizeY;
+      EndY := ((OutY + 1) * InSizeY + FOutputSizeY - 1) div FOutputSizeY; // ceil, exclusive
+      WinArea := (EndX - StartX) * (EndY - StartY);
+      for InX := StartX to EndX - 1 do
+        for InY := StartY to EndY - 1 do
+        begin
+          FOutput.Add
+          (
+            FOutput.GetRawPtr(OutX, OutY),
+            Prev.GetRawPtr(InX, InY),
+            Prev.Depth
+          );
+        end;
+      InvArea := 1 / WinArea;
+      for D := 0 to MaxD do
+        FOutput.Mul(OutX, OutY, D, InvArea);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAdaptiveAvgPool.Backpropagate();
+var
+  StartTime: double;
+  OutX, OutY, InX, InY, D, MaxD: integer;
+  StartX, EndX, StartY, EndY: integer;
+  InSizeX, InSizeY, WinArea: integer;
+  PrevErr: TNNetVolume;
+  Err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    InSizeX := FPrevLayer.Output.SizeX;
+    InSizeY := FPrevLayer.Output.SizeY;
+    MaxD := FOutput.Depth - 1;
+    for OutX := 0 to FOutputSizeX - 1 do
+    begin
+      StartX := (OutX * InSizeX) div FOutputSizeX;
+      EndX := ((OutX + 1) * InSizeX + FOutputSizeX - 1) div FOutputSizeX;
+      for OutY := 0 to FOutputSizeY - 1 do
+      begin
+        StartY := (OutY * InSizeY) div FOutputSizeY;
+        EndY := ((OutY + 1) * InSizeY + FOutputSizeY - 1) div FOutputSizeY;
+        WinArea := (EndX - StartX) * (EndY - StartY);
+        for D := 0 to MaxD do
+        begin
+          Err := FOutputError[OutX, OutY, D] / WinArea;
+          for InX := StartX to EndX - 1 do
+            for InY := StartY to EndY - 1 do
+              PrevErr.Add(InX, InY, D, Err); // accumulate (overlapping windows)
+        end;
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetMaskedMean }
@@ -35582,6 +35719,7 @@ begin
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
+      'TNNetAdaptiveAvgPool':       Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]);
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
       'TNNetMaskedMean':            Result := TNNetMaskedMean.Create();
@@ -35829,6 +35967,7 @@ begin
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
+      if S[0] = 'TNNetAdaptiveAvgPool' then Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]) else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else
       if S[0] = 'TNNetMaskedMean' then Result := TNNetMaskedMean.Create() else

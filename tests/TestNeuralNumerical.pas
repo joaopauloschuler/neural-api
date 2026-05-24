@@ -31,6 +31,10 @@ type
     procedure TestLpPoolGradientCheckP2;
     procedure TestLpPoolGradientCheckP3;
     procedure TestLpPoolLoadFromString;
+    procedure TestAdaptiveAvgPoolForward;
+    procedure TestAdaptiveAvgPoolGlobalAndIdentity;
+    procedure TestAdaptiveAvgPoolGradientCheck;
+    procedure TestAdaptiveAvgPoolLoadFromString;
 
     // Shape-helper layers (TNNetExpandDims / TNNetSqueeze)
     procedure TestExpandDimsForward;
@@ -3851,6 +3855,169 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('LpPool round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaptiveAvgPoolForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D: integer;
+begin
+  // Input 4x4x2 -> output 2x2x2. With In=4, Out=2 the windows are clean
+  // non-overlapping 2x2 blocks, so each output is the mean of one block.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    NN.AddLayer(TNNetAdaptiveAvgPool.Create(2));
+
+    // Channel 0: value = X + 10*Y ; Channel 1: value = 100 + X + 10*Y
+    for X := 0 to 3 do
+      for Y := 0 to 3 do
+      begin
+        Input[X, Y, 0] := X + 10 * Y;
+        Input[X, Y, 1] := 100 + X + 10 * Y;
+      end;
+
+    NN.Compute(Input);
+
+    AssertEquals('AdaptiveAvgPool output SizeX', 2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AdaptiveAvgPool output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('AdaptiveAvgPool output Depth', 2, NN.GetLastLayer.Output.Depth);
+
+    // For each 2x2 output cell assert the exact mean of its 2x2 block.
+    for D := 0 to 1 do
+      for X := 0 to 1 do
+        for Y := 0 to 1 do
+        begin
+          AssertEquals('AdaptiveAvgPool mean at (' + IntToStr(X) + ',' +
+            IntToStr(Y) + ',' + IntToStr(D) + ')',
+            ( Input[2*X,   2*Y,   D] + Input[2*X+1, 2*Y,   D] +
+              Input[2*X,   2*Y+1, D] + Input[2*X+1, 2*Y+1, D] ) / 4.0,
+            NN.GetLastLayer.Output[X, Y, D], 1e-5);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaptiveAvgPoolGlobalAndIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D: integer;
+  Sum0, Sum1: TNeuralFloat;
+begin
+  // Case A: OutX=OutY=1 == global average pooling (per-channel mean).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 5, 2));
+    NN.AddLayer(TNNetAdaptiveAvgPool.Create(1));
+    Sum0 := 0; Sum1 := 0;
+    for X := 0 to 2 do
+      for Y := 0 to 4 do
+      begin
+        Input[X, Y, 0] := Sin(X * 0.7 + Y) * 2.0 + 0.3;
+        Input[X, Y, 1] := Cos(X + Y * 0.4);
+        Sum0 := Sum0 + Input[X, Y, 0];
+        Sum1 := Sum1 + Input[X, Y, 1];
+      end;
+    NN.Compute(Input);
+    AssertEquals('Global avg output SizeX', 1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Global avg output SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Global avg channel 0', Sum0 / 15.0,
+      NN.GetLastLayer.Output[0, 0, 0], 1e-5);
+    AssertEquals('Global avg channel 1', Sum1 / 15.0,
+      NN.GetLastLayer.Output[0, 0, 1], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // Case B: OutX=InX, OutY=InY == identity (each window is a single cell).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 5, 2));
+    NN.AddLayer(TNNetAdaptiveAvgPool.Create(3, 5));
+    for X := 0 to 2 do
+      for Y := 0 to 4 do
+      begin
+        Input[X, Y, 0] := Sin(X * 0.7 + Y) * 2.0 + 0.3;
+        Input[X, Y, 1] := Cos(X + Y * 0.4);
+      end;
+    NN.Compute(Input);
+    for D := 0 to 1 do
+      for X := 0 to 2 do
+        for Y := 0 to 4 do
+          AssertEquals('Identity at (' + IntToStr(X) + ',' + IntToStr(Y) + ',' +
+            IntToStr(D) + ')', Input[X, Y, D],
+            NN.GetLastLayer.Output[X, Y, D], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaptiveAvgPoolGradientCheck;
+begin
+  // Non-divisible shape: In=5 -> Out=2 produces unequal/overlapping windows
+  // (output 0 covers x=0..2, output 1 covers x=2..4; x=2 is shared). This is
+  // the case most likely to expose a windowing / accumulation bug.
+  // Overlapping windows accumulate several output contributions into the
+  // shared input cells; with single-precision arithmetic the central-
+  // difference vs analytic agreement is ~2e-3 there, so use 5e-3 (still well
+  // tighter than the 1e-2 the other pooling gradient checks use).
+  LayerInputGradientCheck(Self, TNNetAdaptiveAvgPool.Create(2),
+    'AdaptiveAvgPool(5->2)', 5, 5, 2, 5e-3);
+end;
+
+procedure TTestNeuralNumerical.TestAdaptiveAvgPoolLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net with a NON-square target (OutX=2, OutY=3) on a
+  // non-divisible input (5x7) so both FStruct slots and the windowing
+  // survive SaveToString -> LoadFromString.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 7, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 7, 2, 1));
+    NN.AddLayer(TNNetAdaptiveAvgPool.Create(2, 3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AdaptiveAvgPool round-trip class identity',
+        NN2.GetLastLayer is TNNetAdaptiveAvgPool);
+      AssertEquals('AdaptiveAvgPool round-trip OutX', 2,
+        NN2.GetLastLayer.Output.SizeX);
+      AssertEquals('AdaptiveAvgPool round-trip OutY', 3,
+        NN2.GetLastLayer.Output.SizeY);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AdaptiveAvgPool SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('AdaptiveAvgPool round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;
