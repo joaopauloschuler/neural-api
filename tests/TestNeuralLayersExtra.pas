@@ -98,6 +98,7 @@ type
     procedure TestCalibrationReportSmoke;
     procedure TestFisherImportanceReportSmoke;
     procedure TestLinearProbeReportSmoke;
+    procedure TestLogitLensReportSmoke;
     procedure TestFeatureSeparabilityReportSmoke;
     procedure TestRepresentationSimilarityReportSmoke;
     procedure TestEnableInputGradient;
@@ -2663,6 +2664,115 @@ begin
   finally
     Samples.Free;
     ValSamples.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLogitLensReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  X: TNNetVolume;
+  Report: string;
+  I, C: integer;
+  AStart, AEnd: integer;
+  AgreeStr, KLStr: string;
+  Agree, KLval: TNeuralFloat;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-1.5, -1.5), (1.5, 1.5), (1.5, -1.5));
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN handled gracefully.
+  Report := TNNet.LogitLensReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    // Constant-width body so every hidden layer is lens-compatible with the
+    // head input; the input layer (width 2) shows up as SKIPPED.
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty probe list handled gracefully (on a valid net).
+    Report := TNNet.LogitLensReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Build an unlabelled 3-cluster probe batch.
+    RandSeed := 1234;
+    for C := 0 to 2 do
+      for I := 1 to 30 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Probes.Add(X);
+      end;
+
+    // The lens correctness checks are exact at ANY weights (fresh init is
+    // fine): the lens at the head input must reproduce p_final exactly.
+    Report := TNNet.LogitLensReport(NN, Probes);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('LogitLensReport', Report) > 0);
+    AssertTrue('agreement bar chart present',
+      Pos('Per-layer lens agreement', Report) > 0);
+    AssertTrue('KL curve present', Pos('KL(p_L || p_final)', Report) > 0);
+    AssertTrue('crystallization section present',
+      Pos('Crystallization depth', Report) > 0);
+    AssertTrue('SKIPPED section present', Pos('SKIPPED layers', Report) > 0);
+    AssertTrue('input layer reported as SKIPPED',
+      Pos('TNNetInput', Report) > 0);
+    AssertTrue('correctness check present',
+      Pos('Correctness check', Report) > 0);
+    AssertTrue('correctness check PASSes',
+      Pos('PASS', Report) > 0);
+
+    // Parse the head-input correctness line and assert agreement==1, KL==0.
+    AStart := Pos('agreement=', Report);
+    AssertTrue('agreement token found', AStart > 0);
+    AStart := AStart + Length('agreement=');
+    AEnd := PosEx(' ', Report, AStart);
+    AssertTrue('agreement terminator found', AEnd > AStart);
+    AgreeStr := Trim(Copy(Report, AStart, AEnd - AStart));
+    Agree := StrToFloatDef(AgreeStr, -1, FS);
+    AssertTrue('agreement parsed', Agree >= 0);
+    AssertTrue('lens at head input agreement == 1.0',
+      Abs(Agree - 1.0) < 1e-4);
+
+    AStart := Pos('KL=', Report);
+    AssertTrue('KL token found', AStart > 0);
+    AStart := AStart + Length('KL=');
+    AEnd := PosEx(' ', Report, AStart);
+    if AEnd <= AStart then AEnd := PosEx('.', Report, AStart) + 7;
+    KLStr := Trim(Copy(Report, AStart, AEnd - AStart));
+    // Trim a trailing '(' or other punctuation if present.
+    while (Length(KLStr) > 0) and
+          not (KLStr[Length(KLStr)] in ['0'..'9']) do
+      KLStr := Copy(KLStr, 1, Length(KLStr) - 1);
+    KLval := StrToFloatDef(KLStr, -1, FS);
+    AssertTrue('KL parsed', KLval >= 0);
+    AssertTrue('lens at head input KL == 0', KLval < 1e-4);
+
+    // Single-layer head (explicit HeadStartIdx = last layer) degenerates to the
+    // trivial profile and still PASSes the correctness check.
+    Report := TNNet.LogitLensReport(NN, Probes, NN.GetLastLayerIdx());
+    AssertTrue('single-head report non-empty', Length(Report) > 0);
+    AssertTrue('single-head note present',
+      Pos('single-layer head', Report) > 0);
+    AssertTrue('single-head still PASSes', Pos('PASS', Report) > 0);
+  finally
+    Probes.Free;
     NN.Free;
   end;
 end;

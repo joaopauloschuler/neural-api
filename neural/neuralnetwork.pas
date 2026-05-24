@@ -5039,6 +5039,52 @@ type
         Lambda: TNeuralFloat = 1e-2;
         MaxFeatDim: integer = 256
       ): string;
+      // LOGIT-LENS diagnostic (nostalgebraist 2020; cf. "Tuned Lens", Belrose
+      // et al. 2023). Answers "if we read out the prediction at THIS layer using
+      // the network's OWN trained output head, what would it already say?" - the
+      // model's running, self-decoded belief at each depth, fitting ZERO new
+      // parameters. Given a classifier NN whose tail is a readout head and an
+      // UNLABELLED probe batch pInput (a TNNetVolumeList of input volumes), the
+      // report identifies the trailing "head" sub-stack and, for every EARLIER
+      // layer whose flattened activation is shape-compatible with the head's
+      // expected input size, SPLICES that activation into the head's input slot
+      // and recomputes ONLY the head layers to obtain a per-layer "lens
+      // distribution" p_L (the head's softmax-family output is read as an
+      // already-normalised probability vector). HEAD HEURISTIC: HeadStartIdx
+      // (default -1) selects the readout as the LAST trainable layer
+      // (Neurons.Count>0) plus any pure activation/softmax tail after it; the
+      // head's expected input is the Output of the layer immediately preceding
+      // HeadStartIdx, and a candidate layer L is lens-compatible iff its flat
+      // Output.Size equals that expected input size. Reports:
+      //   (a) per-layer AGREEMENT rate mean_x[argmax(p_L)==argmax(p_final)] as an
+      //       ASCII bar chart across depth;
+      //   (b) the CRYSTALLIZATION depth - the shallowest layer after which the
+      //       lens argmax matches the final argmax and never flips again - as a
+      //       per-batch mean AND a 10-bin per-sample histogram;
+      //   (c) per-layer mean top-1 confidence and lens ENTROPY (the readout
+      //       sharpens with depth);
+      //   (d) the per-layer KL(p_L || p_final) curve (a monotone decrease means
+      //       the residual stream is incrementally refining toward the final
+      //       answer - the headline picture).
+      // Layers whose flat size does NOT match the head input size are listed
+      // explicitly as SKIPPED (the honest width-compatibility constraint of the
+      // classic lens). BUILT-IN CORRECTNESS: applying the lens AT HeadStartIdx
+      // (i.e. splicing the head's own input layer into its own slot - no
+      // substitution) reproduces p_final EXACTLY (agreement 1.0, KL 0); a
+      // single-layer head degenerates to the trivial "everything resolves at the
+      // last layer" profile. Pure forward-only - NN.Compute and per-head-layer
+      // Compute only, weights are NEVER stepped, no backward pass, no new layer
+      // types; the net's live state is restored on exit. DISTINCT from
+      // LinearProbeReport (which FITS a fresh ridge probe per layer - the lens
+      // fits NOTHING and reuses the model's OWN trained head), from
+      // ActivationPatchingReport (causal cross-input activation swaps) and from
+      // FeatureSeparabilityReport (label-conditioned cluster geometry, no
+      // readout). Guards nil NN and an empty/nil probe list gracefully.
+      class function LogitLensReport(
+        NN: TNNet;
+        pInput: TNNetVolumeList;
+        HeadStartIdx: integer = -1
+      ): string;
       // Label-aware class-GEOMETRY / Neural-Collapse diagnostic (Papyan, Han &
       // Donoho 2020). Where LinearProbeReport asks "is the label DECODABLE
       // here?" (it fits a probe), this asks "what is the GEOMETRY of the feature
@@ -31884,6 +31930,405 @@ begin
 
     Result := Lines.Text;
   finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LogitLensReport(
+  NN: TNNet;
+  pInput: TNNetVolumeList;
+  HeadStartIdx: integer = -1
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cEps = 1e-12;        // probability floor for log/KL
+type
+  TFloatArray = array of TNeuralFloat;
+var
+  Lines: TStringList;
+  LayerIdx, SampleIdx, BinIdx, I, L, C: integer;
+  Layer: TNNetLayer;
+  InVol: TNNetVolume;
+  NumLayers, LastLayer, NumClasses, NumSamples: integer;
+  HeadIdx, HeadInIdx, HeadInSize: integer;
+  LastTrainable: integer;
+  // Per-candidate-layer state (indexed by absolute layer index 0..LastLayer):
+  Compatible: array of boolean;       // flat-size matches the head input
+  Agree: TFloatArray;                 // mean argmax agreement vs final
+  KLsum: TFloatArray;                 // mean KL(p_L || p_final)
+  ConfSum: TFloatArray;               // mean top-1 confidence of p_L
+  EntSum: TFloatArray;                // mean entropy of p_L
+  NumCompat: integer;
+  // Snapshot scratch for the candidate layer's activation.
+  CandSnap: TNNetVolume;
+  FinalArgmax: array of integer;      // per sample
+  FinalProb: array of TFloatArray;    // per sample p_final
+  LensArgmax: array of integer;       // per sample, scratch for one layer
+  // crystallization: per sample, the shallowest compatible layer after which
+  // the lens argmax matches final and never flips again (index into compat list)
+  CrystComp: array of integer;        // -1 = never crystallizes before head
+  CompatOrder: array of integer;      // ordered list of compatible layer idxs
+  PerSampleCorrect: array of array of boolean; // [compatOrderPos][sample]
+  CrystSum, CrystCnt: TNeuralFloat;
+  CrystBins: array of integer;
+  MaxBin, BarLen: integer;
+  Prob: TFloatArray;                  // scratch p_L for one sample
+  KLval, EntVal, Conf, Pf, Pl, Acc, BarVal, MaxKL: TNeuralFloat;
+  Bar, SkipList: string;
+  HaveAny, OnlyHead: boolean;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  CandSnap := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'LogitLensReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (pInput = nil) or (pInput.Count = 0) then
+    begin
+      Result := 'LogitLensReport: pInput is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    NumLayers := NN.CountLayers();
+    LastLayer := NN.GetLastLayerIdx();
+    if NumLayers < 2 then
+    begin
+      Result := 'LogitLensReport: network needs at least 2 layers.' + sLineBreak;
+      Exit;
+    end;
+    NumClasses := NN.GetLastLayer().Output.Size;
+    if NumClasses < 2 then
+    begin
+      Result := 'LogitLensReport: final layer must have >= 2 outputs.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Resolve the head start index. ---
+    // Default heuristic: the LAST trainable layer (Neurons.Count>0) is the
+    // readout's weight matrix; the head sub-stack is that layer plus any pure
+    // activation/softmax tail after it (i.e. HeadStartIdx = last trainable).
+    if HeadStartIdx < 0 then
+    begin
+      LastTrainable := -1;
+      for LayerIdx := 0 to LastLayer do
+        if NN.Layers[LayerIdx].Neurons.Count > 0 then
+          LastTrainable := LayerIdx;
+      if LastTrainable <= 0 then
+        HeadIdx := LastLayer   // no trainable layer found: degenerate 1-layer head
+      else
+        HeadIdx := LastTrainable;
+    end
+    else
+      HeadIdx := HeadStartIdx;
+    if HeadIdx < 1 then HeadIdx := 1;          // need an input slot below the head
+    if HeadIdx > LastLayer then HeadIdx := LastLayer;
+
+    HeadInIdx := HeadIdx - 1;                  // layer feeding the head
+    HeadInSize := NN.Layers[HeadInIdx].Output.Size;
+    OnlyHead := (HeadIdx = LastLayer);         // single-layer head?
+
+    NumSamples := pInput.Count;
+
+    // --- Catalogue which earlier layers (0..HeadInIdx) are lens-compatible. ---
+    SetLength(Compatible, NumLayers);
+    NumCompat := 0;
+    for LayerIdx := 0 to NumLayers - 1 do Compatible[LayerIdx] := False;
+    for LayerIdx := 0 to HeadInIdx do
+      if NN.Layers[LayerIdx].Output.Size = HeadInSize then
+      begin
+        Compatible[LayerIdx] := True;
+        Inc(NumCompat);
+      end;
+    // HeadInIdx itself is always compatible (it IS the head input).
+    SetLength(CompatOrder, NumCompat);
+    I := 0;
+    for LayerIdx := 0 to HeadInIdx do
+      if Compatible[LayerIdx] then
+      begin
+        CompatOrder[I] := LayerIdx;
+        Inc(I);
+      end;
+
+    SetLength(Agree, NumLayers);
+    SetLength(KLsum, NumLayers);
+    SetLength(ConfSum, NumLayers);
+    SetLength(EntSum, NumLayers);
+    for LayerIdx := 0 to NumLayers - 1 do
+    begin
+      Agree[LayerIdx] := 0; KLsum[LayerIdx] := 0;
+      ConfSum[LayerIdx] := 0; EntSum[LayerIdx] := 0;
+    end;
+
+    SetLength(FinalArgmax, NumSamples);
+    SetLength(FinalProb, NumSamples);
+    SetLength(LensArgmax, NumSamples);
+    SetLength(Prob, NumClasses);
+    SetLength(PerSampleCorrect, NumCompat);
+    for I := 0 to NumCompat - 1 do SetLength(PerSampleCorrect[I], NumSamples);
+
+    CandSnap := TNNetVolume.Create();
+
+    // --- (1) final forward pass per sample: record p_final and argmax. ---
+    for SampleIdx := 0 to NumSamples - 1 do
+    begin
+      InVol := pInput[SampleIdx];
+      if InVol = nil then
+      begin
+        SetLength(FinalProb[SampleIdx], NumClasses);
+        for C := 0 to NumClasses - 1 do FinalProb[SampleIdx][C] := 0;
+        FinalArgmax[SampleIdx] := 0;
+        Continue;
+      end;
+      NN.Compute(InVol);
+      FinalArgmax[SampleIdx] := NN.GetLastLayer().Output.GetClass();
+      SetLength(FinalProb[SampleIdx], NumClasses);
+      for C := 0 to NumClasses - 1 do
+        FinalProb[SampleIdx][C] := NN.GetLastLayer().Output.FData[C];
+    end;
+
+    // --- (2) per compatible candidate layer: splice activation into the head
+    //         input slot, recompute ONLY the head layers, read the lens p_L. ---
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      for SampleIdx := 0 to NumSamples - 1 do
+      begin
+        InVol := pInput[SampleIdx];
+        if InVol = nil then
+        begin
+          LensArgmax[SampleIdx] := FinalArgmax[SampleIdx];
+          PerSampleCorrect[I][SampleIdx] := True;
+          Continue;
+        end;
+        // Fresh full forward pass to populate candidate layer L's activation.
+        NN.Compute(InVol);
+        // Snapshot candidate L's Output (Copy resizes to match), then overwrite
+        // the head-input layer's Output with it. When L = HeadInIdx this is the
+        // identity (no substitution) and must reproduce p_final exactly.
+        CandSnap.Copy(NN.Layers[L].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+        // Recompute ONLY the head sub-stack from the spliced input.
+        for C := HeadIdx to LastLayer do
+          NN.Layers[C].Compute();
+        // Read the lens distribution (softmax-family head => already normalised).
+        Conf := 0;
+        for C := 0 to NumClasses - 1 do
+        begin
+          Pl := NN.GetLastLayer().Output.FData[C];
+          if Pl < 0 then Pl := 0;
+          Prob[C] := Pl;
+          if Pl > Conf then Conf := Pl;
+        end;
+        LensArgmax[SampleIdx] := NN.GetLastLayer().Output.GetClass();
+        PerSampleCorrect[I][SampleIdx] :=
+          (LensArgmax[SampleIdx] = FinalArgmax[SampleIdx]);
+        if PerSampleCorrect[I][SampleIdx] then
+          Agree[L] := Agree[L] + 1.0;
+        ConfSum[L] := ConfSum[L] + Conf;
+        // Entropy and KL(p_L || p_final), probabilities floored at cEps.
+        EntVal := 0;
+        KLval := 0;
+        for C := 0 to NumClasses - 1 do
+        begin
+          Pl := Prob[C];
+          if Pl < cEps then Pl := cEps;
+          EntVal := EntVal - Prob[C] * Ln(Pl);
+          Pf := FinalProb[SampleIdx][C];
+          if Pf < cEps then Pf := cEps;
+          KLval := KLval + Prob[C] * Ln(Pl / Pf);
+        end;
+        if KLval < 0 then KLval := 0;
+        EntSum[L] := EntSum[L] + EntVal;
+        KLsum[L] := KLsum[L] + KLval;
+      end;
+      Agree[L] := Agree[L] / NumSamples;
+      ConfSum[L] := ConfSum[L] / NumSamples;
+      EntSum[L] := EntSum[L] / NumSamples;
+      KLsum[L] := KLsum[L] / NumSamples;
+    end;
+
+    // --- (3) per-sample crystallization depth (in compatible-layer order). ---
+    // Shallowest position p such that PerSampleCorrect[p..end] are all True.
+    SetLength(CrystComp, NumSamples);
+    CrystSum := 0;
+    CrystCnt := 0;
+    for SampleIdx := 0 to NumSamples - 1 do
+    begin
+      CrystComp[SampleIdx] := -1;
+      for I := NumCompat - 1 downto 0 do
+      begin
+        if PerSampleCorrect[I][SampleIdx] then
+          CrystComp[SampleIdx] := I
+        else
+          Break;
+      end;
+      if CrystComp[SampleIdx] >= 0 then
+      begin
+        CrystSum := CrystSum + CompatOrder[CrystComp[SampleIdx]];
+        CrystCnt := CrystCnt + 1;
+      end;
+    end;
+
+    // --- (4) report header + per-layer table. ---
+    Lines.Add('LogitLensReport: forward-only LOGIT-LENS (the model''s own ' +
+      'trained head re-applied at each depth; ZERO fitted parameters).');
+    Lines.Add(Format('Layers=%d, classes=%d, probe sample(s)=%d. ' +
+      'HeadStartIdx=%d (%s), head-input layer=%d (%s, size=%d). ' +
+      '%d of %d sub-head layer(s) lens-compatible.',
+      [NumLayers, NumClasses, NumSamples, HeadIdx,
+       NN.Layers[HeadIdx].ClassName, HeadInIdx,
+       NN.Layers[HeadInIdx].ClassName, HeadInSize, NumCompat, HeadInIdx + 1]));
+    if HeadStartIdx < 0 then
+      Lines.Add('Head heuristic: HeadStartIdx defaulted to the last trainable ' +
+        'layer (Neurons.Count>0) plus its activation/softmax tail.');
+    if OnlyHead then
+      Lines.Add('NOTE: single-layer head — the lens degenerates to the ' +
+        'trivial "everything resolves at the last layer" profile.');
+    Lines.Add('');
+    Lines.Add(Format('%-5s %-30s %8s %9s %9s %9s',
+      ['Idx', 'Layer', 'FlatSz', 'Agree', 'KLtoFinal', 'Conf']));
+    Lines.Add(StringOfChar('-', 80));
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      Lines.Add(Format('%-5d %-30s %8d %8.2f%% %9.4f %8.2f%%',
+        [L, NN.Layers[L].ClassName, NN.Layers[L].Output.Size,
+         Agree[L] * 100.0, KLsum[L], ConfSum[L] * 100.0]));
+    end;
+    Lines.Add(StringOfChar('-', 80));
+
+    // --- (5) per-layer AGREEMENT bar chart across depth. ---
+    Lines.Add('');
+    Lines.Add('Per-layer lens agreement with the final argmax (climbs with ' +
+      'depth in a trained net):');
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      BarLen := Round(Agree[L] * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d %6.2f%% |%s', [L, Agree[L] * 100.0, Bar]));
+    end;
+
+    // --- (6) per-layer KL(p_L || p_final) curve (the headline picture). ---
+    MaxKL := 0;
+    for I := 0 to NumCompat - 1 do
+      if KLsum[CompatOrder[I]] > MaxKL then MaxKL := KLsum[CompatOrder[I]];
+    if MaxKL <= 0 then MaxKL := 1.0;
+    Lines.Add('');
+    Lines.Add('Per-layer KL(p_L || p_final) (monotone DECREASE = residual ' +
+      'stream refining toward the final answer):');
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      BarVal := KLsum[L];
+      BarLen := Round((BarVal / MaxKL) * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d %9.4f |%s', [L, KLsum[L], Bar]));
+    end;
+
+    // --- (7) per-layer mean lens ENTROPY (readout sharpens with depth). ---
+    Lines.Add('');
+    Lines.Add('Per-layer mean lens entropy (nats; decreasing = a sharpening ' +
+      'readout):');
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      Lines.Add(Format('  L%-3d entropy=%8.4f  conf=%6.2f%%',
+        [L, EntSum[L], ConfSum[L] * 100.0]));
+    end;
+
+    // --- (8) crystallization depth: per-batch mean + 10-bin histogram. ---
+    Lines.Add('');
+    if CrystCnt > 0 then
+      Lines.Add(Format('Crystallization depth (shallowest layer after which ' +
+        'the lens argmax matches final and never flips): mean = %.2f over ' +
+        '%.0f / %d sample(s).',
+        [CrystSum / CrystCnt, CrystCnt, NumSamples]))
+    else
+      Lines.Add('Crystallization depth: no sample crystallizes before the ' +
+        'head (lens never stabilises to the final argmax).');
+    // Histogram over compatible-layer absolute index range [first..HeadInIdx].
+    SetLength(CrystBins, cBins);
+    for BinIdx := 0 to cBins - 1 do CrystBins[BinIdx] := 0;
+    HaveAny := False;
+    for SampleIdx := 0 to NumSamples - 1 do
+    begin
+      if CrystComp[SampleIdx] < 0 then Continue;
+      HaveAny := True;
+      if NumCompat > 1 then
+        BinIdx := Trunc((CrystComp[SampleIdx] / (NumCompat - 1)) * (cBins - 1))
+      else
+        BinIdx := cBins - 1;
+      if BinIdx < 0 then BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      Inc(CrystBins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if CrystBins[BinIdx] > MaxBin then MaxBin := CrystBins[BinIdx];
+    Lines.Add('Per-sample crystallization histogram (left=shallowest ' +
+      'compatible layer, right=head input):');
+    if not HaveAny then
+      Lines.Add('  (no sample crystallizes)')
+    else
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        if MaxBin > 0 then
+          BarLen := Round((CrystBins[BinIdx] / MaxBin) * cMaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('  bin %2d | n=%4d %s', [BinIdx, CrystBins[BinIdx], Bar]));
+      end;
+
+    // --- (9) SKIPPED (width-incompatible) layers, listed explicitly. ---
+    SkipList := '';
+    for LayerIdx := 0 to HeadInIdx do
+      if not Compatible[LayerIdx] then
+      begin
+        if SkipList <> '' then SkipList := SkipList + ', ';
+        SkipList := SkipList + Format('L%d(%s,size=%d)',
+          [LayerIdx, NN.Layers[LayerIdx].ClassName,
+           NN.Layers[LayerIdx].Output.Size]);
+      end;
+    Lines.Add('');
+    if SkipList = '' then
+      Lines.Add('SKIPPED layers (flat size <> head input size): none.')
+    else
+      Lines.Add('SKIPPED layers (flat size <> head input size ' +
+        IntToStr(HeadInSize) + '): ' + SkipList + '.');
+
+    // --- (10) built-in correctness checks. ---
+    // Lens AT HeadInIdx (the head's own input, no substitution) must reproduce
+    // p_final exactly: agreement 1.0 and KL 0.
+    Lines.Add('');
+    Acc := Agree[HeadInIdx];
+    KLval := KLsum[HeadInIdx];
+    Lines.Add(Format('Correctness check (lens at head input L%d, no ' +
+      'substitution): agreement=%.4f (expect 1.0), KL=%.6f (expect 0).',
+      [HeadInIdx, Acc, KLval]));
+    if (Abs(Acc - 1.0) < 1e-4) and (KLval < 1e-4) then
+      Lines.Add('  PASS: re-applying the head to its own input reproduces ' +
+        'p_final exactly.')
+    else
+      Lines.Add('  FAIL: head-input lens did not reproduce p_final.');
+
+    Result := Lines.Text;
+  finally
+    // Restore the net's live state with a final clean recompute over sample 0
+    // (reverts the transient head-input overwrite). Guard partial setups.
+    if (NN <> nil) and (pInput <> nil) and (pInput.Count > 0) and
+       (pInput[0] <> nil) and (NN.CountLayers() >= 2) then
+      NN.Compute(pInput[0]);
+    if CandSnap <> nil then CandSnap.Free;
     Lines.Free;
   end;
 end;
