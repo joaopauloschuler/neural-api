@@ -38,20 +38,8 @@ rather than acted on.
 <!-- (Sparse / mixture-of-experts routing layer removed: duplicate of the
      concrete TNNetMixtureOfExperts entry under "Probability projections /
      sparsity".) -->
-- [X] TNNetFourierFeatures follow-up: the spectral-bias micro-experiment now
-      unblocked by the landed layer. Fit a high-frequency 1D target (e.g.
-      `y = sin(20x) + 0.5*sin(53x)` on `x in [-1,1]`) with the SAME small ReLU
-      coordinate-MLP twice — once on the raw scalar `x`, once with
-      `TNNetFourierFeatures.Create(M, sigma)` as the front-end — and chart the
-      final MSE gap (the headline Tancik et al. 2020 result: the raw-coordinate
-      MLP cannot fit the high frequencies, the Fourier-mapped one can). ~40-line
-      example; pairs directly with the open `examples/SIREN/` task (FourierFeatures
-      is a drop-in coordinate front-end) and the periodic-activation toy benchmark.
-      (landed: examples/FourierFeaturesSpectralBias/)
-- [X] TNNetFourierFeatures follow-up: sigma bandwidth sweep — same 1D fit with
-      `sigma in {0.5, 2, 8, 32}` charting final MSE vs sigma (too small = still
-      low-pass / underfit; too large = noisy / overfit). The single-knob story.
-      (landed: examples/FourierFeaturesSpectralBias/)
+<!-- (Two TNNetFourierFeatures spectral-bias follow-ups removed: completed,
+     landed in examples/FourierFeaturesSpectralBias/.) -->
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
@@ -211,11 +199,8 @@ breakdown:
      enjoy writing".) -->
 
 ### Bake-off / experiment follow-ups
-- [X] Position-encoding bake-off: same tiny seq model trained with
-      (a) no position info, (b) sinusoidal AddPositionalEmbedding,
-      (c) RoPE, (d) ALiBi, printing final loss and a sample generation
-      per scheme. All four are in tree.
-      (landed: examples/PositionEncodingBakeoff/)
+<!-- (Position-encoding bake-off removed: completed, landed in
+     examples/PositionEncodingBakeoff/.) -->
 - [ ] Position-encoding bake-off follow-up: the landed bake-off uses a
       predict-the-PREVIOUS-token task on which ALiBi lands just above the
       no-position baseline — a single head's `2^-8` slope is a weak recency
@@ -268,13 +253,9 @@ breakdown:
       max-error vs eps.
 
 ### Composite blocks / builders I'd enjoy shipping
-- [X] TNNetPreNormResidual helper — `y = x + Sublayer(LayerNorm(x))`
-      single-line builder. (landed: TNNet.AddPreNormResidual takes the
-      sublayer stack as `array of TNNetLayer`.)
-- [X] AddRMSNormResidual(NN, Sublayer) — companion builder using RMSNorm
-      in place of LayerNorm (LLaMA-style blocks). (landed)
-- [X] AddPostNormResidual(NN, Sublayer) — post-norm pattern (`Sublayer →
-      residual add → LayerNorm`), companion to PreNorm/RMSNormResidual. (landed)
+<!-- (PreNorm / RMSNorm / PostNorm residual builders removed: completed,
+     landed as TNNet.AddPreNormResidual / AddRMSNormResidual /
+     AddPostNormResidual.) -->
 - [ ] TNNetAffineBlock — once TNNetMul lands, `Mul → Bias` builder for a
       learnable per-channel affine transform separable from FullConnect.
 
