@@ -239,6 +239,9 @@ type
     procedure TestCosineEmbeddingLossForwardPassthrough;
     procedure TestCosineEmbeddingLossGradient;
     procedure TestCosineEmbeddingLossLoadFromString;
+    procedure TestInfoNCELossForwardPassthrough;
+    procedure TestInfoNCELossGradient;
+    procedure TestInfoNCELossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -20190,6 +20193,151 @@ begin
     // The structure string encodes FFloatSt[0]; equality proves the
     // non-default margin survived the save/load cycle.
     AssertEquals('CosineEmbeddingLoss round-trip preserves margin',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInfoNCELossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetInfoNCELoss must be an identity passthrough on forward.
+  // d = 2, K = 3 keys -> Depth = 2 * (3 + 1) = 8.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    NN.AddLayer(TNNetInfoNCELoss.Create(2, 0.1));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 2.0 - 0.3;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('InfoNCELoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInfoNCELossGradient;
+const
+  cEps   = 1e-4;
+  cEmb   = 2;       // embedding dim d
+  cKeys  = 3;       // number of keys (positive + negatives)
+  cDepth = cEmb * (cKeys + 1);
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Tau: TNeuralFloat;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  function InfoNCELossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j, c: integer;
+    sj, maxS, sumExp: TNeuralFloat;
+    sims: array[0..cKeys - 1] of TNeuralFloat;
+  begin
+    for j := 0 to cKeys - 1 do
+    begin
+      sj := 0;
+      for c := 0 to cEmb - 1 do
+        sj := sj + AInput[0, 0, c] * AInput[0, 0, cEmb * (1 + j) + c];
+      sims[j] := sj / Tau;
+    end;
+    maxS := sims[0];
+    for j := 1 to cKeys - 1 do
+      if sims[j] > maxS then maxS := sims[j];
+    sumExp := 0;
+    for j := 0 to cKeys - 1 do
+      sumExp := sumExp + Exp(sims[j] - maxS);
+    // L = -s_0 + logsumexp_j(s_j)
+    Result := -sims[0] + (maxS + Ln(sumExp));
+  end;
+
+begin
+  // Reseed: the gradient tests share one RNG and ordering-sensitive checks
+  // elsewhere can trip when a new test is inserted into the sequence.
+  RandSeed := 424242;
+  Tau := 0.5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetInfoNCELoss.Create(cEmb, Tau));
+
+    // q = (0.5, -0.2)
+    Input[0, 0, 0] :=  0.5;  Input[0, 0, 1] := -0.2;
+    // k_0 (positive)
+    Input[0, 0, 2] :=  0.4;  Input[0, 0, 3] := -0.1;
+    // k_1 (negative)
+    Input[0, 0, 4] := -0.3;  Input[0, 0, 5] :=  0.8;
+    // k_2 (negative)
+    Input[0, 0, 6] :=  0.2;  Input[0, 0, 7] :=  0.6;
+    // No external target needed; InfoNCE loss ignores it.
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps;
+      LossP := InfoNCELossAt(Input);
+      Input.Raw[i] := OldV - cEps;
+      LossM := InfoNCELossAt(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('InfoNCELoss grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInfoNCELossLoadFromString;
+const
+  cEmb   = 2;
+  cTau   = 0.13;
+  cDepth = cEmb * 4;   // 1 query + 3 keys
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetInfoNCELoss.Create(cEmb, cTau));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetInfoNCELoss',
+      NN2.GetLastLayer is TNNetInfoNCELoss);
+    // The structure string encodes FStruct[0] (embedding dim) and FFloatSt[0]
+    // (temperature); equality proves the non-default params survived the
+    // save/load cycle.
+    AssertEquals('InfoNCELoss round-trip preserves params',
       NN.GetLastLayer.SaveStructureToString(),
       NN2.GetLastLayer.SaveStructureToString());
   finally

@@ -1593,6 +1593,37 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// InfoNCE / contrastive loss output layer (SimCLR/CPC family) for
+  // self-supervised representation learning. Like TNNetTripletLoss and
+  // TNNetCosineEmbeddingLoss this is a SELF-CONTAINED metric head: there is NO
+  // external target tensor, the supervision is implicit in the input layout.
+  // Per spatial (X,Y) position the input depth is split into (K+1) equal-size
+  // slabs of d channels each: a query q (slab 0) followed by K key vectors
+  // k_0..k_{K-1} (slabs 1..K), where k_0 is the POSITIVE key and the rest are
+  // negatives. So Depth = d*(K+1). The embedding dim d is stored in FStruct[0]
+  // (validated >= 1) and the temperature tau in FFloatSt[0] (default 0.07,
+  // validated > 0); both round-trip via Save/Load. SetPrevLayer validates
+  // Depth mod d = 0 and that the number of slabs (Depth div d) >= 3 (1 query +
+  // at least 2 keys). Using dot-product similarity s_j = <q, k_j> / tau and
+  // p = softmax(s) the per-position loss is
+  //   L = -log( exp(s_0) / sum_j exp(s_j) ) = -s_0 + logsumexp_j(s_j).
+  // The forward pass is an identity passthrough (so Net.Compute returns the raw
+  // q|k_0|..|k_{K-1} layout). Backpropagate ignores the framework-seeded
+  // residual, reads FOutput directly, and writes the +gradient (so the
+  // optimizer descends) into FOutputError using
+  //   dL/dq      = (1/tau) * ( sum_j p_j * k_j  -  k_0 )
+  //   dL/dk_0    = (1/tau) * (p_0 - 1) * q
+  //   dL/dk_j    = (1/tau) * p_j * q       (j > 0)
+  // No trainable parameters; output shape equals input shape.
+  TNNetInfoNCELoss = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(EmbeddingDim: integer; Temperature: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -10131,6 +10162,118 @@ begin
           dLdCos * (AVal * InvDenom - CosVal * BVal / (NormBSq + Eps));
       end;
       FOutputError[X, Y, 2 * ChunkD] := 0;
+    end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetInfoNCELoss }
+
+constructor TNNetInfoNCELoss.Create();
+begin
+  Create(1, 0.07);
+end;
+
+constructor TNNetInfoNCELoss.Create(EmbeddingDim: integer; Temperature: TNeuralFloat);
+begin
+  inherited Create();
+  if EmbeddingDim < 1 then
+    FErrorProc('TNNetInfoNCELoss embedding dim must be >= 1.');
+  if Temperature <= 0 then
+    FErrorProc('TNNetInfoNCELoss temperature must be > 0.');
+  FStruct[0] := EmbeddingDim;
+  FFloatSt[0] := Temperature;
+end;
+
+procedure TNNetInfoNCELoss.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  D, NumSlabs: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  D := FStruct[0];
+  if D < 1 then
+    FErrorProc('TNNetInfoNCELoss embedding dim must be >= 1.');
+  if (pPrevLayer.FOutput.Depth mod D) <> 0 then
+  begin
+    FErrorProc('TNNetInfoNCELoss requires input depth divisible by the ' +
+      'embedding dim. Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth) +
+      ', embedding dim: ' + IntToStr(D));
+  end;
+  NumSlabs := pPrevLayer.FOutput.Depth div D;
+  if NumSlabs < 3 then
+  begin
+    FErrorProc('TNNetInfoNCELoss requires at least 3 slabs (1 query + 2 ' +
+      'keys). Slabs: ' + IntToStr(NumSlabs));
+  end;
+end;
+
+procedure TNNetInfoNCELoss.Backpropagate();
+var
+  StartTime: double;
+  Tau, InvTau, QVal, KVal, MaxS, SumExp, Sj, dLdQ: TNeuralFloat;
+  EmbDim, K, NumSlabs, X, Y, MaxX, MaxY, J, C: integer;
+  Sims, Probs: array of TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Tau := FFloatSt[0];
+  if Tau <= 0 then Tau := 0.07;
+  InvTau := 1.0 / Tau;
+  EmbDim := FStruct[0];
+  if EmbDim < 1 then EmbDim := 1;
+  NumSlabs := FOutput.Depth div EmbDim;
+  K := NumSlabs - 1; // number of key vectors (positive + negatives)
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  SetLength(Sims, K);
+  SetLength(Probs, K);
+  // Per spatial cell: q is slab 0 (channels 0..EmbDim-1), key j is slab (1+j)
+  // occupying channels [EmbDim*(1+j) .. EmbDim*(2+j)-1]. Compute similarities
+  // s_j = <q, k_j>/tau, softmax over j, then write the analytic +gradient.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      // similarities s_j = <q, k_j> / tau
+      for J := 0 to K - 1 do
+      begin
+        Sj := 0;
+        for C := 0 to EmbDim - 1 do
+        begin
+          QVal := FOutput[X, Y, C];
+          KVal := FOutput[X, Y, EmbDim * (1 + J) + C];
+          Sj := Sj + QVal * KVal;
+        end;
+        Sims[J] := Sj * InvTau;
+      end;
+      // softmax over similarities (stable via max subtraction)
+      MaxS := Sims[0];
+      for J := 1 to K - 1 do
+        if Sims[J] > MaxS then MaxS := Sims[J];
+      SumExp := 0;
+      for J := 0 to K - 1 do
+      begin
+        Probs[J] := Exp(Sims[J] - MaxS);
+        SumExp := SumExp + Probs[J];
+      end;
+      for J := 0 to K - 1 do
+        Probs[J] := Probs[J] / SumExp;
+      // gradients per channel
+      for C := 0 to EmbDim - 1 do
+      begin
+        QVal := FOutput[X, Y, C];
+        // dL/dq = (1/tau) * ( sum_j p_j * k_j - k_0 )
+        dLdQ := 0;
+        for J := 0 to K - 1 do
+          dLdQ := dLdQ + Probs[J] * FOutput[X, Y, EmbDim * (1 + J) + C];
+        dLdQ := dLdQ - FOutput[X, Y, EmbDim + C]; // minus k_0
+        FOutputError[X, Y, C] := InvTau * dLdQ;
+        // dL/dk_0 = (1/tau) * (p_0 - 1) * q ; dL/dk_j = (1/tau) * p_j * q (j>0)
+        FOutputError[X, Y, EmbDim + C] := InvTau * (Probs[0] - 1.0) * QVal;
+        for J := 1 to K - 1 do
+          FOutputError[X, Y, EmbDim * (1 + J) + C] := InvTau * Probs[J] * QVal;
+      end;
     end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -43311,6 +43454,7 @@ begin
       'TNNetDiceLoss' :             Result := TNNetDiceLoss.Create();
       'TNNetTripletLoss' :          Result := TNNetTripletLoss.Create(Ft[0]);
       'TNNetCosineEmbeddingLoss' :  Result := TNNetCosineEmbeddingLoss.Create(Ft[0]);
+      'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -43578,6 +43722,7 @@ begin
       if S[0] = 'TNNetDiceLoss' then Result := TNNetDiceLoss.Create() else
       if S[0] = 'TNNetTripletLoss' then Result := TNNetTripletLoss.Create(Ft[0]) else
       if S[0] = 'TNNetCosineEmbeddingLoss' then Result := TNNetCosineEmbeddingLoss.Create(Ft[0]) else
+      if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
