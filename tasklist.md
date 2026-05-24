@@ -1237,6 +1237,54 @@ breakdown:
       return, plus the lens-at-HeadStartIdx-reproduces-final agreement/KL==0
       assertion). Pairs with [[WeightSpectrumReport]] / the grokking experiment
       to watch the crystallization depth shift at a representational transition.
+- [ ] TNNet.MagnitudePruningReport(NN, Samples [, Labels]) — a **no-retrain
+      compressibility** diagnostic answering the practitioner's first pruning
+      question directly: *"if I zero the smallest-magnitude weights, how much
+      can I throw away before the model breaks?"* — measured by ACTUALLY pruning
+      and re-running, not predicted from a proxy. The recipe is forward-only and
+      deterministic: snapshot the whole net once via `SaveDataToString`, then for
+      each global sparsity level `s` in a sweep (default `{0,10,20,...,90,95,99}%`)
+      compute the magnitude threshold that zeros the smallest `s%` of |w| ACROSS
+      all trainable layers (a single global percentile, the standard
+      "global-magnitude" criterion — pooled over the network, not per-layer), apply
+      it in place, run ONE forward pass over the probe batch to read the resulting
+      loss (and, with `Labels`, top-1 accuracy), then restore the original weights
+      bit-for-bit from the snapshot before the next level. It reports: an
+      accuracy-(or-loss-)vs-sparsity ASCII curve across depth of pruning; the
+      **prunability knee** (max sparsity whose accuracy drop stays within a
+      configurable tolerance, default 1%); the per-layer near-zero / pruned
+      fraction at the knee (which layers absorb the pruning — typically the wide
+      classifier head); the realised vs requested global sparsity (a built-in
+      check that the percentile threshold hit its target); and a
+      `highly-compressible` / `moderate` / `fragile` verdict. An optional
+      `PerLayer` flag switches from one global threshold to a per-layer percentile
+      (the "uniform-per-layer" baseline) so the global-vs-uniform pruning question
+      is visible side by side. Built-in correctness checks: `s=0%` reproduces the
+      unpruned loss/accuracy exactly (snapshot-restore faithfulness), `s=100%`
+      drives every weight to zero (degenerate constant output), and the realised
+      sparsity matches the requested level to within one weight. Reuses the
+      `SaveDataToString`/`LoadDataFromString` snapshot-restore pattern already used
+      by [[LayerSensitivityReport]] / `ModeConnectivityReport` and the per-layer
+      weight-iteration of `WeightHistogramReport`. **Distinct from**
+      `FisherImportanceReport` (which RANKS parameters by a Fisher proxy and flags
+      a static near-zero fraction but never actually removes weights or measures
+      the resulting accuracy — this report's whole point is the empirical
+      prune-and-measure curve the Fisher report only gestures at), from the open
+      "Lottery-ticket"-flavored experiment (which magnitude-prunes then RETRAINS
+      from the original init — a training experiment, whereas this is a forward-only
+      no-retrain sensitivity curve, the natural precursor that tells you WHERE the
+      knee is before paying for any retrain), from the open "Surgery" experiment
+      (which zeroes the top-K most-ACTIVE hidden units by activation, not the
+      smallest weights by magnitude), and from `LayerSensitivityReport` (random
+      multiplicative weight JITTER, never a magnitude-thresholded zeroing).
+      Follows the [[introspection-report-pattern]]: declaration + impl in
+      neuralnetwork.pas, an `examples/MagnitudePruning/` demo on a small trained
+      classifier (an over-wide net should stay flat to high sparsity while a
+      tight-fit net's accuracy falls early — the over-parameterised-is-compressible
+      story in one run) plus a global-vs-per-layer contrast, and a smoke test in
+      tests/ (non-empty report, expected header, nil-NN graceful return, plus the
+      `s=0%` reproduces-baseline and realised-vs-requested-sparsity assertions).
+      Weights are restored bit-for-bit at the end; pure forward-only, never stepped.
 - [ ] ActivationPatchingReport follow-up (now landed): the report and example
       shipped, but a KEY finding emerged — on a strictly FEEDFORWARD stack,
       whole-layer patching + downstream recompute lands on the clean-class
