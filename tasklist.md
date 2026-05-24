@@ -418,15 +418,13 @@ breakdown:
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
-- [ ] Pooling bake-off example `examples/PoolingBakeoff/`: same tiny conv
+- [X] Pooling bake-off example `examples/PoolingBakeoff/`: same tiny conv
       classifier, swap the pooling head across `TNNetAvgPool` / `TNNetMaxPool`
-      / `TNNetLpPool` (sweep `p ∈ {1, 2, 4, 8}`) / `TNNetSoftPool`, chart final
-      loss/accuracy on a small CIFAR stub. Visualises the average<->max
-      interpolation empirically. All four pooling layers are in tree.
-      NOW UNBLOCKED to also sweep `TNNetSoftPool` `beta ∈ {0.5, 1, 2, 8}`
-      (landed this lucky-day batch) as a fifth column — the SoftPool beta
-      knob spans the same average↔max family as LpPool's `p`, so the two
-      sweeps can be charted side by side.
+      / `TNNetLpPool` (sweep `p ∈ {1, 2, 4, 8}`) / `TNNetSoftPool` (sweep
+      `beta ∈ {0.5, 1, 2, 8}`). LANDED 2026-05-24: synthetic blob-quadrant
+      task built so the class-mean is invariant and only energy CONCENTRATION
+      is discriminative — AvgPool/LpPool(p=1) sit at chance, MaxPool solves it,
+      and both LpPool's `p` and SoftPool's `beta` interpolate avg→max.
 - [ ] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
       stack accepting two different input resolutions and producing a
       fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
