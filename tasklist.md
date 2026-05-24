@@ -157,6 +157,19 @@ breakdown:
       ReZero; initialised to λ_init≈0.8, mirrored into FFloatSt[0] for structure
       round-trip). Tests: λ=0 degeneracy, input numerical-gradient, λ
       numerical-gradient, LoadFromString round-trip with non-default λ.
+- [ ] TNNetDifferentialAttention follow-up: the paper's headline
+      NOISE-CANCELLATION micro-experiment (deferred at landing — only the four
+      correctness tests shipped). On a tiny causal next-token task with an
+      "all-keys-irrelevant" probe row, compare plain SDPA vs
+      TNNetDifferentialAttention and print the attention-noise mass on the
+      irrelevant keys — the differential output should land strictly below
+      plain SDPA's. ~30-line wiring swap, mirrors the open SinkAttention
+      stability micro-experiment; all pieces now in tree.
+- [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
+      MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
+      TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
+      into differential attention per head — a natural drop-in for the
+      downstream ../gpt-3-for-pascal long-context retrieval.
 - [ ] TNNetSinkAttention follow-up (now landed): attention-sink stability
       micro-experiment. On a tiny causal next-token task with an "all-keys-
       irrelevant" probe row, compare plain SDPA vs TNNetSinkAttention and
@@ -327,9 +340,12 @@ breakdown:
       fixed (non-trainable) binomial blur filter.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-- [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
-      using softplus's stable form (parallel to the SoftPlus negative-x
-      derivative guard).
+<!-- (TNNetMishExact / TNNetMish-stable removed: the in-tree TNNetMish ALREADY
+     implements the stable formulation — its Compute() branches on x>20
+     (softplus≈x) and x<-20 (softplus≈exp(x)≈0) to avoid the exp overflow.
+     A separate "stable Mish" class would be a forward-pass duplicate of
+     TNNetMish, which the "DO NOT REINTRODUCE" policy at the top of this file
+     forbids. Verified 2026-05-24 lucky-day batch.) -->
 - [X] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
       data-dependent (β computed per-channel from a tiny squeeze over the
       spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
@@ -355,10 +371,32 @@ breakdown:
       Registered in both dispatch tables + LoadFromString; 4 tests (identity
       forward incl. extrapolation, input/weight numerical-gradient, save/load
       round-trip) in TestNeuralNumerical.pas.
+- [ ] TNNetSplineActivation follow-up: a KAN-vs-MLP toy-fit micro-experiment.
+      Fit a wiggly 1D target (e.g. `y = sin(3x) + 0.3·sin(11x)`) with a small
+      MLP whose ReLUs are swapped for TNNetSplineActivation at matched param
+      count, and chart final loss + the learned per-channel spline shapes
+      (dump `(x, y)` over [-Range,+Range]). ~30-line activation swap; the
+      headline KAN claim is that the learnable activation buys lower loss at a
+      fixed width. Pairs with the open TNNetAPL bake-off.
+- [ ] TNNetSplineActivation follow-up: knot-count / Range sweep — same toy fit
+      with K ∈ {2, 4, 8, 16} and a couple of Range values, charting the
+      capacity↔overfitting trade and where extra knots stop helping.
+- [ ] TNNetMetaAconC follow-up: the FULL cross-channel-bottleneck β generator
+      (the paper's true Meta-ACON: squeeze → FC channel-reduce → ReLU → FC
+      channel-expand → sigmoid, so β[c] depends on ALL channels' spatial
+      means, not just channel c's). The landed TNNetMetaAconC uses a per-channel
+      affine-over-squeeze simplification; this variant needs a small two-FC
+      sub-block inside the layer (or a builder that wires an SE-style squeeze
+      into the β path) and is NOT a per-channel-transform shape, so scope it as
+      its own layer/builder rather than a ChannelTransformBase descendant.
 - [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
       mean(|W|)` forward with straight-through estimator backward.
-- [ ] TNNetMaxOut2 — two-piece special case of TNNetMaxOut with a tighter
-      API (no group-count parameter).
+<!-- (TNNetMaxOut2 removed: a "two-piece special case of TNNetMaxOut" is just
+     TNNetMaxOut.Create(2) with a thinner constructor — i.e. a forward-pass
+     duplicate of the existing TNNetMaxOut, which the "DO NOT REINTRODUCE"
+     policy at the top of this file forbids. If a no-group-count convenience
+     constructor is genuinely wanted, add an overload to TNNetMaxOut instead of
+     a new class. Flagged 2026-05-24 lucky-day batch.) -->
 - [ ] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
       (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
       S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
