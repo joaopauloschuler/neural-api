@@ -1476,6 +1476,46 @@ type
     constructor Create(); override;
   end;
 
+  /// Wing loss output layer (facial-landmark regression loss; per-element,
+  // like Huber). Given the seeded residual r = output - target per element and
+  // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
+  //   L(r) = w * ln(1 + |r|/eps)        if |r| < w
+  //   L(r) = |r| - C                     otherwise
+  // where C = w - w*ln(1 + w/eps) makes L continuous at |r| = w. The loss is
+  // smooth/log-shaped near zero and linear in the tail (an Huber analogue with
+  // a logarithmic core). The forward pass is an identity passthrough (so
+  // Net.Compute returns the raw regression head); training relies on the
+  // framework seeding FOutputError with (output - target) = r. Backpropagate
+  // replaces each residual with the analytic dL/dr:
+  //   dL/dr = w / (eps + |r|) * sign(r)  if |r| < w
+  //   dL/dr = sign(r)                     otherwise.
+  // The w and eps hyperparameters are stored in FFloatSt[0]/FFloatSt[1]
+  // (defaults 10.0 and 2.0; both validated > 0) and round-trip via Save/Load.
+  TNNetWingLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pWidth, pEpsilon: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
+  /// Label-smoothing loss output layer — a pure TARGET-side transform applied
+  // within the loss seam. Intended to sit after a softmax with a one-hot
+  // target distributed over the Depth axis at each (X,Y) position. The
+  // framework seeds FOutputError = (p - t) where p is the prediction (softmax
+  // probabilities) and t is the one-hot target over Depth. Backpropagate
+  // recovers t = p - FOutputError, builds the smoothed target
+  //   t' = (1 - eps) * t + eps / NumClasses,   NumClasses = Depth,
+  // and writes back the smoothed cross-entropy-with-softmax gradient
+  // FOutputError := p - t'. The forward pass is an identity passthrough.
+  // eps is stored in FFloatSt[0] (default 0.1; validated 0 <= eps < 1) and
+  // round-trips via Save/Load.
+  TNNetLabelSmoothingLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pEps: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Entropy regularizer (passthrough). Treats the input vector p as a
   // probability distribution (intended to sit immediately after a softmax)
   // and adds the term `-lambda * H(p) = lambda * sum(p * log(p))` to the
@@ -8669,6 +8709,104 @@ end;
 constructor TNNetDiceLoss.Create();
 begin
   inherited Create(0.5, 0.5, 1.0);
+end;
+
+{ TNNetWingLoss }
+
+constructor TNNetWingLoss.Create();
+begin
+  Create(10.0, 2.0);
+end;
+
+constructor TNNetWingLoss.Create(pWidth, pEpsilon: TNeuralFloat);
+begin
+  inherited Create();
+  if pWidth <= 0 then
+    FErrorProc('TNNetWingLoss width must be > 0.');
+  if pEpsilon <= 0 then
+    FErrorProc('TNNetWingLoss epsilon must be > 0.');
+  FFloatSt[0] := pWidth;
+  FFloatSt[1] := pEpsilon;
+end;
+
+procedure TNNetWingLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Width, Eps, V, AbsV, Grad: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Width := FFloatSt[0];
+  if Width <= 0 then Width := 10.0;
+  Eps := FFloatSt[1];
+  if Eps <= 0 then Eps := 2.0;
+  SizeM1 := FOutputError.Size - 1;
+  // Framework seeds FOutputError := output - target = r per element.
+  for Idx := 0 to SizeM1 do
+  begin
+    V := FOutputError.FData[Idx];
+    AbsV := Abs(V);
+    if AbsV < Width then
+      // dL/dr = w / (eps + |r|) * sign(r)
+      Grad := Width / (Eps + AbsV)
+    else
+      // dL/dr = sign(r)
+      Grad := 1.0;
+    if V < 0 then Grad := -Grad;
+    FOutputError.FData[Idx] := Grad;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetLabelSmoothingLoss }
+
+constructor TNNetLabelSmoothingLoss.Create();
+begin
+  Create(0.1);
+end;
+
+constructor TNNetLabelSmoothingLoss.Create(pEps: TNeuralFloat);
+begin
+  inherited Create();
+  if (pEps < 0) or (pEps >= 1) then
+    FErrorProc('TNNetLabelSmoothingLoss eps must satisfy 0 <= eps < 1.');
+  FFloatSt[0] := pEps;
+end;
+
+procedure TNNetLabelSmoothingLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1, NumClasses: integer;
+  Eps, P, Seeded, Target, SmoothTarget, Uniform: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Eps := FFloatSt[0];
+  if (Eps < 0) or (Eps >= 1) then Eps := 0.1;
+  // Per (X,Y) position the target is one-hot over Depth, so NumClasses = Depth.
+  NumClasses := FOutput.Depth;
+  if NumClasses < 1 then NumClasses := 1;
+  Uniform := Eps / NumClasses;
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    P := FOutput.FData[Idx];
+    Seeded := FOutputError.FData[Idx];
+    // Framework seeds FOutputError := output - target = p - t. Recover t,
+    // build the smoothed target t' = (1-eps)*t + eps/NumClasses, then write
+    // the smoothed softmax cross-entropy gradient p - t'.
+    Target := P - Seeded;
+    SmoothTarget := (1.0 - Eps) * Target + Uniform;
+    FOutputError.FData[Idx] := P - SmoothTarget;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetEntropyRegularizer }
@@ -35357,6 +35495,8 @@ begin
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
       'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
       'TNNetDiceLoss' :             Result := TNNetDiceLoss.Create();
+      'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
+      'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
       'TNNetUnitNorm' :             Result := TNNetUnitNorm.Create();
       'TNNetMinMaxNorm' :           Result := TNNetMinMaxNorm.Create(Ft[0]);
@@ -35600,6 +35740,8 @@ begin
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
       if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else
       if S[0] = 'TNNetDiceLoss' then Result := TNNetDiceLoss.Create() else
+      if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
+      if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetUnitNorm' then Result := TNNetUnitNorm.Create() else
       if S[0] = 'TNNetMinMaxNorm' then Result := TNNetMinMaxNorm.Create(Ft[0]) else

@@ -342,7 +342,7 @@ breakdown:
       per-block output errors equals the input error.
 
 ### Loss layers
-- [ ] TNNetLabelSmoothingLoss helper — pure target-side transform
+- [X] TNNetLabelSmoothingLoss helper — pure target-side transform
       `(1 - eps) * one_hot + eps / NumClasses`.
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
@@ -353,7 +353,7 @@ breakdown:
 - [X] TNNetDiceLoss — `1 - 2·sum(p·q + ε) / (sum(p²) + sum(q²) + ε)`,
       IoU-flavored segmentation loss.
 - [X] TNNetTverskyLoss — generalized Dice with separate FP/FN weights α, β.
-- [ ] TNNetWingLoss — facial-landmark regression loss with log-shaped wing
+- [X] TNNetWingLoss — facial-landmark regression loss with log-shaped wing
       near zero and a linear tail.
 - [ ] TNNetTripletLoss — `max(0, ||a-p||² - ||a-n||² + margin)`. Input
       depth split into 3 equal anchor/positive/negative chunks.

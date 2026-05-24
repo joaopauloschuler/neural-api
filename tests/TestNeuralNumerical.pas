@@ -175,6 +175,12 @@ type
     procedure TestDiceLossForwardPassthrough;
     procedure TestDiceLossGradient;
     procedure TestDiceLossLoadFromString;
+    procedure TestWingLossForwardPassthrough;
+    procedure TestWingLossGradient;
+    procedure TestWingLossLoadFromString;
+    procedure TestLabelSmoothingLossForwardPassthrough;
+    procedure TestLabelSmoothingLossTransform;
+    procedure TestLabelSmoothingLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -15909,6 +15915,343 @@ begin
   finally
     NN.Free;
     NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWingLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetWingLoss must be an identity passthrough on forward so that
+  // Net.Compute returns the regression head's raw predictions at inference.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetWingLoss.Create(10.0, 2.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 4.0 - 0.5;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('WingLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWingLossGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Vals: array[0..5] of TNeuralFloat;
+  FixedTarget: array[0..5] of TNeuralFloat;
+  Width, Eps: TNeuralFloat;
+  AnaGrad, NumGrad, OldP, LossP, LossM: TNeuralFloat;
+  i, CaseIdx: integer;
+
+  // Scalar Wing loss L(r) summed over all elements, with r = output - target.
+  // Forward is identity so output = input; target is pinned in FixedTarget so
+  // perturbing the input genuinely moves the residual.
+  function WingLossSum(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j: integer;
+    r, ar, C, term: TNeuralFloat;
+  begin
+    Result := 0;
+    C := Width - Width * Ln(1.0 + Width / Eps);
+    for j := 0 to AInput.Size - 1 do
+    begin
+      r := AInput.Raw[j] - FixedTarget[j];
+      ar := Abs(r);
+      if ar < Width then
+        term := Width * Ln(1.0 + ar / Eps)
+      else
+        term := ar - C;
+      Result := Result + term;
+    end;
+  end;
+
+begin
+  // Central-difference numerical-gradient check of the summed Wing loss
+  // against the analytic FOutputError, mirroring TestCharbonnierLossGradient.
+  Vals[0] :=  0.0;
+  Vals[1] :=  0.3;
+  Vals[2] := -0.7;
+  Vals[3] :=  1.5;
+  Vals[4] := -2.5;
+  Vals[5] := 12.0;  // tail region (|r| > default width 10)
+
+  for CaseIdx := 0 to 1 do
+  begin
+    if CaseIdx = 0 then
+    begin
+      Width := 10.0; Eps := 2.0;
+    end
+    else
+    begin
+      Width := 1.0; Eps := 0.5;
+    end;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 1, 1);
+    Target := TNNetVolume.Create(6, 1, 1);
+    try
+      NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetWingLoss.Create(Width, Eps));
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.5 + CaseIdx) * 2.0;
+      // Identity forward => output = input; Target = output - Vals seeds the
+      // framework's (output - target) signal with exactly Vals on the loss.
+      for i := 0 to Input.Size - 1 do
+        Target.Raw[i] := Input.Raw[i] - Vals[i];
+      for i := 0 to Input.Size - 1 do
+        FixedTarget[i] := Target.Raw[i];
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      for i := 0 to LMid.OutputError.Size - 1 do
+      begin
+        AnaGrad := LMid.OutputError.Raw[i];
+
+        // Skip the kink at exactly |r| = Width where the derivative jumps,
+        // and the kink at r = 0 (the |r|-based core is non-differentiable
+        // there; the analytic backward returns the +w/eps subgradient while a
+        // central difference averages the two one-sided slopes to ~0).
+        if Abs(Abs(Vals[i]) - Width) < 1e-2 then Continue;
+        if Abs(Vals[i]) < 1e-2 then Continue;
+
+        // A larger finite-difference step (1e-3) keeps float32 cancellation
+        // error well under the tolerance on the steep logarithmic core.
+        OldP := Input.Raw[i];
+        Input.Raw[i] := OldP + 1e-3;
+        LossP := WingLossSum(Input);
+        Input.Raw[i] := OldP - 1e-3;
+        LossM := WingLossSum(Input);
+        Input.Raw[i] := OldP;
+        NumGrad := (LossP - LossM) / (2 * 1e-3);
+
+        AssertEquals('WingLoss w=' + FloatToStr(Width) +
+          ' eps=' + FloatToStr(Eps) + ' grad at ' + IntToStr(i),
+          NumGrad, AnaGrad, 1e-3);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWingLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  Vals: array[0..3] of TNeuralFloat;
+  Width, Eps, AbsV, Expected: TNeuralFloat;
+  i: integer;
+begin
+  // Save/Load round-trip must preserve both width (FFloatSt[0]) and eps
+  // (FFloatSt[1]). Verified behaviorally via the analytic backward gradient.
+  Width := 3.0;
+  Eps := 0.75;
+  Vals[0] :=  0.4;   // core: |r| < width
+  Vals[1] := -1.2;   // core
+  Vals[2] :=  5.0;   // tail: |r| > width
+  Vals[3] := -8.0;   // tail
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetWingLoss.Create(Width, Eps));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetWingLoss',
+      NN2.GetLastLayer is TNNetWingLoss);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) + 0.2;
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := Input.Raw[i] - Vals[i];
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      AbsV := Abs(Vals[i]);
+      if AbsV < Width then
+        Expected := Width / (Eps + AbsV)
+      else
+        Expected := 1.0;
+      if Vals[i] < 0 then Expected := -Expected;
+      AssertEquals('WingLoss w/eps round-trip grad at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLabelSmoothingLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetLabelSmoothingLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetLabelSmoothingLoss.Create(0.1));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Abs(Sin(i * 0.37)) * 0.5 + 0.01;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('LabelSmoothingLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLabelSmoothingLossTransform;
+const
+  cEps   = 0.1;
+  cTrue  = 2;
+  cDepth = 5;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Probs: array[0..4] of TNeuralFloat;
+  TVal, SmoothTarget, Expected: TNeuralFloat;
+  i: integer;
+begin
+  // Given a known softmax prediction p and a one-hot target t over Depth,
+  // the resulting FOutputError must equal p - ((1-eps)*t + eps/Depth) per
+  // element (pinning the analytic target-side transform directly).
+  Probs[0] := 0.05;
+  Probs[1] := 0.10;
+  Probs[2] := 0.55; // true class
+  Probs[3] := 0.20;
+  Probs[4] := 0.10;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetLabelSmoothingLoss.Create(cEps));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Probs[i];
+    Target.Fill(0);
+    Target.Raw[cTrue] := 1.0;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if i = cTrue then TVal := 1.0 else TVal := 0.0;
+      SmoothTarget := (1.0 - cEps) * TVal + cEps / cDepth;
+      Expected := Probs[i] - SmoothTarget;
+      AssertEquals('LabelSmoothingLoss transform at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 1e-6);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLabelSmoothingLossLoadFromString;
+const
+  cEps   = 0.2;
+  cTrue  = 1;
+  cDepth = 4;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  Probs: array[0..3] of TNeuralFloat;
+  TVal, SmoothTarget, Expected: TNeuralFloat;
+  i: integer;
+begin
+  // Save/Load round-trip must preserve eps (FFloatSt[0]). Verified
+  // behaviorally via the analytic smoothed residual after the round trip.
+  Probs[0] := 0.20;
+  Probs[1] := 0.40; // true class
+  Probs[2] := 0.30;
+  Probs[3] := 0.10;
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetLabelSmoothingLoss.Create(cEps));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetLabelSmoothingLoss',
+      NN2.GetLastLayer is TNNetLabelSmoothingLoss);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Probs[i];
+    Target.Fill(0);
+    Target.Raw[cTrue] := 1.0;
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if i = cTrue then TVal := 1.0 else TVal := 0.0;
+      SmoothTarget := (1.0 - cEps) * TVal + cEps / cDepth;
+      Expected := Probs[i] - SmoothTarget;
+      AssertEquals('LabelSmoothingLoss eps round-trip at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 1e-6);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
   end;
 end;
 
