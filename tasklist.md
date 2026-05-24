@@ -57,11 +57,18 @@ rather than acted on.
      Possible follow-ups: a MULTI-LAYER steering sweep (which layer k gives the
      cleanest monotone control?), and steering toward a class the input is NOT,
      charting the flip threshold.) -->
-- [ ] ActivationSteering follow-up: sweep the steering layer `k` across all
-      hidden layers (not just k=2) and chart which depth gives the cleanest
-      monotone P(target)-vs-alpha control and the smallest alpha-to-flip — the
-      "where does a concept vector bite hardest?" question. ~20-line outer loop
-      over the landed examples/ActivationSteering/ harness.
+<!-- (ActivationSteering depth-sweep follow-up removed: completed, landed
+     2026-05-24 as examples/ActivationSteeringDepthSweep/. Grows the net to four
+     steerable FC+ReLU hidden layers and, for each k, computes the diff-of-class-
+     means v_k, sweeps alpha in {-3..+3} (downstream recompute), and prints the
+     P(target)-vs-alpha curve + a monotonicity up-fraction + alpha-to-flip per
+     layer, then a summary naming the cleanest-monotone layer. Finding: depth
+     MATTERS — k=1/3/4 are perfectly monotone but k=2's diff-of-means direction
+     is genuinely NON-monotone (up-fraction 0.5, pushes P(target) the wrong way
+     for alpha<0); on the coarse grid every layer flips by alpha=1 so the
+     monotonicity measure (not alpha-to-flip) is what discriminates. The alpha=0
+     bit-for-bit no-op check passes at EVERY k. Open follow-up: a finer alpha
+     grid would break the alpha-to-flip tie.) -->
 
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
@@ -1299,109 +1306,45 @@ breakdown:
       as "weak barrier" purely because the denominator is tiny. Add an
       absolute-floor term (e.g. treat barriers below an absolute epsilon as
       "connected" regardless of ratio) and re-pin the example's RUN 1 verdict.
-- [ ] TNNet.PermutationAlignReport(NN, SnapshotB, Samples) — the missing DUAL
-      of the landed [[mode-connectivity]] report: weight-space NEURON-permutation
-      alignment, a.k.a. "Git Re-Basin" (Ainsworth, Hayase & Srinivasa 2022; cf.
-      Entezari et al. 2021, "the role of permutation invariance in linear mode
-      connectivity"). ModeConnectivityReport MEASURES the loss barrier between two
-      independently-trained nets of the same architecture but does nothing about
-      it; the headline result of this line of work is that most of that barrier is
-      an ILLUSION of neuron-labelling — permute the hidden units of net B (and
-      compensate the next layer's input weights) to best match net A's units and
-      the barrier on the straight-line interpolant largely COLLAPSES, because both
-      nets sit in the same loss basin once you quotient out the permutation
-      symmetry. Recipe with existing machinery only — no new layer: with the live
-      net as endpoint A and a `SaveDataToString` snapshot of endpoint B, walk the
-      trainable layers front-to-back and, for each hidden FullConnect/Conv layer,
-      find the neuron permutation `P_L` of B that best aligns B's units to A's —
-      a per-layer assignment either by WEIGHT matching (maximise sum of
-      `<row_i^A, P(row)_i^B>` over the layer's weight rows) or by ACTIVATION
-      matching (correlate the two nets' per-unit activations over `Samples`),
-      solved greedily (a Hungarian solve is the principled version but greedy
-      correlation-descent is fine at toy width and avoids new numerical code).
-      Apply each `P_L` consistently: permute layer L's output neurons AND the
-      NEXT trainable layer's matching input-weight columns so the represented
-      FUNCTION is unchanged. Then re-run the interpolation sweep `theta(alpha) =
-      (1-alpha)*A + alpha*P(B)` (reusing the exact `TNNetVolume.MulMulAdd`
-      snapshot-arithmetic sweep ModeConnectivityReport already ships) and report
-      the loss barrier BEFORE vs AFTER alignment, the per-layer permutation
-      "churn" (fraction of units that moved), and a `barrier collapsed` /
-      `partially reduced` / `unchanged` verdict. Built-in correctness checks
-      (each a clean PASS/FAIL): (1) applying any permutation + its next-layer
-      compensation leaves `NN.Compute` output bit-for-bit unchanged on `Samples`
-      — permutation invariance, the foundational identity; (2) aligning a net to
-      ITSELF yields the identity permutation and a flat zero barrier; (3) the
-      post-alignment barrier is `<=` the pre-alignment barrier (alignment can
-      only help or tie). Follows the [[introspection-report-pattern]]: decl +
-      impl in neuralnetwork.pas, an `examples/PermutationAlign/` demo training the
-      same tiny MLP twice from DIFFERENT inits on a synthetic task (so a real
-      barrier exists pre-alignment and visibly shrinks post-alignment), and a
-      smoke test in tests/ (non-empty report, expected header, nil-NN graceful
-      return, plus the bit-for-bit permutation-invariance and align-to-self
-      assertions). DISTINCT from `ModeConnectivityReport` (measures the barrier,
-      never permutes), from `RepresentationSimilarityReport` / cross-CKA (compares
-      two nets' activations for SIMILARITY but never produces a weight-space
-      permutation or re-interpolates), from `NeuronCorrelationReport` (intra-layer
-      redundancy of ONE net, no cross-net matching) and from `WeightDriftReport`
-      (raw L2 drift, no symmetry quotient). The genuinely new capability is the
-      symmetry-aware weight-space ALIGNMENT itself — turning "these two nets are
-      separated" into "they were the same basin all along, mislabelled." Endpoint-A
-      weights restored bit-for-bit; forward-only (the alignment uses activations or
-      weights, never a backward pass on the inspected nets).
-- [ ] TNNet.PredictionDepthReport(NN, Support, SupportLabels, Queries
-      [, K, QueryLabels]) — a **per-example difficulty** diagnostic built on
-      the *prediction depth* of Baldock, Maennel & Neyshabur 2021 ("Deep
-      Learning Through the Lens of Example Difficulty"), answering a question
-      none of the landed reports answer: *"at how deep a layer does the network
-      actually make up its mind about THIS example?"* — a per-sample resolution
-      depth, not a per-layer aggregate. The recipe is forward-only and
-      non-parametric: run one forward pass over a labelled **support** batch and
-      over the **query** batch, snapshot each layer's flattened activation, and
-      for every query, at every trainable layer, take a **k-NN vote** (default
-      K=5, cosine distance) over the support activations at that same layer. The
-      *prediction depth* of a query is the index of the **shallowest layer after
-      which the k-NN vote agrees with the network's final argmax and never
-      disagrees again** (deeper layers all confirm it) — easy examples are
-      decided early (shallow depth), hard / ambiguous / mislabelled examples stay
-      contested until the last layers (deep depth). Reports: a 10-bin ASCII
-      histogram of prediction depth across the query batch, mean / median depth,
-      the per-layer "newly-resolved" count (how many queries first lock in at
-      each layer — a depth-vs-layer profile), the K deepest (= hardest) query
-      indices as a ready-made hard-example / relabel-candidate queue, and — when
-      `QueryLabels` are supplied — a correctness cross-tab (mean prediction depth
-      of correctly vs incorrectly classified queries; the literature's headline
-      result is that depth correlates with error and with margin). Over-wide
-      layers are random-projected to a `MaxFeatDim` cap (default 256) to bound
-      the distance cost, reusing the projection trick already in
-      [[LinearProbeReport]]. Built-in correctness checks: feeding the **support
-      set as its own queries** must give every sample a finite depth and the
-      final-layer k-NN vote must match the network argmax for ≥ a high fraction
-      (the support is its own nearest neighbour at distance 0); a query whose
-      final argmax is already the majority vote at layer 0 reads depth 0; and a
-      one-class support set drives every depth to 0 (trivially agreeing). The
-      story for the example: at fresh init prediction depths pile up at the
-      LAST layer (nothing is resolved early — the histogram is right-skewed),
-      while after training the mass shifts shallow for the well-separated
-      clusters and a hard / label-noised subset keeps a deep tail — example
-      difficulty made visible. **Distinct from** [[LinearProbeReport]] (fits a
-      *parametric* ridge classifier per layer and reports per-layer *accuracy* /
-      decodability — a global "where does the net become linearly separable?"
-      number, not a per-example depth, and it needs a matrix solve where this
-      needs only distances), from `FeatureSeparabilityReport` (per-layer *cluster
-      geometry*, label-aware but aggregate, no per-sample score), from
-      `TopLogitMarginReport` (output-logit margin only — a confidence number at
-      the *last* layer, with no notion of *which* layer resolved the example),
-      and from `MCDropoutUncertaintyReport` (stochastic epistemic uncertainty,
-      not a deterministic depth). Follows the introspection-report-pattern:
-      declaration + impl in neuralnetwork.pas, a `examples/PredictionDepth/` demo
-      on a synthetic multi-class 2D-blob set (a clean split plus a deliberately
-      label-noised subset so the easy-shallow / hard-deep contrast and the
-      correct-vs-incorrect depth gap are visible in one run), and a smoke test in
-      tests/ (non-empty report, expected header, nil-NN graceful return, plus the
-      support-as-its-own-queries finite-depth / final-layer-agreement assertion).
-      Pairs naturally with the active-learning queue use of
-      [[MCDropoutUncertaintyReport]] and the hard-example pools of
-      `TopLogitMarginReport` / `ConfusionMatrixReport`.
+<!-- (TNNet.PermutationAlignReport removed: completed, landed 2026-05-24 via the
+     [[introspection-report-pattern]] — the Git Re-Basin DUAL of
+     ModeConnectivityReport. Signature
+     `PermutationAlignReport(NN; const SnapshotB; Samples: TNNetVolumePairList;
+     ScoreMode: integer = 0; K: integer = 10)`. Catalogues trainable layers,
+     greedily solves each hidden layer's best B->A unit permutation (ScoreMode=0
+     weight-row cosine / ScoreMode=1 activation correlation over Samples), applies
+     it via ReorderLayerOutputNeurons + PermuteNextLayerInputColumns
+     (next-layer input-column compensation so the function is unchanged), reuses
+     ModeConnectivity's MulMulAdd (1-alpha)*A+alpha*B sweep for pre/post barriers,
+     restores endpoint-A bit-for-bit in try/finally, and emits the three PASS/FAIL
+     checks + collapsed/partially-reduced/unchanged verdict. Ships
+     examples/PermutationAlign/ + TestPermutationAlignReportSmoke. All checks PASS:
+     weight-matching barrier 0.0957->0.0332 (65% reduction), activation-matching
+     0.0957->0.0250 (74%), align-to-self churn 0 / flat-zero barrier, permutation-
+     invariance max output drift <= 1.94e-7. HONEST NOTE for any follow-up: at toy
+     scale the greedy (non-Hungarian) solve lands in the 26-35% post/pre band, so
+     the honest verdict is PARTIALLY REDUCED not COLLAPSED — a true Hungarian
+     assignment is the open follow-up if full collapse is wanted.) -->
+<!-- (TNNet.PredictionDepthReport removed: completed, landed 2026-05-24 via the
+     [[introspection-report-pattern]] — the per-example difficulty diagnostic
+     (prediction depth, Baldock/Maennel/Neyshabur 2021). Two overloads:
+     `PredictionDepthReport(NN, Support, SupportLabels, Queries [, K=5,
+     MaxFeatDim=256])` and the labelled variant adding QueryLabels. Forward-only,
+     non-parametric: snapshots each trainable layer's L2-normed flat activation
+     over support+query batches, per layer takes a K=5 cosine k-NN vote over the
+     support, depth = shallowest layer after which the vote agrees with the net's
+     final argmax and never disagrees again. Reuses LinearProbeReport's sign-random
+     projection for layers wider than MaxFeatDim. Reports depth histogram +
+     mean/median, per-layer newly-resolved profile, K hardest query indices, and a
+     correct-vs-incorrect cross-tab (labelled overload). Ships
+     examples/PredictionDepth/ + TestPredictionDepthReportSmoke. Checks PASS:
+     support-as-own-query agreement 1.0000 / all depth 0, one-class collapse to 0,
+     positive correct-vs-incorrect depth gap after training (fresh-init histogram
+     right-skewed -> trained mass shifts shallow with a deep hard-query tail).
+     DESIGN NOTE for any follow-up: "hard" example queries must be points the
+     NETWORK finds ambiguous (between-blob band), NOT merely relabelled clean
+     points — depth is measured vs the net's own argmax, so a wrong stored label
+     alone doesn't raise depth.) -->
 <!-- (TNNet.LogitLensReport removed: completed, landed 2026-05-24 via the
      [[introspection-report-pattern]]. Signature
      `LogitLensReport(NN; pInput: TNNetVolumeList; HeadStartIdx: integer = -1)`.
