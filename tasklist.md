@@ -894,8 +894,11 @@ breakdown:
 - [ ] SWA effect-size sweep: vary SWA start-epoch fraction ∈ {0.5, 0.6,
       0.7, 0.8, 0.9} and chart final test accuracy.
 - [ ] Cosine-LR vs constant-LR on SimpleImageClassifier, three seeds each.
-- [ ] "Activation cost" microbenchmark — measure forward+backward ns/op
-      on a fixed 64x64x32 volume for each activation.
+<!-- ("Activation cost" microbenchmark removed: duplicate of the per-activation
+     forward/backward ns/op CSV in `examples/ActivationPlayground/` and of
+     `bin/layer_bench <Activation> 64 64 32` under "Tooling / dev experience",
+     both of which already time forward+backward per activation/layer at a
+     chosen shape.) -->
 - [ ] Activation saturation visualizer: train a tiny net with Sigmoid /
       Tanh / HardSigmoid and print the fraction of saturated units per
       layer per epoch.
