@@ -3840,6 +3840,41 @@ type
         MaxSamples: integer = 64;
         Seed: longword = 1234567
       ): string;
+      // Forward-only input-symmetry (equivariance/invariance) diagnostic.
+      // Given a network and a probe batch (a TNNetVolumeList of inputs), it
+      // measures how the forward output reacts to a fixed menu of input-side
+      // symmetry transforms T and reports, PER TRANSFORM:
+      //   (a) "invariance error" = mean over the probe batch of
+      //       ||f(T(x)) - f(x)||_2 / ||f(x)||_2 (the per-sample relative L2
+      //       output change; 0 means the model ignores the transform, i.e. is
+      //       invariant to it). Samples whose ||f(x)||_2 is < cEps are skipped
+      //       in the ratio (counted separately) so a near-zero output does not
+      //       blow the denominator up;
+      //   (b) the top-1 agreement rate mean(argmax(f(T(x))) == argmax(f(x)))
+      //       over the probe batch — meaningful for classifier-shaped outputs,
+      //       reported for every transform regardless;
+      //   (c) a 10-bin ASCII histogram of the per-sample invariance error
+      //       across the probe batch (range [0, max-error]) so outliers are
+      //       visible;
+      //   (d) a one-line verdict: "invariant" (err < InvariantTol, default
+      //       1e-3), "approximately invariant" (err < ApproxTol, default 1e-1)
+      //       or "sensitive" (err >= ApproxTol).
+      // The default transform menu for image-shaped inputs is TNNetFlipX
+      // (horizontal mirror), TNNetFlipY (vertical mirror),
+      // TNNetReverseChannels (channel reversal) and a 1-channel TNNetRoll
+      // (depth roll by 1). Each transform T(x) is produced by a tiny
+      // Input -> Transform forward-only wrapper net built once and re-run per
+      // probe; no backward pass is run and the inspected NN's weights are never
+      // touched. A net wired Input -> FlipX -> Body -> FlipX is FlipX-invariant
+      // by construction and this report will show ~0 invariance error for the
+      // FlipX row on such a net. Guards nil NN and an empty probe list
+      // gracefully (returns a short message; never crashes).
+      class function EquivarianceReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        InvariantTol: TNeuralFloat = 1e-3;
+        ApproxTol: TNeuralFloat = 1e-1
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -25115,6 +25150,229 @@ begin
       if Baseline[I] <> nil then Baseline[I].Free;
     RandSeed := SavedRandSeed;
     Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.EquivarianceReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  InvariantTol: TNeuralFloat = 1e-3;
+  ApproxTol: TNeuralFloat = 1e-1
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cEps = 1e-12;          // guard for near-zero baseline output norm
+  cTransformCount = 4;
+var
+  Lines: TStringList;
+  TName: array[0 .. cTransformCount - 1] of string;
+  TNet: array[0 .. cTransformCount - 1] of TNNet;
+  TIdx, SampleIdx, I, BinIdx, UsedSamples: integer;
+  ShapeX, ShapeY, ShapeD: integer;
+  IsImage: boolean;
+  Base, Trans: TNNetVolume;
+  BaseClass: integer;
+  BaseNorm, Diff, SumSq, DeltaL2, RelErr: TNeuralFloat;
+  Counted, AgreeCount, SkippedZero: integer;
+  AccErr, MaxErr, MeanErr, AgreeRate: TNeuralFloat;
+  // per-sample relative errors for this transform (for the histogram)
+  PerSampleErr: array of TNeuralFloat;
+  Bins: array of integer;
+  MaxBin, BarLen: integer;
+  Bar, Verdict, ShapeStr: string;
+  BinLo, BinHi: TNeuralFloat;
+
+  // Build a tiny forward-only wrapper net: Input(shape of the probe) ->
+  // Transform. Returns nil if the transform cannot be built for this shape.
+  function BuildTransformNet(WhichTransform: integer; X, Y, D: integer): TNNet;
+  var
+    Net: TNNet;
+  begin
+    Net := TNNet.Create();
+    Net.AddLayer(TNNetInput.Create(X, Y, D));
+    case WhichTransform of
+      0: Net.AddLayer(TNNetFlipX.Create());
+      1: Net.AddLayer(TNNetFlipY.Create());
+      2: Net.AddLayer(TNNetReverseChannels.Create());
+      3: Net.AddLayer(TNNetRoll.Create(1));
+    end;
+    Result := Net;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Base := nil;
+  for TIdx := 0 to cTransformCount - 1 do TNet[TIdx] := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'EquivarianceReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'EquivarianceReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if InvariantTol <= 0 then InvariantTol := 1e-3;
+    if ApproxTol <= InvariantTol then ApproxTol := 1e-1;
+
+    // Probe shape comes from the first sample. The transform menu is
+    // image-shaped; degenerate (1x1x1) inputs make the spatial flips no-ops
+    // but the report stays valid (it will simply read ~0 invariance error).
+    ShapeX := Samples[0].SizeX;
+    ShapeY := Samples[0].SizeY;
+    ShapeD := Samples[0].Depth;
+    IsImage := (ShapeX > 1) or (ShapeY > 1) or (ShapeD > 1);
+    ShapeStr := Format('(%d,%d,%d)', [ShapeX, ShapeY, ShapeD]);
+
+    TName[0] := 'TNNetFlipX (mirror X)';
+    TName[1] := 'TNNetFlipY (mirror Y)';
+    TName[2] := 'TNNetReverseChannels';
+    TName[3] := 'TNNetRoll(+1) (depth roll)';
+
+    for TIdx := 0 to cTransformCount - 1 do
+      TNet[TIdx] := BuildTransformNet(TIdx, ShapeX, ShapeY, ShapeD);
+
+    Base := TNNetVolume.Create();
+    Trans := nil; // borrowed reference into the transform net; never freed here
+
+    Lines.Add(Format(
+      'EquivarianceReport: probe shape %s, %d sample(s). ' +
+      'InvariantTol=%g, ApproxTol=%g.',
+      [ShapeStr, Samples.Count, InvariantTol, ApproxTol]));
+    if not IsImage then
+      Lines.Add('Note: input is not image-shaped (1x1x1); spatial flips are '+
+        'no-ops by construction.');
+    Lines.Add(Format('%-28s %12s %12s %10s   %s',
+      ['Transform', 'InvarErr', 'Top1-Agree', 'Skipped', 'Verdict']));
+    Lines.Add(StringOfChar('-', 92));
+
+    for TIdx := 0 to cTransformCount - 1 do
+    begin
+      SetLength(PerSampleErr, 0);
+      AccErr := 0;
+      MaxErr := 0;
+      Counted := 0;
+      AgreeCount := 0;
+      SkippedZero := 0;
+      UsedSamples := 0;
+
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        // Baseline output f(x).
+        NN.Compute(Samples[SampleIdx]);
+        Base.Copy(NN.GetLastLayer.Output);
+        BaseClass := Base.GetClass();
+
+        // Transformed output f(T(x)) via the tiny wrapper net, then NN.
+        TNet[TIdx].Compute(Samples[SampleIdx]);
+        Trans := TNet[TIdx].GetLastLayer.Output;
+        NN.Compute(Trans);
+        // NN.GetLastLayer.Output now holds f(T(x)).
+
+        Inc(UsedSamples);
+
+        // top-1 agreement.
+        if NN.GetLastLayer.Output.GetClass() = BaseClass then Inc(AgreeCount);
+
+        // relative L2 invariance error.
+        SumSq := 0;
+        BaseNorm := 0;
+        if NN.GetLastLayer.Output.Size = Base.Size then
+        begin
+          for I := 0 to Base.Size - 1 do
+          begin
+            Diff := NN.GetLastLayer.Output.Raw[I] - Base.Raw[I];
+            SumSq := SumSq + Diff * Diff;
+            BaseNorm := BaseNorm + Base.Raw[I] * Base.Raw[I];
+          end;
+        end;
+        DeltaL2 := Sqrt(SumSq);
+        BaseNorm := Sqrt(BaseNorm);
+        if BaseNorm < cEps then
+        begin
+          Inc(SkippedZero);
+          Continue;
+        end;
+        RelErr := DeltaL2 / BaseNorm;
+        AccErr := AccErr + RelErr;
+        if RelErr > MaxErr then MaxErr := RelErr;
+        Inc(Counted);
+        SetLength(PerSampleErr, Counted);
+        PerSampleErr[Counted - 1] := RelErr;
+      end;
+
+      if Counted > 0 then MeanErr := AccErr / Counted else MeanErr := 0;
+      if UsedSamples > 0 then AgreeRate := AgreeCount / UsedSamples
+      else AgreeRate := 0;
+
+      if MeanErr < InvariantTol then Verdict := 'invariant'
+      else if MeanErr < ApproxTol then Verdict := 'approximately invariant'
+      else Verdict := 'sensitive';
+
+      Lines.Add(Format('%-28s %12.6f %11.2f%% %10d   %s',
+        [TName[TIdx], MeanErr, AgreeRate * 100.0, SkippedZero, Verdict]));
+
+      // 10-bin histogram of per-sample relative error over [0, MaxErr].
+      SetLength(Bins, cBins);
+      for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+      if (Counted > 0) and (MaxErr > cEps) then
+      begin
+        for I := 0 to Counted - 1 do
+        begin
+          BinIdx := Trunc((PerSampleErr[I] / MaxErr) * cBins);
+          if BinIdx >= cBins then BinIdx := cBins - 1;
+          if BinIdx < 0 then BinIdx := 0;
+          Inc(Bins[BinIdx]);
+        end;
+      end
+      else if Counted > 0 then
+        Bins[0] := Counted; // all-zero error -> first bin
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+      Lines.Add(Format('  per-sample InvarErr histogram (range [0, %.6f]):',
+        [MaxErr]));
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        if MaxErr > cEps then
+        begin
+          BinLo := BinIdx * (MaxErr / cBins);
+          BinHi := (BinIdx + 1) * (MaxErr / cBins);
+        end
+        else
+        begin
+          BinLo := 0;
+          BinHi := 0;
+        end;
+        if MaxBin > 0 then
+          BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('    [%9.6f-%9.6f) | n=%3d %s',
+          [BinLo, BinHi, Bins[BinIdx], Bar]));
+      end;
+      Lines.Add('');
+    end;
+
+    Lines.Add(StringOfChar('-', 92));
+    Lines.Add(
+      'Verdict thresholds: invariant (<InvariantTol), approximately invariant '+
+      '(<ApproxTol), sensitive (>=ApproxTol). InvarErr = mean over the probe '+
+      'batch of ||f(T(x)) - f(x)||_2 / ||f(x)||_2. Top1-Agree = mean argmax '+
+      'agreement. Skipped = samples with ||f(x)||_2 < eps (excluded from '+
+      'InvarErr). Pure forward-only; NN weights untouched.');
+
+    Result := Lines.Text;
+  finally
+    if Base <> nil then Base.Free;
+    for TIdx := 0 to cTransformCount - 1 do
+      if TNet[TIdx] <> nil then TNet[TIdx].Free;
     Lines.Free;
   end;
 end;

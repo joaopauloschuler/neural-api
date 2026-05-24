@@ -5,7 +5,7 @@ unit TestNeuralLayersExtra;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, StrUtils, fpcunit, testregistry, neuralnetwork, neuralvolume;
 
 type
   TTestNeuralLayersExtra = class(TTestCase)
@@ -88,6 +88,7 @@ type
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
+    procedure TestEquivarianceReportSmoke;
   end;
 
 implementation
@@ -1725,6 +1726,91 @@ begin
     Targets.Free;
     Probes.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestEquivarianceReportSmoke;
+var
+  NNPlain, NNInv: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report: string;
+  K, I: integer;
+  FlipXPos, EndPos: integer;
+  FlipXLine: string;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.EquivarianceReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NNPlain := TNNet.Create();
+  NNInv := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    // empty probe list handled gracefully (use a valid net).
+    NNInv.AddLayer(TNNetInput.Create(6, 6, 3));
+    NNInv.AddLayer(TNNetAvgChannel.Create());
+    NNInv.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNInv.AddLayer(TNNetFullConnectLinear.Create(3));
+    NNInv.AddLayer(TNNetSoftMax.Create());
+    NNInv.InitWeights();
+    Report := TNNet.EquivarianceReport(NNInv, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // A plain conv classifier: no built-in spatial symmetry => flip-sensitive.
+    NNPlain.AddLayer(TNNetInput.Create(6, 6, 3));
+    NNPlain.AddLayer(TNNetConvolutionReLU.Create(6, 3, 1, 1));
+    NNPlain.AddLayer(TNNetMaxPool.Create(2));
+    NNPlain.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNPlain.AddLayer(TNNetFullConnectLinear.Create(3));
+    NNPlain.AddLayer(TNNetSoftMax.Create());
+    NNPlain.InitWeights();
+
+    // A handful of image-shaped probes.
+    for K := 0 to 11 do
+    begin
+      V := TNNetVolume.Create(6, 6, 3);
+      for I := 0 to V.Size - 1 do V.Raw[I] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+    end;
+
+    // Plain net: report is well-formed.
+    Report := TNNet.EquivarianceReport(NNPlain, Probes);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('EquivarianceReport', Report) > 0);
+    AssertTrue('FlipX row present', Pos('TNNetFlipX', Report) > 0);
+    AssertTrue('FlipY row present', Pos('TNNetFlipY', Report) > 0);
+    AssertTrue('ReverseChannels row present',
+      Pos('TNNetReverseChannels', Report) > 0);
+    AssertTrue('Roll row present', Pos('TNNetRoll', Report) > 0);
+    AssertTrue('histogram section present',
+      Pos('InvarErr histogram', Report) > 0);
+    // A plain conv classifier should be FlipX-sensitive on random inputs.
+    AssertTrue('plain net flagged sensitive somewhere',
+      Pos('sensitive', Report) > 0);
+
+    // Built-in correctness check: a global-spatial-average net is exactly
+    // FlipX-invariant, so the FlipX row must read the "invariant" verdict.
+    Report := TNNet.EquivarianceReport(NNInv, Probes);
+    AssertTrue('invariant-net report non-empty', Length(Report) > 0);
+    FlipXPos := Pos('TNNetFlipX', Report);
+    AssertTrue('FlipX row present for invariant net', FlipXPos > 0);
+    EndPos := PosEx(sLineBreak, Report, FlipXPos);
+    if EndPos = 0 then EndPos := Length(Report) + 1;
+    FlipXLine := Copy(Report, FlipXPos, EndPos - FlipXPos);
+    AssertTrue('FlipX-invariant net reads "invariant" on the FlipX row',
+      Pos('invariant', FlipXLine) > 0);
+    AssertTrue('FlipX-invariant net is not flagged approximate on FlipX',
+      Pos('approximately', FlipXLine) = 0);
+    AssertTrue('FlipX-invariant net is not flagged sensitive on FlipX',
+      Pos('sensitive', FlipXLine) = 0);
+    AssertTrue('FlipX-invariant net reaches 100% top-1 agreement',
+      Pos('100.00%', FlipXLine) > 0);
+  finally
+    Probes.Free;
+    NNInv.Free;
+    NNPlain.Free;
   end;
 end;
 
