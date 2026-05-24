@@ -155,6 +155,7 @@ type
     procedure TestDiagonalSSMSerializationRoundTrip;
     procedure TestPReLUChannelInputGradientCheck;
     procedure TestPReLUChannelWeightGradientCheck;
+    procedure TestGatedResidualGradient;
     procedure TestSReLUForward;
     procedure TestSReLUInputGradientCheck;
     procedure TestSReLUWeightGradientCheck;
@@ -15419,6 +15420,137 @@ begin
   finally
     NN.Free;
     Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatedResidualGradient;
+// Central-difference numerical gradient check for TNNetGatedResidual: the
+// per-channel generalisation of TNNetReZero (one learnable alpha per depth).
+// Verifies (a) the input gradient, (b) the per-channel alpha weight
+// gradients, and (c) a LoadFromString round-trip. Uses a non-zero initial
+// alpha so all gradients are non-trivial.
+var
+  NN, NN2: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LGate, LGate2: TNNetGatedResidual;
+  Saved: string;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, w0: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    // Non-zero init alpha so the gate is open and gradients are non-trivial.
+    LGate := TNNetGatedResidual.Create(0.7);
+    NN.AddLayer(LGate);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Per-channel alphas pushed apart so each channel exercises a distinct gate.
+    AssertEquals('GatedResidual init alpha channel 0', 0.7,
+      LGate.Neurons[0].Weights.Raw[0], 1e-7);
+    AssertEquals('GatedResidual weight count == Depth', 4,
+      LGate.Neurons[0].Weights.Size);
+    LGate.Neurons[0].Weights.Raw[0] := 0.70;
+    LGate.Neurons[0].Weights.Raw[1] := -0.30;
+    LGate.Neurons[0].Weights.Raw[2] := 1.20;
+    LGate.Neurons[0].Weights.Raw[3] := 0.45;
+
+    // Sample input away from zero.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.43) * 1.3 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    // (a) Input gradient check.
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GatedResidual input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // (b) Per-channel alpha weight gradient check.
+    for i := 0 to LGate.Neurons[0].Weights.Size - 1 do
+    begin
+      w0 := LGate.Neurons[0].Weights.Raw[i];
+      LGate.Neurons[0].Weights.Raw[i] := w0 + epsilon;
+      lossPlus := ComputeLoss(Input);
+      LGate.Neurons[0].Weights.Raw[i] := w0 - epsilon;
+      lossMinus := ComputeLoss(Input);
+      LGate.Neurons[0].Weights.Raw[i] := w0;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LGate.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LGate.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('GatedResidual weight gradient check alpha[' +
+        IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // (c) LoadFromString round-trip: the per-channel weights and the
+    // FFloatSt[0] init-alpha dispatch path must reconstruct exactly.
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LGate2 := NN2.GetLastLayer as TNNetGatedResidual;
+      AssertEquals('GatedResidual round-trip weight count', 4,
+        LGate2.Neurons[0].Weights.Size);
+      for i := 0 to LGate.Neurons[0].Weights.Size - 1 do
+        AssertEquals('GatedResidual round-trip alpha[' + IntToStr(i) + ']',
+          LGate.Neurons[0].Weights.Raw[i],
+          LGate2.Neurons[0].Weights.Raw[i], 1e-6);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GatedResidual round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
     Desired.Free;
   end;
 end;

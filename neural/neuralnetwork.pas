@@ -2419,6 +2419,27 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Gated Residual: the per-channel generalisation of TNNetReZero. Instead of
+  // a single learnable scalar, it holds one learnable scalar alpha[d] PER
+  // CHANNEL (depth): Output[x,y,d] = alpha[d] * Input[x,y,d]. Like ReZero, the
+  // gate is initialised to a constant (default 0.0) so a residual branch
+  // Sum([Sublayer, PrevLayer]) starts as the identity and each channel gate
+  // opens independently during training. Backward produces gradients for both
+  // the input and the per-channel weight vector
+  // (gradAlpha[d] = sum over x,y of OutputError[x,y,d] * Input[x,y,d]).
+  // Storage: FNeurons[0].Weights = alpha (Depth values).
+  TNNetGatedResidual = class(TNNetChannelTransformBase)
+    private
+      FInitialAlpha: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialAlpha: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Global Response Normalization (ConvNeXt-V2, Woo et al. 2023,
   /// https://arxiv.org/abs/2301.00808). Channel-wise contrast normalization
   /// with two learnable per-channel parameters gamma[c] and beta[c]:
@@ -16411,6 +16432,118 @@ begin
 end;
 
 procedure TNNetReZero.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialAlpha);
+  AfterWeightUpdate();
+end;
+
+{ TNNetGatedResidual }
+constructor TNNetGatedResidual.Create();
+begin
+  Create(0.0);
+end;
+
+constructor TNNetGatedResidual.Create(pInitialAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialAlpha := pInitialAlpha;
+  FFloatSt[0] := pInitialAlpha;
+  InitDefault();
+end;
+
+procedure TNNetGatedResidual.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base allocates FNeurons[0] with Depth weights already; we make the
+  // per-channel intent explicit: a single neuron carrying one alpha per depth.
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetGatedResidual.Compute();
+var
+  StartTime: double;
+  W: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+begin
+  StartTime := Now();
+  inherited Compute;
+  W := FNeurons[0].FWeights;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if W.Size <> Depth then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetGatedResidual.');
+  {$ENDIF}
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  // Output[x,y,d] = alpha[d] * Input[x,y,d]
+  for x := 0 to SizeX - 1 do
+    for y := 0 to SizeY - 1 do
+      for d := 0 to Depth - 1 do
+        FOutput[x, y, d] := FOutput[x, y, d] * W.Raw[d];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGatedResidual.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  W: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  gradAlpha: array of TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  W := localNeuron.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+
+  // Gradient w.r.t. each per-channel alpha:
+  // gradAlpha[d] = sum over x,y of OutputError[x,y,d] * Input[x,y,d].
+  SetLength(gradAlpha, Depth);
+  for d := 0 to Depth - 1 do gradAlpha[d] := 0;
+  for x := 0 to SizeX - 1 do
+    for y := 0 to SizeY - 1 do
+      for d := 0 to Depth - 1 do
+        gradAlpha[d] := gradAlpha[d] + FOutputError[x, y, d] * Prev[x, y, d];
+  for d := 0 to Depth - 1 do
+    localNeuron.FDelta.Raw[d] := localNeuron.FDelta.Raw[d] +
+      (-FLearningRate) * gradAlpha[d];
+  SetLength(gradAlpha, 0);
+
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+
+  if hasInputGrad then
+  begin
+    PrevErr := FPrevLayer.FOutputError;
+    // Gradient w.r.t. the input:
+    // dInput[x,y,d] = OutputError[x,y,d] * alpha[d].
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+        for d := 0 to Depth - 1 do
+          PrevErr[x, y, d] := PrevErr[x, y, d] + FOutputError[x, y, d] * W.Raw[d];
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetGatedResidual.InitDefault();
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
@@ -38591,6 +38724,7 @@ begin
       'TNNetChannelBias':           Result := TNNetChannelBias.Create();
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
+      'TNNetGatedResidual':         Result := TNNetGatedResidual.Create(Ft[0]);
       'TNNetGRN':                   Result := TNNetGRN.Create();
       'TNNetDyT':                   Result := TNNetDyT.Create();
       'TNNetEntropyRegularizer':    Result := TNNetEntropyRegularizer.Create(Ft[0]);
@@ -38847,6 +38981,7 @@ begin
       if S[0] = 'TNNetChannelBias' then Result := TNNetChannelBias.Create() else
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
+      if S[0] = 'TNNetGatedResidual' then Result := TNNetGatedResidual.Create(Ft[0]) else
       if S[0] = 'TNNetGRN' then Result := TNNetGRN.Create() else
       if S[0] = 'TNNetDyT' then Result := TNNetDyT.Create() else
       if S[0] = 'TNNetEntropyRegularizer' then Result := TNNetEntropyRegularizer.Create(Ft[0]) else
