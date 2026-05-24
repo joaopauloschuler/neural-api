@@ -885,7 +885,7 @@ breakdown:
 - [ ] `examples/NormalizationBakeoff/` — same idea comparing no-norm /
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm /
       ChannelStdNorm.
-- [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
+- [x] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
       on a fixed toy dataset with a loss-vs-epoch table.
 <!-- (`examples/EmbeddingHeadDemo/` removed: duplicate of the landed
      `examples/TripletEmbedding/` example, which already learns a toy
