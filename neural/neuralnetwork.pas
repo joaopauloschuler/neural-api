@@ -2038,6 +2038,32 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Dynamic Tanh (DyT, Liu et al. 2025, https://arxiv.org/abs/2503.10622).
+  /// A normalization-free, elementwise drop-in alternative to LayerNorm:
+  ///   Y[x,y,c] = gamma[c] * tanh(alpha * X[x,y,c]) + beta[c]
+  /// where alpha is a SINGLE learnable scalar shared across the whole layer
+  /// (init 1.0), and gamma[c] / beta[c] are per-channel (per-depth) learnable
+  /// scale and bias (init 1.0 and 0.0). Output shape == input shape.
+  /// Storage: FNeurons[0].Weights = gamma (Depth values),
+  ///          FNeurons[1].Weights = beta  (Depth values),
+  ///          FNeurons[2].Weights = alpha (1 scalar).
+  /// Use it when you want a norm-free transformer/CNN block: replace a
+  /// LayerNorm with DyT to drop the per-token statistics while keeping the
+  /// squashing/affine behaviour. Backward (t = tanh(alpha*x), dt = 1 - t^2):
+  ///   dL/dx        = OutputError * gamma[c] * alpha * dt
+  ///   dL/dgamma[c] = sum_{x,y} OutputError * t
+  ///   dL/dbeta[c]  = sum_{x,y} OutputError
+  ///   dL/dalpha    = sum_{x,y,c} OutputError * gamma[c] * x * dt
+  TNNetDyT = class(TNNetChannelTransformBase)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Parametric ReLU (He et al. 2015): y = max(0, x) + alpha * min(0, x),
   // where alpha is a SINGLE learnable scalar shared across all elements
   // (channel-shared / "PReLU-shared" variant). Default initial alpha is
@@ -13178,6 +13204,142 @@ begin
   // (because of the residual + X).
   FNeurons[0].FWeights.Fill(0);
   FNeurons[1].FWeights.Fill(0);
+  AfterWeightUpdate();
+end;
+
+{ TNNetDyT }
+constructor TNNetDyT.Create();
+begin
+  inherited Create();
+  // Per-channel weight buffers are allocated in SetPrevLayer once Depth is
+  // known.
+  InitDefault();
+end;
+
+procedure TNNetDyT.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base class allocates FNeurons[0] with Depth weights (gamma). We also
+  // need FNeurons[1] (beta, Depth weights) and FNeurons[2] (alpha, a single
+  // shared scalar).
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  // alpha is a single layer-wide scalar; shrink FNeurons[2] to one weight.
+  FNeurons[2].Weights.ReSize(1, 1, 1);
+  FNeurons[2].BackInertia.ReSize(1, 1, 1);
+  FNeurons[2].Delta.ReSize(1, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetDyT.Compute();
+var
+  StartTime: double;
+  Wg, Wb: TNNetVolume;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  alpha, xv: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (which copies the input into FOutput); we
+  // compute Y directly from FPrevLayer.FOutput.
+  Prev := FPrevLayer.FOutput;
+  Wg := FNeurons[0].FWeights;
+  Wb := FNeurons[1].FWeights;
+  alpha := FNeurons[2].FWeights.Raw[0];
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if (Wg.Size <> Depth) or (Wb.Size <> Depth) or
+     (FNeurons[2].FWeights.Size <> 1) then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetDyT.');
+  {$ENDIF}
+  // Y[x,y,c] = gamma[c] * tanh(alpha * X[x,y,c]) + beta[c]
+  for x := 0 to SizeX - 1 do
+    for y := 0 to SizeY - 1 do
+      for d := 0 to Depth - 1 do
+      begin
+        xv := Prev[x, y, d];
+        FOutput[x, y, d] := Wg.Raw[d] * Tanh(alpha * xv) + Wb.Raw[d];
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDyT.Backpropagate();
+var
+  StartTime: double;
+  Ng, Nb, Na: TNNetNeuron;
+  Wg: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  alpha, xv, gy, t, dt, g_d, gradGamma, gradBeta, gradAlpha: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Ng := FNeurons[0];
+  Nb := FNeurons[1];
+  Na := FNeurons[2];
+  Wg := Ng.FWeights;
+  alpha := Na.FWeights.Raw[0];
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  // Let t = tanh(alpha*x), dt = 1 - t^2.
+  // dL/dgamma[c] += dL/dy * t
+  // dL/dbeta[c]  += dL/dy
+  // dL/dalpha    += sum over everything of dL/dy * gamma[c] * x * dt
+  // dL/dx[x,y,c]  = dL/dy * gamma[c] * alpha * dt
+  gradAlpha := 0;
+  for d := 0 to Depth - 1 do
+  begin
+    g_d := Wg.Raw[d];
+    gradGamma := 0;
+    gradBeta := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        t := Tanh(alpha * xv);
+        dt := 1 - t * t;
+        gradGamma := gradGamma + gy * t;
+        gradBeta := gradBeta + gy;
+        gradAlpha := gradAlpha + gy * g_d * xv * dt;
+        if hasInputGrad then
+          PrevErr[x, y, d] := PrevErr[x, y, d] +
+            gy * g_d * alpha * dt;
+      end;
+    Ng.FDelta.Raw[d] := Ng.FDelta.Raw[d] + (-FLearningRate) * gradGamma;
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * gradBeta;
+  end;
+  Na.FDelta.Raw[0] := Na.FDelta.Raw[0] + (-FLearningRate) * gradAlpha;
+  if (not FBatchUpdate) then
+  begin
+    Ng.UpdateWeights(FInertia);
+    Nb.UpdateWeights(FInertia);
+    Na.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetDyT.InitDefault();
+begin
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  // gamma = 1, beta = 0, alpha = 1.
+  FNeurons[0].FWeights.Fill(1);
+  FNeurons[1].FWeights.Fill(0);
+  FNeurons[2].FWeights.Fill(1);
   AfterWeightUpdate();
 end;
 
@@ -27530,6 +27692,7 @@ begin
       'TNNetChannelMul':            Result := TNNetChannelMul.Create();
       'TNNetReZero':                Result := TNNetReZero.Create(Ft[0]);
       'TNNetGRN':                   Result := TNNetGRN.Create();
+      'TNNetDyT':                   Result := TNNetDyT.Create();
       'TNNetEntropyRegularizer':    Result := TNNetEntropyRegularizer.Create(Ft[0]);
       'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
@@ -27748,6 +27911,7 @@ begin
       if S[0] = 'TNNetChannelMul' then Result := TNNetChannelMul.Create() else
       if S[0] = 'TNNetReZero' then Result := TNNetReZero.Create(Ft[0]) else
       if S[0] = 'TNNetGRN' then Result := TNNetGRN.Create() else
+      if S[0] = 'TNNetDyT' then Result := TNNetDyT.Create() else
       if S[0] = 'TNNetEntropyRegularizer' then Result := TNNetEntropyRegularizer.Create(Ft[0]) else
       if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else

@@ -461,6 +461,7 @@ type
     procedure TestPerplexityReportSmoke;
     procedure TestAttentionEntropyReportSmoke;
     procedure TestLossLandscapeProbeSmoke;
+    procedure TestDyTGradientCheck;
   end;
 
 implementation
@@ -14431,6 +14432,115 @@ begin
   finally
     Samples.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDyTGradientCheck;
+// Central-difference numerical gradient check for TNNetDyT on a small
+// (sizeX=3, sizeY=2, depth=4) shape. Verifies BOTH the input gradient and
+// the three learnable parameters: gamma[c] (neuron 0, Depth values),
+// beta[c] (neuron 1, Depth values) and the shared scalar alpha (neuron 2,
+// one value).
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LDyT: TNNetDyT;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n, c: integer;
+  Names: array[0..2] of string;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  InputPlus := TNNetVolume.Create(3, 2, 4);
+  Desired := TNNetVolume.Create(3, 2, 4);
+  epsilon := 0.0001;
+  Names[0] := 'gamma';
+  Names[1] := 'beta';
+  Names[2] := 'alpha';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    LDyT := TNNetDyT.Create();
+    NN.AddLayer(LDyT);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Non-trivial per-channel gamma/beta and a non-unit alpha so all
+    // gradient terms are exercised.
+    for c := 0 to LDyT.Neurons[0].Weights.Size - 1 do
+    begin
+      LDyT.Neurons[0].Weights.Raw[c] := 0.7 + 0.15 * c;   // gamma
+      LDyT.Neurons[1].Weights.Raw[c] := -0.1 + 0.08 * c;  // beta
+    end;
+    LDyT.Neurons[2].Weights.Raw[0] := 0.6;                // alpha
+
+    // Mix positive and negative inputs so tanh is exercised on both sides.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) * 1.3 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    // --- Input gradient check ---
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('DyT input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // --- Weight gradient check (gamma, beta, alpha) ---
+    for n := 0 to 2 do
+      for i := 0 to LDyT.Neurons[n].Weights.Size - 1 do
+      begin
+        LDyT.Neurons[n].Weights.Raw[i] := LDyT.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LDyT.Neurons[n].Weights.Raw[i] := LDyT.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LDyT.Neurons[n].Weights.Raw[i] := LDyT.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LDyT.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LDyT.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('DyT weight gradient check ' + Names[n] + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 

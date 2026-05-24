@@ -264,8 +264,10 @@ breakdown:
 #### Norm / regularization
 - [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
       `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
-- [ ] TNNetDyT (Dynamic Tanh, Liu et al. 2025) — `gamma[c] * tanh(alpha * x)
+- [X] TNNetDyT (Dynamic Tanh, Liu et al. 2025) — `gamma[c] * tanh(alpha * x)
       + beta[c]`. Per-layer learnable alpha plus per-channel gamma/beta.
+      Landed: class + dual CreateLayer/LoadFromString dispatch +
+      TestDyTGradientCheck (input + gamma/beta/alpha weight grads).
 - [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
       sigmoid gate.
 - [ ] TNNetSwitchableNorm — learnable softmax-weighted combination of
