@@ -800,6 +800,12 @@ Gated Linear Units split the input along the channel (depth) axis into two equal
 | `TNNetSwiGLU`                | 1D, 2D, or 3D (even depth)  | Swish-gated linear unit: outputs `A * Swish(B)`, where `Swish(x) = x * sigmoid(x)`. Created with `TNNetSwiGLU.Create()`. |
 | `TNNetTanhGLU`               | 1D, 2D, or 3D (even depth)  | Tanh-gated linear unit: outputs `A * tanh(B)`. Parameter-free; mirrors `TNNetGLU` with the sigmoid gate swapped for tanh. Created with `TNNetTanhGLU.Create()`. |
 
+### Attention
+| Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
+|-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `TNNetScaledDotProductAttention` | Input: `SeqLen x 1 x 3*d_k` (`Q\|K\|V` concatenated along depth). Output: `SeqLen x 1 x d_k`. | Single-head scaled dot-product attention: `scores[i,j] = dot(Q[i], K[j]) / sqrt(d_k)`, row-softmax, then `out[i] = sum_j attn[i,j]*V[j]`. Optional causal (upper-triangle) mask. Parameter-free. Created with `TNNetScaledDotProductAttention.Create(d_k, CausalMask=false)`. |
+| `TNNetCosineSimilarityAttention` | Input: `SeqLen x 1 x 3*d_k` (`Q\|K\|V` concatenated along depth). Output: `SeqLen x 1 x d_k`. | Drop-in variant of scaled dot-product attention whose raw `Q.K^T` score is replaced by a cosine-similarity score `score[i,j] = scale * (Q[i]/\|\|Q[i]\|\|) . (K[j]/\|\|K[j]\|\|)` — each query and key row is L2-normalized over the `d_k` feature axis (with an epsilon guard) before the dot product. Everything after the scores (row-softmax, `V`-weighting) is identical to SDPA. Because cosine scores are **bounded in `[-scale, +scale]`** this removes the unbounded-logit problem of dot-product attention (more stable softmax / no score blow-up at large `d_k`). Optional causal mask; fixed `scale` (default `1.0`) round-trips via serialization. Parameter-free. The exact L2-normalization Jacobian is back-propagated. Created with `TNNetCosineSimilarityAttention.Create(d_k, CausalMask=false, Scale=1.0)`. |
+
 ### Attention Masking
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|

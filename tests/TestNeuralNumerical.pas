@@ -286,6 +286,10 @@ type
     procedure TestScaledDotProductAttentionForward;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
+    procedure TestCosineSimilarityAttentionForward;
+    procedure TestCosineSimilarityAttentionGradientCheck;
+    procedure TestCosineSimilarityAttentionCausalGradientCheck;
+    procedure TestCosineSimilarityAttentionSerializationRoundTrip;
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
@@ -6843,6 +6847,226 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestCosineSimilarityAttentionForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Dk, i, j, d: integer;
+  Attn: TNNetCosineSimilarityAttention;
+  ScaleVal, SumSq, MaxScore, SumExp, s: TNeuralFloat;
+  QN, KN, Score, Wgt, ExpOut: array of TNeuralFloat;
+  Eps: TNeuralFloat;
+begin
+  SeqLen := 3;
+  Dk := 3;
+  ScaleVal := 2.0;
+  Eps := 1e-12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  SetLength(QN, SeqLen * Dk);
+  SetLength(KN, SeqLen * Dk);
+  SetLength(Score, SeqLen);
+  SetLength(Wgt, SeqLen);
+  SetLength(ExpOut, Dk);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetCosineSimilarityAttention.Create(Dk, false, ScaleVal);
+    NN.AddLayer(Attn);
+
+    // Distinct, non-zero Q/K/V so normalization is exercised.
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := Sin(i * 0.7 + d * 0.3) + 0.5;          // Q
+        Input[i, 0, Dk + d] := Cos(i * 0.4 - d * 0.6) - 0.3;     // K
+        Input[i, 0, 2 * Dk + d] := i * 1.0 + 0.1 * d;            // V
+      end;
+
+    NN.Compute(Input);
+    AssertEquals('Output SizeX', SeqLen, Attn.Output.SizeX);
+    AssertEquals('Output Depth', Dk, Attn.Output.Depth);
+
+    // Hand-compute reference: L2-normalize Q,K rows; cosine*scale; softmax; weight V.
+    for i := 0 to SeqLen - 1 do
+    begin
+      SumSq := 0;
+      for d := 0 to Dk - 1 do SumSq := SumSq + Input[i, 0, d] * Input[i, 0, d];
+      s := 1.0 / Sqrt(SumSq + Eps);
+      for d := 0 to Dk - 1 do QN[i * Dk + d] := Input[i, 0, d] * s;
+    end;
+    for j := 0 to SeqLen - 1 do
+    begin
+      SumSq := 0;
+      for d := 0 to Dk - 1 do SumSq := SumSq + Input[j, 0, Dk + d] * Input[j, 0, Dk + d];
+      s := 1.0 / Sqrt(SumSq + Eps);
+      for d := 0 to Dk - 1 do KN[j * Dk + d] := Input[j, 0, Dk + d] * s;
+    end;
+    for i := 0 to SeqLen - 1 do
+    begin
+      MaxScore := -1e30;
+      for j := 0 to SeqLen - 1 do
+      begin
+        s := 0;
+        for d := 0 to Dk - 1 do s := s + QN[i * Dk + d] * KN[j * Dk + d];
+        Score[j] := s * ScaleVal;
+        if Score[j] > MaxScore then MaxScore := Score[j];
+      end;
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Wgt[j] := Exp(Score[j] - MaxScore);
+        SumExp := SumExp + Wgt[j];
+      end;
+      for j := 0 to SeqLen - 1 do Wgt[j] := Wgt[j] / SumExp;
+      for d := 0 to Dk - 1 do
+      begin
+        ExpOut[d] := 0;
+        for j := 0 to SeqLen - 1 do
+          ExpOut[d] := ExpOut[d] + Wgt[j] * Input[j, 0, 2 * Dk + d];
+        AssertEquals('Cosine attn out [i=' + IntToStr(i) + ',d=' + IntToStr(d) + ']',
+          ExpOut[d], Attn.Output[i, 0, d], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityAttentionGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetCosineSimilarityAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetCosineSimilarityAttention.Create(Dk, false, 1.5);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('CosineAttn input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityAttentionCausalGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetCosineSimilarityAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetCosineSimilarityAttention.Create(Dk, true, 1.5);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('CosineAttn causal input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestRotaryEmbeddingForward;
 var
   NN, NN2: TNNet;
@@ -7690,6 +7914,13 @@ begin
   // d_k = 4, non-causal. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetScaledDotProductAttention.Create(4, false),
     'SDPA', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityAttentionSerializationRoundTrip;
+begin
+  // d_k = 4, causal, non-default scale = 2.5. Input depth must be 3*d_k = 12.
+  SerializationRoundTrip(Self, TNNetCosineSimilarityAttention.Create(4, true, 2.5),
+    'CosineSimilarityAttention', 3, 1, 12, 1e-5);
 end;
 
 // ---------------------------------------------------------------------------

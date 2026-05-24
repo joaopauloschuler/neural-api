@@ -1710,6 +1710,40 @@ type
     property CausalMask: boolean read FCausal;
   end;
 
+  /// Cosine-Similarity Attention (single head).
+  // A drop-in variant of TNNetScaledDotProductAttention where the raw
+  // Q.K^T score is replaced by a cosine-similarity score:
+  //   score[i,j] = scale * (Q[i]/||Q[i]||) . (K[j]/||K[j]||)
+  // i.e. each query row and key row is L2-normalized over the d_k feature
+  // dimension (with an epsilon guard) BEFORE the dot product, then scaled.
+  // Everything after the scores (row-softmax and weighted sum of V) is
+  // identical to scaled dot-product attention. Because cosine scores are
+  // bounded in [-scale, +scale], this removes the unbounded-logit problem
+  // of dot-product attention.
+  // Input layout: SizeY = 1, SizeX = sequence length, Depth = 3 * d_k
+  // (the depth axis is the concatenation Q | K | V, each of size d_k).
+  // Output shape: SizeX x 1 x d_k. No trainable parameters; the scale is a
+  // fixed float (default 1.0) stored in FFloatSt[0] so it round-trips.
+  TNNetCosineSimilarityAttention = class(TNNetScaledDotProductAttention)
+  private
+    FScale: TNeuralFloat;
+    FEps: TNeuralFloat;
+    // Cached per-row normalized vectors and reciprocal norms from Compute(),
+    // reused by Backpropagate(). Layout: X = sequence position, Depth = d_k.
+    FQNorm: TNNetVolume; // normalized query rows
+    FKNorm: TNNetVolume; // normalized key rows
+    FInvQNorm: TNNetVolume; // 1/||Q[i]|| per query row, [SizeX,1,1]
+    FInvKNorm: TNNetVolume; // 1/||K[j]|| per key row, [SizeX,1,1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pScale: TNeuralFloat = 1.0); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Scale: TNeuralFloat read FScale;
+  end;
+
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
   // consecutive pairs of channels.
@@ -9845,6 +9879,222 @@ begin
           end;
         end;
       end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCosineSimilarityAttention }
+
+constructor TNNetCosineSimilarityAttention.Create(d_k: integer;
+  pCausalMask: boolean; pScale: TNeuralFloat);
+begin
+  inherited Create(d_k, pCausalMask);
+  FScale := pScale;
+  FFloatSt[0] := FScale;
+  FEps := 1e-12;
+  FQNorm := TNNetVolume.Create();
+  FKNorm := TNNetVolume.Create();
+  FInvQNorm := TNNetVolume.Create();
+  FInvKNorm := TNNetVolume.Create();
+end;
+
+destructor TNNetCosineSimilarityAttention.Destroy();
+begin
+  FQNorm.Free;
+  FKNorm.Free;
+  FInvQNorm.Free;
+  FInvKNorm.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetCosineSimilarityAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // One normalized vector per sequence position, depth = d_k.
+  FQNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FInvQNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+  FInvKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+end;
+
+procedure TNNetCosineSimilarityAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp, AccVal, SumSq, InvN: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // 1) Precompute the L2-normalized query and key rows (over the d_k feature
+  // dimension) plus their reciprocal norms. score uses qn.kn instead of q.k.
+  for i := 0 to SeqLen - 1 do
+  begin
+    // Query row i.
+    SumSq := 0;
+    for d := 0 to FDk - 1 do
+      SumSq := SumSq + Prev[i, 0, d] * Prev[i, 0, d];
+    InvN := 1.0 / Sqrt(SumSq + FEps);
+    FInvQNorm[i, 0, 0] := InvN;
+    for d := 0 to FDk - 1 do
+      FQNorm[i, 0, d] := Prev[i, 0, d] * InvN;
+    // Key row i.
+    SumSq := 0;
+    for d := 0 to FDk - 1 do
+      SumSq := SumSq + Prev[i, 0, FDk + d] * Prev[i, 0, FDk + d];
+    InvN := 1.0 / Sqrt(SumSq + FEps);
+    FInvKNorm[i, 0, 0] := InvN;
+    for d := 0 to FDk - 1 do
+      FKNorm[i, 0, d] := Prev[i, 0, FDk + d] * InvN;
+  end;
+  // 2) For each query row i: cosine scores, softmax, weighted sum of V.
+  for i := 0 to SeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := 0;
+        for d := 0 to FDk - 1 do
+          Score := Score + FQNorm[i, 0, d] * FKNorm[j, 0, d];
+        Score := Score * FScale;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    // Softmax (numerically stable).
+    SumExp := 0;
+    for j := 0 to SeqLen - 1 do
+    begin
+      Score := Exp(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    // Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d].
+    for d := 0 to FDk - 1 do
+    begin
+      AccVal := 0;
+      for j := 0 to SeqLen - 1 do
+        AccVal := AccVal + FAttn[j, i, 0] * Prev[j, 0, 2 * FDk + d];
+      FOutput[i, 0, d] := AccVal;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCosineSimilarityAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, k, d: integer;
+  Prev, PrevErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  // Accumulated gradients w.r.t the NORMALIZED query/key rows, one row per
+  // sequence position; converted to raw-input gradients via the L2-normalize
+  // Jacobian after all (i,j) score contributions are summed.
+  gQn, gKn: TNNetVolume;
+  SumDAttnAttn, A, dS, Dot, Yi, InvN: TNeuralFloat;
+  OutErr: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := Prev.SizeX;
+    SetLength(dAttn, SeqLen);
+    SetLength(dScore, SeqLen);
+    gQn := TNNetVolume.Create(SeqLen, 1, FDk);
+    gKn := TNNetVolume.Create(SeqLen, 1, FDk);
+    try
+      gQn.Fill(0);
+      gKn.Fill(0);
+      for i := 0 to SeqLen - 1 do
+      begin
+        // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
+        // dV[j,d] += Attn[i,j] * dOut[i,d]
+        // dAttn[j] = sum_d dOut[i,d] * V[j,d]
+        for j := 0 to SeqLen - 1 do
+        begin
+          dAttn[j] := 0;
+          A := FAttn[j, i, 0];
+          for d := 0 to FDk - 1 do
+          begin
+            OutErr := FOutputError[i, 0, d];
+            PrevErr.Add(j, 0, 2 * FDk + d, A * OutErr);
+            dAttn[j] := dAttn[j] + OutErr * Prev[j, 0, 2 * FDk + d];
+          end;
+        end;
+        // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
+        SumDAttnAttn := 0;
+        for k := 0 to SeqLen - 1 do
+          SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
+        for j := 0 to SeqLen - 1 do
+          dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+        // Causal-masked positions (j > i) have attn ~ 0, so dScore[j] ~ 0
+        // already; no special handling needed.
+        // ---- Accumulate gradient into the NORMALIZED rows ----
+        // score[i,j] = scale * qn[i] . kn[j]
+        // d/dqn[i,d] += scale * dScore[j] * kn[j,d]   (summed over j)
+        // d/dkn[j,d] += scale * dScore[j] * qn[i,d]   (summed over i)
+        for j := 0 to SeqLen - 1 do
+        begin
+          dS := dScore[j] * FScale;
+          if dS <> 0 then
+          begin
+            for d := 0 to FDk - 1 do
+            begin
+              gQn.Add(i, 0, d, dS * FKNorm[j, 0, d]);
+              gKn.Add(j, 0, d, dS * FQNorm[i, 0, d]);
+            end;
+          end;
+        end;
+      end;
+      // ---- Convert normalized-row gradients to raw Q/K gradients ----
+      // For y = x/||x|| the input gradient for upstream g is
+      //   dL/dx = (1/||x||) * (g - y * (y . g))   (the (I - y y^T)/||x|| form).
+      // Apply per query row (-> Q at depth d) and per key row (-> K at FDk+d).
+      for i := 0 to SeqLen - 1 do
+      begin
+        // Query row i.
+        InvN := FInvQNorm[i, 0, 0];
+        Dot := 0;
+        for d := 0 to FDk - 1 do
+          Dot := Dot + FQNorm[i, 0, d] * gQn[i, 0, d];
+        for d := 0 to FDk - 1 do
+        begin
+          Yi := FQNorm[i, 0, d];
+          PrevErr.Add(i, 0, d, InvN * (gQn[i, 0, d] - Yi * Dot));
+        end;
+        // Key row i.
+        InvN := FInvKNorm[i, 0, 0];
+        Dot := 0;
+        for d := 0 to FDk - 1 do
+          Dot := Dot + FKNorm[i, 0, d] * gKn[i, 0, d];
+        for d := 0 to FDk - 1 do
+        begin
+          Yi := FKNorm[i, 0, d];
+          PrevErr.Add(i, 0, FDk + d, InvN * (gKn[i, 0, d] - Yi * Dot));
+        end;
+      end;
+    finally
+      gQn.Free;
+      gKn.Free;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -36336,6 +36586,7 @@ begin
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
+      'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -36586,6 +36837,7 @@ begin
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
+      if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
