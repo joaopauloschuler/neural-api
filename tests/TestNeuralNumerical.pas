@@ -290,6 +290,9 @@ type
     procedure TestCosineSimilarityAttentionGradientCheck;
     procedure TestCosineSimilarityAttentionCausalGradientCheck;
     procedure TestCosineSimilarityAttentionSerializationRoundTrip;
+    procedure TestSinkAttentionGradientCheck;
+    procedure TestSinkAttentionSinkParamGradientCheck;
+    procedure TestSinkAttentionSerializationRoundTrip;
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
@@ -7064,6 +7067,205 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkAttentionGradientCheck;
+// Central-difference check of the INPUT gradient (dL/dInput) of a causal
+// TNNetSinkAttention with d_k=4, SeqLen=3, K=2. The sink key/value params are
+// set to deterministic non-zero values so the sinks genuinely participate in
+// the forward/backward path.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetSinkAttention;
+  SeqLen, Dk, NumSinks: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n, w: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NumSinks := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetSinkAttention.Create(Dk, true, NumSinks);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Deterministic non-zero sink params (keys in neurons 0..K-1, values in
+    // neurons K..2K-1) so the sinks actually carry probability mass.
+    for n := 0 to Attn.Neurons.Count - 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        Attn.Neurons[n].Weights.Raw[w] := Sin((n * 7 + w) * 0.37) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      // Tolerance 1e-2: matches the sibling SDPA / cosine attention checks.
+      AssertTrue('SinkAttn input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkAttentionSinkParamGradientCheck;
+// Central-difference check of the TRAINABLE sink-param gradients (sink keys in
+// neurons 0..K-1, sink values in neurons K..2K-1) of a causal
+// TNNetSinkAttention with d_k=4, SeqLen=3, K=2. With learning rate 1 and
+// batch update, the analytical gradient equals -Neuron.Delta (the delta
+// accumulates -FLearningRate * grad), mirroring the APL weight-gradient test.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetSinkAttention;
+  SeqLen, Dk, NumSinks: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n, w: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NumSinks := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetSinkAttention.Create(Dk, true, NumSinks);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Deterministic non-zero sink params so the gradients are non-degenerate.
+    for n := 0 to Attn.Neurons.Count - 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        Attn.Neurons[n].Weights.Raw[w] := Sin((n * 7 + w) * 0.37) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // Check every sink param: 2*K neurons (keys then values), each Dk weights.
+    for n := 0 to Attn.Neurons.Count - 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+      begin
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss;
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        Attn.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -Attn.Neurons[n].Delta.Raw[w];
+
+        // Tolerance 1e-2: matches the sibling attention / APL param checks.
+        AssertTrue('SinkAttn sink-param gradient neuron[' + IntToStr(n) +
+          '] weight[' + IntToStr(w) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkAttentionSerializationRoundTrip;
+// save -> load -> save string equality with NON-default params
+// (d_k=4, causal=true, K=2) plus perturbed sink weights.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetSinkAttention;
+  Saved, Saved2: string;
+  n, w: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Attn := TNNetSinkAttention.Create(4, true, 2);
+    NN.AddLayer(Attn);
+
+    AssertEquals('SinkAttn K=2 neuron count', 4, Attn.Neurons.Count);
+
+    // Perturb every sink weight so the round-trip really has to carry them.
+    for n := 0 to Attn.Neurons.Count - 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        Attn.Neurons[n].Weights.Raw[w] := Sin((n * 13 + w) * 0.27) * 0.6 + 0.1 * n;
+
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('SinkAttn save->load->save string equality', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

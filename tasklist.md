@@ -149,7 +149,7 @@ breakdown:
       gradient-check on a tiny shape.
 
 ### Attention variants / siblings
-- [ ] TNNetSinkAttention — prepend K learnable "attention sink" key/value
+- [X] TNNetSinkAttention — prepend K learnable "attention sink" key/value
       slots that every query can attend to regardless of the causal mask.
       Helps long-context stability, ~30 lines on top of SDPA.
 - [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across

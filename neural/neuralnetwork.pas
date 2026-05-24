@@ -1744,6 +1744,48 @@ type
     property Scale: TNeuralFloat read FScale;
   end;
 
+  /// Attention with learnable "attention sink" slots (StreamingLLM,
+  // Xiao et al. 2023, https://arxiv.org/abs/2309.17453).
+  // A drop-in variant of TNNetScaledDotProductAttention that prepends K
+  // learnable (key,value) "sink" slot pairs that EVERY query attends to,
+  // regardless of the causal mask. Empirically, autoregressive softmax
+  // attention wants an always-available place to dump probability mass;
+  // without it, the first real token tends to act as an implicit sink and
+  // long-context / streaming generation degrades. The learnable sinks give
+  // softmax that explicit outlet and stabilise causal attention.
+  // Scoring reuses the parent's scaling (1/sqrt(d_k)) and causal-mask
+  // convention for the real keys; the sink keys are NEVER masked. For each
+  // query position i over the augmented key set [K sinks ++ SeqLen real keys]:
+  //   score_real[j] = (Q[i] . K[j]) / sqrt(d_k)   (masked if causal and j>i)
+  //   score_sink[s] = (Q[i] . SinkKey[s]) / sqrt(d_k)   (never masked)
+  //   w = softmax([score_sink ++ score_real])
+  //   out[i] = sum_s w_sink[s]*SinkValue[s] + sum_j w_real[j]*V[j]
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k (the depth axis is the concatenation Q | K | V). Output
+  // shape: SizeX x 1 x d_k (same as the parent).
+  // Trainable parameters: the K*(2*d_k) sink slot values are stored as 2*K
+  // neurons each holding d_k weights (neurons 0..K-1 = sink keys, K..2K-1 =
+  // sink values), so weight serialization round-trips automatically through
+  // the base neuron save/load. The sink-slot count K is stored in FStruct[2]
+  // so it round-trips through SaveToString / LoadFromString. Sink keys are
+  // initialised to small random values and sink values to zeros.
+  TNNetSinkAttention = class(TNNetScaledDotProductAttention)
+  private
+    FNumSinks: integer;
+    // Cached augmented attention weights from Compute() reused by
+    // Backpropagate(). Layout: X = augmented key index (0..K-1 = sinks,
+    // K..K+SeqLen-1 = real keys), Y = query index i, [X,Y,0]; rows sum to 1.
+    FSinkAttn: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      NumSinks: integer = 1); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property NumSinks: integer read FNumSinks;
+  end;
+
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
   // consecutive pairs of channels.
@@ -10098,6 +10140,241 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetSinkAttention }
+
+constructor TNNetSinkAttention.Create(d_k: integer; pCausalMask: boolean;
+  NumSinks: integer);
+begin
+  inherited Create(d_k, pCausalMask);
+  if NumSinks < 1 then
+    FErrorProc('TNNetSinkAttention requires NumSinks >= 1. NumSinks=' +
+      IntToStr(NumSinks));
+  FNumSinks := NumSinks;
+  // Persist K so CreateLayer / LoadFromString can reconstruct the layer.
+  FStruct[2] := FNumSinks;
+  FSinkAttn := TNNetVolume.Create();
+end;
+
+destructor TNNetSinkAttention.Destroy();
+begin
+  FSinkAttn.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSinkAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  s, d: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // 2*K trainable sink slots: neurons 0..K-1 = sink keys, K..2K-1 = sink
+  // values, each with d_k weights. Storing them as neurons makes the weights
+  // round-trip automatically through the base neuron save/load.
+  if FNeurons.Count < 2 * FNumSinks then AddMissingNeurons(2 * FNumSinks);
+  SetNumWeightsForAllNeurons(1, 1, FDk);
+  // Initialise sink keys to small random values and sink values to zeros.
+  for s := 0 to FNumSinks - 1 do
+  begin
+    for d := 0 to FDk - 1 do
+      FNeurons[s].FWeights.Raw[d] := (Random - 0.5) * 0.02;     // sink key
+    FNeurons[FNumSinks + s].FWeights.Fill(0);                   // sink value
+  end;
+  AfterWeightUpdate();
+  // Augmented attention map: X = K sinks ++ SeqLen real keys, Y = query.
+  FSinkAttn.ReSize(FNumSinks + pPrevLayer.FOutput.SizeX,
+    pPrevLayer.FOutput.SizeX, 1);
+end;
+
+procedure TNNetSinkAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, AugLen, i, j, s, d: integer;
+  Score, MaxScore, SumExp, AccVal: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  AugLen := FNumSinks + SeqLen;
+  // For each query row i: scores over [sinks ++ real keys], softmax, then a
+  // weighted sum over [sink values ++ real V].
+  for i := 0 to SeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    // 1a) Sink scores (never masked): FSinkAttn[s, i, 0], s in 0..K-1.
+    for s := 0 to FNumSinks - 1 do
+    begin
+      Score := 0;
+      for d := 0 to FDk - 1 do
+        Score := Score + Prev[i, 0, d] * FNeurons[s].FWeights.Raw[d];
+      Score := Score * FInvSqrtDk;
+      FSinkAttn[s, i, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    // 1b) Real-key scores into FSinkAttn[K + j, i, 0], with causal mask.
+    for j := 0 to SeqLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FSinkAttn[FNumSinks + j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := 0;
+        for d := 0 to FDk - 1 do
+          Score := Score + Prev[i, 0, d] * Prev[j, 0, FDk + d];
+        Score := Score * FInvSqrtDk;
+        FSinkAttn[FNumSinks + j, i, 0] := Score;
+      end;
+      if FSinkAttn[FNumSinks + j, i, 0] > MaxScore then
+        MaxScore := FSinkAttn[FNumSinks + j, i, 0];
+    end;
+    // 2) Softmax over the augmented row (numerically stable).
+    SumExp := 0;
+    for j := 0 to AugLen - 1 do
+    begin
+      Score := Exp(FSinkAttn[j, i, 0] - MaxScore);
+      FSinkAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to AugLen - 1 do
+        FSinkAttn[j, i, 0] := FSinkAttn[j, i, 0] / SumExp;
+    // 3) Output[i, d] = sum_s w_sink[s]*SinkValue[s,d] + sum_j w_real[j]*V[j,d].
+    for d := 0 to FDk - 1 do
+    begin
+      AccVal := 0;
+      for s := 0 to FNumSinks - 1 do
+        AccVal := AccVal + FSinkAttn[s, i, 0] * FNeurons[FNumSinks + s].FWeights.Raw[d];
+      for j := 0 to SeqLen - 1 do
+        AccVal := AccVal + FSinkAttn[FNumSinks + j, i, 0] * Prev[j, 0, 2 * FDk + d];
+      FOutput[i, 0, d] := AccVal;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSinkAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, AugLen, i, j, k, s, d: integer;
+  Prev, PrevErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;     // dL/dw over the augmented key set
+  dScore: array of TNeuralFloat;
+  // Accumulated gradients w.r.t the sink key/value params, one row per sink
+  // slot, depth = d_k. Flushed into the neuron deltas after the (i) loop.
+  gSinkKey, gSinkVal: TNNetVolume;
+  SumDAttnAttn, A, dS, OutErr: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  // Sink-param gradients are always computed; input gradients only when the
+  // previous layer actually has a matching error buffer to receive them.
+  hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
+  SeqLen := Prev.SizeX;
+  AugLen := FNumSinks + SeqLen;
+  SetLength(dAttn, AugLen);
+  SetLength(dScore, AugLen);
+  gSinkKey := TNNetVolume.Create(FNumSinks, 1, FDk);
+  gSinkVal := TNNetVolume.Create(FNumSinks, 1, FDk);
+  try
+    gSinkKey.Fill(0);
+    gSinkVal.Fill(0);
+    for i := 0 to SeqLen - 1 do
+    begin
+      // ---- Gradients w.r.t the values (sink + real) and the weights w ----
+      // For sinks s: dSinkVal[s,d] += w_sink[s]*dOut[i,d];
+      //              dAttn[s]      = sum_d dOut[i,d]*SinkVal[s,d]
+      for s := 0 to FNumSinks - 1 do
+      begin
+        dAttn[s] := 0;
+        A := FSinkAttn[s, i, 0];
+        for d := 0 to FDk - 1 do
+        begin
+          OutErr := FOutputError[i, 0, d];
+          gSinkVal.Add(s, 0, d, A * OutErr);
+          dAttn[s] := dAttn[s] + OutErr * FNeurons[FNumSinks + s].FWeights.Raw[d];
+        end;
+      end;
+      // For real keys j: dV[j,d] += w_real[j]*dOut[i,d];
+      //                  dAttn[K+j] = sum_d dOut[i,d]*V[j,d]
+      for j := 0 to SeqLen - 1 do
+      begin
+        dAttn[FNumSinks + j] := 0;
+        A := FSinkAttn[FNumSinks + j, i, 0];
+        for d := 0 to FDk - 1 do
+        begin
+          OutErr := FOutputError[i, 0, d];
+          if hasInputGrad then PrevErr.Add(j, 0, 2 * FDk + d, A * OutErr);
+          dAttn[FNumSinks + j] := dAttn[FNumSinks + j] + OutErr * Prev[j, 0, 2 * FDk + d];
+        end;
+      end;
+      // ---- Softmax Jacobian over the augmented row ----
+      // dScore[m] = w[m] * (dAttn[m] - sum_k dAttn[k]*w[k])
+      SumDAttnAttn := 0;
+      for k := 0 to AugLen - 1 do
+        SumDAttnAttn := SumDAttnAttn + dAttn[k] * FSinkAttn[k, i, 0];
+      for j := 0 to AugLen - 1 do
+        dScore[j] := FSinkAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+      // Causal-masked real positions (j > i) have w ~ 0, so dScore ~ 0 there
+      // already; no special handling needed.
+      // ---- Gradients into Q[i], sink keys, and real keys K[j] ----
+      // score_sink[s] = invSqrtDk * sum_d Q[i,d]*SinkKey[s,d]
+      //   dQ[i,d]      += invSqrtDk * dScore[s] * SinkKey[s,d]
+      //   dSinkKey[s,d]+= invSqrtDk * dScore[s] * Q[i,d]
+      for s := 0 to FNumSinks - 1 do
+      begin
+        dS := dScore[s] * FInvSqrtDk;
+        if dS <> 0 then
+          for d := 0 to FDk - 1 do
+          begin
+            if hasInputGrad then
+              PrevErr.Add(i, 0, d, dS * FNeurons[s].FWeights.Raw[d]);
+            gSinkKey.Add(s, 0, d, dS * Prev[i, 0, d]);
+          end;
+      end;
+      // score_real[j] = invSqrtDk * sum_d Q[i,d]*K[j,d]
+      //   dQ[i,d] += invSqrtDk * dScore[K+j] * K[j,d]
+      //   dK[j,d] += invSqrtDk * dScore[K+j] * Q[i,d]
+      for j := 0 to SeqLen - 1 do
+      begin
+        dS := dScore[FNumSinks + j] * FInvSqrtDk;
+        if (dS <> 0) and hasInputGrad then
+          for d := 0 to FDk - 1 do
+          begin
+            PrevErr.Add(i, 0, d, dS * Prev[j, 0, FDk + d]);
+            PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
+          end;
+      end;
+    end;
+    // ---- Flush sink-param gradients into neuron deltas (LR sign convention,
+    // matching the other trainable layers: delta += -FLearningRate * grad). ----
+    for s := 0 to FNumSinks - 1 do
+      for d := 0 to FDk - 1 do
+      begin
+        FNeurons[s].FDelta.Raw[d] :=
+          FNeurons[s].FDelta.Raw[d] + (-FLearningRate) * gSinkKey[s, 0, d];
+        FNeurons[FNumSinks + s].FDelta.Raw[d] :=
+          FNeurons[FNumSinks + s].FDelta.Raw[d] + (-FLearningRate) * gSinkVal[s, 0, d];
+      end;
+  finally
+    gSinkKey.Free;
+    gSinkVal.Free;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    for s := 0 to 2 * FNumSinks - 1 do
+      FNeurons[s].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -36587,6 +36864,7 @@ begin
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
+      'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -36838,6 +37116,7 @@ begin
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
+      if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
