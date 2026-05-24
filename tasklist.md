@@ -420,6 +420,41 @@ breakdown:
       trained weights left untouched. Example at
       `examples/EffectiveReceptiveField/` contrasting a 3x3-stack stem
       against a dilated/large-kernel stem.
+- [ ] TNNet.GradientConflictReport(NN, Samples, Targets) — a forward+backward
+      `TNNet.*Report` answering "do the samples in this batch pull the weights
+      in compatible directions, or do they fight each other?". For each labelled
+      sample it runs one forward + one backward on a **frozen** net
+      (`ClearDeltas` before each, never `UpdateWeights`) and snapshots that
+      sample's full flattened per-parameter weight-gradient vector `g_i` (reusing
+      the same per-parameter gradient tensors `Backpropagate` already populates —
+      no input-gradient enablement, exactly like [[FisherImportance]]). It then
+      reports the **pairwise gradient cosine similarity** `cos(g_i, g_j) =
+      <g_i,g_j>/(||g_i|| ||g_j||)` across the batch: an overall 10-bin ASCII
+      histogram of the cosines, the **conflict fraction** (share of pairs with
+      cos < 0 — gradients that actively undo each other, the negative-transfer
+      signal from PCGrad / GradNorm multi-task work), the mean/median cosine,
+      the most-conflicting sample pair (a "these two examples disagree most"
+      pointer), and — when class labels are supplied — a per-class-pair mean-cosine
+      matrix so a pair of classes whose gradients systematically oppose
+      (the hard, easily-confused pair) stands out. Optionally restricts the
+      cosine to one chosen layer's gradient slab (the conflict is often
+      concentrated in the classifier head). Reuses the same whole-net snapshot
+      discipline the other frozen-net reports use; weights are never stepped.
+      Distinct from [[FisherImportance]] (which squares each per-sample gradient
+      *per parameter* to rank *which parameters matter* — it discards sign and
+      cross-sample direction; this keeps the whole-vector *direction* and asks
+      *whether samples agree*), from [[NeuronCorrelationReport]] (intra-layer
+      activation redundancy, forward-only, no gradients), and from
+      [[LayerSensitivityReport]] (weight-jitter output delta, no backward). The
+      output is the natural precursor to any future gradient-surgery / PCGrad /
+      sample-reweighting work and a concrete lens on why a batch trains slowly.
+      Companion `examples/GradientConflict/` contrasts a clean linearly-separable
+      3-cluster set (cosines cluster positive, conflict fraction ~0) against a
+      deliberately label-noised / overlapping set (a fat negative-cosine tail and
+      a high conflict fraction emerge). Smoke test
+      `TestGradientConflictReportSmoke` pins the self-cosine `cos(g_i,g_i)=1`
+      diagonal and matrix symmetry (the built-in correctness checks). Follows
+      [[introspection-report-pattern]].
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
