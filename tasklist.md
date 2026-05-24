@@ -977,6 +977,28 @@ breakdown:
       Distinct from the calibration tool above (which summarises
       confidence quality across the whole set) — this one localises
       *which samples* the model is least sure about.
+      - [ ] Follow-up: the shipped `examples/MarginReport/` net ends in a
+            `TNNetSoftMax`, so its "logits" are post-softmax probabilities and
+            the margin lands in `[0, 1]`. Add a second run (or a sibling
+            example) with a raw-logit `TNNetFullConnectLinear` head so the
+            unbounded-margin case is also pinned, and document the
+            interpretation difference in the README.
+- [ ] Shared report-smoke-test helper for the `TNNet.*Report` family. The
+      per-report smoke tests (TopLogitMargin / NeuronCorrelation /
+      LayerSensitivity / DeadNeuron / WeightSpectrum / ...) all repeat the
+      same three assertions: report string non-empty, contains an expected
+      header substring, and a nil-NN call returns gracefully. Capture as
+      `AssertReportSmoke(reportFn, expectedHeader)` in
+      tests/TestNeuralLayersExtra.pas so new report tasks are a one-liner.
+- [ ] Next introspection-report batch (same forward-only `TNNet.*Report`
+      pattern, all still unimplemented, each pairs with an `examples/*/`
+      synthetic demo and a smoke test): `TNNet.SaliencyReport` (input-gradient
+      / SmoothGrad / Integrated-Gradients attribution),
+      `TNNet.EquivarianceReport` (output response to FlipX/FlipY/Roll
+      input symmetries), `TNNeuralTTAEvaluator` (test-time-augmentation
+      accuracy lift), `TNNet.LinearProbeReport` (closed-form per-layer linear
+      probe), and the calibration unit (`neuralcalibration.pas`: ECE / MCE /
+      Brier + reliability diagram). Specs are in the sections below/above.
 ### Input attribution
 - [ ] TNNet.SaliencyReport — given a trained classifier and a probe sample,
       compute three flavours of input attribution and print them side-by-side
