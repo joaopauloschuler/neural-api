@@ -406,17 +406,12 @@ breakdown:
      A separate "stable Mish" class would be a forward-pass duplicate of
      TNNetMish, which the "DO NOT REINTRODUCE" policy at the top of this file
      forbids. Verified 2026-05-24 lucky-day batch.) -->
-- [X] TNNetSplineActivation follow-up: a KAN-vs-MLP toy-fit micro-experiment.
-      Fit a wiggly 1D target (e.g. `y = sin(3x) + 0.3·sin(11x)`) with a small
-      MLP whose ReLUs are swapped for TNNetSplineActivation at matched param
-      count, and chart final loss + the learned per-channel spline shapes
-      (dump `(x, y)` over [-Range,+Range]). ~30-line activation swap; the
-      headline KAN claim is that the learnable activation buys lower loss at a
-      fixed width. Pairs with the open TNNetAPL bake-off.
-      LANDED as examples/SplineActivationKAN/ — matched-param (21 vs 20 weights,
-      via TNNet.CountWeights), spline arm reaches MSE 0.061 vs ReLU 0.187 (67.5%
-      lower); dumps learned control points + sampled activation showing one
-      channel bent away from the identity (a sparse KAN fit).
+<!-- (TNNetSplineActivation KAN-vs-MLP toy-fit removed: completed, landed
+     2026-05-24 as examples/SplineActivationKAN/ — matched-param (21 vs 20
+     weights via TNNet.CountWeights), spline arm reaches MSE 0.061 vs ReLU 0.187
+     (67.5% lower); dumps learned control points + sampled activation showing one
+     channel bent away from the identity (a sparse KAN fit). Open follow-ups
+     remain below: the knot-count/Range sweep and the TNNetAPL bake-off.) -->
 - [ ] TNNetSplineActivation follow-up: knot-count / Range sweep — same toy fit
       with K ∈ {2, 4, 8, 16} and a couple of Range values, charting the
       capacity↔overfitting trade and where extra knots stop helping.
@@ -468,27 +463,25 @@ breakdown:
       spatial only, independently per depth channel) gated by a flag, mirroring
       the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
       Builds on the landed full-volume TNNetMinMaxNorm.
-- [X] TNNetUnitNormConstraint — landed as **TNNetWeightNormLinear**: a
-      differentiable unit-L2 weight reparametrization (the simple g=1 form of
-      Weight Normalization). Each output neuron's weight vector is L2-normalized
-      to unit norm inside the forward pass (`ŵ = w/sqrt(Σwᵢ² + eps)`) and the
-      exact unit-norm Jacobian is backpropagated to the raw weights
-      (gradient-checked). Modelled exactly on TNNetWeightStandardization.
-      Sub-note: a true *post-step hard projection* variant (renormalize the
-      previous layer's weights after each update, non-differentiable) is still
-      open if a hard constraint is ever wanted — but the differentiable
-      reparametrization here covers the headline use case.
+<!-- (TNNetUnitNormConstraint removed: completed, landed as TNNetWeightNormLinear
+     — a differentiable unit-L2 weight reparametrization (the simple g=1 form of
+     Weight Normalization). Each output neuron's weight vector is L2-normalized to
+     unit norm inside the forward pass (`ŵ = w/sqrt(Σwᵢ² + eps)`) and the exact
+     unit-norm Jacobian is backpropagated to the raw weights (gradient-checked).
+     Modelled exactly on TNNetWeightStandardization. The hard-projection variant
+     below is the only open piece.) -->
+- [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
+      projection* (renormalize the previous layer's weights after each update,
+      non-differentiable) — still open if a hard constraint is ever wanted. The
+      differentiable reparametrization (TNNetWeightNormLinear, landed) already
+      covers the headline use case.
 
 #### Reduction / shape
-- [X] TNNetAdaptiveAvgPool example/usage: swap a fixed global-avg head
-      (`TNNetAvgChannel`) for `TNNetAdaptiveAvgPool.Create(1)` in one
-      SimpleImage path, or a tiny demo showing the same conv stack accepting
-      two different input resolutions and producing a fixed-size head.
-      Landed 2026-05-24 as examples/AdaptivePoolResolution/ (together with
-      the TNNetAdaptiveMaxPool example below): one conv stack fed 16x16 and
-      24x24, fixed 1x1 and 2x2 adaptive heads, with built-in
-      Create(1)==global and Create(N)==identity degeneracy assertions and a
-      train-at-16/infer-at-24 sanity step.
+<!-- (TNNetAdaptiveAvgPool example/usage removed: completed, landed 2026-05-24 as
+     examples/AdaptivePoolResolution/ — one conv stack fed 16x16 and 24x24, fixed
+     1x1 and 2x2 adaptive heads, with built-in Create(1)==global and
+     Create(N)==identity degeneracy assertions and a train-at-16/infer-at-24
+     sanity step. Exercises TNNetAdaptiveMaxPool in the same demo.) -->
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
@@ -499,13 +492,9 @@ breakdown:
      the class-mean is invariant and only energy CONCENTRATION is
      discriminative: AvgPool/LpPool(p=1) sit at chance, MaxPool solves it, and
      both LpPool's p and SoftPool's beta interpolate avg→max.) -->
-- [X] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
-      stack accepting two different input resolutions and producing a
-      fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
-      sibling to the open TNNetAdaptiveAvgPool example task above. Layer +
-      gradient/forward tests already landed. Landed 2026-05-24 as
-      examples/AdaptivePoolResolution/ (same example as the AvgPool entry
-      above — both adaptive layers are exercised in one demo).
+<!-- (TNNetAdaptiveMaxPool example/usage removed: completed — landed in the same
+     examples/AdaptivePoolResolution/ demo as the AdaptiveAvgPool entry above;
+     both adaptive layers are exercised in one demo.) -->
 ### Loss layers
 - [ ] TNNetCosineEmbeddingLoss follow-up (now landed): a tiny
       siamese-pair embedding micro-example — train two shared-weight MLP
