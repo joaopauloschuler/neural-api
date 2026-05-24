@@ -1011,7 +1011,7 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
-- [ ] TNNet.RepresentationSimilarityReport(NN, Probes) — a forward-only
+- [x] TNNet.RepresentationSimilarityReport(NN, Probes) — a forward-only
       `TNNet.*Report` that answers "how does the representation reshape
       itself with depth, and which layers are doing redundant work?" by
       computing the **linear Centered Kernel Alignment (CKA)** similarity

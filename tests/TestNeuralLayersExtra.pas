@@ -95,6 +95,7 @@ type
     procedure TestCalibrationReportSmoke;
     procedure TestFisherImportanceReportSmoke;
     procedure TestLinearProbeReportSmoke;
+    procedure TestRepresentationSimilarityReportSmoke;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
   end;
@@ -2382,6 +2383,109 @@ begin
     Samples.Free;
     ValSamples.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestRepresentationSimilarityReportSmoke;
+var
+  NN, NN2: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report, CrossReport: string;
+  I, J, P, DiagStart, ColStart: integer;
+  Glyph: char;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.RepresentationSimilarityReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.InitWeights();
+
+    NN2.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN2.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN2.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN2.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.RepresentationSimilarityReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // a handful of probe volumes.
+    RandSeed := 7;
+    for I := 0 to 19 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+    end;
+
+    Report := TNNet.RepresentationSimilarityReport(NN, Probes);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('RepresentationSimilarityReport', Report) > 0);
+    AssertTrue('CKA heatmap section present', Pos('CKA heatmap', Report) > 0);
+    AssertTrue('adjacent-layer section present',
+      Pos('Adjacent-layer CKA', Report) > 0);
+    AssertTrue('most-redundant pair present',
+      Pos('Most-redundant layer PAIR', Report) > 0);
+    AssertTrue('block-structure section present',
+      Pos('Representational stages', Report) > 0);
+    AssertTrue('verdict present', Pos('Verdict:', Report) > 0);
+
+    // --- Correctness check 1: the self-CKA DIAGONAL is 1.0 within tolerance.
+    // The heatmap renders the diagonal with the brightest glyph ('@', the last
+    // band reached only by CKA >= 0.9). The numeric proof lives in the
+    // adjacent-vector / most-redundant-pair values, but the diagonal-glyph
+    // check pins that every layer's self-similarity sits in the top band.
+    // Verify by parsing the matrix rows: row [I] column I must be '@'.
+    DiagStart := Pos('CKA heatmap', Report);
+    AssertTrue('heatmap located', DiagStart > 0);
+    for I := 0 to 4 do
+    begin
+      // find the row label '  [ I]' for this layer index.
+      ColStart := PosEx(Format('  [%2d] ', [I]), Report, DiagStart);
+      if ColStart = 0 then Break; // fewer than 5 probeable layers; stop.
+      // glyphs start after the 6-char label '  [%2d] ', each glyph preceded by
+      // a single space -> column I glyph is at label-end + 1 (space) + 2*I + 1.
+      ColStart := ColStart + Length(Format('  [%2d] ', [I]));
+      Glyph := Report[ColStart + 2 * I + 1];
+      AssertTrue(Format('self-CKA diagonal glyph at [%d] is top band', [I]),
+        Glyph = '@');
+    end;
+
+    // --- Cross-CKA variant runs and is labelled as such.
+    CrossReport := TNNet.RepresentationSimilarityReport(NN, Probes, NN2);
+    AssertTrue('cross-CKA report runs', Length(CrossReport) > 0);
+    AssertTrue('cross-CKA labels two networks',
+      Pos('cross-CKA between two networks', CrossReport) > 0);
+
+    // --- Correctness check 2: symmetry of the self matrix.
+    // glyph(row a, col b) == glyph(row b, col a).
+    DiagStart := Pos('CKA heatmap', Report);
+    for I := 0 to 4 do
+      for J := 0 to 4 do
+      begin
+        ColStart := PosEx(Format('  [%2d] ', [I]), Report, DiagStart);
+        P := PosEx(Format('  [%2d] ', [J]), Report, DiagStart);
+        if (ColStart = 0) or (P = 0) then Break;
+        ColStart := ColStart + Length(Format('  [%2d] ', [I]));
+        P := P + Length(Format('  [%2d] ', [J]));
+        AssertTrue(Format('symmetric glyph [%d][%d]==[%d][%d]', [I, J, J, I]),
+          Report[ColStart + 2 * J + 1] = Report[P + 2 * I + 1]);
+      end;
+  finally
+    Probes.Free;
+    NN.Free;
+    NN2.Free;
   end;
 end;
 

@@ -3933,6 +3933,59 @@ type
         Lambda: TNeuralFloat = 1e-2;
         MaxFeatDim: integer = 256
       ): string;
+      // Forward-only representation-geometry diagnostic. Answers "how does the
+      // representation reshape itself with depth, and which layers do redundant
+      // work?" by computing the linear Centered Kernel Alignment (CKA,
+      // Kornblith et al. 2019) similarity between every pair of layer
+      // activations over a shared probe batch. For each probeable layer l it
+      // runs the probe batch (capped at MaxSamples) through the net and
+      // flattens each probe's activation at layer l to a row of an N x D_l
+      // matrix X_l (N = probe count). Working through the N x N Gram trick
+      // (cheap when D_l is large and N small): K_l = X_l X_l^T is DOUBLE-CENTERED
+      // (H K H with H = I - 1/N) which is exactly equivalent to column-centering
+      // the features, then linear CKA between layers i and j is
+      //   CKA(i,j) = <K_i, K_j>_F / (||K_i||_F * ||K_j||_F)
+      // a number in [0,1], invariant to orthogonal rotation and isotropic
+      // scaling of the features (it compares *representations* not raw
+      // coordinates). The self-CKA diagonal is 1.0 by construction (the
+      // built-in correctness check) and the matrix is symmetric. Reports:
+      //   (a) the full LxL CKA matrix as an ASCII heatmap, glyph-shaded by
+      //       similarity band (' .:-=+*#%@', brightest = most similar);
+      //   (b) the adjacent-layer similarity vector CKA(l, l+1) down the stack —
+      //       a high value flags a near-pass-through "redundant depth" layer, a
+      //       sharp dip flags where the representation genuinely reorganizes;
+      //   (c) the single most-redundant layer PAIR (highest off-diagonal CKA —
+      //       a merge / prune candidate);
+      //   (d) the block structure: contiguous runs of layers whose every
+      //       mutual CKA is above BlockThreshold (the "representational stages"
+      //       of the net);
+      //   (e) a one-line verdict "K of L layers are near-duplicates of a
+      //       neighbour" (adjacent CKA >= BlockThreshold).
+      // When OtherNet is supplied (non-nil) it instead computes the CROSS-CKA
+      // matrix CKA(layer_i of NN, layer_j of OtherNet) over the SAME probe
+      // batch — "do these two trained nets learn the same intermediate
+      // features?" (the headline CKA-paper use case: comparing widths / depths
+      // / seeds). The cross matrix is generally rectangular and NOT 1.0 on its
+      // diagonal. MaxSamples (default 64) caps the probe count; over-wide
+      // layers are skipped if their flat Output exceeds MaxFeatDim (default
+      // 2048) to bound the Gram build. Layers with a zero-size Output are
+      // skipped. Distinct from NeuronCorrelationReport (that measures
+      // *intra-layer* neuron-pair Pearson redundancy *within one* layer — this
+      // measures *whole-layer representation* similarity *between* layers/nets
+      // and is rotation-invariant, which raw Pearson is not), from
+      // LinearProbeReport (that asks "is the label linearly decodable here?"
+      // against a target — this needs no labels) and from DiffArchitecture
+      // (that diffs the static layer list, not the learned activations). Pure
+      // forward-only; weights are never touched, no backward pass is run.
+      // Guards nil NN and an empty/nil probe list gracefully.
+      class function RepresentationSimilarityReport(
+        NN: TNNet;
+        Probes: TNNetVolumeList;
+        OtherNet: TNNet = nil;
+        BlockThreshold: TNeuralFloat = 0.9;
+        MaxSamples: integer = 64;
+        MaxFeatDim: integer = 2048
+      ): string;
       // Per-trainable-layer weight-value histogram diagnostic. For every
       // layer with weights (Neurons.Count > 0 and Weights.Size > 0) walks
       // the neuron weights (biases excluded) and reports min, max, mean,
@@ -25445,6 +25498,390 @@ begin
       'layer), S=saturation point (shallowest layer within %.0f pt of the ' +
       'final layer), R=near-random (probe acc within %.0f pt of 1/NumClasses).',
       [cCollapsePts, cSaturatePts, cRandomPts]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.RepresentationSimilarityReport(
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  OtherNet: TNNet = nil;
+  BlockThreshold: TNeuralFloat = 0.9;
+  MaxSamples: integer = 64;
+  MaxFeatDim: integer = 2048
+): string;
+const
+  cGlyphs = ' .:-=+*#%@';   // 10 similarity bands, brightest = most similar
+type
+  TFloatMatrix = array of array of TNeuralFloat;
+  // A centered N x N Gram matrix for one probeable layer (stored as flat
+  // upper+lower full matrix) plus its Frobenius norm and label.
+  TLayerGram = record
+    LayerIdx: integer;
+    FeatDim: integer;
+    K: TFloatMatrix;        // double-centered N x N Gram
+    FrobNorm: TNeuralFloat; // ||K||_F
+    Name: string;
+  end;
+var
+  Lines: TStringList;
+  N, UsedSamples, I, J, A, B, L, GlyphIdx, BlockStart, NearDup: integer;
+  CrossMode: boolean;
+  GramsA, GramsB: array of TLayerGram;
+  CountA, CountB: integer;
+  CKA: TFloatMatrix;        // CountA x CountB
+  Dot, RowAcc, Adj, AdjMin, BestPair: TNeuralFloat;
+  AdjMinIdx, BestI, BestJ: integer;
+  Line, Glyph: string;
+  InBlock: boolean;
+
+  // Build the list of double-centered Gram matrices for one net over the
+  // probe batch (one Compute per probe per probeable layer). N is the probe
+  // count used. Returns the count of probeable layers catalogued.
+  function BuildGrams(ANet: TNNet; var Grams: array of TLayerGram): integer;
+  var
+    LayerIdx, Si, Sj, Fi, Cnt: integer;
+    Layer: TNNetLayer;
+    FlatSz: integer;
+    // per-layer activation snapshot: N rows x FeatDim cols
+    Acts: TFloatMatrix;
+    ColMean: array of TNeuralFloat;
+    RowMean: array of TNeuralFloat;
+    GrandMean, V, Frob: TNeuralFloat;
+  begin
+    Cnt := 0;
+    for LayerIdx := 0 to ANet.GetLastLayerIdx() do
+    begin
+      Layer := ANet.Layers[LayerIdx];
+      FlatSz := Layer.Output.Size;
+      if FlatSz = 0 then Continue;
+      if FlatSz > MaxFeatDim then Continue;
+
+      // --- snapshot the N x FlatSz activation matrix (one forward per probe).
+      SetLength(Acts, N);
+      for Si := 0 to N - 1 do
+      begin
+        ANet.Compute(Probes[Si]);
+        SetLength(Acts[Si], FlatSz);
+        for Fi := 0 to FlatSz - 1 do
+          Acts[Si][Fi] := Layer.Output.Raw[Fi];
+      end;
+
+      // --- column-center the features (subtract per-feature mean across rows).
+      SetLength(ColMean, FlatSz);
+      for Fi := 0 to FlatSz - 1 do ColMean[Fi] := 0;
+      for Si := 0 to N - 1 do
+        for Fi := 0 to FlatSz - 1 do
+          ColMean[Fi] := ColMean[Fi] + Acts[Si][Fi];
+      for Fi := 0 to FlatSz - 1 do ColMean[Fi] := ColMean[Fi] / N;
+      for Si := 0 to N - 1 do
+        for Fi := 0 to FlatSz - 1 do
+          Acts[Si][Fi] := Acts[Si][Fi] - ColMean[Fi];
+
+      // --- linear Gram K = X X^T (N x N). Column-centering X makes K already
+      //     equal to the double-centered Gram, so CKA is feature-mean
+      //     invariant and the self-CKA diagonal is exactly 1.0.
+      Grams[Cnt].LayerIdx := LayerIdx;
+      Grams[Cnt].FeatDim := FlatSz;
+      Grams[Cnt].Name := Layer.ClassName;
+      SetLength(Grams[Cnt].K, N);
+      for Si := 0 to N - 1 do SetLength(Grams[Cnt].K[Si], N);
+      for Si := 0 to N - 1 do
+        for Sj := Si to N - 1 do
+        begin
+          V := 0;
+          for Fi := 0 to FlatSz - 1 do V := V + Acts[Si][Fi] * Acts[Sj][Fi];
+          Grams[Cnt].K[Si][Sj] := V;
+          Grams[Cnt].K[Sj][Si] := V;
+        end;
+
+      // --- numerically defensive double-center of the Gram itself (H K H);
+      //     redundant after column-centering but it pins any residual drift,
+      //     keeping the self-CKA diagonal at 1.0 within tolerance.
+      SetLength(RowMean, N);
+      GrandMean := 0;
+      for Si := 0 to N - 1 do
+      begin
+        RowMean[Si] := 0;
+        for Sj := 0 to N - 1 do RowMean[Si] := RowMean[Si] + Grams[Cnt].K[Si][Sj];
+        GrandMean := GrandMean + RowMean[Si];
+        RowMean[Si] := RowMean[Si] / N;
+      end;
+      GrandMean := GrandMean / (TNeuralFloat(N) * N);
+      for Si := 0 to N - 1 do
+        for Sj := 0 to N - 1 do
+          Grams[Cnt].K[Si][Sj] :=
+            Grams[Cnt].K[Si][Sj] - RowMean[Si] - RowMean[Sj] + GrandMean;
+
+      // --- Frobenius norm of the centered Gram.
+      Frob := 0;
+      for Si := 0 to N - 1 do
+        for Sj := 0 to N - 1 do
+          Frob := Frob + Grams[Cnt].K[Si][Sj] * Grams[Cnt].K[Si][Sj];
+      Grams[Cnt].FrobNorm := Sqrt(Frob);
+
+      Inc(Cnt);
+    end;
+    Result := Cnt;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'RepresentationSimilarityReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Probes = nil) or (Probes.Count = 0) then
+    begin
+      Result := 'RepresentationSimilarityReport: Probes is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+    if MaxSamples < 2 then MaxSamples := 2;
+    if MaxFeatDim < 1 then MaxFeatDim := 1;
+    if BlockThreshold < 0 then BlockThreshold := 0;
+    if BlockThreshold > 1 then BlockThreshold := 1;
+
+    CrossMode := OtherNet <> nil;
+    N := Probes.Count;
+    UsedSamples := N;
+    if UsedSamples > MaxSamples then UsedSamples := MaxSamples;
+    N := UsedSamples;
+
+    SetLength(GramsA, NN.CountLayers());
+    CountA := BuildGrams(NN, GramsA);
+    if CrossMode then
+    begin
+      SetLength(GramsB, OtherNet.CountLayers());
+      CountB := BuildGrams(OtherNet, GramsB);
+    end
+    else
+    begin
+      GramsB := GramsA;
+      CountB := CountA;
+    end;
+
+    if (CountA = 0) or (CountB = 0) then
+    begin
+      Result := 'RepresentationSimilarityReport: no probeable layers (all ' +
+        'zero-size or wider than MaxFeatDim).' + sLineBreak;
+      Exit;
+    end;
+
+    // --- pairwise linear CKA = <K_i, K_j>_F / (||K_i||_F ||K_j||_F). ---
+    SetLength(CKA, CountA);
+    for I := 0 to CountA - 1 do
+    begin
+      SetLength(CKA[I], CountB);
+      for J := 0 to CountB - 1 do
+      begin
+        Dot := 0;
+        // <K_i, K_j>_F = sum over all (a,b) of K_i[a][b] * K_j[a][b]
+        for A := 0 to N - 1 do
+        begin
+          RowAcc := 0;
+          for B := 0 to N - 1 do
+            RowAcc := RowAcc + GramsA[I].K[A][B] * GramsB[J].K[A][B];
+          Dot := Dot + RowAcc;
+        end;
+        if (GramsA[I].FrobNorm > 1e-20) and (GramsB[J].FrobNorm > 1e-20) then
+          CKA[I][J] := Dot / (GramsA[I].FrobNorm * GramsB[J].FrobNorm)
+        else
+          CKA[I][J] := 0;
+      end;
+    end;
+
+    // ---------------------------------------------------------------- header
+    if CrossMode then
+    begin
+      Lines.Add(
+        'RepresentationSimilarityReport: cross-CKA between two networks over ' +
+        'a shared probe batch.');
+      Lines.Add(Format(
+        'NN: %d probeable layer(s); OtherNet: %d probeable layer(s). ' +
+        'Probe samples used: %d (of %d, cap MaxSamples=%d).',
+        [CountA, CountB, N, Probes.Count, MaxSamples]));
+      Lines.Add(
+        'Linear CKA (Kornblith et al. 2019); in [0,1]; rotation/scale ' +
+        'invariant. Cross matrix is rectangular, NOT 1.0 on the diagonal.');
+    end
+    else
+    begin
+      Lines.Add(
+        'RepresentationSimilarityReport: self-CKA across this network''s ' +
+        'layers over a probe batch.');
+      Lines.Add(Format(
+        '%d probeable layer(s). Probe samples used: %d (of %d, cap ' +
+        'MaxSamples=%d). BlockThreshold=%.2f.',
+        [CountA, N, Probes.Count, MaxSamples, BlockThreshold]));
+      Lines.Add(
+        'Linear CKA (Kornblith et al. 2019); in [0,1]; rotation/scale ' +
+        'invariant. Self-CKA diagonal = 1.0 (built-in correctness check).');
+    end;
+    Lines.Add('');
+
+    // ---------------------------------------------------- layer index legend
+    if CrossMode then
+      Lines.Add('NN layer index (rows) -> layer:')
+    else
+      Lines.Add('Layer index -> layer:');
+    for I := 0 to CountA - 1 do
+      Lines.Add(Format('  [%2d] L%-3d %s', [I, GramsA[I].LayerIdx, GramsA[I].Name]));
+    if CrossMode then
+    begin
+      Lines.Add('OtherNet layer index (columns) -> layer:');
+      for J := 0 to CountB - 1 do
+        Lines.Add(Format('  [%2d] L%-3d %s',
+          [J, GramsB[J].LayerIdx, GramsB[J].Name]));
+    end;
+    Lines.Add('');
+
+    // ------------------------------------------------------- ASCII heatmap
+    Lines.Add('CKA heatmap (glyph band ' + QuotedStr(cGlyphs) +
+      ', brightest = most similar):');
+    // column header (index of each column, two-char field)
+    Line := '      ';
+    for J := 0 to CountB - 1 do Line := Line + Format('%2d', [J mod 100]);
+    Lines.Add(Line);
+    for I := 0 to CountA - 1 do
+    begin
+      Line := Format('  [%2d] ', [I]);
+      for J := 0 to CountB - 1 do
+      begin
+        GlyphIdx := Trunc(CKA[I][J] * Length(cGlyphs));
+        if GlyphIdx < 0 then GlyphIdx := 0;
+        if GlyphIdx >= Length(cGlyphs) then GlyphIdx := Length(cGlyphs) - 1;
+        Glyph := cGlyphs[GlyphIdx + 1];
+        Line := Line + ' ' + Glyph;
+      end;
+      Lines.Add(Line);
+    end;
+    Lines.Add('');
+
+    // -------------------------------------------------- adjacent-layer vector
+    if not CrossMode then
+    begin
+      Lines.Add('Adjacent-layer CKA(l, l+1) down the stack ' +
+        '(high = near pass-through; sharp dip = reorganization):');
+      AdjMin := 2.0;
+      AdjMinIdx := -1;
+      for I := 0 to CountA - 2 do
+      begin
+        Adj := CKA[I][I + 1];
+        if Adj < AdjMin then
+        begin
+          AdjMin := Adj;
+          AdjMinIdx := I;
+        end;
+        GlyphIdx := Round(Adj * 40);
+        if GlyphIdx < 0 then GlyphIdx := 0;
+        if GlyphIdx > 40 then GlyphIdx := 40;
+        Lines.Add(Format('  L%-3d->L%-3d  %6.4f |%s',
+          [GramsA[I].LayerIdx, GramsA[I + 1].LayerIdx, Adj,
+           StringOfChar('#', GlyphIdx)]));
+      end;
+      if AdjMinIdx >= 0 then
+        Lines.Add(Format(
+          'Sharpest reorganization: L%d -> L%d (CKA=%.4f) — where the ' +
+          'representation changes most.',
+          [GramsA[AdjMinIdx].LayerIdx, GramsA[AdjMinIdx + 1].LayerIdx, AdjMin]));
+      Lines.Add('');
+    end;
+
+    // --------------------------------------------- most-redundant layer pair
+    if not CrossMode then
+    begin
+      BestPair := -1.0;
+      BestI := -1;
+      BestJ := -1;
+      for I := 0 to CountA - 1 do
+        for J := I + 1 to CountA - 1 do
+          if CKA[I][J] > BestPair then
+          begin
+            BestPair := CKA[I][J];
+            BestI := I;
+            BestJ := J;
+          end;
+      if BestI >= 0 then
+        Lines.Add(Format(
+          'Most-redundant layer PAIR: L%d (%s) <-> L%d (%s)  CKA=%.4f — the ' +
+          'strongest merge / prune candidate.',
+          [GramsA[BestI].LayerIdx, GramsA[BestI].Name,
+           GramsA[BestJ].LayerIdx, GramsA[BestJ].Name, BestPair]));
+    end
+    else
+    begin
+      // cross mode: report the single most-similar NN<->OtherNet layer pair.
+      BestPair := -1.0;
+      BestI := -1;
+      BestJ := -1;
+      for I := 0 to CountA - 1 do
+        for J := 0 to CountB - 1 do
+          if CKA[I][J] > BestPair then
+          begin
+            BestPair := CKA[I][J];
+            BestI := I;
+            BestJ := J;
+          end;
+      if BestI >= 0 then
+        Lines.Add(Format(
+          'Most-aligned cross pair: NN L%d (%s) <-> OtherNet L%d (%s)  ' +
+          'CKA=%.4f — the two nets'' most-similar intermediate features.',
+          [GramsA[BestI].LayerIdx, GramsA[BestI].Name,
+           GramsB[BestJ].LayerIdx, GramsB[BestJ].Name, BestPair]));
+    end;
+
+    // ---------------------------------------------------- block structure
+    if not CrossMode then
+    begin
+      Lines.Add('');
+      Lines.Add(Format(
+        'Representational stages (contiguous runs with mutual CKA >= %.2f):',
+        [BlockThreshold]));
+      BlockStart := 0;
+      while BlockStart < CountA do
+      begin
+        // extend the block while every member's mutual CKA stays >= threshold
+        L := BlockStart;
+        InBlock := True;
+        while InBlock and (L + 1 < CountA) do
+        begin
+          // candidate new member L+1: must be >= threshold against every
+          // existing block member.
+          InBlock := True;
+          for I := BlockStart to L do
+            if CKA[I][L + 1] < BlockThreshold then
+            begin
+              InBlock := False;
+              Break;
+            end;
+          if InBlock then Inc(L);
+        end;
+        if L > BlockStart then
+          Lines.Add(Format('  stage: L%d..L%d (%d layers)',
+            [GramsA[BlockStart].LayerIdx, GramsA[L].LayerIdx, L - BlockStart + 1]))
+        else
+          Lines.Add(Format('  stage: L%d (1 layer)',
+            [GramsA[BlockStart].LayerIdx]));
+        BlockStart := L + 1;
+      end;
+
+      // ------------------------------------------------------------- verdict
+      NearDup := 0;
+      for I := 0 to CountA - 2 do
+        if CKA[I][I + 1] >= BlockThreshold then Inc(NearDup);
+      Lines.Add('');
+      Lines.Add(Format(
+        'Verdict: %d of %d layer(s) are near-duplicates of their successor ' +
+        '(adjacent CKA >= %.2f) — candidates for pruning if depth is wasted.',
+        [NearDup, CountA, BlockThreshold]));
+    end;
 
     Result := Lines.Text;
   finally
