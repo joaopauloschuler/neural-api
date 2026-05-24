@@ -868,9 +868,10 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-- [ ] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
-      and print the per-epoch fraction of units that never fire; repeat
-      with LeakyReLU/GELU/Swish.
+- [x] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
+      (implemented on a synthetic 3-Gaussian-blob classification task
+      instead of MNIST, for CPU speed) and print the per-epoch fraction
+      of units that never fire; repeat with LeakyReLU/GELU/Swish.
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
