@@ -307,13 +307,17 @@ breakdown:
      AddPostNormResidual (per-channel gate inits to 0 so the branch starts as
      identity); ships forward-wiring + input numerical-gradient tests. The
      ReZero-vs-GatedResidual depth-ablation follow-up remains open below.) -->
-- [ ] TNNetGatedResidual follow-up: ReZero-vs-GatedResidual depth ablation —
-      train a deepish residual MLP with scalar ReZero vs per-channel
-      GatedResidual gates, chart whether the per-channel gate opens unevenly
-      across channels. NOW EASIER: AddGatedResidual landed, so this is a
-      builder swap against a ReZero-wired arm (mirror the structure of
-      examples/PreNormVsPostNorm/, which already wires a deepish residual
-      stack via the residual builders).
+- [X] TNNetGatedResidual follow-up: ReZero-vs-GatedResidual depth ablation —
+      LANDED 2026-05-24 as examples/ReZeroVsGatedResidual/. Two arms of the
+      same deepish residual MLP on hypotenuse: scalar ReZero (one weight,
+      SetNumWeightsForAllNeurons(1,1,1)) vs per-channel GatedResidual gates.
+      Confirmed the per-channel gate opens UNEVENLY (many channels stay
+      exactly 0, a handful grow both signs) while the ReZero scalar opens
+      uniformly. NOTE captured for future gate-dump examples: TNeuralFit.Fit
+      reloads the best model at the end (LoadFromFile), rebuilding every layer
+      instance, so gate-layer LAYER REFERENCES go stale — capture layer
+      INDICES at build time and read NN.Layers[idx].Neurons[0].Weights after
+      Fit instead.
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
