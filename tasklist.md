@@ -1081,7 +1081,7 @@ breakdown:
       as "weak barrier" purely because the denominator is tiny. Add an
       absolute-floor term (e.g. treat barriers below an absolute epsilon as
       "connected" regardless of ratio) and re-pin the example's RUN 1 verdict.
-- [ ] TNNet.FeatureSeparabilityReport(NN, Samples, NumClasses) — a label-aware
+- [X] TNNet.FeatureSeparabilityReport(NN, Samples, NumClasses) — a label-aware
       **class-geometry / Neural-Collapse** diagnostic (Papyan, Han & Donoho 2020,
       "Prevalence of neural collapse during the terminal phase of training")
       answering a question none of the landed reports answer: *"how tightly does

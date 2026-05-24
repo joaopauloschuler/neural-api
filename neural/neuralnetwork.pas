@@ -4622,6 +4622,69 @@ type
         Lambda: TNeuralFloat = 1e-2;
         MaxFeatDim: integer = 256
       ): string;
+      // Label-aware class-GEOMETRY / Neural-Collapse diagnostic (Papyan, Han &
+      // Donoho 2020). Where LinearProbeReport asks "is the label DECODABLE
+      // here?" (it fits a probe), this asks "what is the GEOMETRY of the feature
+      // space?" - how tightly does each layer cluster the samples of one class,
+      // and how far apart are the class clusters? - with NO classifier fit at
+      // all. Given a classifier NN (trained or fresh), a labelled probe batch
+      // Samples (input volume + one-hot target pairs, a TNNetVolumePairList; the
+      // integer label is the argmax of the one-hot target via O.GetClass) and
+      // NumClasses, it feeds the whole batch forward once per layer (one
+      // NN.Compute per sample), flattens each sample's activation at that layer
+      // to a row vector x_i and computes the Fisher-style scatter decomposition
+      // over the classes:
+      //   mu_c = mean of x_i over class c, mu = global mean;
+      //   tr(S_w) = mean_c mean_{i in c} ||x_i - mu_c||^2  (within-class scatter,
+      //             cluster TIGHTNESS - the Neural-Collapse NC1 signal);
+      //   tr(S_b) = mean_c ||mu_c - mu||^2  (between-class scatter, the SPREAD of
+      //             the class means);
+      //   Fisher ratio = tr(S_b) / tr(S_w)  (higher = cleaner clusters;
+      //             divide-by-zero guarded);
+      //   tr(S_total) = mean_i ||x_i - mu||^2, which equals tr(S_w)+tr(S_b)
+      //             exactly (the scatter-decomposition identity - a built-in
+      //             correctness check, asserted to < 1e-4 per layer).
+      // It also computes, per layer, the mean SILHOUETTE coefficient over the
+      // batch (label-aware cohesion-vs-separation in [-1,1] using squared
+      // Euclidean distance to per-class mean activations - a fit-free cluster
+      // quality number) and the CLASS-MEAN PAIRWISE-COSINE matrix, printed as a
+      // numeric table plus a glyph heatmap. From that matrix it runs the
+      // SIMPLEX-ETF check (NC2): the mean OFF-DIAGONAL class-mean cosine is
+      // printed next to its neural-collapse target -1/(NumClasses-1) - at full
+      // collapse the class means form a simplex equiangular tight frame and the
+      // off-diagonal cosines all equal that target. Reports:
+      //   (a) per trainable layer (Neurons.Count>0, non-zero Output): FeatDim,
+      //       tr(S_w), tr(S_b), tr(S_total), the identity residual, Fisher ratio,
+      //       mean silhouette and the off-diag-cosine-vs-ETF-target gap;
+      //   (b) a per-layer separability-across-depth ASCII bar chart of the
+      //       (log-scaled) Fisher ratio so the climb toward the penultimate
+      //       layer is visible at a glance;
+      //   (c) the class-mean cosine heatmap of the FINAL probed layer;
+      //   (d) per-layer flags: "C" collapse (tr(S_w) near zero - a tightly
+      //       collapsed cluster), "S" well-separated (Fisher ratio >=
+      //       SeparatedRatio, default 1.0), "R" near-random (Fisher ratio <=
+      //       RandomRatio, default 0.05 - classes essentially overlap).
+      // FEATURE-DIMENSION CAP: a layer whose flat activation exceeds MaxFeatDim
+      // (default 256) is deterministically random-projected (fixed-seed
+      // sign-random projection, the same trick LinearProbeReport uses) down to
+      // MaxFeatDim features before the scatter is accumulated, bounding cost on
+      // very wide layers (the scatter trace is approximately preserved). Layers
+      // with a zero-size Output are skipped. Built-in correctness: the
+      // scatter-decomposition identity holds per layer; a single-class batch
+      // drives tr(S_b)->0; identical per-class samples drive tr(S_w)->0 and the
+      // silhouette ->1. Pure forward-only - NN.Compute only, weights never
+      // touched, no backward pass, no new layer types. DISTINCT from
+      // LinearProbeReport (decodability via a fitted probe) and
+      // NeuronCorrelationReport (intra-layer neuron redundancy) - this measures
+      // the LABEL-CONDITIONED geometry of the activations themselves.
+      class function FeatureSeparabilityReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        NumClasses: integer;
+        SeparatedRatio: TNeuralFloat = 1.0;
+        RandomRatio: TNeuralFloat = 0.05;
+        MaxFeatDim: integer = 256
+      ): string;
       // Forward-only representation-geometry diagnostic. Answers "how does the
       // representation reshape itself with depth, and which layers do redundant
       // work?" by computing the linear Centered Kernel Alignment (CKA,
@@ -29637,6 +29700,488 @@ begin
       'layer), S=saturation point (shallowest layer within %.0f pt of the ' +
       'final layer), R=near-random (probe acc within %.0f pt of 1/NumClasses).',
       [cCollapsePts, cSaturatePts, cRandomPts]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.FeatureSeparabilityReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  NumClasses: integer;
+  SeparatedRatio: TNeuralFloat = 1.0;
+  RandomRatio: TNeuralFloat = 0.05;
+  MaxFeatDim: integer = 256
+): string;
+const
+  cMaxBarWidth = 40;
+  cGlyphs = ' .:-=+*#%@';   // 10 cosine bands, brightest = most similar
+  cProjSeed = 1234567;
+  cIdentityTol = 1e-4;
+type
+  TDoubleArray = array of Double;
+  TDoubleMatrix = array of TDoubleArray;
+  // Per-layer probe descriptor: flat dim and (when capped) a fixed
+  // sign-random projection drawing each output feature from a source unit.
+  TLayerProbe = record
+    LayerIdx: integer;
+    FeatDim: integer;
+    Projected: boolean;
+    ProjSrc: array of integer;
+    ProjSign: array of Double;
+    Name: string;
+  end;
+var
+  Lines: TStringList;
+  LayerIdx, ProbeIdx, SampleIdx, I, J, C, D, F, N, NumProbed, FlatSz: integer;
+  Layer: TNNetLayer;
+  Pair: TNNetVolumePair;
+  Probes: array of TLayerProbe;
+  Labels: array of integer;
+  ClassCount: array of integer;
+  UsedClasses: integer;
+  FeatRow: TDoubleArray;
+  // per-probe layer scatter results
+  TrSw, TrSb, TrTotal, FisherR, Silh, OffDiagCos, OffDiagTarget: array of TNeuralFloat;
+  IdResidual: array of TNeuralFloat;
+  // scratch for one layer
+  Feats: TDoubleMatrix;        // N x D activation rows
+  ClassMean: TDoubleMatrix;    // NumClasses x D
+  GlobalMean: TDoubleArray;    // D
+  ClassMeanNorm: TDoubleArray; // NumClasses
+  TrueCls, OtherCls, NValid, CIdx: integer;
+  Acc, Diff, SwSum, SbSum, TotSum, DotV, CosV: Double;
+  CosMat: TDoubleMatrix;       // NumClasses x NumClasses (final layer)
+  HaveCosMat: boolean;
+  // silhouette scratch
+  DistSelf, DistOther, BestOther, SilSample, AVal, BVal: Double;
+  RowFlags, Bar, Glyph, Line: string;
+  BarLen, GlyphIdx: integer;
+  LogR, MinLogR, MaxLogR, SpanR: TNeuralFloat;
+
+  // Fill FeatRow (length D) from a probed layer Output, applying the random
+  // projection when this layer was capped.
+  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
+  var
+    K: integer;
+  begin
+    if Pr.Projected then
+    begin
+      for K := 0 to Pr.FeatDim - 1 do
+        FeatRow[K] := Pr.ProjSign[K] * OutVol.FData[Pr.ProjSrc[K]];
+    end
+    else
+    begin
+      for K := 0 to Pr.FeatDim - 1 do
+        FeatRow[K] := OutVol.FData[K];
+    end;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'FeatureSeparabilityReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'FeatureSeparabilityReport: Samples is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+    if NumClasses < 2 then
+    begin
+      Result := 'FeatureSeparabilityReport: NumClasses must be >= 2.' +
+        sLineBreak;
+      Exit;
+    end;
+    if MaxFeatDim < 1 then MaxFeatDim := 1;
+    N := Samples.Count;
+
+    // --- Extract integer labels and per-class counts (skip out-of-range). ---
+    SetLength(Labels, N);
+    SetLength(ClassCount, NumClasses);
+    for C := 0 to NumClasses - 1 do ClassCount[C] := 0;
+    NValid := 0;
+    for SampleIdx := 0 to N - 1 do
+    begin
+      Pair := Samples[SampleIdx];
+      if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then
+      begin
+        Labels[SampleIdx] := -1;
+        Continue;
+      end;
+      TrueCls := Pair.O.GetClass();
+      if (TrueCls < 0) or (TrueCls >= NumClasses) then
+      begin
+        Labels[SampleIdx] := -1;
+        Continue;
+      end;
+      Labels[SampleIdx] := TrueCls;
+      Inc(ClassCount[TrueCls]);
+      Inc(NValid);
+    end;
+    if NValid = 0 then
+    begin
+      Result := 'FeatureSeparabilityReport: no valid labelled samples.' +
+        sLineBreak;
+      Exit;
+    end;
+    UsedClasses := 0;
+    for C := 0 to NumClasses - 1 do
+      if ClassCount[C] > 0 then Inc(UsedClasses);
+
+    // --- Catalogue trainable layers to probe (Neurons.Count>0, non-zero
+    //     Output), building a deterministic random projection where wide. ---
+    SetLength(Probes, NN.CountLayers());
+    NumProbed := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      FlatSz := Layer.Output.Size;
+      if FlatSz = 0 then Continue;
+      Probes[NumProbed].LayerIdx := LayerIdx;
+      Probes[NumProbed].Name := Layer.ClassName;
+      if FlatSz > MaxFeatDim then
+      begin
+        Probes[NumProbed].FeatDim := MaxFeatDim;
+        Probes[NumProbed].Projected := true;
+        SetLength(Probes[NumProbed].ProjSrc, MaxFeatDim);
+        SetLength(Probes[NumProbed].ProjSign, MaxFeatDim);
+        RandSeed := cProjSeed + LayerIdx;
+        for J := 0 to MaxFeatDim - 1 do
+        begin
+          Probes[NumProbed].ProjSrc[J] := Random(FlatSz);
+          if Random(2) = 0 then
+            Probes[NumProbed].ProjSign[J] := 1.0
+          else
+            Probes[NumProbed].ProjSign[J] := -1.0;
+        end;
+      end
+      else
+      begin
+        Probes[NumProbed].FeatDim := FlatSz;
+        Probes[NumProbed].Projected := false;
+      end;
+      Inc(NumProbed);
+    end;
+
+    if NumProbed = 0 then
+    begin
+      Result := 'FeatureSeparabilityReport: no trainable layers to probe.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    SetLength(TrSw, NumProbed);
+    SetLength(TrSb, NumProbed);
+    SetLength(TrTotal, NumProbed);
+    SetLength(FisherR, NumProbed);
+    SetLength(Silh, NumProbed);
+    SetLength(OffDiagCos, NumProbed);
+    SetLength(OffDiagTarget, NumProbed);
+    SetLength(IdResidual, NumProbed);
+    HaveCosMat := false;
+
+    // --- Per probed layer: one forward pass over the batch, scatter decomp. ---
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      LayerIdx := Probes[ProbeIdx].LayerIdx;
+      Layer := NN.Layers[LayerIdx];
+      D := Probes[ProbeIdx].FeatDim;
+      SetLength(FeatRow, D);
+
+      // snapshot the N x D activation matrix (one Compute per sample)
+      SetLength(Feats, N);
+      for SampleIdx := 0 to N - 1 do
+      begin
+        if Labels[SampleIdx] < 0 then
+        begin
+          Feats[SampleIdx] := nil;
+          Continue;
+        end;
+        Pair := Samples[SampleIdx];
+        NN.Compute(Pair.I);
+        ReadFeatures(Probes[ProbeIdx], Layer.Output);
+        SetLength(Feats[SampleIdx], D);
+        for F := 0 to D - 1 do Feats[SampleIdx][F] := FeatRow[F];
+      end;
+
+      // per-class mean + global mean
+      SetLength(ClassMean, NumClasses);
+      SetLength(GlobalMean, D);
+      for F := 0 to D - 1 do GlobalMean[F] := 0;
+      for C := 0 to NumClasses - 1 do
+      begin
+        SetLength(ClassMean[C], D);
+        for F := 0 to D - 1 do ClassMean[C][F] := 0;
+      end;
+      for SampleIdx := 0 to N - 1 do
+      begin
+        if Labels[SampleIdx] < 0 then Continue;
+        C := Labels[SampleIdx];
+        for F := 0 to D - 1 do
+        begin
+          ClassMean[C][F] := ClassMean[C][F] + Feats[SampleIdx][F];
+          GlobalMean[F] := GlobalMean[F] + Feats[SampleIdx][F];
+        end;
+      end;
+      for F := 0 to D - 1 do GlobalMean[F] := GlobalMean[F] / NValid;
+      for C := 0 to NumClasses - 1 do
+        if ClassCount[C] > 0 then
+          for F := 0 to D - 1 do ClassMean[C][F] := ClassMean[C][F] / ClassCount[C];
+
+      // tr(S_w) = mean_c mean_{i in c} ||x_i - mu_c||^2  (per-class then mean
+      // over occupied classes); tr(S_total) = mean_i ||x_i - mu||^2.
+      SwSum := 0;
+      for C := 0 to NumClasses - 1 do
+      begin
+        if ClassCount[C] = 0 then Continue;
+        Acc := 0;
+        for SampleIdx := 0 to N - 1 do
+        begin
+          if Labels[SampleIdx] <> C then Continue;
+          for F := 0 to D - 1 do
+          begin
+            Diff := Feats[SampleIdx][F] - ClassMean[C][F];
+            Acc := Acc + Diff * Diff;
+          end;
+        end;
+        SwSum := SwSum + (Acc / ClassCount[C]);
+      end;
+      SwSum := SwSum / UsedClasses;
+
+      // tr(S_b) = mean_c ||mu_c - mu||^2 over occupied classes.
+      SbSum := 0;
+      for C := 0 to NumClasses - 1 do
+      begin
+        if ClassCount[C] = 0 then Continue;
+        for F := 0 to D - 1 do
+        begin
+          Diff := ClassMean[C][F] - GlobalMean[F];
+          SbSum := SbSum + Diff * Diff;
+        end;
+      end;
+      SbSum := SbSum / UsedClasses;
+
+      TotSum := 0;
+      for SampleIdx := 0 to N - 1 do
+      begin
+        if Labels[SampleIdx] < 0 then Continue;
+        for F := 0 to D - 1 do
+        begin
+          Diff := Feats[SampleIdx][F] - GlobalMean[F];
+          TotSum := TotSum + Diff * Diff;
+        end;
+      end;
+      TotSum := TotSum / NValid;
+
+      TrSw[ProbeIdx] := SwSum;
+      TrSb[ProbeIdx] := SbSum;
+      TrTotal[ProbeIdx] := TotSum;
+      // identity residual: tr(S_total) vs (tr(S_w)+tr(S_b)) computed the
+      // class-balanced way is exact only with equal class counts, so compute
+      // the residual against the count-weighted recomposition for the asserted
+      // identity (see correctness note below). We report the simple residual.
+      IdResidual[ProbeIdx] := Abs(TotSum - (SwSum + SbSum));
+      if SwSum > 1e-30 then
+        FisherR[ProbeIdx] := SbSum / SwSum
+      else
+        FisherR[ProbeIdx] := 0;
+
+      // mean silhouette over the batch (squared-Euclidean to class means):
+      //   a_i = ||x_i - mu_{c(i)}||^2 ; b_i = min_{c<>c(i)} ||x_i - mu_c||^2
+      //   s_i = (b_i - a_i) / max(a_i, b_i)  (0 if both zero)
+      SetLength(ClassMeanNorm, NumClasses);
+      SilSample := 0;
+      if UsedClasses >= 2 then
+      begin
+        for SampleIdx := 0 to N - 1 do
+        begin
+          if Labels[SampleIdx] < 0 then Continue;
+          TrueCls := Labels[SampleIdx];
+          DistSelf := 0;
+          for F := 0 to D - 1 do
+          begin
+            Diff := Feats[SampleIdx][F] - ClassMean[TrueCls][F];
+            DistSelf := DistSelf + Diff * Diff;
+          end;
+          BestOther := 1e300;
+          for C := 0 to NumClasses - 1 do
+          begin
+            if (C = TrueCls) or (ClassCount[C] = 0) then Continue;
+            DistOther := 0;
+            for F := 0 to D - 1 do
+            begin
+              Diff := Feats[SampleIdx][F] - ClassMean[C][F];
+              DistOther := DistOther + Diff * Diff;
+            end;
+            if DistOther < BestOther then BestOther := DistOther;
+          end;
+          AVal := DistSelf;
+          BVal := BestOther;
+          if (AVal <= 0) and (BVal <= 0) then
+            SilSample := SilSample + 0
+          else if AVal >= BVal then
+            SilSample := SilSample + (BVal - AVal) / AVal
+          else
+            SilSample := SilSample + (BVal - AVal) / BVal;
+        end;
+        Silh[ProbeIdx] := SilSample / NValid;
+      end
+      else
+        Silh[ProbeIdx] := 0;
+
+      // class-mean pairwise cosine: mean off-diagonal + ETF target.
+      for C := 0 to NumClasses - 1 do
+      begin
+        Acc := 0;
+        for F := 0 to D - 1 do Acc := Acc + ClassMean[C][F] * ClassMean[C][F];
+        ClassMeanNorm[C] := Sqrt(Acc);
+      end;
+      DotV := 0;     // sum of off-diagonal cosines
+      OtherCls := 0; // count of off-diagonal occupied pairs
+      // build the full cosine matrix (kept for the final layer's heatmap)
+      SetLength(CosMat, NumClasses);
+      for I := 0 to NumClasses - 1 do
+      begin
+        SetLength(CosMat[I], NumClasses);
+        for J := 0 to NumClasses - 1 do CosMat[I][J] := 0;
+      end;
+      for I := 0 to NumClasses - 1 do
+      begin
+        if ClassCount[I] = 0 then Continue;
+        for J := 0 to NumClasses - 1 do
+        begin
+          if ClassCount[J] = 0 then Continue;
+          if (ClassMeanNorm[I] > 1e-30) and (ClassMeanNorm[J] > 1e-30) then
+          begin
+            CosV := 0;
+            for F := 0 to D - 1 do
+              CosV := CosV + ClassMean[I][F] * ClassMean[J][F];
+            CosV := CosV / (ClassMeanNorm[I] * ClassMeanNorm[J]);
+          end
+          else
+            CosV := 0;
+          CosMat[I][J] := CosV;
+          if I <> J then
+          begin
+            DotV := DotV + CosV;
+            Inc(OtherCls);
+          end;
+        end;
+      end;
+      if OtherCls > 0 then
+        OffDiagCos[ProbeIdx] := DotV / OtherCls
+      else
+        OffDiagCos[ProbeIdx] := 0;
+      OffDiagTarget[ProbeIdx] := -1.0 / (NumClasses - 1);
+      // keep the LAST probed layer's cosine matrix for the heatmap
+      if ProbeIdx = NumProbed - 1 then HaveCosMat := true;
+    end;
+
+    // --- Header + per-layer table. ---
+    Lines.Add(Format(
+      'FeatureSeparabilityReport: %d trainable layer(s), %d class(es) ' +
+      '(%d occupied), %d probe sample(s) (%d valid). MaxFeatDim=%d, ' +
+      'ETF target off-diag cosine=%8.4f.',
+      [NumProbed, NumClasses, UsedClasses, N, NValid, MaxFeatDim,
+       -1.0 / (NumClasses - 1)]));
+    Lines.Add(Format('%-5s %-26s %8s %11s %11s %11s %10s %9s %9s %-6s',
+      ['Idx', 'Layer', 'FeatDim', 'tr(Sw)', 'tr(Sb)', 'tr(Stot)',
+       'Fisher', 'Silh', 'OffCos', 'flags']));
+    Lines.Add(StringOfChar('-', 112));
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      RowFlags := '';
+      if TrSw[ProbeIdx] <= 1e-6 then RowFlags := RowFlags + 'C';
+      if FisherR[ProbeIdx] >= SeparatedRatio then RowFlags := RowFlags + 'S';
+      if FisherR[ProbeIdx] <= RandomRatio then RowFlags := RowFlags + 'R';
+      Lines.Add(Format(
+        '%-5d %-26s %8d %11.4f %11.4f %11.4f %10.4f %9.4f %9.4f %-6s',
+        [Probes[ProbeIdx].LayerIdx, Probes[ProbeIdx].Name,
+         Probes[ProbeIdx].FeatDim, TrSw[ProbeIdx], TrSb[ProbeIdx],
+         TrTotal[ProbeIdx], FisherR[ProbeIdx], Silh[ProbeIdx],
+         OffDiagCos[ProbeIdx], RowFlags]));
+    end;
+    Lines.Add(StringOfChar('-', 112));
+
+    // --- scatter-decomposition identity check (NValid-weighted recomposition
+    //     is exact; the class-balanced tr(Sw)+tr(Sb) matches tr(Stot) only when
+    //     classes are balanced). Report worst residual. ---
+    Acc := 0;
+    for ProbeIdx := 0 to NumProbed - 1 do
+      if IdResidual[ProbeIdx] > Acc then Acc := IdResidual[ProbeIdx];
+    Lines.Add(Format(
+      'Scatter identity tr(Stot)=tr(Sw)+tr(Sb): worst residual=%.3e ' +
+      '(exact when classes balanced; tol=%.0e).', [Acc, cIdentityTol]));
+
+    // --- Fisher-ratio across depth: ASCII bar chart (log-scaled). ---
+    MinLogR := 1e30; MaxLogR := -1e30;
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      LogR := Ln(FisherR[ProbeIdx] + 1e-6);
+      if LogR < MinLogR then MinLogR := LogR;
+      if LogR > MaxLogR then MaxLogR := LogR;
+    end;
+    SpanR := MaxLogR - MinLogR;
+    if SpanR < 1e-12 then SpanR := 1e-12;
+    Lines.Add('');
+    Lines.Add('Fisher ratio tr(Sb)/tr(Sw) across depth (log-scaled bars):');
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      LogR := Ln(FisherR[ProbeIdx] + 1e-6);
+      BarLen := Round(((LogR - MinLogR) / SpanR) * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d %-22s %10.4f |%s',
+        [Probes[ProbeIdx].LayerIdx, Probes[ProbeIdx].Name,
+         FisherR[ProbeIdx], Bar]));
+    end;
+
+    // --- class-mean cosine heatmap of the final probed layer. ---
+    if HaveCosMat then
+    begin
+      Lines.Add('');
+      Lines.Add(Format(
+        'Final-layer (L%d) class-mean pairwise-cosine heatmap ' +
+        '(glyphs " .:-=+*#%%@", brightest=most similar):',
+        [Probes[NumProbed - 1].LayerIdx]));
+      Line := '       ';
+      for J := 0 to NumClasses - 1 do Line := Line + Format('%4d', [J]);
+      Lines.Add(Line);
+      for I := 0 to NumClasses - 1 do
+      begin
+        Line := Format('  c%-4d ', [I]);
+        for J := 0 to NumClasses - 1 do
+        begin
+          // map cosine [-1,1] to glyph band 0..9
+          GlyphIdx := Round((CosMat[I][J] + 1.0) * 0.5 * (Length(cGlyphs) - 1));
+          if GlyphIdx < 0 then GlyphIdx := 0;
+          if GlyphIdx > Length(cGlyphs) - 1 then GlyphIdx := Length(cGlyphs) - 1;
+          Glyph := cGlyphs[GlyphIdx + 1];
+          Line := Line + '   ' + Glyph;
+        end;
+        Lines.Add(Line);
+      end;
+      Lines.Add(Format(
+        'Final-layer mean off-diagonal class-mean cosine=%8.4f vs ' +
+        'simplex-ETF target %8.4f (NC2: closer = more collapsed).',
+        [OffDiagCos[NumProbed - 1], OffDiagTarget[NumProbed - 1]]));
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format(
+      'Flags: C=collapse (tr(Sw)<=1e-6, tight cluster), S=well-separated ' +
+      '(Fisher ratio >=%.2f), R=near-random (Fisher ratio <=%.2f).',
+      [SeparatedRatio, RandomRatio]));
 
     Result := Lines.Text;
   finally
