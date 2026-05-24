@@ -1082,6 +1082,60 @@ breakdown:
       Pairs naturally with the open lottery-ticket / grokking experiments
       ([[WeightSpectrumReport]]) — watching `tr(S_w)` collapse is the cleanest
       single-number window into the terminal phase of training.
+- [ ] TNNet.PredictionDepthReport(NN, Support, SupportLabels, Queries
+      [, K, QueryLabels]) — a **per-example difficulty** diagnostic built on
+      the *prediction depth* of Baldock, Maennel & Neyshabur 2021 ("Deep
+      Learning Through the Lens of Example Difficulty"), answering a question
+      none of the landed reports answer: *"at how deep a layer does the network
+      actually make up its mind about THIS example?"* — a per-sample resolution
+      depth, not a per-layer aggregate. The recipe is forward-only and
+      non-parametric: run one forward pass over a labelled **support** batch and
+      over the **query** batch, snapshot each layer's flattened activation, and
+      for every query, at every trainable layer, take a **k-NN vote** (default
+      K=5, cosine distance) over the support activations at that same layer. The
+      *prediction depth* of a query is the index of the **shallowest layer after
+      which the k-NN vote agrees with the network's final argmax and never
+      disagrees again** (deeper layers all confirm it) — easy examples are
+      decided early (shallow depth), hard / ambiguous / mislabelled examples stay
+      contested until the last layers (deep depth). Reports: a 10-bin ASCII
+      histogram of prediction depth across the query batch, mean / median depth,
+      the per-layer "newly-resolved" count (how many queries first lock in at
+      each layer — a depth-vs-layer profile), the K deepest (= hardest) query
+      indices as a ready-made hard-example / relabel-candidate queue, and — when
+      `QueryLabels` are supplied — a correctness cross-tab (mean prediction depth
+      of correctly vs incorrectly classified queries; the literature's headline
+      result is that depth correlates with error and with margin). Over-wide
+      layers are random-projected to a `MaxFeatDim` cap (default 256) to bound
+      the distance cost, reusing the projection trick already in
+      [[LinearProbeReport]]. Built-in correctness checks: feeding the **support
+      set as its own queries** must give every sample a finite depth and the
+      final-layer k-NN vote must match the network argmax for ≥ a high fraction
+      (the support is its own nearest neighbour at distance 0); a query whose
+      final argmax is already the majority vote at layer 0 reads depth 0; and a
+      one-class support set drives every depth to 0 (trivially agreeing). The
+      story for the example: at fresh init prediction depths pile up at the
+      LAST layer (nothing is resolved early — the histogram is right-skewed),
+      while after training the mass shifts shallow for the well-separated
+      clusters and a hard / label-noised subset keeps a deep tail — example
+      difficulty made visible. **Distinct from** [[LinearProbeReport]] (fits a
+      *parametric* ridge classifier per layer and reports per-layer *accuracy* /
+      decodability — a global "where does the net become linearly separable?"
+      number, not a per-example depth, and it needs a matrix solve where this
+      needs only distances), from `FeatureSeparabilityReport` (per-layer *cluster
+      geometry*, label-aware but aggregate, no per-sample score), from
+      `TopLogitMarginReport` (output-logit margin only — a confidence number at
+      the *last* layer, with no notion of *which* layer resolved the example),
+      and from `MCDropoutUncertaintyReport` (stochastic epistemic uncertainty,
+      not a deterministic depth). Follows the introspection-report-pattern:
+      declaration + impl in neuralnetwork.pas, a `examples/PredictionDepth/` demo
+      on a synthetic multi-class 2D-blob set (a clean split plus a deliberately
+      label-noised subset so the easy-shallow / hard-deep contrast and the
+      correct-vs-incorrect depth gap are visible in one run), and a smoke test in
+      tests/ (non-empty report, expected header, nil-NN graceful return, plus the
+      support-as-its-own-queries finite-depth / final-layer-agreement assertion).
+      Pairs naturally with the active-learning queue use of
+      [[MCDropoutUncertaintyReport]] and the hard-example pools of
+      `TopLogitMarginReport` / `ConfusionMatrixReport`.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
       label-free model selection) was simplified to a fresh-vs-trained contrast
