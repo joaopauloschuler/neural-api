@@ -93,6 +93,7 @@ type
     procedure TestSaliencyReportSmoke;
     procedure TestDecisionBoundaryReportSmoke;
     procedure TestCalibrationReportSmoke;
+    procedure TestFisherImportanceReportSmoke;
   end;
 
 implementation
@@ -2158,6 +2159,115 @@ begin
     AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
   finally
     Inputs.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestFisherImportanceReportSmoke;
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  Report: string;
+  Ep, I, C: integer;
+  EffStart, EffEnd, ParamStart, ParamEnd: integer;
+  EffStr, ParamStr: string;
+  EffVal, ParamVal: TNeuralFloat;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-1.5, -1.5), (1.5, 1.5), (1.5, -1.5));
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN handled gracefully.
+  Report := TNNet.FisherImportanceReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    Report := TNNet.FisherImportanceReport(NN, Samples);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Build a labelled 3-cluster set.
+    RandSeed := 1234;
+    for C := 0 to 2 do
+      for I := 1 to 40 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Train briefly so the Fisher signal is non-degenerate.
+    for Ep := 1 to 30 do
+      for I := 0 to Samples.Count - 1 do
+      begin
+        NN.Compute(Samples[I].I);
+        NN.Backpropagate(Samples[I].O);
+      end;
+
+    Report := TNNet.FisherImportanceReport(NN, Samples);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('FisherImportanceReport', Report) > 0);
+    AssertTrue('empirical Fisher mode present',
+      Pos('empirical Fisher', Report) > 0);
+    AssertTrue('FisherMass column present', Pos('FisherMass', Report) > 0);
+    AssertTrue('participation-ratio line present',
+      Pos('Effective parameter count', Report) > 0);
+    AssertTrue('log10 histogram present',
+      Pos('log10(Fisher) histogram', Report) > 0);
+    AssertTrue('flags legend present', Pos('H=high-importance', Report) > 0);
+    AssertTrue('trainable FC layer reported',
+      Pos('TNNetFullConnectReLU', Report) > 0);
+
+    // Correctness: the effective parameter count (participation ratio) must lie
+    // in (0, NumParams]. Parse "= <eff> / <num> (" out of the report.
+    EffStart := Pos('Effective parameter count (participation ratio) = ',
+      Report);
+    AssertTrue('participation line found', EffStart > 0);
+    EffStart := EffStart +
+      Length('Effective parameter count (participation ratio) = ');
+    EffEnd := PosEx(' /', Report, EffStart);
+    AssertTrue('eff terminator found', EffEnd > EffStart);
+    EffStr := Trim(Copy(Report, EffStart, EffEnd - EffStart));
+    EffVal := StrToFloatDef(EffStr, -1, FS);
+
+    ParamStart := EffEnd + 2;
+    ParamEnd := PosEx(' (', Report, ParamStart);
+    AssertTrue('param terminator found', ParamEnd > ParamStart);
+    ParamStr := Trim(Copy(Report, ParamStart, ParamEnd - ParamStart));
+    ParamVal := StrToFloatDef(ParamStr, -1, FS);
+
+    AssertTrue('effective param count finite',
+      (not IsNan(EffVal)) and (not IsInfinite(EffVal)));
+    AssertTrue('total param count positive', ParamVal > 0);
+    AssertTrue('participation ratio > 0', EffVal > 0);
+    AssertTrue('participation ratio <= total params (+eps)',
+      EffVal <= ParamVal + 1e-3);
+
+    // Predicted-label mode also produces a well-formed report.
+    Report := TNNet.FisherImportanceReport(NN, Samples, False);
+    AssertTrue('predicted-label mode non-empty', Length(Report) > 0);
+    AssertTrue('predicted-label mode tagged',
+      Pos('predicted-label', Report) > 0);
+  finally
+    Samples.Free;
     NN.Free;
   end;
 end;

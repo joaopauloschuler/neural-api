@@ -3846,6 +3846,48 @@ type
         Samples: TNNetVolumeList;
         DeadThreshold: TNeuralFloat = 1e-6
       ): string;
+      // Diagonal (empirical) Fisher-information importance diagnostic. Given a
+      // trained classifier NN and a labelled probe batch Samples (input volume
+      // + one-hot target pairs), estimates the diagonal Fisher information of
+      // every trainable parameter
+      //   F[theta] = E_x[ (d log p(y|x) / d theta)^2 ]
+      // by accumulating per-sample SQUARED parameter gradients over the batch
+      // (one forward + one backward per sample). The label the gradient is
+      // taken w.r.t. is, per sample, either the TRUE label (argmax of the
+      // one-hot target; UseTrueLabel = true, the default) or the model's
+      // PREDICTED label (argmax of the forward output; UseTrueLabel = false) -
+      // both yield the *empirical* Fisher (a one-sample-per-x Monte-Carlo
+      // estimate of the true Fisher). The network is FROZEN: weights are never
+      // stepped; only the transient per-parameter gradient tensors populated by
+      // Backpropagate (Neurons[*].Delta / FBiasDelta, divided by the layer
+      // LearningRate to undo the -LR scaling) are read, and deltas are cleared
+      // between samples. Reports:
+      //   (a) per trainable layer: total Fisher mass and its share of the
+      //       network total - the "which layers can I least afford to prune"
+      //       ranking;
+      //   (b) per layer: mean and max per-parameter Fisher and a near-zero
+      //       count (params with Fisher <= ZeroThreshold are free to
+      //       prune / reuse);
+      //   (c) a 10-bin ASCII histogram of log10(Fisher) across all (positive)
+      //       parameters, showing the heavy-tailed structure;
+      //   (d) the effective-parameter-count = participation ratio
+      //       (sum F)^2 / sum F^2 (in [1, NumParams]) - a one-number
+      //       concentration proxy;
+      //   (e) per-layer flags: "H" high-importance (layer in the top 10% of
+      //       layer Fisher mass), "P" prunable (> PrunableFrac of the layer's
+      //       params have near-zero Fisher), "D" dead layer (whole-layer
+      //       Fisher <= ZeroThreshold).
+      // The accumulated per-parameter Fisher is exactly the curvature term an
+      // Elastic-Weight-Consolidation (EWC) penalty consumes downstream. Pure
+      // forward+backward measurement on a frozen net - no input-gradient
+      // enablement needed (unlike SaliencyReport), no new layer types.
+      class function FisherImportanceReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        UseTrueLabel: boolean = true;
+        ZeroThreshold: TNeuralFloat = 1e-12;
+        PrunableFrac: TNeuralFloat = 0.5
+      ): string;
       // Per-trainable-layer weight-value histogram diagnostic. For every
       // layer with weights (Neurons.Count > 0 and Weights.Size > 0) walks
       // the neuron weights (biases excluded) and reports min, max, mean,
@@ -24470,6 +24512,362 @@ begin
         [TotalDead, TotalUnits, (TotalDead / TotalUnits) * 100.0]))
     else
       Lines.Add('Total dead across net: 0 / 0.');
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.FisherImportanceReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  UseTrueLabel: boolean = true;
+  ZeroThreshold: TNeuralFloat = 1e-12;
+  PrunableFrac: TNeuralFloat = 0.5
+): string;
+const
+  cEps = 1e-30;
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cHeavyFraction = 0.10;
+var
+  Lines: TStringList;
+  LayerIdx, NeuronIdx, K, SampleIdx, BinIdx: integer;
+  FlatIdx, P: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  Pair: TNNetVolumePair;
+  LastLayer: TNNetLayer;
+  LabelClass, OutSize, ParamsThisLayer: integer;
+  LR, G, FVal: TNeuralFloat;
+  Target: TNNetVolume;
+  // per-trainable-layer accumulators (indexed by layer index)
+  LayerFisherSum: array of TNeuralFloat;   // sum of mean-F over the layer
+  LayerFisherMax: array of TNeuralFloat;   // max per-param mean-F in the layer
+  LayerNearZero: array of integer;         // params with mean-F <= ZeroThr
+  LayerParamCnt: array of integer;         // trainable params in the layer
+  LayerHasParams: array of boolean;
+  LayerName: array of string;
+  FlatBase: array of integer;              // flat offset of each layer's params
+  // per-parameter Fisher (one float per trainable parameter of the whole net)
+  ParamFisher: array of TNeuralFloat;
+  // network-wide accumulators
+  NetFisherSum, NetFisherSqSum: TNeuralFloat; // sum F and sum F^2 (for PR)
+  NetParamCnt, NetNearZero, TrainableLayers, ProcessedSamples: integer;
+  EffParams, MassThreshold, LayerMeanF, LayerShare, NearFrac: TNeuralFloat;
+  // log10(F) histogram
+  HistMin, HistMax, Span, V: TNeuralFloat;
+  Bins: array of integer;
+  MaxBin, BarLen, PositiveCount, HaveRange: integer;
+  BinLo, BinHi: TNeuralFloat;
+  Bar, RowFlags, LabelMode: string;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'FisherImportanceReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'FisherImportanceReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'FisherImportanceReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    SetLength(LayerFisherSum, NN.CountLayers());
+    SetLength(LayerFisherMax, NN.CountLayers());
+    SetLength(LayerNearZero, NN.CountLayers());
+    SetLength(LayerParamCnt, NN.CountLayers());
+    SetLength(LayerHasParams, NN.CountLayers());
+    SetLength(LayerName, NN.CountLayers());
+    SetLength(FlatBase, NN.CountLayers());
+
+    NetParamCnt := 0;
+    TrainableLayers := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      LayerFisherSum[LayerIdx] := 0;
+      LayerFisherMax[LayerIdx] := 0;
+      LayerNearZero[LayerIdx] := 0;
+      LayerParamCnt[LayerIdx] := 0;
+      LayerHasParams[LayerIdx] := false;
+      LayerName[LayerIdx] := Layer.ClassName;
+      FlatBase[LayerIdx] := NetParamCnt;
+      if Layer.Neurons.Count = 0 then Continue;
+      ParamsThisLayer := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        // +1 per neuron for the bias parameter.
+        ParamsThisLayer := ParamsThisLayer +
+          Layer.Neurons[NeuronIdx].Delta.Size + 1;
+      if ParamsThisLayer = 0 then Continue;
+      LayerHasParams[LayerIdx] := true;
+      LayerParamCnt[LayerIdx] := ParamsThisLayer;
+      NetParamCnt := NetParamCnt + ParamsThisLayer;
+      Inc(TrainableLayers);
+    end;
+
+    if TrainableLayers = 0 then
+    begin
+      Result := 'FisherImportanceReport: no trainable layers with parameters.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // One bounded scratch float per trainable parameter; accumulates the
+    // sum-over-batch of squared per-parameter gradients.
+    SetLength(ParamFisher, NetParamCnt);
+    for P := 0 to NetParamCnt - 1 do ParamFisher[P] := 0;
+
+    // Why batch update: Delta accumulates -LR * gradient only when batch update
+    // is on; otherwise the gradient is consumed inline and never lands in Delta
+    // where we can read it. We divide back out by LR to recover the raw
+    // gradient. The network is NEVER stepped (no UpdateWeights call) so the
+    // trained weights are left exactly as they were.
+    NN.SetBatchUpdate(true);
+
+    LastLayer := NN.GetLastLayer();
+    OutSize := LastLayer.Output.Size;
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+    ProcessedSamples := 0;
+    try
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        Pair := Samples[SampleIdx];
+        if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+
+        NN.ClearDeltas();
+        NN.Compute(Pair.I);
+
+        // Label the gradient is taken w.r.t. (true vs predicted): both give the
+        // empirical Fisher (a one-sample Monte-Carlo estimate per x).
+        if UseTrueLabel then
+          LabelClass := Pair.O.GetClass()
+        else
+          LabelClass := LastLayer.Output.GetClass();
+        if (LabelClass < 0) or (LabelClass >= OutSize) then Continue;
+
+        Target.Fill(0);
+        Target.Raw[LabelClass] := 1.0;
+        NN.Backpropagate(Target);
+
+        // Accumulate squared per-parameter gradients into the flat array.
+        for LayerIdx := 0 to NN.GetLastLayerIdx() do
+        begin
+          if not LayerHasParams[LayerIdx] then Continue;
+          Layer := NN.Layers[LayerIdx];
+          LR := Layer.LearningRate;
+          if LR <= 0 then LR := 1.0;
+          P := FlatBase[LayerIdx];
+          for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          begin
+            Neuron := Layer.Neurons[NeuronIdx];
+            for K := 0 to Neuron.Delta.Size - 1 do
+            begin
+              G := Neuron.Delta.FData[K] / LR;
+              ParamFisher[P] := ParamFisher[P] + G * G;
+              Inc(P);
+            end;
+            // bias parameter
+            G := Neuron.FBiasDelta / LR;
+            ParamFisher[P] := ParamFisher[P] + G * G;
+            Inc(P);
+          end;
+        end;
+        Inc(ProcessedSamples);
+      end;
+    finally
+      Target.Free;
+    end;
+
+    if ProcessedSamples = 0 then
+    begin
+      Result := 'FisherImportanceReport: no usable labelled samples.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Reduce per-parameter mean Fisher into per-layer / network stats. ---
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    NetFisherSum := 0;
+    NetFisherSqSum := 0;
+    NetNearZero := 0;
+    PositiveCount := 0;
+    HaveRange := 0;
+    HistMin := 0;
+    HistMax := 0;
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LayerIdx] then Continue;
+      P := FlatBase[LayerIdx];
+      for FlatIdx := 0 to LayerParamCnt[LayerIdx] - 1 do
+      begin
+        FVal := ParamFisher[P] / ProcessedSamples; // mean Fisher per param
+        ParamFisher[P] := FVal;                    // store back the mean
+        LayerFisherSum[LayerIdx] := LayerFisherSum[LayerIdx] + FVal;
+        if FVal > LayerFisherMax[LayerIdx] then LayerFisherMax[LayerIdx] := FVal;
+        if FVal <= ZeroThreshold then
+        begin
+          Inc(LayerNearZero[LayerIdx]);
+          Inc(NetNearZero);
+        end;
+        NetFisherSum := NetFisherSum + FVal;
+        NetFisherSqSum := NetFisherSqSum + FVal * FVal;
+        if FVal > 0 then
+        begin
+          V := Log10(FVal + cEps);
+          if HaveRange = 0 then
+          begin
+            HistMin := V;
+            HistMax := V;
+            HaveRange := 1;
+          end
+          else
+          begin
+            if V < HistMin then HistMin := V;
+            if V > HistMax then HistMax := V;
+          end;
+          Inc(PositiveCount);
+        end;
+        Inc(P);
+      end;
+    end;
+
+    // Bin the log10(Fisher) values now that the range is known.
+    if PositiveCount > 0 then
+    begin
+      Span := HistMax - HistMin;
+      if Span <= 0 then Span := 1.0;
+      for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      begin
+        if not LayerHasParams[LayerIdx] then Continue;
+        P := FlatBase[LayerIdx];
+        for FlatIdx := 0 to LayerParamCnt[LayerIdx] - 1 do
+        begin
+          FVal := ParamFisher[P];
+          if FVal > 0 then
+          begin
+            V := Log10(FVal + cEps);
+            BinIdx := Trunc(((V - HistMin) / Span) * cBins);
+            if BinIdx < 0 then BinIdx := 0;
+            if BinIdx >= cBins then BinIdx := cBins - 1;
+            Inc(Bins[BinIdx]);
+          end;
+          Inc(P);
+        end;
+      end;
+    end;
+
+    // Effective parameter count = participation ratio (sum F)^2 / sum F^2.
+    if NetFisherSqSum > 0 then
+      EffParams := (NetFisherSum * NetFisherSum) / NetFisherSqSum
+    else
+      EffParams := 0;
+
+    // High-importance threshold: top 10% of the largest per-layer Fisher mass.
+    MassThreshold := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      if LayerHasParams[LayerIdx] then
+        if LayerFisherSum[LayerIdx] > MassThreshold then
+          MassThreshold := LayerFisherSum[LayerIdx];
+    MassThreshold := MassThreshold * (1.0 - cHeavyFraction);
+
+    // --- Report body ---
+    if UseTrueLabel then LabelMode := 'true-label'
+    else LabelMode := 'predicted-label';
+    Lines.Add(Format(
+      'FisherImportanceReport: %d trainable layer(s), %d param(s), ' +
+      '%d probe sample(s). Mode=%s (empirical Fisher).',
+      [TrainableLayers, NetParamCnt, ProcessedSamples, LabelMode]));
+    Lines.Add(Format('%-5s %-30s %10s %8s %12s %12s %10s %8s %-6s',
+      ['Idx', 'Layer', 'Params', 'Share%', 'FisherMass', 'meanF', 'maxF',
+       'Zero%', 'flags']));
+    Lines.Add(StringOfChar('-', 108));
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LayerIdx] then Continue;
+      if NetFisherSum > 0 then
+        LayerShare := (LayerFisherSum[LayerIdx] / NetFisherSum) * 100.0
+      else
+        LayerShare := 0;
+      if LayerParamCnt[LayerIdx] > 0 then
+        LayerMeanF := LayerFisherSum[LayerIdx] / LayerParamCnt[LayerIdx]
+      else
+        LayerMeanF := 0;
+      NearFrac := LayerNearZero[LayerIdx] / LayerParamCnt[LayerIdx];
+
+      RowFlags := '';
+      if (MassThreshold > 0) and (LayerFisherSum[LayerIdx] >= MassThreshold) then
+        RowFlags := RowFlags + 'H';
+      if NearFrac > PrunableFrac then
+        RowFlags := RowFlags + 'P';
+      if LayerFisherSum[LayerIdx] <= ZeroThreshold then
+        RowFlags := RowFlags + 'D';
+
+      Lines.Add(Format(
+        '%-5d %-30s %10d %7.2f%% %12.4e %12.4e %10.3e %7.1f%% %-6s',
+        [LayerIdx, LayerName[LayerIdx], LayerParamCnt[LayerIdx], LayerShare,
+         LayerFisherSum[LayerIdx], LayerMeanF, LayerFisherMax[LayerIdx],
+         NearFrac * 100.0, RowFlags]));
+    end;
+    Lines.Add(StringOfChar('-', 108));
+    Lines.Add(Format(
+      'Network Fisher mass=%.4e. Near-zero params: %d / %d (%.2f%%, ' +
+      'Fisher<=%g).',
+      [NetFisherSum, NetNearZero, NetParamCnt,
+       (NetNearZero / NetParamCnt) * 100.0, ZeroThreshold]));
+    Lines.Add(Format(
+      'Effective parameter count (participation ratio) = %.2f / %d ' +
+      '(%.2f%% of params carry the importance).',
+      [EffParams, NetParamCnt, (EffParams / NetParamCnt) * 100.0]));
+
+    // log10(Fisher) histogram across all positive-Fisher parameters.
+    Lines.Add('');
+    Lines.Add(Format(
+      'log10(Fisher) histogram across %d positive-Fisher param(s):',
+      [PositiveCount]));
+    if PositiveCount = 0 then
+      Lines.Add('  (no positive-Fisher parameters)')
+    else
+    begin
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+      Span := HistMax - HistMin;
+      if Span <= 0 then Span := 1.0;
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        BinLo := HistMin + BinIdx * (Span / cBins);
+        BinHi := HistMin + (BinIdx + 1) * (Span / cBins);
+        if MaxBin > 0 then
+          BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('  [%8.3f, %8.3f) | n=%6d %s',
+          [BinLo, BinHi, Bins[BinIdx], Bar]));
+      end;
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format(
+      'Flags: H=high-importance (top 10%% of layer Fisher mass), ' +
+      'P=prunable (>%.0f%% near-zero params), D=dead layer ' +
+      '(whole-layer Fisher ~ 0).',
+      [PrunableFrac * 100.0]));
 
     Result := Lines.Text;
   finally
