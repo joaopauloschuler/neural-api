@@ -258,24 +258,13 @@ breakdown:
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [X] TNNetDiagonalSSM — LANDED. Diagonal-state linear-recurrence
-      ("SSM-lite") sequence mixer, the first recurrent layer in the repo.
-      `h_t = a[d]*h_{t-1} + b[d]*x_t`, `y_t = c[d]*h_t + e[d]*x_t`; decay
-      `a = sigmoid(a_raw)` for unconditional stability. Forward is a
-      left-to-right sweep, backward is BPTT (right-to-left). Derives from
-      TNNetChannelTransformBase with four Depth-long weight vectors.
-      Numerical-gradient checks (input + all four weight tensors, max abs
-      err ~4.6e-3), SeqLen=1 feedthrough check, and serialization round-trip
-      in tests/TestNeuralNumerical.pas. Example at examples/DiagonalSSM/
-      prints the learned per-channel decay spectrum.
-      FOLLOW-UPS (still open):
-  - [ ] Add TNNetDiagonalSSM as the fourth contender in the open
-        "causal-conv vs token-shift vs SDPA on the same toy next-token
-        task" experiment — its selling point is matching attention quality
-        at linear cost.
-  - [ ] KV-cache / incremental-decode O(1)-per-step path for
-        TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
-        the SDPA incremental-decode notes above apply doubly here).
+- [ ] TNNetDiagonalSSM follow-up: add it as the fourth contender in the
+      open "causal-conv vs token-shift vs SDPA on the same toy next-token
+      task" experiment — its selling point is matching attention quality
+      at linear cost.
+- [ ] KV-cache / incremental-decode O(1)-per-step path for
+      TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
+      the SDPA incremental-decode notes above apply doubly here).
 #### Norm / regularization
 - [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
       `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
@@ -308,18 +297,9 @@ breakdown:
       fixed (non-trainable) binomial blur filter.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-- [X] TNNetMishLearnable — LANDED. `y = x*tanh(softplus(alpha*x))` with a
-      single learnable inner-scale alpha (default 1.0 reproduces TNNetMish).
-      Input + weight numerical-gradient checks and a non-default round-trip
-      in tests/TestNeuralNumerical.pas.
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [X] TNNetSoftPlusBetaLearnable — LANDED. Learnable-β variant of the
-      fixed-β TNNetSoftPlusBeta: `y = (1/β)·ln(1 + e^(βx))` with a single
-      learnable β (default 1.0), same sigmoid(βx) input-derivative path.
-      Input + weight numerical-gradient checks and a non-default round-trip
-      in tests/TestNeuralNumerical.pas.
 - [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
       with channel-wise learnable `(p1, p2, β)`. Generalizes Swish.
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
@@ -364,18 +344,6 @@ breakdown:
 ### Loss layers
 - [ ] TNNetLabelSmoothingLoss helper — pure target-side transform
       `(1 - eps) * one_hot + eps / NumClasses`.
-- [X] TNNetNLLLoss — LANDED. Companion to TNNetLogSoftMax, consuming
-      per-position log-probabilities over Depth. Forward is an identity
-      passthrough (derives from TNNetIdentity); Backpropagate recovers the
-      target from `logp - FOutputError` and writes the exact NLL gradient
-      `-target` per position, mirroring TNNetFocalLoss's target convention.
-      Tests pin the `-target` gradient and that a `LogSoftMax → NLLLoss`
-      stack matches `softmax(logits) - target` to 1e-4 (the stable
-      LogSoftMax+NLL = cross-entropy decomposition). NOTE: the consistency
-      test needed `TNNetInput.Create(1,1,4,1)` (the 4-arg pError=1 form) —
-      TNNetIdentity-derived layers size FOutputError from the previous
-      layer, so without input error-collection the chain's error volumes
-      stay size 1 and LogSoftMax's backward silently no-ops.
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
 - [ ] TNNetKLDivergence — `sum(p · log(p/q))` with stability clamps on q.
