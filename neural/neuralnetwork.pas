@@ -3917,6 +3917,52 @@ type
         IntgSteps: integer = 20;
         Seed: longword = 1234567
       ): string;
+      // Forward-only decision-boundary visualizer for a 2-input classifier.
+      // Given a trained net whose input layer is 2-D
+      // (TNNetInput.Create(2), i.e. SizeX*SizeY*Depth == 2) and a classifier
+      // head with NumClasses outputs, it sweeps a Gx x Gy grid (default 41x41)
+      // over an axis-aligned bounding box of the (x,y) input plane and runs ONE
+      // forward pass per grid cell, rendering the LEARNED FUNCTION over its
+      // whole input domain (not a statistic of a probe batch) as compact stdout
+      // ASCII art:
+      //   (a) a CLASS MAP: one glyph per grid cell = the argmax class at that
+      //       point (glyphs '0'..'9','A'..'Z'), so the carved-up decision
+      //       regions are directly visible;
+      //   (b) a CONFIDENCE-shaded overlay: the same grid but each cell's glyph
+      //       intensity (~10 buckets '.:-=+*#%@') is set by the top-1 softmax
+      //       probability when the head sums to ~1, or otherwise by the
+      //       normalised top1-top2 logit margin, so low-confidence boundary
+      //       bands show up as faint seams;
+      //   (c) a BOUNDARY-CELL count and an estimated total boundary length =
+      //       the number of grid cells whose 4-neighbours disagree on argmax —
+      //       a single scalar proxy for how convoluted the learned boundary is
+      //       (a near-linear separator gives a short boundary; an overfit wiggly
+      //       boundary gives a long one);
+      //   (d) optional PROBE-SET overlay: when Probes is supplied each sample is
+      //       stamped onto the grid by its TRUE class (argmax of the one-hot
+      //       target) so misclassified points stand out against the boundary;
+      //   (e) a CSV side-output ("x,y,argmax,top1prob" rows, one per grid cell)
+      //       appended as a clearly-delimited trailing section when EmitCsv is
+      //       true, mirroring the LearningRateFinder CSV convention, for
+      //       downstream plotting.
+      // The bounding box is auto-fitted (with a small margin) from Probes when
+      // supplied, else from the caller-supplied (xMin,xMax,yMin,yMax); if no
+      // probes are given and the box is degenerate it defaults to [-3,3]^2.
+      // GUARD: the input layer must be 2-D (SizeX*SizeY*Depth == 2); otherwise
+      // a clear error message string is returned (never crashes). Also guards
+      // nil NN gracefully. Pure forward-only — no backward pass, no training-
+      // time changes, no new layer types; the inspected weights are untouched.
+      class function DecisionBoundaryReport(
+        NN: TNNet;
+        Probes: TNNetVolumePairList = nil;
+        Gx: integer = 41;
+        Gy: integer = 41;
+        xMin: TNeuralFloat = 0;
+        xMax: TNeuralFloat = 0;
+        yMin: TNeuralFloat = 0;
+        yMax: TNeuralFloat = 0;
+        EmitCsv: boolean = False
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -25848,6 +25894,340 @@ begin
     if Noisy <> nil then Noisy.Free;
     if Scaled <> nil then Scaled.Free;
     if Baseline <> nil then Baseline.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.DecisionBoundaryReport(
+  NN: TNNet;
+  Probes: TNNetVolumePairList = nil;
+  Gx: integer = 41;
+  Gy: integer = 41;
+  xMin: TNeuralFloat = 0;
+  xMax: TNeuralFloat = 0;
+  yMin: TNeuralFloat = 0;
+  yMax: TNeuralFloat = 0;
+  EmitCsv: boolean = False
+): string;
+const
+  cClassGlyphs = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  cConfBuckets = ' .:-=+*#%@';   // 10 buckets, blank=lowest .. @=highest
+  cEps = 1e-9;
+  cMaxGrid = 201;                // sanity clamp so art/CSV stays bounded
+var
+  Lines: TStringList;
+  InVol, OutVol: TNNetVolume;
+  InputSize, NumClasses: integer;
+  ix, iy, ci, NeighIdx: integer;
+  vx, vy, BoxW, BoxH, MarginX, MarginY: TNeuralFloat;
+  Sum, Top1, Top2, Conf: TNeuralFloat;
+  ProbabilityHead: boolean;
+  // per-cell results, flat row-major [iy*Gx + ix]
+  ArgMax: array of integer;
+  TopProb: array of TNeuralFloat;
+  // probe overlay (true class per cell, -1 = none), and misclassified count
+  ProbeClass: array of integer;
+  BoundaryCells, NbX, NbY, NbIdx: integer;
+  CenterArg, ProbeMis, ProbeTot: integer;
+  HaveProbes: boolean;
+  RowStr: string;
+  Bucket: integer;
+  Glyph: char;
+  // bounding box auto-fit accumulators
+  P: TNNetVolumePair;
+  pIdx, tClass: integer;
+  px, py: TNeuralFloat;
+  GxLoc, GyLoc: integer;
+
+  function CellGlyph(Cls: integer): char;
+  begin
+    if (Cls >= 0) and (Cls < Length(cClassGlyphs)) then
+      Result := cClassGlyphs[Cls + 1]
+    else
+      Result := '?';
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  InVol := nil;
+  OutVol := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'DecisionBoundaryReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (NN.GetFirstLayer = nil) or (NN.GetLastLayer = nil) then
+    begin
+      Result := 'DecisionBoundaryReport: network has no layers.' + sLineBreak;
+      Exit;
+    end;
+
+    // GUARD: the input layer must be exactly 2-D.
+    InputSize := NN.GetFirstLayer.Output.Size;
+    if InputSize <> 2 then
+    begin
+      Result := Format(
+        'DecisionBoundaryReport: input layer must be 2-D ' +
+        '(SizeX*SizeY*Depth == 2); got %d. Use TNNetInput.Create(2).',
+        [InputSize]) + sLineBreak;
+      Exit;
+    end;
+
+    NumClasses := NN.GetLastLayer.Output.Size;
+    if NumClasses < 1 then
+    begin
+      Result := 'DecisionBoundaryReport: final layer has no outputs.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    GxLoc := Gx;
+    GyLoc := Gy;
+    if GxLoc < 2 then GxLoc := 2;
+    if GyLoc < 2 then GyLoc := 2;
+    if GxLoc > cMaxGrid then GxLoc := cMaxGrid;
+    if GyLoc > cMaxGrid then GyLoc := cMaxGrid;
+
+    HaveProbes := (Probes <> nil) and (Probes.Count > 0);
+
+    // Bounding box: auto-fit from probes when supplied, else use the
+    // caller-supplied box, else fall back to [-3,3]^2.
+    if HaveProbes then
+    begin
+      xMin := 1e30; xMax := -1e30; yMin := 1e30; yMax := -1e30;
+      for pIdx := 0 to Probes.Count - 1 do
+      begin
+        P := Probes[pIdx];
+        if (P = nil) or (P.I = nil) or (P.I.Size < 2) then Continue;
+        px := P.I.FData[0];
+        py := P.I.FData[1];
+        if px < xMin then xMin := px;
+        if px > xMax then xMax := px;
+        if py < yMin then yMin := py;
+        if py > yMax then yMax := py;
+      end;
+      // pad by 10% of the span on each side so probe points sit inside the grid.
+      MarginX := (xMax - xMin) * 0.1;
+      MarginY := (yMax - yMin) * 0.1;
+      if MarginX < cEps then MarginX := 1.0;
+      if MarginY < cEps then MarginY := 1.0;
+      xMin := xMin - MarginX; xMax := xMax + MarginX;
+      yMin := yMin - MarginY; yMax := yMax + MarginY;
+    end;
+    if (xMax - xMin) < cEps then begin xMin := -3.0; xMax := 3.0; end;
+    if (yMax - yMin) < cEps then begin yMin := -3.0; yMax := 3.0; end;
+
+    BoxW := xMax - xMin;
+    BoxH := yMax - yMin;
+
+    SetLength(ArgMax, GxLoc * GyLoc);
+    SetLength(TopProb, GxLoc * GyLoc);
+    SetLength(ProbeClass, GxLoc * GyLoc);
+    for ci := 0 to GxLoc * GyLoc - 1 do ProbeClass[ci] := -1;
+
+    InVol := TNNetVolume.Create(2, 1, 1);
+    OutVol := TNNetVolume.Create();
+
+    // Sweep the grid: one forward pass per cell.
+    for iy := 0 to GyLoc - 1 do
+    begin
+      vy := yMin + (iy / (GyLoc - 1)) * BoxH;
+      for ix := 0 to GxLoc - 1 do
+      begin
+        vx := xMin + (ix / (GxLoc - 1)) * BoxW;
+        InVol.FData[0] := vx;
+        InVol.FData[1] := vy;
+        NN.Compute(InVol);
+        OutVol.Copy(NN.GetLastLayer.Output);
+
+        // top1 / top2 of the raw output values.
+        Top1 := -1e30; Top2 := -1e30; Sum := 0;
+        NeighIdx := 0; // reuse as argmax index here
+        for ci := 0 to NumClasses - 1 do
+        begin
+          Sum := Sum + OutVol.FData[ci];
+          if OutVol.FData[ci] > Top1 then
+          begin
+            Top2 := Top1;
+            Top1 := OutVol.FData[ci];
+            NeighIdx := ci;
+          end
+          else if OutVol.FData[ci] > Top2 then
+            Top2 := OutVol.FData[ci];
+        end;
+        ArgMax[iy * GxLoc + ix] := NeighIdx;
+
+        // Confidence: top-1 softmax prob when the head sums to ~1 (probability
+        // head), otherwise a normalised top1-top2 logit margin in [0,1].
+        ProbabilityHead := (Abs(Sum - 1.0) < 1e-2) and (Top1 >= -cEps);
+        if ProbabilityHead then
+          Conf := Top1
+        else
+        begin
+          if NumClasses < 2 then
+            Conf := 1.0
+          else
+            // squash the (unbounded) margin into [0,1) so the overlay buckets.
+            Conf := (Top1 - Top2) / (1.0 + Abs(Top1 - Top2));
+        end;
+        if Conf < 0 then Conf := 0;
+        if Conf > 1 then Conf := 1;
+        TopProb[iy * GxLoc + ix] := Conf;
+      end;
+    end;
+
+    // Probe overlay: stamp each supplied sample onto the nearest grid cell by
+    // its TRUE class. Tally misclassified probes vs the learned argmax.
+    ProbeMis := 0; ProbeTot := 0;
+    if HaveProbes then
+    begin
+      for pIdx := 0 to Probes.Count - 1 do
+      begin
+        P := Probes[pIdx];
+        if (P = nil) or (P.I = nil) or (P.O = nil) or (P.I.Size < 2) then
+          Continue;
+        px := P.I.FData[0];
+        py := P.I.FData[1];
+        ix := Round(((px - xMin) / BoxW) * (GxLoc - 1));
+        iy := Round(((py - yMin) / BoxH) * (GyLoc - 1));
+        if ix < 0 then ix := 0; if ix > GxLoc - 1 then ix := GxLoc - 1;
+        if iy < 0 then iy := 0; if iy > GyLoc - 1 then iy := GyLoc - 1;
+        tClass := P.O.GetClass();
+        ProbeClass[iy * GxLoc + ix] := tClass;
+        Inc(ProbeTot);
+        if ArgMax[iy * GxLoc + ix] <> tClass then Inc(ProbeMis);
+      end;
+    end;
+
+    // Boundary cells: a cell counts as a boundary cell when any 4-neighbour
+    // disagrees with it on argmax.
+    BoundaryCells := 0;
+    for iy := 0 to GyLoc - 1 do
+      for ix := 0 to GxLoc - 1 do
+      begin
+        CenterArg := ArgMax[iy * GxLoc + ix];
+        for NeighIdx := 0 to 3 do
+        begin
+          NbX := ix; NbY := iy;
+          case NeighIdx of
+            0: NbX := ix - 1;
+            1: NbX := ix + 1;
+            2: NbY := iy - 1;
+            3: NbY := iy + 1;
+          end;
+          if (NbX < 0) or (NbX > GxLoc - 1) or
+             (NbY < 0) or (NbY > GyLoc - 1) then Continue;
+          NbIdx := NbY * GxLoc + NbX;
+          if ArgMax[NbIdx] <> CenterArg then
+          begin
+            Inc(BoundaryCells);
+            Break;
+          end;
+        end;
+      end;
+
+    // ---- header ----
+    Lines.Add(Format(
+      'DecisionBoundaryReport: %dx%d grid over x in [%8.4f, %8.4f], ' +
+      'y in [%8.4f, %8.4f], %d class(es).',
+      [GxLoc, GyLoc, xMin, xMax, yMin, yMax, NumClasses]));
+    if HaveProbes then
+      Lines.Add(Format('Probe overlay: %d sample(s), %d misclassified ' +
+        '(%5.2f%%).', [ProbeTot, ProbeMis,
+        100.0 * ProbeMis / Max(1, ProbeTot)]))
+    else
+      Lines.Add('Probe overlay: none (box auto-fit disabled; using box args).');
+    Lines.Add('');
+
+    // ---- (a) class map (top row = yMax so the plot reads like a graph) ----
+    Lines.Add('(a) Class map (argmax glyph per cell; rows top=yMax .. ' +
+      'bottom=yMin):');
+    for iy := GyLoc - 1 downto 0 do
+    begin
+      RowStr := '  ';
+      for ix := 0 to GxLoc - 1 do
+        RowStr := RowStr + CellGlyph(ArgMax[iy * GxLoc + ix]);
+      Lines.Add(RowStr);
+    end;
+    Lines.Add('');
+
+    // ---- (b) confidence-shaded overlay ----
+    Lines.Add('(b) Confidence overlay (' + Trim(cConfBuckets) +
+      '; blank=low .. @=high top-1 ' +
+      'confidence):');
+    for iy := GyLoc - 1 downto 0 do
+    begin
+      RowStr := '  ';
+      for ix := 0 to GxLoc - 1 do
+      begin
+        Conf := TopProb[iy * GxLoc + ix];
+        Bucket := Trunc(Conf * (Length(cConfBuckets) - 1) + 0.5);
+        if Bucket < 0 then Bucket := 0;
+        if Bucket > Length(cConfBuckets) - 1 then
+          Bucket := Length(cConfBuckets) - 1;
+        Glyph := cConfBuckets[Bucket + 1];
+        RowStr := RowStr + Glyph;
+      end;
+      Lines.Add(RowStr);
+    end;
+    Lines.Add('');
+
+    // ---- (d) probe overlay map (only when probes supplied) ----
+    if HaveProbes then
+    begin
+      Lines.Add('(d) Probe overlay (true-class glyph where a sample lands, ' +
+        '"." elsewhere):');
+      for iy := GyLoc - 1 downto 0 do
+      begin
+        RowStr := '  ';
+        for ix := 0 to GxLoc - 1 do
+        begin
+          if ProbeClass[iy * GxLoc + ix] >= 0 then
+            RowStr := RowStr + CellGlyph(ProbeClass[iy * GxLoc + ix])
+          else
+            RowStr := RowStr + '.';
+        end;
+        Lines.Add(RowStr);
+      end;
+      Lines.Add('');
+    end;
+
+    // ---- (c) boundary scalars ----
+    Lines.Add(StringOfChar('-', 72));
+    Lines.Add(Format(
+      '(c) Boundary cells: %d of %d grid cells (%5.2f%%). ' +
+      'Estimated boundary length = %d (4-neighbour argmax-disagreement count).',
+      [BoundaryCells, GxLoc * GyLoc,
+       100.0 * BoundaryCells / (GxLoc * GyLoc), BoundaryCells]));
+    Lines.Add(
+      'Higher boundary length == a more convoluted (wigglier) learned ' +
+      'decision boundary.');
+
+    // ---- (e) optional CSV side-output ----
+    if EmitCsv then
+    begin
+      Lines.Add('');
+      Lines.Add('--- BEGIN CSV (x,y,argmax,top1prob) ---');
+      Lines.Add('x,y,argmax,top1prob');
+      for iy := 0 to GyLoc - 1 do
+      begin
+        vy := yMin + (iy / (GyLoc - 1)) * BoxH;
+        for ix := 0 to GxLoc - 1 do
+        begin
+          vx := xMin + (ix / (GxLoc - 1)) * BoxW;
+          Lines.Add(Format('%.6f,%.6f,%d,%.6f',
+            [vx, vy, ArgMax[iy * GxLoc + ix], TopProb[iy * GxLoc + ix]]));
+        end;
+      end;
+      Lines.Add('--- END CSV ---');
+    end;
+
+    Result := Lines.Text;
+  finally
+    if InVol <> nil then InVol.Free;
+    if OutVol <> nil then OutVol.Free;
     Lines.Free;
   end;
 end;

@@ -90,6 +90,7 @@ type
     procedure TestLayerSensitivityReportSmoke;
     procedure TestEquivarianceReportSmoke;
     procedure TestSaliencyReportSmoke;
+    procedure TestDecisionBoundaryReportSmoke;
   end;
 
 implementation
@@ -1916,6 +1917,101 @@ begin
       Pos('OK (small)', Report) > 0);
   finally
     if Probe <> nil then Probe.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDecisionBoundaryReportSmoke;
+var
+  NN, NNBad: TNNet;
+  TrainSet: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  Report: string;
+  Ep, I, C: integer;
+  // simple 2-cluster centres so a tiny net learns a clean separator
+  Centers: array[0..1, 0..1] of TNeuralFloat = ((-1.5, -1.5), (1.5, 1.5));
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.DecisionBoundaryReport(nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  // GUARD: a non-2-D input net must return the documented error, not crash.
+  NNBad := TNNet.Create();
+  try
+    NNBad.AddLayer(TNNetInput.Create(3, 1, 1)); // 3-D input, not allowed
+    NNBad.AddLayer(TNNetFullConnectLinear.Create(2));
+    NNBad.AddLayer(TNNetSoftMax.Create());
+    NNBad.InitWeights();
+    Report := TNNet.DecisionBoundaryReport(NNBad);
+    AssertTrue('non-2-D input flagged by guard',
+      Pos('input layer must be 2-D', Report) > 0);
+  finally
+    NNBad.Free;
+  end;
+
+  NN := TNNet.Create();
+  TrainSet := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(12));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    RandSeed := 4242;
+    for C := 0 to 1 do
+      for I := 1 to 80 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(2, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        TrainSet.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    for Ep := 1 to 40 do
+      for I := 0 to TrainSet.Count - 1 do
+      begin
+        NN.Compute(TrainSet[I].I);
+        NN.Backpropagate(TrainSet[I].O);
+      end;
+
+    // Well-formed report with the documented sections (auto-fitted box).
+    Report := TNNet.DecisionBoundaryReport(NN, TrainSet, 21, 21);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('DecisionBoundaryReport', Report) > 0);
+    AssertTrue('class map section present', Pos('(a) Class map', Report) > 0);
+    AssertTrue('confidence overlay section present',
+      Pos('(b) Confidence overlay', Report) > 0);
+    AssertTrue('boundary scalar present', Pos('Boundary cells', Report) > 0);
+    AssertTrue('boundary length reported',
+      Pos('Estimated boundary length', Report) > 0);
+    AssertTrue('probe overlay section present',
+      Pos('(d) Probe overlay', Report) > 0);
+
+    // A learned separator must produce at least one boundary cell, and at
+    // least two distinct classes must appear across the grid.
+    AssertTrue('grid contains class 0', Pos('0', Report) > 0);
+    AssertTrue('grid contains class 1', Pos('1', Report) > 0);
+
+    // CSV side-output appears only when requested, with the documented header.
+    Report := TNNet.DecisionBoundaryReport(NN, TrainSet, 11, 11, 0, 0, 0, 0,
+      True);
+    AssertTrue('CSV section emitted when requested',
+      Pos('BEGIN CSV', Report) > 0);
+    AssertTrue('CSV header present', Pos('x,y,argmax,top1prob', Report) > 0);
+
+    // Caller-supplied box (no probes) still works.
+    Report := TNNet.DecisionBoundaryReport(NN, nil, 15, 15,
+      -2.0, 2.0, -2.0, 2.0);
+    AssertTrue('caller-box report non-empty', Length(Report) > 0);
+    AssertTrue('caller-box has no probe overlay section',
+      Pos('(d) Probe overlay', Report) = 0);
+  finally
+    TrainSet.Free;
     NN.Free;
   end;
 end;
