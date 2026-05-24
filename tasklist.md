@@ -1021,6 +1021,49 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
+- [ ] TNNet.GradientNoiseScaleReport(NN, Samples [, LayerIdx]) — the
+      *gradient signal-to-noise* diagnostic that analytically PREDICTS the
+      already-open "batch-size sweep" experiment (McCandlish et al. 2018,
+      "An Empirical Model of Large-Batch Training"). On a frozen net
+      (`ClearDeltas` before each sample, never `UpdateWeights`) it runs one
+      forward + one backward per labelled sample and snapshots each sample's
+      full flattened per-parameter weight-gradient vector `g_i` — reusing the
+      exact per-sample gradient machinery [[GradientConflictReport]] and
+      [[FisherImportanceReport]] already established (no input-gradient
+      enablement). From the batch it forms the mean gradient `g_bar` and the
+      per-parameter gradient variance across samples, then reports: the
+      per-parameter **gradient SNR** `|g_bar_k| / (std_k + eps)` as a 10-bin
+      ASCII histogram and a per-layer mean (which layers carry a clean signal
+      vs which are noise-dominated); the **simple noise scale**
+      `B_simple = tr(Sigma) / ||g_bar||^2` (`Sigma` = per-sample gradient
+      covariance, estimated as `mean_i||g_i||^2 - ||g_bar||^2` over the batch)
+      — the McCandlish "critical batch size" beyond which larger batches stop
+      buying faster convergence; the **effective-batch curve** that turns
+      B_simple into a noise-vs-batch table (`noise(B) = B_simple/B`) so the
+      sweet-spot batch size is readable directly; and per-layer flags
+      (signal-dominated / noise-dominated, and the layer with the largest
+      noise scale — the one that most wants a bigger batch). An optional
+      `LayerIdx` restricts every statistic to one trainable layer's gradient
+      slab (the head and the stem usually have very different noise scales).
+      Built-in correctness checks: feeding the SAME sample N times must drive
+      the variance term and hence B_simple to ~0 (identical gradients =
+      pure signal), and a single-sample batch must emit a clear "need >= 2
+      samples to estimate gradient variance" message rather than dividing by
+      zero. Distinct from [[GradientConflictReport]] (pairwise cosine
+      *direction* agreement — "do samples fight?"; this measures *magnitude*
+      dispersion — "how noisy is the averaged step?"), from
+      [[FisherImportanceReport]] (per-parameter `E[g^2]` importance for
+      pruning/EWC, not a mean-vs-variance ratio), and from the single-pass
+      [[GradientNormReport]] (one whole-batch gradient magnitude, no
+      per-sample spread). Companion `examples/GradientNoiseScale/` on a small
+      synthetic classifier that contrasts a clean linearly-separable batch
+      (high SNR, tiny B_simple — small batches already near-optimal) against a
+      label-noised / overlapping batch (low SNR, large B_simple — bigger
+      batches genuinely help), printing the predicted critical batch size next
+      to a quick empirical batch-size sweep so the prediction can be eyeballed
+      against reality. Add a `TestGradientNoiseScaleReportSmoke` pinning the
+      identical-sample zero-variance invariant and the single-sample warning
+      path. Weights are never stepped (a measurement, not training).
 - [ ] TNNet.MCDropoutUncertaintyReport(NN, Probes [, NumPasses, Temperature]) —
       Monte-Carlo-Dropout *epistemic* uncertainty estimator (Gal & Ghahramani
       2016, "Dropout as a Bayesian Approximation"). Unlike the rest of the
