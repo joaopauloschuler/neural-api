@@ -402,9 +402,9 @@ breakdown:
       (gradient-measured) counterpart to the analytical
       [[introspection-report-pattern]] `ReceptiveFieldReport`. Picks the
       centre output unit of the final spatial layer, backpropagates a
-      one-hot output error (reusing the input-gradient enablement that
-      SaliencyReport needed — `Layers[0].OutputError` resizing /
-      `EnableInputGradient` once that helper lands), and accumulates
+      one-hot output error (UNBLOCKED: just call the now-landed
+      `TNNet.EnableInputGradient` before the backward pass — same helper
+      SaliencyReport and AdversarialRobustnessReport use), and accumulates
       `|d out_centre / d input|` over a probe batch into a per-(x,y)
       input-plane heatmap. Reports: the 2D ASCII heatmap of input
       sensitivity, the **effective** RF radius (the central region holding
@@ -430,7 +430,7 @@ breakdown:
       EquivarianceReport (worked around by using a global-avg construction
       instead). Add a numerical-gradient / forward+backward regression test
       for `FlipX -> padded Conv` and fix the unpad sizing.
-- [ ] Input-space gradients are not exposed by the public backward path:
+- [x] Input-space gradients are not exposed by the public backward path:
       `Layers[0].OutputError` is a 1-element tensor by default, so the first
       trainable layer silently skips writing the input gradient. SaliencyReport
       works around it by resizing the input layer's `OutputError`/
@@ -441,6 +441,11 @@ breakdown:
       so saliency / adversarial-perturbation callers don't re-derive it, with a
       regression test asserting a non-zero input gradient for both a conv and a
       FullConnect first layer.
+      LANDED: `TNNet.EnableInputGradient` now exists (extracted from
+      SaliencyReport, which calls it; AdversarialRobustnessReport reuses it).
+      Regression test `TestEnableInputGradient` pins non-zero input gradient for
+      both a conv-first and a FullConnect-first net. The FlipX-padded-conv bug
+      above is a SEPARATE, still-open issue.
 
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
@@ -1054,6 +1059,13 @@ breakdown:
       `TestRepresentationSimilarityReportSmoke` asserts the self-CKA
       diagonal is 1.0 within tolerance (the built-in correctness check) and
       the matrix is symmetric. Follows [[introspection-report-pattern]].
+- [ ] RepresentationSimilarityReport follow-up: add an RBF-kernel CKA mode
+      alongside the landed linear-CKA one (Gaussian Gram `K_ij =
+      exp(-||x_i - x_j||^2 / (2*sigma^2))` with sigma a median-distance
+      heuristic, then the same centered HSIC ratio). RBF-CKA catches
+      non-linear representational similarity the linear version misses;
+      gate behind a kernel selector so linear stays the default. Self-CKA
+      diagonal must still read 1.0.
 - [ ] TopLogitMarginReport follow-up: the shipped `examples/MarginReport/`
       net ends in a `TNNetSoftMax`, so its "logits" are post-softmax
       probabilities and the margin lands in `[0, 1]`. Add a second run (or a
@@ -1164,6 +1176,20 @@ breakdown:
       infrastructure already flagged for SaliencyReport
       ([[introspection-report-pattern]]); a genuinely new diagnostic, not a
       re-skin of an existing report.
+      LANDED (FGSM single-step variant + EnableInputGradient helper +
+      synthetic example + smoke test). Two small follow-ups below.
+- [ ] AdversarialRobustnessReport follow-up: add the optional
+      `eps,accuracy` CSV side-output (skipped in the initial landing as
+      "optional") so the degradation curve can be plotted outside the
+      terminal. ~10 lines mirroring the CSV side-output already in
+      DecisionBoundaryReport.
+- [ ] AdversarialRobustnessReport follow-up: add a multi-step PGD
+      (projected gradient descent) attack mode alongside single-step FGSM —
+      iterate `x <- clip(x + alpha*sign(grad), x0 +/- eps)` for K steps. PGD
+      is the standard stronger baseline; the report's accuracy-vs-eps curve
+      should drop faster under PGD than FGSM at matched eps, which is itself
+      a built-in sanity check. Gate behind a `Steps` parameter (Steps=1 ==
+      today's FGSM).
 
 ### Parameter importance (continual learning / pruning)
 - [ ] EWC two-task experiment building on the landed
