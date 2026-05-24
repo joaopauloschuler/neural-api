@@ -1149,3 +1149,54 @@ breakdown:
       monotone-ish climb with a visible saturation knee a few layers
       before the head), so reviewers can eyeball how training reshapes
       per-layer linear separability.
+
+### Adversarial robustness
+- [ ] TNNet.AdversarialRobustnessReport(NN, Samples, Labels [, EpsList]) —
+      given a trained classifier and a labelled probe batch, craft FGSM
+      (fast gradient sign method, Goodfellow et al. 2015) input
+      perturbations `x_adv = x + eps * sign(d loss / d x)` at an
+      increasing menu of epsilons (default `{0, 0.01, 0.02, 0.05, 0.1,
+      0.2}`) and report how the model degrades under worst-case
+      input-space noise. For each eps it does one forward + one backward
+      pass per sample to get the input gradient (reusing the same
+      input-gradient enablement [[SaliencyReport]] needs — the pending
+      `TNNet.EnableInputGradient` helper), takes the sign-step, re-runs a
+      clean forward on the perturbed input, and reports:
+      (a) top-1 accuracy at each eps as a degradation curve (eps=0 is the
+          clean baseline — a built-in sanity check that it matches a
+          plain evaluation pass),
+      (b) the **critical epsilon** per sample (smallest eps that flips the
+          prediction away from the clean argmax) as a 10-bin ASCII
+          histogram, so the spread between fragile and robust inputs is
+          visible — a few samples flipping at tiny eps while most survive
+          is the classic adversarial-fragility signature,
+      (c) the mean clean-confidence of the samples that flip first vs those
+          that survive longest (high-confidence-yet-fragile points are the
+          interesting failure mode),
+      (d) per-class accuracy-at-fixed-eps so a class whose decision
+          boundary sits unusually close to its inputs stands out,
+      (e) an optional `eps,accuracy` CSV side-output for plotting, and a
+          one-line verdict ("robust" / "moderately fragile" / "fragile")
+          from the accuracy drop at the median eps.
+      Forward+backward only on a frozen network — the trained weights are
+      never updated (this is an *evaluation* of robustness, not adversarial
+      *training*). Distinct from [[SaliencyReport]] (per-sample input
+      attribution for one logit — *where* the model looks, not *how far* an
+      input can be pushed before it misclassifies), from
+      [[EquivarianceReport]] (fixed symmetry transforms with no label and
+      no gradient — measures invariance, not worst-case accuracy loss),
+      from [[LayerSensitivityReport]] (jitters *weights* and measures
+      output delta — this jitters *inputs* along the loss gradient and
+      measures label flips), and from [[DecisionBoundaryReport]] (renders
+      the 2-D learned function over a grid — this probes the high-D input
+      neighbourhood of real labelled samples). The output is the natural
+      input for any future "should we add adversarial training / input
+      smoothing?" decision. Companion `examples/AdversarialRobustness/`
+      runs it on a small trained CIFAR-style classifier and prints the
+      eps-vs-accuracy curve plus the critical-epsilon histogram; an
+      optional second run on a model trained with input-noise augmentation
+      shows the curve flattening (the expected robustness gain), so the
+      contrast is eyeballable. Builds directly on the input-gradient
+      infrastructure already flagged for SaliencyReport
+      ([[introspection-report-pattern]]); a genuinely new diagnostic, not a
+      re-skin of an existing report.
