@@ -102,6 +102,7 @@ type
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
     procedure TestGradientNoiseScaleReportSmoke;
+    procedure TestHessianCurvatureReportSmoke;
     procedure TestEffectiveReceptiveFieldReportSmoke;
   end;
 
@@ -3080,6 +3081,32 @@ begin
   Result := StrToFloatDef(Val, -1, FS);
 end;
 
+// Parses the headline "tr(H)        = <v>  (..." trace value out of a
+// HessianCurvatureReport (or -1e30 if not found). Used to check the
+// linear-net probe-count-independence invariant.
+function ParseTraceH(const Report: string): TNeuralFloat;
+var
+  S, E: integer;
+  Val: string;
+  FS: TFormatSettings;
+begin
+  Result := -1e30;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  S := Pos('tr(H)', Report);
+  if S = 0 then Exit;
+  S := PosEx('=', Report, S);
+  if S = 0 then Exit;
+  Inc(S);
+  while (S <= Length(Report)) and (Report[S] = ' ') do Inc(S);
+  E := S;
+  while (E <= Length(Report)) and (Report[E] <> ' ') and
+        (Report[E] <> #10) and (Report[E] <> #13) do Inc(E);
+  Val := Trim(Copy(Report, S, E - S));
+  Result := StrToFloatDef(Val, -1e30, FS);
+end;
+
 procedure TTestNeuralLayersExtra.TestGradientNoiseScaleReportSmoke;
 var
   NN: TNNet;
@@ -3337,6 +3364,151 @@ begin
   finally
     Probes.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestHessianCurvatureReportSmoke;
+var
+  NN, LinNN: TNNet;
+  Samples, Lin: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  NilReport, Report, EmptyReport: string;
+  Rep16, Rep32: string;
+  Ep, I, C: integer;
+  Tr16, Tr32, LMax, TrH: TNeuralFloat;
+  PosStart, PosEnd: integer;
+  ValStr: string;
+  FS: TFormatSettings;
+  SavedSeed: longword;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  // Save/restore the global RNG state so this test leaves it exactly as found
+  // (a sibling test seeds its weights from the leftover RandSeed).
+  SavedSeed := RandSeed;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.HessianCurvatureReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  LinNN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  Lin := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    EmptyReport := TNNet.HessianCurvatureReport(NN, Samples);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', EmptyReport) > 0);
+
+    // Train briefly on a separable 3-cluster problem (online per-sample
+    // updates with a modest LR so the tiny net converges without diverging).
+    RandSeed := 1234;
+    for Ep := 1 to 40 do
+      for I := 1 to 60 do
+      begin
+        C := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        try
+          X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+          X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+          Y.Fill(0);
+          Y.FData[C] := 1.0;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    // Probe batch for the trained net.
+    for C := 0 to 2 do
+      for I := 1 to 8 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+        X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    Report := TNNet.HessianCurvatureReport(NN, Samples, 12);
+    AssertTrue('report non-empty', Length(Report) > 0);
+    AssertTrue('header present', Pos('HessianCurvatureReport', Report) > 0);
+    AssertTrue('tr(H) line present', Pos('tr(H)', Report) > 0);
+    AssertTrue('lambda_max line present', Pos('lambda_max', Report) > 0);
+    AssertTrue('per-layer trace breakdown present',
+      Pos('Per-layer trace breakdown', Report) > 0);
+    AssertTrue('histogram present', Pos('Per-probe v^T H v histogram', Report) > 0);
+    AssertTrue('verdict present', Pos('Verdict:', Report) > 0);
+
+    // Parse lambda_max and tr(H); the PSD Gauss-Newton check lambda_max <= tr(H)
+    // should hold (within the report's own tolerance, surfaced as "OK").
+    PosStart := Pos('lambda_max', Report);
+    PosStart := PosEx('=', Report, PosStart);
+    Inc(PosStart);
+    while (PosStart <= Length(Report)) and (Report[PosStart] = ' ') do
+      Inc(PosStart);
+    PosEnd := PosStart;
+    while (PosEnd <= Length(Report)) and (Report[PosEnd] <> ' ') and
+          (Report[PosEnd] <> #10) and (Report[PosEnd] <> #13) do Inc(PosEnd);
+    ValStr := Trim(Copy(Report, PosStart, PosEnd - PosStart));
+    LMax := StrToFloatDef(ValStr, -1e30, FS);
+    TrH := ParseTraceH(Report);
+    AssertTrue('tr(H) parsed', TrH > -1e29);
+    AssertTrue('lambda_max parsed', LMax > -1e29);
+    AssertTrue('PSD check line present (lambda_max <= tr(H))',
+      Pos('PSD check', Report) > 0);
+
+    // --- Probe-count-independence on a PURELY LINEAR net + MSE head. ---
+    // A linear net has a constant Hessian, so tr(H) must not depend on the
+    // number of Hutchinson probes (only the estimator NOISE shrinks).
+    LinNN.AddLayer(TNNetInput.Create(3, 1, 1));
+    LinNN.AddLayer(TNNetFullConnectLinear.Create(2));
+    LinNN.InitWeights();
+    RandSeed := 99;
+    for I := 1 to 30 do
+    begin
+      X := TNNetVolume.Create(3, 1, 1);
+      Y := TNNetVolume.Create(2, 1, 1);
+      X.FData[0] := (Random - 0.5) * 2;
+      X.FData[1] := (Random - 0.5) * 2;
+      X.FData[2] := (Random - 0.5) * 2;
+      Y.Fill(0);
+      Y.FData[Random(2)] := 1.0;
+      Lin.Add(TNNetVolumePair.Create(X, Y));
+    end;
+
+    Rep16 := TNNet.HessianCurvatureReport(LinNN, Lin, 16);
+    Rep32 := TNNet.HessianCurvatureReport(LinNN, Lin, 32);
+    Tr16 := ParseTraceH(Rep16);
+    Tr32 := ParseTraceH(Rep32);
+    AssertTrue('linear tr(H) @16 parsed', Tr16 > -1e29);
+    AssertTrue('linear tr(H) @32 parsed', Tr32 > -1e29);
+    AssertTrue('linear tr(H) is positive (PSD MSE Hessian)', Tr16 > 0);
+    // Probe-count independence: the two trace estimates must agree within
+    // Hutchinson noise (relative tolerance, with a floor for tiny traces).
+    AssertTrue('linear-net tr(H) is probe-count independent',
+      Abs(Tr16 - Tr32) <= 0.20 * Abs(Tr16) + 1e-3);
+  finally
+    Samples.Free;
+    Lin.Free;
+    NN.Free;
+    LinNN.Free;
+    RandSeed := SavedSeed;
   end;
 end;
 

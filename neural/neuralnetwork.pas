@@ -4433,6 +4433,54 @@ type
         UseTrueLabel: boolean = true;
         LayerIdx: integer = -1
       ): string;
+      // Loss-surface CURVATURE / sharpness diagnostic built on
+      // Hessian-vector products (HVPs). It needs NO second-order autograd: an
+      // HVP is estimated by central-differencing the per-parameter weight
+      // gradient,  H v ~= (grad L(theta + eps*v) - grad L(theta - eps*v)) /
+      // (2*eps), reusing the existing whole-batch forward+backward gradient
+      // machinery (the same one FisherImportanceReport / GradientConflictReport
+      // / GradientNoiseScaleReport read out of Neurons[*].Delta / FBiasDelta,
+      // divided back out by the layer LearningRate) and the EXACT
+      // SaveDataToString / LoadDataFromString whole-net snapshot/restore pattern
+      // LayerSensitivityReport uses, so weights are perturbed by +/-eps*v and
+      // restored BIT-FOR-BIT between probes. The net is FROZEN (ClearDeltas
+      // before each pass, NEVER UpdateWeights; SetBatchUpdate forced on so the
+      // gradient accumulates into Delta rather than being consumed inline). On a
+      // labelled batch (Samples, a TNNetVolumePairList of input + one-hot
+      // target pairs; an MSE head is assumed for the loss) it reports two
+      // classic sharpness numbers:
+      //   1. the HESSIAN TRACE tr(H) = E_v[v^T H v] via the Hutchinson
+      //      estimator over NumProbes (default 16) Rademacher (+/-1) probe
+      //      vectors v — the MEAN curvature averaged over all directions
+      //      (each probe costs two full-batch backprops);
+      //   2. the TOP HESSIAN EIGENVALUE lambda_max(H) via a few power-iteration
+      //      steps on the HVP operator (v <- Hv/||Hv||, lambda_max ~= v^T H v at
+      //      convergence) — the canonical flat-vs-sharp-minimum metric (Keskar
+      //      et al. 2017; Foret et al. SAM 2021).
+      // It also prints the curvature-concentration ratio lambda_max /
+      // (tr(H)/N_params) (how dominant the sharpest direction is vs the mean),
+      // a per-trainable-layer trace breakdown (restricting each Hutchinson
+      // v^T H v dot-product to one layer's parameter slab — which layers carry
+      // the curvature), a 10-bin ASCII histogram of the per-probe v^T H v
+      // samples (the Hutchinson spread = estimator noise), and a
+      // flat / moderate / sharp VERDICT thresholded on lambda_max.
+      // Eps (default 1e-3) is the finite-difference step: large enough to clear
+      // single-precision gradient round-off yet small enough that the central
+      // difference still tracks the true HVP; it is documented here because the
+      // estimate is sensitive to it. Built-in correctness checks (also the
+      // smoke-test invariants): a purely LINEAR net with an MSE head has a
+      // CONSTANT Hessian, so tr(H) must be probe-count-independent (re-running
+      // with 2x NumProbes returns the same value within Hutchinson noise), and
+      // in the PSD Gauss-Newton regime lambda_max <= tr(H) must hold (flagged
+      // if violated). Weights are NEVER stepped — a measurement, not training.
+      // Guards nil NN, an empty batch and a net with no trainable params
+      // gracefully.
+      class function HessianCurvatureReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        NumProbes: integer = 16;
+        Eps: TNeuralFloat = 1e-3
+      ): string;
       // Forward-only intra-layer redundancy diagnostic. For a probe batch
       // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
       // trainable layer with weights (Neurons.Count > 0 and Weights.Size > 0),
@@ -29891,6 +29939,466 @@ begin
 
     Result := Lines.Text;
   finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.HessianCurvatureReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  NumProbes: integer = 16;
+  Eps: TNeuralFloat = 1e-3
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cPowerIters = 8;        // power-iteration steps for lambda_max
+  cNormEps = 1e-30;
+  // lambda_max sharpness verdict thresholds (Keskar/Foret-style bands).
+  cFlatThr = 1.0;
+  cSharpThr = 50.0;
+  // tolerance for the lambda_max <= tr(H) PSD sanity flag (Hutchinson noise).
+  cPsdTol = 1.05;
+type
+  TFloatArray = array of TNeuralFloat;
+var
+  Lines: TStringList;
+  LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, Iter, Probe: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  Pair: TNNetVolumePair;
+  LastLayer: TNNetLayer;
+  OutSize: integer;
+  LR, NormV: TNeuralFloat;
+  Target: TNNetVolume;
+  Snapshot: string;
+  SavedRandSeed: longword;
+  // per-trainable-layer flat-index bookkeeping over the whole net
+  LayerHasParams: array of boolean;
+  FlatBase: array of integer;       // flat offset of each layer's params
+  LayerParamCnt: array of integer;
+  NetParamCnt, TrainableLayers: integer;
+  // working vectors over the net-flat parameter axis
+  GradPlus, GradMinus, Hv, Vprobe: TFloatArray;
+  // scope -> owning trainable-layer index (for the per-layer trace)
+  ParamLayer: array of integer;
+  // Hutchinson trace accumulation
+  VHv, TrAcc, TraceMean, MeanPerParam, Concentration: TNeuralFloat;
+  Quad: TFloatArray;                // per-probe v^T H v samples
+  // per-layer trace breakdown
+  LayerQuadAcc: array of TNeuralFloat;
+  LayerName: array of string;
+  LayerVHv: TNeuralFloat;
+  // power iteration for lambda_max
+  LambdaMax, Dot: TNeuralFloat;
+  // histogram of per-probe v^T H v
+  Bins: array of integer;
+  HistMin, HistMax, Span, BinLo, BinHi: TNeuralFloat;
+  MaxBin, BarLen: integer;
+  Bar, Verdict: string;
+  PsdOk, NonFinite: boolean;
+
+  // Add 'Scale * v_k' to every trainable weight (k walks the net-flat axis).
+  procedure PerturbWeights(const V: TFloatArray; Scale: TNeuralFloat);
+  var
+    LL, NN_, KK, PP: integer;
+    Lay: TNNetLayer;
+    Neu: TNNetNeuron;
+  begin
+    for LL := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LL] then Continue;
+      Lay := NN.Layers[LL];
+      PP := FlatBase[LL];
+      for NN_ := 0 to Lay.Neurons.Count - 1 do
+      begin
+        Neu := Lay.Neurons[NN_];
+        for KK := 0 to Neu.Weights.Size - 1 do
+        begin
+          Neu.Weights.FData[KK] := Neu.Weights.FData[KK] + Scale * V[PP];
+          Inc(PP);
+        end;
+        // bias parameter
+        Neu.FBiasWeight := Neu.FBiasWeight + Scale * V[PP];
+        Inc(PP);
+      end;
+      Lay.AfterWeightUpdate();
+    end;
+  end;
+
+  // Run the WHOLE batch forward+backward on the (already perturbed) FROZEN net
+  // and flatten the resulting per-parameter weight gradient into G (net-flat).
+  // The net is never stepped: ClearDeltas before each pass, no UpdateWeights.
+  // Delta holds -LR*grad under batch update, so dividing by LR yields -grad; we
+  // negate that back to the TRUE gradient (+grad) so the central-difference HVP
+  // and hence v^T H v carry the correct sign (positive curvature at a minimum).
+  procedure ComputeGradient(var G: TFloatArray);
+  var
+    SI, LL, NN_, KK, PP, LblClass: integer;
+    Lay: TNNetLayer;
+    Neu: TNNetNeuron;
+    Lr2: TNeuralFloat;
+  begin
+    for KK := 0 to NetParamCnt - 1 do G[KK] := 0;
+    for SI := 0 to Samples.Count - 1 do
+    begin
+      Pair := Samples[SI];
+      if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+      NN.ClearDeltas();
+      NN.Compute(Pair.I);
+      LblClass := Pair.O.GetClass();
+      if (LblClass < 0) or (LblClass >= OutSize) then Continue;
+      Target.Fill(0);
+      Target.Raw[LblClass] := 1.0;
+      NN.Backpropagate(Target);
+      // Accumulate this sample's per-parameter gradient into G (the loss is the
+      // batch sum; the trace/eigen scale uniformly with the batch size).
+      for LL := 0 to NN.GetLastLayerIdx() do
+      begin
+        if not LayerHasParams[LL] then Continue;
+        Lay := NN.Layers[LL];
+        Lr2 := Lay.LearningRate;
+        if Lr2 <= 0 then Lr2 := 1.0;
+        PP := FlatBase[LL];
+        for NN_ := 0 to Lay.Neurons.Count - 1 do
+        begin
+          Neu := Lay.Neurons[NN_];
+          for KK := 0 to Neu.Delta.Size - 1 do
+          begin
+            G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
+            Inc(PP);
+          end;
+          G[PP] := G[PP] - Neu.FBiasDelta / Lr2;
+          Inc(PP);
+        end;
+      end;
+    end;
+  end;
+
+  // Hessian-vector product Hv ~= (grad(theta+eps*v) - grad(theta-eps*v))/(2 eps)
+  // via central differencing. Weights are restored bit-for-bit from Snapshot
+  // after each probe so the net is unchanged on return.
+  procedure HessianVectorProduct(const V: TFloatArray; var OutHv: TFloatArray);
+  var
+    KK: integer;
+  begin
+    PerturbWeights(V, Eps);
+    ComputeGradient(GradPlus);
+    NN.LoadDataFromString(Snapshot);
+
+    PerturbWeights(V, -Eps);
+    ComputeGradient(GradMinus);
+    NN.LoadDataFromString(Snapshot);
+
+    for KK := 0 to NetParamCnt - 1 do
+      OutHv[KK] := (GradPlus[KK] - GradMinus[KK]) / (2.0 * Eps);
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Snapshot := '';
+  SavedRandSeed := RandSeed;
+  try
+    if NN = nil then
+    begin
+      Result := 'HessianCurvatureReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'HessianCurvatureReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'HessianCurvatureReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+    if NumProbes < 1 then NumProbes := 1;
+    if Eps <= 0 then Eps := 1e-3;
+
+    // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    SetLength(LayerHasParams, NN.CountLayers());
+    SetLength(FlatBase, NN.CountLayers());
+    SetLength(LayerParamCnt, NN.CountLayers());
+
+    NetParamCnt := 0;
+    TrainableLayers := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      LayerHasParams[LIdx] := false;
+      LayerParamCnt[LIdx] := 0;
+      FlatBase[LIdx] := NetParamCnt;
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      K := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        // +1 per neuron for the bias parameter.
+        K := K + Layer.Neurons[NeuronIdx].Weights.Size + 1;
+      if K = 0 then Continue;
+      LayerHasParams[LIdx] := true;
+      LayerParamCnt[LIdx] := K;
+      FlatBase[LIdx] := NetParamCnt;
+      NetParamCnt := NetParamCnt + K;
+      Inc(TrainableLayers);
+    end;
+
+    if (TrainableLayers = 0) or (NetParamCnt = 0) then
+    begin
+      Result := 'HessianCurvatureReport: no trainable layers with parameters.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // Map each net-flat parameter to its owning trainable-layer index.
+    SetLength(ParamLayer, NetParamCnt);
+    SetLength(LayerName, NN.CountLayers());
+    for LIdx := 0 to NN.CountLayers() - 1 do LayerName[LIdx] := '';
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LIdx] then Continue;
+      LayerName[LIdx] := NN.Layers[LIdx].ClassName;
+      P := FlatBase[LIdx];
+      for K := 0 to LayerParamCnt[LIdx] - 1 do
+      begin
+        ParamLayer[P] := LIdx;
+        Inc(P);
+      end;
+    end;
+
+    // Why batch update: Delta accumulates -LR*gradient only with batch update
+    // on; otherwise the gradient is consumed inline and never lands in Delta.
+    // We divide back out by LR to recover the raw gradient. The network is
+    // NEVER stepped (no UpdateWeights) so the trained weights are untouched.
+    NN.SetBatchUpdate(true);
+
+    LastLayer := NN.GetLastLayer();
+    OutSize := LastLayer.Output.Size;
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+
+    // Whole-net snapshot for exact restore between perturbations.
+    Snapshot := NN.SaveDataToString();
+
+    SetLength(GradPlus, NetParamCnt);
+    SetLength(GradMinus, NetParamCnt);
+    SetLength(Hv, NetParamCnt);
+    SetLength(Vprobe, NetParamCnt);
+    SetLength(Quad, NumProbes);
+    SetLength(LayerQuadAcc, NN.CountLayers());
+    for LIdx := 0 to NN.CountLayers() - 1 do LayerQuadAcc[LIdx] := 0;
+
+    try
+      // Guardrail: a diverged net (NaN/Inf weights) makes every HVP non-finite
+      // and the curvature meaningless. Run one unperturbed whole-batch gradient
+      // and bail out cleanly if it is not finite rather than emitting "Nan".
+      ComputeGradient(GradPlus);
+      NonFinite := false;
+      for K := 0 to NetParamCnt - 1 do
+        if IsNan(GradPlus[K]) or IsInfinite(GradPlus[K]) then
+        begin
+          NonFinite := true;
+          Break;
+        end;
+      if NonFinite then
+      begin
+        Lines.Add('HessianCurvatureReport: the network produced a non-finite ' +
+          '(NaN/Inf) gradient on this batch - it has likely diverged during ' +
+          'training, so the curvature is undefined. No report generated.');
+        Result := Lines.Text;
+        Exit;
+      end;
+
+      // --- (1) Hutchinson trace tr(H) = E_v[v^T H v] over Rademacher probes. -
+      RandSeed := 1234567;
+      TrAcc := 0;
+      for Probe := 0 to NumProbes - 1 do
+      begin
+        // Rademacher probe v_k in {-1, +1}.
+        for K := 0 to NetParamCnt - 1 do
+          if Random(2) = 0 then Vprobe[K] := -1.0 else Vprobe[K] := 1.0;
+
+        HessianVectorProduct(Vprobe, Hv);
+
+        VHv := 0;
+        for K := 0 to NetParamCnt - 1 do
+          VHv := VHv + Vprobe[K] * Hv[K];
+        Quad[Probe] := VHv;
+        TrAcc := TrAcc + VHv;
+
+        // Per-layer trace contribution: restrict the v^T H v dot to one layer's
+        // parameter slab (Rademacher v^2 = 1, so this estimates that slab's
+        // diagonal Hessian sum, i.e. its share of the trace).
+        for K := 0 to NetParamCnt - 1 do
+        begin
+          LIdx := ParamLayer[K];
+          LayerQuadAcc[LIdx] := LayerQuadAcc[LIdx] + Vprobe[K] * Hv[K];
+        end;
+      end;
+      TraceMean := TrAcc / NumProbes;
+      for LIdx := 0 to NN.CountLayers() - 1 do
+        LayerQuadAcc[LIdx] := LayerQuadAcc[LIdx] / NumProbes;
+
+      // --- (2) Top eigenvalue lambda_max via power iteration on the HVP. ---
+      // Deterministic unit start vector (independent of the Hutchinson RNG).
+      NormV := 0;
+      for K := 0 to NetParamCnt - 1 do
+      begin
+        if (K and 1) = 0 then Vprobe[K] := 1.0 else Vprobe[K] := -0.5;
+        NormV := NormV + Vprobe[K] * Vprobe[K];
+      end;
+      NormV := Sqrt(NormV);
+      if NormV <= cNormEps then NormV := 1.0;
+      for K := 0 to NetParamCnt - 1 do Vprobe[K] := Vprobe[K] / NormV;
+
+      LambdaMax := 0;
+      for Iter := 1 to cPowerIters do
+      begin
+        HessianVectorProduct(Vprobe, Hv);
+        // Rayleigh quotient (v is unit): lambda ~= v^T H v.
+        Dot := 0;
+        for K := 0 to NetParamCnt - 1 do Dot := Dot + Vprobe[K] * Hv[K];
+        LambdaMax := Dot;
+        // v <- Hv / ||Hv||.
+        NormV := 0;
+        for K := 0 to NetParamCnt - 1 do NormV := NormV + Hv[K] * Hv[K];
+        NormV := Sqrt(NormV);
+        if NormV <= cNormEps then Break;   // flat direction -> H v = 0
+        for K := 0 to NetParamCnt - 1 do Vprobe[K] := Hv[K] / NormV;
+      end;
+    finally
+      // Restore exact weights (also done after every probe inside the HVP).
+      NN.LoadDataFromString(Snapshot);
+      Target.Free;
+    end;
+
+    // --- Derived scalars. ---
+    MeanPerParam := TraceMean / NetParamCnt;
+    if Abs(MeanPerParam) > cNormEps then
+      Concentration := LambdaMax / MeanPerParam
+    else
+      Concentration := 0;
+    // PSD sanity: in the Gauss-Newton regime lambda_max <= tr(H).
+    PsdOk := LambdaMax <= TraceMean * cPsdTol + cNormEps;
+
+    // --- per-probe v^T H v histogram bin edges. ---
+    HistMin := Quad[0];
+    HistMax := Quad[0];
+    for Probe := 1 to NumProbes - 1 do
+    begin
+      if Quad[Probe] < HistMin then HistMin := Quad[Probe];
+      if Quad[Probe] > HistMax then HistMax := Quad[Probe];
+    end;
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    Span := HistMax - HistMin;
+    for Probe := 0 to NumProbes - 1 do
+    begin
+      if Span > cNormEps then
+        BinIdx := Trunc(((Quad[Probe] - HistMin) / Span) * cBins)
+      else
+        BinIdx := 0;
+      if BinIdx < 0 then BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      Inc(Bins[BinIdx]);
+    end;
+
+    // --- Report body. ---
+    Lines.Add(Format(
+      'HessianCurvatureReport: %d sample(s), %d trainable layer(s), ' +
+      '%d param(s). NumProbes=%d, Eps=%g.',
+      [Samples.Count, TrainableLayers, NetParamCnt, NumProbes, Eps]));
+    Lines.Add('Loss-surface curvature via finite-difference Hessian-vector ' +
+      'products (MSE head assumed). Frozen net, no weight step.');
+    Lines.Add('');
+
+    Lines.Add(Format(
+      'tr(H)        = %14.6g  (Hutchinson mean curvature over %d Rademacher ' +
+      'probes)', [TraceMean, NumProbes]));
+    Lines.Add(Format(
+      'lambda_max   = %14.6g  (top Hessian eigenvalue, %d power-iteration ' +
+      'steps)', [LambdaMax, cPowerIters]));
+    Lines.Add(Format(
+      'tr(H)/N      = %14.6g  (mean curvature per parameter)', [MeanPerParam]));
+    Lines.Add(Format(
+      'concentration = lambda_max / (tr(H)/N) = %12.4f  (how dominant the ' +
+      'sharpest direction is)', [Concentration]));
+    Lines.Add('');
+
+    // --- per-probe Hutchinson spread histogram. ---
+    Lines.Add(Format('Per-probe v^T H v histogram (%d bins over [%g, %g]) ' +
+      '- the Hutchinson estimator spread:', [cBins, HistMin, HistMax]));
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if Span > cNormEps then
+      begin
+        BinLo := HistMin + BinIdx * (Span / cBins);
+        BinHi := HistMin + (BinIdx + 1) * (Span / cBins);
+      end
+      else
+      begin
+        BinLo := HistMin; BinHi := HistMin;
+      end;
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%12.4g, %12.4g) | n=%4d %s',
+        [BinLo, BinHi, Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    // --- per-layer trace breakdown. ---
+    Lines.Add('Per-layer trace breakdown (which layers carry the curvature):');
+    Lines.Add('  layer  class                        layer-tr(H)   %of-total');
+    for LIdx := 0 to NN.CountLayers() - 1 do
+    begin
+      if not LayerHasParams[LIdx] then Continue;
+      LayerVHv := LayerQuadAcc[LIdx];
+      if Abs(TraceMean) > cNormEps then
+        Lines.Add(Format('  %4d   %-26s %13.6g %9.2f%%',
+          [LIdx, LayerName[LIdx], LayerVHv,
+           100.0 * LayerVHv / TraceMean]))
+      else
+        Lines.Add(Format('  %4d   %-26s %13.6g %9s',
+          [LIdx, LayerName[LIdx], LayerVHv, 'n/a']));
+    end;
+    Lines.Add('');
+
+    // --- correctness flags. ---
+    if PsdOk then
+      Lines.Add(Format('PSD check: lambda_max (%g) <= tr(H) (%g) -> OK ' +
+        '(consistent with a PSD Gauss-Newton Hessian).',
+        [LambdaMax, TraceMean]))
+    else
+      Lines.Add(Format('PSD check: lambda_max (%g) > tr(H) (%g) -> NOTE: the ' +
+        'finite-difference Hessian has a negative-curvature direction (a ' +
+        'genuine saddle, or Hutchinson/eps noise).', [LambdaMax, TraceMean]));
+    Lines.Add('');
+
+    // --- sharpness verdict on lambda_max. ---
+    if LambdaMax < cFlatThr then
+      Verdict := Format('FLAT minimum (lambda_max = %g < %g): low ' +
+        'sharpness, typically good generalization.', [LambdaMax, cFlatThr])
+    else if LambdaMax < cSharpThr then
+      Verdict := Format('MODERATE curvature (%g <= lambda_max = %g < %g).',
+        [cFlatThr, LambdaMax, cSharpThr])
+    else
+      Verdict := Format('SHARP minimum (lambda_max = %g >= %g): high ' +
+        'sharpness, the generalization literature ties this to a wider ' +
+        'train/test gap.', [LambdaMax, cSharpThr]);
+    Lines.Add('Verdict: ' + Verdict);
+
+    Result := Lines.Text;
+  finally
+    RandSeed := SavedRandSeed;
     Lines.Free;
   end;
 end;
