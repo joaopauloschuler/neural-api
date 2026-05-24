@@ -5641,6 +5641,79 @@ type
         Samples: TNNetVolumePairList;
         K: integer = 10
       ): string;
+      // Forward-only weight-space NEURON-PERMUTATION alignment diagnostic — the
+      // "Git Re-Basin" dual of ModeConnectivityReport (Ainsworth, Hayase &
+      // Srinivasa 2022, "Git Re-Basin: Merging Models modulo Permutation
+      // Symmetries"; Entezari et al. 2021). ModeConnectivityReport MEASURES the
+      // linear-interpolation loss barrier between two independently-trained nets
+      // of the same architecture but does nothing about it. The headline result
+      // this report demonstrates: most of that barrier is an ILLUSION of
+      // neuron-LABELLING — a hidden layer's units are interchangeable up to a
+      // permutation (permute the units AND, in the next layer, the matching
+      // input-weight columns, and the represented FUNCTION is unchanged), so two
+      // nets that look far apart in weight space often sit in the SAME loss
+      // basin once that permutation symmetry is quotiented out. Align net B's
+      // hidden units to net A's, re-interpolate, and the straight-line barrier
+      // largely COLLAPSES.
+      // The live net is endpoint A; a NN.SaveDataToString snapshot is endpoint
+      // B (cloned into a private net of NN's structure, as ModeConnectivity
+      // does); Samples is a TNNetVolumePairList probe set (its .I drives the
+      // forward, its .O is the MSE/argmax target). The recipe, using existing
+      // machinery only (NO new layer, no backward pass):
+      //   1. Catalogue the trainable layers (neurons owning a non-empty weight
+      //      tensor), exactly as ModeConnectivityReport does.
+      //   2. Walk them front-to-back. A HIDDEN trainable layer is one that is
+      //      followed by a later trainable layer; for each such layer L find the
+      //      permutation P_L of B's output neurons that best aligns B's units to
+      //      A's. Two scoring modes share one greedy solver: WEIGHT matching
+      //      maximises the per-row weight-vector cosine <row_i^A, row_{P(i)}^B>,
+      //      and ACTIVATION matching correlates the two nets' per-unit
+      //      activations over Samples (forward both nets once per probe, read
+      //      Layer.Output[unit]). Greedy correlation-descent (repeatedly take the
+      //      globally-best unmatched (A-unit, B-unit) pair) is used at toy width
+      //      — a Hungarian/auction solve is the principled optimum but greedy
+      //      avoids new numerical code and is near-optimal here.
+      //   3. Apply each P_L CONSISTENTLY so the function B computes is unchanged:
+      //      reorder layer L's output neurons (their weight rows AND biases) by
+      //      P_L, and reorder the NEXT trainable layer's matching INPUT-weight
+      //      COLUMNS by the SAME P_L (the next layer reads L's output element i
+      //      from input column i, so the columns must follow the units). The
+      //      report ASSERTS this leaves B.Compute bit-for-bit unchanged on every
+      //      probe (the permutation-invariance identity — correctness check 1).
+      //   4. Re-run ModeConnectivityReport's interpolation sweep
+      //      theta(alpha) = (1-alpha)*A + alpha*P(B), reusing the SAME whole-net
+      //      MulMulAdd snapshot arithmetic, and report the loss barrier BEFORE
+      //      (raw B) vs AFTER (permuted B) alignment, the per-layer permutation
+      //      "churn" (fraction of units P_L moved), and a verdict.
+      // Built-in correctness checks (each a clean PASS/FAIL line):
+      //   1. permutation invariance: applying any P_L + its next-layer column
+      //      compensation leaves B.Compute output bit-for-bit unchanged on
+      //      Samples (the foundational identity);
+      //   2. align-to-self: with SnapshotB := A every P_L is the identity and
+      //      the post-alignment barrier curve is flat zero;
+      //   3. monotonicity: the post-alignment barrier is <= the pre-alignment
+      //      barrier (alignment can only help or tie).
+      // Verdict from the barrier reduction: "barrier collapsed" when the
+      // post-alignment barrier drops to <= cCollapseFrac (25%) of the pre-
+      // alignment barrier (plus an absolute floor), "partially reduced" when it
+      // shrinks meaningfully but not that far, "unchanged" otherwise. ScoreMode
+      // selects weight (default) vs activation matching. Endpoint-A weights are
+      // restored bit-for-bit at the end and on every error path (try/finally);
+      // pure forward-only — NN is never stepped. DISTINCT from
+      // ModeConnectivityReport (measures the barrier, never permutes), from
+      // RepresentationSimilarityReport (compares activations for similarity,
+      // never produces a weight permutation or re-interpolates), from
+      // NeuronCorrelationReport (intra-layer redundancy of ONE net) and from
+      // WeightDriftReport (raw L2 drift, no symmetry quotient). Guards nil NN, an
+      // empty probe batch, an empty/mismatched snapshot and a net with no hidden
+      // trainable layer gracefully.
+      class function PermutationAlignReport(
+        NN: TNNet;
+        const SnapshotB: string;
+        Samples: TNNetVolumePairList;
+        ScoreMode: integer = 0;
+        K: integer = 10
+      ): string;
       // Forward-only intra-layer redundancy diagnostic. For a probe batch
       // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
       // trainable layer with weights (Neurons.Count > 0 and Weights.Size > 0),
@@ -37150,6 +37223,542 @@ begin
     Result := Lines.Text;
   finally
     // Restore endpoint A on every path (idempotent if already restored).
+    if (NN <> nil) and (aSnap <> '') and (not Restored) then
+      NN.LoadDataFromString(aSnap);
+    NetB.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.PermutationAlignReport(
+  NN: TNNet;
+  const SnapshotB: string;
+  Samples: TNNetVolumePairList;
+  ScoreMode: integer = 0;
+  K: integer = 10
+): string;
+const
+  cEps = 1e-12;
+  cBarWidth = 40;
+  // Verdict: post-alignment barrier relative to the PRE-alignment barrier.
+  cCollapseFrac = 0.25;  // post <= 25% of pre -> "collapsed"
+  cReduceFrac   = 0.90;  // post <= 90% of pre -> "partially reduced"
+  cAbsTol       = 1e-6;  // absolute floor so a ~0 barrier reads collapsed
+  cInvTol       = 1e-4;  // permutation-invariance bit-for-bit tolerance
+var
+  Lines: TStringList;
+  NetB: TNNet;
+  aSnap, StructStr, DiffStr, Verdict, ScoreName: string;
+  TrainableIdxs: array of integer;
+  HiddenPos: array of integer;       // index into TrainableIdxs of hidden layers
+  Perm: array of array of integer;   // per-hidden-layer permutation of B units
+  Churn: array of TNeuralFloat;      // per-hidden-layer moved fraction
+  Losses, AlphasArr: array of TNeuralFloat;
+  LIdx, NIdx, I, J, NumAlpha, BarLen, HCount, TIdx, NextTIdx: integer;
+  Layer, LayerB, NextLayerB: TNNetLayer;
+  Alpha, OneMinus, Span: TNeuralFloat;
+  PreBarrier, PostBarrier, PreEnd, PostEnd, MaxL, MinL: TNeuralFloat;
+  InvErrMax, Reduction: TNeuralFloat;
+  InvOK, MonoOK, SelfMode, Restored, AllIdentity: boolean;
+  Bar, MarkStr: string;
+  Width, AWidth: integer;
+  ScoreMat: array of array of TNeuralFloat; // [A-unit, B-unit]
+  ANorm, BNorm: array of TNeuralFloat;
+  UsedA, UsedB: array of boolean;
+  ActA, ActB: array of array of TNeuralFloat; // [unit, sample] activations
+  PreOut: array of array of TNeuralFloat;     // cached B outputs pre-permutation
+  bestI, bestJ, mI, mJ: integer;
+  bestScore, sVal, dotv: TNeuralFloat;
+  outV: TNNetVolume;
+  pr: TNNetVolumePair;
+
+  // Whole-batch mean MSE loss on the CURRENT live (NN) weights.
+  function EvalLoss(): TNeuralFloat;
+  var
+    SI, WI: integer;
+    SLoss, T2, SumL: TNeuralFloat;
+    O2: TNNetVolume;
+    P2: TNNetVolumePair;
+    Tot: integer;
+  begin
+    SumL := 0; Tot := 0;
+    for SI := 0 to Samples.Count - 1 do
+    begin
+      P2 := Samples[SI];
+      if (P2 = nil) or (P2.I = nil) or (P2.O = nil) then Continue;
+      NN.Compute(P2.I);
+      O2 := NN.GetLastLayer().Output;
+      SLoss := 0;
+      for WI := 0 to O2.Size - 1 do
+      begin
+        T2 := 0;
+        if WI < P2.O.Size then T2 := P2.O.FData[WI];
+        SLoss := SLoss + (O2.FData[WI] - T2) * (O2.FData[WI] - T2);
+      end;
+      if O2.Size > 0 then SLoss := 0.5 * SLoss / O2.Size;
+      SumL := SumL + SLoss;
+      Inc(Tot);
+    end;
+    if Tot > 0 then Result := SumL / Tot else Result := 0;
+  end;
+
+  // Reorder a layer's OUTPUT neurons by Perm (new position i := old unit
+  // Perm[i]) — moving each neuron's full weight ROW and its bias together.
+  procedure ReorderLayerOutputNeurons(Lay: TNNetLayer; const P: array of integer);
+  var
+    n, w, sz: integer;
+    oldW: array of array of TNeuralFloat;
+    oldB: array of TNeuralFloat;
+  begin
+    SetLength(oldW, Lay.Neurons.Count);
+    SetLength(oldB, Lay.Neurons.Count);
+    for n := 0 to Lay.Neurons.Count - 1 do
+    begin
+      sz := Lay.Neurons[n].Weights.Size;
+      SetLength(oldW[n], sz);
+      for w := 0 to sz - 1 do oldW[n][w] := Lay.Neurons[n].Weights.FData[w];
+      oldB[n] := Lay.Neurons[n].FBiasWeight;
+    end;
+    for n := 0 to Lay.Neurons.Count - 1 do
+    begin
+      sz := Lay.Neurons[n].Weights.Size;
+      for w := 0 to sz - 1 do
+        Lay.Neurons[n].Weights.FData[w] := oldW[P[n]][w];
+      Lay.Neurons[n].FBiasWeight := oldB[P[n]];
+    end;
+    Lay.AfterWeightUpdate();
+  end;
+
+  // Compensate the NEXT trainable layer's INPUT-weight COLUMNS by the SAME Perm,
+  // so the represented function is unchanged: each neuron reads input column i
+  // from the previous layer's output position i, which now holds old unit P[i].
+  procedure PermuteNextLayerInputColumns(Lay: TNNetLayer; const P: array of integer);
+  var
+    n, c, sz: integer;
+    oldCol: array of TNeuralFloat;
+  begin
+    for n := 0 to Lay.Neurons.Count - 1 do
+    begin
+      sz := Lay.Neurons[n].Weights.Size;
+      SetLength(oldCol, sz);
+      for c := 0 to sz - 1 do oldCol[c] := Lay.Neurons[n].Weights.FData[c];
+      for c := 0 to sz - 1 do
+        if (P[c] >= 0) and (P[c] < sz) then
+          Lay.Neurons[n].Weights.FData[c] := oldCol[P[c]];
+    end;
+    Lay.AfterWeightUpdate();
+  end;
+
+  // Sweep theta(alpha) = (1-alpha)*A + alpha*(current NetB) and return the
+  // barrier height max_alpha L - max(L(0),L(1)) and the endpoint-loss max.
+  // Reuses ModeConnectivityReport's whole-net MulMulAdd snapshot arithmetic.
+  procedure SweepBarrier(out Barrier, EndMax: TNeuralFloat);
+  var
+    AI, TI, NI: integer;
+    Al, OneMin: TNeuralFloat;
+    LayA, LayBb: TNNetLayer;
+  begin
+    for AI := 0 to NumAlpha - 1 do
+    begin
+      Al := AlphasArr[AI];
+      OneMin := 1.0 - Al;
+      NN.LoadDataFromString(aSnap);   // live weights := A
+      for TI := 0 to High(TrainableIdxs) do
+      begin
+        LayA := NN.Layers[TrainableIdxs[TI]];
+        LayBb := NetB.Layers[TrainableIdxs[TI]];
+        for NI := 0 to LayA.Neurons.Count - 1 do
+        begin
+          LayA.Neurons[NI].Weights.MulMulAdd(
+            OneMin, Al, LayBb.Neurons[NI].Weights);
+          LayA.Neurons[NI].FBiasWeight :=
+            OneMin * LayA.Neurons[NI].FBiasWeight +
+            Al * LayBb.Neurons[NI].FBiasWeight;
+        end;
+        LayA.AfterWeightUpdate();
+      end;
+      Losses[AI] := EvalLoss();
+    end;
+    MaxL := Losses[0]; MinL := Losses[0];
+    for AI := 1 to NumAlpha - 1 do
+    begin
+      if Losses[AI] > MaxL then MaxL := Losses[AI];
+      if Losses[AI] < MinL then MinL := Losses[AI];
+    end;
+    EndMax := Losses[0];
+    if Losses[NumAlpha - 1] > EndMax then EndMax := Losses[NumAlpha - 1];
+    Barrier := MaxL - EndMax;
+    if Barrier < 0 then Barrier := 0;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  NetB := nil;
+  aSnap := '';
+  Restored := false;
+  SetLength(TrainableIdxs, 0);
+  try
+    if NN = nil then
+    begin
+      Result := 'PermutationAlignReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'PermutationAlignReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if SnapshotB = '' then
+    begin
+      Result := 'PermutationAlignReport: SnapshotB is empty.' + sLineBreak;
+      Exit;
+    end;
+    if K < 1 then K := 1;
+    NumAlpha := K + 1;
+    if ScoreMode = 1 then ScoreName := 'activation' else ScoreName := 'weight';
+
+    // Endpoint A snapshot (data only) — used to read A on the path and restore.
+    aSnap := NN.SaveDataToString();
+
+    // Build endpoint B by cloning NN's STRUCTURE and loading B's data into it.
+    StructStr := NN.SaveToString();
+    NetB := TNNet.Create();
+    NetB.LoadFromString(StructStr);
+    NetB.LoadDataFromString(SnapshotB);
+
+    DiffStr := NN.DiffArchitecture(NetB);
+    if DiffStr <> '' then
+    begin
+      Result := 'PermutationAlignReport: SnapshotB has a different ' +
+        'architecture than NN. Call TNNet.DiffArchitecture for details.' +
+        sLineBreak;
+      Exit;
+    end;
+    SelfMode := (SnapshotB = aSnap);
+
+    // Catalogue trainable layers (neurons owning a non-empty weight tensor).
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      SetLength(TrainableIdxs, Length(TrainableIdxs) + 1);
+      TrainableIdxs[High(TrainableIdxs)] := LIdx;
+    end;
+    if Length(TrainableIdxs) = 0 then
+    begin
+      Result := 'PermutationAlignReport: no trainable layers with parameters.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // Hidden permutable layers: a trainable layer that is FOLLOWED by another
+    // trainable layer whose per-neuron input-weight tensor has exactly one
+    // element per unit of this layer (so columns map 1:1 to this layer's output
+    // neurons and can be compensated). Last trainable layer is the read-out head
+    // (its output ordering is fixed by the targets) — never permuted.
+    SetLength(HiddenPos, 0);
+    for I := 0 to High(TrainableIdxs) - 1 do
+    begin
+      Layer := NetB.Layers[TrainableIdxs[I]];
+      NextLayerB := NetB.Layers[TrainableIdxs[I + 1]];
+      if NextLayerB.Neurons.Count = 0 then Continue;
+      if NextLayerB.Neurons[0].Weights = nil then Continue;
+      // 1:1 column compensation only well-defined when the next layer's weight
+      // rows are indexed by this layer's output units.
+      if NextLayerB.Neurons[0].Weights.Size <> Layer.Neurons.Count then Continue;
+      SetLength(HiddenPos, Length(HiddenPos) + 1);
+      HiddenPos[High(HiddenPos)] := I;
+    end;
+    if Length(HiddenPos) = 0 then
+    begin
+      Result := 'PermutationAlignReport: no hidden trainable layer with a ' +
+        'next-layer column-compensable interface (need e.g. FullConnect -> ' +
+        'FullConnect). Nothing to permute.' + sLineBreak;
+      Exit;
+    end;
+
+    SetLength(AlphasArr, NumAlpha);
+    SetLength(Losses, NumAlpha);
+    for I := 0 to NumAlpha - 1 do AlphasArr[I] := I / (NumAlpha - 1);
+    AlphasArr[0] := 0;
+    AlphasArr[NumAlpha - 1] := 1;
+
+    // === PRE-alignment barrier (raw B). ===
+    SweepBarrier(PreBarrier, PreEnd);
+    NN.LoadDataFromString(aSnap);   // restore A before touching NetB
+
+    // === Cache B's outputs on every probe (for the invariance check) and, if
+    //     activation scoring, A's & B's per-unit hidden activations. ===
+    NN.LoadDataFromString(SnapshotB);   // NN := B temporarily to read B outputs
+    SetLength(PreOut, Samples.Count);
+    for I := 0 to Samples.Count - 1 do
+    begin
+      pr := Samples[I];
+      SetLength(PreOut[I], 0);
+      if (pr = nil) or (pr.I = nil) then Continue;
+      NN.Compute(pr.I);
+      outV := NN.GetLastLayer().Output;
+      SetLength(PreOut[I], outV.Size);
+      for J := 0 to outV.Size - 1 do PreOut[I][J] := outV.FData[J];
+    end;
+    NN.LoadDataFromString(aSnap);
+
+    // === Solve a permutation per hidden layer and apply it to NetB. ===
+    SetLength(Perm, Length(HiddenPos));
+    SetLength(Churn, Length(HiddenPos));
+    AllIdentity := true;
+    for HCount := 0 to High(HiddenPos) do
+    begin
+      TIdx := TrainableIdxs[HiddenPos[HCount]];
+      NextTIdx := TrainableIdxs[HiddenPos[HCount] + 1];
+      Layer := NN.Layers[TIdx];        // endpoint A (live = A here)
+      LayerB := NetB.Layers[TIdx];     // endpoint B
+      Width := LayerB.Neurons.Count;   // B units == A units (same arch)
+      SetLength(Perm[HCount], Width);
+
+      // Build the WidthxWidth score matrix: score[a][b] = similarity of A-unit a
+      // to B-unit b. Higher is better; greedy picks the global best repeatedly.
+      SetLength(ScoreMat, Width);
+      for I := 0 to Width - 1 do SetLength(ScoreMat[I], Width);
+
+      if ScoreMode = 1 then
+      begin
+        // ACTIVATION matching: correlate per-unit activations over Samples.
+        AWidth := Layer.Output.Size;
+        SetLength(ActA, Width); SetLength(ActB, Width);
+        for I := 0 to Width - 1 do
+        begin
+          SetLength(ActA[I], Samples.Count);
+          SetLength(ActB[I], Samples.Count);
+        end;
+        // A activations (live = A).
+        for I := 0 to Samples.Count - 1 do
+        begin
+          pr := Samples[I];
+          if (pr = nil) or (pr.I = nil) then Continue;
+          NN.Compute(pr.I);
+          for J := 0 to Width - 1 do
+            if J < AWidth then ActA[J][I] := Layer.Output.FData[J]
+            else ActA[J][I] := 0;
+        end;
+        // B activations.
+        NN.LoadDataFromString(SnapshotB);
+        for I := 0 to Samples.Count - 1 do
+        begin
+          pr := Samples[I];
+          if (pr = nil) or (pr.I = nil) then Continue;
+          NN.Compute(pr.I);
+          for J := 0 to Width - 1 do
+            if J < AWidth then ActB[J][I] := Layer.Output.FData[J]
+            else ActB[J][I] := 0;
+        end;
+        NN.LoadDataFromString(aSnap);
+        // Cosine over the sample axis.
+        SetLength(ANorm, Width); SetLength(BNorm, Width);
+        for I := 0 to Width - 1 do
+        begin
+          sVal := 0;
+          for J := 0 to Samples.Count - 1 do sVal := sVal + ActA[I][J]*ActA[I][J];
+          ANorm[I] := Sqrt(sVal);
+          sVal := 0;
+          for J := 0 to Samples.Count - 1 do sVal := sVal + ActB[I][J]*ActB[I][J];
+          BNorm[I] := Sqrt(sVal);
+        end;
+        for I := 0 to Width - 1 do
+          for J := 0 to Width - 1 do
+          begin
+            dotv := 0;
+            for mI := 0 to Samples.Count - 1 do
+              dotv := dotv + ActA[I][mI] * ActB[J][mI];
+            ScoreMat[I][J] := dotv / (ANorm[I]*BNorm[J] + cEps);
+          end;
+      end
+      else
+      begin
+        // WEIGHT matching: cosine between A-unit a's weight row and B-unit b's.
+        SetLength(ANorm, Width); SetLength(BNorm, Width);
+        for I := 0 to Width - 1 do
+        begin
+          sVal := Layer.Neurons[I].Weights.GetSumSqr();
+          ANorm[I] := Sqrt(sVal);
+          sVal := LayerB.Neurons[I].Weights.GetSumSqr();
+          BNorm[I] := Sqrt(sVal);
+        end;
+        for I := 0 to Width - 1 do
+          for J := 0 to Width - 1 do
+          begin
+            dotv := Layer.Neurons[I].Weights.DotProduct(LayerB.Neurons[J].Weights);
+            ScoreMat[I][J] := dotv / (ANorm[I]*BNorm[J] + cEps);
+          end;
+      end;
+
+      // Greedy correlation-descent: repeatedly take the best unmatched pair.
+      SetLength(UsedA, Width); SetLength(UsedB, Width);
+      for I := 0 to Width - 1 do begin UsedA[I] := false; UsedB[I] := false; Perm[HCount][I] := -1; end;
+      for mI := 0 to Width - 1 do
+      begin
+        bestScore := -1e30; bestI := -1; bestJ := -1;
+        for I := 0 to Width - 1 do
+        begin
+          if UsedA[I] then Continue;
+          for J := 0 to Width - 1 do
+          begin
+            if UsedB[J] then Continue;
+            if ScoreMat[I][J] > bestScore then
+            begin
+              bestScore := ScoreMat[I][J]; bestI := I; bestJ := J;
+            end;
+          end;
+        end;
+        if (bestI < 0) or (bestJ < 0) then Break;
+        UsedA[bestI] := true; UsedB[bestJ] := true;
+        // A-unit bestI is matched by B-unit bestJ: after permutation, B's
+        // output position bestI should hold B-unit bestJ. Perm maps NEW position
+        // -> OLD B-unit index.
+        Perm[HCount][bestI] := bestJ;
+      end;
+
+      // Churn = fraction of positions whose B-unit changed.
+      mJ := 0;
+      for I := 0 to Width - 1 do
+        if Perm[HCount][I] <> I then Inc(mJ);
+      Churn[HCount] := mJ / Width;
+      if mJ <> 0 then AllIdentity := false;
+
+      // === Apply Perm to NetB so the represented FUNCTION is unchanged:
+      //     reorder layer L's output neurons (full weight rows + biases) AND the
+      //     NEXT trainable layer's matching input-weight columns by the same P.
+      ReorderLayerOutputNeurons(LayerB, Perm[HCount]);
+      NextLayerB := NetB.Layers[NextTIdx];
+      PermuteNextLayerInputColumns(NextLayerB, Perm[HCount]);
+    end;
+
+    // === Correctness check 1: permutation invariance (B.Compute unchanged). ===
+    InvErrMax := 0;
+    NN.LoadDataFromString(NetB.SaveDataToString());   // NN := permuted B
+    for I := 0 to Samples.Count - 1 do
+    begin
+      pr := Samples[I];
+      if (pr = nil) or (pr.I = nil) then Continue;
+      if Length(PreOut[I]) = 0 then Continue;
+      NN.Compute(pr.I);
+      outV := NN.GetLastLayer().Output;
+      for J := 0 to outV.Size - 1 do
+        if J < Length(PreOut[I]) then
+          if Abs(outV.FData[J] - PreOut[I][J]) > InvErrMax then
+            InvErrMax := Abs(outV.FData[J] - PreOut[I][J]);
+    end;
+    NN.LoadDataFromString(aSnap);
+    InvOK := InvErrMax < cInvTol;
+
+    // === POST-alignment barrier (permuted B). ===
+    SweepBarrier(PostBarrier, PostEnd);
+    NN.LoadDataFromString(aSnap);
+    Restored := true;
+
+    MonoOK := PostBarrier <= PreBarrier + cAbsTol;
+
+    // --- Report body. ---
+    Lines.Add('PermutationAlignReport (Git Re-Basin neuron-permutation alignment)');
+    Lines.Add(StringOfChar('=', 68));
+    Lines.Add(Format('Probe samples: %d   interpolation points: %d (K=%d)   ' +
+      'score: %s', [Samples.Count, NumAlpha, K, ScoreName]));
+    Lines.Add(Format('Trainable layers: %d   hidden permutable layers: %d',
+      [Length(TrainableIdxs), Length(HiddenPos)]));
+    if SelfMode then
+      Lines.Add('Mode: ALIGN-TO-SELF (SnapshotB == A) — expect identity ' +
+        'permutations and a flat zero barrier.');
+    Lines.Add('');
+
+    Lines.Add('Per-hidden-layer permutation churn (fraction of units moved):');
+    for HCount := 0 to High(HiddenPos) do
+      Lines.Add(Format('  layer[%d] (net layer %d, width %d): churn = %.3f',
+        [HCount, TrainableIdxs[HiddenPos[HCount]],
+         NN.Layers[TrainableIdxs[HiddenPos[HCount]]].Neurons.Count,
+         Churn[HCount]]));
+    Lines.Add('');
+
+    // Barrier before/after as two #-bar rows scaled to the larger barrier.
+    Span := PreBarrier;
+    if PostBarrier > Span then Span := PostBarrier;
+    Lines.Add('Loss barrier (linear-interpolation height, max L - max(L0,L1)):');
+    if Span > cEps then BarLen := Round((PreBarrier / Span) * cBarWidth)
+    else BarLen := 0;
+    if BarLen < 0 then BarLen := 0; if BarLen > cBarWidth then BarLen := cBarWidth;
+    Lines.Add(Format('  before align  %.6f |%s', [PreBarrier, StringOfChar('#', BarLen)]));
+    if Span > cEps then BarLen := Round((PostBarrier / Span) * cBarWidth)
+    else BarLen := 0;
+    if BarLen < 0 then BarLen := 0; if BarLen > cBarWidth then BarLen := cBarWidth;
+    Lines.Add(Format('  after  align  %.6f |%s', [PostBarrier, StringOfChar('#', BarLen)]));
+    Lines.Add('');
+
+    Lines.Add(Format('Pre-alignment  barrier = %.6f  (endpoint-loss max %.6f)',
+      [PreBarrier, PreEnd]));
+    Lines.Add(Format('Post-alignment barrier = %.6f  (endpoint-loss max %.6f)',
+      [PostBarrier, PostEnd]));
+    if PreBarrier > cEps then
+    begin
+      Reduction := 1.0 - (PostBarrier / PreBarrier);
+      Lines.Add(Format('Barrier reduction      = %.2f%% of the pre-alignment ' +
+        'barrier', [Reduction * 100]));
+    end;
+    Lines.Add('');
+
+    // --- correctness checks. ---
+    if InvOK then
+      Lines.Add(Format('Check 1 permutation invariance: PASS (max output drift ' +
+        '%.3e < %.0e — permute+compensate preserves B''s function).',
+        [InvErrMax, cInvTol]))
+    else
+      Lines.Add(Format('Check 1 permutation invariance: FAIL (max output drift ' +
+        '%.3e >= %.0e).', [InvErrMax, cInvTol]));
+
+    if SelfMode then
+    begin
+      if AllIdentity and (PostBarrier <= cAbsTol) then
+        Lines.Add('Check 2 align-to-self: PASS (all permutations identity and ' +
+          'post-alignment barrier ~0).')
+      else
+        Lines.Add(Format('Check 2 align-to-self: FAIL (identity=%s, post ' +
+          'barrier %.3e).', [BoolToStr(AllIdentity, true), PostBarrier]));
+    end
+    else
+      Lines.Add('Check 2 align-to-self: SKIPPED (SnapshotB != A; pass ' +
+        'SnapshotB:=A to exercise it).');
+
+    if MonoOK then
+      Lines.Add('Check 3 monotonicity: PASS (post-alignment barrier <= ' +
+        'pre-alignment barrier — alignment can only help or tie).')
+    else
+      Lines.Add(Format('Check 3 monotonicity: FAIL (post %.6f > pre %.6f).',
+        [PostBarrier, PreBarrier]));
+    Lines.Add('');
+
+    // --- verdict. ---
+    if PreBarrier <= cAbsTol then
+      Verdict := Format('NO PRE-ALIGNMENT BARRIER (%.6f <= floor): the two ' +
+        'solutions were already linearly connected; nothing to collapse.',
+        [PreBarrier])
+    else if PostBarrier <= cCollapseFrac * PreBarrier + cAbsTol then
+      Verdict := Format('BARRIER COLLAPSED (post %.6f <= %.0f%% of pre %.6f): ' +
+        'most of the barrier was a neuron-labelling illusion — once the ' +
+        'permutation symmetry is quotiented out the nets share a basin.',
+        [PostBarrier, cCollapseFrac * 100, PreBarrier])
+    else if PostBarrier <= cReduceFrac * PreBarrier then
+      Verdict := Format('PARTIALLY REDUCED (post %.6f, %.1f%% of pre %.6f): ' +
+        'alignment shrank the barrier but a real bump remains.',
+        [PostBarrier, (PostBarrier / PreBarrier) * 100, PreBarrier])
+    else
+      Verdict := Format('UNCHANGED (post %.6f ~ pre %.6f): permutation ' +
+        'alignment did not reduce the barrier here.',
+        [PostBarrier, PreBarrier]);
+    Lines.Add('Verdict: ' + Verdict);
+
+    Result := Lines.Text;
+  finally
     if (NN <> nil) and (aSnap <> '') and (not Restored) then
       NN.LoadDataFromString(aSnap);
     NetB.Free;
