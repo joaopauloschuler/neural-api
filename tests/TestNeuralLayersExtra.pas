@@ -86,6 +86,7 @@ type
     procedure TestWeightSpectrumReportRank1Matrix;
     procedure TestWeightSpectrumReportStructureAndFlags;
     procedure TestTopLogitMarginReportSmoke;
+    procedure TestNeuronCorrelationReportSmoke;
   end;
 
 implementation
@@ -1594,6 +1595,54 @@ begin
     AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
   finally
     Samples.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestNeuronCorrelationReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report: string;
+  I, J: integer;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.NeuronCorrelationReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.NeuronCorrelationReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // a handful of probe volumes.
+    for I := 0 to 15 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+    end;
+
+    Report := TNNet.NeuronCorrelationReport(NN, Probes, 3);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('NeuronCorrelationReport', Report) > 0);
+    AssertTrue('Histogram section present',
+      Pos('|rho| histogram', Report) > 0);
+    AssertTrue('Effective-count section present',
+      Pos('effective neuron count', Report) > 0);
+    AssertTrue('Flags section present', Pos('Flags', Report) > 0);
+  finally
+    Probes.Free;
     NN.Free;
   end;
 end;

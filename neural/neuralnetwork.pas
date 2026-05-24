@@ -3752,6 +3752,48 @@ type
         PowerIters: integer = 10;
         SpectralNormThreshold: TNeuralFloat = 2.0
       ): string;
+      // Forward-only intra-layer redundancy diagnostic. For a probe batch
+      // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
+      // trainable layer with weights (Neurons.Count > 0 and Weights.Size > 0),
+      // treats the layer Output flattened to a vector of length Output.Size as
+      // the per-sample activation of that layer's N "neurons" and measures
+      // redundancy along the NEURON axis — i.e. how correlated neurons are with
+      // each other ACROSS the probe batch (not across samples). In a single
+      // pass over (a capped slice of) the probe batch it accumulates per-neuron
+      // sum, sum-of-squares and the NxN pairwise sum-of-products, then forms the
+      // Pearson correlation matrix rho_ij (mean-centre and std-normalise each
+      // neuron). A neuron whose std < 1e-6 is treated as constant: its rho with
+      // everything is 0 and it is counted as a "constant neuron". Per layer it
+      // reports:
+      //   (a) a 10-bin ASCII histogram of |rho_ij| over the off-diagonal pairs
+      //       i<j (the redundancy distribution);
+      //   (b) the TopPairsPerLayer most-correlated neuron pairs (i, j, rho_ij)
+      //       by |rho| — a "merge / prune one of each pair" candidate list;
+      //   (c) an "effective neuron count" = participation ratio of the
+      //       correlation matrix, computed as the standard
+      //         effective_count = N^2 / ||R||_F^2 = N^2 / (sum_i sum_j rho_ij^2)
+      //       where R is the FULL correlation matrix INCLUDING the unit diagonal
+      //       (rho_ii = 1). This lies in [1, N]: N when all neurons are mutually
+      //       uncorrelated (R = I), 1 when all are perfectly correlated
+      //       (R = all-ones). (The tasklist's ambiguous "sum_i 1/sum_j rho_ij^2"
+      //       is replaced by this well-behaved participation-ratio form.)
+      //   (d) per-layer flags: "near-duplicate pair present" (any |rho_ij| >
+      //       0.95), "collapsed layer" (effective neuron count < 25% of the
+      //       nominal width N) and the constant-neuron count (std < 1e-6).
+      // MaxSamples caps how many probe volumes are used (default 128, for
+      // memory/time). MaxNeurons caps the per-layer width that gets the full
+      // O(N^2) treatment: a layer with N > MaxNeurons (default 512) is skipped
+      // with a "skipped: too wide (N>MaxNeurons)" note (an NxN correlation
+      // matrix would be too expensive). Pure CPU, forward-only — no backward
+      // pass, no weight perturbation. Guards nil NN and an empty probe list
+      // gracefully.
+      class function NeuronCorrelationReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        TopPairsPerLayer: integer = 5;
+        MaxSamples: integer = 128;
+        MaxNeurons: integer = 512
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -24321,6 +24363,327 @@ begin
     Lines.Add('Flags:');
     if Flags.Count = 0 then
       Lines.Add('  (none) — no high-spectral-norm or rank-1-collapse layers.')
+    else
+      Lines.AddStrings(Flags);
+
+    Result := Lines.Text;
+  finally
+    Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.NeuronCorrelationReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  TopPairsPerLayer: integer = 5;
+  MaxSamples: integer = 128;
+  MaxNeurons: integer = 512
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cConstStd = 1e-6;       // a neuron with std below this is "constant"
+  cNearDup = 0.95;        // |rho| above this flags a near-duplicate pair
+  cCollapseFrac = 0.25;   // effective count < this * N flags a collapsed layer
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx, I, J, SampleIdx, BinIdx, K: integer;
+  Layer: TNNetLayer;
+  N, UsedSamples, TrainableLayers: integer;
+  // single-pass accumulators (per layer)
+  Sum: array of TNeuralFloat;        // sum of each neuron's activation
+  SumSq: array of TNeuralFloat;      // sum of squares
+  Cross: array of array of TNeuralFloat; // pairwise sum of products (i<=j)
+  Mean: array of TNeuralFloat;
+  Std: array of TNeuralFloat;
+  V: TNeuralFloat;
+  Rho, Cov, Denom, AbsRho, FrobSq, EffCount: TNeuralFloat;
+  ConstCount, PairCount: integer;
+  // off-diagonal |rho| histogram
+  Bins: array of integer;
+  MaxBin, BarLen: integer;
+  // top-K most-correlated pairs (kept as parallel arrays)
+  TopI, TopJ: array of integer;
+  TopRho: array of TNeuralFloat;     // signed rho
+  TopAbs: array of TNeuralFloat;     // |rho| (sort key)
+  Filled, MinPos: integer;
+  SmallestAbs, SwapF: TNeuralFloat;
+  SwapI: integer;
+  Bar, ShapeStr, Line: string;
+  HasNearDup: boolean;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'NeuronCorrelationReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'NeuronCorrelationReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if TopPairsPerLayer < 0 then TopPairsPerLayer := 0;
+    if MaxSamples < 1 then MaxSamples := 1;
+    if MaxNeurons < 1 then MaxNeurons := 1;
+
+    UsedSamples := Samples.Count;
+    if UsedSamples > MaxSamples then UsedSamples := MaxSamples;
+
+    Lines.Add(
+      'NeuronCorrelationReport: intra-layer neuron redundancy across a probe ' +
+      'batch.');
+    Lines.Add(Format(
+      'Probe samples used: %d (of %d available, cap MaxSamples=%d). ' +
+      'MaxNeurons=%d.',
+      [UsedSamples, Samples.Count, MaxSamples, MaxNeurons]));
+    Lines.Add('Per layer: |rho_ij| histogram (i<j), top correlated pairs, '
+      + 'effective neuron count = N^2 / sum_ij rho_ij^2 (in [1, N]).');
+    Lines.Add('');
+
+    TrainableLayers := 0;
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+
+      Inc(TrainableLayers);
+      N := Layer.Output.Size;
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+
+      Lines.Add(Format('Layer %3d %s  out=%s  N=%d',
+        [LayerIdx, Layer.ClassName, ShapeStr, N]));
+
+      if N < 2 then
+      begin
+        Lines.Add('  skipped: fewer than 2 neurons (nothing to correlate).');
+        Lines.Add('');
+        Continue;
+      end;
+      if N > MaxNeurons then
+      begin
+        Lines.Add(Format(
+          '  skipped: too wide (N>MaxNeurons, %d>%d) — full O(N^2) ' +
+          'correlation matrix is too expensive.', [N, MaxNeurons]));
+        Lines.Add('');
+        Continue;
+      end;
+
+      // ---- single pass over the probe batch: accumulate sum, sum-sq and the
+      // pairwise sum-of-products (upper triangle incl. diagonal). ----
+      SetLength(Sum, N);
+      SetLength(SumSq, N);
+      SetLength(Cross, N);
+      for I := 0 to N - 1 do
+      begin
+        Sum[I] := 0;
+        SumSq[I] := 0;
+        SetLength(Cross[I], N);
+        for J := I to N - 1 do Cross[I][J] := 0;
+      end;
+
+      for SampleIdx := 0 to UsedSamples - 1 do
+      begin
+        NN.Compute(Samples[SampleIdx]);
+        for I := 0 to N - 1 do
+        begin
+          V := Layer.Output.Raw[I];
+          Sum[I] := Sum[I] + V;
+          SumSq[I] := SumSq[I] + V * V;
+          for J := I to N - 1 do
+            Cross[I][J] := Cross[I][J] + V * Layer.Output.Raw[J];
+        end;
+      end;
+
+      // ---- per-neuron mean / std (population). ----
+      SetLength(Mean, N);
+      SetLength(Std, N);
+      ConstCount := 0;
+      for I := 0 to N - 1 do
+      begin
+        Mean[I] := Sum[I] / UsedSamples;
+        V := SumSq[I] / UsedSamples - Mean[I] * Mean[I];
+        if V < 0 then V := 0;
+        Std[I] := Sqrt(V);
+        if Std[I] < cConstStd then Inc(ConstCount);
+      end;
+
+      // ---- correlation-derived quantities in one sweep over i<=j:
+      //   * off-diagonal |rho| histogram (i<j),
+      //   * top-K most-correlated pairs,
+      //   * Frobenius energy sum_ij rho_ij^2 (full matrix, diag rho_ii=1). ----
+      SetLength(Bins, cBins);
+      for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+      SetLength(TopI, TopPairsPerLayer);
+      SetLength(TopJ, TopPairsPerLayer);
+      SetLength(TopRho, TopPairsPerLayer);
+      SetLength(TopAbs, TopPairsPerLayer);
+      Filled := 0;
+      PairCount := 0;
+      FrobSq := 0;
+      HasNearDup := False;
+
+      for I := 0 to N - 1 do
+      begin
+        // diagonal: rho_ii = 1 for a varying neuron, 0 for a constant one.
+        if Std[I] >= cConstStd then FrobSq := FrobSq + 1.0;
+        for J := I + 1 to N - 1 do
+        begin
+          if (Std[I] < cConstStd) or (Std[J] < cConstStd) then
+            Rho := 0
+          else
+          begin
+            // cov = E[xy] - E[x]E[y]
+            Cov := Cross[I][J] / UsedSamples - Mean[I] * Mean[J];
+            Denom := Std[I] * Std[J];
+            if Denom > 1e-30 then
+              Rho := Cov / Denom
+            else
+              Rho := 0;
+            if Rho > 1.0 then Rho := 1.0;
+            if Rho < -1.0 then Rho := -1.0;
+          end;
+
+          // rho_ij appears twice in the full matrix (ij and ji).
+          FrobSq := FrobSq + 2.0 * Rho * Rho;
+
+          AbsRho := Abs(Rho);
+          if AbsRho > cNearDup then HasNearDup := True;
+
+          // off-diagonal |rho| histogram over [0, 1].
+          BinIdx := Trunc(AbsRho * cBins);
+          if BinIdx >= cBins then BinIdx := cBins - 1;
+          if BinIdx < 0 then BinIdx := 0;
+          Inc(Bins[BinIdx]);
+          Inc(PairCount);
+
+          // maintain the top-K by |rho|.
+          if TopPairsPerLayer > 0 then
+          begin
+            if Filled < TopPairsPerLayer then
+            begin
+              TopI[Filled] := I;
+              TopJ[Filled] := J;
+              TopRho[Filled] := Rho;
+              TopAbs[Filled] := AbsRho;
+              Inc(Filled);
+            end
+            else
+            begin
+              // replace the current smallest-|rho| entry if this is larger.
+              MinPos := 0;
+              SmallestAbs := TopAbs[0];
+              for K := 1 to TopPairsPerLayer - 1 do
+                if TopAbs[K] < SmallestAbs then
+                begin
+                  SmallestAbs := TopAbs[K];
+                  MinPos := K;
+                end;
+              if AbsRho > SmallestAbs then
+              begin
+                TopI[MinPos] := I;
+                TopJ[MinPos] := J;
+                TopRho[MinPos] := Rho;
+                TopAbs[MinPos] := AbsRho;
+              end;
+            end;
+          end;
+        end;
+      end;
+
+      // effective neuron count = N^2 / ||R||_F^2 (participation ratio).
+      if FrobSq > 1e-30 then
+        EffCount := (N * N) / FrobSq
+      else
+        EffCount := N;
+      if EffCount > N then EffCount := N;
+      if EffCount < 1 then EffCount := 1;
+
+      // (a) |rho_ij| histogram over the i<j pairs.
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+      Lines.Add(Format('  |rho| histogram over %d pair(s) (10 bins, [0,1]):',
+        [PairCount]));
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        if MaxBin > 0 then
+          BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('    [%.2f-%.2f) | n=%6d %s',
+          [BinIdx / cBins, (BinIdx + 1) / cBins, Bins[BinIdx], Bar]));
+      end;
+
+      // (b) top-K most-correlated pairs (sorted desc by |rho|, selection sort).
+      if TopPairsPerLayer > 0 then
+      begin
+        for I := 0 to Filled - 2 do
+        begin
+          MinPos := I;
+          for J := I + 1 to Filled - 1 do
+            if TopAbs[J] > TopAbs[MinPos] then MinPos := J;
+          if MinPos <> I then
+          begin
+            SwapI := TopI[I]; TopI[I] := TopI[MinPos]; TopI[MinPos] := SwapI;
+            SwapI := TopJ[I]; TopJ[I] := TopJ[MinPos]; TopJ[MinPos] := SwapI;
+            SwapF := TopRho[I]; TopRho[I] := TopRho[MinPos]; TopRho[MinPos] := SwapF;
+            SwapF := TopAbs[I]; TopAbs[I] := TopAbs[MinPos]; TopAbs[MinPos] := SwapF;
+          end;
+        end;
+        Line := Format('  top %d correlated pair(s) (merge/prune one of each):',
+          [TopPairsPerLayer]);
+        Lines.Add(Line);
+        if Filled = 0 then
+          Lines.Add('    (none)')
+        else
+          for I := 0 to Filled - 1 do
+            Lines.Add(Format('    neurons %5d & %5d   rho=%8.4f',
+              [TopI[I], TopJ[I], TopRho[I]]));
+      end;
+
+      // (c) effective neuron count + (e) per-layer flags.
+      Lines.Add(Format(
+        '  effective neuron count = %.2f / %d (%.1f%% of nominal width)',
+        [EffCount, N, 100.0 * EffCount / N]));
+      Lines.Add(Format('  constant neurons (std<%g): %d',
+        [cConstStd, ConstCount]));
+      if HasNearDup then
+        Flags.Add(Format(
+          '  Layer %3d %s: near-duplicate pair present (|rho| > %g).',
+          [LayerIdx, Layer.ClassName, cNearDup]));
+      if EffCount < cCollapseFrac * N then
+        Flags.Add(Format(
+          '  Layer %3d %s: collapsed (effective count %.2f < %.0f%% of N=%d).',
+          [LayerIdx, Layer.ClassName, EffCount, 100.0 * cCollapseFrac, N]));
+      if ConstCount > 0 then
+        Flags.Add(Format(
+          '  Layer %3d %s: %d constant neuron(s) (std < %g).',
+          [LayerIdx, Layer.ClassName, ConstCount, cConstStd]));
+      Lines.Add('');
+    end;
+
+    if TrainableLayers = 0 then
+    begin
+      Lines.Add('No trainable layers with weights found.');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    Lines.Add(Format('Network total: %d trainable layer(s).',
+      [TrainableLayers]));
+    Lines.Add('Flags (near-duplicate / collapsed / constant-neuron):');
+    if Flags.Count = 0 then
+      Lines.Add('  (none) — no redundancy flags raised.')
     else
       Lines.AddStrings(Flags);
 

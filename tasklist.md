@@ -1130,7 +1130,7 @@ breakdown:
       substitutes, not complements).
 
 ### Intra-layer redundancy
-- [ ] TNNet.NeuronCorrelationReport — given a probe batch, for every
+- [X] TNNet.NeuronCorrelationReport — given a probe batch, for every
       trainable layer with a flat (channel/neuron) output axis, walk the
       per-sample activations and report intra-layer redundancy along the
       *neuron* axis (not the sample axis):
