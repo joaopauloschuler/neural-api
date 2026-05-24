@@ -333,18 +333,15 @@ breakdown:
      landed 2026-05-24 as a sibling to AddPreNormResidual/AddRMSNormResidual/
      AddPostNormResidual (per-channel gate inits to 0 so the branch starts as
      identity); ships forward-wiring + input numerical-gradient tests. The
-     ReZero-vs-GatedResidual depth-ablation follow-up remains open below.) -->
-- [X] TNNetGatedResidual follow-up: ReZero-vs-GatedResidual depth ablation —
-      LANDED 2026-05-24 as examples/ReZeroVsGatedResidual/. Two arms of the
-      same deepish residual MLP on hypotenuse: scalar ReZero (one weight,
-      SetNumWeightsForAllNeurons(1,1,1)) vs per-channel GatedResidual gates.
-      Confirmed the per-channel gate opens UNEVENLY (many channels stay
-      exactly 0, a handful grow both signs) while the ReZero scalar opens
-      uniformly. NOTE captured for future gate-dump examples: TNeuralFit.Fit
-      reloads the best model at the end (LoadFromFile), rebuilding every layer
-      instance, so gate-layer LAYER REFERENCES go stale — capture layer
-      INDICES at build time and read NN.Layers[idx].Neurons[0].Weights after
-      Fit instead.
+     ReZero-vs-GatedResidual depth-ablation follow-up landed below.) -->
+<!-- (ReZero-vs-GatedResidual depth ablation removed: completed, landed
+     2026-05-24 as examples/ReZeroVsGatedResidual/. Finding: the per-channel
+     gate opens UNEVENLY (many channels stay exactly 0, a handful grow both
+     signs) while the ReZero scalar opens uniformly. Gotcha for future
+     gate-dump examples: TNeuralFit.Fit reloads the best model at the end
+     (rebuilding every layer instance) so gate-layer LAYER REFERENCES go
+     stale — capture layer INDICES at build time and read
+     NN.Layers[idx].Neurons[0].Weights after Fit.) -->
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
@@ -449,13 +446,13 @@ breakdown:
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
-- [X] Pooling bake-off example `examples/PoolingBakeoff/`: same tiny conv
-      classifier, swap the pooling head across `TNNetAvgPool` / `TNNetMaxPool`
-      / `TNNetLpPool` (sweep `p ∈ {1, 2, 4, 8}`) / `TNNetSoftPool` (sweep
-      `beta ∈ {0.5, 1, 2, 8}`). LANDED 2026-05-24: synthetic blob-quadrant
-      task built so the class-mean is invariant and only energy CONCENTRATION
-      is discriminative — AvgPool/LpPool(p=1) sit at chance, MaxPool solves it,
-      and both LpPool's `p` and SoftPool's `beta` interpolate avg→max.
+<!-- (Pooling bake-off example removed: completed, landed 2026-05-24 as
+     examples/PoolingBakeoff/ — same tiny conv classifier swapping the pooling
+     head across TNNetAvgPool / TNNetMaxPool / TNNetLpPool (p ∈ {1,2,4,8}) /
+     TNNetSoftPool (beta ∈ {0.5,1,2,8}) on a synthetic blob-quadrant task where
+     the class-mean is invariant and only energy CONCENTRATION is
+     discriminative: AvgPool/LpPool(p=1) sit at chance, MaxPool solves it, and
+     both LpPool's p and SoftPool's beta interpolate avg→max.) -->
 - [ ] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
       stack accepting two different input resolutions and producing a
       fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
@@ -512,48 +509,17 @@ breakdown:
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.
 - [ ] Mixup data augmentation helper.
-- [X] Sharpness-Aware Minimization (SAM) experiment `examples/SharpnessAwareMinimization/`
-      LANDED 2026-05-24. Hand-rolled two-pass SAM (ascent perturb via global
-      grad-norm, snapshot/restore via SaveDataToString) vs plain SGD on a noisy-
-      label 2D-blob toy. Both invariants hold: rho=0 == plain SGD bit-for-bit
-      (max weight diff 0.0), and sharpness (LossLandscapeProbe) falls as rho
-      rises (0.41→0.21). KEY LIBRARY NOTE: the library defaults to per-sample
-      updates (FBatchUpdate=false) where Backpropagate applies updates
-      immediately and leaves Neurons[].Delta at ZERO — SAM needs the accumulated
-      gradient tensor, so the example calls NN.SetBatchUpdate(True). Any future
-      manual gradient-surgery example (PCGrad, Lookahead, grad clipping) must do
-      the same or the gradient access is a silent no-op.
-<!-- Original SAM spec (kept for reference):
-      (Foret et al. 2021) — the one well-known optimizer idea NOT covered by the
-      SWA / EMA / Lookahead / gradient-clipping plumbing above, and a natural
-      partner to the landed [[LossLandscapeProbe]] (which already prints a
-      sharpness scalar + loss-doubling radius). SAM is a two-pass step: from the
-      current weights `w`, do (1) a forward+backward to get `g = dL/dw`, (2)
-      climb to the worst-case neighbour `w_adv = w + rho * g/||g||` (the
-      "ascent" step, a whole-net snapshot + perturb), (3) a SECOND
-      forward+backward AT `w_adv` to get the perturbed gradient, then (4) restore
-      `w` and apply that perturbed gradient with the normal optimizer — so the
-      step minimises the loss of the worst point in a rho-ball, biasing training
-      toward FLAT minima. Scope it as a SELF-CONTAINED example with a hand-rolled
-      mini-batch loop (like SineRegression / BinaryAdder already do — no intrusive
-      TNeuralFit surgery), reusing the existing whole-net `SaveDataToString` /
-      `LoadDataFromString` snapshot for the restore (the same trick
-      LayerSensitivityReport uses) and the per-parameter gradient tensors
-      `Backpropagate` already populates for the `||g||` norm and the perturb. Train
-      the SAME tiny MLP twice on a small noisy-label classification toy — plain SGD
-      vs SAM at matched LR/epochs — and report: final train/val loss + accuracy,
-      and the headline FLATNESS contrast by calling `TNNet.LossLandscapeProbe` on
-      both trained nets (SAM's sharpness scalar and loss-doubling radius should
-      land flatter/wider — the built-in correctness signal that SAM did what it
-      claims). Sweep `rho in {0.0, 0.01, 0.05, 0.1, 0.2}` (rho=0 must reproduce
-      plain SGD bit-for-bit — a second built-in invariant) and chart the
-      sharpness-vs-rho and val-accuracy-vs-rho curves. Distinct from everything in
-      tree: LossLandscapeProbe only MEASURES sharpness on a frozen net, the
-      AdversarialRobustness report perturbs the INPUT (not the weights) and never
-      steps, and SWA/EMA average weights post-hoc rather than changing the
-      gradient that is applied. Pure CPU, no external data, fits a few-minute
-      budget. Pairs with the open weight-decay / generalization experiments
-      ([[WeightSpectrumReport]]). -->
+<!-- (Sharpness-Aware Minimization (SAM) experiment removed: completed, landed
+     2026-05-24 as examples/SharpnessAwareMinimization/ — hand-rolled two-pass
+     SAM (ascent perturb via global grad-norm, snapshot/restore via
+     SaveDataToString) vs plain SGD on a noisy-label 2D-blob toy. Both
+     invariants hold: rho=0 == plain SGD bit-for-bit (max weight diff 0.0), and
+     sharpness (LossLandscapeProbe) falls as rho rises (0.41→0.21). KEY LIBRARY
+     NOTE for any future manual gradient-surgery example (PCGrad, Lookahead,
+     grad clipping): the library defaults to per-sample updates
+     (FBatchUpdate=false) where Backpropagate applies updates immediately and
+     leaves Neurons[].Delta at ZERO — call NN.SetBatchUpdate(True) to access the
+     accumulated gradient tensor or the access is a silent no-op.) -->
 - [ ] SAM follow-up: the noisy-label 2D-blob clusters are easily separable so
       clean val-accuracy saturates (~99%) across all rho — the flatness signal
       carries the story but the val-acc-vs-rho curve is flat. A harder task
