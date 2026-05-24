@@ -1024,9 +1024,11 @@ breakdown:
      {Charbonnier, Huber, MSE, LogCosh} is a strict subset of that entry's
      {MSE, Huber, SmoothL1, Charbonnier, LogCosh}, on the same noisy/outlier
      hypotenuse harness.) -->
-- [ ] Loss-family bake-off (output heads): hypotenuse with MSE / Huber /
+- [x] Loss-family bake-off (output heads): hypotenuse with MSE / Huber /
       SmoothL1 / Charbonnier / LogCosh, printing final MSE and epochs-to-
-      converge.
+      converge. (Landed as examples/LossFamilyBakeoff/ — noisy hypotenuse with
+      10% injected outliers, clean held-out test set; all four robust heads
+      beat MSE on clean-test MSE/MAE.)
 <!-- (TanhGLU vs SwiGLU vs GEGLU vs GLU vs ReGLU bake-off removed: completed,
      landed 2026-05-24 as examples/GatedFFNBakeoff/. Same FFN block
      (PointwiseConvLinear(2*d_ff) -> GATE -> PointwiseConvLinear(1)) built five
