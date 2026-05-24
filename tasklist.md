@@ -380,6 +380,27 @@ breakdown:
       next knob). Reuses the landed `TNNet.EstimateSpectralNorm` power-
       iteration helper.
 
+### Bugs surfaced by the introspection-report batch
+- [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
+      overflow when the NEXT layer is a padded convolution: the flip layer's
+      `OutputError` is sized exactly to its output, but a padded conv writes a
+      larger (padded) error region into it, overflowing. Surfaced while wiring
+      an `Input -> FlipX -> Conv -> ...` flip-invariant net for
+      EquivarianceReport (worked around by using a global-avg construction
+      instead). Add a numerical-gradient / forward+backward regression test
+      for `FlipX -> padded Conv` and fix the unpad sizing.
+- [ ] Input-space gradients are not exposed by the public backward path:
+      `Layers[0].OutputError` is a 1-element tensor by default, so the first
+      trainable layer silently skips writing the input gradient. SaliencyReport
+      works around it by resizing the input layer's `OutputError`/
+      `OutputErrorDeriv` to match `Output` AND (for a conv first layer)
+      refreshing `FCalculatePrevLayerError` + `FPrevLayerErrorPadded`, which are
+      cached at wiring time from the then-degenerate 1-element input error.
+      Promote this into a small reusable helper (e.g. `TNNet.EnableInputGradient`)
+      so saliency / adversarial-perturbation callers don't re-derive it, with a
+      regression test asserting a non-zero input gradient for both a conv and a
+      FullConnect first layer.
+
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
       in tests/TestNeuralNumerical.pas. Three-line tests instead of
@@ -974,83 +995,24 @@ breakdown:
       `AssertReportSmoke(reportFn, expectedHeader)` in
       tests/TestNeuralLayersExtra.pas so new report tasks are a one-liner.
 - [ ] Next introspection-report batch (same forward-only `TNNet.*Report`
-      pattern, all still unimplemented, each pairs with an `examples/*/`
-      synthetic demo and a smoke test): `TNNet.SaliencyReport` (input-gradient
-      / SmoothGrad / Integrated-Gradients attribution),
-      `TNNet.EquivarianceReport` (output response to FlipX/FlipY/Roll
-      input symmetries), `TNNeuralTTAEvaluator` (test-time-augmentation
+      pattern, each pairs with an `examples/*/` synthetic demo and a smoke
+      test). Still unimplemented: `TNNeuralTTAEvaluator` (test-time-augmentation
       accuracy lift), `TNNet.LinearProbeReport` (closed-form per-layer linear
       probe), and the calibration unit (`neuralcalibration.pas`: ECE / MCE /
       Brier + reliability diagram). Specs are in the sections below/above.
+      LANDED: `TNNet.SaliencyReport` (commit 1c9e2ad), `TNNet.EquivarianceReport`
+      (commit d9de851), `TNNet.DecisionBoundaryReport` (commit a28022b).
 ### Input attribution
-- [ ] TNNet.SaliencyReport — given a trained classifier and a probe sample,
-      compute three flavours of input attribution and print them side-by-side
-      as compact ASCII heatmaps over the input plane (one row per channel,
-      one cell per pixel, 10 intensity buckets):
-      (a) vanilla input-gradient saliency `|d logit_c / d x|` for the
-          predicted class c (one forward + one backward pass),
-      (b) SmoothGrad over N noisy copies of the input
-          (`x + eta`, `eta ~ N(0, sigma^2)`, default N=16, sigma=0.15 *
-          (max(x)-min(x))) — averages (a) to denoise the saliency,
-      (c) Integrated Gradients along a straight line from a zero baseline
-          to x using K steps (default K=20) — the "did this pixel
-          contribute to the decision?" measure that satisfies the
-          completeness axiom (sum of attributions ≈ logit_c(x) - logit_c(0)).
-      Also report, per channel: total attribution mass, top-K most-attributing
-      pixel coordinates, and the completeness gap for the IG variant as a
-      one-number sanity check. Pure-CPU, reuses the existing
-      forward/backward path — no training-time changes, no new layer types
-      (the input-gradient already flows through TNNetInput's backward).
-      Distinct from [[DeadNeuronReport]] / [[ActivationStatsReport]]
-      (activation statistics, not input attribution),
-      [[GradientNormReport]] (per-layer backward magnitudes summarised, not
-      per-pixel input gradients), [[AttentionEntropyReport]] (attention
-      weights inside an SDPA stack, not classifier-input attribution), and
-      [[ConfusionMatrixReport]] (aggregate label confusions, not per-sample
-      explanations). Companion `examples/SaliencyReport/` runs it on a
-      handful of SimpleImageClassifier CIFAR samples — one correctly
-      classified and one misclassified — so the three heatmaps can be
-      eyeballed against the actual image content, and the completeness gap
-      acts as a built-in regression check on the IG implementation.
+- [X] TNNet.SaliencyReport — LANDED (commit 1c9e2ad): vanilla
+      input-gradient / SmoothGrad / Integrated-Gradients attribution with
+      per-channel mass, top-K pixels, and an IG completeness-gap check.
+      `examples/SaliencyReport/` + smoke test shipped.
 
 ### Input-symmetry equivariance
-- [ ] TNNet.EquivarianceReport — given a trained (or freshly-initialised)
-      network and a probe batch, measure how the forward output reacts to
-      a fixed menu of input-side symmetry transforms and report per
-      transform:
-      (a) "invariance error" — `mean ||f(T(x)) - f(x)||_2 / ||f(x)||_2`
-          across the probe batch (zero = the model ignores the transform),
-      (b) "equivariance error" — `mean ||f(T(x)) - T'(f(x))||_2 /
-          ||f(x)||_2` for transforms with a well-defined output-side action
-          `T'` (e.g. horizontal flip of a segmentation map), zero if the
-          model commutes with `T`,
-      (c) per-class top-1 agreement rate `mean(argmax(f(T(x))) ==
-          argmax(f(x)))` for classifier-shaped outputs,
-      (d) a 10-bin ASCII histogram of per-sample invariance error across
-          the probe batch so outliers are visible,
-      (e) a one-line verdict per transform: "invariant" (err < 1e-3),
-          "approximately invariant" (err < 1e-1), "sensitive" (err >= 1e-1).
-      Default transform menu for image-shaped inputs:
-      `TNNetFlipX` (horizontal mirror), `TNNetFlipY` (vertical mirror),
-      `TNNetReverseChannels` (channel permutation), and a 1-pixel
-      `Roll(X=+1)` translation. The menu is configurable via a small
-      `TInputTransform` callback list so non-image domains (sequence
-      shifts, depth permutations) can plug in. Pure forward-only — no
-      training-time changes, no backward pass needed. Distinct from
-      [[GradientNormReport]] (backward magnitudes), [[SaliencyReport]]
-      (per-pixel input attribution for one sample), [[ConfusionMatrixReport]]
-      (label confusions on the untransformed set), and
-      [[LayerSensitivityReport]] (weight-side perturbations, not
-      input-side transforms). Natural unit-test artifact too: pairs of
-      `TNNetFlipX` round-trip to identity, so a freshly-built net wired
-      `Input -> FlipX -> Body -> FlipX` should report ~0 invariance error
-      on the FlipX probe — a built-in correctness check. Companion
-      `examples/EquivarianceReport/` runs it on (i) a plain conv
-      classifier (expected: low FlipX invariance — CNNs are translation-
-      but not flip-equivariant by default) and (ii) the same architecture
-      trained with `TNNetRandomFlipX` augmentation (expected: invariance
-      error collapses), making the augmentation's effect visible as a
-      single number rather than a wall of accuracy digits.
+- [X] TNNet.EquivarianceReport — LANDED (commit d9de851): per-transform
+      invariance error / argmax-agreement / histogram / verdict over a
+      FlipX/FlipY/ReverseChannels/Roll menu. `examples/EquivarianceReport/`
+      + smoke test shipped.
 
 ### Test-time augmentation evaluator
 - [ ] TNeuralTTAEvaluator — given a trained classifier, a validation set,
@@ -1150,48 +1112,8 @@ breakdown:
       per-layer linear separability.
 
 ### Learned-function visualization
-- [ ] TNNet.DecisionBoundaryReport — given a trained net with a 2-input
-      (`TNNetInput.Create(2)`) classifier head, sweep a `Gx x Gy` grid
-      (default 41x41) over an axis-aligned bounding box of the input
-      plane (auto-fitted from a probe set, or caller-supplied
-      `(xMin,xMax,yMin,yMax)`), run one forward pass per grid cell, and
-      render the *learned function over its whole input domain* — not a
-      statistic of a probe batch — as compact stdout art:
-      (a) an ASCII class map: one glyph per grid cell = `argmax` class
-          (digits/letters per class), so the carved-up regions are
-          directly visible,
-      (b) a confidence-shaded overlay: the same grid but glyph intensity
-          (10 buckets) set by the top-1 softmax probability (or top1-top2
-          logit margin when the head is linear), so low-confidence
-          boundary bands show up as faint seams between regions,
-      (c) a boundary-cell count and estimated total boundary length
-          (grid cells whose 4-neighbours disagree on argmax) — a single
-          scalar proxy for how convoluted the learned boundary is,
-      (d) optional probe-set overlay: stamp the supplied samples onto the
-          grid by true class so misclassified points (sample glyph in a
-          region of a different colour) are visible against the boundary,
-      (e) a CSV side-output (`x, y, argmax, top1prob`) for downstream
-          plotting, mirroring LearningRateFinder's CSV convention.
-      Pure forward-only — no training-time changes, no backward pass, no
-      new layer types. Guards: assert the input layer is 2-D
-      (`SizeX*SizeY*Depth == 2`) with a clear error otherwise, since the
-      whole point is a plottable plane. Distinct from
-      [[GradientAscent]] (optimises an *input image* to maximise an inner
-      neuron for high-D image nets — input-space ascent, not a dense
-      forward sweep of a 2-D domain), from [[SaliencyReport]] (per-pixel
-      attribution for one sample, not the global input->class map),
-      [[ConfusionMatrixReport]] / [[TopLogitMarginReport]] (aggregate or
-      per-sample stats on a fixed probe set, never evaluating the
-      off-sample input regions where the boundary actually lives), and
-      [[ActivationStatsReport]] (internal activations, not the realised
-      input->output function). This is the one tool in the family that
-      answers "what shape did the model actually carve?" rather than
-      "how does it score on these points". Companion
-      `examples/DecisionBoundary/` reuses the synthetic 2-D Gaussian
-      cluster generator already used by ConfusionMatrixReport / MarginReport
-      and prints the class map before and after a short training run
-      (expected: a near-constant single-class plane at init collapsing
-      into clean linearly/curved-separated regions after training), plus
-      a deliberately-overfit run on a tiny noisy two-moons-style set so
-      the wiggly high-boundary-length pathology is visible as both art
-      and the scalar in (c).
+- [X] TNNet.DecisionBoundaryReport — LANDED (commit a28022b): 2-D input-plane
+      grid sweep rendering the learned function as an ASCII class map +
+      confidence overlay + boundary-length scalar + optional probe overlay
+      and CSV side-output; guards non-2-D inputs. `examples/DecisionBoundary/`
+      + smoke test shipped.
