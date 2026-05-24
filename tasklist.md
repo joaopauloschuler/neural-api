@@ -340,10 +340,6 @@ breakdown:
 - [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
       version with Shift in FStruct[0] already landed.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
-- [X] TNNetSqueeze / TNNetExpandDims — numpy-style single-axis shape
-      helpers, less error-prone than open-coding TNNetReshape.
-- [X] TNNetLpPool — generalized pooling `(mean(|x|^p))^(1/p)` with
-      configurable p.
 - [ ] TNNetLpPool follow-up: `p`-sweep bake-off experiment. Same tiny conv
       classifier, swap the pooling for `TNNetLpPool` at `p ∈ {1, 2, 4, 8}`
       plus an `TNNetAvgPool` (≡ p with abs, sort of) and `TNNetMaxPool`
@@ -1025,39 +1021,6 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
-- [X] TNNet.ModeConnectivityReport(NN, SnapshotB, Samples [, K, Targets]) —
-      linear-mode-connectivity / loss-barrier diagnostic between two trained
-      nets of the same architecture (Garipov et al. 2018; Frankle et al. 2020,
-      "Linear Mode Connectivity and the Lottery Ticket Hypothesis"). Answers
-      "do these two solutions sit in the same loss basin, or are they separated
-      by a barrier?" — the question linear weight-drift cannot. Given the live
-      net as endpoint A and a `SaveDataToString` snapshot of endpoint B, sweep
-      `alpha in [0,1]` at K+1 points, set the live weights to the interpolation
-      `theta(alpha) = (1-alpha)*A + alpha*B` (whole-net snapshot arithmetic, no
-      per-neuron loops in the hot path), run one whole-batch forward over
-      `Samples` at each alpha and report: the loss/accuracy curve `L(alpha)` as
-      an ASCII chart, the **barrier height** `max_alpha L(alpha) - max(L(0),
-      L(1))` (>0 == a bump between the basins; ~0 == linearly connected), the
-      argmax-alpha where the barrier peaks, and a `connected` / `weak barrier` /
-      `separated` verdict. Restores endpoint-A weights exactly at the end via
-      the same `SaveDataToString`/`LoadDataFromString` snapshot/restore pattern
-      [[HessianCurvatureReport]] / [[LayerSensitivityReport]] already use — a
-      measurement, never training. Built-in correctness checks: the endpoints
-      `L(0)` and `L(1)` recomputed on the interpolation path must match a direct
-      forward on each snapshot to <1e-5 (the snapshot-arithmetic faithfulness
-      check), and `B := A` collapses the whole curve to a flat line (zero
-      barrier). Distinct from [[WeightDriftReport]] (weight-space L2 drift /
-      frozen fraction, NO loss evaluated along the path), from `LossLandscapeProbe`
-      (walks ONE net along a random filter-normalised direction, not the line
-      connecting two solutions), and from `RepresentationSimilarityReport`'s
-      cross-CKA (compares representations of two nets, not the loss between
-      them). Companion `examples/ModeConnectivity/` trains the same tiny MLP
-      twice — once from the same init / shuffled batches (expect a low barrier,
-      "same basin") and once from two different random inits (expect a higher
-      barrier) — so the basin-vs-barrier contrast is visible in one run; pairs
-      naturally with the open lottery-ticket experiment under "Bake-off /
-      experiment follow-ups" (LMC is the property that experiment implicitly
-      relies on). Pure forward-only; weights are never stepped.
 - [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
       separated verdict robust when the endpoint losses are near zero. As
       landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
