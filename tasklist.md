@@ -211,10 +211,11 @@ breakdown:
      enjoy writing".) -->
 
 ### Bake-off / experiment follow-ups
-- [ ] Position-encoding bake-off: same tiny seq model trained with
+- [X] Position-encoding bake-off: same tiny seq model trained with
       (a) no position info, (b) sinusoidal AddPositionalEmbedding,
       (c) RoPE, (d) ALiBi, printing final loss and a sample generation
       per scheme. All four are in tree.
+      (landed: examples/PositionEncodingBakeoff/)
 - [ ] Causal-mask sanity experiment: train a tiny attention model on
       next-token prediction WITH and WITHOUT TNNetMaskedFill, and show
       the unmasked one cheats (near-zero loss but useless at generation).
