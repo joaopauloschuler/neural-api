@@ -2797,6 +2797,49 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// numpy-style single-axis shape helper. TNNetExpandDims lays the entire
+  // input volume out as a 1-D vector of length N = SizeX*SizeY*Depth along the
+  // axis selected by pAxis, forcing the other two axes to size 1. The total
+  // element count is unchanged; this is a pure shape reinterpretation with
+  // identity data flow (forward = copy, backward = copy the OutputError back).
+  // Shape mapping for an input of total size N:
+  //   pAxis = 0 -> (N, 1, 1)   (vector laid along X)
+  //   pAxis = 1 -> (1, N, 1)   (vector laid along Y)
+  //   pAxis = 2 -> (1, 1, N)   (vector laid along Depth; the canonical form)
+  // It is the inverse of TNNetSqueeze (Squeeze maps any volume to (1,1,N), and
+  // TNNetSqueeze after TNNetExpandDims round-trips back to (1,1,N)).
+  // Use case: place a flat feature vector onto a chosen spatial/channel axis so
+  // a following layer (e.g. a 1-D convolution) sees it on the expected axis.
+  TNNetExpandDims = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pAxis: integer = 2); overload;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// numpy-style single-axis shape helper. TNNetSqueeze removes unit axes by
+  // collapsing any input volume (SizeX, SizeY, Depth) down to the canonical
+  // compact column vector (1, 1, N) where N = SizeX*SizeY*Depth. The total
+  // element count is unchanged; this is a pure shape reinterpretation with
+  // identity data flow (forward = copy, backward = copy the OutputError back).
+  // Shape mapping: (SizeX, SizeY, Depth) -> (1, 1, SizeX*SizeY*Depth).
+  // It is the inverse of TNNetExpandDims: TNNetSqueeze applied after a
+  // TNNetExpandDims reconstructs the original (1,1,N) shape (and data) exactly.
+  // An already-(1,1,D) input is left unchanged. Constructor takes no parameters.
+  // Use case: flatten a (1,N,1)/(N,1,1) shape back to a plain feature vector.
+  TNNetSqueeze = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This is a base class. Do not use it directly.
   TNNetConcatBase = class(TNNetLayer)
   private
@@ -21275,6 +21318,95 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetExpandDims }
+constructor TNNetExpandDims.Create(pAxis: integer);
+begin
+  inherited Create();
+  FStruct[0] := pAxis;
+end;
+
+procedure TNNetExpandDims.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FActivationFn := pPrevLayer.ActivationFn;
+  FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
+  N := pPrevLayer.FOutput.Size;
+  case FStruct[0] of
+    0: begin FOutput.Resize(N, 1, 1); end;
+    1: begin FOutput.Resize(1, N, 1); end;
+  else
+    FOutput.Resize(1, 1, N);
+  end;
+  FOutputError.Resize(FOutput);
+  FOutputErrorDeriv.Resize(FOutput);
+end;
+
+procedure TNNetExpandDims.Compute;
+var
+  Len: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
+  FOutput.Copy(FPrevLayer.FOutput, Len);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetExpandDims.Backpropagate;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  FPrevLayer.FOutputError.Add(FOutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetSqueeze }
+constructor TNNetSqueeze.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetSqueeze.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FActivationFn := pPrevLayer.ActivationFn;
+  FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
+  FOutput.Resize(1, 1, pPrevLayer.FOutput.Size);
+  FOutputError.Resize(FOutput);
+  FOutputErrorDeriv.Resize(FOutput);
+end;
+
+procedure TNNetSqueeze.Compute;
+var
+  Len: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
+  FOutput.Copy(FPrevLayer.FOutput, Len);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSqueeze.Backpropagate;
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  FPrevLayer.FOutputError.Add(FOutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetIdentity }
 procedure TNNetIdentity.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
@@ -25623,6 +25755,8 @@ begin
         LayerFLOPs := Int64(5) * OutSize
       else if (Layer is TNNetPad) or (Layer is TNNetPadXY) or
               (Layer is TNNetReshape) or
+              (Layer is TNNetExpandDims) or
+              (Layer is TNNetSqueeze) or
               (Layer is TNNetConcatBase) or
               (Layer is TNNetSplitChannels) then
         LayerFLOPs := 0
@@ -34563,6 +34697,8 @@ begin
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
+      'TNNetExpandDims' :           Result := TNNetExpandDims.Create(St[0]);
+      'TNNetSqueeze' :              Result := TNNetSqueeze.Create();
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnect' :          Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectSigmoid':    Result := TNNetFullConnectSigmoid.Create(St[0], St[1], St[2], St[3]);
@@ -34795,6 +34931,8 @@ begin
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetExpandDims' then Result := TNNetExpandDims.Create(St[0]) else
+      if S[0] = 'TNNetSqueeze' then Result := TNNetSqueeze.Create() else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectSigmoid' then Result := TNNetFullConnectSigmoid.Create(St[0], St[1], St[2], St[3]) else

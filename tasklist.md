@@ -340,7 +340,7 @@ breakdown:
 - [ ] TNNetRoll follow-up: configurable axis selector. Depth-only
       version with Shift in FStruct[0] already landed.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
-- [ ] TNNetSqueeze / TNNetExpandDims — numpy-style single-axis shape
+- [X] TNNetSqueeze / TNNetExpandDims — numpy-style single-axis shape
       helpers, less error-prone than open-coding TNNetReshape.
 - [X] TNNetLpPool — generalized pooling `(mean(|x|^p))^(1/p)` with
       configurable p.

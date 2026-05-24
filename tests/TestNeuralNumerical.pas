@@ -32,6 +32,13 @@ type
     procedure TestLpPoolGradientCheckP3;
     procedure TestLpPoolLoadFromString;
 
+    // Shape-helper layers (TNNetExpandDims / TNNetSqueeze)
+    procedure TestExpandDimsForward;
+    procedure TestSqueezeForward;
+    procedure TestExpandDimsSqueezeRoundTrip;
+    procedure TestExpandDimsSqueezeLoadFromString;
+    procedure TestExpandDimsGradientCheck;
+
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
     procedure TestSigmoidNumericalPrecision;
@@ -3829,6 +3836,185 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestExpandDimsForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  N, i: integer;
+begin
+  // TNNetExpandDims lays the input out as a 1-D vector of length N along the
+  // chosen axis, forcing the other two axes to 1. Total element count and the
+  // data (in flat order) are unchanged. Input is (2,3,2) -> N = 12.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 3, 2);
+  N := Input.Size; // 12
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.5 - 4.0;
+
+    // pAxis = 0 -> (N, 1, 1)
+    NN.AddLayer(TNNetInput.Create(2, 3, 2));
+    NN.AddLayer(TNNetExpandDims.Create(0));
+    NN.Compute(Input);
+    AssertEquals('ExpandDims axis0 SizeX', N, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('ExpandDims axis0 SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('ExpandDims axis0 Depth', 1, NN.GetLastLayer.Output.Depth);
+    for i := 0 to N - 1 do
+      AssertEquals('ExpandDims axis0 data at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+    NN.Free;
+
+    // pAxis = 1 -> (1, N, 1)
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(2, 3, 2));
+    NN.AddLayer(TNNetExpandDims.Create(1));
+    NN.Compute(Input);
+    AssertEquals('ExpandDims axis1 SizeX', 1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('ExpandDims axis1 SizeY', N, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('ExpandDims axis1 Depth', 1, NN.GetLastLayer.Output.Depth);
+    NN.Free;
+
+    // pAxis = 2 (default) -> (1, 1, N)
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(2, 3, 2));
+    NN.AddLayer(TNNetExpandDims.Create(2));
+    NN.Compute(Input);
+    AssertEquals('ExpandDims axis2 SizeX', 1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('ExpandDims axis2 SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('ExpandDims axis2 Depth', N, NN.GetLastLayer.Output.Depth);
+    for i := 0 to N - 1 do
+      AssertEquals('ExpandDims axis2 data at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSqueezeForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  N, i: integer;
+begin
+  // TNNetSqueeze collapses any (X,Y,D) volume to the canonical (1,1,N) column
+  // vector, N = X*Y*D. Data is preserved element-for-element in flat order.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 3, 2);
+  N := Input.Size; // 12
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+
+    NN.AddLayer(TNNetInput.Create(2, 3, 2));
+    NN.AddLayer(TNNetSqueeze.Create());
+    NN.Compute(Input);
+
+    AssertEquals('Squeeze SizeX', 1, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Squeeze SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Squeeze Depth', N, NN.GetLastLayer.Output.Depth);
+    for i := 0 to N - 1 do
+      AssertEquals('Squeeze data at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpandDimsSqueezeRoundTrip;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  N, i: integer;
+begin
+  // Squeeze after ExpandDims must reconstruct the canonical (1,1,N) shape and
+  // the data exactly. Start from a depth vector (1,1,8), spread it onto the Y
+  // axis via ExpandDims(1) -> (1,8,1), then Squeeze back -> (1,1,8).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 8);
+  N := Input.Size; // 8
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Cos(i * 0.9) - 0.5;
+
+    NN.AddLayer(TNNetInput.Create(1, 1, 8));
+    NN.AddLayer(TNNetExpandDims.Create(1)); // (1, 8, 1)
+    NN.AddLayer(TNNetSqueeze.Create());      // (1, 1, 8)
+    NN.Compute(Input);
+
+    // Intermediate shape sanity.
+    AssertEquals('RoundTrip mid SizeY', N, NN.Layers[1].Output.SizeY);
+    AssertEquals('RoundTrip mid Depth', 1, NN.Layers[1].Output.Depth);
+
+    // Reconstructed shape equals the original (1,1,8).
+    AssertEquals('RoundTrip SizeX', Input.SizeX, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('RoundTrip SizeY', Input.SizeY, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('RoundTrip Depth', Input.Depth, NN.GetLastLayer.Output.Depth);
+    for i := 0 to N - 1 do
+      AssertEquals('RoundTrip data at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpandDimsSqueezeLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net containing TNNetExpandDims with a NON-default axis (0) and
+  // TNNetSqueeze. SaveToString -> LoadFromString -> SaveToString must be
+  // byte-identical, proving the axis param (FStruct[0]) survives serialization.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    NN.AddLayer(TNNetExpandDims.Create(0));
+    NN.AddLayer(TNNetSqueeze.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('ExpandDims round-trip class identity',
+        NN2.Layers[1] is TNNetExpandDims);
+      AssertTrue('Squeeze round-trip class identity',
+        NN2.GetLastLayer is TNNetSqueeze);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ExpandDims/Squeeze SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ExpandDims/Squeeze round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpandDimsGradientCheck;
+begin
+  // Data flow through TNNetExpandDims is pure identity (forward copy, backward
+  // copies the OutputError straight back), so the input gradient must equal the
+  // finite-difference gradient exactly within numerical noise.
+  LayerInputGradientCheck(Self, TNNetExpandDims.Create(1),
+    'ExpandDims(axis=1)', 2, 3, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestZScoreGradientCheck;
