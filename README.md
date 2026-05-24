@@ -538,6 +538,8 @@ The available normalization techniques are:
 * Standard deviation normalization (`TNNetMovingStdNormalization`, `TNNetChannelStdNormalization`).
 * Per-sample layer normalization (`TNNetLayerNorm`, `TNNetRMSNorm`, `TNNetGroupNorm`).
 
+See the [Normalization cheat sheet](docs/normalization.md) for a side-by-side comparison of every normalization layer (axes reduced over, learnable parameters, formula, and when to use each).
+
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetChannelZeroCenter`     | 1D, 2D, or 3D               | Trainable zero-centering normalization.                                                              |
