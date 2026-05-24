@@ -219,9 +219,11 @@ breakdown:
       max-error vs eps.
 
 ### Composite blocks / builders I'd enjoy shipping
-- [ ] TNNetGLUFeedForward block — same shape but using the plain TNNetGLU.
+- [X] TNNetGLUFeedForward block — same shape but using the plain TNNetGLU.
       Gives a working FFN to test the pre-norm-residual builder against
       today, no waiting on new gating layers.
+      Landed: TNNet.AddGLUFeedForward(D_in, D_hidden, D_out) sibling of
+      AddSwiGLUFeedForward/AddGEGLUFeedForward + examples/GLUFeedForward/.
 - [ ] TNNetPreNormResidual helper — `y = x + Sublayer(LayerNorm(x))`
       single-line builder. Take the sublayer as a TNNet builder closure.
 - [ ] AddRMSNormResidual(NN, Sublayer) — companion builder using RMSNorm
