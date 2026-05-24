@@ -302,14 +302,21 @@ breakdown:
       show a qualitative before/after on a repetition-prone prompt — the
       class landed this lucky-day batch (neuralvolume.pas, 7 tests in
       tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
-- [ ] TNNetGatedResidual follow-up (now landed): a residual builder
-      `AddGatedResidual(NN, Sublayer)` that wires
-      `Sum([TNNetGatedResidual(Sublayer-output), branch-input])` — pairs with the
-      open PreNorm/RMSNorm/PostNorm residual builders above.
+- [X] TNNetGatedResidual follow-up: a residual builder
+      `TNNet.AddGatedResidual(pSublayers)` wiring
+      `y = x + GatedResidual(Sublayer(x))`. LANDED (2026-05-24 lucky-day
+      batch) as a sibling to AddPreNormResidual/AddRMSNormResidual/
+      AddPostNormResidual (no normalization; the per-channel gate inits to 0
+      so the branch starts as identity). Ships forward-wiring (exact
+      identity-at-init + x+alpha*Sublayer(x)) and end-to-end input
+      numerical-gradient tests.
 - [ ] TNNetGatedResidual follow-up: ReZero-vs-GatedResidual depth ablation —
       train a deepish residual MLP with scalar ReZero vs per-channel
       GatedResidual gates, chart whether the per-channel gate opens unevenly
-      across channels.
+      across channels. NOW EASIER: AddGatedResidual landed, so this is a
+      builder swap against a ReZero-wired arm (mirror the structure of
+      examples/PreNormVsPostNorm/, which already wires a deepish residual
+      stack via the residual builders).
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
@@ -511,7 +518,13 @@ breakdown:
       budget. Pairs with the open weight-decay / generalization experiments
       ([[WeightSpectrumReport]]).
 ### Introspection / debugging tools
-- [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
+- [X] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
+      LANDED (2026-05-24 lucky-day batch): instance method returning a
+      `digraph` string (node per layer with index/class/output-shape,
+      edges from the real DAG incl. multi-input TNNetConcatBase layers via
+      the same FPrevLayerList SaveStructureToString uses). Ships
+      examples/GraphvizExport/ + TestToGraphvizDotSmoke. Follow-up still
+      open: the sibling WriteLayerTimings(NN, Sample) below.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
@@ -821,12 +834,16 @@ breakdown:
 - [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
       replacing a stride-2 conv on a tiny CIFAR stub.
-- [ ] `examples/PreNormVsPostNorm/` — toy sequence task with the same
-      sublayer wired through PreNorm vs PostNorm builders.
-      NOW UNBLOCKED: the `TNNet.AddPreNormResidual` / `AddRMSNormResidual` /
-      `AddPostNormResidual` builders landed this batch, so this example is a
-      direct three-way builder swap on a tiny deepish residual stack (chart
-      training stability / final loss across PreNorm vs PostNorm vs RMSNorm).
+- [X] `examples/PreNormVsPostNorm/` — same 12-block deepish residual MLP
+      wired three ways via AddPreNormResidual / AddRMSNormResidual /
+      AddPostNormResidual, trained on the synthetic hypotenuse task at
+      matched seed/LR/epochs. LANDED (2026-05-24 lucky-day batch): surfaces
+      the textbook stability gap (pre-norm arms → near-zero error; post-norm
+      oscillates and ends ~10x higher, val MSE ~1000x worse), handles NaN/Inf
+      cleanly, runs ~40s on CPU. Follow-up worth adding: push NUM_BLOCKS / LR
+      until post-norm goes full NaN (`diverged = YES`) to show the harder
+      divergence the harness already guards against; and an AddGatedResidual
+      fourth arm (the builder also landed this batch).
 - [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a tiny-MNIST
       subset (or synthetic 2D classification).
 - [ ] `examples/ModelSummaryDemo/` — three networks printed via
