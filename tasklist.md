@@ -798,7 +798,8 @@ breakdown:
       without LayerNorm/RMSNorm and print per-layer gradient-norm tables
       across steps.
 - [ ] `examples/NormalizationBakeoff/` — same idea comparing no-norm /
-      BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm.
+      BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm /
+      ChannelStdNorm.
 - [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
       on a fixed toy dataset with a loss-vs-epoch table.
 <!-- (`examples/EmbeddingHeadDemo/` removed: duplicate of the landed
@@ -882,8 +883,11 @@ breakdown:
 ### Experiments I'm curious about (additional)
 - [ ] LogSoftMax+NLL vs SoftMax+CE convergence parity test: same seed,
       same tiny classifier, plot val-loss curves.
-- [ ] InstanceNorm vs GroupNorm vs LayerNorm vs ChannelStdNorm single-seed
-      bake-off on a 3-layer CIFAR-ish conv stack.
+<!-- (InstanceNorm vs GroupNorm vs LayerNorm vs ChannelStdNorm single-seed
+     bake-off removed: subsumed by the `examples/NormalizationBakeoff/` entry
+     under "Examples I'd enjoy writing", which compares a strict superset of
+     norms on a small conv stack. ChannelStdNorm — the only norm unique to this
+     entry — was folded into that example's menu so nothing is lost.) -->
 - [ ] Shrink-activation sparsity sweep: ReLU / SoftShrink / HardShrink as
       bottleneck activations, sweep lambda over `{0.1, 0.25, 0.5, 1.0}`,
       report (sparsity %, recon loss).
@@ -898,8 +902,11 @@ breakdown:
 - [ ] LeCunTanh-vs-Tanh ablation reproduction with a small seed/LR sweep
       on top of examples/HyperbolicActivationBakeOff/. Average over 5 seeds
       and report mean+std.
-- [ ] Charbonnier-vs-Huber-vs-MSE-vs-LogCosh head-to-head on the noisy-
-      hypotenuse harness.
+<!-- (Charbonnier-vs-Huber-vs-MSE-vs-LogCosh head-to-head removed: subsumed by
+     the "Loss-family bake-off (output heads)" entry just below — its loss set
+     {Charbonnier, Huber, MSE, LogCosh} is a strict subset of that entry's
+     {MSE, Huber, SmoothL1, Charbonnier, LogCosh}, on the same noisy/outlier
+     hypotenuse harness.) -->
 - [ ] Loss-family bake-off (output heads): hypotenuse with MSE / Huber /
       SmoothL1 / Charbonnier / LogCosh, printing final MSE and epochs-to-
       converge.
