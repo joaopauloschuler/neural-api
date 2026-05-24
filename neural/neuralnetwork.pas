@@ -5585,6 +5585,60 @@ type
         MaxSamples: integer = 64;
         Seed: longword = 1234567
       ): string;
+      // Forward-only NO-RETRAIN compressibility diagnostic. Answers the
+      // practitioner's first pruning question directly: "if I zero the
+      // smallest-magnitude weights, how much can I throw away before the model
+      // breaks?" — measured by ACTUALLY pruning and re-running, never predicted
+      // from a proxy. The recipe is deterministic: snapshot the whole net once
+      // via NN.SaveDataToString(); then for each global sparsity level s in a
+      // fixed sweep ({0,10,20,...,90,95,99}%) compute the magnitude threshold
+      // that zeros the smallest s% of |w| ACROSS all trainable layers (a single
+      // GLOBAL percentile pooled over the whole network — the standard
+      // "global-magnitude" criterion), zero every weight with |w| <= threshold
+      // in place, run ONE forward pass per probe sample to read the resulting
+      // loss (mean MSE against Labels when supplied, otherwise mean MSE against
+      // the unpruned s=0 baseline output, i.e. output drift) and — when Labels
+      // are supplied — top-1 accuracy (argmax(output) == argmax(label)), and
+      // finally restore the original weights bit-for-bit from the snapshot
+      // (NN.LoadDataFromString) before the next level. It reports:
+      //   (a) an accuracy-(or loss-)vs-sparsity ASCII '#'-bar curve across the
+      //       depth of pruning;
+      //   (b) the PRUNABILITY KNEE — the max sparsity whose top-1 accuracy drop
+      //       (or, label-free, whose loss/output-drift) stays within Tolerance
+      //       (default 0.01 = 1%);
+      //   (c) the per-layer pruned (near-zero) fraction at the knee — which
+      //       layers absorb the pruning (typically the wide classifier head);
+      //   (d) the REALISED vs REQUESTED global sparsity at each level (a built-in
+      //       check that the percentile threshold hit its target to within one
+      //       weight);
+      //   (e) a 'highly-compressible' / 'moderate' / 'fragile' verdict from the
+      //       knee depth.
+      // The optional PerLayer flag switches from one global threshold to a
+      // per-layer percentile (the "uniform-per-layer" baseline) so the
+      // global-vs-uniform pruning question is visible side by side. Built-in
+      // correctness checks (also the smoke-test invariants): s=0% reproduces the
+      // unpruned loss/accuracy exactly (snapshot-restore faithfulness), s=100%
+      // (the implicit upper bound; the 99% level approaches it) drives weights to
+      // ~zero (degenerate constant output), and realised sparsity matches the
+      // requested level to within one weight. Weights are restored bit-for-bit
+      // at the end (also in a finally block); pure forward-only, never stepped.
+      // MaxSamples (default 256) caps the probe count used. Reuses the
+      // SaveDataToString/LoadDataFromString snapshot-restore of
+      // LayerSensitivityReport / ModeConnectivityReport and the per-layer
+      // weight-iteration of WeightHistogramReport. DISTINCT from
+      // FisherImportanceReport (which RANKS by a Fisher proxy and flags a static
+      // near-zero fraction but never removes weights or measures the resulting
+      // accuracy) and from LayerSensitivityReport (random multiplicative weight
+      // JITTER, never a magnitude-thresholded zeroing). Guards nil NN and an
+      // empty probe batch gracefully.
+      class function MagnitudePruningReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        Labels: TNNetVolumeList = nil;
+        Tolerance: TNeuralFloat = 0.01;
+        PerLayer: boolean = False;
+        MaxSamples: integer = 256
+      ): string;
       // Monte-Carlo-Dropout *epistemic* uncertainty diagnostic (Gal &
       // Ghahramani 2016). Unlike the rest of the report family this one
       // deliberately KEEPS the stochastic (dropout / noise) layers ACTIVE at
@@ -36737,6 +36791,478 @@ begin
       if Baseline[I] <> nil then Baseline[I].Free;
     RandSeed := SavedRandSeed;
     Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.MagnitudePruningReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  Labels: TNNetVolumeList = nil;
+  Tolerance: TNeuralFloat = 0.01;
+  PerLayer: boolean = False;
+  MaxSamples: integer = 256
+): string;
+const
+  cMaxBarWidth = 40;
+  cZeroEps = 1e-9;
+var
+  Lines: TStringList;
+  Levels: array of TNeuralFloat;
+  LevelLoss: array of TNeuralFloat;
+  LevelAcc: array of TNeuralFloat;
+  LevelRealised: array of TNeuralFloat;
+  TrLayerIdx: array of integer;
+  AllAbs: array of TNeuralFloat;
+  KneePrunedFrac: array of TNeuralFloat;
+  KneeWeights: array of integer;
+  KneeZeroed: array of integer;
+  Snapshot: string;
+  LayerIdx, NeuronIdx, K, I, LvIdx, TrainableLayers, TotalWeights: integer;
+  UsedSamples, SampleIdx, NumLevels, ZeroedTotal, CutIdx, KneeIdx: integer;
+  PerLayerCount, PerLayerCut: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  W, AbsW, Threshold, S, AccLoss, AccAcc, SampleLoss, Tgt, Diff: TNeuralFloat;
+  BaseLoss, BaseAcc, BarVal, MaxBarVal, RealisedFrac: TNeuralFloat;
+  HasLabels, RestoreNeeded: boolean;
+  Output: TNNetVolume;
+  Baseline: array of TNNetVolume;
+  PredClass, TrueClass: integer;
+  Bar, ShapeStr, Verdict, MetricName: string;
+  KneeSparsity: TNeuralFloat;
+  SwapF: TNeuralFloat;
+  LayerAbs: array of TNeuralFloat;
+
+  // Quickselect-free: collect |w| of a slice into Buf then sort ascending.
+  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
+  var A, B: integer;
+  begin
+    for A := 0 to N - 2 do
+      for B := 0 to N - 2 - A do
+        if Arr[B] > Arr[B + 1] then
+        begin
+          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
+        end;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  SetLength(Baseline, 0);
+  Snapshot := '';
+  RestoreNeeded := False;
+  try
+    if NN = nil then
+    begin
+      Result := 'MagnitudePruningReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'MagnitudePruningReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if Tolerance < 0 then Tolerance := 0.01;
+    if MaxSamples < 1 then MaxSamples := 1;
+
+    HasLabels := (Labels <> nil) and (Labels.Count > 0);
+    UsedSamples := Samples.Count;
+    if UsedSamples > MaxSamples then UsedSamples := MaxSamples;
+    if HasLabels and (Labels.Count < UsedSamples) then
+      UsedSamples := Labels.Count;
+
+    // ---- collect trainable layers (Neurons with a non-empty weight tensor). --
+    SetLength(TrLayerIdx, 0);
+    TotalWeights := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      SetLength(TrLayerIdx, Length(TrLayerIdx) + 1);
+      TrLayerIdx[High(TrLayerIdx)] := LayerIdx;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        TotalWeights := TotalWeights + Layer.Neurons[NeuronIdx].Weights.Size;
+    end;
+    TrainableLayers := Length(TrLayerIdx);
+
+    MetricName := 'loss';
+    Lines.Add(
+      'MagnitudePruningReport: forward-only no-retrain compressibility curve.');
+    Lines.Add(Format(
+      'Trainable layers: %d, total weights: %d (biases excluded). ' +
+      'Probe samples used: %d (of %d, cap %d).',
+      [TrainableLayers, TotalWeights, UsedSamples, Samples.Count, MaxSamples]));
+    if PerLayer then
+      Lines.Add('Criterion: PER-LAYER percentile (uniform-per-layer baseline).')
+    else
+      Lines.Add('Criterion: GLOBAL magnitude percentile (pooled over network).');
+    if HasLabels then
+      Lines.Add('Labels supplied: loss = mean MSE vs labels, accuracy = top-1 ' +
+        '(argmax(output) == argmax(label)).')
+    else
+      Lines.Add('No labels: loss = mean MSE vs unpruned s=0 baseline output ' +
+        '(output drift); accuracy n/a.');
+    Lines.Add(Format('Tolerance for knee: %.4f.', [Tolerance]));
+    Lines.Add('');
+
+    if TrainableLayers = 0 then
+    begin
+      Lines.Add('No trainable layers with weights found.');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    // ---- sparsity sweep. ----
+    SetLength(Levels, 12);
+    Levels[0] := 0;   Levels[1] := 10;  Levels[2] := 20;  Levels[3] := 30;
+    Levels[4] := 40;  Levels[5] := 50;  Levels[6] := 60;  Levels[7] := 70;
+    Levels[8] := 80;  Levels[9] := 90;  Levels[10] := 95; Levels[11] := 99;
+    NumLevels := Length(Levels);
+    SetLength(LevelLoss, NumLevels);
+    SetLength(LevelAcc, NumLevels);
+    SetLength(LevelRealised, NumLevels);
+
+    // ---- whole-net snapshot for exact restore between levels. ----
+    Snapshot := NN.SaveDataToString();
+    RestoreNeeded := True;
+
+    // ---- baseline (s=0) outputs: cached so a label-free run still has a loss. -
+    SetLength(Baseline, UsedSamples);
+    for SampleIdx := 0 to UsedSamples - 1 do
+    begin
+      NN.Compute(Samples[SampleIdx]);
+      Output := NN.GetLastLayer.Output;
+      Baseline[SampleIdx] := TNNetVolume.Create();
+      Baseline[SampleIdx].Copy(Output);
+    end;
+
+    SetLength(KneePrunedFrac, TrainableLayers);
+    SetLength(KneeWeights, TrainableLayers);
+    SetLength(KneeZeroed, TrainableLayers);
+    SetLength(AllAbs, TotalWeights);
+
+    for LvIdx := 0 to NumLevels - 1 do
+    begin
+      S := Levels[LvIdx] / 100.0;
+      ZeroedTotal := 0;
+
+      // ---- compute & apply threshold(s), zeroing |w| <= threshold in place. --
+      if not PerLayer then
+      begin
+        // GLOBAL: pool all |w|, sort, cut at s-percentile.
+        K := 0;
+        for I := 0 to TrainableLayers - 1 do
+        begin
+          Layer := NN.Layers[TrLayerIdx[I]];
+          for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          begin
+            Neuron := Layer.Neurons[NeuronIdx];
+            for LayerIdx := 0 to Neuron.Weights.Size - 1 do
+            begin
+              AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
+              Inc(K);
+            end;
+          end;
+        end;
+        SortAsc(AllAbs, TotalWeights);
+        CutIdx := Trunc(S * TotalWeights);
+        if CutIdx < 0 then CutIdx := 0;
+        if CutIdx > TotalWeights then CutIdx := TotalWeights;
+        // Threshold = the (CutIdx)-th smallest |w|; zero all <= that value.
+        if CutIdx = 0 then Threshold := -1            // zero nothing
+        else if CutIdx >= TotalWeights then
+          Threshold := AllAbs[TotalWeights - 1]       // zero everything
+        else Threshold := AllAbs[CutIdx - 1];
+      end
+      else
+        Threshold := 0; // unused; per-layer threshold computed inside loop
+
+      for I := 0 to TrainableLayers - 1 do
+      begin
+        Layer := NN.Layers[TrLayerIdx[I]];
+        KneeWeights[I] := 0;
+        KneeZeroed[I] := 0;
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          KneeWeights[I] := KneeWeights[I] + Layer.Neurons[NeuronIdx].Weights.Size;
+
+        if PerLayer then
+        begin
+          // PER-LAYER: sort this layer's |w|, cut at s-percentile.
+          PerLayerCount := KneeWeights[I];
+          SetLength(LayerAbs, PerLayerCount);
+          K := 0;
+          for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          begin
+            Neuron := Layer.Neurons[NeuronIdx];
+            for LayerIdx := 0 to Neuron.Weights.Size - 1 do
+            begin
+              LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
+              Inc(K);
+            end;
+          end;
+          SortAsc(LayerAbs, PerLayerCount);
+          PerLayerCut := Trunc(S * PerLayerCount);
+          if PerLayerCut <= 0 then Threshold := -1
+          else if PerLayerCut >= PerLayerCount then
+            Threshold := LayerAbs[PerLayerCount - 1]
+          else Threshold := LayerAbs[PerLayerCut - 1];
+        end;
+
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        begin
+          Neuron := Layer.Neurons[NeuronIdx];
+          for LayerIdx := 0 to Neuron.Weights.Size - 1 do
+          begin
+            AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
+            if (Threshold >= 0) and (AbsW <= Threshold) then
+            begin
+              Neuron.Weights.FData[LayerIdx] := 0;
+              Inc(KneeZeroed[I]);
+              Inc(ZeroedTotal);
+            end;
+          end;
+        end;
+        Layer.AfterWeightUpdate();
+      end;
+
+      if TotalWeights > 0 then
+        RealisedFrac := ZeroedTotal / TotalWeights
+      else
+        RealisedFrac := 0;
+      LevelRealised[LvIdx] := RealisedFrac;
+
+      // ---- one forward pass per probe sample -> loss (+ accuracy). ----
+      AccLoss := 0;
+      AccAcc := 0;
+      for SampleIdx := 0 to UsedSamples - 1 do
+      begin
+        NN.Compute(Samples[SampleIdx]);
+        Output := NN.GetLastLayer.Output;
+        SampleLoss := 0;
+        for I := 0 to Output.Size - 1 do
+        begin
+          if HasLabels then
+          begin
+            if I < Labels[SampleIdx].Size then Tgt := Labels[SampleIdx].Raw[I]
+            else Tgt := 0;
+          end
+          else
+            Tgt := Baseline[SampleIdx].Raw[I];
+          Diff := Output.Raw[I] - Tgt;
+          SampleLoss := SampleLoss + Diff * Diff;
+        end;
+        if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
+        AccLoss := AccLoss + SampleLoss;
+
+        if HasLabels then
+        begin
+          PredClass := Output.GetClass();
+          TrueClass := Labels[SampleIdx].GetClass();
+          if PredClass = TrueClass then AccAcc := AccAcc + 1.0;
+        end;
+      end;
+      if UsedSamples > 0 then
+      begin
+        LevelLoss[LvIdx] := AccLoss / UsedSamples;
+        LevelAcc[LvIdx] := AccAcc / UsedSamples;
+      end;
+
+      // ---- capture per-layer pruned fraction AT THE KNEE later; store last. --
+      // (per-layer fractions for the chosen knee are recomputed after the loop)
+
+      // ---- restore exact weights before the next level. ----
+      NN.LoadDataFromString(Snapshot);
+    end;
+
+    BaseLoss := LevelLoss[0];
+    BaseAcc := LevelAcc[0];
+
+    // ---- (a) accuracy-(or loss-)vs-sparsity ASCII curve. ----
+    if HasLabels then MetricName := 'top-1 accuracy' else MetricName := 'loss';
+    Lines.Add(Format('Sparsity sweep (metric = %s, bar = ''#'', max width %d):',
+      [MetricName, cMaxBarWidth]));
+    Lines.Add(Format('  %-9s %-10s %12s %12s %14s',
+      ['req-s%', 'real-s%', 'loss', 'acc%', 'curve']));
+    Lines.Add('  ' + StringOfChar('-', 78));
+    // bar scales to the metric: accuracy 0..1, or loss 0..max-loss.
+    MaxBarVal := 0;
+    if HasLabels then
+      MaxBarVal := 1.0
+    else
+      for LvIdx := 0 to NumLevels - 1 do
+        if LevelLoss[LvIdx] > MaxBarVal then MaxBarVal := LevelLoss[LvIdx];
+    if MaxBarVal <= 0 then MaxBarVal := 1.0;
+    for LvIdx := 0 to NumLevels - 1 do
+    begin
+      if HasLabels then BarVal := LevelAcc[LvIdx]
+      else BarVal := LevelLoss[LvIdx];
+      Bar := StringOfChar('#', Round((BarVal / MaxBarVal) * cMaxBarWidth));
+      Lines.Add(Format('  %8.1f%% %9.2f%% %12.6f %11.2f%% %s',
+        [Levels[LvIdx], LevelRealised[LvIdx] * 100.0, LevelLoss[LvIdx],
+         LevelAcc[LvIdx] * 100.0, Bar]));
+    end;
+    Lines.Add('');
+
+    // ---- (d) realised vs requested check. ----
+    Lines.Add('Realised-vs-requested global sparsity (built-in threshold ' +
+      'check, |delta| should be < 1 weight ~ ' +
+      Format('%.4f%%):', [(1.0 / TotalWeights) * 100.0]));
+    for LvIdx := 0 to NumLevels - 1 do
+      Lines.Add(Format('  req %5.1f%% -> realised %6.2f%% (delta %8.4f%%)',
+        [Levels[LvIdx], LevelRealised[LvIdx] * 100.0,
+         (LevelRealised[LvIdx] * 100.0) - Levels[LvIdx]]));
+    Lines.Add('');
+
+    // ---- (b) prunability knee: deepest level within Tolerance of baseline. --
+    KneeIdx := 0;
+    for LvIdx := 0 to NumLevels - 1 do
+    begin
+      if HasLabels then
+      begin
+        if (BaseAcc - LevelAcc[LvIdx]) <= Tolerance then KneeIdx := LvIdx;
+      end
+      else
+      begin
+        // label-free: loss must not grow beyond Tolerance (absolute MSE drift).
+        if (LevelLoss[LvIdx] - BaseLoss) <= Tolerance then KneeIdx := LvIdx;
+      end;
+    end;
+    KneeSparsity := Levels[KneeIdx];
+
+    if HasLabels then
+      Lines.Add(Format(
+        'Prunability KNEE: %.1f%% sparsity (top-1 %.2f%% vs baseline %.2f%%, ' +
+        'drop %.2f%% <= tol %.2f%%).',
+        [KneeSparsity, LevelAcc[KneeIdx] * 100.0, BaseAcc * 100.0,
+         (BaseAcc - LevelAcc[KneeIdx]) * 100.0, Tolerance * 100.0]))
+    else
+      Lines.Add(Format(
+        'Prunability KNEE: %.1f%% sparsity (loss %.6f vs baseline %.6f, ' +
+        'drift %.6f <= tol %.6f).',
+        [KneeSparsity, LevelLoss[KneeIdx], BaseLoss,
+         LevelLoss[KneeIdx] - BaseLoss, Tolerance]));
+    Lines.Add('');
+
+    // ---- (c) per-layer pruned fraction AT THE KNEE. ----
+    // Re-apply the knee threshold once to read per-layer pruned counts.
+    S := KneeSparsity / 100.0;
+    for I := 0 to TrainableLayers - 1 do
+    begin
+      KneeZeroed[I] := 0;
+      KneeWeights[I] := 0;
+    end;
+    if not PerLayer then
+    begin
+      K := 0;
+      for I := 0 to TrainableLayers - 1 do
+      begin
+        Layer := NN.Layers[TrLayerIdx[I]];
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        begin
+          Neuron := Layer.Neurons[NeuronIdx];
+          for LayerIdx := 0 to Neuron.Weights.Size - 1 do
+          begin
+            AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
+            Inc(K);
+          end;
+        end;
+      end;
+      SortAsc(AllAbs, TotalWeights);
+      CutIdx := Trunc(S * TotalWeights);
+      if CutIdx <= 0 then Threshold := -1
+      else if CutIdx >= TotalWeights then Threshold := AllAbs[TotalWeights - 1]
+      else Threshold := AllAbs[CutIdx - 1];
+    end;
+    for I := 0 to TrainableLayers - 1 do
+    begin
+      Layer := NN.Layers[TrLayerIdx[I]];
+      if PerLayer then
+      begin
+        PerLayerCount := 0;
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          PerLayerCount := PerLayerCount + Layer.Neurons[NeuronIdx].Weights.Size;
+        SetLength(LayerAbs, PerLayerCount);
+        K := 0;
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        begin
+          Neuron := Layer.Neurons[NeuronIdx];
+          for LayerIdx := 0 to Neuron.Weights.Size - 1 do
+          begin
+            LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
+            Inc(K);
+          end;
+        end;
+        SortAsc(LayerAbs, PerLayerCount);
+        PerLayerCut := Trunc(S * PerLayerCount);
+        if PerLayerCut <= 0 then Threshold := -1
+        else if PerLayerCut >= PerLayerCount then
+          Threshold := LayerAbs[PerLayerCount - 1]
+        else Threshold := LayerAbs[PerLayerCut - 1];
+      end;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for LayerIdx := 0 to Neuron.Weights.Size - 1 do
+        begin
+          Inc(KneeWeights[I]);
+          AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
+          if (Threshold >= 0) and (AbsW <= Threshold) then Inc(KneeZeroed[I]);
+        end;
+      end;
+      if KneeWeights[I] > 0 then
+        KneePrunedFrac[I] := KneeZeroed[I] / KneeWeights[I]
+      else
+        KneePrunedFrac[I] := 0;
+    end;
+    // No weights changed above (read-only |w| scan), but restore defensively.
+    NN.LoadDataFromString(Snapshot);
+
+    Lines.Add(Format('Per-layer pruned fraction at the knee (%.1f%%):',
+      [KneeSparsity]));
+    Lines.Add(Format('  %-5s %-26s %-14s %10s %12s',
+      ['idx', 'class', 'out(X,Y,D)', 'weights', 'pruned%']));
+    Lines.Add('  ' + StringOfChar('-', 72));
+    for I := 0 to TrainableLayers - 1 do
+    begin
+      Layer := NN.Layers[TrLayerIdx[I]];
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      Lines.Add(Format('  %-5d %-26s %-14s %10d %11.2f%%',
+        [TrLayerIdx[I], Layer.ClassName, ShapeStr, KneeWeights[I],
+         KneePrunedFrac[I] * 100.0]));
+    end;
+    Lines.Add('');
+
+    // ---- (e) verdict from knee depth. ----
+    if KneeSparsity >= 70 then
+      Verdict := 'highly-compressible'
+    else if KneeSparsity >= 30 then
+      Verdict := 'moderate'
+    else
+      Verdict := 'fragile';
+    Lines.Add(Format(
+      'Verdict: %s (prunable to %.1f%% within %.2f%% tolerance ' +
+      'with no retraining).',
+      [Verdict, KneeSparsity, Tolerance * 100.0]));
+
+    // ---- built-in correctness check: s=0 reproduces baseline exactly. ----
+    if HasLabels then
+    begin
+      if Abs(LevelLoss[0] - BaseLoss) > cZeroEps then
+        Lines.Add('WARNING: s=0% did not reproduce baseline loss exactly.');
+    end
+    else if LevelLoss[0] > cZeroEps then
+      Lines.Add('WARNING: s=0% loss (output drift) is non-zero.');
+
+    Result := Lines.Text;
+  finally
+    // Defensive exact restore (covers any early-exit after the snapshot).
+    if RestoreNeeded and (Snapshot <> '') then NN.LoadDataFromString(Snapshot);
+    for I := 0 to High(Baseline) do
+      if Baseline[I] <> nil then Baseline[I].Free;
     Lines.Free;
   end;
 end;

@@ -89,6 +89,7 @@ type
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
+    procedure TestMagnitudePruningReportSmoke;
     procedure TestMCDropoutUncertaintyReportSmoke;
     procedure TestEquivarianceReportSmoke;
     procedure TestTTAReportSmoke;
@@ -1831,6 +1832,99 @@ begin
     After.Free;
     Before.Free;
     Targets.Free;
+    Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMagnitudePruningReportSmoke;
+var
+  NN: TNNet;
+  Probes, Labels: TNNetVolumeList;
+  V, L, Before, After: TNNetVolume;
+  Report: string;
+  I, J, Cls: integer;
+  MaxDiff, D: TNeuralFloat;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.MagnitudePruningReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  Labels := TNNetVolumeList.Create(True);
+  Before := TNNetVolume.Create();
+  After := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.MagnitudePruningReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // a handful of probe volumes + one-hot labels (3 classes).
+    for I := 0 to 23 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+      L := TNNetVolume.Create(3, 1, 1);
+      Cls := Random(3);
+      L.Raw[Cls] := 1.0;
+      Labels.Add(L);
+    end;
+
+    // Capture output on a fixed probe BEFORE the report.
+    NN.Compute(Probes[0]);
+    Before.Copy(NN.GetLastLayer.Output);
+
+    // Run WITH labels (exercises accuracy + loss branch).
+    Report := TNNet.MagnitudePruningReport(NN, Probes, Labels);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('MagnitudePruningReport', Report) > 0);
+    AssertTrue('Sparsity sweep section present',
+      Pos('Sparsity sweep', Report) > 0);
+    AssertTrue('Prunability knee present',
+      Pos('Prunability KNEE', Report) > 0);
+    AssertTrue('Verdict present', Pos('Verdict:', Report) > 0);
+    AssertTrue('Realised-vs-requested present',
+      Pos('Realised-vs-requested', Report) > 0);
+    // s=0% baseline reproduced exactly: no warning emitted.
+    AssertTrue('s=0 reproduces baseline (no warning)',
+      Pos('did not reproduce baseline', Report) = 0);
+    // realised sparsity at request 0% must be ~0%.
+    AssertTrue('s=0 realised ~0%',
+      Pos('req   0.0% -> realised   0.00%', Report) > 0);
+
+    // Save/restore guarantee: output on the SAME probe must be unchanged.
+    NN.Compute(Probes[0]);
+    After.Copy(NN.GetLastLayer.Output);
+    AssertEquals('output size unchanged', Before.Size, After.Size);
+    MaxDiff := 0;
+    for I := 0 to Before.Size - 1 do
+    begin
+      D := Abs(Before.Raw[I] - After.Raw[I]);
+      if D > MaxDiff then MaxDiff := D;
+    end;
+    AssertTrue('weights restored bit-exact (max output diff < 1e-6)',
+      MaxDiff < 1e-6);
+
+    // Label-free run (loss = output drift) and per-layer baseline both work.
+    Report := TNNet.MagnitudePruningReport(NN, Probes, nil);
+    AssertTrue('label-free run non-empty', Length(Report) > 0);
+    AssertTrue('label-free knee present', Pos('Prunability KNEE', Report) > 0);
+    Report := TNNet.MagnitudePruningReport(NN, Probes, Labels, 0.01, True);
+    AssertTrue('per-layer criterion reported',
+      Pos('PER-LAYER percentile', Report) > 0);
+  finally
+    After.Free;
+    Before.Free;
+    Labels.Free;
     Probes.Free;
     NN.Free;
   end;

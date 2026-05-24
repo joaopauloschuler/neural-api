@@ -1291,7 +1291,7 @@ breakdown:
       return, plus the lens-at-HeadStartIdx-reproduces-final agreement/KL==0
       assertion). Pairs with [[WeightSpectrumReport]] / the grokking experiment
       to watch the crystallization depth shift at a representational transition.
-- [ ] TNNet.MagnitudePruningReport(NN, Samples [, Labels]) — a **no-retrain
+- [X] TNNet.MagnitudePruningReport(NN, Samples [, Labels]) — a **no-retrain
       compressibility** diagnostic answering the practitioner's first pruning
       question directly: *"if I zero the smallest-magnitude weights, how much
       can I throw away before the model breaks?"* — measured by ACTUALLY pruning
