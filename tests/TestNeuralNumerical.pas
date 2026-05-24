@@ -446,6 +446,9 @@ type
     procedure TestL2NormalizeFullVolumeUnitNorm;
     procedure TestL2NormalizeFullVolumeGradientCheck;
     procedure TestL2NormalizeFullVolumeSerializationRoundTrip;
+    procedure TestL2NormalizePerChannelUnitNorm;
+    procedure TestL2NormalizePerChannelGradientCheck;
+    procedure TestL2NormalizePerChannelSerializationRoundTrip;
     procedure TestUnitNormForward;
     procedure TestUnitNormGradientCheck;
     procedure TestUnitNormSerializationRoundTrip;
@@ -11176,6 +11179,106 @@ begin
       AssertEquals('L2Normalize full-volume round-trip preserves axis+epsilon',
         NN.GetLastLayer.SaveStructureToString(),
         NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizePerChannelUnitNorm;
+const
+  SizeX = 2;
+  SizeY = 3;
+  Depth = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD: integer;
+  Sum, Norm: TNeuralFloat;
+  ChanNorm: array[0..Depth - 1] of TNeuralFloat;
+begin
+  // Per-channel mode (axis 2): each depth channel's spatial map has L2 norm 1.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetL2Normalize.Create(2));
+    // Build the input by hand with distinct, non-degenerate values.
+    for CntX := 0 to SizeX - 1 do
+      for CntY := 0 to SizeY - 1 do
+        for CntD := 0 to Depth - 1 do
+          Input[CntX, CntY, CntD] :=
+            (CntX * 3 + CntY) * 0.5 + 1.0 + CntD * 2.0;
+    // Pre-compute each channel's spatial L2 norm (eps default 1e-8 is tiny).
+    for CntD := 0 to Depth - 1 do
+    begin
+      Sum := 0;
+      for CntX := 0 to SizeX - 1 do
+        for CntY := 0 to SizeY - 1 do
+          Sum := Sum + Input[CntX, CntY, CntD] * Input[CntX, CntY, CntD];
+      ChanNorm[CntD] := Sqrt(Sum + 1e-8);
+    end;
+    NN.Compute(Input);
+    // Each channel's spatial map must have unit L2 norm.
+    for CntD := 0 to Depth - 1 do
+    begin
+      Sum := 0;
+      for CntX := 0 to SizeX - 1 do
+        for CntY := 0 to SizeY - 1 do
+          Sum := Sum + NN.GetLastLayer.Output[CntX, CntY, CntD] *
+                       NN.GetLastLayer.Output[CntX, CntY, CntD];
+      AssertEquals('L2Normalize per-channel ||y_d||^2=1 at d=' + IntToStr(CntD),
+        1.0, Sum, 1e-5);
+    end;
+    // Values must equal input / channel-norm.
+    for CntX := 0 to SizeX - 1 do
+      for CntY := 0 to SizeY - 1 do
+        for CntD := 0 to Depth - 1 do
+        begin
+          Norm := Input[CntX, CntY, CntD] / ChanNorm[CntD];
+          AssertEquals('L2Normalize per-channel value at (' + IntToStr(CntX) +
+            ',' + IntToStr(CntY) + ',' + IntToStr(CntD) + ')',
+            Norm, NN.GetLastLayer.Output[CntX, CntY, CntD], 1e-5);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizePerChannelGradientCheck;
+begin
+  // Exact Jacobian for the per-channel (axis 2) reduction on a non-square,
+  // depth>1 shape.
+  LayerInputGradientCheck(Self, TNNetL2Normalize.Create(2),
+    'L2NormalizePerChannel', 2, 3, 2, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizePerChannelSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // Exercise the FStruct[0] (axis) round-trip with the NON-default value 2.
+  SerializationRoundTrip(Self, TNNetL2Normalize.Create(2, 1e-5),
+    'L2NormalizePerChannel', 3, 2, 4, 1e-5);
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    NN.AddLayer(TNNetL2Normalize.Create(2, 2.5e-4));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('L2Normalize per-channel round-trip class name',
+        'TNNetL2Normalize', NN2.GetLastLayer.ClassName);
+      AssertEquals('L2Normalize per-channel round-trip preserves axis+epsilon',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      AssertEquals('L2Normalize per-channel round-trip SaveToString identical',
+        Saved, NN2.SaveToString());
     finally
       NN2.Free;
     end;

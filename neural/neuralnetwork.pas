@@ -1463,6 +1463,10 @@ type
   //   1           = full volume. Reduces the sum-of-squares over the ENTIRE
   //       sample (x, y AND depth) so the whole flattened sample has unit L2
   //       norm: y_i = x_i / sqrt(sum_k x_k^2 + eps).
+  //   2           = per channel over spatial. For EACH depth channel d
+  //       independently, reduces the sum-of-squares over all (x,y) positions
+  //       so that channel's spatial map has unit L2 norm:
+  //       n_d = sqrt(sum_{x,y} x[x,y,d]^2 + eps); y[x,y,d] = x[x,y,d] / n_d.
   // Output shape equals input shape and no trainable parameters. The epsilon
   // stabilizer is stored in FFloatSt[0] (default 1e-8) and round-trips via
   // Save/Load alongside FStruct[0]. The exact backward applies the full
@@ -1474,8 +1478,10 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure ComputePerDepth();
     procedure ComputeFullVolume();
+    procedure ComputePerChannel();
     procedure BackpropagatePerDepth();
     procedure BackpropagateFullVolume();
+    procedure BackpropagatePerChannel();
   public
     constructor Create(); overload; override;
     constructor Create(pEpsilon: TNeuralFloat); overload;
@@ -8627,6 +8633,9 @@ begin
   if FStruct[0] = 1 then
     // Full-volume mode caches a single reciprocal norm for the whole sample.
     FInvNorms.ReSize(1, 1, 1)
+  else if FStruct[0] = 2 then
+    // Per-channel mode caches one reciprocal norm per depth channel.
+    FInvNorms.ReSize(1, 1, FOutput.Depth)
   else
     FInvNorms.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
 end;
@@ -8638,6 +8647,8 @@ begin
   StartTime := Now();
   if FStruct[0] = 1
     then ComputeFullVolume()
+  else if FStruct[0] = 2
+    then ComputePerChannel()
     else ComputePerDepth();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -8698,6 +8709,50 @@ begin
     FOutput.FData[Cnt] := LocalPrevOutput.FData[Cnt] * InvN;
 end;
 
+procedure TNNetL2Normalize.ComputePerChannel();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  Pos: integer;
+  LocalPrevOutput: TNNetVolume;
+  InvN, Eps, Xi: TNeuralFloat;
+  SumSq: array of TNeuralFloat;
+begin
+  // For each depth channel d independently, reduce sum-of-squares over all
+  // (x,y) positions so that channel's spatial map has unit L2 norm:
+  //   n_d = sqrt(sum_{x,y} x[x,y,d]^2 + eps); y[x,y,d] = x[x,y,d] / n_d.
+  LocalPrevOutput := FPrevLayer.FOutput;
+  Eps := FFloatSt[0];
+  if Eps <= 0 then Eps := 1e-8;
+  MaxX := LocalPrevOutput.SizeX - 1;
+  MaxY := LocalPrevOutput.SizeY - 1;
+  MaxD := LocalPrevOutput.Depth - 1;
+  SetLength(SumSq, MaxD + 1);
+  for CntD := 0 to MaxD do
+    SumSq[CntD] := 0;
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+    begin
+      Pos := LocalPrevOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do
+      begin
+        Xi := LocalPrevOutput.FData[Pos + CntD];
+        SumSq[CntD] := SumSq[CntD] + Xi * Xi;
+      end;
+    end;
+  for CntD := 0 to MaxD do
+    FInvNorms.FData[CntD] := 1.0 / Sqrt(SumSq[CntD] + Eps);
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+    begin
+      Pos := LocalPrevOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do
+      begin
+        InvN := FInvNorms.FData[CntD];
+        FOutput.FData[Pos + CntD] := LocalPrevOutput.FData[Pos + CntD] * InvN;
+      end;
+    end;
+end;
+
 procedure TNNetL2Normalize.Backpropagate();
 var
   StartTime: double;
@@ -8712,6 +8767,8 @@ begin
   begin
     if FStruct[0] = 1
       then BackpropagateFullVolume()
+    else if FStruct[0] = 2
+      then BackpropagatePerChannel()
       else BackpropagatePerDepth();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -8770,6 +8827,46 @@ begin
       FPrevLayer.OutputError.FData[Cnt] +
       InvN * (FOutputError.FData[Cnt] - Yi * Dot);
   end;
+end;
+
+procedure TNNetL2Normalize.BackpropagatePerChannel();
+var
+  CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  Pos: integer;
+  Yi, InvN: TNeuralFloat;
+  Dot: array of TNeuralFloat;
+begin
+  // For each channel d, apply the L2-normalize Jacobian over its (x,y) map:
+  //   dL/dx_i = invN_d * (gy_i - y_i * sum_j y_j * gy_j)
+  // with i,j ranging over the spatial positions of channel d, invN_d the
+  // cached reciprocal norm and ||y_channel||=1 after the forward pass.
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  SetLength(Dot, MaxD + 1);
+  for CntD := 0 to MaxD do
+    Dot[CntD] := 0;
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+    begin
+      Pos := FOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do
+        Dot[CntD] := Dot[CntD] +
+          FOutput.FData[Pos + CntD] * FOutputError.FData[Pos + CntD];
+    end;
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+    begin
+      Pos := FOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do
+      begin
+        Yi := FOutput.FData[Pos + CntD];
+        InvN := FInvNorms.FData[CntD];
+        FPrevLayer.OutputError.FData[Pos + CntD] :=
+          FPrevLayer.OutputError.FData[Pos + CntD] +
+          InvN * (FOutputError.FData[Pos + CntD] - Yi * Dot[CntD]);
+      end;
+    end;
 end;
 
 { TNNetUnitNorm }
