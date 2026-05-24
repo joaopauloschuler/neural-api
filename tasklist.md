@@ -433,8 +433,16 @@ breakdown:
       spatial only, independently per depth channel) gated by a flag, mirroring
       the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
       Builds on the landed full-volume TNNetMinMaxNorm.
-- [ ] TNNetUnitNormConstraint — projection layer that L2-normalizes the
-      *weights* of the previous trainable layer after each step.
+- [X] TNNetUnitNormConstraint — landed as **TNNetWeightNormLinear**: a
+      differentiable unit-L2 weight reparametrization (the simple g=1 form of
+      Weight Normalization). Each output neuron's weight vector is L2-normalized
+      to unit norm inside the forward pass (`ŵ = w/sqrt(Σwᵢ² + eps)`) and the
+      exact unit-norm Jacobian is backpropagated to the raw weights
+      (gradient-checked). Modelled exactly on TNNetWeightStandardization.
+      Sub-note: a true *post-step hard projection* variant (renormalize the
+      previous layer's weights after each update, non-differentiable) is still
+      open if a hard constraint is ever wanted — but the differentiable
+      reparametrization here covers the headline use case.
 
 #### Reduction / shape
 - [ ] TNNetAdaptiveAvgPool example/usage: swap a fixed global-avg head
