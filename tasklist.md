@@ -219,11 +219,6 @@ breakdown:
       max-error vs eps.
 
 ### Composite blocks / builders I'd enjoy shipping
-- [X] TNNetGLUFeedForward block — same shape but using the plain TNNetGLU.
-      Gives a working FFN to test the pre-norm-residual builder against
-      today, no waiting on new gating layers.
-      Landed: TNNet.AddGLUFeedForward(D_in, D_hidden, D_out) sibling of
-      AddSwiGLUFeedForward/AddGEGLUFeedForward + examples/GLUFeedForward/.
 - [ ] TNNetPreNormResidual helper — `y = x + Sublayer(LayerNorm(x))`
       single-line builder. Take the sublayer as a TNNet builder closure.
 - [ ] AddRMSNormResidual(NN, Sublayer) — companion builder using RMSNorm
@@ -266,10 +261,6 @@ breakdown:
 #### Norm / regularization
 - [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
       `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
-- [X] TNNetDyT (Dynamic Tanh, Liu et al. 2025) — `gamma[c] * tanh(alpha * x)
-      + beta[c]`. Per-layer learnable alpha plus per-channel gamma/beta.
-      Landed: class + dual CreateLayer/LoadFromString dispatch +
-      TestDyTGradientCheck (input + gamma/beta/alpha weight grads).
 - [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
       sigmoid gate.
 - [ ] TNNetSwitchableNorm — learnable softmax-weighted combination of
@@ -305,13 +296,9 @@ breakdown:
       derivative guard).
 - [ ] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
       neuron per forward pass during training, fixed at average at inference.
-- [X] TNNetSoftPlusBeta — generalized SoftPlus with fixed β (FFloatSt[0],
-      default 1.0). Landed: stable forward + sigmoid(βx) deriv +
-      TestSoftPlusBetaGradientCheck. (Learnable-β variant still open.)
-- [X] TNNetSoftExponential — `(exp(α·x) - 1)/α + α` for α>0, identity for
-      α=0, `-log(1 - α·(x + α))/α` for α<0. Landed: three-branch forward +
-      deriv, fixed α (FFloatSt[0]), TestSoftExponentialGradientCheck covers
-      both α>0 and α<0 branches.
+- [ ] TNNetSoftPlusBetaLearnable — learnable-β variant of the landed
+      fixed-β TNNetSoftPlusBeta. Single learnable β with the same
+      sigmoid(βx) derivative path; parallel to TNNetMishLearnable.
 - [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
       with channel-wise learnable `(p1, p2, β)`. Generalizes Swish.
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
