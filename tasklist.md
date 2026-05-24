@@ -44,33 +44,24 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
-- [ ] Activation-steering / concept-vector demo (`examples/ActivationSteering/`) —
-      the interventional flip-side of the read-only probes: instead of asking
-      "what is decodable from this layer?", inject a CONCEPT DIRECTION into a
-      hidden layer mid-forward and show it CAUSALLY CONTROLS the output (ActAdd /
-      representation engineering, Turner et al. 2023). Train a small softmax
-      classifier on a synthetic 2-class toy (e.g. the XOR-of-signs / two-cluster
-      set the other interpretability examples already use), pick a hidden layer
-      `k`, and compute a steering vector `v = mean(act_k | class 1) -
-      mean(act_k | class 0)` (a diff-of-class-means direction over the training
-      activations — no extra training). Then run forward layer-by-layer up to
-      `k`, do `Output_k.MulAdd(alpha, v)`, recompute layers `k+1..last` (reusing
-      the exact `FLayers[L].Output` + recompute machinery the landed
-      `ActivationPatchingReport` already drives), and sweep `alpha ∈ {-3..+3}`,
-      charting target-class probability vs `alpha` as an ASCII curve. Built-in
-      correctness checks: `alpha = 0` reproduces the unsteered forward pass
-      bit-for-bit, and the target-class probability moves MONOTONICALLY with
-      `alpha` (positive steers toward class 1, negative toward class 0). Also
-      contrast steering with `v` vs a random unit direction of equal norm to show
-      the concept direction is special (random steering perturbs the output far
-      less per unit norm). DISTINCT from everything in tree: `ActivationPatching`
-      swaps WHOLE cached activations between two inputs (causal tracing of a
-      contrast), `SaliencyReport` reads an input-space gradient, `GradientAscent`
-      ascends on the INPUT image, and `LinearProbeReport` /
-      `FeatureSeparabilityReport` only READ what a layer encodes — none ADD a
-      direction to a hidden activation and measure the controllable output shift.
-      Pure CPU, no dataset, forward-only (the steering vector comes from cached
-      activations; weights are never stepped), fits a few-second budget.
+<!-- (Activation-steering / concept-vector demo removed: completed, landed
+     2026-05-24 as examples/ActivationSteering/. Trains a small softmax
+     classifier on a synthetic sign(x0) two-cluster task, computes the
+     diff-of-class-means steering vector v at hidden layer k=2, and sweeps
+     alpha in {-3..+3} injecting Output_k.MulAdd(alpha, v) + downstream recompute
+     (reuses the ActivationPatchingReport CopyNoChecks-then-recompute pattern).
+     All three checks PASS: alpha=0 reproduces the unsteered forward bit-for-bit,
+     P(target) is monotonic in alpha, and v shifts the output ~1.4x more per unit
+     norm than an equal-norm random direction (measured as mean |dP| across the
+     sweep — the max-swing variant nearly ties because both saturate at alpha=3).
+     Possible follow-ups: a MULTI-LAYER steering sweep (which layer k gives the
+     cleanest monotone control?), and steering toward a class the input is NOT,
+     charting the flip threshold.) -->
+- [ ] ActivationSteering follow-up: sweep the steering layer `k` across all
+      hidden layers (not just k=2) and chart which depth gives the cleanest
+      monotone P(target)-vs-alpha control and the smallest alpha-to-flip — the
+      "where does a concept vector bite hardest?" question. ~20-line outer loop
+      over the landed examples/ActivationSteering/ harness.
 
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
@@ -911,8 +902,20 @@ breakdown:
 - [ ] Loss-family bake-off (output heads): hypotenuse with MSE / Huber /
       SmoothL1 / Charbonnier / LogCosh, printing final MSE and epochs-to-
       converge.
-- [ ] TanhGLU vs SwiGLU vs GEGLU vs GLU vs ReGLU bake-off: same tiny seq
-      model, swap the gating layer, chart final loss and wall-clock.
+<!-- (TanhGLU vs SwiGLU vs GEGLU vs GLU vs ReGLU bake-off removed: completed,
+     landed 2026-05-24 as examples/GatedFFNBakeoff/. Same FFN block
+     (PointwiseConvLinear(2*d_ff) -> GATE -> PointwiseConvLinear(1)) built five
+     times, identical except the parameter-free gate (so all arms have identical
+     param counts), trained at matched seed/LR/epochs on a synthetic per-position
+     sequence-regression target. Prints init/final MSE + wall-clock + epochs-to-
+     converge per arm and two PASS checks (no NaN/Inf; every arm beats its
+     pre-training baseline). Ranking is seed-dependent by design — the value is
+     the matched harness. Open follow-up: a multi-seed (mean ± std) version so a
+     statistically meaningful ranking is reportable.) -->
+- [ ] GatedFFNBakeoff follow-up: a multi-seed (e.g. 5 seeds, mean ± std)
+      variant of the landed examples/GatedFFNBakeoff/ so the gate ranking is
+      statistically meaningful rather than a single-seed snapshot. Keep the
+      per-arm dims tiny so 5 seeds x 5 gates still fits the <5-min budget.
 - [ ] LogCoshDualExperiment longer-horizon follow-up: 200-300 epochs and
       5 seeds (mean ± std reporting).
 - [ ] Plain-Tanh vs TanhGLU FFN ablation in a minimal-transformer-without-
@@ -1356,54 +1359,32 @@ breakdown:
       Pairs naturally with the active-learning queue use of
       [[MCDropoutUncertaintyReport]] and the hard-example pools of
       `TopLogitMarginReport` / `ConfusionMatrixReport`.
-- [ ] TNNet.LogitLensReport(NN, Probes [, HeadStartIdx]) — the **logit-lens**
-      diagnostic (nostalgebraist 2020; "Tuned Lens", Belrose et al. 2023),
-      answering a question none of the landed reports answer: *"if we read out
-      the prediction at THIS layer using the network's OWN trained output head,
-      what would it already say?"* — the model's running, self-decoded belief at
-      each depth, using ZERO fitted parameters. The recipe is forward-only: run
-      one forward pass over an unlabelled probe batch, identify the trailing
-      "head" sub-stack (the layers from `HeadStartIdx` to the output — default:
-      the last trainable layer plus any pure activation/softmax tail, i.e. the
-      classifier readout), then for every EARLIER layer whose flattened
-      activation is shape-compatible with the head's expected input, splice that
-      activation into the head and recompute ONLY the head layers to obtain a
-      per-layer "lens distribution" `p_L`. It reports: the per-layer agreement
-      rate `mean_x[argmax(p_L) == argmax(p_final)]` as an ASCII bar chart across
-      depth; the **crystallization depth** (shallowest layer after which the
-      lens argmax matches the final argmax and never flips again — the depth at
-      which the answer is effectively decided, a per-batch-mean and a 10-bin
-      per-sample histogram); the per-layer mean top-1 confidence and lens
-      entropy (the readout sharpens with depth); and the per-layer
-      `KL(p_L || p_final)` curve (monotone decrease = the residual stream
-      incrementally refining toward the final answer — the headline logit-lens
-      picture). Layers whose flat size does NOT match the head input are
-      explicitly listed as SKIPPED (the honest constraint: the classic lens
-      needs width-compatibility), with an optional `Project` flag reusing the
-      deterministic random-projection trick from [[LinearProbeReport]] to force
-      a fit and a note that projected lenses are heuristic. Built-in correctness
-      checks: applying the lens AT `HeadStartIdx` reproduces `p_final` exactly
-      (agreement 1.0, KL 0) since no recompute substitution happens there, and a
-      single-layer head degenerates to the trivial "everything resolves at the
-      last layer" profile. **Distinct from** [[LinearProbeReport]] (which FITS a
-      fresh ridge probe per layer via a closed-form solve and reports what a NEW
-      linear classifier COULD extract — the lens fits NOTHING and reuses the
-      model's OWN trained head, so it measures the model's self-belief, not the
-      layer's linear decodability), from `PredictionDepthReport` (k-NN vote
-      against a labelled support set — a non-parametric neighbour vote, not the
-      model's own readout), from `FeatureSeparabilityReport` (label-aware
-      cluster geometry, no readout at all), and from `ActivationPatchingReport`
-      (causal cross-input activation swaps, not a same-input depth-wise readout).
-      Follows the [[introspection-report-pattern]]: declaration + impl in
-      neuralnetwork.pas, an `examples/LogitLens/` demo on a small classifier
-      whose body keeps a constant width into the head (so most layers are
-      lens-compatible) contrasting fresh-init (agreement stays near chance until
-      the very last layer, flat KL) vs trained (agreement climbs with depth, KL
-      falls monotonically, crystallization depth moves earlier) in one run, and a
-      smoke test in tests/ (non-empty report, expected header, nil-NN graceful
-      return, plus the lens-at-HeadStartIdx-reproduces-final agreement/KL==0
-      assertion). Pairs with [[WeightSpectrumReport]] / the grokking experiment
-      to watch the crystallization depth shift at a representational transition.
+<!-- (TNNet.LogitLensReport removed: completed, landed 2026-05-24 via the
+     [[introspection-report-pattern]]. Signature
+     `LogitLensReport(NN; pInput: TNNetVolumeList; HeadStartIdx: integer = -1)`.
+     Default head = last trainable layer + its activation/softmax tail; for each
+     earlier layer whose flat activation matches the head input size it splices
+     that activation into the head-input slot (Copy then CopyNoChecks, ActivationPatching
+     idiom) and recomputes only the head, reading off p_L. Reports per-layer
+     argmax-agreement bar chart, crystallization depth (mean + 10-bin histogram),
+     mean confidence / lens entropy, and the KL(p_L || p_final) curve; width-
+     incompatible layers listed as SKIPPED. Ships examples/LogitLens/ (fresh-vs-
+     trained contrast on a constant-width classifier) + TestLogitLensReportSmoke.
+     Correctness checks PASS: lens at the head input reproduces p_final exactly
+     (agreement 1.0, KL 0) and the single-layer head degenerates to "resolves at
+     the last layer". HONEST NOTE for any follow-up: on a tiny synthetic net the
+     trained per-layer KL is NOT strictly monotone across the body (a sharper
+     trained head penalises a wrong intermediate readout more), so the example's
+     narrative claims only the seed-robust signals (entropy/confidence sharpening
+     with depth, exact KL=0 / agreement=1.0 at the head input). The `Project`-to-
+     force-a-fit flag from the spec was NOT implemented — incompatible layers are
+     honestly SKIPPED instead; a projected-lens variant is the open follow-up.) -->
+- [ ] LogitLensReport follow-up: the spec's optional `Project` flag (reuse
+      [[LinearProbeReport]]'s deterministic random-projection to FORCE a
+      width-incompatible layer through the head, flagged "heuristic") was not
+      implemented — the landed report honestly SKIPs incompatible layers. Add the
+      projected-lens path behind a flag so deeper/narrower stems get a (heuristic)
+      depth profile too, keeping SKIP as the default honest behaviour.
 - [ ] MagnitudePruningReport follow-up (now landed): the report sweeps a FIXED
       sparsity menu `{0,10,...,90,95,99}%`. Add a "find-the-knee" refinement that
       bisects between the last surviving and first failing sparsity to report the
