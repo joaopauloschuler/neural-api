@@ -2657,16 +2657,25 @@ type
       procedure Backpropagate(); override;
   end;
 
-  /// Tiny parameter-free shape layer that circularly shifts values along the
-  // depth (channel) axis by a constructor-supplied integer Shift:
-  //   Output[x, y, c] := Input[x, y, ((c - Shift) mod Depth + Depth) mod Depth].
-  // Positive Shift shifts values toward higher depth indices with wrap-around.
-  // Negative Shift is supported and is the inverse roll. Backward applies the
-  // inverse roll to OutputError along the same axis and accumulates into the
-  // previous layer's OutputError. Shift is persisted in FStruct[0].
+  /// Tiny parameter-free shape layer that circularly shifts values along a
+  // constructor-selected axis by an integer Shift. Along the chosen axis of
+  // length N: Output[i] := Input[((i - Shift) mod N + N) mod N], with the other
+  // two coordinates held fixed. Positive Shift shifts values toward higher
+  // indices with wrap-around; negative Shift is the inverse roll.
+  // AAxis selects the axis:
+  //   AAxis = 0 -> roll along X     (N = SizeX)
+  //   AAxis = 1 -> roll along Y     (N = SizeY)
+  //   AAxis = 2 -> roll along Depth (N = Depth; the default)
+  // Backward applies the inverse roll to OutputError along the same axis and
+  // accumulates into the previous layer's OutputError (the roll is a pure
+  // permutation, so the input gradient is the inverse roll).
+  // Shift is persisted in FStruct[0]; the axis is persisted in FStruct[1].
+  // The single-argument Create(AShift) is the depth roll (FStruct[1] = 2),
+  // byte-identical to the previous depth-only layout.
   TNNetRoll = class(TNNetIdentity)
     public
       constructor Create(AShift: integer); reintroduce; overload;
+      constructor Create(AShift: integer; AAxis: integer); reintroduce; overload;
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -12034,33 +12043,67 @@ constructor TNNetRoll.Create(AShift: integer);
 begin
   inherited Create();
   FStruct[0] := AShift;
+  // Single-argument form is the depth roll. Persisting axis = 2 keeps the
+  // serialized layout byte-identical to the historic depth-only constructor.
+  FStruct[1] := 2;
+end;
+
+constructor TNNetRoll.Create(AShift: integer; AAxis: integer);
+begin
+  inherited Create();
+  FStruct[0] := AShift;
+  // 0 = X (SizeX), 1 = Y (SizeY), 2 = Depth. Out-of-range falls back to depth.
+  if (AAxis = 0) or (AAxis = 1) then FStruct[1] := AAxis
+  else FStruct[1] := 2;
 end;
 
 procedure TNNetRoll.Compute();
 var
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, Depth, Shift, SrcD: integer;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, SizeX, SizeY, Depth, Shift, Axis, Src: integer;
   StartTime: double;
 begin
   StartTime := Now();
-  MaxX := FOutput.SizeX - 1;
-  MaxY := FOutput.SizeY - 1;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
   MaxD := Depth - 1;
   Shift := FStruct[0];
-  for CntY := 0 to MaxY do
-    for CntX := 0 to MaxX do
-      for CntD := 0 to MaxD do
-      begin
-        // Pascal's mod can be negative for negative LHS; double-mod to wrap.
-        SrcD := ((CntD - Shift) mod Depth + Depth) mod Depth;
-        FOutput[CntX, CntY, CntD] := FPrevLayer.FOutput[CntX, CntY, SrcD];
-      end;
+  Axis := FStruct[1];
+  // Pascal's mod can be negative for negative LHS; double-mod to wrap.
+  case Axis of
+    0:
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
+          for CntD := 0 to MaxD do
+          begin
+            Src := ((CntX - Shift) mod SizeX + SizeX) mod SizeX;
+            FOutput[CntX, CntY, CntD] := FPrevLayer.FOutput[Src, CntY, CntD];
+          end;
+    1:
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
+          for CntD := 0 to MaxD do
+          begin
+            Src := ((CntY - Shift) mod SizeY + SizeY) mod SizeY;
+            FOutput[CntX, CntY, CntD] := FPrevLayer.FOutput[CntX, Src, CntD];
+          end;
+  else
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
+        for CntD := 0 to MaxD do
+        begin
+          Src := ((CntD - Shift) mod Depth + Depth) mod Depth;
+          FOutput[CntX, CntY, CntD] := FPrevLayer.FOutput[CntX, CntY, Src];
+        end;
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetRoll.Backpropagate();
 var
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, Depth, Shift, SrcD: integer;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, SizeX, SizeY, Depth, Shift, Axis, Src: integer;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -12069,21 +12112,43 @@ begin
   TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
-    MaxX := FOutput.SizeX - 1;
-    MaxY := FOutput.SizeY - 1;
+    SizeX := FOutput.SizeX;
+    SizeY := FOutput.SizeY;
     Depth := FOutput.Depth;
+    MaxX := SizeX - 1;
+    MaxY := SizeY - 1;
     MaxD := Depth - 1;
     Shift := FStruct[0];
-    // Inverse roll on upstream error: dL/dInput[x,y,c] =
-    //   OutputError[x, y, ((c + Shift) mod Depth + Depth) mod Depth].
-    // Accumulate so it composes with branches sharing the previous error tensor.
-    for CntY := 0 to MaxY do
-      for CntX := 0 to MaxX do
-        for CntD := 0 to MaxD do
-        begin
-          SrcD := ((CntD + Shift) mod Depth + Depth) mod Depth;
-          FPrevLayer.FOutputError.Add(CntX, CntY, CntD, FOutputError[CntX, CntY, SrcD]);
-        end;
+    Axis := FStruct[1];
+    // Inverse roll on upstream error: the +Shift direction is the inverse of
+    // the forward -Shift roll. Accumulate so it composes with branches sharing
+    // the previous error tensor.
+    case Axis of
+      0:
+        for CntY := 0 to MaxY do
+          for CntX := 0 to MaxX do
+            for CntD := 0 to MaxD do
+            begin
+              Src := ((CntX + Shift) mod SizeX + SizeX) mod SizeX;
+              FPrevLayer.FOutputError.Add(CntX, CntY, CntD, FOutputError[Src, CntY, CntD]);
+            end;
+      1:
+        for CntY := 0 to MaxY do
+          for CntX := 0 to MaxX do
+            for CntD := 0 to MaxD do
+            begin
+              Src := ((CntY + Shift) mod SizeY + SizeY) mod SizeY;
+              FPrevLayer.FOutputError.Add(CntX, CntY, CntD, FOutputError[CntX, Src, CntD]);
+            end;
+    else
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
+          for CntD := 0 to MaxD do
+          begin
+            Src := ((CntD + Shift) mod Depth + Depth) mod Depth;
+            FPrevLayer.FOutputError.Add(CntX, CntY, CntD, FOutputError[CntX, CntY, Src]);
+          end;
+    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -34906,6 +34971,7 @@ var
   I: integer;
   ClassNameStr: string;
   SCount: integer;
+  StructCount: integer;
 begin
   Result := nil;
   S := CreateTokenizedStringList(strData,':');
@@ -34924,6 +34990,7 @@ begin
 
     for I := Low(St) to High(St) do St[i] := 0;
     S2.DelimitedText := S[1];
+    StructCount := S2.Count;
     if S2.Count > 0 then
     begin
       for I := 0 to Min(S2.Count - 1, High(St)) do St[I] := StrToInt(S2[I]);
@@ -35143,7 +35210,10 @@ begin
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetCumSum' :               Result := TNNetCumSum.Create(St[0]);
-      'TNNetRoll' :                 Result := TNNetRoll.Create(St[0]);
+      'TNNetRoll' :                 if StructCount >= 2 then
+                                      Result := TNNetRoll.Create(St[0], St[1])
+                                    else
+                                      Result := TNNetRoll.Create(St[0]);
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
       'TNNetFlipX' :                Result := TNNetFlipX.Create();
       'TNNetFlipY' :                Result := TNNetFlipY.Create();
@@ -35380,7 +35450,11 @@ begin
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
       if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create(St[0]) else
-      if S[0] = 'TNNetRoll' then Result := TNNetRoll.Create(St[0]) else
+      if S[0] = 'TNNetRoll' then
+        begin
+          if StructCount >= 2 then Result := TNNetRoll.Create(St[0], St[1])
+          else Result := TNNetRoll.Create(St[0]);
+        end else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else
       if S[0] = 'TNNetFlipX' then Result := TNNetFlipX.Create() else
       if S[0] = 'TNNetFlipY' then Result := TNNetFlipY.Create() else

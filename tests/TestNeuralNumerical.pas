@@ -320,9 +320,13 @@ type
     procedure TestCumSumSerializationRoundTrip;
     procedure TestCumSumAxisSerializationRoundTrip;
     procedure TestRollForward;
+    procedure TestRollForwardAxisXY;
     procedure TestRollGradientCheck;
+    procedure TestRollGradientCheckAxisX;
+    procedure TestRollGradientCheckAxisY;
     procedure TestRollInvolution;
     procedure TestRollSerializationRoundTrip;
+    procedure TestRollAxisSerializationRoundTrip;
     procedure TestReverseXYForward;
     procedure TestReverseXYGradientCheck;
     procedure TestReverseXYInvolution;
@@ -8317,6 +8321,167 @@ begin
       AssertEquals('Roll reloaded Shift (FStruct[0])',
         NN.GetLastLayer.SaveStructureToString(),
         Reloaded.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollForwardAxisXY;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Last: TNNetLayer;
+  x, y, d, SrcX, SrcY: integer;
+begin
+  // Non-square 3 x 2 x 2 volume seeded with a positional code x*100+y*10+d so
+  // each cell is uniquely identifiable. The cyclic roll reads from the source
+  // index ((i - Shift) mod N + N) mod N along the chosen axis.
+  // ---- X axis (Shift=1, N=SizeX=3): Output[x] := Input[(x-1+3) mod 3]. ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetRoll.Create(1, 0));
+    for y := 0 to 1 do
+      for x := 0 to 2 do
+        for d := 0 to 1 do
+          Input[x, y, d] := x * 100 + y * 10 + d;
+    NN.Compute(Input);
+    Last := NN.GetLastLayer;
+    for y := 0 to 1 do
+      for x := 0 to 2 do
+        for d := 0 to 1 do
+        begin
+          SrcX := ((x - 1) mod 3 + 3) mod 3;
+          AssertEquals(
+            'Roll X (' + IntToStr(x) + ',' + IntToStr(y) + ',' + IntToStr(d) + ')',
+            Input[SrcX, y, d], Last.Output[x, y, d], 1e-6);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // ---- Y axis (Shift=1, N=SizeY=2): Output[y] := Input[(y-1+2) mod 2]. ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    NN.AddLayer(TNNetRoll.Create(1, 1));
+    for y := 0 to 1 do
+      for x := 0 to 2 do
+        for d := 0 to 1 do
+          Input[x, y, d] := x * 100 + y * 10 + d;
+    NN.Compute(Input);
+    Last := NN.GetLastLayer;
+    for y := 0 to 1 do
+      for x := 0 to 2 do
+        for d := 0 to 1 do
+        begin
+          SrcY := ((y - 1) mod 2 + 2) mod 2;
+          AssertEquals(
+            'Roll Y (' + IntToStr(x) + ',' + IntToStr(y) + ',' + IntToStr(d) + ')',
+            Input[x, SrcY, d], Last.Output[x, y, d], 1e-6);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // ---- Depth path must remain unchanged: Create(1) == Create(1, 2). ----
+  // Depth=4, Shift=1: input [10,20,30,40] -> output [40,10,20,30].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetRoll.Create(1, 2));
+    Input.Raw[0] := 10.0;
+    Input.Raw[1] := 20.0;
+    Input.Raw[2] := 30.0;
+    Input.Raw[3] := 40.0;
+    NN.Compute(Input);
+    Last := NN.GetLastLayer;
+    AssertEquals('Roll depth (axis=2) ch0', 40.0, Last.Output.Raw[0], 1e-6);
+    AssertEquals('Roll depth (axis=2) ch1', 10.0, Last.Output.Raw[1], 1e-6);
+    AssertEquals('Roll depth (axis=2) ch2', 20.0, Last.Output.Raw[2], 1e-6);
+    AssertEquals('Roll depth (axis=2) ch3', 30.0, Last.Output.Raw[3], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollGradientCheckAxisX;
+begin
+  // X-axis roll on a non-square shape; backward is the inverse roll along X.
+  LayerInputGradientCheck(Self, TNNetRoll.Create(1, 0),
+    'RollAxisX', 4, 3, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestRollGradientCheckAxisY;
+begin
+  // Y-axis roll on a non-square shape; backward is the inverse roll along Y.
+  // Tolerance relaxed (as for the other axis/CumSum checks) because Single-
+  // precision central differences on this shape sit just above 0.01.
+  LayerInputGradientCheck(Self, TNNetRoll.Create(1, 1),
+    'RollAxisY', 3, 4, 2, 0.05);
+end;
+
+procedure TTestNeuralNumerical.TestRollAxisSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+  Reloaded: TNNetLayer;
+begin
+  // Non-default axis (Y = 1, Shift = 2): SaveToString -> LoadFromString ->
+  // SaveToString must be bit-identical and reload as TNNetRoll.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetRoll.Create(2, 1));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Reloaded := NN2.GetLastLayer;
+      AssertEquals('Roll axis reloaded class name',
+        'TNNetRoll', Reloaded.ClassName);
+      AssertTrue('Roll axis reloaded class equality',
+        Reloaded.ClassType = TNNetRoll);
+      // FStruct[0]=Shift and FStruct[1]=Axis both survive the dispatch.
+      AssertEquals('Roll axis reloaded structure (Shift+Axis)',
+        NN.GetLastLayer.SaveStructureToString(),
+        Reloaded.SaveStructureToString());
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Roll axis full SaveToString bit-identical', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+
+  // Old-style single-arg Create(3) round-trips as depth-roll (FStruct[1] = 2).
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetRoll.Create(3));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Reloaded := NN2.GetLastLayer;
+      AssertTrue('Roll single-arg reloaded class equality',
+        Reloaded.ClassType = TNNetRoll);
+      AssertEquals('Roll single-arg reloaded structure (depth-roll)',
+        NN.GetLastLayer.SaveStructureToString(),
+        Reloaded.SaveStructureToString());
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Roll single-arg full SaveToString bit-identical',
+        Saved, Saved2);
     finally
       NN2.Free;
     end;
