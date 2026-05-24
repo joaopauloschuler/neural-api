@@ -302,14 +302,11 @@ breakdown:
       show a qualitative before/after on a repetition-prone prompt — the
       class landed this lucky-day batch (neuralvolume.pas, 7 tests in
       tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
-- [X] TNNetGatedResidual follow-up: a residual builder
-      `TNNet.AddGatedResidual(pSublayers)` wiring
-      `y = x + GatedResidual(Sublayer(x))`. LANDED (2026-05-24 lucky-day
-      batch) as a sibling to AddPreNormResidual/AddRMSNormResidual/
-      AddPostNormResidual (no normalization; the per-channel gate inits to 0
-      so the branch starts as identity). Ships forward-wiring (exact
-      identity-at-init + x+alpha*Sublayer(x)) and end-to-end input
-      numerical-gradient tests.
+<!-- (TNNetGatedResidual / TNNet.AddGatedResidual builder removed: completed,
+     landed 2026-05-24 as a sibling to AddPreNormResidual/AddRMSNormResidual/
+     AddPostNormResidual (per-channel gate inits to 0 so the branch starts as
+     identity); ships forward-wiring + input numerical-gradient tests. The
+     ReZero-vs-GatedResidual depth-ablation follow-up remains open below.) -->
 - [ ] TNNetGatedResidual follow-up: ReZero-vs-GatedResidual depth ablation —
       train a deepish residual MLP with scalar ReZero vs per-channel
       GatedResidual gates, chart whether the per-channel gate opens unevenly
@@ -518,13 +515,12 @@ breakdown:
       budget. Pairs with the open weight-decay / generalization experiments
       ([[WeightSpectrumReport]]).
 ### Introspection / debugging tools
-- [X] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
-      LANDED (2026-05-24 lucky-day batch): instance method returning a
-      `digraph` string (node per layer with index/class/output-shape,
-      edges from the real DAG incl. multi-input TNNetConcatBase layers via
-      the same FPrevLayerList SaveStructureToString uses). Ships
-      examples/GraphvizExport/ + TestToGraphvizDotSmoke. Follow-up still
-      open: the sibling WriteLayerTimings(NN, Sample) below.
+<!-- (TNNet.ToGraphvizDot removed: completed, landed 2026-05-24 — instance
+     method returning a `digraph` string for the layer DAG (node per layer
+     with index/class/output-shape, edges from the real DAG incl. multi-input
+     TNNetConcatBase layers). Ships examples/GraphvizExport/ +
+     TestToGraphvizDotSmoke. The sibling WriteLayerTimings(NN, Sample)
+     follow-up remains open below.) -->
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
@@ -834,16 +830,12 @@ breakdown:
 - [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
       replacing a stride-2 conv on a tiny CIFAR stub.
-- [X] `examples/PreNormVsPostNorm/` — same 12-block deepish residual MLP
-      wired three ways via AddPreNormResidual / AddRMSNormResidual /
-      AddPostNormResidual, trained on the synthetic hypotenuse task at
-      matched seed/LR/epochs. LANDED (2026-05-24 lucky-day batch): surfaces
-      the textbook stability gap (pre-norm arms → near-zero error; post-norm
-      oscillates and ends ~10x higher, val MSE ~1000x worse), handles NaN/Inf
-      cleanly, runs ~40s on CPU. Follow-up worth adding: push NUM_BLOCKS / LR
-      until post-norm goes full NaN (`diverged = YES`) to show the harder
-      divergence the harness already guards against; and an AddGatedResidual
-      fourth arm (the builder also landed this batch).
+<!-- (`examples/PreNormVsPostNorm/` removed: completed, landed 2026-05-24 —
+     a 12-block residual MLP wired three ways via AddPreNormResidual/
+     AddRMSNormResidual/AddPostNormResidual on the synthetic hypotenuse task,
+     surfacing the pre-norm vs post-norm stability gap. Open follow-ups (push
+     NUM_BLOCKS/LR to full-NaN divergence; an AddGatedResidual fourth arm)
+     remain worth adding.) -->
 - [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a tiny-MNIST
       subset (or synthetic 2D classification).
 - [ ] `examples/ModelSummaryDemo/` — three networks printed via
