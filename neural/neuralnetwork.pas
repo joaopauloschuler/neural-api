@@ -3794,6 +3794,52 @@ type
         MaxSamples: integer = 128;
         MaxNeurons: integer = 512
       ): string;
+      // Forward-only weight-sensitivity diagnostic. For a probe batch
+      // (a TNNetVolumeList) it first records a BASELINE: one NN.Compute per
+      // (capped) probe sample, caching the final-layer output (GetLastLayer.
+      // Output) and, if a Targets list is supplied, the per-sample MSE loss
+      // against the matching target volume. It then visits every TRAINABLE
+      // layer (Neurons.Count > 0 and a non-empty weight tensor) and, for that
+      // ONE layer at a time, runs Trials independent perturbation trials: each
+      // weight is multiplicatively jittered by W *= 1 + eta with eta ~
+      // N(0, Sigma^2) (biases included), the whole probe batch is re-run, and
+      //   * the output-delta L2 = mean over probe samples of
+      //       ||perturbed_output - baseline_output||_2, and
+      //   * the loss-delta = mean over probe samples of |perturbed_MSE -
+      //       baseline_MSE| (only if Targets supplied),
+      // are accumulated; the layer's weights are then RESTORED exactly before
+      // the next trial / layer. Restoration uses a whole-net snapshot taken via
+      // NN.SaveDataToString() at the start and re-applied with
+      // NN.LoadDataFromString() after every perturbation, so the network is
+      // bit-for-bit unchanged when the report returns (also re-applied in a
+      // finally block). NO backward pass is run. Per trainable layer it
+      // reports:
+      //   (a) the mean and max output-delta L2 over the Trials trials
+      //       (sensitivity of the model output to small weight noise);
+      //   (b) the mean loss-delta (or "n/a" when Targets is nil);
+      //   (c) a normalised sensitivity = mean output-delta / param_count, so
+      //       naturally large layers do not dominate purely by size;
+      //   (d) a 10-bin ASCII histogram of the per-layer mean output-delta
+      //       across the whole network;
+      //   (e) a flag list of "high-impact" layers (top 10% by mean
+      //       output-delta) and "low-impact" layers (bottom 10%);
+      //   (f) a one-line "fragility verdict": the ratio of the maximum
+      //       per-layer sensitivity to the median per-layer sensitivity (a
+      //       high ratio means a few layers carry the model).
+      // Sigma (default 0.01) is the relative weight-noise std, Trials
+      // (default 8) the perturbation trials per layer, MaxSamples (default 64)
+      // caps the probe count used, and Seed (default 1234567) makes the
+      // Gaussian noise reproducible (the global RandSeed is saved and restored
+      // around the run). Guards nil NN and an empty probe list gracefully.
+      class function LayerSensitivityReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        Targets: TNNetVolumeList = nil;
+        Sigma: TNeuralFloat = 0.01;
+        Trials: integer = 8;
+        MaxSamples: integer = 64;
+        Seed: longword = 1234567
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -24689,6 +24735,385 @@ begin
 
     Result := Lines.Text;
   finally
+    Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LayerSensitivityReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  Targets: TNNetVolumeList = nil;
+  Sigma: TNeuralFloat = 0.01;
+  Trials: integer = 8;
+  MaxSamples: integer = 64;
+  Seed: longword = 1234567
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cTailFrac = 0.10;   // top/bottom 10% flagged as high/low impact
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx, TrIdx, SampleIdx, I, J, K, BinIdx: integer;
+  Layer: TNNetLayer;
+  UsedSamples, TrainableLayers: integer;
+  HasTargets: boolean;
+  Snapshot: string;
+  SavedRandSeed: longword;
+  LcgState: longword;
+  Eta, G1, G2, U1, U2, R, Theta: TNeuralFloat;
+  HaveSpare: boolean;
+  Spare: TNeuralFloat;
+  // baseline caches (one volume / loss per used probe sample)
+  Baseline: array of TNNetVolume;
+  BaseLoss: array of TNeuralFloat;
+  // per-trainable-layer results (parallel arrays)
+  TrLayerIdx: array of integer;
+  TrParams: array of integer;
+  MeanDelta: array of TNeuralFloat;
+  MaxDelta: array of TNeuralFloat;
+  MeanLossDelta: array of TNeuralFloat;
+  Output: TNNetVolume;
+  Diff, SumSq, SampleLoss, Tgt, DeltaL2, AccDelta, AccLoss, TrialDelta: TNeuralFloat;
+  // histogram of per-layer mean output-delta
+  Bins: array of integer;
+  MinMean, MaxMean, Width, V: TNeuralFloat;
+  MaxBin, BarLen: integer;
+  Bar, ShapeStr: string;
+  // sorted copy of MeanDelta for percentile thresholds + median
+  Sorted: array of TNeuralFloat;
+  SwapF: TNeuralFloat;
+  HighThr, LowThr, Median, MaxSens, FragRatio: TNeuralFloat;
+
+  // Local LCG -> uniform (0,1], so this report never disturbs the caller's
+  // global RNG sequence (RandSeed is also saved/restored as a safeguard).
+  function LcgNext(): TNeuralFloat;
+  begin
+    LcgState := (LcgState * 1664525 + 1013904223) and $FFFFFFFF;
+    // map to (0, 1] avoiding exact 0 for the log() in Box-Muller.
+    Result := (LcgState + 1) / 4294967296.0;
+  end;
+
+  // Standard normal via Box-Muller (one spare cached between calls).
+  function NextGaussian(): TNeuralFloat;
+  begin
+    if HaveSpare then
+    begin
+      HaveSpare := False;
+      Result := Spare;
+      Exit;
+    end;
+    U1 := LcgNext();
+    U2 := LcgNext();
+    R := Sqrt(-2.0 * Ln(U1));
+    Theta := 2.0 * Pi * U2;
+    G1 := R * Cos(Theta);
+    G2 := R * Sin(Theta);
+    Spare := G2;
+    HaveSpare := True;
+    Result := G1;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  SetLength(Baseline, 0);
+  Snapshot := '';
+  HaveSpare := False;
+  Spare := 0;
+  SavedRandSeed := RandSeed;
+  try
+    if NN = nil then
+    begin
+      Result := 'LayerSensitivityReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'LayerSensitivityReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if Sigma <= 0 then Sigma := 0.01;
+    if Trials < 1 then Trials := 1;
+    if MaxSamples < 1 then MaxSamples := 1;
+
+    LcgState := Seed;
+    HasTargets := (Targets <> nil) and (Targets.Count > 0);
+
+    UsedSamples := Samples.Count;
+    if UsedSamples > MaxSamples then UsedSamples := MaxSamples;
+    if HasTargets and (Targets.Count < UsedSamples) then
+      UsedSamples := Targets.Count;
+
+    Lines.Add(
+      'LayerSensitivityReport: forward-only per-layer weight-noise ' +
+      'sensitivity.');
+    Lines.Add(Format(
+      'Probe samples used: %d (of %d available, cap MaxSamples=%d). ' +
+      'Sigma=%.4f, Trials=%d, Seed=%u.',
+      [UsedSamples, Samples.Count, MaxSamples, Sigma, Trials, Seed]));
+    if HasTargets then
+      Lines.Add('Targets supplied: loss-delta = mean |MSE_perturbed - ' +
+        'MSE_baseline| over probe samples.')
+    else
+      Lines.Add('No targets supplied: loss-delta reported as n/a.');
+    Lines.Add('Output-delta L2 = mean over probe samples of ' +
+      '||perturbed_output - baseline_output||_2 (final layer).');
+    Lines.Add('');
+
+    // Whole-net snapshot for exact restore between perturbations.
+    Snapshot := NN.SaveDataToString();
+
+    // ---- baseline: cache final-layer output (and MSE loss) per sample. ----
+    SetLength(Baseline, UsedSamples);
+    SetLength(BaseLoss, UsedSamples);
+    for SampleIdx := 0 to UsedSamples - 1 do
+    begin
+      NN.Compute(Samples[SampleIdx]);
+      Output := NN.GetLastLayer.Output;
+      Baseline[SampleIdx] := TNNetVolume.Create();
+      Baseline[SampleIdx].Copy(Output);
+      SampleLoss := 0;
+      if HasTargets then
+      begin
+        Tgt := 0; // silence hint
+        for I := 0 to Output.Size - 1 do
+        begin
+          if I < Targets[SampleIdx].Size then Tgt := Targets[SampleIdx].Raw[I]
+          else Tgt := 0;
+          Diff := Output.Raw[I] - Tgt;
+          SampleLoss := SampleLoss + Diff * Diff;
+        end;
+        if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
+      end;
+      BaseLoss[SampleIdx] := SampleLoss;
+    end;
+
+    // ---- collect trainable layers. ----
+    SetLength(TrLayerIdx, 0);
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      SetLength(TrLayerIdx, Length(TrLayerIdx) + 1);
+      TrLayerIdx[High(TrLayerIdx)] := LayerIdx;
+    end;
+    TrainableLayers := Length(TrLayerIdx);
+
+    if TrainableLayers = 0 then
+    begin
+      Lines.Add('No trainable layers with weights found.');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    SetLength(TrParams, TrainableLayers);
+    SetLength(MeanDelta, TrainableLayers);
+    SetLength(MaxDelta, TrainableLayers);
+    SetLength(MeanLossDelta, TrainableLayers);
+
+    // ---- per trainable layer: perturb -> measure -> restore, Trials times. --
+    for TrIdx := 0 to TrainableLayers - 1 do
+    begin
+      Layer := NN.Layers[TrLayerIdx[TrIdx]];
+      // param count = sum of weight sizes + one bias per neuron.
+      TrParams[TrIdx] := 0;
+      for I := 0 to Layer.Neurons.Count - 1 do
+        TrParams[TrIdx] := TrParams[TrIdx] + Layer.Neurons[I].Weights.Size + 1;
+
+      AccDelta := 0;
+      AccLoss := 0;
+      MaxDelta[TrIdx] := 0;
+
+      for K := 0 to Trials - 1 do
+      begin
+        // Perturb ONE layer's weights and biases: W *= 1 + eta.
+        for I := 0 to Layer.Neurons.Count - 1 do
+        begin
+          for J := 0 to Layer.Neurons[I].Weights.Size - 1 do
+          begin
+            Eta := Sigma * NextGaussian();
+            Layer.Neurons[I].Weights.FData[J] :=
+              Layer.Neurons[I].Weights.FData[J] * (1.0 + Eta);
+          end;
+          Eta := Sigma * NextGaussian();
+          Layer.Neurons[I].FBiasWeight :=
+            Layer.Neurons[I].FBiasWeight * (1.0 + Eta);
+        end;
+        Layer.AfterWeightUpdate();
+
+        // Measure output-delta L2 (and loss-delta) over the probe batch.
+        TrialDelta := 0;
+        for SampleIdx := 0 to UsedSamples - 1 do
+        begin
+          NN.Compute(Samples[SampleIdx]);
+          Output := NN.GetLastLayer.Output;
+          SumSq := 0;
+          for I := 0 to Output.Size - 1 do
+          begin
+            Diff := Output.Raw[I] - Baseline[SampleIdx].Raw[I];
+            SumSq := SumSq + Diff * Diff;
+          end;
+          DeltaL2 := Sqrt(SumSq);
+          TrialDelta := TrialDelta + DeltaL2;
+
+          if HasTargets then
+          begin
+            SampleLoss := 0;
+            for I := 0 to Output.Size - 1 do
+            begin
+              if I < Targets[SampleIdx].Size then Tgt := Targets[SampleIdx].Raw[I]
+              else Tgt := 0;
+              Diff := Output.Raw[I] - Tgt;
+              SampleLoss := SampleLoss + Diff * Diff;
+            end;
+            if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
+            AccLoss := AccLoss + Abs(SampleLoss - BaseLoss[SampleIdx]);
+          end;
+        end;
+        if UsedSamples > 0 then TrialDelta := TrialDelta / UsedSamples;
+        AccDelta := AccDelta + TrialDelta;
+        if TrialDelta > MaxDelta[TrIdx] then MaxDelta[TrIdx] := TrialDelta;
+
+        // Restore exact weights before the next trial / layer.
+        NN.LoadDataFromString(Snapshot);
+      end;
+
+      MeanDelta[TrIdx] := AccDelta / Trials;
+      if HasTargets and (UsedSamples > 0) then
+        MeanLossDelta[TrIdx] := AccLoss / (Trials * UsedSamples)
+      else
+        MeanLossDelta[TrIdx] := 0;
+    end;
+
+    // ---- per-layer table. ----
+    Lines.Add(Format('Trainable layers: %d', [TrainableLayers]));
+    Lines.Add(Format('  %-5s %-26s %-14s %12s %12s %14s %14s',
+      ['idx', 'class', 'out(X,Y,D)', 'mean-dL2', 'max-dL2',
+       'norm(/param)', 'mean-dLoss']));
+    Lines.Add('  ' + StringOfChar('-', 102));
+    for TrIdx := 0 to TrainableLayers - 1 do
+    begin
+      Layer := NN.Layers[TrLayerIdx[TrIdx]];
+      ShapeStr := Format('(%d,%d,%d)',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      if HasTargets then
+        Lines.Add(Format('  %-5d %-26s %-14s %12.6f %12.6f %14.3e %14.6f',
+          [TrLayerIdx[TrIdx], Layer.ClassName, ShapeStr,
+           MeanDelta[TrIdx], MaxDelta[TrIdx],
+           MeanDelta[TrIdx] / TrParams[TrIdx], MeanLossDelta[TrIdx]]))
+      else
+        Lines.Add(Format('  %-5d %-26s %-14s %12.6f %12.6f %14.3e %14s',
+          [TrLayerIdx[TrIdx], Layer.ClassName, ShapeStr,
+           MeanDelta[TrIdx], MaxDelta[TrIdx],
+           MeanDelta[TrIdx] / TrParams[TrIdx], 'n/a']));
+    end;
+    Lines.Add('');
+
+    // ---- (d) histogram of per-layer mean output-delta. ----
+    MinMean := MeanDelta[0];
+    MaxMean := MeanDelta[0];
+    for TrIdx := 1 to TrainableLayers - 1 do
+    begin
+      if MeanDelta[TrIdx] < MinMean then MinMean := MeanDelta[TrIdx];
+      if MeanDelta[TrIdx] > MaxMean then MaxMean := MeanDelta[TrIdx];
+    end;
+    Width := MaxMean - MinMean;
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for TrIdx := 0 to TrainableLayers - 1 do
+    begin
+      if Width > 1e-30 then
+        BinIdx := Trunc((MeanDelta[TrIdx] - MinMean) / Width * cBins)
+      else
+        BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      if BinIdx < 0 then BinIdx := 0;
+      Inc(Bins[BinIdx]);
+    end;
+    Lines.Add(Format(
+      'Per-layer mean output-delta histogram (10 bins over [%.6f, %.6f]):',
+      [MinMean, MaxMean]));
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%10.6f-%10.6f) | n=%4d %s',
+        [MinMean + BinIdx / cBins * Width,
+         MinMean + (BinIdx + 1) / cBins * Width, Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    // ---- (e) high/low-impact flags via top/bottom-10% thresholds. ----
+    SetLength(Sorted, TrainableLayers);
+    for TrIdx := 0 to TrainableLayers - 1 do Sorted[TrIdx] := MeanDelta[TrIdx];
+    for I := 0 to TrainableLayers - 2 do
+      for J := 0 to TrainableLayers - 2 - I do
+        if Sorted[J] > Sorted[J + 1] then
+        begin
+          SwapF := Sorted[J]; Sorted[J] := Sorted[J + 1]; Sorted[J + 1] := SwapF;
+        end;
+    // median
+    if (TrainableLayers mod 2) = 1 then
+      Median := Sorted[TrainableLayers div 2]
+    else
+      Median := 0.5 * (Sorted[TrainableLayers div 2 - 1] +
+                       Sorted[TrainableLayers div 2]);
+    // top/bottom 10% index thresholds (at least the extreme element each).
+    K := Trunc(cTailFrac * TrainableLayers);
+    if K < 1 then K := 1;
+    HighThr := Sorted[TrainableLayers - K];        // >= this -> high impact
+    LowThr := Sorted[K - 1];                        // <= this -> low impact
+
+    Flags.Add('High-impact layers (top 10% by mean output-delta):');
+    for TrIdx := 0 to TrainableLayers - 1 do
+      if MeanDelta[TrIdx] >= HighThr then
+        Flags.Add(Format('  Layer %3d %s: mean-dL2=%.6f',
+          [TrLayerIdx[TrIdx], NN.Layers[TrLayerIdx[TrIdx]].ClassName,
+           MeanDelta[TrIdx]]));
+    Flags.Add('Low-impact layers (bottom 10% by mean output-delta):');
+    for TrIdx := 0 to TrainableLayers - 1 do
+      if MeanDelta[TrIdx] <= LowThr then
+        Flags.Add(Format('  Layer %3d %s: mean-dL2=%.6f',
+          [TrLayerIdx[TrIdx], NN.Layers[TrLayerIdx[TrIdx]].ClassName,
+           MeanDelta[TrIdx]]));
+    Lines.AddStrings(Flags);
+    Lines.Add('');
+
+    // ---- (f) fragility verdict: max / median sensitivity. ----
+    MaxSens := Sorted[TrainableLayers - 1];
+    if Median > 1e-30 then
+      FragRatio := MaxSens / Median
+    else
+      FragRatio := 0;
+    if Median > 1e-30 then
+      Lines.Add(Format(
+        'Fragility verdict: max/median layer sensitivity = %.2f ' +
+        '(max=%.6f, median=%.6f). High ratio => a few layers carry the model.',
+        [FragRatio, MaxSens, Median]))
+    else
+      Lines.Add(Format(
+        'Fragility verdict: median layer sensitivity is ~0 (max=%.6f); ' +
+        'ratio undefined.', [MaxSens]));
+
+    Result := Lines.Text;
+  finally
+    // Defensive exact restore (covers any early-exit path after the snapshot).
+    if Snapshot <> '' then NN.LoadDataFromString(Snapshot);
+    for I := 0 to High(Baseline) do
+      if Baseline[I] <> nil then Baseline[I].Free;
+    RandSeed := SavedRandSeed;
     Flags.Free;
     Lines.Free;
   end;

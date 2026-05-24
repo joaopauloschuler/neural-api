@@ -1009,7 +1009,7 @@ breakdown:
       acts as a built-in regression check on the IG implementation.
 
 ### Layer sensitivity
-- [ ] TNNet.LayerSensitivityReport — given a probe batch (and an optional
+- [X] TNNet.LayerSensitivityReport — given a probe batch (and an optional
       target volume), multiplicatively perturb each trainable layer's
       weights by small Gaussian noise (`W *= 1 + eta`, `eta ~ N(0,
       sigma^2)`, default sigma=0.01, N=8 trials per layer with fresh

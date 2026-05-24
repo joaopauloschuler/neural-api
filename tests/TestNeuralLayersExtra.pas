@@ -87,6 +87,7 @@ type
     procedure TestWeightSpectrumReportStructureAndFlags;
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
+    procedure TestLayerSensitivityReportSmoke;
   end;
 
 implementation
@@ -1642,6 +1643,86 @@ begin
       Pos('effective neuron count', Report) > 0);
     AssertTrue('Flags section present', Pos('Flags', Report) > 0);
   finally
+    Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLayerSensitivityReportSmoke;
+var
+  NN: TNNet;
+  Probes, Targets: TNNetVolumeList;
+  V, T: TNNetVolume;
+  Before, After: TNNetVolume;
+  Report: string;
+  I, J: integer;
+  MaxDiff, D: TNeuralFloat;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.LayerSensitivityReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  Targets := TNNetVolumeList.Create(True);
+  Before := TNNetVolume.Create();
+  After := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.LayerSensitivityReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // a handful of probe volumes + matching targets.
+    for I := 0 to 15 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+      T := TNNetVolume.Create(2, 1, 1);
+      for J := 0 to 1 do T.Raw[J] := (Random - 0.5) * 2.0;
+      Targets.Add(T);
+    end;
+
+    // Capture output on a fixed probe BEFORE the report.
+    NN.Compute(Probes[0]);
+    Before.Copy(NN.GetLastLayer.Output);
+
+    // Run with targets (exercises the loss-delta branch).
+    Report := TNNet.LayerSensitivityReport(NN, Probes, Targets, 0.02, 4);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('LayerSensitivityReport', Report) > 0);
+    AssertTrue('Histogram section present',
+      Pos('mean output-delta histogram', Report) > 0);
+    AssertTrue('Fragility verdict present',
+      Pos('Fragility verdict', Report) > 0);
+
+    // Save/restore guarantee: output on the SAME probe must be unchanged.
+    NN.Compute(Probes[0]);
+    After.Copy(NN.GetLastLayer.Output);
+    AssertEquals('output size unchanged', Before.Size, After.Size);
+    MaxDiff := 0;
+    for I := 0 to Before.Size - 1 do
+    begin
+      D := Abs(Before.Raw[I] - After.Raw[I]);
+      if D > MaxDiff then MaxDiff := D;
+    end;
+    AssertTrue('weights restored bit-exact (max output diff < 1e-6)',
+      MaxDiff < 1e-6);
+
+    // Without targets the loss column reads n/a.
+    Report := TNNet.LayerSensitivityReport(NN, Probes, nil, 0.02, 4);
+    AssertTrue('n/a loss when no targets', Pos('n/a', Report) > 0);
+  finally
+    After.Free;
+    Before.Free;
+    Targets.Free;
     Probes.Free;
     NN.Free;
   end;
