@@ -4549,6 +4549,58 @@ type
         NumProbes: integer = 16;
         Eps: TNeuralFloat = 1e-3
       ): string;
+      // Linear-mode-connectivity / loss-barrier diagnostic between TWO trained
+      // nets of the SAME architecture (Garipov et al. 2018; Frankle et al. 2020,
+      // "Linear Mode Connectivity and the Lottery Ticket Hypothesis"). Answers
+      // the question linear weight-drift CANNOT: do these two solutions sit in
+      // the same loss basin, or are they separated by a barrier? NN is the live
+      // network = endpoint A; SnapshotB is a NN.SaveDataToString snapshot of
+      // endpoint B (a SECOND solution of the same architecture). Samples is a
+      // whole-batch probe set (a TNNetVolumePairList of input + one-hot/target
+      // pairs) used to evaluate the loss along the line connecting A and B.
+      // PURE forward-only — no training step is ever taken. The algorithm:
+      //   1. Snapshot endpoint A's weights with NN.SaveDataToString.
+      //   2. For alpha at K+1 points evenly spaced over [0,1], set the live
+      //      weights to the linear interpolation theta(alpha) =
+      //      (1-alpha)*A + alpha*B and run ONE whole-batch forward over Samples,
+      //      accumulating the mean loss (MSE between the final-layer Output and
+      //      the per-sample Target, matching LossLandscapeProbe's default) and
+      //      the top-1 argmax accuracy. The interpolation is done with WHOLE-NET
+      //      snapshot arithmetic: LoadDataFromString(aSnap) restores A, then for
+      //      each trainable layer the live weight tensor is blended in place via
+      //      TNNetVolume.MulMulAdd(1-alpha, alpha, B_weights) (self := self*(1-a)
+      //      + B*a) — B's per-layer volumes are read from a TEMP clone of NN's
+      //      STRUCTURE loaded with SnapshotB. No per-scalar hot loop on the path.
+      //   3. Report the loss curve L(alpha) as a #-bar ASCII chart across the
+      //      K+1 alphas, the BARRIER HEIGHT = max_alpha L(alpha) - max(L(0),
+      //      L(1)) (>0 == a bump between the basins; ~0 == linearly connected),
+      //      the argmax-alpha where the barrier peaks, and a VERDICT thresholded
+      //      on the barrier height relative to the endpoint losses E :=
+      //      max(L(0), L(1)): 'connected' when barrier <= cConnTol*E + cAbsTol
+      //      (default cConnTol=0.05, i.e. <5% of the endpoint loss), 'weak
+      //      barrier' when barrier <= cSepTol*E + cAbsTol (default cSepTol=0.20),
+      //      else 'separated'.
+      //   4. Restore endpoint A bit-for-bit via NN.LoadDataFromString(aSnap) at
+      //      the end and on every error path (try/finally).
+      // Built-in correctness checks (also the example/smoke-test invariants):
+      // L(0) and L(1) recomputed on the interpolation path must match a direct
+      // forward on each snapshot to < 1e-5 (the snapshot-arithmetic faithfulness
+      // check, reported as a max abs endpoint mismatch); and B := A collapses
+      // the whole curve to a flat line with a zero barrier. K (default 10) is
+      // the number of INTERIOR steps so the sweep has K+1 alpha points; values
+      // < 1 are bumped to 1. Distinct from WeightDriftReport (weight-space L2
+      // drift / frozen fraction, NO loss along the path), from LossLandscapeProbe
+      // (walks ONE net along a random filter-normalised direction, not the line
+      // connecting two solutions), and from RepresentationSimilarityReport's
+      // cross-CKA (compares two nets' representations, not the loss between them).
+      // Guards nil NN, an empty batch, a snapshot whose architecture differs from
+      // NN, and a net with no trainable params gracefully.
+      class function ModeConnectivityReport(
+        NN: TNNet;
+        const SnapshotB: string;
+        Samples: TNNetVolumePairList;
+        K: integer = 10
+      ): string;
       // Forward-only intra-layer redundancy diagnostic. For a probe batch
       // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
       // trainable layer with weights (Neurons.Count > 0 and Weights.Size > 0),
@@ -30677,6 +30729,273 @@ begin
     Result := Lines.Text;
   finally
     RandSeed := SavedRandSeed;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.ModeConnectivityReport(
+  NN: TNNet;
+  const SnapshotB: string;
+  Samples: TNNetVolumePairList;
+  K: integer = 10
+): string;
+const
+  cEps = 1e-12;
+  cBarWidth = 40;
+  // Verdict thresholds: barrier height relative to the endpoint loss E.
+  cConnTol = 0.05;   // barrier <= 5% of E (plus cAbsTol)  -> connected
+  cSepTol  = 0.20;   // barrier <= 20% of E (plus cAbsTol) -> weak barrier
+  cAbsTol  = 1e-6;   // absolute floor so a ~0-loss basin still reads connected
+var
+  Lines: TStringList;
+  NetB: TNNet;
+  aSnap, StructStr, DiffStr: string;
+  TrainableIdxs: array of integer;
+  Losses, Accs, Alphas: array of TNeuralFloat;
+  LIdx, NIdx, I, NumAlpha, BarLen, ArgMaxIdx: integer;
+  Layer, LayerB: TNNetLayer;
+  Alpha, OneMinus, V: TNeuralFloat;
+  L0, L1, EndLoss, Barrier, MaxL, MinL, Span: TNeuralFloat;
+  L0Direct, L1Direct, EndpointMismatch: TNeuralFloat;
+  Restored: boolean;
+  Bar, Verdict, MarkStr: string;
+
+  // Whole-batch mean MSE loss + top-1 argmax accuracy on the CURRENT weights.
+  procedure EvalBatch(out OutLoss, OutAcc: TNeuralFloat);
+  var
+    SI, WI, PredIdx, TgtIdx: integer;
+    SLoss, T2: TNeuralFloat;
+    Out2: TNNetVolume;
+    Pr: TNNetVolumePair;
+    SumL: TNeuralFloat;
+    Corr, Tot: integer;
+  begin
+    SumL := 0;
+    Corr := 0;
+    Tot := 0;
+    for SI := 0 to Samples.Count - 1 do
+    begin
+      Pr := Samples[SI];
+      if (Pr = nil) or (Pr.I = nil) or (Pr.O = nil) then Continue;
+      NN.Compute(Pr.I);
+      Out2 := NN.GetLastLayer().Output;
+      SLoss := 0;
+      for WI := 0 to Out2.Size - 1 do
+      begin
+        T2 := 0;
+        if WI < Pr.O.Size then T2 := Pr.O.FData[WI];
+        SLoss := SLoss + (Out2.FData[WI] - T2) * (Out2.FData[WI] - T2);
+      end;
+      if Out2.Size > 0 then SLoss := 0.5 * SLoss / Out2.Size;
+      SumL := SumL + SLoss;
+      // top-1 argmax accuracy (meaningful for one-hot targets; harmless else).
+      PredIdx := Out2.GetClass();
+      TgtIdx := Pr.O.GetClass();
+      if PredIdx = TgtIdx then Inc(Corr);
+      Inc(Tot);
+    end;
+    if Tot > 0 then OutLoss := SumL / Tot else OutLoss := 0;
+    if Tot > 0 then OutAcc := Corr / Tot else OutAcc := 0;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  NetB := nil;
+  aSnap := '';
+  Restored := false;
+  SetLength(TrainableIdxs, 0);
+  try
+    if NN = nil then
+    begin
+      Result := 'ModeConnectivityReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'ModeConnectivityReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if SnapshotB = '' then
+    begin
+      Result := 'ModeConnectivityReport: SnapshotB is empty.' + sLineBreak;
+      Exit;
+    end;
+    if K < 1 then K := 1;
+    NumAlpha := K + 1;
+
+    // Endpoint A snapshot (data only) — used both to read A's weights on the
+    // interpolation path and to restore the live net bit-for-bit on exit.
+    aSnap := NN.SaveDataToString();
+
+    // Build endpoint B by cloning NN's STRUCTURE and loading B's data into it.
+    StructStr := NN.SaveToString();
+    NetB := TNNet.Create();
+    NetB.LoadFromString(StructStr);
+    NetB.LoadDataFromString(SnapshotB);
+
+    // Architecture guard: B must match A layer-for-layer.
+    DiffStr := NN.DiffArchitecture(NetB);
+    if DiffStr <> '' then
+    begin
+      Result := 'ModeConnectivityReport: SnapshotB has a different ' +
+        'architecture than NN. Call TNNet.DiffArchitecture for details.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // Catalogue trainable layers (neurons owning a non-empty weight tensor).
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      SetLength(TrainableIdxs, Length(TrainableIdxs) + 1);
+      TrainableIdxs[High(TrainableIdxs)] := LIdx;
+    end;
+    if Length(TrainableIdxs) = 0 then
+    begin
+      Result := 'ModeConnectivityReport: no trainable layers with parameters.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    SetLength(Alphas, NumAlpha);
+    SetLength(Losses, NumAlpha);
+    SetLength(Accs, NumAlpha);
+    for I := 0 to NumAlpha - 1 do
+      Alphas[I] := I / (NumAlpha - 1);
+    Alphas[0] := 0;
+    Alphas[NumAlpha - 1] := 1;
+
+    // Sweep alpha. For each: restore A, blend in B with whole-net snapshot
+    // arithmetic theta = (1-alpha)*A + alpha*B (no per-scalar hot loop), then
+    // evaluate the whole probe batch.
+    for I := 0 to NumAlpha - 1 do
+    begin
+      Alpha := Alphas[I];
+      OneMinus := 1.0 - Alpha;
+      NN.LoadDataFromString(aSnap);   // live weights := A
+      for LIdx := 0 to High(TrainableIdxs) do
+      begin
+        Layer := NN.Layers[TrainableIdxs[LIdx]];
+        LayerB := NetB.Layers[TrainableIdxs[LIdx]];
+        for NIdx := 0 to Layer.Neurons.Count - 1 do
+        begin
+          // W := W*(1-alpha) + B.W*alpha  (vectorised).
+          Layer.Neurons[NIdx].Weights.MulMulAdd(
+            OneMinus, Alpha, LayerB.Neurons[NIdx].Weights);
+          // Bias is a scalar — blend directly.
+          Layer.Neurons[NIdx].FBiasWeight :=
+            OneMinus * Layer.Neurons[NIdx].FBiasWeight +
+            Alpha * LayerB.Neurons[NIdx].FBiasWeight;
+        end;
+        Layer.AfterWeightUpdate();
+      end;
+      EvalBatch(Losses[I], Accs[I]);
+    end;
+
+    // --- Faithfulness check: direct forward on each endpoint snapshot. ---
+    NN.LoadDataFromString(aSnap);
+    EvalBatch(L0Direct, V);
+    NN.LoadDataFromString(SnapshotB);
+    EvalBatch(L1Direct, V);
+
+    // Restore endpoint A exactly before reporting.
+    NN.LoadDataFromString(aSnap);
+    Restored := true;
+
+    L0 := Losses[0];
+    L1 := Losses[NumAlpha - 1];
+    EndpointMismatch := Abs(L0 - L0Direct);
+    if Abs(L1 - L1Direct) > EndpointMismatch then
+      EndpointMismatch := Abs(L1 - L1Direct);
+
+    EndLoss := L0;
+    if L1 > EndLoss then EndLoss := L1;
+
+    // Barrier height + argmax alpha.
+    MaxL := Losses[0];
+    ArgMaxIdx := 0;
+    MinL := Losses[0];
+    for I := 1 to NumAlpha - 1 do
+    begin
+      if Losses[I] > MaxL then begin MaxL := Losses[I]; ArgMaxIdx := I; end;
+      if Losses[I] < MinL then MinL := Losses[I];
+    end;
+    Barrier := MaxL - EndLoss;
+    if Barrier < 0 then Barrier := 0;
+
+    // --- Report body. ---
+    Lines.Add('ModeConnectivityReport (linear mode connectivity / loss barrier)');
+    Lines.Add(StringOfChar('=', 64));
+    Lines.Add(Format('Probe samples: %d   interpolation points: %d (K=%d)',
+      [Samples.Count, NumAlpha, K]));
+    Lines.Add(Format('Trainable layers blended: %d', [Length(TrainableIdxs)]));
+    Lines.Add('');
+    Lines.Add('Loss along theta(alpha) = (1-alpha)*A + alpha*B:');
+    Lines.Add(Format('  %-7s %-12s %-9s  %s',
+      ['alpha', 'loss', 'acc', 'L(alpha)']));
+    Lines.Add('  ' + StringOfChar('-', 60));
+    Span := MaxL - MinL;
+    for I := 0 to NumAlpha - 1 do
+    begin
+      if Span > cEps then
+        BarLen := Round(((Losses[I] - MinL) / Span) * cBarWidth)
+      else
+        BarLen := 0;
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cBarWidth then BarLen := cBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      MarkStr := '';
+      if I = ArgMaxIdx then MarkStr := ' <- peak';
+      if (I = 0) or (I = NumAlpha - 1) then MarkStr := MarkStr + ' (endpoint)';
+      Lines.Add(Format('  %-7.3f %-12.6f %-9.4f |%s%s',
+        [Alphas[I], Losses[I], Accs[I], Bar, MarkStr]));
+    end;
+    Lines.Add('');
+
+    Lines.Add(Format('Endpoint loss L(0) = %.6f   L(1) = %.6f', [L0, L1]));
+    Lines.Add(Format('Max loss on path  = %.6f at alpha = %.3f',
+      [MaxL, Alphas[ArgMaxIdx]]));
+    Lines.Add(Format('Barrier height    = max L - max(L(0),L(1)) = %.6f',
+      [Barrier]));
+    if EndLoss > cEps then
+      Lines.Add(Format('Relative barrier  = %.4f (barrier / endpoint loss)',
+        [Barrier / EndLoss]));
+    Lines.Add('');
+
+    // --- correctness flag: snapshot-arithmetic faithfulness. ---
+    if EndpointMismatch < 1e-5 then
+      Lines.Add(Format('Faithfulness check: endpoint mismatch = %.3e < 1e-5 ' +
+        '-> OK (interpolation reproduces A and B).', [EndpointMismatch]))
+    else
+      Lines.Add(Format('Faithfulness check: endpoint mismatch = %.3e >= 1e-5 ' +
+        '-> WARN: the interpolation path does NOT reproduce the endpoints; ' +
+        'the snapshot arithmetic is suspect.', [EndpointMismatch]));
+    Lines.Add('');
+
+    // --- verdict on the barrier height relative to the endpoint loss. ---
+    if Barrier <= cConnTol * EndLoss + cAbsTol then
+      Verdict := Format('CONNECTED (barrier %.6f <= %.2f%% of endpoint loss): ' +
+        'the two solutions sit in the same loss basin / are linearly connected.',
+        [Barrier, cConnTol * 100])
+    else if Barrier <= cSepTol * EndLoss + cAbsTol then
+      Verdict := Format('WEAK BARRIER (barrier %.6f, %.2f%%-%.2f%% of endpoint ' +
+        'loss): a shallow bump separates the solutions.',
+        [Barrier, cConnTol * 100, cSepTol * 100])
+    else
+      Verdict := Format('SEPARATED (barrier %.6f > %.2f%% of endpoint loss): ' +
+        'the two solutions sit in DIFFERENT basins.', [Barrier, cSepTol * 100]);
+    Lines.Add('Verdict: ' + Verdict);
+
+    Result := Lines.Text;
+  finally
+    // Restore endpoint A on every path (idempotent if already restored).
+    if (NN <> nil) and (aSnap <> '') and (not Restored) then
+      NN.LoadDataFromString(aSnap);
+    NetB.Free;
     Lines.Free;
   end;
 end;

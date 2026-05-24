@@ -1015,7 +1015,7 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
-- [ ] TNNet.ModeConnectivityReport(NN, SnapshotB, Samples [, K, Targets]) —
+- [X] TNNet.ModeConnectivityReport(NN, SnapshotB, Samples [, K, Targets]) —
       linear-mode-connectivity / loss-barrier diagnostic between two trained
       nets of the same architecture (Garipov et al. 2018; Frankle et al. 2020,
       "Linear Mode Connectivity and the Lottery Ticket Hypothesis"). Answers

@@ -104,6 +104,7 @@ type
     procedure TestGradientNoiseScaleReportSmoke;
     procedure TestHessianCurvatureReportSmoke;
     procedure TestEffectiveReceptiveFieldReportSmoke;
+    procedure TestModeConnectivityReportSmoke;
   end;
 
 implementation
@@ -3508,6 +3509,130 @@ begin
     Lin.Free;
     NN.Free;
     LinNN.Free;
+    RandSeed := SavedSeed;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestModeConnectivityReportSmoke;
+var
+  NN, NNB: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  NilReport, EmptyReport, SelfReport, DiffReport: string;
+  I, C: integer;
+  SnapInit, SnapA, SnapB: string;
+  SavedSeed: longword;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+
+  procedure TrainOn(ANN: TNNet);
+  var
+    E, K, Cl: integer;
+    Xi, Yi: TNNetVolume;
+  begin
+    for E := 1 to 30 do
+      for K := 1 to 30 do
+      begin
+        Cl := Random(3);
+        Xi := TNNetVolume.Create(2, 1, 1);
+        Yi := TNNetVolume.Create(3, 1, 1);
+        try
+          Xi.FData[0] := Centers[Cl][0] + (Random - 0.5) * 0.6;
+          Xi.FData[1] := Centers[Cl][1] + (Random - 0.5) * 0.6;
+          Yi.Fill(0);
+          Yi.FData[Cl] := 1.0;
+          ANN.Compute(Xi);
+          ANN.Backpropagate(Yi);
+        finally
+          Xi.Free;
+          Yi.Free;
+        end;
+      end;
+  end;
+
+begin
+  SavedSeed := RandSeed;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.ModeConnectivityReport(nil, '', nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  NNB := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.SetLearningRate(0.05, 0.9);
+    RandSeed := 4242;
+    NN.InitWeights();
+
+    // empty samples handled gracefully (on a valid net + valid snapshot).
+    SnapInit := NN.SaveDataToString();
+    EmptyReport := TNNet.ModeConnectivityReport(NN, SnapInit, Samples);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', EmptyReport) > 0);
+
+    // Endpoint B starts from the SAME init as A (so a same-basin run).
+    NNB.AddLayer(TNNetInput.Create(2, 1, 1));
+    NNB.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNB.AddLayer(TNNetFullConnectLinear.Create(3));
+    NNB.SetLearningRate(0.05, 0.9);
+    NNB.LoadDataFromString(SnapInit);
+
+    // Train both on the 3-cluster task (B with a different shuffle order).
+    RandSeed := 11; TrainOn(NN);
+    RandSeed := 22; TrainOn(NNB);
+
+    // Probe batch.
+    RandSeed := 777;
+    for C := 0 to 2 do
+      for I := 1 to 8 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+        X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Capture A's weights to verify exact restoration afterwards.
+    SnapA := NN.SaveDataToString();
+    SnapB := NNB.SaveDataToString();
+
+    // --- B := A self-connectivity: a flat, zero-barrier curve. ---
+    SelfReport := TNNet.ModeConnectivityReport(NN, SnapA, Samples, 8);
+    AssertTrue('self report non-empty', Length(SelfReport) > 0);
+    AssertTrue('header present',
+      Pos('ModeConnectivityReport', SelfReport) > 0);
+    AssertTrue('barrier line present', Pos('Barrier height', SelfReport) > 0);
+    AssertTrue('verdict present', Pos('Verdict:', SelfReport) > 0);
+    AssertTrue('faithfulness check present',
+      Pos('Faithfulness check', SelfReport) > 0);
+    AssertTrue('B := A reads OK faithfulness',
+      Pos('Faithfulness check: endpoint mismatch = ', SelfReport) > 0);
+    // B == A must collapse to a connected (zero-barrier) verdict.
+    AssertTrue('B := A is CONNECTED', Pos('CONNECTED', SelfReport) > 0);
+
+    // Weights must be restored bit-for-bit (the report is forward-only).
+    AssertEquals('endpoint A restored exactly', SnapA, NN.SaveDataToString());
+
+    // --- a normal A-vs-B report runs and reports a barrier. ---
+    DiffReport := TNNet.ModeConnectivityReport(NN, SnapB, Samples, 6);
+    AssertTrue('A-vs-B report non-empty', Length(DiffReport) > 0);
+    AssertTrue('A-vs-B barrier line present',
+      Pos('Barrier height', DiffReport) > 0);
+    AssertTrue('A-vs-B faithfulness OK',
+      Pos('< 1e-5 -> OK', DiffReport) > 0);
+    AssertEquals('endpoint A restored after A-vs-B', SnapA,
+      NN.SaveDataToString());
+  finally
+    Samples.Free;
+    NN.Free;
+    NNB.Free;
     RandSeed := SavedSeed;
   end;
 end;
