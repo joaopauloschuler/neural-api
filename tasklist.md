@@ -1078,6 +1078,51 @@ breakdown:
       [[WeightSpectrumReport]] (the bottleneck's spectrum fills in as features
       enter superposition) and the open dictionary-learning / sparse-coding line
       of interpretability work.
+- [ ] Edge-of-Stability demo (`examples/EdgeOfStability/`) — reproduce the
+      "progressive sharpening" + "edge of stability" phenomenon (Cohen et al.
+      2021, *Gradient Descent on Neural Networks Typically Occurs at the Edge
+      of Stability*) on a pure-CPU toy. The headline, which NO in-tree
+      experiment shows: under plain full-batch gradient descent at a FIXED
+      learning rate `eta`, the top Hessian eigenvalue `lambda_max` (the
+      sharpness) RISES throughout early training ("progressive sharpening")
+      until it reaches `2/eta` — the classical GD stability limit — and then
+      HOVERS just above that threshold for the rest of training while the loss
+      keeps falling NON-monotonically (small ripples), instead of diverging as
+      the textbook quadratic-bowl analysis predicts. Recipe, reusing the
+      already-landed sharpness machinery — NO new layer or report needed: train
+      a tiny MLP (e.g. `FullConnectReLU -> FullConnectLinear`) on a small
+      synthetic regression/classification batch with FULL-batch plain SGD (not
+      Adam, not mini-batch — the EoS story is specific to deterministic GD) at a
+      fixed `eta`, and every K steps call `TNNet.HessianCurvatureReport` over a
+      fixed probe batch to read off `lambda_max` (its power-iteration-on-HVP
+      `lambda_max` is exactly the number we need — the report already estimates
+      it without forming the Hessian). Chart a two-row ASCII time series of
+      `lambda_max` and the constant `2/eta` line over training steps, plus the
+      loss curve, and flag the "EoS entry step" (first step where `lambda_max`
+      first crosses `2/eta` and stays within a band of it thereafter). Sweep
+      `eta in {small, medium, large}` to show the punchline: the plateau height
+      TRACKS `2/eta` (smaller `eta` -> the net is allowed to get sharper before
+      stalling), the cleanest single demonstration that the optimizer's own
+      stability limit — not the data — caps the curvature it settles at.
+      Built-in correctness signals: `lambda_max` must rise before it plateaus
+      (no progressive sharpening at init means the probe/eta is off); the
+      plateau must sit at/just above `2/eta` (well below it = not yet at the
+      edge, far above = diverging); and the loss must still trend down across
+      the plateau despite the ripples. DISTINCT from the landed
+      `examples/HessianCurvature/` (a STATIC flat-vs-sharp contrast of two
+      ALREADY-trained minima — no time axis, no `2/eta` threshold, no eta
+      sweep), from the SAM example (which MINIMISES sharpness via a perturbed
+      gradient — here sharpness is left to evolve under plain GD and merely
+      observed), from the open grokking demo (delayed GENERALISATION over time,
+      a val-accuracy axis, not a curvature-vs-stability-limit axis) and from
+      double-descent (a CAPACITY axis). Pure CPU, no external data, fits a
+      few-minute budget at tiny width/sample-count. Pairs naturally with
+      [[LossLandscapeProbe]] (its scalar "sharpness" should rise in lockstep
+      with `lambda_max`) and the SAM example (contrast: SAM bends the plateau
+      down). KEY LIBRARY NOTE for whoever builds it: use full-batch GD with
+      `MaxThreadNum := 1` for a deterministic sharpening curve, and remember the
+      report is a pure measurement — it never steps the weights, so interleaving
+      it inside the training loop is safe.
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
 <!-- (Plain "label-smoothing sweep — tabulate test accuracy" removed:
