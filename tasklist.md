@@ -498,6 +498,37 @@ breakdown:
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.
 - [ ] Mixup data augmentation helper.
+- [ ] Sharpness-Aware Minimization (SAM) experiment `examples/SharpnessAwareMinimization/`
+      (Foret et al. 2021) — the one well-known optimizer idea NOT covered by the
+      SWA / EMA / Lookahead / gradient-clipping plumbing above, and a natural
+      partner to the landed [[LossLandscapeProbe]] (which already prints a
+      sharpness scalar + loss-doubling radius). SAM is a two-pass step: from the
+      current weights `w`, do (1) a forward+backward to get `g = dL/dw`, (2)
+      climb to the worst-case neighbour `w_adv = w + rho * g/||g||` (the
+      "ascent" step, a whole-net snapshot + perturb), (3) a SECOND
+      forward+backward AT `w_adv` to get the perturbed gradient, then (4) restore
+      `w` and apply that perturbed gradient with the normal optimizer — so the
+      step minimises the loss of the worst point in a rho-ball, biasing training
+      toward FLAT minima. Scope it as a SELF-CONTAINED example with a hand-rolled
+      mini-batch loop (like SineRegression / BinaryAdder already do — no intrusive
+      TNeuralFit surgery), reusing the existing whole-net `SaveDataToString` /
+      `LoadDataFromString` snapshot for the restore (the same trick
+      LayerSensitivityReport uses) and the per-parameter gradient tensors
+      `Backpropagate` already populates for the `||g||` norm and the perturb. Train
+      the SAME tiny MLP twice on a small noisy-label classification toy — plain SGD
+      vs SAM at matched LR/epochs — and report: final train/val loss + accuracy,
+      and the headline FLATNESS contrast by calling `TNNet.LossLandscapeProbe` on
+      both trained nets (SAM's sharpness scalar and loss-doubling radius should
+      land flatter/wider — the built-in correctness signal that SAM did what it
+      claims). Sweep `rho in {0.0, 0.01, 0.05, 0.1, 0.2}` (rho=0 must reproduce
+      plain SGD bit-for-bit — a second built-in invariant) and chart the
+      sharpness-vs-rho and val-accuracy-vs-rho curves. Distinct from everything in
+      tree: LossLandscapeProbe only MEASURES sharpness on a frozen net, the
+      AdversarialRobustness report perturbs the INPUT (not the weights) and never
+      steps, and SWA/EMA average weights post-hoc rather than changing the
+      gradient that is applied. Pure CPU, no external data, fits a few-minute
+      budget. Pairs with the open weight-decay / generalization experiments
+      ([[WeightSpectrumReport]]).
 ### Introspection / debugging tools
 - [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
