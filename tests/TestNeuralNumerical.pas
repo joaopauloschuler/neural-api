@@ -332,6 +332,10 @@ type
     procedure TestSoftmaxTemperatureIncreasesEntropy;
     procedure TestSoftmaxTemperatureGradientCheck;
     procedure TestSoftmaxTemperatureSerializationRoundTrip;
+    procedure TestGumbelSoftmaxSoftForwardIsProbability;
+    procedure TestGumbelSoftmaxHardForwardIsOneHot;
+    procedure TestGumbelSoftmaxGradientCheck;
+    procedure TestGumbelSoftmaxSerializationRoundTrip;
     procedure TestPointwiseSoftMaxExactJacobianGradientCheck;
     procedure TestSoftMaxExactJacobianGradientCheck;
     procedure TestSoftMinSumsToOne;
@@ -10307,6 +10311,180 @@ begin
   // T=2.5 lives in FFloatSt[0] and must survive SaveStructureToString.
   SerializationRoundTrip(Self, TNNetSoftmaxTemperature.Create(2.5),
     'SoftmaxTemperature', 1, 1, 6, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestGumbelSoftmaxSoftForwardIsProbability;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  Sum, V: TNeuralFloat;
+begin
+  // Soft mode, inference path (Enabled defaults to false => no noise):
+  // y = softmax(logits / tau) must be a valid probability distribution
+  // (non-negative, sums to 1 over the whole volume).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetGumbelSoftmax.Create(1.0, 0));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.7;
+    NN.Compute(Input);
+    Sum := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      V := NN.GetLastLayer.Output.Raw[i];
+      AssertTrue('GumbelSoftmax soft output non-negative at ' + IntToStr(i) +
+        ' (' + FloatToStr(V) + ')', V >= 0);
+      Sum := Sum + V;
+    end;
+    AssertEquals('GumbelSoftmax soft output sums to 1', 1.0, Sum, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGumbelSoftmaxHardForwardIsOneHot;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i, NumOnes: integer;
+  V, Sum: TNeuralFloat;
+begin
+  // Hard straight-through mode: forward output must be one-hot (exactly one
+  // entry equal to 1, the rest 0). Run on the deterministic inference path so
+  // the argmax is the largest logit.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetGumbelSoftmax.Create(1.0, 1));
+    Input.Raw[0] := 0.2;
+    Input.Raw[1] := 1.9; // clear argmax
+    Input.Raw[2] := 0.5;
+    Input.Raw[3] := -1.0;
+    Input.Raw[4] := 0.7;
+    NN.Compute(Input);
+    NumOnes := 0;
+    Sum := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      V := NN.GetLastLayer.Output.Raw[i];
+      AssertTrue('GumbelSoftmax hard output is 0 or 1 at ' + IntToStr(i) +
+        ' (' + FloatToStr(V) + ')',
+        (Abs(V) < 1e-6) or (Abs(V - 1.0) < 1e-6));
+      if Abs(V - 1.0) < 1e-6 then NumOnes := NumOnes + 1;
+      Sum := Sum + V;
+    end;
+    AssertEquals('GumbelSoftmax hard output has exactly one 1', 1, NumOnes);
+    AssertEquals('GumbelSoftmax hard output sums to 1', 1.0, Sum, 1e-6);
+    AssertEquals('GumbelSoftmax hard output one-hot at the argmax logit',
+      1.0, NN.GetLastLayer.Output.Raw[1], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGumbelSoftmaxGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Central-difference gradient check in SOFT mode, mirroring
+  // TestSoftmaxTemperatureGradientCheck. The layer is left disabled (Enabled
+  // = false, the default), so no Gumbel noise is added and the forward is
+  // deterministic: y = softmax(logits / tau). This isolates the exact softmax
+  // Jacobian * (1/tau) backward against a finite-difference reference.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  InputPlus := TNNetVolume.Create(1, 1, 5);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetGumbelSoftmax.Create(2.0, 0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.2 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 * (i + 1);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GumbelSoftmax gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGumbelSoftmaxSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Str1, Str2: string;
+begin
+  // Non-default tau=2.5 (FFloatSt[0]) and hard=1 (FStruct[0]) must both
+  // survive SaveStructureToString. First the shared helper checks the forward
+  // output round-trips (deterministic: the layer is disabled during Compute).
+  SerializationRoundTrip(Self, TNNetGumbelSoftmax.Create(2.5, 1),
+    'GumbelSoftmax', 1, 1, 6, 1e-5);
+
+  // Then assert bit-for-bit structure-string equality after save/load/save.
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetGumbelSoftmax.Create(2.5, 1));
+    Str1 := NN.SaveStructureToString();
+    NN2.LoadStructureFromString(Str1);
+    Str2 := NN2.SaveStructureToString();
+    AssertEquals('GumbelSoftmax structure string round-trips bit-for-bit',
+      Str1, Str2);
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestPointwiseSoftMaxExactJacobianGradientCheck;

@@ -329,7 +329,7 @@ breakdown:
       S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
       The activation has landed, so this is a ~30-line activation swap.
 #### Probability projections / sparsity
-- [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
+- [X] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
       (soft / hard straight-through).
 - [ ] TNNetMixtureOfExperts — top-k softmax gate over N expert sub-networks

@@ -3361,6 +3361,42 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Gumbel-Softmax: differentiable categorical sampling head
+  /// (Jang et al. 2017 / Maddison et al. 2017).
+  ///   y = softmax( (logits + g) / tau ),   g_i = -ln(-ln(U_i)), U_i ~ U(0,1)
+  /// where g is i.i.d. Gumbel(0,1) noise added per element. Adding Gumbel
+  /// noise before the softmax turns the deterministic softmax into a
+  /// reparameterized draw from the categorical distribution defined by the
+  /// logits, while remaining differentiable w.r.t. the logits.
+  ///
+  /// Hyperparameters:
+  ///   - tau (temperature, FFloatSt[0], must be > 0): as tau -> 0 the soft
+  ///     sample sharpens towards a one-hot vector; large tau flattens it.
+  ///   - hard (FStruct[0], 0 = soft, 1 = hard straight-through): in hard
+  ///     mode the FORWARD output is one-hot(argmax(y)), but the BACKWARD pass
+  ///     uses the straight-through estimator (STE): it flows the gradient of
+  ///     the SOFT softmax sample y (cached in FSoftSample), i.e. it treats the
+  ///     forward as if it had emitted the soft y. This lets discrete samples
+  ///     be used downstream while keeping a usable gradient.
+  ///
+  /// Train vs inference (mirrors TNNetDropout / TNNetAddNoiseBase): the Gumbel
+  /// noise is added only while the layer is Enabled (training). TNNet.Compute
+  /// leaves the layer disabled by default, and TNNet.EnableDropouts(true)
+  /// toggled around training enables it. At inference the layer is
+  /// deterministic: y = softmax(logits / tau), no noise.
+  ///
+  /// Normalization scope is the whole volume per sample, matching TNNetSoftMax.
+  TNNetGumbelSoftmax = class(TNNetAddNoiseBase)
+    protected
+      FSoftSample: TNNetVolume;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pTemperature: TNeuralFloat; pHard: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Softmin layer: y = softmax(-x). Lower input scores receive higher
   /// probability mass. Output shape matches input; outputs sum to 1 over the
   /// whole volume (same normalization scope as TNNetSoftMax).
@@ -24212,6 +24248,130 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetGumbelSoftmax }
+constructor TNNetGumbelSoftmax.Create();
+begin
+  // Defaults: tau = 1.0, hard = 0 (soft mode).
+  Create(1.0, 0);
+end;
+
+constructor TNNetGumbelSoftmax.Create(pTemperature: TNeuralFloat; pHard: integer);
+begin
+  inherited Create();
+  if pTemperature <= 0 then
+    FErrorProc('TNNetGumbelSoftmax temperature (tau) must be > 0.');
+  FFloatSt[0] := pTemperature;
+  if pHard <> 0 then FStruct[0] := 1 else FStruct[0] := 0;
+  FSoftSample := TNNetVolume.Create();
+end;
+
+destructor TNNetGumbelSoftmax.Destroy();
+begin
+  FSoftSample.Free();
+  inherited Destroy();
+end;
+
+procedure TNNetGumbelSoftmax.Compute();
+var
+  StartTime: double;
+  Tau, InvTau, U, MaxV: TNeuralFloat;
+  i, SizeM1, ArgMax: integer;
+begin
+  StartTime := Now();
+  Tau := FFloatSt[0];
+  if Tau <= 0 then Tau := 1.0;
+  InvTau := 1.0 / Tau;
+  SizeM1 := FPrevLayer.FOutput.Size - 1;
+
+  // Start from the raw logits.
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+
+  // Add Gumbel(0,1) noise only while training (Enabled), mirroring how
+  // TNNetDropout / TNNetAddNoiseBase gate stochasticity. At inference the
+  // layer is deterministic: y = softmax(logits / tau).
+  if FEnabled then
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      // U in (0,1]; guard away from 0 to avoid Ln(0) in -Ln(-Ln(U)).
+      U := Random();
+      if U < 1e-20 then U := 1e-20;
+      // g = -ln(-ln(U)) ~ Gumbel(0,1).
+      FOutput.FData[i] := FOutput.FData[i] - Ln(-Ln(U));
+    end;
+  end;
+
+  // Scale by 1/tau, then softmax over the whole volume (same axis as
+  // TNNetSoftMax).
+  if InvTau <> 1.0 then FOutput.Mul(InvTau);
+  FOutput.SoftMax();
+
+  // Cache the soft softmax sample y; the straight-through backward pass uses
+  // it for the Jacobian regardless of the forward mode. Use Copy (not
+  // CopyNoChecks) so FSoftSample is resized to match on the first call.
+  FSoftSample.Copy(FOutput);
+
+  // Hard straight-through mode: replace the forward output with the one-hot
+  // argmax of y. The backward pass still uses FSoftSample (STE).
+  if FStruct[0] = 1 then
+  begin
+    ArgMax := 0;
+    MaxV := FOutput.FData[0];
+    for i := 1 to SizeM1 do
+    begin
+      if FOutput.FData[i] > MaxV then
+      begin
+        MaxV := FOutput.FData[i];
+        ArgMax := i;
+      end;
+    end;
+    FOutput.Fill(0);
+    FOutput.FData[ArgMax] := 1;
+  end;
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGumbelSoftmax.Backpropagate();
+var
+  StartTime: double;
+  Tau, InvTau, Dot, Yi: TNeuralFloat;
+  i, SizeM1: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Tau := FFloatSt[0];
+  if Tau <= 0 then Tau := 1.0;
+  InvTau := 1.0 / Tau;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
+    (FSoftSample.Size = FOutputError.Size) then
+  begin
+    // Full softmax Jacobian of the SOFT sample y = softmax((logits+g)/tau),
+    // times the temperature scaling 1/tau (du/dlogits = 1/tau where
+    // u = (logits+g)/tau). This is the exact softmax Jacobian reused from
+    // TNNetSoftMax/TNNetSoftmaxTemperature:
+    //   dL/dlogit_i = (1/tau) * y_i * (dL/dy_i - sum_j y_j * dL/dy_j)
+    // In hard straight-through mode the same SOFT y (FSoftSample) drives the
+    // Jacobian, treating the forward as if it had emitted y (STE).
+    SizeM1 := FSoftSample.Size - 1;
+    Dot := 0;
+    for i := 0 to SizeM1 do
+      Dot := Dot + FSoftSample.FData[i] * FOutputError.FData[i];
+    for i := 0 to SizeM1 do
+    begin
+      Yi := FSoftSample.FData[i];
+      FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i] +
+        InvTau * Yi * (FOutputError.FData[i] - Dot);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetLogSoftMax }
 procedure TNNetLogSoftMax.Compute;
 var
@@ -38065,6 +38225,7 @@ begin
       'TNNetSoftMin' :              Result := TNNetSoftMin.Create(St[0]);
       'TNNetSoftMaxOne' :           Result := TNNetSoftMaxOne.Create();
       'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
+      'TNNetGumbelSoftmax' :        Result := TNNetGumbelSoftmax.Create(Ft[0], St[0]);
       'TNNetCenteredSoftmax' :      Result := TNNetCenteredSoftmax.Create();
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
@@ -38320,6 +38481,7 @@ begin
       if S[0] = 'TNNetSoftMin' then Result := TNNetSoftMin.Create(St[0]) else
       if S[0] = 'TNNetSoftMaxOne' then Result := TNNetSoftMaxOne.Create() else
       if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
+      if S[0] = 'TNNetGumbelSoftmax' then Result := TNNetGumbelSoftmax.Create(Ft[0], St[0]) else
       if S[0] = 'TNNetCenteredSoftmax' then Result := TNNetCenteredSoftmax.Create() else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
