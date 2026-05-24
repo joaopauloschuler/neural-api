@@ -183,6 +183,9 @@ type
     procedure TestAconCGradientCheck;
     procedure TestAconCSwishEquivalence;
     procedure TestAconCSerializationRoundTrip;
+    procedure TestMetaAconCGammaZeroConsistency;
+    procedure TestMetaAconCGradientCheck;
+    procedure TestMetaAconCSerializationRoundTrip;
     procedure TestHuberLossForwardPassthrough;
     procedure TestHuberLossGradientClipping;
     procedure TestSmoothL1LossDefaults;
@@ -20019,6 +20022,235 @@ begin
       end;
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('AconC round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMetaAconCGammaZeroConsistency;
+// With gamma[c]=0, beta[c]=sigmoid(delta[c]) is data-independent (a constant),
+// so Meta-ACON degenerates to ACON-C with that constant beta. Assert the
+// forward output matches the hand-computed AconC-with-constant-beta math.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LMeta: TNNetMetaAconC;
+  i, c: integer;
+  SizeX, SizeY, Depth: integer;
+  p1_d, p2_d, delta_d, beta_d, xv, dv, s, expected: TNeuralFloat;
+begin
+  SizeX := 3; SizeY := 1; Depth := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    LMeta := TNNetMetaAconC.Create();
+    NN.AddLayer(LMeta);
+    // gamma = 0 -> beta is constant per channel = sigmoid(delta).
+    for c := 0 to LMeta.Neurons[0].Weights.Size - 1 do
+    begin
+      LMeta.Neurons[0].Weights.Raw[c] := 1.1 + 0.2 * c;   // p1
+      LMeta.Neurons[1].Weights.Raw[c] := -0.15 + 0.1 * c; // p2
+      LMeta.Neurons[2].Weights.Raw[c] := 0.0;             // gamma = 0
+      LMeta.Neurons[3].Weights.Raw[c] := 0.7 - 0.3 * c;   // delta (known)
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) * 1.3 - 0.2;
+    NN.Compute(Input);
+    for c := 0 to Depth - 1 do
+    begin
+      p1_d := LMeta.Neurons[0].Weights.Raw[c];
+      p2_d := LMeta.Neurons[1].Weights.Raw[c];
+      delta_d := LMeta.Neurons[3].Weights.Raw[c];
+      beta_d := 1 / (1 + Exp(-delta_d));   // gamma=0 so beta = sigmoid(delta)
+      for i := 0 to SizeX - 1 do
+      begin
+        xv := Input[i, 0, c];
+        dv := (p1_d - p2_d) * xv;
+        s := 1 / (1 + Exp(-beta_d * dv));
+        expected := dv * s + p2_d * xv;    // AconC forward with constant beta
+        AssertEquals('MetaAconC gamma=0 == AconC(const beta) at (' +
+          IntToStr(i) + ',' + IntToStr(c) + ')',
+          expected, NN.GetLastLayer.Output[i, 0, c], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMetaAconCGradientCheck;
+// Central-difference numerical gradient check for TNNetMetaAconC on a small
+// shape with SizeX*SizeY>1 (so the squeeze mean is non-trivial and the extra
+// beta-path input gradient is exercised). Verifies the input gradient and the
+// four per-channel params: p1 (neuron 0), p2 (neuron 1), gamma (neuron 2),
+// delta (neuron 3).
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LMeta: TNNetMetaAconC;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n, c: integer;
+  Names: array[0..3] of string;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  Names[0] := 'p1';
+  Names[1] := 'p2';
+  Names[2] := 'gamma';
+  Names[3] := 'delta';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    LMeta := TNNetMetaAconC.Create();
+    NN.AddLayer(LMeta);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Non-trivial per-channel params so every gradient term is exercised.
+    for c := 0 to LMeta.Neurons[0].Weights.Size - 1 do
+    begin
+      LMeta.Neurons[0].Weights.Raw[c] := 1.1 + 0.15 * c;   // p1
+      LMeta.Neurons[1].Weights.Raw[c] := -0.2 + 0.1 * c;   // p2
+      LMeta.Neurons[2].Weights.Raw[c] := 0.5 + 0.3 * c;    // gamma (nonzero!)
+      LMeta.Neurons[3].Weights.Raw[c] := 0.3 - 0.2 * c;    // delta
+    end;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.5) * 1.3 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    // --- Input gradient check (exercises the extra beta-path term) ---
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('MetaAconC input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // --- Weight gradient check (p1, p2, gamma, delta) ---
+    for n := 0 to 3 do
+      for i := 0 to LMeta.Neurons[n].Weights.Size - 1 do
+      begin
+        LMeta.Neurons[n].Weights.Raw[i] := LMeta.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LMeta.Neurons[n].Weights.Raw[i] := LMeta.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LMeta.Neurons[n].Weights.Raw[i] := LMeta.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LMeta.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LMeta.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('MetaAconC weight gradient check ' + Names[n] + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMetaAconCSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  LMeta, LMeta2: TNNetMetaAconC;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LMeta := TNNetMetaAconC.Create();
+    NN.AddLayer(LMeta);
+
+    // Push the four per-channel params away from their defaults.
+    for i := 0 to LMeta.Neurons[0].Weights.Size - 1 do
+    begin
+      LMeta.Neurons[0].Weights.Raw[i] := 1.2 + 0.1 * i;
+      LMeta.Neurons[1].Weights.Raw[i] := -0.15 + 0.07 * i;
+      LMeta.Neurons[2].Weights.Raw[i] := 0.4 + 0.09 * i;
+      LMeta.Neurons[3].Weights.Raw[i] := -0.3 + 0.05 * i;
+    end;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LMeta2 := NN2.GetLastLayer as TNNetMetaAconC;
+      AssertEquals('MetaAconC round-trip neuron count', 4, LMeta2.Neurons.Count);
+      // Re-save and assert string equality.
+      AssertEquals('MetaAconC round-trip SaveToString equality',
+        Saved, NN2.SaveToString());
+      for i := 0 to LMeta.Neurons[0].Weights.Size - 1 do
+      begin
+        AssertEquals('MetaAconC round-trip p1[' + IntToStr(i) + ']',
+          LMeta.Neurons[0].Weights.Raw[i],
+          LMeta2.Neurons[0].Weights.Raw[i], 1e-6);
+        AssertEquals('MetaAconC round-trip p2[' + IntToStr(i) + ']',
+          LMeta.Neurons[1].Weights.Raw[i],
+          LMeta2.Neurons[1].Weights.Raw[i], 1e-6);
+        AssertEquals('MetaAconC round-trip gamma[' + IntToStr(i) + ']',
+          LMeta.Neurons[2].Weights.Raw[i],
+          LMeta2.Neurons[2].Weights.Raw[i], 1e-6);
+        AssertEquals('MetaAconC round-trip delta[' + IntToStr(i) + ']',
+          LMeta.Neurons[3].Weights.Raw[i],
+          LMeta2.Neurons[3].Weights.Raw[i], 1e-6);
+      end;
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MetaAconC round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

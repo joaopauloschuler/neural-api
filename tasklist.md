@@ -330,10 +330,17 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [ ] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
+- [X] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
       data-dependent (β computed per-channel from a tiny squeeze over the
       spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
-      the now-landed AconC forward/backward. NOTE from the AconC bake-off
+      the now-landed AconC forward/backward. Landed: TNNetChannelTransformBase
+      descendant with 4 per-channel neurons (p1,p2,gamma,delta);
+      β[c]=sigmoid(gamma[c]*mean_c+delta[c]) computed each forward (never
+      stored). Uses a per-channel affine-over-squeeze as a tractable in-pattern
+      simplification of the paper's cross-channel bottleneck. Backward handles
+      the extra β-path input gradient with the (1/N) squeeze factor; verified by
+      numerical input/weight gradient checks + a gamma=0==AconC consistency
+      check. NOTE from the AconC bake-off
       (akAconC in examples/ActivationBakeoff/): in that fixed-LR harness the
       Swish-family activations (Swish/SiLU/AconC) do NOT converge on the
       hypotenuse toy (final loss ~50 vs ReLU ~1.9), and untrained AconC ==

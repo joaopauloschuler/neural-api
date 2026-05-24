@@ -2861,6 +2861,49 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Meta-ACON: the data-dependent-beta sibling of TNNetAconC
+  // (Ma, Zhang, Sun et al. 2021, https://arxiv.org/abs/2009.04759).
+  // Like ACON-C it has learnable per-channel p1[c] (FNeurons[0]) and p2[c]
+  // (FNeurons[1]), but the "switch" beta[c] is no longer a static learned
+  // constant: it is COMPUTED each forward from a spatial squeeze of the input.
+  // Let N = SizeX*SizeY and m[c] = mean over all spatial positions of channel c
+  // ("the squeeze"). Then, with learnable gamma[c] (FNeurons[2]) and delta[c]
+  // (FNeurons[3]):
+  //   beta[c] = sigmoid( gamma[c]*m[c] + delta[c] )   (per sample, per channel)
+  //   d       = (p1[c]-p2[c])*x ;  y = d*sigmoid(beta[c]*d) + p2[c]*x
+  // beta is never stored - only the four affine vectors p1,p2,gamma,delta are.
+  // Distinct from TNNetAconC, where beta is a static learned constant; here
+  // beta responds to the per-channel input statistics.
+  //
+  // HONESTY NOTE: the original Meta-ACON generates beta through a small
+  // CROSS-channel bottleneck (squeeze -> FC channel-reduce -> FC
+  // channel-expand -> sigmoid). This implementation instead uses a per-channel
+  // affine-over-squeeze (gamma[c]*mean_c + delta[c]) as a tractable, in-pattern
+  // simplification that keeps the layer within the per-channel
+  // TNNetChannelTransformBase storage model (no cross-channel mixing).
+  //
+  // Backward (let s = sigmoid(beta*d), phi = s + beta*d*s*(1-s)). The squeeze
+  // adds an extra input-gradient path because beta[c] depends on every element
+  // of the channel via m[c]:
+  //   dy/dx_direct = (p1-p2)*phi + p2          (beta held fixed)
+  //   dL/dbeta[c]  = SUM_pos dL/dy * d*d*s*(1-s)   (summed over the channel)
+  //   dL/dx[pos]   = dL/dy*dy/dx_direct + (1/N)*beta*(1-beta)*gamma * dL/dbeta[c]
+  // Param grads (accumulated over all positions and the batch, per channel):
+  //   dL/dp1[c]    += dL/dy * x*phi
+  //   dL/dp2[c]    += dL/dy * x*(1 - phi)
+  //   dL/dgamma[c] += dL/dbeta[c] * beta*(1-beta) * m[c]
+  //   dL/ddelta[c] += dL/dbeta[c] * beta*(1-beta)
+  // Defaults p1=1, p2=0, gamma=0, delta=0 give beta=sigmoid(0)=0.5.
+  TNNetMetaAconC = class(TNNetChannelTransformBase)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetTokenShift: RWKV-style per-channel time-mixing primitive.
   // For each channel c and position t along SizeX (treated as the time axis,
   // with x[-1,c]=0 zero-padding on the left):
@@ -18194,6 +18237,186 @@ begin
   FNeurons[0].FWeights.Fill(1);
   FNeurons[1].FWeights.Fill(0);
   FNeurons[2].FWeights.Fill(1);
+  AfterWeightUpdate();
+end;
+
+{ TNNetMetaAconC }
+constructor TNNetMetaAconC.Create();
+begin
+  inherited Create();
+  InitDefault();
+end;
+
+procedure TNNetMetaAconC.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base class allocates FNeurons[0] (p1). We also need FNeurons[1] (p2),
+  // FNeurons[2] (gamma) and FNeurons[3] (delta), each Depth weights.
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetMetaAconC.Compute();
+var
+  StartTime: double;
+  W1, W2, Wg, Wb: TNNetVolume;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d, N: integer;
+  p1_d, p2_d, gamma_d, delta_d, m_d, beta_d, xv, dv, s: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  W1 := FNeurons[0].FWeights;
+  W2 := FNeurons[1].FWeights;
+  Wg := FNeurons[2].FWeights;
+  Wb := FNeurons[3].FWeights;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  N := SizeX * SizeY;
+  {$IFDEF Debug}
+  if (W1.Size <> Depth) or (W2.Size <> Depth) or (Wg.Size <> Depth) or
+     (Wb.Size <> Depth) then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetMetaAconC.');
+  {$ENDIF}
+  for d := 0 to Depth - 1 do
+  begin
+    p1_d := W1.Raw[d];
+    p2_d := W2.Raw[d];
+    gamma_d := Wg.Raw[d];
+    delta_d := Wb.Raw[d];
+    // Squeeze: m[c] = mean over all spatial positions of channel c.
+    m_d := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+        m_d := m_d + Prev[x, y, d];
+    m_d := m_d / N;
+    // Data-dependent beta.
+    beta_d := 1 / (1 + Exp(-(gamma_d * m_d + delta_d)));
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        dv := (p1_d - p2_d) * xv;
+        s := 1 / (1 + Exp(-beta_d * dv));
+        FOutput[x, y, d] := dv * s + p2_d * xv;
+      end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMetaAconC.Backpropagate();
+var
+  StartTime: double;
+  N1, N2, Ng, Nb: TNNetNeuron;
+  W1, W2, Wg, Wb: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d, N: integer;
+  p1_d, p2_d, gamma_d, delta_d, m_d, beta_d, betaSig: TNeuralFloat;
+  xv, gy, dv, s, sds, phi: TNeuralFloat;
+  gradP1, gradP2, gradBeta, betaPathFactor: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  N1 := FNeurons[0];
+  N2 := FNeurons[1];
+  Ng := FNeurons[2];
+  Nb := FNeurons[3];
+  W1 := N1.FWeights;
+  W2 := N2.FWeights;
+  Wg := Ng.FWeights;
+  Wb := Nb.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  N := SizeX * SizeY;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  for d := 0 to Depth - 1 do
+  begin
+    p1_d := W1.Raw[d];
+    p2_d := W2.Raw[d];
+    gamma_d := Wg.Raw[d];
+    delta_d := Wb.Raw[d];
+    // Recompute the squeeze and beta consistently with the forward.
+    m_d := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+        m_d := m_d + Prev[x, y, d];
+    m_d := m_d / N;
+    beta_d := 1 / (1 + Exp(-(gamma_d * m_d + delta_d)));
+    betaSig := beta_d * (1 - beta_d);   // dbeta/d(pre-activation)
+    gradP1 := 0;
+    gradP2 := 0;
+    gradBeta := 0;   // dL/dbeta[c], summed over all positions of the channel.
+    // First pass: direct-path input gradient + p1/p2 grads + accumulate
+    // dL/dbeta[c] across positions.
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        dv := (p1_d - p2_d) * xv;
+        s := 1 / (1 + Exp(-beta_d * dv));
+        sds := s * (1 - s);
+        phi := s + beta_d * dv * sds;
+        gradP1 := gradP1 + gy * xv * phi;
+        gradP2 := gradP2 + gy * xv * (1 - phi);
+        gradBeta := gradBeta + gy * dv * dv * sds;
+        if hasInputGrad then
+          PrevErr[x, y, d] := PrevErr[x, y, d] +
+            gy * ((p1_d - p2_d) * phi + p2_d);
+      end;
+    // Second pass: distribute the beta-path input gradient. beta[c] depends on
+    // every element of the channel through m[c] (dm/dx = 1/N), and
+    // dbeta/dm = beta*(1-beta)*gamma, so each position gets the same extra
+    // term (1/N)*beta*(1-beta)*gamma * dL/dbeta[c].
+    if hasInputGrad then
+    begin
+      betaPathFactor := betaSig * gamma_d * gradBeta / N;
+      if betaPathFactor <> 0 then
+        for x := 0 to SizeX - 1 do
+          for y := 0 to SizeY - 1 do
+            PrevErr[x, y, d] := PrevErr[x, y, d] + betaPathFactor;
+    end;
+    // Param grads for the affine that produces beta.
+    //   dL/dgamma[c] = dL/dbeta[c] * beta*(1-beta) * m[c]
+    //   dL/ddelta[c] = dL/dbeta[c] * beta*(1-beta)
+    N1.FDelta.Raw[d] := N1.FDelta.Raw[d] + (-FLearningRate) * gradP1;
+    N2.FDelta.Raw[d] := N2.FDelta.Raw[d] + (-FLearningRate) * gradP2;
+    Ng.FDelta.Raw[d] := Ng.FDelta.Raw[d] +
+      (-FLearningRate) * (gradBeta * betaSig * m_d);
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] +
+      (-FLearningRate) * (gradBeta * betaSig);
+  end;
+  if (not FBatchUpdate) then
+  begin
+    N1.UpdateWeights(FInertia);
+    N2.UpdateWeights(FInertia);
+    Ng.UpdateWeights(FInertia);
+    Nb.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetMetaAconC.InitDefault();
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  // p1 = 1, p2 = 0, gamma = 0, delta = 0  (beta = sigmoid(0) = 0.5).
+  FNeurons[0].FWeights.Fill(1);
+  FNeurons[1].FWeights.Fill(0);
+  FNeurons[2].FWeights.Fill(0);
+  FNeurons[3].FWeights.Fill(0);
   AfterWeightUpdate();
 end;
 
@@ -39836,6 +40059,7 @@ begin
       'TNNetAPL':                   Result := TNNetAPL.Create(St[0]);
       'TNNetSplineActivation':      Result := TNNetSplineActivation.Create(St[0], Ft[0]);
       'TNNetAconC':                 Result := TNNetAconC.Create();
+      'TNNetMetaAconC':             Result := TNNetMetaAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
@@ -40098,6 +40322,7 @@ begin
       if S[0] = 'TNNetAPL' then Result := TNNetAPL.Create(St[0]) else
       if S[0] = 'TNNetSplineActivation' then Result := TNNetSplineActivation.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetAconC' then Result := TNNetAconC.Create() else
+      if S[0] = 'TNNetMetaAconC' then Result := TNNetMetaAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
