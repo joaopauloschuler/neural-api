@@ -149,40 +149,14 @@ breakdown:
       gradient-check on a tiny shape.
 
 ### Attention variants / siblings
-- [ ] TNNetDifferentialAttention — the **Differential Transformer** attention
-      head (Ye et al., Microsoft 2024, "Differential Transformer"), a genuinely
-      distinct attention map, not a re-skin of the in-tree softmax variants. A
-      subclass of `TNNetScaledDotProductAttention` (matching the existing
-      [[layer-authoring-extras]] "new attention variant by subclassing SDPA"
-      pattern, exactly as `TNNetCosineSimilarityAttention` / `TNNetSinkAttention`
-      already do) that computes TWO independent softmax attention maps from two
-      query/key sub-projections of the same input and outputs their scaled
-      DIFFERENCE applied to V:
-      `Attn = (softmax(Q1·K1^T/√d) − λ·softmax(Q2·K2^T/√d))·V`, where the second
-      map is meant to estimate and CANCEL common-mode attention noise (the paper's
-      headline: less attention mass wasted on irrelevant context, sharper
-      long-range retrieval). The Q|K depth slab is split in half down the channel
-      axis to form the two (Q1,K1) and (Q2,K2) sub-heads (V is shared, full
-      width); `λ` is a single learnable scalar stored in `FFloatSt[0]`
-      (initialised to the paper's `λ_init ≈ 0.8`, and — like ReZero's single-weight
-      pattern and the open learnable-scale cosine-attention follow-up — trained by
-      one extra gradient term), so backward is the existing SDPA softmax-Jacobian
-      run TWICE (once per map, the second contribution negated and scaled by λ)
-      plus the scalar `∂L/∂λ = −Σ (softmax2·V)·dOut`. **Distinct from** every
-      in-tree attention layer: `TNNetCosineSimilarityAttention` (rescales the
-      logits of a SINGLE map), `TNNetSinkAttention` (adds always-on sink slots to a
-      SINGLE map), and SDPA+`TNNetSoftCapping` (bounds the logits of a SINGLE map) —
-      none of them form or subtract a second map, which is the whole point here.
-      Headline tests: (1) with `λ=0` the layer reduces BIT-FOR-BIT to plain SDPA on
-      the first sub-head (the built-in degeneracy check); (2) a numerical-gradient
-      check on the input AND on the learnable `λ` at a tiny shape
-      (d_k=4, SeqLen=3); (3) on an "all-keys-irrelevant" probe row the differential
-      output's attention-noise mass is strictly below plain SDPA's (the paper's
-      noise-cancellation claim, mirroring the open SinkAttention micro-experiment).
-      LoadFromString round-trip with a non-default `λ`. Pairs with the open MHA
-      breakdown ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so
-      a decoder block can opt into differential heads, and is a natural drop-in for
-      the downstream ../gpt-3-for-pascal model's long-context retrieval.
+- [X] TNNetDifferentialAttention — landed. Differential Transformer attention
+      head (Ye et al., Microsoft 2024), an SDPA subclass that forms two softmax
+      maps from the half-width (Q1,K1)/(Q2,K2) sub-heads of the shared Q|K slab and
+      outputs `(softmax(Q1·K1^T/√(d_k/2)) − λ·softmax(Q2·K2^T/√(d_k/2)))·V` over the
+      full-width shared V. λ is a single learnable scalar (FNeurons[0] weight, like
+      ReZero; initialised to λ_init≈0.8, mirrored into FFloatSt[0] for structure
+      round-trip). Tests: λ=0 degeneracy, input numerical-gradient, λ
+      numerical-gradient, LoadFromString round-trip with non-default λ.
 - [ ] TNNetSinkAttention follow-up (now landed): attention-sink stability
       micro-experiment. On a tiny causal next-token task with an "all-keys-
       irrelevant" probe row, compare plain SDPA vs TNNetSinkAttention and

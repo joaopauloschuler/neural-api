@@ -1816,6 +1816,51 @@ type
     property NumSinks: integer read FNumSinks;
   end;
 
+  /// Differential Attention (Differential Transformer, Ye et al., Microsoft
+  /// 2024, https://arxiv.org/abs/2410.05258).
+  // A drop-in variant of TNNetScaledDotProductAttention that computes TWO
+  // independent softmax attention maps from two query/key sub-projections of
+  // the same input and outputs their scaled DIFFERENCE applied to V:
+  //   Attn = (softmax(Q1.K1^T/sqrt(d_k/2)) - lambda*softmax(Q2.K2^T/sqrt(d_k/2))) . V
+  // The second map estimates and cancels common-mode attention noise, sharpening
+  // the effective attention pattern. The Q|K depth slabs are split in half down
+  // the channel axis: Q1 = Q[0..d_k/2-1], Q2 = Q[d_k/2..d_k-1] (likewise K), so
+  // each sub-head has dimension d_k/2 and the score scaling is 1/sqrt(d_k/2). V
+  // is SHARED at full width (d_k) by both maps; the output retains depth d_k.
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k (the depth axis is the concatenation Q | K | V, each d_k).
+  // Output shape: SizeX x 1 x d_k. d_k MUST be even.
+  // lambda is a single LEARNABLE scalar initialised to the paper's lambda_init
+  // (~0.8), stored as the one weight of FNeurons[0] so it round-trips through
+  // the base neuron save/load and is stepped by the optimizer exactly like
+  // TNNetReZero's alpha. lambda is ALSO mirrored into FFloatSt[0] (kept in sync
+  // on every weight update and passed as the constructor's lambda_init) so the
+  // current value additionally survives SaveStructureToString / LoadFromString.
+  // How it differs from the siblings: CosineSimilarity rescales the SCORES with
+  // a FIXED scalar; Sink augments the key set with learnable sink slots; this
+  // layer subtracts a SECOND learnable-weighted softmax map to denoise the first.
+  // The CausalMask is honoured identically by BOTH maps.
+  TNNetDifferentialAttention = class(TNNetScaledDotProductAttention)
+  private
+    FLambdaInit: TNeuralFloat;
+    FHalfDk: integer;            // d_k / 2, the sub-head dimension
+    FInvSqrtHalfDk: TNeuralFloat; // 1 / sqrt(d_k/2)
+    // Cached second attention map from Compute(), reused by Backpropagate().
+    // FAttn (parent) holds map 1. Layout matches FAttn: X=key j, Y=query i.
+    FAttn2: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pLambdaInit: TNeuralFloat = 0.8); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    // Read-only access to the second (noise) attention map.
+    property AttentionWeights2: TNNetVolume read FAttn2;
+    property Lambda: TNeuralFloat read FLambdaInit;
+  end;
+
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
   // consecutive pairs of channels.
@@ -10825,6 +10870,224 @@ begin
       FNeurons[s].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetDifferentialAttention }
+
+constructor TNNetDifferentialAttention.Create(d_k: integer;
+  pCausalMask: boolean; pLambdaInit: TNeuralFloat);
+begin
+  inherited Create(d_k, pCausalMask);
+  if (FDk mod 2) <> 0 then
+    FErrorProc('TNNetDifferentialAttention requires an even d_k (it is split ' +
+      'into two d_k/2 sub-heads). d_k=' + IntToStr(FDk));
+  FHalfDk := FDk div 2;
+  FInvSqrtHalfDk := 1.0 / Sqrt(FHalfDk);
+  FLambdaInit := pLambdaInit;
+  FFloatSt[0] := FLambdaInit;
+  FAttn2 := TNNetVolume.Create();
+  InitDefault();
+end;
+
+destructor TNNetDifferentialAttention.Destroy();
+begin
+  FAttn2.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetDifferentialAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // One learnable scalar lambda lives in FNeurons[0] (exactly like TNNetReZero),
+  // so it round-trips through the base neuron save/load and is stepped by the
+  // optimizer via UpdateWeights.
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  InitDefault();
+  // Second attention map, same layout as the parent FAttn: X=key, Y=query.
+  FAttn2.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+end;
+
+procedure TNNetDifferentialAttention.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FLambdaInit);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetDifferentialAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score1, Score2, Max1, Max2, Sum1, Sum2, AccVal, lambdaVal: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  lambdaVal := FNeurons[0].FWeights.Raw[0];
+  // For each query row i: two scaled-score maps over the half-width sub-heads,
+  // two softmaxes, then a weighted sum of the SHARED (full-width) V.
+  for i := 0 to SeqLen - 1 do
+  begin
+    // 1) Scaled sub-head scores into FAttn[*,i,0] (map 1: Q1.K1) and
+    //    FAttn2[*,i,0] (map 2: Q2.K2). Q1=Q[0..h-1], Q2=Q[h..d_k-1]; likewise K.
+    Max1 := -1e30;
+    Max2 := -1e30;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+        FAttn2[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score1 := 0;
+        Score2 := 0;
+        for d := 0 to FHalfDk - 1 do
+        begin
+          // Q1.K1: Q depth d, K depth FDk+d.
+          Score1 := Score1 + Prev[i, 0, d] * Prev[j, 0, FDk + d];
+          // Q2.K2: Q depth FHalfDk+d, K depth FDk+FHalfDk+d.
+          Score2 := Score2 + Prev[i, 0, FHalfDk + d] *
+            Prev[j, 0, FDk + FHalfDk + d];
+        end;
+        FAttn[j, i, 0] := Score1 * FInvSqrtHalfDk;
+        FAttn2[j, i, 0] := Score2 * FInvSqrtHalfDk;
+      end;
+      if FAttn[j, i, 0] > Max1 then Max1 := FAttn[j, i, 0];
+      if FAttn2[j, i, 0] > Max2 then Max2 := FAttn2[j, i, 0];
+    end;
+    // 2) Two numerically-stable softmaxes.
+    Sum1 := 0;
+    Sum2 := 0;
+    for j := 0 to SeqLen - 1 do
+    begin
+      Score1 := Exp(FAttn[j, i, 0] - Max1);
+      FAttn[j, i, 0] := Score1;
+      Sum1 := Sum1 + Score1;
+      Score2 := Exp(FAttn2[j, i, 0] - Max2);
+      FAttn2[j, i, 0] := Score2;
+      Sum2 := Sum2 + Score2;
+    end;
+    if Sum1 > 0 then
+      for j := 0 to SeqLen - 1 do FAttn[j, i, 0] := FAttn[j, i, 0] / Sum1;
+    if Sum2 > 0 then
+      for j := 0 to SeqLen - 1 do FAttn2[j, i, 0] := FAttn2[j, i, 0] / Sum2;
+    // 3) Output[i,d] = sum_j (Attn1[i,j] - lambdaVal*Attn2[i,j]) * V[j,d].
+    for d := 0 to FDk - 1 do
+    begin
+      AccVal := 0;
+      for j := 0 to SeqLen - 1 do
+        AccVal := AccVal +
+          (FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0]) * Prev[j, 0, 2 * FDk + d];
+      FOutput[i, 0, d] := AccVal;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDifferentialAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, k, d: integer;
+  Prev, PrevErr: TNNetVolume;
+  dAttn1, dAttn2: array of TNeuralFloat;
+  dScore1, dScore2: array of TNeuralFloat;
+  SumDA1, SumDA2, dS, OutErr, lambdaVal, gradLambda, dV, dotV: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  localNeuron := FNeurons[0];
+  lambdaVal := localNeuron.FWeights.Raw[0];
+  // The lambdaVal gradient is always computed; input gradients only when the
+  // previous layer actually has a matching error buffer to receive them.
+  hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
+  SeqLen := Prev.SizeX;
+  SetLength(dAttn1, SeqLen);
+  SetLength(dAttn2, SeqLen);
+  SetLength(dScore1, SeqLen);
+  SetLength(dScore2, SeqLen);
+  gradLambda := 0;
+  for i := 0 to SeqLen - 1 do
+  begin
+    // ---- Gradients w.r.t the SHARED V[j], the two attention maps, and lambdaVal.
+    // out[i,d] = sum_j (Attn1[j] - lambdaVal*Attn2[j]) * V[j,d]
+    //   dV[j,d]   += (Attn1[j] - lambdaVal*Attn2[j]) * dOut[i,d]
+    //   dAttn1[j]  = sum_d dOut[i,d]*V[j,d]
+    //   dAttn2[j]  = -lambdaVal * sum_d dOut[i,d]*V[j,d]
+    //   dLambda   += -sum_d (sum_j Attn2[j]*V[j,d]) * dOut[i,d]
+    for j := 0 to SeqLen - 1 do
+    begin
+      dotV := 0;
+      dV := FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0];
+      for d := 0 to FDk - 1 do
+      begin
+        OutErr := FOutputError[i, 0, d];
+        if hasInputGrad then PrevErr.Add(j, 0, 2 * FDk + d, dV * OutErr);
+        dotV := dotV + OutErr * Prev[j, 0, 2 * FDk + d];
+      end;
+      dAttn1[j] := dotV;
+      dAttn2[j] := -lambdaVal * dotV;
+      // lambdaVal gradient: -Attn2[j] * (sum_d dOut[i,d]*V[j,d]).
+      gradLambda := gradLambda - FAttn2[j, i, 0] * dotV;
+    end;
+    // ---- Softmax Jacobian for each map: dScore[j] = A[j]*(dAttn[j] - sum_k dAttn[k]*A[k]).
+    SumDA1 := 0;
+    SumDA2 := 0;
+    for k := 0 to SeqLen - 1 do
+    begin
+      SumDA1 := SumDA1 + dAttn1[k] * FAttn[k, i, 0];
+      SumDA2 := SumDA2 + dAttn2[k] * FAttn2[k, i, 0];
+    end;
+    for j := 0 to SeqLen - 1 do
+    begin
+      dScore1[j] := FAttn[j, i, 0] * (dAttn1[j] - SumDA1);
+      dScore2[j] := FAttn2[j, i, 0] * (dAttn2[j] - SumDA2);
+    end;
+    // Causal-masked positions (j > i) have A ~ 0, so dScore ~ 0 already.
+    // ---- Gradients w.r.t the half-width sub-heads of Q and K ----
+    // map1 score = invSqrtHalfDk * sum_d Q1[i,d]*K1[j,d]   (Q depth d, K depth FDk+d)
+    // map2 score = invSqrtHalfDk * sum_d Q2[i,d]*K2[j,d]   (Q depth h+d, K depth FDk+h+d)
+    if hasInputGrad then
+      for j := 0 to SeqLen - 1 do
+      begin
+        dS := dScore1[j] * FInvSqrtHalfDk;
+        if dS <> 0 then
+          for d := 0 to FHalfDk - 1 do
+          begin
+            PrevErr.Add(i, 0, d, dS * Prev[j, 0, FDk + d]);
+            PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
+          end;
+        dS := dScore2[j] * FInvSqrtHalfDk;
+        if dS <> 0 then
+          for d := 0 to FHalfDk - 1 do
+          begin
+            PrevErr.Add(i, 0, FHalfDk + d, dS * Prev[j, 0, FDk + FHalfDk + d]);
+            PrevErr.Add(j, 0, FDk + FHalfDk + d, dS * Prev[i, 0, FHalfDk + d]);
+          end;
+      end;
+  end;
+  // ---- Step lambda like TNNetReZero (delta += -FLearningRate * grad) ----
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
+    (-FLearningRate) * gradLambda;
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  // Keep FFloatSt[0] in sync with the live lambda so the structure string also
+  // carries the current value through SaveStructureToString / LoadFromString.
+  FFloatSt[0] := localNeuron.FWeights.Raw[0];
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
@@ -39221,6 +39484,7 @@ begin
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
+      'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -39479,6 +39743,7 @@ begin
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
+      if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else

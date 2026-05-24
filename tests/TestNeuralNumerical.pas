@@ -309,6 +309,10 @@ type
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
+    procedure TestDifferentialAttentionLambdaZeroDegeneracy;
+    procedure TestDifferentialAttentionGradientCheck;
+    procedure TestDifferentialAttentionLambdaGradientCheck;
+    procedure TestDifferentialAttentionSerializationRoundTrip;
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
@@ -7719,6 +7723,255 @@ begin
       NN2.LoadFromString(Saved);
       Saved2 := NN2.SaveToString();
       AssertEquals('SinkAttn save->load->save string equality', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDifferentialAttentionLambdaZeroDegeneracy;
+// With lambda=0 the second (noise) softmax map is fully cancelled, so the
+// output must equal map 1 alone: softmax(Q1.K1^T / sqrt(d_k/2)) . V, with Q1/K1
+// the FIRST half of the Q|K depth slabs and V the full-width value slab. The
+// reference is computed by hand here (the shapes differ from a plain SDPA
+// instance because V is full width while Q1/K1 are half width).
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Dk, HalfDk, i, j, d: integer;
+  Attn: TNNetDifferentialAttention;
+  InvSqrtH, MaxScore, SumExp, s, ExpOut: TNeuralFloat;
+  Score, Wgt: array of TNeuralFloat;
+begin
+  SeqLen := 3;
+  Dk := 4;
+  HalfDk := Dk div 2;
+  InvSqrtH := 1.0 / Sqrt(HalfDk);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  SetLength(Score, SeqLen);
+  SetLength(Wgt, SeqLen);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDifferentialAttention.Create(Dk, false, 0.0); // lambda=0
+    NN.AddLayer(Attn);
+
+    // Distinct, non-zero Q/K/V.
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := Sin(i * 0.7 + d * 0.3) + 0.5;          // Q
+        Input[i, 0, Dk + d] := Cos(i * 0.4 - d * 0.6) - 0.3;     // K
+        Input[i, 0, 2 * Dk + d] := i * 1.0 + 0.1 * d;            // V
+      end;
+
+    NN.Compute(Input);
+    AssertEquals('DiffAttn output SizeX', SeqLen, Attn.Output.SizeX);
+    AssertEquals('DiffAttn output Depth', Dk, Attn.Output.Depth);
+
+    // Reference: map 1 only = softmax(Q1.K1 / sqrt(d_k/2)) . V (full-width V).
+    for i := 0 to SeqLen - 1 do
+    begin
+      MaxScore := -1e30;
+      for j := 0 to SeqLen - 1 do
+      begin
+        s := 0;
+        for d := 0 to HalfDk - 1 do
+          s := s + Input[i, 0, d] * Input[j, 0, Dk + d]; // Q1 . K1
+        Score[j] := s * InvSqrtH;
+        if Score[j] > MaxScore then MaxScore := Score[j];
+      end;
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Wgt[j] := Exp(Score[j] - MaxScore);
+        SumExp := SumExp + Wgt[j];
+      end;
+      for j := 0 to SeqLen - 1 do Wgt[j] := Wgt[j] / SumExp;
+      for d := 0 to Dk - 1 do
+      begin
+        ExpOut := 0;
+        for j := 0 to SeqLen - 1 do
+          ExpOut := ExpOut + Wgt[j] * Input[j, 0, 2 * Dk + d];
+        AssertEquals('DiffAttn lambda=0 out [i=' + IntToStr(i) + ',d=' +
+          IntToStr(d) + ']', ExpOut, Attn.Output[i, 0, d], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDifferentialAttentionGradientCheck;
+// Central-difference check of the INPUT gradient (dL/dInput) of a
+// TNNetDifferentialAttention with d_k=4 (sub-head=2), SeqLen=3, non-zero lambda.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetDifferentialAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDifferentialAttention.Create(Dk, false, 0.8);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      // Tolerance 1e-2: matches the sibling SDPA / cosine / sink attention
+      // checks (float32 softmax-difference cancellation).
+      AssertTrue('DiffAttn input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDifferentialAttentionLambdaGradientCheck;
+// Central-difference check of the TRAINABLE lambda scalar (the one weight of
+// neuron 0). With learning rate 1 and batch update the analytical gradient
+// equals -Neuron[0].Delta[0] (delta accumulates -FLearningRate * grad),
+// mirroring the Sink sink-param / ReZero alpha checks.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetDifferentialAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDifferentialAttention.Create(Dk, false, 0.8);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss;
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss;
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    Attn.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -Attn.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('DiffAttn lambda gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDifferentialAttentionSerializationRoundTrip;
+// save -> load -> save string equality with NON-default lambda (0.5).
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetDifferentialAttention;
+  Saved, Saved2: string;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Attn := TNNetDifferentialAttention.Create(4, true, 0.5); // non-default lambda
+    NN.AddLayer(Attn);
+
+    AssertEquals('DiffAttn lambda survived create', 0.5,
+      Attn.Neurons[0].Weights.Raw[0], 1e-6);
+
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('DiffAttn save->load->save string equality', Saved, Saved2);
+
+      Attn2 := NN2.Layers[1] as TNNetDifferentialAttention;
+      AssertEquals('DiffAttn lambda survived round-trip', 0.5,
+        Attn2.Neurons[0].Weights.Raw[0], 1e-6);
     finally
       NN2.Free;
     end;
