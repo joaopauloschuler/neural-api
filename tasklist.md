@@ -442,6 +442,38 @@ breakdown:
 - [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
       the stem and chart effective-RF growth vs theoretical-RF growth — the
       headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
+- [ ] `TNNet.NeuralTangentKernelReport(NN, Samples)` — the empirical
+      Neural-Tangent-Kernel diagnostic (Jacot et al. 2018), the gradient-space
+      object that actually governs gradient-descent training dynamics. On a
+      FROZEN net (`ClearDeltas` per sample, never `UpdateWeights`) it snapshots
+      each sample's full flattened per-parameter weight-gradient vector `g_i` of
+      the scalar target-class logit — REUSING the exact per-sample gradient
+      machinery `FisherImportanceReport` / `GradientConflictReport` /
+      `GradientNoiseScaleReport` already share (no input-gradient enablement) —
+      and forms the empirical NTK Gram matrix `K_ij = <g_i, g_j>` over the probe
+      batch. It then reports: the kernel as a glyph-shaded ASCII heatmap; its
+      FULL eigenspectrum via the SAME self-contained Double-precision cyclic
+      Jacobi eigensolver `WeightSpectralTailReport` already ships (so no new
+      numerical code); the condition number `lambda_max/lambda_min` (a predictor
+      of convergence speed — ill-conditioned NTK ⇒ slow training); the
+      **kernel-target alignment** `<K, yy^T>_F / (||K||_F ||yy^T||_F)`
+      (Cristianini et al. 2001 — high alignment predicts good generalization,
+      the headline NTK-theory number); the effective rank / participation ratio
+      `(sum lambda)^2 / sum lambda^2`; a `log10(lambda)` histogram; and an
+      optional fresh-init-vs-trained contrast quantifying NTK DRIFT (≈0 drift =
+      the infinite-width "lazy/kernel" regime; large drift = "rich"
+      feature-learning — the lazy-vs-rich question made visible). Built-in
+      correctness checks: symmetry `K_ij == K_ji`, PSD (all Jacobi eigenvalues
+      `>= 0` since `K = G G^T`), and the diagonal `K_ii == ||g_i||^2 > 0`.
+      DISTINCT from `GradientConflictReport` (which reports normalised pairwise
+      gradient COSINES + a conflict fraction — sign geometry, not the
+      un-normalised kernel, its eigenspectrum, or target alignment), from
+      `RepresentationSimilarityReport` (linear-CKA on forward ACTIVATIONS, not
+      gradients) and from `HessianCurvatureReport` (loss-surface curvature, not
+      the gradient Gram). Ships with an `examples/NeuralTangentKernel/` demo
+      (small classifier; contrast a wide vs narrow hidden layer to show the wide
+      net's NTK drifting less) and the standard report test trio. Forward+
+      backward only on a frozen net; weights are never stepped.
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
