@@ -6044,6 +6044,26 @@ type
       // Clones the neural network and returns the clone.
       function Clone(): TNNet;
 
+      // Emits a Graphviz DOT description of the layer DAG (directed graph)
+      // and returns it as a string ready to be saved to a ".dot" file.
+      // DOT is the plain-text language consumed by Graphviz; render the
+      // result to an image with, for example:
+      //   dot -Tpng net.dot -o net.png
+      //   dot -Tsvg net.dot -o net.svg
+      // One node is emitted per layer (node id = layer index) with a label
+      // of the form "<idx>: <ClassName>\n<SizeX>x<SizeY>x<Depth>" (the shape
+      // is read from the layer's Output volume). Edges follow the real DAG:
+      // a plain layer gets one edge from its previous layer, while a
+      // multi-input layer (TNNetSum / TNNetConcat / TNNetDeepConcat and the
+      // rest of the TNNetConcatBase family) gets one edge from EVERY input
+      // layer, so branched/residual nets render correctly. Input-only layers
+      // (no previous layer) have no incoming edge. This is a pure structural
+      // dump: it is forward/structure-only, never runs a forward or backward
+      // pass and never changes any training state. An empty network returns a
+      // valid empty graph ("digraph NeuralNet {}"). The output is
+      // deterministic for a given network.
+      function ToGraphvizDot(const GraphName: string = 'NeuralNet'): string;
+
       // deprecated - do not use it.
       procedure MulWeightsGlorotBengio(V:TNeuralFloat); deprecated;
       // deprecated - do not use it.
@@ -43415,6 +43435,82 @@ begin
   Result.LoadStructureFromString(NNData);
   Result.CopyWeights(Self);
   NNData := '';
+end;
+
+function TNNet.ToGraphvizDot(const GraphName: string): string;
+var
+  SL: TStringList;
+  LayerCnt: integer;
+  InputCnt: integer;
+  Layer: TNNetLayer;
+  ConcatLayer: TNNetConcatBase;
+  Label_: string;
+  SizeX, SizeY, Depth: integer;
+begin
+  SL := TStringList.Create;
+  try
+    if FLayers.Count = 0 then
+    begin
+      // Valid, empty graph for an empty network.
+      Result := 'digraph ' + GraphName + ' {}';
+      Exit;
+    end;
+
+    SL.Add('digraph ' + GraphName + ' {');
+    SL.Add('  rankdir=TB;');
+    SL.Add('  node [shape=box];');
+
+    // One node per layer. Node id = layer index. The "\n" in the label is
+    // emitted literally so Graphviz renders it as a line break in the box.
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Assigned(Layer.Output) then
+      begin
+        SizeX := Layer.Output.SizeX;
+        SizeY := Layer.Output.SizeY;
+        Depth := Layer.Output.Depth;
+      end
+      else
+      begin
+        SizeX := 0;
+        SizeY := 0;
+        Depth := 0;
+      end;
+      Label_ := Format('%d: %s\n%dx%dx%d',
+        [LayerCnt, Layer.ClassName, SizeX, SizeY, Depth]);
+      SL.Add(Format('  %d [label="%s"];', [LayerCnt, Label_]));
+    end;
+
+    // Edges follow the real DAG, mirroring the input discovery used by
+    // SaveStructureToString (PrevLayer) and TNNetConcatBase.SaveStructureToString
+    // (every entry of FPrevLayerList for multi-input layers).
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer is TNNetConcatBase then
+      begin
+        ConcatLayer := TNNetConcatBase(Layer);
+        for InputCnt := 0 to ConcatLayer.FPrevLayerList.Count - 1 do
+        begin
+          if Assigned(ConcatLayer.FPrevLayerList[InputCnt]) then
+          begin
+            SL.Add(Format('  %d -> %d;',
+              [ConcatLayer.FPrevLayerList[InputCnt].FLayerIdx, LayerCnt]));
+          end;
+        end;
+      end
+      else if Assigned(Layer.PrevLayer) then
+      begin
+        SL.Add(Format('  %d -> %d;', [Layer.PrevLayer.FLayerIdx, LayerCnt]));
+      end;
+    end;
+
+    SL.Add('}');
+    Result := SL.Text;
+  finally
+    SL.Free;
+  end;
 end;
 
 procedure TNNet.LoadDataFromString(strData: string);

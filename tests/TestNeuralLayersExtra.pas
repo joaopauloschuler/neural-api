@@ -109,6 +109,7 @@ type
     procedure TestModeConnectivityReportSmoke;
     procedure TestIntrinsicDimensionReportSmoke;
     procedure TestActivationPatchingReportSmoke;
+    procedure TestToGraphvizDotSmoke;
   end;
 
 implementation
@@ -4217,6 +4218,48 @@ begin
     Before.Free;
     CorruptIn.Free;
     CleanIn.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestToGraphvizDotSmoke;
+var
+  NN: TNNet;
+  ShortCut, LongPath: TNNetLayer;
+  Dot, EmptyDot: string;
+begin
+  // Empty network: a valid empty digraph, no crash.
+  NN := TNNet.Create();
+  try
+    EmptyDot := NN.ToGraphvizDot();
+    AssertTrue('empty net non-empty', Length(EmptyDot) > 0);
+    AssertTrue('empty net contains digraph', Pos('digraph', EmptyDot) > 0);
+  finally
+    NN.Free;
+  end;
+
+  // A tiny branched net with a TNNetSum so multi-input edges are exercised.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    ShortCut := NN.AddLayer(TNNetFullConnectLinear.Create(8));
+    NN.AddLayerAfter(TNNetFullConnectLinear.Create(8), ShortCut);
+    NN.AddLayer(TNNetReLU.Create());
+    LongPath := NN.AddLayer(TNNetFullConnectLinear.Create(8));
+    NN.AddLayer(TNNetSum.Create([ShortCut, LongPath]));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+
+    Dot := NN.ToGraphvizDot('SmokeNet');
+    AssertTrue('dot non-empty', Length(Dot) > 0);
+    AssertTrue('dot contains digraph', Pos('digraph', Dot) > 0);
+    AssertTrue('dot contains the graph name', Pos('SmokeNet', Dot) > 0);
+    AssertTrue('dot contains at least one edge', Pos('->', Dot) > 0);
+    // The TNNetSum node must have two incoming edges; assert both branch
+    // indices point at the sum layer (index 5).
+    AssertTrue('dot mentions the TNNetSum layer', Pos('TNNetSum', Dot) > 0);
+    AssertTrue('shortcut edge into sum present', Pos('1 -> 5', Dot) > 0);
+    AssertTrue('longpath edge into sum present', Pos('4 -> 5', Dot) > 0);
+  finally
     NN.Free;
   end;
 end;
