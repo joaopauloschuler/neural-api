@@ -5,7 +5,7 @@ unit TestNeuralLayersExtra;
 interface
 
 uses
-  Classes, SysUtils, Math, StrUtils, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, StrUtils, fpcunit, testregistry, neuralnetwork, neuralvolume, neuralcalibration;
 
 type
   TTestNeuralLayersExtra = class(TTestCase)
@@ -92,6 +92,7 @@ type
     procedure TestTTAReportSmoke;
     procedure TestSaliencyReportSmoke;
     procedure TestDecisionBoundaryReportSmoke;
+    procedure TestCalibrationReportSmoke;
   end;
 
 implementation
@@ -2089,6 +2090,74 @@ begin
       Pos('(d) Probe overlay', Report) = 0);
   finally
     TrainSet.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestCalibrationReportSmoke;
+var
+  NN: TNNet;
+  Inputs: TNNetVolumeList;
+  Labels: TNeuralIntegerArray;
+  X: TNNetVolume;
+  Report: string;
+  Rep: TNeuralCalibrationReport;
+  T: TNeuralFloat;
+  I, C: integer;
+begin
+  // nil NN handled gracefully (empty inputs too).
+  Report := CalibrationReport(nil, nil, [], 10);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Inputs := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.InitWeights();
+
+    // A handful of labeled samples across 3 classes (no training needed for a
+    // smoke test -- we only need a valid forward pass and a non-empty report).
+    SetLength(Labels, 12);
+    for I := 0 to 11 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(2, 1, 1);
+      X.FData[0] := C * 1.0;
+      X.FData[1] := -C * 1.0;
+      Inputs.Add(X);
+      Labels[I] := C;
+    end;
+
+    Report := CalibrationReport(NN, Inputs, Labels, 10);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('CalibrationReport', Report) > 0);
+    AssertTrue('ECE present', Pos('ECE', Report) > 0);
+    AssertTrue('Reliability diagram section present',
+      Pos('Reliability diagram', Report) > 0);
+
+    // Sane metric ranges.
+    Rep := ComputeCalibration(NN, Inputs, Labels, 10);
+    AssertTrue('NumSamples positive', Rep.NumSamples > 0);
+    AssertTrue('ECE in [0,1]', (Rep.ECE >= 0) and (Rep.ECE <= 1));
+    AssertTrue('MCE in [0,1]', (Rep.MCE >= 0) and (Rep.MCE <= 1));
+    AssertTrue('Brier finite and >= 0',
+      (Rep.Brier >= 0) and (not IsNan(Rep.Brier)) and (not IsInfinite(Rep.Brier)));
+    AssertTrue('Accuracy in [0,1]',
+      (Rep.Accuracy >= 0) and (Rep.Accuracy <= 1));
+
+    // FitTemperature returns a positive finite T.
+    T := FitTemperature(NN, Inputs, Labels);
+    AssertTrue('T positive', T > 0);
+    AssertTrue('T finite', (not IsNan(T)) and (not IsInfinite(T)));
+
+    // nil NN with a valid input list still handled gracefully.
+    Report := CalibrationReport(nil, Inputs, Labels, 10);
+    AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+  finally
+    Inputs.Free;
     NN.Free;
   end;
 end;

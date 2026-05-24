@@ -17,5 +17,8 @@ link*.res
 autosave.csv
 autosave.nn
 
+# Generated diagram images (e.g. reliability diagrams from example runs)
+*.pgm
+
 # Claude Code (created at repo root)
 .claude/
