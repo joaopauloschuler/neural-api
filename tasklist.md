@@ -465,22 +465,6 @@ breakdown:
       EquivarianceReport (worked around by using a global-avg construction
       instead). Add a numerical-gradient / forward+backward regression test
       for `FlipX -> padded Conv` and fix the unpad sizing.
-- [x] Input-space gradients are not exposed by the public backward path:
-      `Layers[0].OutputError` is a 1-element tensor by default, so the first
-      trainable layer silently skips writing the input gradient. SaliencyReport
-      works around it by resizing the input layer's `OutputError`/
-      `OutputErrorDeriv` to match `Output` AND (for a conv first layer)
-      refreshing `FCalculatePrevLayerError` + `FPrevLayerErrorPadded`, which are
-      cached at wiring time from the then-degenerate 1-element input error.
-      Promote this into a small reusable helper (e.g. `TNNet.EnableInputGradient`)
-      so saliency / adversarial-perturbation callers don't re-derive it, with a
-      regression test asserting a non-zero input gradient for both a conv and a
-      FullConnect first layer.
-      LANDED: `TNNet.EnableInputGradient` now exists (extracted from
-      SaliencyReport, which calls it; AdversarialRobustnessReport reuses it).
-      Regression test `TestEnableInputGradient` pins non-zero input gradient for
-      both a conv-first and a FullConnect-first net. The FlipX-padded-conv bug
-      above is a SEPARATE, still-open issue.
 
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
@@ -1051,49 +1035,6 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
-- [x] TNNet.RepresentationSimilarityReport(NN, Probes) — a forward-only
-      `TNNet.*Report` that answers "how does the representation reshape
-      itself with depth, and which layers are doing redundant work?" by
-      computing the **linear Centered Kernel Alignment (CKA)** similarity
-      (Kornblith et al. 2019) between every pair of layer activations over
-      a shared probe batch. For each layer it flattens the per-sample
-      activation to a row of an `N x D_l` matrix `X_l` (N = probe count),
-      column-centers it, and computes the pairwise linear-CKA
-      `CKA(X_i, X_j) = ||X_i^T X_j||_F^2 / (||X_i^T X_i||_F * ||X_j^T X_j||_F)`
-      — a number in `[0, 1]`, invariant to orthogonal rotation and isotropic
-      scaling of the features, so it compares *representations* not raw
-      coordinates. Reports: the full LxL CKA matrix as an ASCII heatmap
-      (glyph-shaded by similarity band), the adjacent-layer similarity
-      vector `CKA(l, l+1)` down the stack (a high value flags a near-pass-
-      through "redundant depth" layer; a sharp dip flags where the
-      representation genuinely reorganizes), the single most-redundant
-      layer pair (highest off-diagonal CKA — a merge/prune candidate), the
-      block structure (contiguous runs of layers with mutual CKA above a
-      threshold, the "representational stages" of the net), and a one-line
-      verdict (e.g. "K of L layers are near-duplicates of a neighbour").
-      Optionally takes a second net (`RepresentationSimilarityReport(NN,
-      OtherNet, Probes)`) to cross-CKA two architectures layer-by-layer —
-      "do these two trained nets learn the same intermediate features?"
-      (the headline use case in the CKA paper: comparing widths/depths/seeds).
-      Pure forward-only; weights never touched; reuses the same
-      activation-snapshot walk the existing reports already do. Distinct
-      from [[NeuronCorrelationReport]] (that measures *intra-layer*
-      neuron-pair Pearson redundancy *within one* layer — this measures
-      *whole-layer representation* similarity *between* layers/nets and is
-      rotation-invariant, which raw Pearson is not), from LinearProbeReport
-      (that asks "is the label linearly decodable here?" against a target —
-      this needs no labels and asks "are these two feature spaces the
-      same?"), and from ArchitectureDiff (that diffs the static layer list,
-      not the learned activations). Companion
-      `examples/RepresentationSimilarity/` contrasts (a) a fresh-init net
-      whose adjacent-layer CKA is already high (untrained layers barely
-      transform their input) against the same net after training (a clearer
-      block structure emerges), and (b) a deliberately over-deep MLP on a
-      simple task so the "middle layers are near-duplicates, depth is
-      wasted" signal lights up. Smoke test
-      `TestRepresentationSimilarityReportSmoke` asserts the self-CKA
-      diagonal is 1.0 within tolerance (the built-in correctness check) and
-      the matrix is symmetric. Follows [[introspection-report-pattern]].
 - [ ] RepresentationSimilarityReport follow-up: add an RBF-kernel CKA mode
       alongside the landed linear-CKA one (Gaussian Gram `K_ij =
       exp(-||x_i - x_j||^2 / (2*sigma^2))` with sigma a median-distance
@@ -1162,57 +1103,6 @@ breakdown:
       substitutes, not complements).
 
 ### Adversarial robustness
-- [x] TNNet.AdversarialRobustnessReport(NN, Samples, Labels [, EpsList]) —
-      given a trained classifier and a labelled probe batch, craft FGSM
-      (fast gradient sign method, Goodfellow et al. 2015) input
-      perturbations `x_adv = x + eps * sign(d loss / d x)` at an
-      increasing menu of epsilons (default `{0, 0.01, 0.02, 0.05, 0.1,
-      0.2}`) and report how the model degrades under worst-case
-      input-space noise. For each eps it does one forward + one backward
-      pass per sample to get the input gradient (reusing the same
-      input-gradient enablement [[SaliencyReport]] needs — the pending
-      `TNNet.EnableInputGradient` helper), takes the sign-step, re-runs a
-      clean forward on the perturbed input, and reports:
-      (a) top-1 accuracy at each eps as a degradation curve (eps=0 is the
-          clean baseline — a built-in sanity check that it matches a
-          plain evaluation pass),
-      (b) the **critical epsilon** per sample (smallest eps that flips the
-          prediction away from the clean argmax) as a 10-bin ASCII
-          histogram, so the spread between fragile and robust inputs is
-          visible — a few samples flipping at tiny eps while most survive
-          is the classic adversarial-fragility signature,
-      (c) the mean clean-confidence of the samples that flip first vs those
-          that survive longest (high-confidence-yet-fragile points are the
-          interesting failure mode),
-      (d) per-class accuracy-at-fixed-eps so a class whose decision
-          boundary sits unusually close to its inputs stands out,
-      (e) an optional `eps,accuracy` CSV side-output for plotting, and a
-          one-line verdict ("robust" / "moderately fragile" / "fragile")
-          from the accuracy drop at the median eps.
-      Forward+backward only on a frozen network — the trained weights are
-      never updated (this is an *evaluation* of robustness, not adversarial
-      *training*). Distinct from [[SaliencyReport]] (per-sample input
-      attribution for one logit — *where* the model looks, not *how far* an
-      input can be pushed before it misclassifies), from
-      [[EquivarianceReport]] (fixed symmetry transforms with no label and
-      no gradient — measures invariance, not worst-case accuracy loss),
-      from [[LayerSensitivityReport]] (jitters *weights* and measures
-      output delta — this jitters *inputs* along the loss gradient and
-      measures label flips), and from [[DecisionBoundaryReport]] (renders
-      the 2-D learned function over a grid — this probes the high-D input
-      neighbourhood of real labelled samples). The output is the natural
-      input for any future "should we add adversarial training / input
-      smoothing?" decision. Companion `examples/AdversarialRobustness/`
-      runs it on a small trained CIFAR-style classifier and prints the
-      eps-vs-accuracy curve plus the critical-epsilon histogram; an
-      optional second run on a model trained with input-noise augmentation
-      shows the curve flattening (the expected robustness gain), so the
-      contrast is eyeballable. Builds directly on the input-gradient
-      infrastructure already flagged for SaliencyReport
-      ([[introspection-report-pattern]]); a genuinely new diagnostic, not a
-      re-skin of an existing report.
-      LANDED (FGSM single-step variant + EnableInputGradient helper +
-      synthetic example + smoke test). Two small follow-ups below.
 - [ ] AdversarialRobustnessReport follow-up: add the optional
       `eps,accuracy` CSV side-output (skipped in the initial landing as
       "optional") so the degradation curve can be plotted outside the
