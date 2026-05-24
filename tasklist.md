@@ -859,7 +859,6 @@ breakdown:
       across α ∈ {0.5, 1, 2, 4}.
 - [ ] Trig identity composition tests: `Sin(x)² + Cos(x)² = 1`, Snake at
       α=1 derivative trig identity.
-- [ ] Exp/Log compose-as-identity test on a small input range.
 - [ ] Test that `TNNetNegate.Compose(TNNetNegate)` round-trips to identity.
 
 ### Norm / extra audits
@@ -896,8 +895,6 @@ breakdown:
 - [ ] TNNetMaxOut CIFAR-style example wired into one of the SimpleImage
       paths.
 - [ ] TNNetCELU CIFAR-style smoke example.
-- [ ] Numerical-gradient test confirming TNNetRMSNorm matches the analytical
-      gradient under non-trivial input distributions (mean ≠ 0, var ≠ 1).
 - [ ] TNNetHardShrink / TNNetSoftShrink sparsity micro-experiment: train a
       tiny autoencoder with each as the bottleneck activation, print
       fraction of zero activations vs reconstruction loss.
