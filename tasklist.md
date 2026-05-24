@@ -88,11 +88,9 @@ rather than acted on.
 - [ ] Weight-initialization sensitivity demo: show how a deep-ish net's
       first-epoch gradient magnitudes change across the available init schemes.
 #### Documentation
-- [ ] Write a short "how numerical gradient testing works in this repo" note so
-      contributors can add layer tests confidently — it's the project's main
-      correctness safety net but isn't explained anywhere. Should cover the
-      eps choice, central differences, tolerance picking, and where to add
-      new tests.
+<!-- ("How numerical gradient testing works in this repo" contributor note
+     removed: duplicate of the docs/numerical_gradient.md tutorial entry under
+     "Documentation I'd enjoy writing".) -->
 - [ ] Write a one-page "layer authoring checklist" — constructor + LoadFromString
       round-trip, CreateLayer dispatch entry, Compute/Backpropagate, and the
       mandatory numerical-gradient test. Captures the recurring steps every
@@ -168,9 +166,10 @@ breakdown:
       across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
       tolerance at each. Pins shape-edge behavior the existing single-shape
       test can't see.
-- [ ] Inline shape annotations on TNNetScaledDotProductAttention's Compute
-      and Backpropagate — most algorithmically dense layer in the repo;
-      deserves a comments pass.
+<!-- (Inline shape-annotation comments on TNNetScaledDotProductAttention
+     Compute/Backpropagate removed: duplicate of the "Inline-comment cleanup
+     pass on TNNetScaledDotProductAttention" entry under "Documentation I'd
+     enjoy writing".) -->
 
 ### Bake-off / experiment follow-ups
 - [ ] Position-encoding bake-off: same tiny seq model trained with
@@ -300,11 +299,6 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [X] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
-      channel. LANDED: four learnable params/channel `(t_r, a_r, t_l, a_l)`
-      init `(0, 1, 0, 0)` (== plain ReLU untrained), input + 4 per-channel
-      weight gradients, dispatch + LoadFromString round-trip, and four tests
-      (Forward / InputGradientCheck / WeightGradientCheck / SerializationRoundTrip).
 - [ ] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
       data-dependent (β computed per-channel from a tiny squeeze over the
       spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
@@ -1168,51 +1162,6 @@ breakdown:
       non-negative-eigenvalue checks on a known small matrix, the
       `lambda_max == sigma_1^2` agreement with `EstimateSpectralNorm`, and a
       nil-NN graceful return.
-- [X] TNNet.MCDropoutUncertaintyReport(NN, Probes [, NumPasses, Temperature]) —
-      LANDED (lucky-day batch 2026-05-24): decl+doc, two overloaded impls
-      (no-labels delegates to labelled core), companion
-      examples/MCDropoutUncertainty/ (synthetic 3-cluster 2D classifier with an
-      OOD band — BALD ~4x higher on the band than the in-distribution cores;
-      ~0.6s runtime), and TestMCDropoutUncertaintyReportSmoke pinning the
-      NumPasses=1+dropout-off zero-epistemic invariant and the no-dropout-layer
-      warning. The report auto-detects softmax / log-softmax / raw-logit heads
-      and temperature-renormalises a prob head rather than re-softmaxing it.
-      Original spec below.
-      Monte-Carlo-Dropout *epistemic* uncertainty estimator (Gal & Ghahramani
-      2016, "Dropout as a Bayesian Approximation"). Unlike the rest of the
-      report family it deliberately KEEPS dropout active at inference: call the
-      existing `TNNet.EnableDropouts(true)` (which toggles the
-      `TNNetAddNoiseBase` family — see the note at neuralnetwork.pas:1605), run
-      `NumPasses` (default 30) stochastic forward passes over each probe input,
-      and aggregate the per-pass softmax/probability vectors. For each sample
-      report: the mean predicted class and its mean confidence, the **predictive
-      entropy** `H[mean_p]` (total uncertainty), the **expected entropy**
-      `mean_t H[p_t]` (aleatoric), and their difference the **mutual information
-      / BALD score** `H[mean_p] - mean_t H[p_t]` (epistemic — the bit MC-Dropout
-      uniquely exposes), plus the variance of the top-class probability across
-      passes and the pass-to-pass argmax flip rate. Aggregate across the batch:
-      a 10-bin ASCII histogram of per-sample BALD, the K most-uncertain sample
-      indices (a ready-made active-learning / human-review queue), and a
-      correctness cross-tab (mean entropy of correctly- vs incorrectly-predicted
-      samples when labels are supplied — a healthy model is more uncertain on
-      its errors). Built-in correctness checks: with `NumPasses=1` *and* dropout
-      disabled the epistemic term must collapse to ~0, and a net containing no
-      `TNNetAddNoiseBase` layer must emit a clear "no stochastic layers — MC
-      sampling is a no-op" warning rather than silently reporting zero variance.
-      Restores the original dropout-enabled flag on exit; weights are never
-      touched (forward-only, no backward pass). Distinct from
-      [[CalibrationReport]] (a single deterministic pass measuring confidence-vs-
-      accuracy, no weight-space stochasticity), from the input-side
-      [[TTAReport]] / [[AdversarialRobustnessReport]] (those perturb the INPUT;
-      this perturbs the NETWORK via dropout masks), and from
-      [[TopLogitMarginReport]] (a deterministic single-pass margin). Companion
-      `examples/MCDropoutUncertainty/` on a synthetic 3-cluster 2D classifier
-      with a deliberately-placed out-of-distribution probe band between the
-      clusters: the OOD band should light up with high BALD while the cluster
-      cores read near-zero epistemic uncertainty — "the model knows what it
-      doesn't know" made visible. Add a `TestMCDropoutUncertaintyReportSmoke`
-      pinning the `NumPasses=1`+dropout-off zero-epistemic invariant and the
-      no-dropout-layer warning path.
 - [ ] RepresentationSimilarityReport follow-up: add an RBF-kernel CKA mode
       alongside the landed linear-CKA one (Gaussian Gram `K_ij =
       exp(-||x_i - x_j||^2 / (2*sigma^2))` with sigma a median-distance
