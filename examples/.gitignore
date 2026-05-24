@@ -1,2 +1,10 @@
 */backup
 */*.lps
+
+# Compiled example executables (Linux, no extension)
+ActivationStatsReport/ActivationStatsReport
+CoordConvSpiral/CoordConvSpiral
+CumSumPositionEncoding/CumSumPositionEncoding
+DomainAdversarial/DomainAdversarial
+PerplexityEval/PerplexityEval
+LogitNormCalibration/LogitNormCalibration

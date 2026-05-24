@@ -13,5 +13,9 @@ bin/
 backup/
 lib/
 tests/RunTests
+link*.res
 autosave.csv
 autosave.nn
+
+# Claude Code (created at repo root)
+.claude/
