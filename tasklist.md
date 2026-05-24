@@ -324,14 +324,6 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [X] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
-      forward pass during training, fixed at average at inference. (Landed
-      as a TNNetReLUBase descendant gated by a per-layer `Enabled` flag,
-      mirroring TNNetDropout's train-vs-inference pattern. NOTE: implemented
-      with one shared slope per forward pass — NOT per-neuron — which is the
-      common simplification and keeps the cached-derivative path simple. A
-      per-neuron-slope follow-up could be a separate task if ever wanted.
-      Numerical-gradient test runs in fixed-slope inference mode.)
 - [ ] TNNetSoftPlusBetaLearnable — learnable-β variant of the landed
       fixed-β TNNetSoftPlusBeta. Single learnable β with the same
       sigmoid(βx) derivative path; parallel to TNNetMishLearnable.
@@ -1047,17 +1039,6 @@ breakdown:
       one-layer forward-only test validating FP16 matches FP32 to within
       1e-2.
 
-### Model calibration / reliability
-- [X] Model-calibration / reliability-diagram tool — `neural/neuralcalibration.pas`
-      LANDED: `ComputeCalibration` / `CalibrationReport` / `FitTemperature` /
-      `WriteReliabilityPGM` + record `TNeuralCalibrationReport`. Reports ECE,
-      MCE, Brier + ASCII and PGM reliability diagrams. Temperature scaling is
-      a coarse-then-fine 1-D grid scan over T in [0.5, 5.0] minimizing NLL;
-      softmax outputs are turned into pseudo-logits via `ln(max(p, eps))`
-      (exact for a plain softmax head up to an additive constant). Example
-      `examples/CalibrationReport/` shows ECE 0.19 -> 0.11 after fitting T.
-      Smoke test `TestCalibrationReportSmoke` in tests/TestNeuralLayersExtra.pas.
-
 ### Introspection (added)
 - [ ] TopLogitMarginReport follow-up: the shipped `examples/MarginReport/`
       net ends in a `TNNetSoftMax`, so its "logits" are post-softmax
@@ -1083,16 +1064,6 @@ breakdown:
       (Gauss-Jordan / LU) before hand-rolling; that is the main risk in the
       task and worth scoping as its own sub-step.
 ### Test-time augmentation evaluator
-- [X] TNeuralTTAEvaluator — LANDED as `class function TNNet.TTAReport` (a
-      forward-only `TNNet.*Report` to match the family, rather than a
-      standalone class). Reuses the in-tree augmentations (identity, FlipX,
-      FlipY, ReverseChannels, Roll(+1)) via the tiny `Input -> Transform`
-      wrapper-net idiom from EquivarianceReport; averages logits (or
-      softmax probs, flag-selectable) and reports baseline / per-transform /
-      ensemble accuracy, per-class delta, agreement rate and a verdict.
-      Example `examples/TestTimeAugmentation/` + smoke test
-      `TestTTAReportSmoke`. Original detailed spec retained below for
-      reference.
 - [ ] (TTAReport follow-up) the shipped report runs on a single synthetic
       probe set; a natural next step is the spec's second run on a model
       trained WITH `TNNetRandomFlipX` augmentation, to show TTA gains shrink
