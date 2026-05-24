@@ -379,45 +379,6 @@ breakdown:
       input-output Jacobian (the entry already flags this as the natural
       next knob). Reuses the landed `TNNet.EstimateSpectralNorm` power-
       iteration helper.
-- [X] TNNet.ReceptiveFieldReport — a purely *analytical* (no probe batch,
-      no forward, no backward) walk of the layer stack that propagates the
-      standard receptive-field recurrence through every spatial layer
-      (Convolution / Deconvolution / Pool family / Padding / Upsample /
-      Stride-bearing layers) and reports per layer:
-      (a) cumulative receptive-field size `r_k` on the input plane
-          (`r_k = r_{k-1} + (kernel-1) * jump_{k-1}`),
-      (b) cumulative jump / effective stride `jump_k = jump_{k-1} * stride_k`
-          (how many input pixels one step of this layer's output moves),
-      (c) the start offset / center of the first output unit
-          (`start_k = start_{k-1} + ((kernel-1)/2 - padding) * jump_{k-1}`),
-      (d) the fraction of the input plane a single deepest-layer output
-          unit can see (`r_final / InputSize`, flagged ">100%" once the RF
-          exceeds the input — the "already global" point), and
-      (e) a flag list: the shallowest layer whose RF first covers the whole
-          input (the natural "the rest is global mixing" cut point) and any
-          layer whose RF stops growing (all-1x1 / pointwise tail).
-      Tracks X and Y independently so rectangular kernels/strides are
-      handled. Pure structural metadata read off each layer's existing
-      kernel/stride/padding fields — finishes instantly, needs no data and
-      no trained weights. Distinct from [[SaliencyReport]] (gradient-based
-      *learned* per-pixel input attribution for one sample and one class —
-      a property of the trained weights), from the empirical effective-RF
-      idea (which would measure the Gaussian-like spread of an actual
-      output-unit gradient over random inputs; this analytical version is
-      the theoretical upper bound and needs neither weights nor a batch),
-      from [[FLOPsReport]] / [[MemoryFootprintReport]] (cost accounting, not
-      spatial reach), and from [[EquivarianceReport]] (output response to
-      input transforms, not the geometric extent of influence). The output
-      is the natural design-time companion to FLOPsReport: it answers "does
-      my stem actually see enough context before the global-pool head?",
-      which CNN/ViT-stem architects ask constantly but the repo currently
-      can't answer without hand arithmetic. Add a small unit check pinning
-      the textbook closed form for a known stack (e.g. three 3x3 stride-1
-      convs → RF 7, jump 1; add a stride-2 layer and assert the jump
-      doubles). Companion `examples/ReceptiveFieldReport/` runs it on (i) a
-      plain VGG-style 3x3 stack and (ii) a stride-2-downsampling stack so
-      reviewers can eyeball how aggressively downsampling grows the RF per
-      layer.
 
 ### Tests / numerical-gradient audit
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
@@ -680,9 +641,8 @@ breakdown:
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
       once with TNNetMaxPool and once with TNNetMaxBlurPool; report
       shift-equivariance delta.
-- [ ] `examples/AbsSquareEnergy/`, `examples/ReverseXYAugmentation/`,
-      `examples/AutoencoderMNIST/`, `examples/AutoencoderReconstructionGrid/`
-      — additional small demos.
+- [ ] `examples/ReverseXYAugmentation/`, `examples/AutoencoderMNIST/`,
+      `examples/AutoencoderReconstructionGrid/` — additional small demos.
 - [ ] `examples/ActivationPlayground/` — prints one CSV row per activation:
       name, forward ns/op, backward ns/op, output range on [-8, 8],
       derivative range, "is monotone?" check.
@@ -1048,26 +1008,6 @@ breakdown:
       eyeballed against the actual image content, and the completeness gap
       acts as a built-in regression check on the IG implementation.
 
-### Activation distribution
-- [X] TNNet.ActivationStatsReport — given a probe batch, walk every layer's
-      forward output and print a per-layer table of
-      `mean / std / min / max / |median| / |skew| / kurtosis` plus
-      `pct_saturated_low` and `pct_saturated_high` (configurable thresholds,
-      default ±0.99·OutputRange for bounded activations, |x|>6 for unbounded),
-      `pct_negative`, `pct_near_zero` (|x| < 1e-6), and a compact 16-bin ASCII
-      histogram over `[-MaxAbs, +MaxAbs]`. End with a flag list:
-      "near-collapsed layers" (std < 1e-4), "saturating layers" (>50%
-      saturated either side), and a 10-bin ASCII histogram of per-layer std
-      across the network so vanishing/exploding activation patterns jump out
-      at a glance. Pure forward-only — no training-time changes. Distinct
-      from [[DeadNeuronReport]] (zero-fraction on ReLU-family layers only),
-      [[WeightHistogramReport]] (weights, not activations),
-      [[GradientNormReport]] (backward magnitudes), and
-      [[AttentionEntropyReport]] (attention-weights only). Companion
-      `examples/ActivationStatsReport/` runs it on (i) a fresh-init network
-      and (ii) the same architecture after a short training run, so reviewers
-      can eyeball how training reshapes the activation distribution.
-
 ### Layer sensitivity
 - [ ] TNNet.LayerSensitivityReport — given a probe batch (and an optional
       target volume), multiplicatively perturb each trainable layer's
@@ -1105,38 +1045,6 @@ breakdown:
       (iii) a small attention stack so reviewers can eyeball how
       fragility shifts across model families (often-uniform MLP vs
       stem-heavy conv vs attention-heavy transformer).
-
-### Weight-matrix spectrum
-- [X] TNNet.WeightSpectrumReport — for every trainable layer in a network,
-      estimate the top singular value `sigma_1(W)` of its weight matrix via
-      a handful of power-iteration steps (default 10), and report per layer:
-      (a) `sigma_1`,
-      (b) `||W||_F` (Frobenius norm, cheap exact),
-      (c) the ratio `sigma_1 / ||W||_F` — a stable-rank-flavoured signal
-          where values near 1 hint at rank-1 collapse (one direction
-          dominates) and values near `1/sqrt(min(in, out))` hint at a
-          well-spread spectrum,
-      (d) `sigma_1` divided by a Marchenko-Pastur baseline
-          `(sqrt(in) + sqrt(out)) * std(W)` — a one-number "is this layer's
-          top mode larger than what a Gaussian init of matching std would
-          produce?" check,
-      (e) a 10-bin ASCII histogram of per-layer `sigma_1 / fan_in_baseline`
-          across the network,
-      (f) a flag list: "spectral-norm > threshold" layers (Lipschitz risk)
-          and "stable-rank ≈ 1" layers (representation collapse risk).
-      Pure forward-only on the weight tensors — no training-time changes,
-      no probe batch needed (a probe-batch variant could land later as
-      `JacobianSpectrumReport` if it proves worth the extra knob).
-      Distinct from [[WeightDriftReport]] (deltas across training, not a
-      snapshot), [[GradientNormReport]] (backward magnitudes, not weight
-      geometry), and [[LossLandscapeProbe]] (forward loss along a random
-      direction, not weight spectrum). The shared spectral-norm helper
-      this would introduce is reusable by the already-listed
-      [[TNNetSpectralNorm]] wrapper task. Companion
-      `examples/WeightSpectrumReport/` runs it on (i) a freshly-initialised
-      net (baseline) and (ii) the same architecture after a short training
-      run, so reviewers can eyeball how training pushes the spectrum away
-      from the init baseline.
 
 ### Input-symmetry equivariance
 - [ ] TNNet.EquivarianceReport — given a trained (or freshly-initialised)
