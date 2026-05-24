@@ -1014,6 +1014,42 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
+- [ ] TNNet.MCDropoutUncertaintyReport(NN, Probes [, NumPasses, Temperature]) —
+      Monte-Carlo-Dropout *epistemic* uncertainty estimator (Gal & Ghahramani
+      2016, "Dropout as a Bayesian Approximation"). Unlike the rest of the
+      report family it deliberately KEEPS dropout active at inference: call the
+      existing `TNNet.EnableDropouts(true)` (which toggles the
+      `TNNetAddNoiseBase` family — see the note at neuralnetwork.pas:1605), run
+      `NumPasses` (default 30) stochastic forward passes over each probe input,
+      and aggregate the per-pass softmax/probability vectors. For each sample
+      report: the mean predicted class and its mean confidence, the **predictive
+      entropy** `H[mean_p]` (total uncertainty), the **expected entropy**
+      `mean_t H[p_t]` (aleatoric), and their difference the **mutual information
+      / BALD score** `H[mean_p] - mean_t H[p_t]` (epistemic — the bit MC-Dropout
+      uniquely exposes), plus the variance of the top-class probability across
+      passes and the pass-to-pass argmax flip rate. Aggregate across the batch:
+      a 10-bin ASCII histogram of per-sample BALD, the K most-uncertain sample
+      indices (a ready-made active-learning / human-review queue), and a
+      correctness cross-tab (mean entropy of correctly- vs incorrectly-predicted
+      samples when labels are supplied — a healthy model is more uncertain on
+      its errors). Built-in correctness checks: with `NumPasses=1` *and* dropout
+      disabled the epistemic term must collapse to ~0, and a net containing no
+      `TNNetAddNoiseBase` layer must emit a clear "no stochastic layers — MC
+      sampling is a no-op" warning rather than silently reporting zero variance.
+      Restores the original dropout-enabled flag on exit; weights are never
+      touched (forward-only, no backward pass). Distinct from
+      [[CalibrationReport]] (a single deterministic pass measuring confidence-vs-
+      accuracy, no weight-space stochasticity), from the input-side
+      [[TTAReport]] / [[AdversarialRobustnessReport]] (those perturb the INPUT;
+      this perturbs the NETWORK via dropout masks), and from
+      [[TopLogitMarginReport]] (a deterministic single-pass margin). Companion
+      `examples/MCDropoutUncertainty/` on a synthetic 3-cluster 2D classifier
+      with a deliberately-placed out-of-distribution probe band between the
+      clusters: the OOD band should light up with high BALD while the cluster
+      cores read near-zero epistemic uncertainty — "the model knows what it
+      doesn't know" made visible. Add a `TestMCDropoutUncertaintyReportSmoke`
+      pinning the `NumPasses=1`+dropout-off zero-epistemic invariant and the
+      no-dropout-layer warning path.
 - [ ] RepresentationSimilarityReport follow-up: add an RBF-kernel CKA mode
       alongside the landed linear-CKA one (Gaussian Gram `K_ij =
       exp(-||x_i - x_j||^2 / (2*sigma^2))` with sigma a median-distance
