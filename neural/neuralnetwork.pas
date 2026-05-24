@@ -1414,6 +1414,30 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Kullback-Leibler divergence loss output layer.
+  // Operates on probability-space inputs: the layer's input q is the model's
+  // predicted distribution (e.g. the output of a SoftMax) and the supplied
+  // target p is the reference distribution. The per-position loss is the
+  // forward KL divergence
+  //   L = KL(p || q) = sum_i p_i * log(p_i / q_i).
+  // The forward pass is an identity passthrough (so Net.Compute returns the
+  // probability head). Training relies on the framework seeding FOutputError
+  // with (output - target) = (q - p); Backpropagate recovers the target as
+  // p = q - FOutputError and replaces the residual with the analytic gradient
+  // of L w.r.t. the prediction:
+  //   dL/dq_i = -p_i / q_i.
+  // The stored gradient is the +gradient (FOutputError := -p_i/q_i), matching
+  // the sign convention of the sibling loss layers (e.g. TNNetNLLLoss stores
+  // -target), so the optimizer descends the loss. For numerical stability q_i
+  // is clamped into [eps, 1] with eps = 1e-7 before the division, and any
+  // target term with p_i <= eps contributes a zero gradient (the 0*log0 := 0
+  // convention). No constructor parameter and no trainable state.
+  TNNetKLDivergence = class(TNNetIdentity)
+  public
+    constructor Create(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Entropy regularizer (passthrough). Treats the input vector p as a
   // probability distribution (intended to sit immediately after a softmax)
   // and adds the term `-lambda * H(p) = lambda * sum(p * log(p))` to the
@@ -8022,6 +8046,50 @@ begin
     // Recover target, then set the exact NLL gradient dL/d(logp) = -target.
     Target := LogP - Seeded;
     FOutputError.FData[Idx] := -Target;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetKLDivergence }
+
+constructor TNNetKLDivergence.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetKLDivergence.Backpropagate();
+const
+  cKLEps = 1e-7;
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Q, Seeded, Target: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    Q := FOutput.FData[Idx];
+    Seeded := FOutputError.FData[Idx];
+    // Framework seeds FOutputError := output - target = q - p. Recover p.
+    Target := Q - Seeded;
+    if Target <= cKLEps then
+    begin
+      // 0 * log 0 := 0, so target=0 terms contribute no gradient.
+      FOutputError.FData[Idx] := 0;
+    end
+    else
+    begin
+      // Clamp q into [eps, 1] before the division.
+      if Q < cKLEps then Q := cKLEps
+      else if Q > 1.0 then Q := 1.0;
+      // dL/dq_i = -p_i / q_i.
+      FOutputError.FData[Idx] := -Target / Q;
+    end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -31721,6 +31789,7 @@ begin
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
+      'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
@@ -31948,6 +32017,7 @@ begin
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
+      if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else

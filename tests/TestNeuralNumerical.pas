@@ -149,6 +149,9 @@ type
     procedure TestNLLLossGradient;
     procedure TestNLLLossLogSoftMaxCrossEntropyConsistency;
     procedure TestNLLLossLoadFromString;
+    procedure TestKLDivergenceForwardPassthrough;
+    procedure TestKLDivergenceGradient;
+    procedure TestKLDivergenceLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -14296,6 +14299,156 @@ begin
       if i = cTrue then ExpectedGrad := -1.0 else ExpectedGrad := 0.0;
       AssertEquals('NLLLoss round-trip gradient at ' + IntToStr(i),
         ExpectedGrad, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKLDivergenceForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetKLDivergence must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetKLDivergence.Create());
+
+    // A probability-like vector summing to 1.
+    Input.Raw[0] := 0.1;
+    Input.Raw[1] := 0.2;
+    Input.Raw[2] := 0.3;
+    Input.Raw[3] := 0.4;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('KLDivergence forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKLDivergenceGradient;
+const
+  cKLEps = 1e-7;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  P, Q: array[0..3] of TNeuralFloat;
+  i: integer;
+  ClampedQ, Expected: TNeuralFloat;
+begin
+  // The framework seeds the last layer's OutputError with (output - target) =
+  // (q - p). TNNetKLDivergence is identity on forward, so it recovers p and
+  // must store the gradient dL/dq_i = -p_i / q_i (with q clamped into [eps,1]).
+  // Target index 3 is zero to exercise the 0*log0 := 0 -> zero-gradient path.
+  Q[0] := 0.2;  P[0] := 0.5;
+  Q[1] := 0.3;  P[1] := 0.2;
+  Q[2] := 0.4;  P[2] := 0.3;
+  Q[3] := 0.1;  P[3] := 0.0;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetKLDivergence.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Q[i];
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := P[i];
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if P[i] <= cKLEps then
+        Expected := 0.0
+      else
+      begin
+        ClampedQ := Q[i];
+        if ClampedQ < cKLEps then ClampedQ := cKLEps
+        else if ClampedQ > 1.0 then ClampedQ := 1.0;
+        Expected := -P[i] / ClampedQ;
+      end;
+      AssertEquals('KLDivergence -p/q gradient at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKLDivergenceLoadFromString;
+const
+  cKLEps = 1e-7;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  P, Q: array[0..3] of TNeuralFloat;
+  i: integer;
+  ClampedQ, Expected: TNeuralFloat;
+begin
+  Q[0] := 0.25;  P[0] := 0.4;
+  Q[1] := 0.25;  P[1] := 0.1;
+  Q[2] := 0.25;  P[2] := 0.5;
+  Q[3] := 0.25;  P[3] := 0.0;
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetKLDivergence.Create());
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetKLDivergence',
+      NN2.GetLastLayer is TNNetKLDivergence);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Q[i];
+    for i := 0 to Input.Size - 1 do
+      Target.Raw[i] := P[i];
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if P[i] <= cKLEps then
+        Expected := 0.0
+      else
+      begin
+        ClampedQ := Q[i];
+        if ClampedQ < cKLEps then ClampedQ := cKLEps
+        else if ClampedQ > 1.0 then ClampedQ := 1.0;
+        Expected := -P[i] / ClampedQ;
+      end;
+      AssertEquals('KLDivergence round-trip -p/q at ' + IntToStr(i),
+        Expected, LMid.OutputError.Raw[i], 0.00001);
     end;
   finally
     NN.Free;
