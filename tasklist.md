@@ -1108,6 +1108,66 @@ breakdown:
       against reality. Add a `TestGradientNoiseScaleReportSmoke` pinning the
       identical-sample zero-variance invariant and the single-sample warning
       path. Weights are never stepped (a measurement, not training).
+- [ ] TNNet.WeightSpectralTailReport(NN [, MaxMatrixDim]) — a *heavy-tailed
+      self-regularization* (HT-SR) diagnostic that predicts per-layer training
+      quality from the WEIGHTS ALONE — no probe batch, no labels, no test set
+      (Martin, Mahoney & Peng 2021, Nature Communications, "Predicting trends
+      in the quality of state-of-the-art neural networks without access to
+      training or test data"; the WeightWatcher `alpha` metric). For every
+      trainable layer it forms the smaller Gram matrix of the reshaped weight
+      tensor (`W^T W` when out >= in, else `W W^T`), computes its FULL
+      eigenvalue spectrum `{lambda_i}` (= the squared singular values of W) with
+      a self-contained symmetric **cyclic Jacobi eigensolver** in Double
+      precision (~50 lines; no external dependency, mirrors the in-tree
+      Gauss-Jordan solve `LinearProbeReport` already ships), and fits a
+      power-law `rho(lambda) ~ lambda^(-alpha)` to the upper tail via the
+      standard Clauset/Hill MLE
+      `alpha = 1 + n / sum_i ln(lambda_i / lambda_min)` swept over candidate
+      `lambda_min` cut points (pick the cut minimising the KS distance to the
+      fitted power law). It reports, per layer: the **power-law exponent
+      alpha** (the headline HT-SR quality number — well-trained layers land in
+      `alpha in [2, 4]`; `alpha > 6` flags an under-trained / still-random-like
+      layer, `alpha < 2` flags an over-correlated / memorising layer), the
+      **weighted alpha** `alpha * log10(lambda_max)` (the WeightWatcher
+      capacity-weighted quality metric that correlates with test accuracy), the
+      KS goodness-of-fit distance (how power-law the tail really is), `lambda_max`
+      and the Marchenko-Pastur bulk edge `(1 + sqrt(in/out))^2 * sigma^2` for
+      reference (eigenvalues beyond the MP edge are the "spikes" carrying the
+      learned signal vs the random bulk), and a per-layer 10-bin ASCII
+      `log10(lambda)` histogram. Network-level: the **average weighted alpha**
+      across layers (a single label-free model-quality scalar — lower is
+      better-trained, per the HT-SR theory), an alpha-across-depth bar chart,
+      and per-layer flags (`under-trained` / `over-correlated` / `well-shaped`
+      / `poor power-law fit`). Over-wide layers are capped at `MaxMatrixDim`
+      (default 512) on the Gram dimension to bound the `O(d^3)` Jacobi sweep,
+      mirroring the `MaxFeatDim` random-projection guard in `LinearProbeReport`.
+      Built-in correctness checks: the Jacobi eigenvalues must be non-negative
+      (PSD Gram) and sum to `||W||_F^2` within tolerance (trace invariance, the
+      same Frobenius quantity `WeightSpectrumReport` already prints), and
+      `lambda_max` must match the power-iteration `EstimateSpectralNorm` value
+      squared. Distinct from [[WeightSpectrumReport]] (which estimates ONLY the
+      top singular value `sigma_1` via power iteration plus a stable-rank ratio
+      and a single MP baseline number — it never forms the full spectrum or
+      fits a tail exponent; this report's whole point is the SHAPE of the
+      eigenvalue distribution, not its largest value), from the activation-side
+      [[NeuronCorrelationReport]] / [[RepresentationSimilarityReport]] (those
+      need a probe batch and characterise activation redundancy, not the static
+      weight-matrix spectrum), and from [[FisherImportanceReport]] (per-parameter
+      gradient importance, needs labels + a backward pass). Pure weight
+      inspection — forward-only is overstating it, there is no forward pass at
+      all and the weights are never touched. Companion
+      `examples/WeightSpectralTail/` trains the same tiny MLP three ways — a
+      fresh-init net (alpha large, near-random bulk, no spikes), a
+      well-trained net (alpha settles into `[2, 4]`, clear MP-edge spikes), and
+      a deliberately over-fit / over-trained net (alpha drifting below 2) — and
+      prints all three reports side by side so the "alpha tells you training
+      quality with no data" story is visible on a pure-CPU toy, plus ranks the
+      three nets by average weighted alpha and checks the ranking matches their
+      actual held-out accuracy (the headline label-free-model-selection claim).
+      Add a `TestWeightSpectralTailReportSmoke` pinning the trace-invariance and
+      non-negative-eigenvalue checks on a known small matrix, the
+      `lambda_max == sigma_1^2` agreement with `EstimateSpectralNorm`, and a
+      nil-NN graceful return.
 - [X] TNNet.MCDropoutUncertaintyReport(NN, Probes [, NumPasses, Temperature]) —
       LANDED (lucky-day batch 2026-05-24): decl+doc, two overloaded impls
       (no-labels delegates to labelled core), companion
