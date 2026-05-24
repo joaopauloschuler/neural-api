@@ -277,18 +277,14 @@ breakdown:
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
 #### Norm / regularization
-- [X] TNNetGatedResidual — per-channel zero-initialised learnable gate
-      `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
-      LANDED (commit 29f41c4): descends TNNetChannelTransformBase, one neuron
-      holding Depth weights via SetNumWeightsForAllNeurons(1,1,Depth), alpha in
-      FFloatSt[0], both dispatch tables + TestGatedResidualGradient (input grad,
-      per-channel alpha grad, LoadFromString round-trip; tol 1e-2).
-      FOLLOW-UP: a residual builder `AddGatedResidual(NN, Sublayer)` that wires
+- [ ] TNNetGatedResidual follow-up (now landed): a residual builder
+      `AddGatedResidual(NN, Sublayer)` that wires
       `Sum([TNNetGatedResidual(Sublayer-output), branch-input])` — pairs with the
       open PreNorm/RMSNorm/PostNorm residual builders above.
-      FOLLOW-UP: ReZero-vs-GatedResidual depth ablation — train a deepish residual
-      MLP with scalar ReZero vs per-channel GatedResidual gates, chart whether the
-      per-channel gate opens unevenly across channels.
+- [ ] TNNetGatedResidual follow-up: ReZero-vs-GatedResidual depth ablation —
+      train a deepish residual MLP with scalar ReZero vs per-channel
+      GatedResidual gates, chart whether the per-channel gate opens unevenly
+      across channels.
 - [ ] TNNetRMSNormGated — RMSNorm followed by a learnable per-channel
       sigmoid gate.
 - [ ] TNNetSwitchableNorm — learnable softmax-weighted combination of
@@ -390,25 +386,10 @@ breakdown:
       synthetic "same vs different class" pair task, and print the learned
       same-pair vs different-pair cosine histograms. Headline use case for
       the landed head; pairs with [[TripletEmbedding]].
-- [X] TNNetKLDivergence follow-up: a knowledge-distillation micro-example —
-      train a small "student" against soft targets from a fixed "teacher"
-      distribution using the landed TNNetKLDivergence head, and contrast its
-      loss curve with a hard-label cross-entropy baseline.
-      LANDED (commit 5152905): examples/KnowledgeDistillation/. Wiring confirmed
-      from source — KL head expects a PROBABILITY input (preceded by SoftMax),
-      target = teacher's temperature-softened distribution. Distilled student
-      (0.861) edged the hard-label student (0.856) and matched the teacher's test
-      acc at lower capacity; verdict line is computed at runtime (honest).
-      FOLLOW-UP: temperature sweep T in {1,2,4,8} on this example — chart how soft-
-      target sharpness changes the distilled student's accuracy/agreement.
-- [X] Dice/Tversky segmentation micro-example: a tiny synthetic binary-mask
-      task (e.g. predict a filled disc/box mask from a noisy input grid) with
-      a sigmoid head + `TNNetDiceLoss`, contrasting the IoU it reaches vs an
-      MSE-head baseline. Headline use case for the landed Dice/Tversky losses.
-      LANDED (commit 2507686): examples/DiceSegmentation/. 16x16 noisy disc/box
-      masks, fully-conv Sigmoid head. Dice head reached Dice 0.987 / IoU 0.975 vs
-      MSE 0.857 / 0.753; the MSE baseline's IoU peaks early then degrades (over-
-      fits the abundant background). Shares RandSeed so both nets start identical.
+- [ ] TNNetKLDivergence distillation follow-up (now landed
+      examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
+      example — chart how soft-target sharpness changes the distilled student's
+      accuracy/agreement.
 - [ ] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
       deliberately class-imbalanced mask, sweep `(α,β) ∈ {(0.5,0.5),(0.3,0.7),
       (0.7,0.3)}` and show how β>α trades precision for recall (fewer false
