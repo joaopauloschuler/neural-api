@@ -4390,6 +4390,49 @@ type
         NN: TNNet;
         MaxMatrixDim: integer = 512
       ): string;
+      // Gradient signal-to-noise diagnostic that ANALYTICALLY PREDICTS the
+      // batch-size sweep (McCandlish et al. 2018, "An Empirical Model of
+      // Large-Batch Training"). For each labelled sample (Samples, a
+      // TNNetVolumePairList of input + one-hot target pairs) it runs one forward
+      // + one backward on a FROZEN net (ClearDeltas before each, NEVER
+      // UpdateWeights) and snapshots that sample's full flattened per-parameter
+      // weight-gradient vector g_i - reusing exactly the per-parameter gradient
+      // tensors Backpropagate already populates (Neurons[*].Delta / FBiasDelta,
+      // divided back out by the layer LearningRate to recover the raw gradient),
+      // the same per-sample machinery FisherImportanceReport and
+      // GradientConflictReport use (NO input-gradient enablement). From the
+      // batch it forms the mean gradient g_bar and the per-parameter gradient
+      // variance across samples and reports:
+      //   (a) the per-parameter gradient SNR |g_bar_k| / (std_k + eps) as a
+      //       10-bin ASCII histogram plus a per-layer mean SNR - which layers
+      //       carry a clean signal vs which are noise-dominated;
+      //   (b) the SIMPLE NOISE SCALE B_simple = tr(Sigma) / ||g_bar||^2, where
+      //       Sigma is the per-sample gradient covariance estimated over the
+      //       batch as mean_i||g_i||^2 - ||g_bar||^2. This is McCandlish's
+      //       "critical batch size": the batch size beyond which larger batches
+      //       stop buying faster convergence;
+      //   (c) the EFFECTIVE-BATCH curve that turns B_simple into a
+      //       noise-vs-batch table noise(B) = B_simple / B, so the sweet-spot
+      //       batch size is readable directly;
+      //   (d) per-layer flags (signal-dominated / noise-dominated, and the
+      //       layer with the largest per-layer noise scale - the one that most
+      //       wants a bigger batch).
+      // LayerIdx optionally restricts every statistic to one trainable layer's
+      // gradient slab (the head and stem usually have very different noise
+      // scales); the default -1 uses ALL trainable layers. Weights are NEVER
+      // stepped (a measurement, not training). Built-in correctness: feeding the
+      // SAME sample N times drives the variance term and hence B_simple to ~0
+      // (identical gradients = pure signal), and a single-sample batch emits a
+      // clear "need >= 2 samples to estimate gradient variance" message rather
+      // than dividing by zero. DISTINCT from GradientConflictReport (pairwise
+      // cosine geometry) and FisherImportanceReport (curvature / importance):
+      // this is the gradient signal/noise RATIO that predicts the batch sweep.
+      class function GradientNoiseScaleReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        UseTrueLabel: boolean = true;
+        LayerIdx: integer = -1
+      ): string;
       // Forward-only intra-layer redundancy diagnostic. For a probe batch
       // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
       // trainable layer with weights (Neurons.Count > 0 and Weights.Size > 0),
@@ -29385,6 +29428,469 @@ begin
     Result := Lines.Text;
   finally
     Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.GradientNoiseScaleReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  UseTrueLabel: boolean = true;
+  LayerIdx: integer = -1
+): string;
+const
+  cEps = 1e-30;
+  cSnrEps = 1e-12;        // floor added to per-param std in the SNR ratio
+  cBins = 10;
+  cMaxBarWidth = 40;
+  // A layer is "signal-dominated" when its mean per-param SNR exceeds this and
+  // "noise-dominated" when it falls below it (1 = signal and noise are equal).
+  cSignalSnr = 1.0;
+type
+  TFloatArray = array of TNeuralFloat;
+var
+  Lines: TStringList;
+  LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  Pair: TNNetVolumePair;
+  LastLayer: TNNetLayer;
+  LabelClass, OutSize: integer;
+  LR, G, V: TNeuralFloat;
+  Target: TNNetVolume;
+  // per-trainable-layer flat-index bookkeeping over the whole net
+  LayerHasParams: array of boolean;
+  LayerInScope: array of boolean;   // included in the stats (LayerIdx filter)
+  FlatBase: array of integer;       // flat offset of each layer's params
+  LayerParamCnt: array of integer;
+  NetParamCnt, TrainableLayers, ScopeParamCnt: integer;
+  RestrictName: string;
+  ScopeMap: array of integer;       // net-flat param -> scope-flat slot (-1)
+  ScopeFlat: integer;
+  // per-sample flattened gradient vectors (only over in-scope params)
+  Grads: array of TFloatArray;      // [usable sample] -> scope-flat gradient
+  UsableCount: integer;
+  // accumulated batch statistics over the scope-flat parameter axis
+  GBar: TFloatArray;                // mean gradient g_bar_k
+  GStd: TFloatArray;                // per-param std across samples
+  GSnr: TFloatArray;                // |g_bar_k| / (std_k + eps)
+  Mean, Var_, Sd: TNeuralFloat;
+  // scope-flat -> owning trainable-layer index (for the per-layer means)
+  ParamLayer: array of integer;
+  LayerSnrSum: array of TNeuralFloat;
+  LayerTrSigma: array of TNeuralFloat;  // tr(Sigma) restricted to the layer
+  LayerGBarSq: array of TNeuralFloat;   // ||g_bar||^2 restricted to the layer
+  LayerScopeCnt: array of integer;
+  LayerName: array of string;
+  // noise-scale scalars
+  TrSigma, GBarSq, MeanGiSq, BSimple, NoiseB: TNeuralFloat;
+  GiSq: TNeuralFloat;
+  // SNR histogram
+  Bins: array of integer;
+  MaxBin, BarLen: integer;
+  HistMin, HistMax, Span, BinLo, BinHi: TNeuralFloat;
+  Bar, LabelMode: string;
+  // per-layer reporting
+  LMean, LayerB, MaxLayerB: TNeuralFloat;
+  MaxLayerBIdx, SignalLayers, NoiseLayers: integer;
+  FlagStr: string;
+  BTab: array[0..6] of integer;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'GradientNoiseScaleReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'GradientNoiseScaleReport: Samples is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'GradientNoiseScaleReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    SetLength(LayerHasParams, NN.CountLayers());
+    SetLength(LayerInScope, NN.CountLayers());
+    SetLength(FlatBase, NN.CountLayers());
+    SetLength(LayerParamCnt, NN.CountLayers());
+
+    NetParamCnt := 0;
+    TrainableLayers := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      LayerHasParams[LIdx] := false;
+      LayerInScope[LIdx] := false;
+      LayerParamCnt[LIdx] := 0;
+      FlatBase[LIdx] := NetParamCnt;
+      if Layer.Neurons.Count = 0 then Continue;
+      K := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        // +1 per neuron for the bias parameter.
+        K := K + Layer.Neurons[NeuronIdx].Delta.Size + 1;
+      if K = 0 then Continue;
+      LayerHasParams[LIdx] := true;
+      LayerParamCnt[LIdx] := K;
+      FlatBase[LIdx] := NetParamCnt;
+      NetParamCnt := NetParamCnt + K;
+      Inc(TrainableLayers);
+    end;
+
+    if TrainableLayers = 0 then
+    begin
+      Result := 'GradientNoiseScaleReport: no trainable layers with ' +
+        'parameters.' + sLineBreak;
+      Exit;
+    end;
+
+    // --- Resolve the optional layer-scope filter (-1 = all trainable). ---
+    if (LayerIdx >= 0) and (LayerIdx <= NN.GetLastLayerIdx()) and
+       LayerHasParams[LayerIdx] then
+    begin
+      LayerInScope[LayerIdx] := true;
+      RestrictName := Format('layer %d (%s) only', [LayerIdx,
+        NN.Layers[LayerIdx].ClassName]);
+    end
+    else
+    begin
+      for LIdx := 0 to NN.GetLastLayerIdx() do
+        LayerInScope[LIdx] := LayerHasParams[LIdx];
+      if LayerIdx >= 0 then
+        RestrictName := Format('requested layer %d has no params; ' +
+          'falling back to all trainable layers', [LayerIdx])
+      else
+        RestrictName := 'all trainable layers';
+    end;
+
+    // Map each net-flat parameter to a scope-flat slot (-1 if out of scope) and
+    // remember which trainable layer each in-scope slot belongs to.
+    SetLength(ScopeMap, NetParamCnt);
+    SetLength(ParamLayer, NetParamCnt);
+    ScopeFlat := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LIdx] then Continue;
+      P := FlatBase[LIdx];
+      for K := 0 to LayerParamCnt[LIdx] - 1 do
+      begin
+        if LayerInScope[LIdx] then
+        begin
+          ScopeMap[P] := ScopeFlat;
+          ParamLayer[ScopeFlat] := LIdx;
+          Inc(ScopeFlat);
+        end
+        else
+          ScopeMap[P] := -1;
+        Inc(P);
+      end;
+    end;
+    ScopeParamCnt := ScopeFlat;
+
+    if ScopeParamCnt = 0 then
+    begin
+      Result := 'GradientNoiseScaleReport: no parameters in scope.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // Why batch update: Delta accumulates -LR * gradient only with batch update
+    // on; otherwise the gradient is consumed inline and never lands in Delta.
+    // We divide back out by LR to recover the raw gradient. The network is NEVER
+    // stepped (no UpdateWeights) so the trained weights are left untouched.
+    NN.SetBatchUpdate(true);
+
+    LastLayer := NN.GetLastLayer();
+    OutSize := LastLayer.Output.Size;
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+
+    SetLength(Grads, Samples.Count);
+    UsableCount := 0;
+
+    try
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        Pair := Samples[SampleIdx];
+        if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+
+        NN.ClearDeltas();
+        NN.Compute(Pair.I);
+
+        if UseTrueLabel then
+          LabelClass := Pair.O.GetClass()
+        else
+          LabelClass := LastLayer.Output.GetClass();
+        if (LabelClass < 0) or (LabelClass >= OutSize) then Continue;
+
+        Target.Fill(0);
+        Target.Raw[LabelClass] := 1.0;
+        NN.Backpropagate(Target);
+
+        // Flatten this sample's in-scope per-parameter gradient vector.
+        SetLength(Grads[UsableCount], ScopeParamCnt);
+        for LIdx := 0 to NN.GetLastLayerIdx() do
+        begin
+          if not LayerInScope[LIdx] then Continue;
+          Layer := NN.Layers[LIdx];
+          LR := Layer.LearningRate;
+          if LR <= 0 then LR := 1.0;
+          P := FlatBase[LIdx];
+          for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          begin
+            Neuron := Layer.Neurons[NeuronIdx];
+            for K := 0 to Neuron.Delta.Size - 1 do
+            begin
+              Grads[UsableCount][ScopeMap[P]] := Neuron.Delta.FData[K] / LR;
+              Inc(P);
+            end;
+            // bias parameter
+            Grads[UsableCount][ScopeMap[P]] := Neuron.FBiasDelta / LR;
+            Inc(P);
+          end;
+        end;
+        Inc(UsableCount);
+      end;
+    finally
+      Target.Free;
+    end;
+
+    // Single-sample (or empty) batch: the gradient variance is undefined.
+    if UsableCount < 2 then
+    begin
+      Result := Format('GradientNoiseScaleReport: only %d usable labelled ' +
+        'sample(s); need >= 2 samples to estimate gradient variance ' +
+        '(no division by zero performed).', [UsableCount]) + sLineBreak;
+      Exit;
+    end;
+
+    // --- Per-parameter mean, variance and SNR over the batch. ---
+    SetLength(GBar, ScopeParamCnt);
+    SetLength(GStd, ScopeParamCnt);
+    SetLength(GSnr, ScopeParamCnt);
+    TrSigma := 0;
+    GBarSq := 0;
+    for K := 0 to ScopeParamCnt - 1 do
+    begin
+      Mean := 0;
+      for I := 0 to UsableCount - 1 do
+        Mean := Mean + Grads[I][K];
+      Mean := Mean / UsableCount;
+      // unbiased per-parameter variance across samples
+      Var_ := 0;
+      for I := 0 to UsableCount - 1 do
+      begin
+        V := Grads[I][K] - Mean;
+        Var_ := Var_ + V * V;
+      end;
+      Var_ := Var_ / (UsableCount - 1);
+      if Var_ < 0 then Var_ := 0;
+      Sd := Sqrt(Var_);
+      GBar[K] := Mean;
+      GStd[K] := Sd;
+      GSnr[K] := Abs(Mean) / (Sd + cSnrEps);
+      TrSigma := TrSigma + Var_;     // tr(Sigma) = sum_k Var_k
+      GBarSq := GBarSq + Mean * Mean; // ||g_bar||^2
+    end;
+
+    // mean_i ||g_i||^2 (a second, independent estimator of tr(Sigma) via
+    // tr(Sigma) = mean_i||g_i||^2 - ||g_bar||^2, reported as a cross-check).
+    MeanGiSq := 0;
+    for I := 0 to UsableCount - 1 do
+    begin
+      GiSq := 0;
+      for K := 0 to ScopeParamCnt - 1 do
+        GiSq := GiSq + Grads[I][K] * Grads[I][K];
+      MeanGiSq := MeanGiSq + GiSq;
+    end;
+    MeanGiSq := MeanGiSq / UsableCount;
+
+    // McCandlish simple noise scale B_simple = tr(Sigma) / ||g_bar||^2.
+    if GBarSq > cEps then
+      BSimple := TrSigma / GBarSq
+    else
+      BSimple := 0;
+
+    // --- Per-layer accumulators over the scope axis. ---
+    SetLength(LayerSnrSum, NN.CountLayers());
+    SetLength(LayerTrSigma, NN.CountLayers());
+    SetLength(LayerGBarSq, NN.CountLayers());
+    SetLength(LayerScopeCnt, NN.CountLayers());
+    SetLength(LayerName, NN.CountLayers());
+    for LIdx := 0 to NN.CountLayers() - 1 do
+    begin
+      LayerSnrSum[LIdx] := 0;
+      LayerTrSigma[LIdx] := 0;
+      LayerGBarSq[LIdx] := 0;
+      LayerScopeCnt[LIdx] := 0;
+      LayerName[LIdx] := '';
+    end;
+    for K := 0 to ScopeParamCnt - 1 do
+    begin
+      LIdx := ParamLayer[K];
+      LayerSnrSum[LIdx] := LayerSnrSum[LIdx] + GSnr[K];
+      LayerTrSigma[LIdx] := LayerTrSigma[LIdx] + GStd[K] * GStd[K];
+      LayerGBarSq[LIdx] := LayerGBarSq[LIdx] + GBar[K] * GBar[K];
+      Inc(LayerScopeCnt[LIdx]);
+      LayerName[LIdx] := NN.Layers[LIdx].ClassName;
+    end;
+
+    // --- SNR histogram bin edges (over the actual SNR range). ---
+    HistMin := GSnr[0];
+    HistMax := GSnr[0];
+    for K := 1 to ScopeParamCnt - 1 do
+    begin
+      if GSnr[K] < HistMin then HistMin := GSnr[K];
+      if GSnr[K] > HistMax then HistMax := GSnr[K];
+    end;
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    Span := HistMax - HistMin;
+    for K := 0 to ScopeParamCnt - 1 do
+    begin
+      if Span > cEps then
+        BinIdx := Trunc(((GSnr[K] - HistMin) / Span) * cBins)
+      else
+        BinIdx := 0;
+      if BinIdx < 0 then BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      Inc(Bins[BinIdx]);
+    end;
+
+    // --- Report body ---
+    if UseTrueLabel then LabelMode := 'true-label'
+    else LabelMode := 'predicted-label';
+    Lines.Add(Format(
+      'GradientNoiseScaleReport: %d usable sample(s) of %d, %d trainable ' +
+      'layer(s), %d param(s) in scope. Mode=%s.',
+      [UsableCount, Samples.Count, TrainableLayers, ScopeParamCnt, LabelMode]));
+    Lines.Add('Scope: ' + RestrictName + '.');
+    Lines.Add(
+      'Per-parameter gradient SNR = |g_bar_k| / (std_k + eps) over the batch.');
+    Lines.Add('');
+
+    Lines.Add(Format('SNR histogram (%d bins over [%8.4f, %8.4f]):',
+      [cBins, HistMin, HistMax]));
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if Span > cEps then
+      begin
+        BinLo := HistMin + BinIdx * (Span / cBins);
+        BinHi := HistMin + (BinIdx + 1) * (Span / cBins);
+      end
+      else
+      begin
+        BinLo := HistMin; BinHi := HistMin;
+      end;
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%8.4f, %8.4f) | n=%6d %s',
+        [BinLo, BinHi, Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    // --- Simple noise scale + the two tr(Sigma) estimators. ---
+    Lines.Add(Format(
+      'tr(Sigma) = %12.6g (sum of per-param variances); ' +
+      'cross-check mean_i||g_i||^2 - ||g_bar||^2 = %12.6g.',
+      [TrSigma, MeanGiSq - GBarSq]));
+    Lines.Add(Format('||g_bar||^2 = %12.6g.', [GBarSq]));
+    Lines.Add(Format(
+      'B_simple = tr(Sigma) / ||g_bar||^2 = %12.6g ' +
+      '(McCandlish critical batch size).', [BSimple]));
+    Lines.Add(
+      'Read it as: batches well below B_simple are noise-limited (a bigger ' +
+      'batch buys faster convergence); batches well above B_simple are ' +
+      'signal-limited (a bigger batch mostly wastes compute).');
+    Lines.Add('');
+
+    // --- Effective-batch noise curve noise(B) = B_simple / B. ---
+    BTab[0] := 1; BTab[1] := 2; BTab[2] := 4; BTab[3] := 8;
+    BTab[4] := 16; BTab[5] := 32; BTab[6] := 64;
+    Lines.Add('Effective-batch curve noise(B) = B_simple / B ' +
+      '(noise ~1 marks the sweet-spot batch):');
+    for I := 0 to High(BTab) do
+    begin
+      if BSimple > cEps then
+        NoiseB := BSimple / BTab[I]
+      else
+        NoiseB := 0;
+      if NoiseB >= 1.0 then FlagStr := 'noise-limited (go bigger)'
+      else FlagStr := 'signal-limited (diminishing returns)';
+      Lines.Add(Format('  B=%4d  noise=%10.4f  %s',
+        [BTab[I], NoiseB, FlagStr]));
+    end;
+    Lines.Add('');
+
+    // --- Per-layer SNR mean + per-layer noise scale. ---
+    Lines.Add('Per-layer gradient SNR & noise scale:');
+    Lines.Add('  layer  class                        meanSNR     ' +
+      'B_layer  verdict');
+    SignalLayers := 0;
+    NoiseLayers := 0;
+    MaxLayerB := -1;
+    MaxLayerBIdx := -1;
+    for LIdx := 0 to NN.CountLayers() - 1 do
+    begin
+      if LayerScopeCnt[LIdx] = 0 then Continue;
+      LMean := LayerSnrSum[LIdx] / LayerScopeCnt[LIdx];
+      if LayerGBarSq[LIdx] > cEps then
+        LayerB := LayerTrSigma[LIdx] / LayerGBarSq[LIdx]
+      else
+        LayerB := 0;
+      if LMean >= cSignalSnr then
+      begin
+        FlagStr := 'signal-dominated';
+        Inc(SignalLayers);
+      end
+      else
+      begin
+        FlagStr := 'noise-dominated';
+        Inc(NoiseLayers);
+      end;
+      if LayerB > MaxLayerB then
+      begin
+        MaxLayerB := LayerB;
+        MaxLayerBIdx := LIdx;
+      end;
+      Lines.Add(Format('  %4d   %-26s %9.4f %11.4g  %s',
+        [LIdx, LayerName[LIdx], LMean, LayerB, FlagStr]));
+    end;
+    Lines.Add('');
+    Lines.Add(Format(
+      'Layers: %d signal-dominated (meanSNR >= %.1f), %d noise-dominated.',
+      [SignalLayers, cSignalSnr, NoiseLayers]));
+    if MaxLayerBIdx >= 0 then
+      Lines.Add(Format(
+        'Largest noise scale: layer %d (%s), B_layer = %12.6g ' +
+        '(this layer most wants a bigger batch).',
+        [MaxLayerBIdx, LayerName[MaxLayerBIdx], MaxLayerB]));
+
+    // overall verdict line for the whole-net scope
+    if BSimple <= 1.0 then
+      Lines.Add(Format(
+        'Verdict: B_simple = %.4g <= 1 => small batches are already ' +
+        'near-optimal (clean, high-SNR batch).', [BSimple]))
+    else
+      Lines.Add(Format(
+        'Verdict: B_simple = %.4g > 1 => a batch of ~%d genuinely helps ' +
+        '(noisy, low-SNR batch).', [BSimple, Round(BSimple)]));
+
+    Result := Lines.Text;
+  finally
     Lines.Free;
   end;
 end;

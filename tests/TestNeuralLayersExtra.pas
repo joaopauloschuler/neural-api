@@ -101,6 +101,7 @@ type
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
+    procedure TestGradientNoiseScaleReportSmoke;
     procedure TestEffectiveReceptiveFieldReportSmoke;
   end;
 
@@ -3050,6 +3051,193 @@ begin
   finally
     Clean.Free;
     Noisy.Free;
+    NN.Free;
+  end;
+end;
+
+// Parses "B_simple = tr(Sigma) / ||g_bar||^2 = <v> (..." out of a
+// GradientNoiseScaleReport and returns <v> (or -1 if not found). B_simple is
+// the McCandlish critical batch size: ~0 for an all-identical batch (pure
+// signal), large for a noisy / overlapping batch (gradients scatter).
+function ParseBSimple(const Report: string): TNeuralFloat;
+var
+  S, E: integer;
+  Val: string;
+  FS: TFormatSettings;
+begin
+  Result := -1;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  S := Pos('B_simple = tr(Sigma) / ||g_bar||^2 = ', Report);
+  if S = 0 then Exit;
+  S := S + Length('B_simple = tr(Sigma) / ||g_bar||^2 = ');
+  while (S <= Length(Report)) and (Report[S] = ' ') do Inc(S);
+  E := S;
+  while (E <= Length(Report)) and (Report[E] <> ' ') and
+        (Report[E] <> #10) and (Report[E] <> #13) do Inc(E);
+  Val := Trim(Copy(Report, S, E - S));
+  Result := StrToFloatDef(Val, -1, FS);
+end;
+
+procedure TTestNeuralLayersExtra.TestGradientNoiseScaleReportSmoke;
+var
+  NN: TNNet;
+  Clean, Noisy, Same, Single: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  CleanReport, NoisyReport, SameReport, SingleReport, HeadReport: string;
+  Ep, I, C, TrueCls, LabelCls: integer;
+  CleanB, NoisyB, SameB: TNeuralFloat;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+begin
+  // nil NN handled gracefully.
+  CleanReport := TNNet.GradientNoiseScaleReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', CleanReport) > 0);
+
+  NN := TNNet.Create();
+  Clean := TNNetVolumePairList.Create();
+  Noisy := TNNetVolumePairList.Create();
+  Same := TNNetVolumePairList.Create();
+  Single := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(12));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    CleanReport := TNNet.GradientNoiseScaleReport(NN, Clean);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', CleanReport) > 0);
+
+    // Train on the clean separable 3-cluster problem.
+    RandSeed := 1234;
+    for Ep := 1 to 40 do
+      for I := 1 to 90 do
+      begin
+        C := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        try
+          X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+          X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+          Y.Fill(0);
+          Y.FData[C] := 1.0;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    // Clean probe batch: tight clusters, honest labels.
+    for C := 0 to 2 do
+      for I := 1 to 16 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+        X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Clean.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Noisy probe batch: heavy overlap + 40% label corruption.
+    for C := 0 to 2 do
+      for I := 1 to 16 do
+      begin
+        TrueCls := C;
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[TrueCls][0] + (Random - 0.5) * 5.0;
+        X.FData[1] := Centers[TrueCls][1] + (Random - 0.5) * 5.0;
+        LabelCls := TrueCls;
+        if Random < 0.4 then
+          LabelCls := (TrueCls + 1 + Random(2)) mod 3;
+        Y.Fill(0);
+        Y.FData[LabelCls] := 1.0;
+        Noisy.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Identical-sample batch: the SAME (x, y) fed N times. Gradients are bit
+    // identical, so the variance term and hence B_simple must be ~0.
+    for I := 1 to 8 do
+    begin
+      X := TNNetVolume.Create(2, 1, 1);
+      Y := TNNetVolume.Create(3, 1, 1);
+      X.FData[0] := Centers[1][0];
+      X.FData[1] := Centers[1][1];
+      Y.Fill(0);
+      Y.FData[1] := 1.0;
+      Same.Add(TNNetVolumePair.Create(X, Y));
+    end;
+
+    // Single-sample batch: variance is undefined.
+    X := TNNetVolume.Create(2, 1, 1);
+    Y := TNNetVolume.Create(3, 1, 1);
+    X.FData[0] := Centers[0][0];
+    X.FData[1] := Centers[0][1];
+    Y.Fill(0);
+    Y.FData[0] := 1.0;
+    Single.Add(TNNetVolumePair.Create(X, Y));
+
+    CleanReport := TNNet.GradientNoiseScaleReport(NN, Clean);
+    NoisyReport := TNNet.GradientNoiseScaleReport(NN, Noisy);
+    SameReport := TNNet.GradientNoiseScaleReport(NN, Same);
+    SingleReport := TNNet.GradientNoiseScaleReport(NN, Single);
+
+    AssertTrue('clean report non-empty', Length(CleanReport) > 0);
+    AssertTrue('Header present',
+      Pos('GradientNoiseScaleReport', CleanReport) > 0);
+    AssertTrue('SNR histogram present',
+      Pos('SNR histogram', CleanReport) > 0);
+    AssertTrue('B_simple line present',
+      Pos('B_simple = tr(Sigma)', CleanReport) > 0);
+    AssertTrue('effective-batch curve present',
+      Pos('Effective-batch curve', CleanReport) > 0);
+    AssertTrue('per-layer table present',
+      Pos('Per-layer gradient SNR & noise scale', CleanReport) > 0);
+
+    // --- Built-in correctness check: identical samples drive B_simple ~0. ---
+    SameB := ParseBSimple(SameReport);
+    AssertTrue('identical-batch B_simple parsed', SameB >= 0);
+    AssertTrue('identical samples drive B_simple to ~0', SameB < 1e-4);
+
+    // --- Single-sample warning path: clear message, no division by zero. ---
+    AssertTrue('single-sample warning present',
+      Pos('need >= 2 samples to estimate gradient variance',
+        SingleReport) > 0);
+
+    // --- Contrast: noisy batch has a much larger B_simple than the clean
+    // linearly-separable batch (low SNR vs high SNR). ---
+    CleanB := ParseBSimple(CleanReport);
+    NoisyB := ParseBSimple(NoisyReport);
+    AssertTrue('clean B_simple parsed', CleanB >= 0);
+    AssertTrue('noisy B_simple parsed', NoisyB >= 0);
+    AssertTrue('noisy batch has larger noise scale than clean',
+      NoisyB > CleanB);
+
+    // --- LayerIdx scope filter runs and is labelled. ---
+    HeadReport := TNNet.GradientNoiseScaleReport(NN, Noisy, True, 2);
+    AssertTrue('layer-restricted report non-empty', Length(HeadReport) > 0);
+    AssertTrue('layer-restricted scope labelled',
+      Pos('layer 2', HeadReport) > 0);
+
+    // predicted-label mode also produces a well-formed report.
+    CleanReport := TNNet.GradientNoiseScaleReport(NN, Clean, False);
+    AssertTrue('predicted-label mode non-empty', Length(CleanReport) > 0);
+    AssertTrue('predicted-label mode tagged',
+      Pos('predicted-label', CleanReport) > 0);
+  finally
+    Clean.Free;
+    Noisy.Free;
+    Same.Free;
+    Single.Free;
     NN.Free;
   end;
 end;
