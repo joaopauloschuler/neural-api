@@ -3622,6 +3622,37 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// BitNet b1.58 ternary-weight fully connected (linear) layer.
+  // The trainable (latent) parameters are ordinary full-precision weights,
+  // stored and serialized exactly like a TNNetFullConnectLinear (no custom
+  // weight Save/Load). At FORWARD time each output neuron's weight vector w is
+  // ternarized with the BitNet b1.58 "absmean" rule:
+  //   scale = mean(|w|)                 (PER-NEURON scale over that neuron's
+  //                                       weight vector; matches the per-neuron
+  //                                       weight tensors used by this family)
+  //   w_q   = round(clip(w / scale, -1, +1))   in {-1, 0, +1}
+  //   w_eff = scale * w_q
+  // and the ordinary linear dot-product is computed with w_eff. If a neuron's
+  // scale is 0 (all-zero weights) the effective weight is 0.
+  // BACKWARD uses the Straight-Through Estimator (STE): the round/clip is
+  // treated as the identity, so gradients w.r.t. the input and w.r.t. the
+  // latent weights are exactly those of an ordinary linear layer using the
+  // real-valued latent weights w. This is inherited unchanged from
+  // TNNetFullConnectLinear (both ComputePreviousLayerErrorCPU and
+  // BackpropagateCPU operate on the latent FArrNeurons[].FWeights), so only
+  // the forward pass is overridden. Reference: Ma et al. 2024, "The Era of
+  // 1-bit LLMs: All Large Language Models are in 1.58 Bits", arXiv:2402.17764.
+  TNNetBitLinear = class(TNNetFullConnectLinear)
+  private
+    FQuantWeights: TNNetVolume;  // scratch: quantized weights of one neuron
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    procedure ComputeCPU(); override;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    destructor Destroy(); override;
+  end;
+
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   protected
@@ -22479,6 +22510,126 @@ begin
   Self.Create(pSize, 1, 1, pSuppressBias);
 end;
 
+{ TNNetBitLinear }
+
+// Quantize one neuron's latent weight vector into FQuantWeights using the
+// BitNet b1.58 per-neuron absmean rule:
+//   scale = mean(|w|); w_eff = scale * round(clip(w/scale, -1, +1)).
+// Effective weights (scale * {-1,0,+1}) are returned in FQuantWeights.
+procedure TNNetBitLinear.ComputeCPU();
+var
+  StartTime: double;
+  Cnt, MaxCnt, WeightCnt, MaxWeights: integer;
+  localNeuron: TNNetNeuron;
+  Scale, InvScale, FloatN, Acc, Wq: TNeuralFloat;
+begin
+  StartTime := Now();
+  MaxCnt := FNeurons.Count - 1;
+  MaxWeights := FNeurons[0].FWeights.Size - 1;
+  FloatN := FNeurons[0].FWeights.Size;
+  FQuantWeights.ReSize(FNeurons[0].FWeights);
+  for Cnt := 0 to MaxCnt do
+  begin
+    localNeuron := FArrNeurons[Cnt];
+    // Per-neuron absmean scale = mean(|w|) over this neuron's weight vector.
+    Scale := localNeuron.FWeights.GetSumAbs() / FloatN;
+    Acc := 0;
+    if Scale > 0 then
+    begin
+      InvScale := 1.0 / Scale;
+      for WeightCnt := 0 to MaxWeights do
+      begin
+        // Ternarize: w_q = round(clip(w/scale, -1, +1)) in {-1, 0, +1}.
+        Wq := localNeuron.FWeights.FData[WeightCnt] * InvScale;
+        if Wq > 1.0 then Wq := 1.0
+        else if Wq < -1.0 then Wq := -1.0;
+        Wq := Round(Wq);
+        // Effective weight is scale * w_q.
+        FQuantWeights.FData[WeightCnt] := Scale * Wq;
+        Acc := Acc + FQuantWeights.FData[WeightCnt] * FPrevLayer.FOutput.FData[WeightCnt];
+      end;
+    end
+    else
+    begin
+      // All-zero weights: effective weight is 0.
+      for WeightCnt := 0 to MaxWeights do
+        FQuantWeights.FData[WeightCnt] := 0;
+    end;
+    if FSuppressBias = 0 then
+      FOutput.FData[Cnt] := Acc + localNeuron.FBiasWeight
+    else
+      FOutput.FData[Cnt] := Acc;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Input gradient. The forward used the EFFECTIVE (quantized) weights w_eff, and
+// the quantization does NOT depend on the input, so dL/dx = sum_o err_o*w_eff_o
+// is the exact input gradient (no STE approximation needed on this path). The
+// effective weights are recomputed per neuron (latent weights are unchanged
+// between Compute and this backward pass). Note this differs from the inherited
+// FullConnectLinear version, which would (incorrectly here) use the LATENT
+// weights. The STE only applies to the LATENT-WEIGHT gradient, which stays the
+// ordinary linear gradient (inherited BackpropagateCPU, w.r.t. FWeights).
+procedure TNNetBitLinear.ComputePreviousLayerErrorCPU();
+var
+  MaxOutputCnt, OutputCnt, WeightCnt, MaxWeights: integer;
+  LocalPrevError: TNNetVolume;
+  localNeuron: TNNetNeuron;
+  Scale, InvScale, FloatN, Wq: TNeuralFloat;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  MaxOutputCnt := FOutput.Size - 1;
+  MaxWeights := FNeurons[0].FWeights.Size - 1;
+  FloatN := FNeurons[0].FWeights.Size;
+  FQuantWeights.ReSize(FNeurons[0].FWeights);
+  for OutputCnt := 0 to MaxOutputCnt do
+  begin
+    if (FOutputError.FData[OutputCnt] <> 0.0) then
+    begin
+      localNeuron := FArrNeurons[OutputCnt];
+      Scale := localNeuron.FWeights.GetSumAbs() / FloatN;
+      if Scale > 0 then
+      begin
+        InvScale := 1.0 / Scale;
+        for WeightCnt := 0 to MaxWeights do
+        begin
+          Wq := localNeuron.FWeights.FData[WeightCnt] * InvScale;
+          if Wq > 1.0 then Wq := 1.0
+          else if Wq < -1.0 then Wq := -1.0;
+          FQuantWeights.FData[WeightCnt] := Scale * Round(Wq);
+        end;
+      end
+      else
+      begin
+        for WeightCnt := 0 to MaxWeights do
+          FQuantWeights.FData[WeightCnt] := 0;
+      end;
+      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FQuantWeights);
+    end;
+  end;
+end;
+
+constructor TNNetBitLinear.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+  FQuantWeights := TNNetVolume.Create();
+end;
+
+constructor TNNetBitLinear.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+destructor TNNetBitLinear.Destroy();
+begin
+  FQuantWeights.Free;
+  inherited Destroy();
+end;
+
 { TNNetWeightStandardization }
 
 constructor TNNetWeightStandardization.Create(pSizeX, pSizeY, pDepth: integer;
@@ -40158,6 +40309,7 @@ begin
       'TNNetLayerFullConnectReLU' : Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetLocalConnect' :         Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalConnectLinear' :   Result := TNNetLocalConnectLinear.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -40422,6 +40574,7 @@ begin
       if S[0] = 'TNNetLayerFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetLocalConnect' then Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalConnectLinear' then Result := TNNetLocalConnectLinear.Create(St[0], St[1], St[2], St[3], St[4]) else

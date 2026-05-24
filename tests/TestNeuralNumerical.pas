@@ -104,6 +104,9 @@ type
     procedure TestWeightStandardizationForward;
     procedure TestWeightStandardizationGradientCheck;
     procedure TestWeightStandardizationSerializationRoundTrip;
+    procedure TestBitLinearForward;
+    procedure TestBitLinearInputGradientCheck;
+    procedure TestBitLinearSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
     procedure TestRMSNormGatedForward;
@@ -21652,6 +21655,181 @@ begin
     end;
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBitLinearForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  BL: TNNetBitLinear;
+  i: integer;
+  Scale, Expected: TNeuralFloat;
+begin
+  // Pin a tiny weight matrix and assert the ternarized forward equals the
+  // hand-computed Wq*x. Single output neuron, 4 inputs, bias suppressed.
+  // Weights = [0.2, 0.6, -0.4, 0.0].
+  //   scale = mean(|w|) = (0.2+0.6+0.4+0.0)/4 = 0.3
+  //   w/scale = [0.667, 2.0, -1.333, 0.0]
+  //   clip(.,-1,+1) = [0.667, 1.0, -1.0, 0.0]
+  //   round         = [1, 1, -1, 0]   (values in {-1,0,+1})
+  //   w_eff = scale * w_q = 0.3 * [1, 1, -1, 0]
+  // With input [1, 1, 1, 1]: out = 0.3*(1 + 1 - 1 + 0) = 0.3.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    BL := TNNetBitLinear.Create({pSize=}1, {pSuppressBias=}1);
+    NN.AddLayer(BL);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 1.0;
+    BL.Neurons[0].Weights.Raw[0] :=  0.2;
+    BL.Neurons[0].Weights.Raw[1] :=  0.6;
+    BL.Neurons[0].Weights.Raw[2] := -0.4;
+    BL.Neurons[0].Weights.Raw[3] :=  0.0;
+
+    NN.Compute(Input);
+
+    Scale := 0.3;
+    Expected := Scale * (1 + 1 - 1 + 0);
+    AssertEquals('BitLinear ternarized forward output', Expected,
+      NN.GetLastLayer.Output.Raw[0], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBitLinearInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  BL: TNNetBitLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, o: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input numerical-gradient check (central differences, tol 1e-2). The STE
+  // backward is inherited unchanged from TNNetFullConnectLinear, so the input
+  // gradient is the ordinary linear gradient computed with the EFFECTIVE
+  // (quantized) weights w_eff = scale*w_q. Since the quantization does not
+  // depend on the input, perturbing the input never crosses a round boundary,
+  // so the finite difference matches the analytical input gradient cleanly.
+  //
+  // Design note: a numerical check w.r.t. the LATENT weights is intentionally
+  // omitted. STE defines the latent-weight gradient as the ordinary linear
+  // gradient using w_eff, but a finite difference perturbs the FORWARD pass,
+  // where w_q = round(clip(w/scale)) is piecewise-constant in w: the numerical
+  // derivative is ~0 between round boundaries and a Dirac spike at a boundary,
+  // so it cannot match the (deliberately surrogate) STE gradient. The forward
+  // equality test above pins the exact quantization instead.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  InputPlus := TNNetVolume.Create(1, 1, 5);
+  Desired := TNNetVolume.Create(1, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1)); // pError=1 resizes error volumes
+    BL := TNNetBitLinear.Create(3);
+    NN.AddLayer(BL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Modest magnitudes keep the (single-precision) finite difference accurate.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    // Non-trivial latent weights kept away from round boundaries (|w/scale| not
+    // near 0.5 or 1.5) so the per-neuron scale is well defined.
+    for o := 0 to BL.Neurons.Count - 1 do
+      for i := 0 to BL.Neurons[o].Weights.Size - 1 do
+        BL.Neurons[o].Weights.Raw[i] := 0.5 + o * 0.4 + i * 0.6 - 1.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('BitLinear input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBitLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  BL: TNNetBitLinear;
+  Input: TNNetVolume;
+  Saved: string;
+  o, i: integer;
+begin
+  // Build a net, save it, load it, and assert Compute matches on both nets.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    BL := TNNetBitLinear.Create({pSize=}3);
+    NN.AddLayer(BL);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    // Perturb the latent weights away from defaults.
+    for o := 0 to BL.Neurons.Count - 1 do
+      for i := 0 to BL.Neurons[o].Weights.Size - 1 do
+        BL.Neurons[o].Weights.Raw[i] := 0.13 * (o + 1) - 0.07 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      AssertTrue('BitLinear token present in serialized string',
+        Pos('TNNetBitLinear', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('BitLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

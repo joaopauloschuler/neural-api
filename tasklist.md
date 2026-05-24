@@ -398,7 +398,7 @@ breakdown:
       sub-block inside the layer (or a builder that wires an SE-style squeeze
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
-- [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
+- [X] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
       mean(|W|)` forward with straight-through estimator backward.
 <!-- (TNNetMaxOut2 removed: a "two-piece special case of TNNetMaxOut" is just
      TNNetMaxOut.Create(2) with a thinner constructor — i.e. a forward-pass
