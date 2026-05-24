@@ -253,6 +253,9 @@ breakdown:
 - [ ] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
       Convolution layer and divides its weight matrix by its largest
       singular value (one power-iteration step per forward pass).
+      NOTE: the reusable power-iteration helper `TNNet.EstimateSpectralNorm`
+      now exists (landed with WeightSpectrumReport) — build the wrapper on
+      top of it rather than re-deriving the iteration.
 - [ ] TNNetStochasticPool — sample one cell per pooling window weighted by
       its activation (softmax of activations over the window) at training,
       take the expectation at inference.
@@ -365,7 +368,18 @@ breakdown:
 - [ ] TNNet.ToGraphvizDot — emit a `.dot` file describing the layer DAG.
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
-- [ ] TNNet.ReceptiveFieldReport — a purely *analytical* (no probe batch,
+- [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
+      approximated from the last probe sample only (streaming moments keep
+      memory bounded). Add an exact per-layer median across the whole probe
+      batch via a two-pass or bounded reservoir approach if it proves worth
+      the memory; the single-sample approximation is documented in the doc
+      comment for now.
+- [ ] WeightSpectrumReport follow-up: a probe-batch `JacobianSpectrumReport`
+      variant that estimates the top singular value of each layer's
+      input-output Jacobian (the entry already flags this as the natural
+      next knob). Reuses the landed `TNNet.EstimateSpectralNorm` power-
+      iteration helper.
+- [X] TNNet.ReceptiveFieldReport — a purely *analytical* (no probe batch,
       no forward, no backward) walk of the layer stack that propagates the
       standard receptive-field recurrence through every spatial layer
       (Convolution / Deconvolution / Pool family / Padding / Upsample /
@@ -1017,7 +1031,7 @@ breakdown:
       acts as a built-in regression check on the IG implementation.
 
 ### Activation distribution
-- [ ] TNNet.ActivationStatsReport — given a probe batch, walk every layer's
+- [X] TNNet.ActivationStatsReport — given a probe batch, walk every layer's
       forward output and print a per-layer table of
       `mean / std / min / max / |median| / |skew| / kurtosis` plus
       `pct_saturated_low` and `pct_saturated_high` (configurable thresholds,
@@ -1075,7 +1089,7 @@ breakdown:
       stem-heavy conv vs attention-heavy transformer).
 
 ### Weight-matrix spectrum
-- [ ] TNNet.WeightSpectrumReport — for every trainable layer in a network,
+- [X] TNNet.WeightSpectrumReport — for every trainable layer in a network,
       estimate the top singular value `sigma_1(W)` of its weight matrix via
       a handful of power-iteration steps (default 10), and report per layer:
       (a) `sigma_1`,
