@@ -1036,40 +1036,42 @@ breakdown:
       faster optimizer / mini-batch path so enough epochs fit, THEN retry the
       true grok. Do not re-attempt the full weight-decay grok as a single
       monolithic example until (b) lands.
-- [ ] Double-descent demo (`examples/DoubleDescent/`) — reproduce the
-      model-wise "double descent" risk curve (Belkin et al. 2019; Nakkiran
-      et al. 2020, *Deep Double Descent*) on a pure-CPU toy. The headline is
-      a phenomenon that NONE of the in-tree experiments show: as model
-      CAPACITY grows, test error first FALLS (classical bias-variance), then
-      RISES to a sharp peak right at the *interpolation threshold* (where the
-      net has just enough parameters to fit the noisy training set exactly),
-      then FALLS AGAIN and keeps improving in the heavily over-parameterised
-      regime — a non-monotone U-then-down curve, not the usual monotone one.
-      Recipe: fix a SMALL training set (e.g. 40-80 samples) with a few
-      percent LABEL NOISE injected (the noise is what makes the peak sharp
-      and visible), hold out a clean validation set, then train the SAME tiny
-      MLP at a sweep of hidden widths spanning under- to over-parameterised
-      (e.g. `H in {2,4,8,16,24,32,48,64,96,128}`, so param-count straddles
-      the train-set size), each to ~full convergence (high epochs / low LR so
-      the small models actually interpolate), and chart a two-row ASCII curve
-      of train-error and test-error vs `log2(param_count)`. Flag the
-      empirical interpolation threshold (smallest width whose train error
-      first hits ~0) and check that the test-error PEAK lands at/just past it
-      (the built-in correctness signal — no peak ⇒ noise too low or models
-      not trained to interpolation). A small ablation toggling label noise
-      on/off makes the point that the peak is noise-driven (the clean-label
-      curve is ~monotone). DISTINCT from the open grokking demo (delayed
-      generalization over TRAINING TIME at FIXED capacity — a time axis,
-      driven by weight decay) and from the open "Width vs depth at fixed
-      parameter budget" heatmap (a fixed-budget val-loss grid with no noisy
-      interpolation peak and no capacity SWEEP past the threshold): this is a
-      generalization-vs-CAPACITY axis and the non-monotone peak is the whole
-      point. Pure CPU, no external data, should fit a few-minute budget if the
-      widths and sample count are kept tiny. Pairs naturally with
-      [[WeightSpectrumReport]] / [[WeightHistogramReport]] (watch the weight
-      norm spike at the interpolation threshold) and with the open
-      MagnitudePruning lottery-ticket follow-up (over-parameterised models are
-      the compressible regime on the right arm of the curve).
+<!-- (Double-descent demo removed: completed, landed 2026-05-24 as
+     examples/DoubleDescent/. Existing layers only, no new layer. Fixed
+     nonlinear teacher class=sign(x'Qx+b'x) over D=4; SMALL train=60 with 15%
+     of labels FLIPPED, LARGE clean test=2000. SAME single-hidden-layer MLP
+     Input(4)->TNNetFullConnectReLU(H)->TNNetFullConnectLinear(1) trained as an
+     MSE regression onto the +-1 target (MSE interpolates the noisy set cleanly
+     where a saturating softmax/cross-entropy head left ~2 hard noisy points
+     permanently misclassified and never reached train-err 0), full-batch GD
+     (SetBatchUpdate(True) + ClearDeltas/accumulate/UpdateWeights per epoch),
+     LR=0.03 mom=0.9 up to 6000 epochs w/ early-stop at train MSE~0. Width
+     sweep H in {1,2,3,4,5,6,8,12,20,32,64,128}, param count via
+     TNNet.CountWeights printed. Two-arm ablation (noise ON vs OFF, same
+     teacher/points/seeds). RESULT (seed 20260524, all 3 checks PASS, ~57s):
+     noisy test err 0.39(underfit,H=1) -> 0.21 VALLEY(H=6) -> 0.38 PEAK(H=8,
+     right at the interpolation threshold where train MSE collapses 0.27->0.027
+     by H=12 and train 0/1 err first hits 0) -> 0.34(over-param,H=128) — the
+     textbook non-monotone U-then-peak-then-down. Clean arm ~monotone
+     (post-min rise 0.017 vs noisy 0.172), confirming the peak is NOISE-driven.
+     Three built-in signals: interpolation-threshold-exists, peak-at/around-
+     threshold (peak is the max test err AT/AFTER the bias-variance VALLEY, not
+     the global argmax — the underfit left edge is also high), and the
+     noise-on/off ablation. CAVEATS: (1) softmax/cross-entropy classification
+     did NOT cleanly interpolate at this scale (stuck at ~2/60 train err across
+     all widths) — switched to MSE-regression-on-+-1; (2) at this single seed
+     the clean arm shows one transient 0.262 wobble at H=12, a seed
+     fluctuation, not a systematic peak — the tested signal (aggregate post-min
+     rise) is 10x smaller than the noisy arm's; (3) the peak HEIGHT and exact
+     threshold are seed-dependent, only the noise-gated SHAPE is the robust
+     claim. Suite stays green at 793. -->
+- [ ] Lottery-ticket / magnitude-pruning follow-up to double descent: the
+      over-parameterised models on the RIGHT arm of examples/DoubleDescent are
+      the compressible regime — prune the H=128 interpolating net by weight
+      magnitude and show it keeps the low test error down to a small fraction
+      of its weights. Pairs with [[WeightSpectrumReport]] /
+      [[WeightHistogramReport]] (watch the weight-norm spike at the
+      interpolation threshold).
 <!-- (Toy-models-of-superposition demo removed: completed, landed 2026-05-24 as
      examples/Superposition/. Importance-weighted-MSE autoencoder
      Input(N=20) -> TNNetFullConnectLinear(M=5){encoder} -> TNNetFullConnectReLU(N){decoder}
