@@ -1387,6 +1387,33 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Negative-log-likelihood (NLL) loss output layer — the companion to
+  // TNNetLogSoftMax. It consumes per-element log-probabilities (the output of
+  // TNNetLogSoftMax) over the Depth axis at each (X,Y) position. Given a
+  // one-hot target t, the per-position loss is
+  //   L = -sum_d t_d * logp_d  =  -logp[true_class].
+  // Because the input is already in log-space, the gradient w.r.t. the input
+  // is exact and trivial: dL/d(logp_d) = -t_d (i.e. -1 at the true class and
+  // 0 elsewhere) per position.
+  //
+  // Stacking TNNetLogSoftMax -> TNNetNLLLoss reproduces the standard
+  // "LogSoftMax + NLLLoss = cross-entropy" decomposition, and is the
+  // numerically-stable counterpart to feeding raw logits into a softmax
+  // followed by a cross-entropy loss: there the combined input gradient is
+  // softmax(logits) - target, which is exactly what LogSoftMax's backward
+  // produces from this layer's -target seed.
+  //
+  // Forward is an identity passthrough (so Net.Compute returns the input
+  // log-probabilities). Training relies on the framework seeding FOutputError
+  // with (output - target) = (logp - target); Backpropagate recovers the
+  // target as (logp - FOutputError) and replaces the residual with -target.
+  // No constructor parameter and no trainable state.
+  TNNetNLLLoss = class(TNNetIdentity)
+  public
+    constructor Create(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Entropy regularizer (passthrough). Treats the input vector p as a
   // probability distribution (intended to sit immediately after a softmax)
   // and adds the term `-lambda * H(p) = lambda * sum(p * log(p))` to the
@@ -7632,6 +7659,37 @@ begin
     begin
       FOutputError.FData[Idx] := 0;
     end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetNLLLoss }
+
+constructor TNNetNLLLoss.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetNLLLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  LogP, Seeded, Target: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    LogP := FOutput.FData[Idx];
+    Seeded := FOutputError.FData[Idx];
+    // Framework seeds FOutputError := output - target = logp - target.
+    // Recover target, then set the exact NLL gradient dL/d(logp) = -target.
+    Target := LogP - Seeded;
+    FOutputError.FData[Idx] := -Target;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -28818,6 +28876,7 @@ begin
       'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
+      'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(Ft[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
@@ -29043,6 +29102,7 @@ begin
       if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
+      if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(Ft[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else

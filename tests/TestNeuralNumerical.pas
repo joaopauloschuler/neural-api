@@ -143,6 +143,9 @@ type
     procedure TestCharbonnierLossLoadFromString;
     procedure TestFocalLossGradient;
     procedure TestFocalLossLoadFromString;
+    procedure TestNLLLossGradient;
+    procedure TestNLLLossLogSoftMaxCrossEntropyConsistency;
+    procedure TestNLLLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -14102,6 +14105,194 @@ begin
 
       AssertEquals('FocalLoss round-trip gradient at ' + IntToStr(i),
         NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNLLLossGradient;
+const
+  cTrue = 2;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  LogP: array[0..4] of TNeuralFloat;
+  i: integer;
+  ExpectedGrad, ScalarLoss: TNeuralFloat;
+begin
+  // TNNetNLLLoss consumes log-probabilities. With a one-hot target the exact
+  // input gradient is dL/d(logp_d) = -target_d (-1 at true class, 0 else), and
+  // the scalar loss is -logp[true_class]. Forward is an identity passthrough.
+  // These (already normalized) log-probs sum-exp to ~1.
+  LogP[0] := -1.6094379; // ln(0.20)
+  LogP[1] := -2.3025851; // ln(0.10)
+  LogP[2] := -0.9162907; // ln(0.40)  <- true class
+  LogP[3] := -1.6094379; // ln(0.20)
+  LogP[4] := -2.3025851; // ln(0.10)
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Target := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetNLLLoss.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := LogP[i];
+    Target.Fill(0);
+    Target.Raw[cTrue] := 1.0;
+
+    // Forward must be a passthrough of the log-probabilities.
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('NLLLoss forward passthrough at ' + IntToStr(i),
+        LogP[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+
+    NN.Backpropagate(Target);
+
+    // Exact NLL gradient at the layer feeding NLLLoss: -target per position.
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if i = cTrue then ExpectedGrad := -1.0 else ExpectedGrad := 0.0;
+      AssertEquals('NLLLoss gradient (-target) at ' + IntToStr(i),
+        ExpectedGrad, LMid.OutputError.Raw[i], 0.00001);
+    end;
+
+    // Scalar loss = -logp[true_class].
+    ScalarLoss := -LogP[cTrue];
+    AssertEquals('NLLLoss scalar loss = -logp[true]',
+      0.9162907, ScalarLoss, 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNLLLossLogSoftMaxCrossEntropyConsistency;
+const
+  cTrue = 1;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LLogits: TNNetIdentity;
+  Logits: array[0..3] of TNeuralFloat;
+  i: integer;
+  MaxV, SumExp: TNeuralFloat;
+  SoftMax: array[0..3] of TNeuralFloat;
+  ExpectedGrad: TNeuralFloat;
+begin
+  // A TNNetLogSoftMax -> TNNetNLLLoss stack on raw logits must produce, at the
+  // logits layer, the SAME input error as softmax-cross-entropy on the same
+  // logits/target, i.e. softmax(logits) - target. NLLLoss seeds -target;
+  // LogSoftMax backward then yields softmax(x)[d] - target[d].
+  Logits[0] :=  0.5;
+  Logits[1] :=  2.0;  // true class
+  Logits[2] := -1.0;
+  Logits[3] :=  0.3;
+
+  // Reference softmax(logits).
+  MaxV := Logits[0];
+  for i := 1 to 3 do if Logits[i] > MaxV then MaxV := Logits[i];
+  SumExp := 0;
+  for i := 0 to 3 do SumExp := SumExp + Exp(Logits[i] - MaxV);
+  for i := 0 to 3 do SoftMax[i] := Exp(Logits[i] - MaxV) / SumExp;
+
+  // Logits live on the Depth axis (1x1x4) because TNNetLogSoftMax normalizes
+  // over Depth at each (X,Y) position.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  Target := TNNetVolume.Create(1, 1, 4);
+  try
+    // pError=1 enables OutputError collection so the error-volume sizes
+    // propagate down the Identity-derived chain.
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    // Identity layer standing in for the logits head; LogSoftMax writes the
+    // input error here.
+    LLogits := TNNetIdentity.Create();
+    NN.AddLayer(LLogits);
+    NN.AddLayer(TNNetLogSoftMax.Create());
+    NN.AddLayer(TNNetNLLLoss.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Logits[i];
+    Target.Fill(0);
+    Target.Raw[cTrue] := 1.0;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // Error flowing into the logits == softmax(logits) - target.
+    for i := 0 to LLogits.OutputError.Size - 1 do
+    begin
+      if i = cTrue then ExpectedGrad := SoftMax[i] - 1.0
+      else ExpectedGrad := SoftMax[i];
+      AssertEquals('LogSoftMax+NLLLoss == softmax(logits)-target at ' +
+        IntToStr(i), ExpectedGrad, LLogits.OutputError.Raw[i], 1e-4);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNLLLossLoadFromString;
+const
+  cTrue = 3;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  LogP: array[0..4] of TNeuralFloat;
+  i: integer;
+  ExpectedGrad: TNeuralFloat;
+begin
+  // SaveStructureToString -> CreateLayer round-trip: the reconstructed layer
+  // must still produce the exact -target NLL gradient.
+  LogP[0] := -1.2039728; // ln(0.30)
+  LogP[1] := -2.3025851; // ln(0.10)
+  LogP[2] := -1.6094379; // ln(0.20)
+  LogP[3] := -1.2039728; // ln(0.30)  <- true class
+  LogP[4] := -2.3025851; // ln(0.10)
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Target := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetNLLLoss.Create());
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetNLLLoss',
+      NN2.GetLastLayer is TNNetNLLLoss);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := LogP[i];
+    Target.Fill(0);
+    Target.Raw[cTrue] := 1.0;
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      if i = cTrue then ExpectedGrad := -1.0 else ExpectedGrad := 0.0;
+      AssertEquals('NLLLoss round-trip gradient at ' + IntToStr(i),
+        ExpectedGrad, LMid.OutputError.Raw[i], 0.00001);
     end;
   finally
     NN.Free;
