@@ -424,6 +424,20 @@ breakdown:
      FullConnectLinear, max err 0.0022), TestFiLMSerializationRoundTrip. Example:
      examples/FiLMConditioning/ — learns K per-class affine transforms via the
      conditioning FC to MSE 0, identity invariant held.) -->
+- [ ] TNNetFiLM follow-up: a CLASS-CONDITIONAL generator/decoder demo — the
+      headline FiLM use case (cGAN / conditional generation, Perez et al.). Build a
+      tiny decoder (a couple of conv/upsample blocks) whose feature maps are
+      FiLM-modulated by gamma|beta produced from a learned class EMBEDDING
+      (TNNetEmbedding -> FC -> 2*Depth), and show one shared trunk emits visibly
+      different per-class outputs on a small synthetic multi-class target. Fork the
+      examples/FiLMConditioning/ wiring (already proves the conditioning FC trains
+      end-to-end through TNNetFiLM) and scale it from a 1x1 feature vector to a
+      small spatial map. Keep it CPU-only and well under 5 minutes.
+- [ ] TNNetFiLM follow-up: a builder helper TNNet.AddFiLMConditioned(featLayer,
+      condLayer) (or a residual FiLM block) that wires the conditioning FC ->
+      (1,1,2*Depth) reshape -> TNNetFiLM in one call, mirroring the existing
+      AddPreNormResidual/AddGatedResidual builder family — removes the manual
+      depth-2*Depth bookkeeping every FiLM site currently repeats.
 - [ ] TNNetMaxBlurPool — anti-aliased max-pool: max-pool followed by a
       fixed (non-trainable) binomial blur filter.
 
