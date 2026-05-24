@@ -276,7 +276,7 @@ breakdown:
 - [ ] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
-- [ ] TNNetTokenHistoryPenalty — a stateful **logit processor** for
+- [X] TNNetTokenHistoryPenalty — a stateful **logit processor** for
       autoregressive sampling that sits BETWEEN the model output and the
       existing `TNNetSamplerBase` family (Greedy / TopK / TopP), NOT a new
       sampler. It owns a per-token occurrence count over the tokens emitted

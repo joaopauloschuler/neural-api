@@ -32,6 +32,15 @@ type
     procedure TestSamplerWithUniformDistribution;
     procedure TestSamplerWithSingleToken;
     procedure TestSamplerWithSoftmaxOutput;
+
+    // TNNetTokenHistoryPenalty tests
+    procedure TestPenaltyNoOpIsBitForBit;
+    procedure TestPenaltyRepetitionDecreases;
+    procedure TestPenaltyFrequencyDecreases;
+    procedure TestPenaltyPresenceDecreases;
+    procedure TestPenaltyRepetitionSignCorrect;
+    procedure TestPenaltyResetHistory;
+    procedure TestPenaltyFrequencyScalesWithCount;
   end;
 
 implementation
@@ -404,6 +413,196 @@ begin
   finally
     V.Free;
     GreedySampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyNoOpIsBitForBit;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V, Before: TNNetVolume;
+  I: integer;
+begin
+  // All knobs at no-op values (r=1, alpha_f=alpha_p=0) must leave the
+  // volume bit-for-bit unchanged, even for registered tokens.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.0, 0.0);
+  V := TNNetVolume.Create(10, 1, 1);
+  Before := TNNetVolume.Create(10, 1, 1);
+  try
+    for I := 0 to 9 do V.Raw[I] := I * 0.7 - 3.0;
+    Before.Copy(V);
+    // Register several tokens to ensure counts are non-zero.
+    Penalty.RegisterToken(2);
+    Penalty.RegisterToken(2);
+    Penalty.RegisterToken(7);
+    Penalty.Apply(V);
+    for I := 0 to 9 do
+      AssertTrue('No-op penalty must be bit-for-bit unchanged at ' + IntToStr(I),
+        V.Raw[I] = Before.Raw[I]);
+  finally
+    V.Free;
+    Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyRepetitionDecreases;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+  OrigLogit: TNeuralFloat;
+begin
+  // A single registered token's positive logit strictly decreases under the
+  // repetition knob alone.
+  Penalty := TNNetTokenHistoryPenalty.Create(2.0, 0.0, 0.0);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Fill(1.0);
+    V.Raw[3] := 4.0;
+    OrigLogit := V.Raw[3];
+    Penalty.RegisterToken(3);
+    Penalty.Apply(V);
+    AssertTrue('Repetition penalty must strictly decrease the logit',
+      V.Raw[3] < OrigLogit);
+    AssertEquals('Repetition penalty on positive logit divides by r',
+      2.0, V.Raw[3], 0.0001);
+    // Unregistered tokens must be untouched.
+    AssertEquals('Unregistered token must be unchanged', 1.0, V.Raw[0], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyFrequencyDecreases;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+  OrigLogit: TNeuralFloat;
+begin
+  // A single registered token's logit strictly decreases under the
+  // frequency knob alone.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.5, 0.0);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Fill(2.0);
+    OrigLogit := V.Raw[1];
+    Penalty.RegisterToken(1);
+    Penalty.Apply(V);
+    AssertTrue('Frequency penalty must strictly decrease the logit',
+      V.Raw[1] < OrigLogit);
+    AssertEquals('Frequency penalty subtracts alpha_f * count',
+      2.0 - 0.5, V.Raw[1], 0.0001);
+    AssertEquals('Unregistered token must be unchanged', 2.0, V.Raw[0], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyPresenceDecreases;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+  OrigLogit: TNeuralFloat;
+begin
+  // A single registered token's logit strictly decreases under the
+  // presence knob alone, and the push is flat (count-independent).
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.0, 0.75);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Fill(2.0);
+    OrigLogit := V.Raw[4];
+    // Register twice; presence push must still be a single flat subtraction.
+    Penalty.RegisterToken(4);
+    Penalty.RegisterToken(4);
+    Penalty.Apply(V);
+    AssertTrue('Presence penalty must strictly decrease the logit',
+      V.Raw[4] < OrigLogit);
+    AssertEquals('Presence penalty subtracts alpha_p once',
+      2.0 - 0.75, V.Raw[4], 0.0001);
+    AssertEquals('Unregistered token must be unchanged', 2.0, V.Raw[0], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyRepetitionSignCorrect;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+begin
+  // Sign-correct CTRL form: a penalty must LOWER the score for both a
+  // positive logit (l/r) and a negative logit (l*r, more negative).
+  Penalty := TNNetTokenHistoryPenalty.Create(2.0, 0.0, 0.0);
+  V := TNNetVolume.Create(2, 1, 1);
+  try
+    V.Raw[0] := 3.0;   // positive
+    V.Raw[1] := -3.0;  // negative
+    Penalty.RegisterToken(0);
+    Penalty.RegisterToken(1);
+    Penalty.Apply(V);
+    // Positive: 3.0 / 2.0 = 1.5 (lower).
+    AssertTrue('Positive logit must decrease', V.Raw[0] < 3.0);
+    AssertEquals('Positive logit divided by r', 1.5, V.Raw[0], 0.0001);
+    // Negative: -3.0 * 2.0 = -6.0 (more negative => lower).
+    AssertTrue('Negative logit must become more negative', V.Raw[1] < -3.0);
+    AssertEquals('Negative logit multiplied by r', -6.0, V.Raw[1], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyResetHistory;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V, Before: TNNetVolume;
+  I: integer;
+begin
+  // After ResetHistory, Apply must again be a no-op for previously
+  // registered tokens.
+  Penalty := TNNetTokenHistoryPenalty.Create(2.0, 0.5, 0.75);
+  V := TNNetVolume.Create(6, 1, 1);
+  Before := TNNetVolume.Create(6, 1, 1);
+  try
+    for I := 0 to 5 do V.Raw[I] := I - 2.5;
+    Before.Copy(V);
+    Penalty.RegisterToken(0);
+    Penalty.RegisterToken(3);
+    Penalty.RegisterToken(3);
+    Penalty.ResetHistory();
+    Penalty.Apply(V);
+    for I := 0 to 5 do
+      AssertTrue('After reset, Apply must be a no-op at ' + IntToStr(I),
+        V.Raw[I] = Before.Raw[I]);
+  finally
+    V.Free;
+    Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyFrequencyScalesWithCount;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+begin
+  // Frequency penalty scales with count: registering the same token twice
+  // must subtract 2*alpha_f.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.5, 0.0);
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Fill(5.0);
+    Penalty.RegisterToken(2);
+    Penalty.RegisterToken(2);
+    Penalty.Apply(V);
+    // 5.0 - 2 * 0.5 = 4.0
+    AssertEquals('Frequency penalty subtracts 2 * alpha_f for count = 2',
+      4.0, V.Raw[2], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
   end;
 end;
 

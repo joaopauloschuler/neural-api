@@ -536,6 +536,43 @@ type
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
 
+  { TNNetTokenHistoryPenalty }
+  // Stateful logit processor that sits BETWEEN the model output and the
+  // TNNetSamplerBase family (Greedy / TopK / TopP). It is NOT a sampler: it
+  // owns a per-token occurrence count over the tokens emitted so far and
+  // rewrites the next-step logit volume in place (Apply) before a sampler
+  // reads it, implementing three standard, distinct knobs:
+  // (a) repetition penalty (Keskar et al. CTRL 2019) - divide a logit by
+  //     FRepetition>1 if its token has appeared, in the sign-correct CTRL
+  //     form (l := l/r for l>0, l := l*r for l<0) so a penalty always lowers
+  //     the score;
+  // (b) frequency penalty - subtract FFrequency * count[t] (scales with how
+  //     OFTEN the token was used);
+  // (c) presence penalty - subtract FPresence once for any token used at
+  //     least once (a flat "encourage new tokens" push).
+  // Typical caller usage:
+  //   Penalty.Apply(Logits); tok := Sampler.GetToken(Logits);
+  //   Penalty.RegisterToken(tok);
+  TNNetTokenHistoryPenalty = class(TObject)
+    protected
+      FRepetition: TNeuralFloat;
+      FFrequency: TNeuralFloat;
+      FPresence: TNeuralFloat;
+      FCounts: array of integer;
+      procedure EnsureSize(NewSize: integer);
+    public
+      // Defaults are NO-OP: r=1.0, alpha_f=0.0, alpha_p=0.0.
+      constructor Create(Repetition: TNeuralFloat = 1.0;
+        Frequency: TNeuralFloat = 0.0; Presence: TNeuralFloat = 0.0);
+      destructor Destroy(); override;
+      // Increments the occurrence count of TokenId (call after each emit).
+      procedure RegisterToken(TokenId: integer);
+      // Clears all counts for a fresh sequence.
+      procedure ResetHistory();
+      // Mutates the logit volume in place; each element index is a token id.
+      procedure Apply(Logits: TNNetVolume);
+  end;
+
   /// Implements a pair of volumes
   TNNetVolumePair = class(TObject)
     protected
@@ -2059,6 +2096,80 @@ function TNNetSamplerGreedy.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
   Result := Origin.GetClassOnPixel(PixelX, PixelY);
+end;
+
+{ TNNetTokenHistoryPenalty }
+
+constructor TNNetTokenHistoryPenalty.Create(Repetition: TNeuralFloat = 1.0;
+  Frequency: TNeuralFloat = 0.0; Presence: TNeuralFloat = 0.0);
+begin
+  inherited Create();
+  FRepetition := Repetition;
+  FFrequency := Frequency;
+  FPresence := Presence;
+  SetLength(FCounts, 0);
+end;
+
+destructor TNNetTokenHistoryPenalty.Destroy();
+begin
+  SetLength(FCounts, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetTokenHistoryPenalty.EnsureSize(NewSize: integer);
+var
+  OldSize, I: integer;
+begin
+  OldSize := Length(FCounts);
+  if NewSize > OldSize then
+  begin
+    SetLength(FCounts, NewSize);
+    for I := OldSize to NewSize - 1 do FCounts[I] := 0;
+  end;
+end;
+
+procedure TNNetTokenHistoryPenalty.RegisterToken(TokenId: integer);
+begin
+  if TokenId < 0 then exit;
+  EnsureSize(TokenId + 1);
+  Inc(FCounts[TokenId]);
+end;
+
+procedure TNNetTokenHistoryPenalty.ResetHistory();
+var
+  I, MaxI: integer;
+begin
+  MaxI := Length(FCounts) - 1;
+  for I := 0 to MaxI do FCounts[I] := 0;
+end;
+
+procedure TNNetTokenHistoryPenalty.Apply(Logits: TNNetVolume);
+var
+  I, MaxToken, Count: integer;
+  Logit: TNeuralFloat;
+begin
+  // The history can never be larger than the logit volume of interest.
+  MaxToken := Length(FCounts) - 1;
+  if MaxToken >= Logits.Size then MaxToken := Logits.Size - 1;
+  for I := 0 to MaxToken do
+  begin
+    Count := FCounts[I];
+    if Count > 0 then
+    begin
+      Logit := Logits.FData[I];
+      // (a) repetition penalty - sign-correct CTRL form.
+      if FRepetition <> 1.0 then
+      begin
+        if Logit > 0 then Logit := Logit / FRepetition
+        else Logit := Logit * FRepetition;
+      end;
+      // (b) frequency penalty - scales with the occurrence count.
+      Logit := Logit - FFrequency * Count;
+      // (c) presence penalty - flat push for any token used at least once.
+      Logit := Logit - FPresence;
+      Logits.FData[I] := Logit;
+    end;
+  end;
 end;
 
 { TStringVolumeList }
