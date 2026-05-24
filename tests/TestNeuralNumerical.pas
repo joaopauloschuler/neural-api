@@ -43,6 +43,8 @@ type
     procedure TestGELUGradientCheck;
     procedure TestMishGradientCheck;
     procedure TestSoftPlusGradientCheck;
+    procedure TestSoftPlusBetaGradientCheck;
+    procedure TestSoftExponentialGradientCheck;
     procedure TestGaussianActivationGradientCheck;
     procedure TestSwishGradientCheck;
     procedure TestSwish6GradientCheck;
@@ -1494,6 +1496,24 @@ procedure TTestNeuralNumerical.TestSoftPlusGradientCheck;
 begin
   ActivationGradientCheck(Self, TNNetSoftPlus.Create(), 'SoftPlus',
     [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusBetaGradientCheck;
+begin
+  // Generalized SoftPlus with a sharper beta = 2.0; smooth everywhere.
+  ActivationGradientCheck(Self, TNNetSoftPlusBeta.Create(2.0), 'SoftPlusBeta',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftExponentialGradientCheck;
+begin
+  // alpha > 0 branch: derivative = exp(alpha*x), smooth everywhere.
+  ActivationGradientCheck(Self, TNNetSoftExponential.Create(0.5), 'SoftExponentialPos',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+  // alpha < 0 branch: keep inputs inside the log domain x < 1/alpha - alpha.
+  // For alpha = -0.3 that bound is ~ -3.03, so bounded inputs are safe.
+  ActivationGradientCheck(Self, TNNetSoftExponential.Create(-0.3), 'SoftExponentialNeg',
+    [0.5, -0.5, 1.0, -1.5, 2.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestGaussianActivationGradientCheck;

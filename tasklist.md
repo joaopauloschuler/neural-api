@@ -303,9 +303,13 @@ breakdown:
       derivative guard).
 - [ ] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
       neuron per forward pass during training, fixed at average at inference.
-- [ ] TNNetSoftPlusBeta — generalized SoftPlus with learnable-or-fixed β.
-- [ ] TNNetSoftExponential — `(exp(α·x) - 1)/α + α` for α>0, identity for
-      α=0, `-log(1 - α·(x + α))/α` for α<0.
+- [X] TNNetSoftPlusBeta — generalized SoftPlus with fixed β (FFloatSt[0],
+      default 1.0). Landed: stable forward + sigmoid(βx) deriv +
+      TestSoftPlusBetaGradientCheck. (Learnable-β variant still open.)
+- [X] TNNetSoftExponential — `(exp(α·x) - 1)/α + α` for α>0, identity for
+      α=0, `-log(1 - α·(x + α))/α` for α<0. Landed: three-branch forward +
+      deriv, fixed α (FFloatSt[0]), TestSoftExponentialGradientCheck covers
+      both α>0 and α<0 branches.
 - [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
       with channel-wise learnable `(p1, p2, β)`. Generalizes Swish.
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per

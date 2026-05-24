@@ -602,6 +602,47 @@ type
     procedure Compute(); override;
   end;
 
+  /// Generalized SoftPlus activation with a fixed beta hyperparameter:
+  // y = (1/beta) * ln(1 + exp(beta*x)). With beta = 1 this is the ordinary
+  // SoftPlus; larger beta makes the curve sharper (closer to ReLU).
+  // Derivative: dy/dx = sigmoid(beta*x) = 1 / (1 + exp(-beta*x)).
+  // beta is a fixed (non-trainable) constructor parameter stored in
+  // FFloatSt[0] for serialization (default 1.0). Requires beta > 0.
+  // Numerically stable: for large beta*x, ln(1+exp(z))/beta ~= x; the
+  // sigmoid derivative uses a sign branch to avoid Exp overflow.
+  // The derivative is cached in FOutputErrorDeriv so TNNetReLUBase handles
+  // the backward chain rule with one multiply.
+  TNNetSoftPlusBeta = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pBeta: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
+  /// SoftExponential parametric activation (Godfrey & Gashler, 2015) with a
+  // fixed alpha hyperparameter:
+  //   alpha < 0:  y = -ln(1 - alpha*(x + alpha)) / alpha
+  //   alpha = 0:  y = x
+  //   alpha > 0:  y = (exp(alpha*x) - 1)/alpha + alpha
+  // Derivative:
+  //   alpha < 0:  dy/dx = 1 / (1 - alpha*(alpha + x))
+  //   alpha = 0:  dy/dx = 1
+  //   alpha > 0:  dy/dx = exp(alpha*x)
+  // alpha is a fixed (non-trainable) constructor parameter stored in
+  // FFloatSt[0] for serialization (default 0.0 = identity).
+  // DOMAIN CONSTRAINT: for alpha < 0 the logarithm argument
+  // (1 - alpha*(x + alpha)) must stay strictly positive, i.e.
+  // x < 1/alpha - alpha; keep inputs bounded when using a negative alpha.
+  // The derivative is cached in FOutputErrorDeriv so TNNetReLUBase handles
+  // the backward chain rule with one multiply.
+  // https://arxiv.org/abs/1602.01321
+  TNNetSoftExponential = class(TNNetReLUBase)
+  public
+    constructor Create(); overload;
+    constructor Create(pAlpha: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Inverse Square Root Unit (ISRU) activation function:
   // y = x / sqrt(1 + alpha * x^2). Smooth everywhere.
   // Derivative: dy/dx = (1 / sqrt(1 + alpha*x^2))^3 = 1 / (1 + alpha*x^2)^(3/2).
@@ -8235,6 +8276,162 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetSoftPlusBeta }
+
+constructor TNNetSoftPlusBeta.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetSoftPlusBeta.Create(pBeta: TNeuralFloat);
+begin
+  inherited Create();
+  if pBeta <= 0 then
+    FErrorProc('TNNetSoftPlusBeta requires beta > 0.');
+  FFloatSt[0] := pBeta;
+end;
+
+procedure TNNetSoftPlusBeta.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  Beta, InvBeta, x, BetaX: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Beta := FFloatSt[0];
+  if Beta <= 0 then Beta := 1.0;
+  InvBeta := 1.0 / Beta;
+
+  // y = (1/beta) * ln(1 + exp(beta*x)); derivative = sigmoid(beta*x).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      BetaX := Beta * x;
+      // Numerically stable softplus: for large beta*x, ln(1+exp(z))/beta ~= x.
+      if BetaX > 30 then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := InvBeta * Ln(1 + Exp(BetaX));
+      // Derivative is sigmoid(beta*x). Sign-branch guards Exp overflow.
+      if BetaX > 30 then
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0
+      else if BetaX < -30 then
+        FOutputErrorDeriv.FData[OutputCnt] := Exp(BetaX)
+      else
+        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + Exp(-BetaX));
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      BetaX := Beta * x;
+      if BetaX > 30 then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := InvBeta * Ln(1 + Exp(BetaX));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSoftExponential }
+
+constructor TNNetSoftExponential.Create();
+begin
+  Create(0.0);
+end;
+
+constructor TNNetSoftExponential.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pAlpha;
+end;
+
+procedure TNNetSoftExponential.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  Alpha, InvAlpha, x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Alpha := FFloatSt[0];
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    if Alpha = 0 then
+    begin
+      for OutputCnt := 0 to SizeM1 do
+      begin
+        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end;
+    end
+    else if Alpha < 0 then
+    begin
+      InvAlpha := 1.0 / Alpha;
+      for OutputCnt := 0 to SizeM1 do
+      begin
+        x := LocalPrevOutput.FData[OutputCnt];
+        // y = -ln(1 - alpha*(x + alpha)) / alpha; argument must stay > 0.
+        FOutput.FData[OutputCnt] := -Ln(1 - Alpha * (x + Alpha)) * InvAlpha;
+        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 - Alpha * (Alpha + x));
+      end;
+    end
+    else
+    begin
+      InvAlpha := 1.0 / Alpha;
+      for OutputCnt := 0 to SizeM1 do
+      begin
+        x := LocalPrevOutput.FData[OutputCnt];
+        // y = (exp(alpha*x) - 1)/alpha + alpha; derivative = exp(alpha*x).
+        FOutput.FData[OutputCnt] := (Exp(Alpha * x) - 1) * InvAlpha + Alpha;
+        FOutputErrorDeriv.FData[OutputCnt] := Exp(Alpha * x);
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    if Alpha = 0 then
+    begin
+      for OutputCnt := 0 to SizeM1 do
+        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+    end
+    else if Alpha < 0 then
+    begin
+      InvAlpha := 1.0 / Alpha;
+      for OutputCnt := 0 to SizeM1 do
+      begin
+        x := LocalPrevOutput.FData[OutputCnt];
+        FOutput.FData[OutputCnt] := -Ln(1 - Alpha * (x + Alpha)) * InvAlpha;
+      end;
+    end
+    else
+    begin
+      InvAlpha := 1.0 / Alpha;
+      for OutputCnt := 0 to SizeM1 do
+      begin
+        x := LocalPrevOutput.FData[OutputCnt];
+        FOutput.FData[OutputCnt] := (Exp(Alpha * x) - 1) * InvAlpha + Alpha;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetGaussianActivation }
@@ -27525,6 +27722,8 @@ begin
       'TNNetSmish' :                Result := TNNetSmish.Create();
       'TNNetPenalizedTanh' :        Result := TNNetPenalizedTanh.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
+      'TNNetSoftPlusBeta' :         Result := TNNetSoftPlusBeta.Create(Ft[0]);
+      'TNNetSoftExponential' :      Result := TNNetSoftExponential.Create(Ft[0]);
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
       'TNNetLogSigmoid' :           Result := TNNetLogSigmoid.Create();
@@ -27744,6 +27943,8 @@ begin
       if S[0] = 'TNNetSmish' then Result := TNNetSmish.Create() else
       if S[0] = 'TNNetPenalizedTanh' then Result := TNNetPenalizedTanh.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
+      if S[0] = 'TNNetSoftPlusBeta' then Result := TNNetSoftPlusBeta.Create(Ft[0]) else
+      if S[0] = 'TNNetSoftExponential' then Result := TNNetSoftExponential.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
       if S[0] = 'TNNetLogSigmoid' then Result := TNNetLogSigmoid.Create() else
