@@ -44,6 +44,26 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
+- [ ] Early-exit / adaptive-inference demo (`examples/EarlyExitNetwork/`) — the
+      BranchyNet (Teerapittayanon et al. 2016) "anytime inference" pattern, which
+      nothing in the tree covers yet. Build ONE trunk of stacked FC+ReLU (or conv)
+      blocks with an AUXILIARY softmax classifier head branching off after each
+      intermediate block as well as the final block, on a synthetic difficulty-
+      graded N-class task (mix easy well-separated blobs with hard near-the-margin
+      points). Train ALL heads JOINTLY by summing their cross-entropy losses (deep
+      supervision via existing `TNNetConcat`/split-free parallel heads + a manual
+      multi-head loss loop, no new layer type needed). Then at INFERENCE run a
+      confidence-gated dynamic-compute policy: walk heads shallow→deep and EXIT at
+      the first head whose softmax max-prob exceeds a threshold tau, recording the
+      exit depth per sample. Sweep tau and chart the accuracy-vs-average-exit-depth
+      (i.e. accuracy vs FLOPs saved, reusing `TNNet.CountFLOPsPerLayer`) trade-off
+      curve as an ASCII plot, showing easy samples leave early while hard ones run
+      the full depth. Two built-in invariants: tau=1.0 forces every sample to the
+      final head (== the plain full-depth net's accuracy, bit-for-bit) and average
+      exit depth is monotone non-decreasing in tau. This is DISTINCT from the
+      existing PredictionDepth example (a post-hoc k-NN probe on a FIXED single-head
+      net measuring where it "makes up its mind") — here the early heads are TRAINED
+      and actually gate compute. README should spell out that contrast explicitly.
 <!-- (Activation-steering / concept-vector demo removed: completed, landed
      2026-05-24 as examples/ActivationSteering/. Trains a small softmax
      classifier on a synthetic sign(x0) two-cluster task, computes the
