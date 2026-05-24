@@ -329,11 +329,16 @@ breakdown:
       S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
       The activation has landed, so this is a ~30-line activation swap.
 #### Probability projections / sparsity
-- [X] TNNetGumbelSoftmax — differentiable categorical sampling:
-      `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
-      (soft / hard straight-through).
+- [ ] TNNetGumbelSoftmax follow-up (now landed): temperature-annealing
+      micro-experiment — train a tiny discrete-latent autoencoder whose
+      bottleneck is a `TNNetGumbelSoftmax`, anneal `tau` from ~2.0 down to
+      ~0.1 over training, and chart reconstruction loss vs `tau` plus the
+      bottleneck's output entropy (the categorical sharpens as tau drops).
+      The layer + its soft/hard modes are in tree; this is the headline
+      use case. Pairs with the open TNNetMixtureOfExperts routing gate.
 - [ ] TNNetMixtureOfExperts — top-k softmax gate over N expert sub-networks
-      plus a load-balancing auxiliary loss.
+      plus a load-balancing auxiliary loss. (The just-landed
+      TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
 
 #### Normalization primitives
 - [ ] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
@@ -1158,120 +1163,33 @@ breakdown:
       Pairs naturally with the active-learning queue use of
       [[MCDropoutUncertaintyReport]] and the hard-example pools of
       `TopLogitMarginReport` / `ConfusionMatrixReport`.
-- [X] TNNet.ActivationPatchingReport(NN, CleanInput, CorruptInput
-      [, TargetIdx]) — a **causal** mechanistic-interpretability diagnostic
-      (activation patching / causal tracing; Vig et al. 2020, Meng et al.
-      ROME 2022, Wang et al. IOI 2022) answering a question NONE of the
-      landed reports answer: *"which layer's activations CARRY the
-      information that decides this prediction?"* — measured by intervention,
-      not correlation. The recipe: take a `(CleanInput, CorruptInput)` pair
-      the trained net maps to different argmax classes (two samples of
-      different true class, or one sample and a noised/blanked copy). Run a
-      clean forward and cache every layer's `Output`; run a corrupt forward;
-      then for each intermediate layer L in turn, restore that single layer's
-      cached CLEAN activation into the corrupt run (overwrite
-      `FLayers[L].Output` via `CopyNoChecks`) and recompute layers L+1..last
-      (the existing per-layer `Compute()` loop / `Compute(pInput,
-      FromLayerIdx)` machinery already forwards from a layer), reading off the
-      **recovery** `r_L = (logit_c(patch_L) - logit_c(corrupt)) /
-      (logit_c(clean) - logit_c(corrupt))` where `c` is the clean argmax class
-      (`TargetIdx`, default = clean argmax). `r_L≈1` ⇒ patching layer L alone
-      restores the clean decision (the information lives there / is read by
-      the rest of the net); `r_L≈0` ⇒ that layer carries nothing causal for
-      this contrast. Reports: a per-layer `r_L` ASCII bar chart across depth
-      (the causal-trace curve — the headline plot), the argmax-flip layer
-      (shallowest L whose patch flips the corrupt argmax back to `c`), the
-      peak-recovery layer and its `r_L`, an early-/late-/distributed
-      localisation verdict, and a per-layer un-normalised delta-logit column
-      (`logit_c(patch_L) - logit_c(corrupt)`) so a near-zero normalisation
-      denominator is visible. Built-in correctness checks: patching the INPUT
-      layer (L=0) gives `r_0 == 1` exactly (it reconstructs the full clean
-      run — the faithfulness check), patching the LAST layer gives
-      `r_last == 1` exactly (its output IS the logits), `CorruptInput :=
-      CleanInput` collapses the denominator so the report warns rather than
-      dividing by zero, and the net's live state is restored by a final clean
-      recompute. **Distinct from** [[SaliencyReport]] /
-      `AdversarialRobustnessReport` (INPUT-space gradient attribution — which
-      pixels matter, a correlational gradient, not a layer-localising causal
-      intervention), from `LayerSensitivityReport` (jitters WEIGHTS with
-      random Gaussian noise and measures output drift — perturbation
-      magnitude, never swaps real activations between two inputs), from
-      `FisherImportanceReport` (per-PARAMETER importance averaged over a
-      batch, not a per-layer causal recovery on one contrastive pair), and
-      from `LinearProbeReport` / `FeatureSeparabilityReport` (decodability /
-      geometry — what's PRESENT in a layer, not what the rest of the net
-      causally USES). Forward-only (no backward pass, no weight steps); the
-      only mutation is the transient activation overwrite, reverted by the
-      final clean recompute. Follows the introspection-report-pattern:
-      declaration + impl in neuralnetwork.pas, an `examples/ActivationPatching/`
-      demo on a synthetic task where the causal layer is KNOWN by construction
-      (a 2-stage net whose stage 1 must compute an intermediate feature the
-      clean/corrupt pair differ on, so the trace peaks at the stage boundary —
-      a ground-truth localisation check), and a smoke test in tests/ (non-empty
-      report, expected header, nil-NN graceful return, plus the `r_0==1` /
-      `r_last==1` exact-recovery assertions).
-- [X] TNNet.IntrinsicDimensionReport(NN, Probes [, MaxFeatDim]) — a forward-only
-      **representation-geometry** diagnostic answering a question none of the
-      landed reports answer: *"how many effective dimensions does each layer's
-      activation cloud actually occupy?"* — the dimensionality of the data
-      MANIFOLD the batch traces out at each depth, not its class structure or
-      its neuron redundancy. For every trainable layer it runs one forward pass
-      over an (unlabelled) probe batch, flattens each sample to a row of an
-      `N x D_l` matrix, and reports TWO complementary intrinsic-dimension
-      estimates side by side: (1) the **linear / PCA** ID via the participation
-      ratio of the activation COVARIANCE eigenspectrum `PR = (sum lambda)^2 /
-      sum lambda^2` (eigenvalues from the smaller `N x N` or `D x D` Gram matrix
-      via the SAME self-contained Double-precision cyclic Jacobi eigensolver
-      `WeightSpectralTailReport` already ships — no new numerical code), i.e.
-      "how many principal components hold the variance"; and (2) the **TwoNN**
-      nonlinear estimator (Facco, Rodriguez, Glielmo & Laio 2017, *Estimating
-      the intrinsic dimension of datasets by a minimal neighbourhood
-      information*): for each sample take the ratio `mu_i = r2_i / r1_i` of its
-      2nd-to-1st nearest-neighbour (Euclidean) distances, sort the `mu_i`, and
-      read the manifold dimension `d` off the closed-form MLE / least-squares
-      slope of `-log(1 - F(mu))` against `log(mu)` (a single line fit through
-      the origin — no SGD, no matrix solve). The GAP between the (larger) linear
-      PCA ID and the (smaller) nonlinear TwoNN ID is itself the headline number:
-      a representation can sit on a low-dimensional CURVED manifold that PCA
-      over-counts. Reports per layer both IDs, the linear/nonlinear gap, a
-      `D_l`-normalised "compression ratio" `TwoNN_ID / D_l`, a per-layer
-      ID-across-depth ASCII bar chart, and `expanded` / `compressed` /
-      near-`full-rank` flags; over-wide layers are deterministically
-      random-projected to `MaxFeatDim` (default 256) to bound the pairwise-
-      distance and eigensolve cost, reusing the projection trick already in
-      [[LinearProbeReport]] / `FeatureSeparabilityReport`. The story for the
-      example is the famous "hunchback" ID profile of Ansuini, Laio, Macke &
-      Zoccolan 2019 (*Intrinsic dimension of data representations in deep
-      networks*): the ID first EXPANDS in the early layers then CONTRACTS
-      monotonically toward the output, and the final-layer ID predicts
-      generalization — so the example contrasts a fresh-init net (flat, near-
-      input ID at every layer) against a trained net (the expand-then-contract
-      curve emerges). Built-in correctness checks: a batch sampled from a known
-      `k`-dimensional linear subspace embedded in a higher-`D` space recovers
-      `PCA_ID ~ k` and `TwoNN_ID ~ k` (the faithfulness check), identical
-      samples drive both IDs to ~0, an isotropic full-rank Gaussian gives
-      `PCA_ID ~ min(N-1, D)`, and the PCA eigenvalues are non-negative (PSD).
-      **Distinct from** `NeuronCorrelationReport` (its participation ratio is
-      over the neuron-neuron Pearson CORRELATION matrix — *linear redundancy
-      among the feature AXES*, "effective neuron count"; this measures the
-      dimensionality of the sample CLOUD in activation space and adds the
-      nonlinear TwoNN manifold estimator the correlation view cannot see), from
-      `FeatureSeparabilityReport` (label-aware class scatter / cluster geometry —
-      needs labels and asks about between-vs-within-class spread, not the
-      unlabelled manifold dimension), from `RepresentationSimilarityReport`
-      (CKA *between two layers* — relative similarity, not an absolute per-layer
-      dimension), and from `WeightSpectrumReport` / `WeightSpectralTailReport`
-      (spectra of the WEIGHT tensors, not the activation cloud). Follows the
-      [[introspection-report-pattern]]: declaration + impl in neuralnetwork.pas,
-      an `examples/IntrinsicDimension/` demo (fresh-vs-trained hunchback
-      contrast plus the known-`k`-subspace ground-truth recovery so the estimate
-      is visibly correct in one run), and a smoke test in tests/ (non-empty
-      report, expected header, nil-NN graceful return, plus the known-`k`-
-      subspace `ID ~ k` recovery and identical-samples `ID ~ 0` assertions).
-      Pure forward-only — `NN.Compute` only, weights never touched, no backward
-      pass. Pairs naturally with the open grokking / lottery-ticket experiments
-      ([[WeightSpectrumReport]]) — watching the final-layer ID drop is a clean
-      single-number window into representation compression during training.
+- [ ] ActivationPatchingReport follow-up (now landed): the report and example
+      shipped, but a KEY finding emerged — on a strictly FEEDFORWARD stack,
+      whole-layer patching + downstream recompute lands on the clean-class
+      manifold at EVERY layer, so `r_L ≈ 1` is flat and nothing localises. The
+      landed example works around this with a BRANCHED net (a raw-input skip
+      fused by `Concat`) so the trace is graded by construction (main-branch
+      patches recover ~0.04, recovery jumps to 1.0 at the fusion layer). The
+      genuine follow-up is finer granularity that DOES localise on a plain
+      feedforward net: per-NEURON / per-CHANNEL activation patching (restore a
+      single channel's clean activation, not the whole layer) and/or the
+      "denoising" direction (patch a CLEAN activation into a CORRUPT run vs the
+      reverse). Add a `Granularity` flag (layer | channel) on top of the landed
+      whole-layer path.
+- [ ] IntrinsicDimensionReport follow-up (now landed): the PCA participation
+      ratio under-counts a known `k`-dim RANDOM subspace (lands ~2.4 for k=3,
+      since PR equals `k` only when the `k` eigenvalues are EQUAL); TwoNN gives
+      the cleaner ~k. The smoke test bands `PCA_ID` loosely as a result. Worth a
+      doc note (or an equal-variance subspace generator in the example so the
+      PCA estimate also reads ~k), and consider reporting the spectral
+      `effective rank exp(entropy(lambda))` alongside PR as a less variance-skewed
+      linear-ID estimate.
+- [ ] IntrinsicDimensionReport follow-up: a training-trajectory variant that
+      calls the report every N epochs on a fixed probe set and charts the
+      final-layer ID dropping over training — a single-number window into
+      representation compression. Pairs with the open grokking / lottery-ticket
+      experiments ([[WeightSpectrumReport]]) and mirrors the open
+      FeatureSeparabilityReport training-trajectory follow-up.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
       label-free model selection) was simplified to a fresh-vs-trained contrast
