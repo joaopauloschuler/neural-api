@@ -363,8 +363,6 @@ breakdown:
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
       is smoothing improves calibration at a small accuracy cost. Both pieces
       (the loss and the calibration report) have landed.
-- [ ] TNNetTripletLoss — `max(0, ||a-p||² - ||a-n||² + margin)`. Input
-      depth split into 3 equal anchor/positive/negative chunks.
 - [ ] TNNetContrastiveLoss / InfoNCE — input split into query/key, computes
       InfoNCE against other samples in the minibatch.
 - [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated

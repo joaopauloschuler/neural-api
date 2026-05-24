@@ -192,6 +192,9 @@ type
     procedure TestLabelSmoothingLossForwardPassthrough;
     procedure TestLabelSmoothingLossTransform;
     procedure TestLabelSmoothingLossLoadFromString;
+    procedure TestTripletLossForwardPassthrough;
+    procedure TestTripletLossGradient;
+    procedure TestTripletLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -16675,6 +16678,215 @@ begin
       Expected := Probs[i] - SmoothTarget;
       AssertEquals('LabelSmoothingLoss eps round-trip at ' + IntToStr(i),
         Expected, LMid.OutputError.Raw[i], 1e-6);
+    end;
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTripletLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetTripletLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetTripletLoss.Create(1.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 2.0 - 0.3;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('TripletLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTripletLossGradient;
+const
+  cEps = 1e-4;
+  cDepth = 6;       // d = 2 per chunk (a|p|n)
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Margin: TNeuralFloat;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i, CaseIdx: integer;
+
+  function TripletLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j, ChunkD: integer;
+    a, p, n, DistAP, DistAN, Hinge: TNeuralFloat;
+  begin
+    ChunkD := AInput.Depth div 3;
+    DistAP := 0;
+    DistAN := 0;
+    for j := 0 to ChunkD - 1 do
+    begin
+      a := AInput[0, 0, j];
+      p := AInput[0, 0, j + ChunkD];
+      n := AInput[0, 0, j + 2 * ChunkD];
+      DistAP := DistAP + (a - p) * (a - p);
+      DistAN := DistAN + (a - n) * (a - n);
+    end;
+    Hinge := DistAP - DistAN + Margin;
+    if Hinge > 0 then Result := Hinge else Result := 0;
+  end;
+
+begin
+  // CaseIdx 0: hinge ACTIVE (positive far, negative close) -> nonzero grad.
+  // CaseIdx 1: hinge INACTIVE (positive close, negative far, big slack) -> 0.
+  for CaseIdx := 0 to 1 do
+  begin
+    Margin := 1.0;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(1, 1, cDepth);
+    Target := TNNetVolume.Create(1, 1, cDepth);
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetTripletLoss.Create(Margin));
+
+      if CaseIdx = 0 then
+      begin
+        // anchor a = (0.5, -0.2)
+        Input[0, 0, 0] :=  0.5;  Input[0, 0, 1] := -0.2;
+        // positive p far from a, negative n close to a -> hinge active.
+        Input[0, 0, 2] :=  1.4;  Input[0, 0, 3] :=  0.9;
+        Input[0, 0, 4] :=  0.55; Input[0, 0, 5] := -0.15;
+      end
+      else
+      begin
+        // positive p close to a, negative n far -> margin satisfied, hinge 0.
+        Input[0, 0, 0] :=  0.5;  Input[0, 0, 1] := -0.2;
+        Input[0, 0, 2] :=  0.52; Input[0, 0, 3] := -0.18;
+        Input[0, 0, 4] := -3.0;  Input[0, 0, 5] :=  3.0;
+      end;
+      // No external target needed; triplet loss ignores it. Fill with zeros.
+      Target.Fill(0);
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      for i := 0 to Input.Size - 1 do
+      begin
+        AnaGrad := LMid.OutputError.Raw[i];
+
+        if CaseIdx = 1 then
+        begin
+          AssertEquals('TripletLoss inactive-hinge grad is zero at ' +
+            IntToStr(i), 0.0, AnaGrad, 1e-6);
+          continue;
+        end;
+
+        OldV := Input.Raw[i];
+        Input.Raw[i] := OldV + cEps;
+        LossP := TripletLossAt(Input);
+        Input.Raw[i] := OldV - cEps;
+        LossM := TripletLossAt(Input);
+        Input.Raw[i] := OldV;
+        NumGrad := (LossP - LossM) / (2 * cEps);
+
+        AssertEquals('TripletLoss active-hinge grad at ' + IntToStr(i),
+          NumGrad, AnaGrad, 1e-3);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTripletLossLoadFromString;
+const
+  cMargin = 0.5;
+  cDepth  = 6;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Saved: string;
+  ChunkD, j: integer;
+  a, p, n, DistAP, DistAN: TNeuralFloat;
+  Expected: TNeuralFloat;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetTripletLoss.Create(cMargin));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetTripletLoss',
+      NN2.GetLastLayer is TNNetTripletLoss);
+    // The structure string encodes FFloatSt[0]; equality proves the
+    // non-default margin survived the save/load cycle.
+    AssertEquals('TripletLoss round-trip structure preserves margin',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+
+    // Drive an ACTIVE hinge so the loaded margin is exercised in the grad.
+    Input[0, 0, 0] :=  0.5;  Input[0, 0, 1] := -0.2;
+    Input[0, 0, 2] :=  1.4;  Input[0, 0, 3] :=  0.9;
+    Input[0, 0, 4] :=  0.55; Input[0, 0, 5] := -0.15;
+    Target.Fill(0);
+
+    NN2.Compute(Input);
+    NN2.Backpropagate(Target);
+
+    ChunkD := cDepth div 3;
+    DistAP := 0;
+    DistAN := 0;
+    for j := 0 to ChunkD - 1 do
+    begin
+      a := Input[0, 0, j];
+      p := Input[0, 0, j + ChunkD];
+      n := Input[0, 0, j + 2 * ChunkD];
+      DistAP := DistAP + (a - p) * (a - p);
+      DistAN := DistAN + (a - n) * (a - n);
+    end;
+    // Sanity: hinge must be active with this configuration and margin=0.5.
+    AssertTrue('TripletLoss round-trip uses active hinge',
+      (DistAP - DistAN + cMargin) > 0);
+
+    LMid := NN2.Layers[1] as TNNetIdentity;
+    for i := 0 to ChunkD - 1 do
+    begin
+      a := Input[0, 0, i];
+      p := Input[0, 0, i + ChunkD];
+      n := Input[0, 0, i + 2 * ChunkD];
+      // dL/da = 2*(n - p)
+      Expected := 2.0 * (n - p);
+      AssertEquals('TripletLoss round-trip dL/da at ' + IntToStr(i),
+        Expected, LMid.OutputError[0, 0, i], 1e-5);
+      // dL/dp = -2*(a - p)
+      Expected := -2.0 * (a - p);
+      AssertEquals('TripletLoss round-trip dL/dp at ' + IntToStr(i),
+        Expected, LMid.OutputError[0, 0, i + ChunkD], 1e-5);
+      // dL/dn = 2*(a - n)
+      Expected := 2.0 * (a - n);
+      AssertEquals('TripletLoss round-trip dL/dn at ' + IntToStr(i),
+        Expected, LMid.OutputError[0, 0, i + 2 * ChunkD], 1e-5);
     end;
   finally
     NN.Free;

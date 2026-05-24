@@ -1476,6 +1476,35 @@ type
     constructor Create(); override;
   end;
 
+  /// Triplet-margin loss output layer for metric / embedding learning.
+  // The input depth is split into 3 EQUAL contiguous chunks of size
+  // d = Depth div 3 (Depth mod 3 must be 0, validated in SetPrevLayer):
+  //   anchor   a = input[ 0 .. d-1   ]
+  //   positive p = input[ d .. 2d-1  ]
+  //   negative n = input[ 2d .. 3d-1 ]
+  // Per spatial (X,Y) cell the loss is the hinge
+  //   L = max(0, ||a - p||^2 - ||a - n||^2 + margin)
+  // (summed over all cells, matching the per-cell aggregation of the sibling
+  // loss heads). Unlike the regression/classification heads there is NO
+  // external target tensor: the supervision is implicit in the a|p|n layout,
+  // so Backpropagate ignores the framework-seeded residual and reads FOutput
+  // directly. When the hinge is ACTIVE (inside-max term > 0) the gradients
+  // written into the three depth slices of FOutputError are
+  //   dL/da =  2*(n - p)      dL/dp = -2*(a - p)      dL/dn = 2*(a - n)
+  // When the hinge is INACTIVE (margin satisfied) all three slices are 0.
+  // The forward pass is an identity passthrough (so Net.Compute returns the
+  // raw a|p|n embedding). margin is stored in FFloatSt[0] (default 1.0,
+  // must be >= 0) and round-trips via Save/Load. No trainable parameters;
+  // output shape equals input shape.
+  TNNetTripletLoss = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pMargin: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -8800,6 +8829,86 @@ end;
 constructor TNNetDiceLoss.Create();
 begin
   inherited Create(0.5, 0.5, 1.0);
+end;
+
+{ TNNetTripletLoss }
+
+constructor TNNetTripletLoss.Create();
+begin
+  Create(1.0);
+end;
+
+constructor TNNetTripletLoss.Create(pMargin: TNeuralFloat);
+begin
+  inherited Create();
+  if pMargin < 0 then
+    FErrorProc('TNNetTripletLoss margin must be >= 0.');
+  FFloatSt[0] := pMargin;
+end;
+
+procedure TNNetTripletLoss.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 3) <> 0 then
+  begin
+    FErrorProc('TNNetTripletLoss requires input depth divisible by 3. ' +
+      'Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+end;
+
+procedure TNNetTripletLoss.Backpropagate();
+var
+  StartTime: double;
+  Margin, a, p, n, DistAP, DistAN, Hinge: TNeuralFloat;
+  MaxX, MaxY, D, ChunkD, X, Y: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Margin := FFloatSt[0];
+  if Margin < 0 then Margin := 1.0;
+  ChunkD := FOutput.Depth div 3;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  // Per spatial cell: accumulate the squared distances over the chunk, decide
+  // whether the hinge is active, then write the 3 gradient slices (or zeros).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      DistAP := 0;
+      DistAN := 0;
+      for D := 0 to ChunkD - 1 do
+      begin
+        a := FOutput[X, Y, D];
+        p := FOutput[X, Y, D + ChunkD];
+        n := FOutput[X, Y, D + 2 * ChunkD];
+        DistAP := DistAP + (a - p) * (a - p);
+        DistAN := DistAN + (a - n) * (a - n);
+      end;
+      Hinge := DistAP - DistAN + Margin;
+      for D := 0 to ChunkD - 1 do
+      begin
+        if Hinge > 0 then
+        begin
+          a := FOutput[X, Y, D];
+          p := FOutput[X, Y, D + ChunkD];
+          n := FOutput[X, Y, D + 2 * ChunkD];
+          // dL/da = 2*(n - p), dL/dp = -2*(a - p), dL/dn = 2*(a - n)
+          FOutputError[X, Y, D]              := 2.0 * (n - p);
+          FOutputError[X, Y, D + ChunkD]     := -2.0 * (a - p);
+          FOutputError[X, Y, D + 2 * ChunkD] := 2.0 * (a - n);
+        end
+        else
+        begin
+          FOutputError[X, Y, D]              := 0;
+          FOutputError[X, Y, D + ChunkD]     := 0;
+          FOutputError[X, Y, D + 2 * ChunkD] := 0;
+        end;
+      end;
+    end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
 end;
 
 { TNNetWingLoss }
@@ -36031,6 +36140,7 @@ begin
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
       'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
       'TNNetDiceLoss' :             Result := TNNetDiceLoss.Create();
+      'TNNetTripletLoss' :          Result := TNNetTripletLoss.Create(Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -36279,6 +36389,7 @@ begin
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
       if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else
       if S[0] = 'TNNetDiceLoss' then Result := TNNetDiceLoss.Create() else
+      if S[0] = 'TNNetTripletLoss' then Result := TNNetTripletLoss.Create(Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
