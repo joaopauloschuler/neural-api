@@ -1015,153 +1015,32 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
-- [ ] TNNet.HessianCurvatureReport(NN, Samples [, NumProbes, Eps]) — a
-      *loss-surface curvature* diagnostic built on Hessian-vector products
-      (HVPs) estimated by finite-differencing the gradient
-      (`H v ~= (grad L(theta + eps*v) - grad L(theta - eps*v)) / (2*eps)`), so
-      no second-order autograd is needed: it reuses the existing whole-batch
-      forward+backward gradient machinery and the exact
-      `SaveDataToString`/`LoadDataFromString` weight snapshot/restore pattern
-      that [[LayerSensitivityReport]] already uses to perturb and restore
-      weights bit-for-bit between probes. On a frozen net (`ClearDeltas`
-      before each pass, never `UpdateWeights`) it reports two classic
-      sharpness numbers the repo currently can't produce: (1) the **Hessian
-      trace** `tr(H) = E_v[v^T H v]` via the Hutchinson estimator over
-      `NumProbes` (default 16) Rademacher (+/-1) probe vectors `v` — the *mean*
-      curvature averaged over all directions; and (2) the **top Hessian
-      eigenvalue** `lambda_max(H)` via a few power-iteration steps on the HVP
-      operator (the canonical flat-vs-sharp-minimum metric, Keskar et al. 2017
-      / Foret et al. SAM 2021). It prints `tr(H)`, `lambda_max`, the
-      curvature-concentration ratio `lambda_max / (tr(H)/N_params)` (how
-      dominant the sharpest direction is), a per-trainable-layer trace
-      breakdown (which layers carry the curvature — restrict each HVP
-      dot-product to one layer's parameter slab), a 10-bin ASCII histogram of
-      the per-probe `v^T H v` samples (Hutchinson spread = estimator noise),
-      and a flat / moderate / sharp verdict thresholded on `lambda_max`.
-      Built-in correctness checks: a purely linear net with an MSE head has a
-      constant Hessian, so `tr(H)` must be probe-count-independent (re-running
-      with 2x NumProbes returns the same value within Hutchinson noise), and
-      `lambda_max <= tr(H)` must hold in the PSD Gauss-Newton regime. Reuses
-      the power-iteration idea behind [[WeightSpectrumReport]]'s
-      `TNNet.EstimateSpectralNorm` but applied to the *loss* HVP operator
-      rather than a weight matrix. Distinct from [[LossLandscapeProbe]] (a
-      *single* filter-normalised 1D slice — one direction's second difference;
-      this aggregates curvature over many random directions and isolates the
-      sharpest one), from `TNNet.WeightSpectrumReport` (top singular value of
-      each *weight matrix* W, a parameter-space quantity unrelated to the
-      *loss* Hessian), and from [[FisherImportanceReport]] (diagonal empirical
-      `E[g^2]`, an outer-product Gauss-Newton approximation, not the true HVP
-      curvature). Companion `examples/HessianCurvature/` trains the same tiny
-      MLP twice — once with a small batch + high LR (sharp minimum) and once
-      with a large batch + low LR / mild weight decay (flat minimum) — and
-      prints both reports so the `lambda_max` gap the generalization
-      literature ties to sharpness is visible on a pure-CPU toy. Add a
-      `TestHessianCurvatureReportSmoke` pinning the linear-net
-      probe-count-independence invariant and a nil-NN graceful return. Weights
-      are never stepped (a measurement, not training).
-- [ ] TNNet.GradientNoiseScaleReport(NN, Samples [, LayerIdx]) — the
-      *gradient signal-to-noise* diagnostic that analytically PREDICTS the
-      already-open "batch-size sweep" experiment (McCandlish et al. 2018,
-      "An Empirical Model of Large-Batch Training"). On a frozen net
-      (`ClearDeltas` before each sample, never `UpdateWeights`) it runs one
-      forward + one backward per labelled sample and snapshots each sample's
-      full flattened per-parameter weight-gradient vector `g_i` — reusing the
-      exact per-sample gradient machinery [[GradientConflictReport]] and
-      [[FisherImportanceReport]] already established (no input-gradient
-      enablement). From the batch it forms the mean gradient `g_bar` and the
-      per-parameter gradient variance across samples, then reports: the
-      per-parameter **gradient SNR** `|g_bar_k| / (std_k + eps)` as a 10-bin
-      ASCII histogram and a per-layer mean (which layers carry a clean signal
-      vs which are noise-dominated); the **simple noise scale**
-      `B_simple = tr(Sigma) / ||g_bar||^2` (`Sigma` = per-sample gradient
-      covariance, estimated as `mean_i||g_i||^2 - ||g_bar||^2` over the batch)
-      — the McCandlish "critical batch size" beyond which larger batches stop
-      buying faster convergence; the **effective-batch curve** that turns
-      B_simple into a noise-vs-batch table (`noise(B) = B_simple/B`) so the
-      sweet-spot batch size is readable directly; and per-layer flags
-      (signal-dominated / noise-dominated, and the layer with the largest
-      noise scale — the one that most wants a bigger batch). An optional
-      `LayerIdx` restricts every statistic to one trainable layer's gradient
-      slab (the head and the stem usually have very different noise scales).
-      Built-in correctness checks: feeding the SAME sample N times must drive
-      the variance term and hence B_simple to ~0 (identical gradients =
-      pure signal), and a single-sample batch must emit a clear "need >= 2
-      samples to estimate gradient variance" message rather than dividing by
-      zero. Distinct from [[GradientConflictReport]] (pairwise cosine
-      *direction* agreement — "do samples fight?"; this measures *magnitude*
-      dispersion — "how noisy is the averaged step?"), from
-      [[FisherImportanceReport]] (per-parameter `E[g^2]` importance for
-      pruning/EWC, not a mean-vs-variance ratio), and from the single-pass
-      [[GradientNormReport]] (one whole-batch gradient magnitude, no
-      per-sample spread). Companion `examples/GradientNoiseScale/` on a small
-      synthetic classifier that contrasts a clean linearly-separable batch
-      (high SNR, tiny B_simple — small batches already near-optimal) against a
-      label-noised / overlapping batch (low SNR, large B_simple — bigger
-      batches genuinely help), printing the predicted critical batch size next
-      to a quick empirical batch-size sweep so the prediction can be eyeballed
-      against reality. Add a `TestGradientNoiseScaleReportSmoke` pinning the
-      identical-sample zero-variance invariant and the single-sample warning
-      path. Weights are never stepped (a measurement, not training).
-- [ ] TNNet.WeightSpectralTailReport(NN [, MaxMatrixDim]) — a *heavy-tailed
-      self-regularization* (HT-SR) diagnostic that predicts per-layer training
-      quality from the WEIGHTS ALONE — no probe batch, no labels, no test set
-      (Martin, Mahoney & Peng 2021, Nature Communications, "Predicting trends
-      in the quality of state-of-the-art neural networks without access to
-      training or test data"; the WeightWatcher `alpha` metric). For every
-      trainable layer it forms the smaller Gram matrix of the reshaped weight
-      tensor (`W^T W` when out >= in, else `W W^T`), computes its FULL
-      eigenvalue spectrum `{lambda_i}` (= the squared singular values of W) with
-      a self-contained symmetric **cyclic Jacobi eigensolver** in Double
-      precision (~50 lines; no external dependency, mirrors the in-tree
-      Gauss-Jordan solve `LinearProbeReport` already ships), and fits a
-      power-law `rho(lambda) ~ lambda^(-alpha)` to the upper tail via the
-      standard Clauset/Hill MLE
-      `alpha = 1 + n / sum_i ln(lambda_i / lambda_min)` swept over candidate
-      `lambda_min` cut points (pick the cut minimising the KS distance to the
-      fitted power law). It reports, per layer: the **power-law exponent
-      alpha** (the headline HT-SR quality number — well-trained layers land in
-      `alpha in [2, 4]`; `alpha > 6` flags an under-trained / still-random-like
-      layer, `alpha < 2` flags an over-correlated / memorising layer), the
-      **weighted alpha** `alpha * log10(lambda_max)` (the WeightWatcher
-      capacity-weighted quality metric that correlates with test accuracy), the
-      KS goodness-of-fit distance (how power-law the tail really is), `lambda_max`
-      and the Marchenko-Pastur bulk edge `(1 + sqrt(in/out))^2 * sigma^2` for
-      reference (eigenvalues beyond the MP edge are the "spikes" carrying the
-      learned signal vs the random bulk), and a per-layer 10-bin ASCII
-      `log10(lambda)` histogram. Network-level: the **average weighted alpha**
-      across layers (a single label-free model-quality scalar — lower is
-      better-trained, per the HT-SR theory), an alpha-across-depth bar chart,
-      and per-layer flags (`under-trained` / `over-correlated` / `well-shaped`
-      / `poor power-law fit`). Over-wide layers are capped at `MaxMatrixDim`
-      (default 512) on the Gram dimension to bound the `O(d^3)` Jacobi sweep,
-      mirroring the `MaxFeatDim` random-projection guard in `LinearProbeReport`.
-      Built-in correctness checks: the Jacobi eigenvalues must be non-negative
-      (PSD Gram) and sum to `||W||_F^2` within tolerance (trace invariance, the
-      same Frobenius quantity `WeightSpectrumReport` already prints), and
-      `lambda_max` must match the power-iteration `EstimateSpectralNorm` value
-      squared. Distinct from [[WeightSpectrumReport]] (which estimates ONLY the
-      top singular value `sigma_1` via power iteration plus a stable-rank ratio
-      and a single MP baseline number — it never forms the full spectrum or
-      fits a tail exponent; this report's whole point is the SHAPE of the
-      eigenvalue distribution, not its largest value), from the activation-side
-      [[NeuronCorrelationReport]] / [[RepresentationSimilarityReport]] (those
-      need a probe batch and characterise activation redundancy, not the static
-      weight-matrix spectrum), and from [[FisherImportanceReport]] (per-parameter
-      gradient importance, needs labels + a backward pass). Pure weight
-      inspection — forward-only is overstating it, there is no forward pass at
-      all and the weights are never touched. Companion
-      `examples/WeightSpectralTail/` trains the same tiny MLP three ways — a
-      fresh-init net (alpha large, near-random bulk, no spikes), a
-      well-trained net (alpha settles into `[2, 4]`, clear MP-edge spikes), and
-      a deliberately over-fit / over-trained net (alpha drifting below 2) — and
-      prints all three reports side by side so the "alpha tells you training
-      quality with no data" story is visible on a pure-CPU toy, plus ranks the
-      three nets by average weighted alpha and checks the ranking matches their
-      actual held-out accuracy (the headline label-free-model-selection claim).
-      Add a `TestWeightSpectralTailReportSmoke` pinning the trace-invariance and
-      non-negative-eigenvalue checks on a known small matrix, the
-      `lambda_max == sigma_1^2` agreement with `EstimateSpectralNorm`, and a
-      nil-NN graceful return.
+- [X] TNNet.HessianCurvatureReport(NN, Samples [, NumProbes, Eps]) — SHIPPED
+      2026-05-24 (commit c822cc6). Loss-surface curvature via finite-difference
+      Hessian-vector products: Hutchinson trace tr(H) over Rademacher probes,
+      top eigenvalue lambda_max via power iteration on the HVP, concentration
+      ratio, per-layer trace breakdown, per-probe histogram, flat/moderate/sharp
+      verdict. Built-in checks (linear-net probe-count-independence, lambda_max
+      <= tr(H) PSD bound, divergence guard) + examples/HessianCurvature/ (sharp-
+      vs flat-minimum) + TestHessianCurvatureReportSmoke.
+- [X] TNNet.GradientNoiseScaleReport(NN, Samples [, UseTrueLabel, LayerIdx]) —
+      SHIPPED 2026-05-24 (commit 2c6047d). Gradient SNR / critical-batch-size
+      diagnostic (McCandlish et al. 2018): per-parameter SNR histogram,
+      B_simple = tr(Sigma)/||g_bar||^2, effective-batch noise curve, per-layer
+      signal/noise flags, optional LayerIdx slab. Built-in checks (identical-
+      sample zero-variance, single-sample warning) + examples/GradientNoiseScale/
+      (clean vs noisy batch + empirical sweep) + TestGradientNoiseScaleReportSmoke.
+- [X] TNNet.WeightSpectralTailReport(NN [, MaxMatrixDim]) — SHIPPED 2026-05-24
+      (commit 284bb47). Label-free HT-SR / WeightWatcher-alpha quality metric
+      from the weight spectrum: full Jacobi eigensolve of each layer's Gram
+      matrix, Clauset/Hill power-law tail fit (alpha), weighted-alpha, MP bulk
+      edge, per-layer flags, average weighted alpha. Built-in checks (PSD non-
+      negativity, Frobenius trace invariance, lambda_max == EstimateSpectralNorm^2)
+      + examples/WeightSpectralTail/ + TestWeightSpectralTailReportSmoke.
+      FOLLOW-UP (open): the spec's 3-way example (fresh / well-trained / over-fit
+      nets ranked by held-out accuracy, validating label-free model selection)
+      was simplified to a fresh-vs-trained contrast; the accuracy-ranking demo
+      is still open.
 - [ ] RepresentationSimilarityReport follow-up: add an RBF-kernel CKA mode
       alongside the landed linear-CKA one (Gaussian Gram `K_ij =
       exp(-||x_i - x_j||^2 / (2*sigma^2))` with sigma a median-distance
