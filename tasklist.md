@@ -1011,6 +1011,49 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
+- [ ] TNNet.RepresentationSimilarityReport(NN, Probes) — a forward-only
+      `TNNet.*Report` that answers "how does the representation reshape
+      itself with depth, and which layers are doing redundant work?" by
+      computing the **linear Centered Kernel Alignment (CKA)** similarity
+      (Kornblith et al. 2019) between every pair of layer activations over
+      a shared probe batch. For each layer it flattens the per-sample
+      activation to a row of an `N x D_l` matrix `X_l` (N = probe count),
+      column-centers it, and computes the pairwise linear-CKA
+      `CKA(X_i, X_j) = ||X_i^T X_j||_F^2 / (||X_i^T X_i||_F * ||X_j^T X_j||_F)`
+      — a number in `[0, 1]`, invariant to orthogonal rotation and isotropic
+      scaling of the features, so it compares *representations* not raw
+      coordinates. Reports: the full LxL CKA matrix as an ASCII heatmap
+      (glyph-shaded by similarity band), the adjacent-layer similarity
+      vector `CKA(l, l+1)` down the stack (a high value flags a near-pass-
+      through "redundant depth" layer; a sharp dip flags where the
+      representation genuinely reorganizes), the single most-redundant
+      layer pair (highest off-diagonal CKA — a merge/prune candidate), the
+      block structure (contiguous runs of layers with mutual CKA above a
+      threshold, the "representational stages" of the net), and a one-line
+      verdict (e.g. "K of L layers are near-duplicates of a neighbour").
+      Optionally takes a second net (`RepresentationSimilarityReport(NN,
+      OtherNet, Probes)`) to cross-CKA two architectures layer-by-layer —
+      "do these two trained nets learn the same intermediate features?"
+      (the headline use case in the CKA paper: comparing widths/depths/seeds).
+      Pure forward-only; weights never touched; reuses the same
+      activation-snapshot walk the existing reports already do. Distinct
+      from [[NeuronCorrelationReport]] (that measures *intra-layer*
+      neuron-pair Pearson redundancy *within one* layer — this measures
+      *whole-layer representation* similarity *between* layers/nets and is
+      rotation-invariant, which raw Pearson is not), from LinearProbeReport
+      (that asks "is the label linearly decodable here?" against a target —
+      this needs no labels and asks "are these two feature spaces the
+      same?"), and from ArchitectureDiff (that diffs the static layer list,
+      not the learned activations). Companion
+      `examples/RepresentationSimilarity/` contrasts (a) a fresh-init net
+      whose adjacent-layer CKA is already high (untrained layers barely
+      transform their input) against the same net after training (a clearer
+      block structure emerges), and (b) a deliberately over-deep MLP on a
+      simple task so the "middle layers are near-duplicates, depth is
+      wasted" signal lights up. Smoke test
+      `TestRepresentationSimilarityReportSmoke` asserts the self-CKA
+      diagonal is 1.0 within tolerance (the built-in correctness check) and
+      the matrix is symmetric. Follows [[introspection-report-pattern]].
 - [ ] TopLogitMarginReport follow-up: the shipped `examples/MarginReport/`
       net ends in a `TNNetSoftMax`, so its "logits" are post-softmax
       probabilities and the margin lands in `[0, 1]`. Add a second run (or a
