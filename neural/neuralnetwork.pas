@@ -2672,7 +2672,22 @@ type
   // Shift is persisted in FStruct[0]; the axis is persisted in FStruct[1].
   // The single-argument Create(AShift) is the depth roll (FStruct[1] = 2),
   // byte-identical to the previous depth-only layout.
+  /// Parameter-free layer that cyclically rolls (wraps) the volume by AShift
+  // positions along the chosen axis. Public AAxis: 0 = X (SizeX), 1 = Y
+  // (SizeY), 2 = Depth (default). Backward is the inverse roll.
+  //
+  // STORED ENCODING (FStruct[1]) differs from the public AAxis on purpose so
+  // that legacy serialized nets keep working: pre-change depth-roll nets and
+  // the single-arg Create(AShift) carry FStruct[1] = 0. Therefore the stored
+  // code is mapped as 0 = Depth (legacy default), 1 = X, 2 = Y. The public
+  // constructor maps Depth->0, X->1, Y->2 at construction time; Compute /
+  // Backpropagate dispatch on the STORED value (else-branch = Depth).
   TNNetRoll = class(TNNetIdentity)
+    private
+      // Builds the layer from the already-stored axis code (0 = Depth, 1 = X,
+      // 2 = Y). Used by the serializer so the stored value passes through
+      // unchanged on load.
+      constructor CreateFromStoredAxis(AShift: integer; AStoredAxis: integer);
     public
       constructor Create(AShift: integer); reintroduce; overload;
       constructor Create(AShift: integer; AAxis: integer); reintroduce; overload;
@@ -12043,18 +12058,34 @@ constructor TNNetRoll.Create(AShift: integer);
 begin
   inherited Create();
   FStruct[0] := AShift;
-  // Single-argument form is the depth roll. Persisting axis = 2 keeps the
-  // serialized layout byte-identical to the historic depth-only constructor.
-  FStruct[1] := 2;
+  // Single-argument form is the depth roll. The stored code 0 means Depth,
+  // which is exactly the historic default FStruct[1] value, so pre-change
+  // serialized depth-roll nets remain byte-identical and load correctly.
+  FStruct[1] := 0;
 end;
 
 constructor TNNetRoll.Create(AShift: integer; AAxis: integer);
 begin
   inherited Create();
   FStruct[0] := AShift;
-  // 0 = X (SizeX), 1 = Y (SizeY), 2 = Depth. Out-of-range falls back to depth.
-  if (AAxis = 0) or (AAxis = 1) then FStruct[1] := AAxis
-  else FStruct[1] := 2;
+  // Public AAxis: 0 = X, 1 = Y, 2 = Depth. Map to the STORED encoding
+  // (0 = Depth, 1 = X, 2 = Y) so the legacy default 0 means Depth.
+  case AAxis of
+    0: FStruct[1] := 1; // X
+    1: FStruct[1] := 2; // Y
+  else
+    FStruct[1] := 0;    // Depth (default / out-of-range)
+  end;
+end;
+
+constructor TNNetRoll.CreateFromStoredAxis(AShift: integer; AStoredAxis: integer);
+begin
+  inherited Create();
+  FStruct[0] := AShift;
+  // The stored code is written straight through (0 = Depth, 1 = X, 2 = Y).
+  // Anything else degrades to the depth roll.
+  if (AStoredAxis = 1) or (AStoredAxis = 2) then FStruct[1] := AStoredAxis
+  else FStruct[1] := 0;
 end;
 
 procedure TNNetRoll.Compute();
@@ -12072,8 +12103,9 @@ begin
   Shift := FStruct[0];
   Axis := FStruct[1];
   // Pascal's mod can be negative for negative LHS; double-mod to wrap.
+  // Stored axis: 1 = X, 2 = Y, else (0) = Depth.
   case Axis of
-    0:
+    1:
       for CntY := 0 to MaxY do
         for CntX := 0 to MaxX do
           for CntD := 0 to MaxD do
@@ -12081,7 +12113,7 @@ begin
             Src := ((CntX - Shift) mod SizeX + SizeX) mod SizeX;
             FOutput[CntX, CntY, CntD] := FPrevLayer.FOutput[Src, CntY, CntD];
           end;
-    1:
+    2:
       for CntY := 0 to MaxY do
         for CntX := 0 to MaxX do
           for CntD := 0 to MaxD do
@@ -12122,9 +12154,9 @@ begin
     Axis := FStruct[1];
     // Inverse roll on upstream error: the +Shift direction is the inverse of
     // the forward -Shift roll. Accumulate so it composes with branches sharing
-    // the previous error tensor.
+    // the previous error tensor. Stored axis: 1 = X, 2 = Y, else (0) = Depth.
     case Axis of
-      0:
+      1:
         for CntY := 0 to MaxY do
           for CntX := 0 to MaxX do
             for CntD := 0 to MaxD do
@@ -12132,7 +12164,7 @@ begin
               Src := ((CntX + Shift) mod SizeX + SizeX) mod SizeX;
               FPrevLayer.FOutputError.Add(CntX, CntY, CntD, FOutputError[Src, CntY, CntD]);
             end;
-      1:
+      2:
         for CntY := 0 to MaxY do
           for CntX := 0 to MaxX do
             for CntD := 0 to MaxD do
@@ -35211,7 +35243,9 @@ begin
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
       'TNNetCumSum' :               Result := TNNetCumSum.Create(St[0]);
       'TNNetRoll' :                 if StructCount >= 2 then
-                                      Result := TNNetRoll.Create(St[0], St[1])
+                                      // St[1] is the STORED axis code (0 = Depth,
+                                      // 1 = X, 2 = Y); pass it through untouched.
+                                      Result := TNNetRoll.CreateFromStoredAxis(St[0], St[1])
                                     else
                                       Result := TNNetRoll.Create(St[0]);
       'TNNetReverseXY' :            Result := TNNetReverseXY.Create();
@@ -35452,7 +35486,8 @@ begin
       if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create(St[0]) else
       if S[0] = 'TNNetRoll' then
         begin
-          if StructCount >= 2 then Result := TNNetRoll.Create(St[0], St[1])
+          // St[1] is the STORED axis code (0 = Depth, 1 = X, 2 = Y).
+          if StructCount >= 2 then Result := TNNetRoll.CreateFromStoredAxis(St[0], St[1])
           else Result := TNNetRoll.Create(St[0]);
         end else
       if S[0] = 'TNNetReverseXY' then Result := TNNetReverseXY.Create() else

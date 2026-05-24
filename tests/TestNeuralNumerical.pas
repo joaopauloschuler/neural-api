@@ -327,6 +327,7 @@ type
     procedure TestRollInvolution;
     procedure TestRollSerializationRoundTrip;
     procedure TestRollAxisSerializationRoundTrip;
+    procedure TestRollLegacyDepthBackwardCompat;
     procedure TestReverseXYForward;
     procedure TestReverseXYGradientCheck;
     procedure TestReverseXYInvolution;
@@ -8464,7 +8465,8 @@ begin
     NN.Free;
   end;
 
-  // Old-style single-arg Create(3) round-trips as depth-roll (FStruct[1] = 2).
+  // Old-style single-arg Create(3) round-trips as depth-roll. The stored axis
+  // code is 0 (the legacy default), which the loader maps back to Depth.
   NN := TNNet.Create();
   try
     NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
@@ -8487,6 +8489,57 @@ begin
     end;
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollLegacyDepthBackwardCompat;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Last: TNNetLayer;
+  LegacySaved, Resaved: string;
+begin
+  // Regression guard for the stored-encoding bug. A depth-roll net saved
+  // BEFORE the configurable-axis change carries FStruct[1] = 0 (the historic
+  // default), because SaveStructureToString writes the whole FStruct array.
+  // The single-arg Create(N) reproduces exactly that layout (stored axis 0),
+  // so its SaveToString output IS the legacy on-disk bytes. The invariant:
+  // loading those bytes must restore a DEPTH roll, never an X roll.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetRoll.Create(1)); // legacy depth roll, stored axis = 0
+    LegacySaved := NN.SaveToString();
+  finally
+    NN.Free;
+  end;
+
+  // Fresh net loads the legacy string; re-save must be bit-identical.
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN2.LoadFromString(LegacySaved);
+    Resaved := NN2.SaveToString();
+    AssertEquals('Legacy depth-roll SaveToString bit-identical round trip',
+      LegacySaved, Resaved);
+
+    // Compute must yield the DEPTH roll, not an X roll. With SizeX=1 an X roll
+    // would be a no-op (output == input), so a wrong dispatch is observable:
+    // input [10,20,30,40] depth-rolled by +1 -> [40,10,20,30].
+    Input.Raw[0] := 10.0;
+    Input.Raw[1] := 20.0;
+    Input.Raw[2] := 30.0;
+    Input.Raw[3] := 40.0;
+    NN2.Compute(Input);
+    Last := NN2.GetLastLayer;
+    AssertEquals('Legacy depth-roll reloaded ch0 (depth, not X)',
+      40.0, Last.Output.Raw[0], 1e-6);
+    AssertEquals('Legacy depth-roll reloaded ch1', 10.0, Last.Output.Raw[1], 1e-6);
+    AssertEquals('Legacy depth-roll reloaded ch2', 20.0, Last.Output.Raw[2], 1e-6);
+    AssertEquals('Legacy depth-roll reloaded ch3', 30.0, Last.Output.Raw[3], 1e-6);
+  finally
+    NN2.Free;
+    Input.Free;
   end;
 end;
 
