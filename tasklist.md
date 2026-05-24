@@ -204,17 +204,21 @@ breakdown:
      scaling probe in examples/LinearAttention/ confirms ~linear (ratio ~2x
      per SeqLen doubling, not ~4x). The CAUSAL variant remains OPEN — see
      the follow-up below.) -->
-- [ ] TNNetLinearAttention CAUSAL follow-up: the causal (autoregressive)
-      variant of the now-landed non-causal TNNetLinearAttention. Needs the
-      running prefix-sum of S = sum_{s<=t} phi(K_s)(x)V_s and Z = sum_{s<=t}
-      phi(K_s) (the "attention is an RNN" identity), so each query t reads
-      its own causal S_t/Z_t — still O(SeqLen*d_k*d_v) with no NxN matrix.
-      Mirror the non-causal Compute/Backpropagate and add a causal
-      gradient-check + a prefix-monotonicity assertion. Unblocks a
-      linear-cost long-context arm for the downstream ../gpt-3-for-pascal
-      model and a "softmax vs linear attention quality-vs-cost" bake-off on a
-      tiny next-token task; pairs with the MHA breakdown
-      ([[TNNetMultiHeadSelfAttention]]) so a head can opt into linear attention.
+<!-- (TNNetLinearAttention CAUSAL follow-up removed: completed, landed
+     2026-05-24 as TNNetCausalLinearAttention in neuralnetwork.pas. The causal
+     (autoregressive) variant of the non-causal TNNetLinearAttention: carries
+     the running prefix-sum S_t = sum_{s<=t} phi(K_s)(x)V_s and Z_t = sum_{s<=t}
+     phi(K_s) (the "attention is an RNN" identity) so each query t reads its own
+     causal S_t/Z_t — still O(SeqLen*d_k*d_v) with no NxN matrix. Registered in
+     both CreateLayer dispatch + LoadFromString. Tests in TestNeuralNumerical.pas:
+     input numerical-gradient check (TestCausalLinearAttentionGradientCheck),
+     a causality / no-future-leak + SeqLen=1 degeneracy (Out_1==V_1) check
+     (TestCausalLinearAttentionCausality), and a serialization round-trip
+     (TestCausalLinearAttentionSerializationRoundTrip). Still-open downstream
+     work lives in its own entries: the "softmax vs linear attention quality-
+     vs-cost" bake-off and folding linear attention into the MHA breakdown
+     ([[TNNetMultiHeadSelfAttention]]) as a per-head opt-in.) -->
+
 - [ ] TNNetDifferentialAttention follow-up: the paper's headline
       NOISE-CANCELLATION micro-experiment (deferred at landing — only the four
       correctness tests shipped). On a tiny causal next-token task with an
