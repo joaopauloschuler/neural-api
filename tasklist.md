@@ -73,7 +73,6 @@ rather than acted on.
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
 - [ ] CI-friendly headless test runner with coverage reporting
-- [ ] Expand layer test coverage — numerical-gradient checks for layers that lack them
 
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
@@ -105,9 +104,6 @@ rather than acted on.
 <!-- (Volume unit micro-benchmark removed: duplicate of the `bin/layer_bench`
      CLI under "Tooling / dev experience", whose own entry notes it "subsumes
      the long-pinned Volume micro-benchmark and extends it to layers".) -->
-#### Experiments I'm curious about
-- [ ] Weight-initialization sensitivity demo: show how a deep-ish net's
-      first-epoch gradient magnitudes change across the available init schemes.
 #### Documentation
 <!-- ("How numerical gradient testing works in this repo" contributor note
      removed: duplicate of the docs/numerical_gradient.md tutorial entry under
@@ -638,8 +634,6 @@ breakdown:
 - [ ] Backward audit for TNNetPointwiseNorm — its backward is the scalar-
       only `Mul(1/n)` approximation; TNNetL2Normalize now implements the
       exact Jacobian. Either replace or add a deprecation comment.
-- [ ] Determinism test: same seed → bit-identical forward+backward across
-      two runs of a 3-layer net.
 - [ ] Random-architecture forward/backward fuzz — generate ~50 random
       stacks, seed-controlled, assert no NaN/Inf in forward, backward,
       or parameter gradients.
