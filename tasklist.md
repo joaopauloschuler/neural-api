@@ -191,14 +191,6 @@ breakdown:
       gradient-check on a tiny shape.
 
 ### Attention variants / siblings
-- [X] TNNetDifferentialAttention — landed. Differential Transformer attention
-      head (Ye et al., Microsoft 2024), an SDPA subclass that forms two softmax
-      maps from the half-width (Q1,K1)/(Q2,K2) sub-heads of the shared Q|K slab and
-      outputs `(softmax(Q1·K1^T/√(d_k/2)) − λ·softmax(Q2·K2^T/√(d_k/2)))·V` over the
-      full-width shared V. λ is a single learnable scalar (FNeurons[0] weight, like
-      ReZero; initialised to λ_init≈0.8, mirrored into FFloatSt[0] for structure
-      round-trip). Tests: λ=0 degeneracy, input numerical-gradient, λ
-      numerical-gradient, LoadFromString round-trip with non-default λ.
 - [ ] TNNetDifferentialAttention follow-up: the paper's headline
       NOISE-CANCELLATION micro-experiment (deferred at landing — only the four
       correctness tests shipped). On a tiny causal next-token task with an
@@ -388,31 +380,6 @@ breakdown:
      A separate "stable Mish" class would be a forward-pass duplicate of
      TNNetMish, which the "DO NOT REINTRODUCE" policy at the top of this file
      forbids. Verified 2026-05-24 lucky-day batch.) -->
-- [X] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
-      data-dependent (β computed per-channel from a tiny squeeze over the
-      spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
-      the now-landed AconC forward/backward. Landed: TNNetChannelTransformBase
-      descendant with 4 per-channel neurons (p1,p2,gamma,delta);
-      β[c]=sigmoid(gamma[c]*mean_c+delta[c]) computed each forward (never
-      stored). Uses a per-channel affine-over-squeeze as a tractable in-pattern
-      simplification of the paper's cross-channel bottleneck. Backward handles
-      the extra β-path input gradient with the (1/N) squeeze factor; verified by
-      numerical input/weight gradient checks + a gamma=0==AconC consistency
-      check. NOTE from the AconC bake-off
-      (akAconC in examples/ActivationBakeoff/): in that fixed-LR harness the
-      Swish-family activations (Swish/SiLU/AconC) do NOT converge on the
-      hypotenuse toy (final loss ~50 vs ReLU ~1.9), and untrained AconC ==
-      Swish by construction. Any fair Meta-ACON comparison needs a
-      per-activation LR or more epochs so the Swish-family rows converge.
-- [X] TNNetSplineActivation — KAN-flavored per-channel learnable piecewise-
-      linear activation with K+1 control points at fixed knots. Landed:
-      TNNetChannelTransformBase descendant, K+1 control-point neurons (default
-      K=4, Range=2.0 in FStruct[0]/FFloatSt[0]); identity init (y[i]=t[i]) so an
-      untrained layer is an exact identity for all x; linear extrapolation along
-      the nearest boundary segment outside [-Range,+Range] (frac unclamped).
-      Registered in both dispatch tables + LoadFromString; 4 tests (identity
-      forward incl. extrapolation, input/weight numerical-gradient, save/load
-      round-trip) in TestNeuralNumerical.pas.
 - [ ] TNNetSplineActivation follow-up: a KAN-vs-MLP toy-fit micro-experiment.
       Fit a wiggly 1D target (e.g. `y = sin(3x) + 0.3·sin(11x)`) with a small
       MLP whose ReLUs are swapped for TNNetSplineActivation at matched param
