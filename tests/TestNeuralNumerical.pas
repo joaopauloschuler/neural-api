@@ -159,6 +159,10 @@ type
     procedure TestSReLUInputGradientCheck;
     procedure TestSReLUWeightGradientCheck;
     procedure TestSReLUSerializationRoundTrip;
+    procedure TestAPLForward;
+    procedure TestAPLInputGradientCheck;
+    procedure TestAPLWeightGradientCheck;
+    procedure TestAPLSerializationRoundTrip;
     procedure TestAconCGradientCheck;
     procedure TestAconCSwishEquivalence;
     procedure TestAconCSerializationRoundTrip;
@@ -15030,6 +15034,275 @@ begin
 
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SReLU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAPLForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LAPL: TNNetAPL;
+  i: integer;
+  Expected: array[0..3] of TNeuralFloat;
+  Vals: array[0..3] of TNeuralFloat;
+begin
+  // APL with S=2 hinges. Custom weights a0=0.5,b0=-1, a1=0.3,b1=2:
+  //   h(x) = max(0,x) + 0.5*max(0,-1-x) + 0.3*max(0,2-x).
+  //   x=-3 -> 0 + 0.5*2 + 0.3*5 = 2.5
+  //   x=0  -> 0 + 0     + 0.3*2 = 0.6
+  //   x=1.5-> 1.5 + 0   + 0.3*0.5 = 1.65
+  //   x=3  -> 3 + 0     + 0      = 3
+  Vals[0] := -3; Vals[1] := 0; Vals[2] := 1.5; Vals[3] := 3;
+  Expected[0] := 2.5; Expected[1] := 0.6; Expected[2] := 1.65; Expected[3] := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    LAPL := TNNetAPL.Create();
+    NN.AddLayer(LAPL);
+
+    // Default S=2: 4 neurons. Slopes in 0,1; knees in 2,3.
+    AssertEquals('APL neuron count', 4, LAPL.Neurons.Count);
+    AssertEquals('APL default slope a0', 0.25, LAPL.Neurons[0].Weights.Raw[0], 1e-7);
+    AssertEquals('APL default slope a1', 0.25, LAPL.Neurons[1].Weights.Raw[0], 1e-7);
+    AssertEquals('APL default knee b0', 0.0, LAPL.Neurons[2].Weights.Raw[0], 1e-7);
+    AssertEquals('APL default knee b1', 1.0, LAPL.Neurons[3].Weights.Raw[0], 1e-7);
+
+    // Override with the custom weights used in the hand calculation.
+    LAPL.Neurons[0].Weights.Raw[0] := 0.5;  // a0
+    LAPL.Neurons[1].Weights.Raw[0] := 0.3;  // a1
+    LAPL.Neurons[2].Weights.Raw[0] := -1.0; // b0
+    LAPL.Neurons[3].Weights.Raw[0] := 2.0;  // b1
+
+    for i := 0 to 3 do
+      Input.Raw[i] := Vals[i];
+    NN.Compute(Input);
+    for i := 0 to 3 do
+      AssertEquals('APL forward at ' + IntToStr(i),
+        Expected[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAPLInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LAPL: TNNetAPL;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LAPL := TNNetAPL.Create(2);
+    NN.AddLayer(LAPL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Put both knees at -0.5 and 0.5 (per channel) with distinct slopes so
+    // both hinges and the ReLU term are exercised; inputs are kept away from
+    // the knees AND from the ReLU kink at x=0 so the piecewise-linear central
+    // differences stay valid (the chosen generator clears every kink by >0.2).
+    for i := 0 to LAPL.Neurons[0].Weights.Size - 1 do
+    begin
+      LAPL.Neurons[0].Weights.Raw[i] := 0.3;   // a0
+      LAPL.Neurons[1].Weights.Raw[i] := 0.15;  // a1
+      LAPL.Neurons[2].Weights.Raw[i] := -0.5;  // b0
+      LAPL.Neurons[3].Weights.Raw[i] := 0.5;   // b1
+    end;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7 + 1.2) * 1.5;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('APL input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAPLWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LAPL: TNNetAPL;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  n, i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LAPL := TNNetAPL.Create(2);
+    NN.AddLayer(LAPL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Same knees as the input-gradient test (b0=-0.5, b1=0.5); inputs kept
+    // away from the knees AND the ReLU kink at x=0 so the piecewise param
+    // gradients (both the slopes a and the knees b) are valid.
+    for i := 0 to LAPL.Neurons[0].Weights.Size - 1 do
+    begin
+      LAPL.Neurons[0].Weights.Raw[i] := 0.3;   // a0
+      LAPL.Neurons[1].Weights.Raw[i] := 0.15;  // a1
+      LAPL.Neurons[2].Weights.Raw[i] := -0.5;  // b0
+      LAPL.Neurons[3].Weights.Raw[i] := 0.5;   // b1
+    end;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7 + 1.2) * 1.5;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    // Check all four per-channel parameters (neurons 0..3 = a0,a1,b0,b1),
+    // every channel.
+    for n := 0 to 3 do
+      for i := 0 to LAPL.Neurons[n].Weights.Size - 1 do
+      begin
+        LAPL.Neurons[n].Weights.Raw[i] := LAPL.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LAPL.Neurons[n].Weights.Raw[i] := LAPL.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LAPL.Neurons[n].Weights.Raw[i] := LAPL.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LAPL.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LAPL.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('APL weight gradient check neuron[' + IntToStr(n) +
+          '] channel[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAPLSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  LAPL, LAPL2: TNNetAPL;
+  n, i: integer;
+begin
+  // Exercise the FStruct[0] (S) dispatch path with a NON-default S=3 and
+  // perturbed per-channel weights; verify all 2*S per-channel weights and S
+  // itself survive the round-trip.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LAPL := TNNetAPL.Create(3);
+    NN.AddLayer(LAPL);
+
+    AssertEquals('APL S=3 neuron count', 6, LAPL.Neurons.Count);
+
+    // Perturb every weight so the round-trip really has to carry them.
+    for n := 0 to LAPL.Neurons.Count - 1 do
+      for i := 0 to LAPL.Neurons[n].Weights.Size - 1 do
+        LAPL.Neurons[n].Weights.Raw[i] :=
+          Sin((n * 13 + i) * 0.27) * 0.6 + 0.1 * n;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LAPL2 := NN2.GetLastLayer as TNNetAPL;
+
+      AssertEquals('APL round-trip neuron count', 6, LAPL2.Neurons.Count);
+      AssertEquals('APL round-trip weight count',
+        Input.Depth, LAPL2.Neurons[0].Weights.Size);
+
+      for n := 0 to LAPL.Neurons.Count - 1 do
+        for i := 0 to LAPL.Neurons[n].Weights.Size - 1 do
+          AssertEquals('APL round-trip weight neuron[' + IntToStr(n) +
+            '] channel[' + IntToStr(i) + ']',
+            LAPL.Neurons[n].Weights.Raw[i],
+            LAPL2.Neurons[n].Weights.Raw[i], 1e-5);
+
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('APL round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

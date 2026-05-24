@@ -2505,6 +2505,41 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Adaptive Piecewise Linear unit (APL, Agostinelli et al. 2015,
+  // https://arxiv.org/abs/1412.6830). A per-channel learnable activation that
+  // sums a fixed ReLU with S hinge terms. Forward, per element x of channel c:
+  //   h(x) = max(0, x) + sum_{s=1..S} a[s,c] * max(0, -x + b[s,c]).
+  // Each hinge has a learnable slope a[s,c] and a learnable knee position
+  // b[s,c]; there are 2*S learnable scalars PER channel (2*S*Depth total). The
+  // number of hinges S (default 2) is configurable and persisted in FStruct[0]
+  // so it round-trips through SaveToString / LoadFromString. APL generalises
+  // ReLU and Leaky-ReLU (a=0 gives plain ReLU) and can learn non-convex,
+  // multi-kink shapes.
+  // Storage (each Depth values): the slopes a[s,.] live in FNeurons[s] and the
+  // knees b[s,.] in FNeurons[S+s], for s in 0..S-1.
+  // Default init: all slopes a=0.25 (a non-degenerate leaky start) and the
+  // knees spread over [0,1] (b[s] = s/(S-1) for S>1, or b=0 for S=1) so the
+  // hinges are distinct rather than collapsed on a single point.
+  // Backward, per element (let gy = OutputError, and 1[.] the indicator):
+  //   dh/dx     = 1[x>0] - sum_s a[s,c] * 1[x < b[s,c]]
+  //   dL/da[s,c] += gy * max(0, b[s,c] - x)
+  //   dL/db[s,c] += gy * a[s,c] * 1[x < b[s,c]]
+  // Param grads accumulate over all spatial positions and the batch per
+  // channel. Descends from TNNetChannelTransformBase to reuse its per-channel
+  // weight storage (the weightless TNNetReLUBase hierarchy cannot store
+  // gradients), mirroring TNNetSReLU's multi-neuron layout.
+  TNNetAPL = class(TNNetChannelTransformBase)
+    private
+      FNumHinges: integer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(NumHinges: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// ACON-C: "Activate Or Not" channel-wise learnable activation
   // (Ma, Zhang, Sun et al. 2021, https://arxiv.org/abs/2009.04759).
   // Generalises Swish with THREE learnable parameters PER channel:
@@ -16308,6 +16343,158 @@ begin
   FNeurons[1].FWeights.Fill(FInitialAr);
   FNeurons[2].FWeights.Fill(FInitialTl);
   FNeurons[3].FWeights.Fill(FInitialAl);
+  AfterWeightUpdate();
+end;
+
+{ TNNetAPL }
+constructor TNNetAPL.Create();
+begin
+  // Default S=2 hinges.
+  Create(2);
+end;
+
+constructor TNNetAPL.Create(NumHinges: integer);
+begin
+  inherited Create();
+  if NumHinges < 1 then
+    raise Exception.Create('TNNetAPL requires NumHinges >= 1.');
+  FNumHinges := NumHinges;
+  // Persist S in the structure string so CreateLayer / LoadFromString can
+  // reconstruct the layer with the right number of hinges.
+  FStruct[0] := NumHinges;
+  InitDefault();
+end;
+
+procedure TNNetAPL.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // We need 2*S neurons: slopes a[0..S-1] in FNeurons[0..S-1] and knees
+  // b[0..S-1] in FNeurons[S..2S-1], each with Depth weights.
+  if FNeurons.Count < 2 * FNumHinges then AddMissingNeurons(2 * FNumHinges);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetAPL.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d, s: integer;
+  xv, acc, a_sd, b_sd: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (which would copy input to FOutput).
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  for d := 0 to Depth - 1 do
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        acc := 0;
+        if xv > 0 then acc := xv;
+        for s := 0 to FNumHinges - 1 do
+        begin
+          a_sd := FNeurons[s].FWeights.Raw[d];
+          b_sd := FNeurons[FNumHinges + s].FWeights.Raw[d];
+          if xv < b_sd then
+            acc := acc + a_sd * (b_sd - xv);
+        end;
+        FOutput[x, y, d] := acc;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAPL.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d, s: integer;
+  xv, gy, a_sd, b_sd, dx: TNeuralFloat;
+  gradA, gradB: array of TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  SetLength(gradA, FNumHinges);
+  SetLength(gradB, FNumHinges);
+  for d := 0 to Depth - 1 do
+  begin
+    for s := 0 to FNumHinges - 1 do
+    begin
+      gradA[s] := 0;
+      gradB[s] := 0;
+    end;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        // ReLU term contributes 1 to dh/dx when x>0.
+        if xv > 0 then dx := 1 else dx := 0;
+        for s := 0 to FNumHinges - 1 do
+        begin
+          a_sd := FNeurons[s].FWeights.Raw[d];
+          b_sd := FNeurons[FNumHinges + s].FWeights.Raw[d];
+          if xv < b_sd then
+          begin
+            // Active hinge: h += a*(b-x).
+            dx := dx - a_sd;                 // dh/dx contribution of this hinge
+            gradA[s] := gradA[s] + gy * (b_sd - xv);
+            gradB[s] := gradB[s] + gy * a_sd;
+          end;
+        end;
+        if hasInputGrad then
+          PrevErr[x, y, d] := PrevErr[x, y, d] + gy * dx;
+      end;
+    for s := 0 to FNumHinges - 1 do
+    begin
+      FNeurons[s].FDelta.Raw[d] :=
+        FNeurons[s].FDelta.Raw[d] + (-FLearningRate) * gradA[s];
+      FNeurons[FNumHinges + s].FDelta.Raw[d] :=
+        FNeurons[FNumHinges + s].FDelta.Raw[d] + (-FLearningRate) * gradB[s];
+    end;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    for s := 0 to 2 * FNumHinges - 1 do
+      FNeurons[s].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetAPL.InitDefault();
+var
+  s: integer;
+  knee: TNeuralFloat;
+begin
+  if FNumHinges < 1 then FNumHinges := 2;
+  if FNeurons.Count < 2 * FNumHinges then AddMissingNeurons(2 * FNumHinges);
+  for s := 0 to FNumHinges - 1 do
+  begin
+    // Slopes start at 0.25 (non-degenerate leaky start).
+    FNeurons[s].FWeights.Fill(0.25);
+    // Knees spread over [0,1] so the hinges are distinct.
+    if FNumHinges = 1 then
+      knee := 0
+    else
+      knee := s / (FNumHinges - 1);
+    FNeurons[FNumHinges + s].FWeights.Fill(knee);
+  end;
   AfterWeightUpdate();
 end;
 
@@ -36288,6 +36475,7 @@ begin
       'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
       'TNNetSReLU':                 Result := TNNetSReLU.Create(Ft[0], Ft[1], Ft[2], Ft[3]);
+      'TNNetAPL':                   Result := TNNetAPL.Create(St[0]);
       'TNNetAconC':                 Result := TNNetAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
@@ -36539,6 +36727,7 @@ begin
       if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else
       if S[0] = 'TNNetSReLU' then Result := TNNetSReLU.Create(Ft[0], Ft[1], Ft[2], Ft[3]) else
+      if S[0] = 'TNNetAPL' then Result := TNNetAPL.Create(St[0]) else
       if S[0] = 'TNNetAconC' then Result := TNNetAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else
