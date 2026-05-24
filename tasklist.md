@@ -300,8 +300,11 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
-      channel.
+- [X] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
+      channel. LANDED: four learnable params/channel `(t_r, a_r, t_l, a_l)`
+      init `(0, 1, 0, 0)` (== plain ReLU untrained), input + 4 per-channel
+      weight gradients, dispatch + LoadFromString round-trip, and four tests
+      (Forward / InputGradientCheck / WeightGradientCheck / SerializationRoundTrip).
 - [ ] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
       data-dependent (β computed per-channel from a tiny squeeze over the
       spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
@@ -795,6 +798,24 @@ breakdown:
       the late generalization. Pairs naturally with [[WeightSpectrumReport]]
       / [[WeightHistogramReport]] to watch the weights reorganize at the
       grok transition.
+      ATTEMPTED 2026-05-24 (lucky-day batch) — NOT shipped, findings to
+      save the next attempt: (1) the clean weight-decay-driven jump to ~100%
+      val accuracy is NOT reproducible within the ~5-minute CPU budget here —
+      the library's full-batch Adam is slow/unstable at the LRs grokking
+      needs, so the thousands of epochs required do not fit the budget.
+      (2) CONCATENATED one-hot input (depth 2P) never generalizes (val ~0): the
+      two independent input weight-blocks act as a pure lookup table and weight
+      decay cannot align them. (3) SUMMED one-hot input (depth P) DOES show
+      delayed generalization (train ~100% by ~epoch 200, val lags near chance
+      then climbs to a ~0.5 plateau) but weight decay made NO difference at
+      this scale. Even the summed variant with two runs + P=23 ran >4m50s and
+      blew the budget. SUGGESTED BREAKDOWN for a future attempt that fits the
+      budget: (a) ship the reproducible *representation contrast* alone
+      (concat-never-generalizes vs summed-delayed-generalizes) as a fast
+      single-run demo, dropping the weight-decay claim; OR (b) first add a
+      faster optimizer / mini-batch path so enough epochs fit, THEN retry the
+      true grok. Do not re-attempt the full weight-decay grok as a single
+      monolithic example until (b) lands.
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
 - [ ] Label-smoothing sweep — train SimpleImageClassifier with `ε ∈ {0,
@@ -1087,7 +1108,16 @@ breakdown:
       against reality. Add a `TestGradientNoiseScaleReportSmoke` pinning the
       identical-sample zero-variance invariant and the single-sample warning
       path. Weights are never stepped (a measurement, not training).
-- [ ] TNNet.MCDropoutUncertaintyReport(NN, Probes [, NumPasses, Temperature]) —
+- [X] TNNet.MCDropoutUncertaintyReport(NN, Probes [, NumPasses, Temperature]) —
+      LANDED (lucky-day batch 2026-05-24): decl+doc, two overloaded impls
+      (no-labels delegates to labelled core), companion
+      examples/MCDropoutUncertainty/ (synthetic 3-cluster 2D classifier with an
+      OOD band — BALD ~4x higher on the band than the in-distribution cores;
+      ~0.6s runtime), and TestMCDropoutUncertaintyReportSmoke pinning the
+      NumPasses=1+dropout-off zero-epistemic invariant and the no-dropout-layer
+      warning. The report auto-detects softmax / log-softmax / raw-logit heads
+      and temperature-renormalises a prob head rather than re-softmaxing it.
+      Original spec below.
       Monte-Carlo-Dropout *epistemic* uncertainty estimator (Gal & Ghahramani
       2016, "Dropout as a Bayesian Approximation"). Unlike the rest of the
       report family it deliberately KEEPS dropout active at inference: call the
