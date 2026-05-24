@@ -96,13 +96,9 @@ const
     ValidationPairs := CreateRegressionPairList(500);
     TestPairs       := CreateRegressionPairList(500);
 
-    NN.AddLayer([
-      TNNetInput.Create(cDIn),
-      // Pack gate || value into 2*D_hidden depth; SwiGLU splits along depth.
-      TNNetFullConnectLinear.Create({SizeX=}1, {SizeY=}1, {Depth=}2 * cDHidden),
-      TNNetSwiGLU.Create(),
-      TNNetFullConnectLinear.Create(cDOut)
-    ]);
+    NN.AddLayer( TNNetInput.Create(cDIn) );
+    // Dense(2*D_hidden) -> SwiGLU -> Dense(D_out) in a single call.
+    NN.AddSwiGLUFeedForward(cDIn, cDHidden, cDOut);
 
     WriteLn('Layers:');
     NN.DebugStructure();
