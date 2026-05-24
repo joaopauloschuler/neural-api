@@ -398,63 +398,42 @@ breakdown:
       input-output Jacobian (the entry already flags this as the natural
       next knob). Reuses the landed `TNNet.EstimateSpectralNorm` power-
       iteration helper.
-- [ ] TNNet.EffectiveReceptiveFieldReport(NN, Probes) — the *empirical*
-      (gradient-measured) counterpart to the analytical
-      [[introspection-report-pattern]] `ReceptiveFieldReport`. Picks the
-      centre output unit of the final spatial layer, backpropagates a
-      one-hot output error (UNBLOCKED: just call the now-landed
-      `TNNet.EnableInputGradient` before the backward pass — same helper
-      SaliencyReport and AdversarialRobustnessReport use), and accumulates
-      `|d out_centre / d input|` over a probe batch into a per-(x,y)
-      input-plane heatmap. Reports: the 2D ASCII heatmap of input
-      sensitivity, the **effective** RF radius (the central region holding
-      e.g. 90% of the total gradient mass — Luo et al. 2016 show this is
-      typically far smaller and more Gaussian than the theoretical RF), and
-      the ratio effective/theoretical RF side-by-side with the analytical
-      `ReceptiveFieldReport` number so the "your stem only really uses the
-      middle third of its theoretical window" story is visible in one run.
-      Distinct from the analytical report (that asks "what *could* an output
-      see?"; this asks "what does it *actually* weight?") and from
-      SaliencyReport (per-sample input attribution for a class logit, not a
-      batch-averaged spatial-extent measurement). Forward+backward only;
-      trained weights left untouched. Example at
-      `examples/EffectiveReceptiveField/` contrasting a 3x3-stack stem
-      against a dilated/large-kernel stem.
-- [ ] TNNet.GradientConflictReport(NN, Samples, Targets) — a forward+backward
-      `TNNet.*Report` answering "do the samples in this batch pull the weights
-      in compatible directions, or do they fight each other?". For each labelled
-      sample it runs one forward + one backward on a **frozen** net
-      (`ClearDeltas` before each, never `UpdateWeights`) and snapshots that
-      sample's full flattened per-parameter weight-gradient vector `g_i` (reusing
-      the same per-parameter gradient tensors `Backpropagate` already populates —
-      no input-gradient enablement, exactly like [[FisherImportance]]). It then
-      reports the **pairwise gradient cosine similarity** `cos(g_i, g_j) =
-      <g_i,g_j>/(||g_i|| ||g_j||)` across the batch: an overall 10-bin ASCII
-      histogram of the cosines, the **conflict fraction** (share of pairs with
-      cos < 0 — gradients that actively undo each other, the negative-transfer
-      signal from PCGrad / GradNorm multi-task work), the mean/median cosine,
-      the most-conflicting sample pair (a "these two examples disagree most"
-      pointer), and — when class labels are supplied — a per-class-pair mean-cosine
-      matrix so a pair of classes whose gradients systematically oppose
-      (the hard, easily-confused pair) stands out. Optionally restricts the
-      cosine to one chosen layer's gradient slab (the conflict is often
-      concentrated in the classifier head). Reuses the same whole-net snapshot
-      discipline the other frozen-net reports use; weights are never stepped.
-      Distinct from [[FisherImportance]] (which squares each per-sample gradient
-      *per parameter* to rank *which parameters matter* — it discards sign and
-      cross-sample direction; this keeps the whole-vector *direction* and asks
-      *whether samples agree*), from [[NeuronCorrelationReport]] (intra-layer
-      activation redundancy, forward-only, no gradients), and from
-      [[LayerSensitivityReport]] (weight-jitter output delta, no backward). The
-      output is the natural precursor to any future gradient-surgery / PCGrad /
-      sample-reweighting work and a concrete lens on why a batch trains slowly.
-      Companion `examples/GradientConflict/` contrasts a clean linearly-separable
-      3-cluster set (cosines cluster positive, conflict fraction ~0) against a
-      deliberately label-noised / overlapping set (a fat negative-cosine tail and
-      a high conflict fraction emerge). Smoke test
-      `TestGradientConflictReportSmoke` pins the self-cosine `cos(g_i,g_i)=1`
-      diagonal and matrix symmetry (the built-in correctness checks). Follows
-      [[introspection-report-pattern]].
+- [x] TNNet.EffectiveReceptiveFieldReport(NN, Probes) — empirical
+      (gradient-measured) counterpart to the analytical ReceptiveFieldReport.
+      Picks the centre output unit, EnableInputGradient + one-hot backward over
+      a probe batch, accumulates `|d out_centre / d input|` into a per-(x,y)
+      heatmap; reports the ASCII heatmap, effective RF radius (central 90% mass)
+      and the effective/theoretical ratio. Landed 4160440 with
+      `examples/EffectiveReceptiveField/` (3x3-stack stem 0.78 vs single-9x9
+      1.00) + TestEffectiveReceptiveFieldReportSmoke.
+- [x] TNNet.GradientConflictReport(NN, Samples, UseTrueLabel, LayerIdx) —
+      forward+backward report of pairwise per-sample weight-gradient cosine
+      similarity across a batch (frozen net: ClearDeltas + Backpropagate, never
+      UpdateWeights, snapshots g_i exactly like FisherImportanceReport). Reports
+      the 10-bin ASCII cosine histogram, conflict fraction (cos<0) plus a
+      strong-conflict tail (cos<-0.5 — the discriminating signal once a softmax
+      head's cross-class pairs sit mildly negative), mean/median, most-conflicting
+      pair, per-class-pair mean-cosine matrix, and an optional LayerIdx slab
+      restriction. Landed 860ee44 with `examples/GradientConflict/` (clean
+      cos<-0.5 = 0% vs noised 16.9%) + TestGradientConflictReportSmoke (pins
+      self-cosine diagonal = 1 and matrix symmetry).
+- [ ] GradientConflictReport follow-up: the raw `cos<0` conflict fraction is
+      dominated by a softmax head's mildly-anti-correlated cross-class pairs, so
+      the report falls back on a `cos<-0.5` strong-conflict tail. Add a sibling
+      run (or example variant) with a raw-logit `TNNetFullConnectLinear` head and
+      document whether the plain `cos<0` fraction becomes discriminating there —
+      the same raw-logit-vs-softmax-head question MarginReport's follow-up raises.
+- [ ] GradientConflictReport follow-up: the per-class-pair mean-cosine matrix is
+      the natural precursor to gradient-surgery / PCGrad — add an experiment that
+      reweights or projects out the most-conflicting class pair's gradient and
+      charts the batch-loss delta.
+- [ ] EffectiveReceptiveFieldReport follow-up: add the optional `(radius, mass-
+      fraction)` CSV side-output so the cumulative-mass curve can be plotted
+      outside the terminal (~10 lines, mirrors the CSV side-output in
+      DecisionBoundaryReport / the AdversarialRobustnessReport CSV follow-up).
+- [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
+      the stem and chart effective-RF growth vs theoretical-RF growth — the
+      headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
