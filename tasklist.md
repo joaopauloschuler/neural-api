@@ -485,7 +485,18 @@ breakdown:
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.
 - [ ] Mixup data augmentation helper.
-- [ ] Sharpness-Aware Minimization (SAM) experiment `examples/SharpnessAwareMinimization/`
+- [X] Sharpness-Aware Minimization (SAM) experiment `examples/SharpnessAwareMinimization/`
+      LANDED 2026-05-24. Hand-rolled two-pass SAM (ascent perturb via global
+      grad-norm, snapshot/restore via SaveDataToString) vs plain SGD on a noisy-
+      label 2D-blob toy. Both invariants hold: rho=0 == plain SGD bit-for-bit
+      (max weight diff 0.0), and sharpness (LossLandscapeProbe) falls as rho
+      rises (0.41→0.21). KEY LIBRARY NOTE: the library defaults to per-sample
+      updates (FBatchUpdate=false) where Backpropagate applies updates
+      immediately and leaves Neurons[].Delta at ZERO — SAM needs the accumulated
+      gradient tensor, so the example calls NN.SetBatchUpdate(True). Any future
+      manual gradient-surgery example (PCGrad, Lookahead, grad clipping) must do
+      the same or the gradient access is a silent no-op.
+<!-- Original SAM spec (kept for reference):
       (Foret et al. 2021) — the one well-known optimizer idea NOT covered by the
       SWA / EMA / Lookahead / gradient-clipping plumbing above, and a natural
       partner to the landed [[LossLandscapeProbe]] (which already prints a
@@ -515,7 +526,14 @@ breakdown:
       steps, and SWA/EMA average weights post-hoc rather than changing the
       gradient that is applied. Pure CPU, no external data, fits a few-minute
       budget. Pairs with the open weight-decay / generalization experiments
-      ([[WeightSpectrumReport]]).
+      ([[WeightSpectrumReport]]). -->
+- [ ] SAM follow-up: the noisy-label 2D-blob clusters are easily separable so
+      clean val-accuracy saturates (~99%) across all rho — the flatness signal
+      carries the story but the val-acc-vs-rho curve is flat. A harder task
+      (overlapping clusters / higher label-noise / a tiny MLP on a small image
+      stub) where SAM's flat minimum actually buys measurable val-accuracy over
+      plain SGD would complete the demonstration. Builds directly on the landed
+      examples/SharpnessAwareMinimization/.
 ### Introspection / debugging tools
 <!-- (TNNet.ToGraphvizDot removed: completed, landed 2026-05-24 — instance
      method returning a `digraph` string for the layer DAG (node per layer
