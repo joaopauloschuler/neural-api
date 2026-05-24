@@ -1048,32 +1048,10 @@ breakdown:
       naturally with the open lottery-ticket experiment under "Bake-off /
       experiment follow-ups" (LMC is the property that experiment implicitly
       relies on). Pure forward-only; weights are never stepped.
-- [X] TNNet.HessianCurvatureReport(NN, Samples [, NumProbes, Eps]) — SHIPPED
-      2026-05-24 (commit c822cc6). Loss-surface curvature via finite-difference
-      Hessian-vector products: Hutchinson trace tr(H) over Rademacher probes,
-      top eigenvalue lambda_max via power iteration on the HVP, concentration
-      ratio, per-layer trace breakdown, per-probe histogram, flat/moderate/sharp
-      verdict. Built-in checks (linear-net probe-count-independence, lambda_max
-      <= tr(H) PSD bound, divergence guard) + examples/HessianCurvature/ (sharp-
-      vs flat-minimum) + TestHessianCurvatureReportSmoke.
-- [X] TNNet.GradientNoiseScaleReport(NN, Samples [, UseTrueLabel, LayerIdx]) —
-      SHIPPED 2026-05-24 (commit 2c6047d). Gradient SNR / critical-batch-size
-      diagnostic (McCandlish et al. 2018): per-parameter SNR histogram,
-      B_simple = tr(Sigma)/||g_bar||^2, effective-batch noise curve, per-layer
-      signal/noise flags, optional LayerIdx slab. Built-in checks (identical-
-      sample zero-variance, single-sample warning) + examples/GradientNoiseScale/
-      (clean vs noisy batch + empirical sweep) + TestGradientNoiseScaleReportSmoke.
-- [X] TNNet.WeightSpectralTailReport(NN [, MaxMatrixDim]) — SHIPPED 2026-05-24
-      (commit 284bb47). Label-free HT-SR / WeightWatcher-alpha quality metric
-      from the weight spectrum: full Jacobi eigensolve of each layer's Gram
-      matrix, Clauset/Hill power-law tail fit (alpha), weighted-alpha, MP bulk
-      edge, per-layer flags, average weighted alpha. Built-in checks (PSD non-
-      negativity, Frobenius trace invariance, lambda_max == EstimateSpectralNorm^2)
-      + examples/WeightSpectralTail/ + TestWeightSpectralTailReportSmoke.
-      FOLLOW-UP (open): the spec's 3-way example (fresh / well-trained / over-fit
-      nets ranked by held-out accuracy, validating label-free model selection)
-      was simplified to a fresh-vs-trained contrast; the accuracy-ranking demo
-      is still open.
+- [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
+      well-trained / over-fit nets ranked by held-out accuracy, validating
+      label-free model selection) was simplified to a fresh-vs-trained contrast
+      at landing; the accuracy-ranking demo is still open.
 - [ ] RepresentationSimilarityReport follow-up: add an RBF-kernel CKA mode
       alongside the landed linear-CKA one (Gaussian Gram `K_ij =
       exp(-||x_i - x_j||^2 / (2*sigma^2))` with sigma a median-distance
