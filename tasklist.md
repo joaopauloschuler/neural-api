@@ -1253,3 +1253,50 @@ breakdown:
       monotone-ish climb with a visible saturation knee a few layers
       before the head), so reviewers can eyeball how training reshapes
       per-layer linear separability.
+
+### Learned-function visualization
+- [ ] TNNet.DecisionBoundaryReport — given a trained net with a 2-input
+      (`TNNetInput.Create(2)`) classifier head, sweep a `Gx x Gy` grid
+      (default 41x41) over an axis-aligned bounding box of the input
+      plane (auto-fitted from a probe set, or caller-supplied
+      `(xMin,xMax,yMin,yMax)`), run one forward pass per grid cell, and
+      render the *learned function over its whole input domain* — not a
+      statistic of a probe batch — as compact stdout art:
+      (a) an ASCII class map: one glyph per grid cell = `argmax` class
+          (digits/letters per class), so the carved-up regions are
+          directly visible,
+      (b) a confidence-shaded overlay: the same grid but glyph intensity
+          (10 buckets) set by the top-1 softmax probability (or top1-top2
+          logit margin when the head is linear), so low-confidence
+          boundary bands show up as faint seams between regions,
+      (c) a boundary-cell count and estimated total boundary length
+          (grid cells whose 4-neighbours disagree on argmax) — a single
+          scalar proxy for how convoluted the learned boundary is,
+      (d) optional probe-set overlay: stamp the supplied samples onto the
+          grid by true class so misclassified points (sample glyph in a
+          region of a different colour) are visible against the boundary,
+      (e) a CSV side-output (`x, y, argmax, top1prob`) for downstream
+          plotting, mirroring LearningRateFinder's CSV convention.
+      Pure forward-only — no training-time changes, no backward pass, no
+      new layer types. Guards: assert the input layer is 2-D
+      (`SizeX*SizeY*Depth == 2`) with a clear error otherwise, since the
+      whole point is a plottable plane. Distinct from
+      [[GradientAscent]] (optimises an *input image* to maximise an inner
+      neuron for high-D image nets — input-space ascent, not a dense
+      forward sweep of a 2-D domain), from [[SaliencyReport]] (per-pixel
+      attribution for one sample, not the global input->class map),
+      [[ConfusionMatrixReport]] / [[TopLogitMarginReport]] (aggregate or
+      per-sample stats on a fixed probe set, never evaluating the
+      off-sample input regions where the boundary actually lives), and
+      [[ActivationStatsReport]] (internal activations, not the realised
+      input->output function). This is the one tool in the family that
+      answers "what shape did the model actually carve?" rather than
+      "how does it score on these points". Companion
+      `examples/DecisionBoundary/` reuses the synthetic 2-D Gaussian
+      cluster generator already used by ConfusionMatrixReport / MarginReport
+      and prints the class map before and after a short training run
+      (expected: a near-constant single-class plane at init collapsing
+      into clean linearly/curved-separated regions after training), plus
+      a deliberately-overfit run on a tiny noisy two-moons-style set so
+      the wiggly high-boundary-length pathology is visible as both art
+      and the scalar in (c).
