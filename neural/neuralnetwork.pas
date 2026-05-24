@@ -3978,6 +3978,50 @@ type
         InvariantTol: TNeuralFloat = 1e-3;
         ApproxTol: TNeuralFloat = 1e-1
       ): string;
+      // Forward-only test-time augmentation (TTA) evaluator. Given a trained
+      // classifier NN, a probe batch of input volumes pInput and the matching
+      // integer class labels pLabels (one per probe; argmax-style indices, NOT
+      // one-hot), it runs only forward passes over a fixed menu of input-side
+      // transforms and reports how augmenting the inputs at inference time moves
+      // top-1 accuracy. The transform menu is: identity (the untransformed
+      // input), TNNetFlipX (mirror X), TNNetFlipY (mirror Y),
+      // TNNetReverseChannels (channel reversal) and TNNetRoll(+1) (depth roll by
+      // 1) — each T(x) produced by a tiny Input -> Transform wrapper net built
+      // once and re-run per probe; the inspected NN's weights are never touched
+      // and no backward pass is ever run. For every probe it caches the
+      // final-layer Output of each transform (logits, or post-softmax
+      // probabilities when AverageProbs is True) and computes the ensemble
+      // prediction as argmax of the per-class AVERAGE across all transforms.
+      // Reports:
+      //   (a) baseline top-1 accuracy on the untransformed (identity) inputs;
+      //   (b) per-transform top-1 accuracy with each transform applied ALONE
+      //       (a near-invariance correctness check: a flip-invariant model
+      //       reads ~baseline on every row);
+      //   (c) full-ensemble TTA top-1 accuracy (argmax of the averaged outputs
+      //       over all transforms) and its delta vs baseline (signed);
+      //   (d) per-class accuracy delta (baseline vs ensemble) so classes that
+      //       LOSE under TTA are visible;
+      //   (e) the per-sample agreement rate
+      //       mean(argmax(avg_output) == argmax(baseline_output));
+      //   (f) a one-line verdict "TTA helps" / "TTA neutral" / "TTA hurts" from
+      //       HelpThreshold (default 0.005) on the ensemble accuracy delta:
+      //       delta > +HelpThreshold => helps, delta < -HelpThreshold => hurts,
+      //       else neutral.
+      // AverageProbs selects the averaging space: False (default) averages raw
+      // final-layer outputs (logits — arithmetic mean), True applies a numerically
+      // stable softmax to each transform's output first then averages the
+      // probabilities (the linear-vs-geometric-mean question; probability
+      // averaging is a soft-voting ensemble). NumClasses is taken from the probe
+      // labels / output size. Guards nil NN, an empty probe batch and a
+      // label-count mismatch gracefully (returns a clear message; never crashes).
+      // Pure forward-only.
+      class function TTAReport(
+        NN: TNNet;
+        pInput: TNNetVolumeList;
+        const pLabels: array of integer;
+        AverageProbs: boolean = False;
+        HelpThreshold: TNeuralFloat = 0.005
+      ): string;
       // Forward+backward input-attribution (saliency) diagnostic. Given a
       // trained classifier NN and a single probe sample (a TNNetVolume input
       // Probe), it picks the predicted class c = argmax(f(Probe)) (or the
@@ -25933,6 +25977,288 @@ begin
     Result := Lines.Text;
   finally
     if Base <> nil then Base.Free;
+    for TIdx := 0 to cTransformCount - 1 do
+      if TNet[TIdx] <> nil then TNet[TIdx].Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.TTAReport(
+  NN: TNNet;
+  pInput: TNNetVolumeList;
+  const pLabels: array of integer;
+  AverageProbs: boolean = False;
+  HelpThreshold: TNeuralFloat = 0.005
+): string;
+const
+  cTransformCount = 5; // identity, FlipX, FlipY, ReverseChannels, Roll(+1)
+var
+  Lines: TStringList;
+  TName: array[0 .. cTransformCount - 1] of string;
+  TNet: array[0 .. cTransformCount - 1 ] of TNNet;
+  TIdx, SampleIdx, I, ShapeX, ShapeY, ShapeD: integer;
+  NumClasses, OutSize, Lbl, Pred, BaseClass, EnsClass: integer;
+  Cur, Avg: TNNetVolume;
+  // per-transform top-1 correct counts.
+  TransformCorrect: array[0 .. cTransformCount - 1] of integer;
+  BaseCorrect, EnsCorrect, AgreeCount, UsedSamples: integer;
+  // per-class support / correct counts (baseline and ensemble).
+  ClassSupport, ClassBaseCorrect, ClassEnsCorrect: array of integer;
+  BaseAcc, EnsAcc, EnsDelta, AgreeRate, ClassBaseAcc, ClassEnsAcc: TNeuralFloat;
+  AvgMode, Verdict, ShapeStr, DeltaTag: string;
+  MaxV, SumExp, E: TNeuralFloat;
+
+  // Build a tiny forward-only wrapper net: Input(shape of the probe) ->
+  // Transform. WhichTransform 0 = identity, which needs NO wrapper net at all
+  // (the raw input is fed straight to NN), so nil is returned for it.
+  function BuildTransformNet(WhichTransform: integer; X, Y, D: integer): TNNet;
+  var
+    Net: TNNet;
+  begin
+    if WhichTransform = 0 then
+    begin
+      Result := nil; // identity: feed the raw input directly to NN
+      Exit;
+    end;
+    Net := TNNet.Create();
+    Net.AddLayer(TNNetInput.Create(X, Y, D));
+    case WhichTransform of
+      1: Net.AddLayer(TNNetFlipX.Create());
+      2: Net.AddLayer(TNNetFlipY.Create());
+      3: Net.AddLayer(TNNetReverseChannels.Create());
+      4: Net.AddLayer(TNNetRoll.Create(1));
+    end;
+    Result := Net;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Avg := nil;
+  for TIdx := 0 to cTransformCount - 1 do TNet[TIdx] := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'TTAReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (pInput = nil) or (pInput.Count = 0) then
+    begin
+      Result := 'TTAReport: pInput is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if Length(pLabels) <> pInput.Count then
+    begin
+      Result := Format(
+        'TTAReport: label count (%d) does not match probe count (%d).',
+        [Length(pLabels), pInput.Count]) + sLineBreak;
+      Exit;
+    end;
+    if HelpThreshold < 0 then HelpThreshold := 0.005;
+
+    ShapeX := pInput[0].SizeX;
+    ShapeY := pInput[0].SizeY;
+    ShapeD := pInput[0].Depth;
+    ShapeStr := Format('(%d,%d,%d)', [ShapeX, ShapeY, ShapeD]);
+
+    // NumClasses: from the final-layer output size, but at least 1 + max label.
+    NN.Compute(pInput[0]);
+    OutSize := NN.GetLastLayer.Output.Size;
+    NumClasses := OutSize;
+    for I := 0 to Length(pLabels) - 1 do
+      if pLabels[I] + 1 > NumClasses then NumClasses := pLabels[I] + 1;
+    if NumClasses < 1 then NumClasses := 1;
+
+    TName[0] := 'identity (baseline)';
+    TName[1] := 'TNNetFlipX (mirror X)';
+    TName[2] := 'TNNetFlipY (mirror Y)';
+    TName[3] := 'TNNetReverseChannels';
+    TName[4] := 'TNNetRoll(+1) (depth roll)';
+    for TIdx := 0 to cTransformCount - 1 do
+      TNet[TIdx] := BuildTransformNet(TIdx, ShapeX, ShapeY, ShapeD);
+
+    Avg := TNNetVolume.Create(OutSize, 1, 1);
+    SetLength(ClassSupport, NumClasses);
+    SetLength(ClassBaseCorrect, NumClasses);
+    SetLength(ClassEnsCorrect, NumClasses);
+    for I := 0 to NumClasses - 1 do
+    begin
+      ClassSupport[I] := 0;
+      ClassBaseCorrect[I] := 0;
+      ClassEnsCorrect[I] := 0;
+    end;
+    for TIdx := 0 to cTransformCount - 1 do TransformCorrect[TIdx] := 0;
+    BaseCorrect := 0;
+    EnsCorrect := 0;
+    AgreeCount := 0;
+    UsedSamples := 0;
+
+    if AverageProbs then AvgMode := 'post-softmax probabilities'
+    else AvgMode := 'raw logits';
+
+    for SampleIdx := 0 to pInput.Count - 1 do
+    begin
+      Lbl := pLabels[SampleIdx];
+      if (Lbl < 0) or (Lbl >= NumClasses) then Continue; // skip bad labels
+      Inc(UsedSamples);
+      Inc(ClassSupport[Lbl]);
+
+      Avg.Fill(0);
+      BaseClass := -1;
+
+      for TIdx := 0 to cTransformCount - 1 do
+      begin
+        // T(x) via the wrapper net, then the classifier on the transformed
+        // input. Identity (TIdx=0, TNet[0]=nil) feeds the raw input directly.
+        if TNet[TIdx] = nil then
+          NN.Compute(pInput[SampleIdx])
+        else
+        begin
+          TNet[TIdx].Compute(pInput[SampleIdx]);
+          NN.Compute(TNet[TIdx].GetLastLayer.Output);
+        end;
+        Cur := NN.GetLastLayer.Output;
+
+        // Per-transform top-1 accuracy (each transform applied alone).
+        Pred := Cur.GetClass();
+        if Pred = Lbl then Inc(TransformCorrect[TIdx]);
+
+        if TIdx = 0 then
+        begin
+          // identity == baseline.
+          BaseClass := Pred;
+          if Pred = Lbl then
+          begin
+            Inc(BaseCorrect);
+            Inc(ClassBaseCorrect[Lbl]);
+          end;
+        end;
+
+        // Accumulate into the ensemble average (logits or softmax probs).
+        if AverageProbs then
+        begin
+          // numerically-stable softmax over the OutSize outputs.
+          MaxV := Cur.Raw[0];
+          for I := 1 to OutSize - 1 do
+            if Cur.Raw[I] > MaxV then MaxV := Cur.Raw[I];
+          SumExp := 0;
+          for I := 0 to OutSize - 1 do
+            SumExp := SumExp + Exp(Cur.Raw[I] - MaxV);
+          if SumExp <= 0 then SumExp := 1;
+          for I := 0 to OutSize - 1 do
+          begin
+            E := Exp(Cur.Raw[I] - MaxV) / SumExp;
+            Avg.Raw[I] := Avg.Raw[I] + E;
+          end;
+        end
+        else
+        begin
+          for I := 0 to OutSize - 1 do
+            Avg.Raw[I] := Avg.Raw[I] + Cur.Raw[I];
+        end;
+      end;
+
+      // Ensemble prediction = argmax of the averaged output. Dividing by the
+      // transform count does not move the argmax, so Avg is read as-is.
+      EnsClass := Avg.GetClass();
+      if EnsClass = Lbl then
+      begin
+        Inc(EnsCorrect);
+        Inc(ClassEnsCorrect[Lbl]);
+      end;
+      if EnsClass = BaseClass then Inc(AgreeCount);
+    end;
+
+    if UsedSamples > 0 then
+    begin
+      BaseAcc := BaseCorrect / UsedSamples;
+      EnsAcc := EnsCorrect / UsedSamples;
+      AgreeRate := AgreeCount / UsedSamples;
+    end
+    else
+    begin
+      BaseAcc := 0;
+      EnsAcc := 0;
+      AgreeRate := 0;
+    end;
+    EnsDelta := EnsAcc - BaseAcc;
+
+    // Header.
+    Lines.Add(Format(
+      'TTAReport: probe shape %s, %d sample(s), %d class(es). ' +
+      'Averaging %s. HelpThreshold=%g.',
+      [ShapeStr, UsedSamples, NumClasses, AvgMode, HelpThreshold]));
+    Lines.Add('');
+
+    // (a) + (b) per-transform top-1 accuracy.
+    Lines.Add('Per-transform top-1 accuracy (each transform applied alone):');
+    Lines.Add(Format('%-28s %12s', ['Transform', 'Top1-Acc']));
+    Lines.Add(StringOfChar('-', 44));
+    for TIdx := 0 to cTransformCount - 1 do
+    begin
+      if UsedSamples > 0 then
+        BaseAcc := TransformCorrect[TIdx] / UsedSamples
+      else
+        BaseAcc := 0;
+      Lines.Add(Format('%-28s %11.2f%%', [TName[TIdx], BaseAcc * 100.0]));
+    end;
+    // restore BaseAcc (clobbered in the loop above) for the summary below.
+    if UsedSamples > 0 then BaseAcc := BaseCorrect / UsedSamples
+    else BaseAcc := 0;
+    Lines.Add('');
+
+    // (c) ensemble accuracy + delta.
+    if EnsDelta >= 0 then DeltaTag := '+' else DeltaTag := '';
+    Lines.Add(Format('Baseline (identity) top-1 accuracy: %7.2f%%',
+      [BaseAcc * 100.0]));
+    Lines.Add(Format('Full-ensemble TTA top-1 accuracy:   %7.2f%%',
+      [EnsAcc * 100.0]));
+    Lines.Add(Format('Ensemble delta vs baseline:         %s%6.2f%% '+
+      '(%8.4f absolute)',
+      [DeltaTag, EnsDelta * 100.0, EnsDelta]));
+    Lines.Add('');
+
+    // (d) per-class accuracy delta (baseline vs ensemble).
+    Lines.Add('Per-class top-1 accuracy (baseline -> ensemble):');
+    Lines.Add(Format('%-6s %8s %10s %10s %10s',
+      ['Class', 'Support', 'Baseline', 'Ensemble', 'Delta']));
+    Lines.Add(StringOfChar('-', 48));
+    for I := 0 to NumClasses - 1 do
+    begin
+      if ClassSupport[I] > 0 then
+      begin
+        ClassBaseAcc := ClassBaseCorrect[I] / ClassSupport[I];
+        ClassEnsAcc := ClassEnsCorrect[I] / ClassSupport[I];
+        Lines.Add(Format('%-6d %8d %9.2f%% %9.2f%% %8.4f',
+          [I, ClassSupport[I], ClassBaseAcc * 100.0, ClassEnsAcc * 100.0,
+           ClassEnsAcc - ClassBaseAcc]));
+      end
+      else
+        Lines.Add(Format('%-6d %8d %10s %10s %10s',
+          [I, 0, '-', '-', '-']));
+    end;
+    Lines.Add('');
+
+    // (e) agreement rate.
+    Lines.Add(Format(
+      'Per-sample agreement rate (argmax(avg) == argmax(baseline)): %6.2f%%',
+      [AgreeRate * 100.0]));
+
+    // (f) verdict.
+    if EnsDelta > HelpThreshold then Verdict := 'TTA helps'
+    else if EnsDelta < -HelpThreshold then Verdict := 'TTA hurts'
+    else Verdict := 'TTA neutral';
+    Lines.Add('');
+    Lines.Add('Verdict: ' + Verdict + Format(
+      ' (ensemble delta %8.4f vs threshold +/-%g).',
+      [EnsDelta, HelpThreshold]));
+    Lines.Add(
+      'Pure forward-only: NN weights untouched, no backward pass. '+
+      'Ensemble = argmax of the per-class average across all 5 transforms.');
+
+    Result := Lines.Text;
+  finally
+    if Avg <> nil then Avg.Free;
     for TIdx := 0 to cTransformCount - 1 do
       if TNet[TIdx] <> nil then TNet[TIdx].Free;
     Lines.Free;

@@ -89,6 +89,7 @@ type
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
     procedure TestEquivarianceReportSmoke;
+    procedure TestTTAReportSmoke;
     procedure TestSaliencyReportSmoke;
     procedure TestDecisionBoundaryReportSmoke;
   end;
@@ -1813,6 +1814,82 @@ begin
     Probes.Free;
     NNInv.Free;
     NNPlain.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestTTAReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report: string;
+  Labels: array of integer;
+  EmptyLabels: array of integer;
+  K, I: integer;
+begin
+  // nil NN handled gracefully (empty labels array).
+  SetLength(EmptyLabels, 0);
+  Report := TNNet.TTAReport(nil, nil, EmptyLabels);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    // A small image classifier.
+    NN.AddLayer(TNNetInput.Create(6, 6, 3));
+    NN.AddLayer(TNNetConvolutionReLU.Create(6, 3, 1, 1));
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.TTAReport(NN, Probes, EmptyLabels);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // A handful of image-shaped probes with labels.
+    SetLength(Labels, 12);
+    for K := 0 to 11 do
+    begin
+      V := TNNetVolume.Create(6, 6, 3);
+      for I := 0 to V.Size - 1 do V.Raw[I] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+      Labels[K] := K mod 3;
+    end;
+
+    // Label-count mismatch handled gracefully.
+    SetLength(EmptyLabels, 3);
+    Report := TNNet.TTAReport(NN, Probes, EmptyLabels);
+    AssertTrue('label mismatch reported gracefully',
+      Pos('does not match', Report) > 0);
+
+    // Well-formed report (logit averaging, default).
+    Report := TNNet.TTAReport(NN, Probes, Labels);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('TTAReport', Report) > 0);
+    AssertTrue('per-transform section present',
+      Pos('Per-transform top-1 accuracy', Report) > 0);
+    AssertTrue('baseline row present',
+      Pos('Baseline (identity) top-1 accuracy', Report) > 0);
+    AssertTrue('ensemble row present',
+      Pos('Full-ensemble TTA top-1 accuracy', Report) > 0);
+    AssertTrue('FlipX row present', Pos('TNNetFlipX', Report) > 0);
+    AssertTrue('per-class section present',
+      Pos('Per-class top-1 accuracy', Report) > 0);
+    AssertTrue('agreement rate present',
+      Pos('Per-sample agreement rate', Report) > 0);
+    AssertTrue('verdict present', Pos('Verdict:', Report) > 0);
+
+    // probability-averaging path also produces a well-formed report.
+    Report := TNNet.TTAReport(NN, Probes, Labels, True);
+    AssertTrue('prob-avg report non-empty', Length(Report) > 0);
+    AssertTrue('prob-avg mode noted',
+      Pos('post-softmax probabilities', Report) > 0);
+  finally
+    Probes.Free;
+    NN.Free;
   end;
 end;
 
