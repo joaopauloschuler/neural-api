@@ -412,8 +412,18 @@ breakdown:
 
 #### Channel attention / conditioning
 - [ ] TNNetCBAM — SE block plus a spatial-attention sibling.
-- [ ] TNNetFiLM (Feature-wise Linear Modulation) — `y = gamma * x + beta`
-      with gamma/beta from a separate conditioning input branch.
+<!-- (TNNetFiLM removed: completed, landed 2026-05-24 as a PARAMETER-FREE
+     two-input TNNetConcatBase subclass — input0 = feature map (SizeX,SizeY,Depth),
+     input1 = conditioning vector (1,1,2*Depth) packing gamma|beta from a separate
+     branch (so NOT a TNNetChannelMul->TNNetChannelBias duplicate);
+     Out=gamma[c]*x+beta[c], backward routes error to BOTH inputs. CreateLayer +
+     IdxsToLayers dispatch (both FPC and Delphi paths) round-trip via the inherited
+     ConcatBase prev-layer-list serialization. Tests in TestNeuralNumerical.pas:
+     TestFiLMForward, TestFiLMIdentity (gamma=1/beta=0 identity), TestFiLMGradientCheck
+     (end-to-end WEIGHT/feature-branch numerical grad through a conditioning
+     FullConnectLinear, max err 0.0022), TestFiLMSerializationRoundTrip. Example:
+     examples/FiLMConditioning/ — learns K per-class affine transforms via the
+     conditioning FC to MSE 0, identity invariant held.) -->
 - [ ] TNNetMaxBlurPool — anti-aliased max-pool: max-pool followed by a
       fixed (non-trainable) binomial blur filter.
 

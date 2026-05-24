@@ -3556,6 +3556,33 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Feature-wise Linear Modulation (FiLM, Perez et al. 2018,
+  // https://arxiv.org/abs/1709.07871). PARAMETER-FREE two-input layer that
+  // applies a per-channel affine modulation whose gamma/beta come from a
+  // SEPARATE conditioning branch (NOT the layer's own weights -- that would be
+  // a TNNetChannelMul -> TNNetChannelBias duplicate):
+  //   Out[x,y,c] = gamma[c] * input0[x,y,c] + beta[c]
+  // Wiring: TNNetFiLM.Create([featureLayer, condLayer]) where
+  //   input0 = featureLayer, shape (SizeX, SizeY, Depth) -- feature map.
+  //   input1 = condLayer,    shape (1, 1, 2*Depth)       -- modulation params:
+  //     channels [0 .. Depth-1]      = gamma (per-channel scale)
+  //     channels [Depth .. 2*Depth-1]= beta  (per-channel shift)
+  // gamma/beta broadcast over the spatial dims. Backward is parameter-free and
+  // flows to BOTH inputs:
+  //   dL/dinput0[x,y,c] = gamma[c] * dOut[x,y,c]
+  //   dL/dgamma[c]      = sum_{x,y} input0[x,y,c]*dOut[x,y,c]  (-> input1[c])
+  //   dL/dbeta[c]       = sum_{x,y} dOut[x,y,c]                (-> input1[Depth+c])
+  TNNetFiLM = class(TNNetConcatBase)
+  private
+    FDepth: integer; // channel count of the modulated feature map (input0)
+  public
+    constructor Create(aL: array of TNNetLayer); overload;
+    destructor Destroy(); override;
+
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   // This layer run the TNNetVolume.DotProducts for layers A and B.
   TNNetDotProducts = class(TNNetLayer)
   private
@@ -21822,6 +21849,132 @@ begin
       if FPrevOutputError[LayerCnt].Size = FOutput.Size then
       begin
         FPrevOutputError[LayerCnt].Add(FOutputError);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateConcat();
+end;
+
+{ TNNetFiLM }
+constructor TNNetFiLM.Create(aL: array of TNNetLayer);
+var
+  LayerCnt: integer;
+  SizeX, SizeY: integer;
+begin
+  inherited Create();
+
+  if Length(aL) <> 2 then
+  begin
+    FErrorProc('TNNetFiLM requires exactly 2 input layers '+
+      '(feature map + conditioning vector). Got ' + IntToStr(Length(aL)) + '.');
+  end
+  else
+  begin
+    // input0 = feature map to modulate.
+    SizeX  := aL[0].FOutput.SizeX;
+    SizeY  := aL[0].FOutput.SizeY;
+    FDepth := aL[0].FOutput.Depth;
+
+    // input1 = conditioning vector packing gamma|beta, shape (1, 1, 2*Depth).
+    if
+    (
+      (aL[1].FOutput.SizeX <> 1) or
+      (aL[1].FOutput.SizeY <> 1) or
+      (aL[1].FOutput.Depth <> 2 * FDepth)
+    ) then
+    begin
+      FErrorProc
+      (
+        'TNNetFiLM conditioning input must be (1, 1, 2*Depth) with '+
+        '2*Depth = ' + IntToStr(2 * FDepth) + '. It is:(' +
+        IntToStr(aL[1].FOutput.SizeX) + ' ' + IntToStr(aL[1].FOutput.SizeY) +
+        ' ' + IntToStr(aL[1].FOutput.Depth) + ').'
+      );
+    end;
+
+    for LayerCnt := Low(aL) to High(aL) do
+    begin
+      FPrevOutput.Add(aL[LayerCnt].FOutput);
+      FPrevOutputError.Add(aL[LayerCnt].FOutputError);
+      FPrevOutputErrorDeriv.Add(aL[LayerCnt].FOutputErrorDeriv);
+      FPrevLayerList.Add(aL[LayerCnt]);
+      aL[LayerCnt].IncDepartingBranchesCnt();
+    end;
+    Output.Resize(SizeX, SizeY, FDepth);
+    FOutputError.Resize(SizeX, SizeY, FDepth);
+    FOutputErrorDeriv.Resize(SizeX, SizeY, FDepth);
+  end;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+destructor TNNetFiLM.Destroy();
+begin
+  inherited Destroy();
+end;
+
+procedure TNNetFiLM.Compute();
+var
+  StartTime: double;
+  Feature, Cond: TNNetVolume;
+  X, Y, C: integer;
+  Gamma, Beta: TNeuralFloat;
+begin
+  StartTime := Now();
+  Feature := FPrevOutput[0];
+  Cond    := FPrevOutput[1];
+  // Out[x,y,c] = gamma[c]*input0[x,y,c] + beta[c]; gamma/beta broadcast over XY.
+  for C := 0 to FDepth - 1 do
+  begin
+    Gamma := Cond[0, 0, C];
+    Beta  := Cond[0, 0, FDepth + C];
+    for X := 0 to FOutput.SizeX - 1 do
+      for Y := 0 to FOutput.SizeY - 1 do
+        FOutput[X, Y, C] := Gamma * Feature[X, Y, C] + Beta;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFiLM.Backpropagate();
+var
+  StartTime: double;
+  Feature, FeatureErr, Cond, CondErr: TNNetVolume;
+  X, Y, C: integer;
+  Gamma, dOut, GradGamma, GradBeta: TNeuralFloat;
+  MaxError: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  MaxError := ForceMaxOutputError(csErrorOverflowBackpropProtection);
+  if MaxError > 0 then
+  begin
+    Feature    := FPrevOutput[0];
+    FeatureErr := FPrevOutputError[0];
+    Cond       := FPrevOutput[1];
+    CondErr    := FPrevOutputError[1];
+    for C := 0 to FDepth - 1 do
+    begin
+      Gamma     := Cond[0, 0, C];
+      GradGamma := 0;
+      GradBeta  := 0;
+      for X := 0 to FOutput.SizeX - 1 do
+        for Y := 0 to FOutput.SizeY - 1 do
+        begin
+          dOut := FOutputError[X, Y, C];
+          // dL/dinput0[x,y,c] = gamma[c] * dOut[x,y,c]
+          if FeatureErr.Size = Feature.Size then
+            FeatureErr[X, Y, C] := FeatureErr[X, Y, C] + Gamma * dOut;
+          // dL/dgamma[c] = sum_{x,y} input0[x,y,c]*dOut ; dL/dbeta[c] = sum dOut
+          GradGamma := GradGamma + Feature[X, Y, C] * dOut;
+          GradBeta  := GradBeta + dOut;
+        end;
+      if CondErr.Size = Cond.Size then
+      begin
+        CondErr[0, 0, C]          := CondErr[0, 0, C] + GradGamma;
+        CondErr[0, 0, FDepth + C] := CondErr[0, 0, FDepth + C] + GradBeta;
       end;
     end;
   end;
@@ -43052,7 +43205,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -43282,6 +43435,7 @@ begin
       'TNNetFlipX' :                Result := TNNetFlipX.Create();
       'TNNetFlipY' :                Result := TNNetFlipY.Create();
       'TNNetSum' :                  Result := TNNetSum.Create(aL);
+      'TNNetFiLM' :                 Result := TNNetFiLM.Create(aL);
       'TNNetSplitChannels' :        Result := TNNetSplitChannels.Create(aIdx);
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
       'TNNetDeLocalConnect' :       Result := TNNetDeLocalConnect.Create(St[0], St[1], St[4]);
@@ -43550,6 +43704,7 @@ begin
       if S[0] = 'TNNetFlipY' then Result := TNNetFlipY.Create() else
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
+      if S[0] = 'TNNetFiLM' then Result := TNNetFiLM.Create(aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else
       if S[0] = 'TNNetSplitChannelEvery' then Result := TNNetSplitChannelEvery.Create(aIdx) else
       if S[0] = 'TNNetDeLocalConnect' then Result := TNNetDeLocalConnect.Create(St[0], St[1], St[4]) else

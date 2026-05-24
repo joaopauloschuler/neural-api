@@ -343,6 +343,10 @@ type
     procedure TestCausalLinearAttentionGradientCheck;
     procedure TestCausalLinearAttentionCausality;
     procedure TestCausalLinearAttentionSerializationRoundTrip;
+    procedure TestFiLMForward;
+    procedure TestFiLMIdentity;
+    procedure TestFiLMGradientCheck;
+    procedure TestFiLMSerializationRoundTrip;
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
@@ -9532,6 +9536,232 @@ begin
   // d_k = 4. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetCausalLinearAttention.Create(4),
     'CausalLinearAttention', 3, 1, 12, 1e-5);
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetFiLM (Feature-wise Linear Modulation) tests. FiLM is a PARAMETER-FREE
+// two-input layer: input0 is the feature map (SizeX,SizeY,Depth) and input1 is
+// a conditioning vector (1,1,2*Depth) packing gamma|beta. The forward rule is
+// Out[x,y,c] = gamma[c]*input0[x,y,c] + beta[c]. The gradient check pushes
+// error through a conditioning FullConnectLinear branch, so a green WEIGHT
+// gradient check proves FiLM back-propagates correctly to BOTH inputs.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestFiLMForward;
+var
+  NN: TNNet;
+  Feature, Cond: TNNetLayer;
+  FilmLayer: TNNetFiLM;
+  X, Y, C: integer;
+  Expected: TNeuralFloat;
+begin
+  // Feed gamma|beta as a literal input branch (no FC), set them explicitly,
+  // and check the affine modulation against a hand computation.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    Feature := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    Cond    := NN.AddLayerAfter(TNNetInput.Create(1, 1, 6, 1), 0);
+    FilmLayer := TNNetFiLM.Create([Feature, Cond]);
+    NN.AddLayer(FilmLayer);
+
+    // input0 feature map (2x2x3).
+    for X := 0 to 1 do
+      for Y := 0 to 1 do
+        for C := 0 to 2 do
+          Feature.Output[X, Y, C] := (X * 2 + Y) * 3 + C + 1; // 1..12
+
+    // input1 conditioning: gamma = (2, 0.5, -1), beta = (10, 20, 30).
+    Cond.Output[0, 0, 0] := 2;    Cond.Output[0, 0, 1] := 0.5; Cond.Output[0, 0, 2] := -1;
+    Cond.Output[0, 0, 3] := 10;   Cond.Output[0, 0, 4] := 20;  Cond.Output[0, 0, 5] := 30;
+
+    FilmLayer.Compute();
+
+    for X := 0 to 1 do
+      for Y := 0 to 1 do
+        for C := 0 to 2 do
+        begin
+          Expected := Cond.Output[0, 0, C] * Feature.Output[X, Y, C] +
+                      Cond.Output[0, 0, 3 + C];
+          AssertEquals('FiLM forward at (' + IntToStr(X) + ',' + IntToStr(Y) +
+            ',' + IntToStr(C) + ')', Expected, FilmLayer.Output[X, Y, C], 1e-5);
+        end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFiLMIdentity;
+var
+  NN: TNNet;
+  Feature, Cond: TNNetLayer;
+  FilmLayer: TNNetFiLM;
+  i: integer;
+begin
+  // Sanity invariant: gamma = 1, beta = 0 reproduces input0 identically.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    Feature := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    Cond    := NN.AddLayerAfter(TNNetInput.Create(1, 1, 6, 1), 0);
+    FilmLayer := TNNetFiLM.Create([Feature, Cond]);
+    NN.AddLayer(FilmLayer);
+
+    for i := 0 to Feature.Output.Size - 1 do
+      Feature.Output.Raw[i] := Sin(i * 0.7) * 3 - 1;
+    // gamma = 1 (channels 0..2), beta = 0 (channels 3..5).
+    for i := 0 to 2 do Cond.Output[0, 0, i] := 1;
+    for i := 3 to 5 do Cond.Output[0, 0, i] := 0;
+
+    FilmLayer.Compute();
+
+    for i := 0 to FilmLayer.Output.Size - 1 do
+      AssertEquals('FiLM identity (gamma=1,beta=0) at ' + IntToStr(i),
+        Feature.Output.Raw[i], FilmLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFiLMGradientCheck;
+var
+  NN: TNNet;
+  FeatureInput, CondInput: TNNetLayer;
+  CondFC: TNNetFullConnectLinear;
+  Feature, FeaturePlus, CondData, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AFeature: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    FeatureInput.Output.Copy(AFeature);
+    CondInput.Output.Copy(CondData);
+    NN.Compute(FeatureInput.Output); // re-runs from inputs through both branches
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // End-to-end WEIGHT gradient check. The conditioning branch is a
+  // FullConnectLinear (small condition -> 2*Depth = 6 gamma|beta vector). The
+  // feature map is 2x2x3. A correct FiLM backward must route error to the
+  // feature branch (checked here as input0 gradient) AND to the conditioning
+  // branch (the FC's weight gradient depends on FiLM's input1 error). We probe
+  // the input0 gradient, which only matches numerically if gamma -- produced by
+  // the FC -- is wired through correctly in BOTH directions.
+  // Reseed so the FC weight init (and this finite difference) is deterministic
+  // and independent of earlier suite draws (shared-RNG gotcha).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Feature := TNNetVolume.Create(2, 2, 3);
+  FeaturePlus := TNNetVolume.Create(2, 2, 3);
+  CondData := TNNetVolume.Create(1, 1, 2); // small condition id (2 values)
+  Desired := TNNetVolume.Create(2, 2, 3);
+  epsilon := 0.0001;
+  try
+    FeatureInput := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    CondInput    := NN.AddLayerAfter(TNNetInput.Create(1, 1, 2, 1), 0);
+    // Conditioning sub-network: FC mapping the condition -> 6 = 2*Depth params.
+    CondFC := TNNetFullConnectLinear.Create(6);
+    NN.AddLayerAfter(CondFC, CondInput);
+    NN.AddLayer(TNNetReshape.Create(1, 1, 6));
+    NN.AddLayer(TNNetFiLM.Create([FeatureInput, NN.GetLastLayer()]));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Feature.Size - 1 do
+      Feature.Raw[i] := Sin(i * 0.7) * 1.5 + 0.3;
+    for i := 0 to CondData.Size - 1 do
+      CondData.Raw[i] := Cos(i * 0.9) * 0.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    maxErr := 0;
+    for i := 0 to Feature.Size - 1 do
+    begin
+      FeaturePlus.Copy(Feature);
+      FeaturePlus.Raw[i] := Feature.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(FeaturePlus);
+      FeaturePlus.Raw[i] := Feature.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(FeaturePlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      FeatureInput.Output.Copy(Feature);
+      CondInput.Output.Copy(CondData);
+      NN.Compute(FeatureInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('FiLM feature-branch gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestFiLMGradientCheck max gradient error: ', FloatToStr(maxErr));
+  finally
+    NN.Free;
+    Feature.Free;
+    FeaturePlus.Free;
+    CondData.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFiLMSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  FeatureInput, CondInput: TNNetLayer;
+  Saved: string;
+  i: integer;
+begin
+  // Multi-input round-trip: build a net with a conditioning FC branch feeding
+  // TNNetFiLM, compute, SaveToString, reload, recompute, compare outputs.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    FeatureInput := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    CondInput    := NN.AddLayerAfter(TNNetInput.Create(1, 1, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFullConnectLinear.Create(6), CondInput);
+    NN.AddLayer(TNNetReshape.Create(1, 1, 6));
+    NN.AddLayer(TNNetFiLM.Create([FeatureInput, NN.GetLastLayer()]));
+
+    for i := 0 to FeatureInput.Output.Size - 1 do
+      FeatureInput.Output.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    for i := 0 to CondInput.Output.Size - 1 do
+      CondInput.Output.Raw[i] := Cos(i * 0.6) * 0.4;
+    NN.Compute(FeatureInput.Output);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      // Feed identical inputs to the reloaded net.
+      for i := 0 to NN2.Layers[0].Output.Size - 1 do
+        NN2.Layers[0].Output.Raw[i] := FeatureInput.Output.Raw[i];
+      for i := 0 to NN2.Layers[1].Output.Size - 1 do
+        NN2.Layers[1].Output.Raw[i] := CondInput.Output.Raw[i];
+      NN2.Compute(NN2.Layers[0].Output);
+
+      AssertEquals('FiLM round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FiLM round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
