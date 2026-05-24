@@ -1067,12 +1067,6 @@ breakdown:
       header substring, and a nil-NN call returns gracefully. Capture as
       `AssertReportSmoke(reportFn, expectedHeader)` in
       tests/TestNeuralLayersExtra.pas so new report tasks are a one-liner.
-- [ ] Next introspection-report batch (same forward-only `TNNet.*Report`
-      pattern, each pairs with an `examples/*/` synthetic demo and a smoke
-      test). All members of this batch have now LANDED: the TTA evaluator,
-      the calibration unit, and `TNNet.LinearProbeReport` (closed-form
-      per-layer linear probe with a hand-rolled Double-precision Gauss-Jordan
-      ridge solve — neuralvolume.pas had no linear-solve helper).
 ### Test-time augmentation evaluator
 - [ ] (TTAReport follow-up) the shipped report runs on a single synthetic
       probe set; a natural next step is the spec's second run on a model
@@ -1172,19 +1166,8 @@ breakdown:
       re-skin of an existing report.
 
 ### Parameter importance (continual learning / pruning)
-- [X] TNNet.FisherImportanceReport — LANDED. Diagonal empirical-Fisher
-      parameter-importance diagnostic: accumulates per-sample squared weight
-      gradients over a labelled probe batch (forward+backward per sample,
-      weights never stepped — reuses the gradient tensors Backpropagate
-      already populates, no input-gradient enablement). Reports per-layer
-      Fisher mass + share, mean/max per-param Fisher, near-zero count, a
-      `log10(Fisher)` histogram, the participation-ratio effective-parameter
-      count, and high-importance/prunable/dead-layer flags. Example
-      `examples/FisherImportance/` contrasts a fresh vs trained net and
-      sketches the EWC two-task consumer; smoke test
-      `TestFisherImportanceReportSmoke`. NOTE: on an easily-learned task the
-      participation ratio can *rise* slightly after training (small, fairly
-      uniform gradients); the observable "importance concentrates" signal is
-      the per-layer Fisher-mass share and the heavy histogram tail, which the
-      example is framed around. Follow-up if wanted: the EWC two-task
-      experiment itself (penalise changes to high-Fisher params on task B).
+- [ ] EWC two-task experiment building on the landed
+      TNNet.FisherImportanceReport: train on task A, snapshot the diagonal
+      Fisher, then train on task B with an L2 penalty pulling high-Fisher
+      params back toward their task-A values; chart task-A retention with and
+      without the penalty.
