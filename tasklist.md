@@ -332,6 +332,14 @@ breakdown:
 
 #### Reduction / shape
 - [X] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
+- [ ] TNNetAdaptiveMaxPool sibling — same target-driven adaptive windowing as
+      the landed TNNetAdaptiveAvgPool, but max (with argmax routing in the
+      backward like TNNetMaxPool) instead of mean. Reuse the
+      `start=floor(o·In/Out)`, `end=ceil((o+1)·In/Out)` window mapping.
+- [ ] TNNetAdaptiveAvgPool example/usage: swap a fixed global-avg head
+      (`TNNetAvgChannel`) for `TNNetAdaptiveAvgPool.Create(1)` in one
+      SimpleImage path, or a tiny demo showing the same conv stack accepting
+      two different input resolutions and producing a fixed-size head.
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetLpPool follow-up: `p`-sweep bake-off experiment. Same tiny conv
       classifier, swap the pooling for `TNNetLpPool` at `p ∈ {1, 2, 4, 8}`
@@ -355,6 +363,19 @@ breakdown:
 - [X] TNNetTverskyLoss — generalized Dice with separate FP/FN weights α, β.
 - [X] TNNetWingLoss — facial-landmark regression loss with log-shaped wing
       near zero and a linear tail.
+- [ ] Dice/Tversky segmentation micro-example: a tiny synthetic binary-mask
+      task (e.g. predict a filled disc/box mask from a noisy input grid) with
+      a sigmoid head + `TNNetDiceLoss`, contrasting the IoU it reaches vs an
+      MSE-head baseline. Headline use case for the landed Dice/Tversky losses.
+- [ ] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
+      deliberately class-imbalanced mask, sweep `(α,β) ∈ {(0.5,0.5),(0.3,0.7),
+      (0.7,0.3)}` and show how β>α trades precision for recall (fewer false
+      negatives). Pure α/β knob study on the landed TNNetTverskyLoss.
+- [ ] LabelSmoothing calibration check: train SimpleImageClassifier with
+      `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
+      each into the `neuralcalibration` ECE/Brier report — the textbook claim
+      is smoothing improves calibration at a small accuracy cost. Both pieces
+      (the loss and the calibration report) have landed.
 - [ ] TNNetTripletLoss — `max(0, ||a-p||² - ||a-n||² + margin)`. Input
       depth split into 3 equal anchor/positive/negative chunks.
 - [ ] TNNetContrastiveLoss / InfoNCE — input split into query/key, computes
