@@ -258,6 +258,36 @@ breakdown:
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
+- [ ] TNNetDiagonalSSM — a diagonal-state linear-recurrence (state-space /
+      "SSM-lite") sequence mixer: the first genuinely *recurrent* layer in
+      the repo, an O(n) causal alternative to the O(n²) SDPA head and a
+      sibling to the (still-open) TNNetCausalConv1D / TNNetTokenShift line.
+      Per channel `d` keep a scalar state `h_t = a[d]*h_{t-1} + b[d]*x_t`
+      and emit `y_t = c[d]*h_t + e[d]*x_t` (the `e*x` skip is the S4D/S5
+      feedthrough that keeps gradients alive at init). Input is a
+      (SeqLen, 1, Depth) sequence laid out along SizeX exactly like the
+      attention layers expect; the recurrence runs along SizeX with the
+      depth axis fully parallel, so one Compute is a single left-to-right
+      sweep. Learnable per-channel parameters `(a, b, c, e)` with `a`
+      stored through a sigmoid (or `-softplus` in log-space) so the decay
+      stays in `(0,1)` and the recurrence is unconditionally stable —
+      document the parameterisation choice in the doc comment. Backward is
+      backprop-through-time: a right-to-left sweep accumulating
+      `dL/dh_t = c[d]*dL/dy_t + a[d]*dL/dh_{t+1}`, then scattering into the
+      input gradient and the four weight gradients. The numerical-gradient
+      test is the headline (input AND all four weight tensors) on a tiny
+      (SeqLen=4, Depth=3) shape — BPTT weight gradients are a classic place
+      for a silent off-by-one between the t and t-1 terms, so this earns its
+      check. Add a SeqLen-edge case at SeqLen=1 (pure feedthrough, state
+      never advances). Pairs with the open "causal-conv vs token-shift vs
+      SDPA on the same toy next-token task" experiment — drop this in as a
+      fourth contender, since its whole selling point is matching attention
+      quality at linear cost. Example at `examples/DiagonalSSM/`: train the
+      single layer on a tiny next-token / copy task and print the learned
+      per-channel decay spectrum `a[d]` (slow-vs-fast memory channels made
+      visible). A genuinely new layer family, not a near-duplicate of any
+      existing mixer; the KV-cache incremental-decode notes above apply
+      doubly here since a linear recurrence is O(1)-per-step by nature.
 #### Norm / regularization
 - [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
       `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
