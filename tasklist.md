@@ -881,6 +881,39 @@ breakdown:
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
+- [ ] `examples/DeepEnsembleUncertainty/` — the gold-standard predictive-
+      uncertainty baseline (Lakshminarayanan et al. 2017, *Simple and Scalable
+      Predictive Uncertainty Estimation using Deep Ensembles*) on a pure-CPU
+      toy, existing layers only — NO new layer. Train M (e.g. 5) INDEPENDENT
+      small softmax classifiers, identical architecture but DIFFERENT RandSeed
+      per member, on the same synthetic 3-cluster 2D task the landed
+      examples/MCDropoutUncertainty/ uses (so the contrast is apples-to-apples).
+      At inference average the per-member post-softmax probability vectors and
+      report, on three probe groups (cluster cores / an OOD band placed in the
+      empty space BETWEEN clusters / a labelled val split — reuse MCDropout's
+      probe layout): (a) mean single-member top-1 accuracy AND mean single-member
+      ECE/Brier vs the ENSEMBLE's accuracy and ECE/Brier, computed via the
+      already-landed `neuralcalibration.ComputeCalibration` / `CalibrationReport`
+      (the headline claim is the ensemble improves BOTH accuracy and calibration
+      over the average member); (b) the predictive-entropy decomposition
+      `total = aleatoric (mean of per-member entropies) + epistemic (mutual
+      information / member disagreement)`, showing the epistemic term spikes on
+      the OOD band and sits ~0 on the confident cluster cores; (c) an ASCII
+      bar of per-group epistemic uncertainty. Built-in correctness signals:
+      M=1 reproduces a single model's predictions bit-for-bit; ensemble accuracy
+      is >= the mean single-member accuracy; the epistemic (MI) term is >= 0
+      everywhere and strictly higher on the OOD band than on the cores. DISTINCT
+      from examples/MCDropoutUncertainty/ (epistemic uncertainty via dropout
+      SAMPLING inside ONE trained net — deep ensembles use M genuinely
+      INDEPENDENT nets, the reference baseline MC-dropout merely approximates;
+      run them on the SAME task so the README can contrast the two epistemic
+      estimates head-to-head), from examples/KnowledgeDistillation/ (an ensemble
+      is the natural teacher there — here we KEEP the ensemble and quantify its
+      uncertainty rather than distilling it into one student) and from the TTA
+      "ensemble" (which averages input TRANSFORMS of a SINGLE model, not
+      independent models). Pure CPU, deterministic per seed list, well under a
+      minute. Pairs with [[CalibrationReport]] (reuses its ECE/Brier machinery)
+      and the MCDropoutUncertainty contrast above.
 - [ ] `examples/SpokenDigitKWS/` — 1D-conv keyword-spotting on FSDD:
       MFCCs → 1D conv stack → classification.
 - [ ] `examples/TimeSeriesForecast/` — one-screen forecasting demo on a
