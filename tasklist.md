@@ -300,10 +300,20 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [ ] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
-      with channel-wise learnable `(p1, p2, β)`. Generalizes Swish.
+- [X] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
+      with channel-wise learnable `(p1, p2, β)`. Generalizes Swish. LANDED:
+      TNNetChannelTransformBase descendant, per-channel (p1,p2,β) init to
+      Swish, exact input + weight gradients, gradient-checked
+      (TestAconCGradientCheck / SwishEquivalence / SerializationRoundTrip).
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
       channel.
+- [ ] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
+      data-dependent (β computed per-channel from a tiny squeeze over the
+      spatial mean, as in the ACON paper's Meta-ACON). Builds directly on
+      the now-landed AconC forward/backward.
+- [ ] AconC-vs-Swish-vs-ReLU bake-off: swap each activation into a fixed
+      3-layer MLP on the hypotenuse toy, chart final loss + epochs-to-
+      converge. AconC has landed, so this is a ~30-line activation swap.
 - [ ] TNNetSplineActivation — KAN-flavored per-channel learnable piecewise-
       linear activation with K+1 control points at fixed knots.
 - [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
@@ -324,8 +334,16 @@ breakdown:
       version: full-volume L2 normalization, per-channel L2 over spatial,
       configurable axis via FStruct[0].
 - [ ] TNNetUnitNorm — alias for L2Normalize on the full volume (Keras name).
-- [ ] TNNetMinMaxNorm — `(x - min(x)) / (max(x) - min(x) + eps)` per sample,
-      with subgradient routing for the argmin/argmax cells.
+- [ ] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
+      spatial only, independently per depth channel) gated by a flag, mirroring
+      the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
+      Builds on the landed full-volume TNNetMinMaxNorm.
+- [X] TNNetMinMaxNorm — `(x - min(x)) / (max(x) - min(x) + eps)` per sample,
+      with subgradient routing for the argmin/argmax cells. LANDED:
+      reduces over the whole sample volume, eps configurable + serialized,
+      exact backward routing through argmin/argmax, gradient-checked on a
+      non-degenerate input (TestMinMaxNorm{Forward,GradientCheck,
+      SerializationRoundTrip}).
 - [ ] TNNetUnitNormConstraint — projection layer that L2-normalizes the
       *weights* of the previous trainable layer after each step.
 
@@ -346,7 +364,15 @@ breakdown:
       `(1 - eps) * one_hot + eps / NumClasses`.
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
-- [ ] TNNetKLDivergence — `sum(p · log(p/q))` with stability clamps on q.
+- [X] TNNetKLDivergence — `sum(p · log(p/q))` with stability clamps on q.
+      LANDED: TNNetIdentity-style loss in the TNNetNLLLoss family; forward
+      pass-through, Backpropagate sets dL/dq_i = -p_i/q_i with q clamped to
+      [1e-7, 1] and 0·log0:=0 for zero-target terms
+      (TestKLDivergence{ForwardPassthrough,Gradient,LoadFromString}).
+- [ ] TNNetKLDivergence follow-up: a knowledge-distillation micro-example —
+      train a small "student" against soft targets from a fixed "teacher"
+      distribution using the landed TNNetKLDivergence head, and contrast its
+      loss curve with a hard-label cross-entropy baseline.
 - [ ] TNNetDiceLoss — `1 - 2·sum(p·q + ε) / (sum(p²) + sum(q²) + ε)`,
       IoU-flavored segmentation loss.
 - [ ] TNNetTverskyLoss — generalized Dice with separate FP/FN weights α, β.
