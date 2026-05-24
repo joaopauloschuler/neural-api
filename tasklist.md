@@ -343,6 +343,24 @@ breakdown:
       interpolation empirically. Forward layer + gradient already landed.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
+- [ ] TNNetSoftPool follow-up: add an optional `beta` temperature to the
+      softmax weights (`w_i = exp(beta*x_i)/sum_j exp(beta*x_j)`) so
+      `beta -> inf` recovers max-pool and `beta -> 0` recovers avg-pool — a
+      single knob spanning the family. Store `beta` in `FFloatSt[0]`,
+      extend BOTH dispatch tables to `Create(St[0],St[1],St[2],Ft[0])`, and
+      add a `beta`-sweep gradient/limit test. Base layer landed (forward
+      `y=sum w_i x_i`, backward `dy/dx_i = w_i*(1+x_i-y)`, beta fixed at 1).
+- [ ] Pooling bake-off example `examples/PoolingBakeoff/`: same tiny conv
+      classifier, swap the pooling head across `TNNetAvgPool` / `TNNetMaxPool`
+      / `TNNetLpPool(p=2)` / `TNNetSoftPool`, chart final loss/accuracy on a
+      small CIFAR stub. Visualises the average<->max interpolation empirically
+      (subsumes the TNNetLpPool `p`-sweep follow-up above — fold them into one
+      example). All four pooling layers are in tree.
+- [ ] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
+      stack accepting two different input resolutions and producing a
+      fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
+      sibling to the open TNNetAdaptiveAvgPool example task above. Layer +
+      gradient/forward tests already landed.
 ### Loss layers
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
@@ -537,6 +555,12 @@ breakdown:
 - [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
       accumulator into the shared LayerInputGradientCheck (and weight-grad
       variant). Sum the SSE in Double; eps and tolerance stay TNeuralFloat.
+      NEW DATA POINT: TNNetAdaptiveMaxPool's gradient check hit the same
+      float32 subtractive-cancellation issue (a single cell carrying the
+      whole window error, num=1.2588 vs ana=1.2709) and had to be loosened
+      to tol 0.02 with an in-code comment — verified NOT a layer bug
+      (double-precision central difference matches analytic exactly). A
+      strong candidate to convert once the Double accumulator helper lands.
 - [ ] Add a "FP32 SSE accumulator warning" comment near LayerInputGradientCheck
       pointing future audits at the DeMaxPool case and the Double-precision
       workaround.
@@ -687,7 +711,10 @@ breakdown:
 - [ ] `examples/FiLMConditional/` — toy "draw a digit of class C" generator
       with FiLM conditioning on a 10-way one-hot class input.
 - [ ] `examples/TripletEmbedding/` — learn a 2D embedding of MNIST digits
-      using TNNetTripletLoss; output a PGM scatter plot.
+      using TNNetTripletLoss; output a PGM scatter plot. UNBLOCKED:
+      TNNetTripletLoss has now landed (a|p|n depth-split hinge head, margin
+      via FFloatSt[0]) — wire the embedding net to emit a depth-3d output
+      and feed it straight into the head.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
       TNNetVectorQuantizer bottleneck.
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
