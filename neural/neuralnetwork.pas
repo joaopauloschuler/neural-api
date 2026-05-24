@@ -3930,6 +3930,49 @@ type
         UseTrueLabel: boolean = true;
         LayerIdx: integer = -1
       ): string;
+      // EMPIRICAL (gradient-measured) receptive-field diagnostic - the
+      // forward+backward counterpart of the purely analytical
+      // ReceptiveFieldReport. The analytical report answers "what input region
+      // COULD a deep output unit see?"; this answers "what input region does
+      // that unit ACTUALLY WEIGHT?" (Luo et al. 2016 show the effective RF is
+      // typically far smaller and more Gaussian than the theoretical one - a
+      // deep stem often only really uses the middle of its theoretical window).
+      // It picks the CENTRE output unit of the final spatial layer (the deepest
+      // layer with SizeX>1 or SizeY>1; falls back to the last layer), enables
+      // input-gradient flow via TNNet.EnableInputGradient (the same helper
+      // SaliencyReport / AdversarialRobustnessReport use), and for every probe
+      // input (Probes, a TNNetVolumeList) runs one NN.Compute then injects a
+      // one-hot output error e_centre on that layer and back-propagates, reading
+      // d(out_centre)/d(input) off the input layer (Layers[0].OutputError). It
+      // accumulates |gradient|, SUMMED over input depth, into a per-(x,y)
+      // input-plane heatmap. The net is FROZEN (ClearDeltas before each pass,
+      // NEVER UpdateWeights - weights are bit-for-bit unchanged). It reports:
+      //   (a) a 2-D ASCII heatmap of the input-plane sensitivity (per-(x,y),
+      //       summed over depth, normalised to its own max), shaded ' .:-=+*#%@'
+      //       like the sibling reports;
+      //   (b) the EFFECTIVE RF radius/diameter - the smallest centred square
+      //       region holding MassFraction (default 0.9) of the total gradient
+      //       mass (so "90% of what this unit weighs lives within +/-r pixels of
+      //       its centre"), plus the centroid and the mass-weighted Gaussian
+      //       std of the heatmap;
+      //   (c) the THEORETICAL RF side-by-side: it calls ReceptiveFieldReport
+      //       internally for the analytical final-RF number and prints the
+      //       effective/theoretical ratio per axis, so the "your stem only
+      //       really uses the middle third of its theoretical window" story is
+      //       visible in one run.
+      // MassFraction (default 0.9) sets the mass quantile for the effective-RF
+      // region; MaxProbes (default 64) caps how many probe volumes are used
+      // (time/memory). Guards nil NN, a <2-layer net and an empty probe list
+      // gracefully. DISTINCT from ReceptiveFieldReport (analytical "could see")
+      // and SaliencyReport (per-sample input attribution for a class logit, not
+      // a batch-averaged spatial-extent measurement). Forward+backward only; the
+      // trained weights are never modified.
+      class function EffectiveReceptiveFieldReport(
+        NN: TNNet;
+        Probes: TNNetVolumeList;
+        MassFraction: TNeuralFloat = 0.9;
+        MaxProbes: integer = 64
+      ): string;
       // Linear-probe (linear separability) diagnostic. Given a classifier NN
       // (trained or fresh) and a labelled probe batch Samples (input volume +
       // one-hot target pairs, a TNNetVolumePairList), trains a CLOSED-FORM
@@ -25579,6 +25622,337 @@ begin
       'Read it as: a fat negative-cosine tail / high conflict fraction means ' +
       'the batch gradients fight each other (small or unstable steps); a ' +
       'cosine mass clustered near +1 means the samples agree.');
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.EffectiveReceptiveFieldReport(
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  MassFraction: TNeuralFloat = 0.9;
+  MaxProbes: integer = 64
+): string;
+const
+  cEps = 1e-30;
+  cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
+var
+  Lines: TStringList;
+  InX, InY, InDepth: integer;
+  SpatialIdx, LastIdx: integer;
+  SpatialLayer, InLayer: TNNetLayer;
+  CenterX, CenterY, CenterUnit: integer;
+  Heat: array of TNeuralFloat;     // [InX*InY], summed over depth
+  Used, P, Px, Py, Ch, Gi, FlatIdx: integer;
+  Probe: TNNetVolume;
+  TotalMass, V, MaxHeat, AbsV: TNeuralFloat;
+  // effective-RF (centred-square mass) bookkeeping
+  CX, CY, R, MaxR, BoxMass, NeededMass: TNeuralFloat;
+  EffRadiusX, EffRadiusY, EffRadius: integer;
+  // centroid + mass-weighted std
+  SumW, SumX, SumY, SumXX, SumYY, MeanX, MeanY, StdX, StdY: TNeuralFloat;
+  RowStr: string;
+  BucketIdx, ix, iy, rad: integer;
+  RowMass: TNeuralFloat;
+  // theoretical RF from the analytical sibling
+  AnalyticReport: string;
+  TheoRFx, TheoRFy: TNeuralFloat;
+  RFLinePos, NumStart, NumEnd: integer;
+  FS: TFormatSettings;
+  TmpStr: string;
+
+  // Find Sub in S at or after FromIdx (1-based); 0 if not found. Avoids the
+  // StrUtils PosEx dependency (this unit does not use StrUtils).
+  function PosFrom(const Sub, S: string; FromIdx: integer): integer;
+  var
+    Rel: integer;
+  begin
+    if FromIdx < 1 then FromIdx := 1;
+    if FromIdx > Length(S) then begin Result := 0; Exit; end;
+    Rel := Pos(Sub, Copy(S, FromIdx, Length(S) - FromIdx + 1));
+    if Rel = 0 then Result := 0
+    else Result := Rel + FromIdx - 1;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'EffectiveReceptiveFieldReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'EffectiveReceptiveFieldReport: network needs at least 2 ' +
+        'layers.' + sLineBreak;
+      Exit;
+    end;
+    if (Probes = nil) or (Probes.Count = 0) then
+    begin
+      Result := 'EffectiveReceptiveFieldReport: Probes is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+    if (MassFraction <= 0) or (MassFraction > 1) then MassFraction := 0.9;
+    if MaxProbes < 1 then MaxProbes := 1;
+
+    InLayer := NN.Layers[0];
+    InX := InLayer.Output.SizeX;
+    InY := InLayer.Output.SizeY;
+    InDepth := InLayer.Output.Depth;
+    if InX < 1 then InX := 1;
+    if InY < 1 then InY := 1;
+
+    // Pick the FINAL SPATIAL layer (deepest layer that still has a 2-D map);
+    // fall back to the last layer when nothing past the input keeps a map.
+    LastIdx := NN.GetLastLayerIdx();
+    SpatialIdx := LastIdx;
+    for P := LastIdx downto 1 do
+      if (NN.Layers[P].Output.SizeX > 1) or (NN.Layers[P].Output.SizeY > 1) then
+      begin
+        SpatialIdx := P;
+        Break;
+      end;
+    SpatialLayer := NN.Layers[SpatialIdx];
+
+    // Centre output unit of that layer (centre pixel, channel 0).
+    CenterX := SpatialLayer.Output.SizeX div 2;
+    CenterY := SpatialLayer.Output.SizeY div 2;
+    CenterUnit := SpatialLayer.Output.GetRawPos(CenterX, CenterY, 0);
+    if CenterUnit >= SpatialLayer.Output.Size then CenterUnit := 0;
+    if CenterUnit < 0 then CenterUnit := 0;
+
+    SetLength(Heat, InX * InY);
+    for Gi := 0 to InX * InY - 1 do Heat[Gi] := 0;
+
+    // Enable input-gradient flow so the backward pass deposits the gradient on
+    // the input layer. A clean Compute below sizes the input Output first.
+    NN.SetBatchUpdate(true);
+    NN.Compute(Probes[0]);
+    NN.EnableInputGradient();
+
+    // Accumulate |d out_centre / d input| (summed over depth) over the probe
+    // batch. Frozen: ClearDeltas before each pass, never UpdateWeights.
+    Used := 0;
+    for P := 0 to Probes.Count - 1 do
+    begin
+      if Used >= MaxProbes then Break;
+      Probe := Probes[P];
+      if (Probe = nil) or (Probe.Size = 0) then Continue;
+      NN.ClearDeltas();
+      NN.Compute(Probe);
+      // Inject the one-hot error e_centre on the spatial layer and run the
+      // backward chain so the propagated quantity is exactly out_centre.
+      NN.ResetBackpropCallCurrCnt();
+      if SpatialLayer.FDepartingBranchesCnt = 0 then
+        SpatialLayer.IncDepartingBranchesCnt();
+      SpatialLayer.OutputError.Fill(0);
+      if (CenterUnit >= 0) and (CenterUnit < SpatialLayer.OutputError.Size) then
+        SpatialLayer.OutputError.Raw[CenterUnit] := 1.0;
+      SpatialLayer.ComputeErrorDeriv();
+      SpatialLayer.Backpropagate();
+      if (InLayer.OutputError <> nil) and
+         (InLayer.OutputError.Size = InX * InY * InDepth) then
+      begin
+        for Py := 0 to InY - 1 do
+          for Px := 0 to InX - 1 do
+          begin
+            AbsV := 0;
+            for Ch := 0 to InDepth - 1 do
+            begin
+              FlatIdx := InLayer.OutputError.GetRawPos(Px, Py, Ch);
+              AbsV := AbsV + Abs(InLayer.OutputError.Raw[FlatIdx]);
+            end;
+            Heat[Py * InX + Px] := Heat[Py * InX + Px] + AbsV;
+          end;
+      end;
+      Inc(Used);
+    end;
+
+    // Theoretical RF from the analytical sibling: parse the "Final receptive
+    // field: <rfx> x <rfy>" line so we never duplicate the recurrence.
+    FS := DefaultFormatSettings;
+    FS.DecimalSeparator := '.';
+    FS.ThousandSeparator := #0;
+    AnalyticReport := TNNet.ReceptiveFieldReport(NN);
+    TheoRFx := 0; TheoRFy := 0;
+    RFLinePos := Pos('Final receptive field: ', AnalyticReport);
+    if RFLinePos > 0 then
+    begin
+      NumStart := RFLinePos + Length('Final receptive field: ');
+      NumEnd := PosFrom(' ', AnalyticReport, NumStart);
+      if NumEnd > NumStart then
+      begin
+        TmpStr := Trim(Copy(AnalyticReport, NumStart, NumEnd - NumStart));
+        TheoRFx := StrToFloatDef(TmpStr, 0, FS);
+      end;
+      // " x <rfy> on a"
+      NumStart := PosFrom('x ', AnalyticReport, NumEnd);
+      if NumStart > 0 then
+      begin
+        NumStart := NumStart + 2;
+        NumEnd := PosFrom(' ', AnalyticReport, NumStart);
+        if NumEnd > NumStart then
+        begin
+          TmpStr := Trim(Copy(AnalyticReport, NumStart, NumEnd - NumStart));
+          TheoRFy := StrToFloatDef(TmpStr, 0, FS);
+        end;
+      end;
+    end;
+
+    // ---------------------------------------------------------------- header
+    Lines.Add(Format(
+      'EffectiveReceptiveFieldReport: empirical (gradient-measured) RF over ' +
+      '%d probe(s). Input plane = %dx%d (depth %d, summed).',
+      [Used, InX, InY, InDepth]));
+    Lines.Add(Format(
+      'Probed output: centre unit (%d,%d) of layer %d (%s, out %dx%dx%d). ' +
+      'Frozen net (no weight update).',
+      [CenterX, CenterY, SpatialIdx, SpatialLayer.ClassName,
+       SpatialLayer.Output.SizeX, SpatialLayer.Output.SizeY,
+       SpatialLayer.Output.Depth]));
+
+    // total mass + max for normalisation
+    TotalMass := 0; MaxHeat := 0;
+    for Gi := 0 to InX * InY - 1 do
+    begin
+      TotalMass := TotalMass + Heat[Gi];
+      if Heat[Gi] > MaxHeat then MaxHeat := Heat[Gi];
+    end;
+
+    if TotalMass <= cEps then
+    begin
+      Lines.Add('');
+      Lines.Add('Gradient mass is ~0 on the input plane (the centre output ' +
+        'unit has no measurable input dependence here — e.g. a dead ReLU ' +
+        'path or a non-differentiable route). No effective RF to report.');
+      Lines.Add('');
+      Lines.Add(Format('Theoretical RF (analytical): %g x %g on %dx%d input.',
+        [TheoRFx, TheoRFy, InX, InY]));
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    // ---------------------------------------------------- 2-D ASCII heatmap
+    Lines.Add('');
+    Lines.Add('Input-plane sensitivity |d out_centre / d in| ' +
+      '(summed over depth, shaded by own max):');
+    for Py := 0 to InY - 1 do
+    begin
+      RowStr := '  ';
+      for Px := 0 to InX - 1 do
+      begin
+        V := Heat[Py * InX + Px];
+        if MaxHeat > cEps then
+          BucketIdx := Trunc((V / MaxHeat) * (Length(cBuckets) - 1) + 0.5)
+        else
+          BucketIdx := 0;
+        if BucketIdx < 0 then BucketIdx := 0;
+        if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+        RowStr := RowStr + cBuckets[BucketIdx + 1];
+      end;
+      Lines.Add(RowStr);
+    end;
+
+    // ------------------------------------------------ centroid + spatial std
+    SumW := 0; SumX := 0; SumY := 0; SumXX := 0; SumYY := 0;
+    for Py := 0 to InY - 1 do
+      for Px := 0 to InX - 1 do
+      begin
+        V := Heat[Py * InX + Px];
+        SumW := SumW + V;
+        SumX := SumX + V * Px;
+        SumY := SumY + V * Py;
+      end;
+    MeanX := SumX / SumW;
+    MeanY := SumY / SumW;
+    for Py := 0 to InY - 1 do
+      for Px := 0 to InX - 1 do
+      begin
+        V := Heat[Py * InX + Px];
+        SumXX := SumXX + V * (Px - MeanX) * (Px - MeanX);
+        SumYY := SumYY + V * (Py - MeanY) * (Py - MeanY);
+      end;
+    StdX := Sqrt(SumXX / SumW);
+    StdY := Sqrt(SumYY / SumW);
+
+    // --------------------------- effective RF: smallest centred square that
+    // holds MassFraction of the mass, measured around the geometric input
+    // centre (where the probed centre output unit projects to). Grow a square
+    // half-width r and accumulate the enclosed mass.
+    CX := (InX - 1) / 2.0;
+    CY := (InY - 1) / 2.0;
+    if InX > InY then MaxR := InX else MaxR := InY;
+    NeededMass := MassFraction * TotalMass;
+    EffRadiusX := InX;       // worst case: full plane
+    EffRadiusY := InY;
+    EffRadius := Trunc(MaxR);
+    for rad := 0 to Trunc(MaxR) do
+    begin
+      BoxMass := 0;
+      for Py := 0 to InY - 1 do
+        for Px := 0 to InX - 1 do
+          if (Abs(Px - CX) <= rad) and (Abs(Py - CY) <= rad) then
+            BoxMass := BoxMass + Heat[Py * InX + Px];
+      if BoxMass >= NeededMass then
+      begin
+        EffRadius := rad;
+        Break;
+      end;
+    end;
+    // per-axis effective half-widths (mass collapsed onto each axis)
+    EffRadiusX := InX; EffRadiusY := InY;
+    for rad := 0 to InX do
+    begin
+      RowMass := 0;
+      for Py := 0 to InY - 1 do
+        for Px := 0 to InX - 1 do
+          if Abs(Px - CX) <= rad then RowMass := RowMass + Heat[Py * InX + Px];
+      if RowMass >= NeededMass then begin EffRadiusX := rad; Break; end;
+    end;
+    for rad := 0 to InY do
+    begin
+      RowMass := 0;
+      for Py := 0 to InY - 1 do
+        for Px := 0 to InX - 1 do
+          if Abs(Py - CY) <= rad then RowMass := RowMass + Heat[Py * InX + Px];
+      if RowMass >= NeededMass then begin EffRadiusY := rad; Break; end;
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format('Mass centroid: (%6.2f, %6.2f) ' +
+      '(plane centre = (%.1f, %.1f)).', [MeanX, MeanY, CX, CY]));
+    Lines.Add(Format('Mass-weighted spatial std: sigma_x=%6.3f  sigma_y=%6.3f.',
+      [StdX, StdY]));
+    Lines.Add(Format(
+      'EFFECTIVE RF (%.0f%% of gradient mass): radius=%d px ' +
+      '(diameter %d), per-axis half-width x=%d y=%d (diameter %dx%d).',
+      [MassFraction * 100.0, EffRadius, EffRadius * 2 + 1,
+       EffRadiusX, EffRadiusY, EffRadiusX * 2 + 1, EffRadiusY * 2 + 1]));
+
+    // ----------------------------------------- effective-vs-theoretical RF
+    Lines.Add('');
+    Lines.Add(Format('Theoretical RF (analytical, ReceptiveFieldReport): ' +
+      '%g x %g on %dx%d input.', [TheoRFx, TheoRFy, InX, InY]));
+    if (TheoRFx > 0) and (TheoRFy > 0) then
+    begin
+      Lines.Add(Format(
+        'Effective / theoretical RF: x = %5.1f / %g = %5.2f   ' +
+        'y = %5.1f / %g = %5.2f.',
+        [EffRadiusX * 2.0 + 1, TheoRFx, (EffRadiusX * 2.0 + 1) / TheoRFx,
+         EffRadiusY * 2.0 + 1, TheoRFy, (EffRadiusY * 2.0 + 1) / TheoRFy]));
+      Lines.Add('Read it as: the unit COULD see the theoretical window but ' +
+        'only really WEIGHTS the effective region — a ratio well below 1 ' +
+        'means the stem uses just the middle of its theoretical RF ' +
+        '(Luo et al. 2016).');
+    end
+    else
+      Lines.Add('Theoretical RF unavailable (could not parse the analytical ' +
+        'report); effective RF reported alone.');
 
     Result := Lines.Text;
   finally

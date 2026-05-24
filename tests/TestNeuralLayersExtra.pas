@@ -99,6 +99,7 @@ type
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
+    procedure TestEffectiveReceptiveFieldReportSmoke;
   end;
 
 implementation
@@ -2871,6 +2872,104 @@ begin
   finally
     Clean.Free;
     Noisy.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestEffectiveReceptiveFieldReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report, NilReport: string;
+  I, X, Y: integer;
+  RatioPos, NumStart, NumEnd: integer;
+  RatioStr: string;
+  Ratio: TNeuralFloat;
+  FS: TFormatSettings;
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.EffectiveReceptiveFieldReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(13, 13, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.InitWeights();
+
+    // empty probe list handled gracefully (on a valid net).
+    Report := TNNet.EffectiveReceptiveFieldReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Synthetic probe batch (no dataset).
+    RandSeed := 4242;
+    for I := 1 to 16 do
+    begin
+      V := TNNetVolume.Create(13, 13, 1);
+      for Y := 0 to 12 do
+        for X := 0 to 12 do
+          V[X, Y, 0] := Random - 0.5;
+      Probes.Add(V);
+    end;
+
+    Report := TNNet.EffectiveReceptiveFieldReport(NN, Probes);
+
+    AssertTrue('report non-empty', Length(Report) > 0);
+    AssertTrue('header present',
+      Pos('EffectiveReceptiveFieldReport', Report) > 0);
+    AssertTrue('probed-output line present',
+      Pos('Probed output: centre unit', Report) > 0);
+    AssertTrue('heatmap header present',
+      Pos('Input-plane sensitivity', Report) > 0);
+    AssertTrue('effective RF line present',
+      Pos('EFFECTIVE RF', Report) > 0);
+    AssertTrue('theoretical RF line present',
+      Pos('Theoretical RF (analytical', Report) > 0);
+    AssertTrue('effective/theoretical ratio present',
+      Pos('Effective / theoretical RF', Report) > 0);
+
+    // --- Sanity invariant 1: the effective RF radius is positive. ---
+    AssertTrue('effective RF radius > 0',
+      Pos('EFFECTIVE RF (90% of gradient mass): radius=0', Report) = 0);
+
+    // --- Sanity invariant 2: the mass is concentrated near the centre, so
+    // the effective/theoretical ratio is <= 1 (the effective RF cannot exceed
+    // the theoretical window). The line reads
+    //   "Effective / theoretical RF: x = <eff> / <theo> = <ratio>   y = ..."
+    // so the ratio value follows the first " = " AFTER the "/ " on the x part.
+    RatioPos := Pos('Effective / theoretical RF: x = ', Report);
+    AssertTrue('ratio line located', RatioPos > 0);
+    // advance past the "/ <theo>" to the "= <ratio>" that closes the x term
+    NumStart := RatioPos + Length('Effective / theoretical RF: x = ');
+    NumStart := Pos('/ ', Copy(Report, NumStart, Length(Report))) + NumStart - 1;
+    AssertTrue('division marker found', NumStart > 0);
+    NumStart := Pos('= ', Copy(Report, NumStart, Length(Report))) + NumStart - 1;
+    AssertTrue('ratio operator found', NumStart > 0);
+    NumStart := NumStart + 2;   // skip "= "
+    while (NumStart <= Length(Report)) and (Report[NumStart] = ' ') do
+      Inc(NumStart);
+    NumEnd := NumStart;
+    while (NumEnd <= Length(Report)) and (Report[NumEnd] <> ' ') and
+          (Report[NumEnd] <> #10) and (Report[NumEnd] <> #13) do
+      Inc(NumEnd);
+    RatioStr := Trim(Copy(Report, NumStart, NumEnd - NumStart));
+    Ratio := StrToFloatDef(RatioStr, -1, FS);
+    AssertTrue('ratio parsed', Ratio >= 0);
+    AssertTrue('effective RF does not exceed theoretical (ratio <= 1.01)',
+      Ratio <= 1.01);
+    AssertTrue('effective RF is a real fraction of theoretical (ratio > 0)',
+      Ratio > 0);
+  finally
+    Probes.Free;
     NN.Free;
   end;
 end;
