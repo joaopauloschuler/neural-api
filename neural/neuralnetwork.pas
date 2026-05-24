@@ -4506,6 +4506,19 @@ type
       // The sublayer runs on the raw input, the residual sum is taken, then
       // LayerNorm is applied. Returns the final LayerNorm layer.
       function AddPostNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // Gated residual block:  y = x + GatedResidual(Sublayer(x)).
+      // Unlike the norm-based siblings above, this block applies NO
+      // normalization. Instead it inserts a TNNetGatedResidual after the
+      // sublayer stack: a per-channel learnable gate alpha[d] that scales the
+      // sublayer output (Output[x,y,d] = alpha[d] * Sublayer(x)[x,y,d]), the
+      // per-channel generalisation of TNNetReZero. alpha is initialised to 0.0,
+      // so at the start of training the gated branch contributes nothing and the
+      // block is the exact identity y = x; each channel gate then opens
+      // independently during training. The gate is the only added parameter.
+      // pSublayers is the caller-provided sublayer stack; its output shape MUST
+      // match the block input shape so the residual sum is valid. Returns the
+      // residual-sum layer.
+      function AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -41832,6 +41845,19 @@ begin
   AddLayer(pSublayers);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   Result := AddLayer( TNNetLayerNorm.Create() );
+end;
+
+function TNNet.AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = x + GatedResidual(Sublayer(x))
+  // The per-channel gate (TNNetGatedResidual) is initialised to 0.0, so the
+  // branch starts at zero contribution and the block begins as the identity.
+  BranchInput := GetLastLayer();
+  AddLayer(pSublayers);
+  AddLayer( TNNetGatedResidual.Create() );
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
 function TNNet.AddGroupedCompression(Compression: TNeuralFloat;

@@ -112,11 +112,13 @@ type
     procedure TestRMSNormGatedForward;
     procedure TestRMSNormGatedGradientCheck;
     procedure TestRMSNormGatedSerializationRoundTrip;
-    // Residual builder helpers (AddPreNormResidual / AddRMSNormResidual / AddPostNormResidual)
+    // Residual builder helpers (AddPreNormResidual / AddRMSNormResidual / AddPostNormResidual / AddGatedResidual)
     procedure TestPreNormResidualGradientCheck;
     procedure TestRMSNormResidualGradientCheck;
     procedure TestPostNormResidualGradientCheck;
     procedure TestPreNormResidualForwardWiring;
+    procedure TestGatedResidualGradientCheck;
+    procedure TestGatedResidualForwardWiring;
     procedure TestSwitchableNormForward;
     procedure TestSwitchableNormGradientCheck;
     procedure TestSwitchableNormSerializationRoundTrip;
@@ -2570,6 +2572,148 @@ begin
     NN.Free;
     Input.Free;
     Manual.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatedResidualGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LGate: TNNetGatedResidual;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // End-to-end input gradient check of AddGatedResidual: a residual block
+  // y = x + GatedResidual(Sublayer(x)). The sublayer is a PointwiseConvLinear
+  // whose output depth (2) matches the input depth so the residual sum is valid.
+  // The gate is set to a non-zero value so the branch contributes and the
+  // gradient is non-trivial.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    NN.AddGatedResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Layers: [0]=Input, [1]=PointwiseConvLinear, [2]=GatedResidual, [3]=Sum.
+    LGate := NN.Layers[2] as TNNetGatedResidual;
+    // Open the gate per channel so the branch actually contributes (kept
+    // moderate so the analytical/numerical gradients stay in a comparable range).
+    LGate.Neurons[0].Weights.Raw[0] := 0.4;
+    LGate.Neurons[0].Weights.Raw[1] := -0.25;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GatedResidual input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatedResidualForwardWiring;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LGate: TNNetGatedResidual;
+  ResidualOut, SublayerOut: TNNetLayer;
+  i, d: integer;
+  alpha: array[0..1] of TNeuralFloat;
+begin
+  // Forward sanity: AddGatedResidual must produce x + GatedResidual(Sublayer(x)).
+  // With the per-channel gate at its default 0.0 the block is the EXACT identity
+  // (output == branch input x). After opening the gate to known constants the
+  // output must equal x + alpha[d] * Sublayer(x).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2));
+    ResidualOut := NN.AddGatedResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+
+    // Layers inside the block: [0]=Input, [1]=PointwiseConvLinear, [2]=GatedResidual, [3]=Sum.
+    SublayerOut := NN.Layers[1];
+    LGate := NN.Layers[2] as TNNetGatedResidual;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.7 - 0.4;
+
+    // Output shape must match the input shape (residual add validity).
+    AssertEquals('GatedResidual output SizeX', 3, ResidualOut.Output.SizeX);
+    AssertEquals('GatedResidual output SizeY', 1, ResidualOut.Output.SizeY);
+    AssertEquals('GatedResidual output Depth', 2, ResidualOut.Output.Depth);
+
+    // The gate is one weight per channel (Depth), initialised to 0.0.
+    AssertEquals('GatedResidual gate weight count == Depth', 2,
+      LGate.Neurons[0].Weights.Size);
+    for d := 0 to LGate.Neurons[0].Weights.Size - 1 do
+      AssertEquals('GatedResidual init alpha channel ' + IntToStr(d), 0.0,
+        LGate.Neurons[0].Weights.Raw[d], 1e-7);
+
+    // At init (alpha=0) the block is the exact identity: output == x.
+    NN.Compute(Input);
+    for i := 0 to ResidualOut.Output.Size - 1 do
+      AssertEquals('GatedResidual identity at init at ' + IntToStr(i),
+        Input.Raw[i], ResidualOut.Output.Raw[i], 1e-6);
+
+    // Open the gate to known per-channel constants and verify
+    // output == x + alpha[d] * Sublayer(x).
+    alpha[0] := 0.75;
+    alpha[1] := -0.40;
+    LGate.Neurons[0].Weights.Raw[0] := alpha[0];
+    LGate.Neurons[0].Weights.Raw[1] := alpha[1];
+
+    NN.Compute(Input);
+    for i := 0 to ResidualOut.Output.Size - 1 do
+    begin
+      d := i mod 2; // Depth is the innermost (fastest) index in Raw.
+      AssertEquals('GatedResidual gated sum at ' + IntToStr(i),
+        Input.Raw[i] + alpha[d] * SublayerOut.Output.Raw[i],
+        ResidualOut.Output.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
