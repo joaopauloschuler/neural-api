@@ -38,7 +38,7 @@ rather than acted on.
 <!-- (Sparse / mixture-of-experts routing layer removed: duplicate of the
      concrete TNNetMixtureOfExperts entry under "Probability projections /
      sparsity".) -->
-- [ ] TNNetFourierFeatures follow-up: the spectral-bias micro-experiment now
+- [X] TNNetFourierFeatures follow-up: the spectral-bias micro-experiment now
       unblocked by the landed layer. Fit a high-frequency 1D target (e.g.
       `y = sin(20x) + 0.5*sin(53x)` on `x in [-1,1]`) with the SAME small ReLU
       coordinate-MLP twice — once on the raw scalar `x`, once with
@@ -47,9 +47,11 @@ rather than acted on.
       MLP cannot fit the high frequencies, the Fourier-mapped one can). ~40-line
       example; pairs directly with the open `examples/SIREN/` task (FourierFeatures
       is a drop-in coordinate front-end) and the periodic-activation toy benchmark.
-- [ ] TNNetFourierFeatures follow-up: sigma bandwidth sweep — same 1D fit with
+      (landed: examples/FourierFeaturesSpectralBias/)
+- [X] TNNetFourierFeatures follow-up: sigma bandwidth sweep — same 1D fit with
       `sigma in {0.5, 2, 8, 32}` charting final MSE vs sigma (too small = still
       low-pass / underfit; too large = noisy / overfit). The single-knob story.
+      (landed: examples/FourierFeaturesSpectralBias/)
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
