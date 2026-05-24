@@ -371,13 +371,17 @@ breakdown:
      A separate "stable Mish" class would be a forward-pass duplicate of
      TNNetMish, which the "DO NOT REINTRODUCE" policy at the top of this file
      forbids. Verified 2026-05-24 lucky-day batch.) -->
-- [ ] TNNetSplineActivation follow-up: a KAN-vs-MLP toy-fit micro-experiment.
+- [X] TNNetSplineActivation follow-up: a KAN-vs-MLP toy-fit micro-experiment.
       Fit a wiggly 1D target (e.g. `y = sin(3x) + 0.3·sin(11x)`) with a small
       MLP whose ReLUs are swapped for TNNetSplineActivation at matched param
       count, and chart final loss + the learned per-channel spline shapes
       (dump `(x, y)` over [-Range,+Range]). ~30-line activation swap; the
       headline KAN claim is that the learnable activation buys lower loss at a
       fixed width. Pairs with the open TNNetAPL bake-off.
+      LANDED as examples/SplineActivationKAN/ — matched-param (21 vs 20 weights,
+      via TNNet.CountWeights), spline arm reaches MSE 0.061 vs ReLU 0.187 (67.5%
+      lower); dumps learned control points + sampled activation showing one
+      channel bent away from the identity (a sparse KAN fit).
 - [ ] TNNetSplineActivation follow-up: knot-count / Range sweep — same toy fit
       with K ∈ {2, 4, 8, 16} and a couple of Range values, charting the
       capacity↔overfitting trade and where extra knots stop helping.
