@@ -107,6 +107,7 @@ type
     procedure TestEffectiveReceptiveFieldReportSmoke;
     procedure TestModeConnectivityReportSmoke;
     procedure TestIntrinsicDimensionReportSmoke;
+    procedure TestActivationPatchingReportSmoke;
   end;
 
 implementation
@@ -3968,6 +3969,161 @@ begin
     DupBatch.Free;
     GTNet.Free;
     RandSeed := SavedSeed;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestActivationPatchingReportSmoke;
+var
+  NN: TNNet;
+  CleanIn, CorruptIn: TNNetVolume;
+  Before, After: TNNetVolume;
+  Report: string;
+  I, J, Tries, CleanCls, CorruptCls: integer;
+  R0, RLast: TNeuralFloat;
+  MaxDiff, D: TNeuralFloat;
+
+  // Pull the r_L value from the bar-chart row that starts with "  <L>  ".
+  // Rows look like:  "  %3d  %6d   %8.4f   %8.4f  ###". We parse the third
+  // numeric field. Returns NaN-ish 1e30 if not found.
+  function ReadRecovery(const S: string; LayerIdx: integer): TNeuralFloat;
+  var
+    Marker, Sub: string;
+    Pos1, Pos2, Cnt, K: integer;
+    Tok: string;
+    Fields: array[0..3] of string;
+  begin
+    Result := 1e30;
+    // Find a line whose trimmed start is the layer index followed by spaces.
+    Pos1 := 1;
+    while Pos1 <= Length(S) do
+    begin
+      Pos2 := Pos1;
+      while (Pos2 <= Length(S)) and (S[Pos2] <> #10) do Inc(Pos2);
+      Sub := Copy(S, Pos1, Pos2 - Pos1);
+      Marker := Trim(Sub);
+      // tokenise on whitespace
+      Cnt := 0;
+      for K := 0 to 3 do Fields[K] := '';
+      Tok := '';
+      for K := 1 to Length(Marker) do
+      begin
+        if Marker[K] = ' ' then
+        begin
+          if Tok <> '' then
+          begin
+            if Cnt <= 3 then Fields[Cnt] := Tok;
+            Inc(Cnt);
+            Tok := '';
+          end;
+        end
+        else Tok := Tok + Marker[K];
+      end;
+      if Tok <> '' then
+      begin
+        if Cnt <= 3 then Fields[Cnt] := Tok;
+        Inc(Cnt);
+      end;
+      // Field0 = layer idx, Field1 = argmax, Field2 = r_L, Field3 = delta.
+      if (Cnt >= 3) and (Fields[0] = IntToStr(LayerIdx)) then
+      begin
+        // Only accept rows where field1 (argmax) is a plain integer, to avoid
+        // matching header/verdict lines that happen to start with a number.
+        if (Fields[1] <> '') and
+           (TryStrToFloat(Fields[2], Result)) then Exit;
+      end;
+      Pos1 := Pos2 + 1;
+    end;
+  end;
+
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.ActivationPatchingReport(nil, nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  CleanIn := TNNetVolume.Create(5, 1, 1);
+  CorruptIn := TNNetVolume.Create(5, 1, 1);
+  Before := TNNetVolume.Create();
+  After := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+
+    // nil input handled gracefully.
+    Report := TNNet.ActivationPatchingReport(NN, nil, CorruptIn);
+    AssertTrue('nil input reported gracefully',
+      Pos('is nil', Report) > 0);
+
+    // Find a clean/corrupt pair the (untrained) net maps to different argmax.
+    CleanCls := -1; CorruptCls := -1;
+    for Tries := 1 to 200 do
+    begin
+      for J := 0 to 4 do CleanIn.Raw[J] := (Random - 0.5) * 4.0;
+      for J := 0 to 4 do CorruptIn.Raw[J] := (Random - 0.5) * 4.0;
+      NN.Compute(CleanIn);
+      CleanCls := NN.GetLastLayer.Output.GetClass();
+      NN.Compute(CorruptIn);
+      CorruptCls := NN.GetLastLayer.Output.GetClass();
+      if CleanCls <> CorruptCls then Break;
+    end;
+
+    // Capture clean output BEFORE the report to verify live-state restore.
+    NN.Compute(CleanIn);
+    Before.Copy(NN.GetLastLayer.Output);
+
+    Report := TNNet.ActivationPatchingReport(NN, CleanIn, CorruptIn);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('ActivationPatchingReport', Report) > 0);
+    AssertTrue('Causal trace section present',
+      Pos('Per-layer recovery r_L', Report) > 0);
+    AssertTrue('Faithfulness section present',
+      Pos('Faithfulness check', Report) > 0);
+
+    // Exact-recovery faithfulness checks: r_0 == 1 and r_last == 1.
+    R0 := ReadRecovery(Report, 0);
+    RLast := ReadRecovery(Report, 4);   // last layer index = 4
+    AssertTrue('r_0 parsed', R0 < 1e29);
+    AssertTrue('r_last parsed', RLast < 1e29);
+    AssertTrue('r_0 == 1 (input patch reconstructs clean run)',
+      Abs(R0 - 1.0) < 1e-4);
+    AssertTrue('r_last == 1 (last layer output is the logits)',
+      Abs(RLast - 1.0) < 1e-4);
+
+    // Live state restored: clean output identical to the pre-report capture.
+    NN.Compute(CleanIn);
+    After.Copy(NN.GetLastLayer.Output);
+    AssertEquals('output size unchanged', Before.Size, After.Size);
+    MaxDiff := 0;
+    for I := 0 to Before.Size - 1 do
+    begin
+      D := Abs(Before.Raw[I] - After.Raw[I]);
+      if D > MaxDiff then MaxDiff := D;
+    end;
+    AssertTrue('live state restored (max output diff < 1e-6)',
+      MaxDiff < 1e-6);
+
+    // Denominator-collapse path: CorruptInput == CleanInput must WARN, not crash.
+    Report := TNNet.ActivationPatchingReport(NN, CleanIn, CleanIn);
+    AssertTrue('denominator-collapse warns',
+      (Pos('WARNING', Report) > 0) and (Pos('denominator collapsed', Report) > 0));
+    AssertTrue('collapse path still non-empty', Length(Report) > 0);
+
+    // TargetIdx out of range handled gracefully.
+    Report := TNNet.ActivationPatchingReport(NN, CleanIn, CorruptIn, 99);
+    AssertTrue('out-of-range TargetIdx reported',
+      Pos('out of range', Report) > 0);
+  finally
+    After.Free;
+    Before.Free;
+    CorruptIn.Free;
+    CleanIn.Free;
+    NN.Free;
   end;
 end;
 

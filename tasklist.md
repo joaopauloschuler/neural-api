@@ -1158,7 +1158,7 @@ breakdown:
       Pairs naturally with the active-learning queue use of
       [[MCDropoutUncertaintyReport]] and the hard-example pools of
       `TopLogitMarginReport` / `ConfusionMatrixReport`.
-- [ ] TNNet.ActivationPatchingReport(NN, CleanInput, CorruptInput
+- [X] TNNet.ActivationPatchingReport(NN, CleanInput, CorruptInput
       [, TargetIdx]) — a **causal** mechanistic-interpretability diagnostic
       (activation patching / causal tracing; Vig et al. 2020, Meng et al.
       ROME 2022, Wang et al. IOI 2022) answering a question NONE of the

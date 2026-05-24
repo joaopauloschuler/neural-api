@@ -5489,6 +5489,59 @@ type
         IntgSteps: integer = 20;
         Seed: longword = 1234567
       ): string;
+      // Forward-only CAUSAL mechanistic-interpretability diagnostic
+      // (activation patching / causal tracing; Vig et al. 2020, Meng et al.
+      // ROME 2022, Wang et al. IOI 2022). It answers a question NONE of the
+      // other reports answer: "which layer's ACTIVATIONS carry the information
+      // that decides this prediction?" — measured by INTERVENTION, not
+      // correlation. Given a (CleanInput, CorruptInput) pair the trained net
+      // maps to different argmax classes (two samples of different class, or a
+      // sample and a noised/blanked copy), it:
+      //   1. runs a clean forward pass and CACHES every layer's Output volume;
+      //   2. runs a corrupt forward pass;
+      //   3. for each layer L in turn, restores ONLY layer L's cached CLEAN
+      //      activation into the corrupt run (overwrites FLayers[L].Output via
+      //      CopyNoChecks) and recomputes layers L+1..last, then reads off the
+      //      RECOVERY
+      //          r_L = (logit_c(patch_L) - logit_c(corrupt))
+      //                / (logit_c(clean) - logit_c(corrupt))
+      //      where c is the clean argmax class (TargetIdx, default = clean
+      //      argmax). r_L≈1 ⇒ patching layer L alone restores the clean
+      //      decision (the causal information lives there / is read by the rest
+      //      of the net); r_L≈0 ⇒ that layer carries nothing causal for this
+      //      contrast.
+      // Reports: a per-layer r_L ASCII bar chart across depth (the causal-trace
+      // curve — the headline plot), the argmax-flip layer (shallowest L whose
+      // patch flips the corrupt argmax back to c), the peak-recovery layer and
+      // its r_L, an early-/late-/distributed localisation verdict, and a
+      // per-layer un-normalised delta-logit column
+      // (logit_c(patch_L) - logit_c(corrupt)) so a near-zero normalisation
+      // denominator is visible. Correctness checks (also the smoke-test
+      // invariants): patching the INPUT layer (L=0) gives r_0 == 1 exactly (it
+      // reconstructs the full clean run — the faithfulness check); patching the
+      // LAST layer gives r_last == 1 exactly (its Output IS the logits);
+      // CorruptInput == CleanInput collapses the denominator so the report
+      // WARNS rather than dividing by zero; and the net's live state is
+      // restored by a final clean recompute before returning. Forward-only: no
+      // backward pass, no weight steps — the ONLY mutation is the transient
+      // activation overwrite, reverted by the final clean recompute. Distinct
+      // from SaliencyReport / AdversarialRobustnessReport (INPUT-space gradient
+      // attribution — which pixels matter, a correlational gradient, not a
+      // layer-localising causal intervention), from LayerSensitivityReport
+      // (jitters WEIGHTS with random Gaussian noise and measures output drift —
+      // perturbation magnitude, never swaps real activations between two
+      // inputs), from FisherImportanceReport (per-PARAMETER importance averaged
+      // over a batch, not a per-layer causal recovery on one contrastive pair)
+      // and from LinearProbeReport / FeatureSeparabilityReport (decodability /
+      // geometry — what's PRESENT in a layer, not what the rest of the net
+      // causally USES). Guards nil NN and nil inputs gracefully (returns a
+      // short message; never crashes).
+      class function ActivationPatchingReport(
+        NN: TNNet;
+        CleanInput: TNNetVolume;
+        CorruptInput: TNNetVolume;
+        TargetIdx: integer = -1
+      ): string;
       // Forward-only decision-boundary visualizer for a 2-input classifier.
       // Given a trained net whose input layer is 2-D
       // (TNNetInput.Create(2), i.e. SizeX*SizeY*Depth == 2) and a classifier
@@ -36641,6 +36694,235 @@ begin
     if Noisy <> nil then Noisy.Free;
     if Scaled <> nil then Scaled.Free;
     if Baseline <> nil then Baseline.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.ActivationPatchingReport(
+  NN: TNNet;
+  CleanInput: TNNetVolume;
+  CorruptInput: TNNetVolume;
+  TargetIdx: integer = -1
+): string;
+const
+  cMaxBarWidth = 40;
+  cEps = 1e-9;     // denominator-collapse guard
+var
+  Lines: TStringList;
+  LayerCnt, LastLayer, NumLayers: integer;
+  CleanCache: array of TNNetVolume;   // cached clean Output per layer
+  Recovery: array of TNeuralFloat;    // r_L per layer
+  DeltaLogit: array of TNeuralFloat;  // logit_c(patch_L) - logit_c(corrupt)
+  PatchArgmax: array of integer;      // argmax after patching layer L
+  CleanClass, CorruptClass, c: integer;
+  CleanLogitC, CorruptLogitC, Denom, PatchLogitC: TNeuralFloat;
+  L, I, BarLen: integer;
+  MaxAbsR, RvalForBar, RangeR, MinR, MaxR: TNeuralFloat;
+  Bar: string;
+  FlipLayer, PeakLayer: integer;
+  PeakR: TNeuralFloat;
+  EarlyMass, LateMass, Mid: TNeuralFloat;
+  Verdict: string;
+  DenomCollapsed: boolean;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  SetLength(CleanCache, 0);
+  try
+    if NN = nil then
+    begin
+      Result := 'ActivationPatchingReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (CleanInput = nil) or (CorruptInput = nil) then
+    begin
+      Result := 'ActivationPatchingReport: CleanInput or CorruptInput is nil.' +
+        sLineBreak;
+      Exit;
+    end;
+    NumLayers := NN.CountLayers();
+    LastLayer := NN.GetLastLayerIdx();
+    if NumLayers < 2 then
+    begin
+      Result := 'ActivationPatchingReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // ---- (1) clean forward pass; cache every layer's Output. ----
+    NN.Compute(CleanInput);
+    CleanClass := NN.GetLastLayer.Output.GetClass();
+    if TargetIdx < 0 then
+      c := CleanClass
+    else
+      c := TargetIdx;
+    if (c < 0) or (c >= NN.GetLastLayer.Output.Size) then
+    begin
+      Result := Format('ActivationPatchingReport: TargetIdx %d out of range ' +
+        '[0, %d).', [c, NN.GetLastLayer.Output.Size]) + sLineBreak;
+      Exit;
+    end;
+    CleanLogitC := NN.GetLastLayer.Output.Raw[c];
+    SetLength(CleanCache, NumLayers);
+    for LayerCnt := 0 to NumLayers - 1 do
+    begin
+      CleanCache[LayerCnt] := TNNetVolume.Create();
+      // Copy (resizes) so each cache volume matches its layer's Output shape.
+      CleanCache[LayerCnt].Copy(NN.Layers[LayerCnt].Output);
+    end;
+
+    // ---- (2) corrupt forward pass; record corrupt logits/argmax. ----
+    NN.Compute(CorruptInput);
+    CorruptClass := NN.GetLastLayer.Output.GetClass();
+    CorruptLogitC := NN.GetLastLayer.Output.Raw[c];
+
+    Denom := CleanLogitC - CorruptLogitC;
+    DenomCollapsed := Abs(Denom) < cEps;
+
+    Lines.Add('ActivationPatchingReport: forward-only CAUSAL activation-' +
+      'patching / causal trace.');
+    Lines.Add(Format('Layers=%d. Clean argmax=%d, Corrupt argmax=%d, ' +
+      'TargetClass c=%d%s.',
+      [NumLayers, CleanClass, CorruptClass, c,
+       BoolToStr(TargetIdx < 0, ' (default=clean argmax)', '')]));
+    Lines.Add(Format('logit_c(clean)=%8.4f  logit_c(corrupt)=%8.4f  ' +
+      'denom=%8.4f', [CleanLogitC, CorruptLogitC, Denom]));
+    if DenomCollapsed then
+    begin
+      Lines.Add('');
+      Lines.Add('WARNING: clean/corrupt logit_c are within ' +
+        Format('%g', [cEps]) + ' (the recovery denominator collapsed).');
+      Lines.Add('  The clean and corrupt runs do not differ on class c, so ' +
+        'r_L = (patch - corrupt)/(clean - corrupt) is undefined (0/0).');
+      Lines.Add('  Pick a (CleanInput, CorruptInput) pair the net maps to ' +
+        'DIFFERENT argmax classes (this is the CorruptInput==CleanInput case).');
+      Lines.Add('  Un-normalised delta-logits are still reported below.');
+    end;
+    if CleanClass = CorruptClass then
+      Lines.Add('NOTE: clean and corrupt argmax agree — the contrast is weak; ' +
+        'prefer a pair that flips the predicted class.');
+    Lines.Add('');
+
+    // ---- (3) per-layer patch: restore clean Output at L, recompute L+1.. ----
+    SetLength(Recovery, NumLayers);
+    SetLength(DeltaLogit, NumLayers);
+    SetLength(PatchArgmax, NumLayers);
+    for L := 0 to NumLayers - 1 do
+    begin
+      // Reset the whole net to the CORRUPT run so each patch is independent.
+      NN.Compute(CorruptInput);
+      // Overwrite ONLY layer L's activation with the cached clean one.
+      // CopyNoChecks: same shape by construction (cache came from this layer).
+      NN.Layers[L].Output.CopyNoChecks(CleanCache[L]);
+      // Recompute every downstream layer from the patched activation.
+      for I := L + 1 to LastLayer do
+        NN.Layers[I].Compute();
+      PatchLogitC := NN.GetLastLayer.Output.Raw[c];
+      PatchArgmax[L] := NN.GetLastLayer.Output.GetClass();
+      DeltaLogit[L] := PatchLogitC - CorruptLogitC;
+      if DenomCollapsed then
+        Recovery[L] := 0
+      else
+        Recovery[L] := DeltaLogit[L] / Denom;
+    end;
+
+    // ---- (4) headline plot: per-layer r_L bar chart across depth. ----
+    MinR := Recovery[0];
+    MaxR := Recovery[0];
+    for L := 1 to NumLayers - 1 do
+    begin
+      if Recovery[L] < MinR then MinR := Recovery[L];
+      if Recovery[L] > MaxR then MaxR := Recovery[L];
+    end;
+    MaxAbsR := Abs(MinR);
+    if Abs(MaxR) > MaxAbsR then MaxAbsR := Abs(MaxR);
+    if MaxAbsR < 1.0 then MaxAbsR := 1.0;   // keep r in [0,1] readable
+    RangeR := MaxR - MinR;
+    if RangeR <= 0 then RangeR := 1.0;
+    Lines.Add('Per-layer recovery r_L (causal trace; r=1 means patching ' +
+      'this layer alone restores the clean decision):');
+    Lines.Add('  Lyr  argmax        r_L  delta_logit  bar (scaled to max|r|=' +
+      Format('%.2f', [MaxAbsR]) + ')');
+    for L := 0 to NumLayers - 1 do
+    begin
+      RvalForBar := Recovery[L];
+      if RvalForBar < 0 then RvalForBar := 0;
+      BarLen := Round((RvalForBar / MaxAbsR) * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  %3d  %6d   %8.4f   %8.4f  %s',
+        [L, PatchArgmax[L], Recovery[L], DeltaLogit[L], Bar]));
+    end;
+    Lines.Add('');
+
+    // ---- (5) argmax-flip layer: shallowest L whose patch yields argmax c. ----
+    FlipLayer := -1;
+    for L := 0 to NumLayers - 1 do
+      if PatchArgmax[L] = c then
+      begin
+        FlipLayer := L;
+        Break;
+      end;
+    if FlipLayer >= 0 then
+      Lines.Add(Format('Argmax-flip layer: %d (shallowest layer whose patch ' +
+        'flips the corrupt argmax back to c=%d).', [FlipLayer, c]))
+    else
+      Lines.Add(Format('Argmax-flip layer: none (no single-layer patch ' +
+        'restores argmax c=%d).', [c]));
+
+    // ---- (6) peak-recovery layer. ----
+    PeakLayer := 0;
+    PeakR := Recovery[0];
+    for L := 1 to NumLayers - 1 do
+      if Recovery[L] > PeakR then
+      begin
+        PeakR := Recovery[L];
+        PeakLayer := L;
+      end;
+    Lines.Add(Format('Peak-recovery layer: %d (r_L=%8.4f).',
+      [PeakLayer, PeakR]));
+
+    // ---- (7) early/late/distributed localisation verdict. ----
+    // Mass = sum of clamped-positive r_L in the first vs second half of depth.
+    Mid := NumLayers div 2;
+    EarlyMass := 0;
+    LateMass := 0;
+    for L := 0 to NumLayers - 1 do
+    begin
+      RvalForBar := Recovery[L];
+      if RvalForBar < 0 then RvalForBar := 0;
+      if L < Mid then EarlyMass := EarlyMass + RvalForBar
+      else LateMass := LateMass + RvalForBar;
+    end;
+    if DenomCollapsed then
+      Verdict := 'undefined (denominator collapsed — see warning above)'
+    else if (PeakR < 0.5) and (EarlyMass + LateMass > 0) then
+      Verdict := 'distributed (no single layer recovers >= 0.5; the decision ' +
+        'is spread across depth)'
+    else if PeakLayer <= Mid then
+      Verdict := Format('early (the causal information localises to the ' +
+        'shallow half; peak at layer %d)', [PeakLayer])
+    else
+      Verdict := Format('late (the causal information localises to the deep ' +
+        'half; peak at layer %d)', [PeakLayer]);
+    Lines.Add('Localisation verdict: ' + Verdict + '.');
+    Lines.Add('');
+
+    // ---- (8) built-in faithfulness checks (r_0 and r_last). ----
+    Lines.Add(Format('Faithfulness check: r_0=%8.4f (expect 1.0 — patching ' +
+      'the input reconstructs the full clean run),', [Recovery[0]]));
+    Lines.Add(Format('                    r_last=%8.4f (expect 1.0 — the last ' +
+      'layer Output IS the logits).', [Recovery[NumLayers - 1]]));
+
+    Result := Lines.Text;
+  finally
+    // Restore the net's live state with a final CLEAN recompute (reverts the
+    // transient activation overwrite). Guard against a nil/partial setup.
+    if (NN <> nil) and (CleanInput <> nil) and (NN.CountLayers() >= 2) then
+      NN.Compute(CleanInput);
+    for I := 0 to High(CleanCache) do
+      if CleanCache[I] <> nil then CleanCache[I].Free;
     Lines.Free;
   end;
 end;
