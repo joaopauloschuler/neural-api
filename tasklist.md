@@ -1025,20 +1025,6 @@ breakdown:
       accuracy lift), `TNNet.LinearProbeReport` (closed-form per-layer linear
       probe), and the calibration unit (`neuralcalibration.pas`: ECE / MCE /
       Brier + reliability diagram). Specs are in the sections below/above.
-      LANDED: `TNNet.SaliencyReport` (commit 1c9e2ad), `TNNet.EquivarianceReport`
-      (commit d9de851), `TNNet.DecisionBoundaryReport` (commit a28022b).
-### Input attribution
-- [X] TNNet.SaliencyReport — LANDED (commit 1c9e2ad): vanilla
-      input-gradient / SmoothGrad / Integrated-Gradients attribution with
-      per-channel mass, top-K pixels, and an IG completeness-gap check.
-      `examples/SaliencyReport/` + smoke test shipped.
-
-### Input-symmetry equivariance
-- [X] TNNet.EquivarianceReport — LANDED (commit d9de851): per-transform
-      invariance error / argmax-agreement / histogram / verdict over a
-      FlipX/FlipY/ReverseChannels/Roll menu. `examples/EquivarianceReport/`
-      + smoke test shipped.
-
 ### Test-time augmentation evaluator
 - [ ] TNeuralTTAEvaluator — given a trained classifier, a validation set,
       and a configurable list of input-side transforms (default menu reuses
@@ -1135,10 +1121,3 @@ breakdown:
       monotone-ish climb with a visible saturation knee a few layers
       before the head), so reviewers can eyeball how training reshapes
       per-layer linear separability.
-
-### Learned-function visualization
-- [X] TNNet.DecisionBoundaryReport — LANDED (commit a28022b): 2-D input-plane
-      grid sweep rendering the learned function as an ASCII class map +
-      confidence overlay + boundary-length scalar + optional probe overlay
-      and CSV side-output; guards non-2-D inputs. `examples/DecisionBoundary/`
-      + smoke test shipped.
