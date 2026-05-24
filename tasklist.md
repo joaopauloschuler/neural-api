@@ -702,10 +702,12 @@ breakdown:
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm.
 - [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
       on a fixed toy dataset with a loss-vs-epoch table.
-- [ ] `examples/EmbeddingHeadDemo/` — train a small net to learn an
-      embedding space on a toy 3-class dataset using TNNetL2Normalize +
-      a hand-rolled triplet loss, print the per-class cosine-similarity
-      matrix.
+<!-- (`examples/EmbeddingHeadDemo/` removed: duplicate of the landed
+     `examples/TripletEmbedding/` example, which already learns a toy
+     multi-class embedding with TNNetL2Normalize and prints the per-class
+     cosine-similarity matrix. The only stated difference was a hand-rolled
+     triplet loss vs the in-tree TNNetTripletLoss head — not worth a second
+     near-identical demo.) -->
 - [ ] `examples/EmbeddingVisualization/` — contrastive head on a 4-class
       toy 2D dataset, dump learned embeddings to CSV with README plotting
       instructions.
@@ -890,8 +892,11 @@ breakdown:
       monolithic example until (b) lands.
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
-- [ ] Label-smoothing sweep — train SimpleImageClassifier with `ε ∈ {0,
-      0.05, 0.1, 0.2}`, tabulate test accuracy.
+<!-- (Plain "label-smoothing sweep — tabulate test accuracy" removed:
+     subsumed by the "LabelSmoothing calibration check" entry under
+     "### Loss layers", which runs the SAME SimpleImageClassifier sweep over
+     the SAME eps ∈ {0, 0.05, 0.1, 0.2} and additionally feeds each into the
+     neuralcalibration ECE/Brier report — a strict superset.) -->
 - [ ] SWA effect-size sweep: vary SWA start-epoch fraction ∈ {0.5, 0.6,
       0.7, 0.8, 0.9} and chart final test accuracy.
 - [ ] Cosine-LR vs constant-LR on SimpleImageClassifier, three seeds each.
@@ -1203,6 +1208,58 @@ breakdown:
       Pairs naturally with the active-learning queue use of
       [[MCDropoutUncertaintyReport]] and the hard-example pools of
       `TopLogitMarginReport` / `ConfusionMatrixReport`.
+- [ ] TNNet.ActivationPatchingReport(NN, CleanInput, CorruptInput
+      [, TargetIdx]) — a **causal** mechanistic-interpretability diagnostic
+      (activation patching / causal tracing; Vig et al. 2020, Meng et al.
+      ROME 2022, Wang et al. IOI 2022) answering a question NONE of the
+      landed reports answer: *"which layer's activations CARRY the
+      information that decides this prediction?"* — measured by intervention,
+      not correlation. The recipe: take a `(CleanInput, CorruptInput)` pair
+      the trained net maps to different argmax classes (two samples of
+      different true class, or one sample and a noised/blanked copy). Run a
+      clean forward and cache every layer's `Output`; run a corrupt forward;
+      then for each intermediate layer L in turn, restore that single layer's
+      cached CLEAN activation into the corrupt run (overwrite
+      `FLayers[L].Output` via `CopyNoChecks`) and recompute layers L+1..last
+      (the existing per-layer `Compute()` loop / `Compute(pInput,
+      FromLayerIdx)` machinery already forwards from a layer), reading off the
+      **recovery** `r_L = (logit_c(patch_L) - logit_c(corrupt)) /
+      (logit_c(clean) - logit_c(corrupt))` where `c` is the clean argmax class
+      (`TargetIdx`, default = clean argmax). `r_L≈1` ⇒ patching layer L alone
+      restores the clean decision (the information lives there / is read by
+      the rest of the net); `r_L≈0` ⇒ that layer carries nothing causal for
+      this contrast. Reports: a per-layer `r_L` ASCII bar chart across depth
+      (the causal-trace curve — the headline plot), the argmax-flip layer
+      (shallowest L whose patch flips the corrupt argmax back to `c`), the
+      peak-recovery layer and its `r_L`, an early-/late-/distributed
+      localisation verdict, and a per-layer un-normalised delta-logit column
+      (`logit_c(patch_L) - logit_c(corrupt)`) so a near-zero normalisation
+      denominator is visible. Built-in correctness checks: patching the INPUT
+      layer (L=0) gives `r_0 == 1` exactly (it reconstructs the full clean
+      run — the faithfulness check), patching the LAST layer gives
+      `r_last == 1` exactly (its output IS the logits), `CorruptInput :=
+      CleanInput` collapses the denominator so the report warns rather than
+      dividing by zero, and the net's live state is restored by a final clean
+      recompute. **Distinct from** [[SaliencyReport]] /
+      `AdversarialRobustnessReport` (INPUT-space gradient attribution — which
+      pixels matter, a correlational gradient, not a layer-localising causal
+      intervention), from `LayerSensitivityReport` (jitters WEIGHTS with
+      random Gaussian noise and measures output drift — perturbation
+      magnitude, never swaps real activations between two inputs), from
+      `FisherImportanceReport` (per-PARAMETER importance averaged over a
+      batch, not a per-layer causal recovery on one contrastive pair), and
+      from `LinearProbeReport` / `FeatureSeparabilityReport` (decodability /
+      geometry — what's PRESENT in a layer, not what the rest of the net
+      causally USES). Forward-only (no backward pass, no weight steps); the
+      only mutation is the transient activation overwrite, reverted by the
+      final clean recompute. Follows the introspection-report-pattern:
+      declaration + impl in neuralnetwork.pas, an `examples/ActivationPatching/`
+      demo on a synthetic task where the causal layer is KNOWN by construction
+      (a 2-stage net whose stage 1 must compute an intermediate feature the
+      clean/corrupt pair differ on, so the trace peaks at the stage boundary —
+      a ground-truth localisation check), and a smoke test in tests/ (non-empty
+      report, expected header, nil-NN graceful return, plus the `r_0==1` /
+      `r_last==1` exact-recovery assertions).
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
       label-free model selection) was simplified to a fresh-vs-trained contrast
