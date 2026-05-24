@@ -1216,3 +1216,58 @@ breakdown:
       infrastructure already flagged for SaliencyReport
       ([[introspection-report-pattern]]); a genuinely new diagnostic, not a
       re-skin of an existing report.
+
+### Parameter importance (continual learning / pruning)
+- [ ] TNNet.FisherImportanceReport(NN, Samples [, Labels]) — given a trained
+      classifier and a labelled probe batch, estimate the **diagonal Fisher
+      information** of each parameter, `F[theta] = E_x[(d log p_model(y|x) /
+      d theta)^2]`, by accumulating the per-sample squared parameter
+      gradients over the batch (one forward + one backward per sample, the
+      gradient taken w.r.t. the model's own predicted/true label so it
+      measures the empirical Fisher), then aggregate per trainable layer and
+      report:
+      (a) per-layer total Fisher mass and its share of the network total —
+          which layers the model's predictions are most sensitive to (the
+          natural "which layers must I protect / least afford to prune"
+          ranking),
+      (b) per-layer mean and max per-parameter Fisher, plus a near-zero
+          count (parameters with Fisher ~ 0 are free to prune or reuse for a
+          new task — the EWC / pruning signal),
+      (c) a 10-bin ASCII histogram of `log10(Fisher)` across all parameters
+          so the heavy-tailed "a few parameters carry most of the
+          importance" structure is visible,
+      (d) an effective-parameter-count = participation ratio
+          `(sum F)^2 / sum F^2` (in `[1, NumParams]`) — a one-number proxy
+          for how concentrated importance is,
+      (e) per-layer flags: "high-importance" (top 10% of layer Fisher mass),
+          "prunable" (>X% of the layer's parameters near-zero Fisher), and
+          "dead layer" (whole-layer Fisher ~ 0 — the predictions don't
+          depend on it at all).
+      Forward+backward only on a frozen network — the trained weights are
+      never updated (this *measures* importance, it does not regularise).
+      The squared-gradient accumulation reuses the existing per-parameter
+      gradient tensors already populated by Backpropagate; no input-gradient
+      enablement needed (unlike Saliency/Adversarial — this reads weight
+      gradients, which the standard backward path already produces).
+      Distinct from [[GradientNormReport]] (a *single* forward+backward,
+      reports the raw `||dL/dW||` magnitude once — Fisher is the *expected
+      squared* gradient of the log-likelihood over a batch, a curvature /
+      importance measure, not a one-shot magnitude), from
+      [[LayerSensitivityReport]] (jitters weights with random Gaussian noise
+      and measures forward output delta — empirical and noise-driven; Fisher
+      is the analytic second-moment of the loss gradient and label-driven),
+      from [[WeightSpectrumReport]] (geometry of the weight matrix itself,
+      no data / no label), and from [[NeuronCorrelationReport]] (redundancy
+      of *activations*, not importance of *parameters* to the loss). The
+      output is the natural input for a future **Elastic Weight
+      Consolidation** continual-learning experiment (penalise changes to
+      high-Fisher parameters when training task B so task A is not
+      forgotten) and for magnitude-times-Fisher pruning. Companion
+      `examples/FisherImportance/` runs it on (i) a freshly-initialised net
+      (expected: diffuse, low Fisher everywhere) and (ii) the same net after
+      a short training run (expected: importance concentrates into a few
+      layers / parameters), so the "training carves out the parameters that
+      matter" story is eyeballable; a tiny EWC two-task sketch in the README
+      shows how the per-parameter Fisher tensor would be consumed downstream.
+      A genuinely new diagnostic in the [[introspection-report-pattern]]
+      family, not a re-skin of an existing report.
