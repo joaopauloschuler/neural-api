@@ -315,7 +315,7 @@ breakdown:
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
-- [ ] TNNetWeightStandardization — normalize convolution weights per
+- [X] TNNetWeightStandardization — normalize convolution weights per
       output channel (zero-mean, unit-variance) before forward.
 - [ ] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
       Convolution layer and divides its weight matrix by its largest

@@ -3396,6 +3396,37 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Weight Standardization fully connected layer (Qiao et al. 2019,
+  // "Micro-Batch Training with Batch-Channel Normalization and Weight
+  // Standardization", arXiv:1903.10520).
+  // This is a self-contained linear (no-activation) dense layer that owns its
+  // own weight matrix. Before the forward dot-product, the weight vector of
+  // EACH output neuron is standardized to zero mean and unit variance over its
+  // input weights: w_hat = (w - mean(w)) / sqrt(var(w) + eps). The raw weights
+  // remain the trainable parameters; the standardization is applied on the fly
+  // and its exact Jacobian is propagated in the backward pass, so the weight
+  // gradient is the gradient w.r.t. the RAW weights.
+  // Design note: the WS paper applies standardization to a Conv/FC layer's own
+  // weights, so modelling it as a self-contained dense layer (rather than a
+  // wrapper that mutates the previous layer's neurons mid-forward-pass) keeps
+  // the layer fully differentiable, self-contained and testable with finite
+  // differences on both the input and the weights.
+  // eps is stored in FFloatSt[0] (default 1e-5) so the layer round-trips
+  // through SaveStructureToString / LoadFromString / CreateLayer.
+  TNNetWeightStandardization = class(TNNetFullConnectLinear)
+  private
+    FWSEpsilon: TNeuralFloat;
+    FRawWeights: TNNetVolume;  // scratch copy of the raw weights of one neuron
+    FStdWeights: TNNetVolume;  // standardized weights of one neuron
+  public
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSizeX, pSizeY, pDepth, pSuppressBias: integer; pEpsilon: TNeuralFloat); overload;
+    constructor Create(pSize: integer; pEpsilon: TNeuralFloat = 1e-5; pSuppressBias: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   protected
@@ -21546,6 +21577,194 @@ begin
   Self.Create(pSize, 1, 1, pSuppressBias);
 end;
 
+{ TNNetWeightStandardization }
+
+constructor TNNetWeightStandardization.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  FWSEpsilon := 1e-5;
+  FFloatSt[0] := FWSEpsilon;
+  FRawWeights := TNNetVolume.Create();
+  FStdWeights := TNNetVolume.Create();
+end;
+
+constructor TNNetWeightStandardization.Create(pSizeX, pSizeY, pDepth,
+  pSuppressBias: integer; pEpsilon: TNeuralFloat);
+begin
+  Self.Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  FWSEpsilon := pEpsilon;
+  FFloatSt[0] := FWSEpsilon;
+end;
+
+constructor TNNetWeightStandardization.Create(pSize: integer;
+  pEpsilon: TNeuralFloat = 1e-5; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+  FWSEpsilon := pEpsilon;
+  FFloatSt[0] := FWSEpsilon;
+end;
+
+destructor TNNetWeightStandardization.Destroy();
+begin
+  FRawWeights.Free;
+  FStdWeights.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetWeightStandardization.Compute();
+var
+  StartTime: double;
+  NeuronCnt, MaxNeurons, WeightCnt, MaxWeights: integer;
+  Mean, Variance, InvStd: TNeuralFloat;
+  FloatN: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+begin
+  StartTime := Now();
+  MaxNeurons := FNeurons.Count - 1;
+  MaxWeights := FNeurons[0].FWeights.Size - 1;
+  FloatN := FNeurons[0].FWeights.Size;
+  for NeuronCnt := 0 to MaxNeurons do
+  begin
+    localNeuron := FArrNeurons[NeuronCnt];
+    // Standardize this neuron's weight vector: w_hat = (w - mean)/sqrt(var+eps).
+    Mean := localNeuron.FWeights.GetSum() / FloatN;
+    Variance := 0;
+    for WeightCnt := 0 to MaxWeights do
+      Variance := Variance +
+        Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
+    Variance := Variance / FloatN;
+    InvStd := 1 / Sqrt(Variance + FWSEpsilon);
+    if FSuppressBias = 0 then
+    begin
+      FOutput.FData[NeuronCnt] := localNeuron.FBiasWeight;
+      for WeightCnt := 0 to MaxWeights do
+        FOutput.FData[NeuronCnt] := FOutput.FData[NeuronCnt] +
+          ((localNeuron.FWeights.FData[WeightCnt] - Mean) * InvStd) *
+          FPrevLayer.FOutput.FData[WeightCnt];
+    end
+    else
+    begin
+      FOutput.FData[NeuronCnt] := 0;
+      for WeightCnt := 0 to MaxWeights do
+        FOutput.FData[NeuronCnt] := FOutput.FData[NeuronCnt] +
+          ((localNeuron.FWeights.FData[WeightCnt] - Mean) * InvStd) *
+          FPrevLayer.FOutput.FData[WeightCnt];
+    end;
+  end;
+  // Linear layer: raw output equals output.
+  FOutputRaw.Copy(FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetWeightStandardization.Backpropagate();
+var
+  StartTime: double;
+  NeuronCnt, MaxNeurons, WeightCnt, MaxWeights: integer;
+  Mean, Variance, InvStd, FloatN: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+  localErrorDeriv, localLearErrorDeriv: TNeuralFloat;
+  SumDwHat, SumDwHatWHat, dwHat, gradRaw: TNeuralFloat;
+  LocalPrevError: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  MaxNeurons := FNeurons.Count - 1;
+  MaxWeights := FNeurons[0].FWeights.Size - 1;
+  FloatN := FNeurons[0].FWeights.Size;
+
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutput.Size = FPrevLayer.FOutputError.Size) then
+    LocalPrevError := FPrevLayer.OutputError
+  else
+    LocalPrevError := nil;
+
+  for NeuronCnt := 0 to MaxNeurons do
+  begin
+    localNeuron := FArrNeurons[NeuronCnt];
+    // Linear activation -> derivative is 1.
+    localErrorDeriv := FOutputError.FData[NeuronCnt];
+    FOutputErrorDeriv.FData[NeuronCnt] := localErrorDeriv;
+
+    // Recompute the per-neuron standardization statistics.
+    Mean := localNeuron.FWeights.GetSum() / FloatN;
+    Variance := 0;
+    for WeightCnt := 0 to MaxWeights do
+      Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
+    Variance := Variance / FloatN;
+    InvStd := 1 / Sqrt(Variance + FWSEpsilon);
+
+    // Standardized weights w_hat (also needed for the input gradient).
+    FStdWeights.ReSize(localNeuron.FWeights);
+    for WeightCnt := 0 to MaxWeights do
+      FStdWeights.FData[WeightCnt] :=
+        (localNeuron.FWeights.FData[WeightCnt] - Mean) * InvStd;
+
+    // ---- Input gradient: dL/dx = sum_o errDeriv_o * w_hat_o ----
+    if Assigned(LocalPrevError) and (localErrorDeriv <> 0.0) then
+      LocalPrevError.MulAdd(localErrorDeriv, FStdWeights);
+
+    if FLearningRate <> 0.0 then
+    begin
+      // ---- Weight gradient w.r.t. RAW weights ----
+      // dL/dw_hat_i = errDeriv * x_i. Map through the standardization Jacobian:
+      // dL/dw_i = invStd * ( dw_hat_i - mean(dw_hat) - w_hat_i*mean(dw_hat*w_hat) )
+      // (same centering+scaling Jacobian as batch/layer normalization, applied
+      //  over the weight vector). This is the EXACT gradient.
+      SumDwHat := 0;
+      SumDwHatWHat := 0;
+      for WeightCnt := 0 to MaxWeights do
+      begin
+        dwHat := localErrorDeriv * FPrevLayer.FOutput.FData[WeightCnt];
+        SumDwHat := SumDwHat + dwHat;
+        SumDwHatWHat := SumDwHatWHat + dwHat * FStdWeights.FData[WeightCnt];
+      end;
+      SumDwHat := SumDwHat / FloatN;
+      SumDwHatWHat := SumDwHatWHat / FloatN;
+
+      localLearErrorDeriv := -FLearningRate * localErrorDeriv;
+      FRawWeights.ReSize(localNeuron.FWeights);
+      for WeightCnt := 0 to MaxWeights do
+      begin
+        dwHat := localErrorDeriv * FPrevLayer.FOutput.FData[WeightCnt];
+        gradRaw := InvStd * ( dwHat - SumDwHat -
+          FStdWeights.FData[WeightCnt] * SumDwHatWHat );
+        // Store -LearningRate*gradRaw so it can be added to Delta/Inertia.
+        FRawWeights.FData[WeightCnt] := -FLearningRate * gradRaw;
+      end;
+
+      if FBatchUpdate then
+      begin
+        localNeuron.FDelta.Add(FRawWeights);
+        if FSuppressBias = 0 then
+          localNeuron.FBiasDelta := localNeuron.FBiasDelta + localLearErrorDeriv;
+      end
+      else
+      begin
+        for WeightCnt := 0 to MaxWeights do
+          localNeuron.FBackInertia.FData[WeightCnt] :=
+            FInertia * localNeuron.FBackInertia.FData[WeightCnt] +
+            (1 - FInertia) * FRawWeights.FData[WeightCnt];
+        localNeuron.FWeights.Add(localNeuron.FBackInertia);
+        if FSuppressBias = 0 then
+        begin
+          localNeuron.FBiasInertia :=
+            (1 - FInertia) * localLearErrorDeriv +
+            FInertia * localNeuron.FBiasInertia;
+          localNeuron.FBiasWeight :=
+            localNeuron.FBiasWeight + localNeuron.FBiasInertia;
+        end;
+      end;
+    end;
+  end;
+
+  if (not FBatchUpdate) and (FLearningRate <> 0.0) then AfterWeightUpdate();
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetAddNumber }
 
 constructor TNNetAddAndDiv.Create(pAdd, pDiv: integer);
@@ -39028,6 +39247,7 @@ begin
       'TNNetLayerFullConnectReLU' : Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetLocalConnect' :         Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalConnectLinear' :   Result := TNNetLocalConnectLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLocalProduct' :         Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -39287,6 +39507,7 @@ begin
       if S[0] = 'TNNetLayerFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetLocalConnect' then Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalConnectLinear' then Result := TNNetLocalConnectLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLocalProduct' then Result := TNNetLocalProduct.Create(St[0], St[1], St[2], St[3], St[4]) else
