@@ -38,6 +38,48 @@ rather than acted on.
 <!-- (Sparse / mixture-of-experts routing layer removed: duplicate of the
      concrete TNNetMixtureOfExperts entry under "Probability projections /
      sparsity".) -->
+- [ ] TNNetFourierFeatures — a **fixed (non-trainable) random Fourier-feature
+      coordinate embedding** (Rahimi & Recht 2007; the "Gaussian Fourier feature
+      mapping" of Tancik et al. 2020, *Fourier Features Let Networks Learn High
+      Frequency Functions*). Maps an input vector `x` (Depth = D_in, typically a
+      small coordinate like `(x, y)`) through a FIXED random Gaussian frequency
+      matrix `B ~ N(0, sigma^2)` of shape `D_in x M` and outputs the
+      concatenation `[cos(2*pi*B^T x), sin(2*pi*B^T x)]` along depth (output
+      Depth = `2*M`). The headline result is that a plain ReLU coordinate-MLP
+      cannot fit high-frequency detail (the NTK is too low-pass — it exhibits
+      "spectral bias"), but pre-mapping the coordinates through this embedding
+      lets the SAME MLP fit sharp 1D/2D signals; `sigma` is the single knob that
+      sets the frequency bandwidth.
+      Scope / shape: `Create(M, sigma [, Seed])`. `B` is sampled ONCE at
+      construction from the layer's own seeded RNG and stored as a NON-trainable
+      buffer (no weight gradient, no update — mirror how a fixed buffer rather
+      than `FNeurons` is persisted). `M` goes in `FStruct[0]`, `sigma` and the
+      seed in `FFloatSt[]`/`FStruct[]`, and `B` itself must be serialised in
+      `SaveDataToString`/`LoadDataFromString` so a save/load round-trip
+      reproduces the exact same mapping (a fresh re-sample would silently change
+      the function — make that a pinned test). Forward is one matmul + the two
+      elementwise transcendentals already used by `TNNetSin`/`TNNetCos`.
+      Backward: `B` is frozen, so only the INPUT gradient flows —
+      `dL/dx = 2*pi*B*(-sin(.)*g_cos + cos(.)*g_sin)` — no parameter gradient.
+      Tests (the standard four-test shape): forward equals a hand-computed
+      `[cos,sin]` concat on a tiny pinned `B` (M=2, D_in=2); input
+      numerical-gradient check; `sigma=0` degeneracy (every row maps to
+      `[cos 0, sin 0] = [1, 0]`, a constant output and zero input gradient);
+      and a `SaveDataToString`/`LoadDataFromString` round-trip asserting the
+      stored `B` (hence `Compute`) is bit-for-bit identical after reload.
+      Register in BOTH `CreateLayer` dispatch tables and the `LoadFromString`
+      cascade. Pairs directly with the open `examples/SIREN/` task as a
+      drop-in front-end and with the open periodic-activation toy benchmarks.
+      DISTINCT from `TNNetSin` / `TNNetCos` (per-element activations with NO
+      projection and NO depth change — this layer's whole point is the fixed
+      random LINEAR lift into a `2*M`-dim frequency basis before the sinusoid),
+      from `TNNetAddPositionalEmbedding` (fixed sinusoids ADDED over SEQUENCE
+      positions for transformers, not a learnable-MLP coordinate lift of a
+      continuous input), and from any trainable `TNNetFullConnect + TNNetSin`
+      pairing (here `B` is FROZEN by design — that frozenness is what gives the
+      clean spectral-bias-removal story and bounds the test to an input-gradient
+      check only). A genuinely new capability, not a re-skin of an existing
+      layer.
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
