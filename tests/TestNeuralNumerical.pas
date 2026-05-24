@@ -337,6 +337,9 @@ type
     procedure TestDifferentialAttentionGradientCheck;
     procedure TestDifferentialAttentionLambdaGradientCheck;
     procedure TestDifferentialAttentionSerializationRoundTrip;
+    procedure TestLinearAttentionGradientCheck;
+    procedure TestLinearAttentionSeqLen1Degeneracy;
+    procedure TestLinearAttentionSerializationRoundTrip;
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
@@ -7743,6 +7746,112 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestLinearAttentionGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetLinearAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Self-contained RNG: these gradient tests share one RNG and some checks are
+  // ordering-sensitive, so reseed (do NOT loosen tolerances to compensate).
+  RandSeed := 424242;
+  SeqLen := 3;
+  Dk := 4; // d_v = d_k = 4
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetLinearAttention.Create(Dk);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // phi(x)=elu(x)+1 is smooth everywhere; exercise both branches (x<0 / x>=0).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('LinearAttention input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLinearAttentionSeqLen1Degeneracy;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetLinearAttention;
+  Dk, d: integer;
+begin
+  // At SeqLen=1: S = phi(K_1) (x) V_1, Z = phi(K_1), so
+  //   Out_1 = phi(Q_1).(phi(K_1)(x)V_1) / (phi(Q_1).phi(K_1)) = V_1 exactly,
+  // for ANY Q_1 / K_1 (the normaliser cancels). Assert Out_1 == V_1.
+  RandSeed := 424242;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3 * Dk);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3 * Dk, 1));
+    Attn := TNNetLinearAttention.Create(Dk);
+    NN.AddLayer(Attn);
+    // Q | K | V slabs with arbitrary, distinct values.
+    for d := 0 to Dk - 1 do
+    begin
+      Input[0, 0, d]          := Sin(d * 0.7) - 0.3;          // Q_1
+      Input[0, 0, Dk + d]     := Cos(d * 0.9) * 0.6 + 0.2;    // K_1
+      Input[0, 0, 2 * Dk + d] := Sin(d * 1.3) * 1.1 - 0.4;    // V_1
+    end;
+    NN.Compute(Input);
+    for d := 0 to Dk - 1 do
+      AssertEquals('LinearAttention SeqLen=1 Out[' + IntToStr(d) + '] == V_1',
+        Input[0, 0, 2 * Dk + d], NN.GetLastLayer.Output[0, 0, d], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestCosineSimilarityAttentionForward;
 var
   NN: TNNet;
@@ -9265,6 +9374,13 @@ begin
   // d_k = 4, causal, non-default scale = 2.5. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetCosineSimilarityAttention.Create(4, true, 2.5),
     'CosineSimilarityAttention', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLinearAttentionSerializationRoundTrip;
+begin
+  // d_k = 4. Input depth must be 3*d_k = 12.
+  SerializationRoundTrip(Self, TNNetLinearAttention.Create(4),
+    'LinearAttention', 3, 1, 12, 1e-5);
 end;
 
 // ---------------------------------------------------------------------------

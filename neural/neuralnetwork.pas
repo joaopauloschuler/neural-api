@@ -1919,6 +1919,50 @@ type
     property Lambda: TNeuralFloat read FLambdaInit;
   end;
 
+  /// Linear (kernelized / softmax-free) Attention, non-causal variant
+  /// (Katharopoulos et al. 2020, "Transformers are RNNs",
+  /// https://arxiv.org/abs/2006.16236).
+  // The first sub-quadratic attention mechanism in this repo. The softmax of
+  // scaled dot-product attention is replaced by a positive feature map
+  //   phi(x) = elu(x) + 1   (= x+1 for x>=0, = exp(x) for x<0; smooth, >0)
+  // applied to Q and K. Associativity then lets the (d_v) output of query t be
+  // read off a SINGLE key-value accumulation instead of an NxN score matrix:
+  //   S = sum_s  phi(K_s) (x) V_s     (a d_k x d_v matrix, accumulated once)
+  //   Z = sum_s  phi(K_s)             (a d_k normaliser vector)
+  //   Out_t = (phi(Q_t) . S) / (phi(Q_t) . Z)
+  // Cost is O(SeqLen * d_k * d_v) — linear in sequence length — and the
+  // SeqLen x SeqLen score matrix is NEVER materialised (the whole point).
+  // This is the NON-CAUSAL (full-prefix) variant: every query reads the same
+  // S / Z over all keys. The causal variant (running prefix-sum of S/Z, the
+  // "attention is an RNN" identity) is a separate follow-up.
+  // Input layout (same as TNNetScaledDotProductAttention): SizeY = 1,
+  // SizeX = sequence length, Depth = 3 * d_k (the depth axis is the
+  // concatenation Q | K | V, each of size d_k; d_v = d_k). Output shape:
+  // SizeX x 1 x d_k. No trainable parameters (projections are separate
+  // FullConnect / PointwiseConv layers, as with SDPA). d_k is stored in
+  // FStruct[0] so it round-trips through SaveToString / LoadFromString.
+  // Because there is no softmax it does NOT subclass
+  // TNNetScaledDotProductAttention; it only reuses the Q|K|V input-split
+  // convention.
+  TNNetLinearAttention = class(TNNetLayer)
+  private
+    FDk: integer;
+    // Forward caches reused by Backpropagate(). Layout: X = sequence position,
+    // Depth = d_k for the phi maps; the per-query denominator is a scalar.
+    FPhiQ: TNNetVolume; // phi(Q[t]) per query position, [SeqLen,1,d_k]
+    FPhiK: TNNetVolume; // phi(K[s]) per key position,   [SeqLen,1,d_k]
+    FS: TNNetVolume;    // S = sum_s phi(K_s) (x) V_s,    [d_k,1,d_k] (X=k,Depth=v)
+    FZ: TNNetVolume;    // Z = sum_s phi(K_s),            [d_k,1,1]
+    FDen: TNNetVolume;  // per-query denominator phi(Q_t).Z, [SeqLen,1,1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Dk: integer read FDk;
+  end;
+
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
   // consecutive pairs of channels.
@@ -10930,6 +10974,204 @@ begin
           end;
         end;
       end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetLinearAttention }
+
+constructor TNNetLinearAttention.Create(d_k: integer);
+begin
+  inherited Create();
+  FDk := d_k;
+  if FDk < 1 then
+    FErrorProc('TNNetLinearAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  FStruct[0] := FDk;
+  FPhiQ := TNNetVolume.Create();
+  FPhiK := TNNetVolume.Create();
+  FS := TNNetVolume.Create();
+  FZ := TNNetVolume.Create();
+  FDen := TNNetVolume.Create();
+end;
+
+destructor TNNetLinearAttention.Destroy();
+begin
+  FPhiQ.Free;
+  FPhiK.Free;
+  FS.Free;
+  FZ.Free;
+  FDen.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLinearAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetLinearAttention requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> 3 * FDk then
+    FErrorProc('TNNetLinearAttention requires input depth = 3*d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  FPhiQ.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FPhiK.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  // S: X = key feature (d_k), Depth = value feature (d_v = d_k).
+  FS.ReSize(FDk, 1, FDk);
+  FZ.ReSize(FDk, 1, 1);
+  FDen.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+end;
+
+procedure TNNetLinearAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, a, b: integer;
+  Prev: TNNetVolume;
+  Q, K, PhiVal, Vb, AccNum, Den: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // 1) Feature maps phi(Q), phi(K) with phi(x) = elu(x)+1.
+  for i := 0 to SeqLen - 1 do
+    for a := 0 to FDk - 1 do
+    begin
+      Q := Prev[i, 0, a];
+      if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := Exp(Q);
+      K := Prev[i, 0, FDk + a];
+      if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := Exp(K);
+    end;
+  // 2) Accumulate S = sum_s phi(K_s) (x) V_s  and  Z = sum_s phi(K_s).
+  FS.Fill(0);
+  FZ.Fill(0);
+  for i := 0 to SeqLen - 1 do
+    for a := 0 to FDk - 1 do
+    begin
+      PhiVal := FPhiK[i, 0, a];
+      FZ.Add(a, 0, 0, PhiVal);
+      for b := 0 to FDk - 1 do
+      begin
+        Vb := Prev[i, 0, 2 * FDk + b];
+        FS.Add(a, 0, b, PhiVal * Vb);
+      end;
+    end;
+  // 3) Out_t = (phi(Q_t) . S) / (phi(Q_t) . Z).
+  for i := 0 to SeqLen - 1 do
+  begin
+    Den := 0;
+    for a := 0 to FDk - 1 do
+      Den := Den + FPhiQ[i, 0, a] * FZ[a, 0, 0];
+    if (Den >= 0) and (Den < 1e-12) then Den := 1e-12;
+    if (Den < 0) and (Den > -1e-12) then Den := -1e-12;
+    FDen[i, 0, 0] := Den;
+    for b := 0 to FDk - 1 do
+    begin
+      AccNum := 0;
+      for a := 0 to FDk - 1 do
+        AccNum := AccNum + FPhiQ[i, 0, a] * FS[a, 0, b];
+      FOutput[i, 0, b] := AccNum / Den;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLinearAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, a, b: integer;
+  Prev, PrevErr: TNNetVolume;
+  // dS[a,b] = sum_i dPhiQ-routed; we accumulate gradients into S and Z first,
+  // then push them through the phi(K)/V outer-product accumulation.
+  dS: TNNetVolume;
+  dZ: TNNetVolume;
+  dPhiQ: array of TNeuralFloat;
+  Den, Out_b, OutErr, gNum, PhiQa, dPhiVal, K: TNeuralFloat;
+  dPhiKa, dVb, q: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := Prev.SizeX;
+    dS := TNNetVolume.Create(FDk, 1, FDk);
+    dZ := TNNetVolume.Create(FDk, 1, 1);
+    try
+      dS.Fill(0);
+      dZ.Fill(0);
+      SetLength(dPhiQ, FDk);
+      // ---- Per query i: route dOut back to phi(Q_i), S and Z ----
+      // Out[i,b] = Num[i,b]/Den[i],  Num[i,b] = sum_a phiQ[i,a]*S[a,b],
+      // Den[i] = sum_a phiQ[i,a]*Z[a].
+      // d/dphiQ[i,a] Out[i,b] = (S[a,b]*Den - Num[i,b]*Z[a]) / Den^2
+      //                       = (S[a,b] - Out[i,b]*Z[a]) / Den
+      // d/dS[a,b] Out[i,b]    = phiQ[i,a]/Den
+      // d/dZ[a]   Out[i,b]    = -Out[i,b]*phiQ[i,a]/Den
+      for i := 0 to SeqLen - 1 do
+      begin
+        Den := FDen[i, 0, 0];
+        for a := 0 to FDk - 1 do dPhiQ[a] := 0;
+        for b := 0 to FDk - 1 do
+        begin
+          OutErr := FOutputError[i, 0, b];
+          if OutErr = 0 then continue;
+          Out_b := FOutput[i, 0, b];
+          gNum := OutErr / Den;            // common factor for S and phiQ-num
+          for a := 0 to FDk - 1 do
+          begin
+            PhiQa := FPhiQ[i, 0, a];
+            // gradient into phi(Q_i)
+            dPhiQ[a] := dPhiQ[a] + OutErr *
+              (FS[a, 0, b] - Out_b * FZ[a, 0, 0]) / Den;
+            // gradient into S[a,b]
+            dS.Add(a, 0, b, gNum * PhiQa);
+            // gradient into Z[a] (denominator term)
+            dZ.Add(a, 0, 0, -OutErr * Out_b * PhiQa / Den);
+          end;
+        end;
+        // phi(Q_i) -> Q_i: phi'(q)=1 for q>=0, exp(q)=phi(q) for q<0.
+        for a := 0 to FDk - 1 do
+        begin
+          q := Prev[i, 0, a];
+          if q >= 0 then dPhiVal := 1 else dPhiVal := FPhiQ[i, 0, a];
+          PrevErr.Add(i, 0, a, dPhiQ[a] * dPhiVal);
+        end;
+      end;
+      // ---- Route dS / dZ back through S = sum_s phiK_s (x) V_s, Z = sum_s phiK_s ----
+      // dphiK[s,a] = sum_b dS[a,b]*V[s,b] + dZ[a]
+      // dV[s,b]    = sum_a dS[a,b]*phiK[s,a]
+      // then phiK -> K via phi'.
+      for i := 0 to SeqLen - 1 do
+      begin
+        for a := 0 to FDk - 1 do
+        begin
+          dPhiKa := dZ[a, 0, 0];
+          for b := 0 to FDk - 1 do
+            dPhiKa := dPhiKa + dS[a, 0, b] * Prev[i, 0, 2 * FDk + b];
+          // phi(K) -> K
+          K := Prev[i, 0, FDk + a];
+          if K >= 0 then dPhiVal := 1 else dPhiVal := FPhiK[i, 0, a];
+          PrevErr.Add(i, 0, FDk + a, dPhiKa * dPhiVal);
+        end;
+        for b := 0 to FDk - 1 do
+        begin
+          dVb := 0;
+          for a := 0 to FDk - 1 do
+            dVb := dVb + dS[a, 0, b] * FPhiK[i, 0, a];
+          PrevErr.Add(i, 0, 2 * FDk + b, dVb);
+        end;
+      end;
+    finally
+      dS.Free;
+      dZ.Free;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -42687,6 +42929,7 @@ begin
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
+      'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -42951,6 +43194,7 @@ begin
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
+      if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
