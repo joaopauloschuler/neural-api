@@ -2270,6 +2270,33 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// ACON-C: "Activate Or Not" channel-wise learnable activation
+  // (Ma, Zhang, Sun et al. 2021, https://arxiv.org/abs/2009.04759).
+  // Generalises Swish with THREE learnable parameters PER channel:
+  // p1[c] (FNeurons[0].Weights, Depth values), p2[c] (FNeurons[1].Weights,
+  // Depth values) and beta[c] (FNeurons[2].Weights, Depth values).
+  // Forward, per element x of channel c (let d = (p1[c]-p2[c])*x):
+  //   y = d * sigmoid(beta[c]*d) + p2[c]*x.
+  // Defaults p1=1, p2=0, beta=1 reduce ACON-C to plain Swish (x*sigmoid(x)),
+  // so an untrained TNNetAconC matches TNNetSwish exactly.
+  // Let s = sigmoid(beta*d) and phi = s + beta*d*s*(1-s) = d(d*s)/dd. Then:
+  //   dy/dx        = (p1-p2)*phi + p2
+  //   dL/dp1[c]   += dL/dy * x*phi
+  //   dL/dp2[c]   += dL/dy * x*(1 - phi)
+  //   dL/dbeta[c] += dL/dy * d*d*s*(1-s)
+  // Mirrors TNNetDyT's multi-parameter per-channel storage pattern (descends
+  // from TNNetChannelTransformBase because the weightless TNNetReLUBase
+  // activation hierarchy cannot store gradients).
+  TNNetAconC = class(TNNetChannelTransformBase)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetTokenShift: RWKV-style per-channel time-mixing primitive.
   // For each channel c and position t along SizeX (treated as the time axis,
   // with x[-1,c]=0 zero-padding on the left):
@@ -14743,6 +14770,148 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
   FNeurons[0].FWeights.Fill(0.25);
+  AfterWeightUpdate();
+end;
+
+{ TNNetAconC }
+constructor TNNetAconC.Create();
+begin
+  inherited Create();
+  // Per-channel weight buffers are allocated in SetPrevLayer once Depth is
+  // known.
+  InitDefault();
+end;
+
+procedure TNNetAconC.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base class allocates FNeurons[0] with Depth weights (p1). We also
+  // need FNeurons[1] (p2, Depth weights) and FNeurons[2] (beta, Depth weights).
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetAconC.Compute();
+var
+  StartTime: double;
+  W1, W2, Wb: TNNetVolume;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  p1_d, p2_d, beta_d, xv, dv, s: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (which would copy input to FOutput).
+  Prev := FPrevLayer.FOutput;
+  W1 := FNeurons[0].FWeights;
+  W2 := FNeurons[1].FWeights;
+  Wb := FNeurons[2].FWeights;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if (W1.Size <> Depth) or (W2.Size <> Depth) or (Wb.Size <> Depth) then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetAconC.');
+  {$ENDIF}
+  // d = (p1[c]-p2[c])*x;  y = d*sigmoid(beta[c]*d) + p2[c]*x.
+  for d := 0 to Depth - 1 do
+  begin
+    p1_d := W1.Raw[d];
+    p2_d := W2.Raw[d];
+    beta_d := Wb.Raw[d];
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        dv := (p1_d - p2_d) * xv;
+        s := 1 / (1 + Exp(-beta_d * dv));
+        FOutput[x, y, d] := dv * s + p2_d * xv;
+      end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAconC.Backpropagate();
+var
+  StartTime: double;
+  N1, N2, Nb: TNNetNeuron;
+  W1, W2, Wb: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  p1_d, p2_d, beta_d, xv, gy, dv, s, sds, phi: TNeuralFloat;
+  gradP1, gradP2, gradBeta: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  N1 := FNeurons[0];
+  N2 := FNeurons[1];
+  Nb := FNeurons[2];
+  W1 := N1.FWeights;
+  W2 := N2.FWeights;
+  Wb := Nb.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  // Let d = (p1-p2)*x, s = sigmoid(beta*d), phi = s + beta*d*s*(1-s).
+  // dy/dx        = (p1-p2)*phi + p2
+  // dL/dp1[c]   += dL/dy * x*phi
+  // dL/dp2[c]   += dL/dy * x*(1 - phi)
+  // dL/dbeta[c] += dL/dy * d*d*s*(1-s)
+  for d := 0 to Depth - 1 do
+  begin
+    p1_d := W1.Raw[d];
+    p2_d := W2.Raw[d];
+    beta_d := Wb.Raw[d];
+    gradP1 := 0;
+    gradP2 := 0;
+    gradBeta := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        dv := (p1_d - p2_d) * xv;
+        s := 1 / (1 + Exp(-beta_d * dv));
+        sds := s * (1 - s);
+        phi := s + beta_d * dv * sds;
+        gradP1 := gradP1 + gy * xv * phi;
+        gradP2 := gradP2 + gy * xv * (1 - phi);
+        gradBeta := gradBeta + gy * dv * dv * sds;
+        if hasInputGrad then
+          PrevErr[x, y, d] := PrevErr[x, y, d] +
+            gy * ((p1_d - p2_d) * phi + p2_d);
+      end;
+    N1.FDelta.Raw[d] := N1.FDelta.Raw[d] + (-FLearningRate) * gradP1;
+    N2.FDelta.Raw[d] := N2.FDelta.Raw[d] + (-FLearningRate) * gradP2;
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * gradBeta;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    N1.UpdateWeights(FInertia);
+    N2.UpdateWeights(FInertia);
+    Nb.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetAconC.InitDefault();
+begin
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  // p1 = 1, p2 = 0, beta = 1  (reduces to Swish: x*sigmoid(x)).
+  FNeurons[0].FWeights.Fill(1);
+  FNeurons[1].FWeights.Fill(0);
+  FNeurons[2].FWeights.Fill(1);
   AfterWeightUpdate();
 end;
 
@@ -31681,6 +31850,7 @@ begin
       'TNNetEntropyRegularizer':    Result := TNNetEntropyRegularizer.Create(Ft[0]);
       'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
+      'TNNetAconC':                 Result := TNNetAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
@@ -31907,6 +32077,7 @@ begin
       if S[0] = 'TNNetEntropyRegularizer' then Result := TNNetEntropyRegularizer.Create(Ft[0]) else
       if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else
+      if S[0] = 'TNNetAconC' then Result := TNNetAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
