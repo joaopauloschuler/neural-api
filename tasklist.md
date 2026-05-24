@@ -973,8 +973,13 @@ breakdown:
       "predict next char of a periodic sequence" using Sparsemax in place
       of softmax over a tiny K|V bank. Print attention-weight histogram
       per step.
-- [ ] `examples/FiLMConditional/` — toy "draw a digit of class C" generator
-      with FiLM conditioning on a 10-way one-hot class input.
+<!-- (`examples/FiLMConditional/` removed: duplicate of the "TNNetFiLM follow-up:
+     a CLASS-CONDITIONAL generator/decoder demo" entry under "#### Channel
+     attention / conditioning" above — both are class-conditional FiLM
+     generators (draw class C). That entry is the richer, current spec (forks
+     the landed examples/FiLMConditioning/ and scales the 1x1 conditioning to a
+     spatial map); this one-liner predates the FiLM landing. Build the one
+     above.) -->
 - [ ] `examples/TripletEmbedding/` MNIST follow-up: a true MNIST version of the
       landed synthetic TripletEmbedding demo, with a PGM scatter-plot output.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
@@ -1059,9 +1064,12 @@ breakdown:
       with K ∈ {1, 2, 4, 8, 16, full}, chart reconstruction loss vs sparsity.
 - [ ] STE bit-width sweep: same network, vary `step ∈ {1.0, 0.5, 0.25,
       0.125, 0.0625}`, plot accuracy vs bit-width.
-- [ ] Straight-through quantization demo: small classifier with one hidden
-      layer's outputs passed through a TNNetStraightThroughEstimator;
-      compare accuracy against unquantized baseline.
+<!-- (Straight-through quantization demo removed: subsumed by the
+     `examples/QuantizationAwareMnist/` entry under "Examples I'd enjoy
+     writing", which runs the SAME STE-vs-unquantized-baseline accuracy
+     comparison and additionally pins it to MNIST and adds final-weight
+     histograms — a strict superset of "small classifier, accuracy vs
+     baseline".) -->
 <!-- (Lottery-ticket sanity check removed: duplicate of the "Lottery-ticket"-
      flavored experiment under "Bake-off / experiment follow-ups".) -->
 - [ ] Sequence-length scaling micro-benchmark — TNNetScaledDotProductAttention
