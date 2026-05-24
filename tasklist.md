@@ -761,6 +761,24 @@ breakdown:
 - [ ] "Learn to copy" toy: SeqLen=8 input → output the same sequence.
 - [ ] "Learn to reverse" toy: same shape, output reversed.
 - [ ] "Smallest net that can learn parity-N" study — sweep N ∈ {2, 4, 6, 8}.
+- [ ] Grokking demo (`examples/Grokking/`) — reproduce delayed generalization
+      (Power et al. 2022) on a pure-CPU toy. Train a tiny MLP on modular
+      addition `(a + b) mod P` for a small prime (e.g. P=23 → 529 input
+      pairs), one-hot inputs concatenated, softmax over P classes, with a
+      fixed ~40/60 train/val split and weight decay on. The headline is the
+      curve shape: train accuracy hits 100% early while val accuracy stays
+      at chance for many epochs, then *suddenly* jumps to ~100% long after
+      the training loss flatlines. Print a two-column ASCII chart of
+      train-acc vs val-acc over a log-spaced epoch axis and flag the
+      "grok epoch" (first epoch where val-acc crosses a threshold, well
+      after train-acc saturates). Distinct from the parity-N capacity
+      study (that asks "can it fit at all?", not "when does it
+      generalize?") and from the "memorize a sequence" demo (which never
+      generalizes by design). A small ablation toggling weight decay
+      on/off makes the point that the regularizer is what eventually drives
+      the late generalization. Pairs naturally with [[WeightSpectrumReport]]
+      / [[WeightHistogramReport]] to watch the weights reorganize at the
+      grok transition.
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
 - [ ] Label-smoothing sweep — train SimpleImageClassifier with `ε ∈ {0,
