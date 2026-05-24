@@ -4908,6 +4908,61 @@ type
         NN: TNNet;
         MaxMatrixDim: integer = 512
       ): string;
+      // Forward-only REPRESENTATION-GEOMETRY diagnostic answering: "how many
+      // effective dimensions does each layer's activation cloud actually
+      // occupy?" — the dimensionality of the data MANIFOLD the probe batch
+      // traces out at each depth, NOT its class structure or neuron redundancy.
+      // For every trainable layer (Neurons.Count > 0 and Weights.Size > 0) it
+      // runs one NN.Compute per (unlabelled) probe sample (a TNNetVolumeList),
+      // flattens each sample's layer Output to a row of an N x D_l matrix, and
+      // reports TWO complementary intrinsic-dimension (ID) estimates side by
+      // side:
+      //   (1) the LINEAR / PCA ID via the PARTICIPATION RATIO of the activation
+      //       COVARIANCE eigenspectrum  PR = (sum lambda)^2 / sum lambda^2  —
+      //       "how many principal components hold the variance". Eigenvalues
+      //       come from the SMALLER of the N x N Gram or D x D covariance matrix
+      //       via the SAME self-contained Double-precision cyclic Jacobi
+      //       eigensolver WeightSpectralTailReport ships (no new numerical
+      //       code). PCA eigenvalues are non-negative (PSD; tiny-negative
+      //       numerical noise is clamped to 0).
+      //   (2) the TwoNN nonlinear estimator (Facco, Rodriguez, Glielmo & Laio
+      //       2017, "Estimating the intrinsic dimension of datasets by a
+      //       minimal neighbourhood information"): for each sample take the
+      //       ratio mu_i = r2_i / r1_i of its 2nd-to-1st nearest-neighbour
+      //       (Euclidean) distances, sort the mu_i, and read the manifold
+      //       dimension d off the least-squares slope of -log(1 - F(mu)) against
+      //       log(mu) — a single line fit through the origin,
+      //       d = sum(x*y) / sum(x*x) over the empirical CDF, skipping
+      //       mu <= 1 / degenerate points. No SGD, no matrix solve.
+      // The GAP between the (larger) linear PCA ID and the (smaller) nonlinear
+      // TwoNN ID is itself a headline number: a representation can sit on a
+      // low-dimensional CURVED manifold that PCA over-counts. Per layer it
+      // reports both IDs, the linear-vs-nonlinear gap, a D_l-normalised
+      // COMPRESSION RATIO TwoNN_ID / D_l, an ID-across-depth ASCII bar chart,
+      // and expanded / compressed / near-full-rank flags. The story is the
+      // "hunchback" ID profile of Ansuini, Laio, Macke & Zoccolan 2019
+      // ("Intrinsic dimension of data representations in deep networks"): ID
+      // first EXPANDS in early layers then CONTRACTS toward the output. Over-
+      // wide layers are deterministically random-projected to MaxFeatDim
+      // (default 256) to bound pairwise-distance and eigensolve cost, reusing
+      // the sign-random projection trick in LinearProbeReport /
+      // FeatureSeparabilityReport. Built-in correctness checks: a batch from a
+      // known k-dim linear subspace embedded in higher D recovers PCA_ID ~ k and
+      // TwoNN_ID ~ k; identical samples drive both IDs to ~0; an isotropic
+      // full-rank Gaussian gives PCA_ID ~ min(N-1, D). DISTINCT from
+      // NeuronCorrelationReport (its participation ratio is over the
+      // neuron-neuron CORRELATION matrix — linear redundancy among feature AXES;
+      // this measures the dimensionality of the sample CLOUD and adds the
+      // nonlinear TwoNN estimator), FeatureSeparabilityReport (label-aware class
+      // scatter), RepresentationSimilarityReport (CKA between two layers) and
+      // WeightSpectrumReport / WeightSpectralTailReport (spectra of the WEIGHT
+      // tensors). Pure forward-only — NN.Compute only, weights never touched, no
+      // backward pass. Guards nil NN and an empty probe batch gracefully.
+      class function IntrinsicDimensionReport(
+        NN: TNNet;
+        Probes: TNNetVolumeList;
+        MaxFeatDim: integer = 256
+      ): string;
       // Gradient signal-to-noise diagnostic that ANALYTICALLY PREDICTS the
       // batch-size sweep (McCandlish et al. 2018, "An Empirical Model of
       // Large-Batch Training"). For each labelled sample (Samples, a
@@ -32326,6 +32381,440 @@ begin
     Lines.Add('Flags:');
     if Flags.Count = 0 then
       Lines.Add('  (none) — all fitted layers well-shaped with good power-law fits.')
+    else
+      Lines.AddStrings(Flags);
+
+    Result := Lines.Text;
+  finally
+    Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.IntrinsicDimensionReport(
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  MaxFeatDim: integer = 256
+): string;
+const
+  cMaxBarWidth = 40;
+  cJacobiSweeps = 60;       // cyclic Jacobi sweeps (quadratic convergence)
+  cJacobiTol    = 1e-12;    // off-diagonal magnitude convergence threshold
+  cProjSeed     = 1234567;
+  cExpandFrac   = 0.50;     // TwoNN_ID/D_l above this => "expanded"
+  cCompressFrac = 0.10;     // TwoNN_ID/D_l below this => "compressed"
+  cFullRankFrac = 0.90;     // PCA_ID/min(N-1,D) above this => "near-full-rank"
+type
+  TDoubleArray = array of Double;
+  TDoubleMatrix = array of TDoubleArray;
+  TLayerProbe = record
+    LayerIdx: integer;
+    FeatDim: integer;        // probe feature dimension (<= MaxFeatDim)
+    Projected: boolean;      // true if random-projected from a wider layer
+    ProjSrc: array of integer;
+    ProjSign: array of Double;
+    Name: string;
+  end;
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx, ProbeIdx, SampleIdx, I, J, K, N, NumProbed, FlatSz, D: integer;
+  Layer: TNNetLayer;
+  Probes2: array of TLayerProbe;
+  FeatRow: TDoubleArray;
+  Feats: TDoubleMatrix;        // N x D activation rows for the current layer
+  ColMean: TDoubleArray;       // D column means (for covariance centering)
+  Gram: TDoubleMatrix;         // smaller of (N x N) or (D x D)
+  Eig: TDoubleArray;
+  GramDim, EffDim: integer;
+  EigSum, EigSqSum, PCA_ID, PR: Double;
+  TwoNN_ID, MaxBar, Compress, Gap: Double;
+  R1, R2, Dist, DiffV, MuI: Double;
+  Mu: TDoubleArray;            // per-sample r2/r1 ratios (>1)
+  NMu: integer;
+  X, Y, SumXY, SumXX, FcdfV: Double;
+  Tmp: Double;
+  Bar, FlagStr, ShapeStr: string;
+  BarLen: integer;
+  // network-level chart accumulators
+  PcaVals, TwoNNVals: TDoubleArray;
+  ChartLayerIdx: array of integer;
+  ChartLayerName: array of string;
+  ChartCount: integer;
+  SavedSeed: longword;
+
+  // Fill FeatRow (length FeatDim) from a probed layer Output, applying the
+  // sign-random projection when this layer was capped.
+  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
+  var
+    F: integer;
+  begin
+    if Pr.Projected then
+    begin
+      for F := 0 to Pr.FeatDim - 1 do
+        FeatRow[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
+    end
+    else
+    begin
+      for F := 0 to Pr.FeatDim - 1 do
+        FeatRow[F] := OutVol.FData[F];
+    end;
+  end;
+
+  // In-place symmetric cyclic Jacobi eigensolver (eigenVALUES only). A is
+  // (Dim x Dim) symmetric; on return A's diagonal holds the eigenvalues. Same
+  // solver WeightSpectralTailReport ships — reused verbatim, no new numerics.
+  procedure JacobiEigenvalues(var A: TDoubleMatrix; Dm: integer;
+    out OutEig: TDoubleArray);
+  var
+    Sweep, P, Q, R: integer;
+    Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
+  begin
+    for Sweep := 1 to cJacobiSweeps do
+    begin
+      Off := 0;
+      for P := 0 to Dm - 2 do
+        for Q := P + 1 to Dm - 1 do
+          Off := Off + A[P][Q] * A[P][Q];
+      if Off <= cJacobiTol then Break;
+      for P := 0 to Dm - 2 do
+        for Q := P + 1 to Dm - 1 do
+        begin
+          Apq := A[P][Q];
+          if Abs(Apq) <= 1e-300 then Continue;
+          App := A[P][P];
+          Aqq := A[Q][Q];
+          Theta := (Aqq - App) / (2.0 * Apq);
+          if Theta >= 0 then
+            T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
+          else
+            T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
+          C := 1.0 / Sqrt(T * T + 1.0);
+          S := T * C;
+          Tau := S / (1.0 + C);
+          A[P][P] := App - T * Apq;
+          A[Q][Q] := Aqq + T * Apq;
+          A[P][Q] := 0.0;
+          A[Q][P] := 0.0;
+          for R := 0 to Dm - 1 do
+          begin
+            if (R = P) or (R = Q) then Continue;
+            Aip := A[R][P];
+            Aiq := A[R][Q];
+            A[R][P] := Aip - S * (Aiq + Tau * Aip);
+            A[R][Q] := Aiq + S * (Aip - Tau * Aiq);
+            A[P][R] := A[R][P];
+            A[Q][R] := A[R][Q];
+          end;
+        end;
+    end;
+    SetLength(OutEig, Dm);
+    for P := 0 to Dm - 1 do OutEig[P] := A[P][P];
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'IntrinsicDimensionReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Probes = nil) or (Probes.Count = 0) then
+    begin
+      Result := 'IntrinsicDimensionReport: Probes is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if MaxFeatDim < 1 then MaxFeatDim := 1;
+    N := Probes.Count;
+
+    // --- Catalogue trainable layers to probe, building a deterministic
+    //     sign-random projection for over-wide layers (cost bound). ---
+    SavedSeed := RandSeed;
+    SetLength(Probes2, NN.CountLayers());
+    NumProbed := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      FlatSz := Layer.Output.Size;
+      if FlatSz = 0 then Continue;
+      Probes2[NumProbed].LayerIdx := LayerIdx;
+      Probes2[NumProbed].Name := Layer.ClassName;
+      if FlatSz > MaxFeatDim then
+      begin
+        Probes2[NumProbed].FeatDim := MaxFeatDim;
+        Probes2[NumProbed].Projected := true;
+        SetLength(Probes2[NumProbed].ProjSrc, MaxFeatDim);
+        SetLength(Probes2[NumProbed].ProjSign, MaxFeatDim);
+        RandSeed := cProjSeed + LayerIdx;
+        for J := 0 to MaxFeatDim - 1 do
+        begin
+          Probes2[NumProbed].ProjSrc[J] := Random(FlatSz);
+          if Random(2) = 0 then
+            Probes2[NumProbed].ProjSign[J] := 1.0
+          else
+            Probes2[NumProbed].ProjSign[J] := -1.0;
+        end;
+      end
+      else
+      begin
+        Probes2[NumProbed].FeatDim := FlatSz;
+        Probes2[NumProbed].Projected := false;
+      end;
+      Inc(NumProbed);
+    end;
+    RandSeed := SavedSeed;
+
+    if NumProbed = 0 then
+    begin
+      Result := 'IntrinsicDimensionReport: no trainable layers to probe.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    Lines.Add(
+      'IntrinsicDimensionReport: per-layer activation-cloud intrinsic ' +
+      'dimension (forward-only, unlabelled probe batch).');
+    Lines.Add(Format(
+      'Probe samples N=%d. Linear PCA_ID = participation ratio of the ' +
+      'covariance eigenspectrum; TwoNN_ID = Facco 2017 nearest-neighbour ' +
+      'estimator. Wide layers random-projected to MaxFeatDim=%d.',
+      [N, MaxFeatDim]));
+    Lines.Add(Format(
+      '%-4s %-24s %8s %9s %9s %8s %9s',
+      ['Idx', 'Class', 'D_l', 'PCA_ID', 'TwoNN_ID', 'gap', 'comp']));
+    Lines.Add(StringOfChar('-', 78));
+
+    SetLength(PcaVals, NumProbed);
+    SetLength(TwoNNVals, NumProbed);
+    SetLength(ChartLayerIdx, NumProbed);
+    SetLength(ChartLayerName, NumProbed);
+    ChartCount := 0;
+
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      LayerIdx := Probes2[ProbeIdx].LayerIdx;
+      Layer := NN.Layers[LayerIdx];
+      D := Probes2[ProbeIdx].FeatDim;
+      ShapeStr := Probes2[ProbeIdx].Name;
+
+      // --- Forward pass: build the N x D activation matrix. ---
+      SetLength(FeatRow, D);
+      SetLength(Feats, N);
+      for SampleIdx := 0 to N - 1 do
+      begin
+        SetLength(Feats[SampleIdx], D);
+        NN.Compute(Probes[SampleIdx]);
+        ReadFeatures(Probes2[ProbeIdx], Layer.Output);
+        for I := 0 to D - 1 do Feats[SampleIdx][I] := FeatRow[I];
+      end;
+
+      // ===================== (1) Linear / PCA ID ======================
+      // Centre the columns, then form the SMALLER of the (D x D) covariance
+      // or the (N x N) Gram of centred rows (same non-zero eigenspectrum).
+      SetLength(ColMean, D);
+      for I := 0 to D - 1 do ColMean[I] := 0;
+      for SampleIdx := 0 to N - 1 do
+        for I := 0 to D - 1 do
+          ColMean[I] := ColMean[I] + Feats[SampleIdx][I];
+      for I := 0 to D - 1 do ColMean[I] := ColMean[I] / N;
+      for SampleIdx := 0 to N - 1 do
+        for I := 0 to D - 1 do
+          Feats[SampleIdx][I] := Feats[SampleIdx][I] - ColMean[I];
+
+      if D <= N then GramDim := D else GramDim := N;
+      SetLength(Gram, GramDim);
+      for I := 0 to GramDim - 1 do
+      begin
+        SetLength(Gram[I], GramDim);
+        for J := 0 to GramDim - 1 do Gram[I][J] := 0;
+      end;
+      if D <= N then
+      begin
+        // covariance C[i][j] = (1/N) sum_n Xc[n,i]*Xc[n,j]   (D x D)
+        for SampleIdx := 0 to N - 1 do
+          for I := 0 to D - 1 do
+            for J := I to D - 1 do
+              Gram[I][J] := Gram[I][J] +
+                Feats[SampleIdx][I] * Feats[SampleIdx][J];
+        for I := 0 to D - 1 do
+          for J := I to D - 1 do
+          begin
+            Gram[I][J] := Gram[I][J] / N;
+            Gram[J][I] := Gram[I][J];
+          end;
+      end
+      else
+      begin
+        // Gram G[a][b] = (1/N) sum_i Xc[a,i]*Xc[b,i]   (N x N); shares the
+        // same non-zero eigenvalues as the D x D covariance.
+        for I := 0 to N - 1 do
+          for J := I to N - 1 do
+          begin
+            Tmp := 0;
+            for K := 0 to D - 1 do
+              Tmp := Tmp + Feats[I][K] * Feats[J][K];
+            Gram[I][J] := Tmp / N;
+            Gram[J][I] := Gram[I][J];
+          end;
+      end;
+
+      JacobiEigenvalues(Gram, GramDim, Eig);
+
+      // PSD: clamp tiny-negative numerical noise; participation ratio.
+      EigSum := 0;
+      EigSqSum := 0;
+      for I := 0 to GramDim - 1 do
+      begin
+        if Eig[I] < 0 then
+        begin
+          if Eig[I] < -1e-6 * (Abs(EigSum) + 1.0) then
+            Flags.Add(Format(
+              '  Layer %3d %s: negative PCA eigenvalue %.6g (PSD violation).',
+              [LayerIdx, ShapeStr, Eig[I]]));
+          Eig[I] := 0;
+        end;
+        EigSum := EigSum + Eig[I];
+        EigSqSum := EigSqSum + Eig[I] * Eig[I];
+      end;
+      if EigSqSum > 1e-30 then
+        PR := (EigSum * EigSum) / EigSqSum
+      else
+        PR := 0;          // all-constant cloud => zero variance => ID ~ 0
+      PCA_ID := PR;
+
+      // ===================== (2) TwoNN nonlinear ID ===================
+      // r1 = nearest, r2 = 2nd-nearest Euclidean distance per sample (over the
+      // UN-centred features). mu = r2/r1; fit d = sum(x*y)/sum(x*x) with
+      // x = log(mu), y = -log(1 - F(mu)) through the origin.
+      SetLength(Mu, N);
+      NMu := 0;
+      if N >= 3 then
+      begin
+        for I := 0 to N - 1 do
+        begin
+          R1 := 1e300;
+          R2 := 1e300;
+          for J := 0 to N - 1 do
+          begin
+            if J = I then Continue;
+            Dist := 0;
+            for K := 0 to D - 1 do
+            begin
+              // un-centre: add the column mean back (centering shifts all rows
+              // equally, so distances are identical — recompute from raw).
+              DiffV := (Feats[I][K] + ColMean[K]) - (Feats[J][K] + ColMean[K]);
+              Dist := Dist + DiffV * DiffV;
+            end;
+            Dist := Sqrt(Dist);
+            if Dist < R1 then
+            begin
+              R2 := R1;
+              R1 := Dist;
+            end
+            else if Dist < R2 then
+              R2 := Dist;
+          end;
+          if (R1 > 1e-12) and (R2 > R1) then
+          begin
+            MuI := R2 / R1;
+            if MuI > 1.0 then
+            begin
+              Mu[NMu] := MuI;
+              Inc(NMu);
+            end;
+          end;
+        end;
+      end;
+
+      if NMu >= 2 then
+      begin
+        // sort mu ascending (insertion sort; NMu small for capped probe batches)
+        for I := 1 to NMu - 1 do
+        begin
+          MuI := Mu[I];
+          J := I - 1;
+          while (J >= 0) and (Mu[J] > MuI) do
+          begin
+            Mu[J + 1] := Mu[J];
+            Dec(J);
+          end;
+          Mu[J + 1] := MuI;
+        end;
+        // empirical CDF F(mu_i) = (i+1)/NMu (skip the last point where F=1).
+        SumXY := 0;
+        SumXX := 0;
+        for I := 0 to NMu - 2 do
+        begin
+          FcdfV := (I + 1) / NMu;
+          X := Ln(Mu[I]);
+          Y := -Ln(1.0 - FcdfV);
+          SumXY := SumXY + X * Y;
+          SumXX := SumXX + X * X;
+        end;
+        if SumXX > 1e-30 then
+          TwoNN_ID := SumXY / SumXX
+        else
+          TwoNN_ID := 0;
+        if TwoNN_ID < 0 then TwoNN_ID := 0;
+      end
+      else
+        TwoNN_ID := 0;     // degenerate (e.g. identical samples) => ID ~ 0
+
+      // ----- per-layer line + flags -----
+      EffDim := D;                    // intrinsic upper bound is min(N-1, D)
+      if (N - 1) < EffDim then EffDim := N - 1;
+      Gap := PCA_ID - TwoNN_ID;
+      if D > 0 then Compress := TwoNN_ID / D else Compress := 0;
+
+      FlagStr := '';
+      if Compress >= cExpandFrac then
+        FlagStr := 'expanded'
+      else if Compress <= cCompressFrac then
+        FlagStr := 'compressed';
+      if (EffDim > 0) and (PCA_ID >= cFullRankFrac * EffDim) then
+      begin
+        if FlagStr <> '' then FlagStr := FlagStr + ',';
+        FlagStr := FlagStr + 'full-rank';
+      end;
+
+      Lines.Add(Format(
+        '%-4d %-24s %8d %9.3f %9.3f %8.3f %9.3f %s',
+        [LayerIdx, ShapeStr, D, PCA_ID, TwoNN_ID, Gap, Compress, FlagStr]));
+
+      PcaVals[ChartCount] := PCA_ID;
+      TwoNNVals[ChartCount] := TwoNN_ID;
+      ChartLayerIdx[ChartCount] := LayerIdx;
+      ChartLayerName[ChartCount] := ShapeStr;
+      Inc(ChartCount);
+    end;
+
+    // --- ID-across-depth ASCII bar chart (TwoNN_ID, the manifold dim). ---
+    Lines.Add('');
+    Lines.Add('TwoNN_ID across depth (the expand-then-contract "hunchback"):');
+    MaxBar := 0;
+    for I := 0 to ChartCount - 1 do
+      if TwoNNVals[I] > MaxBar then MaxBar := TwoNNVals[I];
+    if MaxBar <= 1e-30 then MaxBar := 1;
+    for I := 0 to ChartCount - 1 do
+    begin
+      BarLen := Round((TwoNNVals[I] / MaxBar) * cMaxBarWidth);
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d %-22s TwoNN=%8.3f %s',
+        [ChartLayerIdx[I], ChartLayerName[I], TwoNNVals[I], Bar]));
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format(
+      'Flags: comp=TwoNN_ID/D_l; expanded >= %.2f, compressed <= %.2f; ' +
+      'full-rank when PCA_ID >= %.2f*min(N-1,D_l).',
+      [cExpandFrac, cCompressFrac, cFullRankFrac]));
+    if Flags.Count = 0 then
+      Lines.Add('  (no PSD violations.)')
     else
       Lines.AddStrings(Flags);
 

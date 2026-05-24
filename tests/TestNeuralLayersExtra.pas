@@ -106,6 +106,7 @@ type
     procedure TestHessianCurvatureReportSmoke;
     procedure TestEffectiveReceptiveFieldReportSmoke;
     procedure TestModeConnectivityReportSmoke;
+    procedure TestIntrinsicDimensionReportSmoke;
   end;
 
 implementation
@@ -3798,6 +3799,174 @@ begin
     Samples.Free;
     NN.Free;
     NNB.Free;
+    RandSeed := SavedSeed;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestIntrinsicDimensionReportSmoke;
+var
+  NN, GTNet: TNNet;
+  Probes, SubBatch, DupBatch: TNNetVolumeList;
+  V: TNNetVolume;
+  Report, NilReport: string;
+  I, J, C: integer;
+  SavedSeed: longword;
+  PcaID, TwoID: Double;
+  Basis: array of array of TNeuralFloat;
+  Coeff: array of TNeuralFloat;
+const
+  cAmbient = 16;
+  cKnownK  = 3;
+  cProbeN  = 120;
+
+  // Extract the PCA_ID (4th) and TwoNN_ID (5th) numeric columns off the FIRST
+  // per-layer data row of an IntrinsicDimensionReport (used on single-trainable
+  // -layer nets, so there is exactly one data row). Tokens: Idx Class D_l
+  // PCA_ID TwoNN_ID gap comp [flags].
+  procedure ParseFirstRow(const Rpt: string; out P, T: Double);
+  var
+    L: TStringList;
+    Toks: TStringList;
+    Ln: integer;
+    FS: TFormatSettings;
+  begin
+    P := -1; T := -1;
+    FS := DefaultFormatSettings;
+    FS.DecimalSeparator := '.';
+    L := TStringList.Create();
+    Toks := TStringList.Create();
+    try
+      L.Text := Rpt;
+      for Ln := 0 to L.Count - 1 do
+      begin
+        // first line whose 2nd token starts with 'TNNet' is a data row.
+        Toks.Clear;
+        Toks.Delimiter := ' ';
+        Toks.StrictDelimiter := False;
+        Toks.DelimitedText := L[Ln];
+        if (Toks.Count >= 5) and (Pos('TNNet', Toks[1]) = 1) then
+        begin
+          P := StrToFloatDef(Toks[3], -1, FS);
+          T := StrToFloatDef(Toks[4], -1, FS);
+          Break;
+        end;
+      end;
+    finally
+      Toks.Free;
+      L.Free;
+    end;
+  end;
+
+begin
+  SavedSeed := RandSeed;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.IntrinsicDimensionReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(cAmbient, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(24));
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+    RandSeed := 4242;
+    NN.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.IntrinsicDimensionReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // a small probe batch -> non-empty, headers + chart present.
+    RandSeed := 777;
+    for I := 0 to cProbeN - 1 do
+    begin
+      V := TNNetVolume.Create(cAmbient, 1, 1);
+      for J := 0 to cAmbient - 1 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+    end;
+    Report := TNNet.IntrinsicDimensionReport(NN, Probes);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('IntrinsicDimensionReport', Report) > 0);
+    AssertTrue('PCA_ID column present', Pos('PCA_ID', Report) > 0);
+    AssertTrue('TwoNN_ID column present', Pos('TwoNN_ID', Report) > 0);
+    AssertTrue('Depth chart present', Pos('across depth', Report) > 0);
+    AssertTrue('No PSD violations',
+      Pos('negative PCA eigenvalue', Report) = 0);
+  finally
+    Probes.Free;
+    NN.Free;
+  end;
+
+  // ---- Correctness 1: a known k-dim subspace recovers PCA_ID ~ k & TwoNN_ID ~ k.
+  // Feed a batch lying on a k-dim subspace (linear image in cAmbient dims)
+  // through a fresh wide LINEAR layer; the first layer's cloud is a linear image
+  // of a k-dim object, so both IDs should land near k.
+  GTNet := TNNet.Create();
+  SubBatch := TNNetVolumeList.Create(True);
+  try
+    GTNet.AddLayer(TNNetInput.Create(cAmbient, 1, 1));
+    GTNet.AddLayer(TNNetFullConnectLinear.Create(32));
+    RandSeed := 99;
+    GTNet.InitWeights();
+
+    RandSeed := 12321;
+    SetLength(Basis, cAmbient);
+    for I := 0 to cAmbient - 1 do
+    begin
+      SetLength(Basis[I], cKnownK);
+      for J := 0 to cKnownK - 1 do Basis[I][J] := (Random - 0.5) * 2.0;
+    end;
+    SetLength(Coeff, cKnownK);
+    for C := 0 to cProbeN - 1 do
+    begin
+      for J := 0 to cKnownK - 1 do Coeff[J] := (Random - 0.5) * 2.0;
+      V := TNNetVolume.Create(cAmbient, 1, 1);
+      for I := 0 to cAmbient - 1 do
+      begin
+        V.Raw[I] := 0;
+        for J := 0 to cKnownK - 1 do
+          V.Raw[I] := V.Raw[I] + Basis[I][J] * Coeff[J];
+      end;
+      SubBatch.Add(V);
+    end;
+
+    Report := TNNet.IntrinsicDimensionReport(GTNet, SubBatch);
+    ParseFirstRow(Report, PcaID, TwoID);
+    AssertTrue('parsed PCA_ID', PcaID >= 0);
+    AssertTrue('parsed TwoNN_ID', TwoID >= 0);
+    // both IDs must recover the k=3 subspace within a generous band (the
+    // participation ratio under-counts a non-flat spectrum, so allow [1.5, 6]).
+    AssertTrue('PCA_ID ~ k recovered', (PcaID >= 1.5) and (PcaID <= 6.0));
+    AssertTrue('TwoNN_ID ~ k recovered', (TwoID >= 1.5) and (TwoID <= 6.0));
+  finally
+    SubBatch.Free;
+    GTNet.Free;
+  end;
+
+  // ---- Correctness 2: identical samples drive both IDs to ~0.
+  GTNet := TNNet.Create();
+  DupBatch := TNNetVolumeList.Create(True);
+  try
+    GTNet.AddLayer(TNNetInput.Create(cAmbient, 1, 1));
+    GTNet.AddLayer(TNNetFullConnectLinear.Create(32));
+    RandSeed := 55;
+    GTNet.InitWeights();
+    for I := 0 to cProbeN - 1 do
+    begin
+      V := TNNetVolume.Create(cAmbient, 1, 1);
+      for J := 0 to cAmbient - 1 do V.Raw[J] := 0.37;  // every sample identical
+      DupBatch.Add(V);
+    end;
+    Report := TNNet.IntrinsicDimensionReport(GTNet, DupBatch);
+    ParseFirstRow(Report, PcaID, TwoID);
+    AssertTrue('identical samples PCA_ID ~ 0', (PcaID >= 0) and (PcaID < 0.5));
+    AssertTrue('identical samples TwoNN_ID ~ 0', (TwoID >= 0) and (TwoID < 0.5));
+  finally
+    DupBatch.Free;
+    GTNet.Free;
     RandSeed := SavedSeed;
   end;
 end;

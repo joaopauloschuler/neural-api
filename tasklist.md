@@ -1210,7 +1210,7 @@ breakdown:
       a ground-truth localisation check), and a smoke test in tests/ (non-empty
       report, expected header, nil-NN graceful return, plus the `r_0==1` /
       `r_last==1` exact-recovery assertions).
-- [ ] TNNet.IntrinsicDimensionReport(NN, Probes [, MaxFeatDim]) — a forward-only
+- [X] TNNet.IntrinsicDimensionReport(NN, Probes [, MaxFeatDim]) — a forward-only
       **representation-geometry** diagnostic answering a question none of the
       landed reports answer: *"how many effective dimensions does each layer's
       activation cloud actually occupy?"* — the dimensionality of the data
