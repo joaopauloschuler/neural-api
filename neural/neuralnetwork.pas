@@ -3977,36 +3977,40 @@ type
   /// SoftPool layer (Stergiou, Poppe, Kalliatakis 2021): an
   // activation-weighted ("softmax") average pooling. Over each square
   // pooling window W (side = PoolSize) and per channel it computes
-  //   w_i = exp(x_i) / sum_{j in W} exp(x_j)
+  //   w_i = exp(beta*x_i) / sum_{j in W} exp(beta*x_j)
   //   y   = sum_{i in W} w_i * x_i
   // i.e. each cell contributes proportionally to the soft-weight of its
-  // own activation (beta is fixed at 1.0 here; there is no trainable beta
-  // parameter). The window softmax is numerically stabilised by subtracting
-  // the window maximum before the exp, mirroring the in-tree TNNetSoftMax
-  // guard, so large activations never overflow. SoftPool sits between the
-  // two classic pooling limits: when one activation in the window is much
-  // larger than the rest its weight tends to 1 and SoftPool -> MaxPool
-  // (the dominant activation is selected); when all activations in the
-  // window are equal every weight is 1/N and SoftPool -> AvgPool (the plain
-  // mean). Unlike MaxPool every cell receives a non-zero gradient, which
-  // makes SoftPool a smooth, differentiable down-sampling operator.
-  // The integer pool/stride/padding parameters round-trip via FStruct[0..2]
-  // exactly like TNNetMaxPool / TNNetLpPool; the layer stores nothing extra.
+  // own activation. The temperature beta (stored in FFloatSt[0], default
+  // 1.0 so the layer round-trips through SaveToString / LoadFromString and
+  // existing nets are unchanged) is a single knob spanning the average<->max
+  // pooling family: beta -> +inf recovers MaxPool (the single largest
+  // activation dominates) and beta -> 0 recovers AvgPool (every weight tends
+  // to 1/N). The window softmax is numerically stabilised by subtracting the
+  // window maximum of beta*x before the exp, mirroring the in-tree
+  // TNNetSoftMax guard, so large activations never overflow. When all
+  // activations in the window are equal every weight is 1/N and SoftPool
+  // equals the plain mean regardless of beta. Unlike MaxPool every cell
+  // receives a non-zero gradient, which makes SoftPool a smooth,
+  // differentiable down-sampling operator. The integer pool/stride/padding
+  // parameters round-trip via FStruct[0..2] exactly like TNNetMaxPool /
+  // TNNetLpPool; beta round-trips via FFloatSt[0].
   // Backward uses the analytic per-cell input gradient
-  //   dy/dx_i = w_i * (1 + x_i - y)
-  // so d(loss)/dx_i = OutputError * w_i * (1 + x_i - y), accumulated into the
-  // previous layer's error. The weights w_i and the output y are recomputed
-  // from the cached input and FOutput during the backward pass.
+  //   dy/dx_i = w_i * (1 + beta*(x_i - y))
+  // so d(loss)/dx_i = OutputError * w_i * (1 + beta*(x_i - y)), accumulated
+  // into the previous layer's error. The weights w_i and the output y are
+  // recomputed from the cached input and FOutput during the backward pass.
   TNNetSoftPool = class(TNNetPoolBase)
   private
+    FBeta: TNeuralFloat;
     // Per-output-cell scratch volumes (window maximum and exp-sum). They are
     // sized lazily to FOutput and are NOT serialized, so the layer still
-    // round-trips through SaveToString / LoadFromString via FStruct[0..2].
+    // round-trips through SaveToString / LoadFromString via FStruct[0..2]
+    // (and FFloatSt[0] for beta).
     FWinMax, FExpSum: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pPoolSize: integer; pStride: integer = 0;
-      pPadding: integer = 0); overload;
+      pPadding: integer = 0; pBeta: TNeuralFloat = 1.0); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -23756,9 +23760,11 @@ begin
 end;
 
 constructor TNNetSoftPool.Create(pPoolSize: integer; pStride: integer = 0;
-  pPadding: integer = 0);
+  pPadding: integer = 0; pBeta: TNeuralFloat = 1.0);
 begin
   inherited Create(pPoolSize, pStride, pPadding);
+  FBeta := pBeta;
+  FFloatSt[0] := pBeta;
   FWinMax := TNNetVolume.Create(1, 1, 1);
   FExpSum := TNNetVolume.Create(1, 1, 1);
 end;
@@ -23778,21 +23784,23 @@ var
   StartTime: double;
   OutputRawPos: integer;
   InputRawPtr: TNeuralFloatPtr;
-  ExpVal: TNeuralFloat;
+  ExpVal, BetaX: TNeuralFloat;
 begin
   StartTime := Now();
-  // Per pooling window W and channel:
-  //   w_i = exp(x_i - winMax) / sum_j exp(x_j - winMax)   (winMax stabilises)
+  // Per pooling window W and channel, with temperature beta (FFloatSt[0]):
+  //   w_i = exp(beta*x_i - winMax) / sum_j exp(beta*x_j - winMax)
   //   y   = sum_i w_i * x_i
-  // Every cell of a window shares the same window-wide max and exp-sum, so we
-  // accumulate over the input cells in three passes using the (non-serialized)
-  // scratch volumes FWinMax (per-output-cell window maximum) and FExpSum
-  // (window exp-sum). The final weighted sum is built into FOutput.
+  // where winMax = max_j (beta*x_j) stabilises the exp (max-subtraction trick),
+  // so large beta*x never overflows. Every cell of a window shares the same
+  // window-wide max and exp-sum, so we accumulate over the input cells in three
+  // passes using the (non-serialized) scratch volumes FWinMax (per-output-cell
+  // window maximum of beta*x) and FExpSum (window exp-sum). The final weighted
+  // sum is built into FOutput.
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
 
-  // Pass 1: window maximum per output cell+channel (numerical stability).
+  // Pass 1: window maximum of beta*x per output cell+channel (stability).
   FWinMax.ReSize(FOutput);
   FWinMax.Fill(-3.402823e38);
   for CntX := 0 to MaxX do
@@ -23805,15 +23813,16 @@ begin
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
-        if InputRawPtr^ > FWinMax.FData[OutputRawPos] then
-          FWinMax.FData[OutputRawPos] := InputRawPtr^;
+        BetaX := FBeta * InputRawPtr^;
+        if BetaX > FWinMax.FData[OutputRawPos] then
+          FWinMax.FData[OutputRawPos] := BetaX;
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
     end;
   end;
 
-  // Pass 2: exp-sum of (x - winMax) per output cell+channel, into FExpSum.
+  // Pass 2: exp-sum of (beta*x - winMax) per output cell+channel, into FExpSum.
   FExpSum.ReSize(FOutput);
   FExpSum.Fill(0);
   for CntX := 0 to MaxX do
@@ -23827,14 +23836,14 @@ begin
       for CntD := 0 to MaxD do
       begin
         FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
-          Exp(InputRawPtr^ - FWinMax.FData[OutputRawPos]);
+          Exp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
     end;
   end;
 
-  // Pass 3: weighted sum  y = sum_i x_i * exp(x_i - winMax) / expSum, into
+  // Pass 3: weighted sum  y = sum_i x_i * exp(beta*x_i - winMax) / expSum, into
   // FOutput.
   Output.Fill(0);
   for CntX := 0 to MaxX do
@@ -23849,7 +23858,7 @@ begin
       begin
         if FExpSum.FData[OutputRawPos] > 0 then
         begin
-          ExpVal := Exp(InputRawPtr^ - FWinMax.FData[OutputRawPos]) /
+          ExpVal := Exp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]) /
             FExpSum.FData[OutputRawPos];
           FOutput.FData[OutputRawPos] :=
             FOutput.FData[OutputRawPos] + ExpVal * InputRawPtr^;
@@ -23882,9 +23891,10 @@ begin
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
 
-  // Recompute, per output cell+channel, the window maximum (stability) and the
-  // sum of exp(x - winMax) so w_i = exp(x_i - winMax) / expSum can be rebuilt.
-  // FWinMax = winMax, FExpSum = expSum (the non-serialized scratch volumes).
+  // Recompute, per output cell+channel, the window maximum of beta*x
+  // (stability) and the sum of exp(beta*x - winMax) so
+  // w_i = exp(beta*x_i - winMax) / expSum can be rebuilt. FWinMax = winMax,
+  // FExpSum = expSum (the non-serialized scratch volumes).
   FWinMax.ReSize(FOutput);
   FWinMax.Fill(-3.402823e38);
   for CntX := 0 to MaxX do
@@ -23897,8 +23907,8 @@ begin
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
-        if InputRawPtr^ > FWinMax.FData[OutputRawPos] then
-          FWinMax.FData[OutputRawPos] := InputRawPtr^;
+        if FBeta * InputRawPtr^ > FWinMax.FData[OutputRawPos] then
+          FWinMax.FData[OutputRawPos] := FBeta * InputRawPtr^;
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
@@ -23917,15 +23927,15 @@ begin
       for CntD := 0 to MaxD do
       begin
         FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
-          Exp(InputRawPtr^ - FWinMax.FData[OutputRawPos]);
+          Exp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
     end;
   end;
 
-  // dy/dx_i = w_i * (1 + x_i - y), so
-  // d(loss)/dx_i = OutputError * w_i * (1 + x_i - y).
+  // dy/dx_i = w_i * (1 + beta*(x_i - y)), so
+  // d(loss)/dx_i = OutputError * w_i * (1 + beta*(x_i - y)).
   for CntX := 0 to MaxX do
   begin
     OutX := CntX div FPoolSize;
@@ -23943,8 +23953,9 @@ begin
         Y := FOutput.FData[OutputRawPos];
         if ExpSum > 0 then
         begin
-          Wi := Exp(XVal - WinMax) / ExpSum;
-          Grad := FOutputError.FData[OutputRawPos] * Wi * (1.0 + XVal - Y);
+          Wi := Exp(FBeta * XVal - WinMax) / ExpSum;
+          Grad := FOutputError.FData[OutputRawPos] * Wi *
+            (1.0 + FBeta * (XVal - Y));
           FPrevLayer.OutputError.FData[PrevRawPos] :=
             FPrevLayer.OutputError.FData[PrevRawPos] + Grad;
         end;
@@ -39290,7 +39301,7 @@ begin
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
-      'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2]);
+      'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
       'TNNetAdaptiveAvgPool':       Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]);
       'TNNetAdaptiveMaxPool':       Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]);
@@ -39550,7 +39561,7 @@ begin
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
-      if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
       if S[0] = 'TNNetAdaptiveAvgPool' then Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]) else
       if S[0] = 'TNNetAdaptiveMaxPool' then Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]) else

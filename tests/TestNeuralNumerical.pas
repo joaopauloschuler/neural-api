@@ -32,8 +32,11 @@ type
     procedure TestLpPoolGradientCheckP3;
     procedure TestLpPoolLoadFromString;
     procedure TestSoftPoolGradientCheck;
+    procedure TestSoftPoolGradientCheckBetaSweep;
+    procedure TestSoftPoolBetaLimits;
     procedure TestSoftPoolAvgLimit;
     procedure TestSoftPoolLoadFromString;
+    procedure TestSoftPoolLoadFromStringBeta;
     procedure TestAdaptiveAvgPoolForward;
     procedure TestAdaptiveAvgPoolGlobalAndIdentity;
     procedure TestAdaptiveAvgPoolGradientCheck;
@@ -4074,6 +4077,12 @@ begin
   end;
 end;
 
+// Forward declaration: the Double-precision loss gradient check is defined
+// further below but is reused by the SoftPool beta-sweep test above it.
+procedure DeMaxPoolFamilyGradientCheck(ATestCase: TTestCase;
+  ALayer: TNNetLayer; const AName: string;
+  ASizeX, ASizeY, ASizeD: integer; ATolerance: TNeuralFloat); forward;
+
 // Generic input-gradient check: builds a 1-layer net (Input -> ALayer), drives a
 // real backward pass with a known per-element output error and compares the
 // input error against central finite differences. ALayer is owned by the net.
@@ -4233,6 +4242,75 @@ begin
     'SoftPool', 4, 4, 2, 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestSoftPoolGradientCheckBetaSweep;
+begin
+  // TNNetSoftPool with the beta temperature: w_i = exp(beta*x_i)/sum_j
+  // exp(beta*x_j), y = sum_i w_i*x_i. The analytic per-cell input gradient
+  //   dy/dx_i = w_i * (1 + beta*(x_i - y))
+  // must match a central-difference numerical gradient across beta. We use the
+  // Double-precision loss helper (DeMaxPoolFamilyGradientCheck) with its small
+  // Sin*0.1 inputs: a sharper softmax (larger beta) amplifies the
+  // perturbation-induced delta against the Single-precision sum-of-squares, so
+  // the Double accumulator is needed to keep central differences clean (the
+  // same documented pooling-family convention used by the De*Pool checks).
+  // The max-subtraction stability trick keeps the exp well-conditioned even at
+  // the larger beta values.
+  DeMaxPoolFamilyGradientCheck(Self, TNNetSoftPool.Create(2, 0, 0, 0.5),
+    'SoftPool(beta=0.5)', 4, 4, 2, 0.001);
+  DeMaxPoolFamilyGradientCheck(Self, TNNetSoftPool.Create(2, 0, 0, 1.0),
+    'SoftPool(beta=1.0)', 4, 4, 2, 0.001);
+  DeMaxPoolFamilyGradientCheck(Self, TNNetSoftPool.Create(2, 0, 0, 2.0),
+    'SoftPool(beta=2.0)', 4, 4, 2, 0.001);
+  DeMaxPoolFamilyGradientCheck(Self, TNNetSoftPool.Create(2, 0, 0, 5.0),
+    'SoftPool(beta=5.0)', 4, 4, 2, 0.001);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPoolBetaLimits;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  WinMax, WinMean: TNeuralFloat;
+begin
+  // beta -> +inf recovers MAX pooling; beta -> 0 recovers AVG pooling. Build a
+  // single 2x2x1 window with four distinct values and check both limits.
+  // Window values: 1.0, 2.0, 3.0, 4.0 (max=4.0, mean=2.5).
+  WinMax := 4.0;
+  WinMean := (1.0 + 2.0 + 3.0 + 4.0) / 4.0;
+
+  // Large beta -> MAX.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 1));
+    NN.AddLayer(TNNetSoftPool.Create(2, 0, 0, 50.0));
+    Input.Raw[0] := 1.0; Input.Raw[1] := 2.0;
+    Input.Raw[2] := 3.0; Input.Raw[3] := 4.0;
+    NN.Compute(Input);
+    AssertEquals('SoftPool large-beta -> MAX',
+      WinMax, NN.GetLastLayer.Output.Raw[0], 1e-3);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // Tiny beta -> MEAN. The first-order deviation from the plain mean is
+  // O(beta*Var), so beta = 1e-4 brings the output within ~1e-4 of 2.5.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 1));
+    NN.AddLayer(TNNetSoftPool.Create(2, 0, 0, 0.0001));
+    Input.Raw[0] := 1.0; Input.Raw[1] := 2.0;
+    Input.Raw[2] := 3.0; Input.Raw[3] := 4.0;
+    NN.Compute(Input);
+    AssertEquals('SoftPool tiny-beta -> MEAN',
+      WinMean, NN.GetLastLayer.Output.Raw[0], 1e-3);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestSoftPoolAvgLimit;
 var
   NN: TNNet;
@@ -4291,6 +4369,50 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SoftPool round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPoolLoadFromStringBeta;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net containing TNNetSoftPool with a NON-default beta = 3.0.
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical,
+  // proving beta (FFloatSt[0]) survives both dispatch points alongside the
+  // integer pool params (FStruct[0..2]).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    NN.AddLayer(TNNetSoftPool.Create(2, 0, 0, 3.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('SoftPool(beta) round-trip class identity',
+        NN2.GetLastLayer is TNNetSoftPool);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('SoftPool(beta) SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SoftPool(beta) round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;

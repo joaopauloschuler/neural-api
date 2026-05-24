@@ -387,7 +387,7 @@ breakdown:
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
-- [ ] TNNetSoftPool follow-up: add an optional `beta` temperature to the
+- [X] TNNetSoftPool follow-up: add an optional `beta` temperature to the
       softmax weights (`w_i = exp(beta*x_i)/sum_j exp(beta*x_j)`) so
       `beta -> inf` recovers max-pool and `beta -> 0` recovers avg-pool — a
       single knob spanning the family. Store `beta` in `FFloatSt[0]`,
