@@ -1559,6 +1559,39 @@ type
       constructor Create(); override;
   end;
 
+  /// Randomized Leaky Rectified Linear Unit (RReLU) layer.
+  // For x >= 0, y = x. For x < 0, y = a*x where the negative slope `a` is:
+  //   - TRAINING (Enabled = true, the default): a single slope `a` is sampled
+  //     uniformly from [lower, upper] once per forward Compute() call (the
+  //     common per-pass simplification of Xu et al. 2015) and reused for every
+  //     negative element in that pass. The same slope is stored in
+  //     FOutputErrorDeriv so the matching Backpropagate uses it.
+  //   - INFERENCE (Enabled = false): the fixed average slope (lower+upper)/2 is
+  //     used deterministically, matching the paper's test-time behaviour.
+  // Backward: dy/dx = 1 for x >= 0, and dy/dx = a for x < 0 (the slope chosen in
+  // the matching forward pass). The derivative is cached in FOutputErrorDeriv so
+  // TNNetReLUBase handles the backward chain rule with one multiply.
+  // lower and upper are fixed (non-trainable) constructor hyperparameters stored
+  // in FFloatSt[0] and FFloatSt[1] for serialization (defaults lower = 1/8 and
+  // upper = 1/3). Requires 0 <= lower <= upper.
+  // Phase handling mirrors Dropout's Enabled flag (default true = training).
+  // Note that TNNet.EnableDropouts only touches TNNetAddNoiseBase layers, so it
+  // does NOT reach this layer; toggle the public Enabled property directly to
+  // switch to the deterministic inference (fixed average slope) behaviour.
+  // https://arxiv.org/abs/1505.00853 (Xu, Wang, Chen, Li, 2015 - "Empirical
+  // Evaluation of Rectified Activations in Convolutional Network").
+  TNNetRReLU = class(TNNetReLUBase)
+    protected
+      FEnabled: boolean;
+      FLastSlope: TNeuralFloat;
+    public
+      constructor Create(); overload;
+      constructor Create(pLower, pUpper: TNeuralFloat); overload;
+      procedure Compute(); override;
+      property Enabled: boolean read FEnabled write FEnabled;
+      property LastSlope: TNeuralFloat read FLastSlope;
+  end;
+
   /// This is a plain Sigmoid layer.
   TNNetSigmoid = class(TNNetIdentity)
     private
@@ -12258,6 +12291,85 @@ constructor TNNetVeryLeakyReLU.Create();
 begin
   inherited Create();
   FAlpha := 1/3;
+end;
+
+{ TNNetRReLU }
+constructor TNNetRReLU.Create();
+begin
+  // Paper defaults: lower = 1/8 = 0.125, upper = 1/3 ~= 0.3333.
+  Create(1/8, 1/3);
+end;
+
+constructor TNNetRReLU.Create(pLower, pUpper: TNeuralFloat);
+begin
+  inherited Create();
+  if (pLower < 0) or (pLower > pUpper) then
+    FErrorProc('TNNetRReLU requires 0 <= lower <= upper.');
+  FFloatSt[0] := pLower;
+  FFloatSt[1] := pUpper;
+  // Default to training behaviour (random per-pass slope), matching how
+  // Dropout defaults to Enabled = true.
+  FEnabled := true;
+  FLastSlope := (pLower + pUpper) / 2;
+end;
+
+procedure TNNetRReLU.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  Lower, Upper, Slope, x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  Lower := FFloatSt[0];
+  Upper := FFloatSt[1];
+  if Upper < Lower then Upper := Lower;
+
+  // Phase selection mirrors Dropout: when Enabled (training) a single negative
+  // slope is sampled uniformly from [lower, upper] per forward pass; otherwise
+  // (inference) the fixed average slope (lower+upper)/2 is used.
+  if FEnabled then
+    Slope := Lower + Random * (Upper - Lower)
+  else
+    Slope := (Lower + Upper) / 2;
+  // Store the slope so the matching Backpropagate uses the same value.
+  FLastSlope := Slope;
+
+  // y = x for x >= 0; y = Slope*x for x < 0. Derivative cached in
+  // FOutputErrorDeriv (1 for x >= 0, Slope for x < 0).
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x >= 0 then
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := x * Slope;
+        FOutputErrorDeriv.FData[OutputCnt] := Slope;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x >= 0 then
+        FOutput.FData[OutputCnt] := x
+      else
+        FOutput.FData[OutputCnt] := x * Slope;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetLeakyReLU }
@@ -27726,6 +27838,7 @@ begin
       'TNNetPenalizedTanh' :        Result := TNNetPenalizedTanh.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetSoftPlusBeta' :         Result := TNNetSoftPlusBeta.Create(Ft[0]);
+      'TNNetRReLU' :                Result := TNNetRReLU.Create(Ft[0], Ft[1]);
       'TNNetSoftExponential' :      Result := TNNetSoftExponential.Create(Ft[0]);
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
@@ -27947,6 +28060,7 @@ begin
       if S[0] = 'TNNetPenalizedTanh' then Result := TNNetPenalizedTanh.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetSoftPlusBeta' then Result := TNNetSoftPlusBeta.Create(Ft[0]) else
+      if S[0] = 'TNNetRReLU' then Result := TNNetRReLU.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetSoftExponential' then Result := TNNetSoftExponential.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else

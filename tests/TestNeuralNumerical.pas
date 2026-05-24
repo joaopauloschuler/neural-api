@@ -52,6 +52,8 @@ type
     procedure TestSELUGradientCheck;
     procedure TestLeakyReLUGradientCheck;
     procedure TestVeryLeakyReLUGradientCheck;
+    procedure TestRReLUGradientCheck;
+    procedure TestRReLULoadFromString;
     procedure TestReLU6GradientCheck;
     procedure TestSigmoidGradientCheck;
     procedure TestHyperbolicTangentGradientCheck;
@@ -1541,6 +1543,80 @@ begin
   // Avoid the kink at x = 0.
   ActivationGradientCheck(Self, TNNetVeryLeakyReLU.Create(), 'VeryLeakyReLU',
     [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestRReLUGradientCheck;
+var
+  Layer: TNNetRReLU;
+begin
+  // Central-difference gradient checking requires a DETERMINISTIC forward pass.
+  // RReLU samples a random negative slope per forward pass while training, so
+  // the eps perturbations would each see a different slope. Disable the random
+  // phase (Enabled := false) so the fixed average slope (lower+upper)/2 is used
+  // across every Compute, making the layer deterministic. Avoid the kink at 0.
+  Layer := TNNetRReLU.Create(0.125, 0.3333);
+  Layer.Enabled := false;
+  ActivationGradientCheck(Self, Layer, 'RReLU',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestRReLULoadFromString;
+const
+  Inputs: array[0..4] of TNeuralFloat = (0.5, -0.5, 1.0, -2.0, 2.5);
+  // NON-default hyperparameters; their average slope is (0.05+0.4)/2 = 0.225.
+  cLower = 0.05;
+  cUpper = 0.4;
+  cAvg = (cLower + cUpper) / 2;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i, n: integer;
+  Expected: TNeuralFloat;
+begin
+  // Round-trip SaveToString / LoadFromString with NON-default lower/upper and
+  // the layer in deterministic inference mode so outputs are reproducible.
+  n := Length(Inputs);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(n, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(n, 1, 1, 1));
+    NN.AddLayer(TNNetRReLU.Create(cLower, cUpper));
+    TNNetRReLU(NN.GetLastLayer).Enabled := false; // fixed average slope
+
+    for i := 0 to n - 1 do Input.Raw[i] := Inputs[i];
+    NN.Compute(Input);
+
+    // Sanity: in inference mode negatives use the fixed average slope.
+    for i := 0 to n - 1 do
+    begin
+      if Inputs[i] >= 0 then Expected := Inputs[i]
+      else Expected := Inputs[i] * cAvg;
+      AssertEquals('RReLU inference output at ' + IntToStr(i),
+        Expected, NN.GetLastLayer.Output.Raw[i], 1e-6);
+    end;
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      // Reconstructed layer must be the right class.
+      AssertTrue('RReLU round-trip class identity',
+        NN2.GetLastLayer is TNNetRReLU);
+      // Put the reconstructed layer in the same deterministic mode; matching
+      // outputs prove lower/upper (FFloatSt[0]/[1]) survived serialization.
+      TNNetRReLU(NN2.GetLastLayer).Enabled := false;
+      NN2.Compute(Input);
+      for i := 0 to n - 1 do
+        AssertEquals('RReLU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestReLU6GradientCheck;
