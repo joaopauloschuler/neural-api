@@ -868,10 +868,11 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-- [x] `examples/DeadReLUDiagnostic/` — train a small ReLU net on MNIST
-      (implemented on a synthetic 3-Gaussian-blob classification task
-      instead of MNIST, for CPU speed) and print the per-epoch fraction
-      of units that never fire; repeat with LeakyReLU/GELU/Swish.
+<!-- (examples/DeadReLUDiagnostic/ removed: completed, landed 2026-05-24 — a
+     small ReLU net on a synthetic 3-Gaussian-blob classification task (MNIST
+     swapped for a CPU-fast synthetic) printing the per-epoch fraction of units
+     that never fire, repeated with LeakyReLU/GELU/Swish. The LR-sweep
+     follow-up remains open below.) -->
 - [ ] DeadReLUDiagnostic follow-up: a learning-rate sweep charting ReLU
       dead-fraction vs LR (the landed demo pins ONE aggressive LR=0.5 where
       ReLU strands ~19%); show the dead fraction climbing with LR while
@@ -925,8 +926,9 @@ breakdown:
 - [ ] `examples/NormalizationBakeoff/` — same idea comparing no-norm /
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm /
       ChannelStdNorm.
-- [x] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
-      on a fixed toy dataset with a loss-vs-epoch table.
+<!-- (examples/OptimizerBakeoff/ removed: completed, landed 2026-05-24 — SGD /
+     SGD+momentum / Adam / RMSProp on a fixed toy dataset with a loss-vs-epoch
+     table. The per-optimizer LR shoot-out follow-up remains open below.) -->
 - [ ] OptimizerBakeoff follow-up: a per-optimizer LR shoot-out. The landed
       demo HOLDS LR fixed (0.05 SGD-family / 0.01 Adam-family) to isolate the
       update rule, which leaves plain SGD stalling around 1e-1 while the
@@ -1075,11 +1077,11 @@ breakdown:
      {Charbonnier, Huber, MSE, LogCosh} is a strict subset of that entry's
      {MSE, Huber, SmoothL1, Charbonnier, LogCosh}, on the same noisy/outlier
      hypotenuse harness.) -->
-- [x] Loss-family bake-off (output heads): hypotenuse with MSE / Huber /
-      SmoothL1 / Charbonnier / LogCosh, printing final MSE and epochs-to-
-      converge. (Landed as examples/LossFamilyBakeoff/ — noisy hypotenuse with
-      10% injected outliers, clean held-out test set; all four robust heads
-      beat MSE on clean-test MSE/MAE.)
+<!-- (Loss-family bake-off (output heads) removed: completed, landed 2026-05-24
+     as examples/LossFamilyBakeoff/ — noisy hypotenuse with 10% injected
+     outliers + a clean held-out test set, MSE / Huber / SmoothL1 / Charbonnier
+     / LogCosh heads; all four robust heads beat MSE on clean-test MSE/MAE. The
+     multi-seed follow-up remains open below.) -->
 - [ ] LossFamilyBakeoff follow-up: a multi-seed (e.g. 5 seeds, mean ± std)
       variant so the ranking AMONG the robust heads is statistically
       meaningful — the landed single-seed run cleanly separates MSE from the
