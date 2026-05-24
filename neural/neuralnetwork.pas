@@ -4345,6 +4345,51 @@ type
         PowerIters: integer = 10;
         SpectralNormThreshold: TNeuralFloat = 2.0
       ): string;
+      // Heavy-tailed self-regularization (HT-SR) diagnostic that predicts
+      // per-layer training quality from the WEIGHTS ALONE — no probe batch, no
+      // labels, no test set (Martin, Mahoney & Peng 2021, Nature
+      // Communications; the WeightWatcher "alpha" metric). For every trainable
+      // layer (Neurons.Count > 0 and Weights.Size > 0) it treats the weights as
+      // a matrix W [num_neurons (fan-out) x weights_per_neuron (fan-in)] (biases
+      // excluded, exactly as WeightSpectrumReport selects weights), forms the
+      // SMALLER Gram matrix (W^T W when fan-out >= fan-in, else W W^T), and
+      // computes its FULL eigenvalue spectrum {lambda_i} (= the squared singular
+      // values of W) with a self-contained symmetric cyclic Jacobi eigensolver
+      // in Double precision (no external dependency, mirroring the in-tree
+      // Gauss-Jordan solve LinearProbeReport ships). It then fits a power law
+      // rho(lambda) ~ lambda^(-alpha) to the upper tail of the spectrum via the
+      // standard Clauset/Hill MLE
+      //   alpha = 1 + n / sum_i ln(lambda_i / lambda_min)
+      // swept over candidate lambda_min cut points, picking the cut that
+      // minimises the Kolmogorov-Smirnov distance between the empirical tail and
+      // the fitted power law. Per layer it reports:
+      //   (a) alpha       — the power-law exponent (the headline HT-SR quality
+      //       number). Well-trained layers land in alpha in [2, 4]; alpha > 6
+      //       flags under-trained / still-random-like, alpha < 2 flags
+      //       over-correlated / memorising,
+      //   (b) weighted alpha = alpha * log10(lambda_max) — the WeightWatcher
+      //       capacity-weighted quality metric,
+      //   (c) the KS goodness-of-fit distance of the tail fit,
+      //   (d) lambda_max and the Marchenko-Pastur bulk edge
+      //       (1 + sqrt(in/out))^2 * sigma^2 for reference,
+      //   (e) a per-layer 10-bin ASCII log10(lambda) histogram of the spectrum.
+      // Network-level it reports the average weighted alpha across layers (a
+      // single label-free model-quality scalar; lower is better-trained), an
+      // alpha-across-depth bar chart, and per-layer flags ("under-trained" /
+      // "over-correlated" / "well-shaped" / "poor power-law fit"). Over-wide
+      // layers are capped at MaxMatrixDim (default 512) on the Gram dimension to
+      // bound the O(d^3) Jacobi sweep, mirroring the MaxFeatDim
+      // random-projection guard in LinearProbeReport. Built-in correctness
+      // checks: the Jacobi eigenvalues must be non-negative (PSD Gram) and sum
+      // to ||W||_F^2 within tolerance (trace invariance), and lambda_max must
+      // match the power-iteration EstimateSpectralNorm value squared. Pure CPU,
+      // forward-only on the weight tensors — no training-time changes, no probe
+      // batch, no gradients. Deterministic (no randomness). Guards nil NN
+      // gracefully.
+      class function WeightSpectralTailReport(
+        NN: TNNet;
+        MaxMatrixDim: integer = 512
+      ): string;
       // Forward-only intra-layer redundancy diagnostic. For a probe batch
       // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
       // trainable layer with weights (Neurons.Count > 0 and Weights.Size > 0),
@@ -28820,6 +28865,520 @@ begin
     Lines.Add('Flags:');
     if Flags.Count = 0 then
       Lines.Add('  (none) — no high-spectral-norm or rank-1-collapse layers.')
+    else
+      Lines.AddStrings(Flags);
+
+    Result := Lines.Text;
+  finally
+    Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.WeightSpectralTailReport(
+  NN: TNNet;
+  MaxMatrixDim: integer = 512
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cJacobiSweeps = 60;       // cyclic Jacobi sweeps (quadratic convergence)
+  cJacobiTol    = 1e-12;    // off-diagonal magnitude convergence threshold
+  cMinTailPts   = 5;        // need at least this many tail points to fit alpha
+  cAlphaLo      = 2.0;      // alpha < this: over-correlated / memorising
+  cAlphaHi      = 4.0;      // alpha > cAlphaHi..cUnderTrained: drifting random
+  cUnderTrained = 6.0;      // alpha > this: under-trained / still random-like
+  cBadKS        = 0.20;     // KS distance above this: poor power-law fit
+type
+  TDoubleArray = array of Double;
+  TDoubleMatrix = array of TDoubleArray;
+var
+  Lines: TStringList;
+  Flags: TStringList;
+  LayerIdx, NeuronIdx, K, BinIdx, I, J: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  FanIn, FanOut, Dim, TrainableLayers: integer;
+  Frob, FrobSq, Sigma, W: TNeuralFloat;
+  // Gram matrix (the SMALLER of W^T W / W W^T), its eigenvalues, scratch.
+  Gram: TDoubleMatrix;
+  Eig: TDoubleArray;
+  TraceSum, EigSum, LambdaMax, LambdaMin, Std, MPEdge: Double;
+  Alpha, WeightedAlpha, KS: Double;
+  AlphaSum: Double;
+  // per-layer accumulators for the network-level alpha-vs-depth chart
+  AlphaVals: TDoubleArray;
+  AlphaLayerIdx: array of integer;
+  AlphaLayerName: array of string;
+  AlphaCount: integer;
+  Capped: boolean;
+  ShapeStr, FlagStr, Bar: string;
+  // histogram scratch
+  HistBins: array of integer;
+  MinL, MaxL, LRange, BinLo, BinHi, Lg: Double;
+  MaxBin, BarLen: integer;
+  MaxAlphaForChart: Double;
+  // hoisted scratch (mode objfpc has no inline var declarations)
+  SumW, SumSqW, Acc, Key: Double;
+  Cnt, FirstPos, NPos, CutHi, Cut, NTail: integer;
+  BestKS, BestAlpha, BestLMin, LMin, SumLn, AFit, DKS, Emp, FitV: Double;
+  HaveLg: boolean;
+
+  // In-place symmetric cyclic Jacobi eigensolver. A is (Dim x Dim) symmetric;
+  // on return A's diagonal holds the eigenvalues (off-diagonals driven to ~0).
+  // We only need the eigenVALUES (the squared singular values of W) so we do
+  // not accumulate the rotation matrix. Mirrors the in-tree Gauss-Jordan style
+  // (plain Double loops, no external dependency).
+  procedure JacobiEigenvalues(var A: TDoubleMatrix; D: integer;
+    out OutEig: TDoubleArray);
+  var
+    Sweep, P, Q, R: integer;
+    Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
+  begin
+    for Sweep := 1 to cJacobiSweeps do
+    begin
+      // sum of squared off-diagonal entries (convergence measure)
+      Off := 0;
+      for P := 0 to D - 2 do
+        for Q := P + 1 to D - 1 do
+          Off := Off + A[P][Q] * A[P][Q];
+      if Off <= cJacobiTol then Break;
+
+      for P := 0 to D - 2 do
+        for Q := P + 1 to D - 1 do
+        begin
+          Apq := A[P][Q];
+          if Abs(Apq) <= 1e-300 then Continue;
+          App := A[P][P];
+          Aqq := A[Q][Q];
+          // Jacobi rotation angle that zeroes A[P][Q].
+          Theta := (Aqq - App) / (2.0 * Apq);
+          if Theta >= 0 then
+            T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
+          else
+            T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
+          C := 1.0 / Sqrt(T * T + 1.0);
+          S := T * C;
+          Tau := S / (1.0 + C);
+          // update diagonal
+          A[P][P] := App - T * Apq;
+          A[Q][Q] := Aqq + T * Apq;
+          A[P][Q] := 0.0;
+          A[Q][P] := 0.0;
+          // rotate the remaining entries of rows/cols P and Q
+          for R := 0 to D - 1 do
+          begin
+            if (R = P) or (R = Q) then Continue;
+            Aip := A[R][P];
+            Aiq := A[R][Q];
+            A[R][P] := Aip - S * (Aiq + Tau * Aip);
+            A[R][Q] := Aiq + S * (Aip - Tau * Aiq);
+            A[P][R] := A[R][P];
+            A[Q][R] := A[R][Q];
+          end;
+        end;
+    end;
+    SetLength(OutEig, D);
+    for P := 0 to D - 1 do OutEig[P] := A[P][P];
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Flags := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'WeightSpectralTailReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if MaxMatrixDim < 2 then MaxMatrixDim := 2;
+
+    TrainableLayers := 0;
+    AlphaCount := 0;
+    AlphaSum := 0;
+    SetLength(AlphaVals, NN.GetLastLayerIdx() + 1);
+    SetLength(AlphaLayerIdx, NN.GetLastLayerIdx() + 1);
+    SetLength(AlphaLayerName, NN.GetLastLayerIdx() + 1);
+
+    Lines.Add(
+      'WeightSpectralTailReport: heavy-tailed self-regularization (HT-SR) ' +
+      'power-law alpha from the WEIGHTS ALONE (no data/labels).');
+    Lines.Add(Format(
+      'Gram = smaller of W^T W / W W^T; full eigenspectrum via cyclic Jacobi; ' +
+      'tail fit alpha = 1 + n/sum ln(lambda/lambda_min). Gram dim capped at %d.',
+      [MaxMatrixDim]));
+    Lines.Add(Format(
+      '%-4s %-26s %-13s %8s %9s %8s %11s %11s',
+      ['Idx', 'Class', 'Shape(o,i)', 'alpha', 'w-alpha', 'KS',
+       'lambda_max', 'MP-edge']));
+    Lines.Add(StringOfChar('-', 100));
+
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+
+      FanOut := Layer.Neurons.Count;          // rows of W
+      FanIn  := Layer.Neurons[0].Weights.Size; // cols of W
+
+      // Frobenius norm (= sqrt of sum of squared singular values = sqrt of the
+      // Gram trace) plus the weight std for the Marchenko-Pastur bulk edge.
+      FrobSq := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for K := 0 to Neuron.Weights.Size - 1 do
+        begin
+          W := Neuron.Weights.FData[K];
+          FrobSq := FrobSq + W * W;
+        end;
+      end;
+      Frob := Sqrt(FrobSq);
+      // population std over the FanOut*FanIn weights (mean usually ~0).
+      Std := 0;
+      SumW := 0;
+      SumSqW := 0;
+      Cnt := FanOut * FanIn;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for K := 0 to Neuron.Weights.Size - 1 do
+        begin
+          W := Neuron.Weights.FData[K];
+          SumW := SumW + W;
+          SumSqW := SumSqW + W * W;
+        end;
+      end;
+      if Cnt > 0 then
+      begin
+        Std := SumSqW / Cnt - (SumW / Cnt) * (SumW / Cnt);
+        if Std < 0 then Std := 0;
+        Std := Sqrt(Std);
+      end;
+
+      // The Gram matrix is the SMALLER of W^T W (Dim = FanIn) and W W^T
+      // (Dim = FanOut), so we never form more than min(in,out) eigenvalues.
+      // Cap the Gram dimension at MaxMatrixDim to bound the O(d^3) Jacobi cost
+      // (we simply skip the eigen-decomposition for over-wide layers).
+      if FanIn <= FanOut then Dim := FanIn else Dim := FanOut;
+      Capped := Dim > MaxMatrixDim;
+
+      ShapeStr := Format('(%d,%d)', [FanOut, FanIn]);
+
+      if Capped then
+      begin
+        Lines.Add(Format(
+          '%-4d %-26s %-13s   skipped: Gram dim %d > MaxMatrixDim %d',
+          [LayerIdx, Layer.ClassName, ShapeStr, Dim, MaxMatrixDim]));
+        Inc(TrainableLayers);
+        Continue;
+      end;
+
+      // Build the smaller Gram matrix in Double precision.
+      SetLength(Gram, Dim);
+      for I := 0 to Dim - 1 do
+      begin
+        SetLength(Gram[I], Dim);
+        for J := 0 to Dim - 1 do Gram[I][J] := 0;
+      end;
+      if FanIn <= FanOut then
+      begin
+        // W^T W : (i,j) = sum_n W[n,i] * W[n,j]  (Dim = FanIn)
+        for NeuronIdx := 0 to FanOut - 1 do
+        begin
+          Neuron := Layer.Neurons[NeuronIdx];
+          for I := 0 to Dim - 1 do
+            for J := I to Dim - 1 do
+              Gram[I][J] := Gram[I][J] +
+                Neuron.Weights.FData[I] * Neuron.Weights.FData[J];
+        end;
+      end
+      else
+      begin
+        // W W^T : (i,j) = sum_k W[i,k] * W[j,k]  (Dim = FanOut)
+        for I := 0 to Dim - 1 do
+          for J := I to Dim - 1 do
+          begin
+            Acc := 0;
+            for K := 0 to FanIn - 1 do
+              Acc := Acc + Layer.Neurons[I].Weights.FData[K] *
+                           Layer.Neurons[J].Weights.FData[K];
+            Gram[I][J] := Acc;
+          end;
+      end;
+      // mirror to lower triangle (Jacobi expects a full symmetric matrix)
+      for I := 0 to Dim - 1 do
+        for J := I + 1 to Dim - 1 do
+          Gram[J][I] := Gram[I][J];
+
+      // trace BEFORE the decomposition (= ||W||_F^2, for the trace-invariance
+      // correctness check).
+      TraceSum := 0;
+      for I := 0 to Dim - 1 do TraceSum := TraceSum + Gram[I][I];
+
+      JacobiEigenvalues(Gram, Dim, Eig);
+
+      // Correctness: PSD => clamp tiny-negative numerical noise to 0; trace
+      // invariance: sum(eig) must equal the pre-decomposition trace = ||W||_F^2.
+      EigSum := 0;
+      LambdaMax := 0;
+      for I := 0 to Dim - 1 do
+      begin
+        if Eig[I] < 0 then
+        begin
+          if Eig[I] < -1e-6 * (TraceSum + 1.0) then
+            Flags.Add(Format(
+              '  Layer %3d %s: Jacobi produced a negative eigenvalue %.6g ' +
+              '(PSD violation — numerical issue).',
+              [LayerIdx, Layer.ClassName, Eig[I]]));
+          Eig[I] := 0;
+        end;
+        EigSum := EigSum + Eig[I];
+        if Eig[I] > LambdaMax then LambdaMax := Eig[I];
+      end;
+      if (TraceSum > 1e-20) and
+         (Abs(EigSum - TraceSum) > 1e-4 * (Abs(TraceSum) + 1.0)) then
+        Flags.Add(Format(
+          '  Layer %3d %s: trace-invariance check failed ' +
+          '(sum eig=%.6g vs ||W||_F^2=%.6g).',
+          [LayerIdx, Layer.ClassName, EigSum, TraceSum]));
+
+      // Cross-check: lambda_max must match EstimateSpectralNorm(W)^2.
+      Sigma := TNNet.EstimateSpectralNorm(Layer, 50);
+      if (LambdaMax > 1e-12) and
+         (Abs(Sigma * Sigma - LambdaMax) > 1e-2 * (LambdaMax + 1.0)) then
+        Flags.Add(Format(
+          '  Layer %3d %s: lambda_max=%.6g disagrees with ' +
+          'EstimateSpectralNorm^2=%.6g.',
+          [LayerIdx, Layer.ClassName, LambdaMax, Sigma * Sigma]));
+
+      // Sort the eigenvalues ascending (simple insertion sort — Dim is small
+      // and capped; the tail fit needs an ordered spectrum).
+      for I := 1 to Dim - 1 do
+      begin
+        Key := Eig[I];
+        J := I - 1;
+        while (J >= 0) and (Eig[J] > Key) do
+        begin
+          Eig[J + 1] := Eig[J];
+          Dec(J);
+        end;
+        Eig[J + 1] := Key;
+      end;
+
+      // Marchenko-Pastur bulk edge (1 + sqrt(in/out))^2 * sigma^2, the largest
+      // eigenvalue a pure-random Gaussian Gram of matching std would produce.
+      MPEdge := Sqr(1.0 + Sqrt(FanIn / FanOut)) * Std * Std * FanOut;
+
+      // --- Power-law tail fit (Clauset/Hill MLE swept over lambda_min). ---
+      // For each candidate cut lambda_min = Eig[c] (c from largest downward,
+      // keeping >= cMinTailPts tail points), the Hill MLE is
+      //   alpha = 1 + n / sum_{i in tail} ln(lambda_i / lambda_min).
+      // We pick the cut minimising the KS distance between the empirical tail
+      // CDF and the fitted power-law CDF F(x) = 1 - (x/lambda_min)^(1-alpha).
+      Alpha := 0;
+      KS := 1.0;
+      LambdaMin := 0;
+      WeightedAlpha := 0;
+      // index of the first strictly-positive eigenvalue
+      FirstPos := 0;
+      while (FirstPos < Dim) and (Eig[FirstPos] <= 1e-12 * (LambdaMax + 1e-30)) do
+        Inc(FirstPos);
+      NPos := Dim - FirstPos;
+      if (NPos >= cMinTailPts) and (LambdaMax > 1e-20) then
+      begin
+        BestKS := 1e30;
+        BestAlpha := 0;
+        BestLMin := Eig[FirstPos];
+        // candidate cut = each eigenvalue from FirstPos up to the one that
+        // still leaves cMinTailPts points in the tail.
+        CutHi := Dim - cMinTailPts;
+        for Cut := FirstPos to CutHi do
+        begin
+          LMin := Eig[Cut];
+          if LMin <= 1e-20 then Continue;
+          NTail := Dim - Cut; // tail = Eig[Cut..Dim-1]
+          SumLn := 0;
+          for I := Cut to Dim - 1 do
+            SumLn := SumLn + Ln(Eig[I] / LMin);
+          if SumLn <= 1e-12 then Continue;
+          AFit := 1.0 + NTail / SumLn;
+          // KS distance: empirical tail CDF vs fitted power-law CDF.
+          DKS := 0;
+          for I := Cut to Dim - 1 do
+          begin
+            Emp := (I - Cut + 1) / NTail; // 1/n .. 1
+            FitV := 1.0 - Power(Eig[I] / LMin, 1.0 - AFit);
+            if Abs(Emp - FitV) > DKS then DKS := Abs(Emp - FitV);
+          end;
+          if DKS < BestKS then
+          begin
+            BestKS := DKS;
+            BestAlpha := AFit;
+            BestLMin := LMin;
+          end;
+        end;
+        Alpha := BestAlpha;
+        KS := BestKS;
+        LambdaMin := BestLMin;
+        if LambdaMax > 1.0 then
+          WeightedAlpha := Alpha * Log10(LambdaMax)
+        else
+          WeightedAlpha := Alpha * 0.0; // log10(lambda_max)<=0 => 0 capacity
+      end;
+
+      if Alpha > 0 then
+      begin
+        Lines.Add(Format(
+          '%-4d %-26s %-13s %8.3f %9.3f %8.4f %11.4g %11.4g',
+          [LayerIdx, Layer.ClassName, ShapeStr, Alpha, WeightedAlpha, KS,
+           LambdaMax, MPEdge]));
+        AlphaVals[AlphaCount] := Alpha;
+        AlphaLayerIdx[AlphaCount] := LayerIdx;
+        AlphaLayerName[AlphaCount] := Layer.ClassName;
+        Inc(AlphaCount);
+        AlphaSum := AlphaSum + WeightedAlpha;
+
+        // Per-layer flags.
+        if Alpha > cUnderTrained then
+          Flags.Add(Format(
+            '  Layer %3d %s: alpha=%.3f > %g => UNDER-TRAINED ' +
+            '(still random-like).', [LayerIdx, Layer.ClassName, Alpha,
+            cUnderTrained]))
+        else if Alpha < cAlphaLo then
+          Flags.Add(Format(
+            '  Layer %3d %s: alpha=%.3f < %g => OVER-CORRELATED ' +
+            '(memorising).', [LayerIdx, Layer.ClassName, Alpha, cAlphaLo]));
+        if KS > cBadKS then
+          Flags.Add(Format(
+            '  Layer %3d %s: KS=%.4f > %g => POOR power-law fit ' +
+            '(alpha unreliable).', [LayerIdx, Layer.ClassName, KS, cBadKS]));
+      end
+      else
+        Lines.Add(Format(
+          '%-4d %-26s %-13s   (too few non-zero eigenvalues to fit alpha)',
+          [LayerIdx, Layer.ClassName, ShapeStr]));
+
+      // --- Per-layer 10-bin log10(lambda) histogram. ---
+      MinL := 0; MaxL := 0;
+      HaveLg := False;
+      for I := 0 to Dim - 1 do
+        if Eig[I] > 1e-20 then
+        begin
+          Lg := Log10(Eig[I]);
+          if not HaveLg then
+          begin
+            MinL := Lg; MaxL := Lg; HaveLg := True;
+          end
+          else
+          begin
+            if Lg < MinL then MinL := Lg;
+            if Lg > MaxL then MaxL := Lg;
+          end;
+        end;
+      if HaveLg then
+      begin
+          SetLength(HistBins, cBins);
+          for BinIdx := 0 to cBins - 1 do HistBins[BinIdx] := 0;
+          LRange := MaxL - MinL;
+          for I := 0 to Dim - 1 do
+            if Eig[I] > 1e-20 then
+            begin
+              Lg := Log10(Eig[I]);
+              if LRange > 1e-30 then
+                K := Trunc(((Lg - MinL) / LRange) * cBins)
+              else
+                K := 0;
+              if K >= cBins then K := cBins - 1;
+              if K < 0 then K := 0;
+              Inc(HistBins[K]);
+            end;
+          MaxBin := 0;
+          for BinIdx := 0 to cBins - 1 do
+            if HistBins[BinIdx] > MaxBin then MaxBin := HistBins[BinIdx];
+          Lines.Add(Format(
+            '     log10(lambda) spectrum [%d eigenvalues, log10 in %.3f..%.3f]:',
+            [Dim, MinL, MaxL]));
+          for BinIdx := 0 to cBins - 1 do
+          begin
+            if LRange > 1e-30 then
+            begin
+              BinLo := MinL + BinIdx * (LRange / cBins);
+              BinHi := MinL + (BinIdx + 1) * (LRange / cBins);
+            end
+            else
+            begin
+              BinLo := MinL; BinHi := MinL;
+            end;
+            if MaxBin > 0 then
+              BarLen := Round((HistBins[BinIdx] / MaxBin) * cMaxBarWidth)
+            else
+              BarLen := 0;
+            Bar := StringOfChar('#', BarLen);
+            Lines.Add(Format('       [%8.3f,%8.3f) | n=%3d %s',
+              [BinLo, BinHi, HistBins[BinIdx], Bar]));
+          end;
+      end;
+
+      Inc(TrainableLayers);
+    end;
+
+    Lines.Add(StringOfChar('-', 100));
+
+    if TrainableLayers = 0 then
+    begin
+      Lines.Add('No trainable layers with weights found.');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    if AlphaCount = 0 then
+    begin
+      Lines.Add('No layer yielded a power-law fit (all too small / capped).');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    // Network-level scalar: average weighted alpha (lower is better-trained).
+    Lines.Add(Format(
+      'Average weighted alpha across %d fitted layer(s): %.4f ' +
+      '(label-free model-quality scalar; lower is better-trained).',
+      [AlphaCount, AlphaSum / AlphaCount]));
+
+    // alpha-across-depth bar chart (each row scaled to cMaxBarWidth).
+    MaxAlphaForChart := 0;
+    for I := 0 to AlphaCount - 1 do
+      if AlphaVals[I] > MaxAlphaForChart then MaxAlphaForChart := AlphaVals[I];
+    Lines.Add('alpha across depth (well-trained band alpha in [2,4]):');
+    for I := 0 to AlphaCount - 1 do
+    begin
+      if MaxAlphaForChart > 1e-30 then
+        BarLen := Round((AlphaVals[I] / MaxAlphaForChart) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      if (AlphaVals[I] >= cAlphaLo) and (AlphaVals[I] <= cAlphaHi) then
+        FlagStr := 'well-shaped'
+      else if AlphaVals[I] > cUnderTrained then
+        FlagStr := 'under-trained'
+      else if AlphaVals[I] < cAlphaLo then
+        FlagStr := 'over-correlated'
+      else
+        FlagStr := 'mild';
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d %-22s alpha=%7.3f %-16s %s',
+        [AlphaLayerIdx[I], AlphaLayerName[I], AlphaVals[I], FlagStr, Bar]));
+    end;
+
+    Lines.Add(Format(
+      'Bands: alpha in [%g,%g] well-shaped; alpha > %g under-trained; ' +
+      'alpha < %g over-correlated; KS > %g poor fit.',
+      [cAlphaLo, cAlphaHi, cUnderTrained, cAlphaLo, cBadKS]));
+
+    Lines.Add('Flags:');
+    if Flags.Count = 0 then
+      Lines.Add('  (none) — all fitted layers well-shaped with good power-law fits.')
     else
       Lines.AddStrings(Flags);
 

@@ -85,6 +85,7 @@ type
     procedure TestActivationStatsReportNearCollapsedFlag;
     procedure TestWeightSpectrumReportRank1Matrix;
     procedure TestWeightSpectrumReportStructureAndFlags;
+    procedure TestWeightSpectralTailReportSmoke;
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
@@ -1556,6 +1557,94 @@ begin
     ReportB := TNNet.WeightSpectrumReport(NN);
     AssertTrue('Report is deterministic', Report = ReportB);
   finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestWeightSpectralTailReportSmoke;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  Report, LRow: string;
+  Lines: TStringList;
+  FanOut, FanIn, N, K, I: integer;
+  Sigma, LambdaMaxExpected: TNeuralFloat;
+  LMaxStr: string;
+begin
+  // (1) nil NN handled gracefully.
+  Report := TNNet.WeightSpectralTailReport(nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  // (2) A known small layer. We seed a rank-1-flavoured matrix W = a*b^T plus a
+  // tiny full-rank perturbation so the Gram is genuinely PSD with a clear
+  // top eigenvalue. The report's own built-in checks (non-negative eigenvalues
+  // / trace invariance / lambda_max == sigma_1^2) must all pass => NO PSD,
+  // trace or lambda_max disagreement flags in the output.
+  FanOut := 16; // rows / neurons
+  FanIn  := 10; // cols / weights-per-neuron (=> Gram dim 10, enough tail pts)
+
+  NN := TNNet.Create();
+  Lines := TStringList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(FanIn, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(FanOut));
+    NN.InitWeights();
+
+    Layer := NN.Layers[1];
+    AssertTrue('layer neuron count', Layer.Neurons.Count = FanOut);
+    AssertTrue('layer fan-in', Layer.Neurons[0].Weights.Size = FanIn);
+
+    // Deterministic, well-spread weights (so the Gram is full-rank PSD with
+    // distinct eigenvalues — a non-degenerate spectrum to fit alpha on).
+    for N := 0 to FanOut - 1 do
+      for K := 0 to FanIn - 1 do
+        Layer.Neurons[N].Weights.FData[K] :=
+          Sin(0.7 * (N + 1) + 0.3 * (K + 1)) + 0.05 * (N - K);
+
+    Report := TNNet.WeightSpectralTailReport(NN);
+    AssertTrue('Report non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('WeightSpectralTailReport:', Report) > 0);
+    AssertTrue('alpha column header present', Pos('alpha', Report) > 0);
+    AssertTrue('lambda_max column header present', Pos('lambda_max', Report) > 0);
+    AssertTrue('Bands legend present', Pos('well-shaped', Report) > 0);
+    AssertTrue('Flags section present', Pos('Flags:', Report) > 0);
+
+    // Built-in correctness checks must have passed: no PSD-violation, no
+    // trace-invariance failure, no lambda_max disagreement flags.
+    AssertTrue('No negative-eigenvalue (PSD) flag',
+      Pos('negative eigenvalue', Report) = 0);
+    AssertTrue('No trace-invariance failure flag',
+      Pos('trace-invariance check failed', Report) = 0);
+    AssertTrue('No lambda_max disagreement flag',
+      Pos('disagrees with', Report) = 0);
+
+    // (3) Independently cross-check lambda_max == sigma_1(W)^2: compute sigma_1
+    // with the power-iteration helper (the same value the report cross-checks
+    // against internally) and confirm the printed lambda_max on the layer-1 row
+    // carries its square (formatted with %11.4g, 4 significant figures).
+    Sigma := TNNet.EstimateSpectralNorm(Layer, 60);
+    LambdaMaxExpected := Sigma * Sigma;
+    AssertTrue('sigma_1 positive', Sigma > 0);
+
+    Lines.Text := Report;
+    LRow := '';
+    for I := 0 to Lines.Count - 1 do
+      if Pos('1    TNNetFullConnectLinear', Lines[I]) = 1 then
+        LRow := Lines[I];
+    AssertTrue('Layer-1 row present', LRow <> '');
+    // lambda_max is printed with %.4g (4 significant figures) — reproduce that
+    // exact rendering of sigma_1^2 and require it to appear on the row.
+    LMaxStr := Trim(Format('%.4g', [LambdaMaxExpected]));
+    AssertTrue(Format(
+      'Layer row should carry lambda_max ~= sigma_1^2 = %s. Row: %s',
+      [LMaxStr, LRow]), Pos(LMaxStr, LRow) > 0);
+
+    // (4) Determinism: identical text on a second call (no randomness).
+    AssertTrue('Report deterministic',
+      Report = TNNet.WeightSpectralTailReport(NN));
+  finally
+    Lines.Free;
     NN.Free;
   end;
 end;
