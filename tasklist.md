@@ -989,6 +989,40 @@ breakdown:
       faster optimizer / mini-batch path so enough epochs fit, THEN retry the
       true grok. Do not re-attempt the full weight-decay grok as a single
       monolithic example until (b) lands.
+- [ ] Double-descent demo (`examples/DoubleDescent/`) — reproduce the
+      model-wise "double descent" risk curve (Belkin et al. 2019; Nakkiran
+      et al. 2020, *Deep Double Descent*) on a pure-CPU toy. The headline is
+      a phenomenon that NONE of the in-tree experiments show: as model
+      CAPACITY grows, test error first FALLS (classical bias-variance), then
+      RISES to a sharp peak right at the *interpolation threshold* (where the
+      net has just enough parameters to fit the noisy training set exactly),
+      then FALLS AGAIN and keeps improving in the heavily over-parameterised
+      regime — a non-monotone U-then-down curve, not the usual monotone one.
+      Recipe: fix a SMALL training set (e.g. 40-80 samples) with a few
+      percent LABEL NOISE injected (the noise is what makes the peak sharp
+      and visible), hold out a clean validation set, then train the SAME tiny
+      MLP at a sweep of hidden widths spanning under- to over-parameterised
+      (e.g. `H in {2,4,8,16,24,32,48,64,96,128}`, so param-count straddles
+      the train-set size), each to ~full convergence (high epochs / low LR so
+      the small models actually interpolate), and chart a two-row ASCII curve
+      of train-error and test-error vs `log2(param_count)`. Flag the
+      empirical interpolation threshold (smallest width whose train error
+      first hits ~0) and check that the test-error PEAK lands at/just past it
+      (the built-in correctness signal — no peak ⇒ noise too low or models
+      not trained to interpolation). A small ablation toggling label noise
+      on/off makes the point that the peak is noise-driven (the clean-label
+      curve is ~monotone). DISTINCT from the open grokking demo (delayed
+      generalization over TRAINING TIME at FIXED capacity — a time axis,
+      driven by weight decay) and from the open "Width vs depth at fixed
+      parameter budget" heatmap (a fixed-budget val-loss grid with no noisy
+      interpolation peak and no capacity SWEEP past the threshold): this is a
+      generalization-vs-CAPACITY axis and the non-monotone peak is the whole
+      point. Pure CPU, no external data, should fit a few-minute budget if the
+      widths and sample count are kept tiny. Pairs naturally with
+      [[WeightSpectrumReport]] / [[WeightHistogramReport]] (watch the weight
+      norm spike at the interpolation threshold) and with the open
+      MagnitudePruning lottery-ticket follow-up (over-parameterised models are
+      the compressible regime on the right arm of the curve).
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
 <!-- (Plain "label-smoothing sweep — tabulate test accuracy" removed:
