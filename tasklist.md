@@ -219,14 +219,16 @@ breakdown:
      vs-cost" bake-off and folding linear attention into the MHA breakdown
      ([[TNNetMultiHeadSelfAttention]]) as a per-head opt-in.) -->
 
-- [ ] TNNetDifferentialAttention follow-up: the paper's headline
-      NOISE-CANCELLATION micro-experiment (deferred at landing — only the four
-      correctness tests shipped). On a tiny causal next-token task with an
-      "all-keys-irrelevant" probe row, compare plain SDPA vs
-      TNNetDifferentialAttention and print the attention-noise mass on the
-      irrelevant keys — the differential output should land strictly below
-      plain SDPA's. ~30-line wiring swap, mirrors the open SinkAttention
-      stability micro-experiment; all pieces now in tree.
+<!-- (TNNetDifferentialAttention headline NOISE-CANCELLATION micro-experiment
+      removed: completed, landed 2026-05-24 as
+      examples/DifferentialAttentionNoise/. On a causal probe row whose query
+      is ~orthogonal to every real key, plain SDPA spends the full unit of
+      mass (1.0) on the irrelevant keys, while TNNetDifferentialAttention
+      leaves only 0.2000 effective mass (net and abs agree) — strictly below
+      SDPA's 1.0. The two softmax maps carry the same common-mode noise on
+      the probe row, so lambda (=0.8 lambda_init) of it cancels and the
+      residual is 1-lambda=0.2, confirming the Differential Transformer
+      noise-cancellation claim at init.) -->
 - [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
       MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
       TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
