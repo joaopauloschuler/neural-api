@@ -4392,6 +4392,64 @@ type
         MaxSamples: integer = 64;
         Seed: longword = 1234567
       ): string;
+      // Monte-Carlo-Dropout *epistemic* uncertainty diagnostic (Gal &
+      // Ghahramani 2016). Unlike the rest of the report family this one
+      // deliberately KEEPS the stochastic (dropout / noise) layers ACTIVE at
+      // inference: it calls NN.EnableDropouts(true), runs NumPasses (default
+      // 30) stochastic forward passes over each probe input, applies
+      // softmax(logits / Temperature) to the final-layer output of each pass
+      // (Temperature default 1.0; see the convention note below), and
+      // aggregates the per-pass probability vectors. PER SAMPLE it reports:
+      //   * the mean predicted class (argmax of the pass-averaged probability
+      //     vector mean_p) and its mean confidence max(mean_p);
+      //   * the predictive entropy H[mean_p] = -sum_c mean_p_c log mean_p_c
+      //     (TOTAL uncertainty, in nats);
+      //   * the expected entropy mean_t H[p_t] (ALEATORIC, the average
+      //     per-pass entropy);
+      //   * their difference, the mutual information / BALD score
+      //     H[mean_p] - mean_t H[p_t] (EPISTEMIC — what the model "doesn't
+      //     know", >= 0 by Jensen);
+      //   * the variance of the top-class probability across passes;
+      //   * the pass-to-pass argmax flip rate (fraction of passes whose
+      //     argmax differs from the modal argmax).
+      // ACROSS THE BATCH it reports a 10-bin ASCII histogram of per-sample
+      // BALD, the K most-uncertain sample indices (an active-learning query
+      // queue), and — when a one-hot/integer label per probe is supplied via
+      // the overload — a correctness cross-tab comparing the mean predictive
+      // entropy of correctly- vs incorrectly-predicted samples (a
+      // well-calibrated MC model is more uncertain on the ones it gets wrong).
+      // Convention: the final-layer Output is treated as logits and re-passed
+      // through a numerically-stable softmax(z / Temperature); for a net that
+      // already ends in a softmax head this is a (temperature-scaled)
+      // re-normalisation and at Temperature=1 is a near-identity. Correctness
+      // guards (also the smoke-test invariants): with NumPasses=1 AND dropout
+      // disabled the BALD term collapses to ~0 (single deterministic pass ->
+      // mean_p == p_1 -> H[mean_p] == H[p_1]); a net containing NO
+      // TNNetAddNoiseBase layer emits a clear "no stochastic layers — MC
+      // sampling is a no-op" warning instead of silently reporting zero
+      // variance. The caller's dropout-enabled flag is saved and RESTORED on
+      // exit (try/finally). Weights are never touched — forward-only, no
+      // backward pass. NumPasses caps at MaxSamplesUsed via MaxProbes; TopK
+      // controls the active-learning queue length.
+      class function MCDropoutUncertaintyReport(
+        NN: TNNet;
+        Probes: TNNetVolumeList;
+        NumPasses: integer = 30;
+        Temperature: TNeuralFloat = 1.0;
+        TopK: integer = 10;
+        MaxProbes: integer = 256;
+        Seed: longword = 1234567
+      ): string; overload;
+      class function MCDropoutUncertaintyReport(
+        NN: TNNet;
+        Probes: TNNetVolumeList;
+        const Labels: array of integer;
+        NumPasses: integer = 30;
+        Temperature: TNeuralFloat = 1.0;
+        TopK: integer = 10;
+        MaxProbes: integer = 256;
+        Seed: longword = 1234567
+      ): string; overload;
       // Forward-only input-symmetry (equivariance/invariance) diagnostic.
       // Given a network and a probe batch (a TNNetVolumeList of inputs), it
       // measures how the forward output reacts to a fixed menu of input-side
@@ -29250,6 +29308,482 @@ begin
       if Baseline[I] <> nil then Baseline[I].Free;
     RandSeed := SavedRandSeed;
     Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.MCDropoutUncertaintyReport(
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  NumPasses: integer = 30;
+  Temperature: TNeuralFloat = 1.0;
+  TopK: integer = 10;
+  MaxProbes: integer = 256;
+  Seed: longword = 1234567
+): string;
+var
+  NoLabels: array of integer;
+begin
+  SetLength(NoLabels, 0);
+  Result := MCDropoutUncertaintyReport(NN, Probes, NoLabels,
+    NumPasses, Temperature, TopK, MaxProbes, Seed);
+end;
+
+class function TNNet.MCDropoutUncertaintyReport(
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  const Labels: array of integer;
+  NumPasses: integer = 30;
+  Temperature: TNeuralFloat = 1.0;
+  TopK: integer = 10;
+  MaxProbes: integer = 256;
+  Seed: longword = 1234567
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cEps = 1e-12;
+var
+  Lines: TStringList;
+  LayerIdx, SampleIdx, PassIdx, ClassIdx, BinIdx, I, J: integer;
+  Layer: TNNetLayer;
+  StochasticLayers, UsedProbes, NumClasses: integer;
+  HasLabels, IsProbHead, IsLogHead: boolean;
+  HeadKind: string;
+  SavedDropout: boolean;
+  SavedRandSeed: longword;
+  Output: TNNetVolume;
+  // per-pass probability vector + accumulators
+  Prob: array of TNeuralFloat;       // softmax of the current pass
+  MeanProb: array of TNeuralFloat;   // mean_t p_t  (predictive distribution)
+  PassArgmax: array of integer;      // argmax per pass (for flip rate)
+  TopProbHist: array of TNeuralFloat; // top-class prob across passes
+  // per-sample results (parallel arrays)
+  BALD: array of TNeuralFloat;       // mutual information / epistemic
+  PredEntropy: array of TNeuralFloat; // H[mean_p]  (total)
+  ExpEntropy: array of TNeuralFloat;  // mean_t H[p_t] (aleatoric)
+  TopVar: array of TNeuralFloat;      // variance of top-class prob
+  FlipRate: array of TNeuralFloat;
+  MeanConf: array of TNeuralFloat;
+  PredClass: array of integer;
+  MaxLogit, SumExp, Z, PEnt, EEnt, ExpEntAcc, TopMean, TopM2, Delta2: TNeuralFloat;
+  ModalArg, Flips, BestArg, BestCount: integer;
+  ArgCount: array of integer;
+  // histogram of BALD
+  Bins: array of integer;
+  MinB, MaxB, Span, BinLo, BinHi: TNeuralFloat;
+  MaxBin, BarLen: integer;
+  Bar: string;
+  // active-learning queue (top-K most uncertain by BALD)
+  QueueIdx: array of integer;
+  QueueVal: array of TNeuralFloat;
+  Qn, qi: integer;
+  // correctness cross-tab
+  CorrectCnt, WrongCnt: integer;
+  CorrectEntSum, WrongEntSum: TNeuralFloat;
+  // summary
+  MeanBALD, MeanPred, MeanExp: TNeuralFloat;
+  // local reproducible RNG safeguard
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  SavedDropout := False;
+  SavedRandSeed := RandSeed;
+  try
+    if NN = nil then
+    begin
+      Result := 'MCDropoutUncertaintyReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Probes = nil) or (Probes.Count = 0) then
+    begin
+      Result := 'MCDropoutUncertaintyReport: Probes is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+    if NumPasses < 1 then NumPasses := 1;
+    if Temperature <= 0 then Temperature := 1.0;
+    if TopK < 1 then TopK := 1;
+    if MaxProbes < 1 then MaxProbes := 1;
+    if Seed <> 0 then RandSeed := Seed;
+
+    // Detect stochastic (dropout / noise) layers.
+    StochasticLayers := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      if NN.Layers[LayerIdx] is TNNetAddNoiseBase then Inc(StochasticLayers);
+
+    UsedProbes := Probes.Count;
+    if UsedProbes > MaxProbes then UsedProbes := MaxProbes;
+
+    NumClasses := NN.GetLastLayer.Output.Size;
+    if NumClasses < 1 then
+    begin
+      Result := 'MCDropoutUncertaintyReport: final layer output is empty.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    HasLabels := Length(Labels) > 0;
+    if HasLabels and (Length(Labels) < UsedProbes) then
+      UsedProbes := Length(Labels);
+
+    // Detect the output head so the per-pass probability vector is computed
+    // correctly: a softmax-family head already emits probabilities (re-running
+    // softmax over them would flatten the distribution), a log-softmax head
+    // emits log-probabilities, anything else is treated as raw logits.
+    IsProbHead := (NN.GetLastLayer is TNNetSoftMax) or
+                  (NN.GetLastLayer is TNNetPointwiseSoftMax);
+    IsLogHead := NN.GetLastLayer is TNNetLogSoftMax;
+    if IsLogHead then HeadKind := 'log-softmax (exp then temperature-renorm)'
+    else if IsProbHead then HeadKind := 'softmax (probabilities, temperature-renorm)'
+    else HeadKind := 'raw logits (softmax(z/T))';
+
+    Lines.Add(
+      'MCDropoutUncertaintyReport: Monte-Carlo-Dropout epistemic uncertainty ' +
+      '(Gal & Ghahramani 2016).');
+    Lines.Add(Format(
+      'Probes used: %d (of %d, cap MaxProbes=%d). NumPasses=%d, ' +
+      'Temperature=%.4f, classes=%d, Seed=%u.',
+      [UsedProbes, Probes.Count, MaxProbes, NumPasses, Temperature,
+       NumClasses, Seed]));
+    Lines.Add(Format('Stochastic (TNNetAddNoiseBase) layers found: %d.',
+      [StochasticLayers]));
+    if StochasticLayers = 0 then
+      Lines.Add(
+        'WARNING: no stochastic layers — MC sampling is a no-op ' +
+        '(every pass is deterministic, so epistemic/BALD reads ~0). Add a ' +
+        'TNNetDropout / TNNetGaussianNoise layer for meaningful MC dropout.');
+    Lines.Add(Format('Output head: %s.', [HeadKind]));
+    Lines.Add('Convention: probabilities p^(1/T) renormalised for a ' +
+      'softmax/log-softmax head; softmax(z/T) for a raw-logit head ' +
+      '(T=1 is the identity).');
+    Lines.Add('Entropy/BALD in nats. BALD = H[mean_p] - mean_t H[p_t] ' +
+      '(epistemic >= 0 by Jensen).');
+    Lines.Add('');
+
+    // Snapshot + force dropout active for the MC passes.
+    SavedDropout := False;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      if (NN.Layers[LayerIdx] is TNNetAddNoiseBase) and
+         (TNNetAddNoiseBase(NN.Layers[LayerIdx]).Enabled) then
+        SavedDropout := True;
+    NN.EnableDropouts(True);
+
+    SetLength(Prob, NumClasses);
+    SetLength(MeanProb, NumClasses);
+    SetLength(PassArgmax, NumPasses);
+    SetLength(TopProbHist, NumPasses);
+    SetLength(ArgCount, NumClasses);
+
+    SetLength(BALD, UsedProbes);
+    SetLength(PredEntropy, UsedProbes);
+    SetLength(ExpEntropy, UsedProbes);
+    SetLength(TopVar, UsedProbes);
+    SetLength(FlipRate, UsedProbes);
+    SetLength(MeanConf, UsedProbes);
+    SetLength(PredClass, UsedProbes);
+
+    for SampleIdx := 0 to UsedProbes - 1 do
+    begin
+      for ClassIdx := 0 to NumClasses - 1 do
+      begin
+        MeanProb[ClassIdx] := 0;
+        ArgCount[ClassIdx] := 0;
+      end;
+      ExpEntAcc := 0;
+      // Welford for top-class prob variance.
+      TopMean := 0;
+      TopM2 := 0;
+
+      for PassIdx := 0 to NumPasses - 1 do
+      begin
+        NN.Compute(Probes[SampleIdx]);
+        Output := NN.GetLastLayer.Output;
+
+        // Convert the head output to a probability vector, applying
+        // Temperature consistently across all head kinds.
+        if IsProbHead then
+        begin
+          // Output is already a probability vector p. Temperature scaling on
+          // a probability is p^(1/T) renormalised (== softmax(logit/T) up to
+          // an additive constant); T=1 is the identity.
+          SumExp := 0;
+          for ClassIdx := 0 to NumClasses - 1 do
+          begin
+            Z := Output.Raw[ClassIdx];
+            if Z < cEps then Z := cEps;
+            if Temperature <> 1.0 then Z := Exp(Ln(Z) / Temperature);
+            Prob[ClassIdx] := Z;
+            SumExp := SumExp + Z;
+          end;
+          if SumExp <= 0 then SumExp := cEps;
+          for ClassIdx := 0 to NumClasses - 1 do
+            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
+        end
+        else if IsLogHead then
+        begin
+          // Output is log p. Recover p via exp, then temperature-renormalise
+          // as in the prob-head case (log p / T -> exp -> renormalise).
+          SumExp := 0;
+          MaxLogit := Output.Raw[0] / Temperature;
+          for ClassIdx := 1 to NumClasses - 1 do
+          begin
+            Z := Output.Raw[ClassIdx] / Temperature;
+            if Z > MaxLogit then MaxLogit := Z;
+          end;
+          for ClassIdx := 0 to NumClasses - 1 do
+          begin
+            Z := Exp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
+            Prob[ClassIdx] := Z;
+            SumExp := SumExp + Z;
+          end;
+          if SumExp <= 0 then SumExp := cEps;
+          for ClassIdx := 0 to NumClasses - 1 do
+            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
+        end
+        else
+        begin
+          // Raw logits: numerically-stable softmax(z / Temperature).
+          MaxLogit := Output.Raw[0] / Temperature;
+          for ClassIdx := 1 to NumClasses - 1 do
+          begin
+            Z := Output.Raw[ClassIdx] / Temperature;
+            if Z > MaxLogit then MaxLogit := Z;
+          end;
+          SumExp := 0;
+          for ClassIdx := 0 to NumClasses - 1 do
+          begin
+            Z := Exp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
+            Prob[ClassIdx] := Z;
+            SumExp := SumExp + Z;
+          end;
+          if SumExp <= 0 then SumExp := cEps;
+          for ClassIdx := 0 to NumClasses - 1 do
+            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
+        end;
+
+        // per-pass entropy H[p_t] (aleatoric contribution).
+        PEnt := 0;
+        for ClassIdx := 0 to NumClasses - 1 do
+          if Prob[ClassIdx] > cEps then
+            PEnt := PEnt - Prob[ClassIdx] * Ln(Prob[ClassIdx]);
+        ExpEntAcc := ExpEntAcc + PEnt;
+
+        // accumulate mean_p and per-pass argmax / top-prob.
+        BestArg := 0;
+        for ClassIdx := 0 to NumClasses - 1 do
+        begin
+          MeanProb[ClassIdx] := MeanProb[ClassIdx] + Prob[ClassIdx];
+          if Prob[ClassIdx] > Prob[BestArg] then BestArg := ClassIdx;
+        end;
+        PassArgmax[PassIdx] := BestArg;
+        Inc(ArgCount[BestArg]);
+        TopProbHist[PassIdx] := Prob[BestArg];
+
+        // Welford update on the top-class prob.
+        Delta2 := Prob[BestArg] - TopMean;
+        TopMean := TopMean + Delta2 / (PassIdx + 1);
+        TopM2 := TopM2 + Delta2 * (Prob[BestArg] - TopMean);
+      end;
+
+      // finalize mean_p and expected entropy.
+      for ClassIdx := 0 to NumClasses - 1 do
+        MeanProb[ClassIdx] := MeanProb[ClassIdx] / NumPasses;
+      ExpEntropy[SampleIdx] := ExpEntAcc / NumPasses;
+
+      // predictive entropy H[mean_p] (total).
+      PEnt := 0;
+      for ClassIdx := 0 to NumClasses - 1 do
+        if MeanProb[ClassIdx] > cEps then
+          PEnt := PEnt - MeanProb[ClassIdx] * Ln(MeanProb[ClassIdx]);
+      PredEntropy[SampleIdx] := PEnt;
+
+      // BALD / mutual information (clamp tiny negatives from FP noise).
+      BALD[SampleIdx] := PredEntropy[SampleIdx] - ExpEntropy[SampleIdx];
+      if BALD[SampleIdx] < 0 then BALD[SampleIdx] := 0;
+
+      // predicted class = argmax of mean_p; mean confidence = its prob.
+      BestArg := 0;
+      for ClassIdx := 0 to NumClasses - 1 do
+        if MeanProb[ClassIdx] > MeanProb[BestArg] then BestArg := ClassIdx;
+      PredClass[SampleIdx] := BestArg;
+      MeanConf[SampleIdx] := MeanProb[BestArg];
+
+      // top-class prob variance across passes.
+      if NumPasses > 1 then
+        TopVar[SampleIdx] := TopM2 / NumPasses
+      else
+        TopVar[SampleIdx] := 0;
+
+      // pass-to-pass argmax flip rate (vs the modal argmax).
+      ModalArg := 0;
+      BestCount := ArgCount[0];
+      for ClassIdx := 1 to NumClasses - 1 do
+        if ArgCount[ClassIdx] > BestCount then
+        begin
+          BestCount := ArgCount[ClassIdx];
+          ModalArg := ClassIdx;
+        end;
+      Flips := 0;
+      for PassIdx := 0 to NumPasses - 1 do
+        if PassArgmax[PassIdx] <> ModalArg then Inc(Flips);
+      FlipRate[SampleIdx] := Flips / NumPasses;
+    end;
+
+    // ---- per-sample table (cap printed rows to keep output readable). ----
+    Lines.Add(Format('Per-sample uncertainty (%d sample(s)):', [UsedProbes]));
+    Lines.Add(Format('  %-5s %-6s %8s %9s %9s %9s %9s %9s',
+      ['idx', 'pred', 'conf', 'H[tot]', 'H[alea]', 'BALD', 'topVar',
+       'flip%']));
+    Lines.Add('  ' + StringOfChar('-', 74));
+    J := UsedProbes;
+    if J > 32 then J := 32;
+    for SampleIdx := 0 to J - 1 do
+      Lines.Add(Format('  %-5d %-6d %8.4f %9.4f %9.4f %9.4f %9.5f %8.1f%%',
+        [SampleIdx, PredClass[SampleIdx], MeanConf[SampleIdx],
+         PredEntropy[SampleIdx], ExpEntropy[SampleIdx], BALD[SampleIdx],
+         TopVar[SampleIdx], FlipRate[SampleIdx] * 100.0]));
+    if UsedProbes > J then
+      Lines.Add(Format('  ... (%d more rows omitted)', [UsedProbes - J]));
+    Lines.Add('');
+
+    // ---- 10-bin histogram of per-sample BALD. ----
+    MinB := BALD[0];
+    MaxB := BALD[0];
+    for SampleIdx := 1 to UsedProbes - 1 do
+    begin
+      if BALD[SampleIdx] < MinB then MinB := BALD[SampleIdx];
+      if BALD[SampleIdx] > MaxB then MaxB := BALD[SampleIdx];
+    end;
+    Span := MaxB - MinB;
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for SampleIdx := 0 to UsedProbes - 1 do
+    begin
+      if Span > 1e-30 then
+        BinIdx := Trunc((BALD[SampleIdx] - MinB) / Span * cBins)
+      else
+        BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      if BinIdx < 0 then BinIdx := 0;
+      Inc(Bins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    Lines.Add(Format(
+      'Per-sample BALD histogram (10 bins over [%.4f, %.4f]):',
+      [MinB, MaxB]));
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      BinLo := MinB + BinIdx / cBins * Span;
+      BinHi := MinB + (BinIdx + 1) / cBins * Span;
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%8.4f-%8.4f) | n=%4d %s',
+        [BinLo, BinHi, Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    // ---- top-K most uncertain (active-learning queue) by BALD. ----
+    Qn := TopK;
+    if Qn > UsedProbes then Qn := UsedProbes;
+    SetLength(QueueIdx, UsedProbes);
+    SetLength(QueueVal, UsedProbes);
+    for SampleIdx := 0 to UsedProbes - 1 do
+    begin
+      QueueIdx[SampleIdx] := SampleIdx;
+      QueueVal[SampleIdx] := BALD[SampleIdx];
+    end;
+    // partial selection sort: first Qn descending by BALD.
+    for I := 0 to Qn - 1 do
+      for J := I + 1 to UsedProbes - 1 do
+        if QueueVal[J] > QueueVal[I] then
+        begin
+          Span := QueueVal[I]; QueueVal[I] := QueueVal[J]; QueueVal[J] := Span;
+          qi := QueueIdx[I]; QueueIdx[I] := QueueIdx[J]; QueueIdx[J] := qi;
+        end;
+    Lines.Add(Format(
+      'Active-learning queue — %d most-uncertain sample(s) by BALD:', [Qn]));
+    for I := 0 to Qn - 1 do
+      Lines.Add(Format('  #%-2d sample %-5d BALD=%.4f  H[tot]=%.4f  pred=%d',
+        [I + 1, QueueIdx[I], QueueVal[I],
+         PredEntropy[QueueIdx[I]], PredClass[QueueIdx[I]]]));
+    Lines.Add('');
+
+    // ---- optional correctness cross-tab. ----
+    if HasLabels then
+    begin
+      CorrectCnt := 0;
+      WrongCnt := 0;
+      CorrectEntSum := 0;
+      WrongEntSum := 0;
+      for SampleIdx := 0 to UsedProbes - 1 do
+      begin
+        if PredClass[SampleIdx] = Labels[SampleIdx] then
+        begin
+          Inc(CorrectCnt);
+          CorrectEntSum := CorrectEntSum + PredEntropy[SampleIdx];
+        end
+        else
+        begin
+          Inc(WrongCnt);
+          WrongEntSum := WrongEntSum + PredEntropy[SampleIdx];
+        end;
+      end;
+      Lines.Add('Correctness cross-tab (mean predictive entropy H[tot]):');
+      if CorrectCnt > 0 then
+        Lines.Add(Format('  correct   : n=%-5d mean H[tot]=%.4f',
+          [CorrectCnt, CorrectEntSum / CorrectCnt]))
+      else
+        Lines.Add('  correct   : n=0');
+      if WrongCnt > 0 then
+        Lines.Add(Format('  incorrect : n=%-5d mean H[tot]=%.4f',
+          [WrongCnt, WrongEntSum / WrongCnt]))
+      else
+        Lines.Add('  incorrect : n=0');
+      if (CorrectCnt > 0) and (WrongCnt > 0) then
+      begin
+        if (WrongEntSum / WrongCnt) > (CorrectEntSum / CorrectCnt) then
+          Lines.Add('  -> model is MORE uncertain on its mistakes ' +
+            '(well-behaved MC uncertainty).')
+        else
+          Lines.Add('  -> model is NOT more uncertain on its mistakes ' +
+            '(uncertainty poorly correlated with error).');
+      end;
+      Lines.Add(Format('  accuracy  : %.2f%% (%d/%d).',
+        [100.0 * CorrectCnt / UsedProbes, CorrectCnt, UsedProbes]));
+      Lines.Add('');
+    end;
+
+    // ---- batch summary. ----
+    MeanBALD := 0;
+    MeanPred := 0;
+    MeanExp := 0;
+    for SampleIdx := 0 to UsedProbes - 1 do
+    begin
+      MeanBALD := MeanBALD + BALD[SampleIdx];
+      MeanPred := MeanPred + PredEntropy[SampleIdx];
+      MeanExp := MeanExp + ExpEntropy[SampleIdx];
+    end;
+    MeanBALD := MeanBALD / UsedProbes;
+    MeanPred := MeanPred / UsedProbes;
+    MeanExp := MeanExp / UsedProbes;
+    Lines.Add(Format(
+      'Batch means: H[tot]=%.4f  H[alea]=%.4f  BALD=%.4f  ' +
+      '(BALD range [%.4f, %.4f]).',
+      [MeanPred, MeanExp, MeanBALD, MinB, MaxB]));
+    if StochasticLayers = 0 then
+      Lines.Add('NOTE: zero stochastic layers — the BALD values above are a ' +
+        'no-op artifact, not real epistemic uncertainty.');
+
+    Result := Lines.Text;
+  finally
+    if NN <> nil then NN.EnableDropouts(SavedDropout);
+    RandSeed := SavedRandSeed;
     Lines.Free;
   end;
 end;

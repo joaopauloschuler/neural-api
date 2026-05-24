@@ -88,6 +88,7 @@ type
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
+    procedure TestMCDropoutUncertaintyReportSmoke;
     procedure TestEquivarianceReportSmoke;
     procedure TestTTAReportSmoke;
     procedure TestSaliencyReportSmoke;
@@ -1736,6 +1737,94 @@ begin
     Before.Free;
     Targets.Free;
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMCDropoutUncertaintyReportSmoke;
+var
+  NN, NNNoDrop: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Labels: array of integer;
+  Report: string;
+  I, J: integer;
+  BALDLine: string;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.MCDropoutUncertaintyReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  NNNoDrop := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    // dropout net (stochastic) + softmax head.
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetDropout.Create(0.5));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.InitWeights();
+
+    // empty probe list handled gracefully.
+    Report := TNNet.MCDropoutUncertaintyReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    for I := 0 to 19 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+    end;
+
+    // Non-empty report with the expected header substring.
+    Report := TNNet.MCDropoutUncertaintyReport(NN, Probes, 16, 1.0, 5);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('MCDropoutUncertaintyReport', Report) > 0);
+    AssertTrue('BALD histogram section present',
+      Pos('BALD histogram', Report) > 0);
+    AssertTrue('Active-learning queue present',
+      Pos('Active-learning queue', Report) > 0);
+
+    // SPEC INVARIANT 1: NumPasses=1 AND dropout disabled -> BALD ~ 0.
+    NN.EnableDropouts(False);
+    Report := TNNet.MCDropoutUncertaintyReport(NN, Probes, 1, 1.0, 5);
+    // The batch-means line carries the BALD scalar; parse it out.
+    J := Pos('BALD=', Report);
+    AssertTrue('Batch BALD reported', J > 0);
+    // Find the LAST "BALD=" (batch-means line) and read the float after it.
+    repeat
+      I := J;
+      J := PosEx('BALD=', Report, I + 1);
+    until J = 0;
+    BALDLine := Copy(Report, I + 5, 8);
+    // With a single deterministic pass H[mean_p] == H[p_1] so BALD == 0.0000.
+    AssertTrue('NumPasses=1 + no dropout collapses BALD to ~0 (got "' +
+      BALDLine + '")', Pos('0.0000', BALDLine) = 1);
+    // Restore so the object is in a clean state (not strictly required).
+    NN.EnableDropouts(True);
+
+    // SPEC INVARIANT 2: a net with NO TNNetAddNoiseBase layer warns clearly.
+    NNNoDrop.AddLayer(TNNetInput.Create(4, 1, 1));
+    NNNoDrop.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNNoDrop.AddLayer(TNNetFullConnectLinear.Create(3));
+    NNNoDrop.AddLayer(TNNetSoftMax.Create());
+    NNNoDrop.InitWeights();
+    Report := TNNet.MCDropoutUncertaintyReport(NNNoDrop, Probes, 8, 1.0, 5);
+    AssertTrue('no-stochastic-layer warning present',
+      Pos('no stochastic layers', Report) > 0);
+
+    // Labelled overload exercises the correctness cross-tab path.
+    SetLength(Labels, Probes.Count);
+    for I := 0 to Probes.Count - 1 do Labels[I] := I mod 3;
+    Report := TNNet.MCDropoutUncertaintyReport(NN, Probes, Labels, 8, 1.0, 5);
+    AssertTrue('cross-tab present', Pos('Correctness cross-tab', Report) > 0);
+  finally
+    Probes.Free;
+    NNNoDrop.Free;
     NN.Free;
   end;
 end;
