@@ -325,17 +325,12 @@ breakdown:
       plus a load-balancing auxiliary loss.
 
 #### Normalization primitives
-- [X] TNNetL2Normalize full-volume variant + configurable axis via
-      FStruct[0] (axis 0 = per-(x,y)-over-depth default, axis 1 = full
-      volume; exact (I - y·yᵀ)/n Jacobian on both paths). Landed with
-      tests (TestL2NormalizeFullVolume* / TestUnitNorm*).
 - [ ] TNNetL2Normalize follow-up: a per-channel-L2-over-spatial mode
       (axis 2 — reduce sum-of-squares over (x,y) independently per depth
       channel), the third scope alongside the landed per-(x,y)-over-depth
       and full-volume modes. Mirror the existing axis dispatch in
       Compute/Backpropagate and add the matching numerical-gradient +
       round-trip tests.
-- [X] TNNetUnitNorm — alias for L2Normalize on the full volume (Keras name).
 - [ ] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
       spatial only, independently per depth channel) gated by a flag, mirroring
       the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
@@ -635,10 +630,6 @@ breakdown:
 - [ ] `examples/GradientFlowVisualizer/` — train a deep MLP with and
       without LayerNorm/RMSNorm and print per-layer gradient-norm tables
       across steps.
-- [X] `examples/ActivationBakeoff/` — pure-CPU bake-off of 14 mainstream
-      ReLU-family activations on the fixed hypotenuse MLP; one CSV table of
-      final loss and epochs-to-converge (companion to the hyperbolic-family
-      bake-off). Landed (~2 min wall-clock).
 - [ ] `examples/NormalizationBakeoff/` — same idea comparing no-norm /
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm.
 - [ ] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
@@ -902,12 +893,6 @@ breakdown:
       typical use case.
 - [ ] `docs/activation_taxonomy.md` — organise the ~50 activations now in
       the repo by mathematical family.
-- [X] "Normalization cheat sheet" in `docs/normalization.md`: covers
-      LayerNorm / RMSNorm / ZScore / GroupNorm / InstanceNorm /
-      MovingStdNormalization / ChannelStdNormalization / PixelNorm /
-      L2Normalize / UnitNorm / MinMaxNorm / GRN / DyT / LogitNormalize —
-      reduction axes, learnable params, formula, use case. Linked from
-      README. Landed.
 - [ ] "Saturation activations cheat sheet" in `docs/saturation.md` covering
       Clamp / HardTanh / SoftCapping / ReLU6 / SoftSign / Tanh / HardSigmoid.
 - [ ] "Periodic activations" README subsection covering TNNetSin, TNNetCos,
