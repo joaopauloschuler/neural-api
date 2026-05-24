@@ -1276,9 +1276,12 @@ breakdown:
 - [ ] TNNetMaxOut CIFAR-style example wired into one of the SimpleImage
       paths.
 - [ ] TNNetCELU CIFAR-style smoke example.
-- [ ] TNNetHardShrink / TNNetSoftShrink sparsity micro-experiment: train a
-      tiny autoencoder with each as the bottleneck activation, print
-      fraction of zero activations vs reconstruction loss.
+<!-- (TNNetHardShrink / TNNetSoftShrink sparsity micro-experiment removed:
+     subsumed by the "Shrink-activation sparsity sweep" entry under
+     "### Experiments I'm curious about (additional)", which trains the SAME
+     tiny autoencoder with each shrink activation as the bottleneck and reports
+     sparsity vs reconstruction loss — and additionally adds a ReLU baseline and
+     a lambda sweep, so nothing is lost.) -->
 
 ### Documentation I'd enjoy writing
 - [ ] "Activations cheat sheet" in `docs/activations.md`: one row per
