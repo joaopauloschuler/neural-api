@@ -3888,6 +3888,51 @@ type
         ZeroThreshold: TNeuralFloat = 1e-12;
         PrunableFrac: TNeuralFloat = 0.5
       ): string;
+      // Linear-probe (linear separability) diagnostic. Given a classifier NN
+      // (trained or fresh) and a labelled probe batch Samples (input volume +
+      // one-hot target pairs, a TNNetVolumePairList), trains a CLOSED-FORM
+      // ridge-regularised linear probe on top of EVERY intermediate layer's
+      // flat activation tensor and reports how linearly separable the labels
+      // already are at each depth - i.e. "where does the model become a
+      // classifier?". For each layer it feeds the whole probe batch forward
+      // (one NN.Compute per sample), reads that layer's flat Output as the
+      // probe feature row x (a bias 1.0 column is appended), stacks the rows
+      // into a design matrix X (N x D, D = flat-dim + 1) and the one-hot
+      // targets into Y (N x C), then solves the regularised least-squares
+      //   W = (X^T X + Lambda*I)^-1 X^T Y
+      // with a self-contained Double-precision Gauss-Jordan solve (the Lambda*I
+      // ridge term, default 1e-2, also guards against singular Gram matrices;
+      // a zero pivot is handled gracefully rather than crashing). NO SGD loop
+      // and NO backward pass - the probe is closed-form and the backbone is
+      // pure forward-only and never modified. Reports per layer:
+      //   (a) top-1 linear-probe accuracy on the probe batch (argmax of x*W);
+      //   (b) top-1 linear-probe accuracy on the held-out batch ValSamples if
+      //       supplied (nil = skipped) - the train/val gap flags overfit probes;
+      //   (c) the mean squared error of the one-hot regression target (a
+      //       smoother per-layer signal than the discrete top-1);
+      //   (d) the per-layer probe-accuracy delta acc[k]-acc[k-1] so the layer
+      //       with the largest single jump in linear separability is visible;
+      //   (e) a 10-bin ASCII bar chart of per-layer probe accuracy across the
+      //       network (the saturation point is visible at a glance);
+      //   (f) per-layer flags: "C" representation collapse (probe acc drops
+      //       >5 points vs the previous probed layer), "S" saturation point
+      //       (the shallowest layer within 1 point of the FINAL layer's probe
+      //       acc - the natural transfer-learning cut point), "R" near-random
+      //       (probe acc within 5 points of 1/NumClasses).
+      // FEATURE-DIMENSION CAP: the Gram solve is O(D^3); to keep it bounded a
+      // layer whose flat activation exceeds MaxFeatDim (default 256) is
+      // deterministically random-projected down to MaxFeatDim features (a
+      // fixed-seed sign-random / sparse projection) before the probe is fit, so
+      // very wide layers neither exhaust memory nor blow the runtime. Layers
+      // with a zero-size Output are skipped. Pure forward-only on the network;
+      // no training-time changes, no backward pass, no new layer types.
+      class function LinearProbeReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        ValSamples: TNNetVolumePairList = nil;
+        Lambda: TNeuralFloat = 1e-2;
+        MaxFeatDim: integer = 256
+      ): string;
       // Per-trainable-layer weight-value histogram diagnostic. For every
       // layer with weights (Neurons.Count > 0 and Weights.Size > 0) walks
       // the neuron weights (biases excluded) and reports min, max, mean,
@@ -24868,6 +24913,458 @@ begin
       'P=prunable (>%.0f%% near-zero params), D=dead layer ' +
       '(whole-layer Fisher ~ 0).',
       [PrunableFrac * 100.0]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LinearProbeReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  ValSamples: TNNetVolumePairList = nil;
+  Lambda: TNeuralFloat = 1e-2;
+  MaxFeatDim: integer = 256
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cCollapsePts = 5.0;   // probe-acc drop (points) flagging representation collapse
+  cSaturatePts = 1.0;   // within this many points of the final layer => saturation
+  cRandomPts   = 5.0;   // within this many points of 1/NumClasses => near-random
+  cProjSeed    = 1234567;
+type
+  TDoubleArray = array of Double;
+  TDoubleMatrix = array of TDoubleArray;
+  // A per-layer probed feature: flat dim, and (when capped) a random-projection
+  // map drawing each output feature from a fixed source unit with a +/-1 sign.
+  TLayerProbe = record
+    LayerIdx: integer;
+    FeatDim: integer;        // probe feature dimension (<= MaxFeatDim)
+    Projected: boolean;      // true if random-projected from a wider layer
+    ProjSrc: array of integer;
+    ProjSign: array of Double;
+  end;
+var
+  Lines: TStringList;
+  LayerIdx, ProbeIdx, SampleIdx, BinIdx, I, J, K, C: integer;
+  Layer: TNNetLayer;
+  Pair: TNNetVolumePair;
+  NumClasses, NumProbed, FlatSz, D, N, Nval: integer;
+  HaveVal: boolean;
+  Probes: array of TLayerProbe;
+  ProbeAcc, ProbeMSE, ValAcc, AccDelta: array of TNeuralFloat;
+  ProbeName: array of string;
+  HasVal: array of boolean;
+  RandomBaseline, FinalAcc: TNeuralFloat;
+  PrevAcc: TNeuralFloat;
+  HavePrev: boolean;
+  SatLayer: integer;
+  // closed-form solve scratch (Double precision)
+  Gram: TDoubleMatrix;        // (D x D) = X^T X + Lambda*I
+  XtY: TDoubleMatrix;         // (D x C) = X^T Y
+  Wmat: TDoubleMatrix;        // (D x C) = solved probe weights
+  FeatRow: TDoubleArray;      // length D, the bias-augmented feature row
+  TrueCls, PredCls, CorrectTrain, CorrectVal: integer;
+  MSESum, ColBar, BestVal, Score: Double;
+  BarLen, MaxBin: integer;
+  Bins: array of integer;
+  RowFlags, Bar: string;
+
+  // Fill FeatRow (length D, last entry the bias 1.0) from a probed layer's
+  // Output, applying the random projection if this layer was capped.
+  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
+  var
+    F: integer;
+  begin
+    if Pr.Projected then
+    begin
+      for F := 0 to Pr.FeatDim - 1 do
+        FeatRow[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
+    end
+    else
+    begin
+      for F := 0 to Pr.FeatDim - 1 do
+        FeatRow[F] := OutVol.FData[F];
+    end;
+    FeatRow[Pr.FeatDim] := 1.0;  // bias column
+  end;
+
+  // In-place Gauss-Jordan solve of A*W = B with partial pivoting, Double
+  // precision. A is (Dim x Dim), B is (Dim x Cols); on return B holds the
+  // solution. A zero (singular) pivot is skipped rather than crashing - the
+  // Lambda*I ridge term normally prevents this.
+  procedure GaussJordanSolve(var A: TDoubleMatrix; var B: TDoubleMatrix;
+    Dim, Cols: integer);
+  var
+    Col, Row, PivRow, CC: integer;
+    PivVal, Factor, Tmp: Double;
+    SwapRow: TDoubleArray;
+  begin
+    for Col := 0 to Dim - 1 do
+    begin
+      // partial pivot: largest |A[row][col]| at or below the diagonal
+      PivRow := Col;
+      PivVal := Abs(A[Col][Col]);
+      for Row := Col + 1 to Dim - 1 do
+        if Abs(A[Row][Col]) > PivVal then
+        begin
+          PivVal := Abs(A[Row][Col]);
+          PivRow := Row;
+        end;
+      if PivVal < 1e-18 then
+        Continue; // singular column: leave it, ridge term should avoid this
+      if PivRow <> Col then
+      begin
+        SwapRow := A[PivRow]; A[PivRow] := A[Col]; A[Col] := SwapRow;
+        SwapRow := B[PivRow]; B[PivRow] := B[Col]; B[Col] := SwapRow;
+      end;
+      // normalise pivot row
+      PivVal := A[Col][Col];
+      for CC := Col to Dim - 1 do A[Col][CC] := A[Col][CC] / PivVal;
+      for CC := 0 to Cols - 1 do B[Col][CC] := B[Col][CC] / PivVal;
+      // eliminate this column from every other row
+      for Row := 0 to Dim - 1 do
+      begin
+        if Row = Col then Continue;
+        Factor := A[Row][Col];
+        if Factor = 0 then Continue;
+        for CC := Col to Dim - 1 do
+          A[Row][CC] := A[Row][CC] - Factor * A[Col][CC];
+        for CC := 0 to Cols - 1 do
+          B[Row][CC] := B[Row][CC] - Factor * B[Col][CC];
+      end;
+    end;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'LinearProbeReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'LinearProbeReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.GetLastLayerIdx() < 1 then
+    begin
+      Result := 'LinearProbeReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+    if MaxFeatDim < 1 then MaxFeatDim := 1;
+
+    NumClasses := NN.GetLastLayer().Output.Size;
+    if NumClasses < 2 then
+    begin
+      Result := 'LinearProbeReport: final layer must have >= 2 outputs.' +
+        sLineBreak;
+      Exit;
+    end;
+    RandomBaseline := 1.0 / NumClasses;
+    N := Samples.Count;
+    HaveVal := (ValSamples <> nil) and (ValSamples.Count > 0);
+    if HaveVal then Nval := ValSamples.Count else Nval := 0;
+
+    // --- Catalogue intermediate layers to probe (skip zero-size outputs),
+    //     building a deterministic random projection for over-wide layers. ---
+    SetLength(Probes, NN.CountLayers());
+    NumProbed := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      FlatSz := Layer.Output.Size;
+      if FlatSz = 0 then Continue;
+      Probes[NumProbed].LayerIdx := LayerIdx;
+      if FlatSz > MaxFeatDim then
+      begin
+        Probes[NumProbed].FeatDim := MaxFeatDim;
+        Probes[NumProbed].Projected := true;
+        SetLength(Probes[NumProbed].ProjSrc, MaxFeatDim);
+        SetLength(Probes[NumProbed].ProjSign, MaxFeatDim);
+        // deterministic projection: spread source units across the flat tensor
+        // with a fixed +/-1 sign pattern (a simple sparse sign projection).
+        RandSeed := cProjSeed + LayerIdx;
+        for J := 0 to MaxFeatDim - 1 do
+        begin
+          Probes[NumProbed].ProjSrc[J] := Random(FlatSz);
+          if Random(2) = 0 then
+            Probes[NumProbed].ProjSign[J] := 1.0
+          else
+            Probes[NumProbed].ProjSign[J] := -1.0;
+        end;
+      end
+      else
+      begin
+        Probes[NumProbed].FeatDim := FlatSz;
+        Probes[NumProbed].Projected := false;
+      end;
+      Inc(NumProbed);
+    end;
+
+    if NumProbed = 0 then
+    begin
+      Result := 'LinearProbeReport: no probeable layers (all zero-size).' +
+        sLineBreak;
+      Exit;
+    end;
+
+    SetLength(ProbeAcc, NumProbed);
+    SetLength(ProbeMSE, NumProbed);
+    SetLength(ValAcc, NumProbed);
+    SetLength(AccDelta, NumProbed);
+    SetLength(ProbeName, NumProbed);
+    SetLength(HasVal, NumProbed);
+
+    // --- Fit a closed-form ridge probe per probed layer. ---
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      LayerIdx := Probes[ProbeIdx].LayerIdx;
+      Layer := NN.Layers[LayerIdx];
+      ProbeName[ProbeIdx] := Layer.ClassName;
+      D := Probes[ProbeIdx].FeatDim + 1;  // +1 bias column
+      HasVal[ProbeIdx] := HaveVal;
+
+      SetLength(FeatRow, D);
+      // allocate / zero the Gram and X^T Y accumulators
+      SetLength(Gram, D);
+      SetLength(XtY, D);
+      for I := 0 to D - 1 do
+      begin
+        SetLength(Gram[I], D);
+        SetLength(XtY[I], NumClasses);
+        for J := 0 to D - 1 do Gram[I][J] := 0;
+        for C := 0 to NumClasses - 1 do XtY[I][C] := 0;
+      end;
+
+      // Accumulate G = X^T X and X^T Y over the probe batch (one forward each).
+      for SampleIdx := 0 to N - 1 do
+      begin
+        Pair := Samples[SampleIdx];
+        if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+        NN.Compute(Pair.I);
+        ReadFeatures(Probes[ProbeIdx], Layer.Output);
+        TrueCls := Pair.O.GetClass();
+        for I := 0 to D - 1 do
+        begin
+          for J := I to D - 1 do
+            Gram[I][J] := Gram[I][J] + FeatRow[I] * FeatRow[J];
+          // X^T Y with one-hot Y: only the true-class column gets FeatRow[I]
+          if (TrueCls >= 0) and (TrueCls < NumClasses) then
+            XtY[I][TrueCls] := XtY[I][TrueCls] + FeatRow[I];
+        end;
+      end;
+      // mirror the symmetric Gram and add the Lambda*I ridge term
+      for I := 0 to D - 1 do
+      begin
+        for J := I + 1 to D - 1 do Gram[J][I] := Gram[I][J];
+        Gram[I][I] := Gram[I][I] + Lambda;
+      end;
+
+      // Solve (X^T X + Lambda I) W = X^T Y  -> Wmat (D x C).
+      SetLength(Wmat, D);
+      for I := 0 to D - 1 do
+      begin
+        SetLength(Wmat[I], NumClasses);
+        for C := 0 to NumClasses - 1 do Wmat[I][C] := XtY[I][C];
+      end;
+      GaussJordanSolve(Gram, Wmat, D, NumClasses);
+
+      // --- Evaluate the fitted probe on the probe batch (acc + MSE). ---
+      CorrectTrain := 0;
+      MSESum := 0;
+      for SampleIdx := 0 to N - 1 do
+      begin
+        Pair := Samples[SampleIdx];
+        if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+        NN.Compute(Pair.I);
+        ReadFeatures(Probes[ProbeIdx], Layer.Output);
+        TrueCls := Pair.O.GetClass();
+        // single pass: score each class column, accumulate one-hot MSE, argmax.
+        PredCls := 0;
+        BestVal := -1e30;
+        for C := 0 to NumClasses - 1 do
+        begin
+          Score := 0;
+          for I := 0 to D - 1 do Score := Score + FeatRow[I] * Wmat[I][C];
+          if C = TrueCls then ColBar := 1.0 else ColBar := 0.0;
+          MSESum := MSESum + (Score - ColBar) * (Score - ColBar);
+          if Score > BestVal then
+          begin
+            BestVal := Score;
+            PredCls := C;
+          end;
+        end;
+        if PredCls = TrueCls then Inc(CorrectTrain);
+      end;
+      ProbeAcc[ProbeIdx] := CorrectTrain / N;
+      ProbeMSE[ProbeIdx] := MSESum / (N * NumClasses);
+
+      // --- Evaluate on the held-out batch if supplied. ---
+      if HaveVal then
+      begin
+        CorrectVal := 0;
+        for SampleIdx := 0 to Nval - 1 do
+        begin
+          Pair := ValSamples[SampleIdx];
+          if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+          NN.Compute(Pair.I);
+          ReadFeatures(Probes[ProbeIdx], Layer.Output);
+          TrueCls := Pair.O.GetClass();
+          PredCls := 0;
+          BestVal := -1e30;
+          for C := 0 to NumClasses - 1 do
+          begin
+            Score := 0;
+            for I := 0 to D - 1 do Score := Score + FeatRow[I] * Wmat[I][C];
+            if Score > BestVal then
+            begin
+              BestVal := Score;
+              PredCls := C;
+            end;
+          end;
+          if PredCls = TrueCls then Inc(CorrectVal);
+        end;
+        ValAcc[ProbeIdx] := CorrectVal / Nval;
+      end
+      else
+        ValAcc[ProbeIdx] := 0;
+    end;
+
+    // --- Per-layer accuracy delta + final/ saturation analysis. ---
+    FinalAcc := ProbeAcc[NumProbed - 1];
+    HavePrev := false;
+    PrevAcc := 0;
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      if HavePrev then
+        AccDelta[ProbeIdx] := ProbeAcc[ProbeIdx] - PrevAcc
+      else
+        AccDelta[ProbeIdx] := 0;
+      PrevAcc := ProbeAcc[ProbeIdx];
+      HavePrev := true;
+    end;
+    // shallowest layer within cSaturatePts points of the final layer's acc
+    SatLayer := -1;
+    for ProbeIdx := 0 to NumProbed - 1 do
+      if Abs(ProbeAcc[ProbeIdx] - FinalAcc) * 100.0 <= cSaturatePts then
+      begin
+        SatLayer := ProbeIdx;
+        Break;
+      end;
+
+    // --- Report header + per-layer table. ---
+    if HaveVal then
+      RowFlags := Format(', %d held-out sample(s)', [Nval])
+    else
+      RowFlags := '';
+    Lines.Add(Format(
+      'LinearProbeReport: %d probed layer(s), %d class(es), %d probe sample(s)' +
+      '%s. Lambda=%g, MaxFeatDim=%d, random baseline=%.4f.',
+      [NumProbed, NumClasses, N, RowFlags,
+       Lambda, MaxFeatDim, RandomBaseline]));
+    if HaveVal then
+      Lines.Add(Format('%-5s %-30s %8s %9s %9s %10s %9s %-6s',
+        ['Idx', 'Layer', 'FeatDim', 'ProbeAcc', 'ValAcc', 'OneHotMSE',
+         'dAcc', 'flags']))
+    else
+      Lines.Add(Format('%-5s %-30s %8s %9s %10s %9s %-6s',
+        ['Idx', 'Layer', 'FeatDim', 'ProbeAcc', 'OneHotMSE', 'dAcc', 'flags']));
+    Lines.Add(StringOfChar('-', 100));
+
+    HavePrev := false;
+    PrevAcc := 0;
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      RowFlags := '';
+      // representation collapse: drop >cCollapsePts points vs previous layer
+      if HavePrev and
+         ((PrevAcc - ProbeAcc[ProbeIdx]) * 100.0 > cCollapsePts) then
+        RowFlags := RowFlags + 'C';
+      // saturation point: the shallowest near-final layer
+      if ProbeIdx = SatLayer then RowFlags := RowFlags + 'S';
+      // near-random: within cRandomPts points of 1/NumClasses
+      if Abs(ProbeAcc[ProbeIdx] - RandomBaseline) * 100.0 <= cRandomPts then
+        RowFlags := RowFlags + 'R';
+
+      if HaveVal then
+        Lines.Add(Format(
+          '%-5d %-30s %8d %8.2f%% %8.2f%% %10.5f %8.2f%% %-6s',
+          [Probes[ProbeIdx].LayerIdx, ProbeName[ProbeIdx],
+           Probes[ProbeIdx].FeatDim, ProbeAcc[ProbeIdx] * 100.0,
+           ValAcc[ProbeIdx] * 100.0, ProbeMSE[ProbeIdx],
+           AccDelta[ProbeIdx] * 100.0, RowFlags]))
+      else
+        Lines.Add(Format(
+          '%-5d %-30s %8d %8.2f%% %10.5f %8.2f%% %-6s',
+          [Probes[ProbeIdx].LayerIdx, ProbeName[ProbeIdx],
+           Probes[ProbeIdx].FeatDim, ProbeAcc[ProbeIdx] * 100.0,
+           ProbeMSE[ProbeIdx], AccDelta[ProbeIdx] * 100.0, RowFlags]));
+      PrevAcc := ProbeAcc[ProbeIdx];
+      HavePrev := true;
+    end;
+    Lines.Add(StringOfChar('-', 100));
+    Lines.Add(Format('Final-layer probe accuracy = %.2f%%.',
+      [FinalAcc * 100.0]));
+    if SatLayer >= 0 then
+      Lines.Add(Format(
+        'Saturation point: layer %d (%s) reaches within %.0f pt of the final ' +
+        'probe acc - the natural transfer-learning cut point.',
+        [Probes[SatLayer].LayerIdx, ProbeName[SatLayer], cSaturatePts]));
+
+    // --- ASCII bar chart of per-layer probe accuracy. ---
+    Lines.Add('');
+    Lines.Add('Per-layer probe accuracy (saturation point visible):');
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      BarLen := Round(ProbeAcc[ProbeIdx] * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d %-26s %6.2f%% |%s',
+        [Probes[ProbeIdx].LayerIdx, ProbeName[ProbeIdx],
+         ProbeAcc[ProbeIdx] * 100.0, Bar]));
+    end;
+
+    // --- 10-bin histogram of per-layer probe accuracy over [0,1]. ---
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      BinIdx := Trunc(ProbeAcc[ProbeIdx] * cBins);
+      if BinIdx < 0 then BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      Inc(Bins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    Lines.Add('');
+    Lines.Add('Distribution of per-layer probe accuracy:');
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%4.0f%%, %4.0f%%) | n=%4d %s',
+        [BinIdx * (100.0 / cBins), (BinIdx + 1) * (100.0 / cBins),
+         Bins[BinIdx], Bar]));
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format(
+      'Flags: C=representation collapse (probe acc drops >%.0f pt vs previous ' +
+      'layer), S=saturation point (shallowest layer within %.0f pt of the ' +
+      'final layer), R=near-random (probe acc within %.0f pt of 1/NumClasses).',
+      [cCollapsePts, cSaturatePts, cRandomPts]));
 
     Result := Lines.Text;
   finally

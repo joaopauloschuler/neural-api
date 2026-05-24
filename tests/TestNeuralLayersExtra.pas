@@ -94,6 +94,7 @@ type
     procedure TestDecisionBoundaryReportSmoke;
     procedure TestCalibrationReportSmoke;
     procedure TestFisherImportanceReportSmoke;
+    procedure TestLinearProbeReportSmoke;
   end;
 
 implementation
@@ -2268,6 +2269,116 @@ begin
       Pos('predicted-label', Report) > 0);
   finally
     Samples.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLinearProbeReportSmoke;
+var
+  NN: TNNet;
+  Samples, ValSamples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  Report: string;
+  Ep, I, C: integer;
+  AccStart, AccEnd: integer;
+  AccStr: string;
+  FinalAcc: TNeuralFloat;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-1.5, -1.5), (1.5, 1.5), (1.5, -1.5));
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN handled gracefully.
+  Report := TNNet.LinearProbeReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  ValSamples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    Report := TNNet.LinearProbeReport(NN, Samples);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Build labelled 3-cluster train + held-out sets.
+    RandSeed := 1234;
+    for C := 0 to 2 do
+      for I := 1 to 40 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        ValSamples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Train briefly so the deep layers become linearly separable.
+    for Ep := 1 to 40 do
+      for I := 0 to Samples.Count - 1 do
+      begin
+        NN.Compute(Samples[I].I);
+        NN.Backpropagate(Samples[I].O);
+      end;
+
+    // Report with held-out batch.
+    Report := TNNet.LinearProbeReport(NN, Samples, ValSamples);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('LinearProbeReport', Report) > 0);
+    AssertTrue('ProbeAcc column present', Pos('ProbeAcc', Report) > 0);
+    AssertTrue('ValAcc column present (held-out supplied)',
+      Pos('ValAcc', Report) > 0);
+    AssertTrue('OneHotMSE column present', Pos('OneHotMSE', Report) > 0);
+    AssertTrue('bar chart present',
+      Pos('Per-layer probe accuracy', Report) > 0);
+    AssertTrue('distribution histogram present',
+      Pos('Distribution of per-layer probe accuracy', Report) > 0);
+    AssertTrue('flags legend present',
+      Pos('C=representation collapse', Report) > 0);
+    AssertTrue('final-layer line present',
+      Pos('Final-layer probe accuracy', Report) > 0);
+
+    // Correctness: the final-layer probe accuracy on a well-separated 3-cluster
+    // set after training must be comfortably above the 1/3 random baseline.
+    AccStart := Pos('Final-layer probe accuracy = ', Report);
+    AssertTrue('final-acc line found', AccStart > 0);
+    AccStart := AccStart + Length('Final-layer probe accuracy = ');
+    AccEnd := PosEx('%', Report, AccStart);
+    AssertTrue('final-acc terminator found', AccEnd > AccStart);
+    AccStr := Trim(Copy(Report, AccStart, AccEnd - AccStart));
+    FinalAcc := StrToFloatDef(AccStr, -1, FS);
+    AssertTrue('final probe acc parsed', FinalAcc >= 0);
+    AssertTrue('final probe acc above random baseline', FinalAcc > 60.0);
+
+    // No-held-out variant also produces a well-formed report (no ValAcc col).
+    Report := TNNet.LinearProbeReport(NN, Samples);
+    AssertTrue('no-val report non-empty', Length(Report) > 0);
+    AssertTrue('no-val report has ProbeAcc', Pos('ProbeAcc', Report) > 0);
+    AssertTrue('no-val report omits ValAcc', Pos('ValAcc', Report) = 0);
+  finally
+    Samples.Free;
+    ValSamples.Free;
     NN.Free;
   end;
 end;
