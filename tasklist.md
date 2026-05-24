@@ -294,8 +294,14 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [ ] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
-      neuron per forward pass during training, fixed at average at inference.
+- [X] TNNetRReLU — Randomized Leaky ReLU; slope sampled uniformly per
+      forward pass during training, fixed at average at inference. (Landed
+      as a TNNetReLUBase descendant gated by a per-layer `Enabled` flag,
+      mirroring TNNetDropout's train-vs-inference pattern. NOTE: implemented
+      with one shared slope per forward pass — NOT per-neuron — which is the
+      common simplification and keeps the cached-derivative path simple. A
+      per-neuron-slope follow-up could be a separate task if ever wanted.
+      Numerical-gradient test runs in fixed-slope inference mode.)
 - [ ] TNNetSoftPlusBetaLearnable — learnable-β variant of the landed
       fixed-β TNNetSoftPlusBeta. Single learnable β with the same
       sigmoid(βx) derivative path; parallel to TNNetMishLearnable.
@@ -757,7 +763,8 @@ breakdown:
 - [ ] Sinusoidal vs learned positional embedding head-to-head on the
       binary-addition task.
 - [ ] PReLU vs LeakyReLU vs RReLU on a tiny CIFAR stub at matched param
-      count.
+      count. (UNBLOCKED: TNNetRReLU has now landed — remember to flip its
+      `Enabled` flag off for the eval pass so the fixed average slope is used.)
 - [ ] TopK sparsity sweep: train the same tiny autoencoder bottleneck
       with K ∈ {1, 2, 4, 8, 16, full}, chart reconstruction loss vs sparsity.
 - [ ] STE bit-width sweep: same network, vary `step ∈ {1.0, 0.5, 0.25,
@@ -1011,14 +1018,15 @@ breakdown:
       1e-2.
 
 ### Model calibration / reliability
-- [ ] Model-calibration / reliability-diagram tool — a small unit
-      (`neuralcalibration.pas`) that takes a trained classifier, a
-      validation set, and a bin count, and reports Expected Calibration
-      Error (ECE), Maximum Calibration Error (MCE), and Brier score, plus
-      dumps a reliability diagram as a PGM (per-bin accuracy vs. confidence,
-      with a y=x reference line). Pair with a tiny example on top of an
-      existing classifier that prints metrics before and after a one-parameter
-      temperature-scaling fit on the logits.
+- [X] Model-calibration / reliability-diagram tool — `neural/neuralcalibration.pas`
+      LANDED: `ComputeCalibration` / `CalibrationReport` / `FitTemperature` /
+      `WriteReliabilityPGM` + record `TNeuralCalibrationReport`. Reports ECE,
+      MCE, Brier + ASCII and PGM reliability diagrams. Temperature scaling is
+      a coarse-then-fine 1-D grid scan over T in [0.5, 5.0] minimizing NLL;
+      softmax outputs are turned into pseudo-logits via `ln(max(p, eps))`
+      (exact for a plain softmax head up to an additive constant). Example
+      `examples/CalibrationReport/` shows ECE 0.19 -> 0.11 after fitting T.
+      Smoke test `TestCalibrationReportSmoke` in tests/TestNeuralLayersExtra.pas.
 
 ### Introspection (added)
 - [ ] TopLogitMarginReport follow-up: the shipped `examples/MarginReport/`
@@ -1036,12 +1044,29 @@ breakdown:
       tests/TestNeuralLayersExtra.pas so new report tasks are a one-liner.
 - [ ] Next introspection-report batch (same forward-only `TNNet.*Report`
       pattern, each pairs with an `examples/*/` synthetic demo and a smoke
-      test). Still unimplemented: `TNNeuralTTAEvaluator` (test-time-augmentation
-      accuracy lift), `TNNet.LinearProbeReport` (closed-form per-layer linear
-      probe), and the calibration unit (`neuralcalibration.pas`: ECE / MCE /
-      Brier + reliability diagram). Specs are in the sections below/above.
+      test). Still unimplemented: `TNNet.LinearProbeReport` (closed-form
+      per-layer linear probe — the only remaining member of this batch; the
+      TTA evaluator and the calibration unit have both LANDED). Spec below.
+      NOTE for whoever takes LinearProbeReport: the ridge-regression step
+      `W = (X^T X + lambda*I)^-1 X^T Y` needs a small matrix-inverse /
+      linear-solve helper — confirm whether neuralvolume.pas already has one
+      (Gauss-Jordan / LU) before hand-rolling; that is the main risk in the
+      task and worth scoping as its own sub-step.
 ### Test-time augmentation evaluator
-- [ ] TNeuralTTAEvaluator — given a trained classifier, a validation set,
+- [X] TNeuralTTAEvaluator — LANDED as `class function TNNet.TTAReport` (a
+      forward-only `TNNet.*Report` to match the family, rather than a
+      standalone class). Reuses the in-tree augmentations (identity, FlipX,
+      FlipY, ReverseChannels, Roll(+1)) via the tiny `Input -> Transform`
+      wrapper-net idiom from EquivarianceReport; averages logits (or
+      softmax probs, flag-selectable) and reports baseline / per-transform /
+      ensemble accuracy, per-class delta, agreement rate and a verdict.
+      Example `examples/TestTimeAugmentation/` + smoke test
+      `TestTTAReportSmoke`. Original detailed spec retained below for
+      reference.
+- [ ] (TTAReport follow-up) the shipped report runs on a single synthetic
+      probe set; a natural next step is the spec's second run on a model
+      trained WITH `TNNetRandomFlipX` augmentation, to show TTA gains shrink
+      when the invariance is already learned. given a trained classifier, a validation set,
       and a configurable list of input-side transforms (default menu reuses
       the existing in-tree augmentations: identity, `TNNetFlipX`,
       `TNNetFlipY`, `TNNetReverseChannels`, and a 1-pixel `Roll(X=+1)`),
