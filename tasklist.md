@@ -331,7 +331,6 @@ breakdown:
       *weights* of the previous trainable layer after each step.
 
 #### Reduction / shape
-- [X] TNNetAdaptiveAvgPool — target output (X,Y) regardless of input size.
 - [ ] TNNetAdaptiveMaxPool sibling — same target-driven adaptive windowing as
       the landed TNNetAdaptiveAvgPool, but max (with argmax routing in the
       backward like TNNetMaxPool) instead of mean. Reuse the
@@ -384,19 +383,12 @@ breakdown:
       small CIFAR stub.
 
 ### Loss layers
-- [X] TNNetLabelSmoothingLoss helper — pure target-side transform
-      `(1 - eps) * one_hot + eps / NumClasses`.
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
 - [ ] TNNetKLDivergence follow-up: a knowledge-distillation micro-example —
       train a small "student" against soft targets from a fixed "teacher"
       distribution using the landed TNNetKLDivergence head, and contrast its
       loss curve with a hard-label cross-entropy baseline.
-- [X] TNNetDiceLoss — `1 - 2·sum(p·q + ε) / (sum(p²) + sum(q²) + ε)`,
-      IoU-flavored segmentation loss.
-- [X] TNNetTverskyLoss — generalized Dice with separate FP/FN weights α, β.
-- [X] TNNetWingLoss — facial-landmark regression loss with log-shaped wing
-      near zero and a linear tail.
 - [ ] Dice/Tversky segmentation micro-example: a tiny synthetic binary-mask
       task (e.g. predict a filled disc/box mask from a noisy input grid) with
       a sigmoid head + `TNNetDiceLoss`, contrasting the IoU it reaches vs an
