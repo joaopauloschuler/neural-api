@@ -110,6 +110,7 @@ type
     procedure TestModeConnectivityReportSmoke;
     procedure TestIntrinsicDimensionReportSmoke;
     procedure TestActivationPatchingReportSmoke;
+    procedure TestPredictionDepthReportSmoke;
     procedure TestToGraphvizDotSmoke;
   end;
 
@@ -4370,6 +4371,168 @@ begin
     AssertTrue('shortcut edge into sum present', Pos('1 -> 5', Dot) > 0);
     AssertTrue('longpath edge into sum present', Pos('4 -> 5', Dot) > 0);
   finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestPredictionDepthReportSmoke;
+var
+  NN: TNNet;
+  Support, Queries, OneClass: TNNetVolumeList;
+  SupLabels, QryLabels, OneClassLabels: array of integer;
+  X: TNNetVolume;
+  Report, OneClassReport: string;
+  Ep, I, C, B: integer;
+  FinalAgreeStart, FinalAgreeEnd: integer;
+  AgreeStr: string;
+  Agree: TNeuralFloat;
+  AllZeroDepth: boolean;
+  DepthZeroPos: integer;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+  NoLabels: array of integer;
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  SetLength(NoLabels, 0);
+
+  // nil NN handled gracefully (both overloads).
+  Report := TNNet.PredictionDepthReport(nil, nil, NoLabels, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+  Report := TNNet.PredictionDepthReport(nil, nil, NoLabels, nil, NoLabels);
+  AssertTrue('nil NN reported gracefully (labelled overload)',
+    Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Support := TNNetVolumeList.Create();
+  Queries := TNNetVolumeList.Create();
+  OneClass := TNNetVolumeList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty support handled gracefully (on a valid net).
+    Report := TNNet.PredictionDepthReport(NN, Support, NoLabels, Queries);
+    AssertTrue('empty support reported gracefully',
+      Pos('Support is nil or empty', Report) > 0);
+
+    // Build a labelled 3-cluster support batch (round-robin keeps it balanced).
+    RandSeed := 4242;
+    SetLength(SupLabels, 90);
+    for I := 0 to 89 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(2, 1, 1);
+      X.FData[0] := Centers[C][0] + (Random - 0.5);
+      X.FData[1] := Centers[C][1] + (Random - 0.5);
+      Support.Add(X);
+      SupLabels[I] := C;
+    end;
+    SetLength(QryLabels, 60);
+    for I := 0 to 59 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(2, 1, 1);
+      X.FData[0] := Centers[C][0] + (Random - 0.5);
+      X.FData[1] := Centers[C][1] + (Random - 0.5);
+      Queries.Add(X);
+      QryLabels[I] := C;
+    end;
+
+    // Train briefly so the deep layers separate the clusters.
+    for Ep := 1 to 40 do
+      for B := 0 to Support.Count - 1 do
+      begin
+        X := TNNetVolume.Create(3, 1, 1);
+        X.Fill(0);
+        X.FData[SupLabels[B]] := 1.0;
+        try
+          NN.Compute(Support[B]);
+          NN.Backpropagate(X);
+        finally
+          X.Free;
+        end;
+      end;
+
+    // ---- main report (unlabelled-query overload) ----
+    Report := TNNet.PredictionDepthReport(NN, Support, SupLabels, Queries);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('PredictionDepthReport', Report) > 0);
+    AssertTrue('depth histogram present',
+      Pos('Distribution of prediction depth', Report) > 0);
+    AssertTrue('newly-resolved profile present',
+      Pos('newly-resolved count', Report) > 0);
+    AssertTrue('hardest-query queue present',
+      Pos('Hardest', Report) > 0);
+    AssertTrue('final-layer agreement line present',
+      Pos('Final-layer k-NN-vote-vs-network-argmax agreement', Report) > 0);
+    // labelled overload adds the correctness cross-tab.
+    Report := TNNet.PredictionDepthReport(NN, Support, SupLabels, Queries,
+      QryLabels);
+    AssertTrue('cross-tab present (labelled overload)',
+      Pos('Correctness cross-tab', Report) > 0);
+
+    // ---- built-in correctness: support set fed as its OWN queries ----
+    // every sample gets a finite depth and the final-layer k-NN vote matches
+    // the network argmax for a high fraction (a point is its own nearest
+    // neighbour at cosine distance 0).
+    Report := TNNet.PredictionDepthReport(NN, Support, SupLabels, Support,
+      SupLabels);
+    FinalAgreeStart :=
+      Pos('Final-layer k-NN-vote-vs-network-argmax agreement = ', Report);
+    AssertTrue('agreement line found', FinalAgreeStart > 0);
+    FinalAgreeStart := FinalAgreeStart +
+      Length('Final-layer k-NN-vote-vs-network-argmax agreement = ');
+    FinalAgreeEnd := PosEx(' ', Report, FinalAgreeStart);
+    AssertTrue('agreement terminator found', FinalAgreeEnd > FinalAgreeStart);
+    AgreeStr := Trim(Copy(Report, FinalAgreeStart,
+      FinalAgreeEnd - FinalAgreeStart));
+    Agree := StrToFloatDef(AgreeStr, -1, FS);
+    AssertTrue('agreement parsed', Agree >= 0);
+    AssertTrue('support-as-own-query final-layer agreement is high',
+      Agree >= 0.9);
+
+    // ---- built-in correctness: a ONE-CLASS support set drives depth to 0 ----
+    // with a single support class the k-NN vote can only ever be that class,
+    // and for any query the net itself classifies as that class the depth locks
+    // in immediately at layer 0. Build queries the trained net maps to class 0
+    // and a one-class (class 0) support set.
+    SetLength(OneClassLabels, 30);
+    for I := 0 to 29 do
+    begin
+      X := TNNetVolume.Create(2, 1, 1);
+      X.FData[0] := Centers[0][0] + (Random - 0.5);
+      X.FData[1] := Centers[0][1] + (Random - 0.5);
+      OneClass.Add(X);
+      OneClassLabels[I] := 0;  // all the same class
+    end;
+    // sanity: the trained net maps these points to class 0.
+    NN.Compute(OneClass[0]);
+    AssertEquals('one-class points classify as class 0', 0,
+      NN.GetLastLayer.Output.GetClass());
+    // queries = the same one-class cluster points.
+    OneClassReport := TNNet.PredictionDepthReport(NN, OneClass, OneClassLabels,
+      OneClass);
+    AssertTrue('one-class report non-empty', Length(OneClassReport) > 0);
+    // mean depth must be exactly 0 (every sample locks in at layer 0).
+    AssertTrue('one-class mean depth is 0',
+      Pos('Mean depth = 0.000', OneClassReport) > 0);
+    // all queries land in the shallowest histogram bin.
+    DepthZeroPos := Pos('depth | n=  30', OneClassReport);
+    AllZeroDepth := DepthZeroPos > 0;
+    AssertTrue('one-class: all 30 queries in the depth-0 histogram bin',
+      AllZeroDepth);
+  finally
+    Support.Free;
+    Queries.Free;
+    OneClass.Free;
     NN.Free;
   end;
 end;

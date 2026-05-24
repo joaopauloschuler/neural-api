@@ -5263,6 +5263,78 @@ type
       class function ReceptiveFieldReport(
         NN: TNNet
       ): string;
+      // Per-EXAMPLE difficulty diagnostic based on the PREDICTION DEPTH of
+      // Baldock, Maennel & Neyshabur 2021 ("Deep Learning Through the Lens of
+      // Example Difficulty"). Where LinearProbeReport / FeatureSeparabilityReport
+      // give a per-LAYER aggregate ("how decodable / how clustered is the batch
+      // here?"), this gives a per-SAMPLE resolution depth: "at how deep a layer
+      // does the network actually make up its mind about THIS example?". Easy,
+      // well-separated examples are decided early (shallow depth); hard,
+      // ambiguous or mislabelled examples stay contested until the last layers
+      // (deep). The estimator is forward-only and NON-PARAMETRIC (k-NN votes -
+      // only distances, no probe fit, no matrix solve). Given a classifier NN,
+      // a labelled SUPPORT batch (Support: a TNNetVolumeList of input volumes
+      // with SupportLabels: the matching integer class of each), and a QUERY
+      // batch (Queries: a TNNetVolumeList) it:
+      //   * runs one forward pass over every support and query input and
+      //     SNAPSHOTS each trainable layer's flattened activation;
+      //   * for every query, at every trainable layer, takes a k-NN vote
+      //     (default K=5, COSINE distance) over the support activations at that
+      //     same layer - the predicted class at that depth;
+      //   * defines the PREDICTION DEPTH of a query as the index (into the
+      //     probed-layer list) of the SHALLOWEST layer after which the k-NN vote
+      //     agrees with the network's final argmax AND never disagrees again
+      //     (every deeper layer confirms it). A query already voting the final
+      //     class at layer 0 reads depth 0; one that never settles before the
+      //     last layer reads the maximum depth.
+      // Reports:
+      //   (a) a 10-bin ASCII histogram of prediction depth across the query
+      //       batch (right-skewed at fresh init, shifting shallow after
+      //       training), plus mean / median depth;
+      //   (b) the per-layer "newly-resolved" count - how many queries first
+      //       lock in their final class at each layer (a depth-vs-layer
+      //       profile / where examples get decided);
+      //   (c) the K deepest (= hardest) query indices, a ready-made
+      //       hard-example / relabel-candidate queue;
+      //   (d) when QueryLabels is supplied (the overload), a correctness
+      //       cross-tab: the mean prediction depth of CORRECTLY vs INCORRECTLY
+      //       classified queries (the literature's headline result - depth
+      //       correlates with error / low margin).
+      // FEATURE-DIMENSION CAP: a layer whose flat activation exceeds MaxFeatDim
+      // (default 256) is deterministically random-projected (fixed-seed
+      // sign-random projection, the same trick LinearProbeReport uses) down to
+      // MaxFeatDim features before the cosine distances are computed, bounding
+      // the k-NN cost on very wide layers. Layers with a zero-size Output are
+      // skipped. BUILT-IN CORRECTNESS: feeding the support set as its OWN
+      // queries gives every sample a finite depth and the final-layer k-NN vote
+      // matches the network argmax for a high fraction (a point is its own
+      // nearest neighbour at cosine distance 0); a one-class support set drives
+      // every depth to 0 (the vote can only ever be that one class, which is
+      // the final argmax everywhere a non-degenerate net is consulted - and the
+      // depth-0 lock is immediate). Pure forward-only - NN.Compute only, weights
+      // are NEVER stepped, no backward pass, no new layer types. DISTINCT from
+      // LinearProbeReport (parametric per-layer accuracy via a ridge solve - this
+      // needs only distances), FeatureSeparabilityReport (per-layer aggregate
+      // cluster geometry), TopLogitMarginReport (last-layer confidence only) and
+      // MCDropoutUncertaintyReport (stochastic epistemic uncertainty). Guards
+      // nil NN and empty/nil support or query lists gracefully.
+      class function PredictionDepthReport(
+        NN: TNNet;
+        Support: TNNetVolumeList;
+        const SupportLabels: array of integer;
+        Queries: TNNetVolumeList;
+        K: integer = 5;
+        MaxFeatDim: integer = 256
+      ): string; overload;
+      class function PredictionDepthReport(
+        NN: TNNet;
+        Support: TNNetVolumeList;
+        const SupportLabels: array of integer;
+        Queries: TNNetVolumeList;
+        const QueryLabels: array of integer;
+        K: integer = 5;
+        MaxFeatDim: integer = 256
+      ): string; overload;
       // Forward-only activation-distribution diagnostic. For a probe batch
       // (a TNNetVolumeList) it runs one NN.Compute per sample and, for every
       // layer, walks the layer Output volume accumulating streaming moments so
@@ -31927,6 +31999,505 @@ begin
       'layer), S=saturation point (shallowest layer within %.0f pt of the ' +
       'final layer), R=near-random (probe acc within %.0f pt of 1/NumClasses).',
       [cCollapsePts, cSaturatePts, cRandomPts]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.PredictionDepthReport(
+  NN: TNNet;
+  Support: TNNetVolumeList;
+  const SupportLabels: array of integer;
+  Queries: TNNetVolumeList;
+  K: integer = 5;
+  MaxFeatDim: integer = 256
+): string;
+var
+  NoQLabels: array of integer;
+begin
+  SetLength(NoQLabels, 0);
+  Result := PredictionDepthReport(NN, Support, SupportLabels, Queries,
+    NoQLabels, K, MaxFeatDim);
+end;
+
+class function TNNet.PredictionDepthReport(
+  NN: TNNet;
+  Support: TNNetVolumeList;
+  const SupportLabels: array of integer;
+  Queries: TNNetVolumeList;
+  const QueryLabels: array of integer;
+  K: integer = 5;
+  MaxFeatDim: integer = 256
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cProjSeed = 7654321;
+  cEps = 1e-12;
+type
+  TFloatArray = array of TNeuralFloat;
+  // A per-probed-layer description: which absolute layer, its (possibly capped)
+  // feature dimension, and, when capped, a deterministic sign-random-projection
+  // map drawing each output feature from a fixed source unit with a +/-1 sign
+  // (the same trick LinearProbeReport uses).
+  TLayerProbe = record
+    LayerIdx: integer;
+    FeatDim: integer;
+    Projected: boolean;
+    ProjSrc: array of integer;
+    ProjSign: array of TNeuralFloat;
+  end;
+var
+  Lines: TStringList;
+  LayerIdx, ProbeIdx, I, J, C, BinIdx: integer;
+  Layer: TNNetLayer;
+  NumClasses, NumProbed, FlatSz, NumSupport, NumQuery: integer;
+  HasQLabels: boolean;
+  Probes: array of TLayerProbe;
+  ProbeName: array of string;
+  // Snapshotted activations: SupFeat[probe][supportIdx] = feature row,
+  // QryFeat[probe][queryIdx] = feature row. Each row is L2-pre-normalised so a
+  // cosine distance is 1 - dot.
+  SupFeat: array of array of TFloatArray;
+  QryFeat: array of array of TFloatArray;
+  SupNorm: array of array of TNeuralFloat;   // [probe][supportIdx] cached norm
+  QryNorm: array of array of TNeuralFloat;   // [probe][queryIdx]   cached norm
+  FinalArgmax: array of integer;             // network argmax per query
+  Depth: array of integer;                   // prediction depth per query
+  NewlyResolved: array of integer;           // per probed layer
+  DepthBins: array of integer;
+  Row: TFloatArray;
+  Vote: integer;
+  AgreeAtLayer: array of boolean;            // per probe, scratch for one query
+  // k-NN scratch
+  BestDist: TFloatArray;                     // K smallest distances
+  BestCls: array of integer;                 // their support classes
+  ClassVotes: TFloatArray;                   // weighted vote per class
+  SwapF: TNeuralFloat;
+  SwapI: integer;
+  Dist, Dot, BestVal, MeanDepth, MedianDepth, FracMatch: TNeuralFloat;
+  SortDepth: array of integer;
+  CorrectDepthSum, IncorrectDepthSum: TNeuralFloat;
+  CorrectCnt, IncorrectCnt, MaxDepthVal, FinalLayerAgree, UsedQuery: integer;
+  MaxBin, BarLen, KK, KEff, Found, DeepCount: integer;
+  Bar: string;
+
+  // Fill Row (length FeatDim) from a probed layer's Output, applying the
+  // random projection if this layer was capped. Returns the L2 norm.
+  function ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume;
+    var Dst: TFloatArray): TNeuralFloat;
+  var
+    F: integer;
+    NrmSq: TNeuralFloat;
+  begin
+    NrmSq := 0;
+    if Pr.Projected then
+    begin
+      for F := 0 to Pr.FeatDim - 1 do
+      begin
+        Dst[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
+        NrmSq := NrmSq + Dst[F] * Dst[F];
+      end;
+    end
+    else
+    begin
+      for F := 0 to Pr.FeatDim - 1 do
+      begin
+        Dst[F] := OutVol.FData[F];
+        NrmSq := NrmSq + Dst[F] * Dst[F];
+      end;
+    end;
+    Result := Sqrt(NrmSq);
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'PredictionDepthReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Support = nil) or (Support.Count = 0) then
+    begin
+      Result := 'PredictionDepthReport: Support is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if (Queries = nil) or (Queries.Count = 0) then
+    begin
+      Result := 'PredictionDepthReport: Queries is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.GetLastLayerIdx() < 1 then
+    begin
+      Result := 'PredictionDepthReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+    if Length(SupportLabels) < Support.Count then
+    begin
+      Result := 'PredictionDepthReport: fewer SupportLabels than support ' +
+        'samples.' + sLineBreak;
+      Exit;
+    end;
+    if MaxFeatDim < 1 then MaxFeatDim := 1;
+    if K < 1 then K := 1;
+
+    NumClasses := NN.GetLastLayer().Output.Size;
+    if NumClasses < 2 then
+    begin
+      Result := 'PredictionDepthReport: final layer must have >= 2 outputs.' +
+        sLineBreak;
+      Exit;
+    end;
+    NumSupport := Support.Count;
+    NumQuery := Queries.Count;
+    HasQLabels := Length(QueryLabels) >= NumQuery;
+    KEff := K;
+    if KEff > NumSupport then KEff := NumSupport;
+
+    // --- Catalogue probeable layers (skip zero-size outputs), building a
+    //     deterministic random projection for over-wide layers. ---
+    SetLength(Probes, NN.CountLayers());
+    SetLength(ProbeName, NN.CountLayers());
+    NumProbed := 0;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      FlatSz := Layer.Output.Size;
+      if FlatSz = 0 then Continue;
+      Probes[NumProbed].LayerIdx := LayerIdx;
+      ProbeName[NumProbed] := Layer.ClassName;
+      if FlatSz > MaxFeatDim then
+      begin
+        Probes[NumProbed].FeatDim := MaxFeatDim;
+        Probes[NumProbed].Projected := true;
+        SetLength(Probes[NumProbed].ProjSrc, MaxFeatDim);
+        SetLength(Probes[NumProbed].ProjSign, MaxFeatDim);
+        RandSeed := cProjSeed + LayerIdx;
+        for J := 0 to MaxFeatDim - 1 do
+        begin
+          Probes[NumProbed].ProjSrc[J] := Random(FlatSz);
+          if Random(2) = 0 then
+            Probes[NumProbed].ProjSign[J] := 1.0
+          else
+            Probes[NumProbed].ProjSign[J] := -1.0;
+        end;
+      end
+      else
+      begin
+        Probes[NumProbed].FeatDim := FlatSz;
+        Probes[NumProbed].Projected := false;
+      end;
+      Inc(NumProbed);
+    end;
+    SetLength(Probes, NumProbed);
+    SetLength(ProbeName, NumProbed);
+
+    if NumProbed = 0 then
+    begin
+      Result := 'PredictionDepthReport: no probeable layers (all zero-size).' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Forward pass over the support batch: snapshot per-layer activations
+    //     and cache their L2 norms. ---
+    SetLength(SupFeat, NumProbed, NumSupport);
+    SetLength(SupNorm, NumProbed, NumSupport);
+    for I := 0 to NumSupport - 1 do
+    begin
+      if Support[I] = nil then Continue;
+      NN.Compute(Support[I]);
+      for ProbeIdx := 0 to NumProbed - 1 do
+      begin
+        LayerIdx := Probes[ProbeIdx].LayerIdx;
+        SetLength(SupFeat[ProbeIdx][I], Probes[ProbeIdx].FeatDim);
+        SupNorm[ProbeIdx][I] :=
+          ReadFeatures(Probes[ProbeIdx], NN.Layers[LayerIdx].Output,
+            SupFeat[ProbeIdx][I]);
+      end;
+    end;
+
+    // --- Forward pass over the query batch: snapshot activations + final
+    //     argmax (the network's own decision this depth must agree with). ---
+    SetLength(QryFeat, NumProbed, NumQuery);
+    SetLength(QryNorm, NumProbed, NumQuery);
+    SetLength(FinalArgmax, NumQuery);
+    for I := 0 to NumQuery - 1 do
+    begin
+      if Queries[I] = nil then
+      begin
+        FinalArgmax[I] := -1;
+        Continue;
+      end;
+      NN.Compute(Queries[I]);
+      FinalArgmax[I] := NN.GetLastLayer().Output.GetClass();
+      for ProbeIdx := 0 to NumProbed - 1 do
+      begin
+        LayerIdx := Probes[ProbeIdx].LayerIdx;
+        SetLength(QryFeat[ProbeIdx][I], Probes[ProbeIdx].FeatDim);
+        QryNorm[ProbeIdx][I] :=
+          ReadFeatures(Probes[ProbeIdx], NN.Layers[LayerIdx].Output,
+            QryFeat[ProbeIdx][I]);
+      end;
+    end;
+
+    // --- Per-query prediction depth via per-layer k-NN votes. ---
+    SetLength(Depth, NumQuery);
+    SetLength(NewlyResolved, NumProbed);
+    for ProbeIdx := 0 to NumProbed - 1 do NewlyResolved[ProbeIdx] := 0;
+    SetLength(AgreeAtLayer, NumProbed);
+    SetLength(BestDist, KEff);
+    SetLength(BestCls, KEff);
+    SetLength(ClassVotes, NumClasses);
+    FinalLayerAgree := 0;
+    UsedQuery := 0;
+
+    for I := 0 to NumQuery - 1 do
+    begin
+      if FinalArgmax[I] < 0 then
+      begin
+        Depth[I] := NumProbed - 1;  // unusable query: treat as max depth
+        Continue;
+      end;
+      Inc(UsedQuery);
+      // For each probed layer, k-NN vote over the support set (cosine dist).
+      for ProbeIdx := 0 to NumProbed - 1 do
+      begin
+        Row := QryFeat[ProbeIdx][I];
+        // maintain the KEff smallest distances (simple insertion).
+        for KK := 0 to KEff - 1 do
+        begin
+          BestDist[KK] := 1e30;
+          BestCls[KK] := -1;
+        end;
+        for J := 0 to NumSupport - 1 do
+        begin
+          if Support[J] = nil then Continue;
+          if (QryNorm[ProbeIdx][I] < cEps) or (SupNorm[ProbeIdx][J] < cEps) then
+            Dist := 1.0   // an all-zero activation is maximally far (cos undef)
+          else
+          begin
+            Dot := 0;
+            for C := 0 to Probes[ProbeIdx].FeatDim - 1 do
+              Dot := Dot + Row[C] * SupFeat[ProbeIdx][J][C];
+            Dot := Dot / (QryNorm[ProbeIdx][I] * SupNorm[ProbeIdx][J]);
+            Dist := 1.0 - Dot;  // cosine distance in [0,2]
+          end;
+          // insert into the K-smallest list if it beats the current worst.
+          if Dist < BestDist[KEff - 1] then
+          begin
+            BestDist[KEff - 1] := Dist;
+            BestCls[KEff - 1] := SupportLabels[J];
+            KK := KEff - 1;
+            while (KK > 0) and (BestDist[KK] < BestDist[KK - 1]) do
+            begin
+              SwapF := BestDist[KK]; BestDist[KK] := BestDist[KK - 1];
+              BestDist[KK - 1] := SwapF;
+              SwapI := BestCls[KK]; BestCls[KK] := BestCls[KK - 1];
+              BestCls[KK - 1] := SwapI;
+              Dec(KK);
+            end;
+          end;
+        end;
+        // majority vote (ties -> lowest class index via strict >).
+        for C := 0 to NumClasses - 1 do ClassVotes[C] := 0;
+        for KK := 0 to KEff - 1 do
+          if (BestCls[KK] >= 0) and (BestCls[KK] < NumClasses) then
+            ClassVotes[BestCls[KK]] := ClassVotes[BestCls[KK]] + 1.0;
+        Vote := 0;
+        BestVal := ClassVotes[0];
+        for C := 1 to NumClasses - 1 do
+          if ClassVotes[C] > BestVal then
+          begin
+            BestVal := ClassVotes[C];
+            Vote := C;
+          end;
+        AgreeAtLayer[ProbeIdx] := (Vote = FinalArgmax[I]);
+      end;
+      if AgreeAtLayer[NumProbed - 1] then Inc(FinalLayerAgree);
+      // Prediction depth = shallowest layer after which agreement never breaks.
+      // Walk from the deepest layer up while agreement holds; the depth is the
+      // first index of that trailing all-agree run.
+      Depth[I] := NumProbed; // sentinel: never settles (will clamp below)
+      ProbeIdx := NumProbed - 1;
+      while (ProbeIdx >= 0) and AgreeAtLayer[ProbeIdx] do
+      begin
+        Depth[I] := ProbeIdx;
+        Dec(ProbeIdx);
+      end;
+      if Depth[I] >= NumProbed then Depth[I] := NumProbed - 1;
+      Inc(NewlyResolved[Depth[I]]);
+    end;
+
+    // --- Aggregate statistics. ---
+    MeanDepth := 0;
+    for I := 0 to NumQuery - 1 do MeanDepth := MeanDepth + Depth[I];
+    MeanDepth := MeanDepth / NumQuery;
+    SetLength(SortDepth, NumQuery);
+    for I := 0 to NumQuery - 1 do SortDepth[I] := Depth[I];
+    // simple insertion sort for the median (query batches are modest)
+    for I := 1 to NumQuery - 1 do
+    begin
+      SwapI := SortDepth[I];
+      J := I - 1;
+      while (J >= 0) and (SortDepth[J] > SwapI) do
+      begin
+        SortDepth[J + 1] := SortDepth[J];
+        Dec(J);
+      end;
+      SortDepth[J + 1] := SwapI;
+    end;
+    if NumQuery mod 2 = 1 then
+      MedianDepth := SortDepth[NumQuery div 2]
+    else
+      MedianDepth := (SortDepth[NumQuery div 2 - 1] +
+        SortDepth[NumQuery div 2]) / 2.0;
+
+    // Fraction of queries whose FINAL-LAYER k-NN vote already matches the net
+    // argmax - the built-in support-as-own-query correctness signal (a point is
+    // its own nearest neighbour at cosine distance 0, so this is ~1.0 when the
+    // support set is fed as its own queries).
+    if UsedQuery > 0 then
+      FracMatch := FinalLayerAgree / UsedQuery
+    else
+      FracMatch := 0;
+
+    // --- Header + summary. ---
+    Lines.Add(Format(
+      'PredictionDepthReport: %d probed layer(s), %d class(es), %d support ' +
+      'sample(s), %d query sample(s). K=%d, MaxFeatDim=%d, cosine distance.',
+      [NumProbed, NumClasses, NumSupport, NumQuery, KEff, MaxFeatDim]));
+    Lines.Add(Format(
+      'Prediction depth in [0, %d] (0 = decided at the shallowest layer, %d = ' +
+      'contested until the last layer).', [NumProbed - 1, NumProbed - 1]));
+    Lines.Add(Format('Mean depth = %.3f, median depth = %.3f.',
+      [MeanDepth, MedianDepth]));
+
+    // --- 10-bin histogram of prediction depth over [0, NumProbed-1]. ---
+    SetLength(DepthBins, cBins);
+    for BinIdx := 0 to cBins - 1 do DepthBins[BinIdx] := 0;
+    for I := 0 to NumQuery - 1 do
+    begin
+      if NumProbed <= 1 then
+        BinIdx := 0
+      else
+        BinIdx := Trunc((Depth[I] / (NumProbed - 1)) * cBins);
+      if BinIdx < 0 then BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      Inc(DepthBins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if DepthBins[BinIdx] > MaxBin then MaxBin := DepthBins[BinIdx];
+    Lines.Add('');
+    Lines.Add('Distribution of prediction depth across the query batch:');
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if MaxBin > 0 then
+        BarLen := Round((DepthBins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%5.1f%%, %5.1f%%) depth | n=%4d %s',
+        [BinIdx * (100.0 / cBins), (BinIdx + 1) * (100.0 / cBins),
+         DepthBins[BinIdx], Bar]));
+    end;
+
+    // --- Per-layer "newly-resolved" profile (depth-vs-layer). ---
+    MaxBin := 0;
+    for ProbeIdx := 0 to NumProbed - 1 do
+      if NewlyResolved[ProbeIdx] > MaxBin then MaxBin := NewlyResolved[ProbeIdx];
+    Lines.Add('');
+    Lines.Add('Per-layer newly-resolved count (queries first locking in here):');
+    for ProbeIdx := 0 to NumProbed - 1 do
+    begin
+      if MaxBin > 0 then
+        BarLen := Round((NewlyResolved[ProbeIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  depth %-3d L%-3d %-26s n=%4d %s',
+        [ProbeIdx, Probes[ProbeIdx].LayerIdx, ProbeName[ProbeIdx],
+         NewlyResolved[ProbeIdx], Bar]));
+    end;
+
+    // --- K deepest (hardest) query indices. ---
+    DeepCount := K;
+    if DeepCount > NumQuery then DeepCount := NumQuery;
+    Lines.Add('');
+    Lines.Add(Format(
+      'Hardest %d query indices (deepest prediction depth - relabel / hard-' +
+      'example candidates):', [DeepCount]));
+    // selection of the DeepCount largest depths (stable-ish: lowest index first
+    // among equal depths). Mark consumed entries by setting depth to -1 in copy.
+    SetLength(SortDepth, NumQuery);
+    for I := 0 to NumQuery - 1 do SortDepth[I] := Depth[I];
+    for KK := 0 to DeepCount - 1 do
+    begin
+      MaxDepthVal := -1;
+      Found := -1;
+      for I := 0 to NumQuery - 1 do
+        if SortDepth[I] > MaxDepthVal then
+        begin
+          MaxDepthVal := SortDepth[I];
+          Found := I;
+        end;
+      if Found < 0 then Break;
+      Lines.Add(Format('  query #%-5d depth=%-3d final-argmax=%d',
+        [Found, Depth[Found], FinalArgmax[Found]]));
+      SortDepth[Found] := -1;
+    end;
+
+    // --- Correctness cross-tab when query labels supplied. ---
+    if HasQLabels then
+    begin
+      CorrectDepthSum := 0; IncorrectDepthSum := 0;
+      CorrectCnt := 0; IncorrectCnt := 0;
+      for I := 0 to NumQuery - 1 do
+      begin
+        if FinalArgmax[I] < 0 then Continue;
+        if FinalArgmax[I] = QueryLabels[I] then
+        begin
+          CorrectDepthSum := CorrectDepthSum + Depth[I];
+          Inc(CorrectCnt);
+        end
+        else
+        begin
+          IncorrectDepthSum := IncorrectDepthSum + Depth[I];
+          Inc(IncorrectCnt);
+        end;
+      end;
+      Lines.Add('');
+      Lines.Add('Correctness cross-tab (network argmax vs supplied query label):');
+      if CorrectCnt > 0 then
+        Lines.Add(Format('  correctly classified : n=%-5d mean depth=%.3f',
+          [CorrectCnt, CorrectDepthSum / CorrectCnt]))
+      else
+        Lines.Add('  correctly classified : n=0');
+      if IncorrectCnt > 0 then
+        Lines.Add(Format('  incorrectly classified: n=%-5d mean depth=%.3f',
+          [IncorrectCnt, IncorrectDepthSum / IncorrectCnt]))
+      else
+        Lines.Add('  incorrectly classified: n=0');
+      if (CorrectCnt > 0) and (IncorrectCnt > 0) then
+        Lines.Add(Format(
+          '  -> incorrect-minus-correct mean-depth gap = %.3f (positive = ' +
+          'errors decide deeper, the literature''s headline result).',
+          [(IncorrectDepthSum / IncorrectCnt) -
+           (CorrectDepthSum / CorrectCnt)]));
+    end;
+
+    Lines.Add('');
+    Lines.Add(Format(
+      'Final-layer k-NN-vote-vs-network-argmax agreement = %.4f (a built-in ' +
+      'check: ~1.0 when the support set is fed as its own queries). ' +
+      'Prediction depth follows Baldock, Maennel & Neyshabur 2021.',
+      [FracMatch]));
 
     Result := Lines.Text;
   finally
