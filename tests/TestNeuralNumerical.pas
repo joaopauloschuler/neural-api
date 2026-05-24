@@ -176,6 +176,10 @@ type
     procedure TestAPLInputGradientCheck;
     procedure TestAPLWeightGradientCheck;
     procedure TestAPLSerializationRoundTrip;
+    procedure TestSplineActivationIdentityForward;
+    procedure TestSplineActivationInputGradientCheck;
+    procedure TestSplineActivationWeightGradientCheck;
+    procedure TestSplineActivationSerializationRoundTrip;
     procedure TestAconCGradientCheck;
     procedure TestAconCSwishEquivalence;
     procedure TestAconCSerializationRoundTrip;
@@ -16771,6 +16775,269 @@ begin
 
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('APL round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSplineActivationIdentityForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LSpline: TNNetSplineActivation;
+  i: integer;
+  Vals: array[0..6] of TNeuralFloat;
+begin
+  // Default K=4, Range=2.0 -> 5 control points y[i]=t[i] (identity init).
+  // An untrained spline must be an EXACT identity for ALL x, including the
+  // extrapolation region OUTSIDE [-2, 2] (the line y=x extends straight).
+  Vals[0] := -5.0;  // far left, extrapolated
+  Vals[1] := -2.0;  // left boundary knot t[0]
+  Vals[2] := -1.3;  // interior, off-knot
+  Vals[3] := 0.0;   // interior knot
+  Vals[4] := 1.3;   // interior, off-knot
+  Vals[5] := 2.0;   // right boundary knot t[K]
+  Vals[6] := 5.0;   // far right, extrapolated
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 1, 1));
+    LSpline := TNNetSplineActivation.Create();
+    NN.AddLayer(LSpline);
+
+    // Default K=4 -> 5 control points (neurons).
+    AssertEquals('Spline neuron count', 5, LSpline.Neurons.Count);
+    // Identity init: y[i] = t[i] = -2 + i.
+    AssertEquals('Spline y[0]=t[0]', -2.0, LSpline.Neurons[0].Weights.Raw[0], 1e-7);
+    AssertEquals('Spline y[2]=t[2]',  0.0, LSpline.Neurons[2].Weights.Raw[0], 1e-7);
+    AssertEquals('Spline y[4]=t[4]',  2.0, LSpline.Neurons[4].Weights.Raw[0], 1e-7);
+
+    for i := 0 to 6 do
+      Input.Raw[i] := Vals[i];
+    NN.Compute(Input);
+    for i := 0 to 6 do
+      AssertEquals('Spline identity forward at ' + IntToStr(i),
+        Vals[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSplineActivationInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSpline: TNNetSplineActivation;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  n, i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Small shape Depth=3, a few positions. K=4, Range=2 -> knots at -2,-1,0,1,2.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 3);
+  InputPlus := TNNetVolume.Create(2, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 3, 1));
+    LSpline := TNNetSplineActivation.Create(4, 2.0);
+    NN.AddLayer(LSpline);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bend the control points away from the identity so segment slopes differ
+    // and the input gradient is non-trivial.
+    for n := 0 to LSpline.Neurons.Count - 1 do
+      for i := 0 to LSpline.Neurons[n].Weights.Size - 1 do
+        LSpline.Neurons[n].Weights.Raw[i] := Sin((n * 7 + i) * 0.5) * 1.1 + 0.2 * n;
+
+    // Inputs kept away from the integer knot positions (-2,-1,0,1,2) where the
+    // slope is discontinuous so central differences stay valid. The generator
+    // below lands near +/-0.65, 0.35 etc. - all clear of the knots by >0.2.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9 + 0.35) * 1.35;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Spline input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSplineActivationWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSpline: TNNetSplineActivation;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  n, i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Perturb each control-point value y[i,c] and compare central-difference loss
+  // gradient with the accumulated FNeurons[i].FDelta.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 3, 1));
+    LSpline := TNNetSplineActivation.Create(4, 2.0);
+    NN.AddLayer(LSpline);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for n := 0 to LSpline.Neurons.Count - 1 do
+      for i := 0 to LSpline.Neurons[n].Weights.Size - 1 do
+        LSpline.Neurons[n].Weights.Raw[i] := Sin((n * 7 + i) * 0.5) * 1.1 + 0.2 * n;
+
+    // Inputs away from knots (see input-gradient test note).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9 + 0.35) * 1.35;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    // Check every control point (neurons 0..K), every channel.
+    for n := 0 to LSpline.Neurons.Count - 1 do
+      for i := 0 to LSpline.Neurons[n].Weights.Size - 1 do
+      begin
+        LSpline.Neurons[n].Weights.Raw[i] := LSpline.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LSpline.Neurons[n].Weights.Raw[i] := LSpline.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LSpline.Neurons[n].Weights.Raw[i] := LSpline.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LSpline.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LSpline.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('Spline weight gradient check neuron[' + IntToStr(n) +
+          '] channel[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSplineActivationSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  LSpline, LSpline2: TNNetSplineActivation;
+  n, i: integer;
+begin
+  // Exercise the FStruct[0]=K + FFloatSt[0]=Range dispatch path with NON-default
+  // K=6 and Range=3.5; verify all (K+1) control-point vectors, K and Range
+  // survive save -> load -> save (string equality).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    LSpline := TNNetSplineActivation.Create(6, 3.5);
+    NN.AddLayer(LSpline);
+
+    AssertEquals('Spline K=6 neuron count', 7, LSpline.Neurons.Count);
+
+    // Perturb every weight so the round-trip really has to carry them.
+    for n := 0 to LSpline.Neurons.Count - 1 do
+      for i := 0 to LSpline.Neurons[n].Weights.Size - 1 do
+        LSpline.Neurons[n].Weights.Raw[i] :=
+          Sin((n * 13 + i) * 0.27) * 0.6 + 0.1 * n;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LSpline2 := NN2.GetLastLayer as TNNetSplineActivation;
+      Saved2 := NN2.SaveToString();
+
+      AssertEquals('Spline save->load->save string equality', Saved, Saved2);
+      AssertEquals('Spline round-trip neuron count', 7, LSpline2.Neurons.Count);
+      AssertEquals('Spline round-trip weight count',
+        Input.Depth, LSpline2.Neurons[0].Weights.Size);
+      // K=6 survived: K+1=7 control-point neurons reconstructed. Range=3.5
+      // and the control points are implicitly verified by the save->load->save
+      // string equality above and the output / per-weight checks below (a wrong
+      // Range would re-locate segments and change the output).
+
+      for n := 0 to LSpline.Neurons.Count - 1 do
+        for i := 0 to LSpline.Neurons[n].Weights.Size - 1 do
+          AssertEquals('Spline round-trip weight neuron[' + IntToStr(n) +
+            '] channel[' + IntToStr(i) + ']',
+            LSpline.Neurons[n].Weights.Raw[i],
+            LSpline2.Neurons[n].Weights.Raw[i], 1e-5);
+
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Spline round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

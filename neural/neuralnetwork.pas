@@ -2785,6 +2785,55 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetSplineActivation: a KAN-flavored (Kolmogorov-Arnold Network style)
+  // per-channel learnable piecewise-linear activation. Per channel c there are
+  // K+1 learnable control-point VALUES y[0..K,c] sitting at K+1 FIXED, evenly
+  // spaced knot positions t[0..K] over [-Range,+Range]:
+  //   t[i] = -Range + 2*Range*i/K   (K intervals, K+1 knots).
+  // Only the (K+1)*Depth control-point values are trainable; the knots are
+  // FIXED (not learned). K (number of intervals, default 4 -> 5 control points)
+  // is persisted in FStruct[0] and Range (default 2.0) in FFloatSt[0] so the
+  // layer round-trips through SaveToString / LoadFromString.
+  // Forward, per element x of channel c, with segment i s.t. x in [t[i],t[i+1]]:
+  //   frac = (x - t[i]) / (t[i+1]-t[i]);  y = y[i,c] + frac*(y[i+1,c]-y[i,c]).
+  // Extrapolation convention: for x OUTSIDE [t[0],t[K]] the activation LINEARLY
+  // EXTRAPOLATES using the nearest BOUNDARY segment. For x < t[0] it uses the
+  // (y0,y1) segment (i=0) and for x > t[K] it uses the (y[K-1],y[K]) segment
+  // (i=K-1); in both cases frac is NOT clamped (it goes <0 or >1), so the slope
+  // and the two boundary control points correctly carry the extrapolated value
+  // and gradient.
+  // Storage: control points y[i,.] (Depth values each) live in FNeurons[i] for
+  // i in 0..K, mirroring TNNetAPL's / TNNetSReLU's multi-neuron layout.
+  // Default init: control points are set to the IDENTITY y[i,c]=t[i], so an
+  // untrained TNNetSplineActivation is an EXACT identity map for ALL x (the
+  // interpolation of points on y=x is y=x, and linear extrapolation of that
+  // line is still y=x) - a clean built-in degeneracy check.
+  // Backward, per element (let gy = OutputError, frac as in the forward pass,
+  // possibly <0 or >1 for extrapolation, segment i and step dt = t[i+1]-t[i]):
+  //   dy/dx        = (y[i+1,c]-y[i,c]) / dt   (local / boundary segment slope)
+  //   dL/dy[i,c]   += gy*(1-frac)
+  //   dL/dy[i+1,c] += gy*frac
+  // Param grads accumulate over all spatial positions and the batch per
+  // channel. Descends from TNNetChannelTransformBase to reuse its per-channel
+  // weight storage (the weightless TNNetReLUBase hierarchy cannot store
+  // gradients).
+  TNNetSplineActivation = class(TNNetChannelTransformBase)
+    private
+      FNumIntervals: integer;  // K (number of intervals -> K+1 control points)
+      FRange: TNeuralFloat;    // knots evenly spaced over [-FRange, +FRange]
+      // Returns segment index i (0..K-1) for x and frac (unclamped). Pure.
+      procedure LocateSegment(xv: TNeuralFloat; out i: integer;
+        out frac: TNeuralFloat);
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(NumIntervals: integer;
+        Range: TNeuralFloat = 2.0); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// ACON-C: "Activate Or Not" channel-wise learnable activation
   // (Ma, Zhang, Sun et al. 2021, https://arxiv.org/abs/2009.04759).
   // Generalises Swish with THREE learnable parameters PER channel:
@@ -17847,6 +17896,161 @@ begin
     else
       knee := s / (FNumHinges - 1);
     FNeurons[FNumHinges + s].FWeights.Fill(knee);
+  end;
+  AfterWeightUpdate();
+end;
+
+{ TNNetSplineActivation }
+constructor TNNetSplineActivation.Create();
+begin
+  // Default K=4 intervals (5 control points), Range=2.0.
+  Create(4, 2.0);
+end;
+
+constructor TNNetSplineActivation.Create(NumIntervals: integer;
+  Range: TNeuralFloat = 2.0);
+begin
+  inherited Create();
+  if NumIntervals < 1 then
+    raise Exception.Create('TNNetSplineActivation requires NumIntervals >= 1.');
+  if Range <= 0 then
+    raise Exception.Create('TNNetSplineActivation requires Range > 0.');
+  FNumIntervals := NumIntervals;
+  FRange := Range;
+  // Persist K and Range so CreateLayer / LoadFromString reconstruct the layer.
+  FStruct[0] := NumIntervals;
+  FFloatSt[0] := Range;
+  InitDefault();
+end;
+
+procedure TNNetSplineActivation.LocateSegment(xv: TNeuralFloat;
+  out i: integer; out frac: TNeuralFloat);
+var
+  dt, pos: TNeuralFloat;
+begin
+  // Uniform knots: t[i] = -FRange + dt*i, dt = 2*FRange/K. Segment width dt is
+  // constant, so pos = (xv - t[0]) / dt gives the (fractional) segment index.
+  dt := (2 * FRange) / FNumIntervals;
+  pos := (xv + FRange) / dt;
+  // Clamp the segment INDEX to [0, K-1] but keep frac unclamped so that points
+  // outside [t[0], t[K]] extrapolate along the nearest boundary segment:
+  //   x < t[0]  -> i=0,   frac < 0  (uses (y0,y1) slope)
+  //   x > t[K]  -> i=K-1, frac > 1  (uses (y[K-1],y[K]) slope)
+  i := Trunc(pos);
+  if i < 0 then i := 0;
+  if i > FNumIntervals - 1 then i := FNumIntervals - 1;
+  frac := pos - i;
+end;
+
+procedure TNNetSplineActivation.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // We need K+1 neurons: control points y[0..K] in FNeurons[0..K], each with
+  // Depth weights.
+  if FNeurons.Count < FNumIntervals + 1 then
+    AddMissingNeurons(FNumIntervals + 1);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetSplineActivation.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d, i: integer;
+  xv, frac, y0, y1: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (which would copy input to FOutput).
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  for d := 0 to Depth - 1 do
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        LocateSegment(xv, i, frac);
+        y0 := FNeurons[i].FWeights.Raw[d];
+        y1 := FNeurons[i + 1].FWeights.Raw[d];
+        FOutput[x, y, d] := y0 + frac * (y1 - y0);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSplineActivation.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d, i, c: integer;
+  xv, gy, frac, dt, slope, y0, y1: TNeuralFloat;
+  gradY: array of TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  dt := (2 * FRange) / FNumIntervals;
+  SetLength(gradY, FNumIntervals + 1);
+  for d := 0 to Depth - 1 do
+  begin
+    for c := 0 to FNumIntervals do gradY[c] := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        LocateSegment(xv, i, frac);
+        y0 := FNeurons[i].FWeights.Raw[d];
+        y1 := FNeurons[i + 1].FWeights.Raw[d];
+        // Input gradient: local (or boundary) segment slope.
+        slope := (y1 - y0) / dt;
+        if hasInputGrad then
+          PrevErr[x, y, d] := PrevErr[x, y, d] + gy * slope;
+        // Param gradients: frac is unclamped so extrapolation feeds the two
+        // boundary control points consistently with the forward pass.
+        gradY[i]     := gradY[i]     + gy * (1 - frac);
+        gradY[i + 1] := gradY[i + 1] + gy * frac;
+      end;
+    for c := 0 to FNumIntervals do
+      FNeurons[c].FDelta.Raw[d] :=
+        FNeurons[c].FDelta.Raw[d] + (-FLearningRate) * gradY[c];
+  end;
+  if (not FBatchUpdate) then
+  begin
+    for c := 0 to FNumIntervals do
+      FNeurons[c].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSplineActivation.InitDefault();
+var
+  i: integer;
+  dt, t_i: TNeuralFloat;
+begin
+  if FNumIntervals < 1 then FNumIntervals := 4;
+  if FRange <= 0 then FRange := 2.0;
+  if FNeurons.Count < FNumIntervals + 1 then
+    AddMissingNeurons(FNumIntervals + 1);
+  // Identity init: y[i,c] = t[i] so the layer is an exact identity for all x.
+  dt := (2 * FRange) / FNumIntervals;
+  for i := 0 to FNumIntervals do
+  begin
+    t_i := -FRange + dt * i;
+    FNeurons[i].FWeights.Fill(t_i);
   end;
   AfterWeightUpdate();
 end;
@@ -39630,6 +39834,7 @@ begin
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
       'TNNetSReLU':                 Result := TNNetSReLU.Create(Ft[0], Ft[1], Ft[2], Ft[3]);
       'TNNetAPL':                   Result := TNNetAPL.Create(St[0]);
+      'TNNetSplineActivation':      Result := TNNetSplineActivation.Create(St[0], Ft[0]);
       'TNNetAconC':                 Result := TNNetAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
@@ -39891,6 +40096,7 @@ begin
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else
       if S[0] = 'TNNetSReLU' then Result := TNNetSReLU.Create(Ft[0], Ft[1], Ft[2], Ft[3]) else
       if S[0] = 'TNNetAPL' then Result := TNNetAPL.Create(St[0]) else
+      if S[0] = 'TNNetSplineActivation' then Result := TNNetSplineActivation.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetAconC' then Result := TNNetAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else

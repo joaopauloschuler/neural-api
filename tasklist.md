@@ -339,8 +339,15 @@ breakdown:
       hypotenuse toy (final loss ~50 vs ReLU ~1.9), and untrained AconC ==
       Swish by construction. Any fair Meta-ACON comparison needs a
       per-activation LR or more epochs so the Swish-family rows converge.
-- [ ] TNNetSplineActivation — KAN-flavored per-channel learnable piecewise-
-      linear activation with K+1 control points at fixed knots.
+- [X] TNNetSplineActivation — KAN-flavored per-channel learnable piecewise-
+      linear activation with K+1 control points at fixed knots. Landed:
+      TNNetChannelTransformBase descendant, K+1 control-point neurons (default
+      K=4, Range=2.0 in FStruct[0]/FFloatSt[0]); identity init (y[i]=t[i]) so an
+      untrained layer is an exact identity for all x; linear extrapolation along
+      the nearest boundary segment outside [-Range,+Range] (frac unclamped).
+      Registered in both dispatch tables + LoadFromString; 4 tests (identity
+      forward incl. extrapolation, input/weight numerical-gradient, save/load
+      round-trip) in TestNeuralNumerical.pas.
 - [ ] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
       mean(|W|)` forward with straight-through estimator backward.
 - [ ] TNNetMaxOut2 — two-piece special case of TNNetMaxOut with a tighter
