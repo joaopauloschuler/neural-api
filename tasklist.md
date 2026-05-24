@@ -872,6 +872,12 @@ breakdown:
       (implemented on a synthetic 3-Gaussian-blob classification task
       instead of MNIST, for CPU speed) and print the per-epoch fraction
       of units that never fire; repeat with LeakyReLU/GELU/Swish.
+- [ ] DeadReLUDiagnostic follow-up: a learning-rate sweep charting ReLU
+      dead-fraction vs LR (the landed demo pins ONE aggressive LR=0.5 where
+      ReLU strands ~19%); show the dead fraction climbing with LR while
+      LeakyReLU/GELU/Swish stay near 0 across the whole sweep — the cleanest
+      "dying ReLU is an LR pathology" curve. ~20-line wrapper over the landed
+      example's per-epoch dead-count helper.
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
@@ -888,6 +894,17 @@ breakdown:
       ChannelStdNorm.
 - [x] `examples/OptimizerBakeoff/` — SGD / SGD+momentum / Adam / RMSProp
       on a fixed toy dataset with a loss-vs-epoch table.
+- [ ] OptimizerBakeoff follow-up: a per-optimizer LR shoot-out. The landed
+      demo HOLDS LR fixed (0.05 SGD-family / 0.01 Adam-family) to isolate the
+      update rule, which leaves plain SGD stalling around 1e-1 while the
+      others converge — fair for "same LR, different rule" but not a tuned
+      comparison. Add a variant that sweeps a small LR grid per optimizer and
+      reports each at its OWN best LR, so the "with tuning, plain SGD also
+      converges" caveat in the README becomes a chart. Library note for the
+      builder: RMSProp is reached via the Adam path with Beta1=0
+      (InitAdam(0.0, beta2, eps) + CalcAdamDelta/UpdateWeightsAdam); plain
+      SGD/momentum is SetLearningRate(lr, inertia) + UpdateWeights — both
+      documented in examples/OptimizerBakeoff/README.md.
 <!-- (`examples/EmbeddingHeadDemo/` removed: duplicate of the landed
      `examples/TripletEmbedding/` example, which already learns a toy
      multi-class embedding with TNNetL2Normalize and prints the per-class
@@ -1030,6 +1047,14 @@ breakdown:
       converge. (Landed as examples/LossFamilyBakeoff/ — noisy hypotenuse with
       10% injected outliers, clean held-out test set; all four robust heads
       beat MSE on clean-test MSE/MAE.)
+- [ ] LossFamilyBakeoff follow-up: a multi-seed (e.g. 5 seeds, mean ± std)
+      variant so the ranking AMONG the robust heads is statistically
+      meaningful — the landed single-seed run cleanly separates MSE from the
+      robust group but the ordering within {Huber, SmoothL1, Charbonnier,
+      LogCosh} is seed-dependent (Huber == SmoothL1 at the default delta=1).
+      Sweep the outlier fraction / magnitude too, charting clean-test MSE vs
+      contamination level per head. Keep dims tiny so 5 seeds still fit the
+      <5-min budget. Mirrors the open GatedFFNBakeoff multi-seed follow-up.
 <!-- (TanhGLU vs SwiGLU vs GEGLU vs GLU vs ReGLU bake-off removed: completed,
      landed 2026-05-24 as examples/GatedFFNBakeoff/. Same FFN block
      (PointwiseConvLinear(2*d_ff) -> GATE -> PointwiseConvLinear(1)) built five
