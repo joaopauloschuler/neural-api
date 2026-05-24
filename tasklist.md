@@ -344,6 +344,16 @@ breakdown:
       helpers, less error-prone than open-coding TNNetReshape.
 - [X] TNNetLpPool — generalized pooling `(mean(|x|^p))^(1/p)` with
       configurable p.
+- [ ] TNNetLpPool follow-up: `p`-sweep bake-off experiment. Same tiny conv
+      classifier, swap the pooling for `TNNetLpPool` at `p ∈ {1, 2, 4, 8}`
+      plus an `TNNetAvgPool` (≡ p with abs, sort of) and `TNNetMaxPool`
+      (≡ p→∞) baseline, chart final loss/accuracy — shows the average↔max
+      interpolation empirically. Forward layer + gradient already landed.
+- [ ] TNNetSqueeze follow-up: the landed version always collapses to the
+      canonical `(1,1,N)` vector. Add a `Create(pAxis)` overload that drops
+      only a SPECIFIED unit axis (asserting that axis is size 1), the exact
+      single-axis inverse of `TNNetExpandDims(pAxis)`, leaving the other two
+      axes intact. Mirror the ExpandDims axis dispatch + round-trip test.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 
@@ -1048,6 +1058,13 @@ breakdown:
       naturally with the open lottery-ticket experiment under "Bake-off /
       experiment follow-ups" (LMC is the property that experiment implicitly
       relies on). Pure forward-only; weights are never stepped.
+- [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
+      separated verdict robust when the endpoint losses are near zero. As
+      landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
+      the same-basin run (barrier ~3e-5 on an endpoint loss ~3e-4) misreads
+      as "weak barrier" purely because the denominator is tiny. Add an
+      absolute-floor term (e.g. treat barriers below an absolute epsilon as
+      "connected" regardless of ratio) and re-pin the example's RUN 1 verdict.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
       label-free model selection) was simplified to a fresh-vs-trained contrast
