@@ -310,33 +310,6 @@ breakdown:
 - [ ] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
-- [X] TNNetTokenHistoryPenalty — a stateful **logit processor** for
-      autoregressive sampling that sits BETWEEN the model output and the
-      existing `TNNetSamplerBase` family (Greedy / TopK / TopP), NOT a new
-      sampler. It owns a per-token occurrence count over the tokens emitted
-      so far and rewrites the next-step logit volume in place before a
-      sampler reads it, implementing the three standard, distinct knobs the
-      downstream ../gpt-3-for-pascal generator currently has no way to apply:
-      (a) **repetition penalty** (Keskar et al. CTRL 2019) — divide a logit
-      by `r>1` if its token has appeared (`l := l/r` for `l>0`, `l := l*r`
-      for `l<0`, the sign-correct CTRL form so a penalty always lowers the
-      score); (b) **frequency penalty** — subtract `alpha_f * count[t]`
-      (scales with how OFTEN the token was used); (c) **presence penalty** —
-      subtract `alpha_p` once for any token used at least once (a flat
-      "encourage new tokens" push). Distinct from every `TNNetSampler*`
-      (those pick FROM a fixed logit distribution; this RESHAPES the
-      distribution using generation HISTORY the samplers never see) and from
-      `TNNetSoftCapping` / temperature (history-free, context-free squashes).
-      API sketch: `RegisterToken(tokenId)` after each emit, `ResetHistory`
-      for a fresh sequence, `Apply(Logits: TNNetVolume)` mutating in place;
-      lives in neuralvolume.pas next to the sampler classes so a caller does
-      `Penalty.Apply(Logits); tok := Sampler.GetToken(Logits);
-      Penalty.RegisterToken(tok)`. Headline tests: with all three knobs at
-      their no-op values (`r=1, alpha_f=alpha_p=0`) `Apply` leaves the volume
-      bit-for-bit unchanged; a single registered token's logit strictly
-      decreases under each knob; the sign-correct CTRL branch lowers both a
-      positive and a negative logit. A genuinely new generation capability,
-      not a re-skin of an existing sampler.
 - [ ] TNNetTokenHistoryPenalty follow-up: wire it into the downstream
       ../gpt-3-for-pascal generation loop (call `Apply` before the sampler
       and `RegisterToken` after each emit, `ResetHistory` per sequence) and
@@ -354,13 +327,6 @@ breakdown:
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
-- [X] TNNetWeightStandardization — normalize convolution weights per
-      output channel (zero-mean, unit-variance) before forward.
-      LANDED as a DENSE layer (subclass of TNNetFullConnectLinear that
-      standardizes its OWN weight vector per output neuron, exact Jacobian,
-      eps in FFloatSt[0]). Design note: a wrapper that mutates the PREVIOUS
-      layer's weights mid-forward was rejected as fragile (the prev layer
-      already ran Compute with raw weights).
 - [ ] TNNetWeightStandardization follow-up: a CONVOLUTION variant
       (standardize a conv layer's filters per output channel). The dense
       form landed; the conv form is the headline WS use case (Qiao et al.
@@ -437,13 +403,6 @@ breakdown:
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
-- [X] TNNetSoftPool follow-up: add an optional `beta` temperature to the
-      softmax weights (`w_i = exp(beta*x_i)/sum_j exp(beta*x_j)`) so
-      `beta -> inf` recovers max-pool and `beta -> 0` recovers avg-pool — a
-      single knob spanning the family. Store `beta` in `FFloatSt[0]`,
-      extend BOTH dispatch tables to `Create(St[0],St[1],St[2],Ft[0])`, and
-      add a `beta`-sweep gradient/limit test. Base layer landed (forward
-      `y=sum w_i x_i`, backward `dy/dx_i = w_i*(1+x_i-y)`, beta fixed at 1).
 - [ ] Pooling bake-off example `examples/PoolingBakeoff/`: same tiny conv
       classifier, swap the pooling head across `TNNetAvgPool` / `TNNetMaxPool`
       / `TNNetLpPool` (sweep `p ∈ {1, 2, 4, 8}`) / `TNNetSoftPool`, chart final
