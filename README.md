@@ -497,7 +497,7 @@ Unique pooling variants in the API:
 - TNNetMinMaxPool: Performs both max and min pooling and concatenates the results.
 - TNNetAvgMaxPool: Combines average and max pooling.
 - `TNNetLpPool`: generalized Lp pooling `y = ((1/N)·Σ|xᵢ|^p)^(1/p)` over each window, with a configurable real exponent `p` (`TNNetLpPool.Create(PoolSize, Stride, Padding, p)`, default `p=2`). `p=1` is mean-of-absolute-values, `p=2` is RMS pooling, and large `p` approaches max pooling — a single knob interpolating between average and max pooling. Its analytic backward pass `∂y/∂xᵢ = (y^(1-p)/N)·|xᵢ|^(p-1)·sign(xᵢ)` is numerically gradient-checked.
-- `TNNetSoftPool`: exponentially-weighted ("softmax") pooling (Stergiou, Poppe & Kalliatakis, 2021). Over each window it computes `wᵢ = exp(xᵢ)/Σⱼexp(xⱼ)` and `y = Σᵢ wᵢ·xᵢ` (`TNNetSoftPool.Create(PoolSize, Stride, Padding)`; window softmax stabilised by subtracting the window max). When one activation dominates `SoftPool → MaxPool`; when all activations are equal `SoftPool → AvgPool`. Unlike max pooling every cell receives gradient: its analytic backward pass `∂y/∂xᵢ = wᵢ·(1 + xᵢ − y)` is numerically gradient-checked.
+- `TNNetSoftPool`: exponentially-weighted ("softmax") pooling (Stergiou, Poppe & Kalliatakis, 2021). Over each window it computes `wᵢ = exp(β·xᵢ)/Σⱼexp(β·xⱼ)` and `y = Σᵢ wᵢ·xᵢ` (`TNNetSoftPool.Create(PoolSize, Stride, Padding, β)`, default `β=1`; window softmax stabilised by subtracting the window max). The optional inverse-temperature `β` is a single knob spanning the average↔max family: `β → ∞` recovers max pooling, `β → 0` recovers average pooling, and `β = 1` is the original SoftPool. Unlike max pooling every cell receives gradient: its analytic backward pass `∂y/∂xᵢ = wᵢ·(1 + β·(xᵢ − y))` is numerically gradient-checked across a `β` sweep.
 
 Backpropagation in pooling layers:
 During backpropagation, pooling layers distribute the gradient differently:
@@ -569,6 +569,7 @@ See the [Normalization cheat sheet](docs/normalization.md) for a side-by-side co
 | `TNNetGRN`                   | 2D or 3D                    | Global Response Normalization (ConvNeXt-V2, Woo et al. 2023). Channel-wise contrast normalization with learnable per-channel `gamma` and `beta` (both init 0, so identity at start): `Y = gamma * (X * Nx) + beta + X`, where `Nx[c] = ||X[:,:,c]||_2 / mean_c(||X[:,:,c']||_2)`. |
 | `TNNetZScore`                | 1D, 2D, or 3D               | Per-sample z-score normalization: `y = (x - mean) / sqrt(var + eps)`. No learnable parameters; the unparameterised core of `TNNetLayerNorm`. |
 | `TNNetDyT`                   | 1D, 2D, or 3D               | Dynamic Tanh (Liu et al. 2025): a normalization-free LayerNorm alternative `y[c] = gamma[c]·tanh(alpha·x) + beta[c]`, with a single layer-wide learnable `alpha` plus per-channel learnable `gamma` (init 1) and `beta` (init 0). No batch or per-sample statistics. Created with `TNNetDyT.Create()`. |
+| `TNNetWeightStandardization` | 1D                          | Weight-standardized dense layer (Qiao et al. 2019). A `TNNetFullConnectLinear` that standardizes each output neuron's weight vector to zero-mean, unit-variance (`ŵ = (w − μ)/sqrt(var + eps)`, biased variance) before the forward dot product. Smooths the loss landscape; pairs well with GroupNorm. The exact standardization Jacobian is propagated to the raw weights and is numerically gradient-checked. Created with `TNNetWeightStandardization.Create(Neurons[, eps])`. |
 | `TNNet.AddMovingNorm`        | 1D, 2D, or 3D               | Possible replacement for batch normalization.                                                        |
 | `TNNet.AddChannelMovingNorm` | 1D, 2D, or 3D               | Possible replacement for batch normalization, applied per channel.                                   |
 
@@ -1224,6 +1225,7 @@ This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tr
 
 In short, this API supports:
 * Samplers: `TNNetSamplerGreedy`, `TNNetSamplerTopK` and `TNNetSamplerTopP`.
+* A logit processor for repetition control: `TNNetTokenHistoryPenalty` — a stateful pre-sampler that reshapes the next-token logits in place using generation history, with three standard knobs (repetition penalty in the sign-correct CTRL form, frequency penalty, and presence penalty). Use it as `Penalty.Apply(Logits); tok := Sampler.GetToken(Logits); Penalty.RegisterToken(tok);`.
 * A tokenizer: `TNeuralTokenizer`.
 * A transformer decoder: `AddTransformerBlockCAI`.
 

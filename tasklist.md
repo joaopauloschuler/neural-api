@@ -303,7 +303,12 @@ breakdown:
       decreases under each knob; the sign-correct CTRL branch lowers both a
       positive and a negative logit. A genuinely new generation capability,
       not a re-skin of an existing sampler.
-#### Norm / regularization
+- [ ] TNNetTokenHistoryPenalty follow-up: wire it into the downstream
+      ../gpt-3-for-pascal generation loop (call `Apply` before the sampler
+      and `RegisterToken` after each emit, `ResetHistory` per sequence) and
+      show a qualitative before/after on a repetition-prone prompt — the
+      class landed this lucky-day batch (neuralvolume.pas, 7 tests in
+      tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
 - [ ] TNNetGatedResidual follow-up (now landed): a residual builder
       `AddGatedResidual(NN, Sublayer)` that wires
       `Sum([TNNetGatedResidual(Sublayer-output), branch-input])` — pairs with the
@@ -317,6 +322,17 @@ breakdown:
       to within fp tolerance is the headline test.
 - [X] TNNetWeightStandardization — normalize convolution weights per
       output channel (zero-mean, unit-variance) before forward.
+      LANDED as a DENSE layer (subclass of TNNetFullConnectLinear that
+      standardizes its OWN weight vector per output neuron, exact Jacobian,
+      eps in FFloatSt[0]). Design note: a wrapper that mutates the PREVIOUS
+      layer's weights mid-forward was rejected as fragile (the prev layer
+      already ran Compute with raw weights).
+- [ ] TNNetWeightStandardization follow-up: a CONVOLUTION variant
+      (standardize a conv layer's filters per output channel). The dense
+      form landed; the conv form is the headline WS use case (Qiao et al.
+      pair it with GroupNorm in a conv stack). Mirror the dense Jacobian
+      per output-channel filter. Pairs with a tiny WS+GroupNorm vs
+      BatchNorm CIFAR-stub bake-off.
 - [ ] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
       Convolution layer and divides its weight matrix by its largest
       singular value (one power-iteration step per forward pass).
@@ -399,6 +415,10 @@ breakdown:
       / `TNNetLpPool` (sweep `p ∈ {1, 2, 4, 8}`) / `TNNetSoftPool`, chart final
       loss/accuracy on a small CIFAR stub. Visualises the average<->max
       interpolation empirically. All four pooling layers are in tree.
+      NOW UNBLOCKED to also sweep `TNNetSoftPool` `beta ∈ {0.5, 1, 2, 8}`
+      (landed this lucky-day batch) as a fifth column — the SoftPool beta
+      knob spans the same average↔max family as LpPool's `p`, so the two
+      sweeps can be charted side by side.
 - [ ] TNNetAdaptiveMaxPool example/usage: a tiny demo showing the same conv
       stack accepting two different input resolutions and producing a
       fixed-size head via `TNNetAdaptiveMaxPool.Create(1)` (global-max head),
