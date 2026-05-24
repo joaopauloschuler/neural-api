@@ -236,6 +236,31 @@ breakdown:
       position t depends only on positions ≤ t. Backward is the standard
       conv backward minus the masked-future part. Pairs with TNNetTokenShift
       and unblocks attention-free baseline experiments. (Already possible with existing layers?)
+- [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
+      the single biggest efficiency gap for autoregressive generation with
+      the downstream ../gpt-3-for-pascal model. Today, sampling the next
+      token re-encodes the entire prefix every step, so generating N tokens
+      costs O(N^2) attention work. Add an inference-only mode that, given a
+      one-token query at position t, appends its K and V to a persistent
+      per-layer cache and attends over the cached keys/values [0..t] instead
+      of recomputing them — turning per-step cost from O(t) to O(1) in the
+      prefix length. Scope notes: (a) cache lives on the SDPA layer, gated by
+      an explicit BeginIncrementalDecode / EndIncrementalDecode (or a
+      FCacheEnabled flag) so the training forward/backward path is untouched
+      and bit-for-bit unchanged — the cache only activates for single-token
+      forward passes at inference; (b) RoPE/ALiBi position offsets must be
+      driven by the running cache length, not the (now length-1) input
+      SizeX, so positional encoding stays correct mid-stream; (c) provide a
+      ResetCache for starting a fresh sequence and document the max-context
+      preallocation. Headline correctness test, and a tiny
+      examples/IncrementalDecode/ demo: feed a SeqLen sequence two ways —
+      one full re-encode, and one token-at-a-time through the cached path —
+      and assert the final-position logits match to < 1e-5 (the built-in
+      faithfulness check), then print measured per-token wall-clock vs prefix
+      length to show the O(t)->O(1) flattening. Builds on the existing
+      AttentionWeights accessor and the MHA breakdown above
+      ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
+      genuinely new capability, not a re-skin of an existing layer.
 #### Norm / regularization
 - [ ] TNNetGatedResidual — per-channel zero-initialised learnable gate
       `y = x + alpha[c] * Sublayer(x)` (ReZero-with-channel-dim variant).
