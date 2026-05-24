@@ -347,41 +347,6 @@ breakdown:
       interpolation empirically. Forward layer + gradient already landed.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
-- [ ] TNNetSoftPool — exponentially-weighted ("softmax") pooling
-      (Stergiou, Poppe & Kalliatakis 2021, "Refining activation
-      downsampling with SoftPool"). Per channel, over each pooling window
-      `W`, the output is the activation-weighted average
-      `y = sum_{i in W} (exp(x_i) / sum_{j in W} exp(x_j)) * x_i` — a
-      smooth, fully-differentiable interpolation that sits *between*
-      `TNNetMaxPool` and `TNNetAvgPool`: it preserves more signal than
-      average pooling (large activations dominate) while staying
-      differentiable everywhere, unlike max-pool's hard argmax routing.
-      Genuinely distinct from every pooling layer already in tree or
-      proposed: `TNNetLpPool` uses `(sum|x|^p)^(1/p)` (a different family),
-      `TNNetStochasticPool` *samples* one cell, `TNNetMaxBlurPool` is
-      anti-aliased max, and the adaptive pools only change the output
-      *size*. The backward is the interesting part and the reason this is
-      worth shipping (not a re-skin): with softmax weights
-      `w_i = exp(x_i)/sum_j exp(x_j)`, the per-cell input gradient is
-      `dy/dx_i = w_i * (1 + x_i - y)`, so it carries a true input-dependent
-      Jacobian rather than max-pool's pass-one-through or avg-pool's uniform
-      `1/N`. Numerical-stabilise the window softmax by subtracting the
-      window max before `exp` (mirror the in-tree `TNNetSoftMax` guard).
-      Deliverables follow the layer-authoring checklist: constructor
-      (`PoolSize`, `Stride`, `Padding`, matching `TNNetPoolBase`),
-      Compute/Backpropagate in neuralnetwork.pas, CreateLayer dispatch +
-      LoadFromString round-trip, and a numerical-gradient test on a small
-      shape (e.g. 4x4x2, PoolSize 2). Built-in correctness checks the repo
-      style favours: as one cell's activation grows large relative to its
-      window the output -> that cell (SoftPool -> MaxPool limit), and when
-      all cells in a window are equal the output equals their common value
-      (SoftPool -> AvgPool limit) with gradient `1/N` per cell. Optional
-      follow-up once landed: a `p`-style temperature `beta` on the softmax
-      (`w_i = exp(beta*x_i)/...`) so `beta -> inf` recovers max and
-      `beta -> 0` recovers average — a single knob spanning the family,
-      and a tiny pooling bake-off example contrasting Soft/Avg/Max on a
-      small CIFAR stub.
-
 ### Loss layers
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.

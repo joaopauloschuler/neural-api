@@ -31,6 +31,9 @@ type
     procedure TestLpPoolGradientCheckP2;
     procedure TestLpPoolGradientCheckP3;
     procedure TestLpPoolLoadFromString;
+    procedure TestSoftPoolGradientCheck;
+    procedure TestSoftPoolAvgLimit;
+    procedure TestSoftPoolLoadFromString;
     procedure TestAdaptiveAvgPoolForward;
     procedure TestAdaptiveAvgPoolGlobalAndIdentity;
     procedure TestAdaptiveAvgPoolGradientCheck;
@@ -3855,6 +3858,84 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('LpPool round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPoolGradientCheck;
+begin
+  // TNNetSoftPool: activation-weighted (softmax) average over each 2x2 window.
+  // The analytic per-cell gradient dy/dx_i = w_i * (1 + x_i - y) must match a
+  // central-difference numerical gradient. The Sin-seeded inputs keep every
+  // window exp-sum well above the guard threshold.
+  LayerInputGradientCheck(Self, TNNetSoftPool.Create(2),
+    'SoftPool', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPoolAvgLimit;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+const
+  cConst = 1.7;
+begin
+  // SoftPool -> AvgPool limit: when every cell in a window is EQUAL, all
+  // soft-weights equal 1/N and the output equals that constant.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    NN.AddLayer(TNNetSoftPool.Create(2));
+    Input.Fill(cConst);
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SoftPool avg-limit output at ' + IntToStr(i),
+        cConst, NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPoolLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net containing TNNetSoftPool. SaveToString -> LoadFromString
+  // -> SaveToString must be byte-identical, proving the integer pool params
+  // (FStruct[0..2]) survive both dispatch points.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    NN.AddLayer(TNNetSoftPool.Create(2));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('SoftPool round-trip class identity',
+        NN2.GetLastLayer is TNNetSoftPool);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('SoftPool SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SoftPool round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;

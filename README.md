@@ -491,6 +491,7 @@ Unique pooling variants in the API:
 - TNNetMinMaxPool: Performs both max and min pooling and concatenates the results.
 - TNNetAvgMaxPool: Combines average and max pooling.
 - `TNNetLpPool`: generalized Lp pooling `y = ((1/N)·Σ|xᵢ|^p)^(1/p)` over each window, with a configurable real exponent `p` (`TNNetLpPool.Create(PoolSize, Stride, Padding, p)`, default `p=2`). `p=1` is mean-of-absolute-values, `p=2` is RMS pooling, and large `p` approaches max pooling — a single knob interpolating between average and max pooling. Its analytic backward pass `∂y/∂xᵢ = (y^(1-p)/N)·|xᵢ|^(p-1)·sign(xᵢ)` is numerically gradient-checked.
+- `TNNetSoftPool`: exponentially-weighted ("softmax") pooling (Stergiou, Poppe & Kalliatakis, 2021). Over each window it computes `wᵢ = exp(xᵢ)/Σⱼexp(xⱼ)` and `y = Σᵢ wᵢ·xᵢ` (`TNNetSoftPool.Create(PoolSize, Stride, Padding)`; window softmax stabilised by subtracting the window max). When one activation dominates `SoftPool → MaxPool`; when all activations are equal `SoftPool → AvgPool`. Unlike max pooling every cell receives gradient: its analytic backward pass `∂y/∂xᵢ = wᵢ·(1 + xᵢ − y)` is numerically gradient-checked.
 
 Backpropagation in pooling layers:
 During backpropagation, pooling layers distribute the gradient differently:
