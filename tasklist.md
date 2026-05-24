@@ -216,6 +216,16 @@ breakdown:
       (c) RoPE, (d) ALiBi, printing final loss and a sample generation
       per scheme. All four are in tree.
       (landed: examples/PositionEncodingBakeoff/)
+- [ ] Position-encoding bake-off follow-up: the landed bake-off uses a
+      predict-the-PREVIOUS-token task on which ALiBi lands just above the
+      no-position baseline — a single head's `2^-8` slope is a weak recency
+      bias that under the causal mask favours the query's own position and
+      injects NO positional content into the values, so it cannot do
+      fixed-offset (-1) retrieval. Add an ALiBi-FAVOURABLE second task
+      (a long-context recency / "attend-to-the-nearest-recent-match" task)
+      and/or a multi-head variant with per-head slopes `2^(-8h/H)`, so the
+      arm where ALiBi's locality prior actually wins is also demonstrated.
+      Pairs with the open "ALiBi slope-base sweep" entry.
 - [ ] Causal-mask sanity experiment: train a tiny attention model on
       next-token prediction WITH and WITHOUT TNNetMaskedFill, and show
       the unmasked one cheats (near-zero loss but useless at generation).
@@ -801,6 +811,10 @@ breakdown:
       replacing a stride-2 conv on a tiny CIFAR stub.
 - [ ] `examples/PreNormVsPostNorm/` — toy sequence task with the same
       sublayer wired through PreNorm vs PostNorm builders.
+      NOW UNBLOCKED: the `TNNet.AddPreNormResidual` / `AddRMSNormResidual` /
+      `AddPostNormResidual` builders landed this batch, so this example is a
+      direct three-way builder swap on a tiny deepish residual stack (chart
+      training stability / final loss across PreNorm vs PostNorm vs RMSNorm).
 - [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a tiny-MNIST
       subset (or synthetic 2D classification).
 - [ ] `examples/ModelSummaryDemo/` — three networks printed via
