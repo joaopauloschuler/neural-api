@@ -1015,6 +1015,50 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
+- [ ] TNNet.HessianCurvatureReport(NN, Samples [, NumProbes, Eps]) — a
+      *loss-surface curvature* diagnostic built on Hessian-vector products
+      (HVPs) estimated by finite-differencing the gradient
+      (`H v ~= (grad L(theta + eps*v) - grad L(theta - eps*v)) / (2*eps)`), so
+      no second-order autograd is needed: it reuses the existing whole-batch
+      forward+backward gradient machinery and the exact
+      `SaveDataToString`/`LoadDataFromString` weight snapshot/restore pattern
+      that [[LayerSensitivityReport]] already uses to perturb and restore
+      weights bit-for-bit between probes. On a frozen net (`ClearDeltas`
+      before each pass, never `UpdateWeights`) it reports two classic
+      sharpness numbers the repo currently can't produce: (1) the **Hessian
+      trace** `tr(H) = E_v[v^T H v]` via the Hutchinson estimator over
+      `NumProbes` (default 16) Rademacher (+/-1) probe vectors `v` — the *mean*
+      curvature averaged over all directions; and (2) the **top Hessian
+      eigenvalue** `lambda_max(H)` via a few power-iteration steps on the HVP
+      operator (the canonical flat-vs-sharp-minimum metric, Keskar et al. 2017
+      / Foret et al. SAM 2021). It prints `tr(H)`, `lambda_max`, the
+      curvature-concentration ratio `lambda_max / (tr(H)/N_params)` (how
+      dominant the sharpest direction is), a per-trainable-layer trace
+      breakdown (which layers carry the curvature — restrict each HVP
+      dot-product to one layer's parameter slab), a 10-bin ASCII histogram of
+      the per-probe `v^T H v` samples (Hutchinson spread = estimator noise),
+      and a flat / moderate / sharp verdict thresholded on `lambda_max`.
+      Built-in correctness checks: a purely linear net with an MSE head has a
+      constant Hessian, so `tr(H)` must be probe-count-independent (re-running
+      with 2x NumProbes returns the same value within Hutchinson noise), and
+      `lambda_max <= tr(H)` must hold in the PSD Gauss-Newton regime. Reuses
+      the power-iteration idea behind [[WeightSpectrumReport]]'s
+      `TNNet.EstimateSpectralNorm` but applied to the *loss* HVP operator
+      rather than a weight matrix. Distinct from [[LossLandscapeProbe]] (a
+      *single* filter-normalised 1D slice — one direction's second difference;
+      this aggregates curvature over many random directions and isolates the
+      sharpest one), from `TNNet.WeightSpectrumReport` (top singular value of
+      each *weight matrix* W, a parameter-space quantity unrelated to the
+      *loss* Hessian), and from [[FisherImportanceReport]] (diagonal empirical
+      `E[g^2]`, an outer-product Gauss-Newton approximation, not the true HVP
+      curvature). Companion `examples/HessianCurvature/` trains the same tiny
+      MLP twice — once with a small batch + high LR (sharp minimum) and once
+      with a large batch + low LR / mild weight decay (flat minimum) — and
+      prints both reports so the `lambda_max` gap the generalization
+      literature ties to sharpness is visible on a pure-CPU toy. Add a
+      `TestHessianCurvatureReportSmoke` pinning the linear-net
+      probe-count-independence invariant and a nil-NN graceful return. Weights
+      are never stepped (a measurement, not training).
 - [ ] TNNet.GradientNoiseScaleReport(NN, Samples [, LayerIdx]) — the
       *gradient signal-to-noise* diagnostic that analytically PREDICTS the
       already-open "batch-size sweep" experiment (McCandlish et al. 2018,
