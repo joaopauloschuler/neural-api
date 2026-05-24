@@ -1163,6 +1163,54 @@ breakdown:
       Pairs naturally with the active-learning queue use of
       [[MCDropoutUncertaintyReport]] and the hard-example pools of
       `TopLogitMarginReport` / `ConfusionMatrixReport`.
+- [ ] TNNet.LogitLensReport(NN, Probes [, HeadStartIdx]) — the **logit-lens**
+      diagnostic (nostalgebraist 2020; "Tuned Lens", Belrose et al. 2023),
+      answering a question none of the landed reports answer: *"if we read out
+      the prediction at THIS layer using the network's OWN trained output head,
+      what would it already say?"* — the model's running, self-decoded belief at
+      each depth, using ZERO fitted parameters. The recipe is forward-only: run
+      one forward pass over an unlabelled probe batch, identify the trailing
+      "head" sub-stack (the layers from `HeadStartIdx` to the output — default:
+      the last trainable layer plus any pure activation/softmax tail, i.e. the
+      classifier readout), then for every EARLIER layer whose flattened
+      activation is shape-compatible with the head's expected input, splice that
+      activation into the head and recompute ONLY the head layers to obtain a
+      per-layer "lens distribution" `p_L`. It reports: the per-layer agreement
+      rate `mean_x[argmax(p_L) == argmax(p_final)]` as an ASCII bar chart across
+      depth; the **crystallization depth** (shallowest layer after which the
+      lens argmax matches the final argmax and never flips again — the depth at
+      which the answer is effectively decided, a per-batch-mean and a 10-bin
+      per-sample histogram); the per-layer mean top-1 confidence and lens
+      entropy (the readout sharpens with depth); and the per-layer
+      `KL(p_L || p_final)` curve (monotone decrease = the residual stream
+      incrementally refining toward the final answer — the headline logit-lens
+      picture). Layers whose flat size does NOT match the head input are
+      explicitly listed as SKIPPED (the honest constraint: the classic lens
+      needs width-compatibility), with an optional `Project` flag reusing the
+      deterministic random-projection trick from [[LinearProbeReport]] to force
+      a fit and a note that projected lenses are heuristic. Built-in correctness
+      checks: applying the lens AT `HeadStartIdx` reproduces `p_final` exactly
+      (agreement 1.0, KL 0) since no recompute substitution happens there, and a
+      single-layer head degenerates to the trivial "everything resolves at the
+      last layer" profile. **Distinct from** [[LinearProbeReport]] (which FITS a
+      fresh ridge probe per layer via a closed-form solve and reports what a NEW
+      linear classifier COULD extract — the lens fits NOTHING and reuses the
+      model's OWN trained head, so it measures the model's self-belief, not the
+      layer's linear decodability), from `PredictionDepthReport` (k-NN vote
+      against a labelled support set — a non-parametric neighbour vote, not the
+      model's own readout), from `FeatureSeparabilityReport` (label-aware
+      cluster geometry, no readout at all), and from `ActivationPatchingReport`
+      (causal cross-input activation swaps, not a same-input depth-wise readout).
+      Follows the [[introspection-report-pattern]]: declaration + impl in
+      neuralnetwork.pas, an `examples/LogitLens/` demo on a small classifier
+      whose body keeps a constant width into the head (so most layers are
+      lens-compatible) contrasting fresh-init (agreement stays near chance until
+      the very last layer, flat KL) vs trained (agreement climbs with depth, KL
+      falls monotonically, crystallization depth moves earlier) in one run, and a
+      smoke test in tests/ (non-empty report, expected header, nil-NN graceful
+      return, plus the lens-at-HeadStartIdx-reproduces-final agreement/KL==0
+      assertion). Pairs with [[WeightSpectrumReport]] / the grokking experiment
+      to watch the crystallization depth shift at a representational transition.
 - [ ] ActivationPatchingReport follow-up (now landed): the report and example
       shipped, but a KEY finding emerged — on a strictly FEEDFORWARD stack,
       whole-layer patching + downstream recompute lands on the clean-class
