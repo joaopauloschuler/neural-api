@@ -103,6 +103,9 @@ type
     procedure TestRMSNormGatedForward;
     procedure TestRMSNormGatedGradientCheck;
     procedure TestRMSNormGatedSerializationRoundTrip;
+    procedure TestSwitchableNormForward;
+    procedure TestSwitchableNormGradientCheck;
+    procedure TestSwitchableNormSerializationRoundTrip;
     procedure TestZScoreForward;
     procedure TestZScoreGradientCheck;
     procedure TestZScoreVsLayerNormEquivalence;
@@ -2417,6 +2420,179 @@ begin
       analyticalGrad := -RNorm.Neurons[0].Delta.Raw[i];
 
       AssertTrue('RMSNormGated gate-logit gradient check (' + IntToStr(i) +
+        ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSwitchableNormForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SNorm: TNNetSwitchableNorm;
+  L, R, Mean, Variance, MeanSqr, invStd, invRMS, aLN, aRMS, expected: TNeuralFloat;
+  i: integer;
+begin
+  // At init both mixing logits are 0, so softmax gives a_ln = a_rms = 0.5.
+  // The output must therefore be exactly 0.5*L + 0.5*R, where L is the
+  // LayerNorm-normalized input and R the RMSNorm-normalized input.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 2));
+    SNorm := TNNetSwitchableNorm.Create();
+    NN.AddLayer(SNorm);
+
+    // Default mixing logits are 0 and there are exactly 2 of them.
+    AssertEquals('SwitchableNorm weight count == 2', 2,
+      SNorm.Neurons[0].Weights.Size);
+    for i := 0 to SNorm.Neurons[0].Weights.Size - 1 do
+      AssertEquals('SwitchableNorm init logit ' + IntToStr(i), 0.0,
+        SNorm.Neurons[0].Weights.Raw[i], 1e-7);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := i * 1.5 - 3.0;
+
+    NN.Compute(Input);
+
+    // Compute the expected 0.5*L + 0.5*R independently.
+    Mean := 0;
+    for i := 0 to Input.Size - 1 do Mean := Mean + Input.Raw[i];
+    Mean := Mean / Input.Size;
+    Variance := 0;
+    MeanSqr := 0;
+    for i := 0 to Input.Size - 1 do
+    begin
+      Variance := Variance + Sqr(Input.Raw[i] - Mean);
+      MeanSqr := MeanSqr + Sqr(Input.Raw[i]);
+    end;
+    Variance := Variance / Input.Size;
+    MeanSqr := MeanSqr / Input.Size;
+    invStd := 1 / Sqrt(Variance + 1e-5);
+    invRMS := 1 / Sqrt(MeanSqr + 1e-5);
+    aLN := 0.5;
+    aRMS := 0.5;
+    for i := 0 to Input.Size - 1 do
+    begin
+      L := (Input.Raw[i] - Mean) * invStd;
+      R := Input.Raw[i] * invRMS;
+      expected := aLN * L + aRMS * R;
+      AssertEquals('SwitchableNorm 50/50 blend at ' + IntToStr(i), expected,
+        NN.GetLastLayer.Output.Raw[i], 1e-4);
+    end;
+
+    // Drive the LayerNorm logit to dominate -> output should match pure L.
+    SNorm.Neurons[0].Weights.Raw[0] := 30.0;
+    SNorm.Neurons[0].Weights.Raw[1] := 0.0;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      L := (Input.Raw[i] - Mean) * invStd;
+      AssertEquals('SwitchableNorm LN-dominant at ' + IntToStr(i), L,
+        NN.GetLastLayer.Output.Raw[i], 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSwitchableNormGradientCheck;
+// Central-difference numerical gradient check for TNNetSwitchableNorm. Verifies
+// (a) the input gradient (which couples all sample elements through BOTH the
+// LayerNorm and RMSNorm input Jacobians) and (b) the two mixing-logit
+// gradients (LayerNorm logit and RMSNorm logit), pushed through the softmax
+// Jacobian. Standard tolerance 1e-2.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  SNorm: TNNetSwitchableNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, w0: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    SNorm := TNNetSwitchableNorm.Create();
+    NN.AddLayer(SNorm);
+    // Learning rate 1, batch update on: deltas accumulate -1*gradient and
+    // weights are NOT modified, so finite-difference checks stay valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial mixing logits so the softmax is away from the symmetric point.
+    SNorm.Neurons[0].Weights.Raw[0] := 0.8;
+    SNorm.Neurons[0].Weights.Raw[1] := -0.4;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SwitchableNorm input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the two mixing logits [w_ln, w_rms] ----
+    for i := 0 to SNorm.Neurons[0].Weights.Size - 1 do
+    begin
+      w0 := SNorm.Neurons[0].Weights.Raw[i];
+      SNorm.Neurons[0].Weights.Raw[i] := w0 + epsilon;
+      lossPlus := ComputeLoss(Input);
+      SNorm.Neurons[0].Weights.Raw[i] := w0 - epsilon;
+      lossMinus := ComputeLoss(Input);
+      SNorm.Neurons[0].Weights.Raw[i] := w0;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      SNorm.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // Backprop accumulates Delta := Delta - LearningRate*gradient.
+      // With LearningRate = 1, analytical gradient = -Delta.
+      analyticalGrad := -SNorm.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('SwitchableNorm mixing-logit gradient check (' + IntToStr(i) +
         ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
@@ -9887,6 +10063,15 @@ begin
   // non-trivial.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetRMSNormGated.Create(), 'RMSNormGated', 3, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSwitchableNormSerializationRoundTrip;
+begin
+  // The two mixing logits (FNeurons[0], exactly 2 weights) survive
+  // CreateLayer/LoadFromString; the perturbed-weight helper pushes them off the
+  // default 0 so the softmax blend is non-trivial.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSwitchableNorm.Create(), 'SwitchableNorm', 3, 2, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPixelNormSerializationRoundTrip;

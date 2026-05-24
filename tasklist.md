@@ -287,7 +287,7 @@ breakdown:
       across channels.
 - [X] (done, lucky-day 2026-05-24) TNNetRMSNormGated — RMSNorm
       followed by a learnable per-channel sigmoid gate.
-- [ ] (in progress, lucky-day 2026-05-24) TNNetSwitchableNorm — learnable
+- [X] (done, lucky-day 2026-05-24) TNNetSwitchableNorm — learnable
       softmax-weighted combination of LayerNorm and RMSNorm outputs.
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip

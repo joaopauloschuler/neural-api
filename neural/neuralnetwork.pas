@@ -2471,6 +2471,48 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Switchable Normalization: a learnable SOFTMAX-WEIGHTED CONVEX COMBINATION
+  // of a LayerNorm-style and an RMSNorm-style normalization of the SAME input.
+  // Two learnable scalar logits w_ln, w_rms are softmaxed into mixing weights
+  //   (a_ln, a_rms) = softmax(w_ln, w_rms)  (a_ln + a_rms = 1, both >= 0).
+  // Both normalizations are taken PER-SAMPLE over the whole sample (all
+  // SizeX*SizeY*Depth elements), matching the TNNetLayerNorm / TNNetRMSNorm
+  // conventions and eps defaults (eps = 1e-5):
+  //   L[x,y,d] = (x - mean) / sqrt(var + eps)       (LayerNorm normalization)
+  //   R[x,y,d] = x / sqrt(mean(x^2) + eps)          (RMSNorm normalization)
+  // Output:
+  //   y[x,y,d] = a_ln * L[x,y,d] + a_rms * R[x,y,d].
+  // There is NO per-element affine gamma/beta on top: the ONLY learnable
+  // parameters are the two scalar mixing logits w_ln, w_rms. Both logits are
+  // initialised to 0, so at init softmax gives a_ln = a_rms = 0.5 and an
+  // untrained layer is an exact 50/50 blend of LayerNorm and RMSNorm.
+  // Backward:
+  //   input error: dx = (LayerNorm input-Jacobian applied to a_ln*OutputError)
+  //                   + (RMSNorm  input-Jacobian applied to a_rms*OutputError),
+  //                summed (reusing each layer's exact Backpropagate Jacobian).
+  //   weight grads: dL/da_ln  = sum_all(OutputError .* L),
+  //                 dL/da_rms = sum_all(OutputError .* R), then pushed through
+  //                 the 2-logit softmax Jacobian (d a_i / d w_j =
+  //                 a_i*(delta_ij - a_j)) to get dL/dw_ln, dL/dw_rms.
+  // Storage: FNeurons[0].Weights = the two logits [w_ln, w_rms].
+  TNNetSwitchableNorm = class(TNNetChannelTransformBase)
+    private
+      FNormEpsilon: TNeuralFloat;
+      FInvStdDev: TNeuralFloat;       // LayerNorm 1/sqrt(var+eps)
+      FInvRMS: TNeuralFloat;          // RMSNorm 1/sqrt(mean(x^2)+eps)
+      FMean: TNeuralFloat;            // LayerNorm sample mean (for reference)
+      FNormLN: TNNetVolume;           // cached L (LayerNorm-normalized)
+      FNormRMS: TNNetVolume;          // cached R (RMSNorm-normalized)
+      FTmp: TNNetVolume;              // scratch for backward
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Global Response Normalization (ConvNeXt-V2, Woo et al. 2023,
   /// https://arxiv.org/abs/2301.00808). Channel-wise contrast normalization
   /// with two learnable per-channel parameters gamma[c] and beta[c]:
@@ -19031,6 +19073,185 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
   FNeurons[0].FWeights.Fill(0); // gate logits g[d] -> sigmoid(0) = 0.5
+  AfterWeightUpdate();
+end;
+
+{ TNNetSwitchableNorm }
+constructor TNNetSwitchableNorm.Create();
+begin
+  inherited Create();
+  FNormEpsilon := 1e-5;
+  FInvStdDev := 1;
+  FInvRMS := 1;
+  FMean := 0;
+  FNormLN := TNNetVolume.Create();
+  FNormRMS := TNNetVolume.Create();
+  FTmp := TNNetVolume.Create();
+  InitDefault();
+end;
+
+destructor TNNetSwitchableNorm.Destroy();
+begin
+  FTmp.Free;
+  FNormRMS.Free;
+  FNormLN.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSwitchableNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base allocates FNeurons[0]; we need exactly 2 weights total: the two
+  // mixing logits [w_ln, w_rms].
+  SetNumWeightsForAllNeurons(1, 1, 2);
+  FNormLN.ReSize(FOutput);
+  FNormRMS.ReSize(FOutput);
+  FTmp.ReSize(FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetSwitchableNorm.Compute();
+var
+  StartTime: double;
+  W: TNNetVolume;
+  Mean, Variance, MeanSqr, MaxLogit, ExpLN, ExpRMS, aLN, aRMS: TNeuralFloat;
+  Cnt, SizeM1: integer;
+begin
+  StartTime := Now();
+  inherited Compute;
+  SizeM1 := FOutput.Size - 1;
+
+  // --- LayerNorm-style normalization L = (x - mean)/sqrt(var + eps) ---
+  Mean := FOutput.GetAvg();
+  FMean := Mean;
+  FNormLN.Copy(FOutput);
+  FNormLN.Sub(Mean);
+  Variance := FNormLN.GetSumSqr() / FNormLN.Size;
+  FInvStdDev := 1 / Sqrt(Variance + FNormEpsilon);
+  FNormLN.Mul(FInvStdDev);
+
+  // --- RMSNorm-style normalization R = x / sqrt(mean(x^2) + eps) ---
+  MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
+  FInvRMS := 1 / Sqrt(MeanSqr + FNormEpsilon);
+  FNormRMS.Copy(FOutput);
+  FNormRMS.Mul(FInvRMS);
+
+  // --- softmax over the two mixing logits [w_ln, w_rms] ---
+  W := FNeurons[0].FWeights;
+  if W.Raw[0] > W.Raw[1] then MaxLogit := W.Raw[0] else MaxLogit := W.Raw[1];
+  ExpLN  := Exp(W.Raw[0] - MaxLogit);
+  ExpRMS := Exp(W.Raw[1] - MaxLogit);
+  aLN  := ExpLN  / (ExpLN + ExpRMS);
+  aRMS := ExpRMS / (ExpLN + ExpRMS);
+
+  // --- output: y = a_ln * L + a_rms * R ---
+  for Cnt := 0 to SizeM1 do
+    FOutput.FData[Cnt] := aLN * FNormLN.FData[Cnt] + aRMS * FNormRMS.FData[Cnt];
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSwitchableNorm.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  W: TNNetVolume;
+  FloatSize, MaxLogit, ExpLN, ExpRMS, aLN, aRMS: TNeuralFloat;
+  SumDxHat, SumDxHatXHat, DxHat: TNeuralFloat;
+  gradALN, gradARMS, gradWLN, gradWRMS: TNeuralFloat;
+  Cnt, SizeM1: integer;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  W := localNeuron.FWeights;
+  FloatSize := FOutput.Size;
+  SizeM1 := FOutput.Size - 1;
+
+  // Recompute the softmax mixing weights (same as Compute).
+  if W.Raw[0] > W.Raw[1] then MaxLogit := W.Raw[0] else MaxLogit := W.Raw[1];
+  ExpLN  := Exp(W.Raw[0] - MaxLogit);
+  ExpRMS := Exp(W.Raw[1] - MaxLogit);
+  aLN  := ExpLN  / (ExpLN + ExpRMS);
+  aRMS := ExpRMS / (ExpLN + ExpRMS);
+
+  // ---- Gradient w.r.t. the two mixing logits ----
+  // dL/da_ln  = sum_all(OutputError .* L), dL/da_rms = sum_all(OutputError .* R)
+  gradALN := 0;
+  gradARMS := 0;
+  for Cnt := 0 to SizeM1 do
+  begin
+    gradALN  := gradALN  + FOutputError.FData[Cnt] * FNormLN.FData[Cnt];
+    gradARMS := gradARMS + FOutputError.FData[Cnt] * FNormRMS.FData[Cnt];
+  end;
+  // Push through the 2-logit softmax Jacobian d a_i / d w_j = a_i*(delta_ij-a_j):
+  //   dL/dw_ln  = a_ln *(gradALN - (a_ln*gradALN + a_rms*gradARMS))
+  //   dL/dw_rms = a_rms*(gradARMS - (a_ln*gradALN + a_rms*gradARMS))
+  gradWLN  := aLN  * (gradALN  - (aLN * gradALN + aRMS * gradARMS));
+  gradWRMS := aRMS * (gradARMS - (aLN * gradALN + aRMS * gradARMS));
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] + (-FLearningRate) * gradWLN;
+  localNeuron.FDelta.Raw[1] := localNeuron.FDelta.Raw[1] + (-FLearningRate) * gradWRMS;
+
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // --- LayerNorm input-Jacobian applied to (a_ln * OutputError) ---
+    // dxhat = a_ln * OutputError (LayerNorm has no per-element gamma here)
+    // dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
+    SumDxHat := 0;
+    SumDxHatXHat := 0;
+    for Cnt := 0 to SizeM1 do
+    begin
+      DxHat := aLN * FOutputError.FData[Cnt];
+      FTmp.FData[Cnt] := DxHat;
+      SumDxHat := SumDxHat + DxHat;
+      SumDxHatXHat := SumDxHatXHat + DxHat * FNormLN.FData[Cnt];
+    end;
+    SumDxHat := SumDxHat / FloatSize;
+    SumDxHatXHat := SumDxHatXHat / FloatSize;
+    for Cnt := 0 to SizeM1 do
+      FPrevLayer.FOutputError.FData[Cnt] :=
+        FPrevLayer.FOutputError.FData[Cnt] +
+        FInvStdDev * ( FTmp.FData[Cnt] - SumDxHat -
+          FNormLN.FData[Cnt] * SumDxHatXHat );
+
+    // --- RMSNorm input-Jacobian applied to (a_rms * OutputError), summed in ---
+    // dxhat = a_rms * OutputError
+    // dx = invRMS * ( dxhat - xhat * mean(dxhat*xhat) )
+    SumDxHatXHat := 0;
+    for Cnt := 0 to SizeM1 do
+    begin
+      DxHat := aRMS * FOutputError.FData[Cnt];
+      FTmp.FData[Cnt] := DxHat;
+      SumDxHatXHat := SumDxHatXHat + DxHat * FNormRMS.FData[Cnt];
+    end;
+    SumDxHatXHat := SumDxHatXHat / FloatSize;
+    for Cnt := 0 to SizeM1 do
+      FPrevLayer.FOutputError.FData[Cnt] :=
+        FPrevLayer.FOutputError.FData[Cnt] +
+        FInvRMS * ( FTmp.FData[Cnt] -
+          FNormRMS.FData[Cnt] * SumDxHatXHat );
+  end;
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSwitchableNorm.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].FWeights.Fill(0); // logits [w_ln, w_rms]=0 -> softmax 50/50 blend
   AfterWeightUpdate();
 end;
 
@@ -38894,6 +39115,7 @@ begin
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetRMSNormGated':          Result := TNNetRMSNormGated.Create();
+      'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
       'TNNetPixelNorm':             Result := TNNetPixelNorm.Create();
       'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
@@ -39152,6 +39374,7 @@ begin
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetRMSNormGated' then Result := TNNetRMSNormGated.Create() else
+      if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
       if S[0] = 'TNNetPixelNorm' then Result := TNNetPixelNorm.Create() else
       if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
