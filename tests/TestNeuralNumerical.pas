@@ -421,6 +421,12 @@ type
     procedure TestL2NormalizeUnitNorm;
     procedure TestL2NormalizeGradientCheck;
     procedure TestL2NormalizeSerializationRoundTrip;
+    procedure TestL2NormalizeFullVolumeUnitNorm;
+    procedure TestL2NormalizeFullVolumeGradientCheck;
+    procedure TestL2NormalizeFullVolumeSerializationRoundTrip;
+    procedure TestUnitNormForward;
+    procedure TestUnitNormGradientCheck;
+    procedure TestUnitNormSerializationRoundTrip;
     procedure TestMinMaxNormForward;
     procedure TestMinMaxNormGradientCheck;
     procedure TestMinMaxNormSerializationRoundTrip;
@@ -10528,6 +10534,142 @@ begin
       AssertEquals('L2Normalize round-trip class name',
         'TNNetL2Normalize', NN2.GetLastLayer.ClassName);
       AssertEquals('L2Normalize round-trip structure preserves epsilon',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizeFullVolumeUnitNorm;
+const
+  SizeX = 3;
+  SizeY = 2;
+  Depth = 5;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntD: integer;
+  Sum: TNeuralFloat;
+begin
+  // Full-volume mode (axis 1): the WHOLE flattened sample must have L2 norm 1.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetL2Normalize.Create(1));
+    RandSeed := 12345;
+    for CntD := 0 to Input.Size - 1 do
+      Input.Raw[CntD] := Sin(CntD * 0.37) * 2.5 + 0.4;
+    NN.Compute(Input);
+    Sum := 0;
+    for CntD := 0 to NN.GetLastLayer.Output.Size - 1 do
+      Sum := Sum + NN.GetLastLayer.Output.Raw[CntD] *
+                   NN.GetLastLayer.Output.Raw[CntD];
+    AssertEquals('L2Normalize full-volume ||y||^2=1 over whole sample',
+      1.0, Sum, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizeFullVolumeGradientCheck;
+begin
+  // Exact Jacobian for full-volume reduction (axis 1).
+  LayerInputGradientCheck(Self, TNNetL2Normalize.Create(1),
+    'L2NormalizeFullVolume', 2, 1, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizeFullVolumeSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // Exercise the FStruct[0] (axis) round-trip with the NON-default value 1,
+  // alongside a non-default epsilon.
+  SerializationRoundTrip(Self, TNNetL2Normalize.Create(1, 1e-5),
+    'L2NormalizeFullVolume', 3, 1, 4, 1e-5);
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetL2Normalize.Create(1, 2.5e-4));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('L2Normalize full-volume round-trip class name',
+        'TNNetL2Normalize', NN2.GetLastLayer.ClassName);
+      AssertEquals('L2Normalize full-volume round-trip preserves axis+epsilon',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestUnitNormForward;
+const
+  SizeX = 3;
+  SizeY = 2;
+  Depth = 5;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntD: integer;
+  Sum: TNeuralFloat;
+begin
+  // TNNetUnitNorm normalizes the whole flattened sample to unit L2 norm.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetUnitNorm.Create());
+    RandSeed := 12345;
+    for CntD := 0 to Input.Size - 1 do
+      Input.Raw[CntD] := Sin(CntD * 0.37) * 2.5 + 0.4;
+    NN.Compute(Input);
+    Sum := 0;
+    for CntD := 0 to NN.GetLastLayer.Output.Size - 1 do
+      Sum := Sum + NN.GetLastLayer.Output.Raw[CntD] *
+                   NN.GetLastLayer.Output.Raw[CntD];
+    AssertEquals('UnitNorm ||y||^2=1 over whole sample', 1.0, Sum, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestUnitNormGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetUnitNorm.Create(),
+    'UnitNorm', 2, 1, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestUnitNormSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  SerializationRoundTrip(Self, TNNetUnitNorm.Create(),
+    'UnitNorm', 3, 1, 4, 1e-5);
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetUnitNorm.Create());
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('UnitNorm round-trip class name',
+        'TNNetUnitNorm', NN2.GetLastLayer.ClassName);
+      AssertEquals('UnitNorm round-trip structure (axis stays 1)',
         NN.GetLastLayer.SaveStructureToString(),
         NN2.GetLastLayer.SaveStructureToString());
     finally
