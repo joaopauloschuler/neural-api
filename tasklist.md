@@ -155,9 +155,22 @@ breakdown:
 - [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
       heads (Shazeer et al.). A tiny learnable HxH multiply applied to
       attention logits along the head axis.
-- [ ] TNNetCosineSimilarityAttention — replace `Q·Kᵀ / √d` with
+- [X] TNNetCosineSimilarityAttention — replace `Q·Kᵀ / √d` with
       `(Q/||Q||)·(K/||K||)ᵀ * scale`. Bounded-by-1 logits remove the need
-      for SoftCapping in the attention head.
+      for SoftCapping in the attention head. LANDED 2026-05-24 (lucky batch):
+      subclass of TNNetScaledDotProductAttention overriding Compute/Backpropagate;
+      per-row L2-norm (eps 1e-12) of Q and K cached for backward, exact
+      normalization Jacobian `(g - y·(y·g))/||x||`; fixed `scale` in FFloatSt[0]
+      (d_k=St[0], causal=St[1]); both dispatch tables + forward/input-grad/
+      causal-grad/serialization tests (all pass at 1e-2, no loosening).
+- [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
+      SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
+      `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
+      targets, at matched final loss? All three pieces are now in tree.
+- [ ] TNNetCosineSimilarityAttention follow-up: make `scale` a learnable scalar
+      (sibling to ReZero's single-weight pattern) instead of a fixed FFloatSt[0]
+      constant, and check whether training drives it toward the cargo-culted
+      `1/τ` temperatures used in cosine-attention papers.
 - [ ] SDPA all-masked-row policy decision and test: currently a row where
       every key is masked produces NaN (softmax of all -inf). Concrete
       proposal: detect the all-masked row in Compute, output a zero row,
@@ -313,8 +326,16 @@ breakdown:
       mean(|W|)` forward with straight-through estimator backward.
 - [ ] TNNetMaxOut2 — two-piece special case of TNNetMaxOut with a tighter
       API (no group-count parameter).
-- [ ] TNNetAPL (Adaptive Piecewise Linear) — sum of hinge functions with
-      per-channel learnable knees and slopes.
+- [X] TNNetAPL (Adaptive Piecewise Linear) — sum of hinge functions with
+      per-channel learnable knees and slopes. LANDED 2026-05-24 (lucky batch):
+      `h(x)=max(0,x)+Σ_s a[s,c]·max(0,b[s,c]-x)`, S hinges in FStruct[0]
+      (default S=2). Descends TNNetChannelTransformBase; slopes a in neurons
+      0..S-1, knees b in S..2S-1 (auto-serializing). Forward + input-grad +
+      full weight-grad (a and b) + non-default-S round-trip tests, all green.
+- [ ] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
+      (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
+      S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
+      The activation has landed, so this is a ~30-line activation swap.
 #### Probability projections / sparsity
 - [ ] TNNetGumbelSoftmax — differentiable categorical sampling:
       `softmax((logits + g) / tau)` where `g ~ Gumbel(0,1)`. Two modes
@@ -736,11 +757,15 @@ breakdown:
       per step.
 - [ ] `examples/FiLMConditional/` — toy "draw a digit of class C" generator
       with FiLM conditioning on a 10-way one-hot class input.
-- [ ] `examples/TripletEmbedding/` — learn a 2D embedding of MNIST digits
-      using TNNetTripletLoss; output a PGM scatter plot. UNBLOCKED:
-      TNNetTripletLoss has now landed (a|p|n depth-split hinge head, margin
-      via FFloatSt[0]) — wire the embedding net to emit a depth-3d output
-      and feed it straight into the head.
+- [X] `examples/TripletEmbedding/` — learn an embedding with TNNetTripletLoss.
+      LANDED 2026-05-24 (lucky batch): used a SYNTHETIC 4-class 2D-Gaussian-blob
+      set (no external data, ~0.4s) instead of MNIST. Weight-shared siamese:
+      the triplet is fed as 3 X-positions, a pointwise-conv MLP (featuresize=1)
+      embeds each identically, TNNetL2Normalize puts them on the unit sphere,
+      TNNetReshape lays them out as the a|p|n depth slab the loss consumes.
+      Prints the per-class cosine-similarity matrix (diag ~0.99, off-diag low)
+      + dumps embeddings.csv (git-ignored). Follow-up still open: a true MNIST
+      version with a PGM scatter-plot output.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
       TNNetVectorQuantizer bottleneck.
 - [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
@@ -993,9 +1018,12 @@ breakdown:
 - [ ] "Introspection" README subsection — group CountLayers/Neurons/Weights
       with the new PrintSummary / FLOPs / WeightHistogram / DeadNeuronReport
       utilities.
-- [ ] "Embedding heads" README subsection — group TNNetL2Normalize,
-      TNNetCosineSimilarity, TNNetCosineEmbeddingLoss, TNNetTripletLoss with
-      a one-paragraph "how to build a contrastive head" recipe.
+- [X] "Embedding heads" README subsection — group TNNetL2Normalize,
+      TNNetCosineSimilarity, TNNetTripletLoss with a one-paragraph "how to
+      build a contrastive head" recipe. LANDED 2026-05-24 (lucky batch),
+      linked to examples/TripletEmbedding/. NOTE: TNNetCosineEmbeddingLoss
+      is NOT yet implemented (still open under "### Loss layers"), so it was
+      left out of the table — fold it in once that loss head lands.
 - [ ] "Layer index by family" README appendix — alphabetical-within-family
       table (Convolution / Pooling / Activation / Normalization / Attention
       / Loss / Shape / Regularization).
