@@ -3875,6 +3875,48 @@ type
         InvariantTol: TNeuralFloat = 1e-3;
         ApproxTol: TNeuralFloat = 1e-1
       ): string;
+      // Forward+backward input-attribution (saliency) diagnostic. Given a
+      // trained classifier NN and a single probe sample (a TNNetVolume input
+      // Probe), it picks the predicted class c = argmax(f(Probe)) (or the
+      // caller-supplied ForcedClass when >= 0) and computes three flavours of
+      // per-input-element attribution, printing each as a compact ASCII
+      // heatmap over the input plane (one block per channel, one cell per
+      // pixel, ~10 intensity buckets '.:-=+*#%@', brightest = highest |attr|):
+      //   (a) VANILLA input-gradient saliency |d logit_c / d x|. A single
+      //       forward pass followed by one backward pass with the final-layer
+      //       error set to the one-hot e_c, so the gradient that flows back to
+      //       the input layer is exactly d logit_c / d x (read from the input
+      //       layer's OutputError tensor). "logit_c" here means the final-layer
+      //       Output value at class c (works for softmax-prob or linear heads).
+      //   (b) SMOOTHGRAD: averages (a) over SmoothSamples noisy copies
+      //       x + eta, eta ~ N(0, sigma^2), with sigma = SmoothNoiseFrac *
+      //       (max(x) - min(x)). Denoises the raw gradient.
+      //   (c) INTEGRATED GRADIENTS along the straight line from a zero baseline
+      //       to x in IntgSteps steps:
+      //         IG_i ~= (x_i - 0) * (1/K) * sum_{k=1..K} d logit_c / d x_i
+      //                 evaluated at (k/K)*x.
+      //       Satisfies the completeness axiom: sum_i IG_i ~= logit_c(x) -
+      //       logit_c(0). The "completeness gap" |sum(IG) - (logit_c(x) -
+      //       logit_c(0))| is printed as a one-number sanity/regression check
+      //       (small relative to the logit delta == correct integration).
+      // Also reports, per channel: total attribution mass (sum |attr|) for each
+      // of the three variants, and the TopK most-attributing pixel coordinates
+      // of the vanilla map. Pure CPU; reuses the existing forward/backward path
+      // (SetBatchUpdate / ClearDeltas / Compute / one-hot backward); the
+      // inspected NN's weights are restored untouched (no optimiser step is
+      // applied — only the transient error/gradient tensors are populated).
+      // Guards nil NN and a nil/empty probe gracefully (returns a short
+      // message; never crashes).
+      class function SaliencyReport(
+        NN: TNNet;
+        Probe: TNNetVolume;
+        ForcedClass: integer = -1;
+        TopK: integer = 8;
+        SmoothSamples: integer = 16;
+        SmoothNoiseFrac: TNeuralFloat = 0.15;
+        IntgSteps: integer = 20;
+        Seed: longword = 1234567
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -25373,6 +25415,439 @@ begin
     if Base <> nil then Base.Free;
     for TIdx := 0 to cTransformCount - 1 do
       if TNet[TIdx] <> nil then TNet[TIdx].Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.SaliencyReport(
+  NN: TNNet;
+  Probe: TNNetVolume;
+  ForcedClass: integer = -1;
+  TopK: integer = 8;
+  SmoothSamples: integer = 16;
+  SmoothNoiseFrac: TNeuralFloat = 0.15;
+  IntgSteps: integer = 20;
+  Seed: longword = 1234567
+): string;
+const
+  cEps = 1e-12;
+  cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
+var
+  Lines: TStringList;
+  SizeX, SizeY, Depth, NClasses, OutSize: integer;
+  PredClass: integer;
+  LogitAtX, LogitAtZero: TNeuralFloat;
+  Xmin, Xmax, Sigma: TNeuralFloat;
+  LcgState: longword;
+  HaveSpare: boolean;
+  Spare: TNeuralFloat;
+  // attribution maps, flat over Probe.Size
+  Vanilla, Smooth, Intg: array of TNeuralFloat;
+  // scratch volumes
+  Noisy, Scaled, Grad: TNNetVolume;
+  Baseline: TNNetVolume;
+  InputLayer: TNNetLayer;
+  FirstConv: TNNetConvolutionAbstract;
+  I, K, S, Ch, Px, Py, FlatIdx: integer;
+  GapAbs, IGSum, LogitDelta, RelGap: TNeuralFloat;
+  ChMassV, ChMassS, ChMassI: TNeuralFloat;
+  MapMax: TNeuralFloat;
+  // top-K tracking on the vanilla map (per channel)
+  TopVal: array of TNeuralFloat;
+  TopIdx: array of integer;
+  KeepK, TopCount, J, WorstPos: integer;
+  WorstVal, AbsV: TNeuralFloat;
+  RowStr: string;
+  BucketIdx: integer;
+
+  // Local LCG -> uniform (0,1], so the report never touches the caller's RNG.
+  function LcgNext(): TNeuralFloat;
+  begin
+    LcgState := (LcgState * 1664525 + 1013904223) and $FFFFFFFF;
+    Result := (LcgState + 1) / 4294967296.0;
+  end;
+
+  function NextGaussian(): TNeuralFloat;
+  var
+    U1, U2, R, Theta, G2: TNeuralFloat;
+  begin
+    if HaveSpare then
+    begin
+      HaveSpare := False;
+      Result := Spare;
+      Exit;
+    end;
+    U1 := LcgNext();
+    U2 := LcgNext();
+    R := Sqrt(-2.0 * Ln(U1));
+    Theta := 2.0 * Pi * U2;
+    Result := R * Cos(Theta);
+    G2 := R * Sin(Theta);
+    Spare := G2;
+    HaveSpare := True;
+  end;
+
+  // One forward + one backward pass for input X, injecting the one-hot e_c as
+  // the final-layer output error so the gradient that lands on the input layer
+  // is d (Output_c) / d x. Adds that gradient into AccGrad (does not clear it),
+  // and returns the forward Output value at class c via OutLogit. The NN's
+  // weights are never updated (batch update is on, deltas are read implicitly;
+  // we only consume the transient OutputError tensors).
+  procedure AccumLogitGrad(X: TNNetVolume; c: integer;
+    AccGrad: TNNetVolume; out OutLogit: TNeuralFloat; Scale: TNeuralFloat);
+  var
+    LastIdx, Gi: integer;
+    LastLayer, InLayer: TNNetLayer;
+  begin
+    OutLogit := 0;
+    NN.ClearDeltas();
+    NN.Compute(X);
+    LastIdx := NN.GetLastLayerIdx();
+    LastLayer := NN.Layers[LastIdx];
+    if (c >= 0) and (c < LastLayer.Output.Size) then
+      OutLogit := LastLayer.Output.Raw[c];
+    // Inject the one-hot error e_c directly, then run the layer backward chain.
+    // (TNNet.Backpropagate would instead set Output - target; we want e_c so
+    // the propagated quantity is exactly Output_c.)
+    NN.ResetBackpropCallCurrCnt();
+    if LastLayer.FDepartingBranchesCnt = 0 then LastLayer.IncDepartingBranchesCnt();
+    LastLayer.OutputError.Fill(0);
+    if (c >= 0) and (c < LastLayer.OutputError.Size) then
+      LastLayer.OutputError.Raw[c] := 1.0;
+    LastLayer.ComputeErrorDeriv();
+    LastLayer.Backpropagate();
+    // The gradient flowing into the input is the input layer's OutputError.
+    InLayer := NN.Layers[0];
+    if (InLayer.OutputError <> nil) and
+       (InLayer.OutputError.Size = AccGrad.Size) then
+      for Gi := 0 to AccGrad.Size - 1 do
+        AccGrad.Raw[Gi] := AccGrad.Raw[Gi] + Scale * InLayer.OutputError.Raw[Gi];
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Noisy := nil; Scaled := nil; Grad := nil; Baseline := nil;
+  HaveSpare := False;
+  Spare := 0;
+  LcgState := Seed;
+  if LcgState = 0 then LcgState := 1234567;
+  try
+    if NN = nil then
+    begin
+      Result := 'SaliencyReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'SaliencyReport: network needs at least 2 layers.' + sLineBreak;
+      Exit;
+    end;
+    if (Probe = nil) or (Probe.Size = 0) then
+    begin
+      Result := 'SaliencyReport: Probe is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if TopK < 1 then TopK := 1;
+    if SmoothSamples < 1 then SmoothSamples := 1;
+    if IntgSteps < 1 then IntgSteps := 1;
+    if SmoothNoiseFrac < 0 then SmoothNoiseFrac := 0;
+
+    SizeX := Probe.SizeX;
+    SizeY := Probe.SizeY;
+    Depth := Probe.Depth;
+
+    // Read batch-update / delta state once so weights are never stepped.
+    NN.SetBatchUpdate(true);
+
+    // Predicted class from a clean forward pass on the probe.
+    NN.Compute(Probe);
+    OutSize := NN.GetLastLayer.Output.Size;
+    NClasses := OutSize;
+    if (ForcedClass >= 0) and (ForcedClass < OutSize) then
+      PredClass := ForcedClass
+    else
+      PredClass := NN.GetLastLayer.Output.GetClass();
+
+    Xmin := Probe.GetMin();
+    Xmax := Probe.GetMax();
+    Sigma := SmoothNoiseFrac * (Xmax - Xmin);
+
+    SetLength(Vanilla, Probe.Size);
+    SetLength(Smooth, Probe.Size);
+    SetLength(Intg, Probe.Size);
+    for I := 0 to Probe.Size - 1 do
+    begin
+      Vanilla[I] := 0; Smooth[I] := 0; Intg[I] := 0;
+    end;
+
+    Grad := TNNetVolume.Create(SizeX, SizeY, Depth);
+    Noisy := TNNetVolume.Create(SizeX, SizeY, Depth);
+    Scaled := TNNetVolume.Create(SizeX, SizeY, Depth);
+    Baseline := TNNetVolume.Create(SizeX, SizeY, Depth);
+
+    // Enable input-gradient flow. By default a network's input layer carries a
+    // 1-element OutputError (it never needs gradients for training), so the
+    // first trainable layer's backward pass skips writing the input gradient.
+    // Resize the input layer's transient error tensors to match its Output and
+    // refresh the first layer's cached "calculate previous-layer error" flag
+    // (convolutions cache it at wiring time) so d logit_c / d x reaches the
+    // input. Only transient error tensors are touched; weights are untouched.
+    InputLayer := NN.Layers[0];
+    if InputLayer.OutputError.Size <> InputLayer.Output.Size then
+    begin
+      InputLayer.OutputError.ReSize(InputLayer.Output);
+      InputLayer.OutputErrorDeriv.ReSize(InputLayer.Output);
+    end;
+    InputLayer.OutputError.Fill(0);
+    InputLayer.OutputErrorDeriv.Fill(0);
+    if NN.Layers[1] is TNNetConvolutionAbstract then
+    begin
+      FirstConv := TNNetConvolutionAbstract(NN.Layers[1]);
+      FirstConv.RefreshCalculatePrevLayerError();
+      // The padded previous-error scratch buffer was sized at wiring time from
+      // the (then 1-element) input OutputError; resize it to the now-correct
+      // padded input plane so the unpad step (AddArea) lands the gradient back
+      // on the input layer.
+      if FirstConv.FPadding > 0 then
+        FirstConv.FPrevLayerErrorPadded.ReSize(
+          InputLayer.Output.SizeX + FirstConv.FPadding * 2,
+          InputLayer.Output.SizeY + FirstConv.FPadding * 2,
+          InputLayer.Output.Depth);
+    end;
+
+    // (a) Vanilla saliency: single forward+backward, |d logit_c / d x|.
+    Grad.Fill(0);
+    AccumLogitGrad(Probe, PredClass, Grad, LogitAtX, 1.0);
+    for I := 0 to Probe.Size - 1 do Vanilla[I] := Abs(Grad.Raw[I]);
+
+    // (b) SmoothGrad: average |grad| over SmoothSamples noisy copies.
+    for S := 0 to SmoothSamples - 1 do
+    begin
+      Noisy.Copy(Probe);
+      if Sigma > 0 then
+        for I := 0 to Noisy.Size - 1 do
+          Noisy.Raw[I] := Noisy.Raw[I] + Sigma * NextGaussian();
+      Grad.Fill(0);
+      AccumLogitGrad(Noisy, PredClass, Grad, LogitAtX, 1.0);
+      for I := 0 to Probe.Size - 1 do Smooth[I] := Smooth[I] + Abs(Grad.Raw[I]);
+    end;
+    for I := 0 to Probe.Size - 1 do Smooth[I] := Smooth[I] / SmoothSamples;
+    // restore the clean LogitAtX for completeness reporting below.
+    NN.Compute(Probe);
+    LogitAtX := NN.GetLastLayer.Output.Raw[PredClass];
+
+    // (c) Integrated Gradients along zero-baseline -> Probe.
+    //     IG_i = x_i * (1/K) * sum_{k=1..K} d logit_c / d x_i at (k/K)*x.
+    Grad.Fill(0);
+    for K := 1 to IntgSteps do
+    begin
+      Scaled.Copy(Probe);
+      Scaled.Mul(K / IntgSteps);
+      // accumulate gradients (averaged by 1/K) across the path.
+      AccumLogitGrad(Scaled, PredClass, Grad, LogitAtX, 1.0 / IntgSteps);
+    end;
+    // multiply the averaged path-gradient by (x_i - baseline_i) = x_i.
+    for I := 0 to Probe.Size - 1 do Intg[I] := Grad.Raw[I] * Probe.Raw[I];
+
+    // logit at the zero baseline, for the completeness check.
+    Baseline.Fill(0);
+    NN.Compute(Baseline);
+    LogitAtZero := NN.GetLastLayer.Output.Raw[PredClass];
+
+    IGSum := 0;
+    for I := 0 to Probe.Size - 1 do IGSum := IGSum + Intg[I];
+    LogitDelta := LogitAtX - LogitAtZero;
+    GapAbs := Abs(IGSum - LogitDelta);
+    if Abs(LogitDelta) > cEps then RelGap := GapAbs / Abs(LogitDelta)
+    else RelGap := GapAbs;
+
+    // ---- Render report. ----
+    Lines.Add(Format(
+      'SaliencyReport: probe shape (%d,%d,%d), %d classes. ' +
+      'Predicted class c=%d (forced=%s).',
+      [SizeX, SizeY, Depth, NClasses, PredClass,
+       BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
+    Lines.Add(Format(
+      'logit_c(x)=%8.4f  logit_c(0)=%8.4f  delta=%8.4f  ' +
+      'SmoothGrad N=%d sigma=%.4f  IG steps=%d.',
+      [LogitAtX, LogitAtZero, LogitDelta, SmoothSamples, Sigma, IntgSteps]));
+    Lines.Add(Format(
+      'IG completeness gap |sum(IG) - delta| = %.6g  (relative %.4f%%): %s.',
+      [GapAbs, RelGap * 100.0,
+       BoolToStr((RelGap < 0.1) and (not IsNan(RelGap)),
+                 'OK (small)', 'large - check integration')]));
+    Lines.Add(StringOfChar('-', 72));
+
+    // Heatmaps: one block per channel, per variant, normalised per channel.
+    for Ch := 0 to Depth - 1 do
+    begin
+      ChMassV := 0; ChMassS := 0; ChMassI := 0;
+      for Py := 0 to SizeY - 1 do
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if FlatIdx < Probe.Size then
+          begin
+            ChMassV := ChMassV + Vanilla[FlatIdx];
+            ChMassS := ChMassS + Smooth[FlatIdx];
+            ChMassI := ChMassI + Abs(Intg[FlatIdx]);
+          end;
+        end;
+
+      Lines.Add(Format('Channel %d  mass: vanilla=%.6g smooth=%.6g |IG|=%.6g',
+        [Ch, ChMassV, ChMassS, ChMassI]));
+
+      // (a) vanilla heatmap.
+      MapMax := 0;
+      for Py := 0 to SizeY - 1 do
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if (FlatIdx < Probe.Size) and (Vanilla[FlatIdx] > MapMax) then
+            MapMax := Vanilla[FlatIdx];
+        end;
+      Lines.Add('  (a) vanilla |d logit/dx|:');
+      for Py := 0 to SizeY - 1 do
+      begin
+        RowStr := '    ';
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if (MapMax > cEps) and (FlatIdx < Probe.Size) then
+            BucketIdx := Trunc((Vanilla[FlatIdx] / MapMax) * (Length(cBuckets) - 1) + 0.5)
+          else
+            BucketIdx := 0;
+          if BucketIdx < 0 then BucketIdx := 0;
+          if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+          RowStr := RowStr + cBuckets[BucketIdx + 1] + ' ';
+        end;
+        Lines.Add(RowStr);
+      end;
+
+      // (b) smoothgrad heatmap.
+      MapMax := 0;
+      for Py := 0 to SizeY - 1 do
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if (FlatIdx < Probe.Size) and (Smooth[FlatIdx] > MapMax) then
+            MapMax := Smooth[FlatIdx];
+        end;
+      Lines.Add('  (b) SmoothGrad:');
+      for Py := 0 to SizeY - 1 do
+      begin
+        RowStr := '    ';
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if (MapMax > cEps) and (FlatIdx < Probe.Size) then
+            BucketIdx := Trunc((Smooth[FlatIdx] / MapMax) * (Length(cBuckets) - 1) + 0.5)
+          else
+            BucketIdx := 0;
+          if BucketIdx < 0 then BucketIdx := 0;
+          if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+          RowStr := RowStr + cBuckets[BucketIdx + 1] + ' ';
+        end;
+        Lines.Add(RowStr);
+      end;
+
+      // (c) integrated-gradients heatmap (by |IG|).
+      MapMax := 0;
+      for Py := 0 to SizeY - 1 do
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if (FlatIdx < Probe.Size) and (Abs(Intg[FlatIdx]) > MapMax) then
+            MapMax := Abs(Intg[FlatIdx]);
+        end;
+      Lines.Add('  (c) Integrated Gradients |IG|:');
+      for Py := 0 to SizeY - 1 do
+      begin
+        RowStr := '    ';
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if (MapMax > cEps) and (FlatIdx < Probe.Size) then
+            BucketIdx := Trunc((Abs(Intg[FlatIdx]) / MapMax) * (Length(cBuckets) - 1) + 0.5)
+          else
+            BucketIdx := 0;
+          if BucketIdx < 0 then BucketIdx := 0;
+          if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+          RowStr := RowStr + cBuckets[BucketIdx + 1] + ' ';
+        end;
+        Lines.Add(RowStr);
+      end;
+
+      // Top-K most-attributing pixels of the vanilla map for this channel.
+      KeepK := TopK;
+      SetLength(TopVal, KeepK);
+      SetLength(TopIdx, KeepK);
+      TopCount := 0;
+      for Py := 0 to SizeY - 1 do
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := (Py * SizeX + Px) * Depth + Ch;
+          if FlatIdx >= Probe.Size then Continue;
+          AbsV := Vanilla[FlatIdx];
+          if TopCount < KeepK then
+          begin
+            TopVal[TopCount] := AbsV;
+            TopIdx[TopCount] := FlatIdx;
+            Inc(TopCount);
+          end
+          else
+          begin
+            // replace the current minimum if this one is larger.
+            WorstPos := 0;
+            WorstVal := TopVal[0];
+            for J := 1 to KeepK - 1 do
+              if TopVal[J] < WorstVal then
+              begin
+                WorstVal := TopVal[J];
+                WorstPos := J;
+              end;
+            if AbsV > WorstVal then
+            begin
+              TopVal[WorstPos] := AbsV;
+              TopIdx[WorstPos] := FlatIdx;
+            end;
+          end;
+        end;
+      // selection-sort the kept entries descending.
+      for I := 0 to TopCount - 2 do
+        for J := I + 1 to TopCount - 1 do
+          if TopVal[J] > TopVal[I] then
+          begin
+            WorstVal := TopVal[I]; TopVal[I] := TopVal[J]; TopVal[J] := WorstVal;
+            WorstPos := TopIdx[I]; TopIdx[I] := TopIdx[J]; TopIdx[J] := WorstPos;
+          end;
+      RowStr := Format('  top-%d |grad| pixels (x,y)=val:', [TopCount]);
+      for I := 0 to TopCount - 1 do
+      begin
+        FlatIdx := TopIdx[I];
+        Px := (FlatIdx div Depth) mod SizeX;
+        Py := (FlatIdx div Depth) div SizeX;
+        RowStr := RowStr + Format(' (%d,%d)=%.4g', [Px, Py, TopVal[I]]);
+      end;
+      Lines.Add(RowStr);
+      Lines.Add('');
+    end;
+
+    Lines.Add(StringOfChar('-', 72));
+    Lines.Add(
+      'Heatmap legend "' + cBuckets + '" (blank=0 .. @=channel-max). ' +
+      '(a) vanilla = |d logit_c/dx| one back-pass; (b) SmoothGrad averages '+
+      'over N noisy copies; (c) IG = path-integral from a zero baseline. '+
+      'The completeness gap above is the IG sanity check; small relative gap '+
+      '== correct integration. Forward+backward only; NN weights untouched.');
+
+    Result := Lines.Text;
+  finally
+    if Grad <> nil then Grad.Free;
+    if Noisy <> nil then Noisy.Free;
+    if Scaled <> nil then Scaled.Free;
+    if Baseline <> nil then Baseline.Free;
     Lines.Free;
   end;
 end;

@@ -89,6 +89,7 @@ type
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
     procedure TestEquivarianceReportSmoke;
+    procedure TestSaliencyReportSmoke;
   end;
 
 implementation
@@ -1811,6 +1812,111 @@ begin
     Probes.Free;
     NNInv.Free;
     NNPlain.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestSaliencyReportSmoke;
+var
+  NN: TNNet;
+  X, Y, Probe: TNNetVolume;
+  Report: string;
+  Ep, B, K, I, Cls: integer;
+  RelStart, RelEnd: integer;
+  RelStr: string;
+  RelGap: TNeuralFloat;
+  FS: TFormatSettings;
+begin
+  // Format() in the report emits a '.' decimal separator regardless of locale;
+  // parse with a matching FormatSettings so the test is locale-independent.
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+  // nil NN handled gracefully.
+  Report := TNNet.SaliencyReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probe := nil;
+  try
+    // nil probe handled gracefully (on a valid net).
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    NN.AddLayer(TNNetConvolutionReLU.Create(6, 3, 1, 1));
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+
+    Report := TNNet.SaliencyReport(NN, nil);
+    AssertTrue('nil probe reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Train briefly so the saliency gradient is non-degenerate. Class 0 has a
+    // bright blob top-left/channel 0; class 1 bottom-right/channel 1.
+    RandSeed := 77;
+    for Ep := 1 to 60 do
+      for B := 1 to 16 do
+      begin
+        X := TNNetVolume.Create(6, 6, 2);
+        Y := TNNetVolume.Create(2, 1, 1);
+        try
+          X.Fill(0);
+          Y.Fill(0);
+          Cls := Random(2);
+          Y.Raw[Cls] := 1.0;
+          for I := 0 to X.Size - 1 do X.Raw[I] := Random * 0.1;
+          if Cls = 0 then
+          begin
+            X[1, 1, 0] := 1.0; X[1, 0, 0] := 1.0; X[0, 1, 0] := 1.0;
+          end
+          else
+          begin
+            X[4, 4, 1] := 1.0; X[4, 5, 1] := 1.0; X[5, 4, 1] := 1.0;
+          end;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    // Build a clean class-0 probe.
+    Probe := TNNetVolume.Create(6, 6, 2);
+    Probe.Fill(0);
+    Probe[1, 1, 0] := 1.0; Probe[1, 0, 0] := 1.0; Probe[0, 1, 0] := 1.0;
+
+    Report := TNNet.SaliencyReport(NN, Probe);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('SaliencyReport', Report) > 0);
+    AssertTrue('vanilla section present', Pos('vanilla', Report) > 0);
+    AssertTrue('SmoothGrad section present', Pos('SmoothGrad', Report) > 0);
+    AssertTrue('Integrated Gradients section present',
+      Pos('Integrated Gradients', Report) > 0);
+    AssertTrue('completeness gap reported',
+      Pos('IG completeness gap', Report) > 0);
+    AssertTrue('top-K pixels reported', Pos('top-', Report) > 0);
+
+    // Built-in correctness check: the IG completeness gap must be small and
+    // finite. Parse the relative percentage out of
+    //   "(relative <num>%):".
+    RelStart := Pos('(relative ', Report);
+    AssertTrue('relative gap present', RelStart > 0);
+    RelStart := RelStart + Length('(relative ');
+    RelEnd := PosEx('%)', Report, RelStart);
+    AssertTrue('relative gap terminator present', RelEnd > RelStart);
+    RelStr := Trim(Copy(Report, RelStart, RelEnd - RelStart));
+    RelGap := StrToFloatDef(RelStr, 1e30, FS);
+    AssertFalse('relative gap is finite (not NaN)', IsNan(RelGap));
+    AssertFalse('relative gap is finite (not Inf)', IsInfinite(RelGap));
+    // A correct IG integration satisfies completeness to within a few %.
+    AssertTrue('IG completeness gap is small (relative < 25%)', RelGap < 25.0);
+    AssertTrue('report flags the gap as OK (small)',
+      Pos('OK (small)', Report) > 0);
+  finally
+    if Probe <> nil then Probe.Free;
+    NN.Free;
   end;
 end;
 
