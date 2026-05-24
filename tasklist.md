@@ -331,10 +331,6 @@ breakdown:
       *weights* of the previous trainable layer after each step.
 
 #### Reduction / shape
-- [ ] TNNetAdaptiveMaxPool sibling — same target-driven adaptive windowing as
-      the landed TNNetAdaptiveAvgPool, but max (with argmax routing in the
-      backward like TNNetMaxPool) instead of mean. Reuse the
-      `start=floor(o·In/Out)`, `end=ceil((o+1)·In/Out)` window mapping.
 - [ ] TNNetAdaptiveAvgPool example/usage: swap a fixed global-avg head
       (`TNNetAvgChannel`) for `TNNetAdaptiveAvgPool.Create(1)` in one
       SimpleImage path, or a tiny demo showing the same conv stack accepting
