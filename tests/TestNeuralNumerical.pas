@@ -199,6 +199,9 @@ type
     procedure TestTripletLossForwardPassthrough;
     procedure TestTripletLossGradient;
     procedure TestTripletLossLoadFromString;
+    procedure TestCosineEmbeddingLossForwardPassthrough;
+    procedure TestCosineEmbeddingLossGradient;
+    procedure TestCosineEmbeddingLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -17599,6 +17602,153 @@ begin
     NN2.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineEmbeddingLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetCosineEmbeddingLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 7);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 7, 1));
+    NN.AddLayer(TNNetCosineEmbeddingLoss.Create(0.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 2.0 - 0.3;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('CosineEmbeddingLoss forward is passthrough at ' +
+        IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineEmbeddingLossGradient;
+const
+  cEps = 1e-4;
+  cDepth = 7;       // d = 3 per slab (a|b|y)
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Margin: TNeuralFloat;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i, CaseIdx, ChunkD: integer;
+
+  function CosineEmbeddingLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j, CD: integer;
+    av, bv, yv, dot, na, nb, cosv, hinge: TNeuralFloat;
+  begin
+    CD := (AInput.Depth - 1) div 2;
+    yv := AInput[0, 0, 2 * CD];
+    dot := 0; na := 0; nb := 0;
+    for j := 0 to CD - 1 do
+    begin
+      av := AInput[0, 0, j];
+      bv := AInput[0, 0, j + CD];
+      dot := dot + av * bv;
+      na := na + av * av;
+      nb := nb + bv * bv;
+    end;
+    cosv := dot / (Sqrt(na) * Sqrt(nb) + 1e-12);
+    hinge := cosv - Margin;
+    if hinge < 0 then hinge := 0;
+    Result := yv * (1 - cosv) + (1 - yv) * hinge * hinge;
+  end;
+
+begin
+  // CaseIdx 0: y=1 (similar) sample.
+  // CaseIdx 1: y=0 (dissimilar) sample with cos > m (ACTIVE hinge).
+  ChunkD := (cDepth - 1) div 2;
+  for CaseIdx := 0 to 1 do
+  begin
+    Margin := 0.1;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(1, 1, cDepth);
+    Target := TNNetVolume.Create(1, 1, cDepth);
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetCosineEmbeddingLoss.Create(Margin));
+
+      // a = (0.5, -0.2, 0.7), b = (0.3, 0.9, -0.1): non-degenerate norms and
+      // cos != margin so we sample away from the eps-guard and the max(0,.)
+      // seam. b is far from collinear with a so cos is moderate (> 0.1).
+      Input[0, 0, 0] :=  0.5;  Input[0, 0, 1] := -0.2;  Input[0, 0, 2] := 0.7;
+      Input[0, 0, 3] :=  0.3;  Input[0, 0, 4] :=  0.9;  Input[0, 0, 5] := -0.1;
+      if CaseIdx = 0 then
+        Input[0, 0, 6] := 1.0   // y = 1, similar
+      else
+        Input[0, 0, 6] := 0.0;  // y = 0, dissimilar (hinge active since cos>m)
+      Target.Fill(0);
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      // The y channel (index 2*ChunkD) gradient must be exactly 0.
+      AssertEquals('CosineEmbeddingLoss y-channel grad is zero',
+        0.0, LMid.OutputError[0, 0, 2 * ChunkD], 1e-6);
+
+      for i := 0 to 2 * ChunkD - 1 do
+      begin
+        AnaGrad := LMid.OutputError.Raw[i];
+        OldV := Input.Raw[i];
+        Input.Raw[i] := OldV + cEps;
+        LossP := CosineEmbeddingLossAt(Input);
+        Input.Raw[i] := OldV - cEps;
+        LossM := CosineEmbeddingLossAt(Input);
+        Input.Raw[i] := OldV;
+        NumGrad := (LossP - LossM) / (2 * cEps);
+        AssertEquals('CosineEmbeddingLoss grad case ' + IntToStr(CaseIdx) +
+          ' at ' + IntToStr(i), NumGrad, AnaGrad, 1e-2);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineEmbeddingLossLoadFromString;
+const
+  cMargin = 0.25;
+  cDepth  = 7;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetCosineEmbeddingLoss.Create(cMargin));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetCosineEmbeddingLoss',
+      NN2.GetLastLayer is TNNetCosineEmbeddingLoss);
+    // The structure string encodes FFloatSt[0]; equality proves the
+    // non-default margin survived the save/load cycle.
+    AssertEquals('CosineEmbeddingLoss round-trip preserves margin',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+  finally
+    NN.Free;
+    NN2.Free;
   end;
 end;
 

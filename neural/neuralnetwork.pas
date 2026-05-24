@@ -1505,6 +1505,36 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Pairwise cosine-embedding loss output layer (PyTorch CosineEmbeddingLoss
+  // family) for metric/embedding learning. Like TNNetTripletLoss this is a
+  // SELF-CONTAINED metric head: there is NO external target tensor, the
+  // supervision is implicit in the input layout. Per spatial (X,Y) position the
+  // input depth is split as [ a (d channels) | b (d channels) | y (1 channel) ]
+  // so Depth = 2*d + 1 (validated odd and >= 3 in SetPrevLayer, giving
+  // d = (Depth-1) div 2 >= 1). a and b are the two embeddings to compare; y is
+  // the per-position similarity label: y=1 => "similar", y=0 => "dissimilar".
+  // Let cos = (a.b) / (||a||*||b||) (the denominator is guarded with a small
+  // eps like the L2-normalize code). With margin m stored in FFloatSt[0]
+  // (default 0.0, must be in [-1,1]) the per-position loss is
+  //   L = y*(1 - cos) + (1 - y)*sqr(max(0, cos - m))
+  // The forward pass is an identity passthrough (so Net.Compute returns the
+  // raw a|b|y layout). Backpropagate ignores the framework-seeded residual,
+  // reads FOutput directly, and writes the +gradient (so the optimizer
+  // descends) into FOutputError using
+  //   dL/dcos  = -y + (1-y)*2*max(0, cos - m)
+  //   dcos/da  = b/(||a||*||b||) - cos * a/||a||^2   (symmetric for b)
+  // The a channels receive dL/dcos * dcos/da, the b channels receive
+  // dL/dcos * dcos/db, and the y channel receives 0. margin round-trips via
+  // Save/Load. No trainable parameters; output shape equals input shape.
+  TNNetCosineEmbeddingLoss = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pMargin: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -9017,6 +9047,91 @@ begin
           FOutputError[X, Y, D + 2 * ChunkD] := 0;
         end;
       end;
+    end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetCosineEmbeddingLoss }
+
+constructor TNNetCosineEmbeddingLoss.Create();
+begin
+  Create(0.0);
+end;
+
+constructor TNNetCosineEmbeddingLoss.Create(pMargin: TNeuralFloat);
+begin
+  inherited Create();
+  if (pMargin < -1) or (pMargin > 1) then
+    FErrorProc('TNNetCosineEmbeddingLoss margin must be in [-1, 1].');
+  FFloatSt[0] := pMargin;
+end;
+
+procedure TNNetCosineEmbeddingLoss.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth < 3) or
+     ((pPrevLayer.FOutput.Depth and 1) = 0) then
+  begin
+    FErrorProc('TNNetCosineEmbeddingLoss requires odd input depth >= 3 ' +
+      '(layout a|b|y). Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+end;
+
+procedure TNNetCosineEmbeddingLoss.Backpropagate();
+var
+  StartTime: double;
+  Margin, Eps, YLabel, AVal, BVal, Dot, NormASq, NormBSq: TNeuralFloat;
+  InvDenom, CosVal, dLdCos, NormA, NormB, HingeArg: TNeuralFloat;
+  MaxX, MaxY, ChunkD, X, Y, D: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Margin := FFloatSt[0];
+  if (Margin < -1) or (Margin > 1) then Margin := 0.0;
+  Eps := 1e-12;
+  ChunkD := (FOutput.Depth - 1) div 2;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  // Per spatial cell: read the a|b slabs and the y label, compute the cosine
+  // similarity, then write the +gradient into the a and b slices (0 into y).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      YLabel := FOutput[X, Y, 2 * ChunkD];
+      Dot := 0;
+      NormASq := 0;
+      NormBSq := 0;
+      for D := 0 to ChunkD - 1 do
+      begin
+        AVal := FOutput[X, Y, D];
+        BVal := FOutput[X, Y, D + ChunkD];
+        Dot := Dot + AVal * BVal;
+        NormASq := NormASq + AVal * AVal;
+        NormBSq := NormBSq + BVal * BVal;
+      end;
+      NormA := Sqrt(NormASq);
+      NormB := Sqrt(NormBSq);
+      InvDenom := 1.0 / (NormA * NormB + Eps);
+      CosVal := Dot * InvDenom;
+      HingeArg := CosVal - Margin;
+      if HingeArg < 0 then HingeArg := 0;
+      // dL/dcos = -y + (1-y)*2*max(0, cos - m)
+      dLdCos := -YLabel + (1.0 - YLabel) * 2.0 * HingeArg;
+      for D := 0 to ChunkD - 1 do
+      begin
+        AVal := FOutput[X, Y, D];
+        BVal := FOutput[X, Y, D + ChunkD];
+        // dcos/da = b/(||a||*||b||) - cos * a/||a||^2 (symmetric for b)
+        FOutputError[X, Y, D] :=
+          dLdCos * (BVal * InvDenom - CosVal * AVal / (NormASq + Eps));
+        FOutputError[X, Y, D + ChunkD] :=
+          dLdCos * (AVal * InvDenom - CosVal * BVal / (NormBSq + Eps));
+      end;
+      FOutputError[X, Y, 2 * ChunkD] := 0;
     end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -36855,6 +36970,7 @@ begin
       'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
       'TNNetDiceLoss' :             Result := TNNetDiceLoss.Create();
       'TNNetTripletLoss' :          Result := TNNetTripletLoss.Create(Ft[0]);
+      'TNNetCosineEmbeddingLoss' :  Result := TNNetCosineEmbeddingLoss.Create(Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -37107,6 +37223,7 @@ begin
       if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else
       if S[0] = 'TNNetDiceLoss' then Result := TNNetDiceLoss.Create() else
       if S[0] = 'TNNetTripletLoss' then Result := TNNetTripletLoss.Create(Ft[0]) else
+      if S[0] = 'TNNetCosineEmbeddingLoss' then Result := TNNetCosineEmbeddingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else

@@ -363,7 +363,7 @@ breakdown:
       sibling to the open TNNetAdaptiveAvgPool example task above. Layer +
       gradient/forward tests already landed.
 ### Loss layers
-- [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
+- [X] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
 - [ ] TNNetKLDivergence follow-up: a knowledge-distillation micro-example —
       train a small "student" against soft targets from a fixed "teacher"
