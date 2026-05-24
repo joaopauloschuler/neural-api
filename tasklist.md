@@ -1262,6 +1262,68 @@ breakdown:
       a ground-truth localisation check), and a smoke test in tests/ (non-empty
       report, expected header, nil-NN graceful return, plus the `r_0==1` /
       `r_last==1` exact-recovery assertions).
+- [ ] TNNet.IntrinsicDimensionReport(NN, Probes [, MaxFeatDim]) — a forward-only
+      **representation-geometry** diagnostic answering a question none of the
+      landed reports answer: *"how many effective dimensions does each layer's
+      activation cloud actually occupy?"* — the dimensionality of the data
+      MANIFOLD the batch traces out at each depth, not its class structure or
+      its neuron redundancy. For every trainable layer it runs one forward pass
+      over an (unlabelled) probe batch, flattens each sample to a row of an
+      `N x D_l` matrix, and reports TWO complementary intrinsic-dimension
+      estimates side by side: (1) the **linear / PCA** ID via the participation
+      ratio of the activation COVARIANCE eigenspectrum `PR = (sum lambda)^2 /
+      sum lambda^2` (eigenvalues from the smaller `N x N` or `D x D` Gram matrix
+      via the SAME self-contained Double-precision cyclic Jacobi eigensolver
+      `WeightSpectralTailReport` already ships — no new numerical code), i.e.
+      "how many principal components hold the variance"; and (2) the **TwoNN**
+      nonlinear estimator (Facco, Rodriguez, Glielmo & Laio 2017, *Estimating
+      the intrinsic dimension of datasets by a minimal neighbourhood
+      information*): for each sample take the ratio `mu_i = r2_i / r1_i` of its
+      2nd-to-1st nearest-neighbour (Euclidean) distances, sort the `mu_i`, and
+      read the manifold dimension `d` off the closed-form MLE / least-squares
+      slope of `-log(1 - F(mu))` against `log(mu)` (a single line fit through
+      the origin — no SGD, no matrix solve). The GAP between the (larger) linear
+      PCA ID and the (smaller) nonlinear TwoNN ID is itself the headline number:
+      a representation can sit on a low-dimensional CURVED manifold that PCA
+      over-counts. Reports per layer both IDs, the linear/nonlinear gap, a
+      `D_l`-normalised "compression ratio" `TwoNN_ID / D_l`, a per-layer
+      ID-across-depth ASCII bar chart, and `expanded` / `compressed` /
+      near-`full-rank` flags; over-wide layers are deterministically
+      random-projected to `MaxFeatDim` (default 256) to bound the pairwise-
+      distance and eigensolve cost, reusing the projection trick already in
+      [[LinearProbeReport]] / `FeatureSeparabilityReport`. The story for the
+      example is the famous "hunchback" ID profile of Ansuini, Laio, Macke &
+      Zoccolan 2019 (*Intrinsic dimension of data representations in deep
+      networks*): the ID first EXPANDS in the early layers then CONTRACTS
+      monotonically toward the output, and the final-layer ID predicts
+      generalization — so the example contrasts a fresh-init net (flat, near-
+      input ID at every layer) against a trained net (the expand-then-contract
+      curve emerges). Built-in correctness checks: a batch sampled from a known
+      `k`-dimensional linear subspace embedded in a higher-`D` space recovers
+      `PCA_ID ~ k` and `TwoNN_ID ~ k` (the faithfulness check), identical
+      samples drive both IDs to ~0, an isotropic full-rank Gaussian gives
+      `PCA_ID ~ min(N-1, D)`, and the PCA eigenvalues are non-negative (PSD).
+      **Distinct from** `NeuronCorrelationReport` (its participation ratio is
+      over the neuron-neuron Pearson CORRELATION matrix — *linear redundancy
+      among the feature AXES*, "effective neuron count"; this measures the
+      dimensionality of the sample CLOUD in activation space and adds the
+      nonlinear TwoNN manifold estimator the correlation view cannot see), from
+      `FeatureSeparabilityReport` (label-aware class scatter / cluster geometry —
+      needs labels and asks about between-vs-within-class spread, not the
+      unlabelled manifold dimension), from `RepresentationSimilarityReport`
+      (CKA *between two layers* — relative similarity, not an absolute per-layer
+      dimension), and from `WeightSpectrumReport` / `WeightSpectralTailReport`
+      (spectra of the WEIGHT tensors, not the activation cloud). Follows the
+      [[introspection-report-pattern]]: declaration + impl in neuralnetwork.pas,
+      an `examples/IntrinsicDimension/` demo (fresh-vs-trained hunchback
+      contrast plus the known-`k`-subspace ground-truth recovery so the estimate
+      is visibly correct in one run), and a smoke test in tests/ (non-empty
+      report, expected header, nil-NN graceful return, plus the known-`k`-
+      subspace `ID ~ k` recovery and identical-samples `ID ~ 0` assertions).
+      Pure forward-only — `NN.Compute` only, weights never touched, no backward
+      pass. Pairs naturally with the open grokking / lottery-ticket experiments
+      ([[WeightSpectrumReport]]) — watching the final-layer ID drop is a clean
+      single-number window into representation compression during training.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
       label-free model selection) was simplified to a fresh-vs-trained contrast
