@@ -2351,6 +2351,47 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// S-shaped ReLU (SReLU, Jin et al. 2016, https://arxiv.org/abs/1512.07030).
+  // A continuous piecewise-linear learnable activation with FOUR parameters
+  // PER channel: a right threshold t_r with right slope a_r, and a left
+  // threshold t_l with left slope a_l. Forward, per element x of channel c:
+  //   if x >= t_r[c]:  y = t_r[c] + a_r[c] * (x - t_r[c])
+  //   if x <= t_l[c]:  y = t_l[c] + a_l[c] * (x - t_l[c])
+  //   else (t_l[c] < x < t_r[c]):  y = x
+  // The three pieces meet exactly at the two knees (x=t_l and x=t_r), so the
+  // function is continuous everywhere. SReLU generalises ReLU, Leaky-ReLU and
+  // PReLU and can also learn non-monotone, saturating or amplifying shapes.
+  // Storage (each Depth values): FNeurons[0].Weights = t_r,
+  //   FNeurons[1].Weights = a_r, FNeurons[2].Weights = t_l,
+  //   FNeurons[3].Weights = a_l.
+  // Default inits t_r=0, a_r=1, t_l=0, a_l=0 make an untrained SReLU behave
+  // exactly like a plain ReLU (the central identity branch for x>0, a flat 0
+  // for x<0). The overloaded Create(t_r,a_r,t_l,a_l) lets you pick different
+  // starting knees (e.g. a_l=0.01 for a leaky start); the four initial values
+  // are stored in FFloatSt[0..3] for serialization. Backward, per element
+  // (let gy = OutputError):
+  //   right branch (x>=t_r): dy/dx = a_r;  dL/da_r += gy*(x-t_r);
+  //                          dL/dt_r += gy*(1-a_r)
+  //   left  branch (x<=t_l): dy/dx = a_l;  dL/da_l += gy*(x-t_l);
+  //                          dL/dt_l += gy*(1-a_l)
+  //   central branch:        dy/dx = 1; all four param grads are 0.
+  // Param grads accumulate over all spatial positions and the batch per
+  // channel. Descends from TNNetChannelTransformBase to reuse its per-channel
+  // weight storage (the weightless TNNetReLUBase hierarchy cannot store
+  // gradients).
+  TNNetSReLU = class(TNNetChannelTransformBase)
+    private
+      FInitialTr, FInitialAr, FInitialTl, FInitialAl: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialTr, pInitialAr, pInitialTl,
+        pInitialAl: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// ACON-C: "Activate Or Not" channel-wise learnable activation
   // (Ma, Zhang, Sun et al. 2021, https://arxiv.org/abs/2009.04759).
   // Generalises Swish with THREE learnable parameters PER channel:
@@ -15168,6 +15209,183 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
   FNeurons[0].FWeights.Fill(0.25);
+  AfterWeightUpdate();
+end;
+
+{ TNNetSReLU }
+constructor TNNetSReLU.Create();
+begin
+  // Defaults t_r=0, a_r=1, t_l=0, a_l=0 reduce SReLU to a plain ReLU.
+  Create(0, 1, 0, 0);
+end;
+
+constructor TNNetSReLU.Create(pInitialTr, pInitialAr, pInitialTl,
+  pInitialAl: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialTr := pInitialTr;
+  FInitialAr := pInitialAr;
+  FInitialTl := pInitialTl;
+  FInitialAl := pInitialAl;
+  // Persist the four initial knee parameters in the structure string so the
+  // dispatch in CreateLayer / LoadFromString can reconstruct the layer.
+  FFloatSt[0] := pInitialTr;
+  FFloatSt[1] := pInitialAr;
+  FFloatSt[2] := pInitialTl;
+  FFloatSt[3] := pInitialAl;
+  InitDefault();
+end;
+
+procedure TNNetSReLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base class allocates FNeurons[0] with Depth weights (t_r). We also
+  // need FNeurons[1] (a_r), FNeurons[2] (t_l) and FNeurons[3] (a_l), each
+  // with Depth weights.
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetSReLU.Compute();
+var
+  StartTime: double;
+  Wtr, War, Wtl, Wal: TNNetVolume;
+  Prev: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  tr_d, ar_d, tl_d, al_d, xv: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (which would copy input to FOutput).
+  Prev := FPrevLayer.FOutput;
+  Wtr := FNeurons[0].FWeights;
+  War := FNeurons[1].FWeights;
+  Wtl := FNeurons[2].FWeights;
+  Wal := FNeurons[3].FWeights;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if (Wtr.Size <> Depth) or (War.Size <> Depth) or
+     (Wtl.Size <> Depth) or (Wal.Size <> Depth) then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetSReLU.');
+  {$ENDIF}
+  for d := 0 to Depth - 1 do
+  begin
+    tr_d := Wtr.Raw[d];
+    ar_d := War.Raw[d];
+    tl_d := Wtl.Raw[d];
+    al_d := Wal.Raw[d];
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        if xv >= tr_d then
+          FOutput[x, y, d] := tr_d + ar_d * (xv - tr_d)
+        else if xv <= tl_d then
+          FOutput[x, y, d] := tl_d + al_d * (xv - tl_d)
+        else
+          FOutput[x, y, d] := xv;
+      end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSReLU.Backpropagate();
+var
+  StartTime: double;
+  Ntr, Nar, Ntl, Nal: TNNetNeuron;
+  Wtr, War, Wtl, Wal: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  tr_d, ar_d, tl_d, al_d, xv, gy: TNeuralFloat;
+  gradTr, gradAr, gradTl, gradAl: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Ntr := FNeurons[0];
+  Nar := FNeurons[1];
+  Ntl := FNeurons[2];
+  Nal := FNeurons[3];
+  Wtr := Ntr.FWeights;
+  War := Nar.FWeights;
+  Wtl := Ntl.FWeights;
+  Wal := Nal.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  for d := 0 to Depth - 1 do
+  begin
+    tr_d := Wtr.Raw[d];
+    ar_d := War.Raw[d];
+    tl_d := Wtl.Raw[d];
+    al_d := Wal.Raw[d];
+    gradTr := 0;
+    gradAr := 0;
+    gradTl := 0;
+    gradAl := 0;
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        xv := Prev[x, y, d];
+        gy := FOutputError[x, y, d];
+        if xv >= tr_d then
+        begin
+          // Right branch: y = t_r + a_r*(x - t_r).
+          gradAr := gradAr + gy * (xv - tr_d);
+          gradTr := gradTr + gy * (1 - ar_d);
+          if hasInputGrad then
+            PrevErr[x, y, d] := PrevErr[x, y, d] + gy * ar_d;
+        end
+        else if xv <= tl_d then
+        begin
+          // Left branch: y = t_l + a_l*(x - t_l).
+          gradAl := gradAl + gy * (xv - tl_d);
+          gradTl := gradTl + gy * (1 - al_d);
+          if hasInputGrad then
+            PrevErr[x, y, d] := PrevErr[x, y, d] + gy * al_d;
+        end
+        else
+        begin
+          // Central identity branch: y = x.
+          if hasInputGrad then
+            PrevErr[x, y, d] := PrevErr[x, y, d] + gy;
+        end;
+      end;
+    Ntr.FDelta.Raw[d] := Ntr.FDelta.Raw[d] + (-FLearningRate) * gradTr;
+    Nar.FDelta.Raw[d] := Nar.FDelta.Raw[d] + (-FLearningRate) * gradAr;
+    Ntl.FDelta.Raw[d] := Ntl.FDelta.Raw[d] + (-FLearningRate) * gradTl;
+    Nal.FDelta.Raw[d] := Nal.FDelta.Raw[d] + (-FLearningRate) * gradAl;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    Ntr.UpdateWeights(FInertia);
+    Nar.UpdateWeights(FInertia);
+    Ntl.UpdateWeights(FInertia);
+    Nal.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSReLU.InitDefault();
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  // t_r, a_r, t_l, a_l.
+  FNeurons[0].FWeights.Fill(FInitialTr);
+  FNeurons[1].FWeights.Fill(FInitialAr);
+  FNeurons[2].FWeights.Fill(FInitialTl);
+  FNeurons[3].FWeights.Fill(FInitialAl);
   AfterWeightUpdate();
 end;
 
@@ -32727,6 +32945,7 @@ begin
       'TNNetEntropyRegularizer':    Result := TNNetEntropyRegularizer.Create(Ft[0]);
       'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
+      'TNNetSReLU':                 Result := TNNetSReLU.Create(Ft[0], Ft[1], Ft[2], Ft[3]);
       'TNNetAconC':                 Result := TNNetAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
@@ -32957,6 +33176,7 @@ begin
       if S[0] = 'TNNetEntropyRegularizer' then Result := TNNetEntropyRegularizer.Create(Ft[0]) else
       if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else
+      if S[0] = 'TNNetSReLU' then Result := TNNetSReLU.Create(Ft[0], Ft[1], Ft[2], Ft[3]) else
       if S[0] = 'TNNetAconC' then Result := TNNetAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else

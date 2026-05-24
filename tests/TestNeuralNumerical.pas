@@ -131,6 +131,10 @@ type
     procedure TestDiagonalSSMSerializationRoundTrip;
     procedure TestPReLUChannelInputGradientCheck;
     procedure TestPReLUChannelWeightGradientCheck;
+    procedure TestSReLUForward;
+    procedure TestSReLUInputGradientCheck;
+    procedure TestSReLUWeightGradientCheck;
+    procedure TestSReLUSerializationRoundTrip;
     procedure TestAconCGradientCheck;
     procedure TestAconCSwishEquivalence;
     procedure TestAconCSerializationRoundTrip;
@@ -13685,6 +13689,242 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSReLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LSReLU: TNNetSReLU;
+  i: integer;
+  Expected: array[0..5] of TNeuralFloat;
+  Vals: array[0..5] of TNeuralFloat;
+begin
+  // SReLU with t_r=2, a_r=0.5, t_l=-1, a_l=0.1. Forward, per element:
+  //   x<=-1: y = -1 + 0.1*(x+1);  x>=2: y = 2 + 0.5*(x-2);  else y = x.
+  //   x=-3 -> -1 + 0.1*(-2) = -1.2
+  //   x=-1 -> -1            (left knee)
+  //   x=0  ->  0
+  //   x=1.5-> 1.5
+  //   x=2  ->  2            (right knee)
+  //   x=5  ->  2 + 0.5*3 = 3.5
+  Vals[0] := -3; Vals[1] := -1; Vals[2] := 0; Vals[3] := 1.5; Vals[4] := 2; Vals[5] := 5;
+  Expected[0] := -1.2; Expected[1] := -1; Expected[2] := 0;
+  Expected[3] := 1.5; Expected[4] := 2; Expected[5] := 3.5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    LSReLU := TNNetSReLU.Create(2, 0.5, -1, 0.1);
+    NN.AddLayer(LSReLU);
+
+    AssertEquals('SReLU t_r', 2.0, LSReLU.Neurons[0].Weights.Raw[0], 1e-7);
+    AssertEquals('SReLU a_r', 0.5, LSReLU.Neurons[1].Weights.Raw[0], 1e-7);
+    AssertEquals('SReLU t_l', -1.0, LSReLU.Neurons[2].Weights.Raw[0], 1e-7);
+    AssertEquals('SReLU a_l', 0.1, LSReLU.Neurons[3].Weights.Raw[0], 1e-7);
+
+    for i := 0 to 5 do
+      Input.Raw[i] := Vals[i];
+    NN.Compute(Input);
+    for i := 0 to 5 do
+      AssertEquals('SReLU forward at ' + IntToStr(i),
+        Expected[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSReLUInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSReLU: TNNetSReLU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    // Knees at t_l=-0.7, t_r=0.7 (same on every channel) with distinct
+    // slopes so all three branches are exercised. Inputs below are kept well
+    // away (>= ~0.4) from both knees so central differences stay valid.
+    LSReLU := TNNetSReLU.Create(0.7, 0.5, -0.7, 0.2);
+    NN.AddLayer(LSReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 2.0;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SReLU input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSReLUWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSReLU: TNNetSReLU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  n, i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  Desired := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    // Same knees as the input-gradient test (t_l=-0.7, t_r=0.7); inputs are
+    // kept away from the knees so the piecewise param gradients are valid.
+    LSReLU := TNNetSReLU.Create(0.7, 0.5, -0.7, 0.2);
+    NN.AddLayer(LSReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 2.0;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+
+    // Check all four per-channel parameters (neurons 0..3), every channel.
+    for n := 0 to 3 do
+      for i := 0 to LSReLU.Neurons[n].Weights.Size - 1 do
+      begin
+        LSReLU.Neurons[n].Weights.Raw[i] := LSReLU.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LSReLU.Neurons[n].Weights.Raw[i] := LSReLU.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LSReLU.Neurons[n].Weights.Raw[i] := LSReLU.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LSReLU.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LSReLU.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('SReLU weight gradient check neuron[' + IntToStr(n) +
+          '] channel[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSReLUSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  LSReLU, LSReLU2: TNNetSReLU;
+  i: integer;
+begin
+  // Exercise the FFloatSt[0..3] dispatch path with non-default knees and
+  // verify all four per-channel learnable weights survive the round-trip.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LSReLU := TNNetSReLU.Create(1.3, 0.6, -0.8, 0.05);
+    NN.AddLayer(LSReLU);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LSReLU2 := NN2.GetLastLayer as TNNetSReLU;
+
+      AssertEquals('SReLU round-trip t_r', 1.3,
+        LSReLU2.Neurons[0].Weights.Raw[0], 1e-5);
+      AssertEquals('SReLU round-trip a_r', 0.6,
+        LSReLU2.Neurons[1].Weights.Raw[0], 1e-5);
+      AssertEquals('SReLU round-trip t_l', -0.8,
+        LSReLU2.Neurons[2].Weights.Raw[0], 1e-5);
+      AssertEquals('SReLU round-trip a_l', 0.05,
+        LSReLU2.Neurons[3].Weights.Raw[0], 1e-5);
+      AssertEquals('SReLU round-trip weight count',
+        Input.Depth, LSReLU2.Neurons[0].Weights.Size);
+
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SReLU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
