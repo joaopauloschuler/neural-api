@@ -28,7 +28,10 @@ type
     procedure TestPoolingWithOddDimensions;
     procedure TestMinChannelGradientCheck;
     procedure TestMaxChannelGradientCheck;
-    
+    procedure TestLpPoolGradientCheckP2;
+    procedure TestLpPoolGradientCheckP3;
+    procedure TestLpPoolLoadFromString;
+
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
     procedure TestSigmoidNumericalPrecision;
@@ -3765,6 +3768,67 @@ begin
   // input as MinChannel - no ties for a 4x4x3 volume.
   LayerInputGradientCheck(Self, TNNetMaxChannel.Create(),
     'MaxChannel', 4, 4, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLpPoolGradientCheckP2;
+begin
+  // TNNetLpPool with p=2 is RMS pooling: y = sqrt(mean(x_i^2)) per 2x2 window.
+  // The Sin-seeded inputs (Sin(i*0.7)*2+0.3) are well away from 0 so neither
+  // the per-window output nor any |x_i| underflows the gradient guards.
+  LayerInputGradientCheck(Self, TNNetLpPool.Create(2, 0, 0, 2.0),
+    'LpPool(p=2)', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLpPoolGradientCheckP3;
+begin
+  // TNNetLpPool with p=3: y = (mean(|x_i|^3))^(1/3). Higher curvature than p=2
+  // but the seeded inputs keep every |x_i| and y comfortably above the guard
+  // threshold, so central differences match the analytic gradient.
+  LayerInputGradientCheck(Self, TNNetLpPool.Create(2, 0, 0, 3.0),
+    'LpPool(p=3)', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLpPoolLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net containing TNNetLpPool with a NON-default exponent p=3.0.
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical,
+  // proving the integer pool params (FStruct) and p (FFloatSt[0]) survive.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    NN.AddLayer(TNNetLpPool.Create(2, 0, 0, 3.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('LpPool round-trip class identity',
+        NN2.GetLastLayer is TNNetLpPool);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('LpPool SaveToString round-trip equality', Saved, Saved2);
+
+      // Outputs must also match after reload.
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('LpPool round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestZScoreGradientCheck;

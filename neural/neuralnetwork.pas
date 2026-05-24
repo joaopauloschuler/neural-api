@@ -3449,6 +3449,31 @@ type
     constructor Create(); override;
   end;
 
+  /// Generalized Lp pooling layer. Over each pooling window of N cells it
+  // computes a power-mean of the absolute values:
+  //   y = ( (1/N) * sum_i |x_i|^p )^(1/p)
+  // with a configurable real exponent p (stored in FFloatSt[0], default 2.0
+  // so it round-trips through SaveToString / LoadFromString). The integer
+  // pool/stride/padding parameters round-trip via FStruct[0..2] exactly like
+  // TNNetMaxPool / TNNetAvgPool. Special cases: p=1 yields the mean of the
+  // absolute values; p=2 yields RMS pooling; large p approaches max pooling.
+  // The forward pass mirrors TNNetAvgPool (default stride == pool size,
+  // padding 0). Backward uses the analytic input gradient
+  //   dy/dx_i = (y^(1-p) / N) * |x_i|^(p-1) * sign(x_i)
+  // multiplied by the incoming OutputError. Contributions are guarded so that
+  // windows whose output underflows to ~0 (and individual cells whose |x_i|
+  // underflows to ~0) propagate no gradient, avoiding division by zero.
+  TNNetLpPool = class(TNNetPoolBase)
+  private
+    FP: TNeuralFloat;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pPoolSize: integer; pStride: integer = 0;
+      pPadding: integer = 0; pP: TNeuralFloat = 2.0); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Global Sum Pooling: parameter-free per-channel sum reduction over
   // (X, Y). Output shape is 1 x 1 x Depth. Backward broadcasts the
   // per-channel output error to every (X, Y) cell of that channel.
@@ -20819,6 +20844,125 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetLpPool }
+procedure TNNetLpPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SetLength(FMaxPosX, 0);
+  SetLength(FMaxPosY, 0);
+end;
+
+constructor TNNetLpPool.Create(pPoolSize: integer; pStride: integer = 0;
+  pPadding: integer = 0; pP: TNeuralFloat = 2.0);
+begin
+  inherited Create(pPoolSize, pStride, pPadding);
+  FP := pP;
+  FFloatSt[0] := pP;
+end;
+
+procedure TNNetLpPool.Compute();
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+  OutX, OutY: integer;
+  StartTime: double;
+  OutputRawPos: integer;
+  InputRawPtr: TNeuralFloatPtr;
+  N, InvP: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Accumulate sum_i |x_i|^p into the output.
+  Output.Fill(0);
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
+
+  for CntX := 0 to MaxX do
+  begin
+    OutX := CntX div FPoolSize;
+    for CntY := 0 to MaxY do
+    begin
+      OutY := CntY div FPoolSize;
+      OutputRawPos := FOutput.GetRawPos(OutX, OutY);
+      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
+      for CntD := 0 to MaxD do
+      begin
+        FOutput.FData[OutputRawPos] :=
+          FOutput.FData[OutputRawPos] + Power(Abs(InputRawPtr^), FP);
+        Inc(OutputRawPos);
+        Inc(InputRawPtr);
+      end;
+    end;
+  end;
+
+  // y = ( (1/N) * sum |x_i|^p )^(1/p)
+  N := FPoolSize * FPoolSize;
+  InvP := 1.0 / FP;
+  for OutputRawPos := 0 to FOutput.Size - 1 do
+  begin
+    FOutput.FData[OutputRawPos] :=
+      Power(FOutput.FData[OutputRawPos] / N, InvP);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLpPool.Backpropagate();
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+  OutX, OutY: integer;
+  StartTime: double;
+  OutputRawPos, PrevRawPos: integer;
+  InputRawPtr: TNeuralFloatPtr;
+  N, Y, AbsX, XVal, Coef, Grad: TNeuralFloat;
+const
+  cEps = 1e-12;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if
+    (FBackPropCallCurrentCnt < FDepartingBranchesCnt) or
+    (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  N := FPoolSize * FPoolSize;
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
+
+  // dy/dx_i = (y^(1-p) / N) * |x_i|^(p-1) * sign(x_i)
+  for CntX := 0 to MaxX do
+  begin
+    OutX := CntX div FPoolSize;
+    for CntY := 0 to MaxY do
+    begin
+      OutY := CntY div FPoolSize;
+      OutputRawPos := FOutput.GetRawPos(OutX, OutY);
+      PrevRawPos := FPrevLayer.OutputError.GetRawPos(CntX, CntY);
+      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
+      for CntD := 0 to MaxD do
+      begin
+        Y := FOutput.FData[OutputRawPos];
+        XVal := InputRawPtr^;
+        AbsX := Abs(XVal);
+        // Guard against division by zero / underflow.
+        if (Y > cEps) and (AbsX > cEps) then
+        begin
+          Coef := (Power(Y, 1.0 - FP) / N) * Power(AbsX, FP - 1.0);
+          if XVal < 0 then Coef := -Coef;
+          Grad := Coef * FOutputError.FData[OutputRawPos];
+          FPrevLayer.OutputError.FData[PrevRawPos] :=
+            FPrevLayer.OutputError.FData[PrevRawPos] + Grad;
+        end;
+        Inc(OutputRawPos);
+        Inc(PrevRawPos);
+        Inc(InputRawPtr);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 procedure TNNetDeMaxPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -34466,6 +34610,7 @@ begin
       'TNNetMaxPoolPortable' :      Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]);
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
+      'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
@@ -34697,6 +34842,7 @@ begin
       if S[0] = 'TNNetMaxPoolPortable' then Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
+      if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else

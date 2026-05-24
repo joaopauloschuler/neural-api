@@ -342,7 +342,7 @@ breakdown:
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetSqueeze / TNNetExpandDims — numpy-style single-axis shape
       helpers, less error-prone than open-coding TNNetReshape.
-- [ ] TNNetLpPool — generalized pooling `(mean(|x|^p))^(1/p)` with
+- [X] TNNetLpPool — generalized pooling `(mean(|x|^p))^(1/p)` with
       configurable p.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
