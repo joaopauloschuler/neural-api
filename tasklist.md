@@ -172,6 +172,41 @@ breakdown:
       gradient-check on a tiny shape.
 
 ### Attention variants / siblings
+- [ ] TNNetLinearAttention — kernelized / softmax-free attention
+      (Katharopoulos et al. 2020, *Transformers are RNNs*): the FIRST
+      genuinely sub-quadratic attention mechanism in this repo. Every in-tree
+      attention layer (SDPA + RoPE / ALiBi / MaskedFill / Differential / Sink /
+      CosineSimilarity / SoftCapping) keeps the O(SeqLen^2) `softmax(QK^T)V`
+      core, and [[TNNetDiagonalSSM]] is a state-space recurrence, not
+      attention — so this is a NEW forward pass, not a re-skin. Replace the
+      softmax with a positive feature map `phi(.) = elu(.) + 1` applied to Q
+      and K, then exploit associativity to compute
+      `Out_t = phi(Q_t) . (sum_s phi(K_s) (x) V_s) / (phi(Q_t) . sum_s phi(K_s))`
+      — i.e. accumulate the `d_k x d_v` key-value outer-product matrix `S` and
+      the `d_k` key-sum normaliser `Z` ONCE, then read each query off them, so
+      the cost is O(SeqLen . d_k . d_v) (linear in sequence length) with NO
+      SeqLen x SeqLen score matrix ever materialised. Ship a non-causal
+      (full-prefix) variant first; a causal variant needs the running
+      prefix-sum of `S`/`Z` (the "attention is an RNN" identity) and is the
+      natural follow-up. Backward differentiates the two contractions plus the
+      `elu+1` Jacobian (`phi'(x) = elu(x)+1` for x<0, `1` for x>=0) — all
+      smooth, so a standard input + Q/K/V-projection numerical-gradient check
+      applies. Built-in correctness signals: (a) gradient-check on a tiny shape
+      (d_k=4, d_v=4, SeqLen=3) through the projection; (b) a wall-clock scaling
+      probe at SeqLen in {16,32,64,128,256} showing ~linear (not quadratic)
+      growth — the headline claim, and the mirror of the open SDPA O(n^2)
+      scaling micro-benchmark; (c) at SeqLen=1 the output reduces to plain
+      value-weighting `V_1` (the normaliser cancels), a clean degeneracy
+      assertion. DISTINCT from [[TNNetCosineSimilarityAttention]] (that still
+      forms the full NxN score matrix and softmaxes it — only the score
+      *definition* changes; here the NxN matrix never exists) and from the open
+      KV-cache incremental-decode task for SDPA (that speeds up *generation*
+      with the quadratic core intact; this changes the core's asymptotics for
+      both training and inference). Unblocks a linear-cost long-context arm for
+      the downstream ../gpt-3-for-pascal model and a "softmax vs linear
+      attention quality-vs-cost" bake-off on a tiny next-token task. Pairs with
+      the MHA breakdown ([[TNNetMultiHeadSelfAttention]]) so a head can opt into
+      linear attention.
 - [ ] TNNetDifferentialAttention follow-up: the paper's headline
       NOISE-CANCELLATION micro-experiment (deferred at landing — only the four
       correctness tests shipped). On a tiny causal next-token task with an
