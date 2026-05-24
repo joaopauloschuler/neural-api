@@ -300,11 +300,6 @@ breakdown:
 - [ ] TNNetMishExact / TNNetMish-stable — stable formulation for large |x|
       using softplus's stable form (parallel to the SoftPlus negative-x
       derivative guard).
-- [X] TNNetAconC — "Activate Or Not": `(p1-p2)·x·sigmoid(β(p1-p2)x) + p2·x`
-      with channel-wise learnable `(p1, p2, β)`. Generalizes Swish. LANDED:
-      TNNetChannelTransformBase descendant, per-channel (p1,p2,β) init to
-      Swish, exact input + weight gradients, gradient-checked
-      (TestAconCGradientCheck / SwishEquivalence / SerializationRoundTrip).
 - [ ] TNNetSReLU — S-shaped ReLU with four learnable knee parameters per
       channel.
 - [ ] TNNetMetaAconC follow-up to the landed TNNetAconC — make the β switch
@@ -338,12 +333,6 @@ breakdown:
       spatial only, independently per depth channel) gated by a flag, mirroring
       the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
       Builds on the landed full-volume TNNetMinMaxNorm.
-- [X] TNNetMinMaxNorm — `(x - min(x)) / (max(x) - min(x) + eps)` per sample,
-      with subgradient routing for the argmin/argmax cells. LANDED:
-      reduces over the whole sample volume, eps configurable + serialized,
-      exact backward routing through argmin/argmax, gradient-checked on a
-      non-degenerate input (TestMinMaxNorm{Forward,GradientCheck,
-      SerializationRoundTrip}).
 - [ ] TNNetUnitNormConstraint — projection layer that L2-normalizes the
       *weights* of the previous trainable layer after each step.
 
@@ -364,11 +353,6 @@ breakdown:
       `(1 - eps) * one_hot + eps / NumClasses`.
 - [ ] TNNetCosineEmbeddingLoss — y·(1-cos) + (1-y)·max(0, cos-margin)²
       loss layer.
-- [X] TNNetKLDivergence — `sum(p · log(p/q))` with stability clamps on q.
-      LANDED: TNNetIdentity-style loss in the TNNetNLLLoss family; forward
-      pass-through, Backpropagate sets dL/dq_i = -p_i/q_i with q clamped to
-      [1e-7, 1] and 0·log0:=0 for zero-target terms
-      (TestKLDivergence{ForwardPassthrough,Gradient,LoadFromString}).
 - [ ] TNNetKLDivergence follow-up: a knowledge-distillation micro-example —
       train a small "student" against soft targets from a fixed "teacher"
       distribution using the landed TNNetKLDivergence head, and contrast its
@@ -792,8 +776,7 @@ breakdown:
 - [ ] "Memorize a sentence" demo: train a 1-layer SDPA+RoPE model to
       perfectly memorize a 32-token sequence, print training loss curve
       and reconstructed sample.
-- [ ] "Learn to copy" toy: SeqLen=8 input → output the same sequence.
-- [ ] "Learn to reverse" toy: same shape, output reversed.
+- [ ] "Learn to reverse" toy: SeqLen=8 input → output the reversed sequence.
 - [ ] "Smallest net that can learn parity-N" study — sweep N ∈ {2, 4, 6, 8}.
 - [ ] Grokking demo (`examples/Grokking/`) — reproduce delayed generalization
       (Power et al. 2022) on a pure-CPU toy. Train a tiny MLP on modular
