@@ -1305,6 +1305,55 @@ breakdown:
       as "weak barrier" purely because the denominator is tiny. Add an
       absolute-floor term (e.g. treat barriers below an absolute epsilon as
       "connected" regardless of ratio) and re-pin the example's RUN 1 verdict.
+- [ ] TNNet.PermutationAlignReport(NN, SnapshotB, Samples) — the missing DUAL
+      of the landed [[mode-connectivity]] report: weight-space NEURON-permutation
+      alignment, a.k.a. "Git Re-Basin" (Ainsworth, Hayase & Srinivasa 2022; cf.
+      Entezari et al. 2021, "the role of permutation invariance in linear mode
+      connectivity"). ModeConnectivityReport MEASURES the loss barrier between two
+      independently-trained nets of the same architecture but does nothing about
+      it; the headline result of this line of work is that most of that barrier is
+      an ILLUSION of neuron-labelling — permute the hidden units of net B (and
+      compensate the next layer's input weights) to best match net A's units and
+      the barrier on the straight-line interpolant largely COLLAPSES, because both
+      nets sit in the same loss basin once you quotient out the permutation
+      symmetry. Recipe with existing machinery only — no new layer: with the live
+      net as endpoint A and a `SaveDataToString` snapshot of endpoint B, walk the
+      trainable layers front-to-back and, for each hidden FullConnect/Conv layer,
+      find the neuron permutation `P_L` of B that best aligns B's units to A's —
+      a per-layer assignment either by WEIGHT matching (maximise sum of
+      `<row_i^A, P(row)_i^B>` over the layer's weight rows) or by ACTIVATION
+      matching (correlate the two nets' per-unit activations over `Samples`),
+      solved greedily (a Hungarian solve is the principled version but greedy
+      correlation-descent is fine at toy width and avoids new numerical code).
+      Apply each `P_L` consistently: permute layer L's output neurons AND the
+      NEXT trainable layer's matching input-weight columns so the represented
+      FUNCTION is unchanged. Then re-run the interpolation sweep `theta(alpha) =
+      (1-alpha)*A + alpha*P(B)` (reusing the exact `TNNetVolume.MulMulAdd`
+      snapshot-arithmetic sweep ModeConnectivityReport already ships) and report
+      the loss barrier BEFORE vs AFTER alignment, the per-layer permutation
+      "churn" (fraction of units that moved), and a `barrier collapsed` /
+      `partially reduced` / `unchanged` verdict. Built-in correctness checks
+      (each a clean PASS/FAIL): (1) applying any permutation + its next-layer
+      compensation leaves `NN.Compute` output bit-for-bit unchanged on `Samples`
+      — permutation invariance, the foundational identity; (2) aligning a net to
+      ITSELF yields the identity permutation and a flat zero barrier; (3) the
+      post-alignment barrier is `<=` the pre-alignment barrier (alignment can
+      only help or tie). Follows the [[introspection-report-pattern]]: decl +
+      impl in neuralnetwork.pas, an `examples/PermutationAlign/` demo training the
+      same tiny MLP twice from DIFFERENT inits on a synthetic task (so a real
+      barrier exists pre-alignment and visibly shrinks post-alignment), and a
+      smoke test in tests/ (non-empty report, expected header, nil-NN graceful
+      return, plus the bit-for-bit permutation-invariance and align-to-self
+      assertions). DISTINCT from `ModeConnectivityReport` (measures the barrier,
+      never permutes), from `RepresentationSimilarityReport` / cross-CKA (compares
+      two nets' activations for SIMILARITY but never produces a weight-space
+      permutation or re-interpolates), from `NeuronCorrelationReport` (intra-layer
+      redundancy of ONE net, no cross-net matching) and from `WeightDriftReport`
+      (raw L2 drift, no symmetry quotient). The genuinely new capability is the
+      symmetry-aware weight-space ALIGNMENT itself — turning "these two nets are
+      separated" into "they were the same basin all along, mislabelled." Endpoint-A
+      weights restored bit-for-bit; forward-only (the alignment uses activations or
+      weights, never a backward pass on the inspected nets).
 - [ ] TNNet.PredictionDepthReport(NN, Support, SupportLabels, Queries
       [, K, QueryLabels]) — a **per-example difficulty** diagnostic built on
       the *prediction depth* of Baldock, Maennel & Neyshabur 2021 ("Deep
