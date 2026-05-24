@@ -3512,6 +3512,28 @@ type
         TopConfusedPairs: integer = 5;
         HardExamplesPerClass: integer = 0
       ): string;
+      // Classifier confidence-margin diagnostic. Given a trained classifier
+      // NN, a labeled validation set Samples (input volume + one-hot target)
+      // and the class count NumClasses, runs a single forward pass per sample
+      // and computes the per-sample margin = (top1_logit - top2_logit) on the
+      // raw FINAL-layer Output values (treated as logits). Reports:
+      // (a) an overall 10-bin ASCII margin histogram over
+      //     [min_margin, max_margin] (tallest bar ~40 chars);
+      // (b) per-class mean and median margin, grouped by the sample's TRUE
+      //     class (argmax of the one-hot target) so a systematically-uncertain
+      //     class stands out;
+      // (c) the HardExamplesPerClass lowest-margin sample indices per true
+      //     class — a ready-made "hard examples" pool for active learning,
+      //     label-noise auditing or curriculum work (0 disables; default 5).
+      // Also prints overall mean/median/min/max margin and total sample count.
+      // Pure CPU, single forward pass per sample, no training-time changes,
+      // no new layer types.
+      class function TopLogitMarginReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        NumClasses: integer;
+        HardExamplesPerClass: integer = 5
+      ): string;
       // Generic next-token-prediction evaluator. Given a trained sequence
       // model whose final layer is a softmax-family head (TNNetSoftMax /
       // TNNetPointwiseSoftMax / TNNetLogSoftMax) over a vocabulary of size V
@@ -24621,6 +24643,306 @@ begin
         else
           for J := 0 to K - 1 do
             Line := Line + Format(' %d(%.3f)', [HardIdx[I][J], HardConf[I][J]]);
+        Lines.Add(Line);
+      end;
+      Lines.Add('');
+    end;
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.TopLogitMarginReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  NumClasses: integer;
+  HardExamplesPerClass: integer = 5
+): string;
+const
+  cBins = 10;
+  cMaxBarWidth = 40;
+var
+  Lines: TStringList;
+  // per-sample margin and its true class
+  Margins: array of TNeuralFloat;
+  TrueCls: array of integer;
+  SampleCount: integer;
+  // per-class margin lists (for mean / median)
+  ClassMargins: array of array of TNeuralFloat;
+  // per-class hard-example tracking (lowest margins)
+  HardIdx: array of array of integer;
+  HardMrg: array of array of TNeuralFloat;
+  Bins: array of integer;
+  I, J, K, T, Top1Idx, Top2Idx, BinIdx: integer;
+  Pair: TNNetVolumePair;
+  Output: TNNetVolume;
+  V, Top1Val, Top2Val, Margin: TNeuralFloat;
+  MinMargin, MaxMargin, Span, BinLo, BinHi: TNeuralFloat;
+  SumAll, MeanAll, MedianAll: TNeuralFloat;
+  ClassMean, ClassMedian: TNeuralFloat;
+  AllMargins: array of TNeuralFloat;
+  MaxBin, BarLen, WorstIdx: integer;
+  WorstMrg, TmpF: TNeuralFloat;
+  TmpI: integer;
+  Bar, Line: string;
+
+  // median of a TNeuralFloat dynamic array (sorts a working copy in place)
+  function MedianOf(const Arr: array of TNeuralFloat): TNeuralFloat;
+  var
+    Work: array of TNeuralFloat;
+    A, B, MinPos, N: integer;
+    Sw: TNeuralFloat;
+  begin
+    N := Length(Arr);
+    if N = 0 then
+    begin
+      Result := 0;
+      Exit;
+    end;
+    SetLength(Work, N);
+    for A := 0 to N - 1 do Work[A] := Arr[A];
+    // selection sort (N is small in these diagnostics)
+    for A := 0 to N - 2 do
+    begin
+      MinPos := A;
+      for B := A + 1 to N - 1 do
+        if Work[B] < Work[MinPos] then MinPos := B;
+      if MinPos <> A then
+      begin
+        Sw := Work[A]; Work[A] := Work[MinPos]; Work[MinPos] := Sw;
+      end;
+    end;
+    if (N mod 2) = 1 then
+      Result := Work[N div 2]
+    else
+      Result := (Work[N div 2 - 1] + Work[N div 2]) / 2;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NumClasses <= 0 then
+    begin
+      Result := 'TopLogitMarginReport: NumClasses must be > 0.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'TopLogitMarginReport: empty sample list.' + sLineBreak;
+      Exit;
+    end;
+    if NN = nil then
+    begin
+      Result := 'TopLogitMarginReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+
+    SetLength(ClassMargins, NumClasses);
+    SetLength(HardIdx, NumClasses);
+    SetLength(HardMrg, NumClasses);
+    for I := 0 to NumClasses - 1 do
+    begin
+      SetLength(ClassMargins[I], 0);
+      SetLength(HardIdx[I], 0);
+      SetLength(HardMrg[I], 0);
+    end;
+
+    SetLength(Margins, Samples.Count);
+    SetLength(TrueCls, Samples.Count);
+    SampleCount := 0;
+
+    for I := 0 to Samples.Count - 1 do
+    begin
+      Pair := Samples[I];
+      if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+      T := Pair.O.GetClass();
+      if (T < 0) or (T >= NumClasses) then Continue;
+      NN.Compute(Pair.I);
+      Output := NN.GetLastLayer().Output;
+      if Output.Size < 2 then Continue;
+
+      // top1 / top2 over the raw final-layer outputs (logits)
+      Top1Idx := 0;
+      Top1Val := Output.FData[0];
+      for J := 1 to Output.Size - 1 do
+        if Output.FData[J] > Top1Val then
+        begin
+          Top1Val := Output.FData[J];
+          Top1Idx := J;
+        end;
+      Top2Idx := -1;
+      Top2Val := 0;
+      for J := 0 to Output.Size - 1 do
+      begin
+        if J = Top1Idx then Continue;
+        V := Output.FData[J];
+        if (Top2Idx < 0) or (V > Top2Val) then
+        begin
+          Top2Val := V;
+          Top2Idx := J;
+        end;
+      end;
+      Margin := Top1Val - Top2Val;
+
+      Margins[SampleCount] := Margin;
+      TrueCls[SampleCount] := T;
+      Inc(SampleCount);
+
+      // accumulate into the true-class margin list
+      K := Length(ClassMargins[T]);
+      SetLength(ClassMargins[T], K + 1);
+      ClassMargins[T][K] := Margin;
+
+      // keep the HardExamplesPerClass lowest-margin samples for class T
+      if HardExamplesPerClass > 0 then
+      begin
+        K := Length(HardIdx[T]);
+        if K < HardExamplesPerClass then
+        begin
+          SetLength(HardIdx[T], K + 1);
+          SetLength(HardMrg[T], K + 1);
+          HardIdx[T][K] := I;
+          HardMrg[T][K] := Margin;
+        end
+        else
+        begin
+          // replace the current largest-margin entry if this one is smaller
+          WorstIdx := 0;
+          WorstMrg := HardMrg[T][0];
+          for J := 1 to K - 1 do
+            if HardMrg[T][J] > WorstMrg then
+            begin
+              WorstMrg := HardMrg[T][J];
+              WorstIdx := J;
+            end;
+          if Margin < WorstMrg then
+          begin
+            HardIdx[T][WorstIdx] := I;
+            HardMrg[T][WorstIdx] := Margin;
+          end;
+        end;
+      end;
+    end;
+
+    if SampleCount = 0 then
+    begin
+      Result := 'TopLogitMarginReport: no usable samples.' + sLineBreak;
+      Exit;
+    end;
+
+    // overall stats
+    SetLength(AllMargins, SampleCount);
+    SumAll := 0;
+    MinMargin := Margins[0];
+    MaxMargin := Margins[0];
+    for I := 0 to SampleCount - 1 do
+    begin
+      AllMargins[I] := Margins[I];
+      SumAll := SumAll + Margins[I];
+      if Margins[I] < MinMargin then MinMargin := Margins[I];
+      if Margins[I] > MaxMargin then MaxMargin := Margins[I];
+    end;
+    MeanAll := SumAll / SampleCount;
+    MedianAll := MedianOf(AllMargins);
+
+    Lines.Add('TopLogitMarginReport (margin = top1_logit - top2_logit on '
+      + 'final-layer output):');
+    Lines.Add(Format('Samples: %d   Classes: %d', [SampleCount, NumClasses]));
+    Lines.Add(Format('Overall margin  mean=%.4f  median=%.4f  min=%.4f  max=%.4f',
+      [MeanAll, MedianAll, MinMargin, MaxMargin]));
+    Lines.Add('');
+
+    // (a) overall 10-bin margin histogram over [MinMargin, MaxMargin]
+    SetLength(Bins, cBins);
+    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    Span := MaxMargin - MinMargin;
+    for I := 0 to SampleCount - 1 do
+    begin
+      if Span > 0 then
+        BinIdx := Trunc(((Margins[I] - MinMargin) / Span) * cBins)
+      else
+        BinIdx := 0;
+      if BinIdx >= cBins then BinIdx := cBins - 1;
+      if BinIdx < 0 then BinIdx := 0;
+      Inc(Bins[BinIdx]);
+    end;
+    MaxBin := 0;
+    for BinIdx := 0 to cBins - 1 do
+      if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
+    Lines.Add(Format('Margin histogram (%d bins over [%.4f, %.4f]):',
+      [cBins, MinMargin, MaxMargin]));
+    for BinIdx := 0 to cBins - 1 do
+    begin
+      if Span > 0 then
+      begin
+        BinLo := MinMargin + BinIdx * (Span / cBins);
+        BinHi := MinMargin + (BinIdx + 1) * (Span / cBins);
+      end
+      else
+      begin
+        BinLo := MinMargin;
+        BinHi := MaxMargin;
+      end;
+      if MaxBin > 0 then
+        BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  [%9.4f, %9.4f) | n=%4d %s',
+        [BinLo, BinHi, Bins[BinIdx], Bar]));
+    end;
+    Lines.Add('');
+
+    // (b) per-class mean and median margin (grouped by true class)
+    Lines.Add(Format('%-6s %8s %10s %10s', ['Class', 'Support', 'MeanMrg',
+      'MedianMrg']));
+    Lines.Add(StringOfChar('-', 38));
+    for I := 0 to NumClasses - 1 do
+    begin
+      K := Length(ClassMargins[I]);
+      if K = 0 then
+      begin
+        Lines.Add(Format('%-6d %8d %10s %10s', [I, 0, '-', '-']));
+        Continue;
+      end;
+      ClassMean := 0;
+      for J := 0 to K - 1 do ClassMean := ClassMean + ClassMargins[I][J];
+      ClassMean := ClassMean / K;
+      ClassMedian := MedianOf(ClassMargins[I]);
+      Lines.Add(Format('%-6d %8d %10.4f %10.4f',
+        [I, K, ClassMean, ClassMedian]));
+    end;
+    Lines.Add('');
+
+    // (c) per-class lowest-margin sample indices (hard-examples pool)
+    if HardExamplesPerClass > 0 then
+    begin
+      Lines.Add(Format('Hard examples per class (up to %d, lowest margin first):',
+        [HardExamplesPerClass]));
+      for I := 0 to NumClasses - 1 do
+      begin
+        K := Length(HardIdx[I]);
+        // sort ascending by margin (selection sort)
+        for J := 0 to K - 2 do
+        begin
+          WorstIdx := J;
+          for T := J + 1 to K - 1 do
+            if HardMrg[I][T] < HardMrg[I][WorstIdx] then WorstIdx := T;
+          if WorstIdx <> J then
+          begin
+            TmpI := HardIdx[I][J]; HardIdx[I][J] := HardIdx[I][WorstIdx]; HardIdx[I][WorstIdx] := TmpI;
+            TmpF := HardMrg[I][J]; HardMrg[I][J] := HardMrg[I][WorstIdx]; HardMrg[I][WorstIdx] := TmpF;
+          end;
+        end;
+        Line := Format('  class %d:', [I]);
+        if K = 0 then
+          Line := Line + ' (none)'
+        else
+          for J := 0 to K - 1 do
+            Line := Line + Format(' %d(%.4f)', [HardIdx[I][J], HardMrg[I][J]]);
         Lines.Add(Line);
       end;
       Lines.Add('');

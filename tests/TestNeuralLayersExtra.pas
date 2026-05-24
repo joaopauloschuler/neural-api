@@ -85,6 +85,7 @@ type
     procedure TestActivationStatsReportNearCollapsedFlag;
     procedure TestWeightSpectrumReportRank1Matrix;
     procedure TestWeightSpectrumReportStructureAndFlags;
+    procedure TestTopLogitMarginReportSmoke;
   end;
 
 implementation
@@ -1540,6 +1541,59 @@ begin
     ReportB := TNNet.WeightSpectrumReport(NN);
     AssertTrue('Report is deterministic', Report = ReportB);
   finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestTopLogitMarginReportSmoke;
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  Report: string;
+  I, C: integer;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.TopLogitMarginReport(nil, nil, 3);
+  AssertTrue('nil NN / empty samples reported gracefully', Length(Report) > 0);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.InitWeights();
+
+    // A handful of labeled samples across 3 classes (no training needed for a
+    // smoke test — we only need a valid forward pass and a non-empty report).
+    for I := 0 to 11 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(2, 1, 1);
+      Y := TNNetVolume.Create(3, 1, 1);
+      X.FData[0] := C * 1.0;
+      X.FData[1] := -C * 1.0;
+      Y.Fill(0);
+      Y.FData[C] := 1.0;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+
+    Report := TNNet.TopLogitMarginReport(NN, Samples, 3, 2);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('TopLogitMarginReport', Report) > 0);
+    AssertTrue('Histogram section present',
+      Pos('Margin histogram', Report) > 0);
+    AssertTrue('Hard-examples section present',
+      Pos('Hard examples per class', Report) > 0);
+
+    // nil NN with a valid sample list still handled gracefully.
+    Report := TNNet.TopLogitMarginReport(nil, Samples, 3);
+    AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+  finally
+    Samples.Free;
     NN.Free;
   end;
 end;

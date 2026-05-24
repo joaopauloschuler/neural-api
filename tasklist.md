@@ -960,7 +960,7 @@ breakdown:
       temperature-scaling fit on the logits.
 
 ### Introspection (added)
-- [ ] Top-logit margin report — small helper in a new
+- [X] Top-logit margin report — small helper in a new
       `neuralintrospection.pas` (or extending the calibration unit above)
       that, given a trained classifier and a validation set, computes the
       per-sample `(top1_logit - top2_logit)` margin and prints:
