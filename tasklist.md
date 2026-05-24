@@ -80,6 +80,18 @@ rather than acted on.
       clean spectral-bias-removal story and bounds the test to an input-gradient
       check only). A genuinely new capability, not a re-skin of an existing
       layer.
+- [ ] TNNetFourierFeatures follow-up: the spectral-bias micro-experiment now
+      unblocked by the landed layer. Fit a high-frequency 1D target (e.g.
+      `y = sin(20x) + 0.5*sin(53x)` on `x in [-1,1]`) with the SAME small ReLU
+      coordinate-MLP twice — once on the raw scalar `x`, once with
+      `TNNetFourierFeatures.Create(M, sigma)` as the front-end — and chart the
+      final MSE gap (the headline Tancik et al. 2020 result: the raw-coordinate
+      MLP cannot fit the high frequencies, the Fourier-mapped one can). ~40-line
+      example; pairs directly with the open `examples/SIREN/` task (FourierFeatures
+      is a drop-in coordinate front-end) and the periodic-activation toy benchmark.
+- [ ] TNNetFourierFeatures follow-up: sigma bandwidth sweep — same 1D fit with
+      `sigma in {0.5, 2, 8, 32}` charting final MSE vs sigma (too small = still
+      low-pass / underfit; too large = noisy / overfit). The single-knob story.
 
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
@@ -400,6 +412,22 @@ breakdown:
       its own layer/builder rather than a ChannelTransformBase descendant.
 - [X] TNNetBitLinear (BitNet ternary-weight FullConnect) — `sign(W) *
       mean(|W|)` forward with straight-through estimator backward.
+      LANDED: per-neuron absmean ternarization `Wq = scale*round(clip(W/scale,
+      -1,+1))`, STE backward (overrode ComputePreviousLayerErrorCPU so the
+      input-error path uses the QUANTIZED weights, not the latent ones).
+- [ ] TNNetBitLinear follow-up: a ternary-vs-full-precision bake-off — train the
+      same tiny classifier with `TNNetFullConnectLinear` heads vs `TNNetBitLinear`
+      heads at matched architecture, report final accuracy/loss AND the effective
+      model size (ternary weights are ~1.58 bits each vs 32). The headline BitNet
+      claim is "near-FP accuracy at a fraction of the weight memory"; this is a
+      ~30-line head swap. Pairs with the STE bit-width sweep and the
+      TNNetStraightThroughEstimator quantization demos already in the list.
+- [ ] TNNetBitLinear follow-up: activation-quantization variant — BitNet b1.58
+      also quantizes the *activations* to int8 (absmax per-token). Consider a flag
+      or sibling that rounds the layer INPUT through an absmax STE before the
+      ternary matmul, so the "fully-quantized linear" path is reachable. Scope as
+      its own flag on TNNetBitLinear (forward adds an input absmax-round; backward
+      STE-passes the input gradient unchanged).
 <!-- (TNNetMaxOut2 removed: a "two-piece special case of TNNetMaxOut" is just
      TNNetMaxOut.Create(2) with a thinner constructor — i.e. a forward-pass
      duplicate of the existing TNNetMaxOut, which the "DO NOT REINTRODUCE"
@@ -1339,6 +1367,17 @@ breakdown:
       tests/ (non-empty report, expected header, nil-NN graceful return, plus the
       `s=0%` reproduces-baseline and realised-vs-requested-sparsity assertions).
       Weights are restored bit-for-bit at the end; pure forward-only, never stepped.
+- [ ] MagnitudePruningReport follow-up (now landed): the report sweeps a FIXED
+      sparsity menu `{0,10,...,90,95,99}%`. Add a "find-the-knee" refinement that
+      bisects between the last surviving and first failing sparsity to report the
+      knee to ~1% resolution instead of the 10%-grid step. ~20 lines on top of the
+      landed sweep; the curve already brackets the knee.
+- [ ] MagnitudePruningReport follow-up: this is the no-retrain precursor to the
+      open "Lottery-ticket"-flavored experiment — wire the two together so the
+      knee found here seeds the prune level, then RETRAIN from the original init
+      and chart whether the pruned-then-retrained net recovers the baseline
+      accuracy (the lottery-ticket claim). The report already snapshots/restores
+      the unpruned weights, so the retrain path is the only new piece.
 - [ ] ActivationPatchingReport follow-up (now landed): the report and example
       shipped, but a KEY finding emerged — on a strictly FEEDFORWARD stack,
       whole-layer patching + downstream recompute lands on the clean-class
