@@ -2179,6 +2179,56 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Learnable-alpha Mish: y = x * tanh(softplus(alpha * x)) with a SINGLE
+  // learnable scalar alpha (the inner input scale) shared across all elements,
+  // mirroring the fixed-beta SoftPlusBeta idiom of a learnable inner scale.
+  // Here softplus(z) = ln(1 + exp(z)). With the default initial alpha = 1.0 an
+  // untrained TNNetMishLearnable reproduces the ordinary TNNetMish exactly.
+  // Let s = softplus(alpha*x), t = tanh(s), sig = sigmoid(alpha*x).
+  // Input gradient:  dy/dx     = t + x * (1 - t^2) * (alpha * sig).
+  // Parameter grad:  dy/dalpha = x^2 * (1 - t^2) * sig.
+  // Mirrors TNNetSwishLearnable / TNNetPReLU's single-scalar trainable pattern
+  // (descends from TNNetChannelTransformBase because the weightless
+  // TNNetReLUBase activation hierarchy cannot store gradients). Numerically
+  // stable via sign branches on alpha*x to avoid Exp overflow.
+  // Misra 2019 - "Mish: A Self Regularized Non-Monotonic Activation Function",
+  // https://arxiv.org/abs/1908.08681.
+  TNNetMishLearnable = class(TNNetChannelTransformBase)
+    private
+      FInitialAlpha: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialAlpha: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
+  /// Learnable-beta SoftPlus: y = (1/beta) * ln(1 + exp(beta*x)) with a SINGLE
+  // learnable scalar beta shared across all elements. With the default initial
+  // beta = 1.0 an untrained TNNetSoftPlusBetaLearnable matches the ordinary
+  // TNNetSoftPlus / TNNetSoftPlusBeta(1.0) exactly.
+  // Input gradient:  dy/dx    = sigmoid(beta*x).
+  // Parameter grad:  dy/dbeta = (1/beta) * (x * sigmoid(beta*x) - y),
+  //   where y is the (already computed) output. Equivalently
+  //   dy/dbeta = (x*sigmoid(beta*x))/beta - ln(1+exp(beta*x))/beta^2.
+  // Parallel to TNNetMishLearnable / TNNetSwishLearnable; descends from
+  // TNNetChannelTransformBase because the weightless TNNetReLUBase activation
+  // hierarchy cannot store gradients. Numerically stable via sign branches on
+  // beta*x to avoid Exp overflow.
+  TNNetSoftPlusBetaLearnable = class(TNNetChannelTransformBase)
+    private
+      FInitialBeta: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInitialBeta: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Per-channel Parametric ReLU (He et al. 2015): y[c] = max(0, x[c]) +
   // alpha[c] * min(0, x[c]) with one learnable alpha PER channel stored in
   // FNeurons[0].Weights (length = Depth). Default initial alpha is 0.25
@@ -5908,6 +5958,190 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetMishLearnable }
+
+constructor TNNetMishLearnable.Create();
+begin
+  // Initial alpha = 1.0 reproduces ordinary TNNetMish exactly.
+  Create(1.0);
+end;
+
+constructor TNNetMishLearnable.Create(pInitialAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FInitialAlpha := pInitialAlpha;
+  FFloatSt[0] := pInitialAlpha;
+  InitDefault();
+end;
+
+procedure TNNetMishLearnable.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Override the base which allocates Depth weights: a single shared scalar.
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetMishLearnable.Compute();
+var
+  StartTime: double;
+  alpha, x, ax, sp, expVal, t, sig: TNeuralFloat;
+  i, SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  HasDeriv: boolean;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> 1 then
+  begin
+    FErrorProc('Neuron weight count must be 1 at TNNetMishLearnable.');
+  end;
+  {$ENDIF}
+  alpha := FNeurons[0].FWeights.Raw[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
+  if HasDeriv then
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      ax := alpha * x;
+      // Numerically stable softplus(ax) and sigmoid(ax).
+      if ax > 30 then
+      begin
+        sp := ax;
+        sig := 1.0;
+      end
+      else if ax < -30 then
+      begin
+        expVal := Exp(ax);
+        sp := expVal;
+        sig := expVal;
+      end
+      else
+      begin
+        expVal := Exp(ax);
+        sp := Ln(1 + expVal);
+        sig := expVal / (1 + expVal);
+      end;
+      t := Tanh(sp);
+      FOutput.FData[i] := x * t;
+      // dy/dx = t + x*(1 - t^2)*(alpha*sig).
+      FOutputErrorDeriv.FData[i] := t + x * (1 - t * t) * (alpha * sig);
+    end;
+  end
+  else
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      ax := alpha * x;
+      if ax > 30 then
+        sp := ax
+      else if ax < -30 then
+        sp := Exp(ax)
+      else
+        sp := Ln(1 + Exp(ax));
+      FOutput.FData[i] := x * Tanh(sp);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMishLearnable.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  gradAlpha, alpha, x, ax, sp, expVal, t, sig: TNeuralFloat;
+  i: integer;
+  LocalPrevOutput: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  alpha := localNeuron.FWeights.Raw[0];
+  // Gradient w.r.t. the scalar alpha:
+  // d(alpha) = sum_i OutputError[i] * x_i^2 * (1 - t_i^2) * sig_i.
+  gradAlpha := 0;
+  for i := 0 to FOutputError.Size - 1 do
+  begin
+    x := LocalPrevOutput.Raw[i];
+    ax := alpha * x;
+    if ax > 30 then
+    begin
+      sp := ax;
+      sig := 1.0;
+    end
+    else if ax < -30 then
+    begin
+      expVal := Exp(ax);
+      sp := expVal;
+      sig := expVal;
+    end
+    else
+    begin
+      expVal := Exp(ax);
+      sp := Ln(1 + expVal);
+      sig := expVal / (1 + expVal);
+    end;
+    t := Tanh(sp);
+    gradAlpha := gradAlpha + FOutputError.Raw[i] * x * x * (1 - t * t) * sig;
+  end;
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
+    (-FLearningRate) * gradAlpha;
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Gradient w.r.t. the input:
+    // dInput[i] = OutputError[i] * (t + x*(1 - t^2)*(alpha*sig)).
+    for i := 0 to FOutputError.Size - 1 do
+    begin
+      x := LocalPrevOutput.Raw[i];
+      ax := alpha * x;
+      if ax > 30 then
+      begin
+        sp := ax;
+        sig := 1.0;
+      end
+      else if ax < -30 then
+      begin
+        expVal := Exp(ax);
+        sp := expVal;
+        sig := expVal;
+      end
+      else
+      begin
+        expVal := Exp(ax);
+        sp := Ln(1 + expVal);
+        sig := expVal / (1 + expVal);
+      end;
+      t := Tanh(sp);
+      FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
+        FOutputError.Raw[i] * (t + x * (1 - t * t) * (alpha * sig));
+    end;
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetMishLearnable.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialAlpha);
+  AfterWeightUpdate();
+end;
+
 { TNNetISRU }
 
 constructor TNNetISRU.Create();
@@ -8462,6 +8696,170 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSoftPlusBetaLearnable }
+
+constructor TNNetSoftPlusBetaLearnable.Create();
+begin
+  // Initial beta = 1.0 reproduces ordinary SoftPlus exactly.
+  Create(1.0);
+end;
+
+constructor TNNetSoftPlusBetaLearnable.Create(pInitialBeta: TNeuralFloat);
+begin
+  inherited Create();
+  if pInitialBeta <= 0 then
+    FErrorProc('TNNetSoftPlusBetaLearnable requires beta > 0.');
+  FInitialBeta := pInitialBeta;
+  FFloatSt[0] := pInitialBeta;
+  InitDefault();
+end;
+
+procedure TNNetSoftPlusBetaLearnable.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Override the base which allocates Depth weights: a single shared scalar.
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetSoftPlusBetaLearnable.Compute();
+var
+  StartTime: double;
+  beta, invBeta, x, betaX, sig, y: TNeuralFloat;
+  i, SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  HasDeriv: boolean;
+begin
+  StartTime := Now();
+  inherited Compute;
+  {$IFDEF Debug}
+  if FNeurons[0].FWeights.Size <> 1 then
+  begin
+    FErrorProc('Neuron weight count must be 1 at TNNetSoftPlusBetaLearnable.');
+  end;
+  {$ENDIF}
+  beta := FNeurons[0].FWeights.Raw[0];
+  if beta <= 0 then beta := 1.0;
+  invBeta := 1.0 / beta;
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
+  if HasDeriv then
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      betaX := beta * x;
+      // Numerically stable softplus: for large beta*x, ln(1+exp(z))/beta ~= x.
+      if betaX > 30 then
+        y := x
+      else
+        y := invBeta * Ln(1 + Exp(betaX));
+      FOutput.FData[i] := y;
+      // Derivative w.r.t. input is sigmoid(beta*x); sign-branch guards overflow.
+      if betaX > 30 then
+        sig := 1.0
+      else if betaX < -30 then
+        sig := Exp(betaX)
+      else
+        sig := 1 / (1 + Exp(-betaX));
+      FOutputErrorDeriv.FData[i] := sig;
+    end;
+  end
+  else
+  begin
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      betaX := beta * x;
+      if betaX > 30 then
+        FOutput.FData[i] := x
+      else
+        FOutput.FData[i] := invBeta * Ln(1 + Exp(betaX));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftPlusBetaLearnable.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  gradBeta, beta, invBeta, x, betaX, sig, y: TNeuralFloat;
+  i: integer;
+  LocalPrevOutput: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  LocalPrevOutput := FPrevLayer.Output;
+  beta := localNeuron.FWeights.Raw[0];
+  if beta <= 0 then beta := 1.0;
+  invBeta := 1.0 / beta;
+  // Gradient w.r.t. the scalar beta:
+  // d(beta) = sum_i OutputError[i] * (1/beta) * (x_i*sigmoid(beta*x_i) - y_i),
+  // where y_i = (1/beta)*ln(1+exp(beta*x_i)) is the layer output.
+  gradBeta := 0;
+  for i := 0 to FOutputError.Size - 1 do
+  begin
+    x := LocalPrevOutput.Raw[i];
+    betaX := beta * x;
+    if betaX > 30 then
+    begin
+      sig := 1.0;
+      y := x;
+    end
+    else if betaX < -30 then
+    begin
+      sig := Exp(betaX);
+      y := invBeta * Ln(1 + Exp(betaX));
+    end
+    else
+    begin
+      sig := 1 / (1 + Exp(-betaX));
+      y := invBeta * Ln(1 + Exp(betaX));
+    end;
+    gradBeta := gradBeta + FOutputError.Raw[i] * invBeta * (x * sig - y);
+  end;
+  localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
+    (-FLearningRate) * gradBeta;
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Gradient w.r.t. the input: dInput[i] = OutputError[i] * sigmoid(beta*x_i).
+    for i := 0 to FOutputError.Size - 1 do
+    begin
+      x := LocalPrevOutput.Raw[i];
+      betaX := beta * x;
+      if betaX > 30 then
+        sig := 1.0
+      else if betaX < -30 then
+        sig := Exp(betaX)
+      else
+        sig := 1 / (1 + Exp(-betaX));
+      FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
+        FOutputError.Raw[i] * sig;
+    end;
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetSoftPlusBetaLearnable.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  FNeurons[0].Weights.Fill(FInitialBeta);
+  AfterWeightUpdate();
 end;
 
 { TNNetSoftExponential }
@@ -28361,6 +28759,7 @@ begin
       'TNNetSwish' :                Result := TNNetSwish.Create();
       'TNNetESwish' :               Result := TNNetESwish.Create(Ft[0]);
       'TNNetSwishLearnable' :       Result := TNNetSwishLearnable.Create(Ft[0]);
+      'TNNetMishLearnable' :        Result := TNNetMishLearnable.Create(Ft[0]);
       'TNNetISRU' :                 Result := TNNetISRU.Create(Ft[0]);
       'TNNetISRLU' :                Result := TNNetISRLU.Create(Ft[0]);
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
@@ -28374,6 +28773,7 @@ begin
       'TNNetPenalizedTanh' :        Result := TNNetPenalizedTanh.Create();
       'TNNetSoftPlus' :             Result := TNNetSoftPlus.Create();
       'TNNetSoftPlusBeta' :         Result := TNNetSoftPlusBeta.Create(Ft[0]);
+      'TNNetSoftPlusBetaLearnable' : Result := TNNetSoftPlusBetaLearnable.Create(Ft[0]);
       'TNNetRReLU' :                Result := TNNetRReLU.Create(Ft[0], Ft[1]);
       'TNNetSoftExponential' :      Result := TNNetSoftExponential.Create(Ft[0]);
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
@@ -28584,6 +28984,7 @@ begin
       if S[0] = 'TNNetSwish' then Result := TNNetSwish.Create() else
       if S[0] = 'TNNetESwish' then Result := TNNetESwish.Create(Ft[0]) else
       if S[0] = 'TNNetSwishLearnable' then Result := TNNetSwishLearnable.Create(Ft[0]) else
+      if S[0] = 'TNNetMishLearnable' then Result := TNNetMishLearnable.Create(Ft[0]) else
       if S[0] = 'TNNetISRU' then Result := TNNetISRU.Create(Ft[0]) else
       if S[0] = 'TNNetISRLU' then Result := TNNetISRLU.Create(Ft[0]) else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
@@ -28597,6 +28998,7 @@ begin
       if S[0] = 'TNNetPenalizedTanh' then Result := TNNetPenalizedTanh.Create() else
       if S[0] = 'TNNetSoftPlus' then Result := TNNetSoftPlus.Create() else
       if S[0] = 'TNNetSoftPlusBeta' then Result := TNNetSoftPlusBeta.Create(Ft[0]) else
+      if S[0] = 'TNNetSoftPlusBetaLearnable' then Result := TNNetSoftPlusBetaLearnable.Create(Ft[0]) else
       if S[0] = 'TNNetRReLU' then Result := TNNetRReLU.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetSoftExponential' then Result := TNNetSoftExponential.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else

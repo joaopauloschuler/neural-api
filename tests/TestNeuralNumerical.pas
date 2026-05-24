@@ -390,6 +390,12 @@ type
     procedure TestSwishLearnableGradientCheck;
     procedure TestSwishLearnableWeightGradientCheck;
     procedure TestSwishLearnableSerializationRoundTrip;
+    procedure TestMishLearnableGradientCheck;
+    procedure TestMishLearnableWeightGradientCheck;
+    procedure TestMishLearnableSerializationRoundTrip;
+    procedure TestSoftPlusBetaLearnableGradientCheck;
+    procedure TestSoftPlusBetaLearnableWeightGradientCheck;
+    procedure TestSoftPlusBetaLearnableSerializationRoundTrip;
     procedure TestMaskedMeanForward;
     procedure TestMaskedMeanGradientCheck;
     procedure TestMaskedMeanAllMasked;
@@ -15154,6 +15160,368 @@ begin
         1, LSwish2.Neurons[0].Weights.Size);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SwishLearnable round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// -----------------------------------------------------------------------
+// TNNetMishLearnable: y = x * tanh(softplus(alpha*x)), single learnable alpha.
+// Checks the input gradient and the alpha (weight) gradient against central
+// finite differences, plus a non-default-alpha serialization round-trip.
+// -----------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestMishLearnableGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LMish: TNNetMishLearnable;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 2);
+  InputPlus := TNNetVolume.Create(4, 3, 2);
+  Desired := TNNetVolume.Create(4, 3, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 2, 1));
+    // Non-default alpha exercises both the input-gradient formula and the
+    // alpha-dependence of the forward pass.
+    LMish := TNNetMishLearnable.Create(0.8);
+    NN.AddLayer(LMish);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.83) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.41);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('MishLearnable input gradient at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMishLearnableWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LMish: TNNetMishLearnable;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    LMish := TNNetMishLearnable.Create(0.7);
+    NN.AddLayer(LMish);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3);
+
+    LMish.Neurons[0].Weights.Raw[0] := LMish.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    LMish.Neurons[0].Weights.Raw[0] := LMish.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    LMish.Neurons[0].Weights.Raw[0] := LMish.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    LMish.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -LMish.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('MishLearnable alpha gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMishLearnableSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  LMish, LMish2: TNNetMishLearnable;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LMish := TNNetMishLearnable.Create(0.63);
+    NN.AddLayer(LMish);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LMish2 := NN2.GetLastLayer as TNNetMishLearnable;
+      AssertEquals('MishLearnable round-trip weight value',
+        LMish.Neurons[0].Weights.Raw[0],
+        LMish2.Neurons[0].Weights.Raw[0], 1e-6);
+      AssertEquals('MishLearnable round-trip alpha preserved',
+        0.63, LMish2.Neurons[0].Weights.Raw[0], 1e-5);
+      AssertEquals('MishLearnable round-trip weight count',
+        1, LMish2.Neurons[0].Weights.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MishLearnable round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// -----------------------------------------------------------------------
+// TNNetSoftPlusBetaLearnable: y = (1/beta)*ln(1+exp(beta*x)), single learnable
+// beta. Checks the input gradient and the beta (weight) gradient against
+// central finite differences, plus a non-default-beta serialization round-trip.
+// -----------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestSoftPlusBetaLearnableGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSP: TNNetSoftPlusBetaLearnable;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 2);
+  InputPlus := TNNetVolume.Create(4, 3, 2);
+  Desired := TNNetVolume.Create(4, 3, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 2, 1));
+    // Non-default beta exercises both the input-gradient (sigmoid) formula and
+    // the beta-dependence of the forward pass.
+    LSP := TNNetSoftPlusBetaLearnable.Create(1.4);
+    NN.AddLayer(LSP);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.83) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.41);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SoftPlusBetaLearnable input gradient at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusBetaLearnableWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSP: TNNetSoftPlusBetaLearnable;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  Desired := TNNetVolume.Create(3, 2, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
+    LSP := TNNetSoftPlusBetaLearnable.Create(1.3);
+    NN.AddLayer(LSP);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.3);
+
+    LSP.Neurons[0].Weights.Raw[0] := LSP.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    LSP.Neurons[0].Weights.Raw[0] := LSP.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    LSP.Neurons[0].Weights.Raw[0] := LSP.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    LSP.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -LSP.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('SoftPlusBetaLearnable beta gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPlusBetaLearnableSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  LSP, LSP2: TNNetSoftPlusBetaLearnable;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    LSP := TNNetSoftPlusBetaLearnable.Create(1.7);
+    NN.AddLayer(LSP);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      LSP2 := NN2.GetLastLayer as TNNetSoftPlusBetaLearnable;
+      AssertEquals('SoftPlusBetaLearnable round-trip weight value',
+        LSP.Neurons[0].Weights.Raw[0],
+        LSP2.Neurons[0].Weights.Raw[0], 1e-6);
+      AssertEquals('SoftPlusBetaLearnable round-trip beta preserved',
+        1.7, LSP2.Neurons[0].Weights.Raw[0], 1e-5);
+      AssertEquals('SoftPlusBetaLearnable round-trip weight count',
+        1, LSP2.Neurons[0].Weights.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SoftPlusBetaLearnable round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
