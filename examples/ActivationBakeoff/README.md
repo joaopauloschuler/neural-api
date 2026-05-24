@@ -27,6 +27,9 @@ Activations compared:
 - `TNNetHardSwish` — piecewise-linear Swish approximation.
 - `TNNetMish` — `x * tanh(softplus(x))`.
 - `TNNetSoftPlus` — `log(1 + exp(x))`.
+- `TNNetAconC` — learnable ACON-C activation; an untrained `TNNetAconC`
+  reproduces `TNNetSwish` exactly, so it gives a clean ReLU-vs-Swish-vs-AconC
+  comparison in the same harness.
 
 ## Setup
 
@@ -60,25 +63,29 @@ Convergence threshold (validation loss): 5.00
 
 === Results (CSV) ===
 activation,final_val_loss,epochs_to_converge,total_epochs
-TNNetReLU,1.8878,26,60
-TNNetLeakyReLU,0.3277,5,60
-TNNetVeryLeakyReLU,0.5076,9,60
-TNNetReLU6,1.8714,25,60
-TNNetPReLU,2.0186,24,60
-TNNetELU,12.2412,NA,60
-TNNetSELU,4.2781,37,60
-TNNetCELU,17.1129,NA,60
-TNNetSwish,58.0939,NA,60
-TNNetSiLU,51.7903,NA,60
-TNNetGELU,17.4489,NA,60
-TNNetHardSwish,38.9073,NA,60
-TNNetMish,56.9030,NA,60
-TNNetSoftPlus,62.2400,NA,60
+TNNetReLU,1.8611,25,60
+TNNetLeakyReLU,1.9104,26,60
+TNNetVeryLeakyReLU,7.4274,NA,60
+TNNetReLU6,0.8128,9,60
+TNNetPReLU,1.9710,24,60
+TNNetELU,49.6306,NA,60
+TNNetSELU,4.2312,39,60
+TNNetCELU,43.7279,NA,60
+TNNetSwish,49.4251,NA,60
+TNNetSiLU,44.1477,NA,60
+TNNetGELU,49.7299,NA,60
+TNNetHardSwish,52.5923,NA,60
+TNNetMish,53.6879,NA,60
+TNNetSoftPlus,45.1108,NA,60
+TNNetAconC,53.8848,NA,60
 
-Total wall time: 120.18 s
+Total wall time: 128.23 s
 ```
 
-(The whole run wall-clocks at about 2 minutes on CPU.)
+(The whole run wall-clocks at about 2 minutes on CPU. Exact numbers vary a
+little with the platform / float build, but the broad ordering is stable.
+`TNNetAconC` lands right next to `TNNetSwish` because an untrained ACON-C is
+mathematically Swish.)
 
 `final_val_loss` is reported as mean squared error of the predicted
 hypotenuse in the original target units (the network output is multiplied

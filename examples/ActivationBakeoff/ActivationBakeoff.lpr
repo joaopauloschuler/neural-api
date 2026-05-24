@@ -31,7 +31,7 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
 type
   TActivationKind = (akReLU, akLeakyReLU, akVeryLeakyReLU, akReLU6, akPReLU,
                      akELU, akSELU, akCELU, akSwish, akSiLU, akGELU,
-                     akHardSwish, akMish, akSoftPlus);
+                     akHardSwish, akMish, akSoftPlus, akAconC);
 
   TBakeOffResult = record
     Name: string;
@@ -123,6 +123,7 @@ begin
     akHardSwish:     NN.AddLayer(TNNetHardSwish.Create());
     akMish:          NN.AddLayer(TNNetMish.Create());
     akSoftPlus:      NN.AddLayer(TNNetSoftPlus.Create());
+    akAconC:         NN.AddLayer(TNNetAconC.Create());
   end;
 end;
 
@@ -143,6 +144,7 @@ begin
     akHardSwish:     Result := 'TNNetHardSwish';
     akMish:          Result := 'TNNetMish';
     akSoftPlus:      Result := 'TNNetSoftPlus';
+    akAconC:         Result := 'TNNetAconC';
   end;
 end;
 
