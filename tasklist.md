@@ -404,6 +404,28 @@ breakdown:
       input-output Jacobian (the entry already flags this as the natural
       next knob). Reuses the landed `TNNet.EstimateSpectralNorm` power-
       iteration helper.
+- [ ] TNNet.EffectiveReceptiveFieldReport(NN, Probes) — the *empirical*
+      (gradient-measured) counterpart to the analytical
+      [[introspection-report-pattern]] `ReceptiveFieldReport`. Picks the
+      centre output unit of the final spatial layer, backpropagates a
+      one-hot output error (reusing the input-gradient enablement that
+      SaliencyReport needed — `Layers[0].OutputError` resizing /
+      `EnableInputGradient` once that helper lands), and accumulates
+      `|d out_centre / d input|` over a probe batch into a per-(x,y)
+      input-plane heatmap. Reports: the 2D ASCII heatmap of input
+      sensitivity, the **effective** RF radius (the central region holding
+      e.g. 90% of the total gradient mass — Luo et al. 2016 show this is
+      typically far smaller and more Gaussian than the theoretical RF), and
+      the ratio effective/theoretical RF side-by-side with the analytical
+      `ReceptiveFieldReport` number so the "your stem only really uses the
+      middle third of its theoretical window" story is visible in one run.
+      Distinct from the analytical report (that asks "what *could* an output
+      see?"; this asks "what does it *actually* weight?") and from
+      SaliencyReport (per-sample input attribution for a class logit, not a
+      batch-averaged spatial-extent measurement). Forward+backward only;
+      trained weights left untouched. Example at
+      `examples/EffectiveReceptiveField/` contrasting a 3x3-stack stem
+      against a dilated/large-kernel stem.
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
