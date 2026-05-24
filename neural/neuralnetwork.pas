@@ -2210,6 +2210,45 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetDiagonalSSM: a diagonal-state linear-recurrence ("SSM-lite")
+  // sequence mixer - the first genuinely recurrent layer in the library and an
+  // O(n) causal alternative to the O(n^2) attention head. The input is a
+  // (SeqLen, 1, Depth) sequence laid out along SizeX exactly like the attention
+  // / TNNetTokenShift layers (SizeY must be 1). For each channel d a scalar
+  // hidden state h is swept left-to-right along SizeX with the depth axis fully
+  // parallel:
+  //   h_t = a[d] * h_{t-1} + b[d] * x_t          (h_{-1} = 0)
+  //   y_t = c[d] * h_t     + e[d] * x_t
+  // The e*x term is the S4D/S5 feedthrough (skip) that keeps gradients alive at
+  // initialisation. The decay a[d] is parameterised through a sigmoid -
+  // a[d] = sigmoid(a_raw[d]) - so it stays in (0,1) and the recurrence is
+  // unconditionally stable for any value of the raw learnable weight; the raw
+  // weight a_raw is what is stored and optimised, and the chain rule through the
+  // sigmoid is applied to its gradient. Storage (each Depth-long):
+  //   FNeurons[0].Weights = a_raw  (init 0   -> a = sigmoid(0) = 0.5)
+  //   FNeurons[1].Weights = b      (init 1)
+  //   FNeurons[2].Weights = c      (init 1)
+  //   FNeurons[3].Weights = e      (init 1)
+  // The init (a~=0.5, b=c=e=1) gives a sensible default: a leaky running
+  // accumulator plus an identity feedthrough. Descends from
+  // TNNetChannelTransformBase to reuse its per-channel weight storage and
+  // gradient accumulation, like TNNetTokenShift / TNNetPolynomialActivation.
+  // Backward is backprop-through-time: a right-to-left sweep accumulating
+  //   dL/dh_t = c[d]*dL/dy_t + a[d]*dL/dh_{t+1}
+  // which is then scattered into the input gradient and the four weight
+  // gradients (a_raw via da/da_raw = a*(1-a)).
+  TNNetDiagonalSSM = class(TNNetChannelTransformBase)
+    private
+      FState: TNNetVolume;     // forward state cache h_t, shape (SeqLen,1,Depth)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetPolynomialActivation: per-channel learnable quadratic activation.
   // For each channel c:
   //   y[x,y,c] = a[c] * Input[x,y,c]^2 + b[c] * Input[x,y,c] + c0[c].
@@ -14073,6 +14112,177 @@ begin
   inherited InitDefault();
   // Neutral starting point: equal weight on current and previous token.
   FNeurons[0].Weights.Fill(0.5);
+  AfterWeightUpdate();
+end;
+
+{ TNNetDiagonalSSM }
+constructor TNNetDiagonalSSM.Create();
+begin
+  inherited Create();
+  FState := TNNetVolume.Create();
+  // Depth-dependent weight buffers are (re)allocated in SetPrevLayer.
+  InitDefault();
+end;
+
+destructor TNNetDiagonalSSM.Destroy();
+begin
+  FState.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetDiagonalSSM.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetDiagonalSSM requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  // The base class allocates FNeurons[0] with Depth weights. We need four
+  // Depth-long learnable vectors: a_raw, b, c, e.
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  FState.ReSize(FOutput.SizeX, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetDiagonalSSM.Compute();
+var
+  StartTime: double;
+  Wa, Wb, Wc, We, Prev: TNNetVolume;
+  SeqLen, Depth, t, d: integer;
+  a_d, b_d, c_d, e_d, h, xt: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Do NOT call inherited Compute (it would copy the input into FOutput); we
+  // produce FOutput directly from the recurrence over FPrevLayer.FOutput.
+  Prev := FPrevLayer.FOutput;
+  Wa := FNeurons[0].FWeights;
+  Wb := FNeurons[1].FWeights;
+  Wc := FNeurons[2].FWeights;
+  We := FNeurons[3].FWeights;
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if (Wa.Size <> Depth) or (Wb.Size <> Depth) or (Wc.Size <> Depth) or
+     (We.Size <> Depth) then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetDiagonalSSM.');
+  {$ENDIF}
+  // Per-channel left-to-right sweep with h_{-1} = 0.
+  for d := 0 to Depth - 1 do
+  begin
+    a_d := Sigmoid(Wa.Raw[d]);
+    b_d := Wb.Raw[d];
+    c_d := Wc.Raw[d];
+    e_d := We.Raw[d];
+    h := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      xt := Prev[t, 0, d];
+      h := a_d * h + b_d * xt;
+      FState[t, 0, d] := h;             // cache for BPTT
+      FOutput[t, 0, d] := c_d * h + e_d * xt;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDiagonalSSM.Backpropagate();
+var
+  StartTime: double;
+  Na, Nb, Nc, Ne: TNNetNeuron;
+  Wa, Wb, Wc, We, Prev, PrevErr: TNNetVolume;
+  SeqLen, Depth, t, d: integer;
+  a_d, b_d, c_d, e_d, da_draw: TNeuralFloat;
+  gy, gh, xt, ht, htm1: TNeuralFloat;
+  gradAraw, gradB, gradC, gradE: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Na := FNeurons[0];
+  Nb := FNeurons[1];
+  Nc := FNeurons[2];
+  Ne := FNeurons[3];
+  Wa := Na.FWeights;
+  Wb := Nb.FWeights;
+  Wc := Nc.FWeights;
+  We := Ne.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  // Backprop-through-time, one independent channel at a time. The state
+  // gradient is swept right-to-left:
+  //   gh_t = c[d]*gy_t + a[d]*gh_{t+1}     (gh_{SeqLen} = 0)
+  // From h_t = a*h_{t-1} + b*x_t and y_t = c*h_t + e*x_t:
+  //   dL/dx_t   = b[d]*gh_t + e[d]*gy_t
+  //   dL/db[d] += gh_t * x_t
+  //   dL/dc[d] += gy_t * h_t
+  //   dL/de[d] += gy_t * x_t
+  //   dL/da[d] += gh_t * h_{t-1}      (h_{-1} = 0)
+  // and a = sigmoid(a_raw) so dL/da_raw = dL/da * a*(1-a).
+  for d := 0 to Depth - 1 do
+  begin
+    a_d := Sigmoid(Wa.Raw[d]);
+    b_d := Wb.Raw[d];
+    c_d := Wc.Raw[d];
+    e_d := We.Raw[d];
+    da_draw := a_d * (1 - a_d);
+    gradAraw := 0;
+    gradB := 0;
+    gradC := 0;
+    gradE := 0;
+    gh := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      gy := FOutputError[t, 0, d];
+      ht := FState[t, 0, d];
+      if t > 0 then htm1 := FState[t - 1, 0, d] else htm1 := 0;
+      xt := Prev[t, 0, d];
+      // dL/dh_t: direct path through y_t plus the recurrence from h_{t+1}
+      // (gh already holds a[d]*gh_{t+1} from the previous iteration).
+      gh := c_d * gy + gh;
+      gradC := gradC + gy * ht;
+      gradE := gradE + gy * xt;
+      gradB := gradB + gh * xt;
+      gradAraw := gradAraw + gh * htm1;
+      if hasInputGrad then
+        PrevErr[t, 0, d] := PrevErr[t, 0, d] + b_d * gh + e_d * gy;
+      // Propagate to the previous timestep: gh_{t} contributes a[d]*gh to h_{t-1}.
+      gh := a_d * gh;
+    end;
+    gradAraw := gradAraw * da_draw;
+    Na.FDelta.Raw[d] := Na.FDelta.Raw[d] + (-FLearningRate) * gradAraw;
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * gradB;
+    Nc.FDelta.Raw[d] := Nc.FDelta.Raw[d] + (-FLearningRate) * gradC;
+    Ne.FDelta.Raw[d] := Ne.FDelta.Raw[d] + (-FLearningRate) * gradE;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    Na.UpdateWeights(FInertia);
+    Nb.UpdateWeights(FInertia);
+    Nc.UpdateWeights(FInertia);
+    Ne.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetDiagonalSSM.InitDefault();
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  // a_raw = 0 -> a = sigmoid(0) = 0.5 (leaky accumulator); b = c = e = 1
+  // (unit input mixing plus identity feedthrough).
+  FNeurons[0].FWeights.Fill(0);
+  FNeurons[1].FWeights.Fill(1);
+  FNeurons[2].FWeights.Fill(1);
+  FNeurons[3].FWeights.Fill(1);
   AfterWeightUpdate();
 end;
 
@@ -28338,6 +28548,7 @@ begin
       'TNNetPReLU':                 Result := TNNetPReLU.Create(Ft[0]);
       'TNNetPReLUChannel':          Result := TNNetPReLUChannel.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
+      'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
@@ -28560,6 +28771,7 @@ begin
       if S[0] = 'TNNetPReLU' then Result := TNNetPReLU.Create(Ft[0]) else
       if S[0] = 'TNNetPReLUChannel' then Result := TNNetPReLUChannel.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
+      if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else

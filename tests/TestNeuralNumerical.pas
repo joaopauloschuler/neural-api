@@ -125,6 +125,10 @@ type
     procedure TestPolynomialActivationForward;
     procedure TestPolynomialActivationInputGradientCheck;
     procedure TestPolynomialActivationWeightGradientCheck;
+    procedure TestDiagonalSSMInputGradientCheck;
+    procedure TestDiagonalSSMWeightGradientCheck;
+    procedure TestDiagonalSSMSeqLen1Feedthrough;
+    procedure TestDiagonalSSMSerializationRoundTrip;
     procedure TestPReLUChannelInputGradientCheck;
     procedure TestPReLUChannelWeightGradientCheck;
     procedure TestHuberLossForwardPassthrough;
@@ -13067,6 +13071,249 @@ begin
     Input.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestDiagonalSSMInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSSM: TNNetDiagonalSSM;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  // SeqLen=4, Depth=3 as required by the headline numerical-gradient test.
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LSSM := TNNetDiagonalSSM.Create();
+    NN.AddLayer(LSSM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+
+    // Non-trivial per-channel parameters so every term of the recurrence and
+    // the feedthrough is exercised.
+    LSSM.Neurons[0].Weights.Raw[0] := -0.7;  // a_raw -> a = sigmoid(-0.7)
+    LSSM.Neurons[0].Weights.Raw[1] :=  0.3;
+    LSSM.Neurons[0].Weights.Raw[2] :=  1.1;
+    LSSM.Neurons[1].Weights.Raw[0] :=  0.8;   // b
+    LSSM.Neurons[1].Weights.Raw[1] :=  1.2;
+    LSSM.Neurons[1].Weights.Raw[2] := -0.5;
+    LSSM.Neurons[2].Weights.Raw[0] :=  0.9;   // c
+    LSSM.Neurons[2].Weights.Raw[1] := -0.4;
+    LSSM.Neurons[2].Weights.Raw[2] :=  1.3;
+    LSSM.Neurons[3].Weights.Raw[0] :=  0.6;   // e
+    LSSM.Neurons[3].Weights.Raw[1] := -0.3;
+    LSSM.Neurons[3].Weights.Raw[2] :=  1.0;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('DiagonalSSM input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('DiagonalSSM input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDiagonalSSMWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSSM: TNNetDiagonalSSM;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..3] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'a_raw';
+  Names[1] := 'b';
+  Names[2] := 'c';
+  Names[3] := 'e';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LSSM := TNNetDiagonalSSM.Create();
+    NN.AddLayer(LSSM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+
+    LSSM.Neurons[0].Weights.Raw[0] := -0.7;  // a_raw
+    LSSM.Neurons[0].Weights.Raw[1] :=  0.3;
+    LSSM.Neurons[0].Weights.Raw[2] :=  1.1;
+    LSSM.Neurons[1].Weights.Raw[0] :=  0.8;   // b
+    LSSM.Neurons[1].Weights.Raw[1] :=  1.2;
+    LSSM.Neurons[1].Weights.Raw[2] := -0.5;
+    LSSM.Neurons[2].Weights.Raw[0] :=  0.9;   // c
+    LSSM.Neurons[2].Weights.Raw[1] := -0.4;
+    LSSM.Neurons[2].Weights.Raw[2] :=  1.3;
+    LSSM.Neurons[3].Weights.Raw[0] :=  0.6;   // e
+    LSSM.Neurons[3].Weights.Raw[1] := -0.3;
+    LSSM.Neurons[3].Weights.Raw[2] :=  1.0;
+
+    // Cover all four weight tensors (a_raw, b, c, e). BPTT weight gradients
+    // are a classic place for a silent off-by-one between the t and t-1 terms.
+    for n := 0 to 3 do
+      for i := 0 to LSSM.Neurons[n].Weights.Size - 1 do
+      begin
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LSSM.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // With LearningRate = 1 and batch update on, analytical = -Delta.
+        analyticalGrad := -LSSM.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('DiagonalSSM weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('DiagonalSSM weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDiagonalSSMSeqLen1Feedthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LSSM: TNNetDiagonalSSM;
+  d: integer;
+  a_raw, b_d, c_d, e_d, x0, expected: TNeuralFloat;
+begin
+  // SeqLen=1 edge case: the state never advances, so with h_{-1}=0,
+  // h_0 = b*x_0 and y_0 = c*h_0 + e*x_0 = (c*b + e)*x_0  (pure feedthrough).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    LSSM := TNNetDiagonalSSM.Create();
+    NN.AddLayer(LSSM);
+
+    LSSM.Neurons[0].Weights.Raw[0] := 0.9;   // a_raw (a is irrelevant here)
+    LSSM.Neurons[0].Weights.Raw[1] := -1.2;
+    LSSM.Neurons[0].Weights.Raw[2] := 0.0;
+    LSSM.Neurons[1].Weights.Raw[0] := 0.7;   // b
+    LSSM.Neurons[1].Weights.Raw[1] := 1.4;
+    LSSM.Neurons[1].Weights.Raw[2] := -0.6;
+    LSSM.Neurons[2].Weights.Raw[0] := 1.1;   // c
+    LSSM.Neurons[2].Weights.Raw[1] := -0.5;
+    LSSM.Neurons[2].Weights.Raw[2] := 0.8;
+    LSSM.Neurons[3].Weights.Raw[0] := 0.4;   // e
+    LSSM.Neurons[3].Weights.Raw[1] := 1.0;
+    LSSM.Neurons[3].Weights.Raw[2] := -0.2;
+
+    Input[0, 0, 0] := 1.5;
+    Input[0, 0, 1] := -0.8;
+    Input[0, 0, 2] := 2.3;
+
+    NN.Compute(Input);
+    for d := 0 to 2 do
+    begin
+      a_raw := LSSM.Neurons[0].Weights.Raw[d];  // unused but documents storage
+      b_d := LSSM.Neurons[1].Weights.Raw[d];
+      c_d := LSSM.Neurons[2].Weights.Raw[d];
+      e_d := LSSM.Neurons[3].Weights.Raw[d];
+      x0 := Input[0, 0, d];
+      expected := (c_d * b_d + e_d) * x0;
+      AssertEquals('DiagonalSSM SeqLen=1 feedthrough channel ' + IntToStr(d),
+        expected, LSSM.Output[0, 0, d], 1e-5);
+      if a_raw = 0 then ; // silence "unused" warning paths
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDiagonalSSMSerializationRoundTrip;
+begin
+  // TNNetDiagonalSSM stores four per-channel learnable vectors (a_raw, b, c, e);
+  // the perturbed-weights helper pushes them away from defaults so the round
+  // trip exercises a non-trivial parameter set. SizeY=1 (sequence layout),
+  // SizeX=4 as the time axis.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetDiagonalSSM.Create(), 'DiagonalSSM', 4, 1, 3, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestPReLUChannelInputGradientCheck;
