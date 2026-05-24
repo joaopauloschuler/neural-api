@@ -110,6 +110,7 @@ type
     procedure TestModeConnectivityReportSmoke;
     procedure TestPermutationAlignReportSmoke;
     procedure TestIntrinsicDimensionReportSmoke;
+    procedure TestNeuralTangentKernelReportSmoke;
     procedure TestActivationPatchingReportSmoke;
     procedure TestPredictionDepthReportSmoke;
     procedure TestToGraphvizDotSmoke;
@@ -4375,6 +4376,65 @@ begin
   finally
     DupBatch.Free;
     GTNet.Free;
+    RandSeed := SavedSeed;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestNeuralTangentKernelReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  V: TNNetVolume;
+  Report, NilReport, TooSmallReport: string;
+  I, J: integer;
+  SavedSeed: longword;
+const
+  cInDim  = 8;
+  cProbeN = 8;
+begin
+  SavedSeed := RandSeed;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.NeuralTangentKernelReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(cInDim, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(12));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    RandSeed := 4242;
+    NN.InitWeights();
+
+    // too-small probe list (< 2) handled gracefully.
+    TooSmallReport := TNNet.NeuralTangentKernelReport(NN, Probes);
+    AssertTrue('too-small probes reported gracefully',
+      Pos('at least 2 probe samples', TooSmallReport) > 0);
+
+    // a small probe batch -> non-empty, headers + sections present.
+    RandSeed := 777;
+    for I := 0 to cProbeN - 1 do
+    begin
+      V := TNNetVolume.Create(cInDim, 1, 1);
+      for J := 0 to cInDim - 1 do V.Raw[J] := (Random - 0.5) * 2.0;
+      Probes.Add(V);
+    end;
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present',
+      Pos('NeuralTangentKernelReport', Report) > 0);
+    AssertTrue('Heatmap present', Pos('Kernel heatmap', Report) > 0);
+    AssertTrue('Alignment present', Pos('Kernel-target alignment', Report) > 0);
+    AssertTrue('Effective rank present', Pos('Effective rank', Report) > 0);
+    AssertTrue('Condition number present', Pos('Condition number', Report) > 0);
+    // built-in correctness lines must be present (symmetry == 0, diagonal > 0).
+    AssertTrue('Correctness check present', Pos('Correctness:', Report) > 0);
+  finally
+    Probes.Free;
+    NN.Free;
     RandSeed := SavedSeed;
   end;
 end;

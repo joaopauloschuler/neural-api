@@ -5675,6 +5675,73 @@ type
         Probes: TNNetVolumeList;
         MaxFeatDim: integer = 256
       ): string;
+      // Forward-only EMPIRICAL NEURAL TANGENT KERNEL diagnostic (Jacot, Gabriel
+      // & Hongler 2018, "Neural Tangent Kernel: Convergence and Generalization
+      // in Neural Networks"). The NTK is the central object of the
+      // linearised-training theory: in the infinite-width limit a net trains as
+      // a kernel machine whose kernel K(x,x') = <grad_theta f(x), grad_theta
+      // f(x')> is FIXED, and even at finite width the EMPIRICAL NTK over a probe
+      // batch tells you how the model couples its training examples and how well
+      // that coupling is aligned with the labels. Given a classifier NN and a
+      // SMALL UNLABELLED probe batch Samples (a TNNetVolumeList of input volumes
+      // — keep N small, e.g. 8..16, the kernel is O(N^2) entries each an
+      // O(P)-param dot product), this report measures the empirical NTK of the
+      // scalar TargetClass logit. On a FROZEN net (SetBatchUpdate(true);
+      // ClearDeltas before each sample; NEVER UpdateWeights) it, for each probe
+      // sample i, runs one NN.Compute then one NN.Backpropagate SEEDED with a
+      // one-hot at TargetClass (default -1 = the net's own predicted argmax for
+      // that sample) so the recovered per-parameter weight gradient is exactly
+      // grad_theta of the TargetClass logit. It REUSES the per-sample
+      // gradient-extraction machinery FisherImportanceReport /
+      // GradientConflictReport / GradientNoiseScaleReport share: the flattened
+      // weight-gradient vector g_i is read out of Neurons[*].Delta / FBiasDelta
+      // over every trainable layer (NO input-gradient enablement). Backpropagate
+      // stores Delta = -LearningRate*grad, so g_i is taken as Delta/LearningRate
+      // — a GLOBAL sign flip that CANCELS in the Gram entries K_ij = <g_i, g_j>
+      // (a dot product of two gradients), leaving the eigenvalues and alignment
+      // unaffected; we keep the sign consistent throughout. From the N gradient
+      // vectors it forms the empirical NTK Gram matrix K_ij = <g_i, g_j> and
+      // reports:
+      //   (a) the kernel as a glyph-shaded ASCII heatmap (' .:-=+*#%@' ramp over
+      //       the normalised |K_ij|), so the block structure is visible at a
+      //       glance;
+      //   (b) its FULL eigenspectrum via the SAME self-contained Double-precision
+      //       cyclic Jacobi eigensolver WeightSpectralTailReport /
+      //       IntrinsicDimensionReport ship (no new numerical code), with tiny
+      //       negative numerical noise clamped to 0 (the NTK Gram is PSD);
+      //   (c) the CONDITION NUMBER lambda_max/lambda_min (guarded when
+      //       lambda_min <= 0) — large condition numbers mean ill-conditioned
+      //       kernel regression / slow gradient-descent convergence;
+      //   (d) the KERNEL-TARGET ALIGNMENT <K, yy^T>_F / (||K||_F * ||yy^T||_F)
+      //       (Cristianini, Shawe-Taylor, Elisseeff & Kandola 2001, "On
+      //       Kernel-Target Alignment"), the HEADLINE number, where y is the
+      //       CENTERED TargetClass indicator over the probe batch (the fraction
+      //       of probes in TargetClass subtracted from the {0,1} membership). A
+      //       high alignment means the kernel's dominant eigen-directions already
+      //       separate the target class — the model is well-conditioned for it;
+      //   (e) the EFFECTIVE RANK / participation ratio (sum lambda)^2 /
+      //       sum lambda^2 — how many kernel directions actually carry signal;
+      //   (f) a 10-bin log10(lambda) histogram (the #-bar idiom of the sibling
+      //       reports).
+      // Built-in correctness: the Gram diagonal K_ii = ||g_i||^2 >= 0 and K is
+      // symmetric by construction (reported as a residual ~0); identical probe
+      // samples make the corresponding rows/cols identical (a rank-deficient
+      // kernel). TargetClass out of range falls back to each sample's own
+      // predicted argmax. A possible FOLLOW-UP (deliberately NOT done here to
+      // keep this first version focused) is the fresh-init-vs-trained NTK-drift
+      // contrast (how far the empirical kernel moves during training). DISTINCT
+      // from FisherImportanceReport (per-PARAMETER curvature/importance, not the
+      // sample-sample kernel), GradientConflictReport (pairwise gradient COSINES,
+      // not the raw Gram + its spectrum + label alignment), GradientNoiseScaleReport
+      // (gradient signal/noise for the batch sweep) and WeightSpectralTailReport
+      // (spectrum of the WEIGHT tensors, no data). Pure forward+backward READ on
+      // a frozen net — weights are never stepped. Guards nil NN and an empty /
+      // too-small probe batch (< 2 usable samples) gracefully.
+      class function NeuralTangentKernelReport(
+        NN: TNNet;
+        Samples: TNNetVolumeList;
+        TargetClass: integer = -1
+      ): string;
       // Gradient signal-to-noise diagnostic that ANALYTICALLY PREDICTS the
       // batch-size sweep (McCandlish et al. 2018, "An Empirical Model of
       // Large-Batch Training"). For each labelled sample (Samples, a
@@ -37032,6 +37099,521 @@ begin
     Result := Lines.Text;
   finally
     Flags.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.NeuralTangentKernelReport(
+  NN: TNNet;
+  Samples: TNNetVolumeList;
+  TargetClass: integer = -1
+): string;
+const
+  cEps = 1e-30;
+  cBins = 10;
+  cMaxBarWidth = 40;
+  cJacobiSweeps = 60;       // cyclic Jacobi sweeps (quadratic convergence)
+  cJacobiTol    = 1e-12;    // off-diagonal magnitude convergence threshold
+  cGlyphs       = ' .:-=+*#%@'; // 10-band heatmap ramp (blank -> '@')
+type
+  TFloatArray = array of TNeuralFloat;
+  TDoubleArray = array of Double;
+  TDoubleMatrix = array of TDoubleArray;
+var
+  Lines: TStringList;
+  LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, J, N: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  Probe: TNNetVolume;
+  LastLayer: TNNetLayer;
+  ClassUsed, OutSize: integer;
+  LR, G: TNeuralFloat;
+  Target: TNNetVolume;
+  // per-trainable-layer flat-index bookkeeping over the whole net
+  LayerHasParams: array of boolean;
+  FlatBase: array of integer;
+  LayerParamCnt: array of integer;
+  NetParamCnt, TrainableLayers, M: integer;
+  // per-sample flattened gradient vectors
+  Grads: array of TFloatArray;
+  SampleOrigIdx: array of integer;
+  SampleClassUsed: array of integer; // decoded TargetClass actually used
+  UsableCount: integer;
+  SumSq: TNeuralFloat;
+  // empirical NTK Gram (Double) + eigenspectrum
+  Gram: TDoubleMatrix;
+  Eig: TDoubleArray;
+  Dot, MaxAbs, NormVal: Double;
+  EigSum, EigSqSum, LambdaMax, LambdaMin, CondNum, EffRank: Double;
+  // alignment scratch
+  Yvec: TDoubleArray;          // centered target-class indicator
+  InClass: Double;
+  FrobK, FrobYY, DotKY, Align: Double;
+  // symmetry / diagonal correctness checks
+  SymOK, DiagMin: Double;
+  // histogram scratch
+  MinL, MaxL, LRange, BinLo, BinHi, Lg: Double;
+  HistBins: array of integer;
+  MaxBin, BarLen, HaveLg: integer;
+  Bar, RowStr: string;
+  Glyph: char;
+  CellVal: Double;
+
+  // In-place symmetric cyclic Jacobi eigensolver (eigenVALUES only). A is
+  // (Dim x Dim) symmetric; on return A's diagonal holds the eigenvalues. Same
+  // solver WeightSpectralTailReport / IntrinsicDimensionReport ship — reused
+  // verbatim, no new numerical code.
+  procedure JacobiEigenvalues(var A: TDoubleMatrix; Dm: integer;
+    out OutEig: TDoubleArray);
+  var
+    Sweep, P, Q, R: integer;
+    Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
+  begin
+    for Sweep := 1 to cJacobiSweeps do
+    begin
+      Off := 0;
+      for P := 0 to Dm - 2 do
+        for Q := P + 1 to Dm - 1 do
+          Off := Off + A[P][Q] * A[P][Q];
+      if Off <= cJacobiTol then Break;
+      for P := 0 to Dm - 2 do
+        for Q := P + 1 to Dm - 1 do
+        begin
+          Apq := A[P][Q];
+          if Abs(Apq) <= 1e-300 then Continue;
+          App := A[P][P];
+          Aqq := A[Q][Q];
+          Theta := (Aqq - App) / (2.0 * Apq);
+          if Theta >= 0 then
+            T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
+          else
+            T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
+          C := 1.0 / Sqrt(T * T + 1.0);
+          S := T * C;
+          Tau := S / (1.0 + C);
+          A[P][P] := App - T * Apq;
+          A[Q][Q] := Aqq + T * Apq;
+          A[P][Q] := 0.0;
+          A[Q][P] := 0.0;
+          for R := 0 to Dm - 1 do
+          begin
+            if (R = P) or (R = Q) then Continue;
+            Aip := A[R][P];
+            Aiq := A[R][Q];
+            A[R][P] := Aip - S * (Aiq + Tau * Aip);
+            A[R][Q] := Aiq + S * (Aip - Tau * Aiq);
+            A[P][R] := A[R][P];
+            A[Q][R] := A[R][Q];
+          end;
+        end;
+    end;
+    SetLength(OutEig, Dm);
+    for P := 0 to Dm - 1 do OutEig[P] := A[P][P];
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'NeuralTangentKernelReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count < 2) then
+    begin
+      Result := 'NeuralTangentKernelReport: need at least 2 probe samples.' +
+        sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'NeuralTangentKernelReport: network needs at least 2 layers.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    SetLength(LayerHasParams, NN.CountLayers());
+    SetLength(FlatBase, NN.CountLayers());
+    SetLength(LayerParamCnt, NN.CountLayers());
+
+    NetParamCnt := 0;
+    TrainableLayers := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      LayerHasParams[LIdx] := false;
+      LayerParamCnt[LIdx] := 0;
+      FlatBase[LIdx] := NetParamCnt;
+      if Layer.Neurons.Count = 0 then Continue;
+      M := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        // +1 per neuron for the bias parameter.
+        M := M + Layer.Neurons[NeuronIdx].Delta.Size + 1;
+      if M = 0 then Continue;
+      LayerHasParams[LIdx] := true;
+      LayerParamCnt[LIdx] := M;
+      FlatBase[LIdx] := NetParamCnt;
+      NetParamCnt := NetParamCnt + M;
+      Inc(TrainableLayers);
+    end;
+
+    if TrainableLayers = 0 then
+    begin
+      Result := 'NeuralTangentKernelReport: no trainable layers with params.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // Why batch update: Delta accumulates -LR * gradient only with batch update
+    // on; otherwise the gradient is consumed inline and never lands in Delta.
+    // We divide back out by LR to recover the raw gradient. The network is NEVER
+    // stepped (no UpdateWeights) so the trained weights are left untouched. The
+    // overall gradient sign cancels in the Gram dot products K_ij = <g_i,g_j>.
+    NN.SetBatchUpdate(true);
+
+    LastLayer := NN.GetLastLayer();
+    OutSize := LastLayer.Output.Size;
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+
+    SetLength(Grads, Samples.Count);
+    SetLength(SampleOrigIdx, Samples.Count);
+    SetLength(SampleClassUsed, Samples.Count);
+    UsableCount := 0;
+
+    try
+      for SampleIdx := 0 to Samples.Count - 1 do
+      begin
+        Probe := Samples[SampleIdx];
+        if Probe = nil then Continue;
+
+        NN.ClearDeltas();
+        NN.Compute(Probe);
+
+        // TargetClass logit the gradient is taken w.r.t.: an explicit in-range
+        // class, else this sample's own predicted argmax (a per-sample default).
+        if (TargetClass >= 0) and (TargetClass < OutSize) then
+          ClassUsed := TargetClass
+        else
+          ClassUsed := LastLayer.Output.GetClass();
+        if (ClassUsed < 0) or (ClassUsed >= OutSize) then Continue;
+
+        Target.Fill(0);
+        Target.Raw[ClassUsed] := 1.0;
+        NN.Backpropagate(Target);
+
+        // Flatten this sample's per-parameter weight-gradient vector g_i.
+        SetLength(Grads[UsableCount], NetParamCnt);
+        SumSq := 0;
+        for LIdx := 0 to NN.GetLastLayerIdx() do
+        begin
+          if not LayerHasParams[LIdx] then Continue;
+          Layer := NN.Layers[LIdx];
+          LR := Layer.LearningRate;
+          if LR <= 0 then LR := 1.0;
+          P := FlatBase[LIdx];
+          for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          begin
+            Neuron := Layer.Neurons[NeuronIdx];
+            for K := 0 to Neuron.Delta.Size - 1 do
+            begin
+              G := Neuron.Delta.FData[K] / LR;
+              Grads[UsableCount][P] := G;
+              SumSq := SumSq + G * G;
+              Inc(P);
+            end;
+            // bias parameter
+            G := Neuron.FBiasDelta / LR;
+            Grads[UsableCount][P] := G;
+            SumSq := SumSq + G * G;
+            Inc(P);
+          end;
+        end;
+
+        // Drop degenerate (exactly-zero) gradient vectors.
+        if SumSq <= cEps then
+        begin
+          Grads[UsableCount] := nil;
+          Continue;
+        end;
+        SampleOrigIdx[UsableCount] := SampleIdx;
+        SampleClassUsed[UsableCount] := ClassUsed;
+        Inc(UsableCount);
+      end;
+    finally
+      Target.Free;
+    end;
+
+    if UsableCount < 2 then
+    begin
+      Result := 'NeuralTangentKernelReport: fewer than 2 usable samples ' +
+        '(need >=2 non-zero gradient vectors).' + sLineBreak;
+      Exit;
+    end;
+
+    N := UsableCount;
+
+    // --- Empirical NTK Gram matrix K_ij = <g_i, g_j> (N x N, Double). ---
+    SetLength(Gram, N);
+    for I := 0 to N - 1 do SetLength(Gram[I], N);
+    for I := 0 to N - 1 do
+    begin
+      for J := I to N - 1 do
+      begin
+        Dot := 0;
+        for K := 0 to NetParamCnt - 1 do
+          Dot := Dot + Double(Grads[I][K]) * Double(Grads[J][K]);
+        Gram[I][J] := Dot;
+        Gram[J][I] := Dot;
+      end;
+    end;
+
+    // Correctness: symmetry residual (== 0 by construction) and the smallest
+    // diagonal entry K_ii = ||g_i||^2 (must be > 0 for every usable sample).
+    SymOK := 0;
+    DiagMin := Gram[0][0];
+    for I := 0 to N - 1 do
+    begin
+      if Gram[I][I] < DiagMin then DiagMin := Gram[I][I];
+      for J := 0 to N - 1 do
+        if Abs(Gram[I][J] - Gram[J][I]) > SymOK then
+          SymOK := Abs(Gram[I][J] - Gram[J][I]);
+    end;
+
+    // --- Report header ---
+    Lines.Add(Format(
+      'NeuralTangentKernelReport: empirical NTK over %d usable probe(s) of ' +
+      '%d, %d trainable layer(s), %d param(s).',
+      [N, Samples.Count, TrainableLayers, NetParamCnt]));
+    if (TargetClass >= 0) and (TargetClass < OutSize) then
+      Lines.Add(Format('Target logit: class %d (fixed).', [TargetClass]))
+    else
+      Lines.Add('Target logit: each sample''s own predicted argmax ' +
+        '(TargetClass=-1).');
+    Lines.Add('K_ij = <grad_theta f_i, grad_theta f_j> (gradient sign cancels ' +
+      'in the dot product).');
+    Lines.Add('');
+
+    // --- Glyph-shaded ASCII heatmap of the normalised |K_ij|. ---
+    MaxAbs := 0;
+    for I := 0 to N - 1 do
+      for J := 0 to N - 1 do
+        if Abs(Gram[I][J]) > MaxAbs then MaxAbs := Abs(Gram[I][J]);
+    Lines.Add('Kernel heatmap (rows/cols = probe index, ramp ''' + cGlyphs +
+      ''' from 0 to |K|max):');
+    Bar := '      ';
+    for J := 0 to N - 1 do
+      Bar := Bar + Format('%2d', [J mod 100]);
+    Lines.Add(Bar);
+    for I := 0 to N - 1 do
+    begin
+      RowStr := Format('  [%2d] ', [I]);
+      for J := 0 to N - 1 do
+      begin
+        if MaxAbs > 0 then
+          CellVal := Abs(Gram[I][J]) / MaxAbs
+        else
+          CellVal := 0;
+        BinIdx := Trunc(CellVal * Length(cGlyphs));
+        if BinIdx < 1 then BinIdx := 1;
+        if BinIdx > Length(cGlyphs) then BinIdx := Length(cGlyphs);
+        Glyph := cGlyphs[BinIdx];
+        RowStr := RowStr + Glyph + ' ';
+      end;
+      Lines.Add(RowStr);
+    end;
+    Lines.Add('');
+
+    // --- Full eigenspectrum via the shared cyclic Jacobi eigensolver. ---
+    JacobiEigenvalues(Gram, N, Eig);
+    // PSD => clamp tiny-negative numerical noise to 0.
+    EigSum := 0;
+    EigSqSum := 0;
+    LambdaMax := 0;
+    LambdaMin := 0;
+    for I := 0 to N - 1 do
+    begin
+      if Eig[I] < 0 then Eig[I] := 0;
+      EigSum := EigSum + Eig[I];
+      EigSqSum := EigSqSum + Eig[I] * Eig[I];
+      if Eig[I] > LambdaMax then LambdaMax := Eig[I];
+    end;
+    // smallest eigenvalue (for the condition number)
+    LambdaMin := LambdaMax;
+    for I := 0 to N - 1 do
+      if Eig[I] < LambdaMin then LambdaMin := Eig[I];
+
+    if LambdaMin > 1e-30 then
+      CondNum := LambdaMax / LambdaMin
+    else
+      CondNum := -1; // sentinel: singular kernel
+
+    if EigSqSum > 0 then
+      EffRank := (EigSum * EigSum) / EigSqSum
+    else
+      EffRank := 0;
+
+    // --- Kernel-target alignment <K, yy^T>_F / (||K||_F ||yy^T||_F). ---
+    // y = centered TargetClass indicator over the probe batch. With a fixed
+    // TargetClass every probe shares the same class label, so we use the
+    // per-sample class actually backpropagated (the predicted argmax when
+    // TargetClass=-1) as the membership; centering subtracts its mean.
+    SetLength(Yvec, N);
+    // Build the membership vector: a probe belongs (1) iff its OWN predicted
+    // argmax equals the class used for the kernel target; else 0. This makes the
+    // alignment meaningful for both the fixed and the per-sample-argmax modes.
+    InClass := 0;
+    for I := 0 to N - 1 do
+    begin
+      if (TargetClass >= 0) and (TargetClass < OutSize) then
+      begin
+        // Re-derive each probe's predicted argmax to score membership.
+        // (cheap: one more forward; kept simple and frozen.)
+        NN.Compute(Samples[SampleOrigIdx[I]]);
+        if NN.GetLastLayer().Output.GetClass() = TargetClass then
+          Yvec[I] := 1.0
+        else
+          Yvec[I] := 0.0;
+      end
+      else
+        // per-sample-argmax mode: cluster by the class each probe was seeded on.
+        Yvec[I] := SampleClassUsed[I];
+      InClass := InClass + Yvec[I];
+    end;
+    // Center the indicator. In per-sample mode Yvec holds class IDs; convert to
+    // a one-vs-rest indicator on the MAJORITY class so it stays a {0,1} vector.
+    if not ((TargetClass >= 0) and (TargetClass < OutSize)) then
+    begin
+      // pick the most frequent class id as the positive class
+      // (simple mode-of-array via a bounded scan over OutSize buckets).
+      BinIdx := -1; MaxBin := -1;
+      for K := 0 to OutSize - 1 do
+      begin
+        J := 0;
+        for I := 0 to N - 1 do
+          if Trunc(Yvec[I]) = K then Inc(J);
+        if J > MaxBin then begin MaxBin := J; BinIdx := K; end;
+      end;
+      InClass := 0;
+      for I := 0 to N - 1 do
+      begin
+        if Trunc(Yvec[I]) = BinIdx then Yvec[I] := 1.0 else Yvec[I] := 0.0;
+        InClass := InClass + Yvec[I];
+      end;
+    end;
+    InClass := InClass / N; // mean membership
+    for I := 0 to N - 1 do
+      Yvec[I] := Yvec[I] - InClass; // centered indicator
+
+    // Recompute the Gram (the Jacobi pass destroyed it) for the Frobenius
+    // alignment: K_ij = <g_i, g_j> again over the dot products.
+    DotKY := 0;
+    FrobK := 0;
+    FrobYY := 0;
+    for I := 0 to N - 1 do
+      for J := 0 to N - 1 do
+      begin
+        Dot := 0;
+        for K := 0 to NetParamCnt - 1 do
+          Dot := Dot + Double(Grads[I][K]) * Double(Grads[J][K]);
+        FrobK := FrobK + Dot * Dot;
+        NormVal := Yvec[I] * Yvec[J];
+        FrobYY := FrobYY + NormVal * NormVal;
+        DotKY := DotKY + Dot * NormVal;
+      end;
+    if (FrobK > 0) and (FrobYY > 0) then
+      Align := DotKY / (Sqrt(FrobK) * Sqrt(FrobYY))
+    else
+      Align := 0;
+
+    // --- Scalar summary ---
+    Lines.Add(Format('Eigenvalues (N=%d): lambda_max=%.6g, lambda_min=%.6g, ' +
+      'trace=%.6g.', [N, LambdaMax, LambdaMin, EigSum]));
+    if CondNum >= 0 then
+      Lines.Add(Format('Condition number lambda_max/lambda_min = %.4g.',
+        [CondNum]))
+    else
+      Lines.Add('Condition number = +inf (lambda_min ~ 0: singular kernel; ' +
+        'redundant / collinear probes).');
+    Lines.Add(Format('Kernel-target alignment = %8.4f  (headline; 1 = kernel ' +
+      'perfectly separates the target class, 0 = unaligned).', [Align]));
+    Lines.Add(Format('Effective rank (participation ratio) = %.3f / %d ' +
+      '(%.1f%% of probe directions carry signal).',
+      [EffRank, N, (EffRank / N) * 100.0]));
+    Lines.Add('');
+
+    // --- log10(lambda) histogram. ---
+    MinL := 0; MaxL := 0; HaveLg := 0;
+    for I := 0 to N - 1 do
+      if Eig[I] > 1e-20 then
+      begin
+        Lg := Log10(Eig[I]);
+        if HaveLg = 0 then
+        begin
+          MinL := Lg; MaxL := Lg; HaveLg := 1;
+        end
+        else
+        begin
+          if Lg < MinL then MinL := Lg;
+          if Lg > MaxL then MaxL := Lg;
+        end;
+      end;
+    Lines.Add(Format('log10(lambda) histogram across %d eigenvalue(s):', [N]));
+    if HaveLg = 0 then
+      Lines.Add('  (no positive eigenvalues)')
+    else
+    begin
+      SetLength(HistBins, cBins);
+      for BinIdx := 0 to cBins - 1 do HistBins[BinIdx] := 0;
+      LRange := MaxL - MinL;
+      for I := 0 to N - 1 do
+        if Eig[I] > 1e-20 then
+        begin
+          Lg := Log10(Eig[I]);
+          if LRange > 1e-30 then
+            K := Trunc(((Lg - MinL) / LRange) * cBins)
+          else
+            K := 0;
+          if K >= cBins then K := cBins - 1;
+          if K < 0 then K := 0;
+          Inc(HistBins[K]);
+        end;
+      MaxBin := 0;
+      for BinIdx := 0 to cBins - 1 do
+        if HistBins[BinIdx] > MaxBin then MaxBin := HistBins[BinIdx];
+      for BinIdx := 0 to cBins - 1 do
+      begin
+        if LRange > 1e-30 then
+        begin
+          BinLo := MinL + BinIdx * (LRange / cBins);
+          BinHi := MinL + (BinIdx + 1) * (LRange / cBins);
+        end
+        else
+        begin
+          BinLo := MinL; BinHi := MinL;
+        end;
+        if MaxBin > 0 then
+          BarLen := Round((HistBins[BinIdx] / MaxBin) * cMaxBarWidth)
+        else
+          BarLen := 0;
+        Bar := StringOfChar('#', BarLen);
+        Lines.Add(Format('  [%8.3f,%8.3f) | n=%3d %s',
+          [BinLo, BinHi, HistBins[BinIdx], Bar]));
+      end;
+    end;
+    Lines.Add('');
+
+    Lines.Add(Format(
+      'Correctness: max kernel asymmetry = %.3e (== 0), ' +
+      'min diagonal K_ii = ||g_i||^2 = %.6g (> 0).', [SymOK, DiagMin]));
+    Lines.Add(
+      'Read it as: a high kernel-target alignment with a small condition ' +
+      'number means the model is well-conditioned for this class; a tiny ' +
+      'effective rank means the probes are coupled through few directions.');
+
+    Result := Lines.Text;
+  finally
     Lines.Free;
   end;
 end;
