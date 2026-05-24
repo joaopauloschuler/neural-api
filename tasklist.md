@@ -44,6 +44,33 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
+- [ ] Activation-steering / concept-vector demo (`examples/ActivationSteering/`) —
+      the interventional flip-side of the read-only probes: instead of asking
+      "what is decodable from this layer?", inject a CONCEPT DIRECTION into a
+      hidden layer mid-forward and show it CAUSALLY CONTROLS the output (ActAdd /
+      representation engineering, Turner et al. 2023). Train a small softmax
+      classifier on a synthetic 2-class toy (e.g. the XOR-of-signs / two-cluster
+      set the other interpretability examples already use), pick a hidden layer
+      `k`, and compute a steering vector `v = mean(act_k | class 1) -
+      mean(act_k | class 0)` (a diff-of-class-means direction over the training
+      activations — no extra training). Then run forward layer-by-layer up to
+      `k`, do `Output_k.MulAdd(alpha, v)`, recompute layers `k+1..last` (reusing
+      the exact `FLayers[L].Output` + recompute machinery the landed
+      `ActivationPatchingReport` already drives), and sweep `alpha ∈ {-3..+3}`,
+      charting target-class probability vs `alpha` as an ASCII curve. Built-in
+      correctness checks: `alpha = 0` reproduces the unsteered forward pass
+      bit-for-bit, and the target-class probability moves MONOTONICALLY with
+      `alpha` (positive steers toward class 1, negative toward class 0). Also
+      contrast steering with `v` vs a random unit direction of equal norm to show
+      the concept direction is special (random steering perturbs the output far
+      less per unit norm). DISTINCT from everything in tree: `ActivationPatching`
+      swaps WHOLE cached activations between two inputs (causal tracing of a
+      contrast), `SaliencyReport` reads an input-space gradient, `GradientAscent`
+      ascends on the INPUT image, and `LinearProbeReport` /
+      `FeatureSeparabilityReport` only READ what a layer encodes — none ADD a
+      direction to a hidden activation and measure the controllable output shift.
+      Pure CPU, no dataset, forward-only (the steering vector comes from cached
+      activations; weights are never stepped), fits a few-second budget.
 
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
