@@ -2828,13 +2828,31 @@ type
   // Shape mapping: (SizeX, SizeY, Depth) -> (1, 1, SizeX*SizeY*Depth).
   // It is the inverse of TNNetExpandDims: TNNetSqueeze applied after a
   // TNNetExpandDims reconstructs the original (1,1,N) shape (and data) exactly.
-  // An already-(1,1,D) input is left unchanged. Constructor takes no parameters.
+  // An already-(1,1,D) input is left unchanged.
+  //
+  // Two construction modes:
+  //   Create()         -> collapse-all: any (SizeX, SizeY, Depth) -> (1, 1, N).
+  //   Create(pAxis)    -> single-axis: drop ONLY the specified unit axis. This
+  //                       is the exact single-axis inverse of
+  //                       TNNetExpandDims(pAxis). ExpandDims(pAxis) lays all N
+  //                       elements on axis pAxis with the other two axes = 1;
+  //                       Squeeze(pAxis) asserts that geometry and returns
+  //                       (1,1,N), so ExpandDims(a) then Squeeze(a) is an exact
+  //                       (1,1,N) -> (1,1,N) identity round-trip (shape + data):
+  //     pAxis = 0: assert SizeY=1 and Depth=1 (X carries the vector) -> (1,1,SizeX).
+  //     pAxis = 1: assert SizeX=1 and Depth=1 (Y carries the vector) -> (1,1,SizeY).
+  //     pAxis = 2: assert SizeX=1 and SizeY=1 (Depth carries the vector) -> (1,1,Depth).
+  //
+  // Serialization layout: FStruct[0] is the mode flag (0 = collapse-all,
+  // 1 = single-axis) and FStruct[1] is pAxis. The no-arg form keeps FStruct[0]=0
+  // so its serialized string is byte-identical to earlier versions.
   // Use case: flatten a (1,N,1)/(N,1,1) shape back to a plain feature vector.
   TNNetSqueeze = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
+      constructor Create(pAxis: integer); overload;
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -21423,14 +21441,55 @@ end;
 constructor TNNetSqueeze.Create();
 begin
   inherited Create();
+  // FStruct[0] = 0 -> collapse-all mode (keeps serialization byte-identical to
+  // earlier versions). FStruct[1] is unused in this mode.
+  FStruct[0] := 0;
+end;
+
+constructor TNNetSqueeze.Create(pAxis: integer);
+begin
+  inherited Create();
+  // FStruct[0] = 1 -> single-axis mode; FStruct[1] carries pAxis.
+  FStruct[0] := 1;
+  FStruct[1] := pAxis;
 end;
 
 procedure TNNetSqueeze.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   FActivationFn := pPrevLayer.ActivationFn;
   FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
-  FOutput.Resize(1, 1, pPrevLayer.FOutput.Size);
+  if FStruct[0] = 1 then
+  begin
+    // Single-axis mode: drop ONLY the requested unit axis, asserting that the
+    // other two axes are size 1 (the exact inverse of TNNetExpandDims(pAxis)).
+    case FStruct[1] of
+      0:
+      begin
+        Assert((pPrevLayer.FOutput.SizeY = 1) and (pPrevLayer.FOutput.Depth = 1),
+          'TNNetSqueeze(0) requires SizeY=1 and Depth=1 (X carries the vector).');
+        N := pPrevLayer.FOutput.SizeX;
+      end;
+      1:
+      begin
+        Assert((pPrevLayer.FOutput.SizeX = 1) and (pPrevLayer.FOutput.Depth = 1),
+          'TNNetSqueeze(1) requires SizeX=1 and Depth=1 (Y carries the vector).');
+        N := pPrevLayer.FOutput.SizeY;
+      end;
+    else
+      Assert((pPrevLayer.FOutput.SizeX = 1) and (pPrevLayer.FOutput.SizeY = 1),
+        'TNNetSqueeze(2) requires SizeX=1 and SizeY=1 (Depth carries the vector).');
+      N := pPrevLayer.FOutput.Depth;
+    end;
+    FOutput.Resize(1, 1, N);
+  end
+  else
+  begin
+    // Collapse-all mode: any (SizeX, SizeY, Depth) -> (1, 1, N).
+    FOutput.Resize(1, 1, pPrevLayer.FOutput.Size);
+  end;
   FOutputError.Resize(FOutput);
   FOutputErrorDeriv.Resize(FOutput);
 end;
@@ -35017,7 +35076,9 @@ begin
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
       'TNNetExpandDims' :           Result := TNNetExpandDims.Create(St[0]);
-      'TNNetSqueeze' :              Result := TNNetSqueeze.Create();
+      'TNNetSqueeze' :              if St[0] = 1
+                                    then Result := TNNetSqueeze.Create(St[1])
+                                    else Result := TNNetSqueeze.Create();
       'TNNetLayerFullConnect' :     Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnect' :          Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectSigmoid':    Result := TNNetFullConnectSigmoid.Create(St[0], St[1], St[2], St[3]);
@@ -35251,7 +35312,11 @@ begin
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetExpandDims' then Result := TNNetExpandDims.Create(St[0]) else
-      if S[0] = 'TNNetSqueeze' then Result := TNNetSqueeze.Create() else
+      if S[0] = 'TNNetSqueeze' then
+        begin
+          if St[0] = 1 then Result := TNNetSqueeze.Create(St[1])
+          else Result := TNNetSqueeze.Create();
+        end else
       if S[0] = 'TNNetLayerFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnect' then Result := TNNetFullConnect.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectSigmoid' then Result := TNNetFullConnectSigmoid.Create(St[0], St[1], St[2], St[3]) else

@@ -38,6 +38,9 @@ type
     procedure TestExpandDimsSqueezeRoundTrip;
     procedure TestExpandDimsSqueezeLoadFromString;
     procedure TestExpandDimsGradientCheck;
+    procedure TestExpandDimsSqueezeAxisRoundTrip;
+    procedure TestSqueezeAxisLoadFromString;
+    procedure TestSqueezeAxisGradientCheck;
 
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -4015,6 +4018,101 @@ begin
   // finite-difference gradient exactly within numerical noise.
   LayerInputGradientCheck(Self, TNNetExpandDims.Create(1),
     'ExpandDims(axis=1)', 2, 3, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestExpandDimsSqueezeAxisRoundTrip;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  N, a, i: integer;
+begin
+  // The single-axis TNNetSqueeze(pAxis) is the exact inverse of
+  // TNNetExpandDims(pAxis): for each axis, ExpandDims(a) lays the (1,1,N) vector
+  // onto axis a, then Squeeze(a) must reconstruct the original (1,1,N) shape AND
+  // data exactly. Verify the round-trip identity for pAxis in {0,1,2}.
+  N := 8;
+  for a := 0 to 2 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(1, 1, N);
+    try
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Cos(i * 0.9 + a) - 0.5;
+
+      NN.AddLayer(TNNetInput.Create(1, 1, N));
+      NN.AddLayer(TNNetExpandDims.Create(a)); // vector laid onto axis a
+      NN.AddLayer(TNNetSqueeze.Create(a));    // single-axis inverse -> (1,1,N)
+      NN.Compute(Input);
+
+      AssertEquals('Axis round-trip SizeX axis' + IntToStr(a),
+        1, NN.GetLastLayer.Output.SizeX);
+      AssertEquals('Axis round-trip SizeY axis' + IntToStr(a),
+        1, NN.GetLastLayer.Output.SizeY);
+      AssertEquals('Axis round-trip Depth axis' + IntToStr(a),
+        N, NN.GetLastLayer.Output.Depth);
+      for i := 0 to N - 1 do
+        AssertEquals('Axis round-trip data axis' + IntToStr(a) + ' at ' + IntToStr(i),
+          Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSqueezeAxisLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing the NON-default single-axis TNNetSqueeze.Create(0), proving
+  // the mode flag + axis (FStruct[0]/FStruct[1]) survive serialization and the
+  // reloaded layer is reconstructed as the axis-aware TNNetSqueeze.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetExpandDims.Create(0)); // (6,1,1) so Squeeze(0) is valid
+    NN.AddLayer(TNNetSqueeze.Create(0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('Squeeze(axis) round-trip class identity',
+        NN2.GetLastLayer is TNNetSqueeze);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Squeeze(axis) SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Squeeze(axis) round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSqueezeAxisGradientCheck;
+begin
+  // Single-axis TNNetSqueeze has pure identity data flow (forward copy, backward
+  // copies OutputError straight back), so the input gradient must equal the
+  // finite-difference gradient. Squeeze(1) requires SizeX=1 and Depth=1, so the
+  // probed input shape is (1, N, 1).
+  LayerInputGradientCheck(Self, TNNetSqueeze.Create(1),
+    'Squeeze(axis=1)', 1, 5, 1, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestZScoreGradientCheck;
