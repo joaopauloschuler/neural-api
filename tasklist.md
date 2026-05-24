@@ -232,12 +232,16 @@ breakdown:
       TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
       into differential attention per head — a natural drop-in for the
       downstream ../gpt-3-for-pascal long-context retrieval.
-- [ ] TNNetSinkAttention follow-up (now landed): attention-sink stability
-      micro-experiment. On a tiny causal next-token task with an "all-keys-
-      irrelevant" probe row, compare plain SDPA vs TNNetSinkAttention and
-      print the attention mass that lands on the sink slot(s) vs real keys —
-      the StreamingLLM claim is the sink absorbs the otherwise-misplaced mass.
-      Sweep K ∈ {1, 2, 4}. ~30-line wiring swap; all pieces in tree.
+<!-- (TNNetSinkAttention attention-sink stability micro-experiment removed:
+      completed, landed 2026-05-24 as examples/SinkAttentionStability/. On a
+      causal probe row whose query is ~orthogonal to every real key, plain
+      SDPA is forced to dump the full unit of mass (1.0) onto the irrelevant
+      real keys, while TNNetSinkAttention parks a growing share on the
+      never-masked sink slots: sink mass 0.14/0.25/0.40 for K=1/2/4 and
+      real-key mass falls monotonically to 0.86/0.75/0.60 — strictly below
+      SDPA's 1.0, confirming the StreamingLLM sink-absorption claim. Added a
+      read-only SinkAttentionWeights accessor on the existing layer to read
+      the augmented map.) -->
 - [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
       decoder block can opt into sinks per head behind a flag.

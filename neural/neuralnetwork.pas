@@ -1872,6 +1872,10 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property NumSinks: integer read FNumSinks;
+    // Read-only access to the augmented post-softmax attention map. Layout:
+    // X = augmented key index (0..K-1 = sink slots, K..K+SeqLen-1 = real keys),
+    // Y = query index i, [X,Y,0]; rows sum to 1.
+    property SinkAttentionWeights: TNNetVolume read FSinkAttn;
   end;
 
   /// Differential Attention (Differential Transformer, Ye et al., Microsoft
