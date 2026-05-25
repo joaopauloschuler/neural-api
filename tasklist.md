@@ -44,7 +44,15 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
-- [ ] Early-exit / adaptive-inference demo (`examples/EarlyExitNetwork/`) — the
+- [X] Early-exit / adaptive-inference demo (`examples/EarlyExitNetwork/`) — LANDED
+      2026-05-24 (commit 82ea764). Trunk of FC+ReLU blocks with an aux softmax head
+      after each block, all heads Concat'd into one packed output, trained jointly
+      via a manual deep-supervision loss loop (per-head (p-onehot) seeded through
+      Concat + single Backpropagate under SetBatchUpdate(True)). Confidence-gated
+      tau sweep prints accuracy-vs-avg-exit-depth (split easy/hard); both invariants
+      (tau=1.0 == full-depth acc; avg-depth monotone in tau) PASS. README contrasts
+      it explicitly with PredictionDepth. Original spec below for reference:
+      The
       BranchyNet (Teerapittayanon et al. 2016) "anytime inference" pattern, which
       nothing in the tree covers yet. Build ONE trunk of stacked FC+ReLU (or conv)
       blocks with an AUXILIARY softmax classifier head branching off after each
@@ -559,8 +567,14 @@ breakdown:
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
       is smoothing improves calibration at a small accuracy cost. Both pieces
       (the loss and the calibration report) have landed.
-- [ ] TNNetContrastiveLoss / InfoNCE — input split into query/key, computes
-      InfoNCE against other samples in the minibatch.
+- [X] TNNetContrastiveLoss / InfoNCE — landed 2026-05-24 as `TNNetInfoNCELoss`
+      (commit f071269). Self-contained WITHIN-SAMPLE formulation (not cross-
+      minibatch): depth slabs `q | k_0(+) | k_1..k_{K-1}(-)`, Depth=d*(K+1),
+      embedding dim d in FStruct[0], temperature tau in FFloatSt[0]. Reads FOutput
+      directly (no external target), mirrors TNNetTripletLoss/CosineEmbeddingLoss.
+      Test trio in TestNeuralNumerical.pas. Possible follow-up: a TRUE cross-batch
+      InfoNCE head (negatives = other samples in the minibatch) would need a batch-
+      aware loss hook the per-sample FOutputError path does not currently expose.
 - [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
@@ -643,7 +657,14 @@ breakdown:
 - [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
       the stem and chart effective-RF growth vs theoretical-RF growth — the
       headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
-- [ ] `TNNet.NeuralTangentKernelReport(NN, Samples)` — the empirical
+- [X] `TNNet.NeuralTangentKernelReport(NN, Samples)` — LANDED 2026-05-24 (commit
+      857f679). Heatmap + Jacobi eigenspectrum + condition number + kernel-target
+      alignment + effective rank + log10(lambda) histogram + symmetry/PSD/diagonal
+      correctness checks. Example `examples/NeuralTangentKernelReport/` (synthetic
+      3-class blobs, fresh-vs-trained contrast). The optional fresh-init-vs-trained
+      NTK-DRIFT quantification (lazy-vs-rich, wide-vs-narrow) is left as a follow-up.
+      Original spec below for reference:
+      The empirical
       Neural-Tangent-Kernel diagnostic (Jacot et al. 2018), the gradient-space
       object that actually governs gradient-descent training dynamics. On a
       FROZEN net (`ClearDeltas` per sample, never `UpdateWeights`) it snapshots
