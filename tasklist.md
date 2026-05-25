@@ -44,6 +44,40 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
+- [ ] Concept Bottleneck Model demo (`examples/ConceptBottleneck/`) — the
+      Koh et al. 2020 interpretable-by-design architecture, built from existing
+      layers only (no new layer type). On a synthetic task where each sample's
+      label is a known boolean/linear function of K human-meaningful CONCEPTS
+      (e.g. "is the blob bright", "is it in the top half", "is it round"), wire a
+      two-stage net `Input -> trunk -> TNNetFullConnectSigmoid(K) (concept head)
+      -> TNNetFullConnectLinear(NumClasses) (label head)` and train it JOINTLY
+      with deep supervision: a concept-prediction loss on the sigmoid bottleneck
+      PLUS the usual label cross-entropy (manual two-head loss loop, same
+      seed-through-Concat / SetBatchUpdate(True) pattern the EarlyExitNetwork and
+      ActivationSteering examples already use). The headline payoff is TEST-TIME
+      CONCEPT INTERVENTION, the property that makes CBMs special: at inference,
+      overwrite the predicted concept vector at the bottleneck with the GROUND-
+      TRUTH concept values (or flip one concept by hand) and recompute only the
+      downstream label head — and show (a) injecting true concepts raises label
+      accuracy over the end-to-end prediction (the model's mistakes are
+      attributable to concept errors, not the label head), and (b) flipping a
+      single concept deterministically flips the predicted class in the direction
+      that concept controls. Two built-in invariants: with the concept-loss weight
+      set to 0 the bottleneck is free to drift (concepts no longer align — the
+      "leaky"/joint-vs-independent CBM failure mode, worth showing), and
+      intervening with the model's OWN predicted concepts (a no-op overwrite)
+      reproduces the un-intervened logits bit-for-bit. Print a per-concept
+      accuracy table, the clean-vs-intervened label accuracy, and one worked
+      single-concept flip. DISTINCT from `examples/LinearProbeReport/` (a POST-HOC
+      frozen-net probe that only READS whether a concept is linearly decodable —
+      it never changes the architecture, supervises a bottleneck, or intervenes),
+      from `examples/ActivationSteering/` (edits RAW hidden activations along a
+      diff-of-means direction with NO concept supervision or semantics), and from
+      `examples/DomainAdversarial/` (a gradient-reversal auxiliary head that
+      REMOVES information, the opposite of forcing concepts to be legible). Pure
+      CPU, no external data, well under a minute. The intervention-recompute
+      reuses the same `CopyNoChecks`-then-recompute-downstream machinery as the
+      ActivationPatching / ActivationSteering examples.
 - [X] Early-exit / adaptive-inference demo (`examples/EarlyExitNetwork/`) — LANDED
       2026-05-24 (commit 82ea764). Trunk of FC+ReLU blocks with an aux softmax head
       after each block, all heads Concat'd into one packed output, trained jointly
