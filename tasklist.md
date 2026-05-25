@@ -44,40 +44,24 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
-- [ ] Concept Bottleneck Model demo (`examples/ConceptBottleneck/`) — the
-      Koh et al. 2020 interpretable-by-design architecture, built from existing
-      layers only (no new layer type). On a synthetic task where each sample's
-      label is a known boolean/linear function of K human-meaningful CONCEPTS
-      (e.g. "is the blob bright", "is it in the top half", "is it round"), wire a
-      two-stage net `Input -> trunk -> TNNetFullConnectSigmoid(K) (concept head)
-      -> TNNetFullConnectLinear(NumClasses) (label head)` and train it JOINTLY
-      with deep supervision: a concept-prediction loss on the sigmoid bottleneck
-      PLUS the usual label cross-entropy (manual two-head loss loop, same
-      seed-through-Concat / SetBatchUpdate(True) pattern the EarlyExitNetwork and
-      ActivationSteering examples already use). The headline payoff is TEST-TIME
-      CONCEPT INTERVENTION, the property that makes CBMs special: at inference,
-      overwrite the predicted concept vector at the bottleneck with the GROUND-
-      TRUTH concept values (or flip one concept by hand) and recompute only the
-      downstream label head — and show (a) injecting true concepts raises label
-      accuracy over the end-to-end prediction (the model's mistakes are
-      attributable to concept errors, not the label head), and (b) flipping a
-      single concept deterministically flips the predicted class in the direction
-      that concept controls. Two built-in invariants: with the concept-loss weight
-      set to 0 the bottleneck is free to drift (concepts no longer align — the
-      "leaky"/joint-vs-independent CBM failure mode, worth showing), and
-      intervening with the model's OWN predicted concepts (a no-op overwrite)
-      reproduces the un-intervened logits bit-for-bit. Print a per-concept
-      accuracy table, the clean-vs-intervened label accuracy, and one worked
-      single-concept flip. DISTINCT from `examples/LinearProbeReport/` (a POST-HOC
-      frozen-net probe that only READS whether a concept is linearly decodable —
-      it never changes the architecture, supervises a bottleneck, or intervenes),
-      from `examples/ActivationSteering/` (edits RAW hidden activations along a
-      diff-of-means direction with NO concept supervision or semantics), and from
-      `examples/DomainAdversarial/` (a gradient-reversal auxiliary head that
-      REMOVES information, the opposite of forcing concepts to be legible). Pure
-      CPU, no external data, well under a minute. The intervention-recompute
-      reuses the same `CopyNoChecks`-then-recompute-downstream machinery as the
-      ActivationPatching / ActivationSteering examples.
+<!-- (Concept Bottleneck Model demo removed: completed, landed 2026-05-24 (commit
+     2d7f123) as examples/ConceptBottleneck/. Koh et al. 2020 interpretable-by-design
+     net from existing layers only: Input(6) -> FC+ReLU(16)x2 ->
+     TNNetFullConnectSigmoid(3 concepts) -> TNNetFullConnectLinear(4) -> SoftMax, with
+     a Concat([SoftMax, Sigmoid]) tail packing both heads; label = c0 + 2*c1 (c2 a
+     decoy). Trained JOINTLY with deep supervision (packed-target seeding +
+     SetBatchUpdate(True) batch idiom, the EarlyExitNetwork precedent). Test-time
+     intervention reuses the CopyNoChecks-then-recompute-downstream idiom from
+     ActivationSteering/ActivationPatching. Results (RandSeed=424242, ~10s): per-
+     concept acc c0=0.99/c1=0.99/c2=0.99; clean label acc 0.9833 -> inject-true-
+     concepts 1.0000 (+0.0167); single-concept flip c1 0->1 moves class 1 -> class 3
+     (delta +2, exactly c1's weight). Both invariants PASS: no-op overwrite reproduces
+     logits bit-for-bit (max|dlogit|=0), and lambda=0 drifts mean concept acc
+     0.9922 -> 0.4983 (~chance, the "leaky CBM" failure mode). README contrasts it vs
+     LinearProbeReport (post-hoc READ-only probe), ActivationSteering (edits raw
+     activations, no concept supervision), and DomainAdversarial (gradient-reversal
+     REMOVES info). Suite green at 804. NOTE: FPC Format has no C-style `%+` flag —
+     drop the `+` from sign-prefixed format strings.) -->
 <!-- (Early-exit / adaptive-inference demo removed: completed, landed 2026-05-24
      (commit 82ea764) as examples/EarlyExitNetwork/ — the BranchyNet anytime-inference
      pattern: a trunk of FC+ReLU blocks with an aux softmax head after each block, all
@@ -591,15 +575,21 @@ breakdown:
      A TRUE cross-batch InfoNCE head (negatives = other minibatch samples) would need a
      batch-aware loss hook the per-sample FOutputError path does not expose — remains
      open. The contrastive micro-example follow-up is the entry just below.) -->
-- [ ] TNNetInfoNCELoss follow-up: a self-contained contrastive-embedding
-      micro-example `examples/InfoNCEContrastive/` — train a tiny MLP encoder on a
-      synthetic task where each sample packs a query + its positive (an augmented
-      view of the same latent class) + K negatives into the `q|k_0|..|k_{K-1}` depth
-      layout, drive it through `TNNetInfoNCELoss`, and show the learned embedding
-      pulls positives together / pushes negatives apart (report mean pos-vs-neg
-      cosine gap pre/post training, plus the InfoNCE "alignment vs uniformity"
-      Wang&Isola 2020 numbers). Pure CPU, <1 min. Mirrors the structure of the
-      existing TripletLoss / CosineEmbeddingLoss usage.
+<!-- (TNNetInfoNCELoss contrastive micro-example removed: completed, landed
+     2026-05-24 (commit 19675ba) as examples/InfoNCEContrastive/. A weight-shared
+     pointwise-conv encoder over K+1 X-positions -> L2Normalize -> Reshape packs the
+     `q | k_0(+) | k_1..k_{K-1}(-)` depth-major slab TNNetInfoNCELoss expects (slab
+     0 query, slab 1 positive, 2..K negatives; loss seeds its own gradient via the
+     identity-passthrough Backpropagate, no manual surgery). Synthetic C-class
+     noisy-augmented-view task, deterministic at RandSeed=12345, ~2s. Results: pos-
+     vs-neg cosine gap 0.5902 -> 1.1992 (pos 0.7163->0.9916, neg 0.1261->-0.2076),
+     alignment 0.5674 -> 0.0168, uniformity -1.8768 -> -4.4304, InfoNCE loss 1.0432
+     -> 0.0185 (~56x). All three signals (gap widened, loss fell, alignment fell)
+     PASS or the demo Halt(1)s. README contrasts it vs TripletEmbedding (margin
+     loss, single negative) and CosineEmbeddingLoss. Suite green at 804. NOTE for
+     follow-ups: the head is WITHIN-SAMPLE (negatives packed per row); a TRUE
+     cross-batch InfoNCE still needs a batch-aware loss hook the per-sample
+     FOutputError path does not expose.) -->
 - [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
@@ -909,39 +899,24 @@ breakdown:
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
-- [ ] `examples/DeepEnsembleUncertainty/` — the gold-standard predictive-
-      uncertainty baseline (Lakshminarayanan et al. 2017, *Simple and Scalable
-      Predictive Uncertainty Estimation using Deep Ensembles*) on a pure-CPU
-      toy, existing layers only — NO new layer. Train M (e.g. 5) INDEPENDENT
-      small softmax classifiers, identical architecture but DIFFERENT RandSeed
-      per member, on the same synthetic 3-cluster 2D task the landed
-      examples/MCDropoutUncertainty/ uses (so the contrast is apples-to-apples).
-      At inference average the per-member post-softmax probability vectors and
-      report, on three probe groups (cluster cores / an OOD band placed in the
-      empty space BETWEEN clusters / a labelled val split — reuse MCDropout's
-      probe layout): (a) mean single-member top-1 accuracy AND mean single-member
-      ECE/Brier vs the ENSEMBLE's accuracy and ECE/Brier, computed via the
-      already-landed `neuralcalibration.ComputeCalibration` / `CalibrationReport`
-      (the headline claim is the ensemble improves BOTH accuracy and calibration
-      over the average member); (b) the predictive-entropy decomposition
-      `total = aleatoric (mean of per-member entropies) + epistemic (mutual
-      information / member disagreement)`, showing the epistemic term spikes on
-      the OOD band and sits ~0 on the confident cluster cores; (c) an ASCII
-      bar of per-group epistemic uncertainty. Built-in correctness signals:
-      M=1 reproduces a single model's predictions bit-for-bit; ensemble accuracy
-      is >= the mean single-member accuracy; the epistemic (MI) term is >= 0
-      everywhere and strictly higher on the OOD band than on the cores. DISTINCT
-      from examples/MCDropoutUncertainty/ (epistemic uncertainty via dropout
-      SAMPLING inside ONE trained net — deep ensembles use M genuinely
-      INDEPENDENT nets, the reference baseline MC-dropout merely approximates;
-      run them on the SAME task so the README can contrast the two epistemic
-      estimates head-to-head), from examples/KnowledgeDistillation/ (an ensemble
-      is the natural teacher there — here we KEEP the ensemble and quantify its
-      uncertainty rather than distilling it into one student) and from the TTA
-      "ensemble" (which averages input TRANSFORMS of a SINGLE model, not
-      independent models). Pure CPU, deterministic per seed list, well under a
-      minute. Pairs with [[CalibrationReport]] (reuses its ECE/Brier machinery)
-      and the MCDropoutUncertainty contrast above.
+<!-- (Deep Ensembles uncertainty demo removed: completed, landed 2026-05-24 (commit
+     f9775f5) as examples/DeepEnsembleUncertainty/. M=5 INDEPENDENT softmax MLPs
+     (identical arch, different RandSeed per member via cSeeds) on the SAME synthetic
+     3-cluster 2D task + probe layout as examples/MCDropoutUncertainty/, existing
+     layers only. Averages post-softmax probs; reuses neuralcalibration.
+     ComputeCalibration/CalibrationReport unchanged for ECE/Brier (the ensemble-mean
+     probs are fed through a trivial Input(3)->Identity passthrough net so the
+     calibrator sees them as one net's output — a clean reuse trick worth remembering).
+     Entropy decomposition total=aleatoric(mean per-member H)+epistemic(MI). Results
+     (~5s): val split mean-member Brier 0.2497 -> ensemble 0.2470; epistemic MI cores
+     0.0001 vs OOD band 0.0271 (~270x). All signals PASS: M=1 reproduces member 0 bit-
+     for-bit, ensemble acc >= mean-member acc, MI>=0 everywhere and OOD>cores. README
+     contrasts vs MCDropoutUncertainty (dropout sampling in ONE net), KnowledgeDistillation
+     (ensemble as teacher), TTA (input transforms of one model). Suite green at 804.
+     HONEST CAVEAT: on this saturated toy the ensemble MATCHES (not strictly exceeds)
+     single-member accuracy — it improves Brier and the OOD epistemic spike is the
+     headline; a harder/overlapping task is the open follow-up if an accuracy lift is
+     wanted.) -->
 - [ ] `examples/SpokenDigitKWS/` — 1D-conv keyword-spotting on FSDD:
       MFCCs → 1D conv stack → classification.
 - [ ] `examples/TimeSeriesForecast/` — one-screen forecasting demo on a
