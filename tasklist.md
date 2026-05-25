@@ -78,34 +78,16 @@ rather than acted on.
       CPU, no external data, well under a minute. The intervention-recompute
       reuses the same `CopyNoChecks`-then-recompute-downstream machinery as the
       ActivationPatching / ActivationSteering examples.
-- [X] Early-exit / adaptive-inference demo (`examples/EarlyExitNetwork/`) — LANDED
-      2026-05-24 (commit 82ea764). Trunk of FC+ReLU blocks with an aux softmax head
-      after each block, all heads Concat'd into one packed output, trained jointly
-      via a manual deep-supervision loss loop (per-head (p-onehot) seeded through
-      Concat + single Backpropagate under SetBatchUpdate(True)). Confidence-gated
-      tau sweep prints accuracy-vs-avg-exit-depth (split easy/hard); both invariants
-      (tau=1.0 == full-depth acc; avg-depth monotone in tau) PASS. README contrasts
-      it explicitly with PredictionDepth. Original spec below for reference:
-      The
-      BranchyNet (Teerapittayanon et al. 2016) "anytime inference" pattern, which
-      nothing in the tree covers yet. Build ONE trunk of stacked FC+ReLU (or conv)
-      blocks with an AUXILIARY softmax classifier head branching off after each
-      intermediate block as well as the final block, on a synthetic difficulty-
-      graded N-class task (mix easy well-separated blobs with hard near-the-margin
-      points). Train ALL heads JOINTLY by summing their cross-entropy losses (deep
-      supervision via existing `TNNetConcat`/split-free parallel heads + a manual
-      multi-head loss loop, no new layer type needed). Then at INFERENCE run a
-      confidence-gated dynamic-compute policy: walk heads shallow→deep and EXIT at
-      the first head whose softmax max-prob exceeds a threshold tau, recording the
-      exit depth per sample. Sweep tau and chart the accuracy-vs-average-exit-depth
-      (i.e. accuracy vs FLOPs saved, reusing `TNNet.CountFLOPsPerLayer`) trade-off
-      curve as an ASCII plot, showing easy samples leave early while hard ones run
-      the full depth. Two built-in invariants: tau=1.0 forces every sample to the
-      final head (== the plain full-depth net's accuracy, bit-for-bit) and average
-      exit depth is monotone non-decreasing in tau. This is DISTINCT from the
-      existing PredictionDepth example (a post-hoc k-NN probe on a FIXED single-head
-      net measuring where it "makes up its mind") — here the early heads are TRAINED
-      and actually gate compute. README should spell out that contrast explicitly.
+<!-- (Early-exit / adaptive-inference demo removed: completed, landed 2026-05-24
+     (commit 82ea764) as examples/EarlyExitNetwork/ — the BranchyNet anytime-inference
+     pattern: a trunk of FC+ReLU blocks with an aux softmax head after each block, all
+     heads Concat'd into one packed output, trained jointly via a manual deep-
+     supervision loss loop (per-head (p-onehot) seeded through Concat + single
+     Backpropagate under SetBatchUpdate(True)). A confidence-gated tau sweep prints
+     accuracy-vs-avg-exit-depth (split easy/hard); both invariants (tau=1.0 ==
+     full-depth acc; avg-depth monotone non-decreasing in tau) PASS. README contrasts
+     it explicitly with PredictionDepth (a post-hoc k-NN probe on a FIXED single-head
+     net) — here the early heads are TRAINED and actually gate compute.) -->
 <!-- (Activation-steering / concept-vector demo removed: completed, landed
      2026-05-24 as examples/ActivationSteering/. Trains a small softmax
      classifier on a synthetic sign(x0) two-cluster task, computes the
@@ -601,14 +583,14 @@ breakdown:
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
       is smoothing improves calibration at a small accuracy cost. Both pieces
       (the loss and the calibration report) have landed.
-- [X] TNNetContrastiveLoss / InfoNCE — landed 2026-05-24 as `TNNetInfoNCELoss`
-      (commit f071269). Self-contained WITHIN-SAMPLE formulation (not cross-
-      minibatch): depth slabs `q | k_0(+) | k_1..k_{K-1}(-)`, Depth=d*(K+1),
-      embedding dim d in FStruct[0], temperature tau in FFloatSt[0]. Reads FOutput
-      directly (no external target), mirrors TNNetTripletLoss/CosineEmbeddingLoss.
-      Test trio in TestNeuralNumerical.pas. Possible follow-up: a TRUE cross-batch
-      InfoNCE head (negatives = other samples in the minibatch) would need a batch-
-      aware loss hook the per-sample FOutputError path does not currently expose.
+<!-- (TNNetContrastiveLoss / InfoNCE removed: completed, landed 2026-05-24 (commit
+     f071269) as TNNetInfoNCELoss — self-contained WITHIN-SAMPLE formulation: depth
+     slabs q | k_0(+) | k_1..k_{K-1}(-), Depth=d*(K+1), embedding dim d in FStruct[0],
+     temperature tau in FFloatSt[0]. Reads FOutput directly (no external target),
+     mirrors TNNetTripletLoss/CosineEmbeddingLoss; test trio in TestNeuralNumerical.pas.
+     A TRUE cross-batch InfoNCE head (negatives = other minibatch samples) would need a
+     batch-aware loss hook the per-sample FOutputError path does not expose — remains
+     open. The contrastive micro-example follow-up is the entry just below.) -->
 - [ ] TNNetInfoNCELoss follow-up: a self-contained contrastive-embedding
       micro-example `examples/InfoNCEContrastive/` — train a tiny MLP encoder on a
       synthetic task where each sample packs a query + its positive (an augmented
@@ -700,45 +682,14 @@ breakdown:
 - [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
       the stem and chart effective-RF growth vs theoretical-RF growth — the
       headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
-- [X] `TNNet.NeuralTangentKernelReport(NN, Samples)` — LANDED 2026-05-24 (commit
-      857f679). Heatmap + Jacobi eigenspectrum + condition number + kernel-target
-      alignment + effective rank + log10(lambda) histogram + symmetry/PSD/diagonal
-      correctness checks. Example `examples/NeuralTangentKernelReport/` (synthetic
-      3-class blobs, fresh-vs-trained contrast). The optional fresh-init-vs-trained
-      NTK-DRIFT quantification (lazy-vs-rich, wide-vs-narrow) is left as a follow-up.
-      Original spec below for reference:
-      The empirical
-      Neural-Tangent-Kernel diagnostic (Jacot et al. 2018), the gradient-space
-      object that actually governs gradient-descent training dynamics. On a
-      FROZEN net (`ClearDeltas` per sample, never `UpdateWeights`) it snapshots
-      each sample's full flattened per-parameter weight-gradient vector `g_i` of
-      the scalar target-class logit — REUSING the exact per-sample gradient
-      machinery `FisherImportanceReport` / `GradientConflictReport` /
-      `GradientNoiseScaleReport` already share (no input-gradient enablement) —
-      and forms the empirical NTK Gram matrix `K_ij = <g_i, g_j>` over the probe
-      batch. It then reports: the kernel as a glyph-shaded ASCII heatmap; its
-      FULL eigenspectrum via the SAME self-contained Double-precision cyclic
-      Jacobi eigensolver `WeightSpectralTailReport` already ships (so no new
-      numerical code); the condition number `lambda_max/lambda_min` (a predictor
-      of convergence speed — ill-conditioned NTK ⇒ slow training); the
-      **kernel-target alignment** `<K, yy^T>_F / (||K||_F ||yy^T||_F)`
-      (Cristianini et al. 2001 — high alignment predicts good generalization,
-      the headline NTK-theory number); the effective rank / participation ratio
-      `(sum lambda)^2 / sum lambda^2`; a `log10(lambda)` histogram; and an
-      optional fresh-init-vs-trained contrast quantifying NTK DRIFT (≈0 drift =
-      the infinite-width "lazy/kernel" regime; large drift = "rich"
-      feature-learning — the lazy-vs-rich question made visible). Built-in
-      correctness checks: symmetry `K_ij == K_ji`, PSD (all Jacobi eigenvalues
-      `>= 0` since `K = G G^T`), and the diagonal `K_ii == ||g_i||^2 > 0`.
-      DISTINCT from `GradientConflictReport` (which reports normalised pairwise
-      gradient COSINES + a conflict fraction — sign geometry, not the
-      un-normalised kernel, its eigenspectrum, or target alignment), from
-      `RepresentationSimilarityReport` (linear-CKA on forward ACTIVATIONS, not
-      gradients) and from `HessianCurvatureReport` (loss-surface curvature, not
-      the gradient Gram). Ships with an `examples/NeuralTangentKernel/` demo
-      (small classifier; contrast a wide vs narrow hidden layer to show the wide
-      net's NTK drifting less) and the standard report test trio. Forward+
-      backward only on a frozen net; weights are never stepped.
+<!-- (TNNet.NeuralTangentKernelReport removed: completed, landed 2026-05-24 (commit
+     857f679) — empirical-NTK diagnostic: Gram K_ij=<g_i,g_j> over per-sample
+     target-logit weight-gradients on a FROZEN net, with ASCII heatmap + Jacobi
+     eigenspectrum + condition number + kernel-target alignment + effective rank +
+     log10(lambda) histogram + symmetry/PSD/diagonal correctness checks. Example
+     examples/NeuralTangentKernelReport/ (synthetic 3-class blobs, fresh-vs-trained
+     contrast). The fresh-init-vs-trained NTK-DRIFT quantification (lazy-vs-rich,
+     wide-vs-narrow) is left as the follow-up just below.) -->
 - [ ] NeuralTangentKernelReport follow-up: the fresh-init-vs-trained NTK-DRIFT
       contrast deliberately left out of the first landing (commit 857f679). Add an
       optional second-net / snapshot argument (mirror `ModeConnectivityReport`'s
