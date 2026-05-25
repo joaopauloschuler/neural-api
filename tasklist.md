@@ -575,6 +575,15 @@ breakdown:
       Test trio in TestNeuralNumerical.pas. Possible follow-up: a TRUE cross-batch
       InfoNCE head (negatives = other samples in the minibatch) would need a batch-
       aware loss hook the per-sample FOutputError path does not currently expose.
+- [ ] TNNetInfoNCELoss follow-up: a self-contained contrastive-embedding
+      micro-example `examples/InfoNCEContrastive/` — train a tiny MLP encoder on a
+      synthetic task where each sample packs a query + its positive (an augmented
+      view of the same latent class) + K negatives into the `q|k_0|..|k_{K-1}` depth
+      layout, drive it through `TNNetInfoNCELoss`, and show the learned embedding
+      pulls positives together / pushes negatives apart (report mean pos-vs-neg
+      cosine gap pre/post training, plus the InfoNCE "alignment vs uniformity"
+      Wang&Isola 2020 numbers). Pure CPU, <1 min. Mirrors the structure of the
+      existing TripletLoss / CosineEmbeddingLoss usage.
 - [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
@@ -696,6 +705,18 @@ breakdown:
       (small classifier; contrast a wide vs narrow hidden layer to show the wide
       net's NTK drifting less) and the standard report test trio. Forward+
       backward only on a frozen net; weights are never stepped.
+- [ ] NeuralTangentKernelReport follow-up: the fresh-init-vs-trained NTK-DRIFT
+      contrast deliberately left out of the first landing (commit 857f679). Add an
+      optional second-net / snapshot argument (mirror `ModeConnectivityReport`'s
+      `SnapshotB` or `RepresentationSimilarityReport`'s `OtherNet`) so the report
+      quantifies how far the empirical NTK moved between two checkpoints — e.g. the
+      relative Frobenius drift `||K_trained - K_init||_F / ||K_init||_F` and the
+      change in kernel-target alignment. Headline payoff: ≈0 drift = the
+      infinite-width "lazy / kernel" regime, large drift = "rich" feature learning
+      (the lazy-vs-rich question made visible). Then extend the existing
+      `examples/NeuralTangentKernelReport/` to contrast a WIDE vs NARROW hidden
+      layer and show the wide net's NTK drifts less. Reuse the snapshot machinery
+      already proven in ModeConnectivity/PermutationAlign.
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
