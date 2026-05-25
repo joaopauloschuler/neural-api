@@ -692,6 +692,35 @@ breakdown:
       `examples/NeuralTangentKernelReport/` to contrast a WIDE vs NARROW hidden
       layer and show the wide net's NTK drifts less. Reuse the snapshot machinery
       already proven in ModeConnectivity/PermutationAlign.
+- [ ] `TNNet.TunedLensReport` — the *learned* sibling of the already-landed
+      zero-parameter `LogitLensReport` (Belrose et al. 2023, "Eliciting Latent
+      Predictions with the Tuned Lens"). The logit lens splices a raw hidden
+      activation straight into the model's OWN frozen head; the tuned lens first
+      runs each layer's activation through a small per-layer learned AFFINE
+      "translator" (`TNNetFullConnectLinear(headInputDim)`, one per lens-
+      compatible layer) that is TRAINED to map that layer's residual state into
+      the final-layer basis BEFORE the frozen head decodes it — correcting the
+      representation drift / basis-mismatch that makes the raw logit lens biased
+      and over/under-confident at early depths. Scope: (a) freeze the trunk +
+      head, attach one translator per lens-compatible layer, train only the
+      translators by minimising each layer's KL to the model's final output
+      distribution on an UNLABELLED probe batch (the distillation-to-self target,
+      reusing the frozen-body + downstream-recompute splice idiom from
+      `LogitLensReport` / `ActivationPatchingReport`); (b) emit the per-layer
+      tuned-lens distribution, its entropy, and its KL-to-final, side by side
+      with the raw logit-lens columns so the headline Belrose result is visible —
+      the tuned curve commits EARLIER and tracks the final answer more faithfully
+      (lower KL-to-final, monotone-ish) than the raw lens. Built-in correctness
+      signals: at the LAST layer the translator collapses to identity and tuned
+      == logit == final (max |Δp| ≈ 0); an UNTRAINED translator must do no better
+      than the raw logit lens (KL-to-final not lower) — only after fitting does it
+      win. Ship `examples/TunedLens/` forking the existing LogitLens net/task
+      (constant-width `6 -> FC10+ReLU x4 -> FC4 -> SoftMax`) so the two lenses are
+      directly comparable on the SAME probe batch, plus a `TestTunedLensSmoke`
+      following the introspection-report test recipe. Distinct from LogitLens
+      (zero params, no fitting), LinearProbeReport (probes for an EXTERNAL label,
+      not the model's own next-layer basis), and ActivationSteering (edits
+      activations, doesn't decode them). See [[introspection-report-pattern]].
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
