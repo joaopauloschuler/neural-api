@@ -41,6 +41,7 @@ In this readme file, you’ll find information about:
 * Dataset support.
 * Training (fitting) your neural network.
 * Parallel computing.
+* [Full set of examples](examples/README.md)
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
