@@ -84,7 +84,7 @@
 Beyond the runnable examples above, `TNNet` exposes a family of in-process introspection and diagnostic methods (most are demonstrated by the linked examples). They are grouped here by what they inspect; the linked example carries the full description, sample output and caveats.
 
 ### Architecture & cost
-- **`TNNet.PrintSummary`** / **`SummaryString`** — Keras-style table of per-layer index, class, output shape `(X,Y,D)`, param and neuron counts, ending with totals (`SummaryString` returns it as a string instead of writing to stdout).
+- **`TNNet.PrintSummary`** / **`SummaryString`** — Keras-style table of per-layer index, class, output shape `(X,Y,D)`, param and neuron counts, ending with totals (`SummaryString` returns it as a string instead of writing to stdout). Used throughout the examples (e.g. [ConfusionMatrixReport](ConfusionMatrixReport), [GradientNormReport](GradientNormReport), [PerplexityEval](PerplexityEval)).
 - **`TNNet.ToGraphvizDot`** — emits a Graphviz `.dot` of the layer DAG (one node per layer, edges following the real graph incl. multi-input `TNNetSum` / `TNNetDeepConcat`); render with `dot -Tpng net.dot -o net.png`. → [example](GraphvizExport)
 - **`TNNet.DiffArchitecture(OtherNet)`** / **`DiffArchitectureFromString(s)`** — unified-diff-style report of architectural differences between two networks (LCS-aligned so single inserts/removes don't cascade). → [example](ArchitectureDiff)
 - **`TNNet.ReceptiveFieldReport(NN)`** — analytically propagates the receptive-field recurrence through the spatial layers (size, jump, input coverage, global-mixing cut point); no data needed. → [example](ReceptiveFieldReport)
