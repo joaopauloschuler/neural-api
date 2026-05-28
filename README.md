@@ -31,7 +31,7 @@ You can get A.I. powered help from these tools:
 * [CAI Neural API support at ChatGPT4](https://chatgpt.com/g/g-6BrAwhTQ9-free-pascal-developer-neural-api).
  
 ## Documentation
-In this readme file, you’ll find information about: 
+The documentation covers: 
 * Easy examples.
 * Simple image classification examples.
 * Youtube videos.
@@ -41,7 +41,8 @@ In this readme file, you’ll find information about:
 * Dataset support.
 * Training (fitting) your neural network.
 * Parallel computing.
-* [Full set of examples](examples/README.md)
+* [Full set of examples](examples/README.md).
+* [Normalization Cheat Sheet](docs/normalization.md).
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
