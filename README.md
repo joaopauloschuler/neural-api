@@ -1175,7 +1175,66 @@ When you are done, you should call:
 FProcs.Free; 
 ```
 
-### NLP
+## Introspection & diagnostics
+
+Beyond the runnable examples above, `TNNet` exposes a family of in-process introspection and diagnostic methods (most are demonstrated by the linked examples). They are grouped here by what they inspect; the linked example carries the full description, sample output and caveats.
+
+### Architecture & cost
+- **`TNNet.PrintSummary`** / **`SummaryString`** — Keras-style table of per-layer index, class, output shape `(X,Y,D)`, param and neuron counts, ending with totals (`SummaryString` returns it as a string instead of writing to stdout). Used throughout the examples (e.g. [ConfusionMatrixReport](ConfusionMatrixReport), [GradientNormReport](GradientNormReport), [PerplexityEval](PerplexityEval)).
+- **`TNNet.ToGraphvizDot`** — emits a Graphviz `.dot` of the layer DAG (one node per layer, edges following the real graph incl. multi-input `TNNetSum` / `TNNetDeepConcat`); render with `dot -Tpng net.dot -o net.png`. → [example](GraphvizExport)
+- **`TNNet.DiffArchitecture(OtherNet)`** / **`DiffArchitectureFromString(s)`** — unified-diff-style report of architectural differences between two networks (LCS-aligned so single inserts/removes don't cascade). → [example](ArchitectureDiff)
+- **`TNNet.ReceptiveFieldReport(NN)`** — analytically propagates the receptive-field recurrence through the spatial layers (size, jump, input coverage, global-mixing cut point); no data needed. → [example](ReceptiveFieldReport)
+- **`TNNet.CountFLOPsPerLayer(NN)`** — per-layer forward-pass FLOP estimate and each layer's share, flagging layer classes the estimator doesn't model. → [example](FLOPsReport)
+
+### Weights-only (no forward pass)
+- **`TNNet.WeightHistogramReport(NN)`** — per-trainable-layer weight statistics and ASCII bar histograms. → [example](WeightHistogramReport)
+- **`TNNet.WeightSpectrumReport(NN)`** — top singular value per layer (power iteration via the reusable `TNNet.EstimateSpectralNorm` helper); flags rank-1 collapse / high spectral norm. → [example](WeightSpectrumReport)
+- **`TNNet.WeightSpectralTailReport(NN)`** — label-free HT-SR quality metric: power-law tail exponent `alpha` per layer plus a network-average weighted-alpha (the WeightWatcher metric). → [example](WeightSpectralTail)
+
+### Activations & representation (forward probe batch)
+- **`TNNet.ActivationStatsReport(NN, Samples)`** — per-layer activation distribution statistics; flags near-collapsed / saturating layers. → [example](ActivationStatsReport)
+- **`TNNet.DeadNeuronReport(NN, Samples)`** — dead-unit counts across ReLU-family layers over a probe batch. → [example](DeadNeuronReport)
+- **`TNNet.NeuronCorrelationReport(NN, Samples)`** — intra-layer neuron redundancy: a `|rho|` histogram, top correlated pairs, and an effective-neuron count. → [example](NeuronCorrelationReport)
+- **`TNNet.IntrinsicDimensionReport(NN, Probes)`** — per-layer effective dimensionality: PCA participation ratio + the nonlinear TwoNN manifold estimate, side by side. → [example](IntrinsicDimension)
+- **`TNNet.RepresentationSimilarityReport(NN, Probes [, OtherNet])`** — linear-CKA similarity between every pair of layer activations (rotation/scale-invariant; optional cross-net). → [example](RepresentationSimilarity)
+
+### Classifier evaluation & calibration (forward, labels)
+- **`TNNet.ConfusionMatrixReport(NN, Samples, NumClasses)`** — confusion matrix + precision/recall/F1 + most-confused pairs + per-class hard-example indices. → [example](ConfusionMatrixReport)
+- **`TNNet.TopLogitMarginReport(NN, Samples, NumClasses)`** — per-sample `top1 − top2` logit margin, per-class stats, and a lowest-margin "hard examples" pool. → [example](MarginReport)
+- **`TNNet.PerplexityReport(NN, Tokens, ContextLen)`** — cross-entropy, perplexity, bits-per-character, top-k accuracy and worst-K positions for a sequence head. → [example](PerplexityEval)
+- **`TNNet.TTAReport(NN, Probes, Labels)`** — test-time-augmentation accuracy over a fixed transform menu vs the clean baseline, with a helps/neutral/hurts verdict. → [example](TestTimeAugmentation)
+- **`TNNet.DecisionBoundaryReport(NN, Probes)`** — ASCII argmax map, confidence overlay and boundary-length estimate for a 2-input classifier head. → [example](DecisionBoundary)
+- **`neuralcalibration`** unit (separate from the `*Report` family) — **`CalibrationReport`** / `ComputeCalibration` (ECE/MCE, Brier, reliability diagram) and **`FitTemperature`** (temperature scaling, never mutating the backbone). → [example](CalibrationReport)
+
+### Gradient & curvature geometry (forward + backward, frozen net)
+- **`TNNet.GradientNormReport(NN, Input, Target)`** — per-layer `‖dL/dx‖` and `‖dL/dW‖` with vanishing/exploding flags. → [example](GradientNormReport)
+- **`TNNet.LossLandscapeProbe(NN, Samples, K, R)`** — loss along a filter-normalised random direction; sharpness scalar + loss-doubling radius. → [example](LossLandscapeProbe)
+- **`TNNet.GradientConflictReport(NN, Samples [, UseTrueLabel, LayerIdx])`** — pairwise per-sample gradient cosines: conflict fraction + per-class-pair mean-cosine matrix. → [example](GradientConflict)
+- **`TNNet.GradientNoiseScaleReport(NN, Samples [, UseTrueLabel, LayerIdx])`** — gradient signal-to-noise ratio and the simple noise scale `B_simple` (the critical batch size). → [example](GradientNoiseScale)
+- **`TNNet.NeuralTangentKernelReport(NN, Samples [, TargetClass])`** — empirical NTK Gram, its eigenspectrum, condition number and kernel-target alignment. → [example](NeuralTangentKernelReport)
+- **`TNNet.HessianCurvatureReport(NN, Samples)`** — loss-surface sharpness: Hessian trace + top eigenvalue via finite-difference Hessian-vector products. → [example](HessianCurvature)
+- **`TNNet.EnableInputGradient`** — helper that resizes the input layer's error tensors so a backward pass can deposit `d(output)/d(input)` on `Layers[0]` (off by default; needed by the saliency, adversarial and effective-RF reports).
+
+### Robustness & uncertainty
+- **`TNNet.AdversarialRobustnessReport(NN, Samples, Labels, EpsList)`** — FGSM accuracy-vs-eps degradation curve, per-sample critical-eps histogram, robust/fragile verdict. → [example](AdversarialRobustness)
+- **`TNNet.MCDropoutUncertaintyReport(NN, Probes [, Labels])`** — Monte-Carlo-Dropout total / aleatoric / epistemic (BALD) uncertainty, keeping dropout active at inference. → [example](MCDropoutUncertainty)
+- **`TNNet.EquivarianceReport(NN, Probes)`** — output invariance error under a fixed flip / reverse / roll transform menu, with an invariant/sensitive verdict. → [example](EquivarianceReport)
+- **`TNNet.EffectiveReceptiveFieldReport(NN, Probes)`** — empirical (gradient-measured) receptive field vs the analytical one — what a unit actually *weights*. → [example](EffectiveReceptiveField)
+
+### Interpretability & attribution
+- **`TNNet.SaliencyReport(NN, Probe)`** — input-gradient / SmoothGrad / Integrated-Gradients heatmaps for the predicted class (with the IG completeness check). → [example](SaliencyReport)
+- **`TNNet.AttentionEntropyReport(NN, Probes)`** — per-row attention entropy with dead/spike head flags for every `TNNetScaledDotProductAttention` layer. → [example](AttentionEntropyReport)
+- **`TNNet.ActivationPatchingReport(NN, CleanInput, CorruptInput [, TargetIdx])`** — causal trace: which layer's activations carry the information that decides the prediction. → [example](ActivationPatching)
+- **`TNNet.LogitLensReport(NN, pInput [, HeadStartIdx])`** — re-applies the net's own trained head at each depth (zero new params) to see when the prediction crystallises. → [example](LogitLens)
+- **`TNNet.PredictionDepthReport(NN, Support, SupportLabels, Queries [, QueryLabels])`** — per-example difficulty via the depth where a k-NN vote locks onto the final answer. → [example](PredictionDepth)
+- **`TNNet.LayerSensitivityReport(NN, Samples [, Targets])`** — output/loss delta from small multiplicative per-layer weight perturbations, with a fragility verdict. → [example](LayerSensitivityReport)
+- **`TNNet.MagnitudePruningReport(NN, Samples [, Labels, Tolerance, PerLayer])`** — no-retrain accuracy-vs-sparsity curve and the prunability knee (global or per-layer). → [example](MagnitudePruning)
+
+### Two-net comparison
+- **`TNNet.ModeConnectivityReport(NN, SnapshotB, Samples)`** — loss barrier along the linear interpolation between two trained nets ("same basin or separated?"). → [example](ModeConnectivity)
+- **`TNNet.PermutationAlignReport(NN, SnapshotB, Samples [, ScoreMode, K])`** — "Git Re-Basin": loss barrier before vs after quotienting out neuron-permutation symmetry. → [example](PermutationAlign)
+
+## NLP
 This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories](https://huggingface.co/datasets/schuler/TinyStories4Pascal-Tokenized-v2) dataset. A more [complex NLP example showing the implementation of the GPT-3 Small architecture](https://github.com/joaopauloschuler/gpt-3-for-pascal) is also available.
 
 In short, this API supports:
