@@ -3,9 +3,10 @@ program HyperbolicActivationBakeOff;
 HyperbolicActivationBakeOff: compares 8 hyperbolic-family activations
 on the toy hypotenuse task: y = sqrt(X^2 + Y^2).
 
-Tiny MLP (2 -> 32 -> 1), 50 epochs, 1000 training pairs, fixed RNG
-seed for reproducibility. Reports a CSV-style table of final
-validation loss and epochs-to-converge per activation.
+Tiny MLP (2 -> 32 -> 1), 8 epochs, 102400 training pairs, fixed RNG
+seed for reproducibility. Prints the validation error after every
+epoch and a final CSV-style table of validation loss and
+epochs-to-converge per activation.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -43,11 +44,11 @@ const
   // Validation-loss threshold (on the normalized target) for "converged".
   // Convergence threshold is on MSE in the ORIGINAL target scale (hypotenuse units, ~0..141).
   CONVERGE_THRESHOLD = 5.0;
-  TRAIN_SIZE         = 1000;
+  TRAIN_SIZE         = 102400;
   VAL_SIZE           = 200;
   TEST_SIZE          = 200;
   HIDDEN_UNITS       = 32;
-  NUM_EPOCHS         = 150;
+  NUM_EPOCHS         =  8;
   BATCH_SIZE         = 32;
 
 type
@@ -69,6 +70,7 @@ begin
   Fit := Sender as TNeuralFit;
   if NN = nil then Exit;
   Mse := EvaluateMSEHelper(NN, Validation);
+  WriteLn('Error:', Mse:8:4);
   if (ConvergedAtEpoch < 0) and (Mse < CONVERGE_THRESHOLD) then
     ConvergedAtEpoch := Fit.CurrentEpoch;
 end;

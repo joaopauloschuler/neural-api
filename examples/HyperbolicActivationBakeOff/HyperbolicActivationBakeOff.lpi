@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CONFIG>
   <ProjectOptions>
-    <Version Value="11"/>
+    <Version Value="12"/>
     <PathDelim Value="\"/>
     <General>
       <Flags>
         <MainUnitHasCreateFormStatements Value="False"/>
+        <MainUnitHasTitleStatement Value="False"/>
+        <MainUnitHasScaledStatement Value="False"/>
+        <CompatibilityMode Value="True"/>
       </Flags>
       <SessionStorage Value="InProjectDir"/>
-      <MainUnit Value="0"/>
       <Title Value="Hyperbolic Activation Bake-Off"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
@@ -139,15 +141,12 @@
     <Linking>
       <Debugging>
         <GenerateDebugInfo Value="False"/>
+        <DebugInfoType Value="dsDwarf3"/>
       </Debugging>
     </Linking>
     <Other>
       <CustomOptions Value="-dAVX
 -dRelease"/>
-      <OtherDefines Count="2">
-        <Define0 Value="AVX"/>
-        <Define1 Value="Release"/>
-      </OtherDefines>
     </Other>
   </CompilerOptions>
   <Debugging>
