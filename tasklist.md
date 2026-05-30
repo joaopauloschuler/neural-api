@@ -532,6 +532,28 @@ breakdown:
 - [ ] TNNetMixtureOfExperts — top-k softmax gate over N expert sub-networks
       plus a load-balancing auxiliary loss. (The just-landed
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
+- [ ] TNNetHardConcrete — learnable L0-sparsity gate (Louizos, Welling &
+      Kingma 2018, "Learning Sparse Neural Networks through L0 Regularization").
+      A per-channel multiplicative gate `z ∈ [0,1]` drawn from a hard-concrete
+      distribution: `s = sigmoid((log u − log(1−u) + log α)/β)` stretched to
+      `(γ, ζ)` with `γ<0<ζ` and hard-clipped to `[0,1]`, so a fraction of gates
+      hit EXACTLY 0 (true structural sparsity, not just small weights). Each
+      gate's log-α is a trained weight; β/γ/ζ are constructor constants. The
+      novelty vs what's in tree: TNNetDropout zeroes a RANDOM fixed-rate subset
+      every step and is identity at inference, whereas HardConcrete LEARNS which
+      channels to keep and its expected-L0 cost `Σ sigmoid(log α − β·log(−γ/ζ))`
+      is a differentiable penalty the trainer can add — i.e. it prunes during
+      training. At inference use the deterministic gate
+      `clip(sigmoid(log α)·(ζ−γ)+γ, 0, 1)`. Gradient-checkable through the
+      reparam (treat the noise `u` as fixed per forward, like the existing STE /
+      GumbelSoftmax layers). Register in both CreateLayer + LoadFromString
+      dispatch tables and ship the standard test trio (forward-shape/identity at
+      large log-α, input+weight numerical-gradient, serialization round-trip).
+      Headline follow-up example: an L0-regularised MLP that drives a measurable
+      fraction of gates to hard zero at matched accuracy (report the achieved
+      sparsity %), contrasting with an L2-regularised baseline that leaves all
+      channels nominally alive. Pairs with the open TNNetMixtureOfExperts
+      (gate-style routing) and TNNetBitLinear (compression) entries.
 
 #### Normalization primitives
 - [ ] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
