@@ -3,6 +3,7 @@
 
 # Compiled example executables (Linux, no extension)
 ActivationStatsReport/ActivationStatsReport
+CausalMaskSanity/CausalMaskSanity
 CoordConvSpiral/CoordConvSpiral
 CumSumPositionEncoding/CumSumPositionEncoding
 DomainAdversarial/DomainAdversarial

@@ -336,9 +336,16 @@ breakdown:
       and/or a multi-head variant with per-head slopes `2^(-8h/H)`, so the
       arm where ALiBi's locality prior actually wins is also demonstrated.
       Pairs with the open "ALiBi slope-base sweep" entry.
-- [ ] Causal-mask sanity experiment: train a tiny attention model on
+- [X] Causal-mask sanity experiment: train a tiny attention model on
       next-token prediction WITH and WITHOUT TNNetMaskedFill, and show
       the unmasked one cheats (near-zero loss but useless at generation).
+      Landed as examples/CausalMaskSanity. Uses the SDPA CausalMask flag
+      (same strictly-upper-triangle -1e9 fill as TNNetMaskedFill /
+      TNNetTriangularCausalMask; SDPA masks scores internally so a separate
+      MaskedFill layer cannot be slotted in). Gate asserts all three: unmasked
+      train-CE < masked train-CE (cheats), masked true-autoregressive accuracy
+      > unmasked (generalizes), AND unmasked attention puts large weight on
+      future keys while masked puts ~0 (AttentionWeights).
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
