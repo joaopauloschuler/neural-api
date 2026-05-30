@@ -373,6 +373,7 @@ type
     procedure TestSplitQKVHeadsForwardLayout;
     procedure TestMultiHeadSDPAConcatGradientCheck;
     procedure TestMultiHeadSelfAttentionGradientCheck;
+    procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestTransformerEncoderBlockGradientCheck;
     procedure TestSpatialDropout1DInferenceIdentity;
     procedure TestSpatialDropout1DTrainingMaskShape;
@@ -10129,6 +10130,110 @@ begin
     NN.Free;
     Input.Free;
     InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadCrossAttentionGradientCheck;
+// Encoder-decoder cross-attention: Query from a decoder branch (QSeqLen=3),
+// Keys+Values from a SEPARATE encoder branch (KVSeqLen=4 -- deliberately a
+// DIFFERENT length to prove asymmetric cross-attention). Output must be on the
+// QUERY grid: (3,1,8). We numerically check the QUERY-input gradient.
+// CausalMask is tested only as False: a causal triangle assumes one shared
+// sequence (query position i may only see key positions <= i), which is
+// ill-defined when the query and key/value sequences have different lengths and
+// no positional correspondence, so it is not exercised here.
+var
+  NN: TNNet;
+  QueryInput, KVInput: TNNetLayer;
+  QData, QPlus, KVData, Desired: TNNetVolume;
+  d_model, Heads, QSeqLen, KVSeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AQuery: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    QueryInput.Output.Copy(AQuery);
+    KVInput.Output.Copy(KVData);
+    NN.Compute(QueryInput.Output); // re-runs from both input branches
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  QSeqLen := 3;
+  KVSeqLen := 4;
+  NN := TNNet.Create();
+  QData := TNNetVolume.Create(QSeqLen, 1, d_model);
+  QPlus := TNNetVolume.Create(QSeqLen, 1, d_model);
+  KVData := TNNetVolume.Create(KVSeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(QSeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    QueryInput := NN.AddLayer(TNNetInput.Create(QSeqLen, 1, d_model, 1));
+    KVInput    := NN.AddLayerAfter(TNNetInput.Create(KVSeqLen, 1, d_model, 1), 0);
+    NN.AddMultiHeadCrossAttention(d_model, Heads, QueryInput, KVInput, false);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Output must live on the QUERY grid (length 3), not the KV grid (length 4).
+    AssertTrue('MHCA output SizeX', NN.GetLastLayer.Output.SizeX = QSeqLen);
+    AssertTrue('MHCA output SizeY', NN.GetLastLayer.Output.SizeY = 1);
+    AssertTrue('MHCA output Depth', NN.GetLastLayer.Output.Depth = d_model);
+
+    for i := 0 to QData.Size - 1 do
+      QData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to KVData.Size - 1 do
+      KVData.Raw[i] := Cos(i * 0.37) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    // Forward must be finite.
+    QueryInput.Output.Copy(QData);
+    KVInput.Output.Copy(KVData);
+    NN.Compute(QueryInput.Output);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHCA finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+
+    for i := 0 to QData.Size - 1 do
+    begin
+      QPlus.Copy(QData);
+      QPlus.Raw[i] := QData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(QPlus);
+      QPlus.Raw[i] := QData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(QPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      QueryInput.Output.Copy(QData);
+      KVInput.Output.Copy(KVData);
+      NN.Compute(QueryInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MHCA query-input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestMultiHeadCrossAttentionGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free;
+    QData.Free;
+    QPlus.Free;
+    KVData.Free;
     Desired.Free;
   end;
 end;

@@ -4842,6 +4842,19 @@ type
       // each sequence position), matching the existing AddSelfAttention block.
       function AddMultiHeadSelfAttention(d_model, Heads: integer;
         CausalMask: boolean = false): TNNetLayer;
+      // Encoder-decoder multi-head CROSS-attention. The Query is projected from
+      // QuerySource (the decoder stream, a (QSeqLen,1,d_model) token tensor) and
+      // the Keys+Values are projected from KeyValueSource (the encoder output, a
+      // (KVSeqLen,1,d_model) token tensor). QSeqLen and KVSeqLen may DIFFER; the
+      // result sequence length equals QSeqLen. All projections are token-wise
+      // (TNNetPointwiseConvLinear / 1x1 conv) so the sequence axes are preserved
+      // (TNNetFullConnect* would flatten them). Per head, [Q_h | K_h | V_h]
+      // (width 3*d_k) is concatenated and fed to TNNetScaledDotProductAttention,
+      // heads are concatenated via TNNetDeepConcat, then out-projected token-wise
+      // to depth d_model. Returns the (QSeqLen,1,d_model) out-projection layer.
+      function AddMultiHeadCrossAttention(d_model, Heads: integer;
+        QuerySource, KeyValueSource: TNNetLayer;
+        CausalMask: boolean = false): TNNetLayer;
       // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
       //   PreNorm=True  (default):
       //     x := x + MHA(LayerNorm(x));  x := x + SwiGLU-FFN(LayerNorm(x))
@@ -23485,6 +23498,63 @@ begin
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
+  QuerySource, KeyValueSource: TNNetLayer;
+  CausalMask: boolean = false): TNNetLayer;
+var
+  d_k, HeadCnt, d: integer;
+  QProj, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels, KVChannels: array of integer;
+begin
+  if QuerySource = nil then
+    FErrorProc('AddMultiHeadCrossAttention requires a non-nil QuerySource.');
+  if KeyValueSource = nil then
+    FErrorProc('AddMultiHeadCrossAttention requires a non-nil KeyValueSource.');
+  if Heads < 1 then
+    FErrorProc('AddMultiHeadCrossAttention requires Heads >= 1. Heads=' +
+      IntToStr(Heads));
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddMultiHeadCrossAttention requires d_model divisible by Heads.' +
+      ' d_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  d_k := d_model div Heads;
+  // Token-wise projections: Q from the decoder stream, K and V from the encoder
+  // output. Pointwise (1x1) so the (SeqLen,1,*) sequence axis is preserved.
+  QProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), QuerySource);
+  KProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), KeyValueSource);
+  VProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), KeyValueSource);
+  SetLength(HeadOutputs, Heads);
+  SetLength(QChannels, d_k);
+  SetLength(KVChannels, d_k);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    // Slice this head's d_k channels out of each projection, then pack them as
+    // [Q_h | K_h | V_h] (width 3*d_k) exactly as TNNetScaledDotProductAttention
+    // expects. Q lives on the QuerySeqLen grid; K|V on the KeyValueSeqLen grid
+    // (the two sequence lengths may differ).
+    for d := 0 to d_k - 1 do
+    begin
+      QChannels[d]  := HeadCnt * d_k + d;
+      KVChannels[d] := HeadCnt * d_k + d;
+    end;
+    QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
+    KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
+    VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
+    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
+        HeadPack);
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Token-wise linear out-projection (FullConnectLinear would flatten the
+  // sequence axis; see AddMultiHeadSelfAttention header note).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+  SetLength(KVChannels, 0);
 end;
 
 function TNNet.AddTransformerEncoderBlock(d_model, Heads, d_ff: integer;
