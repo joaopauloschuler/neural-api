@@ -4830,6 +4830,18 @@ type
       // uses GetLastLayer().
       function AddMultiHeadSDPAConcat(d_model, Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil): TNNetLayer;
+      // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
+      // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
+      // out-projection to depth d_model. Returns the out-projection layer.
+      // NOTE on the out-projection: a plain TNNetFullConnectLinear(d_model)
+      // would FLATTEN the whole (SeqLen,1,d_model) tensor into a single
+      // d_model vector (FullConnect uses prev.Output.Size weights/neuron and
+      // emits 1x1xd_model), mixing tokens and destroying the sequence axis.
+      // The correct per-token linear projection here is
+      // TNNetPointwiseConvLinear(d_model) (a 1x1 conv applied independently at
+      // each sequence position), matching the existing AddSelfAttention block.
+      function AddMultiHeadSelfAttention(d_model, Heads: integer;
+        CausalMask: boolean = false): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -23448,6 +23460,15 @@ begin
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(SliceLayers, 0);
   SetLength(HeadOutputs, 0);
+end;
+
+function TNNet.AddMultiHeadSelfAttention(d_model, Heads: integer;
+  CausalMask: boolean = false): TNNetLayer;
+begin
+  AddMultiHeadSDPAConcat(d_model, Heads, CausalMask, GetLastLayer());
+  // Token-wise linear out-projection (see header note: FullConnectLinear would
+  // flatten the sequence axis; PointwiseConvLinear projects each token).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
 end;
 
 // Ported code from:
