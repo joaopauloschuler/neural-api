@@ -336,16 +336,16 @@ breakdown:
       and/or a multi-head variant with per-head slopes `2^(-8h/H)`, so the
       arm where ALiBi's locality prior actually wins is also demonstrated.
       Pairs with the open "ALiBi slope-base sweep" entry.
-- [X] Causal-mask sanity experiment: train a tiny attention model on
-      next-token prediction WITH and WITHOUT TNNetMaskedFill, and show
-      the unmasked one cheats (near-zero loss but useless at generation).
-      Landed as examples/CausalMaskSanity. Uses the SDPA CausalMask flag
-      (same strictly-upper-triangle -1e9 fill as TNNetMaskedFill /
-      TNNetTriangularCausalMask; SDPA masks scores internally so a separate
-      MaskedFill layer cannot be slotted in). Gate asserts all three: unmasked
-      train-CE < masked train-CE (cheats), masked true-autoregressive accuracy
-      > unmasked (generalizes), AND unmasked attention puts large weight on
-      future keys while masked puts ~0 (AttentionWeights).
+<!-- (Causal-mask sanity experiment removed: completed, landed as
+     examples/CausalMaskSanity/. Trains a tiny attention model on next-token
+     prediction WITH and WITHOUT a causal mask and shows the unmasked one
+     cheats (near-zero loss but useless at generation). Uses the SDPA CausalMask
+     flag (same strictly-upper-triangle -1e9 fill as TNNetMaskedFill /
+     TNNetTriangularCausalMask; SDPA masks scores internally so a separate
+     MaskedFill layer cannot be slotted in). Gate asserts all three: unmasked
+     train-CE < masked train-CE (cheats), masked true-autoregressive accuracy
+     > unmasked (generalizes), AND unmasked attention puts large weight on
+     future keys while masked puts ~0 (AttentionWeights).) -->
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
@@ -1026,10 +1026,10 @@ breakdown:
       check.
 - [ ] Scheduler unit tests — given seed and schedule parameters, NextLR
       must produce a deterministic, finite, monotonically-correct sequence.
-- [X] PrintSummary smoke test — capture summary output for canonical
-      networks, assert row count and total-parameter line. (covered by
-      examples/ModelSummaryDemo: parses SummaryString() for three nets,
-      asserts row-per-layer + Totals footer against CountLayers/CountWeights/CountNeurons.)
+<!-- (PrintSummary smoke test removed: completed, covered by
+     examples/ModelSummaryDemo/ — parses SummaryString() for three nets and
+     asserts row-per-layer + Totals footer against CountLayers/CountWeights/
+     CountNeurons.) -->
 - [ ] Backward-pass sign-correlation test — for every layer that overrides
       Backpropagate, perturb input by ±ε, assert gradient direction agrees
       with loss-difference direction >90% of the time across a small grid.
@@ -1180,14 +1180,14 @@ breakdown:
       the eventual MHA-based version.
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
-- [X] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
-      Square(x)))` as a Euclidean-norm-reciprocal head. Built: Input(1,1,F) ->
-      TNNetSquare -> frozen all-ones TNNetFullConnectLinear(1) [exact sum over F,
-      LearningRate:=0] -> TNNetSqrt -> TNNetReciprocal = 1/||x||_2. Self-checking
-      gate Halt(1): forward vs analytic 1/||x|| max err 0.00e0 over 200 vectors,
-      unit-norm e_0 -> 1.0, L2-normalize extension ||x*(1/||x||)||-1 ~1.2e-7,
-      gradient flow MSE 0.115->0.002 (>=10x, no NaN). Contrasts with the fused,
-      axis-aware, save-safe TNNetL2Normalize. Suite green at 816.
+<!-- (examples/EuclideanNormHead/ removed: completed, landed. Demo composing
+     Reciprocal(Sqrt(Square(x))) as a Euclidean-norm-reciprocal head: Input(1,1,F)
+     -> TNNetSquare -> frozen all-ones TNNetFullConnectLinear(1) [exact sum over F,
+     LearningRate:=0] -> TNNetSqrt -> TNNetReciprocal = 1/||x||_2. Self-checking
+     gate Halt(1): forward vs analytic 1/||x|| max err 0.00e0 over 200 vectors,
+     unit-norm e_0 -> 1.0, L2-normalize extension ||x*(1/||x||)||-1 ~1.2e-7,
+     gradient flow MSE 0.115->0.002 (>=10x, no NaN). Contrasts with the fused,
+     axis-aware, save-safe TNNetL2Normalize. Suite green at 816.) -->
 <!-- (examples/SIREN/ removed: completed, landed 2026-05-30. 1D periodic-function
      fit with TNNetSin (Sitzmann et al. 2020 SIREN), existing layers only. Both arms
      identical (Input(1) -> [FullConnectLinear(24) -> act]x3 -> FullConnectLinear(1),
@@ -1210,9 +1210,10 @@ breakdown:
      remain worth adding.) -->
 - [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a tiny-MNIST
       subset (or synthetic 2D classification).
-- [X] `examples/ModelSummaryDemo/` — three structurally-distinct nets (MLP,
-      conv, pre-norm residual) printed via PrintSummary; doubles as the
-      PrintSummary format smoke test (parses SummaryString, gates on Halt(1)).
+<!-- (examples/ModelSummaryDemo/ removed: completed, landed. Three
+     structurally-distinct nets (MLP, conv, pre-norm residual) printed via
+     PrintSummary; doubles as the PrintSummary format smoke test (parses
+     SummaryString, gates on Halt(1)).) -->
 - [ ] `examples/SchedulerCompare/` — same network trained four times with
       constant LR, StepLR, CosineLR, WarmupCosineLR; one chart.
 - [ ] `examples/SWADemo/` — CIFAR-10 baseline vs same network with SWA
@@ -1696,8 +1697,8 @@ breakdown:
 - [ ] "Elementwise activation layer authoring" mini-guide capturing the
       recurring 4-step pattern (Compute, Backpropagate via FOutputErrorDeriv,
       dispatch entry, four-test shape).
-- [ ] `docs/channel_attention.md` — once SE / CBAM / FiLM land, compare
-      them on the same axes.
+- [ ] `docs/channel_attention.md` — once CBAM lands, compare it on the same
+      axes with the already-landed SE (TNNet.AddSEBlock) and FiLM (TNNetFiLM).
 - [ ] `docs/loss_layers.md` — once the loss family is complete, table input
       shape required, scalar vs per-sample, drop-in vs auxiliary.
 - [ ] Short note in `tests/README` on "how to add a numerical-gradient
@@ -1736,7 +1737,8 @@ breakdown:
 ### Stretch / ambitious
 - [ ] `examples/TinyDiffusion/` — a 20-step denoising-diffusion model on
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
-      TNNetSinusoidalTimeEmbedding. Depends on FiLM + timestep embedding.
+      TNNetSinusoidalTimeEmbedding (both FiLM and the timestep embedding have
+      landed, so this is now unblocked).
 - [ ] `examples/HopfieldRetrieval/` — modern Hopfield network as attention
       (Ramsauer et al.): store K patterns, retrieve via a single softmax-
       attention step against a query.
