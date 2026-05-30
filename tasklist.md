@@ -42,35 +42,28 @@ rather than acted on.
      landed in examples/FourierFeaturesSpectralBias/.) -->
 
 ## Interesting applications / examples
-- [ ] DeepSets permutation-invariant set learning demo (`examples/DeepSets/`) —
-      reproduce the Zaheer et al. 2017 "Deep Sets" recipe on a TINY pure-CPU
-      target (e.g. learn to regress the SUM, or the MAX, of a fixed-size bag of
-      N scalars/one-hot digits). Existing layers ONLY, no new layer: lay the N
-      set elements along the X axis as an `(N, 1, F)` volume, apply the SHARED
-      per-element encoder phi with `featuresize=1` pointwise layers
-      (`TNNetPointwiseConvReLU` / `TNNetConvolutionLinear(_, 1, 0, 1)`) so every
-      element sees identical weights, then collapse the set with the EXISTING
-      symmetric pool `TNNetAvgChannel` (or `TNNetMaxChannel`) — which reduces
-      X*Y to one number per channel, i.e. mean/max over the N elements with Y=1,
-      giving `(1, 1, F')` — and finish with the rho head (`TNNetFullConnectReLU`
-      -> `TNNetFullConnectLinear(1)`). The whole point is the architectural
-      INVARIANT, so make it the headline check (mirroring the suite's "bit-for-
-      bit no-op" idiom): a trained net's output must be UNCHANGED when the N
-      input elements are randomly PERMUTED (max|dy| ~ 0 across many shuffles),
-      and SHOULD change when an element's VALUE is edited — print both. Stretch:
-      a sum-pool (`TNNetAvgChannel` scaled, or a mean) generalizes to set sizes
-      unseen at train time (train on N=5, test on N=8) where a flatten+dense
-      baseline cannot even accept the larger input — chart that generalization
-      gap. Conceptually distinct from everything in the suite: it is a
-      permutation-INVARIANT set function, not a sequence model (AttentionCopyTask,
-      DiagonalSSM), a grid model (the conv classifiers), or an order-SENSITIVE
-      MLP. README contrasts it with self-attention (also permutation-equivariant
-      but O(N^2) and far heavier) and notes WHY a plain flatten->dense net fails
-      the permutation invariant. Feasibility risk to settle in v1: confirm
-      `TNNetAvgChannel`'s `(N,1,F)->(1,1,F)` reduction and its backward
-      distribute-equally gradient behave as expected when N>1 along X (it is
-      documented as averaging the whole channel), and pick mean- vs max-pool
-      based on which actually learns the target task.
+<!-- (DeepSets permutation-invariant set-learning demo removed: completed, landed
+     2026-05-30 as examples/DeepSets/. Existing layers only, no new layer:
+     Input(N,1,1) -> TNNetPointwiseConvReLU(16) -> TNNetConvolutionLinear(16,1,0,1)
+     {shared per-element phi} -> TNNetMaxChannel {symmetric pool, (N,1,F)->(1,1,F)}
+     -> TNNetFullConnectReLU(16) -> TNNetFullConnectLinear(1) {rho head}. Manual
+     mini-batch SGD (no NeuralFit, so deterministic/single-threaded), RandSeed=424242,
+     ~3s. Task = regress the MAX of a bag of N scalars, paired with MAX-pool so the
+     pool computes EXACTLY the symmetric statistic being learned (cleanest/exact
+     invariance). Headline checks both PASS or Halt(1): permutation invariance is
+     BIT-FOR-BIT exact (max|dy| = 0 over 200 shuffles), value-sensitivity |dy|=1.82
+     after editing one element. Stretch PASSES: weights trained ONLY on N=5
+     generalize to UNSEEN N=8 (RMSE 0.0123 at N=5 vs 0.0041 at N=8 — exact max-pool
+     generalizes cleanly across set sizes); done via CopyWeights, NOT LoadFromFile
+     (LoadFromFile restores the saved input dim N=5 and breaks the wider net).
+     KEY LIBRARY FINDING (documented in .lpr + README): on an (N,1,F) bag
+     TNNetMaxChannel gives the EXACT per-channel max, but TNNetAvgChannel divides by
+     PoolSize^2 = N^2 (not N) — it returns sum/N^2, since FPoolSize:=SizeX=N while
+     only N of the N*N window cells are non-empty at Y=1. Still symmetric (still
+     permutation-invariant), only the scale differs — a linear rho head absorbs it.
+     README contrasts vs self-attention (also permutation-equivariant but O(N^2) and
+     heavier) and explains why a flatten->dense net cannot be permutation-invariant.
+     Suite green at 816.) -->
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
@@ -517,11 +510,22 @@ breakdown:
       non-square blur-pool use case shows up, generalize the dense-max + blur
       loops to independent (X, Y) extents (the same caveat noted for the removed
       TNNetGlobalMaxPool at the top of this file) rather than forking a class.
-- [ ] TNNetBlurPool sibling: the pure anti-aliasing primitive (fixed binomial
-      blur + stride subsample, NO max stage) so it can sit after ANY layer, not
-      just a max — Zhang 2019 also blur-pools strided convs and average pools.
-      Reuse TNNetMaxBlurPool's fixed-kernel blur+backward, drop the dense-max
-      argmax bookkeeping. Numerical-gradient + round-trip tests mirror MaxBlurPool.
+<!-- (TNNetBlurPool sibling removed: completed, landed 2026-05-30 as a
+     TNNetPoolBase descendant in neuralnetwork.pas right after TNNetMaxBlurPool.
+     The pure anti-aliasing primitive (fixed separable binomial [1,2,1]x[1,2,1]/16
+     blur + stride subsample, NO max stage) so it can sit after ANY layer — it
+     blurs FPrevLayer.Output directly instead of a dense maxmap, dropping all
+     argmax/FMaxMap bookkeeping; border-clamped + renormalized live taps sum to 1.
+     Blur weights are constant (no gradient); backward scatters each output error
+     through the fixed taps. Registered in BOTH dispatch paths (CreateLayer case +
+     Delphi LoadFromString if-chain), round-trips St[0..2]. Tests in
+     TestNeuralNumerical.pas (each reseeds RandSeed:=424242): TestBlurPoolGradientCheck
+     (4x4x2 input grad, tol 0.01 — forward is purely linear so it matches tightly),
+     TestBlurPoolLoadFromString (byte-identical round-trip + recompute to 1e-6), and
+     TestBlurPoolShiftInvariance (blurpool changes less than strided MaxPool under
+     1-3px shifts). Suite green at 816. Same square-input (SizeX=SizeY) constraint
+     as TNNetMaxBlurPool, documented in the class doc comment — rectangular support
+     is the open follow-up above.) -->
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
 <!-- (TNNetMishExact / TNNetMish-stable removed: the in-tree TNNetMish ALREADY
@@ -1142,7 +1146,18 @@ breakdown:
       without TNNetReZero on each residual branch on the hypotenuse toy.
 - [ ] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
       Square(x)))` as a Euclidean-norm-reciprocal head.
-- [ ] `examples/SIREN/` — 1D periodic-function fit with TNNetSin.
+<!-- (examples/SIREN/ removed: completed, landed 2026-05-30. 1D periodic-function
+     fit with TNNetSin (Sitzmann et al. 2020 SIREN), existing layers only. Both arms
+     identical (Input(1) -> [FullConnectLinear(24) -> act]x3 -> FullConnectLinear(1),
+     same width/depth/seed/epochs=400/LR/optimizer): SIREN arm uses TNNetSin, baseline
+     uses TNNetHyperbolicTangent. Target y=sin(3x)+0.3*sin(11x) over x in [-1,1].
+     SIREN init reproduced by hand after InitWeights() via TNNetLayer.InitUniform(s):
+     first layer InitUniform(omega_0) folds the frequency directly into the weights
+     (n=1 so the paper's U(-1/n,1/n)=U(-1,1) scaled by omega_0), later sine-feeding
+     layers InitUniform(sqrt(6/fan_in)/omega_0); omega_0=12 (below the paper's 30,
+     keeps the high-freq advantage while numerically calm). Result (~12s,
+     deterministic): Tanh MSE 0.053259 vs SIREN MSE 0.000016 (~100% reduction). Gate
+     PASSES (SIREN < 0.5*Tanh AND < 0.05), Halt(1) on failure. Suite green at 816.) -->
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
       replacing a stride-2 conv on a tiny CIFAR stub.
 <!-- (`examples/PreNormVsPostNorm/` removed: completed, landed 2026-05-24 —
