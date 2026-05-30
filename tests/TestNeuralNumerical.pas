@@ -98,6 +98,8 @@ type
     procedure TestLayerNormGradientCheck;
     procedure TestGroupNormForward;
     procedure TestGroupNormGradientCheck;
+    procedure TestGroupNormAffineParamCount;
+    procedure TestGroupNormPerElementAffine;
     procedure TestInstanceNormForward;
     procedure TestInstanceNormGradientCheck;
     procedure TestInstanceNormSerializationRoundTrip;
@@ -3509,6 +3511,164 @@ begin
           ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
           Abs(numericalGrad - analyticalGrad) < 0.01);
       end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupNormAffineParamCount;
+var
+  NN: TNNet;
+  GNorm: TNNetGroupNorm;
+begin
+  // Per-channel (textbook, default): one gamma + one beta per channel.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4));
+    GNorm := TNNetGroupNorm.Create(2); // PerChannelAffine defaults to True
+    NN.AddLayer(GNorm);
+    AssertEquals('Per-channel gamma size should equal Depth',
+      4, GNorm.Neurons[0].Weights.Size);
+    AssertEquals('Per-channel beta size should equal Depth',
+      4, GNorm.Neurons[1].Weights.Size);
+  finally
+    NN.Free;
+  end;
+
+  // Per-element (legacy): one gamma + one beta per output element.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4));
+    GNorm := TNNetGroupNorm.Create(2, False);
+    NN.AddLayer(GNorm);
+    AssertEquals('Per-element gamma size should equal the output volume',
+      2 * 2 * 4, GNorm.Neurons[0].Weights.Size);
+    AssertEquals('Per-element beta size should equal the output volume',
+      2 * 2 * 4, GNorm.Neurons[1].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupNormPerElementAffine;
+var
+  NN, NN2: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  GNorm: TNNetGroupNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  Saved: string;
+  i, j: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Legacy per-element affine (PerChannelAffine = False): one gamma/beta per
+  // output element. Verifies the gradients stay correct and that the False
+  // mode round-trips through SaveToString / LoadFromString.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  InputPlus := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    GNorm := TNNetGroupNorm.Create(2, False);
+    NN.AddLayer(GNorm);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Per-element affine -> one weight per output element.
+    AssertEquals('Per-element gamma size should equal the output volume',
+      Input.Size, GNorm.Neurons[0].Weights.Size);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to GNorm.Neurons[0].Weights.Size - 1 do
+    begin
+      GNorm.Neurons[0].Weights.Raw[i] := 1.0 + i * 0.1; // gamma
+      GNorm.Neurons[1].Weights.Raw[i] := i * 0.05 - 0.1; // beta
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Per-element GroupNorm input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. gamma and beta ----
+    for j := 0 to 1 do // 0 = gamma, 1 = beta
+      for i := 0 to GNorm.Neurons[j].Weights.Size - 1 do
+      begin
+        GNorm.Neurons[j].Weights.Raw[i] := GNorm.Neurons[j].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        GNorm.Neurons[j].Weights.Raw[i] := GNorm.Neurons[j].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        GNorm.Neurons[j].Weights.Raw[i] := GNorm.Neurons[j].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        GNorm.Neurons[j].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -GNorm.Neurons[j].Delta.Raw[i];
+
+        AssertTrue('Per-element GroupNorm weight gradient (' + IntToStr(j) + ',' +
+          IntToStr(i) + ') num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Round-trip: the False mode must reconstruct as per-element ----
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      AssertEquals('Per-element round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      AssertEquals('Per-element round-trip gamma size',
+        GNorm.Neurons[0].Weights.Size,
+        NN2.GetLastLayer.Neurons[0].Weights.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Per-element round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
   finally
     NN.Free;
     Input.Free;

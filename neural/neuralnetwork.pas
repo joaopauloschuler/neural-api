@@ -2534,19 +2534,27 @@ type
   /// This layer does group normalization. The input channels (Depth) are
   // split into Groups contiguous groups; each group is normalized
   // independently over (SizeX * SizeY * channels-in-group) to zero mean and
-  // unit variance, then a learnable per-element scale (gamma) and bias (beta)
-  // are applied over the full output volume. Output has the same shape as the
-  // input. Depth must be divisible by Groups; otherwise it falls back to a
-  // single group.
+  // unit variance, then a learnable scale (gamma) and bias (beta) are applied.
+  // Output has the same shape as the input. Depth must be divisible by Groups;
+  // otherwise it falls back to a single group.
+  // PerChannelAffine selects how gamma/beta are shaped:
+  //   True  (default, textbook): one gamma and one beta per channel, broadcast
+  //         over every spatial position. Translation-invariant and independent
+  //         of the input resolution.
+  //   False (legacy): a per-element gamma/beta over the full output volume
+  //         (one weight per SizeX*SizeY*Depth position). Kept for backward
+  //         compatibility; ties the affine to a fixed spatial resolution.
   TNNetGroupNorm = class(TNNetIdentityWithoutL2)
     private
       FGroupNormEpsilon: TNeuralFloat;
       FGroups: integer;
       FChannelsPerGroup: integer;
+      FPerChannelAffine: boolean;
       FInvStdDev: array of TNeuralFloat;
       FNormalized: TNNetVolume;
+      FAuxChannel: TNNetVolume; // per-channel gradient reduction (per-channel affine)
     public
-      constructor Create(Groups: integer); overload;
+      constructor Create(Groups: integer; PerChannelAffine: boolean = True); overload;
       destructor Destroy(); override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
@@ -2557,9 +2565,11 @@ type
   /// Instance normalization: per-sample, per-channel normalization. This is
   // the TNNetGroupNorm limit at Groups = Depth (one channel per group). The
   // group count is resolved at SetPrevLayer time from the input depth.
+  // Like TNNetGroupNorm, the affine defaults to the textbook per-channel form
+  // (PerChannelAffine = True); pass False for the legacy per-element affine.
   TNNetInstanceNorm = class(TNNetGroupNorm)
     public
-      constructor Create(); overload;
+      constructor Create(PerChannelAffine: boolean = True); overload;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   end;
 
@@ -21468,21 +21478,25 @@ begin
 end;
 
 { TNNetGroupNorm }
-constructor TNNetGroupNorm.Create(Groups: integer);
+constructor TNNetGroupNorm.Create(Groups: integer; PerChannelAffine: boolean);
 begin
   inherited Create();
   if Groups < 1 then Groups := 1;
   FGroups := Groups;
   FStruct[0] := Groups;
+  FPerChannelAffine := PerChannelAffine;
+  FStruct[1] := Ord(PerChannelAffine);
   FGroupNormEpsilon := 1e-5;
   FChannelsPerGroup := 0;
   FNormalized := TNNetVolume.Create();
+  FAuxChannel := TNNetVolume.Create();
 end;
 
 destructor TNNetGroupNorm.Destroy();
 begin
   SetLength(FInvStdDev, 0);
   FNormalized.Free;
+  FAuxChannel.Free;
   inherited Destroy();
 end;
 
@@ -21495,7 +21509,15 @@ begin
   SetLength(FInvStdDev, FGroups);
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   // FNeurons[0] holds gamma (scale), FNeurons[1] holds beta (bias).
-  SetNumWeightsForAllNeurons(FOutput);
+  if FPerChannelAffine then
+  begin
+    // Textbook affine: one gamma/beta per channel, broadcast over space.
+    SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+    FAuxChannel.ReSize(1, 1, FOutput.Depth);
+  end
+  else
+    // Legacy affine: one gamma/beta per output element.
+    SetNumWeightsForAllNeurons(FOutput);
   FNormalized.ReSize(FOutput);
   FOutputError.ReSize(FOutput);
   FOutputErrorDeriv.ReSize(FOutput);
@@ -21541,9 +21563,17 @@ begin
   end;
   // Keep the normalized values for the backward pass.
   FNormalized.Copy(FOutput);
-  // Apply learnable per-element scale (gamma) and bias (beta).
-  FOutput.Mul(FNeurons[0].FWeights);
-  FOutput.Add(FNeurons[1].FWeights);
+  // Apply the learnable scale (gamma) and bias (beta).
+  if FPerChannelAffine then
+  begin
+    FOutput.MulChannels(FNeurons[0].FWeights);
+    FOutput.AddToChannels(FNeurons[1].FWeights);
+  end
+  else
+  begin
+    FOutput.Mul(FNeurons[0].FWeights);
+    FOutput.Add(FNeurons[1].FWeights);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -21563,8 +21593,22 @@ begin
   // d(beta)  = sum of ( OutputError )
   FOutputErrorDeriv.Copy(FOutputError);
   FOutputErrorDeriv.Mul(FNormalized);
-  FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputErrorDeriv);
-  FNeurons[1].FDelta.MulAdd(-FLearningRate, FOutputError);
+  if FPerChannelAffine then
+  begin
+    // Per-channel affine: reduce the gamma/beta gradients over all spatial
+    // positions, leaving one value per channel.
+    FAuxChannel.Fill(0);
+    FAuxChannel.AddSumChannel(FOutputErrorDeriv);
+    FNeurons[0].FDelta.MulAdd(-FLearningRate, FAuxChannel);
+    FAuxChannel.Fill(0);
+    FAuxChannel.AddSumChannel(FOutputError);
+    FNeurons[1].FDelta.MulAdd(-FLearningRate, FAuxChannel);
+  end
+  else
+  begin
+    FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputErrorDeriv);
+    FNeurons[1].FDelta.MulAdd(-FLearningRate, FOutputError);
+  end;
   if (not FBatchUpdate) then
   begin
     FNeurons[0].UpdateWeights(FInertia);
@@ -21590,7 +21634,12 @@ begin
           for CntD := DStart to DEnd do
           begin
             RawPos := FOutput.GetRawPos(CntX, CntY, CntD);
-            DxHat := FOutputError.FData[RawPos] * FNeurons[0].FWeights.FData[RawPos];
+            // Per-channel affine broadcasts gamma by channel (FData[CntD]);
+            // the legacy affine indexes gamma per element (FData[RawPos]).
+            if FPerChannelAffine then
+              DxHat := FOutputError.FData[RawPos] * FNeurons[0].FWeights.FData[CntD]
+            else
+              DxHat := FOutputError.FData[RawPos] * FNeurons[0].FWeights.FData[RawPos];
             FOutputErrorDeriv.FData[RawPos] := DxHat;
             SumDxHat := SumDxHat + DxHat;
             SumDxHatXHat := SumDxHatXHat + DxHat * FNormalized.FData[RawPos];
@@ -21622,11 +21671,11 @@ begin
 end;
 
 { TNNetInstanceNorm }
-constructor TNNetInstanceNorm.Create();
+constructor TNNetInstanceNorm.Create(PerChannelAffine: boolean);
 begin
   // Placeholder Groups=1; the real value is bound at SetPrevLayer once Depth
   // is known (one group per channel).
-  inherited Create(1);
+  inherited Create(1, PerChannelAffine);
 end;
 
 procedure TNNetInstanceNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -44192,8 +44241,8 @@ begin
       'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
       'TNNetPixelNorm':             Result := TNNetPixelNorm.Create();
-      'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0]);
-      'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create();
+      'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0], St[1] = 1);
+      'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create(St[1] = 1);
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetChannelNorm':           Result := TNNetChannelNorm.Create();
@@ -44462,8 +44511,8 @@ begin
       if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
       if S[0] = 'TNNetPixelNorm' then Result := TNNetPixelNorm.Create() else
-      if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0]) else
-      if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create() else
+      if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0], St[1] = 1) else
+      if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create(St[1] = 1) else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelNorm' then Result := TNNetChannelNorm.Create() else
