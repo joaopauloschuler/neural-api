@@ -203,6 +203,32 @@ breakdown:
 
 ### Attention variants / siblings
 
+- [ ] Grouped-Query / Multi-Query Attention builder
+      `TNNet.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, KVHeads)` —
+      the one genuinely missing attention shape in the suite. Today
+      AddMultiHeadSelfAttention projects Q, K and V into the SAME number of
+      heads (full MHA); GQA instead uses fewer K/V heads than Q heads, so
+      several query heads SHARE one key/value head (KVHeads=1 degenerates to
+      classic Multi-Query Attention, KVHeads=QueryHeads degenerates to plain
+      MHA — assert both as sanity checks). This is the standard inference-memory
+      win in modern LLMs (Llama-2/3, Mistral): it shrinks the per-layer KV
+      footprint by QueryHeads/KVHeads, which is exactly the bottleneck the open
+      [[KV-cache incremental-decode]] task is fighting in downstream
+      ../gpt-3-for-pascal — so the two compose. Implementation scope: build it
+      over the existing SDPA core (a builder, NOT a new layer class, matching
+      how AddMultiHeadCrossAttention shipped). Project K/V to d_kv =
+      d_model*KVHeads/QueryHeads channels via PointwiseConvLinear (per-token,
+      per the [[mha-builder-and-seq-projection]] note — FullConnect would mix
+      the sequence), then replicate each K/V head across its group of query
+      heads before the per-head SDPA. Require QueryHeads mod KVHeads = 0 and
+      d_model mod QueryHeads = 0 with a clear error otherwise. Tests:
+      (a) a numerical gradient check in TestNeuralNumerical.pas seeded with
+      RandSeed := 424242 per the [[numerical-test-rng-ordering]] note,
+      QueryHeads=4/KVHeads=2; (b) assert the KVHeads=QueryHeads output matches
+      the existing AddMultiHeadSelfAttention to < 1e-5 (same-shape equivalence).
+      Plus a one-paragraph README and a param-count line showing the KV
+      projection shrinkage vs full MHA. A real new capability, not a re-skin.
+
 - [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
       MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
       TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
