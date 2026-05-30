@@ -688,9 +688,12 @@ type
     procedure Compute(); override;
   end;
 
-  /// Gaussian Error Linear Unit (GELU) activation function - This is an experimental layer. Do not use it.
+  /// Gaussian Error Linear Unit (GELU) activation function.
   // A smooth activation function popular in transformer models like BERT and GPT.
   // Uses the tanh approximation formula: GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+  // The tanh approximation is intentional; if you want the closed-form Gaussian
+  // path use TNNetErf (the exact erf-based partner). Several layers build on this
+  // class (e.g. TNNetPhish reuses its derivative).
   // https://arxiv.org/abs/1606.08415
   TNNetGELU = class(TNNetReLUBase)
   public
@@ -698,9 +701,10 @@ type
     procedure Backpropagate(); override;
   end;
 
-  /// Mish activation function - This is an experimental layer. Do not use it.
+  /// Mish activation function.
   // A smooth, non-monotonic self-regularizing activation function.
   // Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+  // See also TNNetSerf, a smooth drop-in replacement for Mish.
   // https://arxiv.org/abs/1908.08681
   TNNetMish = class(TNNetReLUBase)
   public
@@ -794,7 +798,7 @@ type
     procedure Compute(); override;
   end;
 
-  /// SoftPlus activation function - This is an experimental layer. Do not use it.
+  /// SoftPlus activation function.
   // A smooth approximation of ReLU.
   // SoftPlus(x) = ln(1 + exp(x)), derivative is the sigmoid function.
   TNNetSoftPlus = class(TNNetReLUBase)
@@ -803,7 +807,7 @@ type
     procedure Backpropagate(); override;
   end;
 
-  /// Gaussian activation function - This is an experimental layer. Do not use it.
+  /// Gaussian activation function.
   // Gaussian(x) = exp(-x^2), derivative is -2*x*exp(-x^2).
   TNNetGaussianActivation = class(TNNetReLUBase)
   public
@@ -2436,6 +2440,13 @@ type
 
   /// This layer does a standard normalization. There are no trainable parameters
   // in this layer.
+  // NOTE: the forward pass matches a true per-sample layer normalization
+  // (zero mean, unit variance), but the backward pass is an approximation: it
+  // only divides the error by the forward standard deviation and treats that
+  // std as a constant, ignoring that mean/variance depend on the input. For a
+  // mathematically correct gradient prefer TNNetZScore (parameter-free, exact
+  // Jacobian) or TNNetLayerNorm (exact Jacobian plus learnable gamma/beta).
+  // This class is kept for backward compatibility with existing saved models.
   TNNetLayerStdNormalization = class(TNNetIdentity)
     private
       FLastStdDev: TNeuralFloat;
