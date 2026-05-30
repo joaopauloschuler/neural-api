@@ -1151,8 +1151,14 @@ breakdown:
       the eventual MHA-based version.
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
-- [ ] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
-      Square(x)))` as a Euclidean-norm-reciprocal head.
+- [X] `examples/EuclideanNormHead/` — demo composing `Reciprocal(Sqrt(
+      Square(x)))` as a Euclidean-norm-reciprocal head. Built: Input(1,1,F) ->
+      TNNetSquare -> frozen all-ones TNNetFullConnectLinear(1) [exact sum over F,
+      LearningRate:=0] -> TNNetSqrt -> TNNetReciprocal = 1/||x||_2. Self-checking
+      gate Halt(1): forward vs analytic 1/||x|| max err 0.00e0 over 200 vectors,
+      unit-norm e_0 -> 1.0, L2-normalize extension ||x*(1/||x||)||-1 ~1.2e-7,
+      gradient flow MSE 0.115->0.002 (>=10x, no NaN). Contrasts with the fused,
+      axis-aware, save-safe TNNetL2Normalize. Suite green at 816.
 <!-- (examples/SIREN/ removed: completed, landed 2026-05-30. 1D periodic-function
      fit with TNNetSin (Sitzmann et al. 2020 SIREN), existing layers only. Both arms
      identical (Input(1) -> [FullConnectLinear(24) -> act]x3 -> FullConnectLinear(1),

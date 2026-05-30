@@ -7,4 +7,5 @@ CausalMaskSanity/CausalMaskSanity
 CoordConvSpiral/CoordConvSpiral
 CumSumPositionEncoding/CumSumPositionEncoding
 DomainAdversarial/DomainAdversarial
+EuclideanNormHead/EuclideanNormHead
 PerplexityEval/PerplexityEval
