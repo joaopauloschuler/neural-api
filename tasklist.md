@@ -170,23 +170,36 @@ rather than acted on.
 ### TNNetMultiHeadSelfAttention — breakdown
 SDPA + RoPE + MaskedFill + ALiBi are all in tree. Suggested commit-sized
 breakdown:
-- [ ] TNNetTransformerEncoderBlock helper — LayerNorm → MHA → residual →
-      LayerNorm → SwiGLU FFN → residual. Single call, configurable
-      d_model / heads / d_ff. Companion numerical-gradient test on a tiny
-      shape (d_model=8, heads=2, seq=3). Pre-norm and post-norm variants
-      behind a flag. NOW UNBLOCKED: the MHA half is the landed
-      `TNNet.AddMultiHeadSelfAttention(d_model, Heads, CausalMask)`; wrap it
-      with the existing `AddPreNormResidual`/`AddPostNormResidual` builders +
-      a SwiGLU FFN. Use pointwise (1x1) projections inside the FFN over the
-      (SeqLen,1,d_model) tensor, NOT FullConnect — on a (SeqLen,1,d_model)
-      tensor FullConnect flattens the whole sequence into one vector and
-      collapses the token axis (zero input gradient + size mismatch).
+- [X] TNNetTransformerEncoderBlock helper — LANDED as
+      `TNNet.AddTransformerEncoderBlock(d_model, Heads, d_ff; PreNorm=True;
+      CausalMask=False)` (neuralnetwork.pas ~23490). Residual wrappers are
+      inlined (not the array-based AddPreNormResidual/AddPostNormResidual)
+      because the MHA/FFN sublayers add many layers via GetLastLayer chaining
+      and cannot be passed as a pre-built `array of TNNetLayer`. Note: the
+      block prepends a PointwiseConvLinear(3*d_model) QKV-slab projection
+      because AddMultiHeadSelfAttention consumes a 3*d_model slab (see
+      AddSplitQKVHeads). FFN is pointwise (PointwiseConvLinear -> SwiGLU ->
+      PointwiseConvLinear), NOT the FullConnect-based AddSwiGLUFeedForward.
+      Test: TestTransformerEncoderBlockGradientCheck (both PreNorm variants).
 - [ ] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
       front of self-attention and an optional cross-attention sub-block.
       Built on top of the encoder helper above to avoid duplication.
-- [ ] TNNetCrossAttention — same SDPA core but with separate Q vs K|V
-      input branches (so encoder-decoder is reachable). Forward +
-      gradient-check on a tiny shape.
+      NOW FULLY UNBLOCKED: both halves landed — `AddTransformerEncoderBlock`
+      (causal self-attention via CausalMask=True) and
+      `AddMultiHeadCrossAttention(d_model, Heads, QuerySource, KeyValueSource)`
+      for the encoder-decoder cross-attention sub-block. The decoder block is
+      now just: causal self-attn residual -> cross-attn residual (Q from the
+      decoder stream, K|V from the encoder output) -> pointwise SwiGLU FFN
+      residual. Mind that cross-attention takes EXPLICIT source layers, so the
+      decoder builder must thread the encoder-output layer ref through.
+- [X] TNNetCrossAttention — LANDED as the builder
+      `TNNet.AddMultiHeadCrossAttention(d_model, Heads, QuerySource,
+      KeyValueSource; CausalMask=False)` (separate Q vs K|V branches, query and
+      key/value sequences may differ in length; output seq length = query
+      length). Shipped as a builder over the existing SDPA core rather than a
+      new layer class. Test: TestMultiHeadCrossAttentionGradientCheck (QSeqLen=3,
+      KVSeqLen=4 — deliberately unequal). CausalMask left untested (a causal
+      triangle is ill-defined for non-corresponding query/kv lengths).
 
 ### Attention variants / siblings
 
@@ -421,8 +434,19 @@ breakdown:
 - [ ] TNNetMixtureOfExperts — top-k softmax gate over N expert sub-networks
       plus a load-balancing auxiliary loss. (The just-landed
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
-- [ ] TNNetHardConcrete — learnable L0-sparsity gate (Louizos, Welling &
-      Kingma 2018, "Learning Sparse Neural Networks through L0 Regularization").
+- [X] TNNetHardConcrete — LANDED (Louizos, Welling & Kingma 2018, L0
+      regularization). Subclasses TNNetChannelTransformBase for per-depth
+      trained log_alpha; beta/gamma/zeta in FFloatSt[0..2]; gates the DEPTH
+      axis (input shaped (1,1,Features) to gate per-feature). Deterministic
+      inference gate by default; stochastic reparameterized gate when Enabled
+      (wired into EnableDropouts). GRADIENT GOTCHA documented in code: the
+      interior slope is (1/beta)*s*(1-s) while TRAINING (noisy logit scaled by
+      1/beta) but s*(1-s) at inference — a 1/beta mismatch the grad check caught.
+      Tests: TestHardConcreteGateLimits, TestHardConcreteGradientCheck (input +
+      log_alpha weight), TestHardConcreteSerializationRoundTrip. Example
+      examples/HardConcreteSparsity/ reports 83% hard-zero gates (L0) vs 0%
+      (L2 baseline) at matched ~97% acc; lambda knee ~0.05 documented.
+      Original spec retained below for reference. 
       A per-channel multiplicative gate `z ∈ [0,1]` drawn from a hard-concrete
       distribution: `s = sigmoid((log u − log(1−u) + log α)/β)` stretched to
       `(γ, ζ)` with `γ<0<ζ` and hard-clipped to `[0,1]`, so a fraction of gates
