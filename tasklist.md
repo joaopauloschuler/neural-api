@@ -635,6 +635,28 @@ breakdown:
       stub) where SAM's flat minimum actually buys measurable val-accuracy over
       plain SGD would complete the demonstration. Builds directly on the landed
       examples/SharpnessAwareMinimization/.
+- [ ] Muon optimizer experiment (`examples/MuonOptimizer/`) — Newton-Schulz
+      orthogonalized-momentum update (Jordan et al. 2024) for the 2D weight
+      matrices of `TNNetFullConnectLinear` layers, framed as a hand-rolled
+      gradient-surgery demo in the SAM / Lookahead style (NOT a core optimizer
+      rewrite). Per step under `NN.SetBatchUpdate(True)` (so the accumulated
+      `Neurons[].Delta` gradient tensor is actually populated — see
+      [[manual-gradient-and-snapshot-gotchas]]): maintain a momentum buffer
+      `M <- mu*M + G` per dense layer, then replace `M` by its nearest
+      orthogonal matrix via ~5 fixed Newton-Schulz iterations on the normalized
+      `X = M/||M||_F` (the quintic `X <- a*X + b*(XX^T X) + c*(XX^T)^2 X` with the
+      paper's (a,b,c) ~ (3.4445,-4.7750,2.0315), all expressible with the
+      existing `TNNetVolume` matrix ops), and apply `W <- W - lr*O` with the
+      `sqrt(max(rows,cols))` scale so the update RMS matches Adam's. Bake it off
+      against plain SGD-momentum and Adam on a small MLP (the hypotenuse toy or
+      a tiny image stub), charting loss-vs-step and wall-clock/step. Headline
+      correctness signal: after the Newton-Schulz pass the singular values of
+      `O` are all ~1 (assert `||O^T O - I||_F` is small on a probe matrix) — can
+      spot-check the spectrum with the existing `TNNet.EstimateSpectralNorm`
+      power-iteration helper. Genuinely new (no orthogonalized-update path
+      exists in tree); distinct from the differentiable `TNNetWeightNormLinear` /
+      `TNNetWeightStandardization` reparametrizations, which normalize the
+      FORWARD weights, not the update.
 ### Introspection / debugging tools
 <!-- (TNNet.ToGraphvizDot removed: completed, landed 2026-05-24 — instance
      method returning a `digraph` string for the layer DAG (node per layer
