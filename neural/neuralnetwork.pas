@@ -4440,6 +4440,52 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Anti-aliased ("shift-invariant") max pooling (Zhang 2019, "Making
+  // Convolutional Networks Shift-Invariant Again"). A naive strided maxpool
+  // aliases because subsampling follows a non-linear max with no low-pass
+  // step. MaxBlurPool instead computes a DENSE max (window = PoolSize,
+  // stride 1, so the spatial size is preserved) and only THEN subsamples,
+  // applying a FIXED (non-trainable) separable binomial low-pass blur with
+  // the downsampling stride. The result approximately commutes with small
+  // input translations.
+  //
+  // Forward, per channel d:
+  //   maxmap[x,y] = max over (dx,dy) in [0,PoolSize)^2 of input[x+dx,y+dy]
+  //                 (the PoolSize window is anchored at (x,y) and clamped to
+  //                  the input bounds, so maxmap has the input's spatial size)
+  //   out[ox,oy]  = sum_{i,j in {0,1,2}} w[i]*w[j]
+  //                   * maxmap[ox*Stride + i - 1, oy*Stride + j - 1]
+  // where w = [1,2,1]/4 is the size-3 binomial kernel (so the 2D kernel is
+  // [1,2,1]x[1,2,1]/16). Blur source coordinates are clamped to the valid
+  // range and the kernel is RE-NORMALISED by the sum of used weights at the
+  // borders, so edge handling is well defined and the per-cell blur weights
+  // always sum to 1. The blur weights are CONSTANT (no gradient flows to
+  // them) but Backpropagate still routes the input gradient correctly through
+  // both the fixed blur (a transposed conv that scatters each output error to
+  // its blur taps) and the max selection (each blurred contribution is routed
+  // to the argmax cell of its dense-max window, accumulating like TNNetMaxPool).
+  //
+  // The integer pool/stride/padding parameters round-trip via FStruct[0..2]
+  // exactly like TNNetMaxPool. NOTE: like TNNetMaxPool the implementation
+  // assumes SQUARE feature maps (SizeX = SizeY); use square inputs.
+  TNNetMaxBlurPool = class(TNNetPoolBase)
+  private
+    // Dense (stride-1) per-channel max map; same spatial size as the input.
+    // Not serialized (rebuilt every forward pass).
+    FMaxMap: TNNetVolume;
+    // Argmax source position of each maxmap cell, used to route the gradient
+    // back through the max. Indexed exactly like FMaxMap raw positions.
+    FMaxMapPosX, FMaxMapPosY: array of integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure ComputeDenseMax();
+  public
+    constructor Create(pPoolSize: integer = 2; pStride: integer = 0;
+      pPadding: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Global Sum Pooling: parameter-free per-channel sum reduction over
   // (X, Y). Output shape is 1 x 1 x Depth. Backward broadcasts the
   // per-channel output error to every (X, Y) cell of that channel.
@@ -26432,6 +26478,193 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetMaxBlurPool }
+constructor TNNetMaxBlurPool.Create(pPoolSize: integer = 2;
+  pStride: integer = 0; pPadding: integer = 0);
+begin
+  inherited Create(pPoolSize, pStride, pPadding);
+  FMaxMap := TNNetVolume.Create(1, 1, 1);
+end;
+
+destructor TNNetMaxBlurPool.Destroy();
+begin
+  SetLength(FMaxMapPosX, 0);
+  SetLength(FMaxMapPosY, 0);
+  FMaxMap.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetMaxBlurPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // The base FMaxPosX/FMaxPosY arrays are unused by this layer (it keeps its
+  // own argmax map sized to the input, not to the output).
+  SetLength(FMaxPosX, 0);
+  SetLength(FMaxPosY, 0);
+  // FMaxMap mirrors the input spatial size (dense, stride-1 max).
+  FMaxMap.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY,
+    pPrevLayer.Output.Depth);
+  SetLength(FMaxMapPosX, FMaxMap.Size);
+  SetLength(FMaxMapPosY, FMaxMap.Size);
+end;
+
+// Dense (stride-1) max: maxmap[x,y,d] = max over the PoolSize window anchored
+// at (x,y) (clamped to the input bounds) of the input. Also records, per cell,
+// the (x,y) source position of the selected maximum so the gradient can be
+// routed through the max in Backpropagate.
+procedure TNNetMaxBlurPool.ComputeDenseMax();
+var
+  CntX, CntY, CntD, dx, dy: integer;
+  MaxX, MaxY, MaxD, InX, InY: integer;
+  RawPos: integer;
+  CurrVal, BestVal: TNeuralFloat;
+  Input: TNNetVolume;
+begin
+  Input := FPrevLayer.Output;
+  MaxX := Input.SizeX - 1;
+  MaxY := Input.SizeY - 1;
+  MaxD := Input.Depth - 1;
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+      for CntD := 0 to MaxD do
+      begin
+        BestVal := -3.402823e38;
+        RawPos := FMaxMap.GetRawPos(CntX, CntY, CntD);
+        for dx := 0 to FPoolSize - 1 do
+        begin
+          InX := CntX + dx;
+          if InX > MaxX then Continue;
+          for dy := 0 to FPoolSize - 1 do
+          begin
+            InY := CntY + dy;
+            if InY > MaxY then Continue;
+            CurrVal := Input[InX, InY, CntD];
+            if CurrVal > BestVal then
+            begin
+              BestVal := CurrVal;
+              FMaxMapPosX[RawPos] := InX;
+              FMaxMapPosY[RawPos] := InY;
+            end;
+          end;
+        end;
+        FMaxMap.FData[RawPos] := BestVal;
+      end;
+end;
+
+procedure TNNetMaxBlurPool.Compute();
+const
+  // Size-3 binomial low-pass taps [1,2,1] (normalised lazily per cell so the
+  // border-clamped kernel always sums to 1).
+  cW: array[0..2] of TNeuralFloat = (1.0, 2.0, 1.0);
+var
+  StartTime: double;
+  CntOutX, CntOutY, CntD: integer;
+  OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
+  i, j, SrcX, SrcY: integer;
+  WSum, Acc, Wij: TNeuralFloat;
+begin
+  StartTime := Now();
+  ComputeDenseMax();
+  OutMaxX := FOutput.SizeX - 1;
+  OutMaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  InMaxX := FMaxMap.SizeX - 1;
+  InMaxY := FMaxMap.SizeY - 1;
+  // Blur + subsample: out[ox,oy] = sum_{i,j} w[i]*w[j]
+  //   * maxmap[ox*Stride + i - 1, oy*Stride + j - 1], clamping the blur source
+  // coordinates to the valid range and renormalising by the used-weight sum.
+  for CntOutX := 0 to OutMaxX do
+    for CntOutY := 0 to OutMaxY do
+      for CntD := 0 to MaxD do
+      begin
+        Acc := 0;
+        WSum := 0;
+        for i := 0 to 2 do
+        begin
+          SrcX := CntOutX * FStride + i - 1;
+          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+          for j := 0 to 2 do
+          begin
+            SrcY := CntOutY * FStride + j - 1;
+            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+            Wij := cW[i] * cW[j];
+            Acc := Acc + Wij * FMaxMap[SrcX, SrcY, CntD];
+            WSum := WSum + Wij;
+          end;
+        end;
+        if WSum > 0 then Acc := Acc / WSum;
+        FOutput[CntOutX, CntOutY, CntD] := Acc;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMaxBlurPool.Backpropagate();
+const
+  cW: array[0..2] of TNeuralFloat = (1.0, 2.0, 1.0);
+var
+  StartTime: double;
+  CntOutX, CntOutY, CntD: integer;
+  OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
+  i, j, SrcX, SrcY, MapRawPos, PrevRawPos: integer;
+  WSum, Wij, OutErr, Contrib: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if
+    (FBackPropCallCurrentCnt < FDepartingBranchesCnt) or
+    (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  OutMaxX := FOutput.SizeX - 1;
+  OutMaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  InMaxX := FMaxMap.SizeX - 1;
+  InMaxY := FMaxMap.SizeY - 1;
+  // For each output cell error, scatter w[i]*w[j]/WSum * OutErr to the maxmap
+  // cell it read from (the fixed blur is a transposed conv), then route that
+  // contribution to the argmax input cell of that maxmap cell (the max).
+  for CntOutX := 0 to OutMaxX do
+    for CntOutY := 0 to OutMaxY do
+      for CntD := 0 to MaxD do
+      begin
+        OutErr := FOutputError[CntOutX, CntOutY, CntD];
+        if OutErr = 0 then Continue;
+        // First pass: the used-weight normaliser for this output cell.
+        WSum := 0;
+        for i := 0 to 2 do
+        begin
+          SrcX := CntOutX * FStride + i - 1;
+          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+          for j := 0 to 2 do
+          begin
+            SrcY := CntOutY * FStride + j - 1;
+            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+            WSum := WSum + cW[i] * cW[j];
+          end;
+        end;
+        if WSum <= 0 then Continue;
+        // Second pass: scatter to the input via the recorded argmax.
+        for i := 0 to 2 do
+        begin
+          SrcX := CntOutX * FStride + i - 1;
+          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+          for j := 0 to 2 do
+          begin
+            SrcY := CntOutY * FStride + j - 1;
+            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+            Wij := cW[i] * cW[j];
+            Contrib := (Wij / WSum) * OutErr;
+            MapRawPos := FMaxMap.GetRawPos(SrcX, SrcY, CntD);
+            PrevRawPos := FPrevLayer.OutputError.GetRawPos(
+              FMaxMapPosX[MapRawPos], FMaxMapPosY[MapRawPos], CntD);
+            FPrevLayer.OutputError.FData[PrevRawPos] :=
+              FPrevLayer.OutputError.FData[PrevRawPos] + Contrib;
+          end;
+        end;
+      end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 procedure TNNetDeMaxPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -44194,6 +44427,7 @@ begin
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]);
+      'TNNetMaxBlurPool' :          Result := TNNetMaxBlurPool.Create(St[0], St[1], St[2]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
       'TNNetAdaptiveAvgPool':       Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]);
       'TNNetAdaptiveMaxPool':       Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]);
@@ -44464,6 +44698,7 @@ begin
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]) else
+      if S[0] = 'TNNetMaxBlurPool' then Result := TNNetMaxBlurPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
       if S[0] = 'TNNetAdaptiveAvgPool' then Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]) else
       if S[0] = 'TNNetAdaptiveMaxPool' then Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]) else
