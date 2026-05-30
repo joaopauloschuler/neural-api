@@ -170,36 +170,17 @@ rather than acted on.
 ### TNNetMultiHeadSelfAttention — breakdown
 SDPA + RoPE + MaskedFill + ALiBi are all in tree. Suggested commit-sized
 breakdown:
-- [X] TNNetTransformerEncoderBlock helper — LANDED as
-      `TNNet.AddTransformerEncoderBlock(d_model, Heads, d_ff; PreNorm=True;
-      CausalMask=False)` (neuralnetwork.pas ~23490). Residual wrappers are
-      inlined (not the array-based AddPreNormResidual/AddPostNormResidual)
-      because the MHA/FFN sublayers add many layers via GetLastLayer chaining
-      and cannot be passed as a pre-built `array of TNNetLayer`. Note: the
-      block prepends a PointwiseConvLinear(3*d_model) QKV-slab projection
-      because AddMultiHeadSelfAttention consumes a 3*d_model slab (see
-      AddSplitQKVHeads). FFN is pointwise (PointwiseConvLinear -> SwiGLU ->
-      PointwiseConvLinear), NOT the FullConnect-based AddSwiGLUFeedForward.
-      Test: TestTransformerEncoderBlockGradientCheck (both PreNorm variants).
 - [ ] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
       front of self-attention and an optional cross-attention sub-block.
       Built on top of the encoder helper above to avoid duplication.
-      NOW FULLY UNBLOCKED: both halves landed — `AddTransformerEncoderBlock`
-      (causal self-attention via CausalMask=True) and
-      `AddMultiHeadCrossAttention(d_model, Heads, QuerySource, KeyValueSource)`
-      for the encoder-decoder cross-attention sub-block. The decoder block is
-      now just: causal self-attn residual -> cross-attn residual (Q from the
-      decoder stream, K|V from the encoder output) -> pointwise SwiGLU FFN
-      residual. Mind that cross-attention takes EXPLICIT source layers, so the
-      decoder builder must thread the encoder-output layer ref through.
-- [X] TNNetCrossAttention — LANDED as the builder
-      `TNNet.AddMultiHeadCrossAttention(d_model, Heads, QuerySource,
-      KeyValueSource; CausalMask=False)` (separate Q vs K|V branches, query and
-      key/value sequences may differ in length; output seq length = query
-      length). Shipped as a builder over the existing SDPA core rather than a
-      new layer class. Test: TestMultiHeadCrossAttentionGradientCheck (QSeqLen=3,
-      KVSeqLen=4 — deliberately unequal). CausalMask left untested (a causal
-      triangle is ill-defined for non-corresponding query/kv lengths).
+      Compose `AddTransformerEncoderBlock` (causal self-attention via
+      CausalMask=True) and `AddMultiHeadCrossAttention(d_model, Heads,
+      QuerySource, KeyValueSource)` for the encoder-decoder cross-attention
+      sub-block. The decoder block is then: causal self-attn residual ->
+      cross-attn residual (Q from the decoder stream, K|V from the encoder
+      output) -> pointwise SwiGLU FFN residual. Mind that cross-attention takes
+      EXPLICIT source layers, so the decoder builder must thread the
+      encoder-output layer ref through.
 
 ### Attention variants / siblings
 
@@ -460,40 +441,6 @@ breakdown:
 - [ ] TNNetMixtureOfExperts — top-k softmax gate over N expert sub-networks
       plus a load-balancing auxiliary loss. (The just-landed
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
-- [X] TNNetHardConcrete — LANDED (Louizos, Welling & Kingma 2018, L0
-      regularization). Subclasses TNNetChannelTransformBase for per-depth
-      trained log_alpha; beta/gamma/zeta in FFloatSt[0..2]; gates the DEPTH
-      axis (input shaped (1,1,Features) to gate per-feature). Deterministic
-      inference gate by default; stochastic reparameterized gate when Enabled
-      (wired into EnableDropouts). GRADIENT GOTCHA documented in code: the
-      interior slope is (1/beta)*s*(1-s) while TRAINING (noisy logit scaled by
-      1/beta) but s*(1-s) at inference — a 1/beta mismatch the grad check caught.
-      Tests: TestHardConcreteGateLimits, TestHardConcreteGradientCheck (input +
-      log_alpha weight), TestHardConcreteSerializationRoundTrip. Example
-      examples/HardConcreteSparsity/ reports 83% hard-zero gates (L0) vs 0%
-      (L2 baseline) at matched ~97% acc; lambda knee ~0.05 documented.
-      Original spec retained below for reference. 
-      A per-channel multiplicative gate `z ∈ [0,1]` drawn from a hard-concrete
-      distribution: `s = sigmoid((log u − log(1−u) + log α)/β)` stretched to
-      `(γ, ζ)` with `γ<0<ζ` and hard-clipped to `[0,1]`, so a fraction of gates
-      hit EXACTLY 0 (true structural sparsity, not just small weights). Each
-      gate's log-α is a trained weight; β/γ/ζ are constructor constants. The
-      novelty vs what's in tree: TNNetDropout zeroes a RANDOM fixed-rate subset
-      every step and is identity at inference, whereas HardConcrete LEARNS which
-      channels to keep and its expected-L0 cost `Σ sigmoid(log α − β·log(−γ/ζ))`
-      is a differentiable penalty the trainer can add — i.e. it prunes during
-      training. At inference use the deterministic gate
-      `clip(sigmoid(log α)·(ζ−γ)+γ, 0, 1)`. Gradient-checkable through the
-      reparam (treat the noise `u` as fixed per forward, like the existing STE /
-      GumbelSoftmax layers). Register in both CreateLayer + LoadFromString
-      dispatch tables and ship the standard test trio (forward-shape/identity at
-      large log-α, input+weight numerical-gradient, serialization round-trip).
-      Headline follow-up example: an L0-regularised MLP that drives a measurable
-      fraction of gates to hard zero at matched accuracy (report the achieved
-      sparsity %), contrasting with an L2-regularised baseline that leaves all
-      channels nominally alive. Pairs with the open TNNetMixtureOfExperts
-      (gate-style routing) and TNNetBitLinear (compression) entries.
-
 #### Normalization primitives
 - [ ] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
       spatial only, independently per depth channel) gated by a flag, mirroring
@@ -1256,8 +1203,8 @@ breakdown:
 ### Stretch / ambitious
 - [ ] `examples/TinyDiffusion/` — a 20-step denoising-diffusion model on
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
-      TNNetSinusoidalTimeEmbedding (both FiLM and the timestep embedding have
-      landed, so this is now unblocked).
+      TNNetSinusoidalTimeEmbedding (FiLM and the timestep embedding are both
+      in tree).
 - [ ] `examples/HopfieldRetrieval/` — modern Hopfield network as attention
       (Ramsauer et al.): store K patterns, retrieve via a single softmax-
       attention step against a query.
