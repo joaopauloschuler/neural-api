@@ -37,6 +37,53 @@ rather than acted on.
 ## New layer types
 
 ## Interesting applications / examples
+- [ ] Forward-Forward algorithm demo (`examples/ForwardForward/`) — reproduce
+      Hinton's 2022 "The Forward-Forward Algorithm" on a pure-CPU toy. This is
+      the suite's FIRST non-backprop training method: every other example (and
+      the whole library) learns by end-to-end backpropagation; FF replaces the
+      forward+backward pass with TWO forward passes and a per-layer LOCAL
+      objective — no global error signal is ever propagated backward across
+      layers. Recipe, reusing existing layers only (NO new layer class needed):
+      stack a few `TNNetFullConnectReLU` layers, and after each one insert a
+      `TNNetL2Normalize` (the length-normalisation FF requires so a layer cannot
+      cheat by reading the previous layer's activation MAGNITUDE — only its
+      DIRECTION feeds forward). Train each layer GREEDILY and LOCALLY: define a
+      layer's "goodness" `G = sum(activation^2)` over its units, push G ABOVE a
+      threshold `theta` for POSITIVE (real) samples and BELOW it for NEGATIVE
+      (corrupted/fake) samples via the logistic local loss
+      `log(1+exp(-(G-theta)))` on positives and `log(1+exp(+(G-theta)))` on
+      negatives, and update ONLY that layer's weights from its own local
+      gradient. Because the update is per-layer and hand-rolled (not a global
+      backward), drive it through the established gradient-surgery idiom —
+      `NN.SetBatchUpdate(True)` so `Neurons[].Delta` actually accumulates (see
+      [[manual-gradient-and-snapshot-gotchas]]) — writing the goodness gradient
+      `dL/dG * 2 * activation` into each layer's output error and calling its
+      Backpropagate to land the weight delta, with NO error passed to the layer
+      below (the defining FF property). For CLASSIFICATION embed the label in the
+      input (overlay the one-hot class in the first N input slots, the paper's
+      trick); POSITIVE = input carries the CORRECT label, NEGATIVE = input
+      carries a WRONG label. At INFERENCE run the net once per candidate label
+      and pick the label whose ACCUMULATED goodness (summed across layers) is
+      highest. Keep it tiny — a synthetic few-class 2D/blob task or a tiny-MNIST
+      subset — so the greedy per-layer loop fits the <5-min CPU budget;
+      RandSeed:=424242, MaxThreadNum:=1 for a deterministic curve. Built-in
+      correctness gates (Halt(1) otherwise): after training, mean positive
+      goodness must exceed mean negative goodness at EVERY layer (the local
+      objective actually separated the two streams), and the goodness-argmax
+      classifier must beat chance on a held-out set. Tuning honesty (document in
+      README per the Grokking/RandomLabelMemorization caveat style): FF is
+      sensitive to `theta`, the per-layer LR, and how negatives are generated —
+      if accuracy refuses to clear chance in the budget, report which knob
+      failed rather than loosening the gate. DISTINCT from everything in tree:
+      it is the only example that does NOT use backprop (all others, incl. the
+      SAM/Lookahead/Muon gradient-surgery demos, still backpropagate a global
+      loss — those do surgery ON the backprop gradient; FF never forms one), it
+      is NOT layerwise unsupervised pretraining (each layer's objective is the
+      supervised pos/neg goodness contrast, trained jointly-but-locally, not a
+      reconstruction), and it is unrelated to the activation/optimizer bake-offs
+      (which compare components UNDER backprop). Conceptually striking headline:
+      a net that learns a classifier with purely LOCAL, biologically-plausible
+      updates and no backward pass at all.
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
