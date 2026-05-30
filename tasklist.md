@@ -123,21 +123,32 @@ rather than acted on.
 ### TNNetMultiHeadSelfAttention — breakdown
 SDPA + RoPE + MaskedFill + ALiBi are all in tree. Suggested commit-sized
 breakdown:
-- [ ] (MHA-a) Add a small `TNNetSplitChannels`-based helper or example that
-      carves a (3*d_model) Q|K|V depth slab into H per-head (3*d_k) slices,
-      with a sanity test on H=2, d_model=8.
-- [ ] (MHA-b) Add a wiring helper or example that runs one
-      `TNNetScaledDotProductAttention(d_k)` per head slice and concats
-      the H outputs via `TNNetDeepConcat` back to depth d_model. Test on
-      a tiny (H=2, d_k=4, SeqLen=3) shape, numerical-gradient through.
-- [ ] (MHA-c) Wrap (a)+(b)+a `TNNetFullConnectLinear(d_model)` out-projection
-      into a `TNNetMultiHeadSelfAttention` helper class or builder function.
-      Add a numerical-gradient test on the same tiny shape.
+- [X] (MHA-a) `TNNet.AddSplitQKVHeads(d_model, Heads; out SliceLayers)` carves
+      the `[Q_all|K_all|V_all]` (3*d_model) slab into H per-head `[Q_h|K_h|V_h]`
+      (3*d_k) slices via non-contiguous `TNNetSplitChannels`. Forward-layout
+      sentinel test on H=2, d_model=8. Landed (commit 4d05c1d).
+- [X] (MHA-b) `TNNet.AddMultiHeadSDPAConcat(d_model, Heads, CausalMask)` runs one
+      `TNNetScaledDotProductAttention(d_k)` per head slice and concats the H
+      outputs via `TNNetDeepConcat` back to depth d_model. Numerical-gradient
+      test on (H=2, d_k=4, SeqLen=3). Landed (commit 0f07c67).
+- [X] (MHA-c) `TNNet.AddMultiHeadSelfAttention(d_model, Heads, CausalMask)` wraps
+      (a)+(b)+ an out-projection, numerical-gradient test on (d_model=8, heads=2,
+      seq=3). Landed (commit 9c6bae1). NOTE/FINDING: the out-projection must be
+      `TNNetPointwiseConvLinear(d_model)` (per-token 1x1), NOT
+      `TNNetFullConnectLinear(d_model)` — on a (SeqLen,1,d_model) tensor
+      FullConnect flattens the WHOLE sequence into one `1x1xd_model` vector
+      (weights = prev.Output.Size), collapsing the token axis and yielding an
+      identically-zero analytic input gradient + a size mismatch. The landed
+      `AddSelfAttention` block uses the same pointwise projection.
 - [ ] TNNetTransformerEncoderBlock helper — LayerNorm → MHA → residual →
       LayerNorm → SwiGLU FFN → residual. Single call, configurable
       d_model / heads / d_ff. Companion numerical-gradient test on a tiny
       shape (d_model=8, heads=2, seq=3). Pre-norm and post-norm variants
-      behind a flag.
+      behind a flag. NOW UNBLOCKED: the MHA half is the landed
+      `TNNet.AddMultiHeadSelfAttention(d_model, Heads, CausalMask)`; wrap it
+      with the existing `AddPreNormResidual`/`AddPostNormResidual` builders +
+      a SwiGLU FFN. Use pointwise (1x1) projections inside the FFN over the
+      (SeqLen,1,d_model) tensor, NOT FullConnect (see the MHA-c finding above).
 - [ ] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
       front of self-attention and an optional cross-attention sub-block.
       Built on top of the encoder helper above to avoid duplication.
@@ -794,8 +805,13 @@ breakdown:
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
-- [ ] `examples/SubPixelSuperRes/` — a 3-layer net using TNNetPixelShuffle
-      that learns to 2x-upsample 8x8 random checkerboards.
+- [X] `examples/SubPixelSuperRes/` — a 3-layer net using TNNetPixelShuffle
+      that learns to 2x-upsample 8x8 random tiles. Landed (commit a28cc6b):
+      ConvReLU x2 -> ConvLinear(r*r*C=4) -> PixelShuffle(2), synthetic
+      low-freq LR tiles, NN-upscale targets. Test MSE 0.394 -> 0.00012,
+      PSNR 4.04 -> 39.21 dB; manual single-threaded SGD loop, LR=1e-3
+      (1e-2 plateaus, 3e-2 diverges — documented). NOTE: TNNet has no
+      MaxThreadNum property (it lives on the fit object).
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
       (BitFit-style cheap adaptation).
@@ -952,7 +968,19 @@ breakdown:
       of its weights. Pairs with [[WeightSpectrumReport]] /
       [[WeightHistogramReport]] (watch the weight-norm spike at the
       interpolation threshold).
-- [ ] Edge-of-Stability demo (`examples/EdgeOfStability/`) — reproduce the
+- [X] Edge-of-Stability demo (`examples/EdgeOfStability/`) — LANDED (commit
+      d14c129). `Input(4)->FullConnectReLU(12)->FullConnectLinear(2)` MSE head,
+      fixed 24-sample full batch, plain full-batch GD (SetBatchUpdate(true) +
+      SetLearningRate(eta,0)), `lambda_max` read every 25 steps via
+      `HessianCurvatureReport`. eta sweep {0.037,0.040,0.043}: plateau (median
+      of 2nd-half lambda_max) = 52.1/48.3/47.1 vs 2/eta = 54.1/50.0/46.5 —
+      plateau tracks 2/eta and decreases as eta rises. TUNING CAVEAT (in README):
+      usable eta window is narrow — eta>=~0.046 collapses/diverges (dead ReLU or
+      NaN), eta<=~0.03 is curvature-limited (attainable sharpness ceiling below
+      2/eta). Used MEDIAN not mean for the plateau (ripple spikes pollute the
+      mean). Original spec kept below for reference:
+
+      Edge-of-Stability demo — reproduce the
       "progressive sharpening" + "edge of stability" phenomenon (Cohen et al.
       2021, *Gradient Descent on Neural Networks Typically Occurs at the Edge
       of Stability*) on a pure-CPU toy. The headline, which NO in-tree
