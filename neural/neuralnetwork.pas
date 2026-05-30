@@ -4504,6 +4504,38 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Anti-aliased pooling (the pure low-pass primitive from Zhang 2019,
+  // "Making Convolutional Networks Shift-Invariant Again"). Unlike
+  // TNNetMaxBlurPool (dense-max THEN blur), TNNetBlurPool applies the FIXED
+  // (non-trainable) separable binomial low-pass blur DIRECTLY to the layer
+  // input and then subsamples with the downsampling stride. Because there is
+  // no max stage it can sit after ANY layer (a strided conv, an average pool,
+  // etc.) to suppress the aliasing introduced by subsampling.
+  //
+  // Forward, per channel d:
+  //   out[ox,oy]  = sum_{i,j in {0,1,2}} w[i]*w[j]
+  //                   * input[ox*Stride + i - 1, oy*Stride + j - 1]
+  // where w = [1,2,1]/4 is the size-3 binomial kernel (so the 2D kernel is
+  // [1,2,1]x[1,2,1]/16). Blur source coordinates are clamped to the valid
+  // range and the kernel is RE-NORMALISED by the sum of used weights at the
+  // borders, so edge handling is well defined and the per-cell blur weights
+  // always sum to 1. The blur weights are CONSTANT (no gradient flows to
+  // them); Backpropagate routes the input gradient through the fixed blur (a
+  // transposed conv that scatters each output error to its blur taps).
+  //
+  // The integer pool/stride/padding parameters round-trip via FStruct[0..2]
+  // exactly like TNNetMaxPool. NOTE: like TNNetMaxBlurPool the implementation
+  // assumes SQUARE feature maps (SizeX = SizeY); use square inputs.
+  TNNetBlurPool = class(TNNetPoolBase)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pPoolSize: integer = 2; pStride: integer = 0;
+      pPadding: integer = 0); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Global Sum Pooling: parameter-free per-channel sum reduction over
   // (X, Y). Output shape is 1 x 1 x Depth. Backward broadcasts the
   // per-channel output error to every (X, Y) cell of that channel.
@@ -26683,6 +26715,135 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetBlurPool }
+constructor TNNetBlurPool.Create(pPoolSize: integer = 2;
+  pStride: integer = 0; pPadding: integer = 0);
+begin
+  inherited Create(pPoolSize, pStride, pPadding);
+end;
+
+procedure TNNetBlurPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // No argmax bookkeeping: the blur operates directly on the input.
+  SetLength(FMaxPosX, 0);
+  SetLength(FMaxPosY, 0);
+end;
+
+procedure TNNetBlurPool.Compute();
+const
+  // Size-3 binomial low-pass taps [1,2,1] (normalised lazily per cell so the
+  // border-clamped kernel always sums to 1).
+  cW: array[0..2] of TNeuralFloat = (1.0, 2.0, 1.0);
+var
+  StartTime: double;
+  CntOutX, CntOutY, CntD: integer;
+  OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
+  i, j, SrcX, SrcY: integer;
+  WSum, Acc, Wij: TNeuralFloat;
+  Input: TNNetVolume;
+begin
+  StartTime := Now();
+  Input := FPrevLayer.Output;
+  OutMaxX := FOutput.SizeX - 1;
+  OutMaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  InMaxX := Input.SizeX - 1;
+  InMaxY := Input.SizeY - 1;
+  // Blur + subsample: out[ox,oy] = sum_{i,j} w[i]*w[j]
+  //   * input[ox*Stride + i - 1, oy*Stride + j - 1], clamping the blur source
+  // coordinates to the valid range and renormalising by the used-weight sum.
+  for CntOutX := 0 to OutMaxX do
+    for CntOutY := 0 to OutMaxY do
+      for CntD := 0 to MaxD do
+      begin
+        Acc := 0;
+        WSum := 0;
+        for i := 0 to 2 do
+        begin
+          SrcX := CntOutX * FStride + i - 1;
+          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+          for j := 0 to 2 do
+          begin
+            SrcY := CntOutY * FStride + j - 1;
+            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+            Wij := cW[i] * cW[j];
+            Acc := Acc + Wij * Input[SrcX, SrcY, CntD];
+            WSum := WSum + Wij;
+          end;
+        end;
+        if WSum > 0 then Acc := Acc / WSum;
+        FOutput[CntOutX, CntOutY, CntD] := Acc;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBlurPool.Backpropagate();
+const
+  cW: array[0..2] of TNeuralFloat = (1.0, 2.0, 1.0);
+var
+  StartTime: double;
+  CntOutX, CntOutY, CntD: integer;
+  OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
+  i, j, SrcX, SrcY, PrevRawPos: integer;
+  WSum, Wij, OutErr, Contrib: TNeuralFloat;
+  Input: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if
+    (FBackPropCallCurrentCnt < FDepartingBranchesCnt) or
+    (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Input := FPrevLayer.Output;
+  OutMaxX := FOutput.SizeX - 1;
+  OutMaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  InMaxX := Input.SizeX - 1;
+  InMaxY := Input.SizeY - 1;
+  // For each output cell error, scatter w[i]*w[j]/WSum * OutErr to the input
+  // cell it read from (the fixed blur is a transposed conv).
+  for CntOutX := 0 to OutMaxX do
+    for CntOutY := 0 to OutMaxY do
+      for CntD := 0 to MaxD do
+      begin
+        OutErr := FOutputError[CntOutX, CntOutY, CntD];
+        if OutErr = 0 then Continue;
+        // First pass: the used-weight normaliser for this output cell.
+        WSum := 0;
+        for i := 0 to 2 do
+        begin
+          SrcX := CntOutX * FStride + i - 1;
+          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+          for j := 0 to 2 do
+          begin
+            SrcY := CntOutY * FStride + j - 1;
+            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+            WSum := WSum + cW[i] * cW[j];
+          end;
+        end;
+        if WSum <= 0 then Continue;
+        // Second pass: scatter to the input cells.
+        for i := 0 to 2 do
+        begin
+          SrcX := CntOutX * FStride + i - 1;
+          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+          for j := 0 to 2 do
+          begin
+            SrcY := CntOutY * FStride + j - 1;
+            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+            Wij := cW[i] * cW[j];
+            Contrib := (Wij / WSum) * OutErr;
+            PrevRawPos := FPrevLayer.OutputError.GetRawPos(SrcX, SrcY, CntD);
+            FPrevLayer.OutputError.FData[PrevRawPos] :=
+              FPrevLayer.OutputError.FData[PrevRawPos] + Contrib;
+          end;
+        end;
+      end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 procedure TNNetDeMaxPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -44446,6 +44607,7 @@ begin
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetMaxBlurPool' :          Result := TNNetMaxBlurPool.Create(St[0], St[1], St[2]);
+      'TNNetBlurPool' :             Result := TNNetBlurPool.Create(St[0], St[1], St[2]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
       'TNNetAdaptiveAvgPool':       Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]);
       'TNNetAdaptiveMaxPool':       Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]);
@@ -44717,6 +44879,7 @@ begin
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetMaxBlurPool' then Result := TNNetMaxBlurPool.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetBlurPool' then Result := TNNetBlurPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
       if S[0] = 'TNNetAdaptiveAvgPool' then Result := TNNetAdaptiveAvgPool.Create(St[0], St[1]) else
       if S[0] = 'TNNetAdaptiveMaxPool' then Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]) else

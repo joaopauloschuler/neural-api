@@ -622,6 +622,11 @@ type
     procedure TestAttentionEntropyReportSmoke;
     procedure TestLossLandscapeProbeSmoke;
     procedure TestDyTGradientCheck;
+    // TNNetBlurPool (pure anti-aliasing pool; added at the END to avoid
+    // disturbing the shared-RNG ordering of the existing gradient tests).
+    procedure TestBlurPoolGradientCheck;
+    procedure TestBlurPoolLoadFromString;
+    procedure TestBlurPoolShiftInvariance;
   end;
 
 implementation
@@ -23395,6 +23400,148 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBlurPoolGradientCheck;
+begin
+  // TNNetBlurPool: pure anti-aliasing pool (fixed binomial blur applied DIRECTLY
+  // to the input -> subsample by stride; NO max stage). The blur weights are
+  // constant (no gradient flows to them); Backpropagate must route the input
+  // gradient through the fixed blur (a transposed conv that scatters each output
+  // error to its blur taps). Because the forward map is purely linear the
+  // central differences match the analytic input gradient on this 4x4x2 shape.
+  // Reseed the shared RNG so this test (appended at the END of the sequence)
+  // does not perturb the ordering-sensitive checks before it.
+  RandSeed := 424242;
+  LayerInputGradientCheck(Self, TNNetBlurPool.Create(2),
+    'BlurPool', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestBlurPoolLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net containing TNNetBlurPool. SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical, proving the integer pool params
+  // (FStruct[0..2]) survive both dispatch points, and the reloaded layer must
+  // reproduce the same output.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    NN.AddLayer(TNNetBlurPool.Create(2));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('BlurPool round-trip class identity',
+        NN2.GetLastLayer is TNNetBlurPool);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('BlurPool SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('BlurPool round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBlurPoolShiftInvariance;
+var
+  NNAvg, NNBlur: TNNet;
+  Base, Shifted: TNNetVolume;
+  x, y, d, s: integer;
+  AvgChange, BlurChange, Diff: TNeuralFloat;
+  cShifts: integer;
+
+  // Mean absolute change of a net's output between Base and a 1px-shifted Base.
+  function MeanOutputChange(ANet: TNNet): TNeuralFloat;
+  var
+    k: integer;
+    OutBase: TNNetVolume;
+    Sum: TNeuralFloat;
+  begin
+    ANet.Compute(Base);
+    OutBase := TNNetVolume.Create();
+    OutBase.Copy(ANet.GetLastLayer.Output);
+    ANet.Compute(Shifted);
+    Sum := 0;
+    for k := 0 to OutBase.Size - 1 do
+      Sum := Sum + Abs(OutBase.Raw[k] - ANet.GetLastLayer.Output.Raw[k]);
+    Result := Sum / OutBase.Size;
+    OutBase.Free;
+  end;
+
+begin
+  // Shift-invariance sanity check: shifting the input by 1px should change a
+  // BlurPool output LESS (on average) than a plain strided MaxPool (which
+  // subsamples a non-linearity without any low-pass), the whole point of
+  // anti-aliased pooling (Zhang 2019). We average the mean output change over
+  // several 1px horizontal shifts of a smooth 8x8x2 input. Square input keeps
+  // both pools on their fast paths.
+  RandSeed := 424242;
+  Base := TNNetVolume.Create(8, 8, 2);
+  Shifted := TNNetVolume.Create(8, 8, 2);
+  NNAvg := TNNet.Create();
+  NNBlur := TNNet.Create();
+  try
+    // Smooth, distinct, mildly varying signal (no ties).
+    for x := 0 to 7 do
+      for y := 0 to 7 do
+        for d := 0 to 1 do
+          Base[x, y, d] := Sin(x * 0.6 + d) + 0.5 * Cos(y * 0.4) + 0.01 * x;
+
+    NNAvg.AddLayer(TNNetInput.Create(8, 8, 2, 1));
+    NNAvg.AddLayer(TNNetMaxPool.Create(2));
+    NNBlur.AddLayer(TNNetInput.Create(8, 8, 2, 1));
+    NNBlur.AddLayer(TNNetBlurPool.Create(2));
+
+    AvgChange := 0;
+    BlurChange := 0;
+    cShifts := 0;
+    for s := 1 to 3 do
+    begin
+      // Build a 1..3 px horizontal shift of Base (wrap-around).
+      for x := 0 to 7 do
+        for y := 0 to 7 do
+          for d := 0 to 1 do
+            Shifted[x, y, d] := Base[(x + s) mod 8, y, d];
+      AvgChange := AvgChange + MeanOutputChange(NNAvg);
+      BlurChange := BlurChange + MeanOutputChange(NNBlur);
+      Inc(cShifts);
+    end;
+    AvgChange := AvgChange / cShifts;
+    BlurChange := BlurChange / cShifts;
+    Diff := AvgChange - BlurChange;
+
+    AssertTrue('BlurPool should change less under 1px shift than strided MaxPool' +
+      ' (maxChange=' + FloatToStr(AvgChange) +
+      ' blurChange=' + FloatToStr(BlurChange) + ')',
+      BlurChange < AvgChange);
+    AssertTrue('shift-invariance margin should be clearly positive (diff=' +
+      FloatToStr(Diff) + ')', Diff > 1e-4);
+  finally
+    NNAvg.Free;
+    NNBlur.Free;
+    Base.Free;
+    Shifted.Free;
   end;
 end;
 
