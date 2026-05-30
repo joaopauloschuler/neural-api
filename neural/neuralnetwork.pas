@@ -3272,7 +3272,19 @@ type
       procedure Backpropagate(); override;
   end;
 
-  /// This layer interleaves input channels.
+  /// Parameter-free stride-based channel (Depth axis) permutation. The single
+  // constructor parameter is StepSize (the channel stride). Input channel c is
+  // scattered to output channel
+  //   ToChannels[c] = ( ((c*StepSize) mod Depth) + ((c*StepSize) div Depth) )
+  //                   mod Depth.
+  // Reading channels with a fixed stride wraps around the Depth axis and folds
+  // the carry (the div term) back in, spreading neighbouring input channels
+  // apart across the output. Unlike TNNetChannelShuffle there is NO divisibility
+  // constraint: StepSize and Depth need not share any factor (note that if
+  // gcd(StepSize, Depth) > 1 the map is not a bijection and some channels are
+  // dropped/duplicated). Backward scatters OutputError back along the same map.
+  // Typical use: cheaply mix channels after grouped/parallel convolutions when
+  // a generic stride-based interleave is wanted rather than ShuffleNet grouping.
   TNNetInterleaveChannels = class(TNNetIdentity)
     private
       ToChannels: TNeuralIntegerArray;
@@ -3285,11 +3297,17 @@ type
       procedure Backpropagate(); override;
   end;
 
-  /// ShuffleNet channel-shuffle layer. Parameter-free permutation across the
-  // channel axis: reshape Depth=C as (Groups, C/Groups), transpose to
-  // (C/Groups, Groups), flatten. Channel c maps to
-  //   (c mod Groups) * (C div Groups) + (c div Groups).
-  // Backward applies the inverse permutation to OutputError.
+  /// ShuffleNet-style channel-shuffle layer. Parameter-free permutation across
+  // the channel (Depth=C) axis. The single constructor parameter is Groups (the
+  // number of channel groups). The map reshapes the channel axis as
+  // (Groups, C/Groups), transposes to (C/Groups, Groups), then flattens, so
+  // input channel c is sent to output channel
+  //   ToChannels[c] = (c mod Groups) * (C div Groups) + (c div Groups).
+  // This is an exact bijection (true permutation), so backward applies the same
+  // map to scatter OutputError back. CONSTRAINT: Depth must be divisible by
+  // Groups (Depth mod Groups = 0); otherwise the layer raises an error.
+  // Typical use: after a grouped convolution, mix information across the
+  // otherwise-isolated groups (the ShuffleNet group-mixing trick).
   TNNetChannelShuffle = class(TNNetIdentity)
     private
       ToChannels: TNeuralIntegerArray;
