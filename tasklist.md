@@ -37,68 +37,13 @@ rather than acted on.
 ## New layer types
 
 ## Interesting applications / examples
-- [x] Forward-Forward algorithm demo (`examples/ForwardForward/`) — LANDED
-      (commit 0c41613). Net Input(6) -> [FCReLU(30)->L2Norm] x2 with the label
-      one-hot overlaid in the first 4 input slots; two forward passes
-      (positive=correct label, negative=wrong label) train each FF layer
-      greedily by its goodness contrast (local gradient dL/dG*2*a_j written into
-      OutputError, BackpropagateCPU per layer, no global backward), driven under
-      NN.SetBatchUpdate(True). Both gates pass: per-layer pos-goodness >
-      neg-goodness at every layer, and goodness-argmax accuracy 0.897 vs 0.25
-      chance. ~1s CPU, RandSeed:=424242, single-threaded.
-      FOLLOW-UPS still open:
-      - [ ] Scale to a tiny-MNIST few-class subset (the paper's actual task) and
-            report whether the per-layer local objective still beats chance
-            within the <5-min budget.
-      - [ ] Deeper FF stack (4+ layers) — does accumulated-goodness accuracy keep
-            improving with depth, or does the length-normalised signal saturate?
-      ORIGINAL NOTES (kept for context): reproduce
-      Hinton's 2022 "The Forward-Forward Algorithm" on a pure-CPU toy. This is
-      the suite's FIRST non-backprop training method: every other example (and
-      the whole library) learns by end-to-end backpropagation; FF replaces the
-      forward+backward pass with TWO forward passes and a per-layer LOCAL
-      objective — no global error signal is ever propagated backward across
-      layers. Recipe, reusing existing layers only (NO new layer class needed):
-      stack a few `TNNetFullConnectReLU` layers, and after each one insert a
-      `TNNetL2Normalize` (the length-normalisation FF requires so a layer cannot
-      cheat by reading the previous layer's activation MAGNITUDE — only its
-      DIRECTION feeds forward). Train each layer GREEDILY and LOCALLY: define a
-      layer's "goodness" `G = sum(activation^2)` over its units, push G ABOVE a
-      threshold `theta` for POSITIVE (real) samples and BELOW it for NEGATIVE
-      (corrupted/fake) samples via the logistic local loss
-      `log(1+exp(-(G-theta)))` on positives and `log(1+exp(+(G-theta)))` on
-      negatives, and update ONLY that layer's weights from its own local
-      gradient. Because the update is per-layer and hand-rolled (not a global
-      backward), drive it through the established gradient-surgery idiom —
-      `NN.SetBatchUpdate(True)` so `Neurons[].Delta` actually accumulates (see
-      [[manual-gradient-and-snapshot-gotchas]]) — writing the goodness gradient
-      `dL/dG * 2 * activation` into each layer's output error and calling its
-      Backpropagate to land the weight delta, with NO error passed to the layer
-      below (the defining FF property). For CLASSIFICATION embed the label in the
-      input (overlay the one-hot class in the first N input slots, the paper's
-      trick); POSITIVE = input carries the CORRECT label, NEGATIVE = input
-      carries a WRONG label. At INFERENCE run the net once per candidate label
-      and pick the label whose ACCUMULATED goodness (summed across layers) is
-      highest. Keep it tiny — a synthetic few-class 2D/blob task or a tiny-MNIST
-      subset — so the greedy per-layer loop fits the <5-min CPU budget;
-      RandSeed:=424242, MaxThreadNum:=1 for a deterministic curve. Built-in
-      correctness gates (Halt(1) otherwise): after training, mean positive
-      goodness must exceed mean negative goodness at EVERY layer (the local
-      objective actually separated the two streams), and the goodness-argmax
-      classifier must beat chance on a held-out set. Tuning honesty (document in
-      README per the Grokking/RandomLabelMemorization caveat style): FF is
-      sensitive to `theta`, the per-layer LR, and how negatives are generated —
-      if accuracy refuses to clear chance in the budget, report which knob
-      failed rather than loosening the gate. DISTINCT from everything in tree:
-      it is the only example that does NOT use backprop (all others, incl. the
-      SAM/Lookahead/Muon gradient-surgery demos, still backpropagate a global
-      loss — those do surgery ON the backprop gradient; FF never forms one), it
-      is NOT layerwise unsupervised pretraining (each layer's objective is the
-      supervised pos/neg goodness contrast, trained jointly-but-locally, not a
-      reconstruction), and it is unrelated to the activation/optimizer bake-offs
-      (which compare components UNDER backprop). Conceptually striking headline:
-      a net that learns a classifier with purely LOCAL, biologically-plausible
-      updates and no backward pass at all.
+- [ ] Forward-Forward follow-up: scale to a tiny-MNIST few-class subset (the
+      paper's actual task) and report whether the per-layer local objective still
+      beats chance within the <5-min budget. Builds on the landed
+      examples/ForwardForward/.
+- [ ] Forward-Forward follow-up: deeper FF stack (4+ layers) — does
+      accumulated-goodness accuracy keep improving with depth, or does the
+      length-normalised signal saturate?
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
@@ -199,53 +144,17 @@ breakdown:
 
 ### Attention variants / siblings
 
-- [x] Grouped-Query / Multi-Query Attention builder
-      `TNNet.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, KVHeads)` —
-      LANDED (commit 8d3ad19). Builder over the existing SDPA core in
-      neuralnetwork.pas; Q projected to d_model, K/V to KVHeads*d_k, each KV
-      head replicated across its group of query heads. Validates QueryHeads>=1,
-      KVHeads>=1, d_model mod QueryHeads = 0, QueryHeads mod KVHeads = 0.
-      Tests in TestNeuralNumerical.pas: `TestMultiHeadGroupedQueryAttention
-      GradientCheck` (QueryHeads=4/KVHeads=2, RandSeed:=424242) and
-      `TestMultiHeadGroupedQueryAttentionMHAEquivalence` (shape + param-count
-      variant — see follow-up below for the exact <1e-5 weight-for-weight check
-      that was deferred).
-      FOLLOW-UPS still open:
-      - [ ] Exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention equivalence to
-            <1e-5 by copying identical weights. Deferred because
-            AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab
-            (one external projection) whereas GQA does its own three Q/K/V
-            projections from a d_model input, so a weight-for-weight wiring is
-            fiddly; the landed test asserts equal output shape + the exact K/V
-            projection param saving instead.
-      - [ ] Wire GQA into the downstream ../gpt-3-for-pascal decoder and compose
-            with the open [[KV-cache incremental-decode]] task — the KV
-            footprint shrinks by QueryHeads/KVHeads, exactly the bottleneck that
-            task fights.
-      ORIGINAL NOTES (kept for context): the one genuinely missing attention
-      shape in the suite. Today
-      AddMultiHeadSelfAttention projects Q, K and V into the SAME number of
-      heads (full MHA); GQA instead uses fewer K/V heads than Q heads, so
-      several query heads SHARE one key/value head (KVHeads=1 degenerates to
-      classic Multi-Query Attention, KVHeads=QueryHeads degenerates to plain
-      MHA — assert both as sanity checks). This is the standard inference-memory
-      win in modern LLMs (Llama-2/3, Mistral): it shrinks the per-layer KV
-      footprint by QueryHeads/KVHeads, which is exactly the bottleneck the open
-      [[KV-cache incremental-decode]] task is fighting in downstream
-      ../gpt-3-for-pascal — so the two compose. Implementation scope: build it
-      over the existing SDPA core (a builder, NOT a new layer class, matching
-      how AddMultiHeadCrossAttention shipped). Project K/V to d_kv =
-      d_model*KVHeads/QueryHeads channels via PointwiseConvLinear (per-token,
-      per the [[mha-builder-and-seq-projection]] note — FullConnect would mix
-      the sequence), then replicate each K/V head across its group of query
-      heads before the per-head SDPA. Require QueryHeads mod KVHeads = 0 and
-      d_model mod QueryHeads = 0 with a clear error otherwise. Tests:
-      (a) a numerical gradient check in TestNeuralNumerical.pas seeded with
-      RandSeed := 424242 per the [[numerical-test-rng-ordering]] note,
-      QueryHeads=4/KVHeads=2; (b) assert the KVHeads=QueryHeads output matches
-      the existing AddMultiHeadSelfAttention to < 1e-5 (same-shape equivalence).
-      Plus a one-paragraph README and a param-count line showing the KV
-      projection shrinkage vs full MHA. A real new capability, not a re-skin.
+- [ ] GQA follow-up: exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention
+      equivalence to <1e-5 by copying identical weights. Deferred because
+      AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab (one
+      external projection) whereas AddMultiHeadGroupedQueryAttention does its own
+      three Q/K/V projections from a d_model input, so a weight-for-weight wiring
+      is fiddly; the landed test asserts equal output shape + the exact K/V
+      projection param saving instead.
+- [ ] GQA follow-up: wire AddMultiHeadGroupedQueryAttention into the downstream
+      ../gpt-3-for-pascal decoder and compose with the open [[KV-cache
+      incremental-decode]] task — the KV footprint shrinks by QueryHeads/KVHeads,
+      exactly the bottleneck that task fights.
 
 - [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
       MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
@@ -329,46 +238,6 @@ breakdown:
       "pure memorization". Fork the landed demo's net/data/training loop and add
       a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
       so 4 corruption levels still fit the <5-min budget.
-- [x] Epoch-wise (temporal) double descent demo (`examples/EpochWiseDoubleDescent/`)
-      — LANDED (commit bd7d09f). Fixed mildly-over-parameterized MLP (FCReLU x2
-      -> FCLinear -> SoftMax) on well-separated Gaussian blobs with ~15-20%
-      label noise; hand-rolled per-epoch loop (no NeuralFit), RandSeed:=424242,
-      single-threaded. Genuine down-up-down test-error curve: valley 0.092
-      (ep20) -> interior peak 0.294 (ep240, right after train error hits 0 at
-      ep220) -> final 0.250 (ep3000). Both gates pass (interpolation + strict
-      interior peak). ~12s CPU. Tuning note in README: the peak only resolved
-      with mini-batch SGD (batch 5, momentum 0) spreading the noise-memorization
-      phase over hundreds of epochs; full-batch GD collapsed the clean and
-      noise-fitting phases together (flat curve, no peak).
-      ORIGINAL NOTES (kept for context): reproduce the THIRD double-descent axis
-      from Nakkiran et al. 2020
-      (*Deep Double Descent*, the "epoch-wise" figure): a FIXED, mildly
-      over-parameterized MLP trained on a SMALL label-noisy classification set,
-      charting held-out test error against TRAINING EPOCH. The curve is
-      non-monotone over TIME: it first FALLS (classical learning), RISES to a
-      peak around the epoch where train error hits ~0 and the net is forced to
-      interpolate the noisy labels, then FALLS AGAIN with continued training.
-      Distinct from BOTH siblings already in tree and must say so in the README:
-      examples/DoubleDescent/ sweeps CAPACITY at the end of training (the
-      model-wise axis), and grokking is delayed generalization at fixed capacity
-      driven by WEIGHT DECAY on CLEAN labels — here capacity AND weight decay are
-      FIXED, labels carry NOISE, and the only swept axis is epoch count. Build
-      with existing layers only (Input -> FullConnectReLU x2 -> FullConnectLinear
-      -> SoftMax), no NeuralFit (hand-rolled per-epoch loop so test error can be
-      logged every K epochs deterministically), RandSeed:=424242,
-      MaxThreadNum:=1. Self-gate must assert the genuine invariants (Halt(1)
-      otherwise): train error reaches ~0 (interpolation happens), AND the
-      test-error trajectory is NON-MONOTONE with an interior peak strictly above
-      both its earlier valley and its final value (the down-up-down signature) —
-      NOT merely "final < initial". Tuning honesty (document in README per the
-      RandomLabelMemorization/DropPath caveat style): the epoch-wise peak is
-      FRAGILE — it needs enough label noise (~15-20%) to force memorization, a
-      large-enough net to eventually interpolate, and a small-enough LR that the
-      noise-fitting phase is temporally resolvable; if the peak refuses to appear
-      in the CPU budget, report which knob failed rather than loosening the gate.
-      A clean, conceptually-striking generalization-dynamics demo on a time axis
-      the suite does not yet cover.
-
 ### Composite blocks / builders I'd enjoy shipping
 - [ ] TNNetAffineBlock — once TNNetMul lands, `Mul → Bias` builder for a
       learnable per-channel affine transform separable from FullConnect.
@@ -1379,51 +1248,11 @@ breakdown:
       `AssertReportSmoke(reportFn, expectedHeader)` in
       tests/TestNeuralLayersExtra.pas so new report tasks are a one-liner.
 ### Test-time augmentation evaluator
-- [ ] (TTAReport follow-up) the shipped report runs on a single synthetic
-      probe set; a natural next step is the spec's second run on a model
-      trained WITH `TNNetRandomFlipX` augmentation, to show TTA gains shrink
-      when the invariance is already learned. given a trained classifier, a validation set,
-      and a configurable list of input-side transforms (default menu reuses
-      the existing in-tree augmentations: identity, `TNNetFlipX`,
-      `TNNetFlipY`, `TNNetReverseChannels`, and a 1-pixel `Roll(X=+1)`),
-      run a forward pass per transform, average the resulting logits (and,
-      optionally, the post-softmax probabilities — both modes selectable via
-      a flag so the linear-vs-geometric-mean question is empirically
-      checkable), and report:
-      (a) baseline top-1 accuracy on the untransformed inputs,
-      (b) per-transform top-1 accuracy (each transform applied alone — a
-          built-in correctness check for the augmentation; a healthy model
-          shouldn't lose much accuracy under any single near-invariant
-          transform),
-      (c) full-ensemble TTA top-1 accuracy (all transforms averaged
-          together) and the delta vs baseline,
-      (d) per-class accuracy delta so classes that *lose* under TTA (a
-          sign of a non-equivariant decision boundary for that class) are
-          visible,
-      (e) per-sample agreement rate `mean(argmax(avg_logits) ==
-          argmax(baseline_logits))` — high agreement + small accuracy lift
-          means TTA mostly confirms existing decisions; low agreement +
-          large lift means TTA is genuinely flipping borderline samples,
-      (f) a one-line verdict: "TTA helps" / "TTA neutral" / "TTA hurts"
-          based on a configurable threshold.
-      Pure forward-only — no training-time changes, no backward pass.
-      Distinct from [[EquivarianceReport]] (measures how *output* reacts
-      to transforms in isolation, without using a label or computing
-      accuracy — answers "is the model invariant?" not "does averaging
-      under transforms improve val accuracy?"), from [[SaliencyReport]]
-      (per-sample input attribution, not aggregate accuracy lift), and
-      from the calibration / margin-report tools (those summarise
-      confidence quality on the untransformed set, no ensembling). The
-      output is the natural input for any future "should we ship TTA at
-      inference?" decision — you need to know which transforms actually
-      help before paying their inference cost. Companion
-      `examples/TestTimeAugmentation/` runs it on the SimpleImageClassifier
-      CIFAR baseline so the per-transform table and ensemble delta can be
-      eyeballed; the example also runs against a model trained *with*
-      `TNNetRandomFlipX` augmentation so reviewers can see the expected
-      pattern (TTA gains shrink when the model has already learned the
-      invariance during training — TTA and train-time augmentation are
-      substitutes, not complements).
+- [ ] TTAReport follow-up: the shipped report runs on a single synthetic probe
+      set; add the spec's second run on a model trained WITH `TNNetRandomFlipX`
+      augmentation, to show TTA gains shrink when the invariance is already
+      learned (TTA and train-time augmentation are substitutes, not complements).
+      Extends the landed examples/TestTimeAugmentation/.
 
 ### Adversarial robustness
 - [ ] AdversarialRobustnessReport follow-up: add the optional
