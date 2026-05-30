@@ -582,6 +582,34 @@ breakdown:
       `TNNetWeightStandardization` reparametrizations, which normalize the
       FORWARD weights, not the update.
 ### Introspection / debugging tools
+- [ ] `TNNet.GradCAMReport` — Grad-CAM class-localisation map (Selvaraju et al.
+      2017), the CNN attribution the suite is genuinely missing. The landed
+      `SaliencyReport` already covers INPUT-pixel attribution three ways (vanilla
+      `|∂logit_c/∂x|`, SmoothGrad, AND Integrated Gradients with the completeness
+      gap — confirmed in the source, so do NOT re-pitch any of those). Grad-CAM is
+      different in kind: instead of input-pixel gradients it localises at a chosen
+      CONVOLUTION layer's FEATURE-MAP resolution. Recipe, reusing the existing
+      forward/backward splice (no new layer class — a TNNet method + example +
+      smoke test per [[introspection-report-pattern]]): forward the probe, pick
+      `c = argmax`, backprop the one-hot `e_c` to the target conv layer, then for
+      each feature channel `k` compute the importance weight
+      `α_k = mean_xy(∂logit_c/∂A^k_xy)` (global-average-pool the channel's
+      gradient — the `Neurons[].Delta`/OutputError already carries it), form the
+      coarse map `L_xy = ReLU(Σ_k α_k · A^k_xy)`, normalise, and print it as the
+      same ASCII heatmap `SaliencyReport` uses (optionally nearest-upsampled to the
+      input plane so it overlays the printed input). Built-in correctness gate
+      (FAIL line / Halt(1) otherwise): on the SaliencyReport synthetic blob task
+      the Grad-CAM peak must fall inside the class-specific blob's
+      corner/channel — a concrete localisation check the input-gradient maps don't
+      pin. Ship `examples/GradCAM/` forking the SaliencyReport conv net/task so the
+      coarse class-localisation map sits side by side with the fine input-pixel
+      saliency on the SAME sample (the textbook "where did the CNN look" picture),
+      plus a one-paragraph README noting the resolution/locality trade-off
+      (Grad-CAM is coarse but class-discriminative; saliency is fine but noisier)
+      and a `TestGradCAMSmoke`. Distinct from `SaliencyReport`/Integrated Gradients
+      (input-space), `EffectiveReceptiveFieldReport` (input-sensitivity of a
+      central unit, class-agnostic), and `ActivationPatchingReport` (causal
+      internal-activation patch, not a spatial map).
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
