@@ -1574,8 +1574,8 @@ breakdown:
       LayerNorm / RMSNorm references into one walkthrough with a single
       assembled code snippet. Blocked only on MHSA.
 - [ ] "Loss functions" README subsection grouping MSE, MAE, CE, Huber,
-      SmoothL1, LogCosh, Charbonnier, and (once landed) Dice/KL/Focal/
-      LabelSmoothing/CosineEmbedding into a single short table.
+      SmoothL1, LogCosh, Charbonnier, Dice, KL, Focal, LabelSmoothing, and
+      CosineEmbedding into a single short table.
 - [ ] "Robust regression losses" README entry under
       TNNetHuberLoss / TNNetSmoothL1Loss / TNNetLogCoshLoss /
       TNNetCharbonnierLoss.
