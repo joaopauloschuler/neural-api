@@ -37,7 +37,22 @@ rather than acted on.
 ## New layer types
 
 ## Interesting applications / examples
-- [ ] Forward-Forward algorithm demo (`examples/ForwardForward/`) — reproduce
+- [x] Forward-Forward algorithm demo (`examples/ForwardForward/`) — LANDED
+      (commit 0c41613). Net Input(6) -> [FCReLU(30)->L2Norm] x2 with the label
+      one-hot overlaid in the first 4 input slots; two forward passes
+      (positive=correct label, negative=wrong label) train each FF layer
+      greedily by its goodness contrast (local gradient dL/dG*2*a_j written into
+      OutputError, BackpropagateCPU per layer, no global backward), driven under
+      NN.SetBatchUpdate(True). Both gates pass: per-layer pos-goodness >
+      neg-goodness at every layer, and goodness-argmax accuracy 0.897 vs 0.25
+      chance. ~1s CPU, RandSeed:=424242, single-threaded.
+      FOLLOW-UPS still open:
+      - [ ] Scale to a tiny-MNIST few-class subset (the paper's actual task) and
+            report whether the per-layer local objective still beats chance
+            within the <5-min budget.
+      - [ ] Deeper FF stack (4+ layers) — does accumulated-goodness accuracy keep
+            improving with depth, or does the length-normalised signal saturate?
+      ORIGINAL NOTES (kept for context): reproduce
       Hinton's 2022 "The Forward-Forward Algorithm" on a pure-CPU toy. This is
       the suite's FIRST non-backprop training method: every other example (and
       the whole library) learns by end-to-end backpropagation; FF replaces the
@@ -184,9 +199,31 @@ breakdown:
 
 ### Attention variants / siblings
 
-- [ ] Grouped-Query / Multi-Query Attention builder
+- [x] Grouped-Query / Multi-Query Attention builder
       `TNNet.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, KVHeads)` —
-      the one genuinely missing attention shape in the suite. Today
+      LANDED (commit 8d3ad19). Builder over the existing SDPA core in
+      neuralnetwork.pas; Q projected to d_model, K/V to KVHeads*d_k, each KV
+      head replicated across its group of query heads. Validates QueryHeads>=1,
+      KVHeads>=1, d_model mod QueryHeads = 0, QueryHeads mod KVHeads = 0.
+      Tests in TestNeuralNumerical.pas: `TestMultiHeadGroupedQueryAttention
+      GradientCheck` (QueryHeads=4/KVHeads=2, RandSeed:=424242) and
+      `TestMultiHeadGroupedQueryAttentionMHAEquivalence` (shape + param-count
+      variant — see follow-up below for the exact <1e-5 weight-for-weight check
+      that was deferred).
+      FOLLOW-UPS still open:
+      - [ ] Exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention equivalence to
+            <1e-5 by copying identical weights. Deferred because
+            AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab
+            (one external projection) whereas GQA does its own three Q/K/V
+            projections from a d_model input, so a weight-for-weight wiring is
+            fiddly; the landed test asserts equal output shape + the exact K/V
+            projection param saving instead.
+      - [ ] Wire GQA into the downstream ../gpt-3-for-pascal decoder and compose
+            with the open [[KV-cache incremental-decode]] task — the KV
+            footprint shrinks by QueryHeads/KVHeads, exactly the bottleneck that
+            task fights.
+      ORIGINAL NOTES (kept for context): the one genuinely missing attention
+      shape in the suite. Today
       AddMultiHeadSelfAttention projects Q, K and V into the SAME number of
       heads (full MHA); GQA instead uses fewer K/V heads than Q heads, so
       several query heads SHARE one key/value head (KVHeads=1 degenerates to
@@ -292,8 +329,19 @@ breakdown:
       "pure memorization". Fork the landed demo's net/data/training loop and add
       a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
       so 4 corruption levels still fit the <5-min budget.
-- [ ] Epoch-wise (temporal) double descent demo (`examples/EpochWiseDoubleDescent/`)
-      — reproduce the THIRD double-descent axis from Nakkiran et al. 2020
+- [x] Epoch-wise (temporal) double descent demo (`examples/EpochWiseDoubleDescent/`)
+      — LANDED (commit bd7d09f). Fixed mildly-over-parameterized MLP (FCReLU x2
+      -> FCLinear -> SoftMax) on well-separated Gaussian blobs with ~15-20%
+      label noise; hand-rolled per-epoch loop (no NeuralFit), RandSeed:=424242,
+      single-threaded. Genuine down-up-down test-error curve: valley 0.092
+      (ep20) -> interior peak 0.294 (ep240, right after train error hits 0 at
+      ep220) -> final 0.250 (ep3000). Both gates pass (interpolation + strict
+      interior peak). ~12s CPU. Tuning note in README: the peak only resolved
+      with mini-batch SGD (batch 5, momentum 0) spreading the noise-memorization
+      phase over hundreds of epochs; full-batch GD collapsed the clean and
+      noise-fitting phases together (flat curve, no peak).
+      ORIGINAL NOTES (kept for context): reproduce the THIRD double-descent axis
+      from Nakkiran et al. 2020
       (*Deep Double Descent*, the "epoch-wise" figure): a FIXED, mildly
       over-parameterized MLP trained on a SMALL label-noisy classification set,
       charting held-out test error against TRAINING EPOCH. The curve is
