@@ -49,7 +49,8 @@ uses
   fgl,
   {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
-  neuralbyteprediction, neuralcache, neuralab;
+  neuralbyteprediction, neuralcache, neuralab,
+  pascoremath32;
 
 const
   csMaxInterleavedSize: integer = 95;

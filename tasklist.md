@@ -1274,3 +1274,63 @@ breakdown:
       Fisher, then train on task B with an L2 penalty pulling high-Fisher
       params back toward their task-A values; chart task-A retention with and
       without the penalty.
+
+## CORE-MATH (pas-core-math) float32 migration in neuralnetwork.pas
+
+Goal: replace RTL/`Math`-unit *double-precision* scalar calls in
+`neural/neuralnetwork.pas` with the correctly-rounded **float32** equivalents
+from `pascoremath32` (already in the `uses` clause; unit path wired via
+`{$UNITPATH pas-core-math}` in `neuralnetwork.inc`). Everything should run on
+`Single`/float32. Precision shift and Single-vs-Double argument types are
+acceptable/desired — do NOT preserve double semantics.
+
+Mapping legend:
+- `Exp(x)`            -> `pcr_expf(x)`
+- `Ln(x)`            -> `pcr_logf(x)`
+- `Log10(x)`         -> `pcr_log10f(x)`
+- `Power(x,y)`       -> `pcr_powf(x,y)`     (and `Power(2,e)` -> `pcr_exp2f(e)`)
+- `Sin/Cos/Tan`      -> `pcr_sinf/pcr_cosf/pcr_tanf`  (pair -> `pcr_sincosf(x,s,c)`)
+- `Tanh/Sinh/Cosh`   -> `pcr_tanhf/pcr_sinhf/pcr_coshf`
+- `ArcTan/ArcTan2`   -> `pcr_atanf/pcr_atan2f`
+- `1/Sqrt(x)`        -> `pcr_rsqrtf(x)`     (NOTE: no plain `pcr_sqrtf`; leave bare `Sqrt` as-is)
+- fused: `Ln(1+Exp(x))` -> `pcr_log1pf(pcr_expf(x))`; `Exp(x)-1` -> `pcr_expm1f(x)`;
+  hand-rolled erf -> `pcr_erff`.
+
+Per-agent workflow (MANDATORY for every task below):
+1. BENCHMARK BEFORE: build a tiny standalone bench that exercises the affected
+   layers (forward+backward, large N over the changed code path), time it
+   (e.g. `GetTickCount64`/`EpochCount` loops). Record ms.
+2. Edit `neural/neuralnetwork.pas` for the assigned ranges only.
+3. TEST: `bash tests/RunAll.sh` must pass (build green + all tests). The suite
+   is slow (~20+ min); run it in the background and wait.
+4. BENCHMARK AFTER: rebuild the same bench, time it, record ms.
+5. COMMIT on branch `a2` with before/after ms in the message (report the delta
+   even if pcr_* is slower — the migration to float32 is intentional regardless).
+
+### Tasks
+- [ ] **T1 — Activation layers (lines ~7600–20100).** The bulk; mechanical
+      per-element scalar loops. Sigmoid/Swish/Beta-Swish (8206–8482),
+      Mish/Smish/Serf/SoftPlus family (8557–8666, 12733–13293),
+      GELU/TanhGLU (9067–9188, 12809–12829), SELU/ELU/CELU (17258–17396),
+      Gaussian/Exp/Log/Sin/Cos/Sinh/ArcSinh/LeCunTanh/Lisht (13418–14464),
+      AconC/MetaAconC (19884–20099), DyT (19019–19067). Apply fused forms:
+      softplus `Ln(1+Exp)`->`log1pf(expf)`; ELU/CELU/SELU `Exp(x)-1`->`expm1f`
+      (13363, 13391, 17275, 17336, 17396); SerfErf/`TNNetErf`/GELU hand-rolled
+      erf -> `pcr_erff` (12871). Verify against TestNeuralLayers/Numerical.
+- [ ] **T2 — Attention & softmax.** SDPA/Linear/Sink/Differential attention
+      `Exp(...-max)` (11424, 12005, 12224, 12459/12462, 10582);
+      RoPE/sinusoidal `Sin`/`Cos` + `Exp(-..*Ln(Base))` -> `pcr_sincosf` and
+      `pcr_expf`/`pcr_logf` (7641–7657, 12633–12674, 14328/14329);
+      ALiBi `Power(2,e)` -> `pcr_exp2f` (9913);
+      SoftMax/LogSoftMax/Gumbel (28368–28672); SoftPool/LpPool (26780–27057,
+      `Power`->`pcr_powf`).
+- [ ] **T3 — Normalization layers (`1/Sqrt(var+eps)` -> `pcr_rsqrtf`).**
+      LayerNorm/RMSNorm/GroupNorm/PixelNorm/SwitchableNorm/weight-standardization/
+      weight-norm: 21212, 21321/21426, 21588/21593, 21748, 21845, 21978,
+      24565/24625, 24748/24805, plus attention inv-sqrt-dk 11361, 12377 and
+      L2/RMS norm 10826/10853/10890, 11968/11976.
+- [ ] **T4 — Init & diagnostics (lower priority).** He/Glorot init `Sqrt(...)`
+      (47327–49657, convert `1/Sqrt` forms to `pcr_rsqrtf`); Box-Muller
+      `Sin/Cos`->`pcr_sincosf` (40752/40753, 42957/42958); `*Report`
+      diagnostics 31000–44897 (`Ln`->`pcr_logf`, `Log10`->`pcr_log10f`,
+      `1/Sqrt`->`pcr_rsqrtf`).
