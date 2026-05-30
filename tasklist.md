@@ -42,6 +42,35 @@ rather than acted on.
      landed in examples/FourierFeaturesSpectralBias/.) -->
 
 ## Interesting applications / examples
+- [ ] DeepSets permutation-invariant set learning demo (`examples/DeepSets/`) —
+      reproduce the Zaheer et al. 2017 "Deep Sets" recipe on a TINY pure-CPU
+      target (e.g. learn to regress the SUM, or the MAX, of a fixed-size bag of
+      N scalars/one-hot digits). Existing layers ONLY, no new layer: lay the N
+      set elements along the X axis as an `(N, 1, F)` volume, apply the SHARED
+      per-element encoder phi with `featuresize=1` pointwise layers
+      (`TNNetPointwiseConvReLU` / `TNNetConvolutionLinear(_, 1, 0, 1)`) so every
+      element sees identical weights, then collapse the set with the EXISTING
+      symmetric pool `TNNetAvgChannel` (or `TNNetMaxChannel`) — which reduces
+      X*Y to one number per channel, i.e. mean/max over the N elements with Y=1,
+      giving `(1, 1, F')` — and finish with the rho head (`TNNetFullConnectReLU`
+      -> `TNNetFullConnectLinear(1)`). The whole point is the architectural
+      INVARIANT, so make it the headline check (mirroring the suite's "bit-for-
+      bit no-op" idiom): a trained net's output must be UNCHANGED when the N
+      input elements are randomly PERMUTED (max|dy| ~ 0 across many shuffles),
+      and SHOULD change when an element's VALUE is edited — print both. Stretch:
+      a sum-pool (`TNNetAvgChannel` scaled, or a mean) generalizes to set sizes
+      unseen at train time (train on N=5, test on N=8) where a flatten+dense
+      baseline cannot even accept the larger input — chart that generalization
+      gap. Conceptually distinct from everything in the suite: it is a
+      permutation-INVARIANT set function, not a sequence model (AttentionCopyTask,
+      DiagonalSSM), a grid model (the conv classifiers), or an order-SENSITIVE
+      MLP. README contrasts it with self-attention (also permutation-equivariant
+      but O(N^2) and far heavier) and notes WHY a plain flatten->dense net fails
+      the permutation invariant. Feasibility risk to settle in v1: confirm
+      `TNNetAvgChannel`'s `(N,1,F)->(1,1,F)` reduction and its backward
+      distribute-equally gradient behave as expected when N>1 along X (it is
+      documented as averaging the whole channel), and pick mean- vs max-pool
+      based on which actually learns the target task.
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
