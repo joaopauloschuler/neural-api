@@ -137,16 +137,17 @@ rather than acted on.
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
 - [ ] Auto-generated layer API reference from doc comments
-- [ ] Improve source-code comments for TNNetChannelShuffle and
-      TNNetInterleaveChannels in neural/neuralnetwork.pas. Both are
-      parameter-free channel-permutation layers and are easily confused.
-      The doc comments should make the distinction explicit: spell out
-      the permutation formula each one computes, the meaning of the
-      constructor parameter (Groups vs StepSize), any constraints
-      (ChannelShuffle requires Depth mod Groups = 0; InterleaveChannels
-      has no divisibility constraint), and a one-line note on the
-      typical use case (ShuffleNet-style group mixing vs generic
-      stride-based interleaving after grouped/parallel convs).
+<!-- (Improve TNNetChannelShuffle / TNNetInterleaveChannels doc comments removed:
+     completed 2026-05-30. Both class declarations in neuralnetwork.pas now
+     spell out the exact permutation formula derived from the Compute code:
+     TNNetInterleaveChannels (param StepSize) scatters input channel c to
+     ToChannels[c] = (((c*StepSize) mod Depth) + ((c*StepSize) div Depth)) mod
+     Depth, no divisibility constraint (gcd(StepSize,Depth)>1 makes it
+     non-bijective) — generic stride interleave after grouped/parallel convs;
+     TNNetChannelShuffle (param Groups) does reshape (Groups, C/Groups) ->
+     transpose -> flatten, i.e. ToChannels[c] = (c mod Groups)*(C div Groups) +
+     (c div Groups), an exact bijection requiring Depth mod Groups = 0 —
+     ShuffleNet group mixing. Comments only, no behavior change.) -->
 
 ## Added ideas
 
@@ -466,8 +467,32 @@ breakdown:
       (1,1,2*Depth) reshape -> TNNetFiLM in one call, mirroring the existing
       AddPreNormResidual/AddGatedResidual builder family — removes the manual
       depth-2*Depth bookkeeping every FiLM site currently repeats.
-- [ ] TNNetMaxBlurPool — anti-aliased max-pool: max-pool followed by a
-      fixed (non-trainable) binomial blur filter.
+<!-- (TNNetMaxBlurPool removed: completed, landed 2026-05-30 as a TNNetPoolBase
+     descendant in neuralnetwork.pas. Anti-aliased shift-invariant max pool
+     (Zhang 2019): a DENSE stride-1 max into an input-sized maxmap, then a fixed
+     separable binomial [1,2,1]x[1,2,1]/16 blur subsampled by the stride
+     (border-clamped + renormalized so the live taps sum to 1). Backward scatters
+     each output error through the fixed blur taps to the recorded dense-max
+     argmax cells; blur weights are constant (no gradient). Registered in BOTH
+     serialization dispatch paths (CreateLayer case + LoadFromString/Delphi
+     chain), round-trips via FStruct[0..2]. Tests in TestNeuralNumerical.pas:
+     TestMaxBlurPoolGradientCheck (input numerical grad, 4x4x2, tol 0.01),
+     TestMaxBlurPoolLoadFromString (byte-identical round-trip), and
+     TestMaxBlurPoolShiftInvariance (blurpool changes less than strided maxpool
+     under 1px shifts). Example examples/MaxBlurPool/ gate PASSES: 12.2% less
+     mean shift-induced output change vs strided MaxPool. Constraint (documented
+     in the layer doc comment + example README): assumes square feature maps
+     (SizeX = SizeY), same as TNNetMaxPool.) -->
+- [ ] TNNetMaxBlurPool follow-up: rectangular-input support — the landed layer
+      inherits TNNetMaxPool's square-only (SizeX = SizeY) assumption. If a
+      non-square blur-pool use case shows up, generalize the dense-max + blur
+      loops to independent (X, Y) extents (the same caveat noted for the removed
+      TNNetGlobalMaxPool at the top of this file) rather than forking a class.
+- [ ] TNNetBlurPool sibling: the pure anti-aliasing primitive (fixed binomial
+      blur + stride subsample, NO max stage) so it can sit after ANY layer, not
+      just a max — Zhang 2019 also blur-pools strided convs and average pools.
+      Reuse TNNetMaxBlurPool's fixed-kernel blur+backward, drop the dense-max
+      argmax bookkeeping. Numerical-gradient + round-trip tests mirror MaxBlurPool.
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
 <!-- (TNNetMishExact / TNNetMish-stable removed: the in-tree TNNetMish ALREADY
@@ -482,9 +507,15 @@ breakdown:
      (67.5% lower); dumps learned control points + sampled activation showing one
      channel bent away from the identity (a sparse KAN fit). Open follow-ups
      remain below: the knot-count/Range sweep and the TNNetAPL bake-off.) -->
-- [ ] TNNetSplineActivation follow-up: knot-count / Range sweep — same toy fit
-      with K ∈ {2, 4, 8, 16} and a couple of Range values, charting the
-      capacity↔overfitting trade and where extra knots stop helping.
+<!-- (TNNetSplineActivation knot-count/Range sweep removed: completed, landed
+     2026-05-30 as examples/SplineKnotSweep/. Forks the SplineActivationKAN toy
+     fit; sweeps K in {2,4,8,16} x Range in {2.0,4.0}, same seed/data/optimizer
+     in every cell, printing a TRAIN-MSE and a HELD-OUT-MSE grid. Finding: the
+     capacity/overfitting trade is visible on HELD-OUT error (drops ~8x from K=2
+     to a K=8 sweet spot at Range=2.0, then RISES at K=16) — but TRAIN MSE is NOT
+     monotone in K under a fixed SGD budget (K=16 train 0.022 > K=8's 0.006), so
+     the gate asserts the held-out story (knots-help + endpoints-fit +
+     knots-stall), not train-monotonicity. Gate PASSES, Halt(1) on failure.) -->
 - [ ] TNNetMetaAconC follow-up: the FULL cross-channel-bottleneck β generator
       (the paper's true Meta-ACON: squeeze → FC channel-reduce → ReLU → FC
       channel-expand → sigmoid, so β[c] depends on ALL channels' spatial
@@ -493,13 +524,17 @@ breakdown:
       sub-block inside the layer (or a builder that wires an SE-style squeeze
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
-- [ ] TNNetBitLinear follow-up: a ternary-vs-full-precision bake-off — train the
-      same tiny classifier with `TNNetFullConnectLinear` heads vs `TNNetBitLinear`
-      heads at matched architecture, report final accuracy/loss AND the effective
-      model size (ternary weights are ~1.58 bits each vs 32). The headline BitNet
-      claim is "near-FP accuracy at a fraction of the weight memory"; this is a
-      ~30-line head swap. Pairs with the STE bit-width sweep and the
-      TNNetStraightThroughEstimator quantization demos already in the list.
+<!-- (TNNetBitLinear ternary-vs-full-precision bake-off removed: completed,
+     landed 2026-05-30 as examples/BitLinearBakeoff/. Same tiny classifier, same
+     synthetic blob task, same seed, trained once with TNNetFullConnectLinear
+     (FP32) heads and once with TNNetBitLinear (ternary) heads at MATCHED weight
+     count (144 each via TNNet.CountWeights). Result: ternary test acc 100% vs
+     FP32 99.67% (gap -1.33 pts) at 20.19x less weight memory (1.58 vs 32
+     bits/weight => 4.95% of FP bytes). Self-gate PASSES (acc gap <= 8 pts AND
+     memory < 10% of FP AND ternary acc >= 80%), Halt(1) on failure. Runs in
+     0.67s single-threaded (MaxThreadNum := 1 avoids sandbox thread-pool spin-up
+     overhead). Still-open BitLinear sibling: the activation-quantization (int8
+     absmax) b1.58 variant below.) -->
 - [ ] TNNetBitLinear follow-up: activation-quantization variant — BitNet b1.58
       also quantizes the *activations* to int8 (absmax per-token). Consider a flag
       or sibling that rounds the layer INPUT through an absmax STE before the
