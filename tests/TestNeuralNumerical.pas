@@ -375,6 +375,9 @@ type
     procedure TestMultiHeadSelfAttentionGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestTransformerEncoderBlockGradientCheck;
+    procedure TestHardConcreteGateLimits;
+    procedure TestHardConcreteGradientCheck;
+    procedure TestHardConcreteSerializationRoundTrip;
     procedure TestSpatialDropout1DInferenceIdentity;
     procedure TestSpatialDropout1DTrainingMaskShape;
     procedure TestSpatialDropout1DGradientCheck;
@@ -10060,6 +10063,209 @@ begin
   d_ff := 16;
   RunOne(true);
   RunOne(false);
+end;
+
+procedure TTestNeuralNumerical.TestHardConcreteGateLimits;
+// Limiting-behaviour of the DETERMINISTIC inference gate of TNNetHardConcrete:
+// at LARGE positive log_alpha the gate -> 1 (output ~= input); at LARGE
+// negative log_alpha the gate -> 0 (output ~= 0). The layer is left disabled
+// (inference), so the gate is deterministic z = clip(sigmoid(log_alpha)*
+// (zeta-gamma)+gamma, 0, 1) with no noise.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LGate: TNNetHardConcrete;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3));
+    LGate := TNNetHardConcrete.Create();
+    NN.AddLayer(LGate);
+
+    // One learnable log_alpha per depth channel.
+    AssertEquals('HardConcrete weight count == Depth', 3,
+      LGate.Neurons[0].Weights.Size);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 1.3;
+
+    // LARGE positive log_alpha -> gate saturates to clip(1.1*... ,0,1)=1 -> y=x.
+    LGate.Neurons[0].Weights.Fill(40.0);
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('HardConcrete open gate (z->1) at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+
+    // LARGE negative log_alpha -> s->0 -> s_str=gamma<0 -> clip to 0 -> y=0.
+    LGate.Neurons[0].Weights.Fill(-40.0);
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('HardConcrete closed gate (z->0) at ' + IntToStr(i),
+        0.0, NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHardConcreteGradientCheck;
+// Input + weight numerical-gradient check of TNNetHardConcrete on a tiny shape
+// (2,2,3). The layer is run in INFERENCE mode (deterministic gate, fixed/zero
+// noise) so central differences are valid; log_alpha is chosen to keep every
+// channel gate in the DIFFERENTIABLE interior (0 < s_str < 1), avoiding the
+// hard-clip kinks. Both dInput and dlog_alpha are checked.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LGate: TNNetHardConcrete;
+  i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, saved: TNeuralFloat;
+  logAlpha: array[0..2] of TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  InputPlus := TNNetVolume.Create(2, 2, 3);
+  Desired := TNNetVolume.Create(2, 2, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1)); // pError=1 resizes error volumes
+    LGate := TNNetHardConcrete.Create();
+    NN.AddLayer(LGate);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Interior log_alpha values: with beta=2/3, gamma=-0.1, zeta=1.1 the
+    // interior is roughly log_alpha in (-2.4, 2.4); these stay well inside.
+    logAlpha[0] := 0.6;
+    logAlpha[1] := -0.5;
+    logAlpha[2] := 1.1;
+    for i := 0 to 2 do LGate.Neurons[0].Weights.Raw[i] := logAlpha[i];
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.5 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Input gradient check.
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('HardConcrete input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // Weight (log_alpha) gradient check. Perturb each per-channel weight,
+    // restoring it afterwards. The analytic gradient is read from the neuron
+    // Delta accumulated by Backpropagate (Delta = -LearningRate * dL/dw with
+    // LearningRate=1, so dL/dw = -Delta).
+    for i := 0 to 2 do
+    begin
+      saved := LGate.Neurons[0].Weights.Raw[i];
+
+      LGate.Neurons[0].Weights.Raw[i] := saved + epsilon;
+      lossPlus := ComputeLoss(Input);
+
+      LGate.Neurons[0].Weights.Raw[i] := saved - epsilon;
+      lossMinus := ComputeLoss(Input);
+
+      LGate.Neurons[0].Weights.Raw[i] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      LGate.Neurons[0].Delta.Fill(0);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LGate.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('HardConcrete log_alpha gradient at channel ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHardConcreteSerializationRoundTrip;
+// SaveToString -> LoadFromString -> SaveToString must be byte-identical,
+// proving the constructor constants (beta/gamma/zeta in FFloatSt[0..2]) and the
+// per-channel log_alpha weights survive. Compute must match end-to-end after
+// reload.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  LGate: TNNetHardConcrete;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    LGate := TNNetHardConcrete.Create(0.5, -0.2, 1.3); // non-default constants
+    NN.AddLayer(LGate);
+
+    LGate.Neurons[0].Weights.Raw[0] := 0.7;
+    LGate.Neurons[0].Weights.Raw[1] := -0.4;
+    LGate.Neurons[0].Weights.Raw[2] := 1.2;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('HardConcrete round-trip class identity',
+        NN2.GetLastLayer is TNNetHardConcrete);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HardConcrete SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('HardConcrete round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionGradientCheck;

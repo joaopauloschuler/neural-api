@@ -2673,6 +2673,47 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Hard-Concrete gate (Louizos, Welling & Kingma 2018, "Learning Sparse
+  // Neural Networks through L0 Regularization"). A learnable PER-CHANNEL
+  // multiplicative gate z[d] in [0,1] that can hit EXACTLY 0 (hard sparsity):
+  //   s        = sigmoid((logit(u) + log_alpha[d]) / beta)   // u~Uniform(0,1)
+  //   s_str    = s * (zeta - gamma) + gamma                  // gamma<0<zeta
+  //   z[d]     = clip(s_str, 0, 1)                            // hard clip
+  //   y[x,y,d] = x[x,y,d] * z[d]                              // broadcast over x,y
+  // log_alpha is a trained per-channel weight (FNeurons[0].Weights, one per
+  // depth channel). beta, gamma, zeta are constructor constants stored in
+  // FFloatSt[0..2] (paper defaults beta=2/3, gamma=-0.1, zeta=1.1) so they
+  // round-trip through SaveStructureToString / LoadFromString / CreateLayer.
+  // Training (Enabled): one fresh noise sample u per channel per forward,
+  // held FIXED for the matching backward (reparameterization, like
+  // TNNetGumbelSoftmax / TNNetStraightThroughEstimator), so the layer is
+  // numerically-gradient-checkable w.r.t. BOTH x and log_alpha. Inference
+  // (not Enabled): the DETERMINISTIC gate z = clip(sigmoid(log_alpha)*
+  // (zeta-gamma)+gamma, 0, 1), no noise. The gradient is zero in the
+  // hard-clipped regions (s_str<=0 or >=1) and flows through the
+  // sigmoid/stretch elsewhere. On the interior dz/dlog_alpha =
+  // (ds/dlog_alpha)*(zeta-gamma), with ds/dlog_alpha = (1/beta)*s*(1-s) while
+  // training (the noisy logit is scaled by 1/beta) and s*(1-s) at inference
+  // (deterministic gate, no 1/beta); it is 0 in the clipped regions.
+  // FGate caches z[d]; FGateDeriv caches dz/dlog_alpha[d] for the backward.
+  TNNetHardConcrete = class(TNNetChannelTransformBase)
+    protected
+      FEnabled: boolean;
+      FGate: TNNetVolume;
+      FGateDeriv: TNNetVolume;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pBeta, pGamma, pZeta: TNeuralFloat); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      // Default false (deterministic inference gate). TNNet.EnableDropouts also
+      // toggles this so the stochastic training gate is active during Fit.
+      property Enabled: boolean read FEnabled write FEnabled;
+  end;
+
   /// Per-sample root-mean-square normalization followed by a learnable
   // PER-CHANNEL sigmoid gate. Each input sample (all elements across
   // SizeX*SizeY*Depth) is first divided by the root mean square of its
@@ -18476,6 +18517,189 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
   FNeurons[0].Weights.Fill(FInitialAlpha);
+  AfterWeightUpdate();
+end;
+
+{ TNNetHardConcrete }
+constructor TNNetHardConcrete.Create();
+begin
+  // Paper defaults: beta = 2/3, gamma = -0.1, zeta = 1.1.
+  Create(2/3, -0.1, 1.1);
+end;
+
+constructor TNNetHardConcrete.Create(pBeta, pGamma, pZeta: TNeuralFloat);
+begin
+  inherited Create();
+  if pBeta <= 0 then
+    FErrorProc('TNNetHardConcrete beta must be > 0. Got: ' + FloatToStr(pBeta));
+  if pZeta <= pGamma then
+    FErrorProc('TNNetHardConcrete requires gamma < zeta. Got gamma=' +
+      FloatToStr(pGamma) + ' zeta=' + FloatToStr(pZeta));
+  FFloatSt[0] := pBeta;
+  FFloatSt[1] := pGamma;
+  FFloatSt[2] := pZeta;
+  // Default to the deterministic inference gate; TNNet.EnableDropouts(true)
+  // (called by Fit during training) switches on the stochastic training gate.
+  FEnabled := False;
+  FGate := TNNetVolume.Create();
+  FGateDeriv := TNNetVolume.Create();
+  InitDefault();
+end;
+
+destructor TNNetHardConcrete.Destroy();
+begin
+  FGate.Free;
+  FGateDeriv.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetHardConcrete.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // One learnable log_alpha per depth channel.
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  FGate.ReSize(1, 1, FOutput.Depth);
+  FGateDeriv.ReSize(1, 1, FOutput.Depth);
+  InitDefault();
+end;
+
+procedure TNNetHardConcrete.Compute();
+var
+  StartTime: double;
+  W: TNNetVolume;
+  Depth, d: integer;
+  Beta, Gamma, Zeta, InvBeta, Stretch, SlopeFactor: TNeuralFloat;
+  U, NoisyLogit, S, SStr, Z, DZ: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute;
+  W := FNeurons[0].FWeights;
+  Depth := FOutput.Depth;
+  {$IFDEF Debug}
+  if W.Size <> Depth then
+    FErrorProc('Neuron weight count isn''t compatible with output depth ' +
+      'at TNNetHardConcrete.');
+  {$ENDIF}
+  Beta := FFloatSt[0];
+  if Beta <= 0 then Beta := 2/3;
+  InvBeta := 1.0 / Beta;
+  Gamma := FFloatSt[1];
+  Zeta := FFloatSt[2];
+  Stretch := Zeta - Gamma;
+
+  // Per-channel gate. While training (Enabled) draw fresh noise u per channel
+  // and keep s for the matching backward (reparameterization). At inference
+  // the gate is deterministic (no noise): s = sigmoid(log_alpha).
+  for d := 0 to Depth - 1 do
+  begin
+    if FEnabled then
+    begin
+      // Training: noisy logit scaled by 1/beta, so ds/dlog_alpha = (1/beta)*s*(1-s).
+      U := Random();
+      if U < 1e-7 then U := 1e-7;
+      if U > 1 - 1e-7 then U := 1 - 1e-7;
+      NoisyLogit := Ln(U) - Ln(1 - U) + W.Raw[d];
+      S := 1.0 / (1.0 + Exp(-NoisyLogit * InvBeta));
+      SlopeFactor := InvBeta;
+    end
+    else
+    begin
+      // Inference: deterministic gate s = sigmoid(log_alpha) (no 1/beta), so
+      // ds/dlog_alpha = s*(1-s).
+      S := 1.0 / (1.0 + Exp(-W.Raw[d]));
+      SlopeFactor := 1.0;
+    end;
+    SStr := S * Stretch + Gamma;
+    if SStr <= 0 then
+    begin
+      Z := 0;
+      DZ := 0;
+    end
+    else if SStr >= 1 then
+    begin
+      Z := 1;
+      DZ := 0;
+    end
+    else
+    begin
+      Z := SStr;
+      // dz/dlog_alpha = (ds/dlog_alpha) * (zeta - gamma), where ds/dlog_alpha is
+      // (1/beta)*s*(1-s) while training and s*(1-s) at inference.
+      DZ := SlopeFactor * S * (1 - S) * Stretch;
+    end;
+    FGate.Raw[d] := Z;
+    FGateDeriv.Raw[d] := DZ;
+  end;
+
+  // y[x,y,d] = x[x,y,d] * z[d], broadcast over the spatial axes.
+  FOutput.MulChannels(FGate);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetHardConcrete.Backpropagate();
+var
+  StartTime: double;
+  localNeuron: TNNetNeuron;
+  Prev, PrevErr: TNNetVolume;
+  SizeX, SizeY, Depth, x, y, d: integer;
+  gradLogAlpha: array of TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  localNeuron := FNeurons[0];
+  Prev := FPrevLayer.FOutput;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+
+  // Gradient w.r.t. each per-channel log_alpha:
+  // dL/dlog_alpha[d] = (dz/dlog_alpha[d]) * sum over x,y of
+  //                    OutputError[x,y,d] * Input[x,y,d].
+  SetLength(gradLogAlpha, Depth);
+  for d := 0 to Depth - 1 do gradLogAlpha[d] := 0;
+  for x := 0 to SizeX - 1 do
+    for y := 0 to SizeY - 1 do
+      for d := 0 to Depth - 1 do
+        gradLogAlpha[d] := gradLogAlpha[d] +
+          FOutputError[x, y, d] * Prev[x, y, d];
+  for d := 0 to Depth - 1 do
+    localNeuron.FDelta.Raw[d] := localNeuron.FDelta.Raw[d] +
+      (-FLearningRate) * gradLogAlpha[d] * FGateDeriv.Raw[d];
+  SetLength(gradLogAlpha, 0);
+
+  if (not FBatchUpdate) then
+  begin
+    localNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+
+  if hasInputGrad then
+  begin
+    PrevErr := FPrevLayer.FOutputError;
+    // Gradient w.r.t. the input: dInput[x,y,d] = OutputError[x,y,d] * z[d].
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+        for d := 0 to Depth - 1 do
+          PrevErr[x, y, d] := PrevErr[x, y, d] +
+            FOutputError[x, y, d] * FGate.Raw[d];
+    FPrevLayer.Backpropagate();
+  end;
+end;
+
+procedure TNNetHardConcrete.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  // Init log_alpha so the deterministic gate starts mostly open (sigmoid(0)=0.5,
+  // stretched gate ~ 0.5 -> open). The paper initialises log_alpha near a small
+  // positive value; 0 keeps channels alive at start and lets L0 pressure prune.
+  FNeurons[0].Weights.Fill(0);
   AfterWeightUpdate();
 end;
 
@@ -44789,6 +45013,7 @@ begin
       'TNNetSoftMaxOne' :           Result := TNNetSoftMaxOne.Create();
       'TNNetSoftmaxTemperature' :   Result := TNNetSoftmaxTemperature.Create(Ft[0]);
       'TNNetGumbelSoftmax' :        Result := TNNetGumbelSoftmax.Create(Ft[0], St[0]);
+      'TNNetHardConcrete' :         Result := TNNetHardConcrete.Create(Ft[0], Ft[1], Ft[2]);
       'TNNetCenteredSoftmax' :      Result := TNNetCenteredSoftmax.Create();
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
@@ -45061,6 +45286,7 @@ begin
       if S[0] = 'TNNetSoftMaxOne' then Result := TNNetSoftMaxOne.Create() else
       if S[0] = 'TNNetSoftmaxTemperature' then Result := TNNetSoftmaxTemperature.Create(Ft[0]) else
       if S[0] = 'TNNetGumbelSoftmax' then Result := TNNetGumbelSoftmax.Create(Ft[0], St[0]) else
+      if S[0] = 'TNNetHardConcrete' then Result := TNNetHardConcrete.Create(Ft[0], Ft[1], Ft[2]) else
       if S[0] = 'TNNetCenteredSoftmax' then Result := TNNetCenteredSoftmax.Create() else
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
@@ -47155,6 +47381,10 @@ begin
       if (FLayers[LayerCnt] is TNNetAddNoiseBase) then
       begin
         TNNetAddNoiseBase(FLayers[LayerCnt]).Enabled := pFlag;
+      end
+      else if (FLayers[LayerCnt] is TNNetHardConcrete) then
+      begin
+        TNNetHardConcrete(FLayers[LayerCnt]).Enabled := pFlag;
       end;
     end;
   end;

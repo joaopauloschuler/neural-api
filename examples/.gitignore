@@ -9,6 +9,7 @@ CumSumPositionEncoding/CumSumPositionEncoding
 DomainAdversarial/DomainAdversarial
 DropPathAblation/DropPathAblation
 EuclideanNormHead/EuclideanNormHead
+HardConcreteSparsity/HardConcreteSparsity
 ModelSummaryDemo/ModelSummaryDemo
 PerplexityEval/PerplexityEval
 RandomLabelMemorization/RandomLabelMemorization
