@@ -4824,6 +4824,12 @@ type
       // layers in SliceLayers. SourceLayer = nil uses GetLastLayer().
       procedure AddSplitQKVHeads(d_model, Heads: integer;
         out SliceLayers: array of TNNetLayer; SourceLayer: TNNetLayer = nil);
+      // Runs one TNNetScaledDotProductAttention(d_k) per head slice and
+      // concatenates the Heads per-head (SeqLen,1,d_k) outputs back to depth
+      // d_model via TNNetDeepConcat. Returns the concat layer. SourceLayer = nil
+      // uses GetLastLayer().
+      function AddMultiHeadSDPAConcat(d_model, Heads: integer;
+        CausalMask: boolean = false; SourceLayer: TNNetLayer = nil): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -23422,6 +23428,26 @@ begin
       AddLayerAfter(TNNetSplitChannels.Create(Channels), SourceLayer);
   end;
   SetLength(Channels, 0);
+end;
+
+function TNNet.AddMultiHeadSDPAConcat(d_model, Heads: integer;
+  CausalMask: boolean = false; SourceLayer: TNNetLayer = nil): TNNetLayer;
+var
+  d_k, HeadCnt: integer;
+  SliceLayers, HeadOutputs: array of TNNetLayer;
+begin
+  if SourceLayer = nil then SourceLayer := GetLastLayer();
+  d_k := d_model div Heads;
+  SetLength(SliceLayers, Heads);
+  AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
+  SetLength(HeadOutputs, Heads);
+  for HeadCnt := 0 to Heads - 1 do
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
+        SliceLayers[HeadCnt]);
+  Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  SetLength(SliceLayers, 0);
+  SetLength(HeadOutputs, 0);
 end;
 
 // Ported code from:
