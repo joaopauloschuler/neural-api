@@ -4813,6 +4813,17 @@ type
       // match the block input shape so the residual sum is valid. Returns the
       // residual-sum layer.
       function AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // ---- TNNetScaledDotProductAttention multi-head wiring (MHA-a/b/c) ----
+      // Carves a (SeqLen,1,3*d_model) Q|K|V slab into Heads per-head
+      // (SeqLen,1,3*d_k) slices (d_k = d_model div Heads) using
+      // TNNetSplitChannels. The incoming slab is assumed laid out as
+      // [Q_all(d_model) | K_all(d_model) | V_all(d_model)]; each returned slice
+      // re-interleaves head h as [Q_h(d_k) | K_h(d_k) | V_h(d_k)] exactly as
+      // TNNetScaledDotProductAttention.Compute expects (Q at [0..d_k-1],
+      // K at [d_k..2*d_k-1], V at [2*d_k..3*d_k-1]). Returns the per-head slice
+      // layers in SliceLayers. SourceLayer = nil uses GetLastLayer().
+      procedure AddSplitQKVHeads(d_model, Heads: integer;
+        out SliceLayers: array of TNNetLayer; SourceLayer: TNNetLayer = nil);
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -23375,6 +23386,42 @@ begin
   AddLayer( TNNetFullConnectReLU.Create(Bottleneck) );
   Excite := AddLayer( TNNetFullConnectSigmoid.Create(Channels) );
   Result := AddLayer( TNNetChannelMulByLayer.Create(InputLayer, Excite) );
+end;
+
+procedure TNNet.AddSplitQKVHeads(d_model, Heads: integer;
+  out SliceLayers: array of TNNetLayer; SourceLayer: TNNetLayer = nil);
+var
+  d_k, HeadCnt, d: integer;
+  Channels: array of integer;
+begin
+  if SourceLayer = nil then SourceLayer := GetLastLayer();
+  if Heads < 1 then
+    FErrorProc('AddSplitQKVHeads requires Heads >= 1. Heads=' + IntToStr(Heads));
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddSplitQKVHeads requires d_model divisible by Heads. d_model=' +
+      IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  if Length(SliceLayers) < Heads then
+    FErrorProc('AddSplitQKVHeads: SliceLayers array too small. Length=' +
+      IntToStr(Length(SliceLayers)) + ', Heads=' + IntToStr(Heads));
+  if SourceLayer.Output.Depth <> 3 * d_model then
+    FErrorProc('AddSplitQKVHeads requires source depth = 3*d_model. Got depth=' +
+      IntToStr(SourceLayer.Output.Depth) + ', d_model=' + IntToStr(d_model));
+  d_k := d_model div Heads;
+  SetLength(Channels, 3 * d_k);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    // Re-interleave head HeadCnt as [Q_h | K_h | V_h] from the
+    // [Q_all | K_all | V_all] slab.
+    for d := 0 to d_k - 1 do
+    begin
+      Channels[d]           := HeadCnt * d_k + d;                 // Q_h
+      Channels[d_k + d]     := d_model + HeadCnt * d_k + d;       // K_h
+      Channels[2 * d_k + d] := 2 * d_model + HeadCnt * d_k + d;   // V_h
+    end;
+    SliceLayers[HeadCnt] :=
+      AddLayerAfter(TNNetSplitChannels.Create(Channels), SourceLayer);
+  end;
+  SetLength(Channels, 0);
 end;
 
 // Ported code from:

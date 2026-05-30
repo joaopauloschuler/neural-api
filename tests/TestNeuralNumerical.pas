@@ -370,6 +370,7 @@ type
     procedure TestRotaryEmbeddingSerializationRoundTrip;
     procedure TestMaskedFillSerializationRoundTrip;
     procedure TestScaledDotProductAttentionSerializationRoundTrip;
+    procedure TestSplitQKVHeadsForwardLayout;
     procedure TestSpatialDropout1DInferenceIdentity;
     procedure TestSpatialDropout1DTrainingMaskShape;
     procedure TestSpatialDropout1DGradientCheck;
@@ -9827,6 +9828,66 @@ begin
   // d_k = 4, non-causal. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetScaledDotProductAttention.Create(4, false),
     'SDPA', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSplitQKVHeadsForwardLayout;
+// MHA-a: pin the per-head Q|K|V slab slicing. H=2, d_model=8 -> d_k=4,
+// slab depth 24 -> two 12-deep head slices in the [Q_h|K_h|V_h] interleaving
+// that TNNetScaledDotProductAttention expects.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SliceLayers: array of TNNetLayer;
+  d_model, Heads, d_k, SeqLen, h, d, x: integer;
+  Expected, Got: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  d_k := d_model div Heads; // 4
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    SetLength(SliceLayers, Heads);
+    NN.AddSplitQKVHeads(d_model, Heads, SliceLayers);
+    // Distinct value per (x, depth) so we can verify exact channel mapping.
+    for x := 0 to SeqLen - 1 do
+      for d := 0 to 3 * d_model - 1 do
+        Input[x, 0, d] := x * 100 + d;
+    NN.Compute(Input);
+    // Each slice must be (SeqLen,1,3*d_k).
+    for h := 0 to Heads - 1 do
+    begin
+      AssertEquals('slice ' + IntToStr(h) + ' depth', 3 * d_k,
+        SliceLayers[h].Output.Depth);
+      AssertEquals('slice ' + IntToStr(h) + ' sizeX', SeqLen,
+        SliceLayers[h].Output.SizeX);
+      for x := 0 to SeqLen - 1 do
+        for d := 0 to d_k - 1 do
+        begin
+          // Q_h slice slot d <- input channel h*d_k + d
+          Expected := x * 100 + (h * d_k + d);
+          Got := SliceLayers[h].Output[x, 0, d];
+          AssertEquals('Q head ' + IntToStr(h) + ' x' + IntToStr(x) +
+            ' d' + IntToStr(d), Expected, Got);
+          // K_h slice slot d_k+d <- input channel d_model + h*d_k + d
+          Expected := x * 100 + (d_model + h * d_k + d);
+          Got := SliceLayers[h].Output[x, 0, d_k + d];
+          AssertEquals('K head ' + IntToStr(h) + ' x' + IntToStr(x) +
+            ' d' + IntToStr(d), Expected, Got);
+          // V_h slice slot 2*d_k+d <- input channel 2*d_model + h*d_k + d
+          Expected := x * 100 + (2 * d_model + h * d_k + d);
+          Got := SliceLayers[h].Output[x, 0, 2 * d_k + d];
+          AssertEquals('V head ' + IntToStr(h) + ' x' + IntToStr(x) +
+            ' d' + IntToStr(d), Expected, Got);
+        end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestCosineSimilarityAttentionSerializationRoundTrip;
