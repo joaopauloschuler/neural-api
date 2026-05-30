@@ -44,6 +44,31 @@ rather than acted on.
 ## Interesting applications / examples
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
+- [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
+      reproduce Mordvintsev et al. 2020 "Growing Neural CA" on a TINY pure-CPU
+      target (e.g. a 16x16 RGBA emoji-like glyph, channels = 4 visible RGBA +
+      ~8 hidden state = 12-deep grid). One CA "rule" step is a shared-weight
+      conv stack applied in place: per-cell perceive (fixed 3x3 Sobel-x/Sobel-y/
+      identity depthwise filters, or a small learned 3x3 conv) -> 1x1
+      TNNetPointwiseConvReLU -> 1x1 TNNetPointwiseConvLinear update added
+      residually to the grid, with a stochastic per-cell update mask and an
+      alpha>0.1 "alive" mask. Train by UNROLLING T in {48..64} steps sharing one
+      rule via TNNetConvolutionSharedWeights (the SharedWeights layer is the key
+      enabler — without it each step would learn separate weights), L2 loss to the
+      target RGBA at the final step, pool-based sample replacement for
+      persistence. Headline payoff: a net that GROWS the target from a single
+      seed pixel and (stretch) REGENERATES after the grid is damaged — visually
+      striking and conceptually unlike anything in the suite (it is recurrent-in-
+      space self-organisation, not a feed-forward classifier or a diagnostic
+      report). Render frames as ASCII/ppm so it stays dependency-free. Feasibility
+      risk to settle in the first version: confirm the unrolled shared-weight
+      gradient flows correctly under the SetBatchUpdate(True) idiom across T steps
+      (the manual-gradient gotcha noted in [[manual-gradient-and-snapshot-gotchas]]);
+      if full backprop-through-time over 48+ steps blows the CPU budget, fall back
+      to a shorter T or truncated BPTT and document it (the same "what did NOT fit
+      the budget" honesty the Grokking entry uses). Distinct from VisualGAN
+      (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
+      DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
 <!-- (Concept Bottleneck Model demo removed: completed, landed 2026-05-24 (commit
      2d7f123) as examples/ConceptBottleneck/. Koh et al. 2020 interpretable-by-design
      net from existing layers only: Input(6) -> FC+ReLU(16)x2 ->
