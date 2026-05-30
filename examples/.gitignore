@@ -8,4 +8,5 @@ CoordConvSpiral/CoordConvSpiral
 CumSumPositionEncoding/CumSumPositionEncoding
 DomainAdversarial/DomainAdversarial
 EuclideanNormHead/EuclideanNormHead
+ModelSummaryDemo/ModelSummaryDemo
 PerplexityEval/PerplexityEval

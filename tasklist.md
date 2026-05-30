@@ -999,8 +999,10 @@ breakdown:
       check.
 - [ ] Scheduler unit tests — given seed and schedule parameters, NextLR
       must produce a deterministic, finite, monotonically-correct sequence.
-- [ ] PrintSummary smoke test — capture summary output for canonical
-      networks, assert row count and total-parameter line.
+- [X] PrintSummary smoke test — capture summary output for canonical
+      networks, assert row count and total-parameter line. (covered by
+      examples/ModelSummaryDemo: parses SummaryString() for three nets,
+      asserts row-per-layer + Totals footer against CountLayers/CountWeights/CountNeurons.)
 - [ ] Backward-pass sign-correlation test — for every layer that overrides
       Backpropagate, perturb input by ±ε, assert gradient direction agrees
       with loss-difference direction >90% of the time across a small grid.
@@ -1181,8 +1183,9 @@ breakdown:
      remain worth adding.) -->
 - [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a tiny-MNIST
       subset (or synthetic 2D classification).
-- [ ] `examples/ModelSummaryDemo/` — three networks printed via
-      PrintSummary; doubles as a smoke test for the summary output format.
+- [X] `examples/ModelSummaryDemo/` — three structurally-distinct nets (MLP,
+      conv, pre-norm residual) printed via PrintSummary; doubles as the
+      PrintSummary format smoke test (parses SummaryString, gates on Halt(1)).
 - [ ] `examples/SchedulerCompare/` — same network trained four times with
       constant LR, StepLR, CosineLR, WarmupCosineLR; one chart.
 - [ ] `examples/SWADemo/` — CIFAR-10 baseline vs same network with SWA
