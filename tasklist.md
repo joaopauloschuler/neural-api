@@ -1471,6 +1471,33 @@ breakdown:
 - [ ] SWA effect-size sweep: vary SWA start-epoch fraction ∈ {0.5, 0.6,
       0.7, 0.8, 0.9} and chart final test accuracy.
 - [ ] Cosine-LR vs constant-LR on SimpleImageClassifier, three seeds each.
+- [ ] BatchSizeSweep follow-up: the linear LR-scaling rule (Goyal et al. 2017,
+      "Accurate, Large Minibatch SGD"; Krizhevsky 2014). The landed
+      examples/BatchSizeSweep/ holds the learning rate FIXED at 0.01 while varying
+      the batch size, so the large batch (128) needs noticeably more epochs — and
+      the README's closing line even gestures at the fix ("a large batch often
+      wants a larger learning rate") but never demonstrates it. Fork that example
+      into examples/LRBatchScaling/ that, for each batch size B in {8,16,32,64,128},
+      sweeps a small LR grid (e.g. base_lr * B/B0 spanning a few multipliers around
+      the linear prediction) on the SAME fixed seed/data/net/epoch-budget and
+      records epochs-to-converge at each (B, LR) cell. Print a B x LR grid of
+      epochs-to-converge (or final val MSE) and, per batch size, flag the
+      best-LR column; the headline payoff is that the best-LR locus tracks
+      ~linearly with B (the diagonal of the grid), so doubling the batch and
+      doubling the LR keeps epochs-to-converge roughly constant — the cleanest
+      single demonstration that batch size and learning rate are coupled knobs,
+      not independent ones. Built-in correctness gate: the per-batch best LR must
+      be MONOTONE NON-DECREASING in B (a flat or decreasing best-LR curve means
+      the grid is mis-centred or the task saturates too fast — shrink the net /
+      tighten the convergence threshold). Stretch: overlay the sqrt-scaling
+      prediction (best_lr ~ sqrt(B)) as a second reference curve and report which
+      rule the toy actually follows at this scale (small full-batch-ish toys often
+      sit between the two). Keep dims tiny and MaxThreadNum := 1 so the whole
+      B x LR grid still fits the <5-min CPU budget. Distinct from the landed
+      BatchSizeSweep (fixed LR, cost/quality trade only), from the open
+      OptimizerBakeoff per-optimizer LR shoot-out (varies LR per OPTIMIZER at a
+      fixed batch, not LR-vs-batch coupling), and from SchedulerCompare (LR
+      SCHEDULE shape over training, not the batch-coupled base LR).
 <!-- ("Activation cost" microbenchmark removed: duplicate of the per-activation
      forward/backward ns/op CSV in `examples/ActivationPlayground/` and of
      `bin/layer_bench <Activation> 64 64 32` under "Tooling / dev experience",
