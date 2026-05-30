@@ -1308,7 +1308,7 @@ Per-agent workflow (MANDATORY for every task below):
    even if pcr_* is slower — the migration to float32 is intentional regardless).
 
 ### Tasks
-- [ ] **T1 — Activation layers (lines ~7600–20100).** The bulk; mechanical
+- [x] **T1 — Activation layers (lines ~7600–20100).** The bulk; mechanical
       per-element scalar loops. Sigmoid/Swish/Beta-Swish (8206–8482),
       Mish/Smish/Serf/SoftPlus family (8557–8666, 12733–13293),
       GELU/TanhGLU (9067–9188, 12809–12829), SELU/ELU/CELU (17258–17396),

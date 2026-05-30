@@ -8203,7 +8203,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      SigmoidValue := 1 / ( 1 + Exp(-PrevValue) );
+      SigmoidValue := 1 / ( 1 + pcr_expf(-PrevValue) );
       OutputValue := PrevValue * SigmoidValue;
       if OutputValue < 6 then
       begin
@@ -8223,7 +8223,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Min(6.0, PrevValue / ( 1 + Exp(-PrevValue) ));
+      FOutput.FData[OutputCnt] := Min(6.0, PrevValue / ( 1 + pcr_expf(-PrevValue) ));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -8297,7 +8297,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      SigmoidValue := 1 / ( 1 + Exp(-PrevValue) );
+      SigmoidValue := 1 / ( 1 + pcr_expf(-PrevValue) );
       OutputValue := PrevValue * SigmoidValue;
       FOutput.FData[OutputCnt] := OutputValue;
       FOutputErrorDeriv.FData[OutputCnt] := OutputValue + SigmoidValue * (1-OutputValue);
@@ -8309,7 +8309,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := PrevValue / ( 1 + Exp(-PrevValue) );
+      FOutput.FData[OutputCnt] := PrevValue / ( 1 + pcr_expf(-PrevValue) );
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -8351,6 +8351,13 @@ begin
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       BetaX := Beta * PrevValue;
+      // NOTE: kept on RTL Exp (double). ESwish's closed-form analytic
+      // derivative Beta*sig*(1+betaX*(1-sig)) is gradient-checked against a
+      // central finite difference of the forward output with a hard 0.01
+      // tolerance (TestESwishGradientCheck). The correctly-rounded float32
+      // pcr_expf shifts the analytic/numeric gap to ~0.014 at the steepest
+      // sample, tripping that check. Swapping here is out of the question
+      // without editing the test, so this one sigmoid stays double.
       SigmoidValue := 1 / ( 1 + Exp(-BetaX) );
       FOutput.FData[OutputCnt] := Beta * PrevValue * SigmoidValue;
       FOutputErrorDeriv.FData[OutputCnt] :=
@@ -8364,6 +8371,7 @@ begin
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       BetaX := Beta * PrevValue;
+      // Kept on RTL Exp for parity with the deriv branch above (see note).
       FOutput.FData[OutputCnt] := Beta * PrevValue / ( 1 + Exp(-BetaX) );
     end;
   end;
@@ -8421,7 +8429,7 @@ begin
     begin
       x := LocalPrevOutput.FData[i];
       betaX := beta * x;
-      sig := 1 / (1 + Exp(-betaX));
+      sig := 1 / (1 + pcr_expf(-betaX));
       FOutput.FData[i] := x * sig;
       // dy/dx = sigmoid(beta*x) + x*beta*sigmoid(beta*x)*(1 - sigmoid(beta*x)).
       FOutputErrorDeriv.FData[i] := sig + x * beta * sig * (1 - sig);
@@ -8432,7 +8440,7 @@ begin
     for i := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[i];
-      FOutput.FData[i] := x / (1 + Exp(-beta * x));
+      FOutput.FData[i] := x / (1 + pcr_expf(-beta * x));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -8460,7 +8468,7 @@ begin
   begin
     x := LocalPrevOutput.Raw[i];
     betaX := beta * x;
-    sig := 1 / (1 + Exp(-betaX));
+    sig := 1 / (1 + pcr_expf(-betaX));
     gradBeta := gradBeta + FOutputError.Raw[i] * x * x * sig * (1 - sig);
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
@@ -8479,7 +8487,7 @@ begin
     begin
       x := LocalPrevOutput.Raw[i];
       betaX := beta * x;
-      sig := 1 / (1 + Exp(-betaX));
+      sig := 1 / (1 + pcr_expf(-betaX));
       FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
         FOutputError.Raw[i] * (sig + x * beta * sig * (1 - sig));
     end;
@@ -8554,13 +8562,13 @@ begin
       end
       else if ax < -30 then
       begin
-        expVal := Exp(ax);
+        expVal := pcr_expf(ax);
         sp := expVal;
         sig := expVal;
       end
       else
       begin
-        expVal := Exp(ax);
+        expVal := pcr_expf(ax);
         sp := Ln(1 + expVal);
         sig := expVal / (1 + expVal);
       end;
@@ -8579,9 +8587,9 @@ begin
       if ax > 30 then
         sp := ax
       else if ax < -30 then
-        sp := Exp(ax)
+        sp := pcr_expf(ax)
       else
-        sp := Ln(1 + Exp(ax));
+        sp := Ln(1 + pcr_expf(ax));
       FOutput.FData[i] := x * Tanh(sp);
     end;
   end;
@@ -8617,13 +8625,13 @@ begin
     end
     else if ax < -30 then
     begin
-      expVal := Exp(ax);
+      expVal := pcr_expf(ax);
       sp := expVal;
       sig := expVal;
     end
     else
     begin
-      expVal := Exp(ax);
+      expVal := pcr_expf(ax);
       sp := Ln(1 + expVal);
       sig := expVal / (1 + expVal);
     end;
@@ -8653,13 +8661,13 @@ begin
       end
       else if ax < -30 then
       begin
-        expVal := Exp(ax);
+        expVal := pcr_expf(ax);
         sp := expVal;
         sig := expVal;
       end
       else
       begin
-        expVal := Exp(ax);
+        expVal := pcr_expf(ax);
         sp := Ln(1 + expVal);
         sig := expVal / (1 + expVal);
       end;
@@ -9064,7 +9072,7 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       x3 := x * x * x;
       tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      tanhVal := Tanh(tanhArg);
+      tanhVal := pcr_tanhf(tanhArg);
       cdf := 0.5 * (1 + tanhVal);
       outputVal := x * cdf;
       FOutput.FData[OutputCnt] := outputVal;
@@ -9082,7 +9090,7 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       x3 := x * x * x;
       tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      FOutput.FData[OutputCnt] := 0.5 * x * (1 + Tanh(tanhArg));
+      FOutput.FData[OutputCnt] := 0.5 * x * (1 + pcr_tanhf(tanhArg));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -9149,7 +9157,7 @@ begin
         b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
         b3 := b * b * b;
         tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
-        tanhVal := Tanh(tanhArg);
+        tanhVal := pcr_tanhf(tanhArg);
         cdf := 0.5 * (1 + tanhVal);
         FOutput[X, Y, D] := a * (b * cdf);
       end;
@@ -9185,7 +9193,7 @@ begin
           b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
           b3 := b * b * b;
           tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
-          tanhVal := Tanh(tanhArg);
+          tanhVal := pcr_tanhf(tanhArg);
           cdf := 0.5 * (1 + tanhVal);
           geluVal := b * cdf;
           geluDeriv := cdf + 0.5 * b * (1 - tanhVal * tanhVal) *
@@ -12730,9 +12738,9 @@ begin
       end
       else
       begin
-        expVal := Exp(x);
-        softplus := Ln(1 + expVal);
-        tanhSP := Tanh(softplus);
+        expVal := pcr_expf(x);
+        softplus := pcr_logf(1 + expVal);
+        tanhSP := pcr_tanhf(softplus);
         outputVal := x * tanhSP;
         FOutput.FData[OutputCnt] := outputVal;
         // Derivative: Mish'(x) = tanh(softplus(x)) + x * sigmoid(x) * (1 - tanh^2(softplus(x)))
@@ -12755,10 +12763,10 @@ begin
       if x > 20 then
         softplus := x
       else if x < -20 then
-        softplus := Exp(x)
+        softplus := pcr_expf(x)
       else
-        softplus := Ln(1 + Exp(x));
-      FOutput.FData[OutputCnt] := x * Tanh(softplus);
+        softplus := pcr_log1pf(pcr_expf(x));
+      FOutput.FData[OutputCnt] := x * pcr_tanhf(softplus);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -12806,10 +12814,10 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       x3 := x * x * x;
       tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      tanhVal := Tanh(tanhArg);
+      tanhVal := pcr_tanhf(tanhArg);
       cdf := 0.5 * (1 + tanhVal);
       g := x * cdf;
-      t := Tanh(g);
+      t := pcr_tanhf(g);
       FOutput.FData[OutputCnt] := x * t;
       // dg/dx (same as TNNetGELU derivative).
       dg := cdf + 0.5 * x * (1 - tanhVal * tanhVal) *
@@ -12825,8 +12833,8 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       x3 := x * x * x;
       tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      g := 0.5 * x * (1 + Tanh(tanhArg));
-      FOutput.FData[OutputCnt] := x * Tanh(g);
+      g := 0.5 * x * (1 + pcr_tanhf(tanhArg));
+      FOutput.FData[OutputCnt] := x * pcr_tanhf(g);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -12868,7 +12876,7 @@ begin
   if x < 0 then sign := -1.0 else sign := 1.0;
   ax := Abs(x);
   t := 1.0 / (1.0 + p * ax);
-  y := 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Exp(-ax * ax);
+  y := 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * pcr_expf(-ax * ax);
   Result := sign * y;
 end;
 
@@ -12906,13 +12914,13 @@ begin
       end
       else
       begin
-        sp := Ln(1 + Exp(x));
-        sig := 1.0 / (1.0 + Exp(-x));
+        sp := pcr_log1pf(pcr_expf(x));
+        sig := 1.0 / (1.0 + pcr_expf(-x));
         erfSp := SerfErf(sp);
         FOutput.FData[OutputCnt] := x * erfSp;
         // dy/dx = erf(sp) + x * (2/sqrt(pi)) * exp(-sp^2) * sigmoid(x)
         FOutputErrorDeriv.FData[OutputCnt] :=
-          erfSp + x * twoOverSqrtPi * Exp(-sp * sp) * sig;
+          erfSp + x * twoOverSqrtPi * pcr_expf(-sp * sp) * sig;
       end;
     end;
   end
@@ -12925,9 +12933,9 @@ begin
       if x > 30 then
         sp := x
       else if x < -30 then
-        sp := Exp(x)
+        sp := pcr_expf(x)
       else
-        sp := Ln(1 + Exp(x));
+        sp := pcr_log1pf(pcr_expf(x));
       FOutput.FData[OutputCnt] := x * SerfErf(sp);
     end;
   end;
@@ -12973,7 +12981,7 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := SerfErf(x);
       // dy/dx = (2/sqrt(pi)) * exp(-x^2).
-      FOutputErrorDeriv.FData[OutputCnt] := twoOverSqrtPi * Exp(-x * x);
+      FOutputErrorDeriv.FData[OutputCnt] := twoOverSqrtPi * pcr_expf(-x * x);
     end;
   end
   else
@@ -13029,7 +13037,7 @@ begin
       if x > 30 then
         softplusVal := x
       else
-        softplusVal := Ln(1 + Exp(x));
+        softplusVal := pcr_log1pf(pcr_expf(x));
       FOutput.FData[OutputCnt] := softplusVal;
       // Derivative of softplus is the sigmoid function.
       // Numerically stable: for very large x, sigmoid(x) ~= 1; for very
@@ -13038,9 +13046,9 @@ begin
       if x > 30 then
         FOutputErrorDeriv.FData[OutputCnt] := 1.0
       else if x < -30 then
-        FOutputErrorDeriv.FData[OutputCnt] := Exp(x)
+        FOutputErrorDeriv.FData[OutputCnt] := pcr_expf(x)
       else
-        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + Exp(-x));
+        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + pcr_expf(-x));
     end;
   end
   else
@@ -13052,7 +13060,7 @@ begin
       if x > 30 then
         FOutput.FData[OutputCnt] := x
       else
-        FOutput.FData[OutputCnt] := Ln(1 + Exp(x));
+        FOutput.FData[OutputCnt] := pcr_log1pf(pcr_expf(x));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13116,14 +13124,14 @@ begin
       if BetaX > 30 then
         FOutput.FData[OutputCnt] := x
       else
-        FOutput.FData[OutputCnt] := InvBeta * Ln(1 + Exp(BetaX));
+        FOutput.FData[OutputCnt] := InvBeta * pcr_logf(1 + pcr_expf(BetaX));
       // Derivative is sigmoid(beta*x). Sign-branch guards Exp overflow.
       if BetaX > 30 then
         FOutputErrorDeriv.FData[OutputCnt] := 1.0
       else if BetaX < -30 then
-        FOutputErrorDeriv.FData[OutputCnt] := Exp(BetaX)
+        FOutputErrorDeriv.FData[OutputCnt] := pcr_expf(BetaX)
       else
-        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + Exp(-BetaX));
+        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + pcr_expf(-BetaX));
     end;
   end
   else
@@ -13136,7 +13144,7 @@ begin
       if BetaX > 30 then
         FOutput.FData[OutputCnt] := x
       else
-        FOutput.FData[OutputCnt] := InvBeta * Ln(1 + Exp(BetaX));
+        FOutput.FData[OutputCnt] := InvBeta * pcr_logf(1 + pcr_expf(BetaX));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13201,15 +13209,15 @@ begin
       if betaX > 30 then
         y := x
       else
-        y := invBeta * Ln(1 + Exp(betaX));
+        y := invBeta * pcr_logf(1 + pcr_expf(betaX));
       FOutput.FData[i] := y;
       // Derivative w.r.t. input is sigmoid(beta*x); sign-branch guards overflow.
       if betaX > 30 then
         sig := 1.0
       else if betaX < -30 then
-        sig := Exp(betaX)
+        sig := pcr_expf(betaX)
       else
-        sig := 1 / (1 + Exp(-betaX));
+        sig := 1 / (1 + pcr_expf(-betaX));
       FOutputErrorDeriv.FData[i] := sig;
     end;
   end
@@ -13222,7 +13230,7 @@ begin
       if betaX > 30 then
         FOutput.FData[i] := x
       else
-        FOutput.FData[i] := invBeta * Ln(1 + Exp(betaX));
+        FOutput.FData[i] := invBeta * pcr_logf(1 + pcr_expf(betaX));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13260,13 +13268,13 @@ begin
     end
     else if betaX < -30 then
     begin
-      sig := Exp(betaX);
-      y := invBeta * Ln(1 + Exp(betaX));
+      sig := pcr_expf(betaX);
+      y := invBeta * pcr_logf(1 + pcr_expf(betaX));
     end
     else
     begin
-      sig := 1 / (1 + Exp(-betaX));
-      y := invBeta * Ln(1 + Exp(betaX));
+      sig := 1 / (1 + pcr_expf(-betaX));
+      y := invBeta * pcr_logf(1 + pcr_expf(betaX));
     end;
     gradBeta := gradBeta + FOutputError.Raw[i] * invBeta * (x * sig - y);
   end;
@@ -13288,9 +13296,9 @@ begin
       if betaX > 30 then
         sig := 1.0
       else if betaX < -30 then
-        sig := Exp(betaX)
+        sig := pcr_expf(betaX)
       else
-        sig := 1 / (1 + Exp(-betaX));
+        sig := 1 / (1 + pcr_expf(-betaX));
       FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
         FOutputError.Raw[i] * sig;
     end;
@@ -13360,8 +13368,8 @@ begin
       begin
         x := LocalPrevOutput.FData[OutputCnt];
         // y = (exp(alpha*x) - 1)/alpha + alpha; derivative = exp(alpha*x).
-        FOutput.FData[OutputCnt] := (Exp(Alpha * x) - 1) * InvAlpha + Alpha;
-        FOutputErrorDeriv.FData[OutputCnt] := Exp(Alpha * x);
+        FOutput.FData[OutputCnt] := (pcr_expf(Alpha * x) - 1) * InvAlpha + Alpha;
+        FOutputErrorDeriv.FData[OutputCnt] := pcr_expf(Alpha * x);
       end;
     end;
   end
@@ -13379,7 +13387,7 @@ begin
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
-        FOutput.FData[OutputCnt] := -Ln(1 - Alpha * (x + Alpha)) * InvAlpha;
+        FOutput.FData[OutputCnt] := -pcr_logf(1 - Alpha * (x + Alpha)) * InvAlpha;
       end;
     end
     else
@@ -13388,7 +13396,7 @@ begin
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
-        FOutput.FData[OutputCnt] := (Exp(Alpha * x) - 1) * InvAlpha + Alpha;
+        FOutput.FData[OutputCnt] := (pcr_expf(Alpha * x) - 1) * InvAlpha + Alpha;
       end;
     end;
   end;
@@ -13415,7 +13423,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      gaussVal := Exp(-x * x);
+      gaussVal := pcr_expf(-x * x);
       FOutput.FData[OutputCnt] := gaussVal;
       // Derivative: -2*x*exp(-x^2)
       FOutputErrorDeriv.FData[OutputCnt] := -2 * x * gaussVal;
@@ -13427,7 +13435,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Exp(-x * x);
+      FOutput.FData[OutputCnt] := pcr_expf(-x * x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13469,7 +13477,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      tanhVal := Tanh(x);
+      tanhVal := pcr_tanhf(x);
       FOutput.FData[OutputCnt] := x - tanhVal;
       // d/dx (x - tanh(x)) = 1 - (1 - tanh(x)^2) = tanh(x)^2
       FOutputErrorDeriv.FData[OutputCnt] := tanhVal * tanhVal;
@@ -13481,7 +13489,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := x - Tanh(x);
+      FOutput.FData[OutputCnt] := x - pcr_tanhf(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13512,16 +13520,16 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x >= 0 then
       begin
-        expNegAbsX := Exp(-x);
+        expNegAbsX := pcr_expf(-x);
         denom := 1 + expNegAbsX;
-        FOutput.FData[OutputCnt] := -Ln(denom);
+        FOutput.FData[OutputCnt] := -pcr_logf(denom);
         FOutputErrorDeriv.FData[OutputCnt] := expNegAbsX / denom;
       end
       else
       begin
-        expNegAbsX := Exp(x);
+        expNegAbsX := pcr_expf(x);
         denom := 1 + expNegAbsX;
-        FOutput.FData[OutputCnt] := x - Ln(denom);
+        FOutput.FData[OutputCnt] := x - pcr_logf(denom);
         FOutputErrorDeriv.FData[OutputCnt] := 1 / denom;
       end;
     end;
@@ -13533,9 +13541,9 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x >= 0 then
-        FOutput.FData[OutputCnt] := -Ln(1 + Exp(-x))
+        FOutput.FData[OutputCnt] := -pcr_logf(1 + pcr_expf(-x))
       else
-        FOutput.FData[OutputCnt] := x - Ln(1 + Exp(x));
+        FOutput.FData[OutputCnt] := x - pcr_log1pf(pcr_expf(x));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13782,14 +13790,14 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
-  // Exp(x) = exp(min(x, 30)); derivative is y itself.
+  // pcr_expf(x) = exp(min(x, 30)); derivative is y itself.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x > EXP_CLIP then x := EXP_CLIP;
-      y := Exp(x);
+      y := pcr_expf(x);
       FOutput.FData[OutputCnt] := y;
       FOutputErrorDeriv.FData[OutputCnt] := y;
     end;
@@ -13801,7 +13809,7 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x > EXP_CLIP then x := EXP_CLIP;
-      FOutput.FData[OutputCnt] := Exp(x);
+      FOutput.FData[OutputCnt] := pcr_expf(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13830,7 +13838,7 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x < LOG_EPS then g := LOG_EPS else g := x;
-      FOutput.FData[OutputCnt] := Ln(g);
+      FOutput.FData[OutputCnt] := pcr_logf(g);
       FOutputErrorDeriv.FData[OutputCnt] := 1.0 / g;
     end;
   end
@@ -13841,7 +13849,7 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x < LOG_EPS then g := LOG_EPS else g := x;
-      FOutput.FData[OutputCnt] := Ln(g);
+      FOutput.FData[OutputCnt] := pcr_logf(g);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -13910,21 +13918,21 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
-  // Sin(x) = sin(x). Derivative is cos(x).
+  // pcr_sinf(x) = sin(x). Derivative is cos(x).
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Sin(x);
-      FOutputErrorDeriv.FData[OutputCnt] := Cos(x);
+      FOutput.FData[OutputCnt] := pcr_sinf(x);
+      FOutputErrorDeriv.FData[OutputCnt] := pcr_cosf(x);
     end;
   end
   else
   begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := Sin(LocalPrevOutput.FData[OutputCnt]);
+      FOutput.FData[OutputCnt] := pcr_sinf(LocalPrevOutput.FData[OutputCnt]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -13943,21 +13951,21 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
-  // Cos(x) = cos(x). Derivative is -sin(x).
+  // pcr_cosf(x) = cos(x). Derivative is -sin(x).
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Cos(x);
-      FOutputErrorDeriv.FData[OutputCnt] := -Sin(x);
+      FOutput.FData[OutputCnt] := pcr_cosf(x);
+      FOutputErrorDeriv.FData[OutputCnt] := -pcr_sinf(x);
     end;
   end
   else
   begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := Cos(LocalPrevOutput.FData[OutputCnt]);
+      FOutput.FData[OutputCnt] := pcr_cosf(LocalPrevOutput.FData[OutputCnt]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -13982,15 +13990,15 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Sinh(x);
-      FOutputErrorDeriv.FData[OutputCnt] := Cosh(x);
+      FOutput.FData[OutputCnt] := pcr_sinhf(x);
+      FOutputErrorDeriv.FData[OutputCnt] := pcr_coshf(x);
     end;
   end
   else
   begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := Sinh(LocalPrevOutput.FData[OutputCnt]);
+      FOutput.FData[OutputCnt] := pcr_sinhf(LocalPrevOutput.FData[OutputCnt]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -14009,7 +14017,7 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
-  // ArcSinh(x) = ln(x + sqrt(x^2 + 1)). Derivative is 1/sqrt(x^2 + 1).
+  // pcr_asinhf(x) = ln(x + sqrt(x^2 + 1)). Derivative is 1/sqrt(x^2 + 1).
   // Always smooth, no branches: sqrt argument is always >= 1.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -14017,7 +14025,7 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       SqrtVal := Sqrt(x * x + 1.0);
-      FOutput.FData[OutputCnt] := Ln(x + SqrtVal);
+      FOutput.FData[OutputCnt] := pcr_logf(x + SqrtVal);
       FOutputErrorDeriv.FData[OutputCnt] := 1.0 / SqrtVal;
     end;
   end
@@ -14027,7 +14035,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Ln(x + Sqrt(x * x + 1.0));
+      FOutput.FData[OutputCnt] := pcr_logf(x + Sqrt(x * x + 1.0));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -14069,8 +14077,8 @@ begin
       end
       else
       begin
-        logCoshVal := absX + Ln(1.0 + Exp(-2.0 * absX)) - cLn2;
-        FOutputErrorDeriv.FData[OutputCnt] := Tanh(x);
+        logCoshVal := absX + pcr_logf(1.0 + pcr_expf(-2.0 * absX)) - cLn2;
+        FOutputErrorDeriv.FData[OutputCnt] := pcr_tanhf(x);
       end;
       FOutput.FData[OutputCnt] := logCoshVal;
     end;
@@ -14085,7 +14093,7 @@ begin
       if absX > 15 then
         FOutput.FData[OutputCnt] := absX - cLn2
       else
-        FOutput.FData[OutputCnt] := absX + Ln(1.0 + Exp(-2.0 * absX)) - cLn2;
+        FOutput.FData[OutputCnt] := absX + pcr_logf(1.0 + pcr_expf(-2.0 * absX)) - cLn2;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -14116,7 +14124,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      y := cScale * Tanh(cTwoThirds * x);
+      y := cScale * pcr_tanhf(cTwoThirds * x);
       FOutput.FData[OutputCnt] := y;
       FOutputErrorDeriv.FData[OutputCnt] := cTwoThirds * (cScale - y * y * cInvScale);
     end;
@@ -14127,7 +14135,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := cScale * Tanh(cTwoThirds * x);
+      FOutput.FData[OutputCnt] := cScale * pcr_tanhf(cTwoThirds * x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -14169,9 +14177,9 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      SinAx := Sin(Alpha * x);
+      SinAx := pcr_sinf(Alpha * x);
       FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
-      FOutputErrorDeriv.FData[OutputCnt] := 1.0 + Sin(2.0 * Alpha * x);
+      FOutputErrorDeriv.FData[OutputCnt] := 1.0 + pcr_sinf(2.0 * Alpha * x);
     end;
   end
   else
@@ -14180,7 +14188,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      SinAx := Sin(Alpha * x);
+      SinAx := pcr_sinf(Alpha * x);
       FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
     end;
   end;
@@ -14217,8 +14225,8 @@ begin
       end
       else
       begin
-        SinX := Sin(x);
-        CosX := Cos(x);
+        SinX := pcr_sinf(x);
+        CosX := pcr_cosf(x);
         SincVal := SinX / x;
         FOutput.FData[OutputCnt] := SincVal;
         FOutputErrorDeriv.FData[OutputCnt] := (CosX - SincVal) / x;
@@ -14234,7 +14242,7 @@ begin
       if Abs(x) < SINC_EPS then
         FOutput.FData[OutputCnt] := 1.0
       else
-        FOutput.FData[OutputCnt] := Sin(x) / x;
+        FOutput.FData[OutputCnt] := pcr_sinf(x) / x;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -14325,8 +14333,8 @@ begin
     end;
     FZ.FData[j] := Acc;
     Angle := TwoPi * Acc;
-    FOutput.FData[j] := Cos(Angle);
-    FOutput.FData[FNumFeatures + j] := Sin(Angle);
+    FOutput.FData[j] := pcr_cosf(Angle);
+    FOutput.FData[FNumFeatures + j] := pcr_sinf(Angle);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -14356,7 +14364,7 @@ begin
       gCos := FOutputError.FData[j];
       gSin := FOutputError.FData[FNumFeatures + j];
       Angle := TwoPi * FZ.FData[j];
-      dZ := TwoPi * (-Sin(Angle) * gCos + Cos(Angle) * gSin);
+      dZ := TwoPi * (-pcr_sinf(Angle) * gCos + pcr_cosf(Angle) * gSin);
       for i := 0 to DInputs - 1 do
         LocalPrevError.FData[i] := LocalPrevError.FData[i] +
           FFreqMatrix.FData[i * FNumFeatures + j] * dZ;
@@ -14450,7 +14458,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      t := Tanh(x);
+      t := pcr_tanhf(x);
       FOutput.FData[OutputCnt] := x * t;
       FOutputErrorDeriv.FData[OutputCnt] := t + x * (1.0 - t * t);
     end;
@@ -14461,7 +14469,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := x * Tanh(x);
+      FOutput.FData[OutputCnt] := x * pcr_tanhf(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -17255,7 +17263,7 @@ begin
       end
       else
       begin
-        ScaleAlphaExp := FScaleAlpha * Exp(LocalPrevOutput.FData[OutputCnt]);
+        ScaleAlphaExp := FScaleAlpha * pcr_expf(LocalPrevOutput.FData[OutputCnt]);
         FOutput.FData[OutputCnt] := ScaleAlphaExp - FScaleAlpha;
         FOutputErrorDeriv.FData[OutputCnt] := ScaleAlphaExp;
       end;
@@ -17272,7 +17280,7 @@ begin
       end
       else
       begin
-        FOutput.FData[OutputCnt] := FScaleAlpha * Exp(LocalPrevOutput.FData[OutputCnt]) - FScaleAlpha;
+        FOutput.FData[OutputCnt] := FScaleAlpha * pcr_expf(LocalPrevOutput.FData[OutputCnt]) - FScaleAlpha;
       end;
     end;
   end;
@@ -17319,7 +17327,7 @@ begin
       end
       else
       begin
-        OutputValue := FAlpha * (Exp(PrevValue) - 1);
+        OutputValue := FAlpha * (pcr_expf(PrevValue) - 1);
         FOutput.FData[OutputCnt] := OutputValue;
         FOutputErrorDeriv.FData[OutputCnt] := OutputValue + FAlpha;
       end;
@@ -17333,7 +17341,7 @@ begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       if PrevValue > 0
         then FOutput.FData[OutputCnt] := PrevValue
-        else FOutput.FData[OutputCnt] := FAlpha * (Exp(PrevValue) - 1);
+        else FOutput.FData[OutputCnt] := FAlpha * (pcr_expf(PrevValue) - 1);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -17379,7 +17387,7 @@ begin
       end
       else
       begin
-        ExpVal := Exp(PrevValue / FAlpha);
+        ExpVal := pcr_expf(PrevValue / FAlpha);
         FOutput.FData[OutputCnt] := FAlpha * (ExpVal - 1);
         FOutputErrorDeriv.FData[OutputCnt] := ExpVal;
       end;
@@ -17393,7 +17401,7 @@ begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
       if PrevValue > 0
         then FOutput.FData[OutputCnt] := PrevValue
-        else FOutput.FData[OutputCnt] := FAlpha * (Exp(PrevValue / FAlpha) - 1);
+        else FOutput.FData[OutputCnt] := FAlpha * (pcr_expf(PrevValue / FAlpha) - 1);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -19016,7 +19024,7 @@ begin
       for d := 0 to Depth - 1 do
       begin
         xv := Prev[x, y, d];
-        FOutput[x, y, d] := Wg.Raw[d] * Tanh(alpha * xv) + Wb.Raw[d];
+        FOutput[x, y, d] := Wg.Raw[d] * pcr_tanhf(alpha * xv) + Wb.Raw[d];
       end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -19064,7 +19072,7 @@ begin
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
-        t := Tanh(alpha * xv);
+        t := pcr_tanhf(alpha * xv);
         dt := 1 - t * t;
         gradGamma := gradGamma + gy * t;
         gradBeta := gradBeta + gy;
@@ -19881,7 +19889,7 @@ begin
       begin
         xv := Prev[x, y, d];
         dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + Exp(-beta_d * dv));
+        s := 1 / (1 + pcr_expf(-beta_d * dv));
         FOutput[x, y, d] := dv * s + p2_d * xv;
       end;
   end;
@@ -19936,7 +19944,7 @@ begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
         dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + Exp(-beta_d * dv));
+        s := 1 / (1 + pcr_expf(-beta_d * dv));
         sds := s * (1 - s);
         phi := s + beta_d * dv * sds;
         gradP1 := gradP1 + gy * xv * phi;
@@ -20025,13 +20033,13 @@ begin
         m_d := m_d + Prev[x, y, d];
     m_d := m_d / N;
     // Data-dependent beta.
-    beta_d := 1 / (1 + Exp(-(gamma_d * m_d + delta_d)));
+    beta_d := 1 / (1 + pcr_expf(-(gamma_d * m_d + delta_d)));
     for x := 0 to SizeX - 1 do
       for y := 0 to SizeY - 1 do
       begin
         xv := Prev[x, y, d];
         dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + Exp(-beta_d * dv));
+        s := 1 / (1 + pcr_expf(-beta_d * dv));
         FOutput[x, y, d] := dv * s + p2_d * xv;
       end;
   end;
@@ -20083,7 +20091,7 @@ begin
       for y := 0 to SizeY - 1 do
         m_d := m_d + Prev[x, y, d];
     m_d := m_d / N;
-    beta_d := 1 / (1 + Exp(-(gamma_d * m_d + delta_d)));
+    beta_d := 1 / (1 + pcr_expf(-(gamma_d * m_d + delta_d)));
     betaSig := beta_d * (1 - beta_d);   // dbeta/d(pre-activation)
     gradP1 := 0;
     gradP2 := 0;
@@ -20096,7 +20104,7 @@ begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
         dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + Exp(-beta_d * dv));
+        s := 1 / (1 + pcr_expf(-beta_d * dv));
         sds := s * (1 - s);
         phi := s + beta_d * dv * sds;
         gradP1 := gradP1 + gy * xv * phi;
