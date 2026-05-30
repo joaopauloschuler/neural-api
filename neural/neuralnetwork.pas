@@ -31330,6 +31330,7 @@ begin
         LayerFLOPs := OutSize
       else if (Layer is TNNetLayerNorm) or (Layer is TNNetRMSNorm) or
               (Layer is TNNetChannelStdNormalization) or
+              (Layer is TNNetGroupNorm) or
               (Layer is TNNetMovingStdNormalization) then
         LayerFLOPs := Int64(3) * OutSize
       else if (Layer is TNNetReLUBase) or (Layer is TNNetSigmoid) then
@@ -44781,7 +44782,7 @@ begin
       {SupressBias=}pSuppressBias),
     PrevLayer);
   if HasNormalization then
-    FirstLayer := AddLayer( TNNetChannelStdNormalization.Create() );
+    FirstLayer := AddLayer( TNNetInstanceNorm.Create() );
 //  WriteLn(
 //      'Group count:',GroupCount,
 //      ' Output group size:', pNumFeatures div GroupCount,
@@ -44799,7 +44800,7 @@ begin
           {Groups=}GroupCount,
           {SupressBias=}pSuppressBias) );
       if HasNormalization then
-        AddLayer( TNNetChannelStdNormalization.Create() );
+        AddLayer( TNNetInstanceNorm.Create() );
       {$IFDEF Debug}
       if (FirstLayer.Output.Depth <> GetLastLayer().Output.Depth) then
       begin
@@ -44842,7 +44843,7 @@ begin
       {SupressBias=}pSuppressBias),
     PrevLayer);
   if HasNormalization then
-    FirstLayer := AddLayer( TNNetChannelStdNormalization.Create() );
+    FirstLayer := AddLayer( TNNetInstanceNorm.Create() );
   //WriteLn(
   //    'Group count:', GroupCount,
   //    ' Output group size:', pNumFeatures div GroupCount,
@@ -44874,7 +44875,7 @@ begin
         //);
 
         if HasNormalization then
-          AddLayer( TNNetChannelStdNormalization.Create() );
+          AddLayer( TNNetInstanceNorm.Create() );
         {$IFDEF Debug}
         if (FirstLayer.Output.Depth <> GetLastLayer().Output.Depth) then
         begin
@@ -44976,7 +44977,7 @@ end;
 function TNNet.AddChannelMovingNorm(PerCell: boolean; RandomBias,
   RandomAmplifier: integer; pAfterLayer: TNNetLayer): TNNetLayer;
 begin
-  AddLayerAfter( TNNetChannelStdNormalization.Create(), pAfterLayer);
+  AddLayerAfter( TNNetInstanceNorm.Create(), pAfterLayer);
   if PerCell then
   begin
     AddLayer( TNNetCellMul.Create() );
@@ -44984,8 +44985,12 @@ begin
   end
   else
   begin
-    AddLayer( TNNetChannelMul.Create() );
-    AddLayer( TNNetChannelBias.Create() );
+    // TNNetInstanceNorm already applies a learnable per-channel scale and bias,
+    // so the per-channel affine below would be a redundant second affine and is
+    // left commented out. (The PerCell branch keeps CellMul/CellBias because
+    // those add a distinct per-element affine on top of the per-channel norm.)
+    // AddLayer( TNNetChannelMul.Create() );
+    // AddLayer( TNNetChannelBias.Create() );
   end;
   if (RandomBias>0) and (RandomAmplifier>0) then
     Self.AddLayer( TNNetChannelRandomMulAdd.Create(RandomBias, RandomAmplifier) );

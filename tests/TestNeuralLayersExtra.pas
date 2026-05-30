@@ -72,6 +72,12 @@ type
     procedure TestDenseNetBlock;
     procedure TestMobileNetBlock;
 
+    // Normalization builders (use TNNetInstanceNorm internally)
+    procedure TestAddAutoGroupedPointwiseConvUsesInstanceNorm;
+    procedure TestAddAutoGroupedPointwiseConv2UsesInstanceNorm;
+    procedure TestAddChannelMovingNormUsesInstanceNorm;
+    procedure TestAddMovingNormShapeAndForward;
+
     // Introspection
     procedure TestPrintSummary;
     procedure TestDiffArchitectureSelfIsEmpty;
@@ -1042,6 +1048,122 @@ begin
     // Separable conv: depthwise keeps depth, pointwise changes it
     AssertEquals('MobileNet block should preserve spatial size', 8, NN.GetLastLayer.Output.SizeX);
     AssertEquals('MobileNet block output depth', 32, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+function CountInstanceNorm(NN: TNNet): integer;
+var
+  i: integer;
+begin
+  Result := 0;
+  for i := 0 to NN.Layers.Count - 1 do
+    if NN.Layers[i] is TNNetInstanceNorm then Inc(Result);
+end;
+
+procedure TTestNeuralLayersExtra.TestAddAutoGroupedPointwiseConvUsesInstanceNorm;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 16);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 16));
+    NN.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvReLU,
+      {MinChannelsPerGroupCount=}4, {pNumFeatures=}16, {HasNormalization=}true);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+
+    AssertEquals('AddAutoGroupedPointwiseConv preserves spatial size',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddAutoGroupedPointwiseConv output depth',
+      16, NN.GetLastLayer.Output.Depth);
+    // Normalization should now be provided by TNNetInstanceNorm.
+    AssertTrue('AddAutoGroupedPointwiseConv should use TNNetInstanceNorm',
+      CountInstanceNorm(NN) > 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAddAutoGroupedPointwiseConv2UsesInstanceNorm;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 16);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 16));
+    NN.AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvReLU,
+      {MinChannelsPerGroupCount=}4, {pNumFeatures=}16, {HasNormalization=}true);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+
+    AssertEquals('AddAutoGroupedPointwiseConv2 preserves spatial size',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddAutoGroupedPointwiseConv2 output depth',
+      16, NN.GetLastLayer.Output.Depth);
+    AssertTrue('AddAutoGroupedPointwiseConv2 should use TNNetInstanceNorm',
+      CountInstanceNorm(NN) > 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAddChannelMovingNormUsesInstanceNorm;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 8));
+    NN.AddChannelMovingNorm({PerCell=}false, {RandomBias=}0, {RandomAmplifier=}0);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+
+    AssertEquals('AddChannelMovingNorm preserves spatial size',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddChannelMovingNorm preserves depth',
+      8, NN.GetLastLayer.Output.Depth);
+    AssertTrue('AddChannelMovingNorm should use TNNetInstanceNorm',
+      CountInstanceNorm(NN) > 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAddMovingNormShapeAndForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // AddMovingNorm is the global-statistic sibling; it intentionally keeps
+  // TNNetMovingStdNormalization (not swapped). Smoke-test shape and forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 8));
+    NN.AddMovingNorm({PerCell=}false, {RandomBias=}0, {RandomAmplifier=}0);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+
+    AssertEquals('AddMovingNorm preserves spatial size',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddMovingNorm preserves depth',
+      8, NN.GetLastLayer.Output.Depth);
   finally
     NN.Free;
     Input.Free;
