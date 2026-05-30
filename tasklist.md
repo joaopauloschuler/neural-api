@@ -383,6 +383,33 @@ breakdown:
 - [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
       gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
       max-error vs eps.
+- [ ] Random-label memorization demo (`examples/RandomLabelMemorization/`) —
+      reproduce the headline result of Zhang et al. 2017 ("Understanding deep
+      learning requires rethinking generalization") on a pure-CPU toy: a FIXED
+      over-parameterized MLP (e.g. Input -> FC+ReLU(64) x2 -> FullConnectLinear
+      -> SoftMax) is trained TWICE on the SAME synthetic K-class dataset — once
+      with the TRUE labels and once with the labels RANDOMLY SHUFFLED (signal
+      destroyed, inputs unchanged). Headline finding to assert: BOTH runs drive
+      TRAIN accuracy to ~100% (the net has enough capacity to memorize pure
+      noise — fitting random labels takes more epochs but still succeeds), yet
+      only the true-label run generalizes — held-out TEST accuracy stays at
+      chance (~1/K) for the random-label run and far above chance for the true
+      run. The point, printed as the takeaway: train error alone says NOTHING
+      about generalization; classic capacity-based bounds can't explain it.
+      Stretch knob: sweep a label-corruption fraction `p ∈ {0.0, 0.25, 0.5,
+      1.0}` and chart epochs-to-fit-train (rises with p) against the test gap
+      (widens with p) — the smooth interpolation between "real structure" and
+      "pure memorization". Self-gating (Halt(1) on failure) per the
+      DoubleDescent/BitLinearBakeoff house style: assert random-label TRAIN acc
+      >= 0.99 AND random-label TEST acc <= chance + small margin AND true-label
+      TEST acc >> chance. Deterministic at RandSeed=424242, MaxThreadNum:=1,
+      well under a minute, existing layers only (no new layer). DISTINCT from
+      examples/DoubleDescent/ (which SWEEPS model CAPACITY and charts the
+      test-risk peak under fixed label noise) — here capacity is FIXED and the
+      contrast is true-vs-random LABELS at the same architecture; and distinct
+      from the "memorize a 32-token sequence" SDPA demo (a single-sequence
+      sequence model, not a train/test-split classifier showing the
+      generalization gap).
 
 ### Composite blocks / builders I'd enjoy shipping
 <!-- (PreNorm / RMSNorm / PostNorm residual builders removed: completed,
