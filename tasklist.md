@@ -170,23 +170,6 @@ rather than acted on.
 ### TNNetMultiHeadSelfAttention — breakdown
 SDPA + RoPE + MaskedFill + ALiBi are all in tree. Suggested commit-sized
 breakdown:
-- [X] (MHA-a) `TNNet.AddSplitQKVHeads(d_model, Heads; out SliceLayers)` carves
-      the `[Q_all|K_all|V_all]` (3*d_model) slab into H per-head `[Q_h|K_h|V_h]`
-      (3*d_k) slices via non-contiguous `TNNetSplitChannels`. Forward-layout
-      sentinel test on H=2, d_model=8. Landed (commit 4d05c1d).
-- [X] (MHA-b) `TNNet.AddMultiHeadSDPAConcat(d_model, Heads, CausalMask)` runs one
-      `TNNetScaledDotProductAttention(d_k)` per head slice and concats the H
-      outputs via `TNNetDeepConcat` back to depth d_model. Numerical-gradient
-      test on (H=2, d_k=4, SeqLen=3). Landed (commit 0f07c67).
-- [X] (MHA-c) `TNNet.AddMultiHeadSelfAttention(d_model, Heads, CausalMask)` wraps
-      (a)+(b)+ an out-projection, numerical-gradient test on (d_model=8, heads=2,
-      seq=3). Landed (commit 9c6bae1). NOTE/FINDING: the out-projection must be
-      `TNNetPointwiseConvLinear(d_model)` (per-token 1x1), NOT
-      `TNNetFullConnectLinear(d_model)` — on a (SeqLen,1,d_model) tensor
-      FullConnect flattens the WHOLE sequence into one `1x1xd_model` vector
-      (weights = prev.Output.Size), collapsing the token axis and yielding an
-      identically-zero analytic input gradient + a size mismatch. The landed
-      `AddSelfAttention` block uses the same pointwise projection.
 - [ ] TNNetTransformerEncoderBlock helper — LayerNorm → MHA → residual →
       LayerNorm → SwiGLU FFN → residual. Single call, configurable
       d_model / heads / d_ff. Companion numerical-gradient test on a tiny
@@ -195,7 +178,9 @@ breakdown:
       `TNNet.AddMultiHeadSelfAttention(d_model, Heads, CausalMask)`; wrap it
       with the existing `AddPreNormResidual`/`AddPostNormResidual` builders +
       a SwiGLU FFN. Use pointwise (1x1) projections inside the FFN over the
-      (SeqLen,1,d_model) tensor, NOT FullConnect (see the MHA-c finding above).
+      (SeqLen,1,d_model) tensor, NOT FullConnect — on a (SeqLen,1,d_model)
+      tensor FullConnect flattens the whole sequence into one vector and
+      collapses the token axis (zero input gradient + size mismatch).
 - [ ] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
       front of self-attention and an optional cross-attention sub-block.
       Built on top of the encoder helper above to avoid duplication.
@@ -852,13 +837,6 @@ breakdown:
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
-- [X] `examples/SubPixelSuperRes/` — a 3-layer net using TNNetPixelShuffle
-      that learns to 2x-upsample 8x8 random tiles. Landed (commit a28cc6b):
-      ConvReLU x2 -> ConvLinear(r*r*C=4) -> PixelShuffle(2), synthetic
-      low-freq LR tiles, NN-upscale targets. Test MSE 0.394 -> 0.00012,
-      PSNR 4.04 -> 39.21 dB; manual single-threaded SGD loop, LR=1e-3
-      (1e-2 plateaus, 3e-2 diverges — documented). NOTE: TNNet has no
-      MaxThreadNum property (it lives on the fit object).
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
       (BitFit-style cheap adaptation).
@@ -1015,63 +993,6 @@ breakdown:
       of its weights. Pairs with [[WeightSpectrumReport]] /
       [[WeightHistogramReport]] (watch the weight-norm spike at the
       interpolation threshold).
-- [X] Edge-of-Stability demo (`examples/EdgeOfStability/`) — LANDED (commit
-      d14c129). `Input(4)->FullConnectReLU(12)->FullConnectLinear(2)` MSE head,
-      fixed 24-sample full batch, plain full-batch GD (SetBatchUpdate(true) +
-      SetLearningRate(eta,0)), `lambda_max` read every 25 steps via
-      `HessianCurvatureReport`. eta sweep {0.037,0.040,0.043}: plateau (median
-      of 2nd-half lambda_max) = 52.1/48.3/47.1 vs 2/eta = 54.1/50.0/46.5 —
-      plateau tracks 2/eta and decreases as eta rises. TUNING CAVEAT (in README):
-      usable eta window is narrow — eta>=~0.046 collapses/diverges (dead ReLU or
-      NaN), eta<=~0.03 is curvature-limited (attainable sharpness ceiling below
-      2/eta). Used MEDIAN not mean for the plateau (ripple spikes pollute the
-      mean). Original spec kept below for reference:
-
-      Edge-of-Stability demo — reproduce the
-      "progressive sharpening" + "edge of stability" phenomenon (Cohen et al.
-      2021, *Gradient Descent on Neural Networks Typically Occurs at the Edge
-      of Stability*) on a pure-CPU toy. The headline, which NO in-tree
-      experiment shows: under plain full-batch gradient descent at a FIXED
-      learning rate `eta`, the top Hessian eigenvalue `lambda_max` (the
-      sharpness) RISES throughout early training ("progressive sharpening")
-      until it reaches `2/eta` — the classical GD stability limit — and then
-      HOVERS just above that threshold for the rest of training while the loss
-      keeps falling NON-monotonically (small ripples), instead of diverging as
-      the textbook quadratic-bowl analysis predicts. Recipe, reusing the
-      already-landed sharpness machinery — NO new layer or report needed: train
-      a tiny MLP (e.g. `FullConnectReLU -> FullConnectLinear`) on a small
-      synthetic regression/classification batch with FULL-batch plain SGD (not
-      Adam, not mini-batch — the EoS story is specific to deterministic GD) at a
-      fixed `eta`, and every K steps call `TNNet.HessianCurvatureReport` over a
-      fixed probe batch to read off `lambda_max` (its power-iteration-on-HVP
-      `lambda_max` is exactly the number we need — the report already estimates
-      it without forming the Hessian). Chart a two-row ASCII time series of
-      `lambda_max` and the constant `2/eta` line over training steps, plus the
-      loss curve, and flag the "EoS entry step" (first step where `lambda_max`
-      first crosses `2/eta` and stays within a band of it thereafter). Sweep
-      `eta in {small, medium, large}` to show the punchline: the plateau height
-      TRACKS `2/eta` (smaller `eta` -> the net is allowed to get sharper before
-      stalling), the cleanest single demonstration that the optimizer's own
-      stability limit — not the data — caps the curvature it settles at.
-      Built-in correctness signals: `lambda_max` must rise before it plateaus
-      (no progressive sharpening at init means the probe/eta is off); the
-      plateau must sit at/just above `2/eta` (well below it = not yet at the
-      edge, far above = diverging); and the loss must still trend down across
-      the plateau despite the ripples. DISTINCT from the landed
-      `examples/HessianCurvature/` (a STATIC flat-vs-sharp contrast of two
-      ALREADY-trained minima — no time axis, no `2/eta` threshold, no eta
-      sweep), from the SAM example (which MINIMISES sharpness via a perturbed
-      gradient — here sharpness is left to evolve under plain GD and merely
-      observed), from the open grokking demo (delayed GENERALISATION over time,
-      a val-accuracy axis, not a curvature-vs-stability-limit axis) and from
-      double-descent (a CAPACITY axis). Pure CPU, no external data, fits a
-      few-minute budget at tiny width/sample-count. Pairs naturally with
-      [[LossLandscapeProbe]] (its scalar "sharpness" should rise in lockstep
-      with `lambda_max`) and the SAM example (contrast: SAM bends the plateau
-      down). KEY LIBRARY NOTE for whoever builds it: use full-batch GD with
-      `MaxThreadNum := 1` for a deterministic sharpening curve, and remember the
-      report is a pure measurement — it never steps the weights, so interleaving
-      it inside the training loop is safe.
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
 - [ ] SWA effect-size sweep: vary SWA start-epoch fraction ∈ {0.5, 0.6,
@@ -1209,7 +1130,8 @@ breakdown:
 - [ ] "Building a transformer block" README walkthrough — pull
       TNNetMaskedFill / SDPA / RotaryEmbedding / GEGLU / SwiGLU /
       LayerNorm / RMSNorm references into one walkthrough with a single
-      assembled code snippet. Blocked only on MHSA.
+      assembled code snippet. The MHSA half is the landed
+      `TNNet.AddMultiHeadSelfAttention`.
 - [ ] "Loss functions" README subsection grouping MSE, MAE, CE, Huber,
       SmoothL1, LogCosh, Charbonnier, Dice, KL, Focal, LabelSmoothing, and
       CosineEmbedding into a single short table.
