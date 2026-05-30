@@ -179,11 +179,6 @@ rather than acted on.
       1e-2 is fine, when to tighten to 1e-3, when to shrink eps instead of
       loosening the tolerance.
 
-#### Experiments I'm curious about
-- [ ] Batch-size sweep demo: same net and data, vary the batch size, and print
-      how wall-clock-per-epoch and epochs-to-converge trade off. A concrete,
-      visible illustration of a tuning knob beginners always ask about.
-
 ### Added ideas
 - [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
       pattern. Consider a follow-up that allows masking the lower triangle or a
@@ -286,7 +281,7 @@ breakdown:
 - [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
-      targets, at matched final loss? All three pieces are now in tree.
+      targets, at matched final loss?
 - [ ] TNNetCosineSimilarityAttention follow-up: make `scale` a learnable scalar
       (sibling to ReZero's single-weight pattern) instead of a fixed FFloatSt[0]
       constant, and check whether training drives it toward the cargo-culted
@@ -520,9 +515,9 @@ breakdown:
 - [ ] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
       (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
       S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
-      The activation has landed, so this is a ~30-line activation swap.
+      This is a ~30-line activation swap.
 #### Probability projections / sparsity
-- [ ] TNNetGumbelSoftmax follow-up (now landed): temperature-annealing
+- [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
       micro-experiment — train a tiny discrete-latent autoencoder whose
       bottleneck is a `TNNetGumbelSoftmax`, anneal `tau` from ~2.0 down to
       ~0.1 over training, and chart reconstruction loss vs `tau` plus the
@@ -593,27 +588,26 @@ breakdown:
      examples/AdaptivePoolResolution/ demo as the AdaptiveAvgPool entry above;
      both adaptive layers are exercised in one demo.) -->
 ### Loss layers
-- [ ] TNNetCosineEmbeddingLoss follow-up (now landed): a tiny
+- [ ] TNNetCosineEmbeddingLoss follow-up: a tiny
       siamese-pair embedding micro-example — train two shared-weight MLP
       branches whose outputs are concatenated into the `a|b|y` layout, on a
       synthetic "same vs different class" pair task, and print the learned
       same-pair vs different-pair cosine histograms. Headline use case for
       the landed head; pairs with [[TripletEmbedding]].
-- [ ] TNNetKLDivergence distillation follow-up (now landed
-      examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
+- [ ] TNNetKLDivergence distillation follow-up
+      (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
       accuracy/agreement.
 - [ ] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
       deliberately class-imbalanced mask, sweep `(α,β) ∈ {(0.5,0.5),(0.3,0.7),
       (0.7,0.3)}` and show how β>α trades precision for recall (fewer false
       negatives). Pure α/β knob study on the landed TNNetTverskyLoss.
-      NOW UNBLOCKED: fork examples/DiceSegmentation/ (landed above) and swap the
-      head for TNNetTverskyLoss with the three (α,β) pairs.
+      Fork examples/DiceSegmentation/ and swap the head for TNNetTverskyLoss
+      with the three (α,β) pairs.
 - [ ] LabelSmoothing calibration check: train SimpleImageClassifier with
       `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
-      is smoothing improves calibration at a small accuracy cost. Both pieces
-      (the loss and the calibration report) have landed.
+      is smoothing improves calibration at a small accuracy cost.
 <!-- (TNNetContrastiveLoss / InfoNCE removed: completed, landed 2026-05-24 (commit
      f071269) as TNNetInfoNCELoss — self-contained WITHIN-SAMPLE formulation: depth
      slabs q | k_0(+) | k_1..k_{K-1}(-), Depth=d*(K+1), embedding dim d in FStruct[0],
@@ -1069,8 +1063,8 @@ breakdown:
      (RandSeed=424242), pure CPU, ~51 s; suite green at 804. No new layer.
      OPEN follow-up: promote the hand-rolled head to a reusable
      TNNetMixtureDensityLoss per [[loss-layer-pattern]] if it generalises.) -->
-- [ ] `examples/SubPixelSuperRes/` — once TNNetPixelShuffle lands, a
-      3-layer net that learns to 2x-upsample 8x8 random checkerboards.
+- [ ] `examples/SubPixelSuperRes/` — a 3-layer net using TNNetPixelShuffle
+      that learns to 2x-upsample 8x8 random checkerboards.
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
       (BitFit-style cheap adaptation).
@@ -1108,8 +1102,8 @@ breakdown:
       histograms.
 - [ ] `examples/CharbonnierSR/` — minimal variant of SuperResolution that
       swaps the MSE head for TNNetCharbonnierLoss and prints PSNR delta.
-- [ ] `examples/SparseAttentionDemo/` — once TNNetSparsemax lands, toy
-      "predict next char of a periodic sequence" using Sparsemax in place
+- [ ] `examples/SparseAttentionDemo/` — toy "predict next char of a
+      periodic sequence" using Sparsemax in place
       of softmax over a tiny K|V bank. Print attention-weight histogram
       per step.
 <!-- (`examples/FiLMConditional/` removed: duplicate of the "TNNetFiLM follow-up:
@@ -1194,9 +1188,8 @@ breakdown:
       5 seeds (mean ± std reporting).
 - [ ] Plain-Tanh vs TanhGLU FFN ablation in a minimal-transformer-without-
       attention skeleton.
-- [ ] DyT-vs-LayerNorm bake-off. TNNetDyT has now landed, so this is
-      unblocked — a 30-line swap in the existing normalization bake-off
-      harness (or a small standalone synthetic-regression A/B).
+- [ ] DyT-vs-LayerNorm bake-off — a 30-line swap in the existing normalization
+      bake-off harness (or a small standalone synthetic-regression A/B).
 - [ ] Causal-conv vs token-shift vs SDPA on the same toy next-token task.
 - [ ] GRN-as-drop-in: take SimpleImage CIFAR, swap each
       TNNetMovingStdNormalization for TNNetGRN and chart accuracy.
@@ -1207,8 +1200,8 @@ breakdown:
 - [ ] Sinusoidal vs learned positional embedding head-to-head on the
       binary-addition task.
 - [ ] PReLU vs LeakyReLU vs RReLU on a tiny CIFAR stub at matched param
-      count. (UNBLOCKED: TNNetRReLU has now landed — remember to flip its
-      `Enabled` flag off for the eval pass so the fixed average slope is used.)
+      count. (Remember to flip TNNetRReLU's `Enabled` flag off for the eval
+      pass so the fixed average slope is used.)
 - [ ] TopK sparsity sweep: train the same tiny autoencoder bottleneck
       with K ∈ {1, 2, 4, 8, 16, full}, chart reconstruction loss vs sparsity.
 - [ ] STE bit-width sweep: same network, vary `step ∈ {1.0, 0.5, 0.25,
@@ -1600,7 +1593,7 @@ breakdown:
       1e-2.
 
 ### Introspection (added)
-- [ ] FeatureSeparabilityReport follow-up (now landed): the scatter-
+- [ ] FeatureSeparabilityReport follow-up: the scatter-
       decomposition identity `tr(Stot)=tr(Sw)+tr(Sb)` is only exact for
       class-balanced batches (the report uses class-balanced `mean_c`
       definitions and prints the worst residual). Add a count-weighted scatter
@@ -1685,7 +1678,7 @@ breakdown:
       implemented — the landed report honestly SKIPs incompatible layers. Add the
       projected-lens path behind a flag so deeper/narrower stems get a (heuristic)
       depth profile too, keeping SKIP as the default honest behaviour.
-- [ ] MagnitudePruningReport follow-up (now landed): the report sweeps a FIXED
+- [ ] MagnitudePruningReport follow-up: the report sweeps a FIXED
       sparsity menu `{0,10,...,90,95,99}%`. Add a "find-the-knee" refinement that
       bisects between the last surviving and first failing sparsity to report the
       knee to ~1% resolution instead of the 10%-grid step. ~20 lines on top of the
@@ -1696,7 +1689,7 @@ breakdown:
       and chart whether the pruned-then-retrained net recovers the baseline
       accuracy (the lottery-ticket claim). The report already snapshots/restores
       the unpruned weights, so the retrain path is the only new piece.
-- [ ] ActivationPatchingReport follow-up (now landed): the report and example
+- [ ] ActivationPatchingReport follow-up: the report and example
       shipped, but a KEY finding emerged — on a strictly FEEDFORWARD stack,
       whole-layer patching + downstream recompute lands on the clean-class
       manifold at EVERY layer, so `r_L ≈ 1` is flat and nothing localises. The
@@ -1709,7 +1702,7 @@ breakdown:
       "denoising" direction (patch a CLEAN activation into a CORRUPT run vs the
       reverse). Add a `Granularity` flag (layer | channel) on top of the landed
       whole-layer path.
-- [ ] IntrinsicDimensionReport follow-up (now landed): the PCA participation
+- [ ] IntrinsicDimensionReport follow-up: the PCA participation
       ratio under-counts a known `k`-dim RANDOM subspace (lands ~2.4 for k=3,
       since PR equals `k` only when the `k` eigenvalues are EQUAL); TwoNN gives
       the cleaner ~k. The smoke test bands `PCA_ID` loosely as a result. Worth a
