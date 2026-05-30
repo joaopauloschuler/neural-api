@@ -353,9 +353,24 @@ breakdown:
 - [ ] SoftCapping logit-stability micro-experiment: train a tiny classifier
       with and without a `TNNetSoftCapping(c)` before the final softmax,
       and print the rate of NaN/overflow events under an aggressive LR.
-- [ ] DropPath ablation: train a small ResNet-style net on a tiny synthetic
-      task with `TNNetDropPath(p)` after each residual block, sweeping
-      `p ∈ {0.0, 0.1, 0.2}` and printing final loss.
+<!-- (DropPath ablation removed: completed, landed 2026-05-30 as
+     examples/DropPathAblation/. Small ResNet-style classifier
+     Input(6) -> FC(16) -> Reshape(1,1,16) -> 6 residual blocks -> FC(3) ->
+     SoftMax, each block y = x + TNNetDropPath(p)(ReLU(PointwiseConvLinear(x)))
+     with DropPath on the residual BRANCH before the closing TNNetSum
+     (PointwiseConvLinear keeps the branch shape-preserving over Depth so the
+     skip add is valid — NOT FullConnectLinear). Same teacher/data/seed/init,
+     p in {0.0,0.1,0.2}, eval calls EnableDropouts(false) so inference is the
+     deterministic identity. RandSeed=424242, single-threaded, ~12s. Finding
+     (reported honestly per the SAM/OptimizerBakeoff caveat style): on this easy
+     toy test ACCURACY ties at 0.8030 across all p (argmax boundary barely
+     moves), but held-out cross-entropy LOSS falls monotonically with p
+     (3.03 -> 2.80 -> 2.37) while train loss rises (0.375 -> 0.500) — DropPath
+     reduces test over-confidence. Self-gate asserts only true invariants
+     (no arm diverges; every arm trains below init loss; p=0 is a healthy
+     above-chance classifier), Halt(1) on failure. Suite green at 816. BUILD
+     NOTE: the documented fpc line needs -dUseCThreads (+ a LazUtils -Fu) for
+     neuralfit's worker pool; Fit stays single-threaded via MaxThreadNum:=1.) -->
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
 - [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
@@ -383,33 +398,31 @@ breakdown:
 - [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
       gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
       max-error vs eps.
-- [ ] Random-label memorization demo (`examples/RandomLabelMemorization/`) —
-      reproduce the headline result of Zhang et al. 2017 ("Understanding deep
-      learning requires rethinking generalization") on a pure-CPU toy: a FIXED
-      over-parameterized MLP (e.g. Input -> FC+ReLU(64) x2 -> FullConnectLinear
-      -> SoftMax) is trained TWICE on the SAME synthetic K-class dataset — once
-      with the TRUE labels and once with the labels RANDOMLY SHUFFLED (signal
-      destroyed, inputs unchanged). Headline finding to assert: BOTH runs drive
-      TRAIN accuracy to ~100% (the net has enough capacity to memorize pure
-      noise — fitting random labels takes more epochs but still succeeds), yet
-      only the true-label run generalizes — held-out TEST accuracy stays at
-      chance (~1/K) for the random-label run and far above chance for the true
-      run. The point, printed as the takeaway: train error alone says NOTHING
-      about generalization; classic capacity-based bounds can't explain it.
-      Stretch knob: sweep a label-corruption fraction `p ∈ {0.0, 0.25, 0.5,
+<!-- (Random-label memorization demo removed: completed, landed 2026-05-30 as
+     examples/RandomLabelMemorization/ (Zhang et al. 2017). FIXED
+     over-parameterized MLP Input(20) -> FullConnectReLU(64) x2 ->
+     FullConnectLinear(5) -> SoftMax (5696 weights) trained TWICE on the SAME
+     5-class Gaussian-blob inputs (200 train pts) — once with true labels, once
+     with the label column randomly permuted. Result (RandSeed=424242,
+     MaxThreadNum:=1, ~6-9s): random-label TRAIN acc 100.00% (memorizes pure
+     noise) but random-label TEST acc 19.30% (~chance 1/5), while true-label
+     TEST acc 100.00% — train error alone says nothing about generalization.
+     Self-gate PASSES (random TRAIN >= 0.99 AND random TEST <= chance+5% AND
+     true TEST >> chance), Halt(1) on failure. KEY TUNING FINDING (in README):
+     the clean random-label fit to 100% needs MINI-BATCH SGD (batch 25, LR 0.02,
+     mom 0.9) + high input dim D=20 (makes the 200 points individually
+     separable) — full-batch GD and higher LRs (0.05-0.1) plateau ~98% or
+     diverge on the noisy gradient. DISTINCT from examples/DoubleDescent/ (which
+     SWEEPS capacity under fixed label noise) — here capacity is FIXED, contrast
+     is true-vs-random LABELS. Suite green at 816. OPEN follow-up below.) -->
+- [ ] Random-label memorization STRETCH follow-up: the landed
+      examples/RandomLabelMemorization/ does the binary true-vs-fully-shuffled
+      contrast; add the label-corruption-fraction sweep `p ∈ {0.0, 0.25, 0.5,
       1.0}` and chart epochs-to-fit-train (rises with p) against the test gap
       (widens with p) — the smooth interpolation between "real structure" and
-      "pure memorization". Self-gating (Halt(1) on failure) per the
-      DoubleDescent/BitLinearBakeoff house style: assert random-label TRAIN acc
-      >= 0.99 AND random-label TEST acc <= chance + small margin AND true-label
-      TEST acc >> chance. Deterministic at RandSeed=424242, MaxThreadNum:=1,
-      well under a minute, existing layers only (no new layer). DISTINCT from
-      examples/DoubleDescent/ (which SWEEPS model CAPACITY and charts the
-      test-risk peak under fixed label noise) — here capacity is FIXED and the
-      contrast is true-vs-random LABELS at the same architecture; and distinct
-      from the "memorize a 32-token sequence" SDPA demo (a single-sequence
-      sequence model, not a train/test-split classifier showing the
-      generalization gap).
+      "pure memorization". Fork the landed demo's net/data/training loop and add
+      a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
+      so 4 corruption levels still fit the <5-min budget.
 
 ### Composite blocks / builders I'd enjoy shipping
 <!-- (PreNorm / RMSNorm / PostNorm residual builders removed: completed,
@@ -1086,12 +1099,24 @@ breakdown:
      swapped for a CPU-fast synthetic) printing the per-epoch fraction of units
      that never fire, repeated with LeakyReLU/GELU/Swish. The LR-sweep
      follow-up remains open below.) -->
-- [ ] DeadReLUDiagnostic follow-up: a learning-rate sweep charting ReLU
-      dead-fraction vs LR (the landed demo pins ONE aggressive LR=0.5 where
-      ReLU strands ~19%); show the dead fraction climbing with LR while
-      LeakyReLU/GELU/Swish stay near 0 across the whole sweep — the cleanest
-      "dying ReLU is an LR pathology" curve. ~20-line wrapper over the landed
-      example's per-epoch dead-count helper.
+<!-- (DeadReLUDiagnostic learning-rate-sweep follow-up removed: completed, landed
+     2026-05-30 as examples/DeadReLULRSweep/. Reuses the landed DeadReLUDiagnostic
+     net/task/dead-count (max-abs activation per hidden unit over a 96-sample probe
+     batch, dead if <= 1e-6) but sweeps the LEARNING RATE and, per LR, trains each
+     of {ReLU, LeakyReLU, GELU, Swish}, recording the PEAK dead fraction. Result
+     (RandSeed=424242 reseeded per arm, single-threaded, ~11s): ReLU climbs
+     monotonically 10.16% (LR=0.02) -> 11.72 -> 13.28 -> 14.06 -> 17.19% (LR=0.50)
+     while LeakyReLU/GELU/Swish stay at 0.00% across the whole grid — the clean
+     "dying ReLU is an LR pathology" curve. Self-gate PASSES (ReLU top-LR dead-frac
+     exceeds bottom-LR by >5% AND at top LR ReLU strictly exceeds each leaky/smooth
+     activation), Halt(1) on failure. NOTE: LR=1.0 was dropped from the grid — ReLU
+     becomes chaotic there (bounces back to ~14%), breaking monotonicity; the
+     {0.02..0.5} grid gives the clean climb. Suite green at 816.) -->
+- [ ] DeadReLU follow-up (open): chart the LR=1.0+ chaotic regime the LR-sweep
+      demo deliberately excluded — above the monotone band ReLU's dead fraction
+      stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
+      a few seeds (mean +/- std) would show whether the bounce is a seed artifact
+      or a real saturation/recovery transition.
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
