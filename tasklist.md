@@ -35,35 +35,8 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-<!-- (Sparse / mixture-of-experts routing layer removed: duplicate of the
-     concrete TNNetMixtureOfExperts entry under "Probability projections /
-     sparsity".) -->
-<!-- (Two TNNetFourierFeatures spectral-bias follow-ups removed: completed,
-     landed in examples/FourierFeaturesSpectralBias/.) -->
 
 ## Interesting applications / examples
-<!-- (DeepSets permutation-invariant set-learning demo removed: completed, landed
-     2026-05-30 as examples/DeepSets/. Existing layers only, no new layer:
-     Input(N,1,1) -> TNNetPointwiseConvReLU(16) -> TNNetConvolutionLinear(16,1,0,1)
-     {shared per-element phi} -> TNNetMaxChannel {symmetric pool, (N,1,F)->(1,1,F)}
-     -> TNNetFullConnectReLU(16) -> TNNetFullConnectLinear(1) {rho head}. Manual
-     mini-batch SGD (no NeuralFit, so deterministic/single-threaded), RandSeed=424242,
-     ~3s. Task = regress the MAX of a bag of N scalars, paired with MAX-pool so the
-     pool computes EXACTLY the symmetric statistic being learned (cleanest/exact
-     invariance). Headline checks both PASS or Halt(1): permutation invariance is
-     BIT-FOR-BIT exact (max|dy| = 0 over 200 shuffles), value-sensitivity |dy|=1.82
-     after editing one element. Stretch PASSES: weights trained ONLY on N=5
-     generalize to UNSEEN N=8 (RMSE 0.0123 at N=5 vs 0.0041 at N=8 — exact max-pool
-     generalizes cleanly across set sizes); done via CopyWeights, NOT LoadFromFile
-     (LoadFromFile restores the saved input dim N=5 and breaks the wider net).
-     KEY LIBRARY FINDING (documented in .lpr + README): on an (N,1,F) bag
-     TNNetMaxChannel gives the EXACT per-channel max, but TNNetAvgChannel divides by
-     PoolSize^2 = N^2 (not N) — it returns sum/N^2, since FPoolSize:=SizeX=N while
-     only N of the N*N window cells are non-empty at Y=1. Still symmetric (still
-     permutation-invariant), only the scale differs — a linear rho head absorbs it.
-     README contrasts vs self-attention (also permutation-equivariant but O(N^2) and
-     heavier) and explains why a flatten->dense net cannot be permutation-invariant.
-     Suite green at 816.) -->
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
@@ -91,59 +64,6 @@ rather than acted on.
       the budget" honesty the Grokking entry uses). Distinct from VisualGAN
       (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
       DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
-<!-- (Concept Bottleneck Model demo removed: completed, landed 2026-05-24 (commit
-     2d7f123) as examples/ConceptBottleneck/. Koh et al. 2020 interpretable-by-design
-     net from existing layers only: Input(6) -> FC+ReLU(16)x2 ->
-     TNNetFullConnectSigmoid(3 concepts) -> TNNetFullConnectLinear(4) -> SoftMax, with
-     a Concat([SoftMax, Sigmoid]) tail packing both heads; label = c0 + 2*c1 (c2 a
-     decoy). Trained JOINTLY with deep supervision (packed-target seeding +
-     SetBatchUpdate(True) batch idiom, the EarlyExitNetwork precedent). Test-time
-     intervention reuses the CopyNoChecks-then-recompute-downstream idiom from
-     ActivationSteering/ActivationPatching. Results (RandSeed=424242, ~10s): per-
-     concept acc c0=0.99/c1=0.99/c2=0.99; clean label acc 0.9833 -> inject-true-
-     concepts 1.0000 (+0.0167); single-concept flip c1 0->1 moves class 1 -> class 3
-     (delta +2, exactly c1's weight). Both invariants PASS: no-op overwrite reproduces
-     logits bit-for-bit (max|dlogit|=0), and lambda=0 drifts mean concept acc
-     0.9922 -> 0.4983 (~chance, the "leaky CBM" failure mode). README contrasts it vs
-     LinearProbeReport (post-hoc READ-only probe), ActivationSteering (edits raw
-     activations, no concept supervision), and DomainAdversarial (gradient-reversal
-     REMOVES info). Suite green at 804. NOTE: FPC Format has no C-style `%+` flag —
-     drop the `+` from sign-prefixed format strings.) -->
-<!-- (Early-exit / adaptive-inference demo removed: completed, landed 2026-05-24
-     (commit 82ea764) as examples/EarlyExitNetwork/ — the BranchyNet anytime-inference
-     pattern: a trunk of FC+ReLU blocks with an aux softmax head after each block, all
-     heads Concat'd into one packed output, trained jointly via a manual deep-
-     supervision loss loop (per-head (p-onehot) seeded through Concat + single
-     Backpropagate under SetBatchUpdate(True)). A confidence-gated tau sweep prints
-     accuracy-vs-avg-exit-depth (split easy/hard); both invariants (tau=1.0 ==
-     full-depth acc; avg-depth monotone non-decreasing in tau) PASS. README contrasts
-     it explicitly with PredictionDepth (a post-hoc k-NN probe on a FIXED single-head
-     net) — here the early heads are TRAINED and actually gate compute.) -->
-<!-- (Activation-steering / concept-vector demo removed: completed, landed
-     2026-05-24 as examples/ActivationSteering/. Trains a small softmax
-     classifier on a synthetic sign(x0) two-cluster task, computes the
-     diff-of-class-means steering vector v at hidden layer k=2, and sweeps
-     alpha in {-3..+3} injecting Output_k.MulAdd(alpha, v) + downstream recompute
-     (reuses the ActivationPatchingReport CopyNoChecks-then-recompute pattern).
-     All three checks PASS: alpha=0 reproduces the unsteered forward bit-for-bit,
-     P(target) is monotonic in alpha, and v shifts the output ~1.4x more per unit
-     norm than an equal-norm random direction (measured as mean |dP| across the
-     sweep — the max-swing variant nearly ties because both saturate at alpha=3).
-     Possible follow-ups: a MULTI-LAYER steering sweep (which layer k gives the
-     cleanest monotone control?), and steering toward a class the input is NOT,
-     charting the flip threshold.) -->
-<!-- (ActivationSteering depth-sweep follow-up removed: completed, landed
-     2026-05-24 as examples/ActivationSteeringDepthSweep/. Grows the net to four
-     steerable FC+ReLU hidden layers and, for each k, computes the diff-of-class-
-     means v_k, sweeps alpha in {-3..+3} (downstream recompute), and prints the
-     P(target)-vs-alpha curve + a monotonicity up-fraction + alpha-to-flip per
-     layer, then a summary naming the cleanest-monotone layer. Finding: depth
-     MATTERS — k=1/3/4 are perfectly monotone but k=2's diff-of-means direction
-     is genuinely NON-monotone (up-fraction 0.5, pushes P(target) the wrong way
-     for alpha<0); on the coarse grid every layer flips by alpha=1 so the
-     monotonicity measure (not alpha-to-flip) is what discriminates. The alpha=0
-     bit-for-bit no-op check passes at EVERY k. Open follow-up: a finer alpha
-     grid would break the alpha-to-flip tie.) -->
 
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
@@ -159,17 +79,6 @@ rather than acted on.
 ## Documentation / learning
 - [ ] Interactive "build your first transformer in Pascal" tutorial
 - [ ] Auto-generated layer API reference from doc comments
-<!-- (Improve TNNetChannelShuffle / TNNetInterleaveChannels doc comments removed:
-     completed 2026-05-30. Both class declarations in neuralnetwork.pas now
-     spell out the exact permutation formula derived from the Compute code:
-     TNNetInterleaveChannels (param StepSize) scatters input channel c to
-     ToChannels[c] = (((c*StepSize) mod Depth) + ((c*StepSize) div Depth)) mod
-     Depth, no divisibility constraint (gcd(StepSize,Depth)>1 makes it
-     non-bijective) — generic stride interleave after grouped/parallel convs;
-     TNNetChannelShuffle (param Groups) does reshape (Groups, C/Groups) ->
-     transpose -> flatten, i.e. ToChannels[c] = (c mod Groups)*(C div Groups) +
-     (c div Groups), an exact bijection requiring Depth mod Groups = 0 —
-     ShuffleNet group mixing. Comments only, no behavior change.) -->
 
 ## Added ideas
 
@@ -184,13 +93,7 @@ rather than acted on.
       chart loss delta. Forward-only demo landed; the bake-off is still open.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
-<!-- (Volume unit micro-benchmark removed: duplicate of the `bin/layer_bench`
-     CLI under "Tooling / dev experience", whose own entry notes it "subsumes
-     the long-pinned Volume micro-benchmark and extends it to layers".) -->
 #### Documentation
-<!-- ("How numerical gradient testing works in this repo" contributor note
-     removed: duplicate of the docs/numerical_gradient.md tutorial entry under
-     "Documentation I'd enjoy writing".) -->
 - [ ] Write a one-page "layer authoring checklist" — constructor + LoadFromString
       round-trip, CreateLayer dispatch entry, Compute/Backpropagate, and the
       mandatory numerical-gradient test. Captures the recurring steps every
@@ -243,58 +146,12 @@ breakdown:
       gradient-check on a tiny shape.
 
 ### Attention variants / siblings
-<!-- (TNNetLinearAttention — kernelized / softmax-free non-causal attention
-     (Katharopoulos et al. 2020) removed: completed. Landed as a standalone
-     TNNetLayer descendant in neuralnetwork.pas reusing SDPA's Q|K|V
-     input-split: phi(x)=elu(x)+1 feature map, accumulate S = sum_s
-     phi(K_s)(x)V_s and Z = sum_s phi(K_s) once, then Out_t = (phi(Q_t).S)/
-     (phi(Q_t).Z) — O(SeqLen*d_k*d_v), no NxN score matrix. Registered in
-     both CreateLayer dispatch + LoadFromString. Tests in
-     TestNeuralNumerical.pas: input numerical-gradient check (d_k=4,SeqLen=3),
-     SeqLen=1 degeneracy (Out_1==V_1), serialization round-trip. Wall-clock
-     scaling probe in examples/LinearAttention/ confirms ~linear (ratio ~2x
-     per SeqLen doubling, not ~4x). The CAUSAL variant remains OPEN — see
-     the follow-up below.) -->
-<!-- (TNNetLinearAttention CAUSAL follow-up removed: completed, landed
-     2026-05-24 as TNNetCausalLinearAttention in neuralnetwork.pas. The causal
-     (autoregressive) variant of the non-causal TNNetLinearAttention: carries
-     the running prefix-sum S_t = sum_{s<=t} phi(K_s)(x)V_s and Z_t = sum_{s<=t}
-     phi(K_s) (the "attention is an RNN" identity) so each query t reads its own
-     causal S_t/Z_t — still O(SeqLen*d_k*d_v) with no NxN matrix. Registered in
-     both CreateLayer dispatch + LoadFromString. Tests in TestNeuralNumerical.pas:
-     input numerical-gradient check (TestCausalLinearAttentionGradientCheck),
-     a causality / no-future-leak + SeqLen=1 degeneracy (Out_1==V_1) check
-     (TestCausalLinearAttentionCausality), and a serialization round-trip
-     (TestCausalLinearAttentionSerializationRoundTrip). Still-open downstream
-     work lives in its own entries: the "softmax vs linear attention quality-
-     vs-cost" bake-off and folding linear attention into the MHA breakdown
-     ([[TNNetMultiHeadSelfAttention]]) as a per-head opt-in.) -->
 
-<!-- (TNNetDifferentialAttention headline NOISE-CANCELLATION micro-experiment
-      removed: completed, landed 2026-05-24 as
-      examples/DifferentialAttentionNoise/. On a causal probe row whose query
-      is ~orthogonal to every real key, plain SDPA spends the full unit of
-      mass (1.0) on the irrelevant keys, while TNNetDifferentialAttention
-      leaves only 0.2000 effective mass (net and abs agree) — strictly below
-      SDPA's 1.0. The two softmax maps carry the same common-mode noise on
-      the probe row, so lambda (=0.8 lambda_init) of it cancels and the
-      residual is 1-lambda=0.2, confirming the Differential Transformer
-      noise-cancellation claim at init.) -->
 - [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
       MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
       TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
       into differential attention per head — a natural drop-in for the
       downstream ../gpt-3-for-pascal long-context retrieval.
-<!-- (TNNetSinkAttention attention-sink stability micro-experiment removed:
-      completed, landed 2026-05-24 as examples/SinkAttentionStability/. On a
-      causal probe row whose query is ~orthogonal to every real key, plain
-      SDPA is forced to dump the full unit of mass (1.0) onto the irrelevant
-      real keys, while TNNetSinkAttention parks a growing share on the
-      never-masked sink slots: sink mass 0.14/0.25/0.40 for K=1/2/4 and
-      real-key mass falls monotonically to 0.86/0.75/0.60 — strictly below
-      SDPA's 1.0, confirming the StreamingLLM sink-absorption claim. Added a
-      read-only SinkAttentionWeights accessor on the existing layer to read
-      the augmented map.) -->
 - [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
       decoder block can opt into sinks per head behind a flag.
@@ -318,14 +175,8 @@ breakdown:
       across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
       tolerance at each. Pins shape-edge behavior the existing single-shape
       test can't see.
-<!-- (Inline shape-annotation comments on TNNetScaledDotProductAttention
-     Compute/Backpropagate removed: duplicate of the "Inline-comment cleanup
-     pass on TNNetScaledDotProductAttention" entry under "Documentation I'd
-     enjoy writing".) -->
 
 ### Bake-off / experiment follow-ups
-<!-- (Position-encoding bake-off removed: completed, landed in
-     examples/PositionEncodingBakeoff/.) -->
 - [ ] Position-encoding bake-off follow-up: the landed bake-off uses a
       predict-the-PREVIOUS-token task on which ALiBi lands just above the
       no-position baseline — a single head's `2^-8` slope is a weak recency
@@ -336,16 +187,6 @@ breakdown:
       and/or a multi-head variant with per-head slopes `2^(-8h/H)`, so the
       arm where ALiBi's locality prior actually wins is also demonstrated.
       Pairs with the open "ALiBi slope-base sweep" entry.
-<!-- (Causal-mask sanity experiment removed: completed, landed as
-     examples/CausalMaskSanity/. Trains a tiny attention model on next-token
-     prediction WITH and WITHOUT a causal mask and shows the unmasked one
-     cheats (near-zero loss but useless at generation). Uses the SDPA CausalMask
-     flag (same strictly-upper-triangle -1e9 fill as TNNetMaskedFill /
-     TNNetTriangularCausalMask; SDPA masks scores internally so a separate
-     MaskedFill layer cannot be slotted in). Gate asserts all three: unmasked
-     train-CE < masked train-CE (cheats), masked true-autoregressive accuracy
-     > unmasked (generalizes), AND unmasked attention puts large weight on
-     future keys while masked puts ~0 (AttentionWeights).) -->
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
@@ -353,24 +194,6 @@ breakdown:
 - [ ] SoftCapping logit-stability micro-experiment: train a tiny classifier
       with and without a `TNNetSoftCapping(c)` before the final softmax,
       and print the rate of NaN/overflow events under an aggressive LR.
-<!-- (DropPath ablation removed: completed, landed 2026-05-30 as
-     examples/DropPathAblation/. Small ResNet-style classifier
-     Input(6) -> FC(16) -> Reshape(1,1,16) -> 6 residual blocks -> FC(3) ->
-     SoftMax, each block y = x + TNNetDropPath(p)(ReLU(PointwiseConvLinear(x)))
-     with DropPath on the residual BRANCH before the closing TNNetSum
-     (PointwiseConvLinear keeps the branch shape-preserving over Depth so the
-     skip add is valid — NOT FullConnectLinear). Same teacher/data/seed/init,
-     p in {0.0,0.1,0.2}, eval calls EnableDropouts(false) so inference is the
-     deterministic identity. RandSeed=424242, single-threaded, ~12s. Finding
-     (reported honestly per the SAM/OptimizerBakeoff caveat style): on this easy
-     toy test ACCURACY ties at 0.8030 across all p (argmax boundary barely
-     moves), but held-out cross-entropy LOSS falls monotonically with p
-     (3.03 -> 2.80 -> 2.37) while train loss rises (0.375 -> 0.500) — DropPath
-     reduces test over-confidence. Self-gate asserts only true invariants
-     (no arm diverges; every arm trains below init loss; p=0 is a healthy
-     above-chance classifier), Halt(1) on failure. Suite green at 816. BUILD
-     NOTE: the documented fpc line needs -dUseCThreads (+ a LazUtils -Fu) for
-     neuralfit's worker pool; Fit stays single-threaded via MaxThreadNum:=1.) -->
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
 - [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
@@ -398,23 +221,6 @@ breakdown:
 - [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
       gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
       max-error vs eps.
-<!-- (Random-label memorization demo removed: completed, landed 2026-05-30 as
-     examples/RandomLabelMemorization/ (Zhang et al. 2017). FIXED
-     over-parameterized MLP Input(20) -> FullConnectReLU(64) x2 ->
-     FullConnectLinear(5) -> SoftMax (5696 weights) trained TWICE on the SAME
-     5-class Gaussian-blob inputs (200 train pts) — once with true labels, once
-     with the label column randomly permuted. Result (RandSeed=424242,
-     MaxThreadNum:=1, ~6-9s): random-label TRAIN acc 100.00% (memorizes pure
-     noise) but random-label TEST acc 19.30% (~chance 1/5), while true-label
-     TEST acc 100.00% — train error alone says nothing about generalization.
-     Self-gate PASSES (random TRAIN >= 0.99 AND random TEST <= chance+5% AND
-     true TEST >> chance), Halt(1) on failure. KEY TUNING FINDING (in README):
-     the clean random-label fit to 100% needs MINI-BATCH SGD (batch 25, LR 0.02,
-     mom 0.9) + high input dim D=20 (makes the 200 points individually
-     separable) — full-batch GD and higher LRs (0.05-0.1) plateau ~98% or
-     diverge on the noisy gradient. DISTINCT from examples/DoubleDescent/ (which
-     SWEEPS capacity under fixed label noise) — here capacity is FIXED, contrast
-     is true-vs-random LABELS. Suite green at 816. OPEN follow-up below.) -->
 - [ ] Random-label memorization STRETCH follow-up: the landed
       examples/RandomLabelMemorization/ does the binary true-vs-fully-shuffled
       contrast; add the label-corruption-fraction sweep `p ∈ {0.0, 0.25, 0.5,
@@ -453,9 +259,6 @@ breakdown:
       the suite does not yet cover.
 
 ### Composite blocks / builders I'd enjoy shipping
-<!-- (PreNorm / RMSNorm / PostNorm residual builders removed: completed,
-     landed as TNNet.AddPreNormResidual / AddRMSNormResidual /
-     AddPostNormResidual.) -->
 - [ ] TNNetAffineBlock — once TNNetMul lands, `Mul → Bias` builder for a
       learnable per-channel affine transform separable from FullConnect.
 
@@ -502,19 +305,6 @@ breakdown:
       show a qualitative before/after on a repetition-prone prompt — the
       class landed this lucky-day batch (neuralvolume.pas, 7 tests in
       tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
-<!-- (TNNetGatedResidual / TNNet.AddGatedResidual builder removed: completed,
-     landed 2026-05-24 as a sibling to AddPreNormResidual/AddRMSNormResidual/
-     AddPostNormResidual (per-channel gate inits to 0 so the branch starts as
-     identity); ships forward-wiring + input numerical-gradient tests. The
-     ReZero-vs-GatedResidual depth-ablation follow-up landed below.) -->
-<!-- (ReZero-vs-GatedResidual depth ablation removed: completed, landed
-     2026-05-24 as examples/ReZeroVsGatedResidual/. Finding: the per-channel
-     gate opens UNEVENLY (many channels stay exactly 0, a handful grow both
-     signs) while the ReZero scalar opens uniformly. Gotcha for future
-     gate-dump examples: TNeuralFit.Fit reloads the best model at the end
-     (rebuilding every layer instance) so gate-layer LAYER REFERENCES go
-     stale — capture layer INDICES at build time and read
-     NN.Layers[idx].Neurons[0].Weights after Fit.) -->
 - [ ] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
@@ -538,18 +328,6 @@ breakdown:
 
 #### Channel attention / conditioning
 - [ ] TNNetCBAM — SE block plus a spatial-attention sibling.
-<!-- (TNNetFiLM removed: completed, landed 2026-05-24 as a PARAMETER-FREE
-     two-input TNNetConcatBase subclass — input0 = feature map (SizeX,SizeY,Depth),
-     input1 = conditioning vector (1,1,2*Depth) packing gamma|beta from a separate
-     branch (so NOT a TNNetChannelMul->TNNetChannelBias duplicate);
-     Out=gamma[c]*x+beta[c], backward routes error to BOTH inputs. CreateLayer +
-     IdxsToLayers dispatch (both FPC and Delphi paths) round-trip via the inherited
-     ConcatBase prev-layer-list serialization. Tests in TestNeuralNumerical.pas:
-     TestFiLMForward, TestFiLMIdentity (gamma=1/beta=0 identity), TestFiLMGradientCheck
-     (end-to-end WEIGHT/feature-branch numerical grad through a conditioning
-     FullConnectLinear, max err 0.0022), TestFiLMSerializationRoundTrip. Example:
-     examples/FiLMConditioning/ — learns K per-class affine transforms via the
-     conditioning FC to MSE 0, identity invariant held.) -->
 - [ ] TNNetFiLM follow-up: a CLASS-CONDITIONAL generator/decoder demo — the
       headline FiLM use case (cGAN / conditional generation, Perez et al.). Build a
       tiny decoder (a couple of conv/upsample blocks) whose feature maps are
@@ -564,66 +342,13 @@ breakdown:
       (1,1,2*Depth) reshape -> TNNetFiLM in one call, mirroring the existing
       AddPreNormResidual/AddGatedResidual builder family — removes the manual
       depth-2*Depth bookkeeping every FiLM site currently repeats.
-<!-- (TNNetMaxBlurPool removed: completed, landed 2026-05-30 as a TNNetPoolBase
-     descendant in neuralnetwork.pas. Anti-aliased shift-invariant max pool
-     (Zhang 2019): a DENSE stride-1 max into an input-sized maxmap, then a fixed
-     separable binomial [1,2,1]x[1,2,1]/16 blur subsampled by the stride
-     (border-clamped + renormalized so the live taps sum to 1). Backward scatters
-     each output error through the fixed blur taps to the recorded dense-max
-     argmax cells; blur weights are constant (no gradient). Registered in BOTH
-     serialization dispatch paths (CreateLayer case + LoadFromString/Delphi
-     chain), round-trips via FStruct[0..2]. Tests in TestNeuralNumerical.pas:
-     TestMaxBlurPoolGradientCheck (input numerical grad, 4x4x2, tol 0.01),
-     TestMaxBlurPoolLoadFromString (byte-identical round-trip), and
-     TestMaxBlurPoolShiftInvariance (blurpool changes less than strided maxpool
-     under 1px shifts). Example examples/MaxBlurPool/ gate PASSES: 12.2% less
-     mean shift-induced output change vs strided MaxPool. Constraint (documented
-     in the layer doc comment + example README): assumes square feature maps
-     (SizeX = SizeY), same as TNNetMaxPool.) -->
 - [ ] TNNetMaxBlurPool follow-up: rectangular-input support — the landed layer
       inherits TNNetMaxPool's square-only (SizeX = SizeY) assumption. If a
       non-square blur-pool use case shows up, generalize the dense-max + blur
       loops to independent (X, Y) extents (the same caveat noted for the removed
       TNNetGlobalMaxPool at the top of this file) rather than forking a class.
-<!-- (TNNetBlurPool sibling removed: completed, landed 2026-05-30 as a
-     TNNetPoolBase descendant in neuralnetwork.pas right after TNNetMaxBlurPool.
-     The pure anti-aliasing primitive (fixed separable binomial [1,2,1]x[1,2,1]/16
-     blur + stride subsample, NO max stage) so it can sit after ANY layer — it
-     blurs FPrevLayer.Output directly instead of a dense maxmap, dropping all
-     argmax/FMaxMap bookkeeping; border-clamped + renormalized live taps sum to 1.
-     Blur weights are constant (no gradient); backward scatters each output error
-     through the fixed taps. Registered in BOTH dispatch paths (CreateLayer case +
-     Delphi LoadFromString if-chain), round-trips St[0..2]. Tests in
-     TestNeuralNumerical.pas (each reseeds RandSeed:=424242): TestBlurPoolGradientCheck
-     (4x4x2 input grad, tol 0.01 — forward is purely linear so it matches tightly),
-     TestBlurPoolLoadFromString (byte-identical round-trip + recompute to 1e-6), and
-     TestBlurPoolShiftInvariance (blurpool changes less than strided MaxPool under
-     1-3px shifts). Suite green at 816. Same square-input (SizeX=SizeY) constraint
-     as TNNetMaxBlurPool, documented in the class doc comment — rectangular support
-     is the open follow-up above.) -->
 
 #### Activations (gradient-checkable, mostly TNNetReLUBase descendants)
-<!-- (TNNetMishExact / TNNetMish-stable removed: the in-tree TNNetMish ALREADY
-     implements the stable formulation — its Compute() branches on x>20
-     (softplus≈x) and x<-20 (softplus≈exp(x)≈0) to avoid the exp overflow.
-     A separate "stable Mish" class would be a forward-pass duplicate of
-     TNNetMish, which the "DO NOT REINTRODUCE" policy at the top of this file
-     forbids. Verified 2026-05-24 lucky-day batch.) -->
-<!-- (TNNetSplineActivation KAN-vs-MLP toy-fit removed: completed, landed
-     2026-05-24 as examples/SplineActivationKAN/ — matched-param (21 vs 20
-     weights via TNNet.CountWeights), spline arm reaches MSE 0.061 vs ReLU 0.187
-     (67.5% lower); dumps learned control points + sampled activation showing one
-     channel bent away from the identity (a sparse KAN fit). Open follow-ups
-     remain below: the knot-count/Range sweep and the TNNetAPL bake-off.) -->
-<!-- (TNNetSplineActivation knot-count/Range sweep removed: completed, landed
-     2026-05-30 as examples/SplineKnotSweep/. Forks the SplineActivationKAN toy
-     fit; sweeps K in {2,4,8,16} x Range in {2.0,4.0}, same seed/data/optimizer
-     in every cell, printing a TRAIN-MSE and a HELD-OUT-MSE grid. Finding: the
-     capacity/overfitting trade is visible on HELD-OUT error (drops ~8x from K=2
-     to a K=8 sweet spot at Range=2.0, then RISES at K=16) — but TRAIN MSE is NOT
-     monotone in K under a fixed SGD budget (K=16 train 0.022 > K=8's 0.006), so
-     the gate asserts the held-out story (knots-help + endpoints-fit +
-     knots-stall), not train-monotonicity. Gate PASSES, Halt(1) on failure.) -->
 - [ ] TNNetMetaAconC follow-up: the FULL cross-channel-bottleneck β generator
       (the paper's true Meta-ACON: squeeze → FC channel-reduce → ReLU → FC
       channel-expand → sigmoid, so β[c] depends on ALL channels' spatial
@@ -632,29 +357,12 @@ breakdown:
       sub-block inside the layer (or a builder that wires an SE-style squeeze
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
-<!-- (TNNetBitLinear ternary-vs-full-precision bake-off removed: completed,
-     landed 2026-05-30 as examples/BitLinearBakeoff/. Same tiny classifier, same
-     synthetic blob task, same seed, trained once with TNNetFullConnectLinear
-     (FP32) heads and once with TNNetBitLinear (ternary) heads at MATCHED weight
-     count (144 each via TNNet.CountWeights). Result: ternary test acc 100% vs
-     FP32 99.67% (gap -1.33 pts) at 20.19x less weight memory (1.58 vs 32
-     bits/weight => 4.95% of FP bytes). Self-gate PASSES (acc gap <= 8 pts AND
-     memory < 10% of FP AND ternary acc >= 80%), Halt(1) on failure. Runs in
-     0.67s single-threaded (MaxThreadNum := 1 avoids sandbox thread-pool spin-up
-     overhead). Still-open BitLinear sibling: the activation-quantization (int8
-     absmax) b1.58 variant below.) -->
 - [ ] TNNetBitLinear follow-up: activation-quantization variant — BitNet b1.58
       also quantizes the *activations* to int8 (absmax per-token). Consider a flag
       or sibling that rounds the layer INPUT through an absmax STE before the
       ternary matmul, so the "fully-quantized linear" path is reachable. Scope as
       its own flag on TNNetBitLinear (forward adds an input absmax-round; backward
       STE-passes the input gradient unchanged).
-<!-- (TNNetMaxOut2 removed: a "two-piece special case of TNNetMaxOut" is just
-     TNNetMaxOut.Create(2) with a thinner constructor — i.e. a forward-pass
-     duplicate of the existing TNNetMaxOut, which the "DO NOT REINTRODUCE"
-     policy at the top of this file forbids. If a no-group-count convenience
-     constructor is genuinely wanted, add an overload to TNNetMaxOut instead of
-     a new class. Flagged 2026-05-24 lucky-day batch.) -->
 - [ ] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
       (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
       S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
@@ -698,13 +406,6 @@ breakdown:
       spatial only, independently per depth channel) gated by a flag, mirroring
       the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
       Builds on the landed full-volume TNNetMinMaxNorm.
-<!-- (TNNetUnitNormConstraint removed: completed, landed as TNNetWeightNormLinear
-     — a differentiable unit-L2 weight reparametrization (the simple g=1 form of
-     Weight Normalization). Each output neuron's weight vector is L2-normalized to
-     unit norm inside the forward pass (`ŵ = w/sqrt(Σwᵢ² + eps)`) and the exact
-     unit-norm Jacobian is backpropagated to the raw weights (gradient-checked).
-     Modelled exactly on TNNetWeightStandardization. The hard-projection variant
-     below is the only open piece.) -->
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
       projection* (renormalize the previous layer's weights after each update,
       non-differentiable) — still open if a hard constraint is ever wanted. The
@@ -712,24 +413,9 @@ breakdown:
       covers the headline use case.
 
 #### Reduction / shape
-<!-- (TNNetAdaptiveAvgPool example/usage removed: completed, landed 2026-05-24 as
-     examples/AdaptivePoolResolution/ — one conv stack fed 16x16 and 24x24, fixed
-     1x1 and 2x2 adaptive heads, with built-in Create(1)==global and
-     Create(N)==identity degeneracy assertions and a train-at-16/infer-at-24
-     sanity step. Exercises TNNetAdaptiveMaxPool in the same demo.) -->
 - [ ] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
-<!-- (Pooling bake-off example removed: completed, landed 2026-05-24 as
-     examples/PoolingBakeoff/ — same tiny conv classifier swapping the pooling
-     head across TNNetAvgPool / TNNetMaxPool / TNNetLpPool (p ∈ {1,2,4,8}) /
-     TNNetSoftPool (beta ∈ {0.5,1,2,8}) on a synthetic blob-quadrant task where
-     the class-mean is invariant and only energy CONCENTRATION is
-     discriminative: AvgPool/LpPool(p=1) sit at chance, MaxPool solves it, and
-     both LpPool's p and SoftPool's beta interpolate avg→max.) -->
-<!-- (TNNetAdaptiveMaxPool example/usage removed: completed — landed in the same
-     examples/AdaptivePoolResolution/ demo as the AdaptiveAvgPool entry above;
-     both adaptive layers are exercised in one demo.) -->
 ### Loss layers
 - [ ] TNNetCosineEmbeddingLoss follow-up: a tiny
       siamese-pair embedding micro-example — train two shared-weight MLP
@@ -751,29 +437,6 @@ breakdown:
       `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
       is smoothing improves calibration at a small accuracy cost.
-<!-- (TNNetContrastiveLoss / InfoNCE removed: completed, landed 2026-05-24 (commit
-     f071269) as TNNetInfoNCELoss — self-contained WITHIN-SAMPLE formulation: depth
-     slabs q | k_0(+) | k_1..k_{K-1}(-), Depth=d*(K+1), embedding dim d in FStruct[0],
-     temperature tau in FFloatSt[0]. Reads FOutput directly (no external target),
-     mirrors TNNetTripletLoss/CosineEmbeddingLoss; test trio in TestNeuralNumerical.pas.
-     A TRUE cross-batch InfoNCE head (negatives = other minibatch samples) would need a
-     batch-aware loss hook the per-sample FOutputError path does not expose — remains
-     open. The contrastive micro-example follow-up is the entry just below.) -->
-<!-- (TNNetInfoNCELoss contrastive micro-example removed: completed, landed
-     2026-05-24 (commit 19675ba) as examples/InfoNCEContrastive/. A weight-shared
-     pointwise-conv encoder over K+1 X-positions -> L2Normalize -> Reshape packs the
-     `q | k_0(+) | k_1..k_{K-1}(-)` depth-major slab TNNetInfoNCELoss expects (slab
-     0 query, slab 1 positive, 2..K negatives; loss seeds its own gradient via the
-     identity-passthrough Backpropagate, no manual surgery). Synthetic C-class
-     noisy-augmented-view task, deterministic at RandSeed=12345, ~2s. Results: pos-
-     vs-neg cosine gap 0.5902 -> 1.1992 (pos 0.7163->0.9916, neg 0.1261->-0.2076),
-     alignment 0.5674 -> 0.0168, uniformity -1.8768 -> -4.4304, InfoNCE loss 1.0432
-     -> 0.0185 (~56x). All three signals (gap widened, loss fell, alignment fell)
-     PASS or the demo Halt(1)s. README contrasts it vs TripletEmbedding (margin
-     loss, single negative) and CosineEmbeddingLoss. Suite green at 804. NOTE for
-     follow-ups: the head is WITHIN-SAMPLE (negatives packed per row); a TRUE
-     cross-batch InfoNCE still needs a batch-aware loss hook the per-sample
-     FOutputError path does not expose.) -->
 - [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
@@ -801,17 +464,6 @@ breakdown:
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.
 - [ ] Mixup data augmentation helper.
-<!-- (Sharpness-Aware Minimization (SAM) experiment removed: completed, landed
-     2026-05-24 as examples/SharpnessAwareMinimization/ — hand-rolled two-pass
-     SAM (ascent perturb via global grad-norm, snapshot/restore via
-     SaveDataToString) vs plain SGD on a noisy-label 2D-blob toy. Both
-     invariants hold: rho=0 == plain SGD bit-for-bit (max weight diff 0.0), and
-     sharpness (LossLandscapeProbe) falls as rho rises (0.41→0.21). KEY LIBRARY
-     NOTE for any future manual gradient-surgery example (PCGrad, Lookahead,
-     grad clipping): the library defaults to per-sample updates
-     (FBatchUpdate=false) where Backpropagate applies updates immediately and
-     leaves Neurons[].Delta at ZERO — call NN.SetBatchUpdate(True) to access the
-     accumulated gradient tensor or the access is a silent no-op.) -->
 - [ ] SAM follow-up: the noisy-label 2D-blob clusters are easily separable so
       clean val-accuracy saturates (~99%) across all rho — the flatness signal
       carries the story but the val-acc-vs-rho curve is flat. A harder task
@@ -842,12 +494,6 @@ breakdown:
       `TNNetWeightStandardization` reparametrizations, which normalize the
       FORWARD weights, not the update.
 ### Introspection / debugging tools
-<!-- (TNNet.ToGraphvizDot removed: completed, landed 2026-05-24 — instance
-     method returning a `digraph` string for the layer DAG (node per layer
-     with index/class/output-shape, edges from the real DAG incl. multi-input
-     TNNetConcatBase layers). Ships examples/GraphvizExport/ +
-     TestToGraphvizDotSmoke. The sibling WriteLayerTimings(NN, Sample)
-     follow-up remains open below.) -->
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
@@ -878,14 +524,6 @@ breakdown:
 - [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
       the stem and chart effective-RF growth vs theoretical-RF growth — the
       headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
-<!-- (TNNet.NeuralTangentKernelReport removed: completed, landed 2026-05-24 (commit
-     857f679) — empirical-NTK diagnostic: Gram K_ij=<g_i,g_j> over per-sample
-     target-logit weight-gradients on a FROZEN net, with ASCII heatmap + Jacobi
-     eigenspectrum + condition number + kernel-target alignment + effective rank +
-     log10(lambda) histogram + symmetry/PSD/diagonal correctness checks. Example
-     examples/NeuralTangentKernelReport/ (synthetic 3-class blobs, fresh-vs-trained
-     contrast). The fresh-init-vs-trained NTK-DRIFT quantification (lazy-vs-rich,
-     wide-vs-narrow) is left as the follow-up just below.) -->
 - [ ] NeuralTangentKernelReport follow-up: the fresh-init-vs-trained NTK-DRIFT
       contrast deliberately left out of the first landing (commit 857f679). Add an
       optional second-net / snapshot argument (mirror `ModeConnectivityReport`'s
@@ -1067,10 +705,6 @@ breakdown:
       check.
 - [ ] Scheduler unit tests — given seed and schedule parameters, NextLR
       must produce a deterministic, finite, monotonically-correct sequence.
-<!-- (PrintSummary smoke test removed: completed, covered by
-     examples/ModelSummaryDemo/ — parses SummaryString() for three nets and
-     asserts row-per-layer + Totals footer against CountLayers/CountWeights/
-     CountNeurons.) -->
 - [ ] Backward-pass sign-correlation test — for every layer that overrides
       Backpropagate, perturb input by ±ε, assert gradient direction agrees
       with loss-difference direction >90% of the time across a small grid.
@@ -1115,31 +749,11 @@ breakdown:
       that builds a 1-layer net and reports ns/op for forward + backward.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
-<!-- (`neural-bench` CLI removed: duplicate of `bin/layer_bench` above, which
-     already times forward+backward per layer at a chosen shape with CSV.) -->
 ### Examples I'd enjoy writing
 - [ ] `examples/TinyGPT/` — char-level transformer end-to-end demo on
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-<!-- (examples/DeadReLUDiagnostic/ removed: completed, landed 2026-05-24 — a
-     small ReLU net on a synthetic 3-Gaussian-blob classification task (MNIST
-     swapped for a CPU-fast synthetic) printing the per-epoch fraction of units
-     that never fire, repeated with LeakyReLU/GELU/Swish. The LR-sweep
-     follow-up remains open below.) -->
-<!-- (DeadReLUDiagnostic learning-rate-sweep follow-up removed: completed, landed
-     2026-05-30 as examples/DeadReLULRSweep/. Reuses the landed DeadReLUDiagnostic
-     net/task/dead-count (max-abs activation per hidden unit over a 96-sample probe
-     batch, dead if <= 1e-6) but sweeps the LEARNING RATE and, per LR, trains each
-     of {ReLU, LeakyReLU, GELU, Swish}, recording the PEAK dead fraction. Result
-     (RandSeed=424242 reseeded per arm, single-threaded, ~11s): ReLU climbs
-     monotonically 10.16% (LR=0.02) -> 11.72 -> 13.28 -> 14.06 -> 17.19% (LR=0.50)
-     while LeakyReLU/GELU/Swish stay at 0.00% across the whole grid — the clean
-     "dying ReLU is an LR pathology" curve. Self-gate PASSES (ReLU top-LR dead-frac
-     exceeds bottom-LR by >5% AND at top LR ReLU strictly exceeds each leaky/smooth
-     activation), Halt(1) on failure. NOTE: LR=1.0 was dropped from the grid — ReLU
-     becomes chaotic there (bounces back to ~14%), breaking monotonicity; the
-     {0.02..0.5} grid gives the clean climb. Suite green at 816.) -->
 - [ ] DeadReLU follow-up (open): chart the LR=1.0+ chaotic regime the LR-sweep
       demo deliberately excluded — above the monotone band ReLU's dead fraction
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
@@ -1148,24 +762,6 @@ breakdown:
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
-<!-- (Deep Ensembles uncertainty demo removed: completed, landed 2026-05-24 (commit
-     f9775f5) as examples/DeepEnsembleUncertainty/. M=5 INDEPENDENT softmax MLPs
-     (identical arch, different RandSeed per member via cSeeds) on the SAME synthetic
-     3-cluster 2D task + probe layout as examples/MCDropoutUncertainty/, existing
-     layers only. Averages post-softmax probs; reuses neuralcalibration.
-     ComputeCalibration/CalibrationReport unchanged for ECE/Brier (the ensemble-mean
-     probs are fed through a trivial Input(3)->Identity passthrough net so the
-     calibrator sees them as one net's output — a clean reuse trick worth remembering).
-     Entropy decomposition total=aleatoric(mean per-member H)+epistemic(MI). Results
-     (~5s): val split mean-member Brier 0.2497 -> ensemble 0.2470; epistemic MI cores
-     0.0001 vs OOD band 0.0271 (~270x). All signals PASS: M=1 reproduces member 0 bit-
-     for-bit, ensemble acc >= mean-member acc, MI>=0 everywhere and OOD>cores. README
-     contrasts vs MCDropoutUncertainty (dropout sampling in ONE net), KnowledgeDistillation
-     (ensemble as teacher), TTA (input transforms of one model). Suite green at 804.
-     HONEST CAVEAT: on this saturated toy the ensemble MATCHES (not strictly exceeds)
-     single-member accuracy — it improves Brier and the OOD epistemic spike is the
-     headline; a harder/overlapping task is the open follow-up if an accuracy lift is
-     wanted.) -->
 - [ ] `examples/SpokenDigitKWS/` — 1D-conv keyword-spotting on FSDD:
       MFCCs → 1D conv stack → classification.
 - [ ] `examples/TimeSeriesForecast/` — one-screen forecasting demo on a
@@ -1177,9 +773,6 @@ breakdown:
 - [ ] `examples/NormalizationBakeoff/` — same idea comparing no-norm /
       BatchNorm / LayerNorm / RMSNorm / GroupNorm / InstanceNorm /
       ChannelStdNorm.
-<!-- (examples/OptimizerBakeoff/ removed: completed, landed 2026-05-24 — SGD /
-     SGD+momentum / Adam / RMSProp on a fixed toy dataset with a loss-vs-epoch
-     table. The per-optimizer LR shoot-out follow-up remains open below.) -->
 - [ ] OptimizerBakeoff follow-up: a per-optimizer LR shoot-out. The landed
       demo HOLDS LR fixed (0.05 SGD-family / 0.01 Adam-family) to isolate the
       update rule, which leaves plain SGD stalling around 1e-1 while the
@@ -1191,12 +784,6 @@ breakdown:
       (InitAdam(0.0, beta2, eps) + CalcAdamDelta/UpdateWeightsAdam); plain
       SGD/momentum is SetLearningRate(lr, inertia) + UpdateWeights — both
       documented in examples/OptimizerBakeoff/README.md.
-<!-- (`examples/EmbeddingHeadDemo/` removed: duplicate of the landed
-     `examples/TripletEmbedding/` example, which already learns a toy
-     multi-class embedding with TNNetL2Normalize and prints the per-class
-     cosine-similarity matrix. The only stated difference was a hand-rolled
-     triplet loss vs the in-tree TNNetTripletLoss head — not worth a second
-     near-identical demo.) -->
 - [ ] `examples/EmbeddingVisualization/` — contrastive head on a 4-class
       toy 2D dataset, dump learned embeddings to CSV with README plotting
       instructions.
@@ -1207,19 +794,6 @@ breakdown:
 - [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
-<!-- (examples/MixtureDensityNetwork/ removed: completed, landed 2026-05-24 —
-     Bishop (1994) MDN on the inverse-problem toy `x = y + 0.3*sin(2*pi*y) +
-     noise`. Two arms share seed/arch/data: a plain MSE regressor that collapses
-     to the conditional mean (lands at 0.51 in the low-density gap at the fold,
-     where y is 3-valued) and a K=3 MDN trained on the hand-rolled mixture-NLL
-     via the pseudo-target gradient-surgery trick (softmax-pi, softplus-sigma;
-     analytic gradient finite-difference-checked at 3e-10, SetBatchUpdate(True)).
-     The MDN recovers all three modes (mu ~ 0.25/0.48/0.76 at x=0.5) and roughly
-     halves the NLL (-0.67 vs -0.10). Both invariants PASS (K=1 reduces to the
-     MSE arm, mean|dmu|=0.025<0.05; weights sum to 1, max err 0). Deterministic
-     (RandSeed=424242), pure CPU, ~51 s; suite green at 804. No new layer.
-     OPEN follow-up: promote the hand-rolled head to a reusable
-     TNNetMixtureDensityLoss per [[loss-layer-pattern]] if it generalises.) -->
 - [ ] `examples/SubPixelSuperRes/` — a 3-layer net using TNNetPixelShuffle
       that learns to 2x-upsample 8x8 random checkerboards.
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
@@ -1233,40 +807,10 @@ breakdown:
       the eventual MHA-based version.
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
-<!-- (examples/EuclideanNormHead/ removed: completed, landed. Demo composing
-     Reciprocal(Sqrt(Square(x))) as a Euclidean-norm-reciprocal head: Input(1,1,F)
-     -> TNNetSquare -> frozen all-ones TNNetFullConnectLinear(1) [exact sum over F,
-     LearningRate:=0] -> TNNetSqrt -> TNNetReciprocal = 1/||x||_2. Self-checking
-     gate Halt(1): forward vs analytic 1/||x|| max err 0.00e0 over 200 vectors,
-     unit-norm e_0 -> 1.0, L2-normalize extension ||x*(1/||x||)||-1 ~1.2e-7,
-     gradient flow MSE 0.115->0.002 (>=10x, no NaN). Contrasts with the fused,
-     axis-aware, save-safe TNNetL2Normalize. Suite green at 816.) -->
-<!-- (examples/SIREN/ removed: completed, landed 2026-05-30. 1D periodic-function
-     fit with TNNetSin (Sitzmann et al. 2020 SIREN), existing layers only. Both arms
-     identical (Input(1) -> [FullConnectLinear(24) -> act]x3 -> FullConnectLinear(1),
-     same width/depth/seed/epochs=400/LR/optimizer): SIREN arm uses TNNetSin, baseline
-     uses TNNetHyperbolicTangent. Target y=sin(3x)+0.3*sin(11x) over x in [-1,1].
-     SIREN init reproduced by hand after InitWeights() via TNNetLayer.InitUniform(s):
-     first layer InitUniform(omega_0) folds the frequency directly into the weights
-     (n=1 so the paper's U(-1/n,1/n)=U(-1,1) scaled by omega_0), later sine-feeding
-     layers InitUniform(sqrt(6/fan_in)/omega_0); omega_0=12 (below the paper's 30,
-     keeps the high-freq advantage while numerically calm). Result (~12s,
-     deterministic): Tanh MSE 0.053259 vs SIREN MSE 0.000016 (~100% reduction). Gate
-     PASSES (SIREN < 0.5*Tanh AND < 0.05), Halt(1) on failure. Suite green at 816.) -->
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
       replacing a stride-2 conv on a tiny CIFAR stub.
-<!-- (`examples/PreNormVsPostNorm/` removed: completed, landed 2026-05-24 —
-     a 12-block residual MLP wired three ways via AddPreNormResidual/
-     AddRMSNormResidual/AddPostNormResidual on the synthetic hypotenuse task,
-     surfacing the pre-norm vs post-norm stability gap. Open follow-ups (push
-     NUM_BLOCKS/LR to full-NaN divergence; an AddGatedResidual fourth arm)
-     remain worth adding.) -->
 - [ ] `examples/MaxoutMnist/` — minimum-viable Maxout demo on a tiny-MNIST
       subset (or synthetic 2D classification).
-<!-- (examples/ModelSummaryDemo/ removed: completed, landed. Three
-     structurally-distinct nets (MLP, conv, pre-norm residual) printed via
-     PrintSummary; doubles as the PrintSummary format smoke test (parses
-     SummaryString, gates on Halt(1)).) -->
 - [ ] `examples/SchedulerCompare/` — same network trained four times with
       constant LR, StepLR, CosineLR, WarmupCosineLR; one chart.
 - [ ] `examples/SWADemo/` — CIFAR-10 baseline vs same network with SWA
@@ -1282,23 +826,10 @@ breakdown:
       periodic sequence" using Sparsemax in place
       of softmax over a tiny K|V bank. Print attention-weight histogram
       per step.
-<!-- (`examples/FiLMConditional/` removed: duplicate of the "TNNetFiLM follow-up:
-     a CLASS-CONDITIONAL generator/decoder demo" entry under "#### Channel
-     attention / conditioning" above — both are class-conditional FiLM
-     generators (draw class C). That entry is the richer, current spec (forks
-     the landed examples/FiLMConditioning/ and scales the 1x1 conditioning to a
-     spatial map); this one-liner predates the FiLM landing. Build the one
-     above.) -->
 - [ ] `examples/TripletEmbedding/` MNIST follow-up: a true MNIST version of the
       landed synthetic TripletEmbedding demo, with a PGM scatter-plot output.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
       TNNetVectorQuantizer bottleneck.
-<!-- (`examples/AntiAliasedMaxPool/` removed: subsumed by the landed
-     `examples/MaxBlurPool/`, which already trains two tiny nets — one with
-     TNNetMaxPool, one with TNNetMaxBlurPool — and reports the shift-induced
-     output-change delta (~12.2% less mean shift change for blur-pool). The only
-     difference was the dataset (CIFAR-10 vs the landed synthetic shift task);
-     the MaxPool-vs-MaxBlurPool shift-equivariance comparison itself is done. -->
 
 - [ ] `examples/ReverseXYAugmentation/`, `examples/AutoencoderMNIST/`,
       `examples/AutoencoderReconstructionGrid/` — additional small demos.
@@ -1313,11 +844,6 @@ breakdown:
 ### Experiments I'm curious about (additional)
 - [ ] LogSoftMax+NLL vs SoftMax+CE convergence parity test: same seed,
       same tiny classifier, plot val-loss curves.
-<!-- (InstanceNorm vs GroupNorm vs LayerNorm vs ChannelStdNorm single-seed
-     bake-off removed: subsumed by the `examples/NormalizationBakeoff/` entry
-     under "Examples I'd enjoy writing", which compares a strict superset of
-     norms on a small conv stack. ChannelStdNorm — the only norm unique to this
-     entry — was folded into that example's menu so nothing is lost.) -->
 - [ ] Shrink-activation sparsity sweep: ReLU / SoftShrink / HardShrink as
       bottleneck activations, sweep lambda over `{0.1, 0.25, 0.5, 1.0}`,
       report (sparsity %, recon loss).
@@ -1332,16 +858,6 @@ breakdown:
 - [ ] LeCunTanh-vs-Tanh ablation reproduction with a small seed/LR sweep
       on top of examples/HyperbolicActivationBakeOff/. Average over 5 seeds
       and report mean+std.
-<!-- (Charbonnier-vs-Huber-vs-MSE-vs-LogCosh head-to-head removed: subsumed by
-     the "Loss-family bake-off (output heads)" entry just below — its loss set
-     {Charbonnier, Huber, MSE, LogCosh} is a strict subset of that entry's
-     {MSE, Huber, SmoothL1, Charbonnier, LogCosh}, on the same noisy/outlier
-     hypotenuse harness.) -->
-<!-- (Loss-family bake-off (output heads) removed: completed, landed 2026-05-24
-     as examples/LossFamilyBakeoff/ — noisy hypotenuse with 10% injected
-     outliers + a clean held-out test set, MSE / Huber / SmoothL1 / Charbonnier
-     / LogCosh heads; all four robust heads beat MSE on clean-test MSE/MAE. The
-     multi-seed follow-up remains open below.) -->
 - [ ] LossFamilyBakeoff follow-up: a multi-seed (e.g. 5 seeds, mean ± std)
       variant so the ranking AMONG the robust heads is statistically
       meaningful — the landed single-seed run cleanly separates MSE from the
@@ -1350,16 +866,6 @@ breakdown:
       Sweep the outlier fraction / magnitude too, charting clean-test MSE vs
       contamination level per head. Keep dims tiny so 5 seeds still fit the
       <5-min budget. Mirrors the open GatedFFNBakeoff multi-seed follow-up.
-<!-- (TanhGLU vs SwiGLU vs GEGLU vs GLU vs ReGLU bake-off removed: completed,
-     landed 2026-05-24 as examples/GatedFFNBakeoff/. Same FFN block
-     (PointwiseConvLinear(2*d_ff) -> GATE -> PointwiseConvLinear(1)) built five
-     times, identical except the parameter-free gate (so all arms have identical
-     param counts), trained at matched seed/LR/epochs on a synthetic per-position
-     sequence-regression target. Prints init/final MSE + wall-clock + epochs-to-
-     converge per arm and two PASS checks (no NaN/Inf; every arm beats its
-     pre-training baseline). Ranking is seed-dependent by design — the value is
-     the matched harness. Open follow-up: a multi-seed (mean ± std) version so a
-     statistically meaningful ranking is reportable.) -->
 - [ ] GatedFFNBakeoff follow-up: a multi-seed (e.g. 5 seeds, mean ± std)
       variant of the landed examples/GatedFFNBakeoff/ so the gate ranking is
       statistically meaningful rather than a single-seed snapshot. Keep the
@@ -1386,14 +892,6 @@ breakdown:
       with K ∈ {1, 2, 4, 8, 16, full}, chart reconstruction loss vs sparsity.
 - [ ] STE bit-width sweep: same network, vary `step ∈ {1.0, 0.5, 0.25,
       0.125, 0.0625}`, plot accuracy vs bit-width.
-<!-- (Straight-through quantization demo removed: subsumed by the
-     `examples/QuantizationAwareMnist/` entry under "Examples I'd enjoy
-     writing", which runs the SAME STE-vs-unquantized-baseline accuracy
-     comparison and additionally pins it to MNIST and adds final-weight
-     histograms — a strict superset of "small classifier, accuracy vs
-     baseline".) -->
-<!-- (Lottery-ticket sanity check removed: duplicate of the "Lottery-ticket"-
-     flavored experiment under "Bake-off / experiment follow-ups".) -->
 - [ ] Sequence-length scaling micro-benchmark — TNNetScaledDotProductAttention
       at seq_len ∈ {16, 32, 64, 128, 256} with d_k fixed. Confirms O(n²)
       scaling.
@@ -1447,35 +945,6 @@ breakdown:
       faster optimizer / mini-batch path so enough epochs fit, THEN retry the
       true grok. Do not re-attempt the full weight-decay grok as a single
       monolithic example until (b) lands.
-<!-- (Double-descent demo removed: completed, landed 2026-05-24 as
-     examples/DoubleDescent/. Existing layers only, no new layer. Fixed
-     nonlinear teacher class=sign(x'Qx+b'x) over D=4; SMALL train=60 with 15%
-     of labels FLIPPED, LARGE clean test=2000. SAME single-hidden-layer MLP
-     Input(4)->TNNetFullConnectReLU(H)->TNNetFullConnectLinear(1) trained as an
-     MSE regression onto the +-1 target (MSE interpolates the noisy set cleanly
-     where a saturating softmax/cross-entropy head left ~2 hard noisy points
-     permanently misclassified and never reached train-err 0), full-batch GD
-     (SetBatchUpdate(True) + ClearDeltas/accumulate/UpdateWeights per epoch),
-     LR=0.03 mom=0.9 up to 6000 epochs w/ early-stop at train MSE~0. Width
-     sweep H in {1,2,3,4,5,6,8,12,20,32,64,128}, param count via
-     TNNet.CountWeights printed. Two-arm ablation (noise ON vs OFF, same
-     teacher/points/seeds). RESULT (seed 20260524, all 3 checks PASS, ~57s):
-     noisy test err 0.39(underfit,H=1) -> 0.21 VALLEY(H=6) -> 0.38 PEAK(H=8,
-     right at the interpolation threshold where train MSE collapses 0.27->0.027
-     by H=12 and train 0/1 err first hits 0) -> 0.34(over-param,H=128) — the
-     textbook non-monotone U-then-peak-then-down. Clean arm ~monotone
-     (post-min rise 0.017 vs noisy 0.172), confirming the peak is NOISE-driven.
-     Three built-in signals: interpolation-threshold-exists, peak-at/around-
-     threshold (peak is the max test err AT/AFTER the bias-variance VALLEY, not
-     the global argmax — the underfit left edge is also high), and the
-     noise-on/off ablation. CAVEATS: (1) softmax/cross-entropy classification
-     did NOT cleanly interpolate at this scale (stuck at ~2/60 train err across
-     all widths) — switched to MSE-regression-on-+-1; (2) at this single seed
-     the clean arm shows one transient 0.262 wobble at H=12, a seed
-     fluctuation, not a systematic peak — the tested signal (aggregate post-min
-     rise) is 10x smaller than the noisy arm's; (3) the peak HEIGHT and exact
-     threshold are seed-dependent, only the noise-gated SHAPE is the robust
-     claim. Suite stays green at 793. -->
 - [ ] Lottery-ticket / magnitude-pruning follow-up to double descent: the
       over-parameterised models on the RIGHT arm of examples/DoubleDescent are
       the compressible regime — prune the H=128 interpolating net by weight
@@ -1483,40 +952,6 @@ breakdown:
       of its weights. Pairs with [[WeightSpectrumReport]] /
       [[WeightHistogramReport]] (watch the weight-norm spike at the
       interpolation threshold).
-<!-- (Toy-models-of-superposition demo removed: completed, landed 2026-05-24 as
-     examples/Superposition/. Importance-weighted-MSE autoencoder
-     Input(N=20) -> TNNetFullConnectLinear(M=5){encoder} -> TNNetFullConnectReLU(N){decoder}
-     (existing layers only, no new layer), hand-rolled batch training with the
-     weighted-MSE gradient delivered through the stock Backpropagate via a
-     pseudo-target (pseudo_i = out_i - (I_i/batch)*(out_i - in_i), so the summed
-     batch error becomes the MEAN weighted gradient — the /batch is what keeps
-     the dense regime from diverging). Reads the effective UNTIED pre-ReLU map
-     G = D*W (N×N): column-norm = represented norm, off-diag = interference;
-     reports per-feature norm ASCII bars, the glyph-shaded G heatmap,
-     superposition ratio = kept/M, and mean |off-diag|. Sweep
-     S ∈ {0.0,0.7,0.9,0.99} shows the textbook transition: ratio 1.00 (dense:
-     clean M×M diagonal, monosemantic) -> 1.80 -> 3.80 (sparse: 19/20 features
-     packed into 5 dims). All three built-in correctness signals PASS (dense
-     kept≈M and near-diagonal; kept features higher mean-importance than dropped;
-     represented-feature count grows with S). ~2 min, pure CPU, deterministic,
-     suite stays green at 793. CAVEAT: the marginal kept-feature identity at
-     intermediate sparsities is mildly noisy (untied ReLU geometry, near-tied
-     importances), so signal (2) uses a robust mean-importance criterion rather
-     than a strict feature-order prefix test, and "total represented norm" is
-     reported only as a diagnostic (raw G magnitudes are not comparable across S)
-     with represented-feature COUNT as the growth axis. -->
-<!-- (Sparse-autoencoder feature extraction removed: completed, landed as
-     examples/SparseAutoencoder/ — the mechanistic-interpretability SOLUTION
-     companion to examples/Superposition/. Overcomplete sparse autoencoder
-     (Input(d) -> FullConnectReLU(H, H>>d) -> FullConnectLinear(d), existing
-     layers only, no new layer) trained on the dense superposition activations
-     under L = ||out-a||^2 + lambda*|h|, the L1 sub-gradient on the hidden code
-     injected via the pseudo-target gradient-surgery idiom (SetBatchUpdate(True)).
-     Matches learned atoms to ground-truth features by max cosine, sweeps lambda
-     in {0,1e-3,1e-2,1e-1}, and reports the monosemanticity score, the
-     non-monotone recovered-feature count, and the dead-atom fraction.
-     Reproduces Anthropic's *Towards Monosemanticity* (Bricken et al. 2023) on a
-     pure-CPU toy. A hard-TopK SAE variant is the natural open follow-up.) -->
 - [ ] Edge-of-Stability demo (`examples/EdgeOfStability/`) — reproduce the
       "progressive sharpening" + "edge of stability" phenomenon (Cohen et al.
       2021, *Gradient Descent on Neural Networks Typically Occurs at the Edge
@@ -1564,11 +999,6 @@ breakdown:
       it inside the training loop is safe.
 - [ ] "Surgery" experiment: train a small classifier, then zero out the
       top-K most-active hidden units and chart accuracy degradation vs K.
-<!-- (Plain "label-smoothing sweep — tabulate test accuracy" removed:
-     subsumed by the "LabelSmoothing calibration check" entry under
-     "### Loss layers", which runs the SAME SimpleImageClassifier sweep over
-     the SAME eps ∈ {0, 0.05, 0.1, 0.2} and additionally feeds each into the
-     neuralcalibration ECE/Brier report — a strict superset.) -->
 - [ ] SWA effect-size sweep: vary SWA start-epoch fraction ∈ {0.5, 0.6,
       0.7, 0.8, 0.9} and chart final test accuracy.
 - [ ] Cosine-LR vs constant-LR on SimpleImageClassifier, three seeds each.
@@ -1599,11 +1029,6 @@ breakdown:
       OptimizerBakeoff per-optimizer LR shoot-out (varies LR per OPTIMIZER at a
       fixed batch, not LR-vs-batch coupling), and from SchedulerCompare (LR
       SCHEDULE shape over training, not the batch-coupled base LR).
-<!-- ("Activation cost" microbenchmark removed: duplicate of the per-activation
-     forward/backward ns/op CSV in `examples/ActivationPlayground/` and of
-     `bin/layer_bench <Activation> 64 64 32` under "Tooling / dev experience",
-     both of which already time forward+backward per activation/layer at a
-     chosen shape.) -->
 - [ ] Activation saturation visualizer: train a tiny net with Sigmoid /
       Tanh / HardSigmoid and print the fraction of saturated units per
       layer per epoch.
@@ -1683,12 +1108,6 @@ breakdown:
 - [ ] TNNetMaxOut CIFAR-style example wired into one of the SimpleImage
       paths.
 - [ ] TNNetCELU CIFAR-style smoke example.
-<!-- (TNNetHardShrink / TNNetSoftShrink sparsity micro-experiment removed:
-     subsumed by the "Shrink-activation sparsity sweep" entry under
-     "### Experiments I'm curious about (additional)", which trains the SAME
-     tiny autoencoder with each shrink activation as the bottleneck and reports
-     sparsity vs reconstruction loss — and additionally adds a ReLU baseline and
-     a lambda sweep, so nothing is lost.) -->
 
 ### Documentation I'd enjoy writing
 - [ ] "Activations cheat sheet" in `docs/activations.md`: one row per
@@ -1821,65 +1240,6 @@ breakdown:
       as "weak barrier" purely because the denominator is tiny. Add an
       absolute-floor term (e.g. treat barriers below an absolute epsilon as
       "connected" regardless of ratio) and re-pin the example's RUN 1 verdict.
-<!-- (TNNet.PermutationAlignReport removed: completed, landed 2026-05-24 via the
-     [[introspection-report-pattern]] — the Git Re-Basin DUAL of
-     ModeConnectivityReport. Signature
-     `PermutationAlignReport(NN; const SnapshotB; Samples: TNNetVolumePairList;
-     ScoreMode: integer = 0; K: integer = 10)`. Catalogues trainable layers,
-     greedily solves each hidden layer's best B->A unit permutation (ScoreMode=0
-     weight-row cosine / ScoreMode=1 activation correlation over Samples), applies
-     it via ReorderLayerOutputNeurons + PermuteNextLayerInputColumns
-     (next-layer input-column compensation so the function is unchanged), reuses
-     ModeConnectivity's MulMulAdd (1-alpha)*A+alpha*B sweep for pre/post barriers,
-     restores endpoint-A bit-for-bit in try/finally, and emits the three PASS/FAIL
-     checks + collapsed/partially-reduced/unchanged verdict. Ships
-     examples/PermutationAlign/ + TestPermutationAlignReportSmoke. All checks PASS:
-     weight-matching barrier 0.0957->0.0332 (65% reduction), activation-matching
-     0.0957->0.0250 (74%), align-to-self churn 0 / flat-zero barrier, permutation-
-     invariance max output drift <= 1.94e-7. HONEST NOTE for any follow-up: at toy
-     scale the greedy (non-Hungarian) solve lands in the 26-35% post/pre band, so
-     the honest verdict is PARTIALLY REDUCED not COLLAPSED — a true Hungarian
-     assignment is the open follow-up if full collapse is wanted.) -->
-<!-- (TNNet.PredictionDepthReport removed: completed, landed 2026-05-24 via the
-     [[introspection-report-pattern]] — the per-example difficulty diagnostic
-     (prediction depth, Baldock/Maennel/Neyshabur 2021). Two overloads:
-     `PredictionDepthReport(NN, Support, SupportLabels, Queries [, K=5,
-     MaxFeatDim=256])` and the labelled variant adding QueryLabels. Forward-only,
-     non-parametric: snapshots each trainable layer's L2-normed flat activation
-     over support+query batches, per layer takes a K=5 cosine k-NN vote over the
-     support, depth = shallowest layer after which the vote agrees with the net's
-     final argmax and never disagrees again. Reuses LinearProbeReport's sign-random
-     projection for layers wider than MaxFeatDim. Reports depth histogram +
-     mean/median, per-layer newly-resolved profile, K hardest query indices, and a
-     correct-vs-incorrect cross-tab (labelled overload). Ships
-     examples/PredictionDepth/ + TestPredictionDepthReportSmoke. Checks PASS:
-     support-as-own-query agreement 1.0000 / all depth 0, one-class collapse to 0,
-     positive correct-vs-incorrect depth gap after training (fresh-init histogram
-     right-skewed -> trained mass shifts shallow with a deep hard-query tail).
-     DESIGN NOTE for any follow-up: "hard" example queries must be points the
-     NETWORK finds ambiguous (between-blob band), NOT merely relabelled clean
-     points — depth is measured vs the net's own argmax, so a wrong stored label
-     alone doesn't raise depth.) -->
-<!-- (TNNet.LogitLensReport removed: completed, landed 2026-05-24 via the
-     [[introspection-report-pattern]]. Signature
-     `LogitLensReport(NN; pInput: TNNetVolumeList; HeadStartIdx: integer = -1)`.
-     Default head = last trainable layer + its activation/softmax tail; for each
-     earlier layer whose flat activation matches the head input size it splices
-     that activation into the head-input slot (Copy then CopyNoChecks, ActivationPatching
-     idiom) and recomputes only the head, reading off p_L. Reports per-layer
-     argmax-agreement bar chart, crystallization depth (mean + 10-bin histogram),
-     mean confidence / lens entropy, and the KL(p_L || p_final) curve; width-
-     incompatible layers listed as SKIPPED. Ships examples/LogitLens/ (fresh-vs-
-     trained contrast on a constant-width classifier) + TestLogitLensReportSmoke.
-     Correctness checks PASS: lens at the head input reproduces p_final exactly
-     (agreement 1.0, KL 0) and the single-layer head degenerates to "resolves at
-     the last layer". HONEST NOTE for any follow-up: on a tiny synthetic net the
-     trained per-layer KL is NOT strictly monotone across the body (a sharper
-     trained head penalises a wrong intermediate readout more), so the example's
-     narrative claims only the seed-robust signals (entropy/confidence sharpening
-     with depth, exact KL=0 / agreement=1.0 at the head input). The `Project`-to-
-     force-a-fit flag from the spec was NOT implemented — incompatible layers are
-     honestly SKIPPED instead; a projected-lens variant is the open follow-up.) -->
 - [ ] LogitLensReport follow-up: the spec's optional `Project` flag (reuse
       [[LinearProbeReport]]'s deterministic random-projection to FORCE a
       width-incompatible layer through the head, flagged "heuristic") was not
