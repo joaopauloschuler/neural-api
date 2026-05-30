@@ -374,6 +374,8 @@ type
     procedure TestMultiHeadSDPAConcatGradientCheck;
     procedure TestMultiHeadSelfAttentionGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
+    procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
+    procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
     procedure TestTransformerEncoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
     procedure TestHardConcreteGradientCheck;
@@ -10441,6 +10443,151 @@ begin
     QPlus.Free;
     KVData.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadGroupedQueryAttentionGradientCheck;
+// GQA: numerical-gradient check on the input gradient flowing through the
+// AddMultiHeadGroupedQueryAttention builder. QueryHeads=4, KVHeads=2 (so two
+// query heads share each K/V head), d_model=8 (d_k=2), seq=3. The builder does
+// its OWN Q/K/V projections from a (SeqLen,1,d_model) token tensor.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  d_model, QueryHeads, KVHeads, SeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  QueryHeads := 4;
+  KVHeads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, KVHeads, false);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Output shape must match the (SeqLen,1,d_model) token grid.
+    AssertTrue('GQA output SizeX', NN.GetLastLayer.Output.SizeX = SeqLen);
+    AssertTrue('GQA output SizeY', NN.GetLastLayer.Output.SizeY = 1);
+    AssertTrue('GQA output Depth', NN.GetLastLayer.Output.Depth = d_model);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GQA input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestMultiHeadGroupedQueryAttentionGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadGroupedQueryAttentionMHAEquivalence;
+// Degeneracy check: GQA with KVHeads=QueryHeads is plain multi-head attention.
+//
+// A literal weight-for-weight equivalence vs AddMultiHeadSelfAttention is NOT
+// straightforward: AddMultiHeadSelfAttention consumes a PRE-PROJECTED
+// (SeqLen,1,3*d_model) Q|K|V slab (its caller supplies the Q/K/V projection),
+// whereas AddMultiHeadGroupedQueryAttention does its OWN three separate
+// PointwiseConvLinear Q/K/V projections from a (SeqLen,1,d_model) input. The two
+// builders therefore differ structurally (one projection layer vs three) and a
+// trivial weight copy is not well defined. Instead we assert the STRUCTURAL
+// degeneracy that matters:
+//   (a) KVHeads=QueryHeads yields the same output SHAPE as KVHeads=1 (MQA) and
+//       as the full-MHA configuration -- shape is independent of head sharing;
+//   (b) the K/V projection PARAMETER count shrinks by exactly the documented
+//       factor QueryHeads/KVHeads: MQA (KVHeads=1) has fewer total weights than
+//       full MHA (KVHeads=QueryHeads), and the difference equals the K/V
+//       projection saving. TNNetLayer.CountWeights counts only the weight matrix
+//       (in_depth * out_depth, bias excluded), so the saving is exactly
+//       2 projections * (full_kv_width - mqa_kv_width) * d_model.
+var
+  NNFull, NNMQA: TNNet;
+  d_model, QueryHeads, SeqLen, d_k: integer;
+  fullWeights, mqaWeights, expectedSaving: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  QueryHeads := 4;
+  SeqLen := 3;
+  d_k := d_model div QueryHeads;
+  NNFull := TNNet.Create();
+  NNMQA := TNNet.Create();
+  try
+    // Full MHA: KVHeads = QueryHeads (K/V projected to full d_model).
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NNFull.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, QueryHeads, false);
+    // MQA: KVHeads = 1 (K/V projected to a single d_k-wide head).
+    NNMQA.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NNMQA.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, 1, false);
+
+    // (a) Identical output shape regardless of head-sharing.
+    AssertTrue('GQA/MHA full output SizeX',
+      NNFull.GetLastLayer.Output.SizeX = SeqLen);
+    AssertTrue('GQA/MHA full output Depth',
+      NNFull.GetLastLayer.Output.Depth = d_model);
+    AssertTrue('GQA/MQA output SizeX',
+      NNMQA.GetLastLayer.Output.SizeX = SeqLen);
+    AssertTrue('GQA/MQA output Depth',
+      NNMQA.GetLastLayer.Output.Depth = d_model);
+
+    // (b) K/V projection params shrink by factor QueryHeads/KVHeads.
+    // Full K/V width = QueryHeads*d_k = d_model; MQA K/V width = 1*d_k = d_k.
+    // PointwiseConvLinear weights = in_depth(d_model) * out_depth, no bias.
+    // Two projections (K and V) differ; everything else is identical.
+    fullWeights := NNFull.CountWeights();
+    mqaWeights := NNMQA.CountWeights();
+    expectedSaving := 2 * ((QueryHeads * d_k) - (1 * d_k)) * d_model;
+    AssertEquals('GQA->MQA K/V projection weight saving',
+      expectedSaving, fullWeights - mqaWeights);
+  finally
+    NNFull.Free;
+    NNMQA.Free;
   end;
 end;
 

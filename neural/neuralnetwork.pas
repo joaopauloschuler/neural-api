@@ -4896,6 +4896,25 @@ type
       function AddMultiHeadCrossAttention(d_model, Heads: integer;
         QuerySource, KeyValueSource: TNNetLayer;
         CausalMask: boolean = false): TNNetLayer;
+      // Grouped-Query / Multi-Query self-attention over a (SeqLen,1,d_model)
+      // token tensor (the source is GetLastLayer()). Unlike plain MHA, GQA uses
+      // FEWER K/V heads than Query heads: each group of QueryHeads div KVHeads
+      // query heads SHARES one key/value head. KVHeads=QueryHeads degenerates to
+      // standard MHA; KVHeads=1 degenerates to Multi-Query Attention (MQA).
+      // Let d_k := d_model div QueryHeads. Q is projected token-wise to d_model
+      // channels (QueryHeads*d_k); K and V are each projected token-wise to only
+      // KVHeads*d_k channels. For query head h, the KV group is
+      // h div (QueryHeads div KVHeads): the SAME KV head's d_k channels are
+      // replicated across every query head in its group. Per head,
+      // [Q_h | K_group | V_group] (width 3*d_k) is fed to
+      // TNNetScaledDotProductAttention; head outputs are concatenated then
+      // out-projected token-wise to depth d_model. All projections are 1x1 convs
+      // (TNNetPointwiseConvLinear) so the sequence axis is preserved.
+      // K/V parameter cost: full MHA K/V projections scale with QueryHeads, GQA
+      // scales with KVHeads -- a factor QueryHeads/KVHeads fewer K/V params.
+      // Returns the (SeqLen,1,d_model) out-projection layer.
+      function AddMultiHeadGroupedQueryAttention(d_model, QueryHeads,
+        KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
       // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
       //   PreNorm=True  (default):
       //     x := x + MHA(LayerNorm(x));  x := x + SwiGLU-FFN(LayerNorm(x))
@@ -23767,6 +23786,70 @@ begin
     QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
     KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
     VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
+    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
+        HeadPack);
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Token-wise linear out-projection (FullConnectLinear would flatten the
+  // sequence axis; see AddMultiHeadSelfAttention header note).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+  SetLength(KVChannels, 0);
+end;
+
+function TNNet.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads,
+  KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
+var
+  d_k, d_kv, GroupSize, HeadCnt, KVGroup, d: integer;
+  SourceLayer, QProj, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels, KVChannels: array of integer;
+begin
+  if QueryHeads < 1 then
+    FErrorProc('AddMultiHeadGroupedQueryAttention requires QueryHeads >= 1.' +
+      ' QueryHeads=' + IntToStr(QueryHeads));
+  if KVHeads < 1 then
+    FErrorProc('AddMultiHeadGroupedQueryAttention requires KVHeads >= 1.' +
+      ' KVHeads=' + IntToStr(KVHeads));
+  if (d_model mod QueryHeads) <> 0 then
+    FErrorProc('AddMultiHeadGroupedQueryAttention requires d_model divisible' +
+      ' by QueryHeads. d_model=' + IntToStr(d_model) +
+      ', QueryHeads=' + IntToStr(QueryHeads));
+  if (QueryHeads mod KVHeads) <> 0 then
+    FErrorProc('AddMultiHeadGroupedQueryAttention requires QueryHeads' +
+      ' divisible by KVHeads. QueryHeads=' + IntToStr(QueryHeads) +
+      ', KVHeads=' + IntToStr(KVHeads));
+  SourceLayer := GetLastLayer();
+  d_k := d_model div QueryHeads;       // per-head dim
+  d_kv := KVHeads * d_k;               // total K/V projection width (shrunken)
+  GroupSize := QueryHeads div KVHeads; // query heads sharing one KV head
+  // Token-wise projections (1x1 conv preserves the sequence axis). Q keeps the
+  // full d_model width; K and V are projected to only d_kv channels -- this is
+  // where GQA saves K/V parameters (factor QueryHeads/KVHeads vs full MHA).
+  QProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), SourceLayer);
+  KProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_kv), SourceLayer);
+  VProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_kv), SourceLayer);
+  SetLength(HeadOutputs, QueryHeads);
+  SetLength(QChannels, d_k);
+  SetLength(KVChannels, d_k);
+  for HeadCnt := 0 to QueryHeads - 1 do
+  begin
+    // This query head owns its own d_k slice of Q, but shares the KV head of
+    // its group (replicating that KV head across the GroupSize query heads).
+    KVGroup := HeadCnt div GroupSize;
+    for d := 0 to d_k - 1 do
+    begin
+      QChannels[d]  := HeadCnt * d_k + d;
+      KVChannels[d] := KVGroup * d_k + d;
+    end;
+    QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
+    KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
+    VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
+    // Pack [Q_h | K_group | V_group] (width 3*d_k) as SDPA expects.
     HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
     HeadOutputs[HeadCnt] :=
       AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
