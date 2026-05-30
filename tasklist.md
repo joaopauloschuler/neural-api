@@ -1285,49 +1285,18 @@ breakdown:
      than a strict feature-order prefix test, and "total represented norm" is
      reported only as a diagnostic (raw G magnitudes are not comparable across S)
      with represented-feature COUNT as the growth axis. -->
-- [ ] Sparse-autoencoder feature extraction (`examples/SparseAutoencoder/`) —
-      the mechanistic-interpretability SOLUTION companion to the landed
-      examples/Superposition/ (which shows the PROBLEM: a model packing N
-      ground-truth features into M<N dimensions). Reproduce the headline of
-      Anthropic's *Towards Monosemanticity* (Bricken et al. 2023) on a pure-CPU
-      toy, existing layers only — NO new layer. Recipe: generate synthetic data
-      where K sparse "ground-truth" features (one-hot-ish, active with low
-      probability, random magnitudes) are linearly mixed down into a DENSE
-      d-dim activation vector `a = G·f` with d < K (the superposition regime,
-      reusing the Superposition example's data generator). Then train an
-      OVERCOMPLETE sparse autoencoder ON those dense activations —
-      `Input(d) -> TNNetFullConnectReLU(H) {H >> d, the dictionary}
-      -> TNNetFullConnectLinear(d) {tied-or-untied decoder}` — with an L1
-      sparsity penalty on the hidden code (delivered through the stock
-      Backpropagate via the pseudo-target trick the Superposition example
-      already uses: `pseudo_i = out_i - lr_term`, plus an L1 sub-gradient
-      `lambda*sign(hidden)` injected into the hidden layer's OutputError, the
-      same manual-gradient-surgery idiom as the SAM / Superposition examples —
-      remember SetBatchUpdate(True)). The payoff: after training, MATCH each
-      learned dictionary atom (a decoder column / hidden unit) to its
-      best ground-truth feature by max cosine similarity and report (a) a
-      mono-semanticity score — mean max-cosine of recovered atoms to true
-      features (should climb well above the raw activation-to-feature cosine
-      baseline), (b) the recovered-feature COUNT vs the L1 weight `lambda`
-      swept over `{0, 1e-3, 1e-2, 1e-1}` (too little -> dense polysemantic
-      atoms, too much -> dead atoms; a clear interior sweet spot), (c) the mean
-      L0 (active atoms per sample) vs reconstruction MSE trade curve, and (d)
-      an ASCII atom-to-feature confusion/cosine heatmap so the
-      "one atom == one interpretable feature" recovery is visible against the
-      tangled raw activations. Built-in correctness signals: at lambda=0 the SAE
-      is a plain (over-parameterised) autoencoder and recon MSE ~0 but atoms are
-      polysemantic (low max-cosine); the swept curves must be NON-monotone with
-      an interior peak in recovered-feature count; and a "dead atom" fraction
-      reported per lambda. DISTINCT from examples/Superposition/ (that reads the
-      model's OWN encoder geometry G=D·W to MEASURE packing; this trains a
-      SEPARATE overcomplete dictionary to UNPACK it), from the open "TopK
-      sparsity sweep" entry (an UNDERCOMPLETE bottleneck recon-loss-vs-K study,
-      no ground-truth-feature recovery, no dictionary) and from the
-      "Shrink-activation sparsity sweep" (bottleneck activation choice, not
-      dictionary learning). Pure CPU, deterministic, a-few-minutes budget;
-      pairs with [[WeightHistogramReport]] (dead-atom column norms) and the
-      open TNNetTopK sparsity work (a hard-TopK SAE variant is the natural
-      follow-up once the L1 version lands).
+<!-- (Sparse-autoencoder feature extraction removed: completed, landed as
+     examples/SparseAutoencoder/ — the mechanistic-interpretability SOLUTION
+     companion to examples/Superposition/. Overcomplete sparse autoencoder
+     (Input(d) -> FullConnectReLU(H, H>>d) -> FullConnectLinear(d), existing
+     layers only, no new layer) trained on the dense superposition activations
+     under L = ||out-a||^2 + lambda*|h|, the L1 sub-gradient on the hidden code
+     injected via the pseudo-target gradient-surgery idiom (SetBatchUpdate(True)).
+     Matches learned atoms to ground-truth features by max cosine, sweeps lambda
+     in {0,1e-3,1e-2,1e-1}, and reports the monosemanticity score, the
+     non-monotone recovered-feature count, and the dead-atom fraction.
+     Reproduces Anthropic's *Towards Monosemanticity* (Bricken et al. 2023) on a
+     pure-CPU toy. A hard-TopK SAE variant is the natural open follow-up.) -->
 - [ ] Edge-of-Stability demo (`examples/EdgeOfStability/`) — reproduce the
       "progressive sharpening" + "edge of stability" phenomenon (Cohen et al.
       2021, *Gradient Descent on Neural Networks Typically Occurs at the Edge
