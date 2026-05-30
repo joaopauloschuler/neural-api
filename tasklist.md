@@ -1196,9 +1196,13 @@ breakdown:
       landed synthetic TripletEmbedding demo, with a PGM scatter-plot output.
 - [ ] `examples/VQAutoencoder/` — extend VisualAutoencoder with a
       TNNetVectorQuantizer bottleneck.
-- [ ] `examples/AntiAliasedMaxPool/` — train the same tiny CIFAR-10 net
-      once with TNNetMaxPool and once with TNNetMaxBlurPool; report
-      shift-equivariance delta.
+<!-- (`examples/AntiAliasedMaxPool/` removed: subsumed by the landed
+     `examples/MaxBlurPool/`, which already trains two tiny nets — one with
+     TNNetMaxPool, one with TNNetMaxBlurPool — and reports the shift-induced
+     output-change delta (~12.2% less mean shift change for blur-pool). The only
+     difference was the dataset (CIFAR-10 vs the landed synthetic shift task);
+     the MaxPool-vs-MaxBlurPool shift-equivariance comparison itself is done. -->
+
 - [ ] `examples/ReverseXYAugmentation/`, `examples/AutoencoderMNIST/`,
       `examples/AutoencoderReconstructionGrid/` — additional small demos.
 - [ ] `examples/ActivationPlayground/` — prints one CSV row per activation:
