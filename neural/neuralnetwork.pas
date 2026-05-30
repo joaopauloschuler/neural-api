@@ -4842,6 +4842,22 @@ type
       // each sequence position), matching the existing AddSelfAttention block.
       function AddMultiHeadSelfAttention(d_model, Heads: integer;
         CausalMask: boolean = false): TNNetLayer;
+      // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
+      //   PreNorm=True  (default):
+      //     x := x + MHA(LayerNorm(x));  x := x + SwiGLU-FFN(LayerNorm(x))
+      //   PreNorm=False (post-norm):
+      //     x := LayerNorm(x + MHA(x));  x := LayerNorm(x + SwiGLU-FFN(x))
+      // Every projection is token-wise (TNNetPointwiseConvLinear / a 1x1 conv)
+      // so the sequence axis is preserved: a QKV slab projection d_model ->
+      // 3*d_model feeds AddMultiHeadSelfAttention (which expects a Q|K|V slab and
+      // out-projects back to d_model), and the FFN is
+      //   PointwiseConvLinear(2*d_ff) -> TNNetSwiGLU -> PointwiseConvLinear(d_model).
+      // Using TNNetFullConnect* anywhere here would flatten the whole sequence
+      // into one vector and destroy the token axis. The output shape is
+      // (SeqLen,1,d_model), matching the input, so blocks can be stacked.
+      // Returns the last layer of the block.
+      function AddTransformerEncoderBlock(d_model, Heads, d_ff: integer;
+        PreNorm: boolean = true; CausalMask: boolean = false): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -23469,6 +23485,38 @@ begin
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddTransformerEncoderBlock(d_model, Heads, d_ff: integer;
+  PreNorm: boolean = true; CausalMask: boolean = false): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // ---- Attention sub-block: residual around multi-head self-attention. ----
+  // Replicated inline (not via AddPreNormResidual/AddPostNormResidual) because
+  // the attention sublayer adds MANY layers through GetLastLayer() chaining and
+  // cannot be expressed as a pre-built "array of TNNetLayer".
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
+  // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
+  AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
+  AddMultiHeadSelfAttention(d_model, Heads, CausalMask);
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+
+  // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
+  // the depth channel-wise, so the inner projection must be 2*d_ff.
+  AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
+  AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+
+  Result := GetLastLayer();
 end;
 
 // Ported code from:
