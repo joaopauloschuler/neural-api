@@ -6594,6 +6594,28 @@ type
         IntgSteps: integer = 20;
         Seed: longword = 1234567
       ): string;
+      // Forward+backward CNN class-localisation diagnostic: Grad-CAM
+      // (Selvaraju et al. 2017). Unlike SaliencyReport (INPUT-pixel gradient
+      // attribution), Grad-CAM localises at a chosen CONVOLUTION layer's
+      // FEATURE-MAP resolution and is class-discriminative. It forwards Probe,
+      // picks c = argmax of the final output (or ForcedClass), injects the
+      // one-hot e_c at the last layer and runs the layer backward chain to the
+      // target conv layer (ConvLayerIdx, default = the deepest conv-like layer
+      // with spatial extent). For that layer it reads the feature maps A^k
+      // (Output) and the gradient dlogit_c/dA^k (OutputError); each channel's
+      // importance weight is alpha_k = mean over (x,y) of the gradient, the
+      // coarse map is L_xy = ReLU(sum_k alpha_k * A^k_xy), normalised to [0,1]
+      // and printed as the same ASCII heatmap SaliencyReport uses (also
+      // nearest-upsampled to the input plane). Reports the chosen class, the
+      // target conv layer, the coarse and upsampled maps, and the peak cell.
+      // Forward+backward only: no weight steps (the only mutation is transient
+      // error tensors). Guards nil NN / nil probe / no-conv-layer gracefully.
+      class function GradCAMReport(
+        NN: TNNet;
+        Probe: TNNetVolume;
+        ConvLayerIdx: integer = -1;
+        ForcedClass: integer = -1
+      ): string;
       // Forward-only CAUSAL mechanistic-interpretability diagnostic
       // (activation patching / causal tracing; Vig et al. 2020, Meng et al.
       // ROME 2022, Wang et al. IOI 2022). It answers a question NONE of the
@@ -43274,6 +43296,217 @@ begin
     if Noisy <> nil then Noisy.Free;
     if Scaled <> nil then Scaled.Free;
     if Baseline <> nil then Baseline.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.GradCAMReport(
+  NN: TNNet;
+  Probe: TNNetVolume;
+  ConvLayerIdx: integer = -1;
+  ForcedClass: integer = -1
+): string;
+const
+  cEps = 1e-12;
+  cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
+var
+  Lines: TStringList;
+  TargetIdx, LastIdx, PredClass, OutSize: integer;
+  ConvLayer: TNNetLayer;
+  CSizeX, CSizeY, CDepth: integer;
+  ISizeX, ISizeY: integer;
+  Cam: array of TNeuralFloat;           // coarse map, size CSizeX*CSizeY
+  Alpha: TNeuralFloat;
+  k, x, y, fi, BucketIdx: integer;
+  CamMax, v, gsum: TNeuralFloat;
+  PeakX, PeakY: integer;
+  PeakVal: TNeuralFloat;
+  RowStr: string;
+  ux, uy, sx, sy: integer;
+
+  // mirror SaliencyReport's forward+inject-one-hot+backward splice; afterwards
+  // we only READ the target conv layer's Output / OutputError.
+  procedure ForwardBackwardOneHot(c: integer);
+  var
+    Li: integer;
+    LL: TNNetLayer;
+  begin
+    NN.ClearDeltas();
+    NN.Compute(Probe);
+    Li := NN.GetLastLayerIdx();
+    LL := NN.Layers[Li];
+    NN.ResetBackpropCallCurrCnt();
+    if LL.FDepartingBranchesCnt = 0 then LL.IncDepartingBranchesCnt();
+    LL.OutputError.Fill(0);
+    if (c >= 0) and (c < LL.OutputError.Size) then
+      LL.OutputError.Raw[c] := 1.0;
+    LL.ComputeErrorDeriv();
+    LL.Backpropagate();
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'GradCAMReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'GradCAMReport: network needs at least 2 layers.' + sLineBreak;
+      Exit;
+    end;
+    if (Probe = nil) or (Probe.Size = 0) then
+    begin
+      Result := 'GradCAMReport: Probe is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+
+    LastIdx := NN.GetLastLayerIdx();
+
+    // Resolve the target convolution layer.
+    TargetIdx := -1;
+    if (ConvLayerIdx >= 0) and (ConvLayerIdx <= LastIdx) then
+      TargetIdx := ConvLayerIdx
+    else
+    begin
+      // deepest TNNetConvolutionBase with spatial extent.
+      for k := LastIdx downto 0 do
+        if (NN.Layers[k] is TNNetConvolutionBase) and
+           (NN.Layers[k].Output.SizeX > 1) then
+        begin
+          TargetIdx := k;
+          Break;
+        end;
+      if TargetIdx < 0 then
+        for k := LastIdx downto 0 do
+          if NN.Layers[k] is TNNetConvolutionBase then
+          begin
+            TargetIdx := k;
+            Break;
+          end;
+    end;
+    if TargetIdx < 0 then
+    begin
+      Result := 'GradCAMReport: no convolution layer found.' + sLineBreak;
+      Exit;
+    end;
+
+    NN.SetBatchUpdate(true);   // weights are never stepped
+
+    // Predicted class from a clean forward pass.
+    NN.Compute(Probe);
+    OutSize := NN.GetLastLayer.Output.Size;
+    if (ForcedClass >= 0) and (ForcedClass < OutSize) then
+      PredClass := ForcedClass
+    else
+      PredClass := NN.GetLastLayer.Output.GetClass();
+
+    // Forward + inject one-hot e_c + backward to populate OutputError tensors.
+    ForwardBackwardOneHot(PredClass);
+
+    ConvLayer := NN.Layers[TargetIdx];
+    CSizeX := ConvLayer.Output.SizeX;
+    CSizeY := ConvLayer.Output.SizeY;
+    CDepth := ConvLayer.Output.Depth;
+    ISizeX := Probe.SizeX;
+    ISizeY := Probe.SizeY;
+
+    SetLength(Cam, CSizeX * CSizeY);
+    for fi := 0 to CSizeX * CSizeY - 1 do Cam[fi] := 0;
+
+    // L_xy = ReLU( sum_k alpha_k * A^k_xy ),  alpha_k = mean_xy dlogit/dA^k.
+    for k := 0 to CDepth - 1 do
+    begin
+      gsum := 0;
+      for y := 0 to CSizeY - 1 do
+        for x := 0 to CSizeX - 1 do
+          gsum := gsum + ConvLayer.OutputError[x, y, k];
+      Alpha := gsum / (CSizeX * CSizeY);
+      for y := 0 to CSizeY - 1 do
+        for x := 0 to CSizeX - 1 do
+          Cam[y * CSizeX + x] := Cam[y * CSizeX + x] +
+            Alpha * ConvLayer.Output[x, y, k];
+    end;
+    // ReLU + normalise to [0,1].
+    CamMax := 0;
+    for fi := 0 to CSizeX * CSizeY - 1 do
+    begin
+      if Cam[fi] < 0 then Cam[fi] := 0;
+      if Cam[fi] > CamMax then CamMax := Cam[fi];
+    end;
+    if CamMax > cEps then
+      for fi := 0 to CSizeX * CSizeY - 1 do Cam[fi] := Cam[fi] / CamMax;
+
+    // Peak coarse cell.
+    PeakX := 0; PeakY := 0; PeakVal := -1;
+    for y := 0 to CSizeY - 1 do
+      for x := 0 to CSizeX - 1 do
+        if Cam[y * CSizeX + x] > PeakVal then
+        begin
+          PeakVal := Cam[y * CSizeX + x];
+          PeakX := x; PeakY := y;
+        end;
+
+    // ---- Render. ----
+    Lines.Add(Format(
+      'GradCAMReport: probe (%d,%d,%d). Target conv layer #%d "%s" ' +
+      'feature map (%d,%d,%d). Predicted class c=%d (forced=%s).',
+      [Probe.SizeX, Probe.SizeY, Probe.Depth, TargetIdx,
+       ConvLayer.ClassName, CSizeX, CSizeY, CDepth, PredClass,
+       BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
+    Lines.Add(Format(
+      'Coarse Grad-CAM peak at conv cell (x=%d,y=%d) value=%.4f. ' +
+      'Map normalised to [0,1].', [PeakX, PeakY, PeakVal]));
+    Lines.Add(StringOfChar('-', 72));
+
+    Lines.Add(Format('Coarse Grad-CAM map (%dx%d):', [CSizeX, CSizeY]));
+    for y := 0 to CSizeY - 1 do
+    begin
+      RowStr := '    ';
+      for x := 0 to CSizeX - 1 do
+      begin
+        v := Cam[y * CSizeX + x];
+        BucketIdx := Trunc(v * (Length(cBuckets) - 1) + 0.5);
+        if BucketIdx < 0 then BucketIdx := 0;
+        if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+        RowStr := RowStr + cBuckets[BucketIdx + 1] + ' ';
+      end;
+      Lines.Add(RowStr);
+    end;
+
+    // Nearest-upsample the coarse map to the input plane for overlay.
+    Lines.Add(Format('Nearest-upsampled to input plane (%dx%d):',
+      [ISizeX, ISizeY]));
+    for uy := 0 to ISizeY - 1 do
+    begin
+      RowStr := '    ';
+      sy := (uy * CSizeY) div ISizeY;
+      if sy > CSizeY - 1 then sy := CSizeY - 1;
+      for ux := 0 to ISizeX - 1 do
+      begin
+        sx := (ux * CSizeX) div ISizeX;
+        if sx > CSizeX - 1 then sx := CSizeX - 1;
+        v := Cam[sy * CSizeX + sx];
+        BucketIdx := Trunc(v * (Length(cBuckets) - 1) + 0.5);
+        if BucketIdx < 0 then BucketIdx := 0;
+        if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+        RowStr := RowStr + cBuckets[BucketIdx + 1] + ' ';
+      end;
+      Lines.Add(RowStr);
+    end;
+
+    Lines.Add(StringOfChar('-', 72));
+    Lines.Add(
+      'Heatmap legend "' + cBuckets + '" (blank=0 .. @=max). Grad-CAM is ' +
+      'class-discriminative but COARSE (conv-map resolution); compare with ' +
+      'SaliencyReport for fine input-pixel attribution. Forward+backward ' +
+      'only; NN weights untouched.');
+
+    Result := Lines.Text;
+  finally
     Lines.Free;
   end;
 end;

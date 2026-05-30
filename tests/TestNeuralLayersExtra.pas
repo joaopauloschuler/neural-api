@@ -100,6 +100,7 @@ type
     procedure TestEquivarianceReportSmoke;
     procedure TestTTAReportSmoke;
     procedure TestSaliencyReportSmoke;
+    procedure TestGradCAMReportSmoke;
     procedure TestDecisionBoundaryReportSmoke;
     procedure TestCalibrationReportSmoke;
     procedure TestFisherImportanceReportSmoke;
@@ -4916,6 +4917,44 @@ begin
     Support.Free;
     Queries.Free;
     OneClass.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestGradCAMReportSmoke;
+var
+  NN: TNNet;
+  vInput: TNNetVolume;
+  Report: string;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.GradCAMReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  vInput := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 2));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+
+    // nil probe handled gracefully.
+    Report := TNNet.GradCAMReport(NN, nil);
+    AssertTrue('nil probe reported gracefully', Pos('nil or empty', Report) > 0);
+
+    vInput := TNNetVolume.Create(8, 8, 2);
+    vInput.FillForDebug();
+    Report := TNNet.GradCAMReport(NN, vInput);
+    AssertTrue('header present', Pos('GradCAMReport', Report) > 0);
+    AssertTrue('coarse map present', Pos('Coarse Grad-CAM map', Report) > 0);
+    AssertTrue('peak line present', Pos('peak at conv cell', Report) > 0);
+  finally
+    if vInput <> nil then vInput.Free;
     NN.Free;
   end;
 end;

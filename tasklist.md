@@ -451,7 +451,7 @@ breakdown:
       `TNNetWeightStandardization` reparametrizations, which normalize the
       FORWARD weights, not the update.
 ### Introspection / debugging tools
-- [ ] `TNNet.GradCAMReport` — Grad-CAM class-localisation map (Selvaraju et al.
+- [x] `TNNet.GradCAMReport` — Grad-CAM class-localisation map (Selvaraju et al.
       2017), the CNN attribution the suite is genuinely missing. The landed
       `SaliencyReport` already covers INPUT-pixel attribution three ways (vanilla
       `|∂logit_c/∂x|`, SmoothGrad, AND Integrated Gradients with the completeness

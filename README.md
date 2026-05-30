@@ -1237,6 +1237,7 @@ Beyond the runnable examples above, `TNNet` exposes a family of in-process intro
 
 ### Interpretability & attribution
 - **`TNNet.SaliencyReport(NN, Probe)`** — input-gradient / SmoothGrad / Integrated-Gradients heatmaps for the predicted class (with the IG completeness check). → [example](examples/SaliencyReport)
+- **`TNNet.GradCAMReport(NN, Probe [, ConvLayerIdx, ForcedClass])`** — Grad-CAM (Selvaraju et al. 2017) coarse, class-discriminative conv-feature heatmap for the predicted class, nearest-upsampled to the input plane (complements the fine input-pixel `SaliencyReport`). → [example](examples/GradCAM)
 - **`TNNet.AttentionEntropyReport(NN, Probes)`** — per-row attention entropy with dead/spike head flags for every `TNNetScaledDotProductAttention` layer. → [example](examples/AttentionEntropyReport)
 - **`TNNet.ActivationPatchingReport(NN, CleanInput, CorruptInput [, TargetIdx])`** — causal trace: which layer's activations carry the information that decides the prediction. → [example](examples/ActivationPatching)
 - **`TNNet.LogitLensReport(NN, pInput [, HeadStartIdx])`** — re-applies the net's own trained head at each depth (zero new params) to see when the prediction crystallises. → [example](examples/LogitLens)
