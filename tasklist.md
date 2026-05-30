@@ -423,6 +423,34 @@ breakdown:
       "pure memorization". Fork the landed demo's net/data/training loop and add
       a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
       so 4 corruption levels still fit the <5-min budget.
+- [ ] Epoch-wise (temporal) double descent demo (`examples/EpochWiseDoubleDescent/`)
+      — reproduce the THIRD double-descent axis from Nakkiran et al. 2020
+      (*Deep Double Descent*, the "epoch-wise" figure): a FIXED, mildly
+      over-parameterized MLP trained on a SMALL label-noisy classification set,
+      charting held-out test error against TRAINING EPOCH. The curve is
+      non-monotone over TIME: it first FALLS (classical learning), RISES to a
+      peak around the epoch where train error hits ~0 and the net is forced to
+      interpolate the noisy labels, then FALLS AGAIN with continued training.
+      Distinct from BOTH siblings already in tree and must say so in the README:
+      examples/DoubleDescent/ sweeps CAPACITY at the end of training (the
+      model-wise axis), and grokking is delayed generalization at fixed capacity
+      driven by WEIGHT DECAY on CLEAN labels — here capacity AND weight decay are
+      FIXED, labels carry NOISE, and the only swept axis is epoch count. Build
+      with existing layers only (Input -> FullConnectReLU x2 -> FullConnectLinear
+      -> SoftMax), no NeuralFit (hand-rolled per-epoch loop so test error can be
+      logged every K epochs deterministically), RandSeed:=424242,
+      MaxThreadNum:=1. Self-gate must assert the genuine invariants (Halt(1)
+      otherwise): train error reaches ~0 (interpolation happens), AND the
+      test-error trajectory is NON-MONOTONE with an interior peak strictly above
+      both its earlier valley and its final value (the down-up-down signature) —
+      NOT merely "final < initial". Tuning honesty (document in README per the
+      RandomLabelMemorization/DropPath caveat style): the epoch-wise peak is
+      FRAGILE — it needs enough label noise (~15-20%) to force memorization, a
+      large-enough net to eventually interpolate, and a small-enough LR that the
+      noise-fitting phase is temporally resolvable; if the peak refuses to appear
+      in the CPU budget, report which knob failed rather than loosening the gate.
+      A clean, conceptually-striking generalization-dynamics demo on a time axis
+      the suite does not yet cover.
 
 ### Composite blocks / builders I'd enjoy shipping
 <!-- (PreNorm / RMSNorm / PostNorm residual builders removed: completed,
