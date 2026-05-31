@@ -47646,6 +47646,8 @@ begin
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
       'TNNetVectorQuantizer' :      Result := TNNetVectorQuantizer.Create(St[0], Ft[0]);
+      'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2]);
+      'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
@@ -47928,6 +47930,8 @@ begin
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetVectorQuantizer' then Result := TNNetVectorQuantizer.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
