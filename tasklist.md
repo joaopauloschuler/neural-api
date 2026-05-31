@@ -879,6 +879,18 @@ rather than acted on.
 - [X] TNNetSoftSign saturation test on ±1e6: assert `|y| < 1` and
       Backpropagate doesn't NaN.
 - [X] TNNetESwish saturation test at ±extreme inputs.
+- [ ] FP-exception robustness for TNNetSoftSign / TNNetESwish at truly extreme
+      inputs (surfaced 2026-05-31 while writing the saturation tests above):
+      both raise a HARDWARE FP exception rather than returning a finite value
+      at far-extreme magnitudes — TNNetSoftSign's closed-form derivative
+      `1/(1+|x|)^2` overflows float32 around |x|~1e30 (EInvalidOp), and
+      TNNetESwish's `Exp(-beta*x)` overflows the RTL `Exp` around beta*x~-570
+      (EOverflow). The landed tests stay inside the safe-but-saturating band
+      (SoftSign ±1e6, ESwish beta*x up to ±625) and document the limit. Decide
+      a policy: either clamp the offending intermediate (saturate the derivative
+      to 0 / the sigmoid to its asymptote) so the layers stay finite at any
+      input like HardTanh/SoftCapping do, or document the input-range contract.
+      Then extend the tests to the far-extreme range under the chosen policy.
 - [ ] LiSHT / BentIdentity gradient-magnitude sanity at large |x| — both
       grow unboundedly, finite-difference eps must scale with input
       magnitude.
