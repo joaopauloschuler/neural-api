@@ -1297,15 +1297,16 @@ Mapping legend:
   hand-rolled erf -> `pcr_erff`.
 
 Per-agent workflow (MANDATORY for every task below):
-1. BENCHMARK BEFORE: build a tiny standalone bench that exercises the affected
-   layers (forward+backward, large N over the changed code path), time it
-   (e.g. `GetTickCount64`/`EpochCount` loops). Record ms.
-2. Edit `neural/neuralnetwork.pas` for the assigned ranges only.
-3. TEST: `bash tests/RunAll.sh` must pass (build green + all tests). The suite
-   is slow (~20+ min); run it in the background and wait.
-4. BENCHMARK AFTER: rebuild the same bench, time it, record ms.
-5. COMMIT on branch `a2` with before/after ms in the message (report the delta
-   even if pcr_* is slower — the migration to float32 is intentional regardless).
+1. Edit the assigned ranges only (in `neural/neuralnetwork.pas` and/or
+   `neural/neuralvolume.pas`).
+2. COMPILE: the unit must build green. Do NOT run the test suite or benchmarks
+   (deferred — "test another day"). A clean compile is the gate. Compile with:
+   `fpc -B -Fu/home/bpsa/app/neural-api/neural -Fu/home/bpsa/app/neural-api/neural/pas-core-math -Fu/usr/share/lazarus/4.4.0/components/lazutils/lib/x86_64-linux -Mobjfpc -Sh -O2 <unit>`
+   (compiling a unit that uses it, or tests/RunTests.lpr's build step without
+   running, is fine — just confirm zero fatal errors).
+3. COMMIT locally on branch `a2`. NEVER push. Stage only the source file(s) you
+   changed + tasklist.md (tick your task box). Pre-existing compiler
+   Notes/Warnings are not errors.
 
 ### Tasks
 - [x] **T1 — Activation layers (lines ~7600–20100).** The bulk; mechanical
@@ -1334,3 +1335,13 @@ Per-agent workflow (MANDATORY for every task below):
       `Sin/Cos`->`pcr_sincosf` (40752/40753, 42957/42958); `*Report`
       diagnostics 31000–44897 (`Ln`->`pcr_logf`, `Log10`->`pcr_log10f`,
       `1/Sqrt`->`pcr_rsqrtf`).
+- [ ] **T5 — neuralvolume.pas.** This unit is NOT yet wired to pascoremath32:
+      it has no `{$UNITPATH}` and does not list the unit in `uses`. First add
+      `pascoremath32` to the interface `uses` clause (line ~44) and add
+      `{$UNITPATH ./pas-core-math}` near the top (after the `unit`/`{$mode}`
+      header, ~line 40), mirroring how neuralnetwork.inc does it. Then migrate
+      the ~42 scalar calls to float32: `Exp`->`pcr_expf` (9), `Sqrt` where it
+      is `1/Sqrt`->`pcr_rsqrtf` (18 total Sqrt — leave bare `Sqrt` as-is),
+      `Power`->`pcr_powf` (12; `Power(2,e)`->`pcr_exp2f`), `Ln`->`pcr_logf`,
+      `Log2`->`pcr_log2f`, `Sin/Cos`->`pcr_sinf/pcr_cosf` (pair->`pcr_sincosf`).
+      Preserve all clamps/guards.
