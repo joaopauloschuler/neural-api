@@ -487,9 +487,6 @@ rather than acted on.
       channel reduction (no such (X,Y,1)-producing channel-axis reduction layer
       exists). If a fixed avg/max-over-Depth reduction primitive lands, offer it as
       the paper-faithful spatial-descriptor variant behind a flag.
-- [ ] Channel-attention bake-off can now wire arm (c): the landed AddCBAM (see the
-      open "Channel-attention bake-off" entry below — (a) none (b) SE (c) CBAM (d)
-      1x1+sigmoid).
 - [ ] TNNetFiLM follow-up: a CLASS-CONDITIONAL generator/decoder demo — the
       headline FiLM use case (cGAN / conditional generation, Perez et al.). Build a
       tiny decoder (a couple of conv/upsample blocks) whose feature maps are
@@ -540,15 +537,9 @@ rather than acted on.
       ~0.1 over training, and chart reconstruction loss vs `tau` plus the
       bottleneck's output entropy (the categorical sharpens as tau drops).
       The layer + its soft/hard modes are in tree; this is the headline
-      use case. Pairs with the open TNNetMixtureOfExperts routing gate.
-- [x] Mixture-of-Experts feed-forward block (`TNNet.AddMixtureOfExperts`) — DONE
-      (soft/dense gate v1). A token-wise softmax gating network blends N parallel
-      shape-preserving expert MLPs; combine wired as SplitChannels(e,1) ->
-      DeepConcat.Replicate -> CellMulByCell -> Sum. Example
-      examples/MixtureOfExperts, smoke+round-trip test in TestNeuralLayersExtra,
-      README bullets.
+      use case. Pairs with the open hard-top-k MoE routing gate.
 - [ ] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
-      soft block above) — run only the k highest-gated experts per token (sparse
+      soft `TNNet.AddMixtureOfExperts` block) — run only the k highest-gated experts per token (sparse
       dispatch) plus a load-balancing auxiliary loss so the gate does not collapse
       onto one expert. Needs a top-k masking/dispatch mechanism on the gate plus
       an aux-loss head; left out of v1 to avoid shipping an untested router. (The
@@ -705,11 +696,6 @@ rather than acted on.
       `DotProducts` output layout `out[b*NumAs+a]`) into a reusable utility if a
       second orthogonalization example ever needs them.
 ### Introspection / debugging tools
-- [X] WriteLayerTimings(NN, Sample) — landed as `TNNet.LayerTimingReport`
-      (commit be1708d): runs N forward passes and returns a per-layer
-      wall-clock table (mean us/forward + percent ASCII bar + total), reusing
-      the per-layer `ForwardTime` accumulators. Smoke test in
-      tests/TestNeuralLayersExtra.pas.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
       approximated from the last probe sample only (streaming moments keep
       memory bounded). Add an exact per-layer median across the whole probe
