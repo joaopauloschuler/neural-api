@@ -209,6 +209,10 @@ type
     procedure TestDiagonalSSMWeightGradientCheck;
     procedure TestDiagonalSSMSeqLen1Feedthrough;
     procedure TestDiagonalSSMSerializationRoundTrip;
+    procedure TestCausalConv1DInputGradientCheck;
+    procedure TestCausalConv1DWeightGradientCheck;
+    procedure TestCausalConv1DCausality;
+    procedure TestCausalConv1DSerializationRoundTrip;
     procedure TestPReLUChannelInputGradientCheck;
     procedure TestPReLUChannelWeightGradientCheck;
     procedure TestGatedResidualGradient;
@@ -19677,6 +19681,260 @@ begin
   // SizeX=4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDiagonalSSM.Create(), 'DiagonalSSM', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+  SeqLen, InDepth, NumFeat, K: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Deterministic init so this finite-difference check is ordering-independent
+  // (see numerical-test-rng-ordering memory).
+  RandSeed := 424242;
+  SeqLen := 5; InDepth := 3; NumFeat := 2; K := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, NumFeat);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LConv := TNNetCausalConv1D.Create(NumFeat, K);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    // Set non-trivial weights/bias so the gradient is meaningful.
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('CausalConv1D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+  SeqLen, InDepth, NumFeat, K: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 5; InDepth := 3; NumFeat := 2; K := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, NumFeat);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LConv := TNNetCausalConv1D.Create(NumFeat, K);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.25;
+
+    // Check the weight gradient for each tap of each output channel.
+    for n := 0 to LConv.Neurons.Count - 1 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // LearningRate=1, batch update on -> analytical = -Delta.
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('CausalConv1D weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DCausality;
+var
+  NN: TNNet;
+  Input, Base: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  SeqLen, InDepth, NumFeat, K, t, perturbT, f, c: integer;
+  baseOut: TNNetVolume;
+begin
+  // Headline correctness property: perturbing input position perturbT must NOT
+  // change any output position < perturbT (left-only padding => no future leak).
+  RandSeed := 424242;
+  SeqLen := 6; InDepth := 2; NumFeat := 3; K := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Base := TNNetVolume.Create(SeqLen, 1, InDepth);
+  baseOut := TNNetVolume.Create(SeqLen, 1, NumFeat);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LConv := TNNetCausalConv1D.Create(NumFeat, K);
+    NN.AddLayer(LConv);
+    for t := 0 to Base.Size - 1 do
+      Base.Raw[t] := Sin(t * 0.55) * 1.3 + 0.1;
+    // Give every tap a non-zero weight so a leak would actually show.
+    for f := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[f].Weights.Fill(0.5);
+
+    NN.Compute(Base);
+    baseOut.Copy(NN.GetLastLayer.Output);
+
+    for perturbT := 0 to SeqLen - 1 do
+    begin
+      Input.Copy(Base);
+      // Perturb all channels at position perturbT.
+      for c := 0 to InDepth - 1 do
+        Input[perturbT, 0, c] := Input[perturbT, 0, c] + 10.0;
+      NN.Compute(Input);
+      // Outputs strictly before perturbT must be unchanged.
+      for t := 0 to perturbT - 1 do
+        for f := 0 to NumFeat - 1 do
+          AssertEquals('CausalConv1D causality: perturb t=' + IntToStr(perturbT) +
+            ' must not change out t=' + IntToStr(t) + ' f=' + IntToStr(f),
+            baseOut[t, 0, f], NN.GetLastLayer.Output[t, 0, f], 1e-6);
+      // Sanity: output AT perturbT must change (it reads position perturbT).
+      AssertTrue('CausalConv1D causality: perturb t=' + IntToStr(perturbT) +
+        ' should change out t=' + IntToStr(perturbT),
+        Abs(baseOut[perturbT, 0, 0] - NN.GetLastLayer.Output[perturbT, 0, 0]) > 1e-4);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Base.Free;
+    baseOut.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // save -> load -> save string equality (hyperparams + weights + bias).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 3, 1));
+    LConv := TNNetCausalConv1D.Create(2, 3);
+    NN.AddLayer(LConv);
+    // Perturb weights and bias so the round-trip exercises non-default values.
+    for i := 0 to LConv.Neurons.Count - 1 do
+    begin
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.37;
+      LConv.Neurons[i].Weights.Raw[1] := LConv.Neurons[i].Weights.Raw[1] - 0.21;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CausalConv1D save->load->save string equality', Saved, Saved2);
+
+      // Structure parity and compute parity.
+      AssertEquals('CausalConv1D round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CausalConv1D round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestPReLUChannelInputGradientCheck;

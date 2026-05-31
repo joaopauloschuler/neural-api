@@ -367,10 +367,18 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
-- [ ] TNNetCausalConv1D — 1D conv with left-only padding so output at
+- [X] TNNetCausalConv1D — 1D conv with left-only padding so output at
       position t depends only on positions ≤ t. Backward is the standard
       conv backward minus the masked-future part. Pairs with TNNetTokenShift
-      and unblocks attention-free baseline experiments. (Already possible with existing layers?)
+      and unblocks attention-free baseline experiments. (Landed: focused
+      self-contained layer — one neuron per output channel holding a
+      (K,1,InputDepth) window + bias, NOT built on TNNetConvolution
+      machinery; "minus the masked-future part" = simply skipping taps with
+      srcT<0, which by construction never reads srcT>t. Tests: input/weight
+      numerical-gradient, a forward-only causality assertion, and a
+      save->load->save string-equality round-trip in TestNeuralNumerical.pas.
+      NOTE: local kernel-size var must be named e.g. Ksize, not K — `K` is a
+      duplicate identifier against a global const in neuralnetwork.pas.)
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
