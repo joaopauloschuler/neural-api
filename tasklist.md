@@ -779,6 +779,37 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
+- [ ] `examples/EchoStateNetwork/` — Reservoir Computing (Jaeger 2001
+      "Echo State Network") on a TINY pure-CPU target. This is a genuinely
+      DIFFERENT training paradigm from everything in tree: the recurrent core is
+      FIXED and RANDOM — only a single linear readout is trained — so there is no
+      backprop-through-time at all (apt for this feedforward library, which has no
+      RNN/LSTM/GRU). Mechanic per timestep t over a 1-D driving signal x_t:
+      `h_t = (1-a)*h_{t-1} + a*tanh(W_in*x_t + W*h_{t-1})` with leak rate `a`, a
+      reservoir of N~50-200 units, W_in random, and W a sparse random matrix
+      RESCALED to a chosen spectral radius rho<1 (the echo-state property) — reuse
+      the existing `TNNet.EstimateSpectralNorm` power-iteration helper to measure
+      and normalise rho instead of a full eigensolve. Run the reservoir FORWARD
+      (no gradient) over a training sequence, COLLECT the states h_t into a
+      TNNetVolumePair list (input = h_t, target = next value), and train ONLY a
+      `TNNetFullConnectLinear(1)` readout on those collected states — a tiny
+      ridge-style linear fit. Headline task: free-run one-step-ahead prediction of
+      a chaotic/periodic series (Mackey-Glass, or a sum-of-sines `sin(0.2t)+
+      0.3sin(0.31t)`), then feed the readout's own output back as the next input
+      and show the network AUTONOMOUSLY continues the waveform for many steps
+      (render predicted-vs-true as an ASCII plot). Built-in correctness signals
+      (printed PASS/FAIL, `Halt(1)` on failure): (1) teacher-forced one-step NRMSE
+      well below a chance/persistence baseline; (2) an echo-state ABLATION — set
+      rho>1.5 and show the free-run prediction DIVERGES (NRMSE explodes), proving
+      the spectral-radius<1 condition is what makes it work, not incidental. Keep
+      N and sequence length tiny so the whole thing trains in seconds. Distinct
+      from `examples/DiagonalSSM/` (a TRAINED diagonal linear recurrence — the
+      whole state transition learns; ESN FREEZES it), from TNNetTokenShift / the
+      open causal-conv baselines (fixed finite-window shifts, not a recurrent
+      fading-memory state), and from TimeSeriesForecast (a trainable conv/attention
+      forecaster). The reusable nugget this introduces is the
+      "fixed-random-reservoir + train-only-the-readout" pattern, which nothing in
+      tree currently demonstrates.
 - [X] `examples/InductionHeads/` — pure-CPU reproduction of the headline result of
       Olsson et al. 2022 "In-context Learning and Induction Heads"
       (<https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html>):
