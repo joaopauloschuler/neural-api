@@ -7495,6 +7495,10 @@ type
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      // Persist the symbolic engine's learned rules (hex-encoded so the
+      // engine's '>'/newline delimiters cannot collide with the TNNet format).
+      function SaveDataToString(): string; override;
+      procedure LoadDataFromString(strData: string); override;
   end;
 
   // Pointwise (1x1-convolution-style) variant of TNNetByteProcessing. A single
@@ -7523,6 +7527,10 @@ type
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      // Persist the shared symbolic engine's learned rules (hex-encoded; see
+      // TNNetByteProcessing.SaveDataToString).
+      function SaveDataToString(): string; override;
+      procedure LoadDataFromString(strData: string); override;
   end;
 
   // This class is very experimental - do not use it.
@@ -17701,6 +17709,46 @@ begin
 end;
 
 
+{ Byte-engine state serialization helpers }
+
+// Hex-encode an arbitrary string so the result contains only [0-9A-F]. Used to
+// embed the symbolic byte engine's serialized rules (which carry '>' and
+// newline delimiters) inside the TNNet save format without delimiter clashes.
+function NeuralStrToHex(const s: string): string;
+const
+  HexChars: array[0..15] of char = '0123456789ABCDEF';
+var
+  i, b: integer;
+begin
+  SetLength(Result, Length(s) * 2);
+  for i := 1 to Length(s) do
+  begin
+    b := Ord(s[i]);
+    Result[2*i-1] := HexChars[b shr 4];
+    Result[2*i]   := HexChars[b and 15];
+  end;
+end;
+
+function NeuralHexToStr(const s: string): string;
+  function HexVal(c: char): integer;
+  begin
+    case c of
+      '0'..'9': Result := Ord(c) - Ord('0');
+      'A'..'F': Result := Ord(c) - Ord('A') + 10;
+      'a'..'f': Result := Ord(c) - Ord('a') + 10;
+    else
+      Result := 0;
+    end;
+  end;
+var
+  i, n: integer;
+begin
+  n := Length(s) div 2;
+  SetLength(Result, n);
+  for i := 0 to n-1 do
+    Result[i+1] := Chr( (HexVal(s[2*i+1]) shl 4) or HexVal(s[2*i+2]) );
+end;
+
 { TNNetByteProcessing }
 
 procedure TNNetByteProcessing.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -17795,6 +17843,22 @@ begin
   // Continue the backward chain (previously severed here): the previous
   // layer's error has already been augmented with the straight-through signal.
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetByteProcessing.SaveDataToString(): string;
+begin
+  // No TNNetNeuron weights; persist the symbolic engine's learned rules.
+  if FOutput.Size = 0 then Result := '' // engine not initiated (no SetPrevLayer)
+  else Result := NeuralStrToHex(FByteLearning.BytePred.NeuronsToString(0));
+end;
+
+procedure TNNetByteProcessing.LoadDataFromString(strData: string);
+var
+  decoded: string;
+begin
+  if (Length(strData) = 0) or (FOutput.Size = 0) then exit;
+  decoded := NeuralHexToStr(strData);
+  FByteLearning.BytePred.CleanAndLoadNeuronsFromString(decoded);
 end;
 
 { TNNetPointwiseByteProcessing }
@@ -17918,6 +17982,21 @@ begin
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetPointwiseByteProcessing.SaveDataToString(): string;
+begin
+  if FOutput.Size = 0 then Result := ''
+  else Result := NeuralStrToHex(FByteLearning.BytePred.NeuronsToString(0));
+end;
+
+procedure TNNetPointwiseByteProcessing.LoadDataFromString(strData: string);
+var
+  decoded: string;
+begin
+  if (Length(strData) = 0) or (FOutput.Size = 0) then exit;
+  decoded := NeuralHexToStr(strData);
+  FByteLearning.BytePred.CleanAndLoadNeuronsFromString(decoded);
 end;
 
 { TNNetDigital }
