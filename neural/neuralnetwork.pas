@@ -7497,6 +7497,34 @@ type
       procedure Backpropagate(); override;
   end;
 
+  // Pointwise (1x1-convolution-style) variant of TNNetByteProcessing. A single
+  // SHARED symbolic byte engine is applied independently to the Depth vector at
+  // every (X,Y) position, exactly as a pointwise convolution shares one kernel
+  // across all spatial locations. Each position is one training sample for the
+  // shared engine, so it generalizes across positions (weight sharing). Output
+  // keeps the input's SizeX/SizeY; its Depth becomes ceil(Depth/8)*8. The
+  // straight-through estimator carries a saturated (|x|<=1) gradient back to the
+  // previous layer per position (output channel D maps to input channel D, the
+  // bit threshold being a sign()); the discrete engine is treated as the
+  // identity on the backward pass. Experimental, like TNNetByteProcessing.
+  TNNetPointwiseByteProcessing = class(TNNetIdentity)
+    private
+      FByteLearning: TEasyLearnAndPredictClass;
+      FByteInput: array of byte;
+      FByteOutput: array of byte;
+      FByteOutputFound: array of byte;
+      FPosInput: TNNetVolume;   // scratch: one position's input Depth vector
+      FPosOutput: TNNetVolume;  // scratch: one position's output bits
+      FByteLen: integer;
+      FInDepth: integer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(CacheSize, TestCount, OperationCount: integer); overload;
+      destructor Destroy; override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   // This class is very experimental - do not use it.
   TNNetForByteProcessing = class(TNNet)
     private
@@ -17766,6 +17794,129 @@ begin
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   // Continue the backward chain (previously severed here): the previous
   // layer's error has already been augmented with the straight-through signal.
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetPointwiseByteProcessing }
+
+procedure TNNetPointwiseByteProcessing.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInDepth := pPrevLayer.Output.Depth;
+  FByteLen := FInDepth div 8;
+  if (FInDepth mod 8 > 0) then Inc(FByteLen);
+  FByteLearning.Initiate(FByteLen, FByteLen, False{pFullEqual},
+    FStruct[1]{NumNeuronGroups}, FStruct[2]{pNumberOfSearches},
+    (FStruct[0]>0){pUseCache}, FStruct[0]{CacheSize});
+  // Same spatial grid as the input; depth is rounded up to whole bytes.
+  FOutput.Resize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, FByteLen*8);
+  FOutputError.Resize(FOutput);
+  FPosInput.Resize(1, 1, FInDepth);
+  FPosOutput.Resize(1, 1, FByteLen*8);
+  SetLength(FByteInput, FByteLen);
+  SetLength(FByteOutput, FByteLen);
+  SetLength(FByteOutputFound, FByteLen);
+  FByteLearning.BytePred.FUseBelief := True;
+  FByteLearning.BytePred.FGeneralize := True;
+end;
+
+constructor TNNetPointwiseByteProcessing.Create(CacheSize, TestCount,
+  OperationCount: integer);
+begin
+  inherited Create;
+  FPosInput := TNNetVolume.Create;
+  FPosOutput := TNNetVolume.Create;
+  FStruct[0] := CacheSize;
+  FStruct[1] := TestCount;
+  FStruct[2] := OperationCount;
+end;
+
+destructor TNNetPointwiseByteProcessing.Destroy;
+begin
+  SetLength(FByteInput, 0);
+  SetLength(FByteOutput, 0);
+  SetLength(FByteOutputFound, 0);
+  FPosInput.Free;
+  FPosOutput.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetPointwiseByteProcessing.Compute();
+var
+  StartTime: double;
+  X, Y, D, MaxX, MaxY, OutDepthM1: integer;
+begin
+  StartTime := Now();
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  OutDepthM1 := FByteLen*8 - 1;
+  // Apply the one shared engine to each (X,Y) Depth column independently.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      for D := 0 to FInDepth - 1 do
+        FPosInput.FData[D] := FPrevLayer.FOutput[X, Y, D];
+      FPosInput.ReadAsBits(FByteInput, 0.0);
+      FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
+      FPosOutput.CopyAsBits(FByteOutput, -0.5, +0.5);
+      for D := 0 to OutDepthM1 do
+        FOutput[X, Y, D] := FPosOutput.FData[D];
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPointwiseByteProcessing.Backpropagate();
+var
+  StartTime: double;
+  X, Y, D, MaxX, MaxY, InDepthM1, OutDepthM1: integer;
+  v: TNeuralFloat;
+  doPrev: boolean;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  InDepthM1 := FInDepth - 1;
+  OutDepthM1 := FByteLen*8 - 1;
+  doPrev := Assigned(FPrevLayer) and
+            (FPrevLayer.OutputError.Size > 0) and
+            (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+
+  // For every position: (1) push the saturated straight-through gradient to the
+  // previous layer (output channel D maps to input channel D; |x|<=1 like
+  // TNNetSign; padding channels beyond FInDepth carry none), and (2) teach the
+  // shared engine this position's reconstructed target. We must re-Predict per
+  // position to restore the engine's internal per-call state before
+  // newStateFound (Compute left it on the last position). Predict only reads the
+  // learned rules; newStateFound does the learning. FOutputError is never
+  // mutated, so both steps read the original dL/dOutput.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      if doPrev then
+        for D := 0 to InDepthM1 do
+        begin
+          v := FPrevLayer.FOutput[X, Y, D];
+          if Abs(v) <= 1 then
+            FPrevLayer.FOutputError[X, Y, D] :=
+              FPrevLayer.FOutputError[X, Y, D] + FOutputError[X, Y, D];
+        end;
+
+      for D := 0 to InDepthM1 do
+        FPosInput.FData[D] := FPrevLayer.FOutput[X, Y, D];
+      FPosInput.ReadAsBits(FByteInput, 0.0);
+      FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
+      // target = FOutput - dL/dOutput, then read as bits to recover next state.
+      for D := 0 to OutDepthM1 do
+        FPosOutput.FData[D] := FOutput[X, Y, D] - FOutputError[X, Y, D];
+      FPosOutput.ReadAsBits(FByteOutputFound, 0.0);
+      FByteLearning.newStateFound(FByteOutputFound);
+    end;
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
