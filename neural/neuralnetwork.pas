@@ -4985,6 +4985,15 @@ type
       // match the block input shape so the residual sum is valid. Returns the
       // residual-sum layer.
       function AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // Learnable per-channel affine block: appends a TNNetChannelMul (per-channel
+      // scale gamma[d], initialised to 1.0) followed by a TNNetChannelBias
+      // (per-channel shift beta[d], initialised to 0.0) to the current end of the
+      // net, yielding y[x,y,d] = gamma[d]*x[x,y,d] + beta[d]. At init it is the
+      // exact identity (gamma=1, beta=0). This is a cheap, FullConnect-separable
+      // affine transform (only 2*Depth params, no cross-channel mixing) suited to
+      // BitFit-style adaptation: freeze a trunk and train only these affine params.
+      // Returns the TNNetChannelBias layer (the block output).
+      function AddAffineBlock: TNNetLayer;
       // FiLM (Feature-wise Linear Modulation, Perez et al. 2018) conditioning
       // helper:  y[x,y,c] = gamma[c] * featLayer[x,y,c] + beta[c], where the
       // per-channel gamma|beta come from condLayer. This one call replaces the
@@ -46838,6 +46847,17 @@ begin
   AddLayer(pSublayers);
   AddLayer( TNNetGatedResidual.Create() );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddAffineBlock: TNNetLayer;
+begin
+  // Learnable per-channel affine y = gamma[d]*x + beta[d], separable from
+  // FullConnect: a TNNetChannelMul (per-channel scale, initialised to 1.0)
+  // followed by a TNNetChannelBias (per-channel shift, initialised to 0.0).
+  // At init the block is the exact identity (gamma=1, beta=0). Only 2*Depth
+  // trainable params and no cross-channel mixing.
+  AddLayer( TNNetChannelMul.Create() );
+  Result := AddLayer( TNNetChannelBias.Create() );
 end;
 
 function TNNet.AddFiLMConditioned(featLayer, condLayer: TNNetLayer): TNNetLayer;

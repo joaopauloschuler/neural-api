@@ -135,6 +135,9 @@ type
     procedure TestPreNormResidualForwardWiring;
     procedure TestGatedResidualGradientCheck;
     procedure TestGatedResidualForwardWiring;
+    // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
+    procedure TestAddAffineBlockForwardWiring;
+    procedure TestAddAffineBlockGradientCheck;
     procedure TestSwitchableNormForward;
     procedure TestSwitchableNormGradientCheck;
     procedure TestSwitchableNormSerializationRoundTrip;
@@ -2771,6 +2774,158 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddAffineBlockForwardWiring;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  AffineOut: TNNetLayer;
+  LMul, LBias: TNNetLayer;
+  i, d: integer;
+  gamma, beta: array[0..1] of TNeuralFloat;
+begin
+  // Forward sanity: AddAffineBlock = TNNetChannelMul -> TNNetChannelBias.
+  // At init gamma=1, beta=0 so the block is the EXACT identity (output == x).
+  // After setting per-channel gamma|beta to known constants the output must
+  // equal y[d] = gamma[d]*x[d] + beta[d].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2));
+    AffineOut := NN.AddAffineBlock;
+
+    // Layers: [0]=Input, [1]=ChannelMul (gamma), [2]=ChannelBias (beta).
+    LMul := NN.Layers[1];
+    LBias := NN.Layers[2];
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.7 - 0.4;
+
+    // Output shape must match the input shape.
+    AssertEquals('AffineBlock output SizeX', 3, AffineOut.Output.SizeX);
+    AssertEquals('AffineBlock output SizeY', 1, AffineOut.Output.SizeY);
+    AssertEquals('AffineBlock output Depth', 2, AffineOut.Output.Depth);
+
+    // One scale and one bias weight per channel (Depth).
+    AssertEquals('AffineBlock gamma weight count == Depth', 2,
+      LMul.Neurons[0].Weights.Size);
+    AssertEquals('AffineBlock beta weight count == Depth', 2,
+      LBias.Neurons[0].Weights.Size);
+    // gamma initialised to 1, beta to 0.
+    for d := 0 to 1 do
+    begin
+      AssertEquals('AffineBlock init gamma channel ' + IntToStr(d), 1.0,
+        LMul.Neurons[0].Weights.Raw[d], 1e-7);
+      AssertEquals('AffineBlock init beta channel ' + IntToStr(d), 0.0,
+        LBias.Neurons[0].Weights.Raw[d], 1e-7);
+    end;
+
+    // At init the block is the exact identity: output == x.
+    NN.Compute(Input);
+    for i := 0 to AffineOut.Output.Size - 1 do
+      AssertEquals('AffineBlock identity at init at ' + IntToStr(i),
+        Input.Raw[i], AffineOut.Output.Raw[i], 1e-6);
+
+    // Set known per-channel gamma|beta and verify y[d] = gamma[d]*x[d] + beta[d].
+    gamma[0] := 0.75; gamma[1] := -0.40;
+    beta[0]  := 0.30; beta[1]  :=  1.20;
+    LMul.Neurons[0].Weights.Raw[0] := gamma[0];
+    LMul.Neurons[0].Weights.Raw[1] := gamma[1];
+    LBias.Neurons[0].Weights.Raw[0] := beta[0];
+    LBias.Neurons[0].Weights.Raw[1] := beta[1];
+
+    NN.Compute(Input);
+    for i := 0 to AffineOut.Output.Size - 1 do
+    begin
+      d := i mod 2; // Depth is the innermost (fastest) index in Raw.
+      AssertEquals('AffineBlock affine output at ' + IntToStr(i),
+        gamma[d] * Input.Raw[i] + beta[d],
+        AffineOut.Output.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddAffineBlockGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LMul, LBias: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Project memory: TestNeuralNumerical.pas tests share one RNG; reseed so this
+  // test does not perturb an unrelated ordering-sensitive check downstream.
+  RandSeed := 424242;
+  // End-to-end input gradient check through a net containing AddAffineBlock.
+  // gamma|beta are set to non-trivial per-channel constants so the affine
+  // transform actually contributes and the gradient is non-trivial.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    NN.AddAffineBlock;
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Layers: [0]=Input, [1]=ChannelMul (gamma), [2]=ChannelBias (beta).
+    LMul := NN.Layers[1];
+    LBias := NN.Layers[2];
+    LMul.Neurons[0].Weights.Raw[0] := 0.4;
+    LMul.Neurons[0].Weights.Raw[1] := -0.25;
+    LBias.Neurons[0].Weights.Raw[0] := 0.3;
+    LBias.Neurons[0].Weights.Raw[1] := -0.5;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('AffineBlock input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 

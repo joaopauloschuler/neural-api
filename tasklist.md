@@ -277,7 +277,7 @@ breakdown:
       a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
       so 4 corruption levels still fit the <5-min budget.
 ### Composite blocks / builders I'd enjoy shipping
-- [ ] TNNetAffineBlock — `Mul → Bias` builder for a learnable per-channel
+- [X] TNNetAffineBlock — `Mul → Bias` builder for a learnable per-channel
       affine transform separable from FullConnect (built on TNNetChannelMul +
       TNNetChannelBias, both in tree).
 
@@ -852,7 +852,7 @@ breakdown:
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
       (BitFit-style cheap adaptation).
-- [ ] `examples/AffineFineTune/` — once TNNetAffineBlock lands, same
+- [X] `examples/AffineFineTune/` — once TNNetAffineBlock lands, same
       pattern but freezing everything except the inserted Affine blocks
       (built on TNNetChannelBias + TNNetChannelMul).
 - [ ] `examples/TokenShiftBaseline/` — train a tiny next-token char model
