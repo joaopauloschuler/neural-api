@@ -37,26 +37,6 @@ rather than acted on.
 ## New layer types
 
 ## Interesting applications / examples
-- [X] Mahalanobis out-of-distribution detector (`examples/MahalanobisOOD/`) —
-      reproduce Lee et al. 2018 "A Simple Unified Framework for Detecting
-      Out-of-Distribution Samples" on a TINY pure-CPU target. Train a small
-      classifier on an IN-distribution split (e.g. synthetic Gaussian blobs for
-      classes 0..K-1, or MNIST digits 0..4), then FREEZE it and read the
-      penultimate-layer feature vector for each training sample. Fit one
-      class-conditional Gaussian per class: per-class mean mu_c plus a single
-      shared (tied) covariance Sigma pooled across classes; the OOD score for a
-      new x is the max over c of the negative squared Mahalanobis distance
-      -(f-mu_c)^T Sigma^-1 (f-mu_c). Show that held-in samples score higher than
-      OOD samples (held-out classes 5..9, or blobs from a far-away region) and
-      report a single AUROC separating the two score distributions. Note:
-      neuralcalibration.pas already has temperature scaling/ECE but there is no
-      AUROC helper and no OOD example anywhere — the AUROC computation (sort the
-      merged scores, sum ranks / rank-statistic form of the Mann-Whitney U) is
-      the small reusable piece this example introduces. Keep it forward-only
-      after training (no backprop through the detector), invert the KxK feature
-      covariance with the existing volume math (small K so a plain Cholesky or
-      Gauss-Jordan is fine), and add a smoke test asserting AUROC > 0.8 on the
-      easy synthetic split.
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
       SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
       overlap. Add a HARDER near-OOD variant (OOD blobs closer to the in-dist
@@ -290,9 +270,6 @@ breakdown:
       a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
       so 4 corruption levels still fit the <5-min budget.
 ### Composite blocks / builders I'd enjoy shipping
-- [X] TNNetAffineBlock — `Mul → Bias` builder for a learnable per-channel
-      affine transform separable from FullConnect (built on TNNetChannelMul +
-      TNNetChannelBias, both in tree).
 
 #### Attention / sequence
 - [ ] TNNetCausalConv1D — 1D conv with left-only padding so output at
@@ -810,49 +787,6 @@ breakdown:
       forecaster). The reusable nugget this introduces is the
       "fixed-random-reservoir + train-only-the-readout" pattern, which nothing in
       tree currently demonstrates.
-- [X] `examples/InductionHeads/` — pure-CPU reproduction of the headline result of
-      Olsson et al. 2022 "In-context Learning and Induction Heads"
-      (<https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html>):
-      a TINY 2-layer CAUSAL attention-only transformer spontaneously forms an
-      *induction head* that does in-context copying — on a sequence that contains
-      a repeat `... [A][B] ... [A] -> ?`, it predicts `[B]` by finding the earlier
-      occurrence of the current token `[A]`, looking at the token that FOLLOWED it,
-      and copying that token forward. This is a genuinely different phenomenon from
-      the landed `examples/AttentionCopyTask/` (a SINGLE NON-CAUSAL head learning a
-      position-based identity copy of a non-repeated sequence): induction requires
-      (a) a causal mask, (b) repeated random sequences so the only way to win is
-      content-based prefix-matching, not position, and (c) the two-head composition
-      the paper identifies — a layer-1 "previous-token head" that writes token t-1's
-      identity into position t, feeding a layer-2 "prefix-matching head" that
-      attends from the current token back to where that same token appeared before.
-      The toy: vocab ~16, draw a random prefix and CONCATENATE it with itself (one
-      or more times) so every second-half position has a deterministic
-      copy-the-previous-occurrence answer; train next-token CE under a causal mask.
-      Build it from in-tree pieces only — `TNNetEmbedding` +
-      `TNNetSinusoidalPositionalEmbedding` -> two stacked causal blocks via the
-      `AddTransformerEncoderBlock(..., CausalMask=True)` builder (or hand-wired
-      `TNNetMaskedFill` -> packed Q|K|V `TNNetPointwiseConvLinear` ->
-      `TNNetScaledDotProductAttention`) -> `TNNetPointwiseConvLinear(Vocab)` ->
-      `TNNetPointwiseSoftMax(1)`. Headline built-in correctness signals
-      (printed PASS/FAIL, `Halt(1)` on failure): (1) in-context accuracy on the
-      REPEATED half climbs to near-100% while accuracy on the first (unseen) half
-      stays at chance — the model is copying, not memorising; (2) the
-      "in-context learning score" (loss at a late repeated position minus loss at
-      the matching early position) is strongly negative — the textbook ICL metric;
-      (3) read the layer-2 head's attention matrix back via the existing
-      `AttentionWeights` accessor and assert a "prefix-matching score": each query
-      at a repeat puts most of its attention mass on the position ONE AFTER the
-      earlier occurrence of its own token (the induction stripe), and the layer-1
-      head's mass concentrates on the immediately-previous position
-      (previous-token head). Render that attention matrix as a glyph-shaded ASCII
-      heatmap so the induction stripe is visible directly. Distinct from
-      AttentionCopyTask, the PositionEncodingBakeoff recency study, and the
-      single-net diagnostic reports — this trains a real (tiny) two-layer causal
-      transformer and surfaces an EMERGENT algorithmic circuit. Mind the
-      manual-gradient / best-model-reload gotchas in
-      [[manual-gradient-and-snapshot-gotchas]] and the per-token projection rule in
-      [[mha-builder-and-seq-projection]]; keep dims tiny so the whole thing trains
-      well under the 5-minute CPU budget.
 - [ ] InductionHeads follow-up (landed 2026-05-31, Option A — two hand-wired
       single-head causal SDPA blocks): the landed demo asserts the LAYER-2
       prefix-matching stripe (mass 0.978). Add the matching LAYER-1
@@ -917,9 +851,6 @@ breakdown:
       bias-only vs full-affine (mul+bias) target accuracy at matched frozen
       trunk. This is now a ~30-line diff on AffineFineTune, not a from-scratch
       example.
-- [X] `examples/AffineFineTune/` — once TNNetAffineBlock lands, same
-      pattern but freezing everything except the inserted Affine blocks
-      (built on TNNetChannelBias + TNNetChannelMul).
 - [ ] AddAffineBlock follow-up (landed 2026-05-31): the landed AffineFineTune
       inserts a `TNNetReshape(1,1,C)` before each affine block because
       TNNetFullConnect emits units on the SizeX axis while TNNetChannelMul/Bias
