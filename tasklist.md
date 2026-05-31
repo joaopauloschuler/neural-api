@@ -379,6 +379,13 @@ rather than acted on.
       save->load->save string-equality round-trip in TestNeuralNumerical.pas.
       NOTE: local kernel-size var must be named e.g. Ksize, not K — `K` is a
       duplicate identifier against a global const in neuralnetwork.pas.)
+- [ ] TNNetCausalConv1D follow-ups (layer landed 2026-05-31): (a) a DILATED
+      variant (WaveNet-style exponentially-growing receptive field via a
+      `Dilation` ctor param — left-pad by `Dilation*(K-1)`, skip taps at
+      `srcT<0` exactly as the dense form does); (b) it is now the ready 4th
+      contender for the open "causal-conv vs token-shift vs SDPA on the same
+      toy next-token task" experiment below — wire it in and chart loss +
+      per-step cost (its selling point is O(n*K) attention-free mixing).
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
@@ -444,6 +451,22 @@ rather than acted on.
       KV-cache composition that removes that recompute is the explicit follow-up,
       pinned to the open KV-cache task above. Keep vocab/seq/K tiny (K in {2,4})
       so the whole demo stays well inside the <5-min pure-CPU budget.
+      (Landed 2026-05-31: TokenShift DRAFT + causal-attention TARGET, two
+      separate seeded xorshift64* streams — proposal vs accept — so draft==target
+      provably collapses to plain sampling bit-for-bit (mandatory Halt(1) gate),
+      real-draft histogram TV~0.02, accept rate 0.585->0.969 over a draft-quality
+      sweep. ~70s on one core.)
+- [ ] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
+      fairly FLAT, so absolute accept rates are high even for a weak draft and
+      the speedup headline is carried by the monotone accept-rate RISE, not the
+      absolute %. Add a PEAKED-target variant (sharper next-token distribution,
+      e.g. a near-deterministic rule + low-temperature target) so the
+      weak-draft accept rate drops well below 1 and the calls-saved gap between
+      a good and bad draft widens — a more discriminating speedup chart.
+- [ ] SpeculativeDecoding follow-up: KV-cache composition — once the open
+      KV-cache incremental-decode path lands, remove the per-verification-pass
+      prefix recompute (the v1 demo recomputes the whole prefix each pass) so the
+      two efficiency wins (fewer big-model calls x O(1)-per-step) compose.
 - [ ] TNNetDiagonalSSM follow-up: add it as the fourth contender in the
       open "causal-conv vs token-shift vs SDPA on the same toy next-token
       task" experiment — its selling point is matching attention quality
@@ -682,6 +705,16 @@ rather than acted on.
       print the offending layer" check after each forward+backward pass.
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.
+      (Landed 2026-05-31: `TNeuralFit.NaNGuard: boolean` (default False, both
+      RunNNThread loops), backed by `TNNet.FirstLayerWithNonFinite` +
+      `TVolume.HasNonFinite`. Tests pin the isolated detector — default-off,
+      all-finite=-1, NaN/Inf detected at the right layer index.)
+- [ ] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
+      detector helper, not the in-LOOP abort. Add an end-to-end test that runs
+      a short TNeuralFit with `NaNGuard := True` on a net rigged to produce a
+      non-finite activation (e.g. an aggressive LR / a planted Inf weight) and
+      assert training aborts (FShouldQuit set / FErrorProc fired) rather than
+      running to the epoch budget.
 - [ ] Mixup data augmentation helper.
 - [ ] SAM follow-up: the noisy-label 2D-blob clusters are easily separable so
       clean val-accuracy saturates (~99%) across all rho — the flatness signal
