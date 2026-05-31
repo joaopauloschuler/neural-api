@@ -39,9 +39,11 @@ unit neuralvolume;
 {$mode objfpc}
 {$ENDIF}
 
+{$UNITPATH ./pas-core-math}
+
 interface
 
-uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils;
+uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32;
 
 {$include neuralnetwork.inc}
 
@@ -1024,11 +1026,11 @@ var
 begin
   if x > 0 then
   begin
-    Result := 1 / ( 1 + Exp(-x) )
+    Result := 1 / ( 1 + pcr_expf(-x) )
   end
   else
   begin
-    S := Exp(x);
+    S := pcr_expf(x);
     Result := S / (1 + S);
   end;
 end;
@@ -1919,14 +1921,14 @@ end;
 
 function Swish(x: TNeuralFloat): TNeuralFloat;
 begin
-  Result := x / ( 1 + Exp(-x) );
+  Result := x / ( 1 + pcr_expf(-x) );
 end;
 
 function SwishDerivative(x: TNeuralFloat): TNeuralFloat;
 var
   SigmoidValue, OutputValue: TNeuralFloat;
 begin
-  SigmoidValue := 1 / ( 1 + Exp(-x) ); {Swish(x)}
+  SigmoidValue := 1 / ( 1 + pcr_expf(-x) ); {Swish(x)}
   OutputValue := x * SigmoidValue;
   Result :=  OutputValue + SigmoidValue * (1-OutputValue);
 end;
@@ -3819,7 +3821,7 @@ begin
     r := x*x + y*y;
   end;
 
-  RandomGaussianValue := x * Sqrt(-2.0 * Ln(r) / r);
+  RandomGaussianValue := x * Sqrt(-2.0 * pcr_logf(r) / r);
 end;
 
 procedure TVolume.Add(Original: TVolume);
@@ -4401,7 +4403,7 @@ begin
   begin
     vHigh := High(FData);
     for I := 0 to vHigh do
-      FData[I] := Power(FData[I],Value);
+      FData[I] := pcr_powf(FData[I],Value);
   end;
 end;
 
@@ -5862,7 +5864,7 @@ end;
 
 function TVolume.GetPerplexity: T;
 begin
-  Result := Power(2, GetEntropy());
+  Result := pcr_exp2f(GetEntropy());
 end;
 
 procedure TVolume.FlipX();
@@ -6262,7 +6264,7 @@ begin
     for I := 0 to vHigh do
     begin
       // LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
-      LocalValue := Exp( FData[I] );
+      LocalValue := pcr_expf( FData[I] );
       FData[I] := LocalValue;
       TotalSum := TotalSum + FData[I];
     end;
@@ -6320,7 +6322,7 @@ begin
         I := StartPointPos;
         for CountD := 0 to MaxD do
         begin
-          LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+          LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
           FData[I] := LocalValue;
           TotalSum := TotalSum + LocalValue;
           Inc(I);
@@ -6433,7 +6435,7 @@ begin
           I := StartPointPos;
           for CountD := 0 to ChannelsPerGroup - 1 do
           begin
-            LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+            LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
             FData[I] := LocalValue;
             TotalSum := TotalSum + LocalValue;
             Inc(I);
@@ -6768,15 +6770,15 @@ begin
   MaxDepth := FDepth - 1;
   for CntDepth := 0 to MaxDepth do
   begin
-    divTerm := Power(n, (2 * (CntDepth div 2)) / EmbeddingSize);
+    divTerm := pcr_powf(n, (2 * (CntDepth div 2)) / EmbeddingSize);
     for CntX := 0 to MaxX do
     begin
       for CntY := 0 to MaxY do
       begin
         Position := CntY*FSizeX + CntX;
         if CntDepth mod 2 = 0
-          then Self[CntX, CntY, CntDepth] := Sin(Position / divTerm)
-          else Self[CntX, CntY, CntDepth] := Cos(Position / divTerm);
+          then Self[CntX, CntY, CntDepth] := pcr_sinf(Position / divTerm)
+          else Self[CntX, CntY, CntDepth] := pcr_cosf(Position / divTerm);
       end;
     end;
   end;

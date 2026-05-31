@@ -1325,17 +1325,17 @@ Per-agent workflow (MANDATORY for every task below):
       ALiBi `Power(2,e)` -> `pcr_exp2f` (9913);
       SoftMax/LogSoftMax/Gumbel (28368–28672); SoftPool/LpPool (26780–27057,
       `Power`->`pcr_powf`).
-- [ ] **T3 — Normalization layers (`1/Sqrt(var+eps)` -> `pcr_rsqrtf`).**
+- [x] **T3 — Normalization layers (`1/Sqrt(var+eps)` -> `pcr_rsqrtf`).**
       LayerNorm/RMSNorm/GroupNorm/PixelNorm/SwitchableNorm/weight-standardization/
       weight-norm: 21212, 21321/21426, 21588/21593, 21748, 21845, 21978,
       24565/24625, 24748/24805, plus attention inv-sqrt-dk 11361, 12377 and
       L2/RMS norm 10826/10853/10890, 11968/11976.
-- [ ] **T4 — Init & diagnostics (lower priority).** He/Glorot init `Sqrt(...)`
+- [x] **T4 — Init & diagnostics (lower priority).** He/Glorot init `Sqrt(...)`
       (47327–49657, convert `1/Sqrt` forms to `pcr_rsqrtf`); Box-Muller
       `Sin/Cos`->`pcr_sincosf` (40752/40753, 42957/42958); `*Report`
       diagnostics 31000–44897 (`Ln`->`pcr_logf`, `Log10`->`pcr_log10f`,
       `1/Sqrt`->`pcr_rsqrtf`).
-- [ ] **T5 — neuralvolume.pas.** This unit is NOT yet wired to pascoremath32:
+- [x] **T5 — neuralvolume.pas.** This unit is NOT yet wired to pascoremath32:
       it has no `{$UNITPATH}` and does not list the unit in `uses`. First add
       `pascoremath32` to the interface `uses` clause (line ~44) and add
       `{$UNITPATH ./pas-core-math}` near the top (after the `unit`/`{$mode}`
