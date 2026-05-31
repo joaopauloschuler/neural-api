@@ -113,6 +113,49 @@ rather than acted on.
       the budget" honesty the Grokking entry uses). Distinct from VisualGAN
       (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
       DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
+- [ ] Neural ODE (continuous-depth residual) demo + `TNNet.AddNeuralODEBlock` builder
+      (`examples/NeuralODE/`) — reproduce the Chen et al. 2018 "Neural Ordinary
+      Differential Equations" idea on a TINY pure-CPU target. A residual block
+      `x_{n+1} = x_n + f(x_n)` is one explicit Euler step of `dx/dt = f(x,t)`; a
+      Neural ODE replaces a STACK of distinct residual blocks with ONE shared `f`
+      integrated over T sub-steps with a FIXED step size `h = 1/T`, so depth becomes
+      a continuous time axis and the parameter count is independent of T. The key
+      enabler already in tree is `TNNetConvolutionSharedWeights` / a shared-weight
+      pointwise `f` (one `f` reused at every Euler step), exactly like the open
+      Growing-CA entry uses it for the CA rule — without it each step would learn
+      separate weights and it degenerates into an ordinary residual stack. Scope a
+      `TNNet.AddNeuralODEBlock(InputLayer, HiddenDepth, Steps, Method)` builder that
+      wires `Steps` shape-preserving Euler updates `y := y + h*f(y)` sharing one `f`
+      sub-block (`f` = PointwiseConvReLU -> PointwiseConvLinear over Depth so the
+      residual is shape-preserving per the [[residual-builder-helpers]] rule, NOT
+      FullConnect which mixes the whole tensor), with an optional 2nd-order
+      midpoint/RK2 method behind `Method`. Headline payoffs, both striking and
+      distinct from the suite: (a) train a tiny classifier where the ODE block stands
+      in for a deep residual trunk and show accuracy is roughly FLAT as `Steps` grows
+      {1,2,4,8} at CONSTANT parameter count (the "depth for free" property), charting
+      Steps vs accuracy vs param-count; (b) a 2-D toy where the learned flow
+      UNTANGLES two interleaved spiral/ring classes — render the trajectory of a few
+      points across the integration steps as ASCII frames so you can SEE the
+      continuous deformation (the textbook Neural-ODE picture). Feasibility risks to
+      settle honestly in v1, in the "what did NOT fit the budget" style the Grokking
+      entry uses: the headline memory win of Neural ODEs is the ADJOINT-sensitivity
+      backward (integrate an adjoint ODE backwards for O(1)-in-T activation memory);
+      that is a custom backward needing the `SetBatchUpdate(True)` weight-accumulation
+      idiom from [[manual-gradient-and-snapshot-gotchas]] and is the same O(1)-memory
+      capability the open `TNNetReversibleBlock` recompute path and the
+      "Gradient checkpointing" infra task fight for — so v1 should train via ordinary
+      stored-activation backprop-through-the-unrolled-steps (correct, simple) and log
+      the adjoint path as the explicit follow-up, exactly as the ReversibleBlock entry
+      split the inverse-formula demo from the recompute mode. Keep T<=8 and dims tiny
+      so the unrolled forward/backward stays well inside the <5-min pure-CPU budget.
+      Distinct from `TNNetReversibleBlock` (a coupling-layer architecture with an
+      analytic inverse, NOT a time-integrated shared `f`), from the residual builders
+      `AddPreNormResidual`/`AddGatedResidual` (single fixed residual step, separate
+      weights), and from `DiagonalSSM` (a 1-D linear sequence recurrence, not a
+      multi-step nonlinear integrator over a feature tensor). A `TestNeuralODEBlockSmoke`
+      following the introspection-report test recipe should pin the `Steps=1` case as
+      bit-for-bit equal to a single plain residual step, and the shared-weight
+      invariant (all Euler steps read the same neurons).
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
