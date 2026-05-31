@@ -669,6 +669,7 @@ type
     procedure TestDigitalFilterNumerical;
     procedure TestCopyToChannelsNumerical;
     procedure TestSEBlockShapeAndForward;
+    procedure TestCBAMShapeForwardAndGradFlow;
     procedure TestConfusionMatrixReportArithmetic;
     procedure TestGradientNormReportSmoke;
     procedure TestPerplexityReportSmoke;
@@ -5108,6 +5109,71 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCBAMShapeForwardAndGradFlow;
+const
+  W = 8; H = 8; C = 4; R = 2; K = 7;
+var
+  NN: TNNet;
+  InputLayer, CBAMOut: TNNetLayer;
+  Input, Desired: TNNetVolume;
+  Idx: integer;
+  OutVal, GradSumAbs: TNeuralFloat;
+begin
+  // Shared RNG is ordering-sensitive; reseed so later checks stay deterministic.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(W, H, C));
+    CBAMOut := NN.AddCBAM(InputLayer, R, K);
+
+    // CBAM is shape-preserving: output shape must equal input shape.
+    AssertEquals('CBAM output SizeX equals input', W, CBAMOut.Output.SizeX);
+    AssertEquals('CBAM output SizeY equals input', H, CBAMOut.Output.SizeY);
+    AssertEquals('CBAM output Depth equals input', C, CBAMOut.Output.Depth);
+
+    for Idx := 0 to Input.Size - 1 do
+      Input.FData[Idx] := (Random - 0.5) * 2.0;
+
+    NN.Compute(Input);
+
+    // Forward must be finite everywhere.
+    for Idx := 0 to CBAMOut.Output.Size - 1 do
+    begin
+      OutVal := CBAMOut.Output.FData[Idx];
+      AssertFalse('CBAM output contains NaN', IsNaN(OutVal));
+      AssertFalse('CBAM output contains Inf', IsInfinite(OutVal));
+    end;
+
+    // Run a real backward pass and assert finite, non-trivial input-gradient
+    // flow back through both attention sub-modules.
+    Desired.ReSize(CBAMOut.Output);
+    for Idx := 0 to Desired.Size - 1 do
+      Desired.FData[Idx] := Cos(Idx * 0.5);
+
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.Compute(Input);
+    InputLayer.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    GradSumAbs := 0;
+    for Idx := 0 to InputLayer.OutputError.Size - 1 do
+    begin
+      OutVal := InputLayer.OutputError.FData[Idx];
+      AssertFalse('CBAM input gradient contains NaN', IsNaN(OutVal));
+      AssertFalse('CBAM input gradient contains Inf', IsInfinite(OutVal));
+      GradSumAbs := GradSumAbs + Abs(OutVal);
+    end;
+    AssertTrue('CBAM produces non-zero input gradient flow', GradSumAbs > 1e-8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

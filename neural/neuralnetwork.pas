@@ -5117,6 +5117,28 @@ type
       // input -> AvgChannel -> FCReLU(C/r) -> FCSigmoid(C) -> ChannelMulByLayer(input, gating).
       // ReductionRatio is clamped so the bottleneck width is at least 1.
       function AddSEBlock(InputLayer: TNNetLayer; ReductionRatio: integer = 16): TNNetLayer;
+      // CBAM (Convolutional Block Attention Module, Woo et al. 2018). Wires
+      // existing tested layers into the CBAM pattern over a conv feature map
+      // (SizeX,SizeY,C). It is shape-preserving (output shape = input shape).
+      //   1) CHANNEL attention: global avg-pool AND global max-pool over space
+      //      each feed a reduce(C/r)->ReLU->expand(C) MLP; the two are summed,
+      //      sigmoid'd to per-channel weights Mc in (0,1) and broadcast-multiplied
+      //      over space (TNNetChannelMulByLayer).
+      //   2) SPATIAL attention: a pointwise (1x1) conv reduces the channel-refined
+      //      map over depth to a 2-channel descriptor; a SpatialKernelSize conv
+      //      (padded to keep size) + sigmoid yields a per-(x,y) gate Ms in (0,1)
+      //      which is replicated over depth and cell-multiplied with the map.
+      // v1 SIMPLIFICATIONS (documented in examples/CBAMAttention/README.md):
+      //   - the avg and max channel branches use two SEPARATE MLPs (the paper
+      //     shares one MLP); summing-before-sigmoid is otherwise identical.
+      //   - the spatial channel descriptor is a LEARNED pointwise conv (C->2)
+      //     rather than the paper's fixed avg+max over the channel axis, because
+      //     no fixed avg-over-depth / max-over-depth primitive exists as a layer.
+      // ReductionRatio and SpatialKernelSize are clamped to safe values.
+      // NOTE: the spatial branch uses TNNetMaxChannel-free primitives, but the
+      // CHANNEL branch's TNNetMaxChannel assumes square maps (SizeX=SizeY).
+      function AddCBAM(InputLayer: TNNetLayer; ReductionRatio: integer = 16;
+        SpatialKernelSize: integer = 7): TNNetLayer;
       // SwiGLU feed-forward block: FullConnectLinear(2*D_hidden) -> SwiGLU -> FullConnectLinear(D_out).
       // D_in is informational only; the first FullConnect infers its input from the previous layer.
       function AddSwiGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
@@ -24836,6 +24858,57 @@ begin
   AddLayer( TNNetFullConnectReLU.Create(Bottleneck) );
   Excite := AddLayer( TNNetFullConnectSigmoid.Create(Channels) );
   Result := AddLayer( TNNetChannelMulByLayer.Create(InputLayer, Excite) );
+end;
+
+function TNNet.AddCBAM(InputLayer: TNNetLayer; ReductionRatio: integer;
+  SpatialKernelSize: integer): TNNetLayer;
+var
+  Channels, Bottleneck, Padding: integer;
+  AvgMLP, MaxMLP, ChannelGate, ChannelRefined: TNNetLayer;
+  SpatialDescriptor, SpatialGate, SpatialMask: TNNetLayer;
+begin
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  Channels := InputLayer.Output.Depth;
+  if ReductionRatio < 1 then ReductionRatio := 1;
+  Bottleneck := Channels div ReductionRatio;
+  if Bottleneck < 1 then Bottleneck := 1;
+  // SpatialKernelSize must be odd and >= 1 so the symmetric padding below keeps
+  // the (SizeX,SizeY) size exactly (stride 1, Padding = (k-1) div 2).
+  if SpatialKernelSize < 1 then SpatialKernelSize := 1;
+  if (SpatialKernelSize and 1) = 0 then Inc(SpatialKernelSize);
+  Padding := SpatialKernelSize div 2;
+
+  // --- CHANNEL ATTENTION ---------------------------------------------------
+  // Avg-pool branch over space -> shared-shape reduce/expand MLP (linear head,
+  // because the two branches are summed BEFORE the sigmoid).
+  AddLayerAfter( TNNetAvgChannel.Create(), InputLayer );
+  AddLayer( TNNetFullConnectReLU.Create(Bottleneck) );
+  AvgMLP := AddLayer( TNNetFullConnectLinear.Create(Channels) );
+  // Max-pool branch over space -> its own reduce/expand MLP (v1 uses a separate
+  // MLP instead of the paper's shared MLP; see the README).
+  AddLayerAfter( TNNetMaxChannel.Create(), InputLayer );
+  AddLayer( TNNetFullConnectReLU.Create(Bottleneck) );
+  MaxMLP := AddLayer( TNNetFullConnectLinear.Create(Channels) );
+  // Sum the two branches, sigmoid -> per-channel weights Mc in (0,1).
+  AddLayer( TNNetSum.Create([AvgMLP, MaxMLP]) );
+  ChannelGate := AddLayer( TNNetSigmoid.Create() );
+  // Broadcast-multiply the feature map by Mc over the spatial dimensions.
+  ChannelRefined := AddLayer( TNNetChannelMulByLayer.Create(InputLayer, ChannelGate) );
+
+  // --- SPATIAL ATTENTION ---------------------------------------------------
+  // Reduce the channel-refined map over depth to a 2-channel descriptor. v1
+  // uses a LEARNED pointwise (1x1) conv (C->2) in place of the paper's fixed
+  // avg-over-depth and max-over-depth, because no fixed channel-axis reduction
+  // primitive producing a (SizeX,SizeY,1) map exists as a layer (see README).
+  SpatialDescriptor := AddLayerAfter( TNNetPointwiseConvLinear.Create(2), ChannelRefined );
+  // SpatialKernelSize conv -> 1-channel logits, padded to keep size, sigmoid
+  // -> per-(x,y) gate Ms in (0,1).
+  AddLayerAfter( TNNetConvolutionLinear.Create(1, SpatialKernelSize, Padding, 1), SpatialDescriptor );
+  SpatialGate := AddLayer( TNNetSigmoid.Create() );
+  // Replicate the (SizeX,SizeY,1) gate across depth so it can be cell-multiplied
+  // with the (SizeX,SizeY,C) channel-refined map.
+  SpatialMask := AddLayer( TNNetDeepConcat.Replicate(Channels, SpatialGate) );
+  Result := AddLayer( TNNetCellMulByCell.Create(ChannelRefined, SpatialMask) );
 end;
 
 function TNNet.AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
