@@ -17,3 +17,4 @@ MuonOptimizer/MuonOptimizer
 PerplexityEval/PerplexityEval
 QuantileRegression/QuantileRegression
 RandomLabelMemorization/RandomLabelMemorization
+SpeculativeDecoding/SpeculativeDecoding

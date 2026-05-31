@@ -404,7 +404,7 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [ ] Speculative decoding demo (`examples/SpeculativeDecoding/`) — reproduce the
+- [X] Speculative decoding demo (`examples/SpeculativeDecoding/`) — reproduce the
       Leviathan et al. 2023 / Chen et al. 2023 "speculative sampling" trick on a
       TINY pure-CPU pair of next-token models, and prove the headline property: the
       sampled output is DISTRIBUTED EXACTLY as if drawn from the big model alone,
