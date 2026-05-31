@@ -8724,7 +8724,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      InvSqrt := pcr_rsqrtf(1 + Alpha * PrevValue * PrevValue);
+      InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
       FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
       FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
     end;
@@ -8783,7 +8783,7 @@ begin
       end
       else
       begin
-        InvSqrt := pcr_rsqrtf(1 + Alpha * PrevValue * PrevValue);
+        InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
         FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
         FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
       end;
@@ -23943,7 +23943,7 @@ begin
   (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
   ValueT := AddLayer( TNNetTransposeXD.Create() );
   (*W := *)AddLayer( TNNetDotProducts.Create(Query, Key, NoForward) );
-  (*W := *)AddLayer( TNNetMulByConstant.Create(pcr_rsqrtf(EmbeddingDim)) );
+  (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
   (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
   W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
   (*Y := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
@@ -24002,7 +24002,7 @@ begin
       (*W := *)AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
       if Not(HasNorm) then
       begin
-        (*W := *)AddLayer( TNNetMulByConstant.Create(pcr_rsqrtf(InputChannelsPerGroup)) );
+        (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
         (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
       end;
       W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
@@ -31563,7 +31563,7 @@ begin
     begin
       if not HasRow[LayerIdx] then Continue;
       if InErrs[LayerIdx] <= 0 then Continue;
-      V := Log10(InErrs[LayerIdx] + cEps);
+      V := pcr_log10f(InErrs[LayerIdx] + cEps);
       LogVals[LayerIdx] := V;
       if (MaxBin = 0) then
       begin
@@ -31810,7 +31810,7 @@ begin
                   P := Output.FData[WIdx];
                   if P < cEps then P := cEps;
                   if P > 1 then P := 1;
-                  SampleLoss := SampleLoss - Tgt * Ln(P);
+                  SampleLoss := SampleLoss - Tgt * pcr_logf(P);
                 end;
               end;
             end;
@@ -32076,7 +32076,7 @@ begin
             P := AttnMap[j, i, 0];
             if P > cEps then
             begin
-              RowEntropy := RowEntropy - P * Ln(P + cEps);
+              RowEntropy := RowEntropy - P * pcr_logf(P + cEps);
               Inc(ValidK);
             end;
           end;
@@ -32084,7 +32084,7 @@ begin
           // entries. For causal masking row i has i+1 keys; we use the
           // post-softmax non-zero count as an empirical proxy.
           if ValidK > 1 then
-            RowMaxH := Ln(ValidK)
+            RowMaxH := pcr_logf(ValidK)
           else
             RowMaxH := 0;
 
@@ -32135,7 +32135,7 @@ begin
       // detection above.
       AttnMap := AttnLayer.AttentionWeights;
       SeqLen := AttnMap.SizeY;
-      if SeqLen > 1 then LogSeq := Ln(SeqLen) else LogSeq := 0;
+      if SeqLen > 1 then LogSeq := pcr_logf(SeqLen) else LogSeq := 0;
 
       if LogSeq > 0 then
         Lines.Add(Format(
@@ -32743,7 +32743,7 @@ begin
         NetFisherSqSum := NetFisherSqSum + FVal * FVal;
         if FVal > 0 then
         begin
-          V := Log10(FVal + cEps);
+          V := pcr_log10f(FVal + cEps);
           if HaveRange = 0 then
           begin
             HistMin := V;
@@ -32775,7 +32775,7 @@ begin
           FVal := ParamFisher[P];
           if FVal > 0 then
           begin
-            V := Log10(FVal + cEps);
+            V := pcr_log10f(FVal + cEps);
             BinIdx := Trunc(((V - HistMin) / Span) * cBins);
             if BinIdx < 0 then BinIdx := 0;
             if BinIdx >= cBins then BinIdx := cBins - 1;
@@ -34866,10 +34866,10 @@ begin
         begin
           Pl := Prob[C];
           if Pl < cEps then Pl := cEps;
-          EntVal := EntVal - Prob[C] * Ln(Pl);
+          EntVal := EntVal - Prob[C] * pcr_logf(Pl);
           Pf := FinalProb[SampleIdx][C];
           if Pf < cEps then Pf := cEps;
-          KLval := KLval + Prob[C] * Ln(Pl / Pf);
+          KLval := KLval + Prob[C] * pcr_logf(Pl / Pf);
         end;
         if KLval < 0 then KLval := 0;
         EntSum[L] := EntSum[L] + EntVal;
@@ -35482,7 +35482,7 @@ begin
     MinLogR := 1e30; MaxLogR := -1e30;
     for ProbeIdx := 0 to NumProbed - 1 do
     begin
-      LogR := Ln(FisherR[ProbeIdx] + 1e-6);
+      LogR := pcr_logf(FisherR[ProbeIdx] + 1e-6);
       if LogR < MinLogR then MinLogR := LogR;
       if LogR > MaxLogR then MaxLogR := LogR;
     end;
@@ -35492,7 +35492,7 @@ begin
     Lines.Add('Fisher ratio tr(Sb)/tr(Sw) across depth (log-scaled bars):');
     for ProbeIdx := 0 to NumProbed - 1 do
     begin
-      LogR := Ln(FisherR[ProbeIdx] + 1e-6);
+      LogR := pcr_logf(FisherR[ProbeIdx] + 1e-6);
       BarLen := Round(((LogR - MinLogR) / SpanR) * cMaxBarWidth);
       if BarLen < 0 then BarLen := 0;
       if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
@@ -36717,7 +36717,7 @@ begin
             - 3.0 * MeanV * MeanV * MeanV * MeanV;
       if M2 > 1e-30 then
       begin
-        Skew := M3 / Power(M2, 1.5);
+        Skew := M3 / pcr_powf(M2, 1.5);
         Kurt := (M4 / (M2 * M2)) - 3.0; // excess kurtosis (normal = 0)
       end
       else
@@ -37505,7 +37505,7 @@ begin
           NTail := Dim - Cut; // tail = Eig[Cut..Dim-1]
           SumLn := 0;
           for I := Cut to Dim - 1 do
-            SumLn := SumLn + Ln(Eig[I] / LMin);
+            SumLn := SumLn + pcr_logf(Eig[I] / LMin);
           if SumLn <= 1e-12 then Continue;
           AFit := 1.0 + NTail / SumLn;
           // KS distance: empirical tail CDF vs fitted power-law CDF.
@@ -37513,7 +37513,7 @@ begin
           for I := Cut to Dim - 1 do
           begin
             Emp := (I - Cut + 1) / NTail; // 1/n .. 1
-            FitV := 1.0 - Power(Eig[I] / LMin, 1.0 - AFit);
+            FitV := 1.0 - pcr_powf(Eig[I] / LMin, 1.0 - AFit);
             if Abs(Emp - FitV) > DKS then DKS := Abs(Emp - FitV);
           end;
           if DKS < BestKS then
@@ -37527,7 +37527,7 @@ begin
         KS := BestKS;
         LambdaMin := BestLMin;
         if LambdaMax > 1.0 then
-          WeightedAlpha := Alpha * Log10(LambdaMax)
+          WeightedAlpha := Alpha * pcr_log10f(LambdaMax)
         else
           WeightedAlpha := Alpha * 0.0; // log10(lambda_max)<=0 => 0 capacity
       end;
@@ -37570,7 +37570,7 @@ begin
       for I := 0 to Dim - 1 do
         if Eig[I] > 1e-20 then
         begin
-          Lg := Log10(Eig[I]);
+          Lg := pcr_log10f(Eig[I]);
           if not HaveLg then
           begin
             MinL := Lg; MaxL := Lg; HaveLg := True;
@@ -37589,7 +37589,7 @@ begin
           for I := 0 to Dim - 1 do
             if Eig[I] > 1e-20 then
             begin
-              Lg := Log10(Eig[I]);
+              Lg := pcr_log10f(Eig[I]);
               if LRange > 1e-30 then
                 K := Trunc(((Lg - MinL) / LRange) * cBins)
               else
@@ -38052,8 +38052,8 @@ begin
         for I := 0 to NMu - 2 do
         begin
           FcdfV := (I + 1) / NMu;
-          X := Ln(Mu[I]);
-          Y := -Ln(1.0 - FcdfV);
+          X := pcr_logf(Mu[I]);
+          Y := -pcr_logf(1.0 - FcdfV);
           SumXY := SumXY + X * Y;
           SumXX := SumXX + X * X;
         end;
@@ -38571,7 +38571,7 @@ begin
     for I := 0 to N - 1 do
       if Eig[I] > 1e-20 then
       begin
-        Lg := Log10(Eig[I]);
+        Lg := pcr_log10f(Eig[I]);
         if HaveLg = 0 then
         begin
           MinL := Lg; MaxL := Lg; HaveLg := 1;
@@ -38593,7 +38593,7 @@ begin
       for I := 0 to N - 1 do
         if Eig[I] > 1e-20 then
         begin
-          Lg := Log10(Eig[I]);
+          Lg := pcr_log10f(Eig[I]);
           if LRange > 1e-30 then
             K := Trunc(((Lg - MinL) / LRange) * cBins)
           else
@@ -40755,10 +40755,10 @@ var
     end;
     U1 := LcgNext();
     U2 := LcgNext();
-    R := Sqrt(-2.0 * Ln(U1));
+    R := Sqrt(-2.0 * pcr_logf(U1));
     Theta := 2.0 * Pi * U2;
-    G1 := R * Cos(Theta);
-    G2 := R * Sin(Theta);
+    G1 := R * pcr_cosf(Theta);
+    G2 := R * pcr_sinf(Theta);
     Spare := G2;
     HaveSpare := True;
     Result := G1;
@@ -41739,7 +41739,7 @@ begin
           begin
             Z := Output.Raw[ClassIdx];
             if Z < cEps then Z := cEps;
-            if Temperature <> 1.0 then Z := Exp(Ln(Z) / Temperature);
+            if Temperature <> 1.0 then Z := pcr_expf(pcr_logf(Z) / Temperature);
             Prob[ClassIdx] := Z;
             SumExp := SumExp + Z;
           end;
@@ -41760,7 +41760,7 @@ begin
           end;
           for ClassIdx := 0 to NumClasses - 1 do
           begin
-            Z := Exp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
+            Z := pcr_expf((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
             Prob[ClassIdx] := Z;
             SumExp := SumExp + Z;
           end;
@@ -41780,7 +41780,7 @@ begin
           SumExp := 0;
           for ClassIdx := 0 to NumClasses - 1 do
           begin
-            Z := Exp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
+            Z := pcr_expf((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
             Prob[ClassIdx] := Z;
             SumExp := SumExp + Z;
           end;
@@ -41793,7 +41793,7 @@ begin
         PEnt := 0;
         for ClassIdx := 0 to NumClasses - 1 do
           if Prob[ClassIdx] > cEps then
-            PEnt := PEnt - Prob[ClassIdx] * Ln(Prob[ClassIdx]);
+            PEnt := PEnt - Prob[ClassIdx] * pcr_logf(Prob[ClassIdx]);
         ExpEntAcc := ExpEntAcc + PEnt;
 
         // accumulate mean_p and per-pass argmax / top-prob.
@@ -41822,7 +41822,7 @@ begin
       PEnt := 0;
       for ClassIdx := 0 to NumClasses - 1 do
         if MeanProb[ClassIdx] > cEps then
-          PEnt := PEnt - MeanProb[ClassIdx] * Ln(MeanProb[ClassIdx]);
+          PEnt := PEnt - MeanProb[ClassIdx] * pcr_logf(MeanProb[ClassIdx]);
       PredEntropy[SampleIdx] := PEnt;
 
       // BALD / mutual information (clamp tiny negatives from FP noise).
@@ -42398,11 +42398,11 @@ begin
             if Cur.Raw[I] > MaxV then MaxV := Cur.Raw[I];
           SumExp := 0;
           for I := 0 to OutSize - 1 do
-            SumExp := SumExp + Exp(Cur.Raw[I] - MaxV);
+            SumExp := SumExp + pcr_expf(Cur.Raw[I] - MaxV);
           if SumExp <= 0 then SumExp := 1;
           for I := 0 to OutSize - 1 do
           begin
-            E := Exp(Cur.Raw[I] - MaxV) / SumExp;
+            E := pcr_expf(Cur.Raw[I] - MaxV) / SumExp;
             Avg.Raw[I] := Avg.Raw[I] + E;
           end;
         end
@@ -42960,10 +42960,10 @@ var
     end;
     U1 := LcgNext();
     U2 := LcgNext();
-    R := Sqrt(-2.0 * Ln(U1));
+    R := Sqrt(-2.0 * pcr_logf(U1));
     Theta := 2.0 * Pi * U2;
-    Result := R * Cos(Theta);
-    G2 := R * Sin(Theta);
+    Result := R * pcr_cosf(Theta);
+    G2 := R * pcr_sinf(Theta);
     Spare := G2;
     HaveSpare := True;
   end;
@@ -44839,9 +44839,9 @@ begin
       else
       begin
         if OutVal < cEps then OutVal := cEps;
-        NatsHere := -Ln(OutVal);
+        NatsHere := -pcr_logf(OutVal);
       end;
-      BitsHere := NatsHere / Ln(2.0);
+      BitsHere := NatsHere / pcr_logf(2.0);
       SumNats := SumNats + NatsHere;
       SumBits := SumBits + BitsHere;
 
