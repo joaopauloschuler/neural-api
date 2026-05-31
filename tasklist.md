@@ -196,7 +196,15 @@ breakdown:
       decoder block can opt into sinks per head behind a flag.
 - [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
       heads (Shazeer et al.). A tiny learnable HxH multiply applied to
-      attention logits along the head axis.
+      attention logits along the head axis. NOTE (2026-05-31): this repo has
+      NO single head-axis tensor — multi-head attention is built from H
+      SEPARATE TNNetScaledDotProductAttention layers (each FAttn is
+      [key,query,1]) concatenated along Depth. So a clean standalone HxH-mix
+      layer has nothing to operate on. To do this properly, either (a) add an
+      explicit multi-head SDPA tensor representation first, or (b) scope it as
+      a BUILDER that inserts the HxH mix between the per-head logit slabs
+      inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
+      Re-scope before attempting.
 - [X] TNNetSlidingWindowMaskedFill — banded *local* causal attention mask
       (Mistral / Longformer style). Distinct from the strictly-causal
       [[TNNetMaskedFill]] (full upper-triangle): each query position i may
@@ -211,6 +219,17 @@ breakdown:
       but caps the per-query key count (the property that makes long-context
       decode cheap) when W<SeqLen. Natural drop-in for the downstream
       ../gpt-3-for-pascal long-context path.
+- [ ] TNNetSlidingWindowMaskedFill follow-up (landed 2026-05-31): a tiny
+      next-token bake-off — full causal (TNNetMaskedFill / TriangularCausalMask)
+      vs sliding-window at W in {2, 4, full} on a task whose answer lives within
+      the window, charting loss + per-query key count. Shows the long-context
+      cost/quality trade the layer enables. Fork PositionEncodingBakeoff's
+      tiny next-token harness.
+- [ ] TNNetSlidingWindowMaskedFill follow-up: an attention-shape stress test
+      mirroring the open "Attention numerical-gradient stress test" — run the
+      forward-mask + grad check across SeqLen in {1,2,3,5,8} and W in
+      {1,2,SeqLen,SeqLen+2}, pinning the W>=SeqLen==full-causal equivalence and
+      the W=1 diagonal-only edge at every shape.
 - [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
@@ -368,6 +387,15 @@ breakdown:
       (1,1,2*Depth) reshape -> TNNetFiLM in one call, mirroring the existing
       AddPreNormResidual/AddGatedResidual builder family — removes the manual
       depth-2*Depth bookkeeping every FiLM site currently repeats.
+- [ ] TNNetFiLM builder follow-up (AddFiLMConditioned landed 2026-05-31): a
+      RESIDUAL/spatial-map variant. The landed AddFiLMConditioned uses a
+      FullConnectLinear conditioning FC sized for a (1,1,C) cond vector. The
+      class-conditional generator/decoder follow-up above needs FiLM over a
+      SPATIAL feature map (D over SizeX>1,SizeY>1) — confirm the landed builder
+      already broadcasts gamma|beta correctly per-channel over a spatial map
+      (it should, FiLM modulates per Depth channel), and if a per-token/
+      per-spatial-position conditioning is ever wanted, add a PointwiseConv
+      cond path variant gated by a flag.
 - [ ] TNNetMaxBlurPool follow-up: rectangular-input support — the landed layer
       inherits TNNetMaxPool's square-only (SizeX = SizeY) assumption. If a
       non-square blur-pool use case shows up, generalize the dense-max + blur
