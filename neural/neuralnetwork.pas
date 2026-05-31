@@ -5089,6 +5089,16 @@ type
       // BitFit-style adaptation: freeze a trunk and train only these affine params.
       // Returns the TNNetChannelBias layer (the block output).
       function AddAffineBlock: TNNetLayer;
+      // Convenience wrapper around TNNetGatherChannels: appends a learnable-free
+      // depth-channel gather that selects an ORDERED SUBSET (and/or reorders or
+      // duplicates) the previous layer's channels, yielding an output of shape
+      // (SizeX, SizeY, Length(pChannels)) with
+      // Output[X,Y,k] := Input[X,Y,pChannels[k]]. Handy for channel routing /
+      // pruning (keep a hand-picked channel subset). pChannels must be non-empty
+      // and every index in 0 <= idx < PrevLayer.Output.Depth. See the docs note
+      // distinguishing this from TNNetSplitChannels (contiguous range split) and
+      // TNNetGather (single-channel slice). Returns the gather layer.
+      function AddGatherChannels(pChannels: array of integer): TNNetLayer;
       // FiLM (Feature-wise Linear Modulation, Perez et al. 2018) conditioning
       // helper:  y[x,y,c] = gamma[c] * featLayer[x,y,c] + beta[c], where the
       // per-channel gamma|beta come from condLayer. This one call replaces the
@@ -47320,6 +47330,13 @@ begin
   // trainable params and no cross-channel mixing.
   AddLayer( TNNetChannelMul.Create() );
   Result := AddLayer( TNNetChannelBias.Create() );
+end;
+
+function TNNet.AddGatherChannels(pChannels: array of integer): TNNetLayer;
+begin
+  // Thin wrapper: gather an ordered subset/reorder of the previous layer's
+  // depth channels (Output[X,Y,k] := Input[X,Y,pChannels[k]]).
+  Result := Self.AddLayer(TNNetGatherChannels.Create(pChannels));
 end;
 
 function TNNet.AddFiLMConditioned(featLayer, condLayer: TNNetLayer): TNNetLayer;

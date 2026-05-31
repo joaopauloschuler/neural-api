@@ -10,6 +10,7 @@ DomainAdversarial/DomainAdversarial
 DropPathAblation/DropPathAblation
 EchoStateNetwork/EchoStateNetwork
 EuclideanNormHead/EuclideanNormHead
+GatherChannelsRouting/GatherChannelsRouting
 HardConcreteSparsity/HardConcreteSparsity
 ModelSummaryDemo/ModelSummaryDemo
 MuonOptimizer/MuonOptimizer

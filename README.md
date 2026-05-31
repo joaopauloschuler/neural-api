@@ -664,6 +664,11 @@ These layers could be particularly useful in scenarios where:
 - You're designing a network with multiple parallel paths, each operating on different subsets of the input features.
 - You're implementing custom attention mechanisms or feature selection techniques within your network.
 
+**Picking the right channel-select layer.** Three closely related layers select depth channels — pick by the *shape* of the selection:
+- `TNNetGather(Channel)` selects a **single** channel (`Output[x,y,0] := Input[x,y,Channel]`, output depth 1) — the degenerate one-index case.
+- `TNNetSplitChannels` selects a **contiguous range** (`Create(ChannelStart, ChannelLen)`) or an explicit list, and is the right tool for plain slicing / parallel-path splits.
+- `TNNetGatherChannels([i0, i1, ...])` selects an **arbitrary, ordered, possibly-repeated** index list (`Output[x,y,k] := Input[x,y,Channels[k]]`, output depth = list length), so it doubles as a learnable-free channel **reorder / prune / duplicate**. Add it via the convenience builder `TNNet.AddGatherChannels([...])`. See the runnable `examples/GatherChannelsRouting/` demo. Repeats are allowed; backward accumulates the duplicated output errors onto the shared source channel.
+
 | Layer Name                  | Input/Output Dimensions     | Description                                                                                           |
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetSplitChannels`         | 2D or 3D                   | Splits or copies channels from the input. This layer allows getting a subset of the input channels.     |

@@ -71,6 +71,7 @@ type
     procedure TestGatherChannelsGradientCheck;
     procedure TestGatherChannelsRepeatGradientCheck;
     procedure TestGatherChannelsLoadFromString;
+    procedure TestAddGatherChannelsBuilder;
 
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -6293,6 +6294,58 @@ begin
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('GatherChannels round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddGatherChannelsBuilder;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Exercise the TNNet.AddGatherChannels builder convenience wrapper end to end:
+  // (1) forward correctness through the builder path - the gathered output Depth
+  //     must equal the requested index count and each gathered channel value must
+  //     equal the selected SOURCE channel value (out-of-order subset [3,0,2]);
+  // (2) SaveToString/LoadFromString round-trip equality, proving the builder-made
+  //     layer serializes identically to a directly-constructed one.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddGatherChannels([3, 0, 2]);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 1.3) * 2.0 - 0.5;
+    NN.Compute(Input);
+
+    AssertEquals('AddGatherChannels output depth', 3, NN.GetLastLayer.Output.Depth);
+    AssertTrue('AddGatherChannels produced a TNNetGatherChannels',
+      NN.GetLastLayer is TNNetGatherChannels);
+    // Output[0] <- Input ch 3, Output[1] <- Input ch 0, Output[2] <- Input ch 2.
+    AssertEquals('AddGatherChannels gathered ch 3',
+      Input[0, 0, 3], NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('AddGatherChannels gathered ch 0',
+      Input[0, 0, 0], NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('AddGatherChannels gathered ch 2',
+      Input[0, 0, 2], NN.GetLastLayer.Output[0, 0, 2], 1e-6);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddGatherChannels round-trip class identity',
+        NN2.GetLastLayer is TNNetGatherChannels);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddGatherChannels SaveToString round-trip equality', Saved, Saved2);
     finally
       NN2.Free;
     end;

@@ -404,11 +404,6 @@ breakdown:
       covers the headline use case.
 
 #### Reduction / shape
-- [ ] TNNetGatherChannels follow-up: add a `TNNet.Add*` builder convenience
-      wrapper + a usage example (channel-routing / channel-pruning demo) — the
-      class is currently only constructible directly. Also a docs note
-      cross-referencing the near-overlapping TNNetSplitChannels so users pick
-      the right one.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 ### Loss layers
