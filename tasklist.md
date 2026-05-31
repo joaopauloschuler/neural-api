@@ -1327,7 +1327,7 @@ rather than acted on.
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
       TNNetSinusoidalTimeEmbedding (FiLM and the timestep embedding are both
       in tree).
-- [ ] `examples/HopfieldRetrieval/` — modern Hopfield network as attention
+- [X] `examples/HopfieldRetrieval/` — modern Hopfield network as attention
       (Ramsauer et al.): store K patterns, retrieve via a single softmax-
       attention step against a query.
 - [ ] Mixed-precision experiment first step: add `TNeuralFloat16 = packed
