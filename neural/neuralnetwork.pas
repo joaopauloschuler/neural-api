@@ -1325,6 +1325,28 @@ type
     procedure Compute(); override;
   end;
 
+  /// Sliding-window (banded local) causal mask, Mistral / Longformer style.
+  // Distinct from the strictly-causal TNNetMaskedFill (which masks the full
+  // upper triangle): each query position Y may only attend to keys X in the
+  // window [Y-W+1 .. Y] for a constructor window size W (stored in
+  // FStruct[0]). Forward adds a large-negative mask constant (FFloatSt[0],
+  // default -1e9, matching TNNetMaskedFill) to every (X, Y) position where
+  // X > Y (strict future, the causal part) OR X < Y-W+1 (too far in the
+  // past, the window part). All other positions — the W-wide band ending at
+  // and including the diagonal — pass through unchanged. Applied
+  // independently per depth slice. When W >= SeqLen the layer is identical
+  // to TNNetMaskedFill (full causal). No trainable parameters; backward is a
+  // pure gradient passthrough (inherited from TNNetIdentity) since the
+  // forward only adds a constant.
+  TNNetSlidingWindowMaskedFill = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pWindow: integer); overload;
+    constructor Create(pWindow: integer; pMaskValue: TNeuralFloat); overload;
+    procedure Compute(); override;
+  end;
+
   /// Straight-Through Estimator (STE) layer.
   // Forward: y = round(x / step) * step, where step is a configurable
   // quantization grid step stored in FFloatSt[0] (default 1.0, which gives
@@ -9970,6 +9992,63 @@ begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FOutput.Add(FMask);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetSlidingWindowMaskedFill }
+
+constructor TNNetSlidingWindowMaskedFill.Create(pWindow: integer);
+begin
+  Create(pWindow, -1e9);
+end;
+
+constructor TNNetSlidingWindowMaskedFill.Create(pWindow: integer;
+  pMaskValue: TNeuralFloat);
+begin
+  inherited Create();
+  if pWindow < 1 then
+  begin
+    FErrorProc('TNNetSlidingWindowMaskedFill requires Window >= 1. Window=' +
+      IntToStr(pWindow));
+    pWindow := 1;
+  end;
+  FStruct[0] := pWindow;
+  FFloatSt[0] := pMaskValue;
+end;
+
+procedure TNNetSlidingWindowMaskedFill.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FFloatSt[0] = 0 then FFloatSt[0] := -1e9;
+  if FStruct[0] < 1 then FStruct[0] := 1;
+end;
+
+procedure TNNetSlidingWindowMaskedFill.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, W, PastLimit: integer;
+  MaskValue: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  MaskValue := FFloatSt[0];
+  W := FStruct[0];
+  if W < 1 then W := 1;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  // Mask everything outside the W-wide band [Y-W+1 .. Y]:
+  //   X > Y         -> strict future (causal part)
+  //   X < Y-W+1     -> too far in the past (window part)
+  for Y := 0 to MaxY do
+  begin
+    PastLimit := Y - W + 1;
+    for X := 0 to MaxX do
+      if (X > Y) or (X < PastLimit) then
+        for D := 0 to MaxD do
+          FOutput.Add(X, Y, D, MaskValue);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -45678,6 +45757,7 @@ begin
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
       'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
       'TNNetTriangularCausalMask' : Result := TNNetTriangularCausalMask.Create(St[0]);
+      'TNNetSlidingWindowMaskedFill' : Result := TNNetSlidingWindowMaskedFill.Create(St[0], Ft[0]);
       'TNNetStraightThroughEstimator' : Result := TNNetStraightThroughEstimator.Create(Ft[0]);
       'TNNetALiBi' :                Result := TNNetALiBi.Create();
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
@@ -45952,6 +46032,7 @@ begin
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
       if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
       if S[0] = 'TNNetTriangularCausalMask' then Result := TNNetTriangularCausalMask.Create(St[0]) else
+      if S[0] = 'TNNetSlidingWindowMaskedFill' then Result := TNNetSlidingWindowMaskedFill.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetStraightThroughEstimator' then Result := TNNetStraightThroughEstimator.Create(Ft[0]) else
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else

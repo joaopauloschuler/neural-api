@@ -197,7 +197,7 @@ breakdown:
 - [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
       heads (Shazeer et al.). A tiny learnable HxH multiply applied to
       attention logits along the head axis.
-- [ ] TNNetSlidingWindowMaskedFill — banded *local* causal attention mask
+- [X] TNNetSlidingWindowMaskedFill — banded *local* causal attention mask
       (Mistral / Longformer style). Distinct from the strictly-causal
       [[TNNetMaskedFill]] (full upper-triangle): each query position i may
       only attend to keys in [i-W+1 .. i] for a constructor window size W,

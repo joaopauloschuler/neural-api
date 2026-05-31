@@ -315,6 +315,10 @@ type
     procedure TestTriangularCausalMaskGradientCheck;
     procedure TestTriangularCausalMaskSerializationRoundTrip;
     procedure TestTriangularCausalMaskBeforeSDPA;
+    procedure TestSlidingWindowMaskedFillForward;
+    procedure TestSlidingWindowMaskedFillGradientCheck;
+    procedure TestSlidingWindowMaskedFillSerializationRoundTrip;
+    procedure TestSlidingWindowMaskedFillFullWindowEqualsCausal;
     procedure TestALiBiForward;
     procedure TestALiBiGradientCheck;
     procedure TestALiBiSerializationRoundTrip;
@@ -7189,6 +7193,90 @@ begin
     'MaskedFill', 3, 3, 2, 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, W, SeqLen, PastLimit: integer;
+begin
+  SeqLen := 5;
+  W := 3;
+  NN := TNNet.Create();
+  // 5x5 score map, single depth slice; window narrower than the triangle.
+  Input := TNNetVolume.Create(SeqLen, SeqLen, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, SeqLen, 1, 1));
+    NN.AddLayer(TNNetSlidingWindowMaskedFill.Create(W, -1e9));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    for Y := 0 to SeqLen - 1 do
+    begin
+      PastLimit := Y - W + 1;
+      for X := 0 to SeqLen - 1 do
+      begin
+        if (X > Y) or (X < PastLimit) then
+          AssertTrue('SlidingWindowMaskedFill masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y),
+            NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('SlidingWindowMaskedFill band untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillGradientCheck;
+begin
+  // Adding a constant has identity gradient passthrough. A small mask
+  // value keeps float32 precision intact for the central-difference check.
+  LayerInputGradientCheck(Self, TNNetSlidingWindowMaskedFill.Create(2, -0.5),
+    'SlidingWindowMaskedFill', 3, 3, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillFullWindowEqualsCausal;
+var
+  NNWin, NNCausal: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, SeqLen, Depth: integer;
+begin
+  SeqLen := 5;
+  Depth := 2;
+  // W >= SeqLen must reproduce the full causal TNNetMaskedFill exactly.
+  NNWin := TNNet.Create();
+  NNCausal := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, SeqLen, Depth);
+  try
+    NNWin.AddLayer(TNNetInput.Create(SeqLen, SeqLen, Depth, 1));
+    NNWin.AddLayer(TNNetSlidingWindowMaskedFill.Create(SeqLen, -1e9));
+
+    NNCausal.AddLayer(TNNetInput.Create(SeqLen, SeqLen, Depth, 1));
+    NNCausal.AddLayer(TNNetMaskedFill.Create(-1e9));
+
+    Input.Fill(1.0);
+    NNWin.Compute(Input);
+    NNCausal.Compute(Input);
+
+    for D := 0 to Depth - 1 do
+      for Y := 0 to SeqLen - 1 do
+        for X := 0 to SeqLen - 1 do
+          AssertEquals('W>=SeqLen equals full causal at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y) + ' D=' + IntToStr(D),
+            NNCausal.GetLastLayer.Output[X, Y, D],
+            NNWin.GetLastLayer.Output[X, Y, D], 0.0001);
+  finally
+    NNWin.Free;
+    NNCausal.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestTriangularCausalMaskForward;
 var
   NN: TNNet;
@@ -10078,6 +10166,13 @@ begin
   // Use a small mask value to keep float32 precision intact when comparing.
   SerializationRoundTrip(Self, TNNetMaskedFill.Create(-0.5),
     'MaskedFill', 3, 3, 2, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillSerializationRoundTrip;
+begin
+  // Use a small mask value to keep float32 precision intact when comparing.
+  SerializationRoundTrip(Self, TNNetSlidingWindowMaskedFill.Create(2, -0.5),
+    'SlidingWindowMaskedFill', 3, 3, 2, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestALiBiSerializationRoundTrip;
