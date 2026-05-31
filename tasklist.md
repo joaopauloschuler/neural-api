@@ -312,7 +312,7 @@ breakdown:
       show a qualitative before/after on a repetition-prone prompt — the
       class landed this lucky-day batch (neuralvolume.pas, 7 tests in
       tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
-- [ ] TNNetReversibleBlock — RevNet-style additive coupling
+- [X] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
       to within fp tolerance is the headline test.
 - [ ] TNNetWeightStandardization follow-up: a CONVOLUTION variant

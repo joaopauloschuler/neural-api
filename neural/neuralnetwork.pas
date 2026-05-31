@@ -5152,6 +5152,21 @@ type
       // match the block input shape so the residual sum is valid. Returns the
       // residual-sum layer.
       function AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // RevNet-style reversible additive-coupling block (Gomez et al. 2017).
+      // The InputLayer's depth is split into two equal halves x1|x2 (Depth MUST
+      // be even; FErrorProc otherwise). Two shape-preserving pointwise residual
+      // functions F and G (each PointwiseConvReLU(HiddenDim) ->
+      // PointwiseConvLinear(halfDepth)) are wired as:
+      //   y1 = x1 + F(x2)
+      //   y2 = x2 + G(y1)
+      // and the output is Concat(y1, y2) along depth, identical in shape to the
+      // input. The defining property is exact analytic INVERTIBILITY: given the
+      // output (y1,y2) and the SAME F,G weights, the input is recovered by
+      //   x2 = y2 - G(y1)
+      //   x1 = y1 - F(x2)
+      // (see examples/ReversibleBlock for a forward/inverse round-trip demo).
+      // Returns the Concat output layer. HiddenDim sizes the F/G hidden width.
+      function AddReversibleBlock(InputLayer: TNNetLayer; HiddenDim: integer): TNNetLayer;
       // Learnable per-channel affine block: appends a TNNetChannelMul (per-channel
       // scale gamma[d], initialised to 1.0) followed by a TNNetChannelBias
       // (per-channel shift beta[d], initialised to 0.0) to the current end of the
@@ -47637,6 +47652,42 @@ begin
   AddLayer(pSublayers);
   AddLayer( TNNetGatedResidual.Create() );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddReversibleBlock(InputLayer: TNNetLayer; HiddenDim: integer): TNNetLayer;
+var
+  Depth, HalfDepth: integer;
+  X1, X2, FOut, Y1, GOut, Y2: TNNetLayer;
+begin
+  // RevNet additive coupling: y1 = x1 + F(x2), y2 = x2 + G(y1).
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  Depth := InputLayer.Output.Depth;
+  if Odd(Depth) then
+    FErrorProc('AddReversibleBlock requires an even input Depth. Depth=' +
+      IntToStr(Depth));
+  if HiddenDim < 1 then
+    FErrorProc('AddReversibleBlock requires HiddenDim >= 1. HiddenDim=' +
+      IntToStr(HiddenDim));
+  HalfDepth := Depth div 2;
+
+  // Split input depth into x1 = channels [0..HalfDepth-1], x2 = [HalfDepth..Depth-1].
+  X1 := AddLayerAfter( TNNetSplitChannels.Create(0, HalfDepth), InputLayer );
+  X2 := AddLayerAfter( TNNetSplitChannels.Create(HalfDepth, HalfDepth), InputLayer );
+
+  // F(x2): shape-preserving pointwise residual function HalfDepth -> HalfDepth.
+  AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), X2 );
+  FOut := AddLayer( TNNetPointwiseConvLinear.Create(HalfDepth) );
+  // y1 = x1 + F(x2)
+  Y1 := AddLayer( TNNetSum.Create([X1, FOut]) );
+
+  // G(y1): shape-preserving pointwise residual function HalfDepth -> HalfDepth.
+  AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), Y1 );
+  GOut := AddLayer( TNNetPointwiseConvLinear.Create(HalfDepth) );
+  // y2 = x2 + G(y1)
+  Y2 := AddLayer( TNNetSum.Create([X2, GOut]) );
+
+  // output = Concat(y1, y2) along depth, shape-identical to the input.
+  Result := AddLayer( TNNetDeepConcat.Create([Y1, Y2]) );
 end;
 
 function TNNet.AddAffineBlock: TNNetLayer;

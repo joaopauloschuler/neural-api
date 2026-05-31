@@ -837,6 +837,8 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 
 Composite helper: `TNNet.AddSEBlock(InputLayer, ReductionRatio)` wires the standard Squeeze-and-Excitation pattern (`TNNetAvgChannel` -> `TNNetFullConnectReLU(C/r)` -> `TNNetFullConnectSigmoid(C)` -> `TNNetChannelMulByLayer`) onto an existing branch. See `examples/SEBlockCifar/`.
 
+Composite helper: `TNNet.AddReversibleBlock(InputLayer, HiddenDim)` wires a RevNet-style reversible additive-coupling block in one call: it splits the input depth into halves `x1|x2` and produces `y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`, `output = Concat(y1, y2)` (shape-identical to the input), where `F`/`G` are small pointwise residual functions. The defining property is exact analytic invertibility — `x2 = y2 - G(y1)`, `x1 = y1 - F(x2)` recovers the input without inverting `F`/`G`. See `examples/ReversibleBlock/`.
+
 Composite helper: `TNNet.AddFiLMConditioned(featLayer, condLayer)` wires Feature-wise Linear Modulation in one call: `condLayer -> TNNetFullConnectLinear(2*D) -> reshape(1,1,2*D) -> TNNetFiLM([featLayer, cond])`, inferring `D = featLayer.Output.Depth`. It removes the manual `Depth -> 2*Depth` bookkeeping every FiLM call site repeats and mirrors the `AddPreNormResidual`/`AddGatedResidual` builder family. See `examples/FiLMConditioning/`.
 
 Composite helper: `TNNet.AddAffineBlock` wires a learnable per-channel affine transform `y[d] = gamma[d]*x[d] + beta[d]` in one call (`TNNetChannelMul` -> `TNNetChannelBias`), separable from `FullConnect`. It starts as the exact identity (`gamma=1`, `beta=0`), so it can be inserted into a frozen network and fine-tuned cheaply (BitFit-style adaptation). See `examples/AffineFineTune/`.

@@ -144,6 +144,8 @@ type
     procedure TestPreNormResidualForwardWiring;
     procedure TestGatedResidualGradientCheck;
     procedure TestGatedResidualForwardWiring;
+    // AddReversibleBlock builder (RevNet additive coupling + analytic inverse)
+    procedure TestReversibleBlockRoundTrip;
     // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
     procedure TestAddAffineBlockForwardWiring;
     procedure TestAddAffineBlockGradientCheck;
@@ -2792,6 +2794,113 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestReversibleBlockRoundTrip;
+const
+  W = 2; H = 2; C = 4; HALF = 2; HID = 6;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  RevOut, LX1, LX2, LFOut, LY1, LGOut, LY2: TNNetLayer;
+  i, x, y, d: integer;
+  y1v, y2v, x1rec, x2rec, recErr, maxRecErr, outVal: TNeuralFloat;
+begin
+  // RevNet additive coupling round-trip. Build Input(2,2,4) -> AddReversibleBlock,
+  // verify shape preservation, finite forward+backward, then check the analytic
+  // inverse x2 = y2 - G(y1), x1 = y1 - F(x2) reconstructs the original input.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create(W, H, C);
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, C));
+    RevOut := NN.AddReversibleBlock(NN.GetLastLayer(), HID);
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+
+    // Output shape must be identical to the input.
+    AssertEquals('Reversible output SizeX', W, RevOut.Output.SizeX);
+    AssertEquals('Reversible output SizeY', H, RevOut.Output.SizeY);
+    AssertEquals('Reversible output Depth', C, RevOut.Output.Depth);
+
+    // Capture the internal block layers (see AddReversibleBlock wiring order):
+    // [1]=x1 split, [2]=x2 split, [3]=F.ReLU, [4]=F.Linear (F(x2)),
+    // [5]=Sum y1, [6]=G.ReLU, [7]=G.Linear (G(y1)), [8]=Sum y2, [9]=Concat.
+    LX1   := NN.Layers[1];
+    LX2   := NN.Layers[2];
+    LFOut := NN.Layers[4];
+    LY1   := NN.Layers[5];
+    LGOut := NN.Layers[7];
+    LY2   := NN.Layers[8];
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+
+    // Forward output must be finite.
+    for i := 0 to RevOut.Output.Size - 1 do
+    begin
+      outVal := RevOut.Output.Raw[i];
+      AssertFalse('Reversible forward NaN at ' + IntToStr(i), IsNaN(outVal));
+      AssertFalse('Reversible forward Inf at ' + IntToStr(i), IsInfinite(outVal));
+    end;
+
+    // Backward pass must stay finite too.
+    Desired.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to NN.Layers[1].OutputError.Size - 1 do
+    begin
+      outVal := NN.Layers[1].OutputError.Raw[i];
+      AssertFalse('Reversible backward NaN at ' + IntToStr(i), IsNaN(outVal));
+      AssertFalse('Reversible backward Inf at ' + IntToStr(i), IsInfinite(outVal));
+    end;
+
+    // Analytic inverse: with the SAME F,G weights, recover the input from the
+    // output halves. After the forward pass LFOut.Output = F(x2) and
+    // LGOut.Output = G(y1), so:
+    //   x2 = y2 - G(y1),  x1 = y1 - F(x2).
+    maxRecErr := 0;
+    for x := 0 to W - 1 do
+      for y := 0 to H - 1 do
+        for d := 0 to HALF - 1 do
+        begin
+          y1v := RevOut.Output[x, y, d];          // first half of concat == y1
+          y2v := RevOut.Output[x, y, d + HALF];   // second half == y2
+          x2rec := y2v - LGOut.Output[x, y, d];   // x2 = y2 - G(y1)
+          x1rec := y1v - LFOut.Output[x, y, d];   // x1 = y1 - F(x2)
+
+          recErr := Abs(x1rec - LX1.Output[x, y, d]);
+          if recErr > maxRecErr then maxRecErr := recErr;
+          recErr := Abs(x2rec - LX2.Output[x, y, d]);
+          if recErr > maxRecErr then maxRecErr := recErr;
+
+          // Recovered halves must also match the ORIGINAL input channels.
+          recErr := Abs(x1rec - Input[x, y, d]);
+          if recErr > maxRecErr then maxRecErr := recErr;
+          recErr := Abs(x2rec - Input[x, y, d + HALF]);
+          if recErr > maxRecErr then maxRecErr := recErr;
+        end;
+
+    // Also sanity-check that y1 and y2 internal sums match the concat output.
+    for x := 0 to W - 1 do
+      for y := 0 to H - 1 do
+        for d := 0 to HALF - 1 do
+        begin
+          AssertEquals('Concat first half == y1', LY1.Output[x, y, d],
+            RevOut.Output[x, y, d], 1e-6);
+          AssertEquals('Concat second half == y2', LY2.Output[x, y, d],
+            RevOut.Output[x, y, d + HALF], 1e-6);
+        end;
+
+    AssertTrue('Reversible inverse round-trip error < 1e-4 (got ' +
+      FloatToStr(maxRecErr) + ')', maxRecErr < 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 
