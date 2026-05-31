@@ -7514,12 +7514,12 @@ type
   // previous layer per position (output channel D maps to input channel D, the
   // bit threshold being a sign()); the discrete engine is treated as the
   // identity on the backward pass. Experimental, like TNNetByteProcessing.
-  TNNetPointwiseByteProcessing = class(TNNetIdentity)
+  // Inherits the shared symbolic byte engine plus its persistence
+  // (SaveDataToString/LoadDataFromString) and CopyWeights from
+  // TNNetByteProcessing; only the spatial (per-position) forward/backward and
+  // the scratch volumes differ.
+  TNNetPointwiseByteProcessing = class(TNNetByteProcessing)
     private
-      FByteLearning: TEasyLearnAndPredictClass;
-      FByteInput: array of byte;
-      FByteOutput: array of byte;
-      FByteOutputFound: array of byte;
       FPosInput: TNNetVolume;   // scratch: one position's input Depth vector
       FPosOutput: TNNetVolume;  // scratch: one position's output bits
       FByteLen: integer;
@@ -7530,11 +7530,6 @@ type
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
-      // Persist the shared symbolic engine's learned rules (hex-encoded; see
-      // TNNetByteProcessing.SaveDataToString).
-      function SaveDataToString(): string; override;
-      procedure LoadDataFromString(strData: string); override;
-      procedure CopyWeights(Origin: TNNetLayer); override;
   end;
 
   // This class is very experimental - do not use it.
@@ -17904,19 +17899,13 @@ end;
 constructor TNNetPointwiseByteProcessing.Create(CacheSize, TestCount,
   OperationCount: integer);
 begin
-  inherited Create;
+  inherited Create(CacheSize, TestCount, OperationCount);
   FPosInput := TNNetVolume.Create;
   FPosOutput := TNNetVolume.Create;
-  FStruct[0] := CacheSize;
-  FStruct[1] := TestCount;
-  FStruct[2] := OperationCount;
 end;
 
 destructor TNNetPointwiseByteProcessing.Destroy;
 begin
-  SetLength(FByteInput, 0);
-  SetLength(FByteOutput, 0);
-  SetLength(FByteOutputFound, 0);
   FPosInput.Free;
   FPosOutput.Free;
   inherited Destroy;
@@ -17999,34 +17988,6 @@ begin
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
-end;
-
-function TNNetPointwiseByteProcessing.SaveDataToString(): string;
-begin
-  if FOutput.Size = 0 then Result := ''
-  else Result := NeuralStrToHex(FByteLearning.BytePred.NeuronsToString(0));
-end;
-
-procedure TNNetPointwiseByteProcessing.LoadDataFromString(strData: string);
-var
-  decoded: string;
-begin
-  if (Length(strData) = 0) or (FOutput.Size = 0) then exit;
-  decoded := NeuralHexToStr(strData);
-  FByteLearning.BytePred.CleanAndLoadNeuronsFromString(decoded);
-end;
-
-procedure TNNetPointwiseByteProcessing.CopyWeights(Origin: TNNetLayer);
-var
-  s: string;
-begin
-  inherited CopyWeights(Origin);
-  if (Origin is TNNetPointwiseByteProcessing) and (FOutput.Size > 0) and
-     (TNNetPointwiseByteProcessing(Origin).FOutput.Size > 0) then
-  begin
-    s := TNNetPointwiseByteProcessing(Origin).FByteLearning.BytePred.NeuronsToString(0);
-    FByteLearning.BytePred.CleanAndLoadNeuronsFromString(s);
-  end;
 end;
 
 { TNNetDigital }
