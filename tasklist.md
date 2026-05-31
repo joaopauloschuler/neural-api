@@ -329,6 +329,31 @@ breakdown:
       NOTE: the reusable power-iteration helper `TNNet.EstimateSpectralNorm`
       now exists (landed with WeightSpectrumReport) — build the wrapper on
       top of it rather than re-deriving the iteration.
+- [ ] LoRA low-rank adapter (`TNNet.AddLoRAAdapter`) + `examples/LoRAFineTune/` —
+      parameter-efficient fine-tuning by ADDING a trainable low-rank residual
+      `B·A` to a FROZEN dense/pointwise layer (Hu et al. 2021). For a frozen
+      `d_in -> d_out` linear, insert a rank-`r` bypass `down: FullConnectLinear(r)`
+      (A, init small/random) -> `up: FullConnectLinear(d_out)` (B, init ZERO so the
+      adapter is the identity-perturbation at step 0 and the pretrained output is
+      bit-for-bit unchanged on the first forward), scaled by `alpha/r`, then add it
+      residually to the frozen layer's output. Train ONLY A and B (freeze the base
+      via the same SetLearningRate(0)/freeze idiom AffineFineTune already uses).
+      The residual sublayer must be SHAPE-PRESERVING — for a per-token
+      `(SeqLen,1,d_model)` stream use PointwiseConvLinear over Depth, not
+      FullConnect (see [[residual-builder-helpers]] / [[mha-builder-and-seq-projection]]).
+      Headline example: fork examples/AffineFineTune/ (frozen pretrained classifier
+      + shifted task), swap the BitFit affine blocks for LoRA adapters, and chart
+      trainable-param count and recovered accuracy across rank `r ∈ {1,2,4,8}` vs
+      full fine-tune (upper bound) and vs the landed BitFit arm (param-matched
+      baseline) — the textbook "recover most accuracy at a few % of the params"
+      curve. Built-in correctness signals: (a) with B zero-init the wrapped net's
+      forward equals the frozen base to <1e-6 before any training; (b) after
+      training, the merged weight `W + (alpha/r)·B·A` folded back into a single
+      dense layer reproduces the adapted forward (the LoRA "merge for inference"
+      property) to <1e-5. Distinct from AffineFineTune (per-channel affine / BitFit,
+      NOT low-rank) — this is the low-rank-update PEFT method the MemoryFootprintReport
+      doc already names as the natural next step. Add a `TestLoRAAdapterSmoke`
+      following the introspection-report test recipe.
 - [ ] TNNetStochasticPool follow-up: a bake-off vs TNNetMaxPool / TNNetAvgPool /
       TNNetSoftPool on a tiny image-classifier stub — does the stochastic
       regularisation lower the train/val gap at matched architecture? Fork an
