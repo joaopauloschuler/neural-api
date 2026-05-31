@@ -234,6 +234,9 @@ type
     procedure TestCharbonnierLossForwardPassthrough;
     procedure TestCharbonnierLossGradient;
     procedure TestCharbonnierLossLoadFromString;
+    procedure TestQuantileLossForwardPassthrough;
+    procedure TestQuantileLossGradient;
+    procedure TestQuantileLossLoadFromString;
     procedure TestFocalLossGradient;
     procedure TestFocalLossLoadFromString;
     procedure TestNLLLossGradient;
@@ -20410,6 +20413,149 @@ begin
     NN2.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQuantileLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetQuantileLoss must be an identity passthrough on forward.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetQuantileLoss.Create(0.9));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 4.0 - 0.5;
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('QuantileLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQuantileLossGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  Q, AnaGrad, NumGrad, OldP, LossP, LossM, FdEps, E: TNeuralFloat;
+  i, CaseIdx: integer;
+
+  // Pinball loss L_q(e) = max(q*e, (q-1)*e), e = target - prediction,
+  // summed over all elements.
+  function PinballLoss(APred, ATarget: TNNetVolume; AQ: TNeuralFloat): TNeuralFloat;
+  var
+    j: integer;
+    Res, S: TNeuralFloat;
+  begin
+    S := 0.0;
+    for j := 0 to APred.Size - 1 do
+    begin
+      Res := ATarget.Raw[j] - APred.Raw[j];
+      if Res >= 0 then S := S + AQ * Res
+      else S := S + (AQ - 1.0) * Res;
+    end;
+    Result := S;
+  end;
+
+begin
+  // Reseed so this gradient test does not perturb later ordering-sensitive
+  // checks that share the global RNG.
+  RandSeed := 424242;
+  FdEps := 0.01;
+
+  for CaseIdx := 0 to 2 do
+  begin
+    if CaseIdx = 0 then Q := 0.5
+    else if CaseIdx = 1 then Q := 0.1
+    else Q := 0.9;
+
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 1, 1);
+    Target := TNNetVolume.Create(6, 1, 1);
+    try
+      NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+      LMid := TNNetIdentity.Create();
+      NN.AddLayer(LMid);
+      NN.AddLayer(TNNetQuantileLoss.Create(Q));
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.5 + CaseIdx) * 2.0;
+      // Offset targets so residuals are strictly non-zero (avoid the e=0 kink).
+      for i := 0 to Input.Size - 1 do
+      begin
+        if (i mod 2) = 0 then Target.Raw[i] := Input.Raw[i] + 0.7 + 0.1 * i
+        else Target.Raw[i] := Input.Raw[i] - 0.7 - 0.1 * i;
+      end;
+
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+
+      for i := 0 to LMid.OutputError.Size - 1 do
+      begin
+        AnaGrad := LMid.OutputError.Raw[i];
+        // Central-difference of L w.r.t. prediction i.
+        OldP := Input.Raw[i];
+        Input.Raw[i] := OldP + FdEps;
+        LossP := PinballLoss(Input, Target, Q);
+        Input.Raw[i] := OldP - FdEps;
+        LossM := PinballLoss(Input, Target, Q);
+        Input.Raw[i] := OldP;
+        NumGrad := (LossP - LossM) / (2.0 * FdEps);
+        AssertEquals('QuantileLoss q=' + FloatToStr(Q) +
+          ' grad at ' + IntToStr(i),
+          NumGrad, AnaGrad, 0.001);
+
+        // Also pin the exact analytic subgradient by residual sign.
+        E := Target.Raw[i] - Input.Raw[i];
+        if E > 0 then
+          AssertEquals('QuantileLoss q=' + FloatToStr(Q) +
+            ' under-pred sign at ' + IntToStr(i), -Q, AnaGrad, 0.00001)
+        else
+          AssertEquals('QuantileLoss q=' + FloatToStr(Q) +
+            ' over-pred sign at ' + IntToStr(i), 1.0 - Q, AnaGrad, 0.00001);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      Target.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQuantileLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+begin
+  // Round-trip with a NON-default quantile (0.9).
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetQuantileLoss.Create(0.9));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetQuantileLoss',
+      NN2.GetLastLayer is TNNetQuantileLoss);
+
+    Saved2 := NN2.SaveToString();
+    AssertEquals('QuantileLoss round-trip string equality', Saved, Saved2);
+  finally
+    NN.Free;
+    NN2.Free;
   end;
 end;
 

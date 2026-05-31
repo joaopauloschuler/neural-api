@@ -1452,6 +1452,29 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Quantile (pinball) loss output layer for regression.
+  // Forward is an identity passthrough (so Net.Compute returns the raw
+  // regression head). Training relies on the framework seeding the last
+  // layer's FOutputError with (output - target). For a target quantile q in
+  // (0,1) and residual e = (target - prediction), the per-element loss is
+  //   L_q(e) = max(q*e, (q-1)*e)
+  // i.e. q*e when e >= 0 (under-prediction) and (q-1)*e when e < 0. The
+  // subgradient w.r.t. the prediction (the +dL/dprediction stored in
+  // FOutputError, matching sibling regression heads such as Charbonnier) is:
+  //   dL/dprediction = -q       when (target - prediction) > 0
+  //                  =  (1 - q)  when (target - prediction) < 0
+  //                  =  0        at e == 0 (subgradient convention).
+  // Because the framework seeds V := (prediction - target) = -e, Backpropagate
+  // maps V > 0 -> (1 - q), V < 0 -> -q, V = 0 -> 0. The quantile q is stored
+  // in FFloatSt[0] (default 0.5 = median = MAE) and round-trips via Save/Load.
+  // No trainable parameters; output shape equals input shape.
+  TNNetQuantileLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(Quantile: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Focal loss output layer for class-imbalanced classification.
   // Operates on probability-space inputs (i.e. after a softmax) with one-hot
   // targets. The per-sample loss is
@@ -10362,6 +10385,52 @@ begin
   begin
     V := FOutputError.FData[Idx];
     FOutputError.FData[Idx] := V / Sqrt(V * V + EpsSq);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetQuantileLoss }
+
+constructor TNNetQuantileLoss.Create();
+begin
+  Create(0.5);
+end;
+
+constructor TNNetQuantileLoss.Create(Quantile: TNeuralFloat);
+begin
+  inherited Create();
+  if (Quantile <= 0) or (Quantile >= 1) then
+    FErrorProc('TNNetQuantileLoss quantile must be in (0, 1).');
+  FFloatSt[0] := Quantile;
+end;
+
+procedure TNNetQuantileLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Q, V: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Q := FFloatSt[0];
+  if (Q <= 0) or (Q >= 1) then Q := 0.5;
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    // V = prediction - target = -e (e = target - prediction).
+    // e > 0 (V < 0): dL/dprediction = -q
+    // e < 0 (V > 0): dL/dprediction =  1 - q
+    // e = 0 (V = 0): subgradient 0
+    V := FOutputError.FData[Idx];
+    if V > 0 then
+      FOutputError.FData[Idx] := 1.0 - Q
+    else if V < 0 then
+      FOutputError.FData[Idx] := -Q
+    else
+      FOutputError.FData[Idx] := 0.0;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -45939,6 +46008,7 @@ begin
       'TNNetSmoothL1Loss' :         Result := TNNetSmoothL1Loss.Create();
       'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
+      'TNNetQuantileLoss' :         Result := TNNetQuantileLoss.Create(Ft[0]);
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
@@ -46215,6 +46285,7 @@ begin
       if S[0] = 'TNNetSmoothL1Loss' then Result := TNNetSmoothL1Loss.Create() else
       if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
+      if S[0] = 'TNNetQuantileLoss' then Result := TNNetQuantileLoss.Create(Ft[0]) else
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
