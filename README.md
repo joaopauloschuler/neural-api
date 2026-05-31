@@ -43,6 +43,7 @@ The documentation covers:
 * Parallel computing.
 * [Full set of examples](examples/README.md).
 * [Normalization Cheat Sheet](docs/normalization.md).
+* [Layer Authoring Guide](docs/layer-authoring.md) — checklist for adding a new layer plus mini-guides on reading numerical-gradient failures and picking a tolerance.
 * Other scientific publications from the same author.
 
 ### Easy Examples First Please!
@@ -573,6 +574,7 @@ Random layers (`TNNetRandomMulAdd`, `TNNetChannelRandomMulAdd`) serve as powerfu
 | `TNNetChannelRandomMulAdd`   | 1D, 2D, or 3D               | Adds random multiplication and random bias (shift) per channel.                                      |
 | `TNNetGaussianNoise`         | 1D, 2D, or 3D               | Additive `N(0, σ²)` noise at training, identity at inference. σ stored in `FFloatSt[0]`.            |
 | `TNNetGaussianDropout`       | 1D, 2D, or 3D               | Multiplicative `N(1, σ²)` noise at training, identity at inference. σ stored in `FFloatSt[0]`.      |
+| `TNNetDropBlock`             | 2D or 3D                    | Structured spatial dropout (Ghiasi et al. 2018, "DropBlock"). At training it zeroes contiguous `block_size × block_size` square regions of the feature map — one spatial mask broadcast across all `Depth` channels — so spatially-correlated neighbours drop together (unlike `TNNetDropout` which scatters per-element, or `TNNetSpatialDropout2D` which drops whole channels). Seeds are sampled at rate `gamma = (1-keep) * feat_area / (block² * valid_area)` only where a full block fits, then dilated into blocks; survivors are rescaled by `count_all / count_kept` to preserve the expected activation. Identity at inference. Backward gates through the same stored mask. Created with `TNNetDropBlock.Create(block_size, drop_prob)`. |
 | `TNNetMinMaxNorm`            | 1D, 2D, or 3D               | Per-sample min-max normalization `y = (x - min(x)) / (max(x) - min(x) + eps)`, reduced over the whole sample volume so the output range is approximately `[0, 1]`. Non-trainable; `eps` defaults to 1e-7 (constructor-configurable, round-trips via Save/Load). Backward routes the bulk `1/denom` gradient plus the exact argmin/argmax coupling terms. A per-channel mode (`TNNetMinMaxNorm.Create(eps, {PerChannel:=}True)`) reduces min/max over the spatial positions ONLY, independently for each depth channel, so every channel is normalized to its own `[0, 1]` range; the flag round-trips via Save/Load and full-volume stays the default. Created with `TNNetMinMaxNorm.Create()`, `TNNetMinMaxNorm.Create(eps)`, or `TNNetMinMaxNorm.Create(eps, PerChannel)`. |
 
 These layers provide various tools for normalization, regularization, and introducing controlled variability in neural networks. The choice of which layers to use and where to place them in your network architecture depends on the specific problem you're trying to solve, the characteristics of your data, and the behavior you want to encourage in your model.
