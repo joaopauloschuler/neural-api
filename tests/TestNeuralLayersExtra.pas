@@ -122,6 +122,7 @@ type
     procedure TestPredictionDepthReportSmoke;
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
+    procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
   end;
 
 implementation
@@ -4982,6 +4983,63 @@ begin
   // nil NN must not crash
   S := TNNet.LayerTimingReport(nil, nil, 3);
   AssertTrue('nil NN handled', Length(S) > 0);
+end;
+
+procedure TTestNeuralLayersExtra.TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
+const
+  d_model = 6;
+  NumExperts = 4;
+  ExpertHidden = 8;
+var
+  NN, NN2: TNNet;
+  Input, Output, Target: TNNetVolume;
+  MoEOut: TNNetLayer;
+  Struct: string;
+  InitialLoss, FinalLoss: TNeuralFloat;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(1, 1, d_model));
+  MoEOut := NN.AddMixtureOfExperts(nil, NumExperts, ExpertHidden);
+  // Block must be shape-preserving (drop-in FFN replacement).
+  AssertEquals('MoE output depth matches d_model', d_model, MoEOut.Output.Depth);
+  AssertEquals('MoE output SizeX preserved', 1, MoEOut.Output.SizeX);
+  AssertEquals('MoE output SizeY preserved', 1, MoEOut.Output.SizeY);
+  NN.AddLayer(TNNetFullConnectLinear.Create(1));
+  NN.SetLearningRate(0.01, 0.9);
+
+  Input := TNNetVolume.Create(1, 1, d_model);
+  Input.Randomize();
+  Output := TNNetVolume.Create();
+  Target := TNNetVolume.Create(1, 1, 1);
+  Target.Fill(0.5);
+
+  // Round-trip: structure save/load must reproduce the layer count.
+  Struct := NN.SaveStructureToString();
+  NN2 := TNNet.Create();
+  NN2.LoadStructureFromString(Struct);
+  AssertEquals('MoE structure round-trips layer count',
+    NN.CountLayers(), NN2.CountLayers());
+  NN2.Free;
+
+  // Forward + a short train: loss must decrease (the block learns end-to-end).
+  NN.Compute(Input);
+  NN.GetOutput(Output);
+  InitialLoss := Abs(Output.FData[0] - Target.FData[0]);
+  for I := 0 to 400 do
+  begin
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+  end;
+  NN.Compute(Input);
+  NN.GetOutput(Output);
+  FinalLoss := Abs(Output.FData[0] - Target.FData[0]);
+  AssertTrue('MoE final loss should be below initial', FinalLoss < InitialLoss);
+
+  Input.Free;
+  Output.Free;
+  Target.Free;
+  NN.Free;
 end;
 
 initialization

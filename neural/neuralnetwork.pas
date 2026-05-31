@@ -5157,6 +5157,35 @@ type
       // GLU feed-forward block: FullConnectLinear(2*D_hidden) -> GLU -> FullConnectLinear(D_out).
       // D_in is informational only; the first FullConnect infers its input from the previous layer.
       function AddGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
+      // Mixture-of-Experts feed-forward block (Shazeer et al. 2017, soft/dense v1).
+      // Builds NumExperts parallel shape-preserving 2-layer expert MLPs plus a
+      // small gating network, all branching from InputLayer (defaults to the
+      // current last layer). Returns the combined block output, whose shape is
+      // identical to the InputLayer output (d_model = InputLayer.Output.Depth),
+      // so the block is a drop-in replacement for a single FFN and can be wrapped
+      // in AddPreNormResidual([...]) like any other sublayer stack.
+      //
+      // Wiring (everything is token-wise: pointwise/1x1 convs over Depth, so a
+      // (SeqLen,1,d_model) or (1,1,d_model) tensor keeps its sequence axis):
+      //   gate logits := PointwiseConvLinear(NumExperts)(InputLayer)
+      //   g           := SoftMax(gate logits)            -- per-expert weights, sum 1
+      //   expert_e    := PointwiseConvLinear(d_model)(   -- E_e(x), shape-preserving
+      //                    PointwiseConvReLU(ExpertHiddenDim)(InputLayer) )
+      //   y           := Sum_e  g[e] * expert_e          -- gate-weighted combine
+      // The per-expert scalar g[e] is sliced out with TNNetSplitChannels(e,1),
+      // broadcast across the d_model channels with TNNetDeepConcat.Replicate, and
+      // multiplied cell-wise into expert_e with TNNetCellMulByCell (the same
+      // broadcast-multiply mechanism AddCBAM uses for its spatial gate). The
+      // weighted expert outputs are summed with TNNetSum.
+      //
+      // v1 is a SOFT, DENSE gate: every expert is evaluated on every token and the
+      // outputs are blended by the softmax weights. This trains end-to-end with
+      // the existing layers and needs no new gradient code. The sparse hard top-k
+      // router (run only the k highest-gated experts) plus its load-balancing
+      // auxiliary loss are logged as a follow-up in tasklist.md and are NOT
+      // implemented here.
+      function AddMixtureOfExperts(InputLayer: TNNetLayer;
+        NumExperts, ExpertHiddenDim: integer): TNNetLayer;
       // Pre-norm residual block:  y = x + Sublayer(LayerNorm(x)).
       // pSublayers is the caller-provided sublayer stack; its output shape MUST
       // match the block input shape so the residual sum is valid. Returns the
@@ -48010,6 +48039,52 @@ begin
   AddLayer( TNNetGLU.Create() );
   AddLayer( TNNetFullConnectLinear.Create(D_out) );
   Result := GetLastLayer();
+end;
+
+function TNNet.AddMixtureOfExperts(InputLayer: TNNetLayer;
+  NumExperts, ExpertHiddenDim: integer): TNNetLayer;
+var
+  d_model, e: integer;
+  Gate: TNNetLayer;
+  ExpertOut, GateE, GateEBroadcast, WeightedExpert: TNNetLayer;
+  WeightedExperts: array of TNNetLayer;
+begin
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if NumExperts < 1 then NumExperts := 1;
+  if ExpertHiddenDim < 1 then ExpertHiddenDim := 1;
+  d_model := InputLayer.Output.Depth;
+
+  // --- GATING NETWORK ------------------------------------------------------
+  // Token-wise linear projection InputLayer -> NumExperts logits, then SoftMax
+  // over the NumExperts channels gives a (.,.,NumExperts) tensor of per-expert
+  // weights that sum to 1 at every (x,y) position. Soft/dense gate: all experts
+  // run and are blended (see the declaration doc-comment for the hard top-k
+  // follow-up that is intentionally NOT implemented in v1).
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(NumExperts), InputLayer );
+  Gate := AddLayer( TNNetSoftMax.Create() );
+
+  // --- EXPERTS + GATE-WEIGHTED COMBINE -------------------------------------
+  SetLength(WeightedExperts, NumExperts);
+  for e := 0 to NumExperts - 1 do
+  begin
+    // Shape-preserving 2-layer expert MLP over Depth (1x1 convs keep the
+    // sequence axis; FullConnect would flatten it and break per-token blocks).
+    AddLayerAfter( TNNetPointwiseConvReLU.Create(ExpertHiddenDim), InputLayer );
+    ExpertOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+    // Slice this expert's scalar gate weight g[e] (a (.,.,1) channel)...
+    GateE := AddLayerAfter( TNNetSplitChannels.Create(e, 1), Gate );
+    // ...broadcast it across the d_model channels (same trick AddCBAM uses to
+    // broadcast its spatial gate), then cell-multiply it into the expert output.
+    GateEBroadcast := AddLayer( TNNetDeepConcat.Replicate(d_model, GateE) );
+    WeightedExpert := AddLayer( TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+    WeightedExperts[e] := WeightedExpert;
+  end;
+
+  // Sum the gate-weighted expert outputs: y = Sum_e g[e] * E_e(x).
+  if NumExperts = 1
+    then Result := WeightedExperts[0]
+    else Result := AddLayer( TNNetSum.Create(WeightedExperts) );
+  SetLength(WeightedExperts, 0);
 end;
 
 function TNNet.AddPreNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;

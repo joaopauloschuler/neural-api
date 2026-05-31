@@ -541,8 +541,17 @@ rather than acted on.
       bottleneck's output entropy (the categorical sharpens as tau drops).
       The layer + its soft/hard modes are in tree; this is the headline
       use case. Pairs with the open TNNetMixtureOfExperts routing gate.
-- [ ] TNNetMixtureOfExperts — top-k softmax gate over N expert sub-networks
-      plus a load-balancing auxiliary loss. (The just-landed
+- [x] Mixture-of-Experts feed-forward block (`TNNet.AddMixtureOfExperts`) — DONE
+      (soft/dense gate v1). A token-wise softmax gating network blends N parallel
+      shape-preserving expert MLPs; combine wired as SplitChannels(e,1) ->
+      DeepConcat.Replicate -> CellMulByCell -> Sum. Example
+      examples/MixtureOfExperts, smoke+round-trip test in TestNeuralLayersExtra,
+      README bullets.
+- [ ] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
+      soft block above) — run only the k highest-gated experts per token (sparse
+      dispatch) plus a load-balancing auxiliary loss so the gate does not collapse
+      onto one expert. Needs a top-k masking/dispatch mechanism on the gate plus
+      an aux-loss head; left out of v1 to avoid shipping an untested router. (The
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
 #### Normalization primitives
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
