@@ -7492,9 +7492,10 @@ type
       FByteOutput: array of byte;
       FByteOutputFound: array of byte;
       FActionBytes: array of byte;
+      FAddSkipConnection: boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(CacheSize, TestCount, OperationCount: integer); overload;
+      constructor Create(CacheSize, TestCount, OperationCount, AddSkipConnection: integer); overload;
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -7535,7 +7536,7 @@ type
       FInDepth: integer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(CacheSize, TestCount, OperationCount: integer); overload;
+      constructor Create(CacheSize, TestCount, OperationCount, AddSkipConnection: integer); overload;
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -17780,12 +17781,14 @@ begin
 end;
 
 constructor TNNetByteProcessing.Create(CacheSize, TestCount,
-  OperationCount: integer);
+  OperationCount, AddSkipConnection: integer);
 begin
   inherited Create;
   FStruct[0] := CacheSize;
   FStruct[1] := TestCount;
   FStruct[2] := OperationCount;
+  FStruct[3] := AddSkipConnection;
+  FAddSkipConnection := (AddSkipConnection>0);
 end;
 
 destructor TNNetByteProcessing.Destroy;
@@ -17800,7 +17803,12 @@ procedure TNNetByteProcessing.Compute();
 begin
   FPrevLayer.Output.ReadAsBits(FByteInput, 0.0);
   FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
-  FOutput.CopyAsBits(FByteOutput, -0.5, +0.5);
+  if FAddSkipConnection then
+  begin
+    FOutput.CopyAsBits(FByteOutput, 0, +0.5);
+    FOutput.Add(FPrevLayer.Output);
+  end
+  else FOutput.CopyAsBits(FByteOutput, -0.5, +0.5);
 end;
 
 procedure TNNetByteProcessing.Backpropagate();
@@ -17829,14 +17837,21 @@ begin
      (FPrevLayer.OutputError.Size > 0) and
      (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
   begin
-    vMax := FPrevLayer.Output.Size - 1;
-    if vMax > FOutputError.Size - 1 then vMax := FOutputError.Size - 1;
-    for J := 0 to vMax do
+    if (FAddSkipConnection) then
     begin
-      x := FPrevLayer.Output.FData[J];
-      if Abs(x) <= 1 then
-        FPrevLayer.FOutputError.FData[J] :=
-          FPrevLayer.FOutputError.FData[J] + FOutputError.FData[J];
+      FPrevLayer.FOutputError.Add(FOutputError);
+    end
+    else
+    begin
+      vMax := FPrevLayer.Output.Size - 1;
+      if vMax > FOutputError.Size - 1 then vMax := FOutputError.Size - 1;
+      for J := 0 to vMax do
+      begin
+        x := FPrevLayer.Output.FData[J];
+        if Abs(x) <= 1 then
+          FPrevLayer.FOutputError.FData[J] :=
+            FPrevLayer.FOutputError.FData[J] + FOutputError.FData[J];
+      end;
     end;
   end;
 
@@ -17923,9 +17938,9 @@ begin
 end;
 
 constructor TNNetPointwiseByteProcessing.Create(CacheSize, TestCount,
-  OperationCount: integer);
+  OperationCount, AddSkipConnection: integer);
 begin
-  inherited Create(CacheSize, TestCount, OperationCount);
+  inherited Create(CacheSize, TestCount, OperationCount, AddSkipConnection);
   FPosInput := TNNetVolume.Create;
   FPosOutput := TNNetVolume.Create;
 end;
@@ -17941,11 +17956,15 @@ procedure TNNetPointwiseByteProcessing.Compute();
 var
   StartTime: double;
   X, Y, D, MaxX, MaxY, OutDepthM1: integer;
+  MinValue: TNeuralFloat;
 begin
   StartTime := Now();
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   OutDepthM1 := FByteLen*8 - 1;
+  if FAddSkipConnection
+    then MinValue :=    0
+    else MinValue := -0.5;
   // Apply the one shared engine to each (X,Y) Depth column independently.
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
@@ -17954,10 +17973,16 @@ begin
         FPosInput.FData[D] := FPrevLayer.FOutput[X, Y, D];
       FPosInput.ReadAsBits(FByteInput, 0.0);
       FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
-      FPosOutput.CopyAsBits(FByteOutput, -0.5, +0.5);
+      FPosOutput.CopyAsBits(FByteOutput, -MinValue, +0.5);
       for D := 0 to OutDepthM1 do
         FOutput[X, Y, D] := FPosOutput.FData[D];
     end;
+
+  if FAddSkipConnection then
+  begin
+    FOutput.Add(FPrevLayer.Output);
+  end;
+
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -17996,7 +18021,7 @@ begin
         for D := 0 to InDepthM1 do
         begin
           v := FPrevLayer.FOutput[X, Y, D];
-          if Abs(v) <= 1 then
+          if FAddSkipConnection or (Abs(v) <= 1) then
             FPrevLayer.FOutputError[X, Y, D] :=
               FPrevLayer.FOutputError[X, Y, D] + FOutputError[X, Y, D];
         end;
@@ -47742,8 +47767,8 @@ begin
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
       'TNNetVectorQuantizer' :      Result := TNNetVectorQuantizer.Create(St[0], Ft[0]);
-      'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2]);
-      'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2]);
+      'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]);
+      'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
@@ -48026,8 +48051,8 @@ begin
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetVectorQuantizer' then Result := TNNetVectorQuantizer.Create(St[0], Ft[0]) else
-      if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2]) else
-      if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
