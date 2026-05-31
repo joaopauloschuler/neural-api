@@ -65,6 +65,27 @@ rather than acted on.
       attention), GatherChannelsRouting (static channel gather), the open
       TNNetMixtureOfExperts (scalar gate) and the open Modern-Hopfield retrieval.
 
+- [ ] TNNetDropBlock — structured spatial dropout (Ghiasi et al. 2018, "DropBlock:
+      A regularization method for convolutional networks"). Instead of zeroing
+      INDEPENDENT activations (`TNNetDropout`) or whole RESIDUAL BRANCHES
+      (`TNNetDropPath`), DropBlock zeroes contiguous square `block_size x block_size`
+      regions of a conv feature map, so neighbouring (spatially-correlated) units are
+      dropped together — the only form of dropout that actually removes a localized
+      patch of evidence rather than scattered pixels a conv can trivially in-paint.
+      Forward (train only): sample Bernoulli seeds at rate `gamma = (1-keep) *
+      feat_area / (block_size^2 * valid_area)`, expand each seed to its block via a
+      max-pool-style square dilation to build the 0/1 mask, multiply, then rescale by
+      `count(mask)/count_ones(mask)` so the expected activation is preserved;
+      inference is identity. Backward routes the gradient through the SAME stored
+      mask (a pure element-wise gate, like the existing dropout backward). Verify the
+      gradient with the standard numerical-gradient harness using a FIXED mask (seed
+      the RNG / capture the mask so train-mode forward is deterministic for the
+      check), reseed with `RandSeed := 424242` per the numerical-test RNG-ordering
+      convention. Distinct from `TNNetDropout` (per-element), `TNNetSpatialDropout2D`
+      (whole-CHANNEL drop, not a spatial patch), and `TNNetDropPath` (whole-branch
+      stochastic depth). Stretch: a tiny CIFAR-stub bake-off vs plain Dropout at
+      matched rate showing the train/val gap.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
       SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
