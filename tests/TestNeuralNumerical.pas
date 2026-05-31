@@ -345,6 +345,7 @@ type
     procedure TestSlidingWindowMaskedFillGradientCheck;
     procedure TestSlidingWindowMaskedFillSerializationRoundTrip;
     procedure TestSlidingWindowMaskedFillFullWindowEqualsCausal;
+    procedure TestSlidingWindowMaskedFillShapeStress;
     procedure TestALiBiForward;
     procedure TestALiBiGradientCheck;
     procedure TestALiBiSerializationRoundTrip;
@@ -7863,6 +7864,216 @@ begin
     NNWin.Free;
     NNCausal.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillShapeStress;
+const
+  cDepth = 2;
+  cMask  = -1e9;
+var
+  SeqLens: array[0..4] of integer = (1, 2, 3, 5, 8);
+  si, wi, SeqLen, W: integer;
+  Windows: array[0..3] of integer;
+  NNWin, NNCausal: TNNet;
+  Input: TNNetVolume;
+  X, Y, D: integer;
+  PastLimit: integer;
+  Masked: boolean;
+
+  // Forward-mask convention check on an all-ones input for one (SeqLen,W) pair.
+  // Mirrors the layer: position (X,Y) is masked iff X>Y (future) or X<Y-W+1
+  // (older than the W-wide band). Everything in the band stays at 1.0.
+  procedure CheckForwardMask(ASeqLen, AW: integer);
+  var
+    NN: TNNet;
+    In2: TNNetVolume;
+    lx, ly, ld, lp: integer;
+  begin
+    NN := TNNet.Create();
+    In2 := TNNetVolume.Create(ASeqLen, ASeqLen, cDepth);
+    try
+      NN.AddLayer(TNNetInput.Create(ASeqLen, ASeqLen, cDepth, 1));
+      NN.AddLayer(TNNetSlidingWindowMaskedFill.Create(AW, cMask));
+      In2.Fill(1.0);
+      NN.Compute(In2);
+      for ly := 0 to ASeqLen - 1 do
+      begin
+        lp := ly - AW + 1;
+        for lx := 0 to ASeqLen - 1 do
+          for ld := 0 to cDepth - 1 do
+          begin
+            if (lx > ly) or (lx < lp) then
+              AssertTrue(
+                'SWMF stress masked SeqLen=' + IntToStr(ASeqLen) +
+                ' W=' + IntToStr(AW) + ' X=' + IntToStr(lx) +
+                ' Y=' + IntToStr(ly) + ' D=' + IntToStr(ld),
+                NN.GetLastLayer.Output[lx, ly, ld] < -1e8)
+            else
+              AssertEquals(
+                'SWMF stress band SeqLen=' + IntToStr(ASeqLen) +
+                ' W=' + IntToStr(AW) + ' X=' + IntToStr(lx) +
+                ' Y=' + IntToStr(ly) + ' D=' + IntToStr(ld),
+                1.0, NN.GetLastLayer.Output[lx, ly, ld], 0.0001);
+          end;
+      end;
+    finally
+      NN.Free;
+      In2.Free;
+    end;
+  end;
+
+  // Inline identity-passthrough input-gradient check for one (SeqLen,W) pair.
+  // The layer only adds a constant inside the band, so dL/dInput is exactly the
+  // upstream gradient (identity). We use a small mask value (-0.5) and a
+  // moderate epsilon (1e-3) to keep the float32 central difference
+  // well-conditioned even when most cells are masked (small W / large SeqLen).
+  procedure CheckInputGradient(ASeqLen, AW: integer);
+  const
+    cEps = 1e-3;
+  var
+    NN: TNNet;
+    In3, InP, Desired: TNNetVolume;
+    k: integer;
+    lossP, lossM, numG, anaG: TNeuralFloat;
+
+    function LossAt(AV: TNNetVolume): TNeuralFloat;
+    var
+      m: integer;
+      diff: TNeuralFloat;
+    begin
+      NN.Compute(AV);
+      Result := 0;
+      for m := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        diff := NN.GetLastLayer.Output.Raw[m] - Desired.Raw[m];
+        Result := Result + 0.5 * diff * diff;
+      end;
+    end;
+
+  begin
+    NN := TNNet.Create();
+    In3 := TNNetVolume.Create(ASeqLen, ASeqLen, cDepth);
+    InP := TNNetVolume.Create(ASeqLen, ASeqLen, cDepth);
+    Desired := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(ASeqLen, ASeqLen, cDepth, 1));
+      NN.AddLayer(TNNetSlidingWindowMaskedFill.Create(AW, -0.5));
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(True);
+      Desired.ReSize(NN.GetLastLayer.Output);
+      for k := 0 to In3.Size - 1 do In3.Raw[k] := Sin(k * 0.7) * 0.5 + 0.1;
+      for k := 0 to Desired.Size - 1 do Desired.Raw[k] := Cos(k * 0.5) * 0.5;
+      for k := 0 to In3.Size - 1 do
+      begin
+        InP.Copy(In3);
+        InP.Raw[k] := In3.Raw[k] + cEps;
+        lossP := LossAt(InP);
+        InP.Raw[k] := In3.Raw[k] - cEps;
+        lossM := LossAt(InP);
+        numG := (lossP - lossM) / (2 * cEps);
+        NN.Compute(In3);
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        anaG := NN.Layers[0].OutputError.Raw[k];
+        AssertTrue('SWMFstress grad S' + IntToStr(ASeqLen) + 'W' +
+          IntToStr(AW) + ' at ' + IntToStr(k) + ' (num=' + FloatToStr(numG) +
+          ' ana=' + FloatToStr(anaG) + ')', Abs(numG - anaG) < 0.01);
+      end;
+    finally
+      NN.Free;
+      In3.Free;
+      InP.Free;
+      Desired.Free;
+    end;
+  end;
+
+begin
+  // Reseed: the gradient-check helper shares the suite RNG and is order
+  // sensitive; pin it so this stress test cannot perturb later checks.
+  RandSeed := 424242;
+
+  // Forward-mask convention + input-gradient check across the SeqLen/W grid.
+  // W in {1, 2, SeqLen, SeqLen+2}; the last two pin the full-causal regime.
+  for si := 0 to High(SeqLens) do
+  begin
+    SeqLen := SeqLens[si];
+    Windows[0] := 1;
+    Windows[1] := 2;
+    Windows[2] := SeqLen;
+    Windows[3] := SeqLen + 2;
+    for wi := 0 to High(Windows) do
+    begin
+      W := Windows[wi];
+      if W < 1 then W := 1;
+      CheckForwardMask(SeqLen, W);
+      CheckInputGradient(SeqLen, W);
+    end;
+  end;
+
+  // Invariant 1: W >= SeqLen reproduces the full causal TNNetMaskedFill
+  // exactly (here W = SeqLen + 2). Probe with a structured, non-flat input.
+  for si := 0 to High(SeqLens) do
+  begin
+    SeqLen := SeqLens[si];
+    W := SeqLen + 2;
+    NNWin := TNNet.Create();
+    NNCausal := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, SeqLen, cDepth);
+    try
+      NNWin.AddLayer(TNNetInput.Create(SeqLen, SeqLen, cDepth, 1));
+      NNWin.AddLayer(TNNetSlidingWindowMaskedFill.Create(W, cMask));
+      NNCausal.AddLayer(TNNetInput.Create(SeqLen, SeqLen, cDepth, 1));
+      NNCausal.AddLayer(TNNetMaskedFill.Create(cMask));
+      for X := 0 to Input.Size - 1 do
+        Input.Raw[X] := Sin(X * 0.37) * 1.5 - 0.2;
+      NNWin.Compute(Input);
+      NNCausal.Compute(Input);
+      for D := 0 to cDepth - 1 do
+        for Y := 0 to SeqLen - 1 do
+          for X := 0 to SeqLen - 1 do
+            AssertEquals('SWMF W>=SeqLen == causal SeqLen=' + IntToStr(SeqLen) +
+              ' X=' + IntToStr(X) + ' Y=' + IntToStr(Y) + ' D=' + IntToStr(D),
+              NNCausal.GetLastLayer.Output[X, Y, D],
+              NNWin.GetLastLayer.Output[X, Y, D], 0.0001);
+    finally
+      NNWin.Free;
+      NNCausal.Free;
+      Input.Free;
+    end;
+  end;
+
+  // Invariant 2: W = 1 is diagonal-only -- each query Y sees only key X = Y.
+  // Everything off the main diagonal must be masked.
+  for si := 0 to High(SeqLens) do
+  begin
+    SeqLen := SeqLens[si];
+    NNWin := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, SeqLen, cDepth);
+    try
+      NNWin.AddLayer(TNNetInput.Create(SeqLen, SeqLen, cDepth, 1));
+      NNWin.AddLayer(TNNetSlidingWindowMaskedFill.Create(1, cMask));
+      Input.Fill(1.0);
+      NNWin.Compute(Input);
+      for D := 0 to cDepth - 1 do
+        for Y := 0 to SeqLen - 1 do
+          for X := 0 to SeqLen - 1 do
+          begin
+            PastLimit := Y; // W=1 -> band is just [Y..Y]
+            Masked := (X > Y) or (X < PastLimit);
+            if X = Y then
+              AssertEquals('SWMF W=1 diagonal kept SeqLen=' + IntToStr(SeqLen) +
+                ' X=' + IntToStr(X) + ' Y=' + IntToStr(Y),
+                1.0, NNWin.GetLastLayer.Output[X, Y, D], 0.0001)
+            else
+              AssertTrue('SWMF W=1 off-diagonal masked SeqLen=' +
+                IntToStr(SeqLen) + ' X=' + IntToStr(X) + ' Y=' + IntToStr(Y),
+                Masked and (NNWin.GetLastLayer.Output[X, Y, D] < -1e8));
+          end;
+    finally
+      NNWin.Free;
+      Input.Free;
+    end;
   end;
 end;
 
