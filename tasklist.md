@@ -626,11 +626,6 @@ rather than acted on.
       net trained under a constant-valued scheduler matches the fixed-LR run.
       The classes + math are landed; this is the integration the "missing
       plumbing" entry ultimately wants.
-- [X] TNeuralLRScheduler follow-up: ship `examples/SchedulerCompare/` (the open
-      "Examples I'd enjoy writing" entry) now that the schedules exist — same tiny
-      net trained four times under constant / Step / Cosine / WarmupCosine LR,
-      one ASCII chart of the LR curve + final loss per schedule. Drives LR
-      manually per epoch (Sched.NextLR(epoch, epoch) -> SetLearningRate).
 - [ ] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
       average of live weights every N steps after epoch W.
 - [ ] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
@@ -1006,9 +1001,6 @@ rather than acted on.
       builder) that auto-reshapes a (C,1,1) feature vector to (1,1,C) so the
       per-channel affine "just works" on dense-layer output without the manual
       reshape — verify it stays a no-op on already-(*,*,C) conv output.
-- [X] `examples/TokenShiftBaseline/` — train a tiny next-token char model
-      with `TNNetEmbedding → TNNetTokenShift → MLP` and compare against
-      the MHA-based version (`TNNet.AddMultiHeadSelfAttention`).
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
@@ -1367,9 +1359,6 @@ rather than acted on.
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
       TNNetSinusoidalTimeEmbedding (FiLM and the timestep embedding are both
       in tree).
-- [X] `examples/HopfieldRetrieval/` — modern Hopfield network as attention
-      (Ramsauer et al.): store K patterns, retrieve via a single softmax-
-      attention step against a query.
 - [ ] Mixed-precision experiment first step: add `TNeuralFloat16 = packed
       record ...` in neuralvolume.pas with conversion helpers, plus a
       one-layer forward-only test validating FP16 matches FP32 to within
