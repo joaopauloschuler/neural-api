@@ -1936,16 +1936,25 @@ type
   // (M == m, so the argmin and argmax collapse), GetMin/GetMax each pick the
   // first such index; eps keeps the forward finite and the routing well
   // defined (a single index absorbs both the min and max corrections).
+  // Reduction scope is selected by FStruct[0]: 0 (default) = full-volume
+  // (a single min/max over all x,y AND depth per sample); 1 = per-channel
+  // (min/max reduced over the spatial positions x,y ONLY, independently for
+  // each depth channel, so each channel d gets its own min_d/max_d and is
+  // normalized to [0,1] on its own). In per-channel mode the helper volumes
+  // hold one value per depth channel; the flat argmin/argmax index for each
+  // channel is stored so the backward routing matches the full-volume case
+  // scoped to that channel.
   TNNetMinMaxNorm = class(TNNetIdentity)
   protected
-    FArgMin: TNNetVolume;  // flat argmin index per sample (one cell)
-    FArgMax: TNNetVolume;  // flat argmax index per sample (one cell)
-    FDenoms: TNNetVolume;  // (M - m) + eps per sample (one cell)
-    FMaxVals: TNNetVolume; // M per sample (one cell)
+    FArgMin: TNNetVolume;  // flat argmin index (one cell, or one per channel)
+    FArgMax: TNNetVolume;  // flat argmax index (one cell, or one per channel)
+    FDenoms: TNNetVolume;  // (M - m) + eps (one cell, or one per channel)
+    FMaxVals: TNNetVolume; // M (one cell, or one per channel)
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
     constructor Create(pEpsilon: TNeuralFloat); overload;
+    constructor Create(pEpsilon: TNeuralFloat; pPerChannel: boolean); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -12003,8 +12012,17 @@ end;
 
 constructor TNNetMinMaxNorm.Create(pEpsilon: TNeuralFloat);
 begin
+  // Full-volume reduction is the historical default (FStruct[0] = 0).
+  Create(pEpsilon, false);
+end;
+
+constructor TNNetMinMaxNorm.Create(pEpsilon: TNeuralFloat; pPerChannel: boolean);
+begin
   inherited Create();
   FFloatSt[0] := pEpsilon;
+  if pPerChannel
+    then FStruct[0] := 1   // per-channel: reduce over x,y only, per depth
+    else FStruct[0] := 0;  // full-volume: a single min/max per sample
   FArgMin  := TNNetVolume.Create();
   FArgMax  := TNNetVolume.Create();
   FDenoms  := TNNetVolume.Create();
@@ -12023,24 +12041,70 @@ end;
 procedure TNNetMinMaxNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  // One scalar per sample (the reduction is over the whole volume).
-  FArgMin.ReSize(1, 1, 1);
-  FArgMax.ReSize(1, 1, 1);
-  FDenoms.ReSize(1, 1, 1);
-  FMaxVals.ReSize(1, 1, 1);
+  if FStruct[0] = 1 then
+  begin
+    // Per-channel mode: one cached value per depth channel.
+    FArgMin.ReSize(1, 1, FOutput.Depth);
+    FArgMax.ReSize(1, 1, FOutput.Depth);
+    FDenoms.ReSize(1, 1, FOutput.Depth);
+    FMaxVals.ReSize(1, 1, FOutput.Depth);
+  end
+  else
+  begin
+    // Full-volume mode: one scalar per sample (reduction over the whole volume).
+    FArgMin.ReSize(1, 1, 1);
+    FArgMax.ReSize(1, 1, 1);
+    FDenoms.ReSize(1, 1, 1);
+    FMaxVals.ReSize(1, 1, 1);
+  end;
 end;
 
 procedure TNNetMinMaxNorm.Compute();
 var
   StartTime: double;
   CntE, MaxE, ArgMin, ArgMax: integer;
+  CntD, Depth, Pos, NumPos, Idx: integer;
   LocalPrevOutput: TNNetVolume;
-  MinV, MaxV, Denom, Eps: TNeuralFloat;
+  MinV, MaxV, Denom, Eps, Xv: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.FOutput;
   Eps := FFloatSt[0];
   if Eps <= 0 then Eps := 1e-7;
+  if FStruct[0] = 1 then
+  begin
+    // Per-channel mode: reduce over the spatial positions (x,y) ONLY, one
+    // (min_d, max_d, argmin_d, argmax_d, denom_d) per depth channel. Depth is
+    // the fastest-varying axis, so element d of position p lives at p*Depth+d.
+    Depth := LocalPrevOutput.Depth;
+    NumPos := LocalPrevOutput.SizeX * LocalPrevOutput.SizeY;
+    for CntD := 0 to Depth - 1 do
+    begin
+      MinV := LocalPrevOutput.FData[CntD];
+      MaxV := LocalPrevOutput.FData[CntD];
+      ArgMin := CntD;
+      ArgMax := CntD;
+      for Pos := 1 to NumPos - 1 do
+      begin
+        Idx := Pos * Depth + CntD;
+        Xv := LocalPrevOutput.FData[Idx];
+        if Xv < MinV then begin MinV := Xv; ArgMin := Idx; end;
+        if Xv > MaxV then begin MaxV := Xv; ArgMax := Idx; end;
+      end;
+      FArgMin.FData[CntD] := ArgMin;
+      FArgMax.FData[CntD] := ArgMax;
+      Denom := (MaxV - MinV) + Eps;
+      FDenoms.FData[CntD] := Denom;
+      FMaxVals.FData[CntD] := MaxV;
+      for Pos := 0 to NumPos - 1 do
+      begin
+        Idx := Pos * Depth + CntD;
+        FOutput.FData[Idx] := (LocalPrevOutput.FData[Idx] - MinV) / Denom;
+      end;
+    end;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Reduce over the WHOLE volume (all x, y AND depth positions) in one scan,
   // tracking the first argmin/argmax index for the backward routing.
   MaxE := LocalPrevOutput.Size - 1;
@@ -12076,6 +12140,7 @@ procedure TNNetMinMaxNorm.Backpropagate();
 var
   StartTime: double;
   CntE, MaxE, ArgMin, ArgMax: integer;
+  CntD, Depth, Pos, NumPos, Idx: integer;
   Denom, InvDenom, InvDenomSq, Gi, Yi: TNeuralFloat;
   DotGY, ArgMinExtra: TNeuralFloat;
 begin
@@ -12083,6 +12148,47 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  if FStruct[0] = 1 then
+  begin
+    if Assigned(FPrevLayer) and
+      (FPrevLayer.OutputError.Size > 0) and
+      (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+    begin
+      // Per-channel backward: same structure as the full-volume case, but the
+      // bulk term, the argmax-row correction and the argmin extra term are all
+      // scoped to a single depth channel's spatial positions.
+      Depth := FOutput.Depth;
+      NumPos := FOutput.SizeX * FOutput.SizeY;
+      for CntD := 0 to Depth - 1 do
+      begin
+        Denom := FDenoms.FData[CntD];
+        InvDenom := 1.0 / Denom;
+        InvDenomSq := InvDenom * InvDenom;
+        ArgMin := Round(FArgMin.FData[CntD]);
+        ArgMax := Round(FArgMax.FData[CntD]);
+        DotGY := 0;
+        ArgMinExtra := 0;
+        for Pos := 0 to NumPos - 1 do
+        begin
+          Idx := Pos * Depth + CntD;
+          Gi := FOutputError.FData[Idx];
+          Yi := FOutput.FData[Idx];
+          DotGY := DotGY + Gi * Yi;
+          // (x_j - M_d - eps) = (Yi - 1)*Denom_d (see full-volume derivation).
+          ArgMinExtra := ArgMinExtra + Gi * (Yi - 1.0) * Denom;
+          FPrevLayer.OutputError.FData[Idx] :=
+            FPrevLayer.OutputError.FData[Idx] + Gi * InvDenom;
+        end;
+        FPrevLayer.OutputError.FData[ArgMax] :=
+          FPrevLayer.OutputError.FData[ArgMax] - InvDenom * DotGY;
+        FPrevLayer.OutputError.FData[ArgMin] :=
+          FPrevLayer.OutputError.FData[ArgMin] + InvDenomSq * ArgMinExtra;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    FPrevLayer.Backpropagate();
+    exit;
+  end;
   if Assigned(FPrevLayer) and
     (FPrevLayer.OutputError.Size > 0) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
@@ -46806,7 +46912,7 @@ begin
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
       'TNNetUnitNorm' :             Result := TNNetUnitNorm.Create();
-      'TNNetMinMaxNorm' :           Result := TNNetMinMaxNorm.Create(Ft[0]);
+      'TNNetMinMaxNorm' :           Result := TNNetMinMaxNorm.Create(Ft[0], St[0] = 1);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
@@ -47086,7 +47192,7 @@ begin
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetUnitNorm' then Result := TNNetUnitNorm.Create() else
-      if S[0] = 'TNNetMinMaxNorm' then Result := TNNetMinMaxNorm.Create(Ft[0]) else
+      if S[0] = 'TNNetMinMaxNorm' then Result := TNNetMinMaxNorm.Create(Ft[0], St[0] = 1) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else

@@ -30,7 +30,7 @@ A few conventions used below:
 | `TNNetPixelNorm.Create()` | per (X, Y) pixel, over Depth | none | `y = x / sqrt(mean_depth(x^2) + eps)` | StyleGAN-style per-pixel feature-vector norm; GAN generators. |
 | `TNNetL2Normalize.Create([axis][,eps])` | axis 0 (default): per (X, Y) over Depth; axis 1: whole sample; axis 2: per-channel over (X, Y) | none | `y = x / sqrt(sum(x^2) + eps)` | Unit-length feature vectors (embeddings, cosine similarity). |
 | `TNNetUnitNorm.Create()` | whole sample (flattened) | none | `y = x / sqrt(sum_all(x^2) + eps)` | Full-volume unit-L2 (Keras "UnitNorm"); alias of the line above. |
-| `TNNetMinMaxNorm.Create([eps])` | whole sample (X, Y **and** Depth) | none | `y = (x - min) / (max - min + eps)` | Rescale a whole sample to ~`[0, 1]`. |
+| `TNNetMinMaxNorm.Create([eps][,perChannel])` | full-volume (default): whole sample (X, Y **and** Depth); perChannel: per channel over (X, Y) | none | `y = (x - min) / (max - min + eps)` | Rescale to ~`[0, 1]`, globally or independently per channel. |
 | `TNNetGRN.Create()` | per channel L2 over (X, Y), then across channels | gamma + beta, per-channel (both init 0) | `y = gamma[c] * (x * Nx[c]) + beta[c] + x` | ConvNeXt-V2 blocks; channel-competition contrast norm. |
 | `TNNetDyT.Create()` | nothing (no statistics) | gamma + beta per channel, single alpha | `y = gamma[c] * tanh(alpha * x) + beta[c]` | Normalization-FREE drop-in LayerNorm replacement. |
 | `TNNetLogitNormalize.Create([tau][,eps])` | per (X, Y) over Depth | none | `y = x / (tau * sqrt(sum_depth(x^2)) + eps)` | Pre-softmax logit regularizer for calibration / OOD. |
@@ -165,6 +165,17 @@ parameters. **Repo behavior note:** the backward pass is a true subgradient that
 routes a bulk `1/denom` term to every element plus exact coupling corrections at
 the argmin and argmax indices (held fixed); for a constant volume `eps` keeps it
 finite and a single index absorbs both corrections.
+
+A third constructor `Create(eps, perChannel)` selects the reduction scope. With
+`perChannel = false` (the default for `Create()`/`Create(eps)`) the min/max are
+reduced over the whole sample as above. With `perChannel = true` the min/max are
+reduced over the **spatial** positions (X, Y) **only**, independently per depth
+channel, so each channel `d` gets its own `(min_d, max_d)` and is rescaled to
+approximately `[0, 1]` on its own: `y[x,y,d] = (x - m_d) / ((M_d - m_d) + eps)`.
+The backward pass is the same subgradient structure scoped to each channel. The
+mode is stored in `FStruct[0]` (0 = full-volume, 1 = per-channel) and round-trips
+through Save/Load. This mirrors the per-(X,Y)-over-depth vs full-volume split
+offered by `TNNetL2Normalize`.
 
 ### `TNNetGRN`
 Constructor: `Create()`. eps = `1e-6` (fixed). Global Response Normalization

@@ -612,6 +612,9 @@ type
     procedure TestMinMaxNormForward;
     procedure TestMinMaxNormGradientCheck;
     procedure TestMinMaxNormSerializationRoundTrip;
+    procedure TestMinMaxNormPerChannelForward;
+    procedure TestMinMaxNormPerChannelGradientCheck;
+    procedure TestMinMaxNormPerChannelSerializationRoundTrip;
     procedure TestLogitNormalizeGradientCheck;
     procedure TestLogitNormalizeReducesToL2WhenTauOne;
     procedure TestLogitNormalizeSerializationRoundTrip;
@@ -16339,6 +16342,96 @@ begin
     end;
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormPerChannelForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out0Min, Out0Max, Out1Min, Out1Max: TNeuralFloat;
+const
+  SizeX = 2; SizeY = 2; Depth = 2;
+begin
+  // Per-channel mode reduces min/max over the spatial positions (x,y) only,
+  // independently per depth channel. Channel 0 has range [10,40] and channel 1
+  // has a very different range [-3,-1]; each must be normalized to [0,1] on its
+  // own, proving the reduction is scoped per channel (not over the whole volume).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetMinMaxNorm.Create(1e-7, true));
+    // Channel 0 spatial values: 10, 20, 30, 40 -> min 10, max 40.
+    // Channel 1 spatial values: -1, -2, -3, -1.5 -> min -3, max -1.
+    Input.Store(0, 0, 0, 10.0); Input.Store(0, 0, 1, -1.0);
+    Input.Store(1, 0, 0, 20.0); Input.Store(1, 0, 1, -2.0);
+    Input.Store(0, 1, 0, 30.0); Input.Store(0, 1, 1, -3.0);
+    Input.Store(1, 1, 0, 40.0); Input.Store(1, 1, 1, -1.5);
+    NN.Compute(Input);
+    Out0Min := NN.GetLastLayer.Output.Get(0, 0, 0); // channel 0 min cell -> 0
+    Out0Max := NN.GetLastLayer.Output.Get(1, 1, 0); // channel 0 max cell -> 1
+    Out1Min := NN.GetLastLayer.Output.Get(0, 1, 1); // channel 1 min cell -> 0
+    Out1Max := NN.GetLastLayer.Output.Get(0, 0, 1); // channel 1 max cell -> 1
+    AssertEquals('per-channel MinMaxNorm ch0 min ~ 0', 0.0, Out0Min, 1e-5);
+    AssertEquals('per-channel MinMaxNorm ch0 max ~ 1', 1.0, Out0Max, 1e-5);
+    AssertEquals('per-channel MinMaxNorm ch1 min ~ 0', 0.0, Out1Min, 1e-5);
+    AssertEquals('per-channel MinMaxNorm ch1 max ~ 1', 1.0, Out1Max, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormPerChannelGradientCheck;
+begin
+  // Reseed so this finite-difference test does not perturb the shared RNG seen
+  // by later ordering-sensitive gradient tests.
+  RandSeed := 424242;
+  // Per-channel min-max norm reduces over the 2 spatial positions of each of
+  // the 4 depth channels independently. The helper's Sin-seeded inputs give
+  // strictly distinct values, so within every channel the 2 spatial values
+  // have a unique argmin/argmax (no ties) and the documented backward is exact.
+  // Tolerance 1e-2 matches the full-volume MinMaxNorm gradient check.
+  LayerInputGradientCheck(Self, TNNetMinMaxNorm.Create(1e-7, true),
+    'MinMaxNormPerChannel', 2, 1, 4, 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormPerChannelSerializationRoundTrip;
+var
+  NN, NN2, NNFull: TNNet;
+  Saved: string;
+begin
+  // The PerChannel flag lives in FStruct[0] and must survive Save/Load.
+  NN := TNNet.Create();
+  NNFull := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetMinMaxNorm.Create(2.5e-4, true));
+    // A full-volume layer with the SAME epsilon: its structure string must
+    // differ, proving the PerChannel flag is actually encoded in FStruct[0].
+    NNFull.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NNFull.AddLayer(TNNetMinMaxNorm.Create(2.5e-4, false));
+    AssertTrue('per-channel MinMaxNorm structure differs from full-volume',
+      NN.GetLastLayer.SaveStructureToString() <>
+      NNFull.GetLastLayer.SaveStructureToString());
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('per-channel MinMaxNorm round-trip class name',
+        'TNNetMinMaxNorm', NN2.GetLastLayer.ClassName);
+      // SaveStructureToString emits FStruct[0]; equality proves the PerChannel
+      // flag (and epsilon) round-tripped.
+      AssertEquals('per-channel MinMaxNorm round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    NNFull.Free;
   end;
 end;
 
