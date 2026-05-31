@@ -8,6 +8,7 @@ CoordConvSpiral/CoordConvSpiral
 CumSumPositionEncoding/CumSumPositionEncoding
 DomainAdversarial/DomainAdversarial
 DropPathAblation/DropPathAblation
+EchoStateNetwork/EchoStateNetwork
 EuclideanNormHead/EuclideanNormHead
 HardConcreteSparsity/HardConcreteSparsity
 ModelSummaryDemo/ModelSummaryDemo
