@@ -167,6 +167,20 @@ breakdown:
 - [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
       heads (Shazeer et al.). A tiny learnable HxH multiply applied to
       attention logits along the head axis.
+- [ ] TNNetSlidingWindowMaskedFill — banded *local* causal attention mask
+      (Mistral / Longformer style). Distinct from the strictly-causal
+      [[TNNetMaskedFill]] (full upper-triangle): each query position i may
+      only attend to keys in [i-W+1 .. i] for a constructor window size W,
+      so the masked region is a band, not a triangle. Forward zeroes (-inf
+      before softmax) every (i,j) with j>i OR j<i-W+1; backward is the same
+      stencil applied to the gradient (a fixed 0/1 multiplier, no trainable
+      params), so it slots straight into the existing SDPA grad-check
+      harness. Deliverable: layer decl + impl + LoadFromString round-trip,
+      one numerical-gradient test reusing the SeqLen-sweep pattern, and a
+      tiny experiment showing it matches full causal attention when W>=SeqLen
+      but caps the per-query key count (the property that makes long-context
+      decode cheap) when W<SeqLen. Natural drop-in for the downstream
+      ../gpt-3-for-pascal long-context path.
 - [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
