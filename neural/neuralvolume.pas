@@ -6263,7 +6263,9 @@ begin
 
     for I := 0 to vHigh do
     begin
-      LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+      // FData has already been shifted by Sub(MaxValue) above, so do not
+      // subtract MaxValue again here (that would underflow Exp to zero).
+      LocalValue := Exp( NeuronForceRange(FData[I], 4000) );
       // LocalValue := pcr_expf( FData[I] );
       FData[I] := LocalValue;
       TotalSum := TotalSum + FData[I];
