@@ -67,6 +67,11 @@ type
     procedure TestGatherGradientCheck;
     procedure TestGatherLoadFromString;
 
+    // Multi-index gather layer (TNNetGatherChannels)
+    procedure TestGatherChannelsGradientCheck;
+    procedure TestGatherChannelsRepeatGradientCheck;
+    procedure TestGatherChannelsLoadFromString;
+
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
     procedure TestSigmoidNumericalPrecision;
@@ -6207,6 +6212,80 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('Gather round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatherChannelsGradientCheck;
+begin
+  // TNNetGatherChannels selects an ordered subset of channels (output depth =
+  // number of indices). Forward copies each selected channel; backward scatters
+  // each output channel's error back to its source channel. Probe a small
+  // 2x1x4 volume gathering an out-of-order, partial subset {3,0,2}. The volume
+  // is intentionally tiny: the shared harness uses eps=1e-4 in float32, and a
+  // larger output (more squared loss terms) amplifies catastrophic
+  // cancellation in the (lossPlus-lossMinus) central difference past the 0.01
+  // tolerance even though the routing gradient is analytically exact - the
+  // same reason TestSplitChannelsGradientCheck keeps its probe volume small.
+  RandSeed := 424242;
+  LayerInputGradientCheck(Self, TNNetGatherChannels.Create([3, 0, 2]),
+    'GatherChannels([3,0,2])', 2, 1, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGatherChannelsRepeatGradientCheck;
+begin
+  // Repeated indices ARE allowed: channel 1 is selected twice. The backward
+  // pass Adds (accumulates) the gradient of BOTH output copies onto source
+  // channel 1, which is the correct adjoint of duplication - the finite
+  // difference must still match the analytic input gradient.
+  RandSeed := 424242;
+  LayerInputGradientCheck(Self, TNNetGatherChannels.Create([1, 0, 1]),
+    'GatherChannels([1,0,1])', 2, 1, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGatherChannelsLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing a TNNetGatherChannels with a multi-index, out-of-order,
+  // index list that includes a repeat ([2,0,2,1]), proving the variable-length
+  // index list survives serialization and the layer is reconstructed as
+  // TNNetGatherChannels.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    NN.AddLayer(TNNetGatherChannels.Create([2, 0, 2, 1]));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('GatherChannels round-trip class identity',
+        NN2.GetLastLayer is TNNetGatherChannels);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GatherChannels SaveToString round-trip equality', Saved, Saved2);
+
+      AssertEquals('GatherChannels round-trip output depth',
+        4, NN2.GetLastLayer.Output.Depth);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GatherChannels round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;

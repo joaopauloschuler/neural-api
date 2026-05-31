@@ -3422,6 +3422,40 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Multi-index gather layer. Selects an ORDERED SUBSET of depth channels
+  // (the indices given to the constructor) and produces an output of shape
+  // (SizeX, SizeY, N) where N = number of selected indices:
+  //   Output[X, Y, k] := Input[X, Y, Channels[k]].
+  // This is the natural multi-index generalisation of the single-channel
+  // TNNetGather (which is the degenerate N=1 case); it doubles as a learnable-
+  // free channel reorder/prune. Backward scatters each output channel's error
+  // back to its SOURCE input channel:
+  //   PrevLayer.OutputError[X, Y, Channels[k]] += OutputError[X, Y, k].
+  // DESIGN: repeated indices ARE allowed (e.g. duplicating a channel). When an
+  // input channel appears more than once in Channels, the backward pass uses
+  // Add (not assignment), so the gradients from every output copy ACCUMULATE
+  // onto that single source channel - the mathematically correct adjoint of a
+  // forward duplication. Every selected index must satisfy
+  // 0 <= Channel < Input.Depth and the index list must be non-empty; otherwise
+  // the layer raises an error in SetPrevLayer. The index list is stored in its
+  // own structure-string segment (like TNNetSplitChannels), not in FStruct, so
+  // there is no fixed cap on N. The parameterless constructor selects a single
+  // channel 0 (so the serialization registry can always round-trip the layer).
+  TNNetGatherChannels = class(TNNetIdentity)
+    private
+      FChannels: TNeuralIntegerArray;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pChannels: array of integer); overload;
+      destructor Destroy(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+
+      function SaveStructureToString(): string; override;
+  end;
+
   /// ShuffleNet-style channel-shuffle layer. Parameter-free permutation across
   // the channel (Depth=C) axis. The single constructor parameter is Groups (the
   // number of channel groups). The map reshapes the channel axis as
@@ -15155,6 +15189,123 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetGatherChannels }
+
+constructor TNNetGatherChannels.Create();
+begin
+  // The default selects a single channel 0 so the registry can round-trip an
+  // instance that has not yet been wired to a previous layer.
+  Create([0]);
+end;
+
+constructor TNNetGatherChannels.Create(pChannels: array of integer);
+var
+  I: integer;
+begin
+  inherited Create();
+  SetLength(FChannels, Length(pChannels));
+  for I := 0 to High(pChannels) do
+    FChannels[I] := pChannels[I];
+end;
+
+destructor TNNetGatherChannels.Destroy();
+begin
+  SetLength(FChannels, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetGatherChannels.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  I, Channel, Depth, OutDepth: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Depth := pPrevLayer.Output.Depth;
+  OutDepth := Length(FChannels);
+  if OutDepth = 0 then
+  begin
+    FErrorProc('TNNetGatherChannels requires a non-empty channel list');
+    Exit;
+  end;
+  for I := 0 to OutDepth - 1 do
+  begin
+    Channel := FChannels[I];
+    if (Channel < 0) or (Channel >= Depth) then
+    begin
+      FErrorProc('TNNetGatherChannels requires 0 <= Channel < Input.Depth, got Channel=' +
+        IntToStr(Channel) + ' Depth=' + IntToStr(Depth));
+      Exit;
+    end;
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, OutDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGatherChannels.Compute();
+var
+  StartTime: double;
+  X, Y, K, MaxX, MaxY, MaxK: integer;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  MaxX := Prev.SizeX - 1;
+  MaxY := Prev.SizeY - 1;
+  MaxK := Length(FChannels) - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+      for K := 0 to MaxK do
+        FOutput[X, Y, K] := Prev[X, Y, FChannels[K]];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGatherChannels.Backpropagate();
+var
+  StartTime: double;
+  X, Y, K, MaxX, MaxY, MaxK: integer;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxK := Length(FChannels) - 1;
+    // Scatter each output channel's error back to its source channel. Add (not
+    // assign) so repeated indices correctly accumulate onto the shared source.
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+        for K := 0 to MaxK do
+          PrevErr.Add(X, Y, FChannels[K], FOutputError[X, Y, K]);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetGatherChannels.SaveStructureToString(): string;
+var
+  I, MaxChannels: integer;
+  ChannelsStr: string;
+begin
+  // The variable-length index list lives in its own structure-string segment
+  // (the same mechanism TNNetSplitChannels uses), reconstructed via aIdx in
+  // CreateLayer - so there is no fixed cap on the number of indices.
+  ChannelsStr := '';
+  MaxChannels := Length(FChannels) - 1;
+  for I := 0 to MaxChannels do
+  begin
+    if I > 0 then ChannelsStr := ChannelsStr + ';';
+    ChannelsStr := ChannelsStr + IntToStr(FChannels[I]);
+  end;
+  Result := StringReplace(inherited SaveStructureToString,'::',':'+ChannelsStr+':',[rfReplaceAll]);
 end;
 
 { TNNetChannelShuffle }
@@ -45908,6 +46059,7 @@ begin
       'TNNetConcat' :               Result := TNNetConcat.Create(aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
       'TNNetGather' :               Result := TNNetGather.Create(St[0]);
+      'TNNetGatherChannels' :       Result := TNNetGatherChannels.Create(aIdx);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
@@ -46184,6 +46336,7 @@ begin
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
       if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
       if S[0] = 'TNNetGather' then Result := TNNetGather.Create(St[0]) else
+      if S[0] = 'TNNetGatherChannels' then Result := TNNetGatherChannels.Create(aIdx) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
