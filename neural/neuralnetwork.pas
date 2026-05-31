@@ -12334,6 +12334,12 @@ begin
     ArgMin := Round(FArgMin.FData[0]);
     ArgMax := Round(FArgMax.FData[0]);
     MaxE := FOutput.Size - 1;
+    // Bulk term dL/dx_i += gy_i/denom is a contiguous AVX MulAdd over the
+    // whole flattened sample. The two reductions (DotGY, ArgMinExtra) keep the
+    // original single scalar accumulation pass so the summation order — and
+    // therefore the result — stays bit-identical.
+    TNNetVolume.MulAdd(FPrevLayer.OutputError.GetRawPtr(),
+      FOutputError.GetRawPtr(), InvDenom, FOutput.Size);
     DotGY := 0;       // sum_j gy_j * y_j
     ArgMinExtra := 0; // sum_j gy_j * (x_j - M - eps)
     for CntE := 0 to MaxE do
@@ -12345,9 +12351,6 @@ begin
       // Since Denom = (M - MinV) + eps => MinV - M - eps = -Denom, so
       // (x_j - M - eps) = Yi*Denom - Denom = (Yi - 1)*Denom.
       ArgMinExtra := ArgMinExtra + Gi * (Yi - 1.0) * Denom;
-      // bulk term
-      FPrevLayer.OutputError.FData[CntE] :=
-        FPrevLayer.OutputError.FData[CntE] + Gi * InvDenom;
     end;
     // argmax extra: -(1/denom) * sum_j gy_j * y_j
     FPrevLayer.OutputError.FData[ArgMax] :=
@@ -12398,9 +12401,10 @@ end;
 procedure TNNetLogitNormalize.Compute();
 var
   StartTime: double;
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
+  CntX, CntY, MaxX, MaxY, Cnt: integer;
   LocalPrevOutput: TNNetVolume;
-  SumSq, N, InvN, InvDenom, Denom, Tau, Eps, Xi: TNeuralFloat;
+  SumSq, N, InvN, InvDenom, Denom, Tau, Eps: TNeuralFloat;
+  PrevPtr, OutPtr: TNeuralFloatArrPtr;
 const
   Safety = 1e-12;
 begin
@@ -12412,27 +12416,23 @@ begin
   if Eps < 0 then Eps := 1e-8;
   MaxX := LocalPrevOutput.SizeX - 1;
   MaxY := LocalPrevOutput.SizeY - 1;
-  MaxD := LocalPrevOutput.Depth - 1;
+  Cnt := LocalPrevOutput.Depth; // contiguous depth run length
   for CntX := 0 to MaxX do
   begin
     for CntY := 0 to MaxY do
     begin
-      StartPos := LocalPrevOutput.GetRawPos(CntX, CntY, 0);
-      SumSq := 0;
-      for CntD := 0 to MaxD do
-      begin
-        Xi := LocalPrevOutput.FData[StartPos + CntD];
-        SumSq := SumSq + Xi * Xi;
-      end;
+      PrevPtr := LocalPrevOutput.GetRawPtr(CntX, CntY, 0);
+      OutPtr := FOutput.GetRawPtr(CntX, CntY, 0);
+      SumSq := TNNetVolume.DotProduct(PrevPtr, PrevPtr, Cnt);
       N := Sqrt(SumSq + Safety);
       InvN := 1.0 / N;
       Denom := Tau * N + Eps;
       InvDenom := 1.0 / Denom;
       FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)] := InvN;
       FInvDenoms.FData[FInvDenoms.GetRawPos(CntX, CntY, 0)] := InvDenom;
-      for CntD := 0 to MaxD do
-        FOutput.FData[StartPos + CntD] :=
-          LocalPrevOutput.FData[StartPos + CntD] * InvDenom;
+      // out[i] = x[i] * InvDenom
+      system.Move(PrevPtr^, OutPtr^, Cnt * SizeOf(TNeuralFloat));
+      TNNetVolume.Mul(OutPtr, InvDenom, Cnt);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -12441,8 +12441,9 @@ end;
 procedure TNNetLogitNormalize.Backpropagate();
 var
   StartTime: double;
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
-  Dot, Yi, InvN, InvDenom, Tau, TauInvN: TNeuralFloat;
+  CntX, CntY, MaxX, MaxY, N: integer;
+  Dot, InvN, InvDenom, Tau, TauInvN: TNeuralFloat;
+  YPtr, GyPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -12460,27 +12461,21 @@ begin
     // to InvN*(gy_i - y_i*Dot), matching TNNetL2Normalize.
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    MaxD := FOutput.Depth - 1;
+    N := FOutput.Depth; // contiguous depth run length
     for CntX := 0 to MaxX do
     begin
       for CntY := 0 to MaxY do
       begin
-        StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+        YPtr := FOutput.GetRawPtr(CntX, CntY, 0);
+        GyPtr := FOutputError.GetRawPtr(CntX, CntY, 0);
+        PrevErrPtr := FPrevLayer.OutputError.GetRawPtr(CntX, CntY, 0);
         InvN := FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)];
         InvDenom := FInvDenoms.FData[FInvDenoms.GetRawPos(CntX, CntY, 0)];
         TauInvN := Tau * InvN;
-        Dot := 0;
-        for CntD := 0 to MaxD do
-          Dot := Dot + FOutput.FData[StartPos + CntD] *
-            FOutputError.FData[StartPos + CntD];
-        for CntD := 0 to MaxD do
-        begin
-          Yi := FOutput.FData[StartPos + CntD];
-          FPrevLayer.OutputError.FData[StartPos + CntD] :=
-            FPrevLayer.OutputError.FData[StartPos + CntD] +
-            InvDenom * FOutputError.FData[StartPos + CntD] -
-            TauInvN * Yi * Dot;
-        end;
+        Dot := TNNetVolume.DotProduct(YPtr, GyPtr, N);
+        // prevErr += InvDenom*gy - (Tau*InvN*Dot)*y
+        TNNetVolume.MulAdd(PrevErrPtr, GyPtr, InvDenom, N);
+        TNNetVolume.MulAdd(PrevErrPtr, YPtr, -(TauInvN * Dot), N);
       end;
     end;
   end;
