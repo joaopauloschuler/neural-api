@@ -314,7 +314,20 @@ breakdown:
       tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
 - [X] TNNetReversibleBlock — RevNet-style additive coupling
       (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
-      to within fp tolerance is the headline test.
+      to within fp tolerance is the headline test. DONE as a builder
+      `TNNet.AddReversibleBlock(InputLayer, HiddenDim)` (composes
+      SplitChannels -> pointwise F/G -> Sum -> DeepConcat) + examples/ReversibleBlock/
+      (round-trip max error ~8e-10) + TestReversibleBlockRoundTrip.
+- [ ] TNNetReversibleBlock follow-up: the MEMORY-SAVING recompute path (the
+      actual point of RevNet — discard activations in forward, RECONSTRUCT them in
+      backward via the analytic inverse instead of storing them). The landed
+      builder demonstrates the inverse FORMULA and trains via ordinary stored-
+      activation backprop; the O(1)-activation-memory training mode is still open
+      and needs a custom backward that recomputes x1,x2 from y1,y2. Pairs with the
+      open "Gradient checkpointing" infrastructure task.
+- [ ] TNNetReversibleBlock follow-up: stack N reversible blocks into a deep net
+      and show constant activation memory vs a plain residual stack of equal depth
+      (the headline RevNet scaling claim) — depends on the recompute path above.
 - [ ] TNNetWeightStandardization follow-up: a CONVOLUTION variant
       (standardize a conv layer's filters per output channel). The dense
       form landed; the conv form is the headline WS use case (Qiao et al.
@@ -490,6 +503,23 @@ breakdown:
       InfoNCE). Track alongside that batch-aware-loss-hook item.
 - [X] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
       straight-through assignment plus commitment/codebook losses.
+- [ ] TNNetVectorQuantizer follow-up (landed 2026-05-31): the codebook-SIDE
+      gradient (the `2*(z_q - z_e)` pull accumulated into neuron[k*].Delta via the
+      -FLearningRate idiom) is exercised structurally but has NO dedicated
+      finite-difference test — the landed trio covers forward nearest-neighbor,
+      serialization, and the INPUT/commitment gradient only. Add a codebook-delta
+      check: with a STABLE argmin (input pinned closest to one fixed code), perturb
+      that code's weights and central-difference the codebook-loss term against the
+      accumulated neuron delta. Mirror the TNNetCenterLoss center-delta test.
+- [ ] TNNetVectorQuantizer follow-up: EMA codebook update variant (van den Oord
+      et al.'s recommended alternative to the codebook-loss gradient) — track a
+      cross-batch EMA of assigned encoder vectors per code. Needs the same
+      batch-aware loss hook logged for cross-batch InfoNCE / CenterLoss-EMA; track
+      alongside those.
+- [ ] TNNetVectorQuantizer follow-up: report active-codebook usage (count of codes
+      selected at least once over a probe batch) to expose codebook collapse — the
+      headline VQ-VAE failure mode. Pairs with the open "VQ codebook collapse stress
+      test" experiment and the `examples/VQAutoencoder/` demo below.
 
 ### Training infrastructure (the "missing plumbing")
 - [ ] TNeuralLRScheduler interface (`function NextLR(Epoch, Step): TNeuralFloat;`)
