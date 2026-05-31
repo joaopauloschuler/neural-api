@@ -17973,7 +17973,7 @@ begin
         FPosInput.FData[D] := FPrevLayer.FOutput[X, Y, D];
       FPosInput.ReadAsBits(FByteInput, 0.0);
       FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
-      FPosOutput.CopyAsBits(FByteOutput, -MinValue, +0.5);
+      FPosOutput.CopyAsBits(FByteOutput, MinValue, +0.5);
       for D := 0 to OutDepthM1 do
         FOutput[X, Y, D] := FPosOutput.FData[D];
     end;
