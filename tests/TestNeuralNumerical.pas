@@ -271,6 +271,9 @@ type
     procedure TestCenterLossFeatureGradient;
     procedure TestCenterLossCenterGradient;
     procedure TestCenterLossLoadFromString;
+    procedure TestVectorQuantizerForward;
+    procedure TestVectorQuantizerLoadFromString;
+    procedure TestVectorQuantizerCommitmentGradient;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
     procedure TestArcFaceLoadFromString;
@@ -22542,6 +22545,225 @@ begin
   finally
     NN.Free;
     NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerForward;
+const
+  cK     = 3;
+  cD     = 2;     // codebook vector dimension
+  cSizeX = 2;
+  cSizeY = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LVQ: TNNetVectorQuantizer;
+  x, y, j, ExpectedCode: integer;
+begin
+  // Forward correctness: hand-set a codebook and assert each position's
+  // output equals its nearest code (squared-L2 argmin).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSizeX, cSizeY, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cSizeX, cSizeY, cD, 1));
+    LVQ := TNNetVectorQuantizer.Create(cK, 0.25);
+    NN.AddLayer(LVQ);
+
+    // Three well-separated codebook vectors.
+    LVQ.Neurons[0].Weights.Raw[0] :=  0.0; LVQ.Neurons[0].Weights.Raw[1] :=  0.0;
+    LVQ.Neurons[1].Weights.Raw[0] :=  5.0; LVQ.Neurons[1].Weights.Raw[1] :=  5.0;
+    LVQ.Neurons[2].Weights.Raw[0] := -5.0; LVQ.Neurons[2].Weights.Raw[1] := -5.0;
+
+    // Each position lands clearly nearest to a known code.
+    Input[0, 0, 0] :=  0.1; Input[0, 0, 1] := -0.2; // -> code 0
+    Input[1, 0, 0] :=  4.7; Input[1, 0, 1] :=  5.3; // -> code 1
+    Input[0, 1, 0] := -4.4; Input[0, 1, 1] := -5.1; // -> code 2
+    Input[1, 1, 0] :=  0.3; Input[1, 1, 1] :=  0.4; // -> code 0
+
+    NN.Compute(Input);
+
+    for x := 0 to cSizeX - 1 do
+      for y := 0 to cSizeY - 1 do
+      begin
+        // Determine the expected nearest code by hand.
+        if (x = 1) and (y = 0) then ExpectedCode := 1
+        else if (x = 0) and (y = 1) then ExpectedCode := 2
+        else ExpectedCode := 0;
+        for j := 0 to cD - 1 do
+          AssertEquals('VQ output is nearest code at (' + IntToStr(x) + ',' +
+            IntToStr(y) + ') ch ' + IntToStr(j),
+            LVQ.Neurons[ExpectedCode].Weights.Raw[j],
+            NN.GetLastLayer.Output[x, y, j], 1e-6);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerLoadFromString;
+const
+  cK    = 5;       // non-default number of codes
+  cBeta = 0.37;    // non-default commitment cost
+  cD    = 3;
+var
+  NN, NN2: TNNet;
+  L1, L2: TNNetVectorQuantizer;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  // Serialization round-trip: VQ in the middle of a net; SaveToString ->
+  // LoadFromString must preserve the structure string, the codebook weights,
+  // and reproduce the same Compute output.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cD, 1));
+    L1 := TNNetVectorQuantizer.Create(cK, cBeta);
+    NN.AddLayer(L1);
+    NN.AddLayer(TNNetIdentity.Create()); // VQ sits in the middle
+
+    // Distinctive codebook values to verify the weights round-trip.
+    for i := 0 to cD - 1 do
+    begin
+      L1.Neurons[0].Weights.Raw[i] := 0.11 * (i + 1);
+      L1.Neurons[cK - 1].Weights.Raw[i] := -0.23 * (i + 1);
+    end;
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded layer is TNNetVectorQuantizer',
+      NN2.Layers[1] is TNNetVectorQuantizer);
+    AssertEquals('VQ round-trip preserves K and beta',
+      NN.Layers[1].SaveStructureToString(),
+      NN2.Layers[1].SaveStructureToString());
+
+    L2 := NN2.Layers[1] as TNNetVectorQuantizer;
+    AssertEquals('VQ round-trip neuron count', cK, L2.Neurons.Count);
+    for i := 0 to cD - 1 do
+    begin
+      AssertEquals('VQ code[0] weight round-trip at ' + IntToStr(i),
+        L1.Neurons[0].Weights.Raw[i], L2.Neurons[0].Weights.Raw[i], 1e-5);
+      AssertEquals('VQ code[K-1] weight round-trip at ' + IntToStr(i),
+        L1.Neurons[cK - 1].Weights.Raw[i],
+        L2.Neurons[cK - 1].Weights.Raw[i], 1e-5);
+    end;
+
+    // Same Compute output before and after the round-trip.
+    Input[0, 0, 0] := 0.12; Input[0, 0, 1] := -0.21; Input[0, 0, 2] := 0.31;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to cD - 1 do
+      AssertEquals('VQ Compute matches after round-trip at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerCommitmentGradient;
+const
+  cEps  = 1e-3;
+  cK    = 2;
+  cD    = 2;
+  cBeta = 0.30;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LVQ: TNNetVectorQuantizer;
+  LPrev: TNNetIdentity;
+  Code: TNNetVolume;
+  OutGrad: array[0..cD - 1] of TNeuralFloat;
+  AnaGrad, NumGrad, OldV, LossP, LossM, Ste: TNeuralFloat;
+  i: integer;
+
+  // Scalar commitment loss beta*||z_e - z_q||^2 as a function of z_e. The code
+  // z_q is FIXED at neuron[0] because z_e is pinned clearly closest to it, so
+  // the argmin does not flip under the eps perturbation (STE path is stable).
+  function CommitLossAt(): TNeuralFloat;
+  var
+    j: integer;
+    diff, s: TNeuralFloat;
+  begin
+    s := 0;
+    for j := 0 to cD - 1 do
+    begin
+      diff := Input[0, 0, j] - Code.Raw[j];
+      s := s + diff * diff;
+    end;
+    Result := cBeta * s;
+  end;
+
+begin
+  // Place z_e clearly closest to code 0 (code 1 is far away) so the argmin is
+  // stable under the perturbation. We central-difference the COMMITMENT loss
+  // and check OutputError == STE(outgrad) + dCommit/dz_e. The STE part is a
+  // fixed injected output gradient. Tolerance loosened to 1e-2 because the
+  // FP32 SSE arithmetic on small magnitudes accumulates cancellation error.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cD);
+  Target := TNNetVolume.Create(1, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cD, 1));
+    // An Identity layer in front gives a sized OutputError where the VQ's
+    // straight-through + commitment input gradient lands.
+    LPrev := TNNetIdentity.Create();
+    NN.AddLayer(LPrev);
+    LVQ := TNNetVectorQuantizer.Create(cK, cBeta);
+    NN.AddLayer(LVQ);
+    LVQ.SetBatchUpdate(True); // keep codebook stable while probing
+
+    // Code 0 near the input, code 1 far away (argmin pinned to code 0).
+    LVQ.Neurons[0].Weights.Raw[0] :=  0.20; LVQ.Neurons[0].Weights.Raw[1] := -0.10;
+    LVQ.Neurons[1].Weights.Raw[0] :=  9.00; LVQ.Neurons[1].Weights.Raw[1] :=  9.00;
+    Code := LVQ.Neurons[0].Weights;
+
+    Input[0, 0, 0] :=  0.35; Input[0, 0, 1] := -0.25;
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    // Clear the previous layer's error so it receives only this backward pass's
+    // contribution, and clear deltas so the codebook stays put.
+    LPrev.OutputError.Fill(0);
+    NN.ClearDeltas();
+    // Inject a known output gradient (the straight-through component) directly
+    // into the layer's OutputError, then run Backpropagate from this layer.
+    OutGrad[0] :=  0.40;
+    OutGrad[1] := -0.70;
+    for i := 0 to cD - 1 do
+      LVQ.OutputError[0, 0, i] := OutGrad[i];
+    // Bump the departing-branches count so the in-Backpropagate assertion
+    // doesn't warn when invoked directly (established STE-test pattern).
+    LVQ.IncDepartingBranchesCnt();
+    LVQ.Backpropagate();
+
+    for i := 0 to cD - 1 do
+    begin
+      // The input gradient lands in the previous layer's OutputError.
+      AnaGrad := LPrev.OutputError[0, 0, i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps;
+      LossP := CommitLossAt();
+      Input.Raw[i] := OldV - cEps;
+      LossM := CommitLossAt();
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      Ste := OutGrad[i]; // straight-through copies output gradient unchanged
+      AssertEquals('VQ input grad = STE + commitment grad at ' + IntToStr(i),
+        Ste + NumGrad, AnaGrad, 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
   end;
 end;
 

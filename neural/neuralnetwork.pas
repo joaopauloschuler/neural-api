@@ -1714,6 +1714,41 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// VQ-VAE codebook bottleneck (van den Oord et al. 2017, "Neural Discrete
+  // Representation Learning"). Replaces each input feature VECTOR (the
+  // Depth-vector z_e at every spatial position (X,Y)) with its nearest entry
+  // z_q from a learnable codebook of K vectors, each of dim = Input.Depth.
+  // Output shape == input shape. The K codebook vectors are stored as the
+  // layer's trainable weights: K neurons, each holding a Depth-length weight
+  // vector, so they serialize AUTOMATICALLY through the base neuron save/load
+  // (no custom Save/Load), mirroring TNNetCenterLoss's per-class centers.
+  // K is stored in FStruct[0] (default 8, validated >= 1) and the commitment
+  // cost beta in FFloatSt[0] (default 0.25, validated > 0); both round-trip via
+  // Save/Load.
+  // Forward (Compute): per (X,Y) position, find the codebook index k* whose
+  // vector minimizes the squared-L2 distance to z_e, then write codebook[k*]
+  // (= z_q) into the output; the chosen k* is cached for the backward pass.
+  // Backpropagate:
+  //   straight-through  the output gradient is copied unchanged to the input
+  //                     gradient (gradient of z_q flows to z_e as identity,
+  //                     like TNNetBitLinear treats round/clip in backward).
+  //   commitment loss   2*beta*(z_e - z_q) is added to the input gradient
+  //                     (pulls the encoder output toward the chosen code).
+  //   codebook loss     2*(z_q - z_e) is accumulated into neuron[k*]'s delta
+  //                     via the -FLearningRate idiom (FBatchUpdate respected
+  //                     exactly like TNNetCenterLoss / TNNetGatedResidual),
+  //                     pulling the code toward the encoder output.
+  TNNetVectorQuantizer = class(TNNetIdentity)
+  private
+    FChosenIdx: array of integer; // cached argmin index per (X,Y) position
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(NumCodes: integer; Commitment: TNeuralFloat); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// ArcFace additive angular-margin softmax output layer (Deng et al. 2019,
   // "ArcFace: Additive Angular Margin Loss for Deep Face Recognition"). This is
   // a SELF-CONTAINED softmax-cross-entropy head with a trainable per-class
@@ -11071,6 +11106,149 @@ begin
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetVectorQuantizer }
+
+constructor TNNetVectorQuantizer.Create();
+begin
+  // Defaults: K = 8 codebook entries, commitment cost beta = 0.25 (paper).
+  Create(8, 0.25);
+end;
+
+constructor TNNetVectorQuantizer.Create(NumCodes: integer; Commitment: TNeuralFloat);
+begin
+  inherited Create();
+  if NumCodes < 1 then
+    FErrorProc('TNNetVectorQuantizer number of codes must be >= 1.');
+  if Commitment <= 0 then
+    FErrorProc('TNNetVectorQuantizer commitment cost must be > 0.');
+  FStruct[0] := NumCodes;
+  FFloatSt[0] := Commitment;
+end;
+
+procedure TNNetVectorQuantizer.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  K, D: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  K := FStruct[0];
+  if K < 1 then
+    FErrorProc('TNNetVectorQuantizer number of codes must be >= 1.');
+  D := pPrevLayer.FOutput.Depth; // codebook vector dimension
+  // Allocate K codebook vectors as K neurons, each holding a Depth-length
+  // weight vector. They serialize automatically through the base neuron
+  // save/load (no custom Save/Load), exactly like TNNetCenterLoss centers.
+  AddMissingNeurons(K);
+  SetNumWeightsForAllNeurons(D, 1, 1);
+  InitDefault();
+  // One cached argmin index per spatial (X,Y) position.
+  SetLength(FChosenIdx, FOutput.SizeX * FOutput.SizeY);
+end;
+
+procedure TNNetVectorQuantizer.Compute();
+var
+  StartTime: double;
+  K, D, X, Y, MaxX, MaxY, I, Code, BestCode, PosIdx: integer;
+  Dist, BestDist, Diff: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  // Identity copy first so the input z_e is available in FOutput; we then
+  // overwrite each position with its nearest codebook vector z_q.
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  K := FStruct[0];
+  if K < 1 then K := 1;
+  D := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      // Find the codebook entry with smallest squared-L2 distance to z_e.
+      BestCode := 0;
+      BestDist := -1;
+      for Code := 0 to K - 1 do
+      begin
+        W := FNeurons[Code].FWeights;
+        Dist := 0;
+        for I := 0 to D - 1 do
+        begin
+          Diff := FPrevLayer.FOutput[X, Y, I] - W.Raw[I];
+          Dist := Dist + Diff * Diff;
+        end;
+        if (BestDist < 0) or (Dist < BestDist) then
+        begin
+          BestDist := Dist;
+          BestCode := Code;
+        end;
+      end;
+      PosIdx := X * FOutput.SizeY + Y;
+      FChosenIdx[PosIdx] := BestCode;
+      // Write the chosen code z_q into the output at this position.
+      W := FNeurons[BestCode].FWeights;
+      for I := 0 to D - 1 do
+        FOutput[X, Y, I] := W.Raw[I];
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetVectorQuantizer.Backpropagate();
+var
+  StartTime: double;
+  Beta, ZeVal, ZqVal, Grad: TNeuralFloat;
+  K, D, X, Y, MaxX, MaxY, I, BestCode, PosIdx: integer;
+  CodeNeuron: TNNetNeuron;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Beta := FFloatSt[0];
+  if Beta <= 0 then Beta := 0.25;
+  K := FStruct[0];
+  if K < 1 then K := 1;
+  D := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  // Per spatial cell: FOutputError already holds the gradient of z_q. We add
+  // the commitment term so the FOutputError passed to the previous layer
+  // (via inherited BackpropagateNoTest's Add) becomes the straight-through
+  // gradient plus 2*beta*(z_e - z_q). We also pull the chosen code toward z_e.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      PosIdx := X * FOutput.SizeY + Y;
+      BestCode := FChosenIdx[PosIdx];
+      if BestCode < 0 then BestCode := 0;
+      if BestCode > K - 1 then BestCode := K - 1;
+      CodeNeuron := FNeurons[BestCode];
+      W := CodeNeuron.FWeights;
+      for I := 0 to D - 1 do
+      begin
+        ZeVal := FPrevLayer.FOutput[X, Y, I]; // encoder output z_e
+        ZqVal := W.Raw[I];                    // chosen code z_q
+        // Commitment gradient added to the straight-through gradient:
+        // dL_commit/dz_e[i] = 2*beta*(z_e[i] - z_q[i]).
+        FOutputError[X, Y, I] := FOutputError[X, Y, I] + 2 * Beta * (ZeVal - ZqVal);
+        // Codebook gradient: pull the code toward z_e. The optimizer move
+        // (+FDelta after the -FLearningRate idiom) accumulates 2*(z_q - z_e).
+        Grad := 2 * (ZqVal - ZeVal);
+        CodeNeuron.FDelta.Raw[I] := CodeNeuron.FDelta.Raw[I] +
+          (-FLearningRate) * Grad;
+      end;
+    end;
+  if (not FBatchUpdate) then
+  begin
+    UpdateWeights();
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Straight-through estimator: the (now commitment-augmented) FOutputError is
+  // added to the previous layer's error unchanged — z_q's gradient flows to
+  // z_e as identity, like TNNetBitLinear treats round/clip in backward.
   inherited BackpropagateNoTest();
 end;
 
@@ -46264,6 +46442,7 @@ begin
       'TNNetCosineEmbeddingLoss' :  Result := TNNetCosineEmbeddingLoss.Create(Ft[0]);
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
+      'TNNetVectorQuantizer' :      Result := TNNetVectorQuantizer.Create(St[0], Ft[0]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
@@ -46542,6 +46721,7 @@ begin
       if S[0] = 'TNNetCosineEmbeddingLoss' then Result := TNNetCosineEmbeddingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetVectorQuantizer' then Result := TNNetVectorQuantizer.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else

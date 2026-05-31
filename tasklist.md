@@ -477,7 +477,7 @@ breakdown:
       batch-aware loss hook (the per-sample FOutputError path is blind to other
       minibatch samples, the same limitation logged for a true cross-batch
       InfoNCE). Track alongside that batch-aware-loss-hook item.
-- [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
+- [X] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
       straight-through assignment plus commitment/codebook losses.
 
 ### Training infrastructure (the "missing plumbing")
