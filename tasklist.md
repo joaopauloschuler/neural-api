@@ -816,7 +816,7 @@ breakdown:
       (built on TNNetChannelBias + TNNetChannelMul).
 - [ ] `examples/TokenShiftBaseline/` — train a tiny next-token char model
       with `TNNetEmbedding → TNNetTokenShift → MLP` and compare against
-      the eventual MHA-based version.
+      the MHA-based version (`TNNet.AddMultiHeadSelfAttention`).
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
       without TNNetReZero on each residual branch on the hypotenuse toy.
 - [ ] `examples/SpaceToDepthStem/` — show the SpaceToDepth → Conv stem
@@ -913,9 +913,6 @@ breakdown:
       decoder.
 - [ ] VQ codebook collapse stress test: K in {16, 64, 256} and a few
       commitment-loss weights, report per-run active codebook entries.
-- [ ] "Tiny induction-heads" demo: train a 2-layer attention-only model on
-      a repeat-the-pattern toy task and show the second layer's attention
-      diagonal jumps to the previous-occurrence position.
 - [ ] "Memorize a sentence" demo: train a 1-layer SDPA+RoPE model to
       perfectly memorize a 32-token sequence, print training loss curve
       and reconstructed sample.
