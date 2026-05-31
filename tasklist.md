@@ -510,14 +510,6 @@ rather than acted on.
       plus a load-balancing auxiliary loss. (The just-landed
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
 #### Normalization primitives
-- [X] TNNetMinMaxNorm follow-up: a per-channel variant (min/max reduced over
-      spatial only, independently per depth channel) gated by a flag, mirroring
-      the per-(x,y)-over-depth vs full-volume split discussed for L2Normalize.
-      Builds on the landed full-volume TNNetMinMaxNorm. LANDED 2026-05-31
-      (commit 8dfcd85): new ctor `Create(pEpsilon, pPerChannel: boolean)`,
-      flag in FStruct[0] (auto-serialized; both load-dispatch sites updated),
-      per-channel reduce-over-(x,y) Compute/Backpropagate branch, forward +
-      input-grad + round-trip tests. Full-volume stays the exact default.
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
       projection* (renormalize the previous layer's weights after each update,
       non-differentiable) — still open if a hard constraint is ever wanted. The
@@ -534,25 +526,11 @@ rather than acted on.
       of three separate models, then add the monotonicity guard (sort/penalize so the
       q=0.1 prediction never exceeds q=0.9 — "quantile crossing"). The landed example
       uses three independent tiny MLPs; the joint head is the headline production form.
-- [X] TNNetArcFace follow-up (landed 2026-05-31, head + tests): a face/embedding
-      recognition micro-example (examples/ArcFaceEmbedding/) — train a tiny embedding
-      net with the ArcFace head on a synthetic multi-class blob (or tiny-MNIST subset),
-      then show the angular margin TIGHTENS intra-class cosine clusters vs a plain
-      softmax head (print same-class vs different-class cosine histograms, mirroring the
-      open CosineEmbeddingLoss siamese demo). Sweep the margin m in {0, 0.3, 0.5} to
-      show the separation grow. Pairs with [[FeatureSeparability]] and the open
-      TNNetCenterLoss SOFTMAX-JOINT follow-up. LANDED 2026-05-31 (commit dd16433):
-      examples/ArcFaceEmbedding/ — 4-blob synthetic, SplitChannels feature/label
-      branches, margin sweep {0,0.3,0.5} prints same/diff cosine + separation
-      (rises monotonically with m), runs in ~1.7s. FOLLOW-UP still open: contrast
-      vs an actual plain-softmax head arm (the demo currently shows the trend
-      WITHIN ArcFace across margins, not ArcFace-vs-softmax side by side).
-- [X] TNNetArcFace follow-up: confirm the m=0, s=1 degenerate case reduces to a
-      plain normalized-softmax (cosine) classifier and add a pinning test asserting it
-      matches a hand-wired cosine-softmax head to <1e-4 — the natural correctness anchor
-      now that the margin path is in tree. LANDED 2026-05-31 (commit 7a3c795):
-      TestArcFaceDegenerateIsCosineSoftmax pins the m=0,s=1 backward dL/dx against a
-      hand-wired cosine-Jacobian + softmax cross-entropy reference to <1e-4.
+- [ ] ArcFaceEmbedding follow-up: contrast the landed examples/ArcFaceEmbedding/
+      against an actual plain-softmax head arm side by side — the demo currently
+      shows the separation trend WITHIN ArcFace across margins m in {0,0.3,0.5},
+      not ArcFace-vs-softmax head to head. Pairs with [[FeatureSeparability]] and
+      the open TNNetCenterLoss SOFTMAX-JOINT follow-up.
 - [ ] TNNetCosineEmbeddingLoss follow-up: a tiny
       siamese-pair embedding micro-example — train two shared-weight MLP
       branches whose outputs are concatenated into the `a|b|y` layout, on a
@@ -601,15 +579,6 @@ rather than acted on.
       test" experiment and the `examples/VQAutoencoder/` demo below.
 
 ### Training infrastructure (the "missing plumbing")
-- [X] TNeuralLRScheduler interface (`function NextLR(Epoch, Step): TNeuralFloat;`)
-      with concrete implementations: TStepLR, TCosineAnnealingLR
-      (η_min + (η_max-η_min)·0.5·(1+cos(π·t/T))), TWarmupCosineLR (linear
-      warmup then cosine), and PolyLR (`η · (1 - t/T)^p`). LANDED 2026-05-31
-      (commit cf3ad78): new unit neural/neuralscheduler.pas with the abstract base
-      + four schedulers (Step keys on `t=Step`, clamped to [0,T]); 22 deterministic
-      boundary/monotonicity tests in tests/TestNeuralScheduler.pas (registered in
-      RunTests.lpr). NOTE: this is the standalone-class half only — see the two
-      open follow-ups directly below.
 - [ ] TNeuralLRScheduler follow-up: WIRE the scheduler into the training loop —
       have TNeuralFit/TNeuralImageFit call `NextLR(Epoch, Step)` each
       epoch/step (gated behind an optional Scheduler property so the default
@@ -1288,8 +1257,9 @@ rather than acted on.
       TNNetHuberLoss / TNNetSmoothL1Loss / TNNetLogCoshLoss /
       TNNetCharbonnierLoss.
 - [ ] "Learning-rate schedulers" README subsection — one paragraph per
-      schedule with a snippet showing how to wire it into TNeuralImageFit
-      (once the scheduler interface lands).
+      schedule with a snippet showing how to wire it into TNeuralImageFit.
+      The scheduler classes (TNeuralLRScheduler family) have landed; the
+      Fit-integration is still the open follow-up under "Training infrastructure".
 - [ ] "Introspection" README subsection — group CountLayers/Neurons/Weights
       with the new PrintSummary / FLOPs / WeightHistogram / DeadNeuronReport
       utilities.
