@@ -39,6 +39,16 @@ Wiring is the usual multi-input style:
 NN.AddLayer(TNNetFiLM.Create([featureLayer, condLayer]));
 ```
 
+In practice the conditioning source first has to be projected to `2*Depth` and
+reshaped to `(1,1,2*Depth)`. The `TNNet.AddFiLMConditioned` builder wires that
+whole `condLayer -> FullConnectLinear(2*Depth) -> Reshape -> TNNetFiLM` chain in
+one call (inferring `Depth` from the feature layer), which is what this example
+uses:
+
+```pascal
+FilmLayer := NN.AddFiLMConditioned(featLayer, condLayer) as TNNetFiLM;
+```
+
 ## What this demo does
 
 A tiny synthetic **conditional transform** task. A fixed feature vector of

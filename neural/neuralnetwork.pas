@@ -4985,6 +4985,20 @@ type
       // match the block input shape so the residual sum is valid. Returns the
       // residual-sum layer.
       function AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // FiLM (Feature-wise Linear Modulation, Perez et al. 2018) conditioning
+      // helper:  y[x,y,c] = gamma[c] * featLayer[x,y,c] + beta[c], where the
+      // per-channel gamma|beta come from condLayer. This one call replaces the
+      // manual "condLayer -> FullConnectLinear(2*D) -> reshape (1,1,2*D) ->
+      // TNNetFiLM([featLayer, condFC])" boilerplate every FiLM call site repeats.
+      // featLayer: the feature map to modulate (Depth = D, any SizeX/SizeY).
+      // condLayer: the conditioning source (e.g. an embedding/FC, typically a
+      //   (1,1,C) vector). D is inferred from featLayer.Output.Depth at build
+      //   time, so featLayer must already be wired into the net. The conditioning
+      //   TNNetFullConnectLinear emits exactly 2*D values reshaped to (1,1,2*D)
+      //   so gamma|beta broadcast per channel over the feature map. FiLM adds no
+      //   parameters of its own; the conditioning FC is the only added weight.
+      // Returns the TNNetFiLM layer.
+      function AddFiLMConditioned(featLayer, condLayer: TNNetLayer): TNNetLayer;
       // ---- TNNetScaledDotProductAttention multi-head wiring (MHA-a/b/c) ----
       // Carves a (SeqLen,1,3*d_model) Q|K|V slab into Heads per-head
       // (SeqLen,1,3*d_k) slices (d_k = d_model div Heads) using
@@ -46824,6 +46838,26 @@ begin
   AddLayer(pSublayers);
   AddLayer( TNNetGatedResidual.Create() );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddFiLMConditioned(featLayer, condLayer: TNNetLayer): TNNetLayer;
+var
+  D: integer;
+  CondFC: TNNetLayer;
+begin
+  // y = gamma * featLayer + beta, gamma|beta produced from condLayer.
+  if featLayer = nil then
+    FErrorProc('AddFiLMConditioned requires a non-nil featLayer.');
+  if condLayer = nil then
+    FErrorProc('AddFiLMConditioned requires a non-nil condLayer.');
+  // featLayer is already wired into the net, so its output shape is known.
+  D := featLayer.Output.Depth;
+  // Conditioning branch: map condLayer -> 2*D params (gamma|beta), then ensure
+  // the (1,1,2*D) shape TNNetFiLM expects so gamma|beta broadcast per channel.
+  CondFC := AddLayerAfter(TNNetFullConnectLinear.Create(2 * D), condLayer);
+  CondFC := AddLayerAfter(TNNetReshape.Create(1, 1, 2 * D), CondFC);
+  // FiLM modulates featLayer with the produced gamma|beta. Two explicit sources.
+  Result := AddLayer( TNNetFiLM.Create([featLayer, CondFC]) );
 end;
 
 function TNNet.AddGroupedCompression(Compression: TNeuralFloat;

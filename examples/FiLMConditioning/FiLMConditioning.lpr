@@ -113,12 +113,10 @@ begin
     FeatureIn := NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
     // Layer 1: the condition one-hot (input1 of the conditioning sub-network).
     CondIn := NN.AddLayerAfter(TNNetInput.Create(1, 1, cClasses, 1), 0);
-    // Conditioning sub-network: one FC mapping the one-hot -> 2*Depth params.
-    NN.AddLayerAfter(TNNetFullConnectLinear.Create(2 * cDepth), CondIn);
-    NN.AddLayer(TNNetReshape.Create(1, 1, 2 * cDepth)); // ensure (1,1,2*Depth)
-    // FiLM modulates the feature with the produced gamma|beta.
-    FilmLayer := TNNetFiLM.Create([FeatureIn, NN.GetLastLayer()]);
-    NN.AddLayer(FilmLayer);
+    // One-call FiLM conditioning: AddFiLMConditioned wires the conditioning
+    // FC (one-hot -> 2*Depth) -> reshape (1,1,2*Depth) -> TNNetFiLM internally,
+    // replacing the manual Depth -> 2*Depth bookkeeping.
+    FilmLayer := NN.AddFiLMConditioned(FeatureIn, CondIn) as TNNetFiLM;
 
     NN.SetLearningRate(0.05, 0.0);
     NN.SetBatchUpdate(false);

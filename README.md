@@ -825,6 +825,8 @@ It's worth noting that the effectiveness of adding `TNNetCellBias` after convolu
 
 Composite helper: `TNNet.AddSEBlock(InputLayer, ReductionRatio)` wires the standard Squeeze-and-Excitation pattern (`TNNetAvgChannel` -> `TNNetFullConnectReLU(C/r)` -> `TNNetFullConnectSigmoid(C)` -> `TNNetChannelMulByLayer`) onto an existing branch. See `examples/SEBlockCifar/`.
 
+Composite helper: `TNNet.AddFiLMConditioned(featLayer, condLayer)` wires Feature-wise Linear Modulation in one call: `condLayer -> TNNetFullConnectLinear(2*D) -> reshape(1,1,2*D) -> TNNetFiLM([featLayer, cond])`, inferring `D = featLayer.Output.Depth`. It removes the manual `Depth -> 2*Depth` bookkeeping every FiLM call site repeats and mirrors the `AddPreNormResidual`/`AddGatedResidual` builder family. See `examples/FiLMConditioning/`.
+
 ### Embedding Layers
 `TNNetEmbedding` is designed to convert input tokens (usually represented as integers) into dense vector representations (embedding vectors). `TNNetTokenAndPositionalEmbedding` extends `TNNetEmbedding` by adding positional information to the token embeddings. This is crucial for transformer models that don't have an inherent notion of sequence order. Both layers are crucial for modern NLP tasks, especially when working with transformer-based models. They allow the network to work with text data by converting tokens into rich, informative vector representations that capture both semantic meaning and positional information. By using `TNNetTokenAndPositionalEmbedding`, you're equipping your model with the fundamental building blocks needed for advanced NLP tasks as it provides both embedding and positional encoding.
 

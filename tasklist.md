@@ -363,7 +363,7 @@ breakdown:
       examples/FiLMConditioning/ wiring (already proves the conditioning FC trains
       end-to-end through TNNetFiLM) and scale it from a 1x1 feature vector to a
       small spatial map. Keep it CPU-only and well under 5 minutes.
-- [ ] TNNetFiLM follow-up: a builder helper TNNet.AddFiLMConditioned(featLayer,
+- [X] TNNetFiLM follow-up: a builder helper TNNet.AddFiLMConditioned(featLayer,
       condLayer) (or a residual FiLM block) that wires the conditioning FC ->
       (1,1,2*Depth) reshape -> TNNetFiLM in one call, mirroring the existing
       AddPreNormResidual/AddGatedResidual builder family — removes the manual

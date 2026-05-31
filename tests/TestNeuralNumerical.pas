@@ -371,6 +371,7 @@ type
     procedure TestFiLMIdentity;
     procedure TestFiLMGradientCheck;
     procedure TestFiLMSerializationRoundTrip;
+    procedure TestAddFiLMConditionedBuilder;
     procedure TestRotaryEmbeddingForward;
     procedure TestRotaryEmbeddingGradientCheck;
     procedure TestRotaryEmbeddingInverse;
@@ -11183,6 +11184,90 @@ begin
       NN2.Free;
     end;
   finally
+    NN.Free;
+  end;
+end;
+
+// TNNet.AddFiLMConditioned builder: the one-call helper must wire
+// condLayer -> FullConnectLinear(2*D) -> Reshape(1,1,2*D) -> TNNetFiLM(feat,cond)
+// exactly as the hand-rolled FiLM boilerplate does. We assert (a) the returned
+// layer is a TNNetFiLM whose output shape equals the feature shape (FiLM is
+// shape-preserving over the feature map), (b) a forward+backward produces no
+// NaN/Inf, and (c) a full SaveToString/LoadFromString round-trip reproduces the
+// assembled net's Compute end-to-end to 1e-5.
+procedure TTestNeuralNumerical.TestAddFiLMConditionedBuilder;
+var
+  NN, NN2: TNNet;
+  FeatureInput, CondInput, FilmOut: TNNetLayer;
+  Desired: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Desired := TNNetVolume.Create();
+  try
+    FeatureInput := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    CondInput    := NN.AddLayerAfter(TNNetInput.Create(1, 1, 2, 1), 0);
+    // One-call builder replacing the manual FC -> reshape -> FiLM block.
+    FilmOut := NN.AddFiLMConditioned(FeatureInput, CondInput);
+
+    AssertTrue('AddFiLMConditioned returns a TNNetFiLM', FilmOut is TNNetFiLM);
+    // FiLM is shape-preserving over the feature map.
+    AssertEquals('FiLM builder output SizeX', FeatureInput.Output.SizeX, FilmOut.Output.SizeX);
+    AssertEquals('FiLM builder output SizeY', FeatureInput.Output.SizeY, FilmOut.Output.SizeY);
+    AssertEquals('FiLM builder output Depth', FeatureInput.Output.Depth, FilmOut.Output.Depth);
+
+    for i := 0 to FeatureInput.Output.Size - 1 do
+      FeatureInput.Output.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    for i := 0 to CondInput.Output.Size - 1 do
+      CondInput.Output.Raw[i] := Cos(i * 0.6) * 0.4;
+    NN.Compute(FeatureInput.Output);
+
+    // Forward must be finite.
+    for i := 0 to FilmOut.Output.Size - 1 do
+    begin
+      AssertFalse('FiLM builder forward not NaN at ' + IntToStr(i),
+        IsNan(FilmOut.Output.Raw[i]));
+      AssertFalse('FiLM builder forward not Inf at ' + IntToStr(i),
+        IsInfinite(FilmOut.Output.Raw[i]));
+    end;
+
+    // Backward through the composed block must also be finite (error routes to
+    // both inputs and the conditioning FC weights).
+    Desired.ReSize(FilmOut.Output);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := FilmOut.Output.Raw[i] - 0.3;
+    NN.Backpropagate(Desired);
+    for i := 0 to CondInput.Output.Size - 1 do
+      AssertFalse('FiLM builder cond-branch error not NaN at ' + IntToStr(i),
+        IsNan(CondInput.OutputError.Raw[i]));
+    for i := 0 to FeatureInput.Output.Size - 1 do
+      AssertFalse('FiLM builder feature-branch error not NaN at ' + IntToStr(i),
+        IsNan(FeatureInput.OutputError.Raw[i]));
+
+    // Whole-net serialization round-trip to 1e-5.
+    NN.Compute(FeatureInput.Output);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      for i := 0 to NN2.Layers[0].Output.Size - 1 do
+        NN2.Layers[0].Output.Raw[i] := FeatureInput.Output.Raw[i];
+      for i := 0 to NN2.Layers[1].Output.Size - 1 do
+        NN2.Layers[1].Output.Raw[i] := CondInput.Output.Raw[i];
+      NN2.Compute(NN2.Layers[0].Output);
+      AssertEquals('FiLM builder round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FiLM builder round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    Desired.Free;
     NN.Free;
   end;
 end;
