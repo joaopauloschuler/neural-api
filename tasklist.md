@@ -134,69 +134,16 @@ rather than acted on.
       the budget" honesty the Grokking entry uses). Distinct from VisualGAN
       (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
       DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
-- [X] Neural ODE (continuous-depth residual) demo + `TNNet.AddNeuralODEBlock` builder
-      (`examples/NeuralODE/`) — landed 2026-05-31. `AddNeuralODEBlock(InputLayer,
-      HiddenDim, Steps)` integrates `Steps` shared-weight Euler updates
-      `y := y + h*f(y)` (h=1/Steps) over one shape-preserving `f` =
-      PointwiseConvReLU(HiddenDim) -> PointwiseConvLinear(d_model); step 1 holds the
-      only real weights, every later step reuses them via
-      `TNNetConvolutionSharedWeights`, so param count is constant in Steps.
-      `TestNeuralODEBlockSmoke` pins Steps=1 bit-for-bit equal to a hand-built plain
-      residual step, asserts the shared-weight invariant (step-2 convs read the
-      step-1 neurons; mutating a step-1 weight is seen downstream), and checks finite
-      forward+backward. `examples/NeuralODE/` sweeps Steps {1,2,4} on a synthetic
-      concentric-rings task showing constant 34 neurons / 288 weights with roughly
-      flat accuracy (1.000 / 0.971 / 0.947, mean of 5 seeds), in ~7 s on 1 CPU thread.
-      Deferred follow-ups (logged, NOT in v1):
+- [ ] Neural ODE follow-ups (builder `TNNet.AddNeuralODEBlock` + `examples/NeuralODE/`
+      landed 2026-05-31, Euler-only, trains via stored-activation backprop through the
+      unrolled steps). Deferred:
         - [ ] RK2/midpoint integrator behind an optional `Method` param (v1 Euler-only).
         - [ ] Adjoint-sensitivity O(1)-in-Steps backward (integrate the adjoint ODE
-              backwards using the `SetBatchUpdate(True)` weight-accumulation idiom);
-              v1 trains via stored-activation backprop through the unrolled steps.
+              backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
+              Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
+              recompute path and the "Gradient checkpointing" infra task.
         - [ ] 2-D trajectory ASCII-frame visualisation of the learned flow untangling
               the two classes (the textbook Neural-ODE picture).
-      --- original spec below ---
-      reproduce the Chen et al. 2018 "Neural Ordinary
-      Differential Equations" idea on a TINY pure-CPU target. A residual block
-      `x_{n+1} = x_n + f(x_n)` is one explicit Euler step of `dx/dt = f(x,t)`; a
-      Neural ODE replaces a STACK of distinct residual blocks with ONE shared `f`
-      integrated over T sub-steps with a FIXED step size `h = 1/T`, so depth becomes
-      a continuous time axis and the parameter count is independent of T. The key
-      enabler already in tree is `TNNetConvolutionSharedWeights` / a shared-weight
-      pointwise `f` (one `f` reused at every Euler step), exactly like the open
-      Growing-CA entry uses it for the CA rule — without it each step would learn
-      separate weights and it degenerates into an ordinary residual stack. Scope a
-      `TNNet.AddNeuralODEBlock(InputLayer, HiddenDepth, Steps, Method)` builder that
-      wires `Steps` shape-preserving Euler updates `y := y + h*f(y)` sharing one `f`
-      sub-block (`f` = PointwiseConvReLU -> PointwiseConvLinear over Depth so the
-      residual is shape-preserving per the [[residual-builder-helpers]] rule, NOT
-      FullConnect which mixes the whole tensor), with an optional 2nd-order
-      midpoint/RK2 method behind `Method`. Headline payoffs, both striking and
-      distinct from the suite: (a) train a tiny classifier where the ODE block stands
-      in for a deep residual trunk and show accuracy is roughly FLAT as `Steps` grows
-      {1,2,4,8} at CONSTANT parameter count (the "depth for free" property), charting
-      Steps vs accuracy vs param-count; (b) a 2-D toy where the learned flow
-      UNTANGLES two interleaved spiral/ring classes — render the trajectory of a few
-      points across the integration steps as ASCII frames so you can SEE the
-      continuous deformation (the textbook Neural-ODE picture). Feasibility risks to
-      settle honestly in v1, in the "what did NOT fit the budget" style the Grokking
-      entry uses: the headline memory win of Neural ODEs is the ADJOINT-sensitivity
-      backward (integrate an adjoint ODE backwards for O(1)-in-T activation memory);
-      that is a custom backward needing the `SetBatchUpdate(True)` weight-accumulation
-      idiom from [[manual-gradient-and-snapshot-gotchas]] and is the same O(1)-memory
-      capability the open `TNNetReversibleBlock` recompute path and the
-      "Gradient checkpointing" infra task fight for — so v1 should train via ordinary
-      stored-activation backprop-through-the-unrolled-steps (correct, simple) and log
-      the adjoint path as the explicit follow-up, exactly as the ReversibleBlock entry
-      split the inverse-formula demo from the recompute mode. Keep T<=8 and dims tiny
-      so the unrolled forward/backward stays well inside the <5-min pure-CPU budget.
-      Distinct from `TNNetReversibleBlock` (a coupling-layer architecture with an
-      analytic inverse, NOT a time-integrated shared `f`), from the residual builders
-      `AddPreNormResidual`/`AddGatedResidual` (single fixed residual step, separate
-      weights), and from `DiagonalSSM` (a 1-D linear sequence recurrence, not a
-      multi-step nonlinear integrator over a feature tensor). A `TestNeuralODEBlockSmoke`
-      following the introspection-report test recipe should pin the `Steps=1` case as
-      bit-for-bit equal to a single plain residual step, and the shared-weight
-      invariant (all Euler steps read the same neurons).
 - [ ] HyperNetwork demo + `TNNetHyperLinear` weight-generating layer
       (`examples/HyperNetwork/`) — reproduce the core Ha et al. 2016 "HyperNetworks"
       idea on a TINY pure-CPU multi-task target: a small "generator" net consumes a
@@ -894,12 +841,8 @@ rather than acted on.
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
       "no-central-difference, hand-picked kink convention" pattern
       repeats. Capture as `AssertKinkDerivative(layer, x_kink, expected_dydx)`.
-- [X] TNNetClamp kink-region test at `x = MinValue` and `x = MaxValue`.
 - [ ] TNNetHardShrink / TNNetSoftShrink kink-region tests at hand-picked
       inputs (no central differences).
-- [X] TNNetSoftSign saturation test on ±1e6: assert `|y| < 1` and
-      Backpropagate doesn't NaN.
-- [X] TNNetESwish saturation test at ±extreme inputs.
 - [ ] FP-exception robustness for TNNetSoftSign / TNNetESwish at truly extreme
       inputs (surfaced 2026-05-31 while writing the saturation tests above):
       both raise a HARDWARE FP exception rather than returning a finite value
@@ -915,15 +858,11 @@ rather than acted on.
 - [ ] LiSHT / BentIdentity gradient-magnitude sanity at large |x| — both
       grow unboundedly, finite-difference eps must scale with input
       magnitude.
-- [X] TNNetAbs near-zero gradient handling test — explicitly skip x = 0
-      sampling and pin the convention (currently `sign(0) = 0`).
-- [X] TNNetSquare gradient-magnitude sanity test at large |x|.
 - [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer raises the
       documented error when SizeY > 1.
 - [ ] Two-layer TokenShift composition test (catches subtle double-pass
       bugs in the t-1 / t+1 input-gradient scatter).
 - [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
-- [X] TNNetSoftMin saturation test on extreme inputs.
 - [ ] Audit TNNetSigmoid and TNNetHardSigmoid for negative-x / positive-x
       symmetric-stability (same question as SoftPlus).
 - [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
@@ -1058,11 +997,6 @@ rather than acted on.
       without MixUp on CIFAR-10 and report the delta.
 - [ ] `examples/AttentionViz/` — load a tiny trained SDPA model and dump
       the per-head attention matrix as a PGM image.
-- [X] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
-      block on a toy denoising or autoregressive-bit task. No MHSA
-      needed; demonstrates the FFN half-block.
-      (landed 2026-05-31: 4-block pre-norm SwiGLU FFN stack, per-token
-      denoising, ~5.9x better val MSE than echo baseline, 6464 params, ~15s.)
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
       (BitFit-style cheap adaptation). NOTE (2026-05-31): the landed
