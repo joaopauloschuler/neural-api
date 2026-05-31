@@ -407,6 +407,24 @@ breakdown:
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 ### Loss layers
+- [ ] TNNetQuantileLoss follow-up (landed 2026-05-31, head + examples/QuantileRegression/):
+      a SINGLE-model multi-quantile head — emit a 3-wide output and train all three
+      quantiles q in {0.1,0.5,0.9} jointly (per-channel q) in one forward pass instead
+      of three separate models, then add the monotonicity guard (sort/penalize so the
+      q=0.1 prediction never exceeds q=0.9 — "quantile crossing"). The landed example
+      uses three independent tiny MLPs; the joint head is the headline production form.
+- [ ] TNNetArcFace follow-up (landed 2026-05-31, head + tests): a face/embedding
+      recognition micro-example (examples/ArcFaceEmbedding/) — train a tiny embedding
+      net with the ArcFace head on a synthetic multi-class blob (or tiny-MNIST subset),
+      then show the angular margin TIGHTENS intra-class cosine clusters vs a plain
+      softmax head (print same-class vs different-class cosine histograms, mirroring the
+      open CosineEmbeddingLoss siamese demo). Sweep the margin m in {0, 0.3, 0.5} to
+      show the separation grow. Pairs with [[FeatureSeparability]] and the open
+      TNNetCenterLoss SOFTMAX-JOINT follow-up.
+- [ ] TNNetArcFace follow-up: confirm the m=0, s=1 degenerate case reduces to a
+      plain normalized-softmax (cosine) classifier and add a pinning test asserting it
+      matches a hand-wired cosine-softmax head to <1e-4 — the natural correctness anchor
+      now that the margin path is in tree.
 - [ ] TNNetCosineEmbeddingLoss follow-up: a tiny
       siamese-pair embedding micro-example — train two shared-weight MLP
       branches whose outputs are concatenated into the `a|b|y` layout, on a
