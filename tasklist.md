@@ -246,6 +246,46 @@ TestNeuralNumerical.pas central-difference pattern:
 - [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
       pattern. Consider a follow-up that allows masking the lower triangle or a
       configurable offset, if a non-causal masking use case shows up.
+- [ ] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
+      attribution via TracIn-CP (Pruthi et al. 2020, "Estimating Training Data
+      Influence by Tracing Gradient Descent"). Answers a question NOTHING in the
+      tree currently answers: "which TRAINING examples are most responsible for
+      THIS test prediction?" — i.e. attribution back to the *data*, not to
+      activations (ActivationPatchingReport is causal tracing over layers at
+      inference) and not to the input pixels (SaliencyReport is input-space
+      gradient). TracIn is the CPU-friendly form of influence functions: it
+      needs NO Hessian inverse (unlike Koh & Liang 2017), only first-order
+      gradient dot products, which this API already computes per sample during
+      Backpropagate. Influence of a training point `z_train` on a test point
+      `z_test` is `I(z_train, z_test) = sum over saved checkpoints k of
+      eta_k * <grad_loss(z_train; theta_k), grad_loss(z_test; theta_k)>`
+      (TracIn-CP — one term per checkpoint, scaled by that interval's LR).
+      Mechanics in this library: run a single backward pass per example with
+      `SetBatchUpdate(True)` so per-sample weight gradients are NOT zeroed
+      (the [[manual-gradient-and-snapshot-gotchas]] idiom), read the flattened
+      gradient out of each trainable layer (`Neurons[].Delta`-derived weight
+      grads / the layer delta volumes), and take the dot product against the
+      cached test-point gradient — summed over a handful of `.nn` checkpoints
+      saved across training. Report: top-k PROPONENTS (most positive influence,
+      "examples that pushed the model toward this prediction") and top-k
+      OPPONENTS (most negative). The example should be GRADED by construction so
+      it is self-checking in the house style: train a tiny classifier on a 2-D
+      blob task where each test point has an obvious same-class cluster, then
+      mislabel ONE planted training example and show TracIn ranks that planted
+      mislabel as the top OPPONENT of test points it corrupts — the textbook
+      "TracIn surfaces mislabelled data" result (the paper's headline
+      self-influence application). Feasibility notes to settle in v1, honestly
+      logged like the Grokking/Capsule entries: (a) checkpoint storage — start
+      with the FINAL weights only (1-checkpoint TracIn ≈ a single gradient-dot
+      similarity / "TracInLast") and ADD multi-checkpoint summation only if the
+      single-checkpoint ranking is too noisy on the toy; (b) cost is O(N_train)
+      backward passes per test point, so cap N_train small (a few hundred) and
+      say so; (c) confirm reading per-sample weight gradients out of a layer
+      after one backward pass actually works under `SetBatchUpdate(True)` before
+      committing to the full report — that is the one true unknown. Distinct
+      from every existing `TNNet.*Report` (none touch the training set) and a
+      natural companion to the open Mahalanobis-OOD / ConformalPrediction
+      data-quality tooling.
 
 ### Ideas from JP
 - [ ] Better integrate TBytePredictionViaNNet and TEasyBytePredictionViaNNet with
