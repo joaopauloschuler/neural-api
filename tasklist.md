@@ -292,17 +292,6 @@ rather than acted on.
       the window, charting loss + per-query key count. Shows the long-context
       cost/quality trade the layer enables. Fork PositionEncodingBakeoff's
       tiny next-token harness.
-- [X] TNNetSlidingWindowMaskedFill follow-up: an attention-shape stress test
-      mirroring the open "Attention numerical-gradient stress test" — run the
-      forward-mask + grad check across SeqLen in {1,2,3,5,8} and W in
-      {1,2,SeqLen,SeqLen+2}, pinning the W>=SeqLen==full-causal equivalence and
-      the W=1 diagonal-only edge at every shape.
-      DONE 2026-05-31: TestSlidingWindowMaskedFillShapeStress in
-      tests/TestNeuralNumerical.pas (forward band-mask convention + inline
-      eps=1e-3 input-grad check per pair; W>=SeqLen == TNNetMaskedFill, W=1
-      diagonal-only). Note: the shared LayerInputGradientCheck (fixed eps 1e-4,
-      large Sin-seeded inputs) hit float32 cancellation at S5W1 — used an inline
-      check with a small mask value instead of loosening the shared tolerance.
 - [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
@@ -600,19 +589,6 @@ rather than acted on.
       batch-aware loss hook (the per-sample FOutputError path is blind to other
       minibatch samples, the same limitation logged for a true cross-batch
       InfoNCE). Track alongside that batch-aware-loss-hook item.
-- [X] TNNetVectorQuantizer follow-up (landed 2026-05-31): the codebook-SIDE
-      gradient (the `2*(z_q - z_e)` pull accumulated into neuron[k*].Delta via the
-      -FLearningRate idiom) is exercised structurally but has NO dedicated
-      finite-difference test — the landed trio covers forward nearest-neighbor,
-      serialization, and the INPUT/commitment gradient only. Add a codebook-delta
-      check: with a STABLE argmin (input pinned closest to one fixed code), perturb
-      that code's weights and central-difference the codebook-loss term against the
-      accumulated neuron delta. Mirror the TNNetCenterLoss center-delta test.
-      DONE 2026-05-31: TestVectorQuantizerCodebookGradient in
-      tests/TestNeuralNumerical.pas (input pinned closest to code 0, perturb that
-      code, central-difference ||sg[z_e]-z_q||^2 against Neurons[0].Delta; asserts
-      Delta == -LR*dL/dz_q, directional move toward z_e, and zero delta on the
-      non-chosen code). Mirrors TestCenterLossCenterGradient.
 - [ ] TNNetVectorQuantizer follow-up: EMA codebook update variant (van den Oord
       et al.'s recommended alternative to the codebook-loss gradient) — track a
       cross-batch EMA of assigned encoder vectors per code. Needs the same
@@ -935,22 +911,6 @@ rather than acted on.
 - [ ] EchoStateNetwork follow-up: an optional ridge closed-form readout solve
       (normal equations) as a deterministic alternative to the SGD readout loop,
       showing the classic ESN one-shot linear fit (the SGD loop is LR-sensitive).
-- [X] InductionHeads follow-up (landed 2026-05-31, Option A — two hand-wired
-      single-head causal SDPA blocks): the landed demo asserts the LAYER-2
-      prefix-matching stripe (mass 0.978). Add the matching LAYER-1
-      "previous-token head" assertion — render block-1's attention matrix and
-      pin that each query concentrates mass on position t-1 (the immediately-
-      previous token). Together the two stripes show the full two-head
-      COMPOSITION the paper identifies, not just the layer-2 head in isolation.
-      DONE 2026-05-31 (commit 6b62731): added layer-1 .AttentionWeights readout,
-      heatmap, and GATE 4. HONEST FINDING — the trained layer-1 head is NOT a
-      razor-sharp t-1 stripe but a self-dominated local-recency window (raw t-1
-      mass ~0.32 vs ~0.21 uniform-causal). The robust past-relative signal IS
-      there: among strictly-earlier keys, i-1 is the argmax on 100% of first-half
-      rows and holds ~70% of past mass. GATE 4 asserts argmax-of-past > 0.9 and
-      share-of-past > 0.5 (safely below the observed 1.00/0.70). A follow-up could
-      train a sharper layer-1 head (more epochs / inductive bias) if a clean t-1
-      stripe is wanted.
 - [ ] InductionHeads follow-up: ablate the causal mask and the second layer
       independently (1-layer causal, 2-layer NON-causal) and show in-context
       copy accuracy COLLAPSES to chance in each — a built-in proof that both the
