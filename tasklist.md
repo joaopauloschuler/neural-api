@@ -91,37 +91,6 @@ rather than acted on.
       the budget" honesty the Grokking entry uses). Distinct from VisualGAN
       (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
       DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
-- [X] `examples/ConformalPrediction/` — split (inductive) conformal prediction:
-      turn a trained classifier's softmax scores into prediction SETS with a
-      finite-sample, distribution-free marginal-coverage guarantee (Vovk;
-      Angelopoulos & Bates 2021 "A Gentle Introduction to Conformal Prediction").
-      The whole point is the coverage GUARANTEE, which none of the existing
-      uncertainty examples provide: CalibrationReport reports scalar ECE/Brier,
-      DeepEnsembleUncertainty / MCDropoutUncertainty give a predictive-variance
-      number, MarginReport reports a top-logit margin — all point/scalar outputs,
-      whereas conformal emits a variable-size LABEL SET per input that provably
-      contains the true label with probability >= 1-alpha. Pure-CPU, no new layer,
-      no retraining: (1) train any small in-tree classifier (fork the
-      SimpleImageClassifier net on a tiny CIFAR/MNIST stub, or a synthetic
-      multi-class blob) ending in TNNetSoftMax; (2) on a held-out CALIBRATION split
-      compute the nonconformity score `s_i = 1 - softmax[true_class_i]` for each
-      sample; (3) take the conformal quantile `qhat = ceil((n+1)(1-alpha))/n`-th
-      empirical quantile of the calibration scores; (4) at test time emit the set
-      `{ k : 1 - softmax[k] <= qhat }`. Built-in correctness signals (printed
-      PASS/FAIL, Halt(1) on failure): the empirical test-set coverage must land at
-      ~1-alpha (within sampling noise) ACROSS alpha in {0.01, 0.05, 0.10, 0.20} —
-      the headline guarantee — and the mean SET SIZE must shrink monotonically as
-      alpha grows (looser coverage -> smaller sets) and as model accuracy rises.
-      Print a small table: alpha | target-coverage | empirical-coverage |
-      mean-set-size | singleton% | empty%. Stretch: contrast the naive
-      LAC/threshold score above with the adaptive APS (cumulative-softmax) score
-      and show APS gives more uniform CLASS-CONDITIONAL coverage on an imbalanced
-      stub. Distinct from the whole uncertainty cluster (CalibrationReport,
-      DeepEnsembleUncertainty, MCDropoutUncertainty, TestTimeAugmentation,
-      MarginReport) — those quantify confidence; this one wraps any frozen model in
-      a guaranteed-coverage SET predictor. Keep dims tiny so the train + calibrate
-      + 4-alpha sweep fits the <5-min CPU budget; MaxThreadNum := 1 for determinism.
-
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
@@ -225,20 +194,6 @@ breakdown:
       a BUILDER that inserts the HxH mix between the per-head logit slabs
       inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
       Re-scope before attempting.
-- [X] TNNetSlidingWindowMaskedFill — banded *local* causal attention mask
-      (Mistral / Longformer style). Distinct from the strictly-causal
-      [[TNNetMaskedFill]] (full upper-triangle): each query position i may
-      only attend to keys in [i-W+1 .. i] for a constructor window size W,
-      so the masked region is a band, not a triangle. Forward zeroes (-inf
-      before softmax) every (i,j) with j>i OR j<i-W+1; backward is the same
-      stencil applied to the gradient (a fixed 0/1 multiplier, no trainable
-      params), so it slots straight into the existing SDPA grad-check
-      harness. Deliverable: layer decl + impl + LoadFromString round-trip,
-      one numerical-gradient test reusing the SeqLen-sweep pattern, and a
-      tiny experiment showing it matches full causal attention when W>=SeqLen
-      but caps the per-query key count (the property that makes long-context
-      decode cheap) when W<SeqLen. Natural drop-in for the downstream
-      ../gpt-3-for-pascal long-context path.
 - [ ] TNNetSlidingWindowMaskedFill follow-up (landed 2026-05-31): a tiny
       next-token bake-off — full causal (TNNetMaskedFill / TriangularCausalMask)
       vs sliding-window at W in {2, 4, full} on a task whose answer lives within
@@ -402,11 +357,6 @@ breakdown:
       examples/FiLMConditioning/ wiring (already proves the conditioning FC trains
       end-to-end through TNNetFiLM) and scale it from a 1x1 feature vector to a
       small spatial map. Keep it CPU-only and well under 5 minutes.
-- [X] TNNetFiLM follow-up: a builder helper TNNet.AddFiLMConditioned(featLayer,
-      condLayer) (or a residual FiLM block) that wires the conditioning FC ->
-      (1,1,2*Depth) reshape -> TNNetFiLM in one call, mirroring the existing
-      AddPreNormResidual/AddGatedResidual builder family — removes the manual
-      depth-2*Depth bookkeeping every FiLM site currently repeats.
 - [ ] TNNetFiLM builder follow-up (AddFiLMConditioned landed 2026-05-31): a
       RESIDUAL/spatial-map variant. The landed AddFiLMConditioned uses a
       FullConnectLinear conditioning FC sized for a (1,1,C) cond vector. The
