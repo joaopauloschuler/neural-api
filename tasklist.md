@@ -441,8 +441,6 @@ breakdown:
       batch-aware loss hook (the per-sample FOutputError path is blind to other
       minibatch samples, the same limitation logged for a true cross-batch
       InfoNCE). Track alongside that batch-aware-loss-hook item.
-- [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
-      recognition heads.
 - [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
       straight-through assignment plus commitment/codebook losses.
 

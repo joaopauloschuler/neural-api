@@ -1714,6 +1714,44 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// ArcFace additive angular-margin softmax output layer (Deng et al. 2019,
+  // "ArcFace: Additive Angular Margin Loss for Deep Face Recognition"). This is
+  // a SELF-CONTAINED softmax-cross-entropy head with a trainable per-class
+  // weight matrix; supervision is implicit in the input layout (NO external
+  // target tensor, exactly like TNNetCenterLoss / TNNetTripletLoss). Per
+  // spatial (X,Y) position the input depth is split as [ x (d embedding
+  // channels) | y (1 label channel) ] so Depth = d + 1 (validated >= 2 in
+  // SetPrevLayer, giving d = Depth-1 >= 1). The active class is c =
+  // round(label channel). The K class weight vectors (each of dim d) are
+  // stored as the layer's trainable weights: K neurons, each holding a
+  // d-length weight vector, so they serialize AUTOMATICALLY through the base
+  // neuron save/load (no custom Save/Load).
+  // Forward: both the embedding x and each class weight W_k are L2-normalized,
+  // so cos(theta_k) = <x_hat, W_k_hat>. For the true class y the additive
+  // angular margin m is applied: cos(theta'_y) = cos(theta_y + m) =
+  // cos(theta_y)*cos(m) - sin(theta_y)*sin(m), sin(theta_y)=sqrt(1-cos^2).
+  // All logits are scaled by s: z_k = s*cos(theta_k) (k<>y), z_y =
+  // s*cos(theta'_y). The loss is softmax cross-entropy L = -log(softmax(z)_y).
+  // K is stored in FStruct[0] (default 2, validated >= 1), the margin m in
+  // FFloatSt[0] (default 0.5 rad, validated >= 0) and the scale s in
+  // FFloatSt[1] (default 30.0, validated > 0); all round-trip via Save/Load.
+  // The forward pass is an identity passthrough (so Net.Compute returns the
+  // raw x|y layout). Backpropagate ignores the framework-seeded residual,
+  // reads FOutput directly, and writes the analytic gradients:
+  //   feature gradient  dL/dx into the d embedding channels -> FOutputError
+  //   label channel     receives 0
+  //   weight gradient   dL/dW_k accumulated into neuron[k]'s delta via the
+  //                     -FLearningRate idiom (FBatchUpdate respected like
+  //                     sibling trainable layers). Output shape == input shape.
+  TNNetArcFace = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(NumClasses: integer; Margin, Scale: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -11014,6 +11052,204 @@ begin
         CenterNeuron.FDelta.Raw[I] := CenterNeuron.FDelta.Raw[I] +
           (-FLearningRate) * Grad;
       end;
+      // The label channel carries no gradient.
+      FOutputError[X, Y, LabelIdx] := 0;
+    end;
+  if (not FBatchUpdate) then
+  begin
+    UpdateWeights();
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetArcFace }
+
+constructor TNNetArcFace.Create();
+begin
+  // Defaults: K = 2 classes, margin m = 0.5 rad, scale s = 30.0 (paper).
+  Create(2, 0.5, 30.0);
+end;
+
+constructor TNNetArcFace.Create(NumClasses: integer; Margin, Scale: TNeuralFloat);
+begin
+  inherited Create();
+  if NumClasses < 1 then
+    FErrorProc('TNNetArcFace number of classes must be >= 1.');
+  if Margin < 0 then
+    FErrorProc('TNNetArcFace margin must be >= 0.');
+  if Scale <= 0 then
+    FErrorProc('TNNetArcFace scale must be > 0.');
+  FStruct[0] := NumClasses;
+  FFloatSt[0] := Margin;
+  FFloatSt[1] := Scale;
+end;
+
+procedure TNNetArcFace.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  K, D: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.Depth < 2 then
+  begin
+    FErrorProc('TNNetArcFace requires input depth >= 2 (layout x|y). ' +
+      'Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  K := FStruct[0];
+  if K < 1 then
+    FErrorProc('TNNetArcFace number of classes must be >= 1.');
+  D := pPrevLayer.FOutput.Depth - 1; // embedding dimension
+  // Allocate K class weight vectors as K neurons, each holding a d-length
+  // weight vector. They serialize automatically through the base neuron
+  // save/load. InitDefault seeds small random weights so the initial class
+  // directions are non-degenerate (a zero weight has an undefined direction).
+  AddMissingNeurons(K);
+  SetNumWeightsForAllNeurons(D, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetArcFace.Backpropagate();
+var
+  StartTime: double;
+  Margin, Scale, CosM, SinM, InvXNorm: TNeuralFloat;
+  XNorm, WNorm, Dot, CosT, MaxLogit, SumExp, ProbY: TNeuralFloat;
+  SinTheta, CosMargined, DMarginDCos, AK, GK, Logit: TNeuralFloat;
+  K, D, LabelIdx, ClassC, X, Y, MaxX, MaxY, I, Kk: integer;
+  WeightNeuron: TNNetNeuron;
+  W: TNNetVolume;
+  CosArr, ANorm, ProbArr, GradX: array of TNeuralFloat;
+  WNormArr: array of TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Margin := FFloatSt[0];
+  if Margin < 0 then Margin := 0.5;
+  Scale := FFloatSt[1];
+  if Scale <= 0 then Scale := 30.0;
+  K := FStruct[0];
+  if K < 1 then K := 1;
+  D := FOutput.Depth - 1;        // embedding dimension
+  LabelIdx := FOutput.Depth - 1; // label channel index (last channel)
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  CosM := Cos(Margin);
+  SinM := Sin(Margin);
+  SetLength(CosArr, K);
+  SetLength(ANorm, K);     // cos value used in the logit (margined for y)
+  SetLength(ProbArr, K);
+  SetLength(WNormArr, K);
+  SetLength(GradX, D);
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      ClassC := Round(FOutput[X, Y, LabelIdx]);
+      if ClassC < 0 then ClassC := 0;
+      if ClassC > K - 1 then ClassC := K - 1;
+
+      // Embedding L2 norm.
+      XNorm := 0;
+      for I := 0 to D - 1 do
+        XNorm := XNorm + FOutput[X, Y, I] * FOutput[X, Y, I];
+      XNorm := Sqrt(XNorm);
+      if XNorm < 1e-12 then XNorm := 1e-12;
+      InvXNorm := 1.0 / XNorm;
+
+      // cos(theta_k) for every class and the margined logit cosines.
+      for Kk := 0 to K - 1 do
+      begin
+        W := FNeurons[Kk].FWeights;
+        WNorm := 0;
+        Dot := 0;
+        for I := 0 to D - 1 do
+        begin
+          WNorm := WNorm + W.Raw[I] * W.Raw[I];
+          Dot := Dot + FOutput[X, Y, I] * W.Raw[I];
+        end;
+        WNorm := Sqrt(WNorm);
+        if WNorm < 1e-12 then WNorm := 1e-12;
+        WNormArr[Kk] := WNorm;
+        CosT := Dot * InvXNorm / WNorm;
+        // Clamp for numerical safety (acos/sqrt domain).
+        if CosT > 1.0 then CosT := 1.0;
+        if CosT < -1.0 then CosT := -1.0;
+        CosArr[Kk] := CosT;
+        if Kk = ClassC then
+        begin
+          // cos(theta_y + m) = cos*cosM - sin*sinM
+          SinTheta := 1.0 - CosT * CosT;
+          if SinTheta < 0 then SinTheta := 0;
+          SinTheta := Sqrt(SinTheta);
+          CosMargined := CosT * CosM - SinTheta * SinM;
+          ANorm[Kk] := CosMargined;
+        end
+        else
+          ANorm[Kk] := CosT;
+      end;
+
+      // Softmax over the scaled (margined) logits.
+      MaxLogit := Scale * ANorm[0];
+      for Kk := 1 to K - 1 do
+      begin
+        Logit := Scale * ANorm[Kk];
+        if Logit > MaxLogit then MaxLogit := Logit;
+      end;
+      SumExp := 0;
+      for Kk := 0 to K - 1 do
+      begin
+        ProbArr[Kk] := Exp(Scale * ANorm[Kk] - MaxLogit);
+        SumExp := SumExp + ProbArr[Kk];
+      end;
+      if SumExp < 1e-30 then SumExp := 1e-30;
+      ProbY := 0;
+      for Kk := 0 to K - 1 do
+      begin
+        ProbArr[Kk] := ProbArr[Kk] / SumExp;
+        if Kk = ClassC then ProbY := ProbArr[Kk];
+      end;
+
+      // Accumulate feature gradient dL/dx and weight gradients.
+      for I := 0 to D - 1 do GradX[I] := 0;
+      for Kk := 0 to K - 1 do
+      begin
+        // dL/dz_k = p_k - [k==y]; z_k = s * cos-term.
+        GK := ProbArr[Kk];
+        if Kk = ClassC then GK := GK - 1.0;
+        // a_k = dL/d(cos(theta_k)) folding in the margin chain for the true
+        // class. For k=y: d(cos(theta'_y))/d(cos(theta_y)) =
+        //   cosM + sinM * cos / sqrt(1 - cos^2).
+        CosT := CosArr[Kk];
+        if Kk = ClassC then
+        begin
+          SinTheta := 1.0 - CosT * CosT;
+          if SinTheta < 1e-12 then SinTheta := 1e-12;
+          DMarginDCos := CosM + SinM * CosT / Sqrt(SinTheta);
+          AK := Scale * GK * DMarginDCos;
+        end
+        else
+          AK := Scale * GK;
+
+        WeightNeuron := FNeurons[Kk];
+        W := WeightNeuron.FWeights;
+        WNorm := WNormArr[Kk];
+        // d(cos)/dx   = (W_hat - cos * x_hat) / ||x||
+        // d(cos)/dW_k = (x_hat - cos * W_k_hat) / ||W_k||
+        for I := 0 to D - 1 do
+        begin
+          // x_hat[i] = x[i]/||x|| ; W_hat[i] = W[i]/||W||
+          GradX[I] := GradX[I] + AK *
+            (W.Raw[I] / WNorm - CosT * FOutput[X, Y, I] * InvXNorm) * InvXNorm;
+          // weight gradient (descend): accumulate -LR * dL/dW into delta.
+          WeightNeuron.FDelta.Raw[I] := WeightNeuron.FDelta.Raw[I] +
+            (-FLearningRate) * AK *
+            (FOutput[X, Y, I] * InvXNorm - CosT * W.Raw[I] / WNorm) / WNorm;
+        end;
+      end;
+
+      for I := 0 to D - 1 do
+        FOutputError[X, Y, I] := GradX[I];
       // The label channel carries no gradient.
       FOutputError[X, Y, LabelIdx] := 0;
     end;
@@ -46018,6 +46254,7 @@ begin
       'TNNetCosineEmbeddingLoss' :  Result := TNNetCosineEmbeddingLoss.Create(Ft[0]);
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
+      'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -46295,6 +46532,7 @@ begin
       if S[0] = 'TNNetCosineEmbeddingLoss' then Result := TNNetCosineEmbeddingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else

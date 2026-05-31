@@ -270,6 +270,9 @@ type
     procedure TestCenterLossFeatureGradient;
     procedure TestCenterLossCenterGradient;
     procedure TestCenterLossLoadFromString;
+    procedure TestArcFaceForwardPassthrough;
+    procedure TestArcFaceFeatureGradient;
+    procedure TestArcFaceLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -22483,6 +22486,211 @@ begin
         L1.Neurons[cK - 1].Weights.Raw[i],
         L2.Neurons[cK - 1].Weights.Raw[i], 1e-5);
     end;
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestArcFaceForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetArcFace must be an identity passthrough on forward and produce a
+  // finite scalar loss after Backpropagate.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5); // d = 4 embedding + 1 label
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetArcFace.Create(3, 0.5, 30.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.3 - 0.1;
+    Input.Raw[Input.Size - 1] := 1.0; // label channel = class 1
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ArcFace forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestArcFaceFeatureGradient;
+const
+  cEps    = 1e-4;
+  cD      = 4;            // embedding dimension
+  cDepth  = cD + 1;       // + label channel
+  cK      = 4;            // number of classes
+  cClass  = 2;            // active class
+  cMargin = 0.35;
+  cScale  = 8.0;          // moderate scale keeps the softmax well-conditioned
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LArc: TNNetArcFace;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  // Scalar ArcFace loss = -log softmax(s*cos')_y, mirroring the layer forward.
+  function ArcFaceLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j, k: integer;
+    xn, wn, dot, cs, st, csm, maxl, sumexp, py, logit: TNeuralFloat;
+    cosm, sinm: TNeuralFloat;
+    logits: array of TNeuralFloat;
+  begin
+    cosm := Cos(cMargin);
+    sinm := Sin(cMargin);
+    SetLength(logits, cK);
+    xn := 0;
+    for j := 0 to cD - 1 do xn := xn + AInput[0, 0, j] * AInput[0, 0, j];
+    xn := Sqrt(xn);
+    for k := 0 to cK - 1 do
+    begin
+      wn := 0; dot := 0;
+      for j := 0 to cD - 1 do
+      begin
+        wn := wn + LArc.Neurons[k].Weights.Raw[j] * LArc.Neurons[k].Weights.Raw[j];
+        dot := dot + AInput[0, 0, j] * LArc.Neurons[k].Weights.Raw[j];
+      end;
+      wn := Sqrt(wn);
+      cs := dot / (xn * wn);
+      if cs > 1.0 then cs := 1.0;
+      if cs < -1.0 then cs := -1.0;
+      if k = cClass then
+      begin
+        st := Sqrt(1.0 - cs * cs);
+        csm := cs * cosm - st * sinm;
+        logits[k] := cScale * csm;
+      end
+      else
+        logits[k] := cScale * cs;
+    end;
+    maxl := logits[0];
+    for k := 1 to cK - 1 do
+      if logits[k] > maxl then maxl := logits[k];
+    sumexp := 0;
+    for k := 0 to cK - 1 do
+      sumexp := sumexp + Exp(logits[k] - maxl);
+    py := Exp(logits[cClass] - maxl) / sumexp;
+    logit := py; // silence unused-var style; py is the softmax prob of y
+    Result := -Ln(logit);
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    LArc := TNNetArcFace.Create(cK, cMargin, cScale);
+    NN.AddLayer(LArc);
+    // Keep class weights stable while probing the embedding gradient.
+    LArc.SetBatchUpdate(True);
+
+    // Set deterministic, non-degenerate class weight vectors.
+    LArc.Neurons[0].Weights.Raw[0] :=  0.5; LArc.Neurons[0].Weights.Raw[1] := -0.2;
+    LArc.Neurons[0].Weights.Raw[2] :=  0.7; LArc.Neurons[0].Weights.Raw[3] :=  0.1;
+    LArc.Neurons[1].Weights.Raw[0] := -0.3; LArc.Neurons[1].Weights.Raw[1] :=  0.6;
+    LArc.Neurons[1].Weights.Raw[2] :=  0.2; LArc.Neurons[1].Weights.Raw[3] := -0.4;
+    LArc.Neurons[2].Weights.Raw[0] :=  0.4; LArc.Neurons[2].Weights.Raw[1] :=  0.4;
+    LArc.Neurons[2].Weights.Raw[2] := -0.5; LArc.Neurons[2].Weights.Raw[3] :=  0.3;
+    LArc.Neurons[3].Weights.Raw[0] :=  0.1; LArc.Neurons[3].Weights.Raw[1] := -0.7;
+    LArc.Neurons[3].Weights.Raw[2] :=  0.3; LArc.Neurons[3].Weights.Raw[3] :=  0.6;
+
+    // Embedding chosen so cos(theta) stays comfortably inside (-1,1).
+    Input[0, 0, 0] :=  0.6;
+    Input[0, 0, 1] := -0.3;
+    Input[0, 0, 2] :=  0.5;
+    Input[0, 0, 3] :=  0.9;
+    Input[0, 0, cD] := cClass; // label channel
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to cD - 1 do
+    begin
+      AnaGrad := LArc.OutputError[0, 0, i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps;
+      LossP := ArcFaceLossAt(Input);
+      Input.Raw[i] := OldV - cEps;
+      LossM := ArcFaceLossAt(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      // Tolerance 1e-2 (float32; the s-scaled softmax amplifies cancellation,
+      // matching the CenterLoss precedent's 1e-2 feature-gradient tolerance).
+      AssertEquals('ArcFace feature grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-2);
+    end;
+    AssertEquals('ArcFace label-channel grad is zero',
+      0.0, LArc.OutputError[0, 0, cD], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestArcFaceLoadFromString;
+const
+  cK      = 6;     // non-default number of classes
+  cMargin = 0.42;  // non-default margin
+  cScale  = 17.5;  // non-default scale
+  cD      = 3;
+  cDepth  = cD + 1;
+var
+  NN, NN2: TNNet;
+  L1, L2: TNNetArcFace;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    L1 := TNNetArcFace.Create(cK, cMargin, cScale);
+    NN.AddLayer(L1);
+
+    for i := 0 to cD - 1 do
+    begin
+      L1.Neurons[0].Weights.Raw[i] := 0.13 * (i + 1);
+      L1.Neurons[cK - 1].Weights.Raw[i] := -0.27 * (i + 1);
+    end;
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetArcFace',
+      NN2.GetLastLayer is TNNetArcFace);
+    AssertEquals('ArcFace round-trip preserves K, margin and scale',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+
+    L2 := NN2.GetLastLayer as TNNetArcFace;
+    AssertEquals('ArcFace round-trip neuron count', cK, L2.Neurons.Count);
+    for i := 0 to cD - 1 do
+    begin
+      AssertEquals('ArcFace weight[0] round-trip at ' + IntToStr(i),
+        L1.Neurons[0].Weights.Raw[i], L2.Neurons[0].Weights.Raw[i], 1e-5);
+      AssertEquals('ArcFace weight[K-1] round-trip at ' + IntToStr(i),
+        L1.Neurons[cK - 1].Weights.Raw[i],
+        L2.Neurons[cK - 1].Weights.Raw[i], 1e-5);
+    end;
+
+    // A second save must be bit-identical to the first (full registry
+    // round-trip incl. trainable neurons).
+    Saved2 := NN2.SaveToString();
+    AssertEquals('ArcFace save->load->save is identical', Saved, Saved2);
   finally
     NN.Free;
     NN2.Free;
