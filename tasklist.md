@@ -209,25 +209,6 @@ rather than acted on.
       new float32 based layers. This is also curious and interesting.
 - [ ] More image generative examples and or experiments.
 
-### TNNetMultiHeadSelfAttention — breakdown
-SDPA + RoPE + MaskedFill + ALiBi are all in tree. Suggested commit-sized
-breakdown:
-- [X] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
-      front of self-attention and an optional cross-attention sub-block.
-      LANDED 2026-05-31: TNNet.AddTransformerDecoderBlock(d_model, Heads, d_ff,
-      EncoderOutput, PreNorm) composes causal self-attn + cross-attn + SwiGLU FFN
-      residuals; numerical input-grad test (PreNorm True/False) +
-      examples/TransformerDecoderBlock/.
-      Built on top of the encoder helper above to avoid duplication.
-      Compose `AddTransformerEncoderBlock` (causal self-attention via
-      CausalMask=True) and `AddMultiHeadCrossAttention(d_model, Heads,
-      QuerySource, KeyValueSource)` for the encoder-decoder cross-attention
-      sub-block. The decoder block is then: causal self-attn residual ->
-      cross-attn residual (Q from the decoder stream, K|V from the encoder
-      output) -> pointwise SwiGLU FFN residual. Mind that cross-attention takes
-      EXPLICIT source layers, so the decoder builder must thread the
-      encoder-output layer ref through.
-
 ### Attention variants / siblings
 
 - [ ] GQA follow-up: exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention
@@ -409,38 +390,6 @@ breakdown:
       value of the flattened conv weight matrix per output channel / full
       kernel) on top of `TNNet.EstimateSpectralNorm`, mirroring the dense
       forward/backward (scale by 1/sigma, sigma treated constant in backward).
-- [X] LoRA low-rank adapter (`TNNet.AddLoRAAdapter`) + `examples/LoRAFineTune/` —
-      LANDED 2026-05-31: builder adds B·A (B zero-init) residually to a frozen
-      base via PointwiseConvLinear; TestLoRAAdapterSmoke (zero-init identity
-      <1e-6) + examples/LoRAFineTune/ rank sweep r in {1,2,4,8}. NOTE: builder
-      zeros B at construction — callers must NOT call NN.InitWeights() after
-      (it re-runs InitDefault and overwrites B's zero-init). Merge-for-inference
-      weight-fold check (correctness signal 2) DEFERRED (fiddly with two
-      PointwiseConvLinear projections + scale). Below original task text:
-      parameter-efficient fine-tuning by ADDING a trainable low-rank residual
-      `B·A` to a FROZEN dense/pointwise layer (Hu et al. 2021). For a frozen
-      `d_in -> d_out` linear, insert a rank-`r` bypass `down: FullConnectLinear(r)`
-      (A, init small/random) -> `up: FullConnectLinear(d_out)` (B, init ZERO so the
-      adapter is the identity-perturbation at step 0 and the pretrained output is
-      bit-for-bit unchanged on the first forward), scaled by `alpha/r`, then add it
-      residually to the frozen layer's output. Train ONLY A and B (freeze the base
-      via the same SetLearningRate(0)/freeze idiom AffineFineTune already uses).
-      The residual sublayer must be SHAPE-PRESERVING — for a per-token
-      `(SeqLen,1,d_model)` stream use PointwiseConvLinear over Depth, not
-      FullConnect (see [[residual-builder-helpers]] / [[mha-builder-and-seq-projection]]).
-      Headline example: fork examples/AffineFineTune/ (frozen pretrained classifier
-      + shifted task), swap the BitFit affine blocks for LoRA adapters, and chart
-      trainable-param count and recovered accuracy across rank `r ∈ {1,2,4,8}` vs
-      full fine-tune (upper bound) and vs the landed BitFit arm (param-matched
-      baseline) — the textbook "recover most accuracy at a few % of the params"
-      curve. Built-in correctness signals: (a) with B zero-init the wrapped net's
-      forward equals the frozen base to <1e-6 before any training; (b) after
-      training, the merged weight `W + (alpha/r)·B·A` folded back into a single
-      dense layer reproduces the adapted forward (the LoRA "merge for inference"
-      property) to <1e-5. Distinct from AffineFineTune (per-channel affine / BitFit,
-      NOT low-rank) — this is the low-rank-update PEFT method the MemoryFootprintReport
-      doc already names as the natural next step. Add a `TestLoRAAdapterSmoke`
-      following the introspection-report test recipe.
 - [ ] TNNetStochasticPool follow-up: a bake-off vs TNNetMaxPool / TNNetAvgPool /
       TNNetSoftPool on a tiny image-classifier stub — does the stochastic
       regularisation lower the train/val gap at matched architecture? Fork an
@@ -449,15 +398,6 @@ breakdown:
       its single-branch ShakeDrop generalization.
 
 #### Channel attention / conditioning
-- [X] TNNetCBAM — SE block plus a spatial-attention sibling.
-      LANDED 2026-05-31 as the builder TNNet.AddCBAM(InputLayer, ReductionRatio=16,
-      SpatialKernelSize=7) — pure composite over tested layers, shape-preserving,
-      no new gradient code. Channel attention: dual global avg+max pool, each
-      through a reduce->ReLU->expand MLP, summed->sigmoid->ChannelMulByLayer.
-      Spatial attention: pointwise conv C->2 descriptor -> padded
-      SpatialKernelSize conv -> sigmoid gate, replicated over depth + CellMulByCell.
-      TestCBAMShapeForwardAndGradFlow + examples/CBAMAttention/.
-      Two v1 simplifications -> follow-ups below.
 - [ ] TNNetCBAM follow-up: the landed AddCBAM uses TWO SEPARATE channel MLPs
       (avg-branch + max-branch summed before the sigmoid) instead of the paper's
       single SHARED MLP applied to both pooled descriptors. If a weight-sharing
@@ -1305,8 +1245,8 @@ breakdown:
 - [ ] "Elementwise activation layer authoring" mini-guide capturing the
       recurring 4-step pattern (Compute, Backpropagate via FOutputErrorDeriv,
       dispatch entry, four-test shape).
-- [ ] `docs/channel_attention.md` — once CBAM lands, compare it on the same
-      axes with the already-landed SE (TNNet.AddSEBlock) and FiLM (TNNetFiLM).
+- [ ] `docs/channel_attention.md` — compare the landed CBAM (TNNet.AddCBAM)
+      on the same axes with SE (TNNet.AddSEBlock) and FiLM (TNNetFiLM).
 - [ ] `docs/loss_layers.md` — once the loss family is complete, table input
       shape required, scalar vs per-sample, drop-in vs auxiliary.
 - [ ] Short note in `tests/README` on "how to add a numerical-gradient
