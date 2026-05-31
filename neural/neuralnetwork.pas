@@ -1629,6 +1629,46 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Center loss output layer (Wen et al. 2016, "A Discriminative Feature
+  // Learning Approach for Deep Face Recognition"). Center loss is a PENALTY
+  // head that pulls every feature vector toward a trainable per-class center;
+  // it is meant to be ADDED ALONGSIDE a separate classification head (e.g. a
+  // softmax / cross-entropy output). This layer therefore contributes ONLY the
+  // center-pull gradient (lambda/2)*||x - c_y||^2 and does NOT fold in any
+  // softmax / cross-entropy term itself.
+  // Like TNNetTripletLoss this is a SELF-CONTAINED head: there is NO external
+  // target tensor, supervision is implicit in the input layout. Per spatial
+  // (X,Y) position the input depth is split as [ x (d feature channels) |
+  // y (1 label channel) ] so Depth = d + 1 (validated >= 2 in SetPrevLayer,
+  // giving d = Depth-1 >= 1). The active class is c = round(label channel).
+  // The K class centers (each of dim d) are stored as the layer's trainable
+  // weights: K neurons, each holding a d-length weight vector, so they
+  // serialize AUTOMATICALLY through the base neuron save/load (no custom
+  // Save/Load). NumClasses K is stored in FStruct[0] (default 2, validated
+  // >= 1) and lambda in FFloatSt[0] (default 1.0, validated > 0); both
+  // round-trip via Save/Load.
+  // The forward pass is an identity passthrough (so Net.Compute returns the
+  // raw x|y layout). Backpropagate ignores the framework-seeded residual,
+  // reads FOutput directly, and for the active class c:
+  //   feature gradient  dL/dx[i] = lambda*(x[i] - c_c[i])  -> FOutputError[i]
+  //   label channel     receives 0
+  //   center gradient   the center is pulled toward the feature; (c_c[i]-x[i])
+  //                     is accumulated into neuron[c]'s delta with the
+  //                     -FLearningRate idiom so the optimizer moves c toward x.
+  // FBatchUpdate is respected exactly like sibling trainable layers. NOTE:
+  // this framework's per-sample FOutputError path cannot see other minibatch
+  // samples, so the classic cross-batch EMA center update of the paper is out
+  // of scope; the centers are learned by the optimizer like any other weight.
+  // Output shape equals input shape.
+  TNNetCenterLoss = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(NumClasses: integer; Lambda: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -10631,6 +10671,105 @@ begin
           FOutputError[X, Y, EmbDim * (1 + J) + C] := InvTau * Probs[J] * QVal;
       end;
     end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetCenterLoss }
+
+constructor TNNetCenterLoss.Create();
+begin
+  // Default K from FStruct[0] is 0 before InitStruct; mirror the documented
+  // default of K = 2 classes and lambda = 1.0.
+  Create(2, 1.0);
+end;
+
+constructor TNNetCenterLoss.Create(NumClasses: integer; Lambda: TNeuralFloat);
+begin
+  inherited Create();
+  if NumClasses < 1 then
+    FErrorProc('TNNetCenterLoss number of classes must be >= 1.');
+  if Lambda <= 0 then
+    FErrorProc('TNNetCenterLoss lambda must be > 0.');
+  FStruct[0] := NumClasses;
+  FFloatSt[0] := Lambda;
+end;
+
+procedure TNNetCenterLoss.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  K, D: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.Depth < 2 then
+  begin
+    FErrorProc('TNNetCenterLoss requires input depth >= 2 (layout x|y). ' +
+      'Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  K := FStruct[0];
+  if K < 1 then
+    FErrorProc('TNNetCenterLoss number of classes must be >= 1.');
+  D := pPrevLayer.FOutput.Depth - 1; // feature dimension
+  // Allocate K class centers as K neurons, each holding a d-length weight
+  // vector. They serialize automatically through the base neuron save/load.
+  AddMissingNeurons(K);
+  SetNumWeightsForAllNeurons(D, 1, 1);
+  // Centers start at zero so the initial pull is simply toward the origin
+  // before training drives them toward the per-class feature means.
+  InitDefault();
+end;
+
+procedure TNNetCenterLoss.Backpropagate();
+var
+  StartTime: double;
+  Lambda, XVal, CVal, Grad: TNeuralFloat;
+  K, D, LabelIdx, ClassC, X, Y, MaxX, MaxY, I: integer;
+  CenterNeuron: TNNetNeuron;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Lambda := FFloatSt[0];
+  if Lambda <= 0 then Lambda := 1.0;
+  K := FStruct[0];
+  if K < 1 then K := 1;
+  D := FOutput.Depth - 1;       // feature dimension
+  LabelIdx := FOutput.Depth - 1; // label channel index (last channel)
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  // Per spatial cell: read the active class label, then pull both the feature
+  // (via FOutputError) and the class center (via the neuron delta) together.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      ClassC := Round(FOutput[X, Y, LabelIdx]);
+      // Clamp the class index into the valid center range.
+      if ClassC < 0 then ClassC := 0;
+      if ClassC > K - 1 then ClassC := K - 1;
+      CenterNeuron := FNeurons[ClassC];
+      W := CenterNeuron.FWeights;
+      for I := 0 to D - 1 do
+      begin
+        XVal := FOutput[X, Y, I];
+        CVal := W.Raw[I];
+        // feature gradient: dL/dx[i] = lambda*(x[i] - c_c[i])
+        FOutputError[X, Y, I] := Lambda * (XVal - CVal);
+        // center gradient: the center is pulled toward the feature, so the
+        // optimizer move (+FDelta after -FLearningRate idiom) accumulates
+        // (c_c[i] - x[i]). Matches the sibling trainable-layer convention.
+        Grad := CVal - XVal;
+        CenterNeuron.FDelta.Raw[I] := CenterNeuron.FDelta.Raw[I] +
+          (-FLearningRate) * Grad;
+      end;
+      // The label channel carries no gradient.
+      FOutputError[X, Y, LabelIdx] := 0;
+    end;
+  if (not FBatchUpdate) then
+  begin
+    UpdateWeights();
+    AfterWeightUpdate();
+  end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -45366,6 +45505,7 @@ begin
       'TNNetTripletLoss' :          Result := TNNetTripletLoss.Create(Ft[0]);
       'TNNetCosineEmbeddingLoss' :  Result := TNNetCosineEmbeddingLoss.Create(Ft[0]);
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
+      'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -45638,6 +45778,7 @@ begin
       if S[0] = 'TNNetTripletLoss' then Result := TNNetTripletLoss.Create(Ft[0]) else
       if S[0] = 'TNNetCosineEmbeddingLoss' then Result := TNNetCosineEmbeddingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else

@@ -408,7 +408,7 @@ breakdown:
       `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
       is smoothing improves calibration at a small accuracy cost.
-- [ ] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
+- [x] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
       class centers stored as the layer's weight tensor.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
       recognition heads.

@@ -252,6 +252,10 @@ type
     procedure TestInfoNCELossForwardPassthrough;
     procedure TestInfoNCELossGradient;
     procedure TestInfoNCELossLoadFromString;
+    procedure TestCenterLossForwardPassthrough;
+    procedure TestCenterLossFeatureGradient;
+    procedure TestCenterLossCenterGradient;
+    procedure TestCenterLossLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
     procedure TestPadXYGradientCheck;
@@ -21507,6 +21511,264 @@ begin
     AssertEquals('InfoNCELoss round-trip preserves params',
       NN.GetLastLayer.SaveStructureToString(),
       NN2.GetLastLayer.SaveStructureToString());
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCenterLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetCenterLoss must be an identity passthrough on forward.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5); // d = 4 features + 1 label
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    NN.AddLayer(TNNetCenterLoss.Create(3, 0.5));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 1.5 - 0.2;
+    Input.Raw[Input.Size - 1] := 1.0; // label channel = class 1
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('CenterLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCenterLossFeatureGradient;
+const
+  cEps    = 1e-4;
+  cD      = 4;            // feature dimension
+  cDepth  = cD + 1;       // + label channel
+  cClass  = 2;            // active class
+  cLambda = 0.7;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LCenter: TNNetCenterLoss;
+  Center: TNNetVolume;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  // Scalar center loss (lambda/2)*||x - c_y||^2 over the feature channels.
+  function CenterLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j: integer;
+    diff, s: TNeuralFloat;
+  begin
+    s := 0;
+    for j := 0 to cD - 1 do
+    begin
+      diff := AInput[0, 0, j] - Center.Raw[j];
+      s := s + diff * diff;
+    end;
+    Result := 0.5 * cLambda * s;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    LCenter := TNNetCenterLoss.Create(4, cLambda); // K = 4 classes
+    NN.AddLayer(LCenter);
+    // Keep weights stable while we probe the feature gradient.
+    LCenter.SetBatchUpdate(True);
+
+    // Set a known center for the active class so the analytic gradient is
+    // deterministic.
+    Center := LCenter.Neurons[cClass].Weights;
+    Center.Raw[0] :=  0.3;
+    Center.Raw[1] := -0.5;
+    Center.Raw[2] :=  0.9;
+    Center.Raw[3] :=  0.1;
+
+    Input[0, 0, 0] :=  0.5;
+    Input[0, 0, 1] := -0.2;
+    Input[0, 0, 2] :=  0.4;
+    Input[0, 0, 3] :=  1.1;
+    Input[0, 0, cD] := cClass; // label channel
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to cD - 1 do
+    begin
+      AnaGrad := LCenter.OutputError[0, 0, i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps;
+      LossP := CenterLossAt(Input);
+      Input.Raw[i] := OldV - cEps;
+      LossM := CenterLossAt(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('CenterLoss feature grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-2);
+    end;
+    // The label channel carries no gradient.
+    AssertEquals('CenterLoss label-channel grad is zero',
+      0.0, LCenter.OutputError[0, 0, cD], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCenterLossCenterGradient;
+const
+  cEps    = 1e-4;
+  cD      = 3;
+  cDepth  = cD + 1;
+  cClass  = 1;
+  cLambda = 0.8;
+  cLR     = 0.05;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LCenter: TNNetCenterLoss;
+  Center: TNNetVolume;
+  AnaDelta, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  OldCenter: array[0..cD - 1] of TNeuralFloat;
+  i: integer;
+
+  // Scalar center loss as a function of the (perturbed) center weights.
+  function CenterLossAt(): TNeuralFloat;
+  var
+    j: integer;
+    diff, s: TNeuralFloat;
+  begin
+    s := 0;
+    for j := 0 to cD - 1 do
+    begin
+      diff := Input[0, 0, j] - Center.Raw[j];
+      s := s + diff * diff;
+    end;
+    Result := 0.5 * cLambda * s;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    LCenter := TNNetCenterLoss.Create(3, cLambda);
+    NN.AddLayer(LCenter);
+    // LR = cLR, inertia 0 so the full delta applies on UpdateWeights.
+    NN.SetLearningRate(cLR, 0.0);
+    // Accumulate the center delta without applying it, so we can read it.
+    LCenter.SetBatchUpdate(True);
+
+    Center := LCenter.Neurons[cClass].Weights;
+    Center.Raw[0] := 0.2;
+    Center.Raw[1] := 0.7;
+    Center.Raw[2] := -0.4;
+
+    Input[0, 0, 0] :=  0.9;
+    Input[0, 0, 1] := -0.3;
+    Input[0, 0, 2] :=  0.6;
+    Input[0, 0, cD] := cClass;
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // The accumulated neuron delta follows the -FLearningRate idiom on the
+    // center gradient dL/dc[i] = lambda*(c[i] - x[i]); so
+    // Delta[i] = -LR * lambda*(c[i] - x[i]) = -LR * dL/dc[i].
+    for i := 0 to cD - 1 do
+    begin
+      AnaDelta := LCenter.Neurons[cClass].Delta.Raw[i];
+      OldCenter[i] := Center.Raw[i];
+      OldV := Center.Raw[i];
+      Center.Raw[i] := OldV + cEps;
+      LossP := CenterLossAt();
+      Center.Raw[i] := OldV - cEps;
+      LossM := CenterLossAt();
+      Center.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      // Delta should equal -LR * dL/dc[i].
+      AssertEquals('CenterLoss center delta at ' + IntToStr(i),
+        -cLR * NumGrad, AnaDelta, 1e-2);
+    end;
+
+    // Directional check: applying the update moves the center toward x.
+    LCenter.UpdateWeights();
+    for i := 0 to cD - 1 do
+      AssertTrue('CenterLoss center moves toward feature at ' + IntToStr(i),
+        Abs(Center.Raw[i] - Input[0, 0, i]) <
+        Abs(OldCenter[i] - Input[0, 0, i]) + 1e-9);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCenterLossLoadFromString;
+const
+  cK      = 5;     // non-default number of classes
+  cLambda = 0.37;  // non-default lambda
+  cD      = 3;
+  cDepth  = cD + 1;
+var
+  NN, NN2: TNNet;
+  L1, L2: TNNetCenterLoss;
+  Saved: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    L1 := TNNetCenterLoss.Create(cK, cLambda);
+    NN.AddLayer(L1);
+
+    // Give the centers distinctive values to verify the weights round-trip.
+    for i := 0 to cD - 1 do
+    begin
+      L1.Neurons[0].Weights.Raw[i] := 0.11 * (i + 1);
+      L1.Neurons[cK - 1].Weights.Raw[i] := -0.23 * (i + 1);
+    end;
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetCenterLoss',
+      NN2.GetLastLayer is TNNetCenterLoss);
+    // Structure string encodes FStruct[0] (K) and FFloatSt[0] (lambda).
+    AssertEquals('CenterLoss round-trip preserves K and lambda',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+
+    L2 := NN2.GetLastLayer as TNNetCenterLoss;
+    AssertEquals('CenterLoss round-trip neuron count', cK,
+      L2.Neurons.Count);
+    for i := 0 to cD - 1 do
+    begin
+      AssertEquals('CenterLoss center[0] weight round-trip at ' + IntToStr(i),
+        L1.Neurons[0].Weights.Raw[i], L2.Neurons[0].Weights.Raw[i], 1e-5);
+      AssertEquals('CenterLoss center[K-1] weight round-trip at ' +
+        IntToStr(i),
+        L1.Neurons[cK - 1].Weights.Raw[i],
+        L2.Neurons[cK - 1].Weights.Raw[i], 1e-5);
+    end;
   finally
     NN.Free;
     NN2.Free;
