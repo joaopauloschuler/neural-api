@@ -111,6 +111,7 @@ var
   // Layer indices captured at build time (re-read NN.Layers[idx] after any
   // best-model reload; here we train manually so refs stay valid, but indices
   // are the robust idiom).
+  gAttn1Idx: integer; // layer-1 (previous-token) SDPA layer
   gAttn2Idx: integer; // layer-2 (induction) SDPA layer
 
 // Draw a random prefix of length L and concatenate it with itself.
@@ -180,8 +181,8 @@ begin
   Result.SetLearningRate(cLR, cInertia);
   Result.SetL2Decay(0.0);
 
+  gAttn1Idx := Sdpa1.LayerIdx;
   gAttn2Idx := Sdpa2.LayerIdx;
-  if Sdpa1 = nil then ; // silence "unused" on some FPC versions
 end;
 
 function CrossEntropyAt(Output, Target: TNNetVolume; t: integer): TNeuralFloat;
@@ -386,14 +387,112 @@ begin
   UniformBaseline := SumUniform / Max(1, Rows);
 end;
 
+// Glyph-shaded ASCII heatmap of a single probe's LAYER-1 attention matrix
+// (X=key j, Y=query i; causal so the upper triangle is empty). The previous-
+// token head's signature is the SUB-diagonal: every query i (i>=1) should put
+// its mass on key i-1, the immediately-preceding token. That is what the
+// layer-1 head writes into each position to feed the layer-2 induction head.
+procedure RenderAttention1(Attn: TNNetVolume; const S: TSeq);
+const
+  cGlyphs = ' .:-=+*#%@';
+var
+  i, j, g: integer;
+  v: TNeuralFloat;
+  Row: string;
+begin
+  WriteLn('  layer-1 attention map (rows=query i, cols=key j; brighter=more mass)');
+  WriteLn('  the previous-token stripe: query i puts mass on key (i-1), the token');
+  WriteLn('  immediately before it. Tokens shown at left.');
+  Write('        key:');
+  for j := 0 to cSeqLen - 1 do Write(Format('%2d', [j mod 10]));
+  WriteLn;
+  for i := 0 to cSeqLen - 1 do
+  begin
+    Row := '';
+    for j := 0 to cSeqLen - 1 do
+    begin
+      v := Attn[j, i, 0];
+      g := Trunc(v * (Length(cGlyphs) - 1) + 0.5);
+      if g < 0 then g := 0;
+      if g > Length(cGlyphs) - 1 then g := Length(cGlyphs) - 1;
+      Row := Row + cGlyphs[g + 1] + ' ';
+    end;
+    WriteLn(Format('  q%2d tok%2d : %s', [i, S[i], Row]));
+  end;
+end;
+
+// Layer-1 "previous-token head" readout. Empirically this trained head is a
+// LOCAL recency window: a query at i keeps a chunk of mass on itself (key i)
+// and spreads the remainder over the nearest earlier tokens, with the
+// immediately-previous token (key i-1) the single STRONGEST of those earlier
+// keys. The layer-2 induction head reads back exactly this "what came right
+// before me" signal. We therefore probe the head honestly along two axes,
+// over the first-half rows i in [1 .. L-1] where the window is clean (the deep
+// repeated tail diffuses and is not needed by the composition):
+//   PrevMass    = mean mass on key i-1 (the previous token);
+//   PrevOfPast  = mean SHARE of i-1 within the strictly-earlier mass (keys < i),
+//                 i.e. among all past tokens, how dominant is t-1;
+//   ArgmaxFrac  = fraction of rows where i-1 is the argmax over the PAST keys
+//                 (j in [0 .. i-1], self excluded).
+// UniformBaseline = mean 1/(i+1): the flat-causal mass a non-selective head
+// would put on any single key.
+procedure PrevTokenScore(NN: TNNet;
+  out PrevMass, UniformBaseline, PrevOfPast, ArgmaxFrac: TNeuralFloat);
+const
+  cProbes = 200;
+var
+  k, i, j, ArgK: integer;
+  InputV, TargetV: TNNetVolume;
+  Attn: TNNetVolume;
+  S: TSeq;
+  SumPrev, SumUniform, SumPrevShare, Best, PastMass: TNeuralFloat;
+  Rows, ArgHits: integer;
+begin
+  InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
+  TargetV := TNNetVolume.Create(cSeqLen, 1, cVocab);
+  SumPrev := 0; SumUniform := 0; SumPrevShare := 0; Rows := 0; ArgHits := 0;
+  try
+    for k := 1 to cProbes do
+    begin
+      MakeSeq(S);
+      FillPair(S, InputV, TargetV);
+      NN.Compute(InputV);
+      Attn := TNNetScaledDotProductAttention(NN.Layers[gAttn1Idx]).AttentionWeights;
+      for i := 1 to cPrefix - 1 do
+      begin
+        SumPrev := SumPrev + Attn[i - 1, i, 0];
+        SumUniform := SumUniform + 1.0 / (i + 1); // uniform over causal keys 0..i
+        // Strictly-earlier mass (keys 0..i-1, self i excluded) + argmax over it.
+        PastMass := 0; ArgK := 0; Best := -1;
+        for j := 0 to i - 1 do
+        begin
+          PastMass := PastMass + Attn[j, i, 0];
+          if Attn[j, i, 0] > Best then begin Best := Attn[j, i, 0]; ArgK := j; end;
+        end;
+        if PastMass > 1e-9 then
+          SumPrevShare := SumPrevShare + Attn[i - 1, i, 0] / PastMass;
+        if ArgK = i - 1 then Inc(ArgHits);
+        Inc(Rows);
+      end;
+    end;
+  finally
+    InputV.Free; TargetV.Free;
+  end;
+  PrevMass := SumPrev / Max(1, Rows);
+  UniformBaseline := SumUniform / Max(1, Rows);
+  PrevOfPast := SumPrevShare / Max(1, Rows);
+  ArgmaxFrac := ArgHits / Max(1, Rows);
+end;
+
 var
   NN: TNNet;
   Acc1, Acc2, CE1, CE2: TNeuralFloat;
   StripeMass, UniformBaseline, ICLScore: TNeuralFloat;
+  PrevMass, PrevUniform, PrevOfPast, PrevArgmaxFrac: TNeuralFloat;
   InputV, TargetV: TNNetVolume;
-  Attn: TNNetVolume;
+  Attn, Attn1: TNNetVolume;
   S: TSeq;
-  Gate1, Gate2, Gate3, AllMandatory: boolean;
+  Gate1, Gate2, Gate3, Gate4, AllMandatory: boolean;
 begin
   // Fast-math kernels can transiently underflow during early training; mask
   // FPU exceptions so the host doesn't abort (matches AttentionCopyTask).
@@ -421,15 +520,24 @@ begin
 
     EvaluateHalves(NN, Acc1, Acc2, CE1, CE2);
     PrefixMatchScore(NN, StripeMass, UniformBaseline);
+    PrevTokenScore(NN, PrevMass, PrevUniform, PrevOfPast, PrevArgmaxFrac);
     ICLScore := CE2 - CE1;  // late-repeated CE minus early CE; should be << 0
 
-    // Render the layer-2 attention map for one representative probe.
+    // Render BOTH layer attention maps for one representative probe so the full
+    // two-head composition is visible: layer-1 previous-token + layer-2 induction.
     InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
     TargetV := TNNetVolume.Create(cSeqLen, 1, cVocab);
     MakeSeq(S);
     FillPair(S, InputV, TargetV);
     NN.Compute(InputV);
-    Attn := TNNetScaledDotProductAttention(NN.Layers[gAttn2Idx]).AttentionWeights;
+    Attn1 := TNNetScaledDotProductAttention(NN.Layers[gAttn1Idx]).AttentionWeights;
+    Attn  := TNNetScaledDotProductAttention(NN.Layers[gAttn2Idx]).AttentionWeights;
+
+    WriteLn(StringOfChar('=', 72));
+    WriteLn('LAYER-1 (PREVIOUS-TOKEN HEAD) ATTENTION HEATMAP');
+    WriteLn(StringOfChar('=', 72));
+    RenderAttention1(Attn1, S);
+    WriteLn;
 
     WriteLn(StringOfChar('=', 72));
     WriteLn('LAYER-2 (INDUCTION HEAD) ATTENTION HEATMAP');
@@ -453,6 +561,10 @@ begin
     WriteLn(Format('In-context learning score (CE2 - CE1)    : %.4f   (want << 0)',
       [ICLScore]));
     WriteLn;
+    WriteLn(Format('Prev-token (layer-1) t-1 stripe mass     : %.4f', [PrevMass]));
+    WriteLn(Format('Uniform-causal baseline mass (layer-1)   : %.4f', [PrevUniform]));
+    WriteLn(Format('Prev-token t-1 share of strictly-past    : %.4f', [PrevOfPast]));
+    WriteLn(Format('Prev-token t-1 argmax-of-past fraction   : %.4f', [PrevArgmaxFrac]));
     WriteLn(Format('Prefix-match (induction) stripe mass     : %.4f', [StripeMass]));
     WriteLn(Format('Uniform-causal baseline mass             : %.4f', [UniformBaseline]));
     WriteLn(StringOfChar('=', 72));
@@ -462,6 +574,14 @@ begin
     Gate1 := (Acc2 > 0.8) and (Acc2 > Acc1 + 0.4);
     Gate2 := (ICLScore < 0.0);
     Gate3 := (StripeMass > 2.0 * UniformBaseline) and (StripeMass > 0.25);
+    // Gate 4: layer-1 previous-token head. The trained head is a local-recency
+    // window dominated by self-attention, so the RAW t-1 mass (~0.32) is modest;
+    // but among strictly-EARLIER tokens the immediately-previous one (t-1) is the
+    // unambiguous winner: it is the argmax of the past on ~100% of first-half
+    // rows and captures ~0.70 of the past mass. That backward-looking "what came
+    // right before me" signal is exactly what the layer-2 induction head reads.
+    // Measured argmax-of-past ~1.00, share-of-past ~0.70; assert safely below.
+    Gate4 := (PrevArgmaxFrac > 0.9) and (PrevOfPast > 0.5);
 
     if Gate1 then
       WriteLn('GATE 1 (in-context copy)   : PASS  ',
@@ -484,6 +604,15 @@ begin
       WriteLn('GATE 3 (induction stripe)  : WARN  ',
         Format('(stripe %.4f vs uniform %.4f; see README budget note)',
           [StripeMass, UniformBaseline]));
+
+    if Gate4 then
+      WriteLn('GATE 4 (prev-token head)   : PASS  ',
+        Format('(t-1 is argmax-of-past on %.1f%% of rows, %.0f%% of past mass)',
+          [100*PrevArgmaxFrac, 100*PrevOfPast]))
+    else
+      WriteLn('GATE 4 (prev-token head)   : WARN  ',
+        Format('(t-1 argmax-of-past %.1f%%, past-mass share %.0f%%; see README note)',
+          [100*PrevArgmaxFrac, 100*PrevOfPast]));
 
     WriteLn;
     WriteLn('Interpretation: the model cannot predict the unseen first half above');

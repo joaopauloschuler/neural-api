@@ -94,6 +94,47 @@ fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural -Fu../../neural/pas-core-math Ind
 
 Trains and self-checks in well under a minute on a single core (~17 s observed).
 
+## The previous-token head (layer-1 attention heatmap)
+
+The two-head *composition* only works if layer 1 actually behaves like a
+previous-token head, so the example now reads layer 1's `.AttentionWeights`
+too and renders it. Rows are queries `i`, columns are keys `j`:
+
+```
+        key: 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9
+  q 0 tok 7 : @
+  q 1 tok 9 : = +
+  q 2 tok11 : . - +
+  q 3 tok 8 :   . - +
+  q 4 tok 1 :     . - +
+  q 5 tok10 :       . - +
+  q 6 tok 3 :         . - =
+  q 7 tok 6 :           . - =
+  q 8 tok 0 :             . - +
+  q 9 tok11 :               . - +
+  q10 tok 7 :                 . - +
+  q11 tok 9 :                   : = :
+  q12 tok11 :                   . : : .
+  q13 tok 8 : .   .           . . . . . .
+  ...
+```
+
+**Honest reading.** This trained layer-1 head is a *local-recency window*
+dominated by self-attention: each query `i` keeps the brightest cell on itself
+(key `i`, the `+`/`=` on the diagonal) and spreads the rest over the nearest
+earlier tokens. So the **raw** mass on the previous token `i-1` is only modest
+(~`0.32`). What is unambiguous is that among the *strictly-earlier* tokens
+(`j < i`), the immediately-previous token `i-1` is the clear winner — it is the
+**argmax of the past on ~100% of first-half rows** and carries **~70% of the
+past mass** (the `-` cell that sits just left of the diagonal). That
+backward-looking "what came right before me" signal is exactly what the
+layer-2 induction head reads back, so the example asserts on those two
+past-relative measures rather than pretending the head is a razor-sharp `t-1`
+stripe (it is not — see the budget notes). In the deep repeated tail
+(`q13`..`q19`) the layer-1 map diffuses; the composition does not need those
+rows sharp, so the readout is taken over the first-half rows where the window
+is clean.
+
 ## The induction stripe (layer-2 attention heatmap)
 
 A glyph-shaded ASCII heatmap of the layer-2 head for one probe. Rows are queries
@@ -140,12 +181,17 @@ First-half  mean cross-entropy           : 2.6417
 Second-half mean cross-entropy           : 0.0780
 In-context learning score (CE2 - CE1)    : -2.5637   (want << 0)
 
+Prev-token (layer-1) t-1 stripe mass     : 0.3200
+Uniform-causal baseline mass (layer-1)   : 0.2143
+Prev-token t-1 share of strictly-past    : 0.7003
+Prev-token t-1 argmax-of-past fraction   : 1.0000
 Prefix-match (induction) stripe mass     : 0.9783
 Uniform-causal baseline mass             : 0.0688
 
 GATE 1 (in-context copy)   : PASS  (2nd-half 99.7% >> 1st-half 8.5%)
 GATE 2 (ICL score < 0)     : PASS  (CE2-CE1 = -2.5637)
 GATE 3 (induction stripe)  : PASS  (stripe 0.9783 > 2x uniform 0.0688)
+GATE 4 (prev-token head)   : PASS  (t-1 is argmax-of-past on 100.0% of rows, 70% of past mass)
 ```
 
 ## What the built-in checks assert
@@ -161,6 +207,14 @@ GATE 3 (induction stripe)  : PASS  (stripe 0.9783 > 2x uniform 0.0688)
 3. **Induction stripe (rendered + scored; soft gate):** mean attention mass that
    second-half queries place on the induction-target key `i-L+1`, compared to
    the uniform-causal baseline. Asserts `stripe > 2x baseline` and `stripe > 0.25`.
+4. **Previous-token head (rendered + scored; soft gate):** the matching *layer-1*
+   readout. Over the first-half query rows, the immediately-previous token `i-1`
+   is the **argmax over the strictly-earlier keys** (self excluded) and carries
+   the bulk of the past mass. Asserts `t-1 argmax-of-past fraction > 0.9`
+   **and** `t-1 share of strictly-past mass > 0.5`. Together with gate 3 this
+   pins **both** halves of the two-head composition the paper identifies — the
+   layer-1 previous-token head feeding the layer-2 prefix-matching head — not
+   just the layer-2 head.
 
 ## Budget notes (honesty)
 
@@ -168,11 +222,19 @@ GATE 3 (induction stripe)  : PASS  (stripe 0.9783 > 2x uniform 0.0688)
   finish in ~17 s on one CPU core, far under the 5-minute limit, so no claim had
   to be reduced. The headline near-100% second-half accuracy is the *full*
   result, not a reduced one.
-- Gate 3 (the attention-readout check) is implemented as a **soft** gate per the
-  task spec: the heatmap is always rendered and the stripe score is always
-  printed, but only gates 1 and 2 hard-`Halt(1)`. In practice gate 3 also passes
-  strongly (stripe mass ~0.98 vs uniform ~0.07), so the soft treatment is purely
-  conservative — the attention readout did *not* prove fiddly here.
+- Gates 3 and 4 (the attention-readout checks) are implemented as **soft** gates
+  per the task spec: both heatmaps are always rendered and the scores always
+  printed, but only gates 1 and 2 hard-`Halt(1)`. In practice both pass strongly.
+- **The layer-1 head is NOT a razor-sharp `t-1` stripe**, and the example does
+  not pretend it is. The trained head is a self-dominated local-recency window:
+  the raw mass it puts on the previous token `i-1` is only ~`0.32` (vs a ~`0.21`
+  uniform baseline). The honest, robust signal is *relative to the past*: among
+  the strictly-earlier keys, `i-1` is the argmax on ~100% of first-half rows and
+  holds ~70% of the past mass. Gate 4 asserts those two past-relative numbers
+  (`> 0.9` and `> 0.5`), comfortably below the observed `1.00`/`0.70`, instead of
+  asserting a clean `t-1`-mass threshold the model does not actually achieve.
+  This is the layer-1 analogue of the layer-2 stripe, measured the way the data
+  actually behaves.
 - A single repeat (prefix concatenated once) is enough to make the second half
   fully determined; more repeats were unnecessary and would only enlarge the
   sequence and slow training.
