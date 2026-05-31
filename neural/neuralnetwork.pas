@@ -13625,9 +13625,10 @@ end;
 procedure TNNetDifferentialAttention.Compute();
 var
   StartTime: double;
-  SeqLen, i, j, d: integer;
-  Score1, Score2, Max1, Max2, Sum1, Sum2, AccVal, lambdaVal: TNeuralFloat;
+  SeqLen, i, j: integer;
+  Score1, Score2, Max1, Max2, Sum1, Sum2, lambdaVal: TNeuralFloat;
   Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -13639,6 +13640,10 @@ begin
   begin
     // 1) Scaled sub-head scores into FAttn[*,i,0] (map 1: Q1.K1) and
     //    FAttn2[*,i,0] (map 2: Q2.K2). Q1=Q[0..h-1], Q2=Q[h..d_k-1]; likewise K.
+    //    The depth axis is contiguous, so each sub-head score is an AVX dot
+    //    product over FHalfDk floats: Q1 at GetRawPtr(i,0,0), K1 at
+    //    GetRawPtr(j,0,FDk); Q2 at GetRawPtr(i,0,FHalfDk), K2 at
+    //    GetRawPtr(j,0,FDk+FHalfDk).
     Max1 := -1e30;
     Max2 := -1e30;
     for j := 0 to SeqLen - 1 do
@@ -13650,16 +13655,11 @@ begin
       end
       else
       begin
-        Score1 := 0;
-        Score2 := 0;
-        for d := 0 to FHalfDk - 1 do
-        begin
-          // Q1.K1: Q depth d, K depth FDk+d.
-          Score1 := Score1 + Prev[i, 0, d] * Prev[j, 0, FDk + d];
-          // Q2.K2: Q depth FHalfDk+d, K depth FDk+FHalfDk+d.
-          Score2 := Score2 + Prev[i, 0, FHalfDk + d] *
-            Prev[j, 0, FDk + FHalfDk + d];
-        end;
+        Score1 := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FHalfDk);
+        Score2 := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, FHalfDk), Prev.GetRawPtr(j, 0, FDk + FHalfDk),
+          FHalfDk);
         FAttn[j, i, 0] := Score1 * FInvSqrtHalfDk;
         FAttn2[j, i, 0] := Score2 * FInvSqrtHalfDk;
       end;
@@ -13682,15 +13682,15 @@ begin
       for j := 0 to SeqLen - 1 do FAttn[j, i, 0] := FAttn[j, i, 0] / Sum1;
     if Sum2 > 0 then
       for j := 0 to SeqLen - 1 do FAttn2[j, i, 0] := FAttn2[j, i, 0] / Sum2;
-    // 3) Output[i,d] = sum_j (Attn1[i,j] - lambdaVal*Attn2[i,j]) * V[j,d].
-    for d := 0 to FDk - 1 do
-    begin
-      AccVal := 0;
-      for j := 0 to SeqLen - 1 do
-        AccVal := AccVal +
-          (FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0]) * Prev[j, 0, 2 * FDk + d];
-      FOutput[i, 0, d] := AccVal;
-    end;
+    // 3) Output[i,d] = sum_j (Attn1[i,j] - lambdaVal*Attn2[i,j]) * V[j,d]. V is
+    //    contiguous along depth, so accumulate j-outer with AVX MulAdd over FDk
+    //    floats (the old d-outer / j-inner order was strided over j).
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for j := 0 to FDk - 1 do
+      OutPtr^[j] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0], FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -13698,11 +13698,11 @@ end;
 procedure TNNetDifferentialAttention.Backpropagate();
 var
   StartTime: double;
-  SeqLen, i, j, k, d: integer;
+  SeqLen, i, j, k: integer;
   Prev, PrevErr: TNNetVolume;
   dAttn1, dAttn2: array of TNeuralFloat;
   dScore1, dScore2: array of TNeuralFloat;
-  SumDA1, SumDA2, dS, OutErr, lambdaVal, gradLambda, dV, dotV: TNeuralFloat;
+  SumDA1, SumDA2, dS, lambdaVal, gradLambda, dV, dotV: TNeuralFloat;
   localNeuron: TNNetNeuron;
   hasInputGrad: boolean;
 begin
@@ -13731,16 +13731,16 @@ begin
     //   dAttn1[j]  = sum_d dOut[i,d]*V[j,d]
     //   dAttn2[j]  = -lambdaVal * sum_d dOut[i,d]*V[j,d]
     //   dLambda   += -sum_d (sum_j Attn2[j]*V[j,d]) * dOut[i,d]
+    // Depth is contiguous: dV accumulation is an AVX MulAdd and dotV (= dAttn1)
+    // is an AVX dot product (dOut[i] . V[j]) over FDk floats.
     for j := 0 to SeqLen - 1 do
     begin
-      dotV := 0;
       dV := FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0];
-      for d := 0 to FDk - 1 do
-      begin
-        OutErr := FOutputError[i, 0, d];
-        if hasInputGrad then PrevErr.Add(j, 0, 2 * FDk + d, dV * OutErr);
-        dotV := dotV + OutErr * Prev[j, 0, 2 * FDk + d];
-      end;
+      if hasInputGrad then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk),
+          FOutputError.GetRawPtr(i, 0, 0), dV, FDk);
+      dotV := TNNetVolume.DotProduct(
+        FOutputError.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
       dAttn1[j] := dotV;
       dAttn2[j] := -lambdaVal * dotV;
       // lambdaVal gradient: -Attn2[j] * (sum_d dOut[i,d]*V[j,d]).
@@ -13763,23 +13763,29 @@ begin
     // ---- Gradients w.r.t the half-width sub-heads of Q and K ----
     // map1 score = invSqrtHalfDk * sum_d Q1[i,d]*K1[j,d]   (Q depth d, K depth FDk+d)
     // map2 score = invSqrtHalfDk * sum_d Q2[i,d]*K2[j,d]   (Q depth h+d, K depth FDk+h+d)
+    // Depth is contiguous: dQ1[i] += dS1*K1[j] and dK1[j] += dS1*Q1[i] (and the
+    // Q2/K2 sub-head likewise) are AVX MulAdd over FHalfDk floats. Q1 at
+    // GetRawPtr(i,0,0), K1 at GetRawPtr(j,0,FDk); Q2 at GetRawPtr(i,0,FHalfDk),
+    // K2 at GetRawPtr(j,0,FDk+FHalfDk).
     if hasInputGrad then
       for j := 0 to SeqLen - 1 do
       begin
         dS := dScore1[j] * FInvSqrtHalfDk;
         if dS <> 0 then
-          for d := 0 to FHalfDk - 1 do
-          begin
-            PrevErr.Add(i, 0, d, dS * Prev[j, 0, FDk + d]);
-            PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
-          end;
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+            Prev.GetRawPtr(j, 0, FDk), dS, FHalfDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+            Prev.GetRawPtr(i, 0, 0), dS, FHalfDk);
+        end;
         dS := dScore2[j] * FInvSqrtHalfDk;
         if dS <> 0 then
-          for d := 0 to FHalfDk - 1 do
-          begin
-            PrevErr.Add(i, 0, FHalfDk + d, dS * Prev[j, 0, FDk + FHalfDk + d]);
-            PrevErr.Add(j, 0, FDk + FHalfDk + d, dS * Prev[i, 0, FHalfDk + d]);
-          end;
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, FHalfDk),
+            Prev.GetRawPtr(j, 0, FDk + FHalfDk), dS, FHalfDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk + FHalfDk),
+            Prev.GetRawPtr(i, 0, FHalfDk), dS, FHalfDk);
+        end;
       end;
   end;
   // ---- Step lambda like TNNetReZero (delta += -FLearningRate * grad) ----
