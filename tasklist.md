@@ -400,6 +400,46 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
+- [ ] Speculative decoding demo (`examples/SpeculativeDecoding/`) — reproduce the
+      Leviathan et al. 2023 / Chen et al. 2023 "speculative sampling" trick on a
+      TINY pure-CPU pair of next-token models, and prove the headline property: the
+      sampled output is DISTRIBUTED EXACTLY as if drawn from the big model alone,
+      while calling the big model far fewer times. Mechanism: a small fast DRAFT
+      model autoregressively proposes a block of K candidate tokens `x_1..x_K`
+      (cheap, K serial draft steps); the big TARGET model then scores all K+1
+      positions in ONE batched forward pass over the prefix+draft; walk the block
+      left-to-right and ACCEPT token `x_i` with probability `min(1, p_target(x_i) /
+      p_draft(x_i))`, and on the FIRST rejection resample that position from the
+      renormalised residual `norm(max(0, p_target - p_draft))` and discard the rest
+      — so each verification pass commits between 1 and K+1 tokens. This is a
+      genuinely new mechanism for this repo: nothing here does the
+      accept/reject-with-residual-resample correction, and it is DISTINCT from the
+      open KV-cache entry above (that flattens the per-step cost of ONE model;
+      speculative decoding reduces the NUMBER of big-model steps and is orthogonal —
+      they compose), from DeepEnsembleUncertainty / KnowledgeDistillation (combine
+      model OUTPUTS or transfer knowledge; they do not preserve the target's exact
+      sampling distribution), and from EarlyExitNetwork (one model exits early; here
+      two separate models cooperate). Headline payoffs, both visible on the
+      terminal: (a) the EXACTNESS check — sample N tokens twice from the same fixed
+      prefix and seed stream, once by plain target-only sampling and once via the
+      speculative loop, and assert the empirical token histograms match to within
+      sampling noise (the built-in faithfulness anchor; with the draft == target the
+      acceptance rule reduces to always-accept and the two paths are bit-for-bit
+      identical — pin that degenerate case exactly); (b) the SPEEDUP story — chart
+      mean accepted-tokens-per-verification and big-model-calls-saved as the
+      draft/target agreement varies (train the draft on the same toy so it is a
+      decent-but-imperfect approximator), showing the accept rate (hence speedup)
+      rises with agreement and falls as K outruns the draft's reliability. Scope it
+      forking an existing tiny char-level next-token harness (e.g.
+      examples/InductionHeads/ or TokenShiftBaseline) so both models are small
+      TNNet decoders sharing the toy vocabulary; the draft is just a shallower /
+      narrower TNNet. Feasibility notes in the honest "what did NOT fit the budget"
+      style the Grokking entry uses: v1 is FORWARD-ONLY (both models pretrained,
+      generation only — no gradient surgery, so the SetBatchUpdate gotchas do not
+      apply) and recomputes the prefix each verification pass (correct, simple); the
+      KV-cache composition that removes that recompute is the explicit follow-up,
+      pinned to the open KV-cache task above. Keep vocab/seq/K tiny (K in {2,4})
+      so the whole demo stays well inside the <5-min pure-CPU budget.
 - [ ] TNNetDiagonalSSM follow-up: add it as the fourth contender in the
       open "causal-conv vs token-shift vs SDPA on the same toy next-token
       task" experiment — its selling point is matching attention quality
