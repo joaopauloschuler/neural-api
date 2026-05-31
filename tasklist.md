@@ -457,6 +457,24 @@ breakdown:
       recognition heads.
 - [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
       straight-through assignment plus commitment/codebook losses.
+- [ ] TNNetQuantileLoss (pinball) regression head — verified absent from neural/
+      *.pas AND this tasklist (2026-05-31; the existing regression heads are MSE /
+      SmoothL1 / LogCosh, and the existing loss heads — Triplet, InfoNCE, Center,
+      CosineEmbedding, Tversky, Dice, LabelSmoothing — are all classification /
+      metric / segmentation, so this is NOT a near-duplicate). Pinball loss
+      `L_q(e)=max(q*e,(q-1)*e)` for a target quantile q, so one model trained on
+      q in {0.1,0.5,0.9} emits a calibrated PREDICTION INTERVAL rather than a point
+      estimate. Implement as a self-contained head (TNNetIdentity passthrough +
+      Backpropagate that writes the asymmetric subgradient; q stored in the
+      structure string) per [[loss-layer-pattern]], with the loss-head numerical /
+      forward-equality test trio. Headline example (examples/QuantileRegression/):
+      fit the three quantiles on a HETEROSCEDASTIC 1-D dataset (noise growing with
+      x), plot the q=0.5 median plus the [q=0.1,q=0.9] band as an ASCII chart, and
+      print empirical interval COVERAGE (~80% of held-out points should fall inside
+      the band) as the built-in PASS/FAIL check. Distinct from the existing
+      single-model-vs-ensemble uncertainty examples (MCDropoutUncertainty,
+      DeepEnsembleUncertainty, ConformalPrediction) — this is a single
+      deterministic forward pass with no sampling and no calibration set.
 
 ### Training infrastructure (the "missing plumbing")
 - [ ] TNeuralLRScheduler interface (`function NextLR(Epoch, Step): TNeuralFloat;`)
