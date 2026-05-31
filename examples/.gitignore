@@ -12,5 +12,6 @@ EchoStateNetwork/EchoStateNetwork
 EuclideanNormHead/EuclideanNormHead
 HardConcreteSparsity/HardConcreteSparsity
 ModelSummaryDemo/ModelSummaryDemo
+MuonOptimizer/MuonOptimizer
 PerplexityEval/PerplexityEval
 RandomLabelMemorization/RandomLabelMemorization
