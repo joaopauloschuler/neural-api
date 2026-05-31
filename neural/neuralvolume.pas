@@ -6263,8 +6263,8 @@ begin
 
     for I := 0 to vHigh do
     begin
-      // LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
-      LocalValue := pcr_expf( FData[I] );
+      LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+      // LocalValue := pcr_expf( FData[I] );
       FData[I] := LocalValue;
       TotalSum := TotalSum + FData[I];
     end;
@@ -6322,7 +6322,8 @@ begin
         I := StartPointPos;
         for CountD := 0 to MaxD do
         begin
-          LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
+          // LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
+          LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
           FData[I] := LocalValue;
           TotalSum := TotalSum + LocalValue;
           Inc(I);
@@ -6435,7 +6436,8 @@ begin
           I := StartPointPos;
           for CountD := 0 to ChannelsPerGroup - 1 do
           begin
-            LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
+            //LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
+            LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
             FData[I] := LocalValue;
             TotalSum := TotalSum + LocalValue;
             Inc(I);
