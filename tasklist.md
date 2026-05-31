@@ -1494,3 +1494,39 @@ rather than acted on.
       Fisher, then train on task B with an L2 penalty pulling high-Fisher
       params back toward their task-A values; chart task-A retention with and
       without the penalty.
+
+### Loss-landscape degeneracy (Singular Learning Theory)
+- [ ] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
+      — estimate the *local learning coefficient* (LLC, an empirical
+      RLCT) of a trained network from Singular Learning Theory (Watanabe;
+      Lau, Murfet, Wei et al. 2023, "Quantifying Degeneracy in Singular
+      Models via the LLC"). This measures the volume-scaling /
+      effective-dimensionality of the minimum the optimizer settled into —
+      a fundamentally DIFFERENT quantity from the already-landed
+      `HessianCurvatureReport` / [[EdgeOfStability]] top-eigenvalue (which
+      is purely 2nd-order and blind to flat, degenerate directions that the
+      LLC is precisely designed to count). Estimator is the SGLD-based
+      WBIC/free-energy form: from the trained weights `w*`, run a short
+      tempered SGLD chain that samples the local posterior with a Gaussian
+      anchor `gamma/2 * ||w - w*||^2` pinning it to the basin, then
+      `LLC_hat = n*beta * ( mean_chain[ L(w) ] - L(w*) )` where `L` is the
+      average training NLL, `n` the sample count, and `beta = 1/log(n)` the
+      WBIC inverse-temperature. Pure CPU, tiny MLP. The honest headline (in
+      the "what did NOT fit the budget" style the [[Grokking]] entry uses):
+      report the LLC and contrast it with the raw parameter count to show
+      `LLC_hat << dim(w)` — the network uses far fewer *effective* degrees
+      of freedom than it has weights. A clean built-in sanity check: a
+      deliberately over-parameterised net (duplicate-then-halve a hidden
+      layer so two units are forced redundant) should have a LOWER LLC than
+      a minimal net fitting the same function, because the duplicated
+      directions are flat/degenerate. The SGLD chain reuses the existing
+      backward pass (no new gradient machinery); the only new infrastructure
+      is the anchored-Langevin weight update + chain averaging, which can
+      live entirely inside the report method. NOTE the known pitfall to call
+      out in the README: LLC estimates are sensitive to the SGLD step size
+      `epsilon` and localisation `gamma` — ship a fixed, documented
+      (epsilon, gamma, chain-length) and a one-line caveat that the absolute
+      value is calibration-dependent but the *ordering* (minimal < redundant
+      < random-init) is the robust, reproducible signal. Pairs with
+      [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
+      degeneracy-aware generalization of "effective parameter count").
