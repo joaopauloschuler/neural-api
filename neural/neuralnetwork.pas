@@ -5277,6 +5277,32 @@ type
       // Returns the last layer of the block.
       function AddTransformerEncoderBlock(d_model, Heads, d_ff: integer;
         PreNorm: boolean = true; CausalMask: boolean = false): TNNetLayer;
+      // Composite builder assembling a standard transformer DECODER block by
+      // stacking three residual sub-blocks on the current decoder stream:
+      //   1. CAUSAL multi-head self-attention (same idiom as the encoder block
+      //      with CausalMask=True: a QKV slab projection d_model -> 3*d_model
+      //      feeds AddMultiHeadSelfAttention).
+      //   2. Multi-head CROSS-attention: Query from the current decoder stream,
+      //      Key|Value from the explicit EncoderOutput layer
+      //      (AddMultiHeadCrossAttention does its own Q/K/V projections).
+      //   3. Token-wise SwiGLU feed-forward
+      //      (PointwiseConvLinear(2*d_ff) -> TNNetSwiGLU -> PointwiseConvLinear(d_model)).
+      // Each sub-block is a residual (TNNetSum back to the sub-block input) with
+      // PreNorm/PostNorm LayerNorm placement matching AddTransformerEncoderBlock:
+      //   PreNorm=True  (default):
+      //     x := x + CausalMHA(LayerNorm(x));
+      //     x := x + CrossMHA(LayerNorm(x), EncoderOutput);
+      //     x := x + SwiGLU-FFN(LayerNorm(x))
+      //   PreNorm=False (post-norm):
+      //     x := LayerNorm(x + CausalMHA(x));
+      //     x := LayerNorm(x + CrossMHA(x, EncoderOutput));
+      //     x := LayerNorm(x + SwiGLU-FFN(x))
+      // Every projection is token-wise (1x1 conv) so the (SeqLen,1,d_model)
+      // sequence axis is preserved; output shape (SeqLen,1,d_model) matches the
+      // decoder-stream input so blocks can be stacked. EncoderOutput must be a
+      // non-nil (KVSeqLen,1,d_model) layer. Returns the last layer of the block.
+      function AddTransformerDecoderBlock(d_model, Heads, d_ff: integer;
+        EncoderOutput: TNNetLayer; PreNorm: boolean = true): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -24989,6 +25015,55 @@ begin
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
   AddMultiHeadSelfAttention(d_model, Heads, CausalMask);
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+
+  // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
+  // the depth channel-wise, so the inner projection must be 2*d_ff.
+  AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
+  AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddTransformerDecoderBlock(d_model, Heads, d_ff: integer;
+  EncoderOutput: TNNetLayer; PreNorm: boolean = true): TNNetLayer;
+var
+  BranchInput, QuerySource: TNNetLayer;
+begin
+  if EncoderOutput = nil then
+    FErrorProc('AddTransformerDecoderBlock requires a non-nil EncoderOutput.');
+
+  // ---- Self-attention sub-block: residual around CAUSAL multi-head ----
+  // self-attention. Replicated inline (not via AddPreNormResidual/
+  // AddPostNormResidual) because the attention sublayer adds MANY layers
+  // through GetLastLayer() chaining and cannot be expressed as a pre-built
+  // "array of TNNetLayer".
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
+  // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
+  AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
+  AddMultiHeadSelfAttention(d_model, Heads, {CausalMask=}true);
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+
+  // ---- Cross-attention sub-block: residual around multi-head ----
+  // cross-attention. Query comes from the (optionally normed) decoder stream;
+  // Key|Value come from the explicit encoder output. AddMultiHeadCrossAttention
+  // does its own token-wise Q/K/V projections, so we hand it the source layers
+  // directly (it takes EXPLICIT source refs).
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  QuerySource := GetLastLayer();
+  AddMultiHeadCrossAttention(d_model, Heads, QuerySource, EncoderOutput,
+    {CausalMask=}false);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
 

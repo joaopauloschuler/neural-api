@@ -417,6 +417,7 @@ type
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
     procedure TestTransformerEncoderBlockGradientCheck;
+    procedure TestTransformerDecoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
     procedure TestHardConcreteGradientCheck;
     procedure TestHardConcreteSerializationRoundTrip;
@@ -10821,6 +10822,120 @@ begin
   Heads := 2;
   SeqLen := 3;
   d_ff := 16;
+  RunOne(true);
+  RunOne(false);
+end;
+
+procedure TTestNeuralNumerical.TestTransformerDecoderBlockGradientCheck;
+// AddTransformerDecoderBlock builder: CAUSAL self-attention residual ->
+// cross-attention residual (Q from decoder stream, K|V from a SEPARATE encoder
+// output, KVSeqLen=4 deliberately != decoder SeqLen=3) -> SwiGLU FFN residual.
+// Verified for BOTH PreNorm=True and PreNorm=False. Tiny shape: d_model=8,
+// heads=2, decoder seq=3, d_ff=8. Output must stay on the decoder grid
+// (SeqLen,1,d_model). We numerically check the DECODER-input gradient.
+var
+  d_model, Heads, SeqLen, KVSeqLen, d_ff: integer;
+
+  procedure RunOne(PreNorm: boolean);
+  var
+    NN: TNNet;
+    DecIn, EncOut: TNNetLayer;
+    Input, InputPlus, EncData, Desired: TNNetVolume;
+    i: integer;
+    epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+    function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+    var k: integer; diff: TNeuralFloat;
+    begin
+      DecIn.Output.Copy(AInput);
+      EncOut.Output.Copy(EncData);
+      NN.Compute(DecIn.Output); // re-runs from both input branches
+      Result := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+        Result := Result + 0.5 * diff * diff;
+      end;
+    end;
+
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, d_model);
+    InputPlus := TNNetVolume.Create(SeqLen, 1, d_model);
+    EncData := TNNetVolume.Create(KVSeqLen, 1, d_model);
+    Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+    epsilon := 0.001;
+    maxErr := 0;
+    try
+      DecIn := NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+      EncOut := NN.AddLayerAfter(TNNetInput.Create(KVSeqLen, 1, d_model, 1), 0);
+      // Bring the active layer back to the decoder stream before building the
+      // block (AddLayerAfter above left the encoder input as the last layer).
+      NN.AddLayerAfter(TNNetIdentity.Create(), DecIn);
+      NN.AddTransformerDecoderBlock(d_model, Heads, d_ff, EncOut, PreNorm);
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(true);
+
+      // Output shape must match the decoder input shape so blocks can stack.
+      AssertTrue('TDB output SizeX', NN.GetLastLayer.Output.SizeX = SeqLen);
+      AssertTrue('TDB output SizeY', NN.GetLastLayer.Output.SizeY = 1);
+      AssertTrue('TDB output Depth', NN.GetLastLayer.Output.Depth = d_model);
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+      for i := 0 to EncData.Size - 1 do
+        EncData.Raw[i] := Cos(i * 0.37) * 0.8 - 0.2;
+      for i := 0 to Desired.Size - 1 do
+        Desired.Raw[i] := Cos(i * 0.31);
+
+      // Forward must be finite.
+      DecIn.Output.Copy(Input);
+      EncOut.Output.Copy(EncData);
+      NN.Compute(DecIn.Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('TDB finite forward at ' + IntToStr(i),
+          not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+          not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+
+      for i := 0 to Input.Size - 1 do
+      begin
+        InputPlus.Copy(Input);
+        InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(InputPlus);
+        InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+        lossMinus := ComputeLoss(InputPlus);
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        DecIn.Output.Copy(Input);
+        EncOut.Output.Copy(EncData);
+        NN.Compute(DecIn.Output);
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('TDB PreNorm=' + BoolToStr(PreNorm, true) +
+          ' input gradient at ' + IntToStr(i) +
+          ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+      InputPlus.Free;
+      EncData.Free;
+      Desired.Free;
+    end;
+  end;
+
+begin
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  KVSeqLen := 4;
+  d_ff := 8;
   RunOne(true);
   RunOne(false);
 end;
