@@ -158,12 +158,11 @@
     </CodeGeneration>
     <Other>
       <CustomOptions Value="-dRelease
--dAVX"/>
-      <OtherDefines Count="4">
+-dAVX2"/>
+      <OtherDefines Count="3">
         <Define0 Value="AVX2"/>
         <Define1 Value="Release"/>
         <Define2 Value="CheckRange"/>
-        <Define3 Value="AVX"/>
       </OtherDefines>
     </Other>
   </CompilerOptions>

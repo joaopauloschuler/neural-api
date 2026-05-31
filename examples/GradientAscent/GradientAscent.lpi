@@ -51,12 +51,11 @@
             </Debugging>
           </Linking>
           <Other>
-            <CustomOptions Value="-dAVX"/>
-            <OtherDefines Count="4">
+            <CustomOptions Value="-dAVX2"/>
+            <OtherDefines Count="3">
               <Define0 Value="OpenCL"/>
-              <Define1 Value="AVX"/>
-              <Define2 Value="AVX2"/>
-              <Define3 Value="AVX512"/>
+              <Define1 Value="AVX2"/>
+              <Define2 Value="AVX512"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -87,15 +86,14 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dRelease
--dAVX"/>
-            <OtherDefines Count="7">
+-dAVX2"/>
+            <OtherDefines Count="6">
               <Define0 Value="AVX2"/>
               <Define1 Value="Release"/>
               <Define2 Value="OpenCL"/>
               <Define3 Value="MakeQuick"/>
               <Define4 Value="AVX512"/>
-              <Define5 Value="AVX"/>
-              <Define6 Value="Debug"/>
+              <Define5 Value="Debug"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -159,7 +157,7 @@
     </Linking>
     <Other>
       <CustomOptions Value="-dRelease
--dAVX"/>
+-dAVX2"/>
     </Other>
   </CompilerOptions>
   <Debugging>

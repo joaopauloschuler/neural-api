@@ -62,10 +62,10 @@
       </Debugging>
     </Linking>
     <Other>
-      <CustomOptions Value="-dAVX
+      <CustomOptions Value="-dAVX2
 -dRelease"/>
       <OtherDefines Count="2">
-        <Define0 Value="AVX"/>
+        <Define0 Value="AVX2"/>
         <Define1 Value="Release"/>
       </OtherDefines>
     </Other>

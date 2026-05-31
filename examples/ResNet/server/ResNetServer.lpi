@@ -78,13 +78,12 @@
       </Debugging>
     </Linking>
     <Other>
-      <CustomOptions Value="-dAVX
+      <CustomOptions Value="-dAVX2
 -dRelease"/>
-      <OtherDefines Count="4">
-        <Define0 Value="AVX"/>
-        <Define1 Value="AVX2"/>
-        <Define2 Value="OpenCL"/>
-        <Define3 Value="Release"/>
+      <OtherDefines Count="3">
+        <Define0 Value="AVX2"/>
+        <Define1 Value="OpenCL"/>
+        <Define2 Value="Release"/>
       </OtherDefines>
     </Other>
   </CompilerOptions>
