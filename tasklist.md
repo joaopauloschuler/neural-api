@@ -571,12 +571,6 @@ rather than acted on.
       shows the separation trend WITHIN ArcFace across margins m in {0,0.3,0.5},
       not ArcFace-vs-softmax head to head. Pairs with [[FeatureSeparability]] and
       the open TNNetCenterLoss SOFTMAX-JOINT follow-up.
-- [ ] TNNetCosineEmbeddingLoss follow-up: a tiny
-      siamese-pair embedding micro-example — train two shared-weight MLP
-      branches whose outputs are concatenated into the `a|b|y` layout, on a
-      synthetic "same vs different class" pair task, and print the learned
-      same-pair vs different-pair cosine histograms. Headline use case for
-      the landed head; pairs with [[TripletEmbedding]].
 - [ ] TNNetKLDivergence distillation follow-up
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
