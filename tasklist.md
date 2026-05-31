@@ -37,7 +37,7 @@ rather than acted on.
 ## New layer types
 
 ## Interesting applications / examples
-- [ ] Mahalanobis out-of-distribution detector (`examples/MahalanobisOOD/`) —
+- [X] Mahalanobis out-of-distribution detector (`examples/MahalanobisOOD/`) —
       reproduce Lee et al. 2018 "A Simple Unified Framework for Detecting
       Out-of-Distribution Samples" on a TINY pure-CPU target. Train a small
       classifier on an IN-distribution split (e.g. synthetic Gaussian blobs for
