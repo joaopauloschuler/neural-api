@@ -9,7 +9,8 @@ uses
   Classes, consoletestrunner,
   TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
   TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
-  TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical;
+  TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
+  TestNeuralScheduler;
 
 type
   TMyTestRunner = class(TTestRunner)
