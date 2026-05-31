@@ -9353,7 +9353,7 @@ begin
       begin
         a := FPrevLayer.FOutput[X, Y, D];
         b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-        sigmoidVal := 1 / (1 + Exp(-b));
+        sigmoidVal := 1 / (1 + pcr_expf(-b));
         swishVal := b * sigmoidVal;
         FOutput[X, Y, D] := a * swishVal;
       end;
@@ -9384,7 +9384,7 @@ begin
         begin
           a := FPrevLayer.FOutput[X, Y, D];
           b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-          sigmoidVal := 1 / (1 + Exp(-b));
+          sigmoidVal := 1 / (1 + pcr_expf(-b));
           swishVal := b * sigmoidVal;
           // Swish'(b) = swish + sigmoid * (1 - swish)
           swishDeriv := swishVal + sigmoidVal * (1 - swishVal);
@@ -9436,7 +9436,7 @@ begin
       begin
         a := FPrevLayer.FOutput[X, Y, D];
         b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-        sigmoidVal := 1 / (1 + Exp(-b));
+        sigmoidVal := 1 / (1 + pcr_expf(-b));
         FOutput[X, Y, D] := a * sigmoidVal;
       end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -9466,7 +9466,7 @@ begin
         begin
           a := FPrevLayer.FOutput[X, Y, D];
           b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-          sigmoidVal := 1 / (1 + Exp(-b));
+          sigmoidVal := 1 / (1 + pcr_expf(-b));
           // sigmoid'(b) = sigmoid * (1 - sigmoid)
           sigmoidDeriv := sigmoidVal * (1 - sigmoidVal);
           err := FOutputError[X, Y, D];
@@ -9607,7 +9607,7 @@ begin
       begin
         a := FPrevLayer.FOutput[X, Y, D];
         b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-        tanhVal := Tanh(b);
+        tanhVal := pcr_tanhf(b);
         FOutput[X, Y, D] := a * tanhVal;
       end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -9637,7 +9637,7 @@ begin
         begin
           a := FPrevLayer.FOutput[X, Y, D];
           b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-          tanhVal := Tanh(b);
+          tanhVal := pcr_tanhf(b);
           // tanh'(b) = 1 - tanh^2(b)
           tanhDeriv := 1 - tanhVal * tanhVal;
           err := FOutputError[X, Y, D];
