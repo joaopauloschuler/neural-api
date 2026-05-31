@@ -546,6 +546,12 @@ type
     procedure TestLogGradientCheck;
     procedure TestLogSerializationRoundTrip;
     procedure TestLogExtremeNegativeInputSaturation;
+    procedure TestSoftSignExtremeInputSaturation;
+    procedure TestESwishExtremeInputSaturation;
+    procedure TestAbsNearZeroGradientConvention;
+    procedure TestSquareGradientMagnitudeAtLargeInput;
+    procedure TestSoftMinExtremeInputSaturation;
+    procedure TestClampKinkBoundaryConvention;
     procedure TestExpLogComposeAsIdentity;
     procedure TestReciprocalForward;
     procedure TestReciprocalEpsGuard;
@@ -27088,6 +27094,406 @@ begin
     NNBlur.Free;
     Base.Free;
     Shifted.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftSignExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  v, g: TNeuralFloat;
+  i: integer;
+begin
+  // SoftSign(x) = x / (1 + |x|) is bounded in (-1, 1). Driving it with +/-1e6
+  // (and other extremes) must keep |y| < 1 and must not produce NaN/Inf in
+  // either forward or backward. The analytic derivative 1/(1+|x|)^2 underflows
+  // smoothly toward 0 at large |x| and must stay finite. Mirrors the
+  // HardTanh/SoftCapping extreme-input saturation pattern.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetSoftSign.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    // +/-1e6 is the headline saturation case the tasklist asks for. The
+    // analytic derivative is 1/(1+|x|)^2; at |x|=1e6 that denominator squared
+    // is ~1e12, comfortably inside float range. (Pushing to |x|~1e30 would
+    // square to ~1e60 and overflow float32 with a hardware FP exception, which
+    // is a genuine limitation of the closed-form derivative, not something
+    // this saturation test should pretend is finite.)
+    Input.Raw[0] := 1e6;
+    Input.Raw[1] := -1e6;
+    Input.Raw[2] := 1e5;
+    Input.Raw[3] := -1e5;
+    Input.Raw[4] := 1e3;
+    Input.Raw[5] := -1e3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.3);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('SoftSign saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftSign saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('SoftSign saturation strictly inside (-1, 1) at ' + IntToStr(i) +
+        ' v=' + FloatToStr(v), Abs(v) < 1.0);
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.OutputError.Raw[i];
+      AssertFalse('SoftSign saturation output-grad NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftSign saturation output-grad Inf at ' + IntToStr(i), IsInfinite(v));
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('SoftSign saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('SoftSign saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestESwishExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Beta, vPos, vNeg, g: TNeuralFloat;
+  i: integer;
+begin
+  // ESwish(x) = beta * x * sigmoid(beta*x). As x -> +inf, sigmoid -> 1 so the
+  // output grows like beta*x (positive, large). As x -> -inf, sigmoid -> 0
+  // faster than x grows so the output -> 0 from below. Forward and backward
+  // must both stay finite (no NaN/Inf) at extreme magnitudes.
+  RandSeed := 424242;
+  Beta := 1.25;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetESwish.Create(Beta));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    // Sigmoid(beta*x) saturates by |beta*x| ~ 40, so x = +/-500 (beta*x = +/-625)
+    // fully exercises both asymptotes. We deliberately keep |x| well below the
+    // point where Exp(-beta*x) overflows the (double-precision) RTL Exp at
+    // x ~ -570 and raises a hardware FP exception -- that overflow is a real
+    // numerical limit of the closed-form sigmoid, not a finite value this
+    // saturation test should mask.
+    Input.Raw[0] := 500.0;
+    Input.Raw[1] := -500.0;
+    Input.Raw[2] := 200.0;
+    Input.Raw[3] := -200.0;
+    Input.Raw[4] := 30.0;
+    Input.Raw[5] := -30.0;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.3);
+
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      vPos := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('ESwish saturation forward NaN at ' + IntToStr(i), IsNan(vPos));
+      AssertFalse('ESwish saturation forward Inf at ' + IntToStr(i), IsInfinite(vPos));
+    end;
+
+    // Asymptotic behaviour: large +x -> ~ beta*x (grows large positive);
+    // large -x -> 0 from below (tiny magnitude).
+    vPos := NN.GetLastLayer.Output.Raw[2]; // x = 200
+    vNeg := NN.GetLastLayer.Output.Raw[3]; // x = -200
+    AssertTrue('ESwish(+200) ~ beta*x grows large positive (v=' + FloatToStr(vPos) + ')',
+      vPos > 0.5 * Beta * 200);
+    AssertTrue('ESwish(-200) decays to ~0 from below (v=' + FloatToStr(vNeg) + ')',
+      Abs(vNeg) < 1e-3);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      vPos := NN.GetLastLayer.OutputError.Raw[i];
+      AssertFalse('ESwish saturation output-grad NaN at ' + IntToStr(i), IsNan(vPos));
+      AssertFalse('ESwish saturation output-grad Inf at ' + IntToStr(i), IsInfinite(vPos));
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('ESwish saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('ESwish saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAbsNearZeroGradientConvention;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  y, g: TNeuralFloat;
+  i: integer;
+begin
+  // TNNetAbs.Compute implements y = |x| with the convention (see
+  // neuralnetwork.pas): derivative = +1 for x > 0, -1 for x < 0, and 0 at
+  // exactly x = 0 (sign(0) = 0). We pin THAT convention directly with
+  // hand-picked points and an upstream error of 1 per element, and we
+  // deliberately do NOT central-difference across the x=0 kink.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetAbs.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Input.Raw[0] := 2.5;
+    Input.Raw[1] := -2.5;
+    Input.Raw[2] := 0.0;   // the kink: convention pins derivative to 0 here
+    Input.Raw[3] := 0.75;
+    Input.Raw[4] := -0.75;
+
+    NN.Compute(Input);
+    // Forward: y = |x|.
+    AssertEquals('Abs(2.5)', 2.5, NN.GetLastLayer.Output.Raw[0], 1e-6);
+    AssertEquals('Abs(-2.5)', 2.5, NN.GetLastLayer.Output.Raw[1], 1e-6);
+    AssertEquals('Abs(0)', 0.0, NN.GetLastLayer.Output.Raw[2], 1e-6);
+    AssertEquals('Abs(0.75)', 0.75, NN.GetLastLayer.Output.Raw[3], 1e-6);
+    AssertEquals('Abs(-0.75)', 0.75, NN.GetLastLayer.Output.Raw[4], 1e-6);
+
+    // Backward: feed upstream error = 1 so the input gradient equals the
+    // pinned local derivative sign(x).
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := NN.GetLastLayer.Output.Raw[i] - 1.0;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    g := NN.Layers[0].OutputError.Raw[0];
+    AssertEquals('d|x|/dx at x>0 is +1', 1.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[1];
+    AssertEquals('d|x|/dx at x<0 is -1', -1.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[2];
+    AssertEquals('d|x|/dx at exactly x=0 pinned to 0 (sign(0)=0)', 0.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[3];
+    AssertEquals('d|x|/dx at x>0 is +1', 1.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[4];
+    AssertEquals('d|x|/dx at x<0 is -1', -1.0, g, 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSquareGradientMagnitudeAtLargeInput;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  x, eps, yPlus, yMinus, fd, analytic, g: TNeuralFloat;
+  i: integer;
+const
+  cPoints: array[0..3] of TNeuralFloat = (50.0, -50.0, 120.0, -200.0);
+begin
+  // Square(x) = x^2; analytic derivative 2x grows unboundedly, so the
+  // finite-difference eps used to validate the backward pass must scale with
+  // |x|. We pin forward y = x^2 and compare the analytic input gradient (from
+  // Backpropagate with upstream error = 1) against a magnitude-scaled central
+  // difference at moderately large |x|; nothing may go NaN/Inf.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    NN.AddLayer(TNNetSquare.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to 3 do
+      Input.Raw[i] := cPoints[i];
+
+    NN.Compute(Input);
+    for i := 0 to 3 do
+    begin
+      x := cPoints[i];
+      AssertEquals('Square(' + FloatToStr(x) + ')', x * x,
+        NN.GetLastLayer.Output.Raw[i], Abs(x) * 1e-3 + 1e-3);
+      AssertFalse('Square forward NaN at ' + IntToStr(i),
+        IsNan(NN.GetLastLayer.Output.Raw[i]));
+      AssertFalse('Square forward Inf at ' + IntToStr(i),
+        IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+    end;
+
+    // Upstream error = 1 => input gradient is the analytic local derivative 2x.
+    for i := 0 to 3 do
+      Desired.Raw[i] := NN.GetLastLayer.Output.Raw[i] - 1.0;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    for i := 0 to 3 do
+    begin
+      x := cPoints[i];
+      analytic := 2.0 * x;
+      // eps scaled to input magnitude so the central difference stays valid.
+      eps := Abs(x) * 1e-3;
+      yPlus := (x + eps) * (x + eps);
+      yMinus := (x - eps) * (x - eps);
+      fd := (yPlus - yMinus) / (2 * eps);
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('Square input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('Square input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+      AssertEquals('Square analytic grad matches scaled central diff at x=' +
+        FloatToStr(x), fd, g, Abs(analytic) * 1e-2 + 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftMinExtremeInputSaturation;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Sum, v, g: TNeuralFloat;
+  i: integer;
+begin
+  // SoftMin(x) = softmax(-x): a softmax-family normalization, so the output is
+  // a probability vector (each entry in [0,1], summing to 1) and must stay
+  // finite even when one component is extreme. The internal SoftMax subtracts
+  // the max for stability, so a huge component must not overflow.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    NN.AddLayer(TNNetSoftMin.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Input.Raw[0] := 1e6;    // extreme: softmin gives it ~0 mass
+    Input.Raw[1] := 0.5;
+    Input.Raw[2] := -2.0;
+    Input.Raw[3] := 1.0;
+    Input.Raw[4] := -1e6;   // extreme low: softmin gives it ~all the mass
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Abs(Sin(i * 0.3));
+
+    NN.Compute(Input);
+    Sum := 0;
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.Output.Raw[i];
+      AssertFalse('SoftMin saturation forward NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftMin saturation forward Inf at ' + IntToStr(i), IsInfinite(v));
+      AssertTrue('SoftMin output in [0,1] at ' + IntToStr(i) + ' v=' + FloatToStr(v),
+        (v >= -1e-6) and (v <= 1.0 + 1e-6));
+      Sum := Sum + v;
+    end;
+    AssertEquals('SoftMin output sums to 1 under extreme input', 1.0, Sum, 1e-3);
+    // Smallest input (-1e6) should carry essentially all the probability mass.
+    AssertTrue('SoftMin gives the extreme-low component ~all mass',
+      NN.GetLastLayer.Output.Raw[4] > 0.99);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to Input.Size - 1 do
+    begin
+      v := NN.GetLastLayer.OutputError.Raw[i];
+      AssertFalse('SoftMin saturation output-grad NaN at ' + IntToStr(i), IsNan(v));
+      AssertFalse('SoftMin saturation output-grad Inf at ' + IntToStr(i), IsInfinite(v));
+      g := NN.Layers[0].OutputError.Raw[i];
+      AssertFalse('SoftMin saturation input-grad NaN at ' + IntToStr(i), IsNan(g));
+      AssertFalse('SoftMin saturation input-grad Inf at ' + IntToStr(i), IsInfinite(g));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestClampKinkBoundaryConvention;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  g: TNeuralFloat;
+  MinV, MaxV: TNeuralFloat;
+  i: integer;
+begin
+  // TNNetClamp.Compute (see neuralnetwork.pas) implements y = clamp(x,Min,Max)
+  // with the convention: derivative = 1 STRICTLY inside (Min,Max), and 0 AT or
+  // outside either boundary. The boundary comparisons are x <= MinV and
+  // x >= MaxV, so the derivative at exactly x = MinV and x = MaxV is 0. We pin
+  // the forward clamp and the chosen derivative AT both kinks with hand-picked
+  // inputs straddling the boundaries; no central differences across a kink.
+  RandSeed := 424242;
+  MinV := -1.0;
+  MaxV := 2.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+    NN.AddLayer(TNNetClamp.Create(MinV, MaxV));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Input.Raw[0] := -3.0;   // below min  -> clamped to MinV, deriv 0
+    Input.Raw[1] := MinV;   // exactly at min kink -> deriv 0 (x <= MinV)
+    Input.Raw[2] := 0.5;    // strictly inside -> deriv 1
+    Input.Raw[3] := MaxV;   // exactly at max kink -> deriv 0 (x >= MaxV)
+    Input.Raw[4] := 5.0;    // above max -> clamped to MaxV, deriv 0
+    Input.Raw[5] := -0.25;  // strictly inside -> deriv 1
+
+    NN.Compute(Input);
+    // Forward clamp behaviour.
+    AssertEquals('Clamp(-3) -> MinV', MinV, NN.GetLastLayer.Output.Raw[0], 1e-6);
+    AssertEquals('Clamp(MinV) -> MinV', MinV, NN.GetLastLayer.Output.Raw[1], 1e-6);
+    AssertEquals('Clamp(0.5) passthrough', 0.5, NN.GetLastLayer.Output.Raw[2], 1e-6);
+    AssertEquals('Clamp(MaxV) -> MaxV', MaxV, NN.GetLastLayer.Output.Raw[3], 1e-6);
+    AssertEquals('Clamp(5) -> MaxV', MaxV, NN.GetLastLayer.Output.Raw[4], 1e-6);
+    AssertEquals('Clamp(-0.25) passthrough', -0.25, NN.GetLastLayer.Output.Raw[5], 1e-6);
+
+    // Upstream error = 1 so the input gradient equals the pinned local deriv.
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := NN.GetLastLayer.Output.Raw[i] - 1.0;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    g := NN.Layers[0].OutputError.Raw[0];
+    AssertEquals('Clamp deriv below min is 0', 0.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[1];
+    AssertEquals('Clamp deriv AT min kink is 0 (x<=MinV)', 0.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[2];
+    AssertEquals('Clamp deriv strictly inside is 1', 1.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[3];
+    AssertEquals('Clamp deriv AT max kink is 0 (x>=MaxV)', 0.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[4];
+    AssertEquals('Clamp deriv above max is 0', 0.0, g, 1e-6);
+    g := NN.Layers[0].OutputError.Raw[5];
+    AssertEquals('Clamp deriv strictly inside is 1', 1.0, g, 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

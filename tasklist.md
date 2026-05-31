@@ -873,24 +873,24 @@ rather than acted on.
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
       "no-central-difference, hand-picked kink convention" pattern
       repeats. Capture as `AssertKinkDerivative(layer, x_kink, expected_dydx)`.
-- [ ] TNNetClamp kink-region test at `x = MinValue` and `x = MaxValue`.
+- [X] TNNetClamp kink-region test at `x = MinValue` and `x = MaxValue`.
 - [ ] TNNetHardShrink / TNNetSoftShrink kink-region tests at hand-picked
       inputs (no central differences).
-- [ ] TNNetSoftSign saturation test on ±1e6: assert `|y| < 1` and
+- [X] TNNetSoftSign saturation test on ±1e6: assert `|y| < 1` and
       Backpropagate doesn't NaN.
-- [ ] TNNetESwish saturation test at ±extreme inputs.
+- [X] TNNetESwish saturation test at ±extreme inputs.
 - [ ] LiSHT / BentIdentity gradient-magnitude sanity at large |x| — both
       grow unboundedly, finite-difference eps must scale with input
       magnitude.
-- [ ] TNNetAbs near-zero gradient handling test — explicitly skip x = 0
+- [X] TNNetAbs near-zero gradient handling test — explicitly skip x = 0
       sampling and pin the convention (currently `sign(0) = 0`).
-- [ ] TNNetSquare gradient-magnitude sanity test at large |x|.
+- [X] TNNetSquare gradient-magnitude sanity test at large |x|.
 - [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer raises the
       documented error when SizeY > 1.
 - [ ] Two-layer TokenShift composition test (catches subtle double-pass
       bugs in the t-1 / t+1 input-gradient scatter).
 - [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
-- [ ] TNNetSoftMin saturation test on extreme inputs.
+- [X] TNNetSoftMin saturation test on extreme inputs.
 - [ ] Audit TNNetSigmoid and TNNetHardSigmoid for negative-x / positive-x
       symmetric-stability (same question as SoftPlus).
 - [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
