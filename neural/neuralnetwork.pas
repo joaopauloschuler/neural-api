@@ -5176,6 +5176,30 @@ type
       // BitFit-style adaptation: freeze a trunk and train only these affine params.
       // Returns the TNNetChannelBias layer (the block output).
       function AddAffineBlock: TNNetLayer;
+      // LoRA low-rank adapter (Hu et al. 2021, https://arxiv.org/abs/2106.09685).
+      // Adds a trainable rank-Rank residual bypass B*A to the output of a FROZEN
+      // linear/pointwise projection FrozenLayer (the d_in -> d_out base whose
+      // output is being adapted). The bypass is built FROM the layer that feeds
+      // FrozenLayer (FrozenLayer.PrevLayer):
+      //   down: TNNetPointwiseConvLinear(Rank)   -- A, d_in  -> Rank
+      //   up  : TNNetPointwiseConvLinear(d_out)  -- B, Rank  -> d_out
+      //   scale by Alpha/Rank, then TNNetSum([FrozenLayer, scaledUp]).
+      // The projections are POINTWISE (over Depth) so a per-token (SeqLen,1,d)
+      // stream keeps its sequence axis (a TNNetFullConnect would flatten/mix the
+      // sequence and zero the per-token gradient); the residual is therefore
+      // shape-preserving. B (the up projection) is ZERO-initialised (weights and
+      // bias), so at step 0 the bypass contributes nothing and the wrapped net's
+      // forward equals the frozen base BIT-FOR-BIT (the LoRA "starts as identity"
+      // property). A is left at its default random init. Only A and B are added
+      // as trainable params; this builder does NOT freeze the base -- the CALLER
+      // must freeze it (per-layer LearningRate := 0, see examples/LoRAFineTune).
+      // FrozenLayer must have a PrevLayer (it cannot be an input layer). Returns
+      // the TNNetSum layer (the adapted output). CAVEAT: a later NN.InitWeights()
+      // re-runs InitDefault on every layer and would overwrite B's zero-init --
+      // do not call it after building the adapter (layers are already initialised
+      // at AddLayer time: the base randomly, B at zero).
+      function AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
+        Alpha: TNeuralFloat = 1.0): TNNetLayer;
       // Convenience wrapper around TNNetGatherChannels: appends a learnable-free
       // depth-channel gather that selects an ORDERED SUBSET (and/or reorders or
       // duplicates) the previous layer's channels, yielding an output of shape
@@ -24812,6 +24836,41 @@ begin
   AddLayer( TNNetFullConnectReLU.Create(Bottleneck) );
   Excite := AddLayer( TNNetFullConnectSigmoid.Create(Channels) );
   Result := AddLayer( TNNetChannelMulByLayer.Create(InputLayer, Excite) );
+end;
+
+function TNNet.AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
+  Alpha: TNeuralFloat): TNNetLayer;
+var
+  InputLayer, Down, Up, Scaled: TNNetLayer;
+  d_out, n: integer;
+begin
+  if FrozenLayer = nil then
+    FErrorProc('AddLoRAAdapter requires a non-nil FrozenLayer.');
+  if Rank < 1 then
+    FErrorProc('AddLoRAAdapter requires Rank >= 1. Rank=' + IntToStr(Rank));
+  // The bypass starts from the SAME input that feeds the frozen base, so that
+  // B*A and the base see identical activations.
+  InputLayer := FrozenLayer.PrevLayer;
+  if InputLayer = nil then
+    FErrorProc('AddLoRAAdapter: FrozenLayer must have a PrevLayer (it cannot ' +
+      'be an input layer).');
+  d_out := FrozenLayer.Output.Depth;
+  // down (A): d_in -> Rank, pointwise so the (SeqLen,1,d_in) sequence axis is
+  // preserved (FullConnect would flatten/mix the whole sequence).
+  Down := AddLayerAfter(TNNetPointwiseConvLinear.Create(Rank), InputLayer);
+  // up (B): Rank -> d_out, pointwise. Zero-initialised below.
+  Up := AddLayer(TNNetPointwiseConvLinear.Create(d_out));
+  // Zero-init B (weights AND bias) so the bypass is the exact zero map at step 0
+  // and the wrapped forward equals the frozen base bit-for-bit. B trains away
+  // from zero during fine-tuning; A keeps its default random init.
+  for n := 0 to Up.Neurons.Count - 1 do
+    Up.Neurons[n].Fill(0);
+  Up.ClearBias();
+  Up.AfterWeightUpdate(); // refresh concatenated-weight caches after manual zero
+  // Scale the bypass by Alpha/Rank (the standard LoRA scaling). Non-trainable.
+  Scaled := AddLayer(TNNetMulByConstant.Create(Alpha / Rank));
+  // Residual add: adapted = base + (Alpha/Rank) * B*A.
+  Result := AddLayer(TNNetSum.Create([FrozenLayer, Scaled]));
 end;
 
 procedure TNNet.AddSplitQKVHeads(d_model, Heads: integer;

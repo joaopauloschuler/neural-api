@@ -149,6 +149,8 @@ type
     // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
     procedure TestAddAffineBlockForwardWiring;
     procedure TestAddAffineBlockGradientCheck;
+    // AddLoRAAdapter builder (low-rank residual bypass over a frozen projection)
+    procedure TestLoRAAdapterSmoke;
     procedure TestSwitchableNormForward;
     procedure TestSwitchableNormGradientCheck;
     procedure TestSwitchableNormSerializationRoundTrip;
@@ -3053,6 +3055,113 @@ begin
     NN.Free;
     Input.Free;
     InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLoRAAdapterSmoke;
+const
+  cSeqLen  = 4;
+  cDModel  = 6;
+  cRank    = 2;
+  cAlpha   = 4.0;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  FrozenBase, Adapted, Down, Up: TNNetLayer;
+  baseRef: array of TNeuralFloat;
+  i, n, w: integer;
+  maxDiff, dlt: TNeuralFloat;
+  upMovedBefore, upMovedAfter, downMoved: boolean;
+  downRef, upRef: TNeuralFloat;
+begin
+  // Project memory: TestNeuralNumerical.pas tests share one RNG; reseed so this
+  // test does not perturb an unrelated ordering-sensitive check downstream.
+  RandSeed := 424242;
+  // Build a per-token (SeqLen,1,d_model) stream -> frozen pointwise projection,
+  // then AddLoRAAdapter on it. Three assertions:
+  //   (1) adapted output shape == frozen base shape;
+  //   (2) with B (up) zero-init the adapted forward == frozen base forward to
+  //       < 1e-6 BEFORE any training (LoRA "starts as identity");
+  //   (3) after a few training steps A and B move while the frozen base stays
+  //       bit-for-bit put.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSeqLen, 1, cDModel, 1); // pError=1 sizes errors
+  Desired := TNNetVolume.Create(cSeqLen, 1, cDModel);
+  try
+    NN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    FrozenBase := NN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    Adapted := NN.AddLoRAAdapter(FrozenBase, cRank, cAlpha);
+    NN.SetLearningRate(0.1, 0.0);
+    // NOTE: do NOT call NN.InitWeights() here -- it would re-run InitDefault on
+    // every layer and overwrite the builder's zero-init of B. Layers are already
+    // initialised at AddLayer time (the base randomly, B at zero).
+
+    // The adapter inserts: Down (A) after the input, Up (B), MulByConstant,
+    // Sum. Down is the first added layer after FrozenBase.
+    Down := NN.Layers[FrozenBase.LayerIdx + 1];
+    Up   := NN.Layers[FrozenBase.LayerIdx + 2];
+
+    // (1) shape preservation
+    AssertEquals('LoRA adapted SizeX', cSeqLen, Adapted.Output.SizeX);
+    AssertEquals('LoRA adapted SizeY', 1,       Adapted.Output.SizeY);
+    AssertEquals('LoRA adapted Depth', cDModel, Adapted.Output.Depth);
+    AssertEquals('LoRA down (A) rank', cRank,   Down.Output.Depth);
+    AssertEquals('LoRA up (B) d_out',  cDModel, Up.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+
+    // (2) starts as identity: adapted == frozen base, bit-for-bit (< 1e-6).
+    NN.Compute(Input);
+    maxDiff := 0;
+    for i := 0 to Adapted.Output.Size - 1 do
+    begin
+      dlt := Abs(Adapted.Output.Raw[i] - FrozenBase.Output.Raw[i]);
+      if dlt > maxDiff then maxDiff := dlt;
+    end;
+    AssertTrue('LoRA zero-init B: adapted == frozen base < 1e-6 (got ' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-6);
+
+    // Snapshot the frozen base weights + bias, and one A/B weight, for the
+    // trainability check below.
+    SetLength(baseRef, FrozenBase.Neurons.Count);
+    for n := 0 to FrozenBase.Neurons.Count - 1 do
+      baseRef[n] := FrozenBase.Neurons[n].Weights.Raw[0];
+    downRef := Down.Neurons[0].Weights.Raw[0];
+    upRef   := Up.Neurons[0].Weights.Raw[0];
+
+    // Freeze ONLY the base (per-layer LR := 0); A and B keep the net LR.
+    FrozenBase.LearningRate := 0.0;
+
+    // A few SGD steps on a non-trivial target so the adapter must move.
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+    NN.SetBatchUpdate(false);
+    for i := 1 to 20 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+
+    // (3a) frozen base unchanged, bit-for-bit.
+    for n := 0 to FrozenBase.Neurons.Count - 1 do
+      AssertEquals('LoRA frozen base weight unchanged (neuron ' + IntToStr(n) + ')',
+        baseRef[n], FrozenBase.Neurons[n].Weights.Raw[0], 0.0);
+
+    // (3b) A and B moved (the adapter trained).
+    downMoved := Abs(Down.Neurons[0].Weights.Raw[0] - downRef) > 1e-6;
+    upMovedAfter := False;
+    for n := 0 to Up.Neurons.Count - 1 do
+      for w := 0 to Up.Neurons[n].Weights.Size - 1 do
+        if Abs(Up.Neurons[n].Weights.Raw[w]) > 1e-6 then upMovedAfter := True;
+    upMovedBefore := Abs(Up.Neurons[0].Weights.Raw[0] - upRef) > 1e-6;
+    AssertTrue('LoRA A (down) trained (moved from init)', downMoved);
+    AssertTrue('LoRA B (up) trained away from zero init',
+      upMovedAfter or upMovedBefore);
+  finally
+    NN.Free;
+    Input.Free;
     Desired.Free;
   end;
 end;
