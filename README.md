@@ -492,6 +492,7 @@ The CAI Neural API also provides specialized versions:
 | `TNNetAvgChannel`            | 2D or 3D (output: 1D)       | Calculates the average value per channel.                                                             |
 | `TNNetMaxChannel`            | 2D or 3D (output: 1D)       | Calculates the maximum value per channel.                                                             |
 | `TNNetMinChannel`            | 2D or 3D (output: 1D)       | Calculates the minimum value per channel.                                                             |
+| `TNNetGather`                | 2D or 3D (output: depth 1)  | Selects a single depth channel: `Output[x,y,0] := Input[x,y,Channel]`.                                |
 | `TNNet.AddMinMaxChannel`     | 1D, 2D, or 3D               | Performs both min and max channel operations, then concatenates the results.                           |
 | `TNNet.AddAvgMaxChannel`     | 1D, 2D, or 3D               | Performs both average and max channel operations, then concatenates the results.                       |
 

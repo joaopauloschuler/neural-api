@@ -384,7 +384,7 @@ breakdown:
       covers the headline use case.
 
 #### Reduction / shape
-- [ ] TNNetGather — single-channel index-into-a-channel layer.
+- [x] TNNetGather — single-channel index-into-a-channel layer.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 ### Loss layers

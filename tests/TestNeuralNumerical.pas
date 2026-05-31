@@ -59,6 +59,11 @@ type
     procedure TestSqueezeAxisLoadFromString;
     procedure TestSqueezeAxisGradientCheck;
 
+    // Single-channel gather layer (TNNetGather)
+    procedure TestGatherForward;
+    procedure TestGatherGradientCheck;
+    procedure TestGatherLoadFromString;
+
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
     procedure TestSigmoidNumericalPrecision;
@@ -5801,6 +5806,97 @@ begin
   // probed input shape is (1, N, 1).
   LayerInputGradientCheck(Self, TNNetSqueeze.Create(1),
     'Squeeze(axis=1)', 1, 5, 1, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGatherForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, Channel: integer;
+begin
+  // TNNetGather(channel=k) selects one depth slice and produces a (SizeX,SizeY,1)
+  // output: Output[x,y,0] = Input[x,y,k]. Seed a (3,2,4) volume with a value that
+  // encodes its (x,y,d) coordinates, then assert the selected channel is copied.
+  RandSeed := 424242;
+  Channel := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    for D := 0 to Input.Depth - 1 do
+      for Y := 0 to Input.SizeY - 1 do
+        for X := 0 to Input.SizeX - 1 do
+          Input[X, Y, D] := X * 100 + Y * 10 + D;
+
+    NN.AddLayer(TNNetInput.Create(3, 2, 4));
+    NN.AddLayer(TNNetGather.Create(Channel));
+    NN.Compute(Input);
+
+    AssertEquals('Gather output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Gather output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Gather output Depth', 1, NN.GetLastLayer.Output.Depth);
+    for Y := 0 to Input.SizeY - 1 do
+      for X := 0 to Input.SizeX - 1 do
+        AssertEquals('Gather selected value at ' + IntToStr(X) + ',' + IntToStr(Y),
+          Input[X, Y, Channel], NN.GetLastLayer.Output[X, Y, 0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatherGradientCheck;
+begin
+  // TNNetGather has pure routing data flow: forward copies the selected channel,
+  // backward scatters OutputError straight back to that channel (other channels
+  // get zero gradient). The analytic input gradient must match the finite
+  // difference. Probe a 4x4x3 volume selecting channel 1.
+  RandSeed := 424242;
+  LayerInputGradientCheck(Self, TNNetGather.Create(1),
+    'Gather(channel=1)', 4, 4, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGatherLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing a NON-default TNNetGather.Create(2), proving the selected
+  // channel (FStruct[0]) survives serialization and the reloaded layer is
+  // reconstructed as TNNetGather.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+    NN.AddLayer(TNNetGather.Create(2));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('Gather round-trip class identity',
+        NN2.GetLastLayer is TNNetGather);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Gather SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Gather round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestZScoreGradientCheck;
