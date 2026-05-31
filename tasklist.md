@@ -57,6 +57,19 @@ rather than acted on.
       covariance with the existing volume math (small K so a plain Cholesky or
       Gauss-Jordan is fine), and add a smoke test asserting AUROC > 0.8 on the
       easy synthetic split.
+- [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
+      SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
+      overlap. Add a HARDER near-OOD variant (OOD blobs closer to the in-dist
+      manifold, or a held-out-CLASS split rather than a far-away region) so the
+      AUROC lands in a discriminating 0.8–0.99 band and the curve actually moves.
+- [ ] MahalanobisOOD follow-up: contrast TIED (single pooled) covariance vs
+      PER-CLASS (untied) covariance and chart the AUROC delta — the tied form is
+      the paper's default but the untied form is the obvious ablation.
+- [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
+      lives LOCAL to the example. If a second consumer appears (calibration ECE
+      report, anomaly autoencoder, etc.), promote it to a public function in
+      neuralvolume.pas / neuralcalibration.pas with its own unit test (pin AUROC
+      against a hand-computed tiny example including ties).
 - [ ] Forward-Forward follow-up: scale to a tiny-MNIST few-class subset (the
       paper's actual task) and report whether the per-layer local objective still
       beats chance within the <5-min budget. Builds on the landed
@@ -809,6 +822,20 @@ breakdown:
       [[manual-gradient-and-snapshot-gotchas]] and the per-token projection rule in
       [[mha-builder-and-seq-projection]]; keep dims tiny so the whole thing trains
       well under the 5-minute CPU budget.
+- [ ] InductionHeads follow-up (landed 2026-05-31, Option A — two hand-wired
+      single-head causal SDPA blocks): the landed demo asserts the LAYER-2
+      prefix-matching stripe (mass 0.978). Add the matching LAYER-1
+      "previous-token head" assertion — render block-1's attention matrix and
+      pin that each query concentrates mass on position t-1 (the immediately-
+      previous token). Together the two stripes show the full two-head
+      COMPOSITION the paper identifies, not just the layer-2 head in isolation.
+- [ ] InductionHeads follow-up: ablate the causal mask and the second layer
+      independently (1-layer causal, 2-layer NON-causal) and show in-context
+      copy accuracy COLLAPSES to chance in each — a built-in proof that both the
+      causal mask AND the two-layer composition are necessary, not incidental.
+- [ ] InductionHeads follow-up: sweep the number of repeats / prefix length and
+      chart the in-context learning score vs sequence position (the textbook ICL
+      curve — loss should drop sharply at the first repeated position).
 - [ ] DeadReLU follow-up (open): chart the LR=1.0+ chaotic regime the LR-sweep
       demo deliberately excluded — above the monotone band ReLU's dead fraction
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
@@ -851,10 +878,24 @@ breakdown:
       needed; demonstrates the FFN half-block.
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
-      (BitFit-style cheap adaptation).
+      (BitFit-style cheap adaptation). NOTE (2026-05-31): the landed
+      examples/AffineFineTune/ already provides the freeze idiom (per-layer
+      `LearningRate := 0` + net inertia 0, asserting base weights are
+      bit-identical after fine-tune) and the trainable-param-count comparison —
+      fork it and drop the TNNetChannelMul half so only bias adapts, then chart
+      bias-only vs full-affine (mul+bias) target accuracy at matched frozen
+      trunk. This is now a ~30-line diff on AffineFineTune, not a from-scratch
+      example.
 - [X] `examples/AffineFineTune/` — once TNNetAffineBlock lands, same
       pattern but freezing everything except the inserted Affine blocks
       (built on TNNetChannelBias + TNNetChannelMul).
+- [ ] AddAffineBlock follow-up (landed 2026-05-31): the landed AffineFineTune
+      inserts a `TNNetReshape(1,1,C)` before each affine block because
+      TNNetFullConnect emits units on the SizeX axis while TNNetChannelMul/Bias
+      scale per-Depth. Consider an `AddAffineBlock` overload (or a sibling
+      builder) that auto-reshapes a (C,1,1) feature vector to (1,1,C) so the
+      per-channel affine "just works" on dense-layer output without the manual
+      reshape — verify it stays a no-op on already-(*,*,C) conv output.
 - [ ] `examples/TokenShiftBaseline/` — train a tiny next-token char model
       with `TNNetEmbedding → TNNetTokenShift → MLP` and compare against
       the MHA-based version (`TNNet.AddMultiHeadSelfAttention`).
