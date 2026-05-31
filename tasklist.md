@@ -1103,6 +1103,44 @@ rather than acted on.
       agree with their textbook formula.
 
 ### Experiments I'm curious about (additional)
+- [ ] `examples/InformationPlane/` (optionally backed by a
+      `TNNet.InformationPlaneReport` introspection method, [[introspection-report-pattern]])
+      — reproduce the **information-plane trajectory** of the Information
+      Bottleneck story (Tishby & Zaslavsky 2015; Shwartz-Ziv & Tishby 2017,
+      "Opening the Black Box of Deep Neural Networks via Information"): for a
+      tiny fully-connected classifier on a small synthetic binary task, track
+      the mutual information pair `(I(X;T), I(T;Y))` of EACH hidden layer `T`
+      across training epochs and plot every layer's path through the 2-D
+      information plane as an ASCII scatter. The narrative target is the two
+      reported phases — a fast **fitting/ERM** phase where both `I(X;T)` and
+      `I(T;Y)` rise, followed by a slow **compression** phase where `I(X;T)`
+      DROPS while `I(T;Y)` stays high (the layer forgets input detail
+      irrelevant to the label). MI is estimated with the original *binning*
+      estimator: discretize each neuron's bounded activation into B equal-width
+      bins, treat the per-sample bin-tuple as a discrete code, and compute
+      plug-in entropies `I(X;T)=H(T)-H(T|X)` and `I(T;Y)=H(T)-H(T|Y)` from
+      empirical histograms — no new gradient machinery, only forward-pass
+      activation collection over the full dataset at each logged epoch. This is
+      a DIFFERENT axis from everything already shipped: [[RepresentationSimilarity]]
+      (CKA = representation geometry, not MI), IntrinsicDimension /
+      PredictionDepth (per-example geometry), and the SLT/curvature reports
+      (LocalLearningCoefficient, HessianCurvature, FisherImportance — posterior
+      volume & 2nd-order curvature, never input/label MI). HONEST headline in
+      the house "what did NOT reproduce" style: the binning estimator REQUIRES
+      a saturating activation to show compression — use `TNNetFullConnect`
+      (tanh, bounded -> bins are meaningful) for the headline run, and document
+      Saxe et al. 2018 ("On the Information Bottleneck Theory of Deep
+      Learning") which showed the compression phase is largely an artifact of
+      double-saturating nonlinearities and binning: ship a built-in
+      contrast arm with a ReLU trunk (`TNNetFullConnectReLU`, unbounded ->
+      fixed-width binning is ill-defined and the clean compression bend
+      vanishes), so the example itself demonstrates the controversy rather than
+      overclaiming. Document the known pitfalls: MI is upper-bounded by
+      `log2(#samples)` and by `B^width`, so keep width/B/sample-count balanced
+      (e.g. B=30, hidden width ~4-6, a few thousand samples) and state that the
+      absolute MI values are estimator-dependent — the robust, reproducible
+      signal is the SHAPE of the trajectory and the tanh-vs-ReLU difference,
+      not the nats. Pure CPU, tiny MLP, <5-min budget.
 - [ ] LogSoftMax+NLL vs SoftMax+CE convergence parity test: same seed,
       same tiny classifier, plot val-loss curves.
 - [ ] Shrink-activation sparsity sweep: ReLU / SoftShrink / HardShrink as
