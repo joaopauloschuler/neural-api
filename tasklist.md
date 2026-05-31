@@ -341,12 +341,6 @@ breakdown:
       show a qualitative before/after on a repetition-prone prompt — the
       class landed this lucky-day batch (neuralvolume.pas, 7 tests in
       tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
-- [X] TNNetReversibleBlock — RevNet-style additive coupling
-      (`y1 = x1 + F(x2)`, `y2 = x2 + G(y1)`). Forward + inverse round-trip
-      to within fp tolerance is the headline test. DONE as a builder
-      `TNNet.AddReversibleBlock(InputLayer, HiddenDim)` (composes
-      SplitChannels -> pointwise F/G -> Sum -> DeepConcat) + examples/ReversibleBlock/
-      (round-trip max error ~8e-10) + TestReversibleBlockRoundTrip.
 - [ ] TNNetReversibleBlock follow-up: the MEMORY-SAVING recompute path (the
       actual point of RevNet — discard activations in forward, RECONSTRUCT them in
       backward via the analytic inverse instead of storing them). The landed
@@ -363,18 +357,6 @@ breakdown:
       pair it with GroupNorm in a conv stack). Mirror the dense Jacobian
       per output-channel filter. Pairs with a tiny WS+GroupNorm vs
       BatchNorm CIFAR-stub bake-off.
-- [X] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
-      Convolution layer and divides its weight matrix by its largest
-      singular value (one power-iteration step per forward pass).
-      NOTE: the reusable power-iteration helper `TNNet.EstimateSpectralNorm`
-      now exists (landed with WeightSpectrumReport) — build the wrapper on
-      top of it rather than re-deriving the iteration.
-      DONE for the DENSE case: `TNNetSpectralNorm` descends
-      `TNNetFullConnectLinear`; forward divides W by sigma_1 (shared scalar
-      from `EstimateSpectralNorm`, Iters in FStruct[5], default 10), backward
-      treats sigma as constant and propagates the input error through the
-      SCALED weights. Tests: TestSpectralNorm{Forward,InputGradientCheck,
-      SerializationRoundTrip}.
 - [ ] TNNetSpectralNorm — CONVOLUTION variant (still open). The dense wrapper
       landed; add a convolution-layer spectral-norm wrapper (largest singular
       value of the flattened conv weight matrix per output channel / full
@@ -530,8 +512,6 @@ breakdown:
       batch-aware loss hook (the per-sample FOutputError path is blind to other
       minibatch samples, the same limitation logged for a true cross-batch
       InfoNCE). Track alongside that batch-aware-loss-hook item.
-- [X] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
-      straight-through assignment plus commitment/codebook losses.
 - [ ] TNNetVectorQuantizer follow-up (landed 2026-05-31): the codebook-SIDE
       gradient (the `2*(z_q - z_e)` pull accumulated into neuron[k*].Delta via the
       -FLearningRate idiom) is exercised structurally but has NO dedicated
