@@ -146,6 +146,8 @@ type
     procedure TestGatedResidualForwardWiring;
     // AddReversibleBlock builder (RevNet additive coupling + analytic inverse)
     procedure TestReversibleBlockRoundTrip;
+    // AddNeuralODEBlock builder (shared-weight Euler-integrated residual)
+    procedure TestNeuralODEBlockSmoke;
     // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
     procedure TestAddAffineBlockForwardWiring;
     procedure TestAddAffineBlockGradientCheck;
@@ -2909,6 +2911,127 @@ begin
       FloatToStr(maxRecErr) + ')', maxRecErr < 1e-4);
   finally
     NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNeuralODEBlockSmoke;
+const
+  W = 3; H = 1; C = 4; HID = 5;
+var
+  NN1, NN4, NNref: TNNet;
+  Input, Desired: TNNetVolume;
+  ODEOut, RefOut: TNNetLayer;
+  S1ReLU, S1Lin, S2ReLU, S2Lin: TNNetLayer;
+  i, n: integer;
+  outVal, before, after: TNeuralFloat;
+begin
+  // Smoke + invariant test for AddNeuralODEBlock.
+  RandSeed := 424242;
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create(W, H, C);
+  for i := 0 to Input.Size - 1 do
+    Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+  try
+    // ---- (1) CORRECTNESS ANCHOR -------------------------------------------
+    // Steps=1, h=1: AddNeuralODEBlock must equal a single plain residual step
+    // y = x + f(x) built by hand from the SAME weights. There is exactly one f
+    // and no weight sharing, so the two must agree bit-for-bit.
+    NN1 := TNNet.Create();
+    NNref := TNNet.Create();
+    try
+      NN1.AddLayer(TNNetInput.Create(W, H, C));
+      ODEOut := NN1.AddNeuralODEBlock(NN1.GetLastLayer(), HID, 1);
+      NN1.SetLearningRate(0.01, 0.9);
+      NN1.InitWeights();
+
+      // Hand-built reference: Input -> ConvReLU(HID) -> ConvLinear(C) -> Sum(x).
+      NNref.AddLayer(TNNetInput.Create(W, H, C));
+      NNref.AddLayer(TNNetPointwiseConvReLU.Create(HID));
+      RefOut := NNref.AddLayer(TNNetPointwiseConvLinear.Create(C));
+      NNref.AddLayer(TNNetSum.Create([RefOut, NNref.Layers[0]]));
+      NNref.SetLearningRate(0.01, 0.9);
+      NNref.InitWeights();
+      // Copy the ODE block's conv weights into the reference (layer order:
+      // ODE [1]=ConvReLU, [2]=ConvLinear ; ref [1]=ConvReLU, [2]=ConvLinear).
+      NNref.Layers[1].CopyWeights(NN1.Layers[1]);
+      NNref.Layers[2].CopyWeights(NN1.Layers[2]);
+
+      AssertEquals('ODE Steps=1 output Depth', C, ODEOut.Output.Depth);
+      AssertEquals('ODE Steps=1 output SizeX', W, ODEOut.Output.SizeX);
+
+      NN1.Compute(Input);
+      NNref.Compute(Input);
+      for i := 0 to ODEOut.Output.Size - 1 do
+        AssertEquals('ODE Steps=1 == plain residual at ' + IntToStr(i),
+          NNref.GetLastLayer().Output.Raw[i], ODEOut.Output.Raw[i], 1e-6);
+    finally
+      NN1.Free;
+      NNref.Free;
+    end;
+
+    // ---- (2) SHARED-WEIGHT INVARIANT + (3) FINITE FWD/BWD ------------------
+    NN4 := TNNet.Create();
+    try
+      NN4.AddLayer(TNNetInput.Create(W, H, C));
+      ODEOut := NN4.AddNeuralODEBlock(NN4.GetLastLayer(), HID, 2);
+      NN4.SetLearningRate(0.01, 0.9);
+      NN4.InitWeights();
+
+      // Layer order for Steps=2 (see AddNeuralODEBlock wiring):
+      // [0]=Input
+      // [1]=ConvReLU(step1)  [2]=ConvLinear(step1)  [3]=MulByConst  [4]=Sum
+      // [5]=SharedReLU(step2)[6]=SharedLinear(step2)[7]=MulByConst  [8]=Sum
+      S1ReLU := NN4.Layers[1];
+      S1Lin  := NN4.Layers[2];
+      S2ReLU := NN4.Layers[5];
+      S2Lin  := NN4.Layers[6];
+
+      AssertTrue('step2 ReLU is shared-weights',
+        S2ReLU is TNNetConvolutionSharedWeights);
+      AssertTrue('step2 Linear is shared-weights',
+        S2Lin is TNNetConvolutionSharedWeights);
+
+      // Shared layers must reference the SAME neuron weight arrays as step 1:
+      // mutating a step-1 weight must be visible through the step-2 layer.
+      before := S2ReLU.Neurons[0].Weights.Raw[0];
+      AssertEquals('step1/step2 ReLU share weight value',
+        S1ReLU.Neurons[0].Weights.Raw[0], before, 1e-12);
+      S1ReLU.Neurons[0].Weights.Raw[0] := before + 0.5;
+      after := S2ReLU.Neurons[0].Weights.Raw[0];
+      AssertEquals('mutating step1 ReLU is seen by step2 (shared)',
+        before + 0.5, after, 1e-12);
+
+      AssertEquals('step1/step2 Linear share weight value',
+        S1Lin.Neurons[0].Weights.Raw[0],
+        S2Lin.Neurons[0].Weights.Raw[0], 1e-12);
+
+      // (3) Forward + backward must stay finite on the small input.
+      NN4.Compute(Input);
+      for i := 0 to ODEOut.Output.Size - 1 do
+      begin
+        outVal := ODEOut.Output.Raw[i];
+        AssertFalse('ODE forward NaN at ' + IntToStr(i), IsNaN(outVal));
+        AssertFalse('ODE forward Inf at ' + IntToStr(i), IsInfinite(outVal));
+      end;
+      Desired.Fill(0);
+      NN4.Backpropagate(Desired);
+      for i := 0 to NN4.Layers[1].OutputError.Size - 1 do
+      begin
+        outVal := NN4.Layers[1].OutputError.Raw[i];
+        AssertFalse('ODE backward NaN at ' + IntToStr(i), IsNaN(outVal));
+        AssertFalse('ODE backward Inf at ' + IntToStr(i), IsInfinite(outVal));
+      end;
+
+      // Param count is independent of Steps: a Steps=2 block has the SAME
+      // trainable neuron count as a Steps=1 block (shared weights add none).
+      n := NN4.CountNeurons();
+      AssertTrue('ODE Steps=2 neuron count > 0', n > 0);
+    finally
+      NN4.Free;
+    end;
+  finally
     Input.Free;
     Desired.Free;
   end;

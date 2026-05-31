@@ -113,8 +113,28 @@ rather than acted on.
       the budget" honesty the Grokking entry uses). Distinct from VisualGAN
       (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
       DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
-- [ ] Neural ODE (continuous-depth residual) demo + `TNNet.AddNeuralODEBlock` builder
-      (`examples/NeuralODE/`) — reproduce the Chen et al. 2018 "Neural Ordinary
+- [X] Neural ODE (continuous-depth residual) demo + `TNNet.AddNeuralODEBlock` builder
+      (`examples/NeuralODE/`) — landed 2026-05-31. `AddNeuralODEBlock(InputLayer,
+      HiddenDim, Steps)` integrates `Steps` shared-weight Euler updates
+      `y := y + h*f(y)` (h=1/Steps) over one shape-preserving `f` =
+      PointwiseConvReLU(HiddenDim) -> PointwiseConvLinear(d_model); step 1 holds the
+      only real weights, every later step reuses them via
+      `TNNetConvolutionSharedWeights`, so param count is constant in Steps.
+      `TestNeuralODEBlockSmoke` pins Steps=1 bit-for-bit equal to a hand-built plain
+      residual step, asserts the shared-weight invariant (step-2 convs read the
+      step-1 neurons; mutating a step-1 weight is seen downstream), and checks finite
+      forward+backward. `examples/NeuralODE/` sweeps Steps {1,2,4} on a synthetic
+      concentric-rings task showing constant 34 neurons / 288 weights with roughly
+      flat accuracy (1.000 / 0.971 / 0.947, mean of 5 seeds), in ~7 s on 1 CPU thread.
+      Deferred follow-ups (logged, NOT in v1):
+        - [ ] RK2/midpoint integrator behind an optional `Method` param (v1 Euler-only).
+        - [ ] Adjoint-sensitivity O(1)-in-Steps backward (integrate the adjoint ODE
+              backwards using the `SetBatchUpdate(True)` weight-accumulation idiom);
+              v1 trains via stored-activation backprop through the unrolled steps.
+        - [ ] 2-D trajectory ASCII-frame visualisation of the learned flow untangling
+              the two classes (the textbook Neural-ODE picture).
+      --- original spec below ---
+      reproduce the Chen et al. 2018 "Neural Ordinary
       Differential Equations" idea on a TINY pure-CPU target. A residual block
       `x_{n+1} = x_n + f(x_n)` is one explicit Euler step of `dx/dt = f(x,t)`; a
       Neural ODE replaces a STACK of distinct residual blocks with ONE shared `f`

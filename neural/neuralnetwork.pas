@@ -5227,6 +5227,38 @@ type
       // (see examples/ReversibleBlock for a forward/inverse round-trip demo).
       // Returns the Concat output layer. HiddenDim sizes the F/G hidden width.
       function AddReversibleBlock(InputLayer: TNNetLayer; HiddenDim: integer): TNNetLayer;
+      // Neural ODE block (Chen et al. 2018, https://arxiv.org/abs/1806.07366).
+      // A residual block x_{n+1} = x_n + f(x_n) is one explicit Euler step of the
+      // ODE dx/dt = f(x,t). This builder replaces a STACK of distinct residual
+      // blocks with ONE shared residual function f integrated forward over `Steps`
+      // explicit-Euler sub-steps of fixed size h = 1/Steps:
+      //     y := InputLayer
+      //     repeat Steps times:  y := y + h * f(y)
+      // The headline property is "depth for free": the parameter count is
+      // INDEPENDENT of Steps, because the SAME f is reused at every step.
+      //
+      // f is a shape-preserving pointwise 2-layer residual function over Depth
+      // (d_model = InputLayer.Output.Depth):
+      //     f(y) := PointwiseConvLinear(d_model)( PointwiseConvReLU(HiddenDim)(y) )
+      // 1x1/pointwise convs keep the sequence axis intact (FullConnect would
+      // flatten it and break the residual sum), so the block is shape-preserving
+      // and can be wrapped in AddPreNormResidual([...]) like any other FFN block.
+      //
+      // WEIGHT SHARING: step 1 creates the two real convolution layers; every
+      // later step reuses their weights via TNNetConvolutionSharedWeights (which
+      // links to the step-1 convs and shares their FNeurons). Without sharing the
+      // block would degenerate into an ordinary residual stack with Steps-many
+      // distinct weight sets, defeating the purpose -- this builder ALWAYS shares.
+      //
+      // InputLayer defaults to GetLastLayer() when nil; Steps is clamped to >= 1
+      // and HiddenDim to >= 1. Returns the final integrated layer (shape identical
+      // to InputLayer.Output).
+      //
+      // v1 is EULER-ONLY: an RK2/midpoint integrator (Method param) and the
+      // O(1)-memory adjoint-sensitivity backward pass (Chen et al. sec. 2) are
+      // logged as follow-ups in tasklist.md and are NOT implemented here; training
+      // uses ordinary stored-activation backprop through the unrolled steps.
+      function AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer;
       // Learnable per-channel affine block: appends a TNNetChannelMul (per-channel
       // scale gamma[d], initialised to 1.0) followed by a TNNetChannelBias
       // (per-channel shift beta[d], initialised to 0.0) to the current end of the
@@ -48167,6 +48199,53 @@ begin
 
   // output = Concat(y1, y2) along depth, shape-identical to the input.
   Result := AddLayer( TNNetDeepConcat.Create([Y1, Y2]) );
+end;
+
+function TNNet.AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer;
+var
+  d_model, step: integer;
+  h: TNeuralFloat;
+  Y: TNNetLayer;
+  Step1ReLUConv, Step1LinearConv: TNNetLayer;
+  FOut, ScaledFOut: TNNetLayer;
+begin
+  // Continuous-depth residual block: integrate dx/dt = f(x) with `Steps` explicit
+  // Euler sub-steps of size h = 1/Steps, reusing ONE shared f at every step.
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if Steps < 1 then Steps := 1;
+  if HiddenDim < 1 then HiddenDim := 1;
+  d_model := InputLayer.Output.Depth;
+  h := 1.0 / Steps;
+
+  Step1ReLUConv := nil;
+  Step1LinearConv := nil;
+  Y := InputLayer;
+
+  for step := 1 to Steps do
+  begin
+    // f(y): shape-preserving pointwise 2-layer residual function over Depth.
+    if step = 1 then
+    begin
+      // Step 1 creates the two REAL convolution layers (the only trainable
+      // weights of the whole block).
+      Step1ReLUConv := AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), Y );
+      Step1LinearConv := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+      FOut := Step1LinearConv;
+    end
+    else
+    begin
+      // Later steps REUSE the step-1 weights via shared-weight convolutions
+      // (same FNeurons + activation fn). This is what makes param count
+      // independent of Steps.
+      AddLayerAfter( TNNetConvolutionSharedWeights.Create(Step1ReLUConv), Y );
+      FOut := AddLayer( TNNetConvolutionSharedWeights.Create(Step1LinearConv) );
+    end;
+    // Euler update: y := y + h * f(y).
+    ScaledFOut := AddLayer( TNNetMulByConstant.Create(h) );
+    Y := AddLayer( TNNetSum.Create([ScaledFOut, Y]) );
+  end;
+
+  Result := Y;
 end;
 
 function TNNet.AddAffineBlock: TNNetLayer;
