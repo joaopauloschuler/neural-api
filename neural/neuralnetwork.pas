@@ -4561,6 +4561,53 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Stochastic pooling layer (Zeiler & Fergus 2013, "Stochastic Pooling for
+  /// Regularization of Deep Convolutional Neural Networks"). Over each square
+  /// pooling window W (side = PoolSize) and per channel it forms a probability
+  /// distribution from the (assumed NON-NEGATIVE, e.g. post-ReLU) activations
+  ///   p_i = a_i / sum_{j in W} a_j
+  /// and behaves differently at train vs inference time:
+  ///   - TRAINING (Enabled = true, toggled by TNNet.EnableDropouts(true) like
+  ///     the dropout / noise layers): SAMPLE one cell index k in the window
+  ///     with probability p_i and output that cell's activation a_k. The
+  ///     sampled position is cached in the inherited FMaxPosX/FMaxPosY arrays
+  ///     so Backpropagate (the inherited single-cell routing of TNNetPoolBase)
+  ///     sends the WHOLE window's output error to the sampled cell only,
+  ///     exactly like max-pool routes to its argmax.
+  ///   - INFERENCE (Enabled = false, the default): output the
+  ///     probability-weighted EXPECTATION y = sum_i p_i*a_i. No sampling,
+  ///     fully deterministic. Backward in this mode routes the output error to
+  ///     the cell whose activation is closest to the produced expectation
+  ///     (cached argmax-of-closeness in FMaxPosX/FMaxPosY); inference backward
+  ///     is not normally used (it exists only so the layer never crashes if
+  ///     backprop runs while disabled).
+  /// Sampling uses the library RNG (Random, uniform [0,1)) so results are
+  /// reproducible under a fixed RandSeed, mirroring TNNetDropout / TNNetDropPath.
+  ///
+  /// DEFENSIVE FALLBACK: the paper assumes non-negative activations. If a
+  /// window sum sum_j a_j <= 0 (all zero, or negatives present) the layer
+  /// cannot build a valid distribution, so it FALLS BACK to a plain average:
+  /// training outputs the window mean and routes the gradient to the window
+  /// centre cell; inference outputs the window mean too. This guarantees no
+  /// division by zero and no sampling of garbage.
+  ///
+  /// The integer pool/stride/padding parameters round-trip via FStruct[0..2]
+  /// exactly like TNNetMaxPool. NOTE: like TNNetMaxPool the implementation
+  /// assumes SQUARE feature maps (SizeX = SizeY); use square inputs.
+  TNNetStochasticPool = class(TNNetPoolBase)
+  private
+    // Train vs inference gate, mirroring TNNetAddNoiseBase. Default false
+    // (deterministic expectation). TNNet.EnableDropouts(true) flips it on for
+    // training so the forward pass samples.
+    FEnabled: boolean;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pPoolSize: integer; pStride: integer = 0;
+      pPadding: integer = 0); overload;
+    procedure Compute(); override;
+    property Enabled: boolean read FEnabled write FEnabled;
+  end;
+
   /// Anti-aliased ("shift-invariant") max pooling (Zhang 2019, "Making
   // Convolutional Networks Shift-Invariant Again"). A naive strided maxpool
   // aliases because subsampling follows a non-linear max with no low-pass
@@ -27312,6 +27359,147 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetStochasticPool }
+constructor TNNetStochasticPool.Create(pPoolSize: integer; pStride: integer = 0;
+  pPadding: integer = 0);
+begin
+  inherited Create(pPoolSize, pStride, pPadding);
+  // Deterministic expectation by default; TNNet.EnableDropouts(true) enables
+  // sampling for training.
+  FEnabled := false;
+end;
+
+procedure TNNetStochasticPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+end;
+
+procedure TNNetStochasticPool.Compute();
+var
+  CntX, CntY, CntD: integer;
+  OutputMaxX, OutputMaxY, MaxD: integer;
+  InX, InY, InXMax, InYMax: integer;
+  CntInputPX, CntInputPY: integer;
+  OutputRawPos: integer;
+  StartTime: double;
+  Sum, Acc, R, Threshold, CurrValue, Y, BestDiff, Diff, Mean, Cnt: TNeuralFloat;
+  BestX, BestY, Picked: integer;
+begin
+  StartTime := Now();
+  // Per square pooling window W and channel:
+  //   p_i = a_i / sum_j a_j  (a_i assumed non-negative, e.g. post-ReLU)
+  //   training : sample cell k ~ p_i, output a_k, cache k for backward
+  //   inference: output expectation y = sum_i p_i*a_i, cache closest cell
+  // Defensive fallback when sum_j a_j <= 0: window mean, route to centre cell.
+  // Window iteration mirrors TNNetMaxPool.ComputeWithStride so any stride /
+  // padding is supported; the sampled (or representative) cell position is
+  // stored in the inherited FMaxPosX/FMaxPosY arrays so the inherited
+  // TNNetPoolBase backward routes the window error to that single cell.
+  OutputMaxX := Output.SizeX - 1;
+  OutputMaxY := Output.SizeY - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
+
+  for CntY := 0 to OutputMaxY do
+  begin
+    InY := CntY * FStride - FPadding;
+    InYMax := Min(InY + FPoolSize - 1, FPrevLayer.Output.SizeY - 1);
+    if InY < 0 then InY := 0;
+    for CntX := 0 to OutputMaxX do
+    begin
+      InX := CntX * FStride - FPadding;
+      InXMax := Min(InX + FPoolSize - 1, FPrevLayer.Output.SizeX - 1);
+      if InX < 0 then InX := 0;
+      OutputRawPos := Output.GetRawPos(CntX, CntY);
+      for CntD := 0 to MaxD do
+      begin
+        // Pass 1: window sum and cell count.
+        Sum := 0;
+        Cnt := 0;
+        for CntInputPX := InX to InXMax do
+          for CntInputPY := InY to InYMax do
+          begin
+            Sum := Sum + FPrevLayer.Output[CntInputPX, CntInputPY, CntD];
+            Cnt := Cnt + 1;
+          end;
+
+        if Sum > 0 then
+        begin
+          if FEnabled then
+          begin
+            // TRAINING: sample one cell with probability p_i = a_i / Sum.
+            R := Random; // uniform [0,1)
+            Threshold := R * Sum;
+            Acc := 0;
+            // Default to the last cell to absorb floating point slack.
+            BestX := InXMax;
+            BestY := InYMax;
+            Picked := 0;
+            for CntInputPX := InX to InXMax do
+            begin
+              for CntInputPY := InY to InYMax do
+              begin
+                CurrValue := FPrevLayer.Output[CntInputPX, CntInputPY, CntD];
+                Acc := Acc + CurrValue;
+                if (Picked = 0) and (Acc > Threshold) then
+                begin
+                  BestX := CntInputPX;
+                  BestY := CntInputPY;
+                  Picked := 1;
+                end;
+              end;
+            end;
+            FOutput.FData[OutputRawPos] :=
+              FPrevLayer.Output[BestX, BestY, CntD];
+            FMaxPosX[OutputRawPos] := BestX;
+            FMaxPosY[OutputRawPos] := BestY;
+          end
+          else
+          begin
+            // INFERENCE: expectation y = sum_i p_i*a_i = sum_i a_i^2 / Sum.
+            Y := 0;
+            for CntInputPX := InX to InXMax do
+              for CntInputPY := InY to InYMax do
+              begin
+                CurrValue := FPrevLayer.Output[CntInputPX, CntInputPY, CntD];
+                Y := Y + CurrValue * CurrValue;
+              end;
+            Y := Y / Sum;
+            FOutput.FData[OutputRawPos] := Y;
+            // Cache the cell whose activation is closest to y for backward.
+            BestX := InX;
+            BestY := InY;
+            BestDiff := 3.402823e38;
+            for CntInputPX := InX to InXMax do
+              for CntInputPY := InY to InYMax do
+              begin
+                CurrValue := FPrevLayer.Output[CntInputPX, CntInputPY, CntD];
+                Diff := Abs(CurrValue - Y);
+                if Diff < BestDiff then
+                begin
+                  BestDiff := Diff;
+                  BestX := CntInputPX;
+                  BestY := CntInputPY;
+                end;
+              end;
+            FMaxPosX[OutputRawPos] := BestX;
+            FMaxPosY[OutputRawPos] := BestY;
+          end;
+        end
+        else
+        begin
+          // FALLBACK: window sum <= 0, use the plain mean and route to centre.
+          if Cnt > 0 then Mean := Sum / Cnt else Mean := 0;
+          FOutput.FData[OutputRawPos] := Mean;
+          FMaxPosX[OutputRawPos] := (InX + InXMax) div 2;
+          FMaxPosY[OutputRawPos] := (InY + InYMax) div 2;
+        end;
+        Inc(OutputRawPos);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetMaxBlurPool }
 constructor TNNetMaxBlurPool.Create(pPoolSize: integer = 2;
   pStride: integer = 0; pPadding: integer = 0);
@@ -45603,6 +45791,7 @@ begin
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]);
+      'TNNetStochasticPool' :       Result := TNNetStochasticPool.Create(St[0], St[1], St[2]);
       'TNNetMaxBlurPool' :          Result := TNNetMaxBlurPool.Create(St[0], St[1], St[2]);
       'TNNetBlurPool' :             Result := TNNetBlurPool.Create(St[0], St[1], St[2]);
       'TNNetAvgChannel':            Result := TNNetAvgChannel.Create();
@@ -45878,6 +46067,7 @@ begin
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]) else
+      if S[0] = 'TNNetStochasticPool' then Result := TNNetStochasticPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMaxBlurPool' then Result := TNNetMaxBlurPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetBlurPool' then Result := TNNetBlurPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgChannel' then Result := TNNetAvgChannel.Create() else
@@ -47948,6 +48138,10 @@ begin
       else if (FLayers[LayerCnt] is TNNetHardConcrete) then
       begin
         TNNetHardConcrete(FLayers[LayerCnt]).Enabled := pFlag;
+      end
+      else if (FLayers[LayerCnt] is TNNetStochasticPool) then
+      begin
+        TNNetStochasticPool(FLayers[LayerCnt]).Enabled := pFlag;
       end;
     end;
   end;

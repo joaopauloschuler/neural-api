@@ -37,6 +37,9 @@ type
     procedure TestSoftPoolAvgLimit;
     procedure TestSoftPoolLoadFromString;
     procedure TestSoftPoolLoadFromStringBeta;
+    procedure TestStochasticPoolInferenceExpectation;
+    procedure TestStochasticPoolTrainingSampleAndGrad;
+    procedure TestStochasticPoolLoadFromString;
     procedure TestMaxBlurPoolGradientCheck;
     procedure TestMaxBlurPoolLoadFromString;
     procedure TestMaxBlurPoolShiftInvariance;
@@ -5047,6 +5050,157 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SoftPool(beta) round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestStochasticPoolInferenceExpectation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  a0, a1, a2, a3, Sum, Expected: TNeuralFloat;
+begin
+  // INFERENCE mode (Enabled = false, the default): TNNetStochasticPool must
+  // emit the probability-weighted EXPECTATION y = sum_i p_i*a_i over each
+  // window, where p_i = a_i / sum_j a_j (a_i non-negative). For a single 2x2
+  // window this is sum_i a_i^2 / sum_i a_i.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 1));
+    NN.AddLayer(TNNetStochasticPool.Create(2));
+    NN.EnableDropouts(false); // inference / deterministic expectation
+
+    a0 := 1.0; a1 := 2.0; a2 := 3.0; a3 := 4.0;
+    Input[0, 0, 0] := a0; Input[1, 0, 0] := a1;
+    Input[0, 1, 0] := a2; Input[1, 1, 0] := a3;
+    NN.Compute(Input);
+
+    Sum := a0 + a1 + a2 + a3;
+    Expected := (a0*a0 + a1*a1 + a2*a2 + a3*a3) / Sum;
+    AssertEquals('StochasticPool inference output is 1x1', 1,
+      NN.GetLastLayer.Output.Size);
+    AssertEquals('StochasticPool inference expectation',
+      Expected, NN.GetLastLayer.Output[0, 0, 0], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestStochasticPoolTrainingSampleAndGrad;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Pool: TNNetStochasticPool;
+  Prev: TNNetLayer;
+  a0, a1, a2, a3, Out, KnownErr: TNeuralFloat;
+  SampledX, SampledY, x, y: integer;
+  IsValidSample: boolean;
+begin
+  // TRAINING mode (Enabled = true via EnableDropouts(true)): the forward must
+  // SAMPLE one cell of the window (output equals one of the actual cells), and
+  // backward must route the WHOLE window error to exactly that sampled cell
+  // (the inherited TNNetPoolBase single-cell routing), 0 elsewhere. A central-
+  // difference check is meaningless for a stochastic forward, so we pin the
+  // deterministic backward routing against the recorded sample position.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 1, 1));
+    Pool := TNNetStochasticPool.Create(2);
+    NN.AddLayer(Pool);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true); // training / sampling
+
+    a0 := 1.0; a1 := 2.0; a2 := 3.0; a3 := 4.0;
+    Input[0, 0, 0] := a0; Input[1, 0, 0] := a1;
+    Input[0, 1, 0] := a2; Input[1, 1, 0] := a3;
+    NN.Compute(Input);
+
+    // The output must equal one of the actual window cells (a valid sample).
+    Out := Pool.Output[0, 0, 0];
+    IsValidSample :=
+      (Abs(Out - a0) < 1e-6) or (Abs(Out - a1) < 1e-6) or
+      (Abs(Out - a2) < 1e-6) or (Abs(Out - a3) < 1e-6);
+    AssertTrue('StochasticPool training output is a valid sampled cell',
+      IsValidSample);
+
+    // Inject a known upstream gradient and backpropagate.
+    Prev := NN.Layers[0];
+    Prev.OutputError.Fill(0);
+    KnownErr := 0.75;
+    Pool.OutputError.Fill(0);
+    Pool.OutputError[0, 0, 0] := KnownErr;
+    Pool.Backpropagate();
+
+    // Determine the sampled cell from the output value, then assert the
+    // gradient is KnownErr there and 0 at every other window cell.
+    if Abs(Out - a0) < 1e-6 then begin SampledX := 0; SampledY := 0; end
+    else if Abs(Out - a1) < 1e-6 then begin SampledX := 1; SampledY := 0; end
+    else if Abs(Out - a2) < 1e-6 then begin SampledX := 0; SampledY := 1; end
+    else begin SampledX := 1; SampledY := 1; end;
+
+    for x := 0 to 1 do
+      for y := 0 to 1 do
+        if (x = SampledX) and (y = SampledY) then
+          AssertEquals('StochasticPool grad routed to sampled cell',
+            KnownErr, Prev.OutputError[x, y, 0], 1e-5)
+        else
+          AssertEquals('StochasticPool no grad at non-sampled cell',
+            0.0, Prev.OutputError[x, y, 0], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestStochasticPoolLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip a net containing TNNetStochasticPool with NON-default pool /
+  // stride / padding (pool=3, stride=2, padding=1). SaveToString ->
+  // LoadFromString -> SaveToString must be byte-identical, proving the integer
+  // params (FStruct[0..2]) survive both dispatch points.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2, 1));
+    NN.AddLayer(TNNetStochasticPool.Create(3, 2, 1));
+    NN.EnableDropouts(false); // deterministic for the round-trip comparison
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Abs(Sin(i * 0.7)) * 2.0 + 0.1; // non-negative activations
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('StochasticPool round-trip class identity',
+        NN2.GetLastLayer is TNNetStochasticPool);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('StochasticPool SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.EnableDropouts(false);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('StochasticPool round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;

@@ -314,7 +314,7 @@ breakdown:
       NOTE: the reusable power-iteration helper `TNNet.EstimateSpectralNorm`
       now exists (landed with WeightSpectrumReport) — build the wrapper on
       top of it rather than re-deriving the iteration.
-- [ ] TNNetStochasticPool — sample one cell per pooling window weighted by
+- [x] TNNetStochasticPool — sample one cell per pooling window weighted by
       its activation (softmax of activations over the window) at training,
       take the expectation at inference.
 - [ ] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
