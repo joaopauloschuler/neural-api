@@ -966,7 +966,7 @@ rather than acted on.
       builder) that auto-reshapes a (C,1,1) feature vector to (1,1,C) so the
       per-channel affine "just works" on dense-layer output without the manual
       reshape — verify it stays a no-op on already-(*,*,C) conv output.
-- [ ] `examples/TokenShiftBaseline/` — train a tiny next-token char model
+- [X] `examples/TokenShiftBaseline/` — train a tiny next-token char model
       with `TNNetEmbedding → TNNetTokenShift → MLP` and compare against
       the MHA-based version (`TNNet.AddMultiHeadSelfAttention`).
 - [ ] `examples/ReZeroDeepMLP/` — train a 16-layer residual MLP with and
