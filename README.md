@@ -1234,6 +1234,7 @@ Beyond the runnable examples above, `TNNet` exposes a family of in-process intro
 - **`TNNet.DiffArchitecture(OtherNet)`** / **`DiffArchitectureFromString(s)`** — unified-diff-style report of architectural differences between two networks (LCS-aligned so single inserts/removes don't cascade). → [example](examples/ArchitectureDiff)
 - **`TNNet.ReceptiveFieldReport(NN)`** — analytically propagates the receptive-field recurrence through the spatial layers (size, jump, input coverage, global-mixing cut point); no data needed. → [example](examples/ReceptiveFieldReport)
 - **`TNNet.CountFLOPsPerLayer(NN)`** — per-layer forward-pass FLOP estimate and each layer's share, flagging layer classes the estimator doesn't model. → [example](examples/FLOPsReport)
+- **`TNNet.LayerTimingReport(NN, Sample, Iterations)`** — per-layer forward-pass wall-clock cost: mean microseconds/forward and percent of total (ASCII `#`-bar) measured over `Iterations` forward passes.
 
 ### Weights-only (no forward pass)
 - **`TNNet.WeightHistogramReport(NN)`** — per-trainable-layer weight statistics and ASCII bar histograms. → [example](examples/WeightHistogramReport)

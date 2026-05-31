@@ -121,6 +121,7 @@ type
     procedure TestActivationPatchingReportSmoke;
     procedure TestPredictionDepthReportSmoke;
     procedure TestToGraphvizDotSmoke;
+    procedure TestLayerTimingReportSmoke;
   end;
 
 implementation
@@ -4957,6 +4958,30 @@ begin
     if vInput <> nil then vInput.Free;
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLayerTimingReportSmoke;
+var
+  NN: TNNet;
+  Sample: TNNetVolume;
+  S: string;
+begin
+  NN := TNNet.Create;
+  NN.AddLayer(TNNetInput.Create(8, 8, 3));
+  NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+  NN.AddLayer(TNNetFullConnectReLU.Create(10));
+  NN.AddLayer(TNNetSoftMax.Create());
+  Sample := TNNetVolume.Create(8, 8, 3);
+  Sample.FillForDebug();
+  S := TNNet.LayerTimingReport(NN, Sample, 3);
+  AssertTrue('Report is not empty', Length(S) > 0);
+  AssertTrue('Report has header', Pos('Layer Timing Report', S) > 0);
+  AssertTrue('Report has total', Pos('TOTAL:', S) > 0);
+  Sample.Free;
+  NN.Free;
+  // nil NN must not crash
+  S := TNNet.LayerTimingReport(nil, nil, 3);
+  AssertTrue('nil NN handled', Length(S) > 0);
 end;
 
 initialization

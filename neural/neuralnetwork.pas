@@ -5706,6 +5706,24 @@ type
         Samples: TNNetVolumeList;
         DeadThreshold: TNeuralFloat = 1e-6
       ): string;
+      // LayerTimingReport runs Iterations forward passes of Sample through NN
+      // and returns a human-readable table of per-layer forward-pass wall-clock
+      // cost. It calls NN.ClearTime to zero the per-layer FForwardTime
+      // accumulators, runs Iterations full forward passes (NN.Compute(Sample)),
+      // then reads each layer's accumulated ForwardTime (a TDateTime span in
+      // days) and divides by Iterations to get the mean. Each row reports the
+      // layer index, class name, output shape (XxYxDepth), mean
+      // microseconds/forward and the percent of the total forward time, with an
+      // ASCII '#'-bar for the percent column and a trailing total line. Useful
+      // for spotting forward-pass bottlenecks. Pure forward-only; reuses the
+      // framework's existing timing infrastructure and leaves no training-time
+      // state behind. Returns a short message (never crashes) when NN is nil,
+      // NN has no layers, or Sample is nil.
+      class function LayerTimingReport(
+        NN: TNNet;
+        Sample: TNNetVolume;
+        Iterations: integer = 50
+      ): string;
       // Diagonal (empirical) Fisher-information importance diagnostic. Given a
       // trained classifier NN and a labelled probe batch Samples (input volume
       // + one-hot target pairs), estimates the diagonal Fisher information of
@@ -33979,6 +33997,79 @@ begin
     Lines.Add(Format('TOTAL FLOPs: %d   (uncovered classes: %d)',
       [TotalFLOPs, Uncovered]));
 
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LayerTimingReport(
+  NN: TNNet;
+  Sample: TNNetVolume;
+  Iterations: integer = 50
+): string;
+var
+  Lines: TStringList;
+  LayerCnt, IterCnt, i: integer;
+  Layer: TNNetLayer;
+  MeanUs, Pct, TotalUs: double;
+  BarLen: integer;
+  Bar, ShapeStr: string;
+const
+  // TForwardTime is a TDateTime span measured in days; this converts to us.
+  cUsPerDay = 24.0 * 60.0 * 60.0 * 1000.0 * 1000.0;
+begin
+  Result := '';
+  if NN = nil then
+  begin
+    Result := 'LayerTimingReport: NN is nil.' + sLineBreak;
+    Exit;
+  end;
+  if NN.GetLastLayerIdx() < 0 then
+  begin
+    Result := 'LayerTimingReport: NN has no layers.' + sLineBreak;
+    Exit;
+  end;
+  if Sample = nil then
+  begin
+    Result := 'LayerTimingReport: Sample is nil.' + sLineBreak;
+    Exit;
+  end;
+  if Iterations < 1 then Iterations := 1;
+  // Zero the per-layer FForwardTime accumulators, then run Iterations full
+  // forward passes so each layer's ForwardTime sums its own Compute cost.
+  NN.ClearTime();
+  for IterCnt := 1 to Iterations do
+  begin
+    NN.Compute(Sample);
+  end;
+  TotalUs := 0;
+  for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    TotalUs := TotalUs + NN.Layers[LayerCnt].ForwardTime * cUsPerDay;
+  Lines := TStringList.Create;
+  try
+    Lines.Add('Layer Timing Report');
+    Lines.Add(StringOfChar('=', 19));
+    Lines.Add(Format('Forward passes timed: %d', [Iterations]));
+    Lines.Add(Format('%-4s %-24s %-14s %12s %6s', ['Idx', 'Layer', 'Output', 'us/fwd', '%']));
+    Lines.Add(StringOfChar('-', 70));
+    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerCnt];
+      MeanUs := (Layer.ForwardTime * cUsPerDay) / Iterations;
+      Pct := 0;
+      if TotalUs > 0 then Pct := 100.0 * (Layer.ForwardTime * cUsPerDay) / TotalUs;
+      BarLen := Round(Pct / 5);
+      Bar := '';
+      for i := 1 to BarLen do Bar := Bar + '#';
+      ShapeStr := Format('%dx%dx%d',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      Lines.Add(Format('%-4d %-24s %-14s %12.2f %5.1f %s',
+        [LayerCnt, Layer.ClassName, ShapeStr, MeanUs, Pct, Bar]));
+    end;
+    Lines.Add(StringOfChar('-', 70));
+    Lines.Add(Format('TOTAL: %.2f us/forward across %d layer(s)',
+      [TotalUs / Iterations, NN.GetLastLayerIdx() + 1]));
     Result := Lines.Text;
   finally
     Lines.Free;
