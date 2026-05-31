@@ -465,34 +465,6 @@ breakdown:
       `TNNetWeightStandardization` reparametrizations, which normalize the
       FORWARD weights, not the update.
 ### Introspection / debugging tools
-- [x] `TNNet.GradCAMReport` — Grad-CAM class-localisation map (Selvaraju et al.
-      2017), the CNN attribution the suite is genuinely missing. The landed
-      `SaliencyReport` already covers INPUT-pixel attribution three ways (vanilla
-      `|∂logit_c/∂x|`, SmoothGrad, AND Integrated Gradients with the completeness
-      gap — confirmed in the source, so do NOT re-pitch any of those). Grad-CAM is
-      different in kind: instead of input-pixel gradients it localises at a chosen
-      CONVOLUTION layer's FEATURE-MAP resolution. Recipe, reusing the existing
-      forward/backward splice (no new layer class — a TNNet method + example +
-      smoke test per [[introspection-report-pattern]]): forward the probe, pick
-      `c = argmax`, backprop the one-hot `e_c` to the target conv layer, then for
-      each feature channel `k` compute the importance weight
-      `α_k = mean_xy(∂logit_c/∂A^k_xy)` (global-average-pool the channel's
-      gradient — the `Neurons[].Delta`/OutputError already carries it), form the
-      coarse map `L_xy = ReLU(Σ_k α_k · A^k_xy)`, normalise, and print it as the
-      same ASCII heatmap `SaliencyReport` uses (optionally nearest-upsampled to the
-      input plane so it overlays the printed input). Built-in correctness gate
-      (FAIL line / Halt(1) otherwise): on the SaliencyReport synthetic blob task
-      the Grad-CAM peak must fall inside the class-specific blob's
-      corner/channel — a concrete localisation check the input-gradient maps don't
-      pin. Ship `examples/GradCAM/` forking the SaliencyReport conv net/task so the
-      coarse class-localisation map sits side by side with the fine input-pixel
-      saliency on the SAME sample (the textbook "where did the CNN look" picture),
-      plus a one-paragraph README noting the resolution/locality trade-off
-      (Grad-CAM is coarse but class-discriminative; saliency is fine but noisier)
-      and a `TestGradCAMSmoke`. Distinct from `SaliencyReport`/Integrated Gradients
-      (input-space), `EffectiveReceptiveFieldReport` (input-sensitivity of a
-      central unit, class-agnostic), and `ActivationPatchingReport` (causal
-      internal-activation patch, not a spatial map).
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
@@ -753,6 +725,49 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
+- [ ] `examples/InductionHeads/` — pure-CPU reproduction of the headline result of
+      Olsson et al. 2022 "In-context Learning and Induction Heads"
+      (<https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html>):
+      a TINY 2-layer CAUSAL attention-only transformer spontaneously forms an
+      *induction head* that does in-context copying — on a sequence that contains
+      a repeat `... [A][B] ... [A] -> ?`, it predicts `[B]` by finding the earlier
+      occurrence of the current token `[A]`, looking at the token that FOLLOWED it,
+      and copying that token forward. This is a genuinely different phenomenon from
+      the landed `examples/AttentionCopyTask/` (a SINGLE NON-CAUSAL head learning a
+      position-based identity copy of a non-repeated sequence): induction requires
+      (a) a causal mask, (b) repeated random sequences so the only way to win is
+      content-based prefix-matching, not position, and (c) the two-head composition
+      the paper identifies — a layer-1 "previous-token head" that writes token t-1's
+      identity into position t, feeding a layer-2 "prefix-matching head" that
+      attends from the current token back to where that same token appeared before.
+      The toy: vocab ~16, draw a random prefix and CONCATENATE it with itself (one
+      or more times) so every second-half position has a deterministic
+      copy-the-previous-occurrence answer; train next-token CE under a causal mask.
+      Build it from in-tree pieces only — `TNNetEmbedding` +
+      `TNNetSinusoidalPositionalEmbedding` -> two stacked causal blocks via the
+      `AddTransformerEncoderBlock(..., CausalMask=True)` builder (or hand-wired
+      `TNNetMaskedFill` -> packed Q|K|V `TNNetPointwiseConvLinear` ->
+      `TNNetScaledDotProductAttention`) -> `TNNetPointwiseConvLinear(Vocab)` ->
+      `TNNetPointwiseSoftMax(1)`. Headline built-in correctness signals
+      (printed PASS/FAIL, `Halt(1)` on failure): (1) in-context accuracy on the
+      REPEATED half climbs to near-100% while accuracy on the first (unseen) half
+      stays at chance — the model is copying, not memorising; (2) the
+      "in-context learning score" (loss at a late repeated position minus loss at
+      the matching early position) is strongly negative — the textbook ICL metric;
+      (3) read the layer-2 head's attention matrix back via the existing
+      `AttentionWeights` accessor and assert a "prefix-matching score": each query
+      at a repeat puts most of its attention mass on the position ONE AFTER the
+      earlier occurrence of its own token (the induction stripe), and the layer-1
+      head's mass concentrates on the immediately-previous position
+      (previous-token head). Render that attention matrix as a glyph-shaded ASCII
+      heatmap so the induction stripe is visible directly. Distinct from
+      AttentionCopyTask, the PositionEncodingBakeoff recency study, and the
+      single-net diagnostic reports — this trains a real (tiny) two-layer causal
+      transformer and surfaces an EMERGENT algorithmic circuit. Mind the
+      manual-gradient / best-model-reload gotchas in
+      [[manual-gradient-and-snapshot-gotchas]] and the per-token projection rule in
+      [[mha-builder-and-seq-projection]]; keep dims tiny so the whole thing trains
+      well under the 5-minute CPU budget.
 - [ ] DeadReLU follow-up (open): chart the LR=1.0+ chaotic regime the LR-sweep
       demo deliberately excluded — above the monotone band ReLU's dead fraction
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
@@ -1288,74 +1303,3 @@ breakdown:
       Fisher, then train on task B with an L2 penalty pulling high-Fisher
       params back toward their task-A values; chart task-A retention with and
       without the penalty.
-
-## CORE-MATH (pas-core-math) float32 migration in neuralnetwork.pas
-
-Goal: replace RTL/`Math`-unit *double-precision* scalar calls in
-`neural/neuralnetwork.pas` with the correctly-rounded **float32** equivalents
-from `pascoremath32` (already in the `uses` clause; unit path wired via
-`{$UNITPATH pas-core-math}` in `neuralnetwork.inc`). Everything should run on
-`Single`/float32. Precision shift and Single-vs-Double argument types are
-acceptable/desired — do NOT preserve double semantics.
-
-Mapping legend:
-- `Exp(x)`            -> `pcr_expf(x)`
-- `Ln(x)`            -> `pcr_logf(x)`
-- `Log10(x)`         -> `pcr_log10f(x)`
-- `Power(x,y)`       -> `pcr_powf(x,y)`     (and `Power(2,e)` -> `pcr_exp2f(e)`)
-- `Sin/Cos/Tan`      -> `pcr_sinf/pcr_cosf/pcr_tanf`  (pair -> `pcr_sincosf(x,s,c)`)
-- `Tanh/Sinh/Cosh`   -> `pcr_tanhf/pcr_sinhf/pcr_coshf`
-- `ArcTan/ArcTan2`   -> `pcr_atanf/pcr_atan2f`
-- `1/Sqrt(x)`        -> `pcr_rsqrtf(x)`     (NOTE: no plain `pcr_sqrtf`; leave bare `Sqrt` as-is)
-- fused: `Ln(1+Exp(x))` -> `pcr_log1pf(pcr_expf(x))`; `Exp(x)-1` -> `pcr_expm1f(x)`;
-  hand-rolled erf -> `pcr_erff`.
-
-Per-agent workflow (MANDATORY for every task below):
-1. Edit the assigned ranges only (in `neural/neuralnetwork.pas` and/or
-   `neural/neuralvolume.pas`).
-2. COMPILE: the unit must build green. Do NOT run the test suite or benchmarks
-   (deferred — "test another day"). A clean compile is the gate. Compile with:
-   `fpc -B -Fu/home/bpsa/app/neural-api/neural -Fu/home/bpsa/app/neural-api/neural/pas-core-math -Fu/usr/share/lazarus/4.4.0/components/lazutils/lib/x86_64-linux -Mobjfpc -Sh -O2 <unit>`
-   (compiling a unit that uses it, or tests/RunTests.lpr's build step without
-   running, is fine — just confirm zero fatal errors).
-3. COMMIT locally on branch `a2`. NEVER push. Stage only the source file(s) you
-   changed + tasklist.md (tick your task box). Pre-existing compiler
-   Notes/Warnings are not errors.
-
-### Tasks
-- [x] **T1 — Activation layers (lines ~7600–20100).** The bulk; mechanical
-      per-element scalar loops. Sigmoid/Swish/Beta-Swish (8206–8482),
-      Mish/Smish/Serf/SoftPlus family (8557–8666, 12733–13293),
-      GELU/TanhGLU (9067–9188, 12809–12829), SELU/ELU/CELU (17258–17396),
-      Gaussian/Exp/Log/Sin/Cos/Sinh/ArcSinh/LeCunTanh/Lisht (13418–14464),
-      AconC/MetaAconC (19884–20099), DyT (19019–19067). Apply fused forms:
-      softplus `Ln(1+Exp)`->`log1pf(expf)`; ELU/CELU/SELU `Exp(x)-1`->`expm1f`
-      (13363, 13391, 17275, 17336, 17396); SerfErf/`TNNetErf`/GELU hand-rolled
-      erf -> `pcr_erff` (12871). Verify against TestNeuralLayers/Numerical.
-- [x] **T2 — Attention & softmax.** SDPA/Linear/Sink/Differential attention
-      `Exp(...-max)` (11424, 12005, 12224, 12459/12462, 10582);
-      RoPE/sinusoidal `Sin`/`Cos` + `Exp(-..*Ln(Base))` -> `pcr_sincosf` and
-      `pcr_expf`/`pcr_logf` (7641–7657, 12633–12674, 14328/14329);
-      ALiBi `Power(2,e)` -> `pcr_exp2f` (9913);
-      SoftMax/LogSoftMax/Gumbel (28368–28672); SoftPool/LpPool (26780–27057,
-      `Power`->`pcr_powf`).
-- [x] **T3 — Normalization layers (`1/Sqrt(var+eps)` -> `pcr_rsqrtf`).**
-      LayerNorm/RMSNorm/GroupNorm/PixelNorm/SwitchableNorm/weight-standardization/
-      weight-norm: 21212, 21321/21426, 21588/21593, 21748, 21845, 21978,
-      24565/24625, 24748/24805, plus attention inv-sqrt-dk 11361, 12377 and
-      L2/RMS norm 10826/10853/10890, 11968/11976.
-- [x] **T4 — Init & diagnostics (lower priority).** He/Glorot init `Sqrt(...)`
-      (47327–49657, convert `1/Sqrt` forms to `pcr_rsqrtf`); Box-Muller
-      `Sin/Cos`->`pcr_sincosf` (40752/40753, 42957/42958); `*Report`
-      diagnostics 31000–44897 (`Ln`->`pcr_logf`, `Log10`->`pcr_log10f`,
-      `1/Sqrt`->`pcr_rsqrtf`).
-- [x] **T5 — neuralvolume.pas.** This unit is NOT yet wired to pascoremath32:
-      it has no `{$UNITPATH}` and does not list the unit in `uses`. First add
-      `pascoremath32` to the interface `uses` clause (line ~44) and add
-      `{$UNITPATH ./pas-core-math}` near the top (after the `unit`/`{$mode}`
-      header, ~line 40), mirroring how neuralnetwork.inc does it. Then migrate
-      the ~42 scalar calls to float32: `Exp`->`pcr_expf` (9), `Sqrt` where it
-      is `1/Sqrt`->`pcr_rsqrtf` (18 total Sqrt — leave bare `Sqrt` as-is),
-      `Power`->`pcr_powf` (12; `Power(2,e)`->`pcr_exp2f`), `Ln`->`pcr_logf`,
-      `Log2`->`pcr_log2f`, `Sin/Cos`->`pcr_sinf/pcr_cosf` (pair->`pcr_sincosf`).
-      Preserve all clamps/guards.
