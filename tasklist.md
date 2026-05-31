@@ -404,11 +404,23 @@ breakdown:
       covers the headline use case.
 
 #### Reduction / shape
-- [ ] TNNetGather follow-up: a MULTI-index variant that selects an ordered
+- [X] TNNetGather follow-up: a MULTI-index variant that selects an ordered
       SUBSET of depth channels (output depth = number of selected indices),
       so it doubles as a learnable-free channel reorder/prune. The landed
       single-channel form is the degenerate one-index case; backward scatters
       each output channel's error back to its source channel.
+      DONE 2026-05-31 as `TNNetGatherChannels` (TNNetIdentity subclass;
+      variable-length index list stored in its own structure-string segment
+      like TNNetSplitChannels, registered in both CreateLayer dispatch sites).
+      Repeats ARE allowed — backward accumulates (Add) onto the duplicated
+      source channel (the correct adjoint of forward duplication). Three tests
+      in TestNeuralNumerical.pas (input-grad, repeat-index grad, LoadFromString
+      round-trip); full suite 847 tests green.
+- [ ] TNNetGatherChannels follow-up: add a `TNNet.Add*` builder convenience
+      wrapper + a usage example (channel-routing / channel-pruning demo) — the
+      class is currently only constructible directly. Also a docs note
+      cross-referencing the near-overlapping TNNetSplitChannels so users pick
+      the right one.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 ### Loss layers
@@ -473,28 +485,20 @@ breakdown:
       stub) where SAM's flat minimum actually buys measurable val-accuracy over
       plain SGD would complete the demonstration. Builds directly on the landed
       examples/SharpnessAwareMinimization/.
-- [ ] Muon optimizer experiment (`examples/MuonOptimizer/`) — Newton-Schulz
-      orthogonalized-momentum update (Jordan et al. 2024) for the 2D weight
-      matrices of `TNNetFullConnectLinear` layers, framed as a hand-rolled
-      gradient-surgery demo in the SAM / Lookahead style (NOT a core optimizer
-      rewrite). Per step under `NN.SetBatchUpdate(True)` (so the accumulated
-      `Neurons[].Delta` gradient tensor is actually populated — see
-      [[manual-gradient-and-snapshot-gotchas]]): maintain a momentum buffer
-      `M <- mu*M + G` per dense layer, then replace `M` by its nearest
-      orthogonal matrix via ~5 fixed Newton-Schulz iterations on the normalized
-      `X = M/||M||_F` (the quintic `X <- a*X + b*(XX^T X) + c*(XX^T)^2 X` with the
-      paper's (a,b,c) ~ (3.4445,-4.7750,2.0315), all expressible with the
-      existing `TNNetVolume` matrix ops), and apply `W <- W - lr*O` with the
-      `sqrt(max(rows,cols))` scale so the update RMS matches Adam's. Bake it off
-      against plain SGD-momentum and Adam on a small MLP (the hypotenuse toy or
-      a tiny image stub), charting loss-vs-step and wall-clock/step. Headline
-      correctness signal: after the Newton-Schulz pass the singular values of
-      `O` are all ~1 (assert `||O^T O - I||_F` is small on a probe matrix) — can
-      spot-check the spectrum with the existing `TNNet.EstimateSpectralNorm`
-      power-iteration helper. Genuinely new (no orthogonalized-update path
-      exists in tree); distinct from the differentiable `TNNetWeightNormLinear` /
-      `TNNetWeightStandardization` reparametrizations, which normalize the
-      FORWARD weights, not the update.
+- [ ] Muon optimizer follow-up (`examples/MuonOptimizer/` landed): the demo
+      uses the published 5-step quintic, whose stable fixed points are
+      `sigma ~ 0.868` / `~1.264` (NOT 1), so the orthogonalized update is only
+      *semi*-orthogonal (singular values squeezed into ~[0.7,1.3], the headline
+      check asserts that band rather than `||O^T O - I||_F ~ 0`). Possible
+      follow-ups: (a) add a "tight orthogonality" variant that normalizes by the
+      spectral norm and runs more iterations / coefficient schedule that
+      actually drives sigma -> 1, and assert a strict `||O^T O - I||_F < 1e-3`;
+      (b) make the bake-off favorable to Muon on a problem where it should win
+      (wider hidden layers / anisotropic gradients) rather than the tiny 3-input
+      toy where SGD/Adam are already saturated; (c) factor the
+      `MatMul`/`MatTranspose` packed-matrix helpers (note the
+      `DotProducts` output layout `out[b*NumAs+a]`) into a reusable utility if a
+      second orthogonalization example ever needs them.
 ### Introspection / debugging tools
 - [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
       per-layer wall-clock to stdout.
@@ -756,7 +760,7 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-- [ ] `examples/EchoStateNetwork/` — Reservoir Computing (Jaeger 2001
+- [X] `examples/EchoStateNetwork/` — Reservoir Computing (Jaeger 2001
       "Echo State Network") on a TINY pure-CPU target. This is a genuinely
       DIFFERENT training paradigm from everything in tree: the recurrent core is
       FIXED and RANDOM — only a single linear readout is trained — so there is no
@@ -787,6 +791,17 @@ breakdown:
       forecaster). The reusable nugget this introduces is the
       "fixed-random-reservoir + train-only-the-readout" pattern, which nothing in
       tree currently demonstrates.
+      DONE 2026-05-31: N=100, leak 0.3, 10% sparse W rescaled via
+      EstimateSpectralNorm; only a TNNetFullConnectLinear(1) readout trained on
+      collected states. Teacher-forced one-step NRMSE 0.0161 vs persistence
+      baseline 0.2136; rho>1 ablation free-run diverges (NaN) — all PASS, ~4s.
+- [ ] EchoStateNetwork follow-up: add a `TNNetSpectralRadius` helper (power
+      iteration on W·v only, no W^T step) so reservoirs can target the true
+      spectral RADIUS rather than the conservative spectral-norm upper bound
+      EstimateSpectralNorm gives — would let rho_target be set directly <1.
+- [ ] EchoStateNetwork follow-up: an optional ridge closed-form readout solve
+      (normal equations) as a deterministic alternative to the SGD readout loop,
+      showing the classic ESN one-shot linear fit (the SGD loop is LR-sensitive).
 - [ ] InductionHeads follow-up (landed 2026-05-31, Option A — two hand-wired
       single-head causal SDPA blocks): the landed demo asserts the LAYER-2
       prefix-matching stripe (mass 0.978). Add the matching LAYER-1
