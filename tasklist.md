@@ -37,6 +37,26 @@ rather than acted on.
 ## New layer types
 
 ## Interesting applications / examples
+- [ ] Mahalanobis out-of-distribution detector (`examples/MahalanobisOOD/`) —
+      reproduce Lee et al. 2018 "A Simple Unified Framework for Detecting
+      Out-of-Distribution Samples" on a TINY pure-CPU target. Train a small
+      classifier on an IN-distribution split (e.g. synthetic Gaussian blobs for
+      classes 0..K-1, or MNIST digits 0..4), then FREEZE it and read the
+      penultimate-layer feature vector for each training sample. Fit one
+      class-conditional Gaussian per class: per-class mean mu_c plus a single
+      shared (tied) covariance Sigma pooled across classes; the OOD score for a
+      new x is the max over c of the negative squared Mahalanobis distance
+      -(f-mu_c)^T Sigma^-1 (f-mu_c). Show that held-in samples score higher than
+      OOD samples (held-out classes 5..9, or blobs from a far-away region) and
+      report a single AUROC separating the two score distributions. Note:
+      neuralcalibration.pas already has temperature scaling/ECE but there is no
+      AUROC helper and no OOD example anywhere — the AUROC computation (sort the
+      merged scores, sum ranks / rank-statistic form of the Mann-Whitney U) is
+      the small reusable piece this example introduces. Keep it forward-only
+      after training (no backprop through the detector), invert the KxK feature
+      covariance with the existing volume math (small K so a plain Cholesky or
+      Gauss-Jordan is fine), and add a smoke test asserting AUROC > 0.8 on the
+      easy synthetic split.
 - [ ] Forward-Forward follow-up: scale to a tiny-MNIST few-class subset (the
       paper's actual task) and report whether the per-layer local objective still
       beats chance within the <5-min budget. Builds on the landed
