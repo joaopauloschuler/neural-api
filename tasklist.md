@@ -1318,7 +1318,7 @@ Per-agent workflow (MANDATORY for every task below):
       softplus `Ln(1+Exp)`->`log1pf(expf)`; ELU/CELU/SELU `Exp(x)-1`->`expm1f`
       (13363, 13391, 17275, 17336, 17396); SerfErf/`TNNetErf`/GELU hand-rolled
       erf -> `pcr_erff` (12871). Verify against TestNeuralLayers/Numerical.
-- [ ] **T2 — Attention & softmax.** SDPA/Linear/Sink/Differential attention
+- [x] **T2 — Attention & softmax.** SDPA/Linear/Sink/Differential attention
       `Exp(...-max)` (11424, 12005, 12224, 12459/12462, 10582);
       RoPE/sinusoidal `Sin`/`Cos` + `Exp(-..*Ln(Base))` -> `pcr_sincosf` and
       `pcr_expf`/`pcr_logf` (7641–7657, 12633–12674, 14328/14329);

@@ -7636,15 +7636,16 @@ begin
   // Precompute the frequency table once:
   //   freq[i] = exp(-ln(MaxPeriod) * i / half)  for i in 0..half-1.
   Half := FEmbeddingSize div 2;
-  LogMax := Ln(FMaxPeriod);
+  LogMax := pcr_logf(FMaxPeriod);
   for i := 0 to Half - 1 do
-    FFreq.Raw[i] := Exp(-LogMax * i / Half);
+    FFreq.Raw[i] := pcr_expf(-LogMax * i / Half);
 end;
 
 procedure TNNetSinusoidalTimeEmbedding.Compute();
 var
   i, Half: integer;
   t, Angle: TNeuralFloat;
+  SinVal, CosVal: Single;
   StartTime: double;
 begin
   StartTime := Now();
@@ -7653,8 +7654,9 @@ begin
   for i := 0 to Half - 1 do
   begin
     Angle := t * FFreq.Raw[i];
-    FOutput.Raw[i] := Sin(Angle);
-    FOutput.Raw[Half + i] := Cos(Angle);
+    pcr_sincosf(Angle, SinVal, CosVal);
+    FOutput.Raw[i] := SinVal;
+    FOutput.Raw[Half + i] := CosVal;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -9918,7 +9920,7 @@ begin
   Depth := FOutput.Depth;
   FSlopes.ReSize(1, 1, Depth);
   for H := 0 to Depth - 1 do
-    FSlopes.Raw[H] := Power(2, -8 * (H + 1) / Depth);
+    FSlopes.Raw[H] := pcr_exp2f(-8 * (H + 1) / Depth);
 end;
 
 procedure TNNetALiBi.Compute();
@@ -10587,7 +10589,7 @@ begin
       SumExp := 0;
       for J := 0 to K - 1 do
       begin
-        Probs[J] := Exp(Sims[J] - MaxS);
+        Probs[J] := pcr_expf(Sims[J] - MaxS);
         SumExp := SumExp + Probs[J];
       end;
       for J := 0 to K - 1 do
@@ -11366,7 +11368,7 @@ begin
   FCausal := CausalMask;
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
-  FInvSqrtDk := 1.0 / Sqrt(FDk);
+  FInvSqrtDk := pcr_rsqrtf(FDk);
   FStruct[0] := FDk;
   if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
   FAttn := TNNetVolume.Create();
@@ -11429,7 +11431,7 @@ begin
     SumExp := 0;
     for j := 0 to SeqLen - 1 do
     begin
-      Score := Exp(FAttn[j, i, 0] - MaxScore);
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
       FAttn[j, i, 0] := Score;
       SumExp := SumExp + Score;
     end;
@@ -11578,9 +11580,9 @@ begin
     for a := 0 to FDk - 1 do
     begin
       Q := Prev[i, 0, a];
-      if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := Exp(Q);
+      if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := pcr_expf(Q);
       K := Prev[i, 0, FDk + a];
-      if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := Exp(K);
+      if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := pcr_expf(K);
     end;
   // 2) Accumulate S = sum_s phi(K_s) (x) V_s  and  Z = sum_s phi(K_s).
   FS.Fill(0);
@@ -11777,9 +11779,9 @@ begin
     for a := 0 to FDk - 1 do
     begin
       Q := Prev[i, 0, a];
-      if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := Exp(Q);
+      if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := pcr_expf(Q);
       K := Prev[i, 0, FDk + a];
-      if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := Exp(K);
+      if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := pcr_expf(K);
     end;
   // 2) Running prefix sums and Out_t in a single left-to-right sweep. Add
   //    phi(K_t) (x) V_t and phi(K_t) BEFORE reading S_t / Z_t so query t sees
@@ -12010,7 +12012,7 @@ begin
     SumExp := 0;
     for j := 0 to SeqLen - 1 do
     begin
-      Score := Exp(FAttn[j, i, 0] - MaxScore);
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
       FAttn[j, i, 0] := Score;
       SumExp := SumExp + Score;
     end;
@@ -12229,7 +12231,7 @@ begin
     SumExp := 0;
     for j := 0 to AugLen - 1 do
     begin
-      Score := Exp(FSinkAttn[j, i, 0] - MaxScore);
+      Score := pcr_expf(FSinkAttn[j, i, 0] - MaxScore);
       FSinkAttn[j, i, 0] := Score;
       SumExp := SumExp + Score;
     end;
@@ -12382,7 +12384,7 @@ begin
     FErrorProc('TNNetDifferentialAttention requires an even d_k (it is split ' +
       'into two d_k/2 sub-heads). d_k=' + IntToStr(FDk));
   FHalfDk := FDk div 2;
-  FInvSqrtHalfDk := 1.0 / Sqrt(FHalfDk);
+  FInvSqrtHalfDk := pcr_rsqrtf(FHalfDk);
   FLambdaInit := pLambdaInit;
   FFloatSt[0] := FLambdaInit;
   FAttn2 := TNNetVolume.Create();
@@ -12464,10 +12466,10 @@ begin
     Sum2 := 0;
     for j := 0 to SeqLen - 1 do
     begin
-      Score1 := Exp(FAttn[j, i, 0] - Max1);
+      Score1 := pcr_expf(FAttn[j, i, 0] - Max1);
       FAttn[j, i, 0] := Score1;
       Sum1 := Sum1 + Score1;
-      Score2 := Exp(FAttn2[j, i, 0] - Max2);
+      Score2 := pcr_expf(FAttn2[j, i, 0] - Max2);
       FAttn2[j, i, 0] := Score2;
       Sum2 := Sum2 + Score2;
     end;
@@ -12638,9 +12640,8 @@ begin
   begin
     for k := 0 to HalfD - 1 do
     begin
-      Angle := pos * Exp(-2.0 * k * InvD * Ln(Base));
-      c := Cos(Angle);
-      s := Sin(Angle);
+      Angle := pos * pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
+      pcr_sincosf(Angle, s, c);
       x0 := Prev[pos, 0, 2 * k];
       x1 := Prev[pos, 0, 2 * k + 1];
       FOutput[pos, 0, 2 * k]     := c * x0 - s * x1;
@@ -12677,9 +12678,8 @@ begin
     begin
       for k := 0 to HalfD - 1 do
       begin
-        Angle := pos * Exp(-2.0 * k * InvD * Ln(Base));
-        c := Cos(Angle);
-        s := Sin(Angle);
+        Angle := pos * pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
+        pcr_sincosf(Angle, s, c);
         gy0 := FOutputError[pos, 0, 2 * k];
         gy1 := FOutputError[pos, 0, 2 * k + 1];
         // Transpose rotation: gx0 =  c*gy0 + s*gy1
@@ -26785,7 +26785,7 @@ begin
       for CntD := 0 to MaxD do
       begin
         FOutput.FData[OutputRawPos] :=
-          FOutput.FData[OutputRawPos] + Power(Abs(InputRawPtr^), FP);
+          FOutput.FData[OutputRawPos] + pcr_powf(Abs(InputRawPtr^), FP);
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
@@ -26798,7 +26798,7 @@ begin
   for OutputRawPos := 0 to FOutput.Size - 1 do
   begin
     FOutput.FData[OutputRawPos] :=
-      Power(FOutput.FData[OutputRawPos] / N, InvP);
+      pcr_powf(FOutput.FData[OutputRawPos] / N, InvP);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -26844,7 +26844,7 @@ begin
         // Guard against division by zero / underflow.
         if (Y > cEps) and (AbsX > cEps) then
         begin
-          Coef := (Power(Y, 1.0 - FP) / N) * Power(AbsX, FP - 1.0);
+          Coef := (pcr_powf(Y, 1.0 - FP) / N) * pcr_powf(AbsX, FP - 1.0);
           if XVal < 0 then Coef := -Coef;
           Grad := Coef * FOutputError.FData[OutputRawPos];
           FPrevLayer.OutputError.FData[PrevRawPos] :=
@@ -26945,7 +26945,7 @@ begin
       for CntD := 0 to MaxD do
       begin
         FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
-          Exp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
+          pcr_expf(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
@@ -26967,7 +26967,7 @@ begin
       begin
         if FExpSum.FData[OutputRawPos] > 0 then
         begin
-          ExpVal := Exp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]) /
+          ExpVal := pcr_expf(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]) /
             FExpSum.FData[OutputRawPos];
           FOutput.FData[OutputRawPos] :=
             FOutput.FData[OutputRawPos] + ExpVal * InputRawPtr^;
@@ -27036,7 +27036,7 @@ begin
       for CntD := 0 to MaxD do
       begin
         FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
-          Exp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
+          pcr_expf(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
@@ -27062,7 +27062,7 @@ begin
         Y := FOutput.FData[OutputRawPos];
         if ExpSum > 0 then
         begin
-          Wi := Exp(FBeta * XVal - WinMax) / ExpSum;
+          Wi := pcr_expf(FBeta * XVal - WinMax) / ExpSum;
           Grad := FOutputError.FData[OutputRawPos] * Wi *
             (1.0 + FBeta * (XVal - Y));
           FPrevLayer.OutputError.FData[PrevRawPos] :=
@@ -28373,10 +28373,10 @@ begin
   MaxV := FOutput.FData[0];
   for i := 1 to SizeM1 do
     if FOutput.FData[i] > MaxV then MaxV := FOutput.FData[i];
-  S := Exp(-MaxV);
+  S := pcr_expf(-MaxV);
   for i := 0 to SizeM1 do
   begin
-    V := Exp(FOutput.FData[i] - MaxV);
+    V := pcr_expf(FOutput.FData[i] - MaxV);
     FOutput.FData[i] := V;
     S := S + V;
   end;
@@ -28539,7 +28539,7 @@ begin
       U := Random();
       if U < 1e-20 then U := 1e-20;
       // g = -ln(-ln(U)) ~ Gumbel(0,1).
-      FOutput.FData[i] := FOutput.FData[i] - Ln(-Ln(U));
+      FOutput.FData[i] := FOutput.FData[i] - pcr_logf(-pcr_logf(U));
     end;
   end;
 
@@ -28637,8 +28637,8 @@ begin
           MaxVal := FOutput.FData[StartPos + CntD];
       SumExp := 0;
       for CntD := 0 to MaxD do
-        SumExp := SumExp + Exp(FOutput.FData[StartPos + CntD] - MaxVal);
-      LogSumExp := Ln(SumExp);
+        SumExp := SumExp + pcr_expf(FOutput.FData[StartPos + CntD] - MaxVal);
+      LogSumExp := pcr_logf(SumExp);
       for CntD := 0 to MaxD do
         FOutput.FData[StartPos + CntD] :=
           (FOutput.FData[StartPos + CntD] - MaxVal) - LogSumExp;
@@ -28677,7 +28677,7 @@ begin
           SumDy := SumDy + FOutputError.FData[StartPos + CntD];
         for CntD := 0 to MaxD do
         begin
-          Yi := Exp(FOutput.FData[StartPos + CntD]);
+          Yi := pcr_expf(FOutput.FData[StartPos + CntD]);
           FPrevLayer.OutputError.FData[StartPos + CntD] :=
             FPrevLayer.OutputError.FData[StartPos + CntD] +
             FOutputError.FData[StartPos + CntD] - Yi * SumDy;
