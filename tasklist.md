@@ -766,7 +766,7 @@ breakdown:
       a short text snippet (Tiny Shakespeare or repeated arithmetic).
       Highest-value example missing from the repo; natural capstone for
       the transformer-building-blocks line of work.
-- [ ] `examples/InductionHeads/` — pure-CPU reproduction of the headline result of
+- [X] `examples/InductionHeads/` — pure-CPU reproduction of the headline result of
       Olsson et al. 2022 "In-context Learning and Induction Heads"
       (<https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html>):
       a TINY 2-layer CAUSAL attention-only transformer spontaneously forms an
