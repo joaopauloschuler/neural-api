@@ -12777,9 +12777,9 @@ end;
 procedure TNNetLinearAttention.Compute();
 var
   StartTime: double;
-  SeqLen, i, a, b: integer;
+  SeqLen, i, a: integer;
   Prev: TNNetVolume;
-  Q, K, PhiVal, Vb, AccNum, Den: TNeuralFloat;
+  Q, K, PhiVal, Den: TNeuralFloat;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -12793,7 +12793,10 @@ begin
       K := Prev[i, 0, FDk + a];
       if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := pcr_expf(K);
     end;
-  // 2) Accumulate S = sum_s phi(K_s) (x) V_s  and  Z = sum_s phi(K_s).
+  // 2) Accumulate S = sum_s phi(K_s) (x) V_s  and  Z = sum_s phi(K_s). For a
+  //    fixed key feature a, S row a (contiguous over value feature b) gets
+  //    phi(K_i,a) * V_i added: an AVX MulAdd over FDk floats (V at
+  //    GetRawPtr(i,0,2*FDk)).
   FS.Fill(0);
   FZ.Fill(0);
   for i := 0 to SeqLen - 1 do
@@ -12801,28 +12804,26 @@ begin
     begin
       PhiVal := FPhiK[i, 0, a];
       FZ.Add(a, 0, 0, PhiVal);
-      for b := 0 to FDk - 1 do
-      begin
-        Vb := Prev[i, 0, 2 * FDk + b];
-        FS.Add(a, 0, b, PhiVal * Vb);
-      end;
+      TNNetVolume.MulAdd(FS.GetRawPtr(a, 0, 0),
+        Prev.GetRawPtr(i, 0, 2 * FDk), PhiVal, FDk);
     end;
-  // 3) Out_t = (phi(Q_t) . S) / (phi(Q_t) . Z).
+  // 3) Out_t = (phi(Q_t) . S) / (phi(Q_t) . Z). Den = phi(Q_i) . Z is an AVX
+  //    dot product (Z contiguous over a). The numerator is written b-outer /
+  //    a-inner (strided over a in FS); reorder to a-outer, accumulating
+  //    phi(Q_i,a) * S row a (contiguous over b) into the output row via MulAdd,
+  //    then divide the whole row by Den (clamped exactly as before, first).
   for i := 0 to SeqLen - 1 do
   begin
-    Den := 0;
-    for a := 0 to FDk - 1 do
-      Den := Den + FPhiQ[i, 0, a] * FZ[a, 0, 0];
+    Den := TNNetVolume.DotProduct(
+      FPhiQ.GetRawPtr(i, 0, 0), FZ.GetRawPtr(0, 0, 0), FDk);
     if (Den >= 0) and (Den < 1e-12) then Den := 1e-12;
     if (Den < 0) and (Den > -1e-12) then Den := -1e-12;
     FDen[i, 0, 0] := Den;
-    for b := 0 to FDk - 1 do
-    begin
-      AccNum := 0;
-      for a := 0 to FDk - 1 do
-        AccNum := AccNum + FPhiQ[i, 0, a] * FS[a, 0, b];
-      FOutput[i, 0, b] := AccNum / Den;
-    end;
+    FillChar(FOutput.GetRawPtr(i, 0, 0)^, FDk * SizeOf(TNeuralFloat), 0);
+    for a := 0 to FDk - 1 do
+      TNNetVolume.MulAdd(FOutput.GetRawPtr(i, 0, 0),
+        FS.GetRawPtr(a, 0, 0), FPhiQ[i, 0, a], FDk);
+    TNNetVolume.Mul(FOutput.GetRawPtr(i, 0, 0), 1 / Den, FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -12836,9 +12837,8 @@ var
   // then push them through the phi(K)/V outer-product accumulation.
   dS: TNNetVolume;
   dZ: TNNetVolume;
-  dPhiQ: array of TNeuralFloat;
-  Den, Out_b, OutErr, gNum, PhiQa, dPhiVal, K: TNeuralFloat;
-  dPhiKa, dVb, q: TNeuralFloat;
+  Den, PhiQa, dPhiVal, K, T: TNeuralFloat;
+  dPhiKa, q: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -12855,7 +12855,6 @@ begin
     try
       dS.Fill(0);
       dZ.Fill(0);
-      SetLength(dPhiQ, FDk);
       // ---- Per query i: route dOut back to phi(Q_i), S and Z ----
       // Out[i,b] = Num[i,b]/Den[i],  Num[i,b] = sum_a phiQ[i,a]*S[a,b],
       // Den[i] = sum_a phiQ[i,a]*Z[a].
@@ -12863,58 +12862,54 @@ begin
       //                       = (S[a,b] - Out[i,b]*Z[a]) / Den
       // d/dS[a,b] Out[i,b]    = phiQ[i,a]/Den
       // d/dZ[a]   Out[i,b]    = -Out[i,b]*phiQ[i,a]/Den
+      // The b accumulations are reordered a-outer so each contiguous depth run
+      // (FS / dS row a, the dOut and Out rows) is an AVX dot product / MulAdd:
+      //   dPhiQ[a] = (dOut.S_row_a)/Den - T*Z[a]  with  T = (dOut.Out)/Den
+      //   dS[a,*] += (PhiQa/Den) * dOut_row     (MulAdd)
+      //   dZ[a]   += -T * PhiQa
       for i := 0 to SeqLen - 1 do
       begin
         Den := FDen[i, 0, 0];
-        for a := 0 to FDk - 1 do dPhiQ[a] := 0;
-        for b := 0 to FDk - 1 do
-        begin
-          OutErr := FOutputError[i, 0, b];
-          if OutErr = 0 then continue;
-          Out_b := FOutput[i, 0, b];
-          gNum := OutErr / Den;            // common factor for S and phiQ-num
-          for a := 0 to FDk - 1 do
-          begin
-            PhiQa := FPhiQ[i, 0, a];
-            // gradient into phi(Q_i)
-            dPhiQ[a] := dPhiQ[a] + OutErr *
-              (FS[a, 0, b] - Out_b * FZ[a, 0, 0]) / Den;
-            // gradient into S[a,b]
-            dS.Add(a, 0, b, gNum * PhiQa);
-            // gradient into Z[a] (denominator term)
-            dZ.Add(a, 0, 0, -OutErr * Out_b * PhiQa / Den);
-          end;
-        end;
-        // phi(Q_i) -> Q_i: phi'(q)=1 for q>=0, exp(q)=phi(q) for q<0.
+        // T = sum_b dOut[i,b]*Out[i,b] / Den (contiguous over b).
+        T := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
+          FOutput.GetRawPtr(i, 0, 0), FDk) / Den;
         for a := 0 to FDk - 1 do
         begin
+          PhiQa := FPhiQ[i, 0, a];
+          // gradient into phi(Q_i,a): (dOut . S row a)/Den - T*Z[a]
+          dPhiVal := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
+            FS.GetRawPtr(a, 0, 0), FDk) / Den - T * FZ[a, 0, 0];
+          // phi(Q_i) -> Q_i: phi'(q)=1 for q>=0, exp(q)=phi(q) for q<0.
           q := Prev[i, 0, a];
-          if q >= 0 then dPhiVal := 1 else dPhiVal := FPhiQ[i, 0, a];
-          PrevErr.Add(i, 0, a, dPhiQ[a] * dPhiVal);
+          if q >= 0 then PrevErr.Add(i, 0, a, dPhiVal)
+          else PrevErr.Add(i, 0, a, dPhiVal * PhiQa);
+          // gradient into S[a,*]
+          TNNetVolume.MulAdd(dS.GetRawPtr(a, 0, 0),
+            FOutputError.GetRawPtr(i, 0, 0), PhiQa / Den, FDk);
+          // gradient into Z[a] (denominator term)
+          dZ.Add(a, 0, 0, -T * PhiQa);
         end;
       end;
       // ---- Route dS / dZ back through S = sum_s phiK_s (x) V_s, Z = sum_s phiK_s ----
       // dphiK[s,a] = sum_b dS[a,b]*V[s,b] + dZ[a]
       // dV[s,b]    = sum_a dS[a,b]*phiK[s,a]
       // then phiK -> K via phi'.
+      // dphiK[s,a] is a dot product of dS row a with V_s (both contiguous over
+      // b). dV[s,*] is strided over a in dS, so accumulate a-outer via MulAdd of
+      // dS row a scaled by phiK[s,a] into the V error row.
       for i := 0 to SeqLen - 1 do
       begin
         for a := 0 to FDk - 1 do
         begin
-          dPhiKa := dZ[a, 0, 0];
-          for b := 0 to FDk - 1 do
-            dPhiKa := dPhiKa + dS[a, 0, b] * Prev[i, 0, 2 * FDk + b];
+          dPhiKa := dZ[a, 0, 0] + TNNetVolume.DotProduct(
+            dS.GetRawPtr(a, 0, 0), Prev.GetRawPtr(i, 0, 2 * FDk), FDk);
           // phi(K) -> K
           K := Prev[i, 0, FDk + a];
           if K >= 0 then dPhiVal := 1 else dPhiVal := FPhiK[i, 0, a];
           PrevErr.Add(i, 0, FDk + a, dPhiKa * dPhiVal);
-        end;
-        for b := 0 to FDk - 1 do
-        begin
-          dVb := 0;
-          for a := 0 to FDk - 1 do
-            dVb := dVb + dS[a, 0, b] * FPhiK[i, 0, a];
-          PrevErr.Add(i, 0, 2 * FDk + b, dVb);
+          // dV[s,*] += dS row a * phiK[s,a]
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 2 * FDk),
+            dS.GetRawPtr(a, 0, 0), FPhiK[i, 0, a], FDk);
         end;
       end;
     finally
@@ -12976,9 +12971,9 @@ end;
 procedure TNNetCausalLinearAttention.Compute();
 var
   StartTime: double;
-  SeqLen, i, a, b: integer;
+  SeqLen, i, a: integer;
   Prev: TNNetVolume;
-  Q, K, PhiVal, Vb, AccNum, Den: TNeuralFloat;
+  Q, K, PhiVal, Den: TNeuralFloat;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -12995,7 +12990,10 @@ begin
   // 2) Running prefix sums and Out_t in a single left-to-right sweep. Add
   //    phi(K_t) (x) V_t and phi(K_t) BEFORE reading S_t / Z_t so query t sees
   //    itself (the s <= t inclusive bound). FS[*, t, *] / FZ[*, t] cache the
-  //    prefix sum as of position t for the backward pass.
+  //    prefix sum as of position t for the backward pass. S_i row (a,i) is
+  //    contiguous over the value feature b: copy the previous prefix row then
+  //    AVX-MulAdd phi(K_i,a)*V_i into it (S_0 is just phi(K_0)*V_0). The Den dot
+  //    product and the a-outer numerator MulAdd mirror the non-causal case.
   for i := 0 to SeqLen - 1 do
   begin
     for a := 0 to FDk - 1 do
@@ -13004,28 +13002,27 @@ begin
       // Z_i = Z_{i-1} + phi(K_i)
       if i = 0 then FZ[a, i, 0] := PhiVal
       else FZ[a, i, 0] := FZ[a, i - 1, 0] + PhiVal;
-      for b := 0 to FDk - 1 do
-      begin
-        Vb := Prev[i, 0, 2 * FDk + b];
-        // S_i = S_{i-1} + phi(K_i) (x) V_i
-        if i = 0 then FS[a, i, b] := PhiVal * Vb
-        else FS[a, i, b] := FS[a, i - 1, b] + PhiVal * Vb;
-      end;
+      // S_i = S_{i-1} + phi(K_i) (x) V_i
+      if i = 0 then
+        FillChar(FS.GetRawPtr(a, i, 0)^, FDk * SizeOf(TNeuralFloat), 0)
+      else
+        Move(FS.GetRawPtr(a, i - 1, 0)^, FS.GetRawPtr(a, i, 0)^,
+          FDk * SizeOf(TNeuralFloat));
+      TNNetVolume.MulAdd(FS.GetRawPtr(a, i, 0),
+        Prev.GetRawPtr(i, 0, 2 * FDk), PhiVal, FDk);
     end;
-    // Out_i = (phi(Q_i) . S_i) / (phi(Q_i) . Z_i)
-    Den := 0;
-    for a := 0 to FDk - 1 do
-      Den := Den + FPhiQ[i, 0, a] * FZ[a, i, 0];
+    // Out_i = (phi(Q_i) . S_i) / (phi(Q_i) . Z_i). Z_i row (over a) is
+    // contiguous (depth 1), so Den is an AVX dot product.
+    Den := TNNetVolume.DotProduct(
+      FPhiQ.GetRawPtr(i, 0, 0), FZ.GetRawPtr(0, i, 0), FDk);
     if (Den >= 0) and (Den < 1e-12) then Den := 1e-12;
     if (Den < 0) and (Den > -1e-12) then Den := -1e-12;
     FDen[i, 0, 0] := Den;
-    for b := 0 to FDk - 1 do
-    begin
-      AccNum := 0;
-      for a := 0 to FDk - 1 do
-        AccNum := AccNum + FPhiQ[i, 0, a] * FS[a, i, b];
-      FOutput[i, 0, b] := AccNum / Den;
-    end;
+    FillChar(FOutput.GetRawPtr(i, 0, 0)^, FDk * SizeOf(TNeuralFloat), 0);
+    for a := 0 to FDk - 1 do
+      TNNetVolume.MulAdd(FOutput.GetRawPtr(i, 0, 0),
+        FS.GetRawPtr(a, i, 0), FPhiQ[i, 0, a], FDk);
+    TNNetVolume.Mul(FOutput.GetRawPtr(i, 0, 0), 1 / Den, FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -13042,9 +13039,8 @@ var
   // and value i must receive.
   dSacc: TNNetVolume;
   dZacc: TNNetVolume;
-  dPhiQ: array of TNeuralFloat;
-  Den, Out_b, OutErr, gNum, PhiQa, dPhiVal, K: TNeuralFloat;
-  dPhiKa, dVb, q: TNeuralFloat;
+  Den, PhiQa, dPhiVal, K, T: TNeuralFloat;
+  dPhiKa, q: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -13061,7 +13057,6 @@ begin
     try
       dSacc.Fill(0);
       dZacc.Fill(0);
-      SetLength(dPhiQ, FDk);
       // Sweep queries from last to first. For each query i:
       //   1) route dOut_i back into phi(Q_i), and ADD the per-query
       //      contributions into the running dSacc / dZacc (these target S_i,Z_i);
@@ -13073,54 +13068,47 @@ begin
       // d/dphiQ[i,a] Out[i,b] = (S_i[a,b] - Out[i,b]*Z_i[a]) / Den
       // d/dS_i[a,b] Out[i,b]  = phiQ[i,a]/Den
       // d/dZ_i[a]   Out[i,b]  = -Out[i,b]*phiQ[i,a]/Den
+      // As in the non-causal case the b accumulations are reordered a-outer so
+      // each contiguous depth run is an AVX dot product / MulAdd:
+      //   dPhiQ[a] = (dOut . S_i row a)/Den - T*Z_i[a], T = (dOut.Out)/Den
+      //   dSacc[a,*] += (PhiQa/Den) * dOut row   (MulAdd)
+      //   dZacc[a]   += -T * PhiQa
       for i := SeqLen - 1 downto 0 do
       begin
         Den := FDen[i, 0, 0];
-        for a := 0 to FDk - 1 do dPhiQ[a] := 0;
-        for b := 0 to FDk - 1 do
-        begin
-          OutErr := FOutputError[i, 0, b];
-          if OutErr = 0 then continue;
-          Out_b := FOutput[i, 0, b];
-          gNum := OutErr / Den;            // common factor for S and phiQ-num
-          for a := 0 to FDk - 1 do
-          begin
-            PhiQa := FPhiQ[i, 0, a];
-            // gradient into phi(Q_i)
-            dPhiQ[a] := dPhiQ[a] + OutErr *
-              (FS[a, i, b] - Out_b * FZ[a, i, 0]) / Den;
-            // gradient into S_i[a,b] -> running reverse prefix sum
-            dSacc.Add(a, 0, b, gNum * PhiQa);
-            // gradient into Z_i[a] (denominator term)
-            dZacc.Add(a, 0, 0, -OutErr * Out_b * PhiQa / Den);
-          end;
-        end;
-        // phi(Q_i) -> Q_i: phi'(q)=1 for q>=0, exp(q)=phi(q) for q<0.
+        T := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
+          FOutput.GetRawPtr(i, 0, 0), FDk) / Den;
         for a := 0 to FDk - 1 do
         begin
+          PhiQa := FPhiQ[i, 0, a];
+          // gradient into phi(Q_i,a): (dOut . S_i row a)/Den - T*Z_i[a]
+          dPhiVal := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
+            FS.GetRawPtr(a, i, 0), FDk) / Den - T * FZ[a, i, 0];
+          // phi(Q_i) -> Q_i: phi'(q)=1 for q>=0, exp(q)=phi(q) for q<0.
           q := Prev[i, 0, a];
-          if q >= 0 then dPhiVal := 1 else dPhiVal := FPhiQ[i, 0, a];
-          PrevErr.Add(i, 0, a, dPhiQ[a] * dPhiVal);
+          if q >= 0 then PrevErr.Add(i, 0, a, dPhiVal)
+          else PrevErr.Add(i, 0, a, dPhiVal * PhiQa);
+          // gradient into S_i[a,*] -> running reverse prefix sum
+          TNNetVolume.MulAdd(dSacc.GetRawPtr(a, 0, 0),
+            FOutputError.GetRawPtr(i, 0, 0), PhiQa / Den, FDk);
+          // gradient into Z_i[a] (denominator term)
+          dZacc.Add(a, 0, 0, -T * PhiQa);
         end;
         // dSacc / dZacc now hold sum_{u>=i}; route into phi(K_i) / V_i.
-        // dphiK[i,a] = sum_b dSacc[a,b]*V[i,b] + dZacc[a]
-        // dV[i,b]    = sum_a dSacc[a,b]*phiK[i,a]
+        // dphiK[i,a] = sum_b dSacc[a,b]*V[i,b] + dZacc[a]  (dot product, both
+        //   contiguous over b)
+        // dV[i,b]    = sum_a dSacc[a,b]*phiK[i,a]  (strided over a; accumulate
+        //   a-outer via MulAdd of dSacc row a scaled by phiK[i,a])
         for a := 0 to FDk - 1 do
         begin
-          dPhiKa := dZacc[a, 0, 0];
-          for b := 0 to FDk - 1 do
-            dPhiKa := dPhiKa + dSacc[a, 0, b] * Prev[i, 0, 2 * FDk + b];
+          dPhiKa := dZacc[a, 0, 0] + TNNetVolume.DotProduct(
+            dSacc.GetRawPtr(a, 0, 0), Prev.GetRawPtr(i, 0, 2 * FDk), FDk);
           // phi(K) -> K
           K := Prev[i, 0, FDk + a];
           if K >= 0 then dPhiVal := 1 else dPhiVal := FPhiK[i, 0, a];
           PrevErr.Add(i, 0, FDk + a, dPhiKa * dPhiVal);
-        end;
-        for b := 0 to FDk - 1 do
-        begin
-          dVb := 0;
-          for a := 0 to FDk - 1 do
-            dVb := dVb + dSacc[a, 0, b] * FPhiK[i, 0, a];
-          PrevErr.Add(i, 0, 2 * FDk + b, dVb);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 2 * FDk),
+            dSacc.GetRawPtr(a, 0, 0), FPhiK[i, 0, a], FDk);
         end;
       end;
     finally
