@@ -653,8 +653,11 @@ rather than acted on.
       `DotProducts` output layout `out[b*NumAs+a]`) into a reusable utility if a
       second orthogonalization example ever needs them.
 ### Introspection / debugging tools
-- [ ] WriteLayerTimings(NN, Sample) — runs one forward pass and prints
-      per-layer wall-clock to stdout.
+- [X] WriteLayerTimings(NN, Sample) — landed as `TNNet.LayerTimingReport`
+      (commit be1708d): runs N forward passes and returns a per-layer
+      wall-clock table (mean us/forward + percent ASCII bar + total), reusing
+      the per-layer `ForwardTime` accumulators. Smoke test in
+      tests/TestNeuralLayersExtra.pas.
 - [ ] ActivationStatsReport follow-up: the per-layer `|median|` is currently
       approximated from the last probe sample only (streaming moments keep
       memory bounded). Add an exact per-layer median across the whole probe
