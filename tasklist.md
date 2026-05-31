@@ -62,40 +62,14 @@ rather than acted on.
       iteration count tiny (e.g. 8 primary-capsule types, 10 digit capsules, 3
       routing iters) so a full forward/backward stays inside the <5-min pure-CPU
       budget. Distinct from AttentionCopyTask/InductionHeads (dot-product
-      attention), GatherChannelsRouting (static channel gather), the open
-      TNNetMixtureOfExperts (scalar gate) and the open Modern-Hopfield retrieval.
+      attention), GatherChannelsRouting (static channel gather), the landed
+      TNNet.AddMixtureOfExperts (scalar gate) and the landed Modern-Hopfield retrieval.
 
-- [X] TNNetDropBlock — structured spatial dropout (Ghiasi et al. 2018, "DropBlock:
-      A regularization method for convolutional networks"). LANDED 2026-05-31: layer
-      subclasses TNNetAddNoiseBase, Create(pBlockSize, pDropProb), one spatial keep
-      mask broadcast over Depth, survivor rescale, identity at inference, FreezeMask
-      for the grad check. Both CreateLayer dispatch tables updated; round-trips.
-      Tests: TestDropBlockGradientCheck (TestNeuralNumerical.pas, fixed/frozen mask,
-      RandSeed:=424242, eps 0.01) + TestDropBlockSmokeAndRoundTrip
-      (TestNeuralLayersExtra.pas). Full suite green (900 tests). Original spec below.
-  - [ ] DropBlock follow-up: the STRETCH bake-off is still open — a tiny CIFAR-stub
-        train comparing TNNetDropBlock vs plain TNNetDropout at matched drop rate,
-        charting the train/val gap to show the localized-patch regularizer helps a
-        conv net generalize where scattered-pixel dropout does not. Keep it <5-min CPU.
-        Instead of zeroing
-      INDEPENDENT activations (`TNNetDropout`) or whole RESIDUAL BRANCHES
-      (`TNNetDropPath`), DropBlock zeroes contiguous square `block_size x block_size`
-      regions of a conv feature map, so neighbouring (spatially-correlated) units are
-      dropped together — the only form of dropout that actually removes a localized
-      patch of evidence rather than scattered pixels a conv can trivially in-paint.
-      Forward (train only): sample Bernoulli seeds at rate `gamma = (1-keep) *
-      feat_area / (block_size^2 * valid_area)`, expand each seed to its block via a
-      max-pool-style square dilation to build the 0/1 mask, multiply, then rescale by
-      `count(mask)/count_ones(mask)` so the expected activation is preserved;
-      inference is identity. Backward routes the gradient through the SAME stored
-      mask (a pure element-wise gate, like the existing dropout backward). Verify the
-      gradient with the standard numerical-gradient harness using a FIXED mask (seed
-      the RNG / capture the mask so train-mode forward is deterministic for the
-      check), reseed with `RandSeed := 424242` per the numerical-test RNG-ordering
-      convention. Distinct from `TNNetDropout` (per-element), `TNNetSpatialDropout2D`
-      (whole-CHANNEL drop, not a spatial patch), and `TNNetDropPath` (whole-branch
-      stochastic depth). Stretch: a tiny CIFAR-stub bake-off vs plain Dropout at
-      matched rate showing the train/val gap.
+- [ ] DropBlock follow-up (TNNetDropBlock landed 2026-05-31): the STRETCH bake-off
+      is still open — a tiny CIFAR-stub train comparing TNNetDropBlock vs plain
+      TNNetDropout at matched drop rate, charting the train/val gap to show the
+      localized-patch regularizer helps a conv net generalize where scattered-pixel
+      dropout does not. Keep it <5-min CPU.
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
@@ -227,21 +201,6 @@ rather than acted on.
       chart loss delta. Forward-only demo landed; the bake-off is still open.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
-#### Documentation
-All three landed 2026-05-31 in `docs/layer-authoring.md` (one doc, three sections),
-grounded in the actual TNNetDropBlock/TNNetSpatialDropout2D/TNNetGRN code + the
-TestNeuralNumerical.pas central-difference pattern:
-- [X] Write a one-page "layer authoring checklist" — constructor + LoadFromString
-      round-trip, CreateLayer dispatch entry (both tables), Compute/Backpropagate,
-      and the mandatory numerical-gradient test. Captures the recurring steps every
-      new-layer task in this file actually follows.
-- [X] "Reading a numerical-gradient failure" mini-guide — when the harness
-      reports a mismatch, what does the magnitude tell you (analytic-bug
-      vs. tolerance-too-tight vs. discontinuity-near-the-eps-step)?
-- [X] "Picking a tolerance" mini-guide for numerical-gradient tests — when
-      1e-2 is fine, when to tighten to 1e-3, when to shrink eps instead of
-      loosening the tolerance.
-
 ### Added ideas
 - [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
       pattern. Consider a follow-up that allows masking the lower triangle or a
@@ -284,7 +243,7 @@ TestNeuralNumerical.pas central-difference pattern:
       after one backward pass actually works under `SetBatchUpdate(True)` before
       committing to the full report — that is the one true unknown. Distinct
       from every existing `TNNet.*Report` (none touch the training set) and a
-      natural companion to the open Mahalanobis-OOD / ConformalPrediction
+      natural companion to the landed Mahalanobis-OOD / ConformalPrediction
       data-quality tooling.
 
 ### Ideas from JP
