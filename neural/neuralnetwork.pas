@@ -17720,12 +17720,53 @@ begin
 end;
 
 procedure TNNetByteProcessing.Backpropagate();
+var
+  StartTime: double;
+  J, vMax: integer;
+  x: TNeuralFloat;
 begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+
+  // Straight-through estimator. FOutputError currently holds dL/dOutput. The
+  // forward path thresholds each previous-layer float at 0.0 into a bit
+  // (ReadAsBits), and output bit J maps back to input position J, so the
+  // bit-threshold is a sign() and we reuse the saturated-STE convention of
+  // TNNetSign: pass the gradient through unchanged where |x| <= 1, kill it
+  // otherwise. The discrete byte engine in between is treated as the identity
+  // on the backward pass. This lets the upstream (differentiable) layers
+  // co-adapt to present bit patterns the symbolic predictor handles well,
+  // exactly as TNNetVectorQuantizer feeds its encoder. Padding bits beyond the
+  // previous layer's size carry no gradient. Capture this signal before the
+  // lines below repurpose FOutputError to reconstruct the target state.
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    vMax := FPrevLayer.Output.Size - 1;
+    if vMax > FOutputError.Size - 1 then vMax := FOutputError.Size - 1;
+    for J := 0 to vMax do
+    begin
+      x := FPrevLayer.Output.FData[J];
+      if Abs(x) <= 1 then
+        FPrevLayer.FOutputError.FData[J] :=
+          FPrevLayer.FOutputError.FData[J] + FOutputError.FData[J];
+    end;
+  end;
+
+  // Online training of the discrete engine: target = FOutput - dL/dOutput.
+  // Reading it as bits recovers the "found" next state to learn from.
   FOutputError.Mul(-1);
   FOutputError.Add(FOutput);
   FOutputError.ReadAsBits(FByteOutputFound, 0.0);
   FByteLearning.newStateFound(FByteOutputFound);
-  // This layer doesn't backpropagate.
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Continue the backward chain (previously severed here): the previous
+  // layer's error has already been augmented with the straight-through signal.
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetDigital }
