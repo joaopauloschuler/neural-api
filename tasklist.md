@@ -315,8 +315,16 @@ breakdown:
       now exists (landed with WeightSpectrumReport) — build the wrapper on
       top of it rather than re-deriving the iteration.
 - [x] TNNetStochasticPool — sample one cell per pooling window weighted by
-      its activation (softmax of activations over the window) at training,
-      take the expectation at inference.
+      its activation (probability `pᵢ = aᵢ/Σⱼaⱼ` over the window, NOT a softmax —
+      Zeiler & Fergus 2013 assume non-negative/post-ReLU activations) at
+      training, take the probability-weighted expectation at inference.
+      Landed on TNNetPoolBase (reuses the inherited argmax-style single-cell
+      backward routing); train/inference toggled by TNNet.EnableDropouts;
+      degenerate `Σ ≤ 0` window falls back to the plain mean.
+- [ ] TNNetStochasticPool follow-up: a bake-off vs TNNetMaxPool / TNNetAvgPool /
+      TNNetSoftPool on a tiny image-classifier stub — does the stochastic
+      regularisation lower the train/val gap at matched architecture? Fork an
+      existing pooling example (examples/PoolingBakeoff/) and add the new arm.
 - [ ] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
       its single-branch ShakeDrop generalization.
 
@@ -385,6 +393,11 @@ breakdown:
 
 #### Reduction / shape
 - [x] TNNetGather — single-channel index-into-a-channel layer.
+- [ ] TNNetGather follow-up: a MULTI-index variant that selects an ordered
+      SUBSET of depth channels (output depth = number of selected indices),
+      so it doubles as a learnable-free channel reorder/prune. The landed
+      single-channel form is the degenerate one-index case; backward scatters
+      each output channel's error back to its source channel.
 - [ ] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
 ### Loss layers
@@ -408,8 +421,22 @@ breakdown:
       `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
       is smoothing improves calibration at a small accuracy cost.
-- [x] TNNetCenterLoss — joint softmax + `λ·||x - c_y||²` with EMA-updated
-      class centers stored as the layer's weight tensor.
+- [x] TNNetCenterLoss — `(λ/2)·||x - c_y||²` PENALTY head with trainable
+      per-class centers stored as the layer's neuron weight tensor. Landed as a
+      self-contained label-as-channel head (`x|y` layout, `Depth = d + 1`,
+      label = `round(last channel)`); contributes only the center-pull gradient
+      and is meant to be ADDED ALONGSIDE a separate softmax/cross-entropy head.
+      Centers learned by the optimizer (the per-sample FOutputError path can't
+      see the minibatch, so the paper's cross-batch EMA update was scoped out).
+- [ ] TNNetCenterLoss follow-up: a true SOFTMAX-JOINT variant (or an example)
+      that wires the landed penalty head alongside a classification head and
+      shows the headline Wen et al. result — center loss tightens intra-class
+      feature clusters (visualise a 2-D embedding before/after). Pairs with the
+      [[FeatureSeparability]] example.
+- [ ] TNNetCenterLoss follow-up: cross-batch EMA-updated centers — needs a
+      batch-aware loss hook (the per-sample FOutputError path is blind to other
+      minibatch samples, the same limitation logged for a true cross-batch
+      InfoNCE). Track alongside that batch-aware-loss-hook item.
 - [ ] TNNetArcFace — additive angular-margin softmax for face/embedding
       recognition heads.
 - [ ] TNNetVectorQuantizer (VQ-VAE bottleneck) — codebook of K vectors with
