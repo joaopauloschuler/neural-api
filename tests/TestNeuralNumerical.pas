@@ -700,6 +700,7 @@ type
     procedure TestBlurPoolGradientCheck;
     procedure TestBlurPoolLoadFromString;
     procedure TestBlurPoolShiftInvariance;
+    procedure TestPointwiseByteProcessingSerializationRoundTrip;
   end;
 
 implementation
@@ -27459,6 +27460,81 @@ begin
     NNBlur.Free;
     Base.Free;
     Shifted.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPointwiseByteProcessingSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  skip, i: integer;
+  minOut: TNeuralFloat;
+begin
+  // Round-trip a net containing TNNetPointwiseByteProcessing for both the
+  // no-skip (FStruct[3]=0) and skip-connection (FStruct[3]=1) configurations.
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical,
+  // proving the AddSkipConnection flag (FStruct[3]) survives both dispatch
+  // points, and the reloaded layer must reproduce the same forward output.
+  //
+  // The no-skip case additionally guards the pFalse sign: a 0-bit must map to
+  // -0.5 (not +0.5). A prior sign bug (CopyAsBits(..., -MinValue, +0.5))
+  // collapsed every output to +0.5; here we assert at least one output is
+  // clearly negative, which fails under that bug.
+  RandSeed := 424242;
+  for skip := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    // Depth 8 -> exactly one byte per (X,Y) column; 2x2 grid exercises the
+    // shared-engine-per-position path.
+    Input := TNNetVolume.Create(2, 2, 8);
+    try
+      NN.AddLayer(TNNetInput.Create(2, 2, 8));
+      NN.AddLayer(TNNetPointwiseByteProcessing.Create(0, 8, 40, skip));
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.7) * 2.0 - 0.3;
+      NN.Compute(Input);
+
+      Saved := NN.SaveToString();
+      NN2 := TNNet.Create();
+      try
+        NN2.LoadFromString(Saved);
+        AssertTrue('PointwiseByteProcessing round-trip class identity (skip=' +
+          IntToStr(skip) + ')',
+          NN2.GetLastLayer is TNNetPointwiseByteProcessing);
+        AssertEquals('PointwiseByteProcessing structure round-trip (skip=' +
+          IntToStr(skip) + ')',
+          NN.Layers[1].SaveStructureToString(),
+          NN2.Layers[1].SaveStructureToString());
+        Saved2 := NN2.SaveToString();
+        AssertEquals('PointwiseByteProcessing SaveToString round-trip equality' +
+          ' (skip=' + IntToStr(skip) + ')', Saved, Saved2);
+
+        NN2.Compute(Input);
+        for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+          AssertEquals('PointwiseByteProcessing round-trip output at ' +
+            IntToStr(i) + ' (skip=' + IntToStr(skip) + ')',
+            NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+      finally
+        NN2.Free;
+      end;
+
+      if skip = 0 then
+      begin
+        // pFalse sign guard: a correctly-mapped 0-bit yields -0.5.
+        minOut := NN.GetLastLayer.Output.Raw[0];
+        for i := 1 to NN.GetLastLayer.Output.Size - 1 do
+          if NN.GetLastLayer.Output.Raw[i] < minOut then
+            minOut := NN.GetLastLayer.Output.Raw[i];
+        AssertTrue('PointwiseByteProcessing no-skip output must contain a' +
+          ' negative (0-bit -> -0.5), got min=' + FloatToStr(minOut),
+          minOut < -0.4);
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
   end;
 end;
 
