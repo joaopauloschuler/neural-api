@@ -124,6 +124,7 @@ type
       FFileNameBase: string;
       FClipDelta: single;
       FClipNorm: single;
+      FNaNGuard: boolean;
       FTargetAccuracy: single;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
       FRunning, FShouldQuit: boolean;
@@ -180,6 +181,11 @@ type
       property MinBackpropagationError: TNeuralFloat read FMinBackpropagationError write FMinBackpropagationError;
       property MinBackpropagationErrorProportion: TNeuralFloat read FMinBackpropagationErrorProportion write FMinBackpropagationErrorProportion;
       property Momentum: single read FInertia write FInertia;
+      /// When enabled, after each training batch's forward+backward pass the
+      /// network is scanned for NaN/Inf in any layer's Output/OutputError. If
+      /// found, the offending layer index/class is printed and training aborts.
+      /// OFF by default so the default training path is unchanged.
+      property NaNGuard: boolean read FNaNGuard write FNaNGuard;
       property MultipleSamplesAtValidation: boolean read FMultipleSamplesAtValidation write FMultipleSamplesAtValidation;
       property NN: TNNet read FNN;
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
@@ -1419,6 +1425,19 @@ begin
       LocalNN.Backpropagate( vOutput );
     end;
 
+    if FNaNGuard then
+    begin
+      DepthCnt := LocalNN.FirstLayerWithNonFinite();
+      if DepthCnt >= 0 then
+      begin
+        FErrorProc('NaNGuard: non-finite (NaN/Inf) value detected on layer '+
+          IntToStr(DepthCnt)+' - '+LocalNN.Layers[DepthCnt].ClassName+
+          '. Aborting training.');
+        FShouldQuit := true;
+        Break;
+      end;
+    end;
+
     CurrentLoss := 0;
     if Assigned(FLossFn) then
     begin
@@ -1980,6 +1999,7 @@ begin
   FInertia := 0.9;
   FClipDelta := 0.0;
   FClipNorm := 1.0;
+  FNaNGuard := false;
   FFileNameBase := 'autosave';
   FL2Decay := 0.0000001;
   FTargetAccuracy := 1;
@@ -2717,6 +2737,19 @@ begin
       // TODO: this is an experiment to be tested:
       // decreases probability to train with good sample.
       // FTrainingSampleProcessedCnt.FData[ImgIdx] := FTrainingSampleProcessedCnt.FData[ImgIdx] + 1;
+    end;
+
+    if FNaNGuard then
+    begin
+      DepthCnt := LocalNN.FirstLayerWithNonFinite();
+      if DepthCnt >= 0 then
+      begin
+        FErrorProc('NaNGuard: non-finite (NaN/Inf) value detected on layer '+
+          IntToStr(DepthCnt)+' - '+LocalNN.Layers[DepthCnt].ClassName+
+          '. Aborting training.');
+        FShouldQuit := true;
+        Break;
+      end;
     end;
 
     if (OutputValue > 0) then

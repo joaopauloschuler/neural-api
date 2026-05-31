@@ -193,6 +193,8 @@ type
     procedure ForceMaxRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxMagnitude(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxAbs(Value: T); {$IFDEF Release} inline; {$ENDIF}
+    // Returns true if any element is NaN or +/-Inf (non-finite).
+    function HasNonFinite(): boolean;
     procedure ForcePositive(); {$IFDEF Release} inline; {$ENDIF}
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
@@ -4681,6 +4683,21 @@ begin
     VFix := Value/VMaxAbs;
     Self.Mul( VFix );
     WriteLn(VMaxAbs:6:2);
+  end;
+end;
+
+function TVolume.HasNonFinite(): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FSize - 1 do
+  begin
+    if IsNan(FData[I]) or IsInfinite(FData[I]) then
+    begin
+      Result := true;
+      Exit;
+    end;
   end;
 end;
 

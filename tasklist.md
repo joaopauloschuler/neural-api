@@ -678,7 +678,7 @@ rather than acted on.
       and `clip_value` (element-wise).
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
-- [ ] NaN/Inf guard hook for TNeuralFit — optional "abort training and
+- [X] NaN/Inf guard hook for TNeuralFit — optional "abort training and
       print the offending layer" check after each forward+backward pass.
       Plus a regression test that deliberately seeds a NaN and confirms
       the assertion fires at the right layer.

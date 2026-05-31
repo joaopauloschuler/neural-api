@@ -5589,6 +5589,9 @@ type
       procedure CopyInertia(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       function ForceMaxAbsoluteDelta(vMax: TNeuralFloat = 0.01): TNeuralFloat;
       function ForceMaxAbsoluteWeight(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Scans every layer's Output (and optionally OutputError) for NaN/Inf.
+      // Returns the index of the first non-finite layer, or -1 if all finite.
+      function FirstLayerWithNonFinite(CheckOutputError: boolean = true): integer;
       function ForceMaxWeightNorm(vMax: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       function GetMaxAbsoluteDelta(): TNeuralFloat;
       function NormalizeMaxAbsoluteDelta(NewMax: TNeuralFloat = 0.1): TNeuralFloat;
@@ -49378,6 +49381,30 @@ begin
         end;
         {$ENDIF}
       end;
+    end;
+  end;
+end;
+
+function TNNet.FirstLayerWithNonFinite(CheckOutputError: boolean): integer;
+var
+  LayerCnt: integer;
+  Layer: TNNetLayer;
+begin
+  Result := -1;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    Layer := FLayers[LayerCnt];
+    if (Layer.Output <> nil) and (Layer.Output.Size > 0) and
+       Layer.Output.HasNonFinite() then
+    begin
+      Result := LayerCnt;
+      Exit;
+    end;
+    if CheckOutputError and (Layer.OutputError <> nil) and
+       (Layer.OutputError.Size > 0) and Layer.OutputError.HasNonFinite() then
+    begin
+      Result := LayerCnt;
+      Exit;
     end;
   end;
 end;
