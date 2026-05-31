@@ -12607,8 +12607,9 @@ procedure TNNetScaledDotProductAttention.Compute();
 var
   StartTime: double;
   SeqLen, i, j, d: integer;
-  Score, MaxScore, SumExp, AccVal: TNeuralFloat;
+  Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -12616,7 +12617,9 @@ begin
   // For each query row i: compute scores, softmax, then weighted sum of V.
   for i := 0 to SeqLen - 1 do
   begin
-    // 1) Scaled scores into FAttn[*, i, 0].
+    // 1) Scaled scores into FAttn[*, i, 0]. The depth axis is contiguous, so
+    //    score = Q[i] . K[j] is an AVX dot product over FDk floats:
+    //    Q at GetRawPtr(i,0,0), K at GetRawPtr(j,0,FDk).
     MaxScore := -1e30;
     for j := 0 to SeqLen - 1 do
     begin
@@ -12626,9 +12629,8 @@ begin
       end
       else
       begin
-        Score := 0;
-        for d := 0 to FDk - 1 do
-          Score := Score + Prev[i, 0, d] * Prev[j, 0, FDk + d];
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
         Score := Score * FInvSqrtDk;
         FAttn[j, i, 0] := Score;
       end;
@@ -12645,14 +12647,15 @@ begin
     if SumExp > 0 then
       for j := 0 to SeqLen - 1 do
         FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
-    // 3) Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d].
+    // 3) Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d]. V is contiguous along
+    //    depth, so accumulate j-outer with AVX MulAdd over FDk floats (the old
+    //    d-outer / j-inner order was strided over j and not vectorizable).
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
     for d := 0 to FDk - 1 do
-    begin
-      AccVal := 0;
-      for j := 0 to SeqLen - 1 do
-        AccVal := AccVal + FAttn[j, i, 0] * Prev[j, 0, 2 * FDk + d];
-      FOutput[i, 0, d] := AccVal;
-    end;
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -12660,12 +12663,11 @@ end;
 procedure TNNetScaledDotProductAttention.Backpropagate();
 var
   StartTime: double;
-  SeqLen, i, j, k, d: integer;
+  SeqLen, i, j, k: integer;
   Prev, PrevErr: TNNetVolume;
   dAttn: array of TNeuralFloat;
   dScore: array of TNeuralFloat;
   SumDAttnAttn, A, dS: TNeuralFloat;
-  OutErr: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -12684,16 +12686,15 @@ begin
       // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
       // dV[j,d] += Attn[i,j] * dOut[i,d]
       // dAttn[j] = sum_d dOut[i,d] * V[j,d]
+      // Depth is contiguous: dV accumulation is an AVX MulAdd and dAttn[j] is
+      // an AVX dot product (dOut[i] . V[j]) over FDk floats.
       for j := 0 to SeqLen - 1 do
       begin
-        dAttn[j] := 0;
         A := FAttn[j, i, 0];
-        for d := 0 to FDk - 1 do
-        begin
-          OutErr := FOutputError[i, 0, d];
-          PrevErr.Add(j, 0, 2 * FDk + d, A * OutErr);
-          dAttn[j] := dAttn[j] + OutErr * Prev[j, 0, 2 * FDk + d];
-        end;
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk),
+          FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+        dAttn[j] := TNNetVolume.DotProduct(
+          FOutputError.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
       end;
       // ---- Softmax Jacobian: dScore[j] = Attn[j] * (dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
       SumDAttnAttn := 0;
@@ -12708,16 +12709,17 @@ begin
       // score[i,j] = invSqrtDk * sum_d Q[i,d]*K[j,d]
       // dQ[i,d] += invSqrtDk * sum_j dScore[j] * K[j,d]
       // dK[j,d] += invSqrtDk * dScore[j] * Q[i,d]
+      // Depth is contiguous: dQ[i] += dS*K[j] and dK[j] += dS*Q[i] are AVX
+      // MulAdd over FDk floats (Q at GetRawPtr(i,0,0), K at GetRawPtr(j,0,FDk)).
       for j := 0 to SeqLen - 1 do
       begin
         dS := dScore[j] * FInvSqrtDk;
         if dS <> 0 then
         begin
-          for d := 0 to FDk - 1 do
-          begin
-            PrevErr.Add(i, 0, d, dS * Prev[j, 0, FDk + d]);
-            PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
-          end;
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+            Prev.GetRawPtr(j, 0, FDk), dS, FDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+            Prev.GetRawPtr(i, 0, 0), dS, FDk);
         end;
       end;
     end;
