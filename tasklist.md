@@ -35,6 +35,35 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetCapsule + routing-by-agreement (Sabour/Hinton/Frosst 2017, "Dynamic
+      Routing Between Capsules") — genuinely distinct from everything in tree:
+      attention routes by scaled dot-product, MoE routes by a softmax gate, the
+      open Modern-Hopfield entry retrieves by energy; capsules route by *iterative
+      agreement* between vector-valued units, which nothing here does. Two pieces:
+      (1) a `squash` nonlinearity `v = (||s||^2 / (1+||s||^2)) * (s/||s||)` that
+      compresses a capsule VECTOR's length into [0,1) while preserving its
+      orientation (new — the existing length-based code at neuralnetwork.pas only
+      squashes scalar margins, not vectors); and (2) a `TNNetCapsuleRouting` layer
+      that, given lower-level capsules, applies the per-pair transform matrices and
+      runs the fixed 3-iteration routing loop (softmax over coupling coefficients
+      `c_ij`, weighted sum, squash, update logits by agreement `u_hat . v`). Train
+      a tiny `CapsNet` on a small MNIST/Fashion-MNIST subset with the paper's
+      MARGIN loss (`T_k*max(0,m+-||v_k||)^2 + lambda*(1-T_k)*max(0,||v_k||-m-)^2`)
+      and report digit accuracy vs a param-matched plain CNN; stretch goal is the
+      capsule's headline property — perturb one dimension of the winning capsule's
+      output vector and show it varies an interpretable pose factor (stroke
+      thickness / skew) when fed to a small reconstruction decoder. Feasibility
+      risks to settle in v1, in the honest "what did NOT fit the CPU budget" style
+      the Grokking/CA entries use: the routing loop's softmax-over-coupling is an
+      INNER iteration that is NOT a gradient step, so the coupling logits `b_ij`
+      must be reset per forward pass and only the transform-matrix weights carry
+      gradients — verify the backward path under the `SetBatchUpdate(True)` idiom
+      from [[manual-gradient-and-snapshot-gotchas]], and keep the capsule count /
+      iteration count tiny (e.g. 8 primary-capsule types, 10 digit capsules, 3
+      routing iters) so a full forward/backward stays inside the <5-min pure-CPU
+      budget. Distinct from AttentionCopyTask/InductionHeads (dot-product
+      attention), GatherChannelsRouting (static channel gather), the open
+      TNNetMixtureOfExperts (scalar gate) and the open Modern-Hopfield retrieval.
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
