@@ -8724,7 +8724,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
+      InvSqrt := pcr_rsqrtf(1 + Alpha * PrevValue * PrevValue);
       FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
       FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
     end;
@@ -8783,7 +8783,7 @@ begin
       end
       else
       begin
-        InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
+        InvSqrt := pcr_rsqrtf(1 + Alpha * PrevValue * PrevValue);
         FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
         FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
       end;
@@ -10833,7 +10833,7 @@ begin
         Xi := LocalPrevOutput.FData[StartPos + CntD];
         SumSq := SumSq + Xi * Xi;
       end;
-      InvN := 1.0 / Sqrt(SumSq + Eps);
+      InvN := pcr_rsqrtf(SumSq + Eps);
       FInvNorms.FData[FInvNorms.GetRawPos(CntX, CntY, 0)] := InvN;
       for CntD := 0 to MaxD do
         FOutput.FData[StartPos + CntD] :=
@@ -10860,7 +10860,7 @@ begin
     Xi := LocalPrevOutput.FData[Cnt];
     SumSq := SumSq + Xi * Xi;
   end;
-  InvN := 1.0 / Sqrt(SumSq + Eps);
+  InvN := pcr_rsqrtf(SumSq + Eps);
   FInvNorms.FData[0] := InvN;
   for Cnt := 0 to MaxPos do
     FOutput.FData[Cnt] := LocalPrevOutput.FData[Cnt] * InvN;
@@ -10897,7 +10897,7 @@ begin
       end;
     end;
   for CntD := 0 to MaxD do
-    FInvNorms.FData[CntD] := 1.0 / Sqrt(SumSq[CntD] + Eps);
+    FInvNorms.FData[CntD] := pcr_rsqrtf(SumSq[CntD] + Eps);
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
@@ -11975,7 +11975,7 @@ begin
     SumSq := 0;
     for d := 0 to FDk - 1 do
       SumSq := SumSq + Prev[i, 0, d] * Prev[i, 0, d];
-    InvN := 1.0 / Sqrt(SumSq + FEps);
+    InvN := pcr_rsqrtf(SumSq + FEps);
     FInvQNorm[i, 0, 0] := InvN;
     for d := 0 to FDk - 1 do
       FQNorm[i, 0, d] := Prev[i, 0, d] * InvN;
@@ -11983,7 +11983,7 @@ begin
     SumSq := 0;
     for d := 0 to FDk - 1 do
       SumSq := SumSq + Prev[i, 0, FDk + d] * Prev[i, 0, FDk + d];
-    InvN := 1.0 / Sqrt(SumSq + FEps);
+    InvN := pcr_rsqrtf(SumSq + FEps);
     FInvKNorm[i, 0, 0] := InvN;
     for d := 0 to FDk - 1 do
       FKNorm[i, 0, d] := Prev[i, 0, FDk + d] * InvN;
@@ -21217,7 +21217,7 @@ begin
   Mean := FOutput.GetAvg();
   FOutput.Sub(Mean);
   Variance := FOutput.GetSumSqr() / FOutput.Size;
-  FInvStdDev := 1 / Sqrt(Variance + FLayerNormEpsilon);
+  FInvStdDev := pcr_rsqrtf(Variance + FLayerNormEpsilon);
   FOutput.Mul(FInvStdDev);
   // Keep the normalized values for the backward pass.
   FNormalized.Copy(FOutput);
@@ -21326,7 +21326,7 @@ begin
   inherited Compute;
   // Divide the whole sample by its root mean square (no mean subtraction).
   MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
-  FInvRMS := 1 / Sqrt(MeanSqr + FRMSNormEpsilon);
+  FInvRMS := pcr_rsqrtf(MeanSqr + FRMSNormEpsilon);
   FOutput.Mul(FInvRMS);
   // Keep the normalized values for the backward pass.
   FNormalized.Copy(FOutput);
@@ -21431,7 +21431,7 @@ begin
   // Divide the whole sample by its root mean square (no mean subtraction),
   // exactly like TNNetRMSNorm.
   MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
-  FInvRMS := 1 / Sqrt(MeanSqr + FRMSNormEpsilon);
+  FInvRMS := pcr_rsqrtf(MeanSqr + FRMSNormEpsilon);
   FOutput.Mul(FInvRMS);
   // Keep the normalized values n[x,y,d] for the backward pass.
   FNormalized.Copy(FOutput);
@@ -21593,12 +21593,12 @@ begin
   FNormLN.Copy(FOutput);
   FNormLN.Sub(Mean);
   Variance := FNormLN.GetSumSqr() / FNormLN.Size;
-  FInvStdDev := 1 / Sqrt(Variance + FNormEpsilon);
+  FInvStdDev := pcr_rsqrtf(Variance + FNormEpsilon);
   FNormLN.Mul(FInvStdDev);
 
   // --- RMSNorm-style normalization R = x / sqrt(mean(x^2) + eps) ---
   MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
-  FInvRMS := 1 / Sqrt(MeanSqr + FNormEpsilon);
+  FInvRMS := pcr_rsqrtf(MeanSqr + FNormEpsilon);
   FNormRMS.Copy(FOutput);
   FNormRMS.Mul(FInvRMS);
 
@@ -21753,7 +21753,7 @@ begin
   Mean := FOutput.GetAvg();
   FOutput.Sub(Mean);
   Variance := FOutput.GetSumSqr() / FOutput.Size;
-  FInvStdDev := 1 / Sqrt(Variance + FZScoreEpsilon);
+  FInvStdDev := pcr_rsqrtf(Variance + FZScoreEpsilon);
   FOutput.Mul(FInvStdDev);
   // Keep the normalized values for the backward pass.
   FNormalized.Copy(FOutput);
@@ -21850,7 +21850,7 @@ begin
       SumSqr := 0;
       for c := 0 to Depth - 1 do
         SumSqr := SumSqr + FOutput.FData[BaseIdx + c] * FOutput.FData[BaseIdx + c];
-      InvRMS := 1 / Sqrt(SumSqr / Depth + FPixelNormEpsilon);
+      InvRMS := pcr_rsqrtf(SumSqr / Depth + FPixelNormEpsilon);
       FInvRMS[PixelIdx] := InvRMS;
       for c := 0 to Depth - 1 do
         FOutput.FData[BaseIdx + c] := FOutput.FData[BaseIdx + c] * InvRMS;
@@ -21983,7 +21983,7 @@ begin
           Variance := Variance + FOutput[CntX, CntY, CntD] * FOutput[CntX, CntY, CntD];
         end;
     Variance := Variance / GroupSize;
-    FInvStdDev[GroupCnt] := 1 / Sqrt(Variance + FGroupNormEpsilon);
+    FInvStdDev[GroupCnt] := pcr_rsqrtf(Variance + FGroupNormEpsilon);
     for CntX := 0 to FOutput.SizeX - 1 do
       for CntY := 0 to FOutput.SizeY - 1 do
         for CntD := DStart to DEnd do
@@ -23943,7 +23943,7 @@ begin
   (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
   ValueT := AddLayer( TNNetTransposeXD.Create() );
   (*W := *)AddLayer( TNNetDotProducts.Create(Query, Key, NoForward) );
-  (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  (*W := *)AddLayer( TNNetMulByConstant.Create(pcr_rsqrtf(EmbeddingDim)) );
   (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
   W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
   (*Y := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
@@ -24002,7 +24002,7 @@ begin
       (*W := *)AddLayer( TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, NoForward) );
       if Not(HasNorm) then
       begin
-        (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(InputChannelsPerGroup)) );
+        (*W := *)AddLayer( TNNetMulByConstant.Create(pcr_rsqrtf(InputChannelsPerGroup)) );
         (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
       end;
       W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
@@ -24570,7 +24570,7 @@ begin
       Variance := Variance +
         Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
     Variance := Variance / FloatN;
-    InvStd := 1 / Sqrt(Variance + FWSEpsilon);
+    InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
     if FSuppressBias = 0 then
     begin
       FOutput.FData[NeuronCnt] := localNeuron.FBiasWeight;
@@ -24630,7 +24630,7 @@ begin
     for WeightCnt := 0 to MaxWeights do
       Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
     Variance := Variance / FloatN;
-    InvStd := 1 / Sqrt(Variance + FWSEpsilon);
+    InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
 
     // Standardized weights w_hat (also needed for the input gradient).
     FStdWeights.ReSize(localNeuron.FWeights);
@@ -24753,7 +24753,7 @@ begin
     Norm := 0;
     for WeightCnt := 0 to MaxWeights do
       Norm := Norm + Sqr(localNeuron.FWeights.FData[WeightCnt]);
-    InvNorm := 1 / Sqrt(Norm + FWNEpsilon);
+    InvNorm := pcr_rsqrtf(Norm + FWNEpsilon);
     if FSuppressBias = 0 then
     begin
       FOutput.FData[NeuronCnt] := localNeuron.FBiasWeight;
@@ -24810,7 +24810,7 @@ begin
     Norm := 0;
     for WeightCnt := 0 to MaxWeights do
       Norm := Norm + Sqr(localNeuron.FWeights.FData[WeightCnt]);
-    InvNorm := 1 / Sqrt(Norm + FWNEpsilon);
+    InvNorm := pcr_rsqrtf(Norm + FWNEpsilon);
 
     // Unit-norm weights w_hat (also needed for the input gradient).
     FStdWeights.ReSize(localNeuron.FWeights);
@@ -37260,7 +37260,7 @@ var
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
           else
             T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
-          C := 1.0 / Sqrt(T * T + 1.0);
+          C := pcr_rsqrtf(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
           // update diagonal
@@ -37790,7 +37790,7 @@ var
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
           else
             T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
-          C := 1.0 / Sqrt(T * T + 1.0);
+          C := pcr_rsqrtf(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
           A[P][P] := App - T * Apq;
@@ -38211,7 +38211,7 @@ var
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
           else
             T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
-          C := 1.0 / Sqrt(T * T + 1.0);
+          C := pcr_rsqrtf(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
           A[P][P] := App - T * Apq;
