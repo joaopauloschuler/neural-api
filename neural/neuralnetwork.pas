@@ -273,7 +273,10 @@ type
       procedure SumWeights(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumInertia(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure SumDeltas(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
-      procedure SumDeltasNoChecks(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
+      // Virtual (not inlined) so layers whose trainable state lives outside the
+      // TNNetNeuron weights (e.g. TNNetByteProcessing's symbolic engine) can
+      // fold a thread clone's learning back into the main net during Fit.
+      procedure SumDeltasNoChecks(Origin: TNNetLayer); virtual;
       // Copies all weights by their corresponding weights found at Origin.
       // Both layers must have the same number of weights and neurons for this
       // function to work as expected.
@@ -7502,6 +7505,12 @@ type
       // Carry the learned engine across Clone()/CopyWeights (the base only
       // copies TNNetNeuron weights, of which this layer has none).
       procedure CopyWeights(Origin: TNNetLayer); override;
+      // Fold a thread clone's learning back into the main net during Fit. The
+      // engine learns online (outside the TNNetNeuron deltas the base sums), so
+      // we copy Origin's learned rules over our own (last-writer-wins). This is
+      // exact and lossless for single-thread Fit; for multi-thread it keeps the
+      // most-recently-reduced clone's engine.
+      procedure SumDeltasNoChecks(Origin: TNNetLayer); override;
   end;
 
   // Pointwise (1x1-convolution-style) variant of TNNetByteProcessing. A single
@@ -17865,6 +17874,23 @@ var
   s: string;
 begin
   inherited CopyWeights(Origin);
+  if (Origin is TNNetByteProcessing) and (FOutput.Size > 0) and
+     (TNNetByteProcessing(Origin).FOutput.Size > 0) then
+  begin
+    s := TNNetByteProcessing(Origin).FByteLearning.BytePred.NeuronsToString(0);
+    FByteLearning.BytePred.CleanAndLoadNeuronsFromString(s);
+  end;
+end;
+
+procedure TNNetByteProcessing.SumDeltasNoChecks(Origin: TNNetLayer);
+var
+  s: string;
+begin
+  inherited SumDeltasNoChecks(Origin);
+  // The base summed TNNetNeuron deltas (this layer has none); fold the engine's
+  // online-learned rules back from the clone by overwriting ours with its
+  // (last-writer-wins). Same guard as CopyWeights: both engines must be
+  // initiated (FOutput.Size>0, set in SetPrevLayer).
   if (Origin is TNNetByteProcessing) and (FOutput.Size > 0) and
      (TNNetByteProcessing(Origin).FOutput.Size > 0) then
   begin
