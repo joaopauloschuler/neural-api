@@ -283,6 +283,7 @@ type
     procedure TestVectorQuantizerCommitmentGradient;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
+    procedure TestArcFaceDegenerateIsCosineSoftmax;
     procedure TestArcFaceLoadFromString;
 
     // Transform / reshaping / element-wise layer gradient checks
@@ -23309,6 +23310,117 @@ begin
         NumGrad, AnaGrad, 1e-2);
     end;
     AssertEquals('ArcFace label-channel grad is zero',
+      0.0, LArc.OutputError[0, 0, cD], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestArcFaceDegenerateIsCosineSoftmax;
+const
+  cD      = 3;            // embedding dimension
+  cDepth  = cD + 1;       // + label channel
+  cK      = 4;            // number of classes
+  cClass  = 2;            // active (true) class
+  // Degenerate ArcFace parameters: zero angular margin, unit scale.
+  // cos(theta_y + 0) = cos(theta_y), so the margined logit collapses to the
+  // plain cosine logit for ALL classes -> a normalized-softmax (cosine)
+  // classifier.
+  cMargin = 0.0;
+  cScale  = 1.0;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LArc: TNNetArcFace;
+  XNorm: TNeuralFloat;
+  Cosines, Probs, RefGradX: array of TNeuralFloat;
+  WNorm, Dot, MaxL, SumExp, GK, AnaGrad: TNeuralFloat;
+  i, k: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cDepth);
+  Target := TNNetVolume.Create(1, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cDepth, 1));
+    LArc := TNNetArcFace.Create(cK, cMargin, cScale);
+    NN.AddLayer(LArc);
+    LArc.SetBatchUpdate(True); // keep class weights frozen during the probe
+
+    // Deterministic, non-degenerate class weight vectors.
+    LArc.Neurons[0].Weights.Raw[0] :=  0.5; LArc.Neurons[0].Weights.Raw[1] := -0.2; LArc.Neurons[0].Weights.Raw[2] :=  0.7;
+    LArc.Neurons[1].Weights.Raw[0] := -0.3; LArc.Neurons[1].Weights.Raw[1] :=  0.6; LArc.Neurons[1].Weights.Raw[2] :=  0.2;
+    LArc.Neurons[2].Weights.Raw[0] :=  0.4; LArc.Neurons[2].Weights.Raw[1] :=  0.4; LArc.Neurons[2].Weights.Raw[2] := -0.5;
+    LArc.Neurons[3].Weights.Raw[0] :=  0.1; LArc.Neurons[3].Weights.Raw[1] := -0.7; LArc.Neurons[3].Weights.Raw[2] :=  0.3;
+
+    Input[0, 0, 0] :=  0.6;
+    Input[0, 0, 1] := -0.3;
+    Input[0, 0, 2] :=  0.5;
+    Input[0, 0, cD] := cClass; // label channel
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // ---- Hand-wired cosine-softmax reference (margin=0, scale=1) ----
+    SetLength(Cosines, cK);
+    SetLength(Probs, cK);
+    SetLength(RefGradX, cD);
+
+    XNorm := 0;
+    for i := 0 to cD - 1 do XNorm := XNorm + Input[0, 0, i] * Input[0, 0, i];
+    XNorm := Sqrt(XNorm);
+
+    for k := 0 to cK - 1 do
+    begin
+      WNorm := 0; Dot := 0;
+      for i := 0 to cD - 1 do
+      begin
+        WNorm := WNorm + LArc.Neurons[k].Weights.Raw[i] * LArc.Neurons[k].Weights.Raw[i];
+        Dot := Dot + Input[0, 0, i] * LArc.Neurons[k].Weights.Raw[i];
+      end;
+      WNorm := Sqrt(WNorm);
+      Cosines[k] := Dot / (XNorm * WNorm);
+    end;
+
+    // Softmax over the plain cosine logits (scale = 1).
+    MaxL := Cosines[0];
+    for k := 1 to cK - 1 do if Cosines[k] > MaxL then MaxL := Cosines[k];
+    SumExp := 0;
+    for k := 0 to cK - 1 do
+    begin
+      Probs[k] := Exp(Cosines[k] - MaxL);
+      SumExp := SumExp + Probs[k];
+    end;
+    for k := 0 to cK - 1 do Probs[k] := Probs[k] / SumExp;
+
+    // Cross-entropy gradient (p - onehot) pushed back through the cosine
+    // Jacobian d(cos_k)/dx = (W_k_hat - cos_k * x_hat) / ||x||.
+    for i := 0 to cD - 1 do RefGradX[i] := 0;
+    for k := 0 to cK - 1 do
+    begin
+      GK := Probs[k];
+      if k = cClass then GK := GK - 1.0;
+      WNorm := 0;
+      for i := 0 to cD - 1 do
+        WNorm := WNorm + LArc.Neurons[k].Weights.Raw[i] * LArc.Neurons[k].Weights.Raw[i];
+      WNorm := Sqrt(WNorm);
+      for i := 0 to cD - 1 do
+        RefGradX[i] := RefGradX[i] + GK *
+          (LArc.Neurons[k].Weights.Raw[i] / WNorm - Cosines[k] * Input[0, 0, i] / XNorm) / XNorm;
+    end;
+
+    // The ArcFace layer (m=0,s=1) must reproduce the cosine-softmax feature
+    // gradient exactly.
+    for i := 0 to cD - 1 do
+    begin
+      AnaGrad := LArc.OutputError[0, 0, i];
+      AssertEquals('ArcFace(m=0,s=1) matches cosine-softmax grad at ' + IntToStr(i),
+        RefGradX[i], AnaGrad, 1e-4);
+    end;
+    AssertEquals('ArcFace(m=0,s=1) label-channel grad is zero',
       0.0, LArc.OutputError[0, 0, cD], 1e-6);
   finally
     NN.Free;
