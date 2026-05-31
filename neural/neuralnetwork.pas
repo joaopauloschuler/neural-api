@@ -21723,7 +21723,7 @@ procedure TNNetCausalConv1D.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  SeqLen, InputDepth, Ksize, t, f, k, c, srcT: integer;
+  SeqLen, InputDepth, Ksize, t, f, k, srcT: integer;
   W: TNNetVolume;
   sum: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -21743,13 +21743,14 @@ begin
         then sum := localNeuron.FBiasWeight
         else sum := 0;
       // Left-only padding: tap k reads input position t-(Ksize-1)+k.
-      // Positions < 0 are the (zero) left padding -> skipped.
+      // Positions < 0 are the (zero) left padding -> skipped. The depth axis is
+      // contiguous, so each tap is an AVX dot product over InputDepth floats.
       for k := 0 to Ksize - 1 do
       begin
         srcT := t - (Ksize - 1) + k;
         if srcT < 0 then continue; // padded (and never reads srcT > t)
-        for c := 0 to InputDepth - 1 do
-          sum := sum + W[k, 0, c] * Prev[srcT, 0, c];
+        sum := sum + TNNetVolume.DotProduct(
+          W.GetRawPtr(k, 0), Prev.GetRawPtr(srcT, 0), InputDepth);
       end;
       FOutput[t, 0, f] := sum;
     end;
@@ -21761,9 +21762,9 @@ procedure TNNetCausalConv1D.Backpropagate();
 var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
-  SeqLen, InputDepth, Ksize, t, f, k, c, srcT: integer;
+  SeqLen, InputDepth, Ksize, t, f, k, srcT: integer;
   W, GW: TNNetVolume;
-  gy, xv: TNeuralFloat;
+  gy: TNeuralFloat;
   localNeuron: TNNetNeuron;
   hasInputGrad: boolean;
 begin
@@ -21798,17 +21799,17 @@ begin
       if gy = 0 then continue;
       if FSuppressBias = 0 then
         localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
+      // Depth axis is contiguous: accumulate each tap with AVX MulAdd
+      //   (PtrA[i] += PtrB[i] * Value) over InputDepth floats.
       for k := 0 to Ksize - 1 do
       begin
         srcT := t - (Ksize - 1) + k;
         if srcT < 0 then continue;
-        for c := 0 to InputDepth - 1 do
-        begin
-          xv := Prev[srcT, 0, c];
-          GW[k, 0, c] := GW[k, 0, c] + (-FLearningRate) * gy * xv;
-          if hasInputGrad then
-            PrevErr[srcT, 0, c] := PrevErr[srcT, 0, c] + gy * W[k, 0, c];
-        end;
+        TNNetVolume.MulAdd(GW.GetRawPtr(k, 0), Prev.GetRawPtr(srcT, 0),
+          (-FLearningRate) * gy, InputDepth);
+        if hasInputGrad then
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(srcT, 0), W.GetRawPtr(k, 0),
+            gy, InputDepth);
       end;
     end;
     if (not FBatchUpdate) then localNeuron.UpdateWeights(FInertia);
