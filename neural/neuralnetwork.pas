@@ -7499,6 +7499,9 @@ type
       // engine's '>'/newline delimiters cannot collide with the TNNet format).
       function SaveDataToString(): string; override;
       procedure LoadDataFromString(strData: string); override;
+      // Carry the learned engine across Clone()/CopyWeights (the base only
+      // copies TNNetNeuron weights, of which this layer has none).
+      procedure CopyWeights(Origin: TNNetLayer); override;
   end;
 
   // Pointwise (1x1-convolution-style) variant of TNNetByteProcessing. A single
@@ -7531,6 +7534,7 @@ type
       // TNNetByteProcessing.SaveDataToString).
       function SaveDataToString(): string; override;
       procedure LoadDataFromString(strData: string); override;
+      procedure CopyWeights(Origin: TNNetLayer); override;
   end;
 
   // This class is very experimental - do not use it.
@@ -17861,6 +17865,19 @@ begin
   FByteLearning.BytePred.CleanAndLoadNeuronsFromString(decoded);
 end;
 
+procedure TNNetByteProcessing.CopyWeights(Origin: TNNetLayer);
+var
+  s: string;
+begin
+  inherited CopyWeights(Origin);
+  if (Origin is TNNetByteProcessing) and (FOutput.Size > 0) and
+     (TNNetByteProcessing(Origin).FOutput.Size > 0) then
+  begin
+    s := TNNetByteProcessing(Origin).FByteLearning.BytePred.NeuronsToString(0);
+    FByteLearning.BytePred.CleanAndLoadNeuronsFromString(s);
+  end;
+end;
+
 { TNNetPointwiseByteProcessing }
 
 procedure TNNetPointwiseByteProcessing.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -17997,6 +18014,19 @@ begin
   if (Length(strData) = 0) or (FOutput.Size = 0) then exit;
   decoded := NeuralHexToStr(strData);
   FByteLearning.BytePred.CleanAndLoadNeuronsFromString(decoded);
+end;
+
+procedure TNNetPointwiseByteProcessing.CopyWeights(Origin: TNNetLayer);
+var
+  s: string;
+begin
+  inherited CopyWeights(Origin);
+  if (Origin is TNNetPointwiseByteProcessing) and (FOutput.Size > 0) and
+     (TNNetPointwiseByteProcessing(Origin).FOutput.Size > 0) then
+  begin
+    s := TNNetPointwiseByteProcessing(Origin).FByteLearning.BytePred.NeuronsToString(0);
+    FByteLearning.BytePred.CleanAndLoadNeuronsFromString(s);
+  end;
 end;
 
 { TNNetDigital }
