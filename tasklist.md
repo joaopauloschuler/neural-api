@@ -71,7 +71,7 @@ rather than acted on.
       the budget" honesty the Grokking entry uses). Distinct from VisualGAN
       (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
       DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
-- [ ] `examples/ConformalPrediction/` — split (inductive) conformal prediction:
+- [X] `examples/ConformalPrediction/` — split (inductive) conformal prediction:
       turn a trained classifier's softmax scores into prediction SETS with a
       finite-sample, distribution-free marginal-coverage guarantee (Vovk;
       Angelopoulos & Bates 2021 "A Gentle Introduction to Conformal Prediction").
