@@ -135,8 +135,6 @@ rather than acted on.
       This is very interesting.
 - [ ] Use TBytePredictionViaNNet and TEasyBytePredictionViaNNet as inspiration for
       new float32 based layers. This is also curious and interesting.
-- [ ] Integrate with float32 functions from https://github.com/joaopauloschuler/pas-core-math
-      for faster and more precise math.
 - [ ] More image generative examples and or experiments.
 
 ### TNNetMultiHeadSelfAttention — breakdown
