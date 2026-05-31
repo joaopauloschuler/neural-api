@@ -324,6 +324,7 @@ NN.AddLayer([
 | `TNNetFullConnectSigmoid`    | 1D, 2D, or 3D               | Sigmoid       | Fully connected layer with Sigmoid activation.                                                         |
 | `TNNet.AddGroupedFullConnect`| 1D, 2D, or 3D               | Optional      | Adds a grouped fully connected layer, inspired by `TNNet.AddGroupedConvolution`.                       |
 | `TNNetBitLinear`             | 1D, 2D, or 3D               | None          | BitNet b1.58 ternary-weight linear layer: forward uses per-neuron absmean-quantized weights `Wq = scale*round(clip(W/scale,-1,+1))` with `scale = mean(|W|)`; latent full-precision weights train via a straight-through estimator (round/clip treated as identity in backward). |
+| `TNNetSpectralNorm`          | 1D, 2D, or 3D               | None          | Spectral-normalized dense layer (Miyato et al. 2018): forward divides the weight matrix by its largest singular value `sigma_1` (estimated by power iteration, `Iters` steps in `FStruct[5]`, default 10) so the effective operator `W/sigma_1` has spectral norm ~1; `sigma_1` is treated as constant in backward (input error propagated through the scaled weights). |
 
 ### Convolutional Layers
 Neurons, filters, and kernels are often used as synonyms in the context of neural networks, particularly in convolutional neural networks (CNNs). They are closely related concepts that are used interchangeably. Here's why:

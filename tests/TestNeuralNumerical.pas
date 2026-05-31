@@ -129,6 +129,9 @@ type
     procedure TestBitLinearForward;
     procedure TestBitLinearInputGradientCheck;
     procedure TestBitLinearSerializationRoundTrip;
+    procedure TestSpectralNormForward;
+    procedure TestSpectralNormInputGradientCheck;
+    procedure TestSpectralNormSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
     procedure TestRMSNormGatedForward;
@@ -25709,6 +25712,188 @@ begin
         Pos('TNNetBitLinear', Saved) > 0);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('BitLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralNormForward;
+var
+  NN, NNScaled: TNNet;
+  Input: TNNetVolume;
+  SN: TNNetSpectralNorm;
+  FC: TNNetFullConnectLinear;
+  o, i: integer;
+  Sigma, ScaledSigma: TNeuralFloat;
+begin
+  // Spectral-norm forward property: the EFFECTIVE operator W/sigma_1 must have
+  // spectral norm ~1. Build a SpectralNorm layer with a pinned rank-structured
+  // weight matrix, then mirror the SCALED weights (W/sigma) into a plain
+  // FullConnectLinear and assert EstimateSpectralNorm on the scaled matrix ~1.
+  NN := TNNet.Create();
+  NNScaled := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    SN := TNNetSpectralNorm.Create({pSizeX=}3, {pSizeY=}1, {pDepth=}1, {pSuppressBias=}1, {pIters=}30);
+    NN.AddLayer(SN);
+
+    // A non-degenerate weight matrix (3 neurons x 4 inputs) with a clearly
+    // dominant singular direction.
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.3 + 0.5 * o - 0.2 * i + 0.1 * o * i;
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.0;
+    NN.Compute(Input);
+
+    Sigma := TNNet.EstimateSpectralNorm(SN, 50);
+    AssertTrue('SpectralNorm latent sigma is positive', Sigma > 0.1);
+
+    // Build a FullConnectLinear carrying the SCALED weights W/sigma.
+    NNScaled.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    FC := TNNetFullConnectLinear.Create({pSize=}3, {pSuppressBias=}1);
+    NNScaled.AddLayer(FC);
+    for o := 0 to FC.Neurons.Count - 1 do
+      for i := 0 to FC.Neurons[o].Weights.Size - 1 do
+        FC.Neurons[o].Weights.Raw[i] := SN.Neurons[o].Weights.Raw[i] / Sigma;
+
+    ScaledSigma := TNNet.EstimateSpectralNorm(FC, 50);
+    // Power iteration is approximate; allow a few percent.
+    AssertEquals('SpectralNorm effective spectral norm ~ 1', 1.0,
+      ScaledSigma, 0.03);
+  finally
+    NN.Free;
+    NNScaled.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralNormInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  SN: TNNetSpectralNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, o: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input numerical-gradient check (central differences, tol 1e-2). sigma is
+  // treated as CONSTANT w.r.t. the gradient (the power iteration is not
+  // differentiated), so the input gradient is the ordinary linear gradient
+  // using the SCALED weights W/sigma. A finite difference of the input never
+  // changes sigma (sigma depends only on W), so the numerical derivative
+  // matches the analytical scaled-weight input gradient cleanly. The latent
+  // WEIGHT gradient is NOT finite-difference-checked here (constant-sigma
+  // approximation); the forward property test pins the scaling instead.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  InputPlus := TNNetVolume.Create(1, 1, 5);
+  Desired := TNNetVolume.Create(1, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    SN := TNNetSpectralNorm.Create({pSizeX=}3, {pSizeY=}1, {pDepth=}1, {pSuppressBias=}0, {pIters=}20);
+    NN.AddLayer(SN);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    // Small, non-degenerate latent weights (well away from a singular matrix)
+    // keep the single-precision finite difference accurate.
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.2 + 0.15 * o - 0.1 * i + 0.05 * o * i;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SpectralNorm input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralNormSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  SN: TNNetSpectralNorm;
+  Input: TNNetVolume;
+  Saved: string;
+  o, i: integer;
+begin
+  // SpectralNorm in the MIDDLE of a net: save/load and assert structure string
+  // and Compute match (the Iters count round-trips via FStruct[5]).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    SN := TNNetSpectralNorm.Create({pSizeX=}5, {pSizeY=}1, {pDepth=}1, {pSuppressBias=}0, {pIters=}7);
+    NN.AddLayer(SN);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.13 * (o + 1) - 0.07 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      AssertTrue('SpectralNorm token present in serialized string',
+        Pos('TNNetSpectralNorm', Saved) > 0);
+      AssertEquals('SpectralNorm structure string matches after round-trip',
+        NN.Layers[1].SaveStructureToString(),
+        NN2.Layers[1].SaveStructureToString());
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SpectralNorm Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

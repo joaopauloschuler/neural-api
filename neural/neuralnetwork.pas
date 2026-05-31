@@ -4124,6 +4124,43 @@ type
     destructor Destroy(); override;
   end;
 
+  // Spectral-normalization wrapper around a dense (FullConnect) layer.
+  // The latent (trainable) weight matrix W lives in FNeurons and is stored /
+  // serialized exactly like a TNNetFullConnectLinear (no custom Save/Load).
+  // FORWARD divides the whole weight matrix by its largest singular value
+  // sigma_1(W) (a single SCALAR shared by every neuron), so the effective
+  // operator W/sigma_1 has spectral norm ~1:
+  //   sigma = max(TNNet.EstimateSpectralNorm(Self, Iters), eps)
+  //   w_eff = W / sigma
+  //   y     = w_eff * x + b
+  // sigma_1 is estimated by Iters steps of power iteration (the reusable
+  // TNNet.EstimateSpectralNorm helper). Iters is stored in FStruct[5]
+  // (default 10 for a stable estimate; the task's "one step per forward"
+  // corresponds to Iters=1). Reference: Miyato et al. 2018, "Spectral
+  // Normalization for Generative Adversarial Networks", arXiv:1802.05957.
+  // BACKWARD: sigma is treated as a CONSTANT w.r.t. the gradient (the standard
+  // SpectralNorm approximation: the power iteration is NOT differentiated), so
+  //   - the INPUT gradient is the ordinary linear input gradient using the
+  //     SCALED weights w_eff (overridden ComputePreviousLayerErrorCPU below,
+  //     since the inherited version would wrongly use the LATENT weights W);
+  //   - the LATENT-WEIGHT gradient is the ordinary linear weight gradient
+  //     (inherited BackpropagateCPU, w.r.t. FWeights) scaled by 1/sigma via the
+  //     forward output error chain — kept as the plain inherited gradient, the
+  //     same constant-sigma approximation used by reference implementations.
+  // Only the dense case is implemented; a convolution variant is a follow-up.
+  TNNetSpectralNorm = class(TNNetFullConnectLinear)
+  private
+    FScaledWeights: TNNetVolume;  // scratch: W/sigma for one neuron
+    FSigma: TNeuralFloat;         // last estimated largest singular value
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    procedure ComputeCPU(); override;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSizeX, pSizeY, pDepth, pSuppressBias, pIters: integer); overload;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    destructor Destroy(); override;
+  end;
+
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   protected
@@ -25540,6 +25577,105 @@ begin
   inherited Destroy();
 end;
 
+{ TNNetSpectralNorm }
+
+// Forward: estimate sigma_1(W) with power iteration (shared scalar over all
+// neurons), then run the ordinary linear forward against the SCALED weights
+// w_eff = W / max(sigma, eps). The scaled weights of each neuron are cached in
+// FScaledWeights (reused per neuron, like TNNetBitLinear caches its quantized
+// weights), so the matmul uses the TRANSFORMED weights, not the latent ones.
+procedure TNNetSpectralNorm.ComputeCPU();
+const
+  cEps = 1e-12;
+var
+  Cnt, MaxCnt: integer;
+  InvSigma, Acc: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+begin
+  MaxCnt := FNeurons.Count - 1;
+  // sigma_1(W) via Iters power-iteration steps (FStruct[5]); deterministic seed.
+  FSigma := TNNet.EstimateSpectralNorm(Self, FStruct[5]);
+  if FSigma < cEps then FSigma := cEps;
+  InvSigma := 1.0 / FSigma;
+  for Cnt := 0 to MaxCnt do
+  begin
+    localNeuron := FArrNeurons[Cnt];
+    FScaledWeights.ReSize(localNeuron.FWeights);
+    FScaledWeights.Copy(localNeuron.FWeights);
+    FScaledWeights.Mul(InvSigma);
+    Acc := FScaledWeights.DotProduct(FPrevLayer.Output);
+    if FSuppressBias = 0 then
+      FOutput.FData[Cnt] := Acc + localNeuron.FBiasWeight
+    else
+      FOutput.FData[Cnt] := Acc;
+  end;
+end;
+
+// Input gradient. Forward used the SCALED weights w_eff = W/sigma, so the input
+// gradient is dL/dx = sum_o err_o * w_eff_o. sigma is treated as a CONSTANT
+// (the power iteration is not differentiated — the standard SpectralNorm
+// approximation), so this is the ordinary linear input gradient evaluated at
+// the scaled weights. The inherited FullConnectLinear version would (wrongly
+// here) use the LATENT weights W, so it is overridden; same mismatch trap that
+// TNNetBitLinear documents.
+procedure TNNetSpectralNorm.ComputePreviousLayerErrorCPU();
+const
+  cEps = 1e-12;
+var
+  MaxOutputCnt, OutputCnt: integer;
+  InvSigma: TNeuralFloat;
+  LocalPrevError: TNNetVolume;
+  localNeuron: TNNetNeuron;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  MaxOutputCnt := FOutput.Size - 1;
+  // Reuse the sigma estimated during the matching forward pass.
+  if FSigma < cEps then FSigma := cEps;
+  InvSigma := 1.0 / FSigma;
+  for OutputCnt := 0 to MaxOutputCnt do
+  begin
+    if (FOutputError.FData[OutputCnt] <> 0.0) then
+    begin
+      localNeuron := FArrNeurons[OutputCnt];
+      FScaledWeights.ReSize(localNeuron.FWeights);
+      FScaledWeights.Copy(localNeuron.FWeights);
+      FScaledWeights.Mul(InvSigma);
+      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FScaledWeights);
+    end;
+  end;
+end;
+
+constructor TNNetSpectralNorm.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+  FScaledWeights := TNNetVolume.Create();
+  FSigma := 1.0;
+  // Default power-iteration steps: 10 (a stable estimate). Iters=1 reproduces
+  // the task's "one power-iteration step per forward pass".
+  if FStruct[5] < 1 then FStruct[5] := 10;
+end;
+
+constructor TNNetSpectralNorm.Create(pSizeX, pSizeY, pDepth, pSuppressBias, pIters: integer);
+begin
+  Self.Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  if pIters < 1 then pIters := 1;
+  FStruct[5] := pIters;
+end;
+
+constructor TNNetSpectralNorm.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+destructor TNNetSpectralNorm.Destroy();
+begin
+  FScaledWeights.Free;
+  inherited Destroy();
+end;
+
 { TNNetWeightStandardization }
 
 constructor TNNetWeightStandardization.Create(pSizeX, pSizeY, pDepth: integer;
@@ -46495,6 +46631,7 @@ begin
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetWeightNormLinear':      Result := TNNetWeightNormLinear.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetLocalConnect' :         Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -46776,6 +46913,7 @@ begin
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetWeightNormLinear' then Result := TNNetWeightNormLinear.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetLocalConnect' then Result := TNNetLocalConnect.Create(St[0], St[1], St[2], St[3], St[4]) else

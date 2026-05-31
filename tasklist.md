@@ -321,12 +321,23 @@ breakdown:
       pair it with GroupNorm in a conv stack). Mirror the dense Jacobian
       per output-channel filter. Pairs with a tiny WS+GroupNorm vs
       BatchNorm CIFAR-stub bake-off.
-- [ ] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
+- [X] TNNetSpectralNorm wrapper — wraps an existing FullConnect or
       Convolution layer and divides its weight matrix by its largest
       singular value (one power-iteration step per forward pass).
       NOTE: the reusable power-iteration helper `TNNet.EstimateSpectralNorm`
       now exists (landed with WeightSpectrumReport) — build the wrapper on
       top of it rather than re-deriving the iteration.
+      DONE for the DENSE case: `TNNetSpectralNorm` descends
+      `TNNetFullConnectLinear`; forward divides W by sigma_1 (shared scalar
+      from `EstimateSpectralNorm`, Iters in FStruct[5], default 10), backward
+      treats sigma as constant and propagates the input error through the
+      SCALED weights. Tests: TestSpectralNorm{Forward,InputGradientCheck,
+      SerializationRoundTrip}.
+- [ ] TNNetSpectralNorm — CONVOLUTION variant (still open). The dense wrapper
+      landed; add a convolution-layer spectral-norm wrapper (largest singular
+      value of the flattened conv weight matrix per output channel / full
+      kernel) on top of `TNNet.EstimateSpectralNorm`, mirroring the dense
+      forward/backward (scale by 1/sigma, sigma treated constant in backward).
 - [ ] LoRA low-rank adapter (`TNNet.AddLoRAAdapter`) + `examples/LoRAFineTune/` —
       parameter-efficient fine-tuning by ADDING a trainable low-rank residual
       `B·A` to a FROZEN dense/pointwise layer (Hu et al. 2021). For a frozen
