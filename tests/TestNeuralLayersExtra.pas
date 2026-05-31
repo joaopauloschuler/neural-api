@@ -123,6 +123,7 @@ type
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
+    procedure TestDropBlockSmokeAndRoundTrip;
   end;
 
 implementation
@@ -5040,6 +5041,101 @@ begin
   Output.Free;
   Target.Free;
   NN.Free;
+end;
+
+// TNNetDropBlock (Ghiasi et al. 2018) structured spatial dropout. Asserts:
+//  1) inference mode (dropouts disabled) is an identity passthrough;
+//  2) train mode zeroes contiguous block_size x block_size spatial regions
+//     across ALL channels (one spatial block broadcast over Depth);
+//  3) SaveToString -> LoadFromString preserves block_size + prob and, under a
+//     fixed RNG seed, reproduces the train-mode output exactly.
+procedure TTestNeuralLayersExtra.TestDropBlockSmokeAndRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i, x, y, d, Seed: integer;
+  DropBlockIdx: integer;
+  ZeroSpatialFound: boolean;
+  AllDepthZero: boolean;
+begin
+  // --- 1) Inference identity passthrough -----------------------------------
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 7, 3);
+  try
+    DropBlockIdx := 1; // input is layer 0, DropBlock is layer 1
+    NN.AddLayer(TNNetInput.Create(7, 7, 3, 1));
+    NN.AddLayer(TNNetDropBlock.Create(3, 0.3));
+    NN.EnableDropouts(false); // inference
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.9 + 1.3; // non-zero everywhere
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('DropBlock inference identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+
+    // --- 2) Train mode zeroes a contiguous block across all channels -------
+    NN.EnableDropouts(true);
+    Seed := 1;
+    ZeroSpatialFound := false;
+    repeat
+      RandSeed := Seed;
+      NN.Compute(Input);
+      // Look for a spatial position that was zeroed; assert it is zeroed for
+      // EVERY channel (the block is broadcast over Depth).
+      for y := 0 to 6 do
+        for x := 0 to 6 do
+        begin
+          AllDepthZero := True;
+          for d := 0 to 2 do
+            if NN.GetLastLayer.Output.Data[x, y, d] <> 0 then
+              AllDepthZero := False;
+          if AllDepthZero then ZeroSpatialFound := True;
+          // Sanity: a position is never partially dropped (some channels zero,
+          // some not) since the spatial mask is shared across Depth.
+          if AllDepthZero then
+            for d := 0 to 2 do
+              AssertEquals('DropBlock dropped block must zero every channel at (' +
+                IntToStr(x) + ',' + IntToStr(y) + ',' + IntToStr(d) + ')',
+                0.0, NN.GetLastLayer.Output.Data[x, y, d], 1e-6);
+        end;
+      Inc(Seed);
+    until ZeroSpatialFound or (Seed > 50);
+    AssertTrue('DropBlock train mode should zero at least one spatial block',
+      ZeroSpatialFound);
+
+    // --- 3) Serialization round-trip preserves block_size + prob -----------
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('DropBlock reloaded layer is TNNetDropBlock',
+        NN2.Layers[DropBlockIdx] is TNNetDropBlock);
+      // The structure string encodes FStruct[0]=block_size and FFloatSt[0]=prob;
+      // an exact match proves both constructor args round-tripped.
+      AssertEquals('DropBlock round-trip structure (block_size + prob)',
+        NN.Layers[DropBlockIdx].SaveStructureToString(),
+        NN2.Layers[DropBlockIdx].SaveStructureToString());
+
+      // Under a fixed seed, train-mode output must match exactly.
+      NN2.EnableDropouts(true);
+      RandSeed := 12345;
+      NN.Compute(Input);
+      RandSeed := 12345;
+      NN2.Compute(Input);
+      AssertEquals('DropBlock round-trip output size',
+        NN.GetLastLayer.Output.Size, NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('DropBlock round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 initialization

@@ -436,6 +436,7 @@ type
     procedure TestSpatialDropout2DTrainingMaskShape;
     procedure TestSpatialDropout2DGradientCheck;
     procedure TestSpatialDropout2DSerializationRoundTrip;
+    procedure TestDropBlockGradientCheck;
     procedure TestGaussianNoiseInferenceIdentity;
     procedure TestGaussianNoiseGradient;
     procedure TestGaussianNoiseSerializationRoundTrip;
@@ -12738,6 +12739,112 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetDropBlock (Ghiasi et al. 2018). Structured spatial dropout zeroing
+// contiguous block_size x block_size regions broadcast across all channels.
+// The gradient must route through the SAME stored spatial keep mask (a pure
+// element-wise gate including the rescale). The mask is sampled with the repo
+// RNG, so reseeding before every forward (as ComputeLossSeeded does) pins the
+// SAME mask across the central-difference probe and the analytic pass.
+// ---------------------------------------------------------------------------
+procedure TTestNeuralNumerical.TestDropBlockGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, k: integer;
+  diff: TNeuralFloat;
+  Seed: longint;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    d: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      d := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * d * d;
+    end;
+  end;
+
+begin
+  // Repo convention: this file's gradient tests share one RNG and are
+  // ordering-sensitive. Reseed to a fixed value so this test is reproducible
+  // without disturbing tolerances of neighbouring tests.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  InputPlus := TNNetVolume.Create(5, 5, 2);
+  Desired := TNNetVolume.Create();
+  // Larger probe step: TNeuralFloat is single precision, and DropBlock's
+  // surviving-activation rescale amplifies the loss, so a tiny epsilon suffers
+  // from catastrophic cancellation in the central difference.
+  epsilon := 0.01;
+  Seed := 4242;
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2, 1));
+    NN.AddLayer(TNNetDropBlock.Create(3, 0.3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.EnableDropouts(true);
+
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.5);
+
+    // Sample a mask that drops at least one block (so the gate is exercised)
+    // yet keeps some activations, then FREEZE it so every subsequent forward
+    // reuses the SAME stored mask. This makes the central-difference probe and
+    // the analytic backward pass share an identical element-wise gate+rescale.
+    while True do
+    begin
+      RandSeed := Seed;
+      TNNetDropBlock(NN.Layers[1]).FreezeMask := false;
+      NN.Compute(Input);
+      diff := 0;
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+        diff := diff + Abs(NN.GetLastLayer.Output.Raw[k]);
+      // Require the mask to have dropped something (a rescale > 1 implies a
+      // dropped block) so the structured-dropout path is genuinely tested.
+      if (diff > 1e-3) and (TNNetDropBlock(NN.Layers[1]).KeepMask.GetMax() > 1.0001)
+        then break;
+      Inc(Seed);
+    end;
+    // Freeze the just-sampled mask for the remainder of the check.
+    TNNetDropBlock(NN.Layers[1]).FreezeMask := true;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('DropBlock input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 

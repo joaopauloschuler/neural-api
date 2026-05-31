@@ -2543,6 +2543,38 @@ type
       property ChannelMask: TNNetVolume read FChannelMask;
   end;
 
+  /// DropBlock (Ghiasi et al. 2018, "DropBlock: A regularization method for
+  // convolutional networks"). Structured spatial dropout that zeroes
+  // contiguous square block_size x block_size regions of the feature map so
+  // that spatially-correlated neighbouring units drop together. Unlike
+  // TNNetDropout (per-element), TNNetSpatialDropout2D (whole channel) or
+  // TNNetDropPath (whole branch), one spatial 0/1 mask is sampled per (x,y)
+  // position and broadcast across ALL channels (Depth).
+  // At training (FEnabled = true): Bernoulli seeds are sampled at rate
+  // gamma = (1-keep_prob)*feat_area / (block_size^2 * valid_area), only in
+  // positions where a full block fits, then expanded by a square dilation to
+  // build the drop mask; surviving activations are rescaled by
+  // count_all/count_kept so the expected activation is preserved. The same
+  // keep mask is reused on the backward pass. At inference (FEnabled = false)
+  // the layer is the identity. Block size is stored in FStruct[0] and the
+  // drop probability in FFloatSt[0] for serialization. No trainable params.
+  TNNetDropBlock = class(TNNetAddNoiseBase)
+    protected
+      FBlockSize: integer;
+      FKeepMask: TNNetVolume; // (SizeX, SizeY, 1) keep mask, 0 or rescale value
+      FFreezeMask: boolean;   // when true, Compute reuses the stored mask
+    public
+      constructor Create(pBlockSize: integer = 7; pDropProb: TNeuralFloat = 0.1); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure RefreshMask();
+      property KeepMask: TNNetVolume read FKeepMask;
+      // Set True (after one Compute populated the mask) to reuse the SAME mask
+      // across subsequent forward passes -- used by numerical-gradient checks.
+      property FreezeMask: boolean read FFreezeMask write FFreezeMask;
+  end;
+
   /// Additive Gaussian noise. At training (FEnabled = true), forward adds
   // N(0, sigma^2) noise per element: y = x + n. At inference (FEnabled = false)
   // the layer is the identity. Backward is identity (dL/dx = dL/dy) since
@@ -28139,6 +28171,155 @@ begin
   BackpropagateNoTest();
 end;
 
+{ TNNetDropBlock }
+constructor TNNetDropBlock.Create(pBlockSize: integer; pDropProb: TNeuralFloat);
+begin
+  inherited Create();
+  if pBlockSize < 1 then pBlockSize := 1;
+  if pDropProb < 0 then pDropProb := 0;
+  if pDropProb >= 1 then pDropProb := 0.99;
+  FBlockSize := pBlockSize;
+  FStruct[0] := pBlockSize;
+  FFloatSt[0] := pDropProb;
+  FKeepMask := TNNetVolume.Create(1, 1, 1);
+  if pDropProb > 0 then FEnabled := true;
+end;
+
+destructor TNNetDropBlock.Destroy();
+begin
+  FKeepMask.Free;
+  inherited Destroy();
+end;
+
+// Samples a fresh spatial keep mask into FKeepMask (shape SizeX,SizeY,1).
+// Surviving positions hold the rescale factor count_all/count_kept; dropped
+// positions hold 0. Must be called when FKeepMask matches FOutput's spatial
+// extent. Resampling is separated from Compute so that a numerical-gradient
+// check can reuse a fixed mask across multiple forward passes.
+procedure TNNetDropBlock.RefreshMask();
+var
+  P, Gamma: TNeuralFloat;
+  SizeX, SizeY, BS: integer;
+  FeatArea, ValidArea, MaxSeedX, MaxSeedY: integer;
+  x, y, bx, by, ex, ey: integer;
+  CntKept, CntAll: integer;
+  Rescale: TNeuralFloat;
+begin
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  BS := FBlockSize;
+  if BS > SizeX then BS := SizeX;
+  if BS > SizeY then BS := SizeY;
+  if BS < 1 then BS := 1;
+  P := FFloatSt[0];
+  // FKeepMask is a single spatial slice (Depth = 1) broadcast over channels.
+  FKeepMask.Fill(1);
+  if not (FEnabled and (P > 0)) then exit;
+
+  FeatArea := SizeX * SizeY;
+  MaxSeedX := SizeX - BS + 1;
+  MaxSeedY := SizeY - BS + 1;
+  if (MaxSeedX < 1) or (MaxSeedY < 1) then exit; // block does not fit: identity
+  ValidArea := MaxSeedX * MaxSeedY;
+  // gamma = (1-keep_prob) * feat_area / (block_size^2 * valid_area)
+  Gamma := P * FeatArea / (BS * BS * ValidArea);
+
+  // Sample Bernoulli seeds only where a full block fits, then dilate each
+  // seed into a BSxBS block of zeros (square max-pool-style dilation).
+  for y := 0 to MaxSeedY - 1 do
+  begin
+    for x := 0 to MaxSeedX - 1 do
+    begin
+      if Random < Gamma then
+      begin
+        ex := x + BS - 1;
+        ey := y + BS - 1;
+        for by := y to ey do
+          for bx := x to ex do
+            FKeepMask.Data[bx, by, 0] := 0;
+      end;
+    end;
+  end;
+
+  // Rescale surviving activations by count_all / count_kept so the expected
+  // activation is preserved. Guard against an all-zero mask (passthrough).
+  CntAll := FeatArea;
+  CntKept := 0;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+      if FKeepMask.Data[x, y, 0] <> 0 then Inc(CntKept);
+  if CntKept = 0 then
+  begin
+    // Everything dropped: fall back to identity to avoid div-by-zero.
+    FKeepMask.Fill(1);
+    exit;
+  end;
+  Rescale := CntAll / CntKept;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+      if FKeepMask.Data[x, y, 0] <> 0 then
+        FKeepMask.Data[x, y, 0] := Rescale;
+end;
+
+procedure TNNetDropBlock.Compute();
+var
+  StartTime: double;
+  x, y, d: integer;
+  m: TNeuralFloat;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  // Keep the spatial mask sized to the feature map (Depth = 1, broadcast).
+  if (FKeepMask.SizeX <> FOutput.SizeX) or (FKeepMask.SizeY <> FOutput.SizeY) then
+    FKeepMask.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+  if FEnabled and (FFloatSt[0] > 0) then
+  begin
+    if not FFreezeMask then RefreshMask();
+    // Apply the spatial keep mask broadcast over all channels (Depth).
+    for y := 0 to FOutput.SizeY - 1 do
+      for x := 0 to FOutput.SizeX - 1 do
+      begin
+        m := FKeepMask.Data[x, y, 0];
+        if m <> 1 then
+          for d := 0 to FOutput.Depth - 1 do
+            FOutput.Data[x, y, d] := FOutput.Data[x, y, d] * m;
+      end;
+  end
+  else
+  begin
+    FKeepMask.Fill(1);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDropBlock.Backpropagate();
+var
+  StartTime: double;
+  x, y, d: integer;
+  m: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Route the gradient through the SAME stored spatial keep mask (same
+  // element-wise gate and rescale used on the forward pass).
+  if FEnabled and (FOutputError.Size = FOutput.Size) and
+     (FKeepMask.SizeX = FOutput.SizeX) and (FKeepMask.SizeY = FOutput.SizeY) then
+  begin
+    for y := 0 to FOutput.SizeY - 1 do
+      for x := 0 to FOutput.SizeX - 1 do
+      begin
+        m := FKeepMask.Data[x, y, 0];
+        if m <> 1 then
+          for d := 0 to FOutput.Depth - 1 do
+            FOutputError.Data[x, y, d] := FOutputError.Data[x, y, d] * m;
+      end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
 { TNNetGaussianNoise }
 constructor TNNetGaussianNoise.Create(pSigma: TNeuralFloat);
 begin
@@ -47096,6 +47277,7 @@ begin
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
       'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
+      'TNNetDropBlock' :            Result := TNNetDropBlock.Create(St[0], Ft[0]);
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
@@ -47376,6 +47558,7 @@ begin
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
+      if S[0] = 'TNNetDropBlock' then Result := TNNetDropBlock.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
