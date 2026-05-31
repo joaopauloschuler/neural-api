@@ -13158,32 +13158,35 @@ procedure TNNetCosineSimilarityAttention.Compute();
 var
   StartTime: double;
   SeqLen, i, j, d: integer;
-  Score, MaxScore, SumExp, AccVal, SumSq, InvN: TNeuralFloat;
+  Score, MaxScore, SumExp, SumSq, InvN: TNeuralFloat;
   Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   // 1) Precompute the L2-normalized query and key rows (over the d_k feature
   // dimension) plus their reciprocal norms. score uses qn.kn instead of q.k.
+  // The depth axis is contiguous, so sum-of-squares is an AVX self dot product
+  // over FDk floats and the normalize is a Move followed by an AVX scalar Mul.
   for i := 0 to SeqLen - 1 do
   begin
-    // Query row i.
-    SumSq := 0;
-    for d := 0 to FDk - 1 do
-      SumSq := SumSq + Prev[i, 0, d] * Prev[i, 0, d];
+    // Query row i (Q at GetRawPtr(i,0,0)).
+    SumSq := TNNetVolume.DotProduct(
+      Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(i, 0, 0), FDk);
     InvN := pcr_rsqrtf(SumSq + FEps);
     FInvQNorm[i, 0, 0] := InvN;
-    for d := 0 to FDk - 1 do
-      FQNorm[i, 0, d] := Prev[i, 0, d] * InvN;
-    // Key row i.
-    SumSq := 0;
-    for d := 0 to FDk - 1 do
-      SumSq := SumSq + Prev[i, 0, FDk + d] * Prev[i, 0, FDk + d];
+    Move(Prev.GetRawPtr(i, 0, 0)^, FQNorm.GetRawPtr(i, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(FQNorm.GetRawPtr(i, 0, 0), InvN, FDk);
+    // Key row i (K at GetRawPtr(i,0,FDk)).
+    SumSq := TNNetVolume.DotProduct(
+      Prev.GetRawPtr(i, 0, FDk), Prev.GetRawPtr(i, 0, FDk), FDk);
     InvN := pcr_rsqrtf(SumSq + FEps);
     FInvKNorm[i, 0, 0] := InvN;
-    for d := 0 to FDk - 1 do
-      FKNorm[i, 0, d] := Prev[i, 0, FDk + d] * InvN;
+    Move(Prev.GetRawPtr(i, 0, FDk)^, FKNorm.GetRawPtr(i, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(FKNorm.GetRawPtr(i, 0, 0), InvN, FDk);
   end;
   // 2) For each query row i: cosine scores, softmax, weighted sum of V.
   for i := 0 to SeqLen - 1 do
@@ -13197,9 +13200,9 @@ begin
       end
       else
       begin
-        Score := 0;
-        for d := 0 to FDk - 1 do
-          Score := Score + FQNorm[i, 0, d] * FKNorm[j, 0, d];
+        // score = scale * (qn[i] . kn[j]); AVX dot product over FDk floats.
+        Score := TNNetVolume.DotProduct(
+          FQNorm.GetRawPtr(i, 0, 0), FKNorm.GetRawPtr(j, 0, 0), FDk);
         Score := Score * FScale;
         FAttn[j, i, 0] := Score;
       end;
@@ -13216,14 +13219,15 @@ begin
     if SumExp > 0 then
       for j := 0 to SeqLen - 1 do
         FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
-    // Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d].
+    // Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d]. V is contiguous along
+    // depth, so accumulate j-outer with AVX MulAdd over FDk floats (the old
+    // d-outer / j-inner order was strided over j and not vectorizable).
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
     for d := 0 to FDk - 1 do
-    begin
-      AccVal := 0;
-      for j := 0 to SeqLen - 1 do
-        AccVal := AccVal + FAttn[j, i, 0] * Prev[j, 0, 2 * FDk + d];
-      FOutput[i, 0, d] := AccVal;
-    end;
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -13239,8 +13243,8 @@ var
   // sequence position; converted to raw-input gradients via the L2-normalize
   // Jacobian after all (i,j) score contributions are summed.
   gQn, gKn: TNNetVolume;
-  SumDAttnAttn, A, dS, Dot, Yi, InvN: TNeuralFloat;
-  OutErr: TNeuralFloat;
+  SumDAttnAttn, A, dS, Dot, InvN: TNeuralFloat;
+  RawPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -13264,16 +13268,15 @@ begin
         // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
         // dV[j,d] += Attn[i,j] * dOut[i,d]
         // dAttn[j] = sum_d dOut[i,d] * V[j,d]
+        // Depth is contiguous: dV accumulation is an AVX MulAdd and dAttn[j] is
+        // an AVX dot product (dOut[i] . V[j]) over FDk floats.
         for j := 0 to SeqLen - 1 do
         begin
-          dAttn[j] := 0;
           A := FAttn[j, i, 0];
-          for d := 0 to FDk - 1 do
-          begin
-            OutErr := FOutputError[i, 0, d];
-            PrevErr.Add(j, 0, 2 * FDk + d, A * OutErr);
-            dAttn[j] := dAttn[j] + OutErr * Prev[j, 0, 2 * FDk + d];
-          end;
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk),
+            FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+          dAttn[j] := TNNetVolume.DotProduct(
+            FOutputError.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
         end;
         // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
         SumDAttnAttn := 0;
@@ -13287,16 +13290,17 @@ begin
         // score[i,j] = scale * qn[i] . kn[j]
         // d/dqn[i,d] += scale * dScore[j] * kn[j,d]   (summed over j)
         // d/dkn[j,d] += scale * dScore[j] * qn[i,d]   (summed over i)
+        // Depth is contiguous: gQn[i] += dS*kn[j] and gKn[j] += dS*qn[i] are
+        // AVX MulAdd over FDk floats.
         for j := 0 to SeqLen - 1 do
         begin
           dS := dScore[j] * FScale;
           if dS <> 0 then
           begin
-            for d := 0 to FDk - 1 do
-            begin
-              gQn.Add(i, 0, d, dS * FKNorm[j, 0, d]);
-              gKn.Add(j, 0, d, dS * FQNorm[i, 0, d]);
-            end;
+            TNNetVolume.MulAdd(gQn.GetRawPtr(i, 0, 0),
+              FKNorm.GetRawPtr(j, 0, 0), dS, FDk);
+            TNNetVolume.MulAdd(gKn.GetRawPtr(j, 0, 0),
+              FQNorm.GetRawPtr(i, 0, 0), dS, FDk);
           end;
         end;
       end;
@@ -13304,28 +13308,25 @@ begin
       // For y = x/||x|| the input gradient for upstream g is
       //   dL/dx = (1/||x||) * (g - y * (y . g))   (the (I - y y^T)/||x|| form).
       // Apply per query row (-> Q at depth d) and per key row (-> K at FDk+d).
+      // dL/dx[d] = InvN*g[d] - (InvN*Dot)*y[d], with Dot = y . g (contiguous
+      // over depth). Each is an AVX dot product plus two AVX MulAdd into the
+      // (contiguous) Q/K depth run of PrevErr.
       for i := 0 to SeqLen - 1 do
       begin
-        // Query row i.
+        // Query row i (-> Q at depth d).
         InvN := FInvQNorm[i, 0, 0];
-        Dot := 0;
-        for d := 0 to FDk - 1 do
-          Dot := Dot + FQNorm[i, 0, d] * gQn[i, 0, d];
-        for d := 0 to FDk - 1 do
-        begin
-          Yi := FQNorm[i, 0, d];
-          PrevErr.Add(i, 0, d, InvN * (gQn[i, 0, d] - Yi * Dot));
-        end;
-        // Key row i.
+        Dot := TNNetVolume.DotProduct(
+          FQNorm.GetRawPtr(i, 0, 0), gQn.GetRawPtr(i, 0, 0), FDk);
+        RawPtr := PrevErr.GetRawPtr(i, 0, 0);
+        TNNetVolume.MulAdd(RawPtr, gQn.GetRawPtr(i, 0, 0), InvN, FDk);
+        TNNetVolume.MulAdd(RawPtr, FQNorm.GetRawPtr(i, 0, 0), -InvN * Dot, FDk);
+        // Key row i (-> K at depth FDk+d).
         InvN := FInvKNorm[i, 0, 0];
-        Dot := 0;
-        for d := 0 to FDk - 1 do
-          Dot := Dot + FKNorm[i, 0, d] * gKn[i, 0, d];
-        for d := 0 to FDk - 1 do
-        begin
-          Yi := FKNorm[i, 0, d];
-          PrevErr.Add(i, 0, FDk + d, InvN * (gKn[i, 0, d] - Yi * Dot));
-        end;
+        Dot := TNNetVolume.DotProduct(
+          FKNorm.GetRawPtr(i, 0, 0), gKn.GetRawPtr(i, 0, 0), FDk);
+        RawPtr := PrevErr.GetRawPtr(i, 0, FDk);
+        TNNetVolume.MulAdd(RawPtr, gKn.GetRawPtr(i, 0, 0), InvN, FDk);
+        TNNetVolume.MulAdd(RawPtr, FKNorm.GetRawPtr(i, 0, 0), -InvN * Dot, FDk);
       end;
     finally
       gQn.Free;
@@ -13384,8 +13385,9 @@ procedure TNNetSinkAttention.Compute();
 var
   StartTime: double;
   SeqLen, AugLen, i, j, s, d: integer;
-  Score, MaxScore, SumExp, AccVal: TNeuralFloat;
+  Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -13396,17 +13398,19 @@ begin
   for i := 0 to SeqLen - 1 do
   begin
     MaxScore := -1e30;
-    // 1a) Sink scores (never masked): FSinkAttn[s, i, 0], s in 0..K-1.
+    // 1a) Sink scores (never masked): FSinkAttn[s, i, 0], s in 0..K-1. Depth is
+    // contiguous (Q at GetRawPtr(i,0,0), sink key in FWeights), so each score is
+    // an AVX dot product over FDk floats.
     for s := 0 to FNumSinks - 1 do
     begin
-      Score := 0;
-      for d := 0 to FDk - 1 do
-        Score := Score + Prev[i, 0, d] * FNeurons[s].FWeights.Raw[d];
+      Score := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(i, 0, 0), FNeurons[s].FWeights.GetRawPtr(0, 0, 0), FDk);
       Score := Score * FInvSqrtDk;
       FSinkAttn[s, i, 0] := Score;
       if Score > MaxScore then MaxScore := Score;
     end;
     // 1b) Real-key scores into FSinkAttn[K + j, i, 0], with causal mask.
+    // score = Q[i] . K[j] is an AVX dot product (K at GetRawPtr(j,0,FDk)).
     for j := 0 to SeqLen - 1 do
     begin
       if FCausal and (j > i) then
@@ -13415,9 +13419,8 @@ begin
       end
       else
       begin
-        Score := 0;
-        for d := 0 to FDk - 1 do
-          Score := Score + Prev[i, 0, d] * Prev[j, 0, FDk + d];
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
         Score := Score * FInvSqrtDk;
         FSinkAttn[FNumSinks + j, i, 0] := Score;
       end;
@@ -13436,15 +13439,18 @@ begin
       for j := 0 to AugLen - 1 do
         FSinkAttn[j, i, 0] := FSinkAttn[j, i, 0] / SumExp;
     // 3) Output[i, d] = sum_s w_sink[s]*SinkValue[s,d] + sum_j w_real[j]*V[j,d].
+    // Sink values and V are contiguous along depth, so accumulate s-outer then
+    // j-outer with AVX MulAdd over FDk floats into the zeroed output row (the
+    // old d-outer order was strided over the value source and not vectorizable).
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
     for d := 0 to FDk - 1 do
-    begin
-      AccVal := 0;
-      for s := 0 to FNumSinks - 1 do
-        AccVal := AccVal + FSinkAttn[s, i, 0] * FNeurons[FNumSinks + s].FWeights.Raw[d];
-      for j := 0 to SeqLen - 1 do
-        AccVal := AccVal + FSinkAttn[FNumSinks + j, i, 0] * Prev[j, 0, 2 * FDk + d];
-      FOutput[i, 0, d] := AccVal;
-    end;
+      OutPtr^[d] := 0;
+    for s := 0 to FNumSinks - 1 do
+      TNNetVolume.MulAdd(OutPtr, FNeurons[FNumSinks + s].FWeights.GetRawPtr(0, 0, 0),
+        FSinkAttn[s, i, 0], FDk);
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FSinkAttn[FNumSinks + j, i, 0], FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -13459,8 +13465,9 @@ var
   // Accumulated gradients w.r.t the sink key/value params, one row per sink
   // slot, depth = d_k. Flushed into the neuron deltas after the (i) loop.
   gSinkKey, gSinkVal: TNNetVolume;
-  SumDAttnAttn, A, dS, OutErr: TNeuralFloat;
+  SumDAttnAttn, A, dS: TNeuralFloat;
   hasInputGrad: boolean;
+  OutErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -13483,31 +13490,27 @@ begin
     for i := 0 to SeqLen - 1 do
     begin
       // ---- Gradients w.r.t the values (sink + real) and the weights w ----
+      // Depth is contiguous: each dVal accumulation is an AVX MulAdd and each
+      // dAttn is an AVX dot product (dOut[i] . value-row) over FDk floats.
+      OutErrPtr := FOutputError.GetRawPtr(i, 0, 0);
       // For sinks s: dSinkVal[s,d] += w_sink[s]*dOut[i,d];
       //              dAttn[s]      = sum_d dOut[i,d]*SinkVal[s,d]
       for s := 0 to FNumSinks - 1 do
       begin
-        dAttn[s] := 0;
         A := FSinkAttn[s, i, 0];
-        for d := 0 to FDk - 1 do
-        begin
-          OutErr := FOutputError[i, 0, d];
-          gSinkVal.Add(s, 0, d, A * OutErr);
-          dAttn[s] := dAttn[s] + OutErr * FNeurons[FNumSinks + s].FWeights.Raw[d];
-        end;
+        TNNetVolume.MulAdd(gSinkVal.GetRawPtr(s, 0, 0), OutErrPtr, A, FDk);
+        dAttn[s] := TNNetVolume.DotProduct(
+          OutErrPtr, FNeurons[FNumSinks + s].FWeights.GetRawPtr(0, 0, 0), FDk);
       end;
       // For real keys j: dV[j,d] += w_real[j]*dOut[i,d];
       //                  dAttn[K+j] = sum_d dOut[i,d]*V[j,d]
       for j := 0 to SeqLen - 1 do
       begin
-        dAttn[FNumSinks + j] := 0;
         A := FSinkAttn[FNumSinks + j, i, 0];
-        for d := 0 to FDk - 1 do
-        begin
-          OutErr := FOutputError[i, 0, d];
-          if hasInputGrad then PrevErr.Add(j, 0, 2 * FDk + d, A * OutErr);
-          dAttn[FNumSinks + j] := dAttn[FNumSinks + j] + OutErr * Prev[j, 0, 2 * FDk + d];
-        end;
+        if hasInputGrad then
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk), OutErrPtr, A, FDk);
+        dAttn[FNumSinks + j] := TNNetVolume.DotProduct(
+          OutErrPtr, Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
       end;
       // ---- Softmax Jacobian over the augmented row ----
       // dScore[m] = w[m] * (dAttn[m] - sum_k dAttn[k]*w[k])
@@ -13522,29 +13525,34 @@ begin
       // score_sink[s] = invSqrtDk * sum_d Q[i,d]*SinkKey[s,d]
       //   dQ[i,d]      += invSqrtDk * dScore[s] * SinkKey[s,d]
       //   dSinkKey[s,d]+= invSqrtDk * dScore[s] * Q[i,d]
+      // Depth is contiguous: dQ[i] += dS*SinkKey[s] and dSinkKey[s] += dS*Q[i]
+      // are AVX MulAdd over FDk floats.
       for s := 0 to FNumSinks - 1 do
       begin
         dS := dScore[s] * FInvSqrtDk;
         if dS <> 0 then
-          for d := 0 to FDk - 1 do
-          begin
-            if hasInputGrad then
-              PrevErr.Add(i, 0, d, dS * FNeurons[s].FWeights.Raw[d]);
-            gSinkKey.Add(s, 0, d, dS * Prev[i, 0, d]);
-          end;
+        begin
+          if hasInputGrad then
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+              FNeurons[s].FWeights.GetRawPtr(0, 0, 0), dS, FDk);
+          TNNetVolume.MulAdd(gSinkKey.GetRawPtr(s, 0, 0),
+            Prev.GetRawPtr(i, 0, 0), dS, FDk);
+        end;
       end;
       // score_real[j] = invSqrtDk * sum_d Q[i,d]*K[j,d]
       //   dQ[i,d] += invSqrtDk * dScore[K+j] * K[j,d]
       //   dK[j,d] += invSqrtDk * dScore[K+j] * Q[i,d]
+      // Both are AVX MulAdd over the contiguous FDk depth runs.
       for j := 0 to SeqLen - 1 do
       begin
         dS := dScore[FNumSinks + j] * FInvSqrtDk;
         if (dS <> 0) and hasInputGrad then
-          for d := 0 to FDk - 1 do
-          begin
-            PrevErr.Add(i, 0, d, dS * Prev[j, 0, FDk + d]);
-            PrevErr.Add(j, 0, FDk + d, dS * Prev[i, 0, d]);
-          end;
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+            Prev.GetRawPtr(j, 0, FDk), dS, FDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+            Prev.GetRawPtr(i, 0, 0), dS, FDk);
+        end;
       end;
     end;
     // ---- Flush sink-param gradients into neuron deltas (LR sign convention,
