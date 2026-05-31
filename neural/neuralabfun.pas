@@ -403,9 +403,12 @@ begin
     Self.TestBasePosition := StrToInt(S[0]);
     Self.TestThreshold := StrToInt(S[1]);
     Self.N := S.Count - 2;
+    // Tests are emitted by ToString starting at T[0] (S[2]); load back from
+    // T[0], not T[1] -- the previous T[NCount-1] left T[0] zeroed and dropped
+    // the last test, corrupting every reloaded relation.
     for NCount := 2 to S.Count - 1 do
     begin
-      Self.T[NCount-1].LoadFromString(S[NCount]);
+      Self.T[NCount-2].LoadFromString(S[NCount]);
     end;
     S.Free;
   end;
