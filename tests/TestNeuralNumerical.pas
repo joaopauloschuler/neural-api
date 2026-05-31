@@ -281,6 +281,7 @@ type
     procedure TestVectorQuantizerForward;
     procedure TestVectorQuantizerLoadFromString;
     procedure TestVectorQuantizerCommitmentGradient;
+    procedure TestVectorQuantizerCodebookGradient;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
     procedure TestArcFaceDegenerateIsCosineSoftmax;
@@ -23467,6 +23468,111 @@ begin
       AssertEquals('VQ input grad = STE + commitment grad at ' + IntToStr(i),
         Ste + NumGrad, AnaGrad, 1e-2);
     end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerCodebookGradient;
+const
+  cEps  = 1e-3;
+  cK    = 2;
+  cD    = 2;
+  cBeta = 0.30;
+  cLR   = 0.05;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LVQ: TNNetVectorQuantizer;
+  LPrev: TNNetIdentity;
+  Code: TNNetVolume;
+  AnaDelta, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  OldCode: array[0..cD - 1] of TNeuralFloat;
+  i: integer;
+
+  // Codebook loss term ||sg[z_e] - z_q||^2 as a function of the chosen code
+  // z_q (= neuron[0]). z_e is treated as a stop-gradient constant, exactly as
+  // the layer's codebook-gradient idiom does (Grad = 2*(z_q - z_e)). The
+  // argmin is pinned to code 0 (code 1 far away) so it cannot flip under eps.
+  function CodebookLossAt(): TNeuralFloat;
+  var
+    j: integer;
+    diff, s: TNeuralFloat;
+  begin
+    s := 0;
+    for j := 0 to cD - 1 do
+    begin
+      diff := Code.Raw[j] - Input[0, 0, j];
+      s := s + diff * diff;
+    end;
+    Result := s;
+  end;
+
+begin
+  // Stable-argmin codebook-side gradient check, mirroring TestCenterLoss's
+  // center-delta test: perturb the chosen code and central-difference the
+  // codebook loss against the accumulated neuron delta.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cD);
+  Target := TNNetVolume.Create(1, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cD, 1));
+    LPrev := TNNetIdentity.Create();
+    NN.AddLayer(LPrev);
+    LVQ := TNNetVectorQuantizer.Create(cK, cBeta);
+    NN.AddLayer(LVQ);
+    // LR = cLR; accumulate the codebook delta without applying it so we can
+    // read it (the -FLearningRate idiom needs SetBatchUpdate(True)).
+    NN.SetLearningRate(cLR, 0.0);
+    LVQ.SetBatchUpdate(True);
+
+    // Code 0 near the input, code 1 far away => argmin pinned to code 0.
+    LVQ.Neurons[0].Weights.Raw[0] :=  0.20; LVQ.Neurons[0].Weights.Raw[1] := -0.10;
+    LVQ.Neurons[1].Weights.Raw[0] :=  9.00; LVQ.Neurons[1].Weights.Raw[1] :=  9.00;
+    Code := LVQ.Neurons[0].Weights;
+
+    Input[0, 0, 0] :=  0.35; Input[0, 0, 1] := -0.25;
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    LPrev.OutputError.Fill(0);
+    NN.ClearDeltas();
+    LVQ.OutputError.Fill(0); // isolate the codebook delta from any STE gradient
+    LVQ.IncDepartingBranchesCnt();
+    LVQ.Backpropagate();
+
+    // The accumulated chosen-code delta follows the -FLearningRate idiom on the
+    // codebook gradient dL/dz_q[i] = 2*(z_q[i] - z_e[i]); so
+    // Delta[i] = -LR * dL/dz_q[i].
+    for i := 0 to cD - 1 do
+    begin
+      AnaDelta := LVQ.Neurons[0].Delta.Raw[i];
+      OldCode[i] := Code.Raw[i];
+      OldV := Code.Raw[i];
+      Code.Raw[i] := OldV + cEps;
+      LossP := CodebookLossAt();
+      Code.Raw[i] := OldV - cEps;
+      LossM := CodebookLossAt();
+      Code.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('VQ codebook delta at ' + IntToStr(i),
+        -cLR * NumGrad, AnaDelta, 1e-2);
+    end;
+
+    // Directional check: applying the update moves the chosen code toward z_e.
+    LVQ.UpdateWeights();
+    for i := 0 to cD - 1 do
+      AssertTrue('VQ code moves toward z_e at ' + IntToStr(i),
+        Abs(Code.Raw[i] - Input[0, 0, i]) <
+        Abs(OldCode[i] - Input[0, 0, i]) + 1e-9);
+
+    // The non-chosen code (code 1) must receive no codebook gradient.
+    for i := 0 to cD - 1 do
+      AssertEquals('VQ unchosen code delta is zero at ' + IntToStr(i),
+        0.0, LVQ.Neurons[1].Delta.Raw[i], 1e-9);
   finally
     NN.Free;
     Input.Free;
