@@ -1025,9 +1025,11 @@ rather than acted on.
       without MixUp on CIFAR-10 and report the delta.
 - [ ] `examples/AttentionViz/` — load a tiny trained SDPA model and dump
       the per-head attention matrix as a PGM image.
-- [ ] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
+- [X] `examples/TinyTransformerFFN/` — SwiGLU + RMSNorm + residual FFN
       block on a toy denoising or autoregressive-bit task. No MHSA
       needed; demonstrates the FFN half-block.
+      (landed 2026-05-31: 4-block pre-norm SwiGLU FFN stack, per-token
+      denoising, ~5.9x better val MSE than echo baseline, 6464 params, ~15s.)
 - [ ] `examples/BiasOnlyTuning/` — freeze a pretrained classifier and
       fine-tune only inserted TNNetChannelBias layers on a new task
       (BitFit-style cheap adaptation). NOTE (2026-05-31): the landed
