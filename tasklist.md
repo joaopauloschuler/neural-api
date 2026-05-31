@@ -586,11 +586,11 @@ rather than acted on.
       net trained under a constant-valued scheduler matches the fixed-LR run.
       The classes + math are landed; this is the integration the "missing
       plumbing" entry ultimately wants.
-- [ ] TNeuralLRScheduler follow-up: ship `examples/SchedulerCompare/` (the open
+- [X] TNeuralLRScheduler follow-up: ship `examples/SchedulerCompare/` (the open
       "Examples I'd enjoy writing" entry) now that the schedules exist — same tiny
       net trained four times under constant / Step / Cosine / WarmupCosine LR,
-      one ASCII chart of the LR curve + final loss per schedule. Depends on the
-      Fit-integration follow-up above (or can drive LR manually per epoch).
+      one ASCII chart of the LR curve + final loss per schedule. Drives LR
+      manually per epoch (Sched.NextLR(epoch, epoch) -> SetLearningRate).
 - [ ] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
       average of live weights every N steps after epoch W.
 - [ ] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
