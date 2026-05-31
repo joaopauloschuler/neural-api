@@ -169,8 +169,12 @@ rather than acted on.
 ### TNNetMultiHeadSelfAttention — breakdown
 SDPA + RoPE + MaskedFill + ALiBi are all in tree. Suggested commit-sized
 breakdown:
-- [ ] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
+- [X] TNNetTransformerDecoderBlock helper — adds the causal MaskedFill in
       front of self-attention and an optional cross-attention sub-block.
+      LANDED 2026-05-31: TNNet.AddTransformerDecoderBlock(d_model, Heads, d_ff,
+      EncoderOutput, PreNorm) composes causal self-attn + cross-attn + SwiGLU FFN
+      residuals; numerical input-grad test (PreNorm True/False) +
+      examples/TransformerDecoderBlock/.
       Built on top of the encoder helper above to avoid duplication.
       Compose `AddTransformerEncoderBlock` (causal self-attention via
       CausalMask=True) and `AddMultiHeadCrossAttention(d_model, Heads,
@@ -362,7 +366,14 @@ breakdown:
       value of the flattened conv weight matrix per output channel / full
       kernel) on top of `TNNet.EstimateSpectralNorm`, mirroring the dense
       forward/backward (scale by 1/sigma, sigma treated constant in backward).
-- [ ] LoRA low-rank adapter (`TNNet.AddLoRAAdapter`) + `examples/LoRAFineTune/` —
+- [X] LoRA low-rank adapter (`TNNet.AddLoRAAdapter`) + `examples/LoRAFineTune/` —
+      LANDED 2026-05-31: builder adds B·A (B zero-init) residually to a frozen
+      base via PointwiseConvLinear; TestLoRAAdapterSmoke (zero-init identity
+      <1e-6) + examples/LoRAFineTune/ rank sweep r in {1,2,4,8}. NOTE: builder
+      zeros B at construction — callers must NOT call NN.InitWeights() after
+      (it re-runs InitDefault and overwrites B's zero-init). Merge-for-inference
+      weight-fold check (correctness signal 2) DEFERRED (fiddly with two
+      PointwiseConvLinear projections + scale). Below original task text:
       parameter-efficient fine-tuning by ADDING a trainable low-rank residual
       `B·A` to a FROZEN dense/pointwise layer (Hu et al. 2021). For a frozen
       `d_in -> d_out` linear, insert a rank-`r` bypass `down: FullConnectLinear(r)`
@@ -395,7 +406,28 @@ breakdown:
       its single-branch ShakeDrop generalization.
 
 #### Channel attention / conditioning
-- [ ] TNNetCBAM — SE block plus a spatial-attention sibling.
+- [X] TNNetCBAM — SE block plus a spatial-attention sibling.
+      LANDED 2026-05-31 as the builder TNNet.AddCBAM(InputLayer, ReductionRatio=16,
+      SpatialKernelSize=7) — pure composite over tested layers, shape-preserving,
+      no new gradient code. Channel attention: dual global avg+max pool, each
+      through a reduce->ReLU->expand MLP, summed->sigmoid->ChannelMulByLayer.
+      Spatial attention: pointwise conv C->2 descriptor -> padded
+      SpatialKernelSize conv -> sigmoid gate, replicated over depth + CellMulByCell.
+      TestCBAMShapeForwardAndGradFlow + examples/CBAMAttention/.
+      Two v1 simplifications -> follow-ups below.
+- [ ] TNNetCBAM follow-up: the landed AddCBAM uses TWO SEPARATE channel MLPs
+      (avg-branch + max-branch summed before the sigmoid) instead of the paper's
+      single SHARED MLP applied to both pooled descriptors. If a weight-sharing
+      mechanism for two parallel FC branches becomes easy (TNNetConvolutionSharedWeights
+      is conv-only), revisit to share the reduce->ReLU->expand weights.
+- [ ] TNNetCBAM follow-up: the landed spatial branch uses a LEARNED pointwise
+      C->2 descriptor instead of the paper's FIXED avg-over-depth + max-over-depth
+      channel reduction (no such (X,Y,1)-producing channel-axis reduction layer
+      exists). If a fixed avg/max-over-Depth reduction primitive lands, offer it as
+      the paper-faithful spatial-descriptor variant behind a flag.
+- [ ] Channel-attention bake-off can now wire arm (c): the landed AddCBAM (see the
+      open "Channel-attention bake-off" entry below — (a) none (b) SE (c) CBAM (d)
+      1x1+sigmoid).
 - [ ] TNNetFiLM follow-up: a CLASS-CONDITIONAL generator/decoder demo — the
       headline FiLM use case (cGAN / conditional generation, Perez et al.). Build a
       tiny decoder (a couple of conv/upsample blocks) whose feature maps are
