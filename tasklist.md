@@ -1381,11 +1381,11 @@ rather than acted on.
       (GEGLU, SwiGLU, DropPath, RotaryEmbedding) so the auto-generated
       layer reference has clean source to pull from.
 - [ ] README "What landed this month" entry: SDPA, RoPE, MaskedFill,
-      SoftCapping, DropPath, GEGLU/SwiGLU/GLU, SquaredReLU, LayerScale,
+      SoftCapping, DropPath, GEGLU/SwiGLU/GLU, SquaredReLU,
       SpatialDropouts. One line each.
 - [ ] One-pager "transformer building blocks landed in this repo": table
       of LayerNorm / MaskedFill / SDPA / RoPE / SoftCapping / DropPath /
-      GEGLU / SwiGLU / GLU / SquaredReLU / LayerScale / AddPositionalEmbedding
+      GEGLU / SwiGLU / GLU / SquaredReLU / AddPositionalEmbedding
       / ChannelShuffle / ALiBi / TanhGLU with "what it is" + "use it when".
 - [ ] Short "where the test suite lives" map: tests/TestNeuralNumerical vs
       older `tests/*` programs, how RunAll.sh orchestrates them.
