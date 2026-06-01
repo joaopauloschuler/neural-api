@@ -597,7 +597,7 @@ rather than acted on.
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
       accuracy/agreement.
-- [ ] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
+- [X] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
       deliberately class-imbalanced mask, sweep `(α,β) ∈ {(0.5,0.5),(0.3,0.7),
       (0.7,0.3)}` and show how β>α trades precision for recall (fewer false
       negatives). Pure α/β knob study on the landed TNNetTverskyLoss.
