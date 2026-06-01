@@ -206,58 +206,6 @@ rather than acted on.
       than GENERATING a fresh weight set), and from the Neural-ODE/Growing-CA entries
       (shared-weight time/space recurrence, weights still owned by the layer).
 
-- [X] Reptile first-order meta-learning + examples/MetaLearningReptile/ (Nichol,
-      Achiam & Schulman 2018, "On First-Order Meta-Learning Algorithms",
-      https://arxiv.org/abs/1803.02999) — a genuinely NEW training PARADIGM for this
-      repo: nothing in the tree learns across a task DISTRIBUTION. Every existing
-      example/optimizer/wrapper trains ONE net to minimise loss on ONE dataset; Reptile
-      instead learns an INITIALIZATION `theta` such that, for a freshly sampled task,
-      a few ordinary SGD steps adapt it to that task fast (few-shot learning). The
-      algorithm is strikingly simple and pure-CPU friendly, which is exactly why it
-      (not full MAML) is the right v1: the headline second-order MAML gradient
-      (`d/d theta` through an inner-loop unroll) needs differentiating through the
-      optimizer — awkward and heavy under this API's per-layer Backpropagate contract,
-      the same honest "what did NOT fit the framework budget" call the Capsule/DEQ
-      entries make. Reptile needs NONE of it: OUTER loop — sample a task `T`, COPY the
-      meta-weights into a worker net (`Worker.CopyWeights(Meta)` per
-      [[manual-gradient-and-snapshot-gotchas]]: CopyWeights, not LoadFromFile, so layer
-      refs stay live), run `k` ordinary SGD steps on `T` to get adapted weights `phi`,
-      then move the meta-weights toward the adapted ones `theta := theta + eps*(phi -
-      theta)` (a per-weight interpolation — mechanically the SAME weight-space move the
-      landed TNNetSWAWrapper / TNNetEMAWrapper / TNNetLookaheadWrapper already do, so it
-      slots straight into that wrapper family). Ship it as a caller-driven
-      `TNNetReptileMetaTrainer` (neuralnetwork.pas, beside those wrappers):
-      Create(pMetaNN, pEpsilon); BeginTask returns/initialises the worker as a
-      CopyWeights clone; MergeTask reads the adapted worker weights and applies the
-      `theta += eps*(phi - theta)` interpolation in place. Distinct from all of them:
-      SWA/EMA average weights ACROSS TIME on ONE task; Reptile interpolates toward weights
-      adapted to a DIFFERENT task each step, and the interpolation direction
-      `(phi - theta)` is provably (Nichol et al. sec. 5) a first-order approximation to
-      the gradient that maximises inner-task generalization — meta-learning, not
-      averaging. The example trains on a DISTRIBUTION of tiny sine-regression tasks
-      `y = A*sin(x + p)` with amplitude `A` and phase `p` randomised per task (the
-      paper's own toy), then shows the headline payoff: from the Reptile meta-init, a
-      held-out task fits in `k in {1,2,4}` gradient steps to far lower loss than the
-      same `k` steps from a random init or from a net pre-trained on the AVERAGE task
-      (the joint-training baseline) — i.e. it learned to LEARN sines, not the mean sine.
-      Built-in correctness gates in the house style: (a) `eps=0` leaves the meta-weights
-      byte-for-byte unchanged (the degenerate anchor, mirroring the
-      LRScheduler/clip_value "default path unchanged" discipline); (b) `eps=1` makes the
-      meta-weights exactly the last task's adapted weights `phi` (pure copy, no meta-
-      learning — the opposite anchor); (c) post-adaptation held-out loss from the
-      meta-init must beat the random-init baseline at matched `k` (the actual
-      meta-learning claim, graded by construction). Tests in TestNeuralTraining.pas per
-      the [[loss-layer-pattern]]/[[introspection-report-pattern]] recipe pin (a) and (b)
-      exactly and (c) as a loosely-banded trend on a fixed seed. Keep the net tiny
-      (`1 -> FullConnectReLU(16) -> FullConnectReLU(16) -> FullConnectLinear(1)`), the
-      task count and inner-step count small, and MaxThreadNum := 1 so the whole
-      outer/inner loop fits the <5-min pure-CPU budget. Distinct from the RL/DQN entry
-      (that learns a policy by reward, single environment), from transfer/fine-tuning
-      (AffineFineTune / LoRAFineTune adapt ONE pretrained net to ONE new task — no task
-      distribution, no learned init), and from HyperNetwork (GENERATES task weights from
-      a context vector in one forward pass rather than ADAPTING a shared init by
-      gradient steps).
-
 - [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
       landed 2026-06-01, sine-regression task distribution, manual inner-loop
       Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
@@ -429,13 +377,6 @@ rather than acted on.
 - [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
       next-token task and chart loss + max-logit-norm.
-- [X] "Lottery-ticket"-flavored experiment: train a small dense net,
-      magnitude-prune the bottom X% of weights, retrain from the original
-      init, and compare. Pure CPU, finishes in seconds.
-      Done: examples/LotteryTicket (two-spiral task, magnitude mask enforced
-      via OnAfterStep re-zeroing; LT vs random-reinit vs dense over a 50-95%
-      sparsity sweep, averaged over 5 trials). LT matches dense and beats
-      random reinit at 50/70/90% sparsity.
 - [ ] Lottery-ticket follow-up: ITERATIVE magnitude pruning (IMP, the paper's
       actual method) vs the landed one-shot prune. Loop: train -> prune the
       bottom p% of SURVIVING weights -> reset survivors to theta_0 -> retrain,
@@ -1548,7 +1489,7 @@ rather than acted on.
       calls the report every N epochs on a fixed probe set and charts
       `tr(Sw)` collapse + Fisher-ratio climb over training — the cleanest
       single-number window into the terminal phase / neural collapse. Pairs
-      with the open grokking / lottery-ticket experiments
+      with the open grokking experiment and the landed lottery-ticket experiment
       ([[WeightSpectrumReport]]).
 - [ ] `TNNet.NeuralCollapseReport` + `examples/NeuralCollapse/` — measure the
       four canonical Neural-Collapse metrics (Papyan, Han & Donoho 2020, "Prevalence
@@ -1595,7 +1536,7 @@ rather than acted on.
       knee to ~1% resolution instead of the 10%-grid step. ~20 lines on top of the
       landed sweep; the curve already brackets the knee.
 - [ ] MagnitudePruningReport follow-up: this is the no-retrain precursor to the
-      open "Lottery-ticket"-flavored experiment — wire the two together so the
+      landed "Lottery-ticket" experiment (examples/LotteryTicket) — wire the two together so the
       knee found here seeds the prune level, then RETRAIN from the original init
       and chart whether the pruned-then-retrained net recovers the baseline
       accuracy (the lottery-ticket claim). The report already snapshots/restores
@@ -1624,8 +1565,8 @@ rather than acted on.
 - [ ] IntrinsicDimensionReport follow-up: a training-trajectory variant that
       calls the report every N epochs on a fixed probe set and charts the
       final-layer ID dropping over training — a single-number window into
-      representation compression. Pairs with the open grokking / lottery-ticket
-      experiments ([[WeightSpectrumReport]]) and mirrors the open
+      representation compression. Pairs with the open grokking experiment and the
+      landed lottery-ticket experiment ([[WeightSpectrumReport]]) and mirrors the open
       FeatureSeparabilityReport training-trajectory follow-up.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
