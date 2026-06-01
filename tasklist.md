@@ -519,8 +519,19 @@ rather than acted on.
       TNNetSoftPool on a tiny image-classifier stub — does the stochastic
       regularisation lower the train/val gap at matched architecture? Fork an
       existing pooling example (examples/PoolingBakeoff/) and add the new arm.
-- [ ] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
-      its single-branch ShakeDrop generalization.
+- [x] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
+      its single-branch ShakeDrop generalization. DONE: TNNetShakeShakeMerge
+      (3-input: B1,B2,skip) + TNNetShakeDropMerge (2-input: B,skip), with
+      builders TNNet.AddShakeShakeBlock / AddShakeDropBlock; registered in both
+      CreateLayer dispatch tables, the LoadFromString cascade, the multi-input
+      aL cascade and EnableDropouts. Full forward+backward "shake" (independent
+      random forward alpha vs backward beta) is implemented; eval is the
+      deterministic 0.5/0.5 (Shake-Shake) / p_l (ShakeDrop) combination.
+      SCOPE NOTE (what did NOT fit): alpha/beta/b_l are sampled per
+      forward/backward PASS (per-BATCH), not per-sample — the paper's best
+      "Shake-Shake-Image" per-image grain is the documented v1 simplification.
+      Tests in TestNeuralLayersExtra: eval-correctness, save/load/save
+      round-trip, train smoke (TestShakeShake*/TestShakeDropEvalAndRoundTrip).
 
 #### Channel attention / conditioning
 - [ ] TNNetCBAM follow-up: the landed AddCBAM uses TWO SEPARATE channel MLPs

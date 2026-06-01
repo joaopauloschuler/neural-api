@@ -4003,6 +4003,69 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Shake-Shake regularization merge (Gastaldi 2017,
+  // "Shake-Shake regularization", https://arxiv.org/abs/1705.07485). A
+  // PARAMETER-FREE three-input layer that combines two parallel residual
+  // branches B1, B2 with a SKIP/identity input as:
+  //   forward (train):  y = skip + alpha*B1 + (1-alpha)*B2,  alpha~U(0,1)
+  //   backward (train): the gradient into B1 is scaled by an INDEPENDENT
+  //                     beta~U(0,1) and into B2 by (1-beta) -- the "shake":
+  //                     forward and backward use different random coefficients.
+  //   inference (FEnabled=false): y = skip + 0.5*B1 + 0.5*B2 (expected value).
+  // Wiring: TNNetShakeShakeMerge.Create([B1, B2, skip]) where all three inputs
+  // are the SAME shape (use AddShakeShakeBlock to build the canonical block).
+  // The skip input always receives an unscaled gradient (identity path).
+  // SCOPE NOTE (what did NOT fit): alpha/beta are sampled PER FORWARD/BACKWARD
+  // PASS (per-batch), NOT per-sample. The original paper's best "Shake-Shake-
+  // Image" level samples a different alpha per image in the mini-batch; the
+  // per-batch level shipped here is the paper's "Shake-Keep"-adjacent coarser
+  // grain and is documented as the v1 simplification. The independent
+  // forward/backward random coefficients ("Shake-Shake") ARE implemented.
+  TNNetShakeShakeMerge = class(TNNetConcatBase)
+  protected
+    FEnabled: boolean;        // train-vs-inference gate (mirrors TNNetDropPath)
+    FAlpha: TNeuralFloat;     // forward coefficient on B1 (1-FAlpha on B2)
+    FBeta: TNeuralFloat;      // backward coefficient on B1 (1-FBeta on B2)
+  public
+    constructor Create(aL: array of TNNetLayer); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Enabled: boolean read FEnabled write FEnabled;
+    property Alpha: TNeuralFloat read FAlpha;
+    property Beta: TNeuralFloat read FBeta;
+  end;
+
+  /// ShakeDrop regularization merge (Yamada et al. 2018, "ShakeDrop
+  // Regularization for Deep Residual Learning",
+  // https://arxiv.org/abs/1802.02375). The single-branch generalization of
+  // Shake-Shake: a PARAMETER-FREE two-input layer combining ONE residual
+  // branch B with a SKIP input as:
+  //   forward (train):  y = skip + (b_l + alpha - b_l*alpha)*B,  b_l~Bernoulli(p_l)
+  //                     alpha~U(-1,1) (paper's default range)
+  //   backward (train): the gradient into B is scaled by
+  //                     (b_l + beta - b_l*beta),  beta~U(0,1) (paper default),
+  //                     reusing the SAME b_l sampled in the forward pass.
+  //   inference (FEnabled=false): y = skip + E[b_l]*B = skip + p_l*B.
+  // p_l (the Bernoulli keep-probability) is stored in FFloatSt[0] for
+  // serialization. Wiring: TNNetShakeDropMerge.Create([B, skip]).
+  // SCOPE NOTE: b_l/alpha/beta are sampled per forward/backward PASS
+  // (per-batch), same v1 grain as TNNetShakeShakeMerge.
+  TNNetShakeDropMerge = class(TNNetConcatBase)
+  protected
+    FEnabled: boolean;        // train-vs-inference gate
+    FGate: TNeuralFloat;      // forward multiplier (b_l + alpha - b_l*alpha)
+    FBackGate: TNeuralFloat;  // backward multiplier (b_l + beta - b_l*beta)
+    FBl: TNeuralFloat;        // Bernoulli gate sampled in Compute, reused in Backprop
+  public
+    constructor Create(aL: array of TNNetLayer); overload;
+    constructor Create(pKeepProb: TNeuralFloat; aL: array of TNNetLayer); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Enabled: boolean read FEnabled write FEnabled;
+  end;
+
   // This layer run the TNNetVolume.DotProducts for layers A and B.
   TNNetDotProducts = class(TNNetLayer)
   private
@@ -5298,6 +5361,23 @@ type
       // match the block input shape so the residual sum is valid. Returns the
       // residual-sum layer.
       function AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // Shake-Shake regularization block (Gastaldi 2017,
+      // https://arxiv.org/abs/1705.07485). Builds TWO parallel shape-preserving
+      // residual branches over the current last layer, each
+      //   PointwiseConvReLU(HiddenDim) -> PointwiseConvLinear(InputDepth),
+      // and merges them with the skip/identity input via TNNetShakeShakeMerge:
+      //   train:     y = x + alpha*B1 + (1-alpha)*B2 (alpha~U(0,1) per batch),
+      //              branch gradients scaled by an INDEPENDENT beta~U(0,1).
+      //   inference: y = x + 0.5*B1 + 0.5*B2 (deterministic, via EnableDropouts).
+      // HiddenDim sizes each branch's hidden width. Returns the merge layer.
+      function AddShakeShakeBlock(HiddenDim: integer): TNNetLayer;
+      // ShakeDrop regularization block (Yamada et al. 2018,
+      // https://arxiv.org/abs/1802.02375), the single-branch generalization of
+      // Shake-Shake. Builds ONE shape-preserving residual branch
+      //   PointwiseConvReLU(HiddenDim) -> PointwiseConvLinear(InputDepth)
+      // merged with the skip input via TNNetShakeDropMerge. pKeepProb is the
+      // Bernoulli keep-probability p_l (default 0.9). Returns the merge layer.
+      function AddShakeDropBlock(HiddenDim: integer; pKeepProb: TNeuralFloat = 0.9): TNNetLayer;
       // RevNet-style reversible additive-coupling block (Gomez et al. 2017).
       // The InputLayer's depth is split into two equal halves x1|x2 (Depth MUST
       // be even; FErrorProc otherwise). Two shape-preserving pointwise residual
@@ -24800,6 +24880,250 @@ begin
         CondErr[0, 0, FDepth + C] := CondErr[0, 0, FDepth + C] + GradBeta;
       end;
     end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateConcat();
+end;
+
+{ TNNetShakeShakeMerge }
+constructor TNNetShakeShakeMerge.Create(aL: array of TNNetLayer);
+var
+  LayerCnt: integer;
+  SizeX, SizeY, Deep: integer;
+begin
+  inherited Create();
+  if Length(aL) <> 3 then
+  begin
+    FErrorProc('TNNetShakeShakeMerge requires exactly 3 input layers '+
+      '(branch1, branch2, skip). Got ' + IntToStr(Length(aL)) + '.');
+  end
+  else
+  begin
+    SizeX := aL[0].FOutput.SizeX;
+    SizeY := aL[0].FOutput.SizeY;
+    Deep  := aL[0].FOutput.Depth;
+    for LayerCnt := Low(aL) to High(aL) do
+    begin
+      if
+      (
+        (aL[LayerCnt].FOutput.SizeX <> SizeX) or
+        (aL[LayerCnt].FOutput.SizeY <> SizeY) or
+        (aL[LayerCnt].FOutput.Depth <> Deep)
+      ) then
+      begin
+        FErrorProc
+        (
+          'Size doesn''t match at TNNetShakeShakeMerge at index: '+IntToStr(LayerCnt)+
+          ' Should be:('+IntToStr(SizeX)+' '+IntToStr(SizeY)+' '+IntToStr(Deep)+' '+')'+
+          ' It is:('+IntToStr(aL[LayerCnt].FOutput.SizeX)+' '+IntToStr(aL[LayerCnt].FOutput.SizeY)+' '+IntToStr(aL[LayerCnt].FOutput.Depth)+' '+').'
+        );
+      end;
+      FPrevOutput.Add(aL[LayerCnt].FOutput);
+      FPrevOutputError.Add(aL[LayerCnt].FOutputError);
+      FPrevOutputErrorDeriv.Add(aL[LayerCnt].FOutputErrorDeriv);
+      FPrevLayerList.Add(aL[LayerCnt]);
+      aL[LayerCnt].IncDepartingBranchesCnt();
+    end;
+    Output.Resize(SizeX, SizeY, Deep);
+    FOutputError.Resize(SizeX, SizeY, Deep);
+    FOutputErrorDeriv.Resize(SizeX, SizeY, Deep);
+  end;
+  FEnabled := true;
+  FAlpha := 0.5;
+  FBeta := 0.5;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+destructor TNNetShakeShakeMerge.Destroy();
+begin
+  inherited Destroy();
+end;
+
+procedure TNNetShakeShakeMerge.Compute();
+var
+  StartTime: double;
+  B1, B2, Skip: TNNetVolume;
+  I: integer;
+begin
+  StartTime := Now();
+  B1   := FPrevOutput[0];
+  B2   := FPrevOutput[1];
+  Skip := FPrevOutput[2];
+  if FEnabled then
+    FAlpha := Random // uniform [0,1)
+  else
+    FAlpha := 0.5;   // inference: deterministic expected value
+  // y = skip + alpha*B1 + (1-alpha)*B2
+  for I := 0 to FOutput.Size - 1 do
+    FOutput.FData[I] := Skip.FData[I] +
+      FAlpha * B1.FData[I] + (1 - FAlpha) * B2.FData[I];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetShakeShakeMerge.Backpropagate();
+var
+  StartTime: double;
+  B1Err, B2Err, SkipErr: TNNetVolume;
+  I: integer;
+  MaxError: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  MaxError := ForceMaxOutputError(csErrorOverflowBackpropProtection);
+  if MaxError > 0 then
+  begin
+    B1Err   := FPrevOutputError[0];
+    B2Err   := FPrevOutputError[1];
+    SkipErr := FPrevOutputError[2];
+    if FEnabled then
+      FBeta := Random // INDEPENDENT of FAlpha -- this is the "shake"
+    else
+      FBeta := 0.5;
+    // dL/dB1 = beta*dOut ; dL/dB2 = (1-beta)*dOut ; dL/dskip = dOut
+    if B1Err.Size = FOutput.Size then
+      for I := 0 to FOutput.Size - 1 do
+        B1Err.FData[I] := B1Err.FData[I] + FBeta * FOutputError.FData[I];
+    if B2Err.Size = FOutput.Size then
+      for I := 0 to FOutput.Size - 1 do
+        B2Err.FData[I] := B2Err.FData[I] + (1 - FBeta) * FOutputError.FData[I];
+    if SkipErr.Size = FOutput.Size then
+      for I := 0 to FOutput.Size - 1 do
+        SkipErr.FData[I] := SkipErr.FData[I] + FOutputError.FData[I];
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateConcat();
+end;
+
+{ TNNetShakeDropMerge }
+constructor TNNetShakeDropMerge.Create(aL: array of TNNetLayer);
+begin
+  Create(0.9, aL);
+end;
+
+constructor TNNetShakeDropMerge.Create(pKeepProb: TNeuralFloat; aL: array of TNNetLayer);
+var
+  LayerCnt: integer;
+  SizeX, SizeY, Deep: integer;
+begin
+  inherited Create();
+  if pKeepProb < 0 then pKeepProb := 0;
+  if pKeepProb > 1 then pKeepProb := 1;
+  FFloatSt[0] := pKeepProb;
+  if Length(aL) <> 2 then
+  begin
+    FErrorProc('TNNetShakeDropMerge requires exactly 2 input layers '+
+      '(branch, skip). Got ' + IntToStr(Length(aL)) + '.');
+  end
+  else
+  begin
+    SizeX := aL[0].FOutput.SizeX;
+    SizeY := aL[0].FOutput.SizeY;
+    Deep  := aL[0].FOutput.Depth;
+    for LayerCnt := Low(aL) to High(aL) do
+    begin
+      if
+      (
+        (aL[LayerCnt].FOutput.SizeX <> SizeX) or
+        (aL[LayerCnt].FOutput.SizeY <> SizeY) or
+        (aL[LayerCnt].FOutput.Depth <> Deep)
+      ) then
+      begin
+        FErrorProc
+        (
+          'Size doesn''t match at TNNetShakeDropMerge at index: '+IntToStr(LayerCnt)+
+          ' Should be:('+IntToStr(SizeX)+' '+IntToStr(SizeY)+' '+IntToStr(Deep)+' '+')'+
+          ' It is:('+IntToStr(aL[LayerCnt].FOutput.SizeX)+' '+IntToStr(aL[LayerCnt].FOutput.SizeY)+' '+IntToStr(aL[LayerCnt].FOutput.Depth)+' '+').'
+        );
+      end;
+      FPrevOutput.Add(aL[LayerCnt].FOutput);
+      FPrevOutputError.Add(aL[LayerCnt].FOutputError);
+      FPrevOutputErrorDeriv.Add(aL[LayerCnt].FOutputErrorDeriv);
+      FPrevLayerList.Add(aL[LayerCnt]);
+      aL[LayerCnt].IncDepartingBranchesCnt();
+    end;
+    Output.Resize(SizeX, SizeY, Deep);
+    FOutputError.Resize(SizeX, SizeY, Deep);
+    FOutputErrorDeriv.Resize(SizeX, SizeY, Deep);
+  end;
+  FEnabled := true;
+  FGate := FFloatSt[0];
+  FBackGate := FFloatSt[0];
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+destructor TNNetShakeDropMerge.Destroy();
+begin
+  inherited Destroy();
+end;
+
+procedure TNNetShakeDropMerge.Compute();
+var
+  StartTime: double;
+  B, Skip: TNNetVolume;
+  I: integer;
+  bl, Alpha: TNeuralFloat;
+begin
+  StartTime := Now();
+  B    := FPrevOutput[0];
+  Skip := FPrevOutput[1];
+  if FEnabled then
+  begin
+    // b_l ~ Bernoulli(p_l): 1 with prob p_l (=FFloatSt[0]). Stored in FBl so
+    // the backward pass reuses the SAME Bernoulli draw (paper convention);
+    // only alpha (forward) and beta (backward) differ -- the "shake".
+    if Random < FFloatSt[0] then bl := 1 else bl := 0;
+    FBl := bl;
+    Alpha := 2 * Random - 1; // uniform [-1,1) (paper default forward range)
+    FGate := bl + Alpha - bl * Alpha;
+  end
+  else
+  begin
+    // inference: E[forward multiplier] = E[b_l] = p_l (alpha is zero-mean).
+    FGate := FFloatSt[0];
+  end;
+  // y = skip + gate*B
+  for I := 0 to FOutput.Size - 1 do
+    FOutput.FData[I] := Skip.FData[I] + FGate * B.FData[I];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetShakeDropMerge.Backpropagate();
+var
+  StartTime: double;
+  BErr, SkipErr: TNNetVolume;
+  I: integer;
+  MaxError, bl, Beta: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  MaxError := ForceMaxOutputError(csErrorOverflowBackpropProtection);
+  if MaxError > 0 then
+  begin
+    BErr    := FPrevOutputError[0];
+    SkipErr := FPrevOutputError[1];
+    if FEnabled then
+    begin
+      // Reuse the SAME b_l sampled in Compute (paper convention); only beta is
+      // a fresh independent draw -- the backward "shake".
+      bl := FBl;
+      Beta := Random; // uniform [0,1) (paper default backward range)
+      FBackGate := bl + Beta - bl * Beta;
+    end
+    else
+      FBackGate := FFloatSt[0];
+    // dL/dB = backgate*dOut ; dL/dskip = dOut
+    if BErr.Size = FOutput.Size then
+      for I := 0 to FOutput.Size - 1 do
+        BErr.FData[I] := BErr.FData[I] + FBackGate * FOutputError.FData[I];
+    if SkipErr.Size = FOutput.Size then
+      for I := 0 to FOutput.Size - 1 do
+        SkipErr.FData[I] := SkipErr.FData[I] + FOutputError.FData[I];
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   BackpropagateConcat();
@@ -47886,7 +48210,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -48134,6 +48458,8 @@ begin
       'TNNetFlipY' :                Result := TNNetFlipY.Create();
       'TNNetSum' :                  Result := TNNetSum.Create(aL);
       'TNNetFiLM' :                 Result := TNNetFiLM.Create(aL);
+      'TNNetShakeShakeMerge' :      Result := TNNetShakeShakeMerge.Create(aL);
+      'TNNetShakeDropMerge' :       Result := TNNetShakeDropMerge.Create(Ft[0], aL);
       'TNNetSplitChannels' :        Result := TNNetSplitChannels.Create(aIdx);
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
       'TNNetDeLocalConnect' :       Result := TNNetDeLocalConnect.Create(St[0], St[1], St[4]);
@@ -48420,6 +48746,8 @@ begin
       if S[0] = 'TNNetDeepConcat' then Result := TNNetDeepConcat.Create(aL) else
       if S[0] = 'TNNetSum' then Result := TNNetSum.Create(aL) else
       if S[0] = 'TNNetFiLM' then Result := TNNetFiLM.Create(aL) else
+      if S[0] = 'TNNetShakeShakeMerge' then Result := TNNetShakeShakeMerge.Create(aL) else
+      if S[0] = 'TNNetShakeDropMerge' then Result := TNNetShakeDropMerge.Create(Ft[0], aL) else
       if S[0] = 'TNNetSplitChannels' then Result := TNNetSplitChannels.Create(aIdx) else
       if S[0] = 'TNNetSplitChannelEvery' then Result := TNNetSplitChannelEvery.Create(aIdx) else
       if S[0] = 'TNNetDeLocalConnect' then Result := TNNetDeLocalConnect.Create(St[0], St[1], St[4]) else
@@ -49109,6 +49437,39 @@ begin
   AddLayer(pSublayers);
   AddLayer( TNNetGatedResidual.Create() );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddShakeShakeBlock(HiddenDim: integer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+  Depth: integer;
+  B1, B2: TNNetLayer;
+begin
+  // y = x + alpha*B1(x) + (1-alpha)*B2(x) (Shake-Shake, Gastaldi 2017).
+  BranchInput := GetLastLayer();
+  Depth := BranchInput.Output.Depth;
+  // Branch 1: shape-preserving pointwise residual function Depth -> Depth.
+  AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), BranchInput );
+  B1 := AddLayer( TNNetPointwiseConvLinear.Create(Depth) );
+  // Branch 2: independent shape-preserving pointwise residual function.
+  AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), BranchInput );
+  B2 := AddLayer( TNNetPointwiseConvLinear.Create(Depth) );
+  // Merge with skip via the Shake-Shake stochastic combiner.
+  Result := AddLayer( TNNetShakeShakeMerge.Create([B1, B2, BranchInput]) );
+end;
+
+function TNNet.AddShakeDropBlock(HiddenDim: integer; pKeepProb: TNeuralFloat): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+  Depth: integer;
+  B: TNNetLayer;
+begin
+  // y = x + gate*B(x) (ShakeDrop, Yamada et al. 2018), single branch.
+  BranchInput := GetLastLayer();
+  Depth := BranchInput.Output.Depth;
+  AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), BranchInput );
+  B := AddLayer( TNNetPointwiseConvLinear.Create(Depth) );
+  Result := AddLayer( TNNetShakeDropMerge.Create(pKeepProb, [B, BranchInput]) );
 end;
 
 function TNNet.AddReversibleBlock(InputLayer: TNNetLayer; HiddenDim: integer): TNNetLayer;
@@ -50716,6 +51077,14 @@ begin
       else if (FLayers[LayerCnt] is TNNetStochasticPool) then
       begin
         TNNetStochasticPool(FLayers[LayerCnt]).Enabled := pFlag;
+      end
+      else if (FLayers[LayerCnt] is TNNetShakeShakeMerge) then
+      begin
+        TNNetShakeShakeMerge(FLayers[LayerCnt]).Enabled := pFlag;
+      end
+      else if (FLayers[LayerCnt] is TNNetShakeDropMerge) then
+      begin
+        TNNetShakeDropMerge(FLayers[LayerCnt]).Enabled := pFlag;
       end;
     end;
   end;

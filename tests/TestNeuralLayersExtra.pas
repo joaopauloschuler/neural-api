@@ -126,6 +126,10 @@ type
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
     procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
+    procedure TestShakeShakeEvalDeterministicCombination;
+    procedure TestShakeShakeRoundTrip;
+    procedure TestShakeShakeTrainSmoke;
+    procedure TestShakeDropEvalAndRoundTrip;
   end;
 
 implementation
@@ -5328,6 +5332,174 @@ begin
         AssertEquals('DropBlock round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Shake-Shake (a): in EVAL mode the block reduces to the deterministic
+// 0.5/0.5 combination. With constant branches B1=2x, B2=3x and skip=x the
+// output must equal x + 0.5*2x + 0.5*3x = 3.5x exactly, independent of RNG.
+procedure TTestNeuralLayersExtra.TestShakeShakeEvalDeterministicCombination;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, B1, B2: TNNetLayer;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    // B1 = 2*x, B2 = 3*x, both shape-preserving branches off the input.
+    B1 := NN.AddLayerAfter(TNNetMulByConstant.Create(2.0), InputLayer);
+    B2 := NN.AddLayerAfter(TNNetMulByConstant.Create(3.0), InputLayer);
+    NN.AddLayer(TNNetShakeShakeMerge.Create([B1, B2, InputLayer]));
+    NN.EnableDropouts(false); // inference: deterministic 0.5/0.5
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.9;
+    // Run several times: eval output is deterministic regardless of RandSeed.
+    RandSeed := 7;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ShakeShake eval = x + 0.5*2x + 0.5*3x = 3.5x at ' + IntToStr(i),
+        3.5 * Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Shake-Shake (b): LoadFromString round-trip of a net containing the block is
+// bit-for-bit stable (save, load, save again, assert equal string).
+procedure TTestNeuralLayersExtra.TestShakeShakeRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+  MergeIdx: integer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 4, 1));
+    NN.AddShakeShakeBlock(8); // builder: two pointwise branches + merge
+    MergeIdx := NN.GetLastLayerIdx();
+    AssertTrue('AddShakeShakeBlock last layer is TNNetShakeShakeMerge',
+      NN.Layers[MergeIdx] is TNNetShakeShakeMerge);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ShakeShake save/load/save is bit-for-bit stable',
+        Saved, Saved2);
+      AssertTrue('ShakeShake reloaded merge is TNNetShakeShakeMerge',
+        NN2.Layers[MergeIdx] is TNNetShakeShakeMerge);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+// Shake-Shake (c): a tiny net with a ShakeShake block trains a few steps
+// without NaN/Inf and the loss stays finite (and typically decreases).
+procedure TTestNeuralLayersExtra.TestShakeShakeTrainSmoke;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Step, i: integer;
+  LossFirst, LossLast, Err: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  Target := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddShakeShakeBlock(6);
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+    NN.SetLearningRate(0.01, 0.9);
+    NN.EnableDropouts(true);
+
+    for i := 0 to 3 do
+    begin
+      Input.Raw[i] := Sin(i * 0.5) * 0.5;
+      Target.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+
+    LossFirst := 0;
+    LossLast := 0;
+    for Step := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.GetLastLayer.Output.Sub(Target);
+      Err := NN.GetLastLayer.Output.GetSumSqr();
+      AssertFalse('ShakeShake train loss must be finite at step ' + IntToStr(Step),
+        IsNan(Err) or IsInfinite(Err));
+      if Step = 0 then LossFirst := Err;
+      LossLast := Err;
+      NN.Backpropagate(Target);
+    end;
+    AssertTrue('ShakeShake final loss must be finite',
+      (not IsNan(LossLast)) and (not IsInfinite(LossLast)));
+    // Loss should not blow up relative to the start.
+    AssertTrue('ShakeShake training should not diverge (lossLast <= 5*lossFirst+1)',
+      LossLast <= 5 * LossFirst + 1);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+// ShakeDrop: eval reduces to y = x + p_l*B (deterministic), and a net with the
+// block round-trips bit-for-bit (save/load/save), preserving p_l (FFloatSt[0]).
+procedure TTestNeuralLayersExtra.TestShakeDropEvalAndRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  InputLayer, B: TNNetLayer;
+  Saved, Saved2: string;
+  i, MergeIdx: integer;
+  KeepProb: TNeuralFloat;
+begin
+  KeepProb := 0.75;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    B := NN.AddLayerAfter(TNNetMulByConstant.Create(2.0), InputLayer); // B = 2x
+    NN.AddLayer(TNNetShakeDropMerge.Create(KeepProb, [B, InputLayer]));
+    MergeIdx := NN.GetLastLayerIdx();
+    NN.EnableDropouts(false); // inference: y = x + p_l*B = x + 0.75*2x = 2.5x
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.33) * 0.6 + 0.8;
+    RandSeed := 11;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ShakeDrop eval = x + 0.75*2x = 2.5x at ' + IntToStr(i),
+        2.5 * Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ShakeDrop save/load/save is bit-for-bit stable',
+        Saved, Saved2);
+      AssertTrue('ShakeDrop reloaded merge is TNNetShakeDropMerge',
+        NN2.Layers[MergeIdx] is TNNetShakeDropMerge);
+      AssertEquals('ShakeDrop round-trip structure (keep prob)',
+        NN.Layers[MergeIdx].SaveStructureToString(),
+        NN2.Layers[MergeIdx].SaveStructureToString());
     finally
       NN2.Free;
     end;
