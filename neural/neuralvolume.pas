@@ -920,6 +920,29 @@ type
     numerical instability in forward/backward passes. }
   procedure AssertFinite(V: TNNetVolume; const Where: string);
 
+  { RandomBetaValue draws a sample from a Beta(Alpha, Alpha) distribution
+    using the repo's global Random RNG. Implemented via two Gamma(Alpha,1)
+    draws: Beta = Ga/(Ga+Gb). For Alpha=1 this reduces to Uniform(0,1), the
+    common practical Mixup default. The Gamma sampler uses the Marsaglia &
+    Tsang (2000) method, supporting any Alpha > 0. }
+  function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
+  function RandomBetaValue(Alpha: TNeuralFloat): TNeuralFloat;
+
+  { MixVolumes computes the convex combination
+      Output := Lambda*A + (1-Lambda)*B
+    Output is resized to match A. A and B must have matching sizes. }
+  procedure MixVolumes(Output, A, B: TNNetVolume; Lambda: TNeuralFloat);
+
+  { CreateMixedVolumePairList returns a NEW TNNetVolumePairList (owning copies)
+    where each pair is the Mixup convex combination of an original pair with a
+    randomly-permuted partner pair. Lambda is drawn per pair from
+    Beta(Alpha, Alpha). The input list is NOT mutated. The caller owns the
+    result and must Free it. Pass a fixed FixedLambda >= 0 to override the
+    Beta draw (handy for tests / deterministic runs); FixedLambda < 0 (default)
+    uses the Beta sampler. }
+  function CreateMixedVolumePairList(Original: TNNetVolumePairList;
+    Alpha: TNeuralFloat = 1.0; FixedLambda: TNeuralFloat = -1.0): TNNetVolumePairList;
+
   function GetLastChars(const InputStr: string; LenStr: Integer): string;
 
   procedure TestTNNetVolume();
@@ -1602,6 +1625,127 @@ begin
   if Abs(x) < Tolerance
   then WriteLn(' Passed.')
   else WriteLn(' FAILED.');
+end;
+
+// Marsaglia & Tsang (2000) "A Simple Method for Generating Gamma Variables".
+// Generates a Gamma(Alpha, 1) sample using the repo's global Random RNG.
+// Standard normal sample (Marsaglia polar) using the global Random RNG.
+function RandomStdNormal(): TNeuralFloat;
+var
+  r, x, y: TNeuralFloat;
+begin
+  r := 0;
+  while (r > 1) or (r = 0) do
+  begin
+    x := 2.0 * Random() - 1.0;
+    y := 2.0 * Random() - 1.0;
+    r := x * x + y * y;
+  end;
+  Result := x * Sqrt(-2.0 * Ln(r) / r);
+end;
+
+function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
+var
+  d, c, x, v, u: TNeuralFloat;
+begin
+  Result := 0;
+  if Alpha <= 0 then Exit;
+  // Boost: for Alpha < 1 use Gamma(Alpha) = Gamma(Alpha+1) * U^(1/Alpha).
+  if Alpha < 1 then
+  begin
+    u := Random();
+    // Guard against log(0) below by avoiding a zero draw.
+    while u <= 0 do u := Random();
+    Result := RandomGammaValue(Alpha + 1.0) * Power(u, 1.0 / Alpha);
+    Exit;
+  end;
+  d := Alpha - 1.0 / 3.0;
+  c := 1.0 / Sqrt(9.0 * d);
+  while True do
+  begin
+    repeat
+      x := RandomStdNormal();
+      v := 1.0 + c * x;
+    until v > 0;
+    v := v * v * v;
+    u := Random();
+    if u < 1.0 - 0.0331 * (x * x) * (x * x) then
+    begin
+      Result := d * v;
+      Exit;
+    end;
+    if Ln(u) < 0.5 * x * x + d * (1.0 - v + Ln(v)) then
+    begin
+      Result := d * v;
+      Exit;
+    end;
+  end;
+end;
+
+function RandomBetaValue(Alpha: TNeuralFloat): TNeuralFloat;
+var
+  ga, gb: TNeuralFloat;
+begin
+  // Beta(1,1) == Uniform(0,1): fast path and exact.
+  if Alpha = 1.0 then
+  begin
+    Result := Random();
+    Exit;
+  end;
+  ga := RandomGammaValue(Alpha);
+  gb := RandomGammaValue(Alpha);
+  if ga + gb <= 0
+  then Result := 0.5
+  else Result := ga / (ga + gb);
+end;
+
+procedure MixVolumes(Output, A, B: TNNetVolume; Lambda: TNeuralFloat);
+begin
+  // Output := Lambda*A + (1-Lambda)*B, reusing AVX-backed volume ops.
+  Output.Copy(A);
+  Output.Mul(Lambda);
+  Output.MulAdd(1.0 - Lambda, B);
+end;
+
+function CreateMixedVolumePairList(Original: TNNetVolumePairList;
+  Alpha: TNeuralFloat; FixedLambda: TNeuralFloat): TNNetVolumePairList;
+var
+  Cnt, I, J, Tmp, Partner: integer;
+  Perm: array of integer;
+  Lambda: TNeuralFloat;
+  MixedA, MixedB: TNNetVolume;
+  PartnerPair: TNNetVolumePair;
+begin
+  Result := TNNetVolumePairList.Create();
+  if Original = nil then Exit;
+  Cnt := Original.Count;
+  if Cnt = 0 then Exit;
+
+  // Build a random derangement-ish permutation (Fisher-Yates) so each sample
+  // is paired with another sample from the same list (minibatch mixup).
+  SetLength(Perm, Cnt);
+  for I := 0 to Cnt - 1 do Perm[I] := I;
+  for I := Cnt - 1 downto 1 do
+  begin
+    J := Random(I + 1);
+    Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
+  end;
+
+  for I := 0 to Cnt - 1 do
+  begin
+    Partner := Perm[I];
+    PartnerPair := Original[Partner];
+    if FixedLambda >= 0
+    then Lambda := FixedLambda
+    else Lambda := RandomBetaValue(Alpha);
+
+    MixedA := TNNetVolume.Create();
+    MixedB := TNNetVolume.Create();
+    MixVolumes(MixedA, Original[I].A, PartnerPair.A, Lambda);
+    MixVolumes(MixedB, Original[I].B, PartnerPair.B, Lambda);
+    // TNNetVolumePair.Create takes ownership of the volumes.
+    Result.Add(TNNetVolumePair.Create(MixedA, MixedB));
+  end;
 end;
 
 // https://machinelearningmastery.com/a-gentle-introduction-to-positional-encoding-in-transformer-models-part-1/

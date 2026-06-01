@@ -650,7 +650,7 @@ rather than acted on.
       non-finite activation (e.g. an aggressive LR / a planted Inf weight) and
       assert training aborts (FShouldQuit set / FErrorProc fired) rather than
       running to the epoch budget.
-- [ ] Mixup data augmentation helper.
+- [X] Mixup data augmentation helper.
 - [ ] SAM follow-up: the noisy-label 2D-blob clusters are easily separable so
       clean val-accuracy saturates (~99%) across all rho — the flatness signal
       carries the story but the val-acc-vs-rho curve is flat. A harder task
