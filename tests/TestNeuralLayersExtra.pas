@@ -26,6 +26,7 @@ type
     // Upsample tests
     procedure TestUpsampleForward;
     procedure TestUpsampleDepthToSpace;
+    procedure TestUpsampleBackwardErrorSum;
     
     // Power and transformation layers
     procedure TestPowerLayer;
@@ -351,6 +352,104 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestUpsampleBackwardErrorSum;
+var
+  NN: TNNet;
+  Input, Target, DesiredErr: TNNetVolume;
+  UpLayer, InLayer: TNNetLayer;
+  CntX, CntY, OutD, OutX, OutY, Gi: integer;
+  BlockSum, InSum, OutSum, ExpInputErr: TNeuralFloat;
+begin
+  // TNNetUpsample (depth-to-space) maps each input position bijectively
+  // into a 2x2 output block at a single output channel. Backward must route
+  // each output-block error back to exactly its source input element, so:
+  //   (a) total input error == total output error (no error created/lost),
+  //   (b) the sum of a 2x2 output block at channel OutD equals the sum of
+  //       the 4 source input channels (4*OutD..4*OutD+3) at (CntX, CntY).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 8); // 2x2x8 -> 4x4x2
+  Target := TNNetVolume.Create(4, 4, 2);
+  DesiredErr := TNNetVolume.Create(4, 4, 2);
+  try
+    InLayer := NN.AddLayer(TNNetInput.Create(2, 2, 8));
+    UpLayer := NN.AddLayer(TNNetUpsample.Create());
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    // The input layer normally keeps a size-1 error buffer (inputs don't
+    // backprop). Give it a full-size buffer so TNNetUpsample's backward
+    // (guarded by FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)
+    // actually routes the error into it and we can inspect the result.
+    InLayer.OutputError.ReSize(InLayer.Output);
+
+    AssertEquals('Upsample output SizeX', 4, UpLayer.Output.SizeX);
+    AssertEquals('Upsample output SizeY', 4, UpLayer.Output.SizeY);
+    AssertEquals('Upsample output Depth', 2, UpLayer.Output.Depth);
+
+    // Drive backprop through the public TNNet.Backpropagate path. The last
+    // layer's error is computed as (Output - Target), so pick a Target that
+    // yields a distinct, known error in every output cell.
+    DesiredErr.FillForDebug();
+    Target.Copy(UpLayer.Output);
+    Target.Sub(DesiredErr); // Target = Output - DesiredErr => error = DesiredErr
+    NN.Backpropagate(Target);
+
+    // Confirm the last-layer error matches what we asked for.
+    for Gi := 0 to UpLayer.OutputError.Size - 1 do
+      AssertEquals('Upsample seeded output error at ' + IntToStr(Gi),
+        DesiredErr.Raw[Gi], UpLayer.OutputError.Raw[Gi], 0.0001);
+
+    // (a) Total error is preserved.
+    OutSum := UpLayer.OutputError.GetSum();
+    InSum := InLayer.OutputError.GetSum();
+    AssertEquals('Upsample backward preserves total error',
+      OutSum, InSum, 0.0001);
+
+    // (b) Per-block error sum equals the source input-channel error sum, and
+    //     each input element equals exactly its mapped output-block cell.
+    for OutD := 0 to UpLayer.Output.Depth - 1 do
+      for CntX := 0 to 1 do
+        for CntY := 0 to 1 do
+        begin
+          OutX := CntX * 2;
+          OutY := CntY * 2;
+          BlockSum :=
+            UpLayer.OutputError[OutX,   OutY,   OutD] +
+            UpLayer.OutputError[OutX+1, OutY,   OutD] +
+            UpLayer.OutputError[OutX,   OutY+1, OutD] +
+            UpLayer.OutputError[OutX+1, OutY+1, OutD];
+          ExpInputErr :=
+            InLayer.OutputError[CntX, CntY, OutD*4]   +
+            InLayer.OutputError[CntX, CntY, OutD*4+1] +
+            InLayer.OutputError[CntX, CntY, OutD*4+2] +
+            InLayer.OutputError[CntX, CntY, OutD*4+3];
+          AssertEquals('Upsample block error sum == input error sum at CntX=' +
+            IntToStr(CntX) + ' CntY=' + IntToStr(CntY) + ' OutD=' +
+            IntToStr(OutD), BlockSum, ExpInputErr, 0.0001);
+
+          // Exact bijective routing (matches Compute's index mapping).
+          AssertEquals('Upsample back routes cell 0',
+            UpLayer.OutputError[OutX, OutY, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4], 0.0001);
+          AssertEquals('Upsample back routes cell 1',
+            UpLayer.OutputError[OutX+1, OutY, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4+1], 0.0001);
+          AssertEquals('Upsample back routes cell 2',
+            UpLayer.OutputError[OutX, OutY+1, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4+2], 0.0001);
+          AssertEquals('Upsample back routes cell 3',
+            UpLayer.OutputError[OutX+1, OutY+1, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4+3], 0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+    DesiredErr.Free;
   end;
 end;
 
