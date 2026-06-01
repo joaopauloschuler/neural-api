@@ -45,6 +45,10 @@ type
     procedure TestEMADecayZeroEqualsLive;
     procedure TestEMADecayOneKeepsShadow;
     procedure TestEMAConvergesToConstant;
+    procedure TestLookaheadIdentityK1Alpha1;
+    procedure TestLookaheadInterpolationExact;
+    procedure TestLookaheadNonBoundaryNoChange;
+    procedure TestLookaheadSmoke;
   end;
 
 implementation
@@ -961,6 +965,118 @@ begin
       SampleWeight(EMA.ShadowNet), 0.001);
   finally
     EMA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadIdentityK1Alpha1;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 5.0);
+  // k=1, alpha=1.0: each Step synchronizes; phi := 0*phi + 1*theta = theta,
+  // and theta := phi leaves the live net unchanged.
+  LA := TNNetLookaheadWrapper.Create(Live, 1, 1.0);
+  try
+    AssertTrue('Lookahead k=1 Step synchronizes', LA.Step);
+    AssertEquals('Lookahead k=1,a=1 -> slow == fast', 5.0,
+      SampleWeight(LA.ShadowNet), 0.0);
+    AssertEquals('Lookahead k=1,a=1 -> live unchanged', 5.0,
+      SampleWeight(Live), 0.0);
+    AssertEquals('Lookahead counter reset after sync', 0, LA.StepCount);
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadInterpolationExact;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+  Expected: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  // Slow phi seeded at 2.0.
+  FillNetWeights(Live, 2.0);
+  LA := TNNetLookaheadWrapper.Create(Live, 3, 0.5); // k=3, alpha=0.5
+  try
+    // Base optimizer moved fast weights to theta=8.0.
+    FillNetWeights(Live, 8.0);
+    // Two non-boundary steps must not synchronize.
+    AssertFalse('Lookahead step 1 no sync', LA.Step);
+    AssertFalse('Lookahead step 2 no sync', LA.Step);
+    // k-th step synchronizes.
+    AssertTrue('Lookahead step 3 syncs', LA.Step);
+    // phi := phi + alpha*(theta - phi) = 2 + 0.5*(8-2) = 5.0
+    Expected := 2.0 + 0.5 * (8.0 - 2.0);
+    AssertEquals('Lookahead exact interpolation (slow)', Expected,
+      SampleWeight(LA.ShadowNet), 0.0001);
+    // Live net now holds phi.
+    AssertEquals('Lookahead live reset to slow', Expected,
+      SampleWeight(Live), 0.0001);
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadNonBoundaryNoChange;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 1.0);
+  LA := TNNetLookaheadWrapper.Create(Live, 5, 0.5); // k=5
+  try
+    // Base optimizer set fast weights to 9.0 (not synced yet).
+    FillNetWeights(Live, 9.0);
+    // Calls 1..k-1 must NOT touch the live weights.
+    AssertFalse('Lookahead step 1 no sync', LA.Step);
+    AssertFalse('Lookahead step 2 no sync', LA.Step);
+    AssertFalse('Lookahead step 3 no sync', LA.Step);
+    AssertFalse('Lookahead step 4 no sync', LA.Step);
+    AssertEquals('Lookahead non-boundary leaves live unchanged', 9.0,
+      SampleWeight(Live), 0.0);
+    // Slow weights are still the seed (1.0).
+    AssertEquals('Lookahead non-boundary leaves slow unchanged', 1.0,
+      SampleWeight(LA.ShadowNet), 0.0);
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadSmoke;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+  I: integer;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  LA := TNNetLookaheadWrapper.Create(Live, 5, 0.5);
+  try
+    // Simulate a base optimizer nudging the fast weights and driving Step().
+    for I := 1 to 23 do
+    begin
+      // pretend a base-optimizer update happened
+      FillNetWeights(Live, I * 0.1);
+      LA.Step;
+    end;
+    // After several sync cycles nothing should be NaN/crash; pin finiteness.
+    AssertTrue('Lookahead smoke: slow weight finite',
+      SampleWeight(LA.ShadowNet) = SampleWeight(LA.ShadowNet));
+    AssertTrue('Lookahead smoke: live weight finite',
+      SampleWeight(Live) = SampleWeight(Live));
+  finally
+    LA.Free;
     Live.Free;
   end;
 end;

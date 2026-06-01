@@ -7475,6 +7475,44 @@ type
       property Decay: TNeuralFloat read FDecay write FDecay;
   end;
 
+  { TNNetLookaheadWrapper }
+  // Lookahead optimizer wrapper (Zhang et al. 2019, "Lookahead Optimizer:
+  // k steps forward, 1 step back"). Sibling to SWA/EMA: the caller drives a
+  // base optimizer on the live ("fast") weights theta and invokes Step() after
+  // each base update. A shadow net holds the "slow" weights phi, seeded from
+  // the live weights on Create. Every k-th Step the wrapper performs the
+  // slow-update and resets the fast weights to the slow weights:
+  //   phi   := phi + alpha*(theta - phi)   (i.e. (1-alpha)*phi + alpha*theta)
+  //   theta := phi
+  // Typical defaults: k=5 or 6, alpha=0.5.
+  TNNetLookaheadWrapper = class(TMObject)
+    protected
+      FLiveNet: TNNet;     // fast weights theta (driven by base optimizer)
+      FSlowNet: TNNet;     // slow weights phi (the shadow)
+      FLookaheadK: integer;// inner steps between slow-updates (k)
+      FAlpha: TNeuralFloat;// slow-weight step size
+      FStepCount: integer; // inner steps since the last slow-update
+    public
+      // pK = inner steps per slow-update (k>=1); pAlpha = slow step size.
+      constructor Create(pNN: TNNet; pK: integer; pAlpha: TNeuralFloat);
+      destructor Destroy; override;
+      // Call AFTER each base-optimizer update on the live net. Increments the
+      // inner counter; every k-th call performs the slow-update and writes the
+      // slow weights back into the live net (theta := phi). Returns True on the
+      // calls where a slow-update (synchronization) happened.
+      function Step: boolean;
+      // Forces a slow-update immediately, regardless of the counter, then
+      // resets the inner counter. (phi := (1-alpha)*phi + alpha*theta; theta := phi)
+      procedure Synchronize;
+      // Copies the slow (phi) weights into Dest (same architecture).
+      procedure CopySlowTo(Dest: TNNet);
+      // The network holding the slow weights (owned by this wrapper).
+      function ShadowNet: TNNet;
+      property K: integer read FLookaheadK;
+      property Alpha: TNeuralFloat read FAlpha write FAlpha;
+      property StepCount: integer read FStepCount;
+  end;
+
   { THistoricalNets }
   THistoricalNets = class(TNNet)
     public
@@ -50911,6 +50949,52 @@ end;
 function TNNetEMAWrapper.ShadowNet: TNNet;
 begin
   Result := FShadowNet;
+end;
+
+{ TNNetLookaheadWrapper }
+
+constructor TNNetLookaheadWrapper.Create(pNN: TNNet; pK: integer; pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FLiveNet := pNN;
+  if pK < 1 then pK := 1;
+  FLookaheadK := pK;
+  FAlpha := pAlpha;
+  FStepCount := 0;
+  // Slow weights phi are seeded from the current (fast) live weights.
+  FSlowNet := pNN.Clone();
+end;
+
+destructor TNNetLookaheadWrapper.Destroy;
+begin
+  FSlowNet.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetLookaheadWrapper.Synchronize;
+begin
+  // Slow-update: phi := phi + alpha*(theta - phi) = (1-alpha)*phi + alpha*theta
+  FSlowNet.MulMulAddWeights(1 - FAlpha, FAlpha, FLiveNet);
+  // Reset fast weights to the new slow weights: theta := phi.
+  FLiveNet.CopyWeights(FSlowNet);
+  FStepCount := 0;
+end;
+
+function TNNetLookaheadWrapper.Step: boolean;
+begin
+  Inc(FStepCount);
+  Result := (FStepCount >= FLookaheadK);
+  if Result then Synchronize;
+end;
+
+procedure TNNetLookaheadWrapper.CopySlowTo(Dest: TNNet);
+begin
+  Dest.CopyWeights(FSlowNet);
+end;
+
+function TNNetLookaheadWrapper.ShadowNet: TNNet;
+begin
+  Result := FSlowNet;
 end;
 
 function TNNet.ToGraphvizDot(const GraphName: string): string;
