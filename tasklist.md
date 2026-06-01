@@ -65,11 +65,11 @@ rather than acted on.
       attention), GatherChannelsRouting (static channel gather), the landed
       TNNet.AddMixtureOfExperts (scalar gate) and the landed Modern-Hopfield retrieval.
 
-- [ ] DropBlock follow-up (TNNetDropBlock landed 2026-05-31): the STRETCH bake-off
-      is still open — a tiny CIFAR-stub train comparing TNNetDropBlock vs plain
-      TNNetDropout at matched drop rate, charting the train/val gap to show the
-      localized-patch regularizer helps a conv net generalize where scattered-pixel
-      dropout does not. Keep it <5-min CPU.
+- [x] DropBlock follow-up (TNNetDropBlock landed 2026-05-31): bake-off landed
+      2026-06-01 as examples/DropBlockBakeoff/ — a synthetic-image CNN trained
+      three ways (none / TNNetDropout / TNNetDropBlock) at a matched drop rate,
+      charting the train/test gap. Honest invariant-gated self-check (trains,
+      finite, deterministic eval); ~144 s CPU.
 
 - [ ] TNNet.AddDeepEquilibriumBlock + examples/DeepEquilibrium/ (Bai/Kolter/Koltun
       2019, "Deep Equilibrium Models") — the IMPLICIT cousin of the landed NeuralODE
