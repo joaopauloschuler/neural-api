@@ -235,14 +235,6 @@ rather than acted on.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 ### Added ideas
-- [X] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
-      pattern. Consider a follow-up that allows masking the lower triangle or a
-      configurable offset, if a non-causal masking use case shows up.
-      DONE 2026-06-01: added overloaded ctor
-      `Create(pMaskValue, pOffset, pLowerTriangle=False)` — causal masks `X>Y+Offset`,
-      anti-causal masks `X<Y-Offset`; defaults reproduce the legacy strict
-      upper-triangle byte-for-byte. Offset/flag round-trip via FStruct[0]/FStruct[1].
-      Tests in TestNeuralNumerical.pas.
 - [ ] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
       attribution via TracIn-CP (Pruthi et al. 2020, "Estimating Training Data
       Influence by Tracing Gradient Descent"). Answers a question NOTHING in the
@@ -572,15 +564,6 @@ rather than acted on.
       differentiable reparametrization (TNNetWeightNormLinear, landed) already
       covers the headline use case.
 
-#### Reduction / shape
-- [X] TNNetUpsampleNearest backward consistency: assert summing the
-      per-block output errors equals the input error.
-      DONE 2026-06-01: the actual class is `TNNetUpsample` (a `TNNetDeMaxPool`
-      subclass, depth-to-space). Test `TestUpsampleBackwardErrorSum` in
-      TestNeuralLayersExtra.pas pins total-error conservation + the exact per-cell
-      bijective routing. No production bug. Gotcha: `TNNetDeMaxPool.Backpropagate`
-      only routes error when prev-layer OutputError.Size == Output.Size, so an
-      Input/Identity prev needs its OutputError resized to full size first.
 ### Loss layers
 - [ ] TNNetQuantileLoss follow-up (landed 2026-05-31, head + examples/QuantileRegression/):
       a SINGLE-model multi-quantile head — emit a 3-wide output and train all three
@@ -638,16 +621,6 @@ rather than acted on.
       win is a flatter, better-generalising averaged solution). Mirror the open
       TNeuralLRScheduler-wiring follow-up's "opt-in, regression-test the default is
       unchanged" discipline.
-- [X] Lookahead optimizer wrapper — every k inner SGD steps, set slow weights
-      `φ ← φ + α·(θ - φ)` and rewind fast weights to φ.
-      DONE 2026-06-01: `TNNetLookaheadWrapper` (neuralnetwork.pas), sibling of the
-      landed TNNetSWAWrapper/TNNetEMAWrapper. API: Create(pNN,pK,pAlpha), Step
-      (call after each base update; True on a sync step), Synchronize, CopySlowTo,
-      ShadowNet, props K/Alpha/StepCount. Slow-update via
-      `MulMulAddWeights(1-Alpha,Alpha,LiveNet)` then `CopyWeights`. 4 tests in
-      TestNeuralTraining.pas. Like SWA/EMA, it is caller-driven — wiring it into
-      TNeuralFit (and an examples/WeightAveraging/ demo) remains the open SWA/EMA
-      integration follow-up above.
 - [ ] TNNetGrokfastWrapper — accelerate grokking with a slow-gradient amplifier
       (Lee et al. 2024, "Grokfast: Accelerated Grokking by Amplifying Slow
       Gradients", https://arxiv.org/abs/2405.20233). The mechanism is a one-line
