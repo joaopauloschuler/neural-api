@@ -572,10 +572,11 @@ rather than acted on.
       ternary matmul, so the "fully-quantized linear" path is reachable. Scope as
       its own flag on TNNetBitLinear (forward adds an input absmax-round; backward
       STE-passes the input gradient unchanged).
-- [ ] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
+- [X] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
       (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
       S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
-      This is a ~30-line activation swap.
+      DONE — examples/APLBakeoff/ ships exactly this (ReLU/PReLU/APL S=1,2,4 on
+      the hypotenuse toy, prints per-arm trainable-param count).
 #### Probability projections / sparsity
 - [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
       micro-experiment — train a tiny discrete-latent autoencoder whose
