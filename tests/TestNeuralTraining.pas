@@ -37,6 +37,11 @@ type
     
     // Overfitting detection
     procedure TestSmallNetworkFitsData;
+
+    // Weight-averaging wrappers (SWA / EMA)
+    procedure TestSWAMeanOfConstant;
+    procedure TestSWAMeanOfTwo;
+    procedure TestSWAMeanOfThree;
   end;
 
 implementation
@@ -797,6 +802,100 @@ begin
   finally
     NN.Free;
     TrainPairs.Free;
+  end;
+end;
+
+// --- Helpers for SWA / EMA tests ---------------------------------------------
+
+// Builds a tiny deterministic net (Input(2) -> FullConnectLinear(2)).
+function BuildTinyNet: TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(2),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+end;
+
+// Sets every trainable weight (and bias) of NN to constant V.
+procedure FillNetWeights(NN: TNNet; V: TNeuralFloat);
+var
+  LayerCnt, NeuronCnt: integer;
+begin
+  for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    for NeuronCnt := 0 to NN.Layers[LayerCnt].Neurons.Count - 1 do
+      NN.Layers[LayerCnt].Neurons[NeuronCnt].Fill(V);
+end;
+
+// Returns a representative weight (first weight of the first neuron of the
+// last layer) to pin invariants against.
+function SampleWeight(NN: TNNet): TNeuralFloat;
+begin
+  Result := NN.GetLastLayer.Neurons[0].Weights.Raw[0];
+end;
+
+procedure TTestNeuralTraining.TestSWAMeanOfConstant;
+var
+  Live: TNNet;
+  SWA: TNNetSWAWrapper;
+  I: integer;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 3.0);
+  SWA := TNNetSWAWrapper.Create(Live);
+  try
+    // Accumulating the SAME weights K times -> mean equals those weights.
+    for I := 1 to 5 do SWA.Accumulate;
+    AssertEquals('SWA mean of constant equals constant', 3.0,
+      SampleWeight(SWA.ShadowNet), 0.0001);
+    AssertEquals('SWA counter', 5, SWA.Count);
+  finally
+    SWA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestSWAMeanOfTwo;
+var
+  Live: TNNet;
+  SWA: TNNetSWAWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  SWA := TNNetSWAWrapper.Create(Live);
+  try
+    FillNetWeights(Live, 2.0);
+    SWA.Accumulate;
+    FillNetWeights(Live, 4.0);
+    SWA.Accumulate;
+    // mean of 2 and 4 = 3
+    AssertEquals('SWA mean of A,B = (A+B)/2', 3.0,
+      SampleWeight(SWA.ShadowNet), 0.0001);
+  finally
+    SWA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestSWAMeanOfThree;
+var
+  Live: TNNet;
+  SWA: TNNetSWAWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  SWA := TNNetSWAWrapper.Create(Live);
+  try
+    FillNetWeights(Live, 1.0); SWA.Accumulate;
+    FillNetWeights(Live, 2.0); SWA.Accumulate;
+    FillNetWeights(Live, 6.0); SWA.Accumulate;
+    // mean of 1,2,6 = 3
+    AssertEquals('SWA mean of A,B,C = (A+B+C)/3', 3.0,
+      SampleWeight(SWA.ShadowNet), 0.0001);
+  finally
+    SWA.Free;
+    Live.Free;
   end;
 end;
 

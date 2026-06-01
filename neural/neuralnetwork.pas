@@ -7361,6 +7361,40 @@ type
       property MaxDeltaLayer: integer read FMaxDeltaLayer;
   end;
 
+  { TNNetSWAWrapper }
+  // Stochastic Weight Averaging (SWA) helper. Observes a live TNNet and
+  // maintains a shadow network holding the running (uniform) MEAN of the live
+  // weights at the moments the caller chooses to Accumulate. The shadow shares
+  // the live net's architecture (cloned on Create). After training, ShadowNet
+  // holds the averaged weights for inference.
+  // Schedule ("every N steps after epoch W") is intentionally left to the
+  // caller: see ShouldAccumulate() as a convenience predicate. The core
+  // deliverable here is the correct averaging math + counter.
+  TNNetSWAWrapper = class(TMObject)
+    protected
+      FLiveNet: TNNet;
+      FShadowNet: TNNet;
+      FCount: integer; // number of snapshots already folded into the mean
+    public
+      constructor Create(LiveNet: TNNet);
+      destructor Destroy; override;
+      // Folds the current live weights into the running mean:
+      //   shadow := shadow*(n/(n+1)) + live*(1/(n+1)); n := n+1
+      // The first Accumulate (n=0) simply copies the live weights.
+      procedure Accumulate;
+      // Resets the running mean (Count back to 0).
+      procedure Reset;
+      // Convenience scheduler predicate: accumulate every N steps once Epoch
+      // has reached W (i.e. Epoch >= StartEpoch and Step mod EveryNSteps = 0).
+      function ShouldAccumulate(Epoch, Step, StartEpoch, EveryNSteps: integer): boolean;
+      // Copies the averaged (shadow) weights into Dest (same architecture).
+      procedure CopyShadowTo(Dest: TNNet);
+      // Number of snapshots folded into the current mean.
+      property Count: integer read FCount;
+      // The network holding the averaged weights (owned by this wrapper).
+      function ShadowNet: TNNet;
+  end;
+
   { THistoricalNets }
   THistoricalNets = class(TNNet)
     public
@@ -50635,6 +50669,67 @@ begin
   Result.LoadStructureFromString(NNData);
   Result.CopyWeights(Self);
   NNData := '';
+end;
+
+{ TNNetSWAWrapper }
+
+constructor TNNetSWAWrapper.Create(LiveNet: TNNet);
+begin
+  inherited Create();
+  FLiveNet := LiveNet;
+  // Shadow shares the live architecture; weights are (re)set by Accumulate.
+  FShadowNet := LiveNet.Clone();
+  FCount := 0;
+end;
+
+destructor TNNetSWAWrapper.Destroy;
+begin
+  FShadowNet.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetSWAWrapper.Accumulate;
+begin
+  if FCount = 0 then
+  begin
+    // First snapshot: the mean is just the live weights.
+    FShadowNet.CopyWeights(FLiveNet);
+  end
+  else
+  begin
+    // Incremental uniform mean:
+    //   mean_{n+1} = mean_n * (n/(n+1)) + live * (1/(n+1))
+    FShadowNet.MulMulAddWeights
+    (
+      FCount / (FCount + 1),
+      1 / (FCount + 1),
+      FLiveNet
+    );
+  end;
+  Inc(FCount);
+end;
+
+procedure TNNetSWAWrapper.Reset;
+begin
+  FCount := 0;
+end;
+
+function TNNetSWAWrapper.ShouldAccumulate(Epoch, Step, StartEpoch, EveryNSteps: integer): boolean;
+begin
+  Result :=
+    (Epoch >= StartEpoch) and
+    (EveryNSteps > 0) and
+    (Step mod EveryNSteps = 0);
+end;
+
+procedure TNNetSWAWrapper.CopyShadowTo(Dest: TNNet);
+begin
+  Dest.CopyWeights(FShadowNet);
+end;
+
+function TNNetSWAWrapper.ShadowNet: TNNet;
+begin
+  Result := FShadowNet;
 end;
 
 function TNNet.ToGraphvizDot(const GraphName: string): string;

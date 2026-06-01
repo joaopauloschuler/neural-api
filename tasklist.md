@@ -634,7 +634,7 @@ rather than acted on.
       net trained under a constant-valued scheduler matches the fixed-LR run.
       The classes + math are landed; this is the integration the "missing
       plumbing" entry ultimately wants.
-- [ ] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
+- [X] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
       average of live weights every N steps after epoch W.
 - [ ] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
       weights for inference, sibling to SWA.
