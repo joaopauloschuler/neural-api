@@ -386,7 +386,7 @@ rather than acted on.
 - [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
       gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
       max-error vs eps.
-- [ ] Random-label memorization STRETCH follow-up: the landed
+- [X] Random-label memorization STRETCH follow-up: the landed
       examples/RandomLabelMemorization/ does the binary true-vs-fully-shuffled
       contrast; add the label-corruption-fraction sweep `p ∈ {0.0, 0.25, 0.5,
       1.0}` and chart epochs-to-fit-train (rises with p) against the test gap

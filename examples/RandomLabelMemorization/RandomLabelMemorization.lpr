@@ -47,6 +47,19 @@ house style:
   - true-label   TEST  accuracy >> chance          (it does generalise)
   - both TRAIN accuracies ~100%                     (same train error, different generalisation)
 
+PART 2 -- label-corruption-fraction sweep: the binary true-vs-fully-shuffled
+contrast above is just the two endpoints. Part 2 sweeps the label-corruption
+fraction p across {0.0, 0.25, 0.5, 1.0} on the SAME inputs/net/weight-init seed
+(corrupting a fraction p of the training labels by reassigning each chosen
+sample to a uniformly random class; inputs untouched) and charts, per p:
+  - epochs-to-fit-train (epochs until train accuracy >= 98%) -- RISES with p,
+  - the test gap (train acc minus test acc)                  -- WIDENS with p.
+This is the smooth interpolation between "real structure" (p=0, generalises)
+and "pure memorisation" (p=1, no generalisation). Its gate (Halt(1) on failure)
+asserts the qualitative trend: epochs-to-fit larger at p=1 than p=0, the test
+gap at p=1 wider than at p=0 by a comfortable margin, and every level still
+fits within budget.
+
 This is DISTINCT from examples/DoubleDescent (which sweeps CAPACITY under a
 fixed amount of label noise and looks at the non-monotone test-error curve).
 Here capacity is FIXED and the contrast is TRUE labels vs RANDOM labels.
@@ -179,6 +192,25 @@ begin
   end;
 end;
 
+// Corrupt a FRACTION p of the training labels by reassigning each chosen
+// sample to a uniformly random class (drawn fresh, may coincide with the true
+// class). The inputs are untouched. p=0 leaves the set clean; p=1 corrupts
+// every label. This is the smooth interpolation between "real structure" (p=0)
+// and "pure memorisation" (p=1) -- distinct from ShuffleLabels (which permutes,
+// preserving the marginal). Reseed before the call for reproducibility.
+procedure CorruptLabels(Pairs: TNNetVolumePairList; p: TNeuralFloat);
+var
+  I, NewCls: integer;
+begin
+  for I := 0 to Pairs.Count - 1 do
+    if Random < p then
+    begin
+      NewCls := Random(cClasses);
+      Pairs[I].O.Fill(0);
+      Pairs[I].O.SetClassForSoftMax(NewCls);
+    end;
+end;
+
 // ---------------------------------------------------------------------------
 // The FIXED over-parameterised classifier (identical for both runs):
 //   Input(cDim) -> FullConnectReLU(cHidden) -> FullConnectReLU(cHidden)
@@ -280,13 +312,103 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// Corruption-fraction SWEEP support.
+// RunSweepOne forks RunOne's net/data/training loop but records the FIRST epoch
+// at which train accuracy reaches >= cFitThreshold (the "epochs-to-fit"
+// counter). Train accuracy is probed every cProbeEvery epochs; EpochsToFit is
+// the probe epoch at which the threshold was first crossed (cMaxSweepEpochs if
+// never reached within budget). The net keeps training to cMaxSweepEpochs (or a
+// short tail past the fit) so the reported final train/test accuracies reflect
+// a fully-converged fit.
+// ---------------------------------------------------------------------------
+type
+  TSweepResult = record
+    P           : TNeuralFloat;
+    TrainAcc    : TNeuralFloat;
+    TestAcc     : TNeuralFloat;
+    EpochsToFit : integer;
+    Fitted      : boolean;
+  end;
+
+const
+  cFitThreshold   = 0.98;   // "fit the train set" = train acc >= this (well
+                            // above the 1/K=20% chance rate: unambiguous
+                            // memorisation, yet reachable for full corruption
+                            // within budget under plain mini-batch SGD)
+  cProbeEvery     = 10;     // probe train accuracy every N epochs
+  cMaxSweepEpochs = 4000;   // budget cap per corruption level (ample headroom;
+                            // full corruption fits within ~100 epochs)
+
+function RunSweepOne(p: TNeuralFloat;
+  TrainSet, TestSet: TNNetVolumePairList): TSweepResult;
+var
+  NN: TNNet;
+  Epoch, I, J, B, Tmp, InBatch: integer;
+  Order: array of integer;
+  TrAcc: TNeuralFloat;
+begin
+  Result.P := p;
+  Result.Fitted := False;
+  Result.EpochsToFit := cMaxSweepEpochs;
+  // Reseed before build so weight init is IDENTICAL across all corruption levels.
+  RandSeed := cSeed;
+  BuildNet(NN);
+  SetLength(Order, TrainSet.Count);
+  for I := 0 to High(Order) do Order[I] := I;
+  try
+    for Epoch := 1 to cMaxSweepEpochs do
+    begin
+      for I := High(Order) downto 1 do
+      begin
+        J := Random(I + 1);
+        Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
+      end;
+      InBatch := 0;
+      NN.ClearDeltas();
+      for B := 0 to High(Order) do
+      begin
+        NN.Compute(TrainSet[Order[B]].I);
+        NN.Backpropagate(TrainSet[Order[B]].O);
+        Inc(InBatch);
+        if (InBatch >= cBatch) or (B = High(Order)) then
+        begin
+          NN.UpdateWeights();
+          NN.ClearDeltas();
+          InBatch := 0;
+        end;
+      end;
+      if (Epoch mod cProbeEvery = 0) or (Epoch = cMaxSweepEpochs) then
+      begin
+        TrAcc := Accuracy(NN, TrainSet);
+        if (not Result.Fitted) and (TrAcc >= cFitThreshold) then
+        begin
+          Result.Fitted := True;
+          Result.EpochsToFit := Epoch;
+          Break;  // fitted -> stop; final accuracies measured right after fit
+        end;
+      end;
+    end;
+    Result.TrainAcc := Accuracy(NN, TrainSet);
+    Result.TestAcc  := Accuracy(NN, TestSet);
+  finally
+    NN.Free;
+  end;
+end;
+
 var
   TrainTrue, TrainRandom, TestSet: TNNetVolumePairList;
+  TrainCleanForSweep, TestSetForSweep, SweepTrain: TNNetVolumePairList;
   TrueRun, RandRun: TRunResult;
+  SweepRes: array[0..3] of TSweepResult;
+  SweepI: integer;
+  GapLo, GapHi: TNeuralFloat;
   StartTime, EndTime: TDateTime;
   PassRandTrain, PassRandTest, PassTrueTest, PassBothTrain: boolean;
+  PassEpochsRise, PassGapWiden, PassAllFit, PassSweep: boolean;
 const
   cTestMargin = 0.05;  // random-label test acc must stay within chance+margin
+  cPs: array[0..3] of TNeuralFloat = (0.0, 0.25, 0.5, 1.0);  // corruption sweep
 begin
   // Manual Compute/Backpropagate are single-threaded, so this whole run is
   // deterministic on one CPU core without any thread-pool setup.
@@ -319,6 +441,11 @@ begin
   TrainRandom := CopyPairs(TrainTrue);
   ShuffleLabels(TrainRandom);
 
+  // Keep clean copies of the train inputs/labels and the test set for PART 2's
+  // corruption sweep (Part 1's try/finally below frees the originals).
+  TrainCleanForSweep := CopyPairs(TrainTrue);
+  TestSetForSweep := CopyPairs(TestSet);
+
   try
     Write('Training on TRUE labels   ');
     TrueRun := RunOne('TRUE labels  ', cEpochsTrue, TrainTrue, TestSet);
@@ -332,8 +459,6 @@ begin
     TrainRandom.Free;
     TestSet.Free;
   end;
-
-  EndTime := Now;
 
   WriteLn;
   WriteLn('=== Results ===');
@@ -388,8 +513,100 @@ begin
     WriteLn('=> ALL CHECKS PASS: random-label memorization reproduced.')
   else
     WriteLn('=> SOME CHECKS FAILED (see above).');
+
+  // -------------------------------------------------------------------------
+  // PART 2: label-corruption-fraction SWEEP.
+  // The binary contrast above is the two endpoints. Now sweep the corruption
+  // fraction p across {0.0, 0.25, 0.5, 1.0} on the SAME inputs/net/seed and
+  // chart the smooth interpolation:
+  //   - epochs-to-fit-train (epochs until train acc >= 99%) should RISE with p
+  //     (more noise to memorise => more steps), and
+  //   - the test gap (train acc - test acc) should WIDEN with p (the fit comes
+  //     more and more from memorisation, less and less from real structure).
+  // -------------------------------------------------------------------------
+  WriteLn;
+  WriteLn('================================================================');
+  WriteLn('PART 2: label-corruption-fraction sweep (smooth interpolation).');
+  WriteLn('================================================================');
+  WriteLn(Format('Sweep p in {0.00, 0.25, 0.50, 1.00}; fit = train acc >= %.0f%%; '
+    + 'budget %d epochs/level.', [cFitThreshold * 100, cMaxSweepEpochs]));
+  WriteLn('Same inputs, same net, same weight-init seed; only the training-label');
+  WriteLn('corruption fraction p changes.  gap = TRAIN acc - TEST acc.');
+  WriteLn;
+
+  for SweepI := 0 to High(cPs) do
+  begin
+    // Fresh corrupted copy of the clean true-label train set, reseeded so the
+    // corruption draw (and thus the result) is deterministic per level.
+    SweepTrain := CopyPairs(TrainCleanForSweep);
+    RandSeed := cSeed + 1 + SweepI;  // distinct, deterministic corruption draw
+    CorruptLabels(SweepTrain, cPs[SweepI]);
+    Write(Format('  p=%.2f training ... ', [cPs[SweepI]]));
+    SweepRes[SweepI] := RunSweepOne(cPs[SweepI], SweepTrain, TestSetForSweep);
+    SweepTrain.Free;
+    WriteLn(Format('epochs-to-fit=%d%s', [SweepRes[SweepI].EpochsToFit,
+      BoolToStr(SweepRes[SweepI].Fitted, '', ' (NOT fitted within budget)')]));
+  end;
+
+  WriteLn;
+  WriteLn('=== Sweep results ===');
+  WriteLn('   p     epochs-to-fit   TRAIN acc   TEST acc      gap');
+  for SweepI := 0 to High(cPs) do
+    WriteLn(Format(' %.2f   %10d      %6.2f%%    %6.2f%%   %6.2f%%',
+      [SweepRes[SweepI].P, SweepRes[SweepI].EpochsToFit,
+       SweepRes[SweepI].TrainAcc * 100, SweepRes[SweepI].TestAcc * 100,
+       (SweepRes[SweepI].TrainAcc - SweepRes[SweepI].TestAcc) * 100]));
+  WriteLn;
+
+  WriteLn('=== Sweep correctness gate ===');
+
+  // 5. epochs-to-fit RISES with p (lenient: the p=1.0 endpoint needs strictly
+  //    more epochs than the clean p=0.0 endpoint -- memorising noise is harder).
+  PassEpochsRise := SweepRes[High(cPs)].EpochsToFit > SweepRes[0].EpochsToFit;
+  WriteLn(Format('[%s] epochs-to-fit rises with p: p=1.00 took %d epochs vs '
+    + 'p=0.00 took %d (more noise => more steps).',
+    [BoolToStr(PassEpochsRise, 'PASS', 'FAIL'),
+     SweepRes[High(cPs)].EpochsToFit, SweepRes[0].EpochsToFit]));
+
+  // 6. The test gap WIDENS with p: gap at p=1.0 is much larger than at p=0.0.
+  GapLo := SweepRes[0].TrainAcc - SweepRes[0].TestAcc;
+  GapHi := SweepRes[High(cPs)].TrainAcc - SweepRes[High(cPs)].TestAcc;
+  PassGapWiden := GapHi >= GapLo + 0.40;
+  WriteLn(Format('[%s] test gap widens with p: gap(p=1.00)=%.2f%% vs '
+    + 'gap(p=0.00)=%.2f%% (must widen by >= 40%%).',
+    [BoolToStr(PassGapWiden, 'PASS', 'FAIL'), GapHi * 100, GapLo * 100]));
+
+  // 7. Every corruption level still FITS the train set within budget (capacity
+  //    to memorise holds across the whole sweep).
+  PassAllFit := True;
+  for SweepI := 0 to High(cPs) do
+    if not SweepRes[SweepI].Fitted then PassAllFit := False;
+  WriteLn(Format('[%s] all %d corruption levels reached train acc >= %.0f%% '
+    + 'within budget.',
+    [BoolToStr(PassAllFit, 'PASS', 'FAIL'), Length(cPs), cFitThreshold * 100]));
+
+  PassSweep := PassEpochsRise and PassGapWiden and PassAllFit;
+
+  WriteLn;
+  WriteLn('SWEEP TAKEAWAY: as the label-corruption fraction p goes 0 -> 1, the');
+  WriteLn('network needs MORE epochs to fit the train set and its test gap WIDENS');
+  WriteLn('-- a smooth interpolation from learning real structure (p=0) to pure');
+  WriteLn('memorization (p=1).');
+  WriteLn;
+
+  TestSetForSweep.Free;
+  TrainCleanForSweep.Free;
+
+  EndTime := Now;
+
+  if PassRandTrain and PassRandTest and PassTrueTest and PassBothTrain
+     and PassSweep then
+    WriteLn('=> ALL CHECKS PASS: binary contrast + corruption sweep reproduced.')
+  else
+    WriteLn('=> SOME CHECKS FAILED (see above).');
   WriteLn(Format('Total wall-clock: %.1f s', [(EndTime - StartTime) * 86400.0]));
 
-  if not (PassRandTrain and PassRandTest and PassTrueTest and PassBothTrain) then
+  if not (PassRandTrain and PassRandTest and PassTrueTest and PassBothTrain
+          and PassSweep) then
     Halt(1);
 end.
