@@ -536,6 +536,19 @@ rather than acted on.
       "Shake-Shake-Image" per-image grain is the documented v1 simplification.
       Tests in TestNeuralLayersExtra: eval-correctness, save/load/save
       round-trip, train smoke (TestShakeShake*/TestShakeDropEvalAndRoundTrip).
+- [ ] ShakeShake follow-up (a): PER-SAMPLE alpha/beta grain — the landed
+      TNNetShakeShakeMerge / TNNetShakeDropMerge sample one alpha/beta/b_l per
+      forward/backward PASS (per-batch). Sample an independent coefficient per
+      batch-item instead (the paper's "Shake-Shake-Image" best variant). Needs a
+      per-sample scalar broadcast in Compute/Backpropagate and the
+      SetBatchUpdate(True) idiom from [[manual-gradient-and-snapshot-gotchas]];
+      keep eval deterministic. Add a test that two samples in one batch get
+      different effective scales.
+- [ ] ShakeShake follow-up (b): examples/ShakeShakeReg/ demo — contrast an
+      AddShakeShakeBlock stack vs a plain two-branch (deterministic 0.5/0.5)
+      residual on a small noisy/over-parameterised task, charting the train/val
+      gap narrowing (the headline regularisation win, à la the Mixup/SAM
+      follow-ups). Pure CPU, <5 min, no binaries committed.
 
 #### Channel attention / conditioning
 - [ ] TNNetCBAM follow-up: the landed AddCBAM uses TWO SEPARATE channel MLPs
