@@ -359,6 +359,14 @@ rather than acted on.
 - [X] SoftCapping logit-stability micro-experiment: train a tiny classifier
       with and without a `TNNetSoftCapping(c)` before the final softmax,
       and print the rate of NaN/overflow events under an aggressive LR.
+      DONE in examples/SoftCappingStability/. FINDING for downstream tasks
+      (Causal-mask + SoftCapping study, numerical-precision study): the
+      in-tree SoftMax is internally hardened (subtracts the row max + clamps
+      range) and the cross-entropy gradient is bounded, so a literal float32
+      `Inf` essentially never materialises even at LR=5 (uncapped logits
+      reached ~1e4 but stayed finite). Count the physically-meaningful blow-up
+      instead — a logit past the exp-overflow point `|logit| > 88.7` — not raw
+      IsInfinite, or the contrast looks empty.
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
 - [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
