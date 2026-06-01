@@ -7395,6 +7395,31 @@ type
       function ShadowNet: TNNet;
   end;
 
+  { TNNetEMAWrapper }
+  // Exponential Moving Average (EMA) of network weights, sibling to SWA.
+  // Maintains a shadow net updated as:
+  //   shadow := Decay*shadow + (1-Decay)*live
+  // Decay close to 1 keeps a long memory (slow shadow); Decay=0 makes the
+  // shadow equal to the live weights after a single Update. The shadow is
+  // seeded from the live weights on Create.
+  TNNetEMAWrapper = class(TMObject)
+    protected
+      FLiveNet: TNNet;
+      FShadowNet: TNNet;
+      FDecay: TNeuralFloat;
+    public
+      constructor Create(LiveNet: TNNet; Decay: TNeuralFloat);
+      destructor Destroy; override;
+      // Folds the live weights into the shadow with geometric decay.
+      procedure Update;
+      // Copies the shadow (EMA) weights into Dest (same architecture).
+      // This is the "SetEmaShadow" operation: push averaged weights for use.
+      procedure SetEmaShadow(Dest: TNNet);
+      // The network holding the EMA weights (owned by this wrapper).
+      function ShadowNet: TNNet;
+      property Decay: TNeuralFloat read FDecay write FDecay;
+  end;
+
   { THistoricalNets }
   THistoricalNets = class(TNNet)
     public
@@ -50728,6 +50753,39 @@ begin
 end;
 
 function TNNetSWAWrapper.ShadowNet: TNNet;
+begin
+  Result := FShadowNet;
+end;
+
+{ TNNetEMAWrapper }
+
+constructor TNNetEMAWrapper.Create(LiveNet: TNNet; Decay: TNeuralFloat);
+begin
+  inherited Create();
+  FLiveNet := LiveNet;
+  FDecay := Decay;
+  // Seed the shadow from the live weights.
+  FShadowNet := LiveNet.Clone();
+end;
+
+destructor TNNetEMAWrapper.Destroy;
+begin
+  FShadowNet.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetEMAWrapper.Update;
+begin
+  // shadow := Decay*shadow + (1-Decay)*live
+  FShadowNet.MulMulAddWeights(FDecay, 1 - FDecay, FLiveNet);
+end;
+
+procedure TNNetEMAWrapper.SetEmaShadow(Dest: TNNet);
+begin
+  Dest.CopyWeights(FShadowNet);
+end;
+
+function TNNetEMAWrapper.ShadowNet: TNNet;
 begin
   Result := FShadowNet;
 end;

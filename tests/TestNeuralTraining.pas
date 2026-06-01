@@ -42,6 +42,9 @@ type
     procedure TestSWAMeanOfConstant;
     procedure TestSWAMeanOfTwo;
     procedure TestSWAMeanOfThree;
+    procedure TestEMADecayZeroEqualsLive;
+    procedure TestEMADecayOneKeepsShadow;
+    procedure TestEMAConvergesToConstant;
   end;
 
 implementation
@@ -895,6 +898,69 @@ begin
       SampleWeight(SWA.ShadowNet), 0.0001);
   finally
     SWA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestEMADecayZeroEqualsLive;
+var
+  Live: TNNet;
+  EMA: TNNetEMAWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  EMA := TNNetEMAWrapper.Create(Live, 0.0);
+  try
+    FillNetWeights(Live, 7.5);
+    EMA.Update; // shadow := 0*shadow + 1*live = live
+    AssertEquals('EMA Decay=0 -> shadow == live', 7.5,
+      SampleWeight(EMA.ShadowNet), 0.0);
+  finally
+    EMA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestEMADecayOneKeepsShadow;
+var
+  Live: TNNet;
+  EMA: TNNetEMAWrapper;
+  Seeded: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 5.0);
+  EMA := TNNetEMAWrapper.Create(Live, 1.0); // shadow seeded from live = 5.0
+  try
+    Seeded := SampleWeight(EMA.ShadowNet);
+    FillNetWeights(Live, 99.0);
+    EMA.Update; // shadow := 1*shadow + 0*live = shadow (unchanged)
+    AssertEquals('EMA Decay=1 leaves shadow unchanged', Seeded,
+      SampleWeight(EMA.ShadowNet), 0.0);
+  finally
+    EMA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestEMAConvergesToConstant;
+var
+  Live: TNNet;
+  EMA: TNNetEMAWrapper;
+  I: integer;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 0.0);
+  EMA := TNNetEMAWrapper.Create(Live, 0.5); // shadow seeded at 0
+  try
+    FillNetWeights(Live, 10.0); // constant live target
+    for I := 1 to 50 do EMA.Update;
+    // EMA of a constant live net converges to that constant.
+    AssertEquals('EMA converges to constant live value', 10.0,
+      SampleWeight(EMA.ShadowNet), 0.001);
+  finally
+    EMA.Free;
     Live.Free;
   end;
 end;

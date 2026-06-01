@@ -636,7 +636,7 @@ rather than acted on.
       plumbing" entry ultimately wants.
 - [X] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
       average of live weights every N steps after epoch W.
-- [ ] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
+- [X] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
       weights for inference, sibling to SWA.
 - [ ] Lookahead optimizer wrapper — every k inner SGD steps, set slow weights
       `φ ← φ + α·(θ - φ)` and rewind fast weights to φ.
