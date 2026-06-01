@@ -344,6 +344,9 @@ type
     procedure TestReLU6Forward;
     procedure TestReLU6ExtremeInputSaturation;
     procedure TestMaskedFillForward;
+    procedure TestMaskedFillDefaultMatchesUpperTriangle;
+    procedure TestMaskedFillOffset;
+    procedure TestMaskedFillLowerTriangle;
     procedure TestMaskedFillGradientCheck;
     procedure TestTriangularCausalMaskForward;
     procedure TestTriangularCausalMaskGradientCheck;
@@ -7903,6 +7906,106 @@ begin
             NN.GetLastLayer.Output[X, Y, 0] < -1e8)
         else
           AssertEquals('MaskedFill lower/diagonal untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedFillDefaultMatchesUpperTriangle;
+var
+  NNNew, NNOld: TNNet;
+  Input: TNNetVolume;
+  X, Y, D: integer;
+begin
+  // The new offset/lower-triangle ctor with Offset=0, LowerTriangle=False
+  // must reproduce the legacy single-arg ctor (strict upper triangle) exactly.
+  NNNew := TNNet.Create();
+  NNOld := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NNNew.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    NNNew.AddLayer(TNNetMaskedFill.Create(-1e9, 0, False));
+    NNOld.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    NNOld.AddLayer(TNNetMaskedFill.Create(-1e9));
+
+    Input.FillForDebug();
+    NNNew.Compute(Input);
+    NNOld.Compute(Input);
+
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        for D := 0 to 1 do
+          AssertEquals('Default offset ctor matches legacy upper triangle at X='
+            + IntToStr(X) + ' Y=' + IntToStr(Y) + ' D=' + IntToStr(D),
+            NNOld.GetLastLayer.Output[X, Y, D],
+            NNNew.GetLastLayer.Output[X, Y, D], 0.0);
+  finally
+    NNNew.Free;
+    NNOld.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedFillOffset;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y: integer;
+begin
+  // Offset=1 keeps a wider band: mask only where X > Y + 1.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9, 1, False));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+      begin
+        if X > Y + 1 then
+          AssertTrue('Offset upper triangle masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Offset band untouched at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), 1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMaskedFillLowerTriangle;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y: integer;
+begin
+  // Anti-causal: LowerTriangle=True, Offset=0 masks where X < Y.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9, 0, True));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+      begin
+        if X < Y then
+          AssertTrue('Lower triangle masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Lower triangle upper/diag untouched at X=' +
             IntToStr(X) + ' Y=' + IntToStr(Y),
             1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
       end;

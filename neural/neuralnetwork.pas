@@ -1296,12 +1296,23 @@ type
   // unchanged. The transform is applied independently for each depth slice.
   // This layer has no trainable parameter. As it only adds a constant,
   // the backward pass is a straight gradient passthrough.
+  // The masked region is configurable via the constructor:
+  //   pOffset (FStruct[0]) shifts the diagonal of the boundary, and
+  //   pLowerTriangle (FStruct[1], 0/1) selects which triangle is masked.
+  // Default (Offset=0, LowerTriangle=False) reproduces the strictly-causal
+  // upper triangle exactly (mask where X > Y), so existing callers are
+  // byte-for-byte unchanged. With LowerTriangle=False a position is masked
+  // when X > Y + Offset (a larger Offset keeps a wider band around / above
+  // the diagonal); with LowerTriangle=True (anti-causal) a position is
+  // masked when X < Y - Offset.
   TNNetMaskedFill = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload;
     constructor Create(pMaskValue: TNeuralFloat); overload;
+    constructor Create(pMaskValue: TNeuralFloat; pOffset: integer;
+      pLowerTriangle: boolean = False); overload;
     procedure Compute(); override;
   end;
 
@@ -10492,8 +10503,16 @@ end;
 
 constructor TNNetMaskedFill.Create(pMaskValue: TNeuralFloat);
 begin
+  Create(pMaskValue, 0, False);
+end;
+
+constructor TNNetMaskedFill.Create(pMaskValue: TNeuralFloat; pOffset: integer;
+  pLowerTriangle: boolean = False);
+begin
   inherited Create();
   FFloatSt[0] := pMaskValue;
+  FStruct[0] := pOffset;
+  if pLowerTriangle then FStruct[1] := 1 else FStruct[1] := 0;
 end;
 
 procedure TNNetMaskedFill.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -10506,20 +10525,35 @@ procedure TNNetMaskedFill.Compute();
 var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
-  X, Y, D: integer;
+  X, Y, D, Offset: integer;
+  LowerTriangle: boolean;
   MaskValue: TNeuralFloat;
 begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaskValue := FFloatSt[0];
+  Offset := FStruct[0];
+  LowerTriangle := (FStruct[1] <> 0);
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
-  // Mask the upper triangle: column index (X) greater than row index (Y).
-  for Y := 0 to MaxY do
-    for X := Y + 1 to MaxX do
-      for D := 0 to MaxD do
-        FOutput.Add(X, Y, D, MaskValue);
+  if LowerTriangle then
+  begin
+    // Anti-causal: mask the lower triangle, X < Y - Offset.
+    for Y := 0 to MaxY do
+      for X := 0 to Y - Offset - 1 do
+        for D := 0 to MaxD do
+          FOutput.Add(X, Y, D, MaskValue);
+  end
+  else
+  begin
+    // Causal: mask the upper triangle, X > Y + Offset.
+    // Offset = 0 is the strictly-causal default (X > Y).
+    for Y := 0 to MaxY do
+      for X := Y + Offset + 1 to MaxX do
+        for D := 0 to MaxD do
+          FOutput.Add(X, Y, D, MaskValue);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -47849,7 +47883,7 @@ begin
       'TNNetCosineSimilarity' :     Result := TNNetCosineSimilarity.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
       'TNNetMaxOut' :               Result := TNNetMaxOut.Create(St[0]);
-      'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0]);
+      'TNNetMaskedFill' :           Result := TNNetMaskedFill.Create(Ft[0], St[0], St[1] <> 0);
       'TNNetTriangularCausalMask' : Result := TNNetTriangularCausalMask.Create(St[0]);
       'TNNetSlidingWindowMaskedFill' : Result := TNNetSlidingWindowMaskedFill.Create(St[0], Ft[0]);
       'TNNetStraightThroughEstimator' : Result := TNNetStraightThroughEstimator.Create(Ft[0]);
@@ -48133,7 +48167,7 @@ begin
       if S[0] = 'TNNetCosineSimilarity' then Result := TNNetCosineSimilarity.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
       if S[0] = 'TNNetMaxOut' then Result := TNNetMaxOut.Create(St[0]) else
-      if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0]) else
+      if S[0] = 'TNNetMaskedFill' then Result := TNNetMaskedFill.Create(Ft[0], St[0], St[1] <> 0) else
       if S[0] = 'TNNetTriangularCausalMask' then Result := TNNetTriangularCausalMask.Create(St[0]) else
       if S[0] = 'TNNetSlidingWindowMaskedFill' then Result := TNNetSlidingWindowMaskedFill.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetStraightThroughEstimator' then Result := TNNetStraightThroughEstimator.Create(Ft[0]) else
