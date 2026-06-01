@@ -2142,6 +2142,51 @@ type
     property Lambda: TNeuralFloat read FLambdaInit;
   end;
 
+  /// Retention (single head) of a Retentive Network (RetNet, Sun et al. 2023,
+  /// "Retentive Network: A Successor to Transformer for Large Language Models",
+  /// https://arxiv.org/abs/2307.08621).
+  // A softmax-FREE, causal token mixer that replaces softmax(Q.K^T/sqrt(d))V
+  // with a fixed exponential-decay mask applied to the raw scores:
+  //   D[n,m] = gamma^(n-m) for n >= m, else 0   (lower-triangular causal decay)
+  //   out[n] = sum_{m<=n} (Q[n] . K[m]) * D[n,m] * V[m]
+  // There is NO row-normalising softmax: D is a FIXED multiplicative weight, so
+  // older tokens are geometrically down-weighted by their relative distance and
+  // future tokens are hard-masked to zero. gamma is a per-head constant in
+  // (0,1); the paper uses a geometric schedule of gamma across heads, which is
+  // the obvious knob for a multi-head builder (one gamma per head). gamma is a
+  // FIXED constant in this v1 (learning gamma via direct gradient is a logged
+  // follow-up); it is stored in FFloatSt[0] so it round-trips, and d_k in
+  // FStruct[0].
+  // This is the PARALLEL (training) form. The mathematically identical
+  // RECURRENT (inference) form keeps an O(1)-per-step state
+  //   S_n = gamma * S_{n-1} + K_n^T V_n ,  out_n = Q_n S_n
+  // and produces the SAME output token-for-token; examples/RetentionDualForm
+  // trains the parallel form and asserts the hand-rolled recurrent loop agrees.
+  // Input layout (same Q|K|V convention as TNNetScaledDotProductAttention):
+  // SizeY = 1, SizeX = sequence length, Depth = 3 * d_k (depth axis is the
+  // concatenation Q | K | V, each of size d_k). Output shape: SizeX x 1 x d_k.
+  // No trainable parameters. Because there is no softmax it does NOT subclass
+  // TNNetScaledDotProductAttention; it only reuses the Q|K|V input-split
+  // convention and the cached score matrix for the backward pass.
+  TNNetRetention = class(TNNetLayer)
+  private
+    FDk: integer;
+    FGamma: TNeuralFloat;
+    FScore: TNNetVolume; // raw masked scores (Q.K^T) (.) D, [X=key m, Y=query n, 1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pGamma: TNeuralFloat = 0.96); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Read-only access to the decay-masked score matrix populated by Compute().
+    // Layout: X = key index m, Y = query index n, Score[m,n,0]; the lower
+    // triangle (m<=n) holds (Q[n].K[m])*gamma^(n-m), the strict upper triangle 0.
+    property RetentionScores: TNNetVolume read FScore;
+    property Dk: integer read FDk;
+    property Gamma: TNeuralFloat read FGamma;
+  end;
+
   /// Linear (kernelized / softmax-free) Attention, non-causal variant
   /// (Katharopoulos et al. 2020, "Transformers are RNNs",
   /// https://arxiv.org/abs/2006.16236).
@@ -5555,6 +5600,22 @@ type
       // each sequence position), matching the existing AddSelfAttention block.
       function AddMultiHeadSelfAttention(d_model, Heads: integer;
         CausalMask: boolean = false): TNNetLayer;
+      // Multi-head RETENTION block (RetNet, Sun et al. 2023) over a
+      // (SeqLen,1,3*d_model) Q|K|V slab. Built exactly like
+      // AddMultiHeadSelfAttention but with one softmax-free TNNetRetention per
+      // head instead of TNNetScaledDotProductAttention: per-head split ->
+      // per-head Retention (each with its OWN gamma) -> concat -> token-wise
+      // linear out-projection to depth d_model. Each head's decay constant
+      // follows the paper's geometric schedule
+      //   gamma_h = 1 - 2^(-GammaMinExp - h)   (h = 0..Heads-1)
+      // so heads cover a spread of memory horizons (smaller gamma = shorter
+      // memory). Retention is INHERENTLY causal (the decay mask hard-zeros the
+      // strict upper triangle), so there is no CausalMask flag. gamma is fixed
+      // (not learned) in this v1. The out-projection is token-wise
+      // (TNNetPointwiseConvLinear; see AddMultiHeadSelfAttention's note on why
+      // FullConnect would flatten the sequence). Returns the out-projection.
+      function AddRetention(d_model, Heads: integer;
+        GammaMinExp: TNeuralFloat = 5.0): TNNetLayer;
       // Encoder-decoder multi-head CROSS-attention. The Query is projected from
       // QuerySource (the decoder stream, a (QSeqLen,1,d_model) token tensor) and
       // the Keys+Values are projected from KeyValueSource (the encoder output, a
@@ -13059,6 +13120,143 @@ begin
         end;
       end;
     end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetRetention }
+
+constructor TNNetRetention.Create(d_k: integer; pGamma: TNeuralFloat);
+begin
+  inherited Create();
+  FDk := d_k;
+  FGamma := pGamma;
+  if FDk < 1 then
+    FErrorProc('TNNetRetention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  if (FGamma <= 0) or (FGamma >= 1) then
+    FErrorProc('TNNetRetention requires gamma in (0,1). gamma=' + FloatToStr(FGamma));
+  FStruct[0] := FDk;
+  FFloatSt[0] := FGamma;
+  FScore := TNNetVolume.Create();
+end;
+
+destructor TNNetRetention.Destroy();
+begin
+  FScore.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRetention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetRetention requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> 3 * FDk then
+    FErrorProc('TNNetRetention requires input depth = 3*d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // Score matrix: rows = queries (n), cols = keys (m). Use X=key, Y=query.
+  FScore.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+end;
+
+procedure TNNetRetention.Compute();
+var
+  StartTime: double;
+  SeqLen, n, m, d: integer;
+  Decay, Dot: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // For each query row n: masked scores then decay-weighted sum of V.
+  for n := 0 to SeqLen - 1 do
+  begin
+    OutPtr := FOutput.GetRawPtr(n, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    // Decay = gamma^(n-m). Build it incrementally from m=n downwards (Decay=1
+    // at m=n, multiply by gamma each step back) to avoid a Power() per cell.
+    Decay := 1.0;
+    for m := n downto 0 do
+    begin
+      // Raw content score Q[n].K[m] is an AVX dot product over FDk floats
+      // (Q at GetRawPtr(n,0,0), K at GetRawPtr(m,0,FDk)). NO 1/sqrt(d) and NO
+      // softmax: the decay mask is the only score weighting.
+      Dot := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(n, 0, 0), Prev.GetRawPtr(m, 0, FDk), FDk);
+      FScore[m, n, 0] := Dot * Decay;
+      // out[n] += score[n,m] * V[m]; V contiguous along depth -> AVX MulAdd.
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(m, 0, 2 * FDk),
+        FScore[m, n, 0], FDk);
+      Decay := Decay * FGamma;
+    end;
+    // Strict upper triangle (m > n) is hard-masked to 0.
+    for m := n + 1 to SeqLen - 1 do
+      FScore[m, n, 0] := 0;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRetention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, n, m, d: integer;
+  Prev, PrevErr: TNNetVolume;
+  Decay, dScoreNM, dS: TNeuralFloat;
+  dScore: array of TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := Prev.SizeX;
+    SetLength(dScore, SeqLen);
+    for n := 0 to SeqLen - 1 do
+    begin
+      // out[n,d] = sum_{m<=n} score[n,m] * V[m,d], score[n,m] = (Q[n].K[m])*D[n,m].
+      // ---- dV[m] and dScore[m] (only m<=n contribute; D[n,m]=0 otherwise) ----
+      // dV[m,d] += score[n,m] * dOut[n,d]
+      // dScore[m] = sum_d dOut[n,d] * V[m,d]
+      // Depth is contiguous: dV is an AVX MulAdd, dScore[m] an AVX dot product.
+      for m := 0 to n do
+      begin
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(m, 0, 2 * FDk),
+          FOutputError.GetRawPtr(n, 0, 0), FScore[m, n, 0], FDk);
+        dScore[m] := TNNetVolume.DotProduct(
+          FOutputError.GetRawPtr(n, 0, 0), Prev.GetRawPtr(m, 0, 2 * FDk), FDk);
+      end;
+      // ---- dQ[n] and dK[m] through score[n,m] = D[n,m] * (Q[n].K[m]) ----
+      // The decay mask D[n,m] is a FIXED elementwise multiplier on the raw dot
+      // product, so dRawScore[n,m] = dScore[m] * D[n,m] (same structure as the
+      // SDPA backward but with the softmax Jacobian replaced by the constant D).
+      // dQ[n,d] += dRawScore[n,m] * K[m,d];  dK[m,d] += dRawScore[n,m] * Q[n,d].
+      Decay := 1.0; // gamma^(n-m), m = n downto 0
+      for m := n downto 0 do
+      begin
+        dScoreNM := dScore[m] * Decay;
+        dS := dScoreNM;
+        if dS <> 0 then
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(n, 0, 0),
+            Prev.GetRawPtr(m, 0, FDk), dS, FDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(m, 0, FDk),
+            Prev.GetRawPtr(n, 0, 0), dS, FDk);
+        end;
+        Decay := Decay * FGamma;
+      end;
+    end;
+    SetLength(dScore, 0);
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -26307,6 +26505,39 @@ begin
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddRetention(d_model, Heads: integer;
+  GammaMinExp: TNeuralFloat): TNNetLayer;
+var
+  d_k, HeadCnt: integer;
+  Gamma: TNeuralFloat;
+  SourceLayer: TNNetLayer;
+  SliceLayers, HeadOutputs: array of TNNetLayer;
+begin
+  if Heads < 1 then
+    FErrorProc('AddRetention requires Heads >= 1. Heads=' + IntToStr(Heads));
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddRetention requires d_model divisible by Heads. d_model=' +
+      IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  SourceLayer := GetLastLayer();
+  d_k := d_model div Heads;
+  SetLength(SliceLayers, Heads);
+  AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
+  SetLength(HeadOutputs, Heads);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    // Geometric per-head decay schedule: gamma_h = 1 - 2^(-GammaMinExp - h).
+    Gamma := 1.0 - Power(2.0, -GammaMinExp - HeadCnt);
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetRetention.Create(d_k, Gamma), SliceLayers[HeadCnt]);
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Token-wise linear out-projection (FullConnectLinear would flatten the
+  // sequence axis; see AddMultiHeadSelfAttention header note).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(SliceLayers, 0);
+  SetLength(HeadOutputs, 0);
 end;
 
 function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
@@ -48335,6 +48566,7 @@ begin
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
+      'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -48621,6 +48853,7 @@ begin
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
+      if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else

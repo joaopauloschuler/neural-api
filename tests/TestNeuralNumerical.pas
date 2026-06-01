@@ -402,6 +402,9 @@ type
     procedure TestDifferentialAttentionGradientCheck;
     procedure TestDifferentialAttentionLambdaGradientCheck;
     procedure TestDifferentialAttentionSerializationRoundTrip;
+    procedure TestRetentionGradientCheck;
+    procedure TestRetentionRecurrentEquivalence;
+    procedure TestRetentionSerializationRoundTrip;
     procedure TestLinearAttentionGradientCheck;
     procedure TestLinearAttentionSeqLen1Degeneracy;
     procedure TestLinearAttentionSerializationRoundTrip;
@@ -11230,6 +11233,147 @@ begin
   // d_k = 4, non-causal. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetScaledDotProductAttention.Create(4, false),
     'SDPA', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestRetentionGradientCheck;
+// Finite-difference input-gradient check for TNNetRetention (RetNet single
+// head). The decay mask D[n,m]=gamma^(n-m) (n>=m, else 0) is a FIXED
+// elementwise multiplier on the raw Q.K^T score, so backward is the SDPA
+// structure with the softmax Jacobian replaced by the constant mask.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Rtn: TNNetRetention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, MaxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242; // ordering-independent init (see memory note)
+  SeqLen := 4;
+  Dk := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  MaxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Rtn := TNNetRetention.Create(Dk, 0.9);
+    NN.AddLayer(Rtn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > MaxErr then
+        MaxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Retention input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestRetentionGradientCheck max gradient error: ', MaxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRetentionRecurrentEquivalence;
+// Proves the dual form at the layer level: the PARALLEL form
+// out[n] = sum_{m<=n} (Q[n].K[m]) gamma^(n-m) V[m] equals the RECURRENT form
+// S_n = gamma*S_{n-1} + K_n^T V_n,  out_n = Q_n S_n, token-for-token.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Rtn: TNNetRetention;
+  SeqLen, Dk, n, a, b, i: integer;
+  Gamma, MaxDiff, RecOut: TNeuralFloat;
+  State: array of array of TNeuralFloat; // [d_k(a)][d_k(b)] for K^T V
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  Dk := 3;
+  Gamma := 0.85;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  MaxDiff := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Rtn := TNNetRetention.Create(Dk, Gamma);
+    NN.AddLayer(Rtn);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.7 + 0.1;
+    NN.Compute(Input);
+
+    // Recurrent state S is a (Dk x Dk) matrix: S[a,b] accumulates K[a]*V[b].
+    SetLength(State, Dk, Dk);
+    for a := 0 to Dk - 1 do
+      for b := 0 to Dk - 1 do
+        State[a][b] := 0;
+    for n := 0 to SeqLen - 1 do
+    begin
+      // S_n = gamma*S_{n-1} + K_n^T V_n
+      for a := 0 to Dk - 1 do
+        for b := 0 to Dk - 1 do
+          State[a][b] := Gamma * State[a][b] +
+            Input[n, 0, Dk + a] * Input[n, 0, 2 * Dk + b];
+      // out_n[b] = sum_a Q_n[a] * S_n[a,b]
+      for b := 0 to Dk - 1 do
+      begin
+        RecOut := 0;
+        for a := 0 to Dk - 1 do
+          RecOut := RecOut + Input[n, 0, a] * State[a][b];
+        if Abs(RecOut - Rtn.Output[n, 0, b]) > MaxDiff then
+          MaxDiff := Abs(RecOut - Rtn.Output[n, 0, b]);
+      end;
+    end;
+    WriteLn('  TestRetentionRecurrentEquivalence max abs diff: ', MaxDiff:0:10);
+    AssertTrue('Retention parallel vs recurrent agree, maxdiff=' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRetentionSerializationRoundTrip;
+begin
+  // d_k = 4, gamma = 0.93. Input depth must be 3*d_k = 12.
+  SerializationRoundTrip(Self, TNNetRetention.Create(4, 0.93),
+    'Retention', 3, 1, 12, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSplitQKVHeadsForwardLayout;
