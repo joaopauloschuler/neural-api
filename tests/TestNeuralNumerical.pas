@@ -701,6 +701,7 @@ type
     procedure TestBlurPoolLoadFromString;
     procedure TestBlurPoolShiftInvariance;
     procedure TestPointwiseByteProcessingSerializationRoundTrip;
+    procedure TestPointwiseByteProcessingTrainedRoundTrip;
   end;
 
 implementation
@@ -27460,6 +27461,118 @@ begin
     NNBlur.Free;
     Base.Free;
     Shifted.Free;
+  end;
+end;
+
+function LongestEngineNeuronRecord(const HexData: string): integer;
+  // Hex-decode a byte layer's SaveDataToString and return the length of the
+  // longest chr(10)-delimited neuron record. The engine serializes one neuron
+  // per line; a record over 255 chars is exactly what used to be truncated by
+  // the ShortString ToString in neuralabfun (the bug this guards).
+  function HexVal(c: char): integer;
+  begin
+    case c of
+      '0'..'9': Result := Ord(c) - Ord('0');
+      'A'..'F': Result := Ord(c) - Ord('A') + 10;
+      'a'..'f': Result := Ord(c) - Ord('a') + 10;
+    else
+      Result := 0;
+    end;
+  end;
+var
+  decoded: string;
+  L: TStringList;
+  i, n, lineLen: integer;
+begin
+  n := Length(HexData) div 2;
+  SetLength(decoded, n);
+  for i := 0 to n - 1 do
+    decoded[i + 1] := Chr(HexVal(HexData[2 * i + 1]) * 16 +
+                          HexVal(HexData[2 * i + 2]));
+  Result := 0;
+  L := TStringList.Create;
+  try
+    L.StrictDelimiter := True;
+    L.Delimiter := Chr(10);
+    L.DelimitedText := decoded;
+    for i := 0 to L.Count - 1 do
+    begin
+      lineLen := Length(L[i]);
+      if lineLen > Result then Result := lineLen;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPointwiseByteProcessingTrainedRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, ep, longest: integer;
+begin
+  // Regression for the ShortString truncation in neuralabfun's serialization:
+  // a TNNetPointwiseByteProcessing with a skip connection learns near-all-ones
+  // targets (output = bits + ReLU-ish input), so each neuron accumulates many
+  // operations and its serialized record grows past the old 255-char
+  // ShortString cap. Before the {$H+} fix, SaveToString -> LoadFromString
+  // truncated a record mid-operation and LoadFromString raised
+  // EConvertError ('' is an invalid integer) in TOperation.LoadFromString.
+  // This trains until at least one engine record exceeds 255 chars, then
+  // asserts the full net round-trips byte-identically and recomputes equally.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 16);
+  Desired := TNNetVolume.Create(4);
+  try
+    NN.AddLayer([
+      TNNetInput.Create(8, 8, 16),
+      TNNetPointwiseByteProcessing.Create(1, 100, 10000, 1),
+      TNNetFullConnectLinear.Create(4),
+      TNNetSoftMax.Create(1)
+    ]);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Random() * 2 - 1;
+    Desired.SetClassForSoftMax(1);
+
+    // Train the online byte engine so its serialized records grow.
+    for ep := 0 to 24 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+
+    // Guard: confirm we actually reached the >255-char regime that triggered
+    // the truncation. If this ever stops holding, the test no longer protects
+    // against the bug and should be strengthened (more epochs / larger input).
+    longest := LongestEngineNeuronRecord(NN.Layers[1].SaveDataToString());
+    AssertTrue('engine must serialize a record over the old 255-char cap to' +
+      ' exercise the truncation bug (longest=' + IntToStr(longest) + ')',
+      longest > 255);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      // The actual regression: this LoadFromString used to raise EConvertError.
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('trained PointwiseByteProcessing SaveToString round-trip' +
+        ' equality', Saved, Saved2);
+
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('trained PointwiseByteProcessing round-trip output at ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

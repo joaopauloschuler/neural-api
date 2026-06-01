@@ -27,6 +27,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 unit neuralabfun;
 {$IFDEF FPC}
 {$mode objfpc}
+{$H+} // long (Ansi) strings: ToString/LoadFromString serialize neuron test
+      // layers that exceed the 255-char ShortString cap; without this the
+      // engine's saved relations are silently truncated mid-operation and
+      // fail to reload (EConvertError in TOperation.LoadFromString).
 {$ENDIF}
 interface
 
