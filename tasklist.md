@@ -71,6 +71,39 @@ rather than acted on.
       localized-patch regularizer helps a conv net generalize where scattered-pixel
       dropout does not. Keep it <5-min CPU.
 
+- [ ] TNNet.AddDeepEquilibriumBlock + examples/DeepEquilibrium/ (Bai/Kolter/Koltun
+      2019, "Deep Equilibrium Models") — the IMPLICIT cousin of the landed NeuralODE
+      block, and genuinely distinct from it: NeuralODE unrolls a FIXED number of
+      explicit-Euler steps `y := y + h·f(y)` (a known-length forward graph), whereas
+      a DEQ defines its output as the FIXED POINT `z* = f(z*, x)` of a shape-preserving
+      transform `f` and finds it by iterating `z_{k+1} := f(z_k, x)` to convergence —
+      "infinite-depth weight-tied" with a data-dependent iteration count. Two pieces:
+      (1) a builder that wraps a caller-supplied shape-preserving sublayer block `f`
+      (same contract as AddNeuralODEBlock / the residual builders in
+      [[residual-builder-helpers]] — PointwiseConvLinear over Depth, not FullConnect,
+      so the input gradient survives per [[mha-builder-and-seq-projection]]) and, in
+      the forward pass, iterates it from `z_0 = 0` until `||z_{k+1} - z_k|| < tol` or a
+      `MaxIters` cap (stored in FStruct, e.g. tol=1e-4, MaxIters=30); (2) the backward
+      path. The HONEST feasibility call to settle in v1, in the same "what did NOT fit
+      the CPU/framework budget" style as the Capsule and Grokking entries: the exact
+      DEQ gradient needs the implicit-function theorem (an inverse-Jacobian solve via
+      a second fixed-point iteration), which is heavy and awkward under this API's
+      per-layer Backpropagate contract. So v1 should ship the JACOBIAN-FREE / phantom
+      gradient approximation (Geng et al. 2021): run the forward iteration to a fixed
+      point with weight updates suppressed, then backprop through only the LAST one
+      (or last few) `f` applications — i.e. detach the earlier iterates. This is the
+      standard tractable DEQ training trick, composes cleanly with the existing
+      SetBatchUpdate(True) gradient-surgery idiom from [[manual-gradient-and-snapshot-gotchas]],
+      and keeps the whole thing inside the <5-min pure-CPU budget. The example trains a
+      tiny classifier whose only trunk is one DEQ block and reports (a) accuracy at
+      constant weight count, (b) the mean forward iteration-count-to-convergence per
+      epoch (the "adaptive depth" signal — should fall as training stabilises `f`), and
+      (c) a side-by-side with a param-matched NeuralODE block to make the
+      explicit-unroll vs implicit-fixed-point contrast concrete. Distinct from NeuralODE
+      (fixed explicit steps), ReZero/GatedResidual (single residual hop), and the
+      Modern-Hopfield retrieval (single-step softmax, not iterated to a learned `f`'s
+      fixed point).
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
       SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
