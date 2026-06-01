@@ -495,6 +495,40 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
+- [ ] Beam-search decoding + a decoding-strategy bake-off example
+      (examples/BeamSearchDecode/): the `TNNetSamplerBase` family is today
+      Greedy / TopK / TopP — all *per-token, stochastic* samplers that commit
+      to one token and never reconsider. Beam search is the missing
+      *deterministic, sequence-level* strategy: keep the `B` highest
+      log-probability partial sequences, expand each by every candidate next
+      token, then re-prune to the top `B` by CUMULATIVE log-prob — so it can
+      recover from a locally-greedy mistake that a single argmax locks in.
+      Because it scores whole sequences (not one token), it does NOT fit the
+      `GetToken(Origin)` sampler interface and should NOT be forced into a
+      `TNNetSamplerBeam` subclass (that would be a misfit re-skin); implement
+      it as a standalone `DecodeBeamSearch(NN, Prompt, MaxLen, BeamWidth,
+      LengthPenalty)` routine that drives the model's forward pass directly,
+      living either in the example or as a small `neuraldecode`-style helper.
+      Scope notes to settle honestly in v1, in the "what did NOT fit" style of
+      the Grokking/SpeculativeDecoding entries: (a) work in LOG space and SUM
+      log-probs (never multiply probabilities — underflow); (b) apply the
+      Wu et al. 2016 length-penalty `score = sum_logp / ((5+L)/6)^alpha` so
+      beams aren't biased toward short sequences, and show the `alpha=0`
+      (raw, short-biased) vs `alpha>0` contrast; (c) v1 re-encodes each
+      candidate prefix every step (O(L^2), same honest limitation the
+      SpeculativeDecoding demo carries) and explicitly defers the
+      [[KV-cache incremental-decode]] composition as the logged follow-up;
+      (d) terminate a beam when it emits the stop/EOS token and keep it in a
+      finished-pool ranked against still-growing beams. Headline experiment:
+      on a tiny char-level next-token model where greedy demonstrably
+      DEAD-ENDS (a deliberately constructed prompt whose locally-likeliest
+      first token leads to a globally worse continuation), print a table of
+      Greedy vs Beam(B=2,4,8) showing beam recovering the higher total
+      log-prob sequence, plus the diversity contrast against the existing TopK
+      / TopP stochastic samplers (beam = sharp/repetitive, sampling =
+      diverse/noisier). Composes with the existing samplers and the
+      ../gpt-3-for-pascal decoder; a genuinely new decoding capability, not a
+      variant of an existing TNNetSampler.
 - [ ] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
       fairly FLAT, so absolute accept rates are high even for a weak draft and
       the speedup headline is carried by the monotone accept-rate RISE, not the
