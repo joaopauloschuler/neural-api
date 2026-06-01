@@ -416,9 +416,13 @@ rather than acted on.
 - [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
       next-token task and chart loss + max-logit-norm.
-- [ ] "Lottery-ticket"-flavored experiment: train a small dense net,
+- [X] "Lottery-ticket"-flavored experiment: train a small dense net,
       magnitude-prune the bottom X% of weights, retrain from the original
       init, and compare. Pure CPU, finishes in seconds.
+      Done: examples/LotteryTicket (two-spiral task, magnitude mask enforced
+      via OnAfterStep re-zeroing; LT vs random-reinit vs dense over a 50-95%
+      sparsity sweep, averaged over 5 trials). LT matches dense and beats
+      random reinit at 50/70/90% sparsity.
 - [ ] Init-scheme × depth heatmap: for depths {2, 4, 8, 16} and inits
       {Glorot, He, LeCun, plain N(0, 0.01)}, plot first-step gradient norm
       at the deepest layer.

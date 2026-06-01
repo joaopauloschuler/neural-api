@@ -69,6 +69,7 @@ You can learn more about how to build and train simple neural networks at the fo
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
 * [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
 * [Reptile first-order meta-learning: learning an initialization that adapts to a new sine-regression task in a few SGD steps](https://github.com/joaopauloschuler/neural-api/tree/master/examples/MetaLearningReptile)
+* [Lottery Ticket Hypothesis: magnitude-prune a small dense net, then retrain the sparse mask from the original init vs from fresh random weights — the original-init "winning ticket" matches the dense net and beats random reinit at moderate-to-high sparsity (pure CPU)](https://github.com/joaopauloschuler/neural-api/tree/master/examples/LotteryTicket)
 
 ### Loading and Saving Neural Networks
 Loading is very easy:
