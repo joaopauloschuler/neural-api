@@ -206,6 +206,58 @@ rather than acted on.
       than GENERATING a fresh weight set), and from the Neural-ODE/Growing-CA entries
       (shared-weight time/space recurrence, weights still owned by the layer).
 
+- [ ] Reptile first-order meta-learning + examples/MetaLearningReptile/ (Nichol,
+      Achiam & Schulman 2018, "On First-Order Meta-Learning Algorithms",
+      https://arxiv.org/abs/1803.02999) — a genuinely NEW training PARADIGM for this
+      repo: nothing in the tree learns across a task DISTRIBUTION. Every existing
+      example/optimizer/wrapper trains ONE net to minimise loss on ONE dataset; Reptile
+      instead learns an INITIALIZATION `theta` such that, for a freshly sampled task,
+      a few ordinary SGD steps adapt it to that task fast (few-shot learning). The
+      algorithm is strikingly simple and pure-CPU friendly, which is exactly why it
+      (not full MAML) is the right v1: the headline second-order MAML gradient
+      (`d/d theta` through an inner-loop unroll) needs differentiating through the
+      optimizer — awkward and heavy under this API's per-layer Backpropagate contract,
+      the same honest "what did NOT fit the framework budget" call the Capsule/DEQ
+      entries make. Reptile needs NONE of it: OUTER loop — sample a task `T`, COPY the
+      meta-weights into a worker net (`Worker.CopyWeights(Meta)` per
+      [[manual-gradient-and-snapshot-gotchas]]: CopyWeights, not LoadFromFile, so layer
+      refs stay live), run `k` ordinary SGD steps on `T` to get adapted weights `phi`,
+      then move the meta-weights toward the adapted ones `theta := theta + eps*(phi -
+      theta)` (a per-weight interpolation — mechanically the SAME weight-space move the
+      landed TNNetSWAWrapper / TNNetEMAWrapper / TNNetLookaheadWrapper already do, so it
+      slots straight into that wrapper family). Ship it as a caller-driven
+      `TNNetReptileMetaTrainer` (neuralnetwork.pas, beside those wrappers):
+      Create(pMetaNN, pEpsilon); BeginTask returns/initialises the worker as a
+      CopyWeights clone; MergeTask reads the adapted worker weights and applies the
+      `theta += eps*(phi - theta)` interpolation in place. Distinct from all of them:
+      SWA/EMA average weights ACROSS TIME on ONE task; Reptile interpolates toward weights
+      adapted to a DIFFERENT task each step, and the interpolation direction
+      `(phi - theta)` is provably (Nichol et al. sec. 5) a first-order approximation to
+      the gradient that maximises inner-task generalization — meta-learning, not
+      averaging. The example trains on a DISTRIBUTION of tiny sine-regression tasks
+      `y = A*sin(x + p)` with amplitude `A` and phase `p` randomised per task (the
+      paper's own toy), then shows the headline payoff: from the Reptile meta-init, a
+      held-out task fits in `k in {1,2,4}` gradient steps to far lower loss than the
+      same `k` steps from a random init or from a net pre-trained on the AVERAGE task
+      (the joint-training baseline) — i.e. it learned to LEARN sines, not the mean sine.
+      Built-in correctness gates in the house style: (a) `eps=0` leaves the meta-weights
+      byte-for-byte unchanged (the degenerate anchor, mirroring the
+      LRScheduler/clip_value "default path unchanged" discipline); (b) `eps=1` makes the
+      meta-weights exactly the last task's adapted weights `phi` (pure copy, no meta-
+      learning — the opposite anchor); (c) post-adaptation held-out loss from the
+      meta-init must beat the random-init baseline at matched `k` (the actual
+      meta-learning claim, graded by construction). Tests in TestNeuralTraining.pas per
+      the [[loss-layer-pattern]]/[[introspection-report-pattern]] recipe pin (a) and (b)
+      exactly and (c) as a loosely-banded trend on a fixed seed. Keep the net tiny
+      (`1 -> FullConnectReLU(16) -> FullConnectReLU(16) -> FullConnectLinear(1)`), the
+      task count and inner-step count small, and MaxThreadNum := 1 so the whole
+      outer/inner loop fits the <5-min pure-CPU budget. Distinct from the RL/DQN entry
+      (that learns a policy by reward, single environment), from transfer/fine-tuning
+      (AffineFineTune / LoRAFineTune adapt ONE pretrained net to ONE new task — no task
+      distribution, no learned init), and from HyperNetwork (GENERATES task weights from
+      a context vector in one forward pass rather than ADAPTING a shared init by
+      gradient steps).
+
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
