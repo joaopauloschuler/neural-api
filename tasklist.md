@@ -439,18 +439,6 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
-- [ ] TNNetCausalConv1D follow-ups (layer landed 2026-05-31): (a) DONE
-      2026-06-01 — DILATED variant shipped (WaveNet-style exponentially-growing
-      receptive field via an optional `Dilation` ctor param: left-pad by
-      `Dilation*(K-1)`, tap k reads `srcT = t-Dilation*(K-1-k)`, skip `srcT<0`
-      exactly as the dense form; Dilation=1 is bit-for-bit identical. Stored in
-      FStruct[5], round-trips through Save/Load. Tests: dilated forward,
-      gradient-check, serialization round-trip in TestNeuralNumerical.pas).
-      (b) DONE 2026-06-01 — wired as an arm in examples/SequenceMixerBakeoff/
-      (TokenShift vs CausalConv1D vs DiagonalSSM vs Attention on the same tiny
-      char-level next-token task; charts loss, accuracy, lag-1/long-range
-      accuracy and wall-clock per arm). CausalConv1D (K=5, reach 4) fully solves
-      the lag-4 retrieval at O(n*K).
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
@@ -521,13 +509,6 @@ rather than acted on.
       KV-cache incremental-decode path lands, remove the per-verification-pass
       prefix recompute (the v1 demo recomputes the whole prefix each pass) so the
       two efficiency wins (fewer big-model calls x O(1)-per-step) compose.
-- [x] TNNetDiagonalSSM follow-up: add it as the fourth contender in the
-      open "causal-conv vs token-shift vs SDPA on the same toy next-token
-      task" experiment — its selling point is matching attention quality
-      at linear cost. DONE 2026-06-01 — it is the DiagonalSSM arm in
-      examples/SequenceMixerBakeoff/ (lands above TokenShift on the long-range
-      retrieval column at linear cost, below the K=5 conv / attention on this
-      lag-4 task — an honest "linear but limited reach" result).
 - [ ] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
@@ -562,19 +543,6 @@ rather than acted on.
       TNNetSoftPool on a tiny image-classifier stub — does the stochastic
       regularisation lower the train/val gap at matched architecture? Fork an
       existing pooling example (examples/PoolingBakeoff/) and add the new arm.
-- [x] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
-      its single-branch ShakeDrop generalization. DONE: TNNetShakeShakeMerge
-      (3-input: B1,B2,skip) + TNNetShakeDropMerge (2-input: B,skip), with
-      builders TNNet.AddShakeShakeBlock / AddShakeDropBlock; registered in both
-      CreateLayer dispatch tables, the LoadFromString cascade, the multi-input
-      aL cascade and EnableDropouts. Full forward+backward "shake" (independent
-      random forward alpha vs backward beta) is implemented; eval is the
-      deterministic 0.5/0.5 (Shake-Shake) / p_l (ShakeDrop) combination.
-      SCOPE NOTE (what did NOT fit): alpha/beta/b_l are sampled per
-      forward/backward PASS (per-BATCH), not per-sample — the paper's best
-      "Shake-Shake-Image" per-image grain is the documented v1 simplification.
-      Tests in TestNeuralLayersExtra: eval-correctness, save/load/save
-      round-trip, train smoke (TestShakeShake*/TestShakeDropEvalAndRoundTrip).
 - [ ] ShakeShake follow-up (a): PER-SAMPLE alpha/beta grain — the landed
       TNNetShakeShakeMerge / TNNetShakeDropMerge sample one alpha/beta/b_l per
       forward/backward PASS (per-batch). Sample an independent coefficient per
@@ -639,11 +607,6 @@ rather than acted on.
       ternary matmul, so the "fully-quantized linear" path is reachable. Scope as
       its own flag on TNNetBitLinear (forward adds an input absmax-round; backward
       STE-passes the input gradient unchanged).
-- [X] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
-      (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
-      S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
-      DONE — examples/APLBakeoff/ ships exactly this (ReLU/PReLU/APL S=1,2,4 on
-      the hypotenuse toy, prints per-arm trainable-param count).
 #### Probability projections / sparsity
 - [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
       micro-experiment — train a tiny discrete-latent autoencoder whose
@@ -769,15 +732,6 @@ rather than acted on.
       (lambda>0) to deliberately over-weight the grokking-relevant band, not to
       smooth the step. The paper's cheaper Grokfast-MA (windowed moving average) is a
       logged v2 follow-up; v1 ships the EMA form only.
-- [x] GradientClipping options on TNeuralFit — the global `clip_norm` path
-      already exists (TNeuralFitBase.ClipNorm -> NormalizeNormPerLayer in
-      neuralfit.pas). DONE: element-wise `ClipValue` option added — clamps each
-      weight gradient to [-v, v] before the optimizer step via
-      TNNet.ClipWeightGradientsToValue / TNNetLayer.ClipDeltasToValue, applied
-      next to the ClipNorm site in neuralfit.pas, defaults to 0.0 (disabled).
-      Regression tests in TestNeuralTraining.pas: clip_value=0 leaves training
-      byte-for-byte unchanged (TestClipValueDefaultIdentical) + post-clip
-      gradients are bounded (TestClipValueBoundsGradients).
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
 - [ ] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
@@ -1254,10 +1208,6 @@ rather than acted on.
       attention skeleton.
 - [ ] DyT-vs-LayerNorm bake-off — a 30-line swap in the existing normalization
       bake-off harness (or a small standalone synthetic-regression A/B).
-- [x] Causal-conv vs token-shift vs SDPA on the same toy next-token task.
-      DONE 2026-06-01 — examples/SequenceMixerBakeoff/ (four arms: TokenShift,
-      CausalConv1D, DiagonalSSM, Attention; shared embedding + MLP read-out,
-      matched init, reach-ordered long-range accuracy result).
 - [ ] GRN-as-drop-in: take SimpleImage CIFAR, swap each
       TNNetMovingStdNormalization for TNNetGRN and chart accuracy.
 - [ ] TNNetChannelBias-vs-TNNetChannelMul ablation: train a small
