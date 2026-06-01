@@ -356,7 +356,7 @@ rather than acted on.
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
       any future mixed-precision work.
-- [ ] SoftCapping logit-stability micro-experiment: train a tiny classifier
+- [X] SoftCapping logit-stability micro-experiment: train a tiny classifier
       with and without a `TNNetSoftCapping(c)` before the final softmax,
       and print the rate of NaN/overflow events under an aggressive LR.
 - [ ] DropPath schedule study: linearly increasing drop probability with
