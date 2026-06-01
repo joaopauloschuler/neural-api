@@ -64,7 +64,7 @@ helper is not in core.)
 From this directory:
 
 ```
-fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural -Fu../../neural/pas-core-math MahalanobisOOD.lpr
+fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural MahalanobisOOD.lpr
 ./MahalanobisOOD
 ```
 

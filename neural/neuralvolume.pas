@@ -39,8 +39,6 @@ unit neuralvolume;
 {$mode objfpc}
 {$ENDIF}
 
-{$UNITPATH ./pas-core-math}
-
 interface
 
 uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32;

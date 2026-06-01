@@ -78,7 +78,7 @@ lazbuild ArcFaceEmbedding.lpi
 Or directly with `fpc` (mirrors how the test suite is built):
 
 ```
-fpc -O3 -Mobjfpc -Sh -Fu../../neural -Fu../../neural/pas-core-math ArcFaceEmbedding.lpr
+fpc -O3 -Mobjfpc -Sh -Fu../../neural ArcFaceEmbedding.lpr
 ./ArcFaceEmbedding
 ```
 

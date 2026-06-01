@@ -58,7 +58,7 @@ The test split is 4000 points so the coverage band is meaningful.
 From this directory:
 
 ```
-fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural -Fu../../neural/pas-core-math ConformalPrediction.lpr
+fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural ConformalPrediction.lpr
 ./ConformalPrediction
 ```
 
