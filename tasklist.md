@@ -648,6 +648,45 @@ rather than acted on.
       TestNeuralTraining.pas. Like SWA/EMA, it is caller-driven — wiring it into
       TNeuralFit (and an examples/WeightAveraging/ demo) remains the open SWA/EMA
       integration follow-up above.
+- [ ] TNNetGrokfastWrapper — accelerate grokking with a slow-gradient amplifier
+      (Lee et al. 2024, "Grokfast: Accelerated Grokking by Amplifying Slow
+      Gradients", https://arxiv.org/abs/2405.20233). The mechanism is a one-line
+      idea with a striking payoff: delayed generalization ("grokking") is driven
+      by the SLOW-varying (low-frequency) component of the gradient trajectory,
+      while the fast-varying component is mostly overfitting noise. Grokfast keeps
+      a per-weight EMA of the gradient `mu := beta*mu + (1-beta)*g` and steps on
+      the AMPLIFIED filtered gradient `g_hat := g + lambda*mu` (the "Grokfast-EMA"
+      variant; lambda ~ 2..5, beta ~ 0.9..0.98). Boosting the low-frequency band
+      compresses the thousands-of-epochs grokking delay by up to ~50x. This is the
+      missing piece that makes the still-open `examples/Grokking/` demo (line ~1163)
+      actually FIT the <5-min pure-CPU budget — its logged ATTEMPTED note says the
+      clean weight-decay-driven val-accuracy jump needs more epochs than the budget
+      allows; Grokfast is the published fix for exactly that, so ship the two
+      together (Grokfast-on vs Grokfast-off grok-epoch contrast becomes the
+      example's headline chart). Mechanically a caller-driven wrapper in the SAME
+      family as the landed TNNetSWAWrapper / TNNetEMAWrapper / TNNetLookaheadWrapper
+      (neuralnetwork.pas): Create(pNN, pLambda, pBeta); call Filter (or Step) AFTER
+      the backward pass and BEFORE the optimizer update so it rewrites the live
+      weight gradients in place — using the SetBatchUpdate(True) gradient-accumulation
+      idiom from [[manual-gradient-and-snapshot-gotchas]] so per-sample deltas are
+      not zeroed before it reads them. It needs a per-weight EMA buffer the same
+      shape as the weights (a shadow TNNet or per-layer Volume, exactly like the
+      SWA/EMA shadow). Tests in the TestNeuralTraining.pas trio per the
+      [[loss-layer-pattern]]/[[introspection-report-pattern]] recipe: (a) lambda=0
+      leaves the gradient byte-for-byte unchanged (degenerates to plain SGD — the
+      correctness anchor, mirroring the "default path unchanged" discipline of the
+      LRScheduler/clip_value follow-ups); (b) on a constant-gradient stream the EMA
+      converges to that constant so `g_hat -> (1+lambda)*g`; (c) the filtered
+      gradient's low-frequency energy exceeds the raw gradient's on a rigged
+      slow+fast synthetic signal. Genuinely DISTINCT from the existing wrappers and
+      optimizers: SWA/EMA/Lookahead all average the WEIGHTS (post-step), whereas
+      Grokfast filters the GRADIENT (pre-step); Muon ORTHOGONALIZES the gradient
+      matrix (a spatial/spectral transform) whereas Grokfast is a TEMPORAL low-pass
+      across steps; and although momentum is also a gradient EMA, Grokfast's headline
+      is ADDING the amplified slow component back on top of the raw gradient
+      (lambda>0) to deliberately over-weight the grokking-relevant band, not to
+      smooth the step. The paper's cheaper Grokfast-MA (windowed moving average) is a
+      logged v2 follow-up; v1 ships the EMA form only.
 - [ ] GradientClipping options on TNeuralFit — the global `clip_norm` path
       already exists (TNeuralFitBase.ClipNorm -> NormalizeNormPerLayer in
       neuralfit.pas). Remaining piece: an element-wise `clip_value` option that
