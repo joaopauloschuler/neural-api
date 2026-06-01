@@ -1418,6 +1418,32 @@ rather than acted on.
       single-number window into the terminal phase / neural collapse. Pairs
       with the open grokking / lottery-ticket experiments
       ([[WeightSpectrumReport]]).
+- [ ] `TNNet.NeuralCollapseReport` + `examples/NeuralCollapse/` — measure the
+      four canonical Neural-Collapse metrics (Papyan, Han & Donoho 2020, "Prevalence
+      of neural collapse during the terminal phase of deep learning training") on a
+      probe set of penultimate-layer features. Genuinely distinct from the existing
+      `FeatureSeparabilityReport` and its line-1415 trajectory follow-up: those stop
+      at the `tr(Sw)` collapse + Fisher-ratio *magnitude* (a partial NC1), whereas the
+      headline NC result is the *simplex-ETF geometry* (NC2), which nothing in the tree
+      computes. Report all four: NC1 = within-class variability collapse
+      `tr(Sw·Sb^+)/C` → 0 (reuse FeatureSeparability's class-mean / scatter machinery,
+      do NOT re-derive it); NC2 = convergence to a simplex equiangular tight frame —
+      the centered class means become EQUINORM (coefficient of variation of `||mean_c −
+      global_mean||` → 0) and EQUIANGULAR (every pair's cosine → `−1/(C−1)`, so print
+      the mean and max deviation from that target — this angle check is the novel,
+      visually striking piece); NC3 = self-duality, cosine alignment between the
+      centered class-mean matrix and the final classifier weight rows (skip honestly,
+      flagged, if the head is not a width-matched `TNNetFullConnectLinear` /
+      `TNNetPointwiseConvLinear`); NC4 = classifier collapses to nearest-class-mean,
+      i.e. fraction of probe points whose argmax logit equals their nearest centered
+      class mean. The example trains a small classifier WELL past zero train-error
+      (the "terminal phase") and calls the report every N epochs on a fixed probe to
+      chart the C−1 pairwise cosines converging onto the `−1/(C−1)` line as an ASCII
+      trajectory — the simplex assembling itself. Pure CPU, no dataset download (a
+      synthetic few-class Gaussian-blob task is enough to exhibit collapse). Follow the
+      introspection-report recipe ([[introspection-report-pattern]]): decl + impl +
+      smoke test (pin NC2's equiangular target on a hand-built exact-simplex feature
+      set so the cosine math is verified independent of training) + README + docs row.
 - [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
       separated verdict robust when the endpoint losses are near zero. As
       landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
