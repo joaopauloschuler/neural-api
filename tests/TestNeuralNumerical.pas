@@ -231,6 +231,10 @@ type
     procedure TestSplineActivationInputGradientCheck;
     procedure TestSplineActivationWeightGradientCheck;
     procedure TestSplineActivationSerializationRoundTrip;
+    procedure TestSquashInputGradientCheck;
+    procedure TestSquashLengthBounded;
+    procedure TestCapsuleRoutingWeightGradientCheck;
+    procedure TestCapsuleRoutingSerializationRoundTrip;
     procedure TestFourierFeaturesForwardPinnedB;
     procedure TestFourierFeaturesInputGradientCheck;
     procedure TestFourierFeaturesSigmaZeroDegeneracy;
@@ -2687,6 +2691,233 @@ begin
     NN.Free;
     Input.Free;
     Manual.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSquashInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input-gradient check of the vector squash nonlinearity. Depth 6 = 2 capsules
+  // of dim 3; each group is squashed independently. No trainable parameters, so
+  // we only verify the input Jacobian.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  InputPlus := TNNetVolume.Create(1, 1, 6);
+  Desired := TNNetVolume.Create(1, 1, 6);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetSquash.Create(3));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Squash input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSquashLengthBounded;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  len: TNeuralFloat;
+  i: integer;
+begin
+  // Headline squash property: a LONG capsule vector saturates toward length 1,
+  // a SHORT one shrinks toward 0; orientation is preserved. Single capsule dim 4.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetSquash.Create(4));
+
+    // Large-norm input -> output length close to (but below) 1.
+    for i := 0 to 3 do Input.Raw[i] := 5.0;
+    NN.Compute(Input);
+    len := Sqrt(NN.GetLastLayer.Output.GetSumSqr());
+    AssertTrue('Squash large vector length in [0.9,1.0) (' + FloatToStr(len) + ')',
+      (len > 0.9) and (len < 1.0));
+
+    // Small-norm input -> output length much smaller than the input length.
+    for i := 0 to 3 do Input.Raw[i] := 0.05;
+    NN.Compute(Input);
+    len := Sqrt(NN.GetLastLayer.Output.GetSumSqr());
+    AssertTrue('Squash small vector length < 0.05 (' + FloatToStr(len) + ')',
+      len < 0.05);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCapsuleRoutingWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LCaps: TNNetCapsuleRouting;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, nIdx, w: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Weight-gradient check of TNNetCapsuleRouting under the DETACHED-COUPLING
+  // backward. The coupling coefficients c_ij are constants captured in the
+  // forward pass, so the analytic gradient w.r.t. the transform-matrix weights
+  // W_ij is exact for THAT forward. The finite-difference probe re-runs the full
+  // forward (which recomputes c_ij); to keep the probe consistent with the
+  // detached analytic gradient we use a SINGLE routing iteration so c_ij does
+  // not depend on W (b_ij reset to 0 => uniform softmax, independent of the
+  // weights). With >1 iteration the numerical gradient would also pick up the
+  // (deliberately dropped) routing-feedback term. 3 input capsules dim 2,
+  // 2 output capsules dim 2.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);   // 3 in-caps * dim 2
+  Desired := TNNetVolume.Create(1, 1, 4); // 2 out-caps * dim 2
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetCapsuleRouting.Create(3, 2, 2, 2, 1));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    LCaps := NN.Layers[1] as TNNetCapsuleRouting;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    for nIdx := 0 to LCaps.Neurons.Count - 1 do
+      for w := 0 to LCaps.Neurons[nIdx].Weights.Size - 1 do
+      begin
+        LCaps.Neurons[nIdx].Weights.Raw[w] := LCaps.Neurons[nIdx].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LCaps.Neurons[nIdx].Weights.Raw[w] := LCaps.Neurons[nIdx].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LCaps.Neurons[nIdx].Weights.Raw[w] := LCaps.Neurons[nIdx].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LCaps.Neurons[nIdx].ClearDelta;
+        NN.Backpropagate(Desired);
+        // Backprop accumulates Delta := Delta - LearningRate*gradient.
+        // With LearningRate = 1, analytical gradient = -Delta.
+        analyticalGrad := -LCaps.Neurons[nIdx].Delta.Raw[w];
+
+        AssertTrue('CapsuleRouting W gradient check (neuron ' + IntToStr(nIdx) +
+          ' w ' + IntToStr(w) + ') num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCapsuleRoutingSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input, Out1, Out2: TNNetVolume;
+  S: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString must preserve the layer hyperparameters and
+  // the W weights, reproducing the output exactly.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  Out1 := TNNetVolume.Create();
+  Out2 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetCapsuleRouting.Create(3, 2, 2, 2, 3));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.2 + 0.1;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(S);
+      NN2.Compute(Input);
+      Out2.Copy(NN2.GetLastLayer.Output);
+      AssertTrue('CapsuleRouting structure round-trips',
+        NN.GetLastLayer.SaveStructureToString() =
+        NN2.GetLastLayer.SaveStructureToString());
+      for i := 0 to Out1.Size - 1 do
+        AssertTrue('CapsuleRouting output round-trip at ' + IntToStr(i),
+          Abs(Out1.Raw[i] - Out2.Raw[i]) < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Out1.Free;
+    Out2.Free;
   end;
 end;
 

@@ -2934,6 +2934,85 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Capsule vector "squash" nonlinearity (Sabour, Frosst & Hinton 2017,
+  /// "Dynamic Routing Between Capsules"). The Depth axis is interpreted as a
+  /// contiguous run of capsule VECTORS, each of length pDim (so
+  /// Depth = numCaps * pDim, capsules laid out adjacently along Depth). For
+  /// each spatial position (x,y) and each capsule group s the layer applies
+  ///   v = (||s||^2 / (1 + ||s||^2)) * (s / ||s||)
+  /// which compresses the capsule's LENGTH into [0,1) while preserving its
+  /// orientation (a SHORT vector shrinks ~to 0, a LONG vector saturates ~to
+  /// unit length). This is distinct from the existing scalar-margin length code
+  /// in this unit: it squashes the whole VECTOR, not a scalar. pDim is stored in
+  /// FStruct[0] (round-trips via SaveStructureToString / CreateLayer). No
+  /// trainable parameters. Backward applies the exact per-group Jacobian:
+  /// let n2 = ||s||^2, n = sqrt(n2 + eps), f = n2/(1+n2); then
+  ///   v_i = (f/n) * s_i, and
+  ///   dv_i/ds_j = (f/n) * delta_ij + s_i * d(f/n)/ds_j, with
+  ///   d(f/n)/ds_j = ( (2/((1+n2)^2)) * (1/n) - (f/n^3) ) * s_j.
+  /// FScale caches f/n per group for the forward output and reuse in backward.
+  TNNetSquash = class(TNNetIdentity)
+    protected
+      FScale: TNNetVolume;  // caches f/n per (x,y,capsule)
+      FNorm2: TNNetVolume;  // caches ||s||^2 per (x,y,capsule)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pDim: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// Capsule routing-by-agreement layer (Sabour, Frosst & Hinton 2017,
+  /// "Dynamic Routing Between Capsules"). Input is interpreted as a flat run of
+  /// numInCaps lower-level capsule vectors of length inDim laid out along Depth
+  /// (input Depth = numInCaps * inDim, taken at spatial position (0,0); any
+  /// spatial extent is flattened by reading the contiguous depth run). Output is
+  /// numOutCaps higher-level capsule vectors of length outDim, laid out the same
+  /// way ((1,1,numOutCaps*outDim)).
+  ///
+  /// Trainable parameters: per (input-capsule i, output-capsule j) pair a
+  /// transform matrix W_ij of shape (outDim x inDim). Stored as
+  /// numInCaps*numOutCaps neurons, neuron index (i*numOutCaps + j) holding
+  /// outDim*inDim weights (row-major: weight[o*inDim + k] = W_ij[o,k]). Weights
+  /// auto-serialize via the base neuron save/load.
+  ///
+  /// Forward (per sample): prediction vectors u_hat_{j|i} = W_ij * u_i. The
+  /// coupling logits b_ij are RESET to 0 every forward pass (they are NOT a
+  /// gradient-carrying parameter) and the fixed 3-iteration routing loop runs:
+  ///   c_i. = softmax_j(b_i.);  s_j = sum_i c_ij * u_hat_{j|i};
+  ///   v_j  = squash(s_j);      b_ij += u_hat_{j|i} . v_j.
+  /// The final v_j (after the last squash) is the output.
+  ///
+  /// Backward (DETACHED-COUPLING approximation — documented honestly): the
+  /// routing coefficients c_ij are treated as CONSTANTS captured in the forward
+  /// pass (the standard tractable simplification the framework's per-layer
+  /// Backpropagate contract favours — differentiating through the 3 unrolled
+  /// softmax/agreement iterations is not attempted in v1). Gradients flow through
+  /// (a) the final squash Jacobian, (b) the weighted sum s_j = sum_i c_ij u_hat,
+  /// and (c) the linear map u_hat = W_ij u_i — so ONLY the transform matrices
+  /// W_ij carry gradients (and the input gradient flows back through them). This
+  /// matches the tasklist's permitted "routing is a forward-only attention-like
+  /// reweighting" path. Iteration count in FStruct[0], numInCaps FStruct[1],
+  /// inDim FStruct[2], numOutCaps FStruct[3], outDim FStruct[4].
+  TNNetCapsuleRouting = class(TNNetLayer)
+    protected
+      FNumInCaps, FInDim, FNumOutCaps, FOutDim, FRoutingIters: integer;
+      FUHat: TNNetVolume;   // (numOutCaps, numInCaps, outDim): u_hat_{j|i}
+      FCoupling: TNNetVolume; // (numOutCaps, numInCaps, 1): detached c_ij
+      FSquashScale: TNNetVolume; // (numOutCaps,1,1): f/n per output capsule
+      FSj: TNNetVolume;     // (numOutCaps, 1, outDim): pre-squash s_j
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pNumInCaps, pInDim, pNumOutCaps, pOutDim, pRoutingIters: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Hard-Concrete gate (Louizos, Welling & Kingma 2018, "Learning Sparse
   // Neural Networks through L0 Regularization"). A learnable PER-CHANNEL
   // multiplicative gate z[d] in [0,1] that can hit EXACTLY 0 (hard sparsity):
@@ -20772,6 +20851,362 @@ begin
   inherited InitDefault();
   FNeurons[0].Weights.Fill(FInitialAlpha);
   AfterWeightUpdate();
+end;
+
+{ TNNetSquash }
+constructor TNNetSquash.Create();
+begin
+  Create(2);
+end;
+
+constructor TNNetSquash.Create(pDim: integer);
+begin
+  inherited Create();
+  if pDim < 1 then pDim := 1;
+  FStruct[0] := pDim;
+  FScale := TNNetVolume.Create();
+  FNorm2 := TNNetVolume.Create();
+end;
+
+destructor TNNetSquash.Destroy();
+begin
+  FScale.Free;
+  FNorm2.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSquash.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Dim, NumCaps: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Dim := FStruct[0];
+  {$IFDEF Debug}
+  if (FOutput.Depth mod Dim) <> 0 then
+    FErrorProc('TNNetSquash: Depth ('+IntToStr(FOutput.Depth)+
+      ') must be a multiple of capsule dim ('+IntToStr(Dim)+').');
+  {$ENDIF}
+  NumCaps := FOutput.Depth div Dim;
+  // One scalar (f/n and ||s||^2) per (x,y,capsule).
+  FScale.ReSize(FOutput.SizeX, FOutput.SizeY, NumCaps);
+  FNorm2.ReSize(FOutput.SizeX, FOutput.SizeY, NumCaps);
+end;
+
+procedure TNNetSquash.Compute();
+var
+  StartTime: double;
+  Dim, NumCaps, x, y, c, i, baseD: integer;
+  Prev: TNNetVolume;
+  SumSq, n, fOverN, Eps: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Dim := FStruct[0];
+  NumCaps := FOutput.Depth div Dim;
+  Eps := 1e-12;
+  for x := 0 to FOutput.SizeX - 1 do
+    for y := 0 to FOutput.SizeY - 1 do
+      for c := 0 to NumCaps - 1 do
+      begin
+        baseD := c * Dim;
+        SumSq := 0;
+        for i := 0 to Dim - 1 do
+          SumSq := SumSq + Sqr(Prev[x, y, baseD + i]);
+        n := Sqrt(SumSq + Eps);
+        // f = ||s||^2 / (1 + ||s||^2); v = (f/n) * s
+        fOverN := (SumSq / (1 + SumSq)) / n;
+        FNorm2[x, y, c] := SumSq;
+        FScale[x, y, c] := fOverN;
+        for i := 0 to Dim - 1 do
+          FOutput[x, y, baseD + i] := fOverN * Prev[x, y, baseD + i];
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSquash.Backpropagate();
+var
+  StartTime: double;
+  Dim, NumCaps, x, y, c, i, baseD: integer;
+  Prev, PrevErr: TNNetVolume;
+  SumSq, n, fOverN, dFON, sDotG, gi, si, Eps: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    Dim := FStruct[0];
+    NumCaps := FOutput.Depth div Dim;
+    Eps := 1e-12;
+    // Per capsule group: v_i = (f/n) * s_i, so
+    //   dL/ds_j = (f/n)*g_j + (s.g) * d(f/n)/ds_j, with
+    //   d(f/n)/ds_j = ( 2/((1+n2)^2)/n - (f/n^3) ) * s_j
+    // where g = dL/dv (FOutputError), n2 = ||s||^2, n = sqrt(n2+eps),
+    //       f = n2/(1+n2), f/n cached in FScale.
+    for x := 0 to FOutput.SizeX - 1 do
+      for y := 0 to FOutput.SizeY - 1 do
+        for c := 0 to NumCaps - 1 do
+        begin
+          baseD := c * Dim;
+          SumSq := FNorm2[x, y, c];
+          fOverN := FScale[x, y, c];
+          n := Sqrt(SumSq + Eps);
+          // scalar coefficient of s_j in d(f/n)/ds_j
+          dFON := ( 2 / Sqr(1 + SumSq) ) / n - fOverN / (SumSq + Eps);
+          sDotG := 0;
+          for i := 0 to Dim - 1 do
+            sDotG := sDotG + Prev[x, y, baseD + i] * FOutputError[x, y, baseD + i];
+          for i := 0 to Dim - 1 do
+          begin
+            gi := FOutputError[x, y, baseD + i];
+            si := Prev[x, y, baseD + i];
+            PrevErr[x, y, baseD + i] := PrevErr[x, y, baseD + i] +
+              fOverN * gi + sDotG * dFON * si;
+          end;
+        end;
+    FPrevLayer.Backpropagate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+end;
+
+{ TNNetCapsuleRouting }
+constructor TNNetCapsuleRouting.Create();
+begin
+  Create(8, 4, 4, 4, 3);
+end;
+
+constructor TNNetCapsuleRouting.Create(pNumInCaps, pInDim, pNumOutCaps, pOutDim, pRoutingIters: integer);
+begin
+  inherited Create();
+  if pNumInCaps  < 1 then pNumInCaps  := 1;
+  if pInDim      < 1 then pInDim      := 1;
+  if pNumOutCaps < 1 then pNumOutCaps := 1;
+  if pOutDim     < 1 then pOutDim     := 1;
+  if pRoutingIters < 1 then pRoutingIters := 1;
+  FNumInCaps    := pNumInCaps;
+  FInDim        := pInDim;
+  FNumOutCaps   := pNumOutCaps;
+  FOutDim       := pOutDim;
+  FRoutingIters := pRoutingIters;
+  FStruct[0] := pRoutingIters;
+  FStruct[1] := pNumInCaps;
+  FStruct[2] := pInDim;
+  FStruct[3] := pNumOutCaps;
+  FStruct[4] := pOutDim;
+  FUHat        := TNNetVolume.Create();
+  FCoupling    := TNNetVolume.Create();
+  FSquashScale := TNNetVolume.Create();
+  FSj          := TNNetVolume.Create();
+  FOutput.ReSize(1, 1, pNumOutCaps * pOutDim);
+  FOutputError.ReSize(1, 1, pNumOutCaps * pOutDim);
+  FOutputErrorDeriv.ReSize(1, 1, pNumOutCaps * pOutDim);
+end;
+
+destructor TNNetCapsuleRouting.Destroy();
+begin
+  FUHat.Free;
+  FCoupling.Free;
+  FSquashScale.Free;
+  FSj.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetCapsuleRouting.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  {$IFDEF Debug}
+  if pPrevLayer.Output.Size < FNumInCaps * FInDim then
+    FErrorProc('TNNetCapsuleRouting: previous layer size ('+
+      IntToStr(pPrevLayer.Output.Size)+') < numInCaps*inDim ('+
+      IntToStr(FNumInCaps*FInDim)+').');
+  {$ENDIF}
+  // One neuron per (i,j) pair, each holding W_ij as outDim*inDim weights.
+  AddMissingNeurons(FNumInCaps * FNumOutCaps);
+  SetNumWeightsForAllNeurons(FOutDim * FInDim, 1, 1);
+  FUHat.ReSize(FNumOutCaps, FNumInCaps, FOutDim);
+  FCoupling.ReSize(FNumOutCaps, FNumInCaps, 1);
+  FSquashScale.ReSize(FNumOutCaps, 1, 1);
+  FSj.ReSize(FNumOutCaps, 1, FOutDim);
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetCapsuleRouting.InitDefault();
+var
+  cnt: integer;
+begin
+  if FNeurons.Count < FNumInCaps * FNumOutCaps then
+    AddMissingNeurons(FNumInCaps * FNumOutCaps);
+  for cnt := 0 to FNeurons.Count - 1 do
+    FNeurons[cnt].InitHeUniform(1);
+end;
+
+procedure TNNetCapsuleRouting.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  i, j, o, k, it, nIdx: integer;
+  W: TNNetVolume;
+  acc, sumSq, n, fOverN, Eps, maxB, sumExp, c, agree: TNeuralFloat;
+  bLogits: array of TNeuralFloat; // (numInCaps x numOutCaps) coupling logits
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Eps := 1e-12;
+
+  // 1) Prediction vectors u_hat_{j|i} = W_ij * u_i.
+  for i := 0 to FNumInCaps - 1 do
+    for j := 0 to FNumOutCaps - 1 do
+    begin
+      nIdx := i * FNumOutCaps + j;
+      W := FNeurons[nIdx].FWeights;
+      for o := 0 to FOutDim - 1 do
+      begin
+        acc := 0;
+        for k := 0 to FInDim - 1 do
+          acc := acc + W.Raw[o * FInDim + k] * Prev.Raw[i * FInDim + k];
+        FUHat[j, i, o] := acc;
+      end;
+    end;
+
+  // 2) Routing-by-agreement. Coupling logits b_ij RESET to 0 each forward.
+  SetLength(bLogits, FNumInCaps * FNumOutCaps);
+  for i := 0 to FNumInCaps * FNumOutCaps - 1 do bLogits[i] := 0;
+
+  for it := 1 to FRoutingIters do
+  begin
+    // c_i. = softmax over j of b_i.  ; cache into FCoupling.
+    for i := 0 to FNumInCaps - 1 do
+    begin
+      maxB := bLogits[i * FNumOutCaps];
+      for j := 1 to FNumOutCaps - 1 do
+        if bLogits[i * FNumOutCaps + j] > maxB then maxB := bLogits[i * FNumOutCaps + j];
+      sumExp := 0;
+      for j := 0 to FNumOutCaps - 1 do
+      begin
+        c := Exp(bLogits[i * FNumOutCaps + j] - maxB);
+        FCoupling[j, i, 0] := c;
+        sumExp := sumExp + c;
+      end;
+      for j := 0 to FNumOutCaps - 1 do
+        FCoupling[j, i, 0] := FCoupling[j, i, 0] / sumExp;
+    end;
+
+    // s_j = sum_i c_ij * u_hat_{j|i}; v_j = squash(s_j).
+    for j := 0 to FNumOutCaps - 1 do
+    begin
+      for o := 0 to FOutDim - 1 do
+      begin
+        acc := 0;
+        for i := 0 to FNumInCaps - 1 do
+          acc := acc + FCoupling[j, i, 0] * FUHat[j, i, o];
+        FSj[j, 0, o] := acc;
+      end;
+      sumSq := 0;
+      for o := 0 to FOutDim - 1 do sumSq := sumSq + Sqr(FSj[j, 0, o]);
+      n := Sqrt(sumSq + Eps);
+      fOverN := (sumSq / (1 + sumSq)) / n;
+      FSquashScale[j, 0, 0] := fOverN;
+      for o := 0 to FOutDim - 1 do
+        FOutput.Raw[j * FOutDim + o] := fOverN * FSj[j, 0, o];
+    end;
+
+    // b_ij += u_hat_{j|i} . v_j  (skip on the last iteration).
+    if it < FRoutingIters then
+      for i := 0 to FNumInCaps - 1 do
+        for j := 0 to FNumOutCaps - 1 do
+        begin
+          agree := 0;
+          for o := 0 to FOutDim - 1 do
+            agree := agree + FUHat[j, i, o] * FOutput.Raw[j * FOutDim + o];
+          bLogits[i * FNumOutCaps + j] := bLogits[i * FNumOutCaps + j] + agree;
+        end;
+  end;
+  SetLength(bLogits, 0);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCapsuleRouting.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  i, j, o, k, nIdx: integer;
+  W, Delta: TNNetVolume;
+  sumSq, n, fOverN, dFON, sDotG, gOut, dSj, dUHat, Eps: TNeuralFloat;
+  gS: array of TNeuralFloat;  // dL/ds_j (length outDim, reused per j)
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  Eps := 1e-12;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  SetLength(gS, FOutDim);
+
+  // Detached-coupling backward: c_ij are CONSTANTS (FCoupling, from forward).
+  // Gradient flows: g_v -> (squash Jacobian) -> g_s -> (sum c_ij) -> g_uhat
+  //                     -> (W u) -> {W grad, input grad}.
+  for j := 0 to FNumOutCaps - 1 do
+  begin
+    // squash Jacobian at s_j (same form as TNNetSquash):
+    sumSq := 0;
+    for o := 0 to FOutDim - 1 do sumSq := sumSq + Sqr(FSj[j, 0, o]);
+    n := Sqrt(sumSq + Eps);
+    fOverN := FSquashScale[j, 0, 0];
+    dFON := ( 2 / Sqr(1 + sumSq) ) / n - fOverN / (sumSq + Eps);
+    sDotG := 0;
+    for o := 0 to FOutDim - 1 do
+      sDotG := sDotG + FSj[j, 0, o] * FOutputError.Raw[j * FOutDim + o];
+    for o := 0 to FOutDim - 1 do
+    begin
+      gOut := FOutputError.Raw[j * FOutDim + o];
+      gS[o] := fOverN * gOut + sDotG * dFON * FSj[j, 0, o];
+    end;
+
+    // s_j = sum_i c_ij u_hat_{j|i}  =>  dL/d u_hat_{j|i}[o] = c_ij * gS[o].
+    // u_hat_{j|i}[o] = sum_k W_ij[o,k] * u_i[k].
+    for i := 0 to FNumInCaps - 1 do
+    begin
+      nIdx := i * FNumOutCaps + j;
+      W := FNeurons[nIdx].FWeights;
+      Delta := FNeurons[nIdx].FDelta;
+      for o := 0 to FOutDim - 1 do
+      begin
+        dUHat := FCoupling[j, i, 0] * gS[o];
+        for k := 0 to FInDim - 1 do
+        begin
+          // W grad: dL/dW_ij[o,k] = dUHat * u_i[k]  (descend => -LR * grad)
+          Delta.Raw[o * FInDim + k] := Delta.Raw[o * FInDim + k] +
+            (-FLearningRate) * dUHat * Prev.Raw[i * FInDim + k];
+          // input grad: dL/du_i[k] += dUHat * W_ij[o,k]
+          if hasInputGrad then
+          begin
+            dSj := dUHat * W.Raw[o * FInDim + k];
+            PrevErr.Raw[i * FInDim + k] := PrevErr.Raw[i * FInDim + k] + dSj;
+          end;
+        end;
+      end;
+    end;
+  end;
+  SetLength(gS, 0);
+
+  if (not FBatchUpdate) then
+  begin
+    for nIdx := 0 to FNeurons.Count - 1 do
+      FNeurons[nIdx].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+
+  if hasInputGrad then FPrevLayer.Backpropagate();
 end;
 
 { TNNetHardConcrete }
@@ -48593,6 +49028,8 @@ begin
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
       'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
       'TNNetDropBlock' :            Result := TNNetDropBlock.Create(St[0], Ft[0]);
+      'TNNetSquash' :               Result := TNNetSquash.Create(St[0]);
+      'TNNetCapsuleRouting' :       Result := TNNetCapsuleRouting.Create(St[1], St[2], St[3], St[4], St[0]);
       'TNNetCausalConv1D' :         Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1));
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
@@ -48880,6 +49317,8 @@ begin
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
       if S[0] = 'TNNetDropBlock' then Result := TNNetDropBlock.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetSquash' then Result := TNNetSquash.Create(St[0]) else
+      if S[0] = 'TNNetCapsuleRouting' then Result := TNNetCapsuleRouting.Create(St[1], St[2], St[3], St[4], St[0]) else
       if S[0] = 'TNNetCausalConv1D' then Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1)) else
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
