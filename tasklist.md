@@ -630,12 +630,6 @@ rather than acted on.
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
       accuracy/agreement.
-- [X] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
-      deliberately class-imbalanced mask, sweep `(α,β) ∈ {(0.5,0.5),(0.3,0.7),
-      (0.7,0.3)}` and show how β>α trades precision for recall (fewer false
-      negatives). Pure α/β knob study on the landed TNNetTverskyLoss.
-      Fork examples/DiceSegmentation/ and swap the head for TNNetTverskyLoss
-      with the three (α,β) pairs.
 - [ ] LabelSmoothing calibration check: train SimpleImageClassifier with
       `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
       each into the `neuralcalibration` ECE/Brier report — the textbook claim
@@ -667,10 +661,6 @@ rather than acted on.
       net trained under a constant-valued scheduler matches the fixed-LR run.
       The classes + math are landed; this is the integration the "missing
       plumbing" entry ultimately wants.
-- [X] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
-      average of live weights every N steps after epoch W.
-- [X] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
-      weights for inference, sibling to SWA.
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
       (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
       TNeuralFit calls them yet. Wire an optional hook into the training loop (call
@@ -697,7 +687,6 @@ rather than acted on.
       non-finite activation (e.g. an aggressive LR / a planted Inf weight) and
       assert training aborts (FShouldQuit set / FErrorProc fired) rather than
       running to the epoch budget.
-- [X] Mixup data augmentation helper.
 - [ ] Mixup follow-up: the landed examples/Mixup/ toy is LINEARLY SEPARABLE so both
       the plain and mixup-augmented arms hit ~100% val accuracy — the helper is
       pinned by unit tests but the demo does not yet SHOW mixup winning. Add a
