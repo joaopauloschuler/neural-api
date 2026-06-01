@@ -235,9 +235,14 @@ rather than acted on.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 ### Added ideas
-- [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
+- [X] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
       pattern. Consider a follow-up that allows masking the lower triangle or a
       configurable offset, if a non-causal masking use case shows up.
+      DONE 2026-06-01: added overloaded ctor
+      `Create(pMaskValue, pOffset, pLowerTriangle=False)` — causal masks `X>Y+Offset`,
+      anti-causal masks `X<Y-Offset`; defaults reproduce the legacy strict
+      upper-triangle byte-for-byte. Offset/flag round-trip via FStruct[0]/FStruct[1].
+      Tests in TestNeuralNumerical.pas.
 - [ ] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
       attribution via TracIn-CP (Pruthi et al. 2020, "Estimating Training Data
       Influence by Tracing Gradient Descent"). Answers a question NOTHING in the
@@ -552,6 +557,14 @@ rather than acted on.
       onto one expert. Needs a top-k masking/dispatch mechanism on the gate plus
       an aux-loss head; left out of v1 to avoid shipping an untested router. (The
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
+- [ ] AddMixtureOfDepths follow-up (builder + examples/MixtureOfDepths/ landed
+      2026-06-01): (a) add a load-balancing / capacity-utilisation auxiliary loss so
+      the router spreads its budget instead of fixating on a few positions; (b) a
+      Gumbel/learned-threshold router variant (the v1 uses a sigmoid + the existing
+      TNNetTopK top-Capacity mask); (c) the v1 example's learned allocation came out
+      mostly POSITIONAL on the test seed rather than a sharp hard-vs-easy content
+      split — design a next-token task where the triage provably tracks "hard"
+      tokens to make the interpretability headline land.
 #### Normalization primitives
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
       projection* (renormalize the previous layer's weights after each update,
@@ -560,8 +573,14 @@ rather than acted on.
       covers the headline use case.
 
 #### Reduction / shape
-- [ ] TNNetUpsampleNearest backward consistency: assert summing the
+- [X] TNNetUpsampleNearest backward consistency: assert summing the
       per-block output errors equals the input error.
+      DONE 2026-06-01: the actual class is `TNNetUpsample` (a `TNNetDeMaxPool`
+      subclass, depth-to-space). Test `TestUpsampleBackwardErrorSum` in
+      TestNeuralLayersExtra.pas pins total-error conservation + the exact per-cell
+      bijective routing. No production bug. Gotcha: `TNNetDeMaxPool.Backpropagate`
+      only routes error when prev-layer OutputError.Size == Output.Size, so an
+      Input/Identity prev needs its OutputError resized to full size first.
 ### Loss layers
 - [ ] TNNetQuantileLoss follow-up (landed 2026-05-31, head + examples/QuantileRegression/):
       a SINGLE-model multi-quantile head — emit a 3-wide output and train all three
@@ -619,8 +638,16 @@ rather than acted on.
       win is a flatter, better-generalising averaged solution). Mirror the open
       TNeuralLRScheduler-wiring follow-up's "opt-in, regression-test the default is
       unchanged" discipline.
-- [ ] Lookahead optimizer wrapper — every k inner SGD steps, set slow weights
+- [X] Lookahead optimizer wrapper — every k inner SGD steps, set slow weights
       `φ ← φ + α·(θ - φ)` and rewind fast weights to φ.
+      DONE 2026-06-01: `TNNetLookaheadWrapper` (neuralnetwork.pas), sibling of the
+      landed TNNetSWAWrapper/TNNetEMAWrapper. API: Create(pNN,pK,pAlpha), Step
+      (call after each base update; True on a sync step), Synchronize, CopySlowTo,
+      ShadowNet, props K/Alpha/StepCount. Slow-update via
+      `MulMulAddWeights(1-Alpha,Alpha,LiveNet)` then `CopyWeights`. 4 tests in
+      TestNeuralTraining.pas. Like SWA/EMA, it is caller-driven — wiring it into
+      TNeuralFit (and an examples/WeightAveraging/ demo) remains the open SWA/EMA
+      integration follow-up above.
 - [ ] GradientClipping options on TNeuralFit — the global `clip_norm` path
       already exists (TNeuralFitBase.ClipNorm -> NormalizeNormPerLayer in
       neuralfit.pas). Remaining piece: an element-wise `clip_value` option that
