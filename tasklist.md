@@ -638,10 +638,24 @@ rather than acted on.
       average of live weights every N steps after epoch W.
 - [X] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
       weights for inference, sibling to SWA.
+- [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
+      (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
+      TNeuralFit calls them yet. Wire an optional hook into the training loop (call
+      EMA Update each step / SWA Accumulate every N steps after epoch W, gated behind
+      an opt-in property so the default path is byte-for-byte unchanged), plus an
+      examples/WeightAveraging/ demo that contrasts the live net vs the SWA-averaged
+      and EMA-shadow nets' val accuracy on a tiny noisy task (the headline SWA/EMA
+      win is a flatter, better-generalising averaged solution). Mirror the open
+      TNeuralLRScheduler-wiring follow-up's "opt-in, regression-test the default is
+      unchanged" discipline.
 - [ ] Lookahead optimizer wrapper — every k inner SGD steps, set slow weights
       `φ ← φ + α·(θ - φ)` and rewind fast weights to φ.
-- [ ] GradientClipping options on TNeuralFit — both `clip_norm` (global)
-      and `clip_value` (element-wise).
+- [ ] GradientClipping options on TNeuralFit — the global `clip_norm` path
+      already exists (TNeuralFitBase.ClipNorm -> NormalizeNormPerLayer in
+      neuralfit.pas). Remaining piece: an element-wise `clip_value` option that
+      clamps each weight gradient to [-v, v] before the optimizer step (a separate
+      knob from per-layer norm clipping), with a regression test that clip_value=0
+      leaves the fixed-LR path byte-for-byte unchanged.
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
 - [ ] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
@@ -651,6 +665,15 @@ rather than acted on.
       assert training aborts (FShouldQuit set / FErrorProc fired) rather than
       running to the epoch budget.
 - [X] Mixup data augmentation helper.
+- [ ] Mixup follow-up: the landed examples/Mixup/ toy is LINEARLY SEPARABLE so both
+      the plain and mixup-augmented arms hit ~100% val accuracy — the helper is
+      pinned by unit tests but the demo does not yet SHOW mixup winning. Add a
+      harder/over-parameterised arm (label noise, overlapping clusters, or a small
+      net trained to memorise) where the soft mixup targets measurably narrow the
+      train/val gap, so the regulariser's benefit is visible (mirror the SAM /
+      RandomLabelMemorization follow-ups that make a flat saturating signal
+      discriminating). Also exercise CreateMixedVolumePairList with general
+      alpha != 1 (the demo path uses the Beta(1,1)=Uniform default).
 - [ ] SAM follow-up: the noisy-label 2D-blob clusters are easily separable so
       clean val-accuracy saturates (~99%) across all rho — the flatness signal
       carries the story but the val-acc-vs-rho curve is flat. A harder task
