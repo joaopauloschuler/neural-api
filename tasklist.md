@@ -258,6 +258,19 @@ rather than acted on.
       a context vector in one forward pass rather than ADAPTING a shared init by
       gradient steps).
 
+- [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
+      landed 2026-06-01, sine-regression task distribution, manual inner-loop
+      Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
+      distribution (e.g. rotated/shifted 2-D blob few-shot tasks) so the
+      meta-init claim is shown on more than 1-D regression; (b) the tiny ReLU
+      net proved numerically delicate under the summed full-batch gradient —
+      ForceMaxAbsoluteDelta was a no-op on the manual path, so it needed input
+      normalisation + a small stable LR. Worth a short note in
+      docs/ (or the example README) on why the manual UpdateWeights path
+      bypasses the clip and what the stable-training recipe is, so the next
+      manual-inner-loop example (HyperNetwork, MAML, Growing-CA) doesn't
+      rediscover the divergence the hard way.
+
 ## Infrastructure / dev experience
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
@@ -423,6 +436,13 @@ rather than acted on.
       via OnAfterStep re-zeroing; LT vs random-reinit vs dense over a 50-95%
       sparsity sweep, averaged over 5 trials). LT matches dense and beats
       random reinit at 50/70/90% sparsity.
+- [ ] Lottery-ticket follow-up: ITERATIVE magnitude pruning (IMP, the paper's
+      actual method) vs the landed one-shot prune. Loop: train -> prune the
+      bottom p% of SURVIVING weights -> reset survivors to theta_0 -> retrain,
+      for several rounds reaching the same final sparsity as one-shot. Fork
+      examples/LotteryTicket and chart whether IMP finds a winning ticket at the
+      95% sparsity where the landed one-shot run collapsed to ~67% (the headline
+      "iterative beats one-shot at extreme sparsity" result). Pure CPU, &lt;5 min.
 - [ ] Init-scheme × depth heatmap: for depths {2, 4, 8, 16} and inits
       {Glorot, He, LeCun, plain N(0, 0.01)}, plot first-step gradient norm
       at the deepest layer.
