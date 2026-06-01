@@ -104,7 +104,21 @@ rather than acted on.
       Modern-Hopfield retrieval (single-step softmax, not iterated to a learned `f`'s
       fixed point).
 
-- [ ] TNNet.AddRetention (RetNet, Sun et al. 2023, "Retentive Network: A Successor
+- [X] TNNet.AddRetention (RetNet, Sun et al. 2023, "Retentive Network: A Successor
+      to Transformer for Large Language Models") + examples/RetentionDualForm/ —
+      DONE. TNNetRetention layer (parallel decay-masked form, forward+backward,
+      gamma in FFloatSt[0]/d_k in FStruct[0], registered in both dispatch tables)
+      + TNNet.AddRetention builder (H concatenated single-head TNNetRetention,
+      geometric per-head gamma schedule, pointwise out-proj). Tests:
+      TestRetentionGradientCheck (max err ~3e-4), TestRetentionRecurrentEquivalence
+      (max diff ~6e-8), TestRetentionSerializationRoundTrip. Example trains the
+      parallel form then asserts a hand-rolled recurrent loop matches it
+      (max abs diff ~9.5e-6 < 1e-4 gate). Follow-ups:
+      (a) learn gamma via direct gradient (currently a fixed constant);
+      (b) chunkwise-recurrent hybrid form (throughput optimisation, skipped in v1).
+      Original spec below.
+- [ ] (superseded by the [X] above; kept for context) TNNet.AddRetention (RetNet,
+      Sun et al. 2023, "Retentive Network: A Successor
       to Transformer for Large Language Models") + examples/RetentionDualForm/ — a
       token mixer that is genuinely distinct from everything already in tree, and
       whose headline property (one mechanism, two mathematically-equal forms) is
