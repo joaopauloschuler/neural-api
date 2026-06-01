@@ -33,11 +33,26 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
 type
   THeadKind = (hkPlainMSE, hkLogCoshLoss);
 
+  // Regression statistics, all in the ORIGINAL target scale (the network
+  // output is multiplied back by TARGET_SCALE before measuring) except for
+  // LogCosh, which is the mean log(cosh(residual)) on the normalized scale
+  // the network actually optimizes.
+  TEvalStats = record
+    MSE: TNeuralFloat;     // mean squared error
+    RMSE: TNeuralFloat;    // sqrt(MSE)
+    MAE: TNeuralFloat;     // mean absolute error
+    MaxAbsErr: TNeuralFloat; // worst single-sample absolute error
+    R2: TNeuralFloat;      // coefficient of determination
+    LogCosh: TNeuralFloat; // mean log(cosh(residual)) on normalized scale
+  end;
+
   TRunResult = record
     Name: string;
-    FinalValLoss: TNeuralFloat;
+    Val: TEvalStats;
+    Test: TEvalStats;
     EpochsToConverge: integer; // -1 if never converged
     Epochs: integer;
+    Seconds: TNeuralFloat;     // per-config training wall time
   end;
 
 const
@@ -61,6 +76,7 @@ type
   end;
 
 function EvaluateMSEHelper(NN: TNNet; Pairs: TNNetVolumePairList): TNeuralFloat; forward;
+function ComputeStats(NN: TNNet; Pairs: TNNetVolumePairList): TEvalStats; forward;
 
 procedure TConvergenceTracker.OnAfterEpoch(Sender: TObject);
 var
@@ -112,22 +128,57 @@ begin
 end;
 
 function EvaluateMSEHelper(NN: TNNet; Pairs: TNNetVolumePairList): TNeuralFloat;
+begin
+  // Thin wrapper kept for the convergence tracker; MSE is in original scale.
+  Result := ComputeStats(NN, Pairs).MSE;
+end;
+
+function ComputeStats(NN: TNNet; Pairs: TNNetVolumePairList): TEvalStats;
 var
   I: integer;
-  Pred: TNeuralFloat;
-  SumSq: Double;
+  PredN, TgtN, Pred, Tgt, Err, ResidN: TNeuralFloat;
+  SumSq, SumAbs, SumLogCosh, SumTgt, SumTgtSq, SSRes, SSTot, MeanTgt: Double;
+  N: integer;
 begin
-  SumSq := 0;
-  for I := 0 to Pairs.Count - 1 do
+  FillChar(Result, SizeOf(Result), 0);
+  N := Pairs.Count;
+  if N = 0 then Exit;
+
+  SumSq := 0; SumAbs := 0; SumLogCosh := 0; SumTgt := 0; SumTgtSq := 0;
+  Result.MaxAbsErr := 0;
+  for I := 0 to N - 1 do
   begin
     NN.Compute(Pairs[I].I);
-    Pred := NN.GetLastLayer().Output.FData[0];
-    SumSq := SumSq + Sqr((Pred - Pairs[I].O.FData[0]) * TARGET_SCALE);
+    PredN := NN.GetLastLayer().Output.FData[0];  // normalized prediction
+    TgtN  := Pairs[I].O.FData[0];                 // normalized target
+    ResidN := PredN - TgtN;
+
+    Pred := PredN * TARGET_SCALE;                 // original scale
+    Tgt  := TgtN  * TARGET_SCALE;
+    Err  := Pred - Tgt;
+
+    SumSq      := SumSq + Sqr(Err);
+    SumAbs     := SumAbs + Abs(Err);
+    // log(cosh x) computed stably as |x| + log1p(exp(-2|x|)) - log(2).
+    SumLogCosh := SumLogCosh + (Abs(ResidN) + Ln(1 + Exp(-2*Abs(ResidN))) - Ln(2));
+    SumTgt     := SumTgt + Tgt;
+    SumTgtSq   := SumTgtSq + Sqr(Tgt);
+    if Abs(Err) > Result.MaxAbsErr then Result.MaxAbsErr := Abs(Err);
   end;
-  if Pairs.Count > 0 then
-    Result := SumSq / Pairs.Count
+
+  Result.MSE     := SumSq / N;
+  Result.RMSE    := Sqrt(Result.MSE);
+  Result.MAE     := SumAbs / N;
+  Result.LogCosh := SumLogCosh / N;
+
+  // R^2 = 1 - SSres/SStot, with SStot the variance of the targets.
+  MeanTgt := SumTgt / N;
+  SSRes   := SumSq;
+  SSTot   := SumTgtSq - N * Sqr(MeanTgt);
+  if SSTot > 0 then
+    Result.R2 := 1 - SSRes / SSTot
   else
-    Result := 0;
+    Result.R2 := 0;
 end;
 
 function RunOne(Kind: THeadKind;
@@ -135,6 +186,7 @@ function RunOne(Kind: THeadKind;
 var
   NN: TNNet;
   NFit: TNeuralFit;
+  StartTime, EndTime: TDateTime;
 begin
   Result.Name := HeadName(Kind);
   Result.Epochs := NUM_EPOCHS;
@@ -143,6 +195,7 @@ begin
   NN := TNNet.Create();
   NFit := TNeuralFit.Create();
   try
+    StartTime := Now;
     NN.AddLayer(TNNetInput.Create(2));
     NN.AddLayer(TNNetFullConnectLinear.Create(HIDDEN_UNITS));
     NN.AddLayer(TNNetLogCoshActivation.Create());
@@ -161,9 +214,12 @@ begin
     GTracker.Validation := Validation;
     NFit.OnAfterEpoch := @GTracker.OnAfterEpoch;
     NFit.Fit(NN, Train, Validation, Test, BATCH_SIZE, NUM_EPOCHS);
+    EndTime := Now;
 
-    Result.FinalValLoss := EvaluateMSEHelper(NN, Validation);
+    Result.Val  := ComputeStats(NN, Validation);
+    Result.Test := ComputeStats(NN, Test);
     Result.EpochsToConverge := GTracker.ConvergedAtEpoch;
+    Result.Seconds := (EndTime - StartTime) * 86400;
   finally
     GTracker.NN := nil;
     GTracker.Validation := nil;
@@ -212,7 +268,8 @@ begin
 
   WriteLn;
   WriteLn('=== Results (CSV) ===');
-  WriteLn('config,final_val_mse,epochs_to_converge,total_epochs');
+  WriteLn('config,val_mse,val_rmse,val_mae,val_max_err,val_r2,val_logcosh,',
+          'test_mse,test_rmse,test_mae,test_r2,epochs_to_converge,total_epochs,seconds');
   for Kind := Low(THeadKind) to High(THeadKind) do
   begin
     if Results[Kind].EpochsToConverge < 0 then
@@ -220,10 +277,44 @@ begin
     else
       Convergence := IntToStr(Results[Kind].EpochsToConverge);
     WriteLn(Results[Kind].Name, ',',
-            FloatToStrF(Results[Kind].FinalValLoss, ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Val.MSE,       ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Val.RMSE,      ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Val.MAE,       ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Val.MaxAbsErr, ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Val.R2,        ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Val.LogCosh,   ffFixed, 8, 6), ',',
+            FloatToStrF(Results[Kind].Test.MSE,      ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Test.RMSE,     ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Test.MAE,      ffFixed, 8, 4), ',',
+            FloatToStrF(Results[Kind].Test.R2,       ffFixed, 8, 4), ',',
             Convergence, ',',
-            Results[Kind].Epochs);
+            Results[Kind].Epochs, ',',
+            FloatToStrF(Results[Kind].Seconds, ffFixed, 8, 2));
   end;
+
+  WriteLn;
+  WriteLn('=== Per-config summary ===');
+  for Kind := Low(THeadKind) to High(THeadKind) do
+  begin
+    WriteLn(Results[Kind].Name, ':');
+    WriteLn('  validation : MSE=', FloatToStrF(Results[Kind].Val.MSE, ffFixed, 8, 4),
+            '  RMSE=', FloatToStrF(Results[Kind].Val.RMSE, ffFixed, 8, 4),
+            '  MAE=', FloatToStrF(Results[Kind].Val.MAE, ffFixed, 8, 4),
+            '  maxErr=', FloatToStrF(Results[Kind].Val.MaxAbsErr, ffFixed, 8, 4),
+            '  R2=', FloatToStrF(Results[Kind].Val.R2, ffFixed, 8, 4),
+            '  LogCosh=', FloatToStrF(Results[Kind].Val.LogCosh, ffFixed, 8, 6));
+    WriteLn('  test       : MSE=', FloatToStrF(Results[Kind].Test.MSE, ffFixed, 8, 4),
+            '  RMSE=', FloatToStrF(Results[Kind].Test.RMSE, ffFixed, 8, 4),
+            '  MAE=', FloatToStrF(Results[Kind].Test.MAE, ffFixed, 8, 4),
+            '  R2=', FloatToStrF(Results[Kind].Test.R2, ffFixed, 8, 4));
+    if Results[Kind].EpochsToConverge < 0 then
+      WriteLn('  converged  : NA (MSE < ', CONVERGE_THRESHOLD:0:2,
+              ' not reached in ', Results[Kind].Epochs, ' epochs)')
+    else
+      WriteLn('  converged  : epoch ', Results[Kind].EpochsToConverge);
+    WriteLn('  train time : ', FormatFloat('0.00', Results[Kind].Seconds), ' s');
+  end;
+
   WriteLn;
   WriteLn('Total wall time: ', FormatFloat('0.00', (EndTime - StartTime)*86400), ' s');
 end;
