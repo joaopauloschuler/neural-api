@@ -213,6 +213,9 @@ type
     procedure TestCausalConv1DWeightGradientCheck;
     procedure TestCausalConv1DCausality;
     procedure TestCausalConv1DSerializationRoundTrip;
+    procedure TestCausalConv1DDilatedForward;
+    procedure TestCausalConv1DDilatedWeightGradientCheck;
+    procedure TestCausalConv1DDilatedSerializationRoundTrip;
     procedure TestPReLUChannelInputGradientCheck;
     procedure TestPReLUChannelWeightGradientCheck;
     procedure TestGatedResidualGradient;
@@ -20032,6 +20035,207 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CausalConv1D round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DDilatedForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  W0, W1: TNeuralFloat;
+  x: array[0..4] of TNeuralFloat;
+  t: integer;
+  expected: TNeuralFloat;
+begin
+  // Hand-computable dilated forward pass.
+  // NumFeat=1, K=2, Dilation=2, InDepth=1, bias suppressed.
+  // Tap k reads srcT = t - 2*(2-1-k) = t-2+2k:
+  //   k=0 -> x[t-2], k=1 -> x[t]   (skip x[t-2] when t<2)
+  //   y[t] = W0*x[t-2] + W1*x[t]    (W0 term absent for t=0,1)
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+    LConv := TNNetCausalConv1D.Create(1, 2, {SuppressBias=}1, {Dilation=}2);
+    NN.AddLayer(LConv);
+    W0 := 0.5; W1 := -0.25;
+    LConv.Neurons[0].Weights.Raw[0] := W0; // tap k=0 (reads x[t-2])
+    LConv.Neurons[0].Weights.Raw[1] := W1; // tap k=1 (reads x[t])
+    x[0] := 1.0; x[1] := 2.0; x[2] := -3.0; x[3] := 0.5; x[4] := 4.0;
+    for t := 0 to 4 do Input[t, 0, 0] := x[t];
+    NN.Compute(Input);
+    for t := 0 to 4 do
+    begin
+      if t < 2 then expected := W1 * x[t]
+      else expected := W0 * x[t - 2] + W1 * x[t];
+      AssertEquals('CausalConv1D dilated forward t=' + IntToStr(t),
+        expected, NN.GetLastLayer.Output[t, 0, 0], 1e-6);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DDilatedWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+  SeqLen, InDepth, NumFeat, K, Dil: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 6; InDepth := 3; NumFeat := 2; K := 3; Dil := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, NumFeat);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LConv := TNNetCausalConv1D.Create(NumFeat, K, 0, Dil);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.25;
+
+    for n := 0 to LConv.Neurons.Count - 1 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('CausalConv1D dilated weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DDilatedSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetCausalConv1D;
+  Saved, Saved2: string;
+  i: integer;
+
+  // Extract integer FStruct slot at index AIdx from a SaveStructureToString()
+  // result of the form 'ClassName:s0;s1;...;sN::f0;f1;...'.
+  function StructSlot(const AStruct: string; AIdx: integer): integer;
+  var
+    body, tok: string;
+    p, slot: integer;
+  begin
+    body := Copy(AStruct, Pos(':', AStruct) + 1, MaxInt);
+    p := Pos('::', body);
+    if p > 0 then body := Copy(body, 1, p - 1);
+    slot := 0;
+    Result := 0;
+    while body <> '' do
+    begin
+      p := Pos(';', body);
+      if p > 0 then
+      begin
+        tok := Copy(body, 1, p - 1);
+        Delete(body, 1, p);
+      end
+      else
+      begin
+        tok := body;
+        body := '';
+      end;
+      if slot = AIdx then
+      begin
+        Result := StrToInt(tok);
+        Exit;
+      end;
+      Inc(slot);
+    end;
+  end;
+
+begin
+  // Dilation=3 must survive a LoadFromString round-trip.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 1, 3, 1));
+    LConv := TNNetCausalConv1D.Create(2, 3, 0, 3);
+    NN.AddLayer(LConv);
+    AssertEquals('CausalConv1D Dilation stored in FStruct[5] before save', 3,
+      StructSlot(LConv.SaveStructureToString(), 5));
+    for i := 0 to LConv.Neurons.Count - 1 do
+    begin
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.37;
+      LConv.Neurons[i].Weights.Raw[1] := LConv.Neurons[i].Weights.Raw[1] - 0.21;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('CausalConv1D round-trip class identity',
+        NN2.GetLastLayer is TNNetCausalConv1D);
+      AssertEquals('CausalConv1D Dilation survives round-trip', 3,
+        StructSlot(NN2.GetLastLayer.SaveStructureToString(), 5));
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CausalConv1D dilated save->load->save string equality', Saved, Saved2);
+      AssertEquals('CausalConv1D dilated round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CausalConv1D dilated round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

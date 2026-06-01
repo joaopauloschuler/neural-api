@@ -3371,21 +3371,27 @@ type
   // InputDepth) sequence laid out along SizeX exactly like TNNetTokenShift /
   // the attention layers (SizeY must be 1). For each output channel f, position
   // t and kernel tap k (0..K-1, where K = FeatureSize):
-  //   y[t,0,f] = bias[f] + sum_{k=0..K-1} sum_{c} W[f][k,0,c] * x[t-(K-1)+k,0,c]
-  // with x[<0,0,c] = 0 (the left padding). This is a standard learnable conv
-  // (weights per output-channel x input-channel x tap); backward is the usual
-  // conv backward restricted to the causal window (taps that read padded/future
-  // positions contribute nothing). One neuron per output channel f holds a
-  // (K, 1, InputDepth) weight volume plus a scalar bias, so weights/bias
+  //   y[t,0,f] = bias[f]
+  //            + sum_{k=0..K-1} sum_{c} W[f][k,0,c] * x[t-Dilation*(K-1-k),0,c]
+  // with x[<0,0,c] = 0 (the left padding). The optional Dilation (>=1, default 1)
+  // gives a WaveNet-style exponentially-growing receptive field: taps are spaced
+  // Dilation apart in time and the left pad grows to Dilation*(K-1). Dilation=1
+  // is bit-for-bit identical to the dense causal conv. This is a standard
+  // learnable conv (weights per output-channel x input-channel x tap); backward
+  // is the usual conv backward restricted to the causal window (taps that read
+  // padded/future positions contribute nothing). One neuron per output channel f
+  // holds a (K, 1, InputDepth) weight volume plus a scalar bias, so weights/bias
   // serialize automatically via the base neuron save/load. NumFeatures is stored
-  // in FStruct[0], FeatureSize (K) in FStruct[1] and the bias-suppression flag in
-  // FStruct[4] (matching the convolution layers' slot) for round-tripping.
+  // in FStruct[0], FeatureSize (K) in FStruct[1], the bias-suppression flag in
+  // FStruct[4] (matching the convolution layers' slot) and Dilation in FStruct[5]
+  // for round-tripping.
   TNNetCausalConv1D = class(TNNetLayer)
     private
       FFeatureSize: integer; // kernel size K
+      FDilation: integer;    // WaveNet-style dilation (>=1); 1 == dense causal conv
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+      constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0; pDilation: integer = 1); overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -22207,15 +22213,17 @@ begin
 end;
 
 { TNNetCausalConv1D }
-constructor TNNetCausalConv1D.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+constructor TNNetCausalConv1D.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0; pDilation: integer = 1);
 begin
   inherited Create();
   FFeatureSize := Max(pFeatureSize, 1);
+  FDilation := Max(pDilation, 1);
   FSuppressBias := pSuppressBias;
   AddNeurons(pNumFeatures);
   FStruct[0] := pNumFeatures;
   FStruct[1] := FFeatureSize;
   FStruct[4] := FSuppressBias;
+  FStruct[5] := FDilation;
 end;
 
 procedure TNNetCausalConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -22242,7 +22250,7 @@ procedure TNNetCausalConv1D.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  SeqLen, InputDepth, Ksize, t, f, k, srcT: integer;
+  SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
   W: TNNetVolume;
   sum: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -22252,6 +22260,7 @@ begin
   SeqLen := Prev.SizeX;
   InputDepth := Prev.Depth;
   Ksize := FFeatureSize;
+  Dil := FDilation;
   for f := 0 to FNeurons.Count - 1 do
   begin
     localNeuron := FNeurons[f];
@@ -22261,12 +22270,12 @@ begin
       if FSuppressBias = 0
         then sum := localNeuron.FBiasWeight
         else sum := 0;
-      // Left-only padding: tap k reads input position t-(Ksize-1)+k.
+      // Left-only padding: tap k reads input position t-Dil*(Ksize-1-k).
       // Positions < 0 are the (zero) left padding -> skipped. The depth axis is
       // contiguous, so each tap is an AVX dot product over InputDepth floats.
       for k := 0 to Ksize - 1 do
       begin
-        srcT := t - (Ksize - 1) + k;
+        srcT := t - Dil * (Ksize - 1 - k);
         if srcT < 0 then continue; // padded (and never reads srcT > t)
         sum := sum + TNNetVolume.DotProduct(
           W.GetRawPtr(k, 0), Prev.GetRawPtr(srcT, 0), InputDepth);
@@ -22281,7 +22290,7 @@ procedure TNNetCausalConv1D.Backpropagate();
 var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
-  SeqLen, InputDepth, Ksize, t, f, k, srcT: integer;
+  SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
   W, GW: TNNetVolume;
   gy: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -22295,13 +22304,14 @@ begin
   SeqLen := FOutput.SizeX;
   InputDepth := Prev.Depth;
   Ksize := FFeatureSize;
+  Dil := FDilation;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = Prev.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
 
   // Standard conv backward restricted to the causal window. For each output
-  // channel f, position t and tap k reading srcT = t-(Ksize-1)+k (>=0):
+  // channel f, position t and tap k reading srcT = t-Dil*(Ksize-1-k) (>=0):
   //   dL/dW[f][k,c] += OutErr[t,f] * x[srcT,c]
   //   dL/dx[srcT,c] += OutErr[t,f] * W[f][k,c]
   //   dL/dbias[f]   += OutErr[t,f]
@@ -22322,7 +22332,7 @@ begin
       //   (PtrA[i] += PtrB[i] * Value) over InputDepth floats.
       for k := 0 to Ksize - 1 do
       begin
-        srcT := t - (Ksize - 1) + k;
+        srcT := t - Dil * (Ksize - 1 - k);
         if srcT < 0 then continue;
         TNNetVolume.MulAdd(GW.GetRawPtr(k, 0), Prev.GetRawPtr(srcT, 0),
           (-FLearningRate) * gy, InputDepth);
@@ -48024,7 +48034,7 @@ begin
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
       'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
       'TNNetDropBlock' :            Result := TNNetDropBlock.Create(St[0], Ft[0]);
-      'TNNetCausalConv1D' :         Result := TNNetCausalConv1D.Create(St[0], St[1], St[4]);
+      'TNNetCausalConv1D' :         Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1));
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
@@ -48308,7 +48318,7 @@ begin
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
       if S[0] = 'TNNetDropBlock' then Result := TNNetDropBlock.Create(St[0], Ft[0]) else
-      if S[0] = 'TNNetCausalConv1D' then Result := TNNetCausalConv1D.Create(St[0], St[1], St[4]) else
+      if S[0] = 'TNNetCausalConv1D' then Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1)) else
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else

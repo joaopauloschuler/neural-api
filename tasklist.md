@@ -435,13 +435,17 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
-- [ ] TNNetCausalConv1D follow-ups (layer landed 2026-05-31): (a) a DILATED
-      variant (WaveNet-style exponentially-growing receptive field via a
-      `Dilation` ctor param — left-pad by `Dilation*(K-1)`, skip taps at
-      `srcT<0` exactly as the dense form does); (b) it is now the ready 4th
-      contender for the open "causal-conv vs token-shift vs SDPA on the same
-      toy next-token task" experiment below — wire it in and chart loss +
-      per-step cost (its selling point is O(n*K) attention-free mixing).
+- [ ] TNNetCausalConv1D follow-ups (layer landed 2026-05-31): (a) DONE
+      2026-06-01 — DILATED variant shipped (WaveNet-style exponentially-growing
+      receptive field via an optional `Dilation` ctor param: left-pad by
+      `Dilation*(K-1)`, tap k reads `srcT = t-Dilation*(K-1-k)`, skip `srcT<0`
+      exactly as the dense form; Dilation=1 is bit-for-bit identical. Stored in
+      FStruct[5], round-trips through Save/Load. Tests: dilated forward,
+      gradient-check, serialization round-trip in TestNeuralNumerical.pas).
+      (b) STILL OPEN — it is now the ready 4th contender for the open
+      "causal-conv vs token-shift vs SDPA on the same toy next-token task"
+      experiment below — wire it in and chart loss + per-step cost (its selling
+      point is O(n*K) attention-free mixing).
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
