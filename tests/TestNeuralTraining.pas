@@ -49,6 +49,12 @@ type
     procedure TestLookaheadInterpolationExact;
     procedure TestLookaheadNonBoundaryNoChange;
     procedure TestLookaheadSmoke;
+
+    // Reptile first-order meta-learning
+    procedure TestReptileEpsZeroUnchanged;
+    procedure TestReptileEpsOneCopiesPhi;
+    procedure TestReptileInterpolationExact;
+    procedure TestReptileMetaInitBeatsRandom;
   end;
 
 implementation
@@ -1078,6 +1084,237 @@ begin
   finally
     LA.Free;
     Live.Free;
+  end;
+end;
+
+// ----------------------------------------------------------------------------
+// Reptile first-order meta-learning tests
+// ----------------------------------------------------------------------------
+
+// Builds the tiny sine-regression net used by the Reptile example/tests:
+//   1 -> FullConnectReLU(16) -> FullConnectReLU(16) -> FullConnectLinear(1)
+function BuildReptileNet: TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(1),
+    TNNetFullConnectReLU.Create(16),
+    TNNetFullConnectReLU.Create(16),
+    TNNetFullConnectLinear.Create(1)
+  ]);
+end;
+
+// Runs InnerSteps full-batch SGD steps adapting NN to a single sine task
+// y = A*sin(x+P) sampled at NumPts points in [-5,5].
+procedure AdaptToSineTask(NN: TNNet; A, P: TNeuralFloat;
+  InnerSteps, NumPts: integer; LR: TNeuralFloat);
+var
+  Inp, Des: TNNetVolume;
+  Step, I: integer;
+  X: TNeuralFloat;
+begin
+  Inp := TNNetVolume.Create(1, 1, 1);
+  Des := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.SetLearningRate(LR, 0.0);
+    for Step := 1 to InnerSteps do
+    begin
+      for I := 0 to NumPts - 1 do
+      begin
+        X := -5.0 + 10.0 * (I / (NumPts - 1));
+        Inp.Raw[0] := X * 0.2; // normalise to [-1,1] for well-conditioned SGD
+        Des.Raw[0] := A * Sin(X + P);
+        NN.Compute(Inp);
+        NN.Backpropagate(Des);
+      end;
+      NN.UpdateWeights();
+    end;
+  finally
+    Inp.Free;
+    Des.Free;
+  end;
+end;
+
+// Mean absolute error of NN on a sine task over NumPts points in [-5,5].
+function SineTaskLoss(NN: TNNet; A, P: TNeuralFloat; NumPts: integer): TNeuralFloat;
+var
+  Inp, Out: TNNetVolume;
+  I: integer;
+  X, Err: TNeuralFloat;
+begin
+  Inp := TNNetVolume.Create(1, 1, 1);
+  Out := TNNetVolume.Create(1, 1, 1);
+  Err := 0;
+  try
+    for I := 0 to NumPts - 1 do
+    begin
+      X := -5.0 + 10.0 * (I / (NumPts - 1));
+      Inp.Raw[0] := X * 0.2;
+      NN.Compute(Inp);
+      NN.GetOutput(Out);
+      Err := Err + Abs(Out.Raw[0] - A * Sin(X + P));
+    end;
+  finally
+    Inp.Free;
+    Out.Free;
+  end;
+  Result := Err / NumPts;
+end;
+
+// Sum of |weight| difference between two same-architecture nets (byte-for-byte
+// proxy: exact equality => 0).
+function NetWeightDiff(A, B: TNNet): TNeuralFloat;
+var
+  L, N, W: integer;
+  Sum: TNeuralFloat;
+begin
+  Sum := 0;
+  for L := 0 to A.GetLastLayerIdx() do
+    for N := 0 to A.Layers[L].Neurons.Count - 1 do
+      for W := 0 to A.Layers[L].Neurons[N].Weights.Size - 1 do
+        Sum := Sum + Abs(A.Layers[L].Neurons[N].Weights.Raw[W] -
+                         B.Layers[L].Neurons[N].Weights.Raw[W]);
+  Result := Sum;
+end;
+
+procedure TTestNeuralTraining.TestReptileEpsZeroUnchanged;
+var
+  Meta, Snapshot: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Worker: TNNet;
+begin
+  RandSeed := 424242;
+  Meta := BuildReptileNet();
+  Snapshot := Meta.Clone(); // captures theta before merging
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, 0.0);
+  try
+    // Adapt a worker to an arbitrary task, then merge with eps=0.
+    Worker := Trainer.BeginTask();
+    FillNetWeights(Worker, 12.34); // phi wildly different from theta
+    Trainer.MergeTask();
+    // eps=0 -> theta := 1*theta + 0*phi: byte-for-byte unchanged.
+    AssertEquals('Reptile eps=0 leaves meta-weights unchanged', 0.0,
+      NetWeightDiff(Meta, Snapshot), 0.0);
+  finally
+    Trainer.Free;
+    Snapshot.Free;
+    Meta.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReptileEpsOneCopiesPhi;
+var
+  Meta, PhiSnapshot: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Worker: TNNet;
+begin
+  RandSeed := 424242;
+  Meta := BuildReptileNet();
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, 1.0);
+  PhiSnapshot := Meta.Clone();
+  try
+    Worker := Trainer.BeginTask();
+    FillNetWeights(Worker, 7.5); // phi = adapted worker weights
+    PhiSnapshot.CopyWeights(Worker);
+    Trainer.MergeTask();
+    // eps=1 -> theta := phi exactly (pure copy).
+    AssertEquals('Reptile eps=1 makes meta-weights exactly phi', 0.0,
+      NetWeightDiff(Meta, PhiSnapshot), 0.0);
+  finally
+    Trainer.Free;
+    PhiSnapshot.Free;
+    Meta.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReptileInterpolationExact;
+var
+  Meta: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Worker: TNNet;
+  Expected: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Meta := BuildReptileNet();
+  FillNetWeights(Meta, 2.0); // theta = 2.0
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, 0.25);
+  try
+    Worker := Trainer.BeginTask();
+    FillNetWeights(Worker, 10.0); // phi = 10.0
+    Trainer.MergeTask();
+    // theta := theta + eps*(phi-theta) = 2 + 0.25*(10-2) = 4.0
+    Expected := 2.0 + 0.25 * (10.0 - 2.0);
+    AssertEquals('Reptile exact interpolation', Expected,
+      SampleWeight(Meta), 0.0001);
+  finally
+    Trainer.Free;
+    Meta.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReptileMetaInitBeatsRandom;
+const
+  cMetaIters = 2000;  // outer Reptile iterations
+  cInnerSteps = 16;   // SGD steps per task
+  cNumPts = 20;       // points per sine task
+  cInnerLR = 0.0007;  // inner-loop learning rate (stable for the summed grad)
+  cEps = 0.1;         // outer Reptile step
+  cAdaptK = 4;        // held-out adaptation steps (matched k)
+var
+  Meta, RandInit, MetaAdapt, RandAdapt, Worker: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Iter, T: integer;
+  A, P: TNeuralFloat;
+  MetaLoss, RandLoss: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // Random-init baseline (frozen reference init).
+  RandInit := BuildReptileNet();
+  // Meta net starts from the SAME random init for a fair comparison.
+  Meta := BuildReptileNet();
+  Meta.CopyWeights(RandInit);
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, cEps);
+  try
+    // Outer Reptile loop over a distribution of sine tasks.
+    for Iter := 1 to cMetaIters do
+    begin
+      A := 0.5 + Random * 2.5;          // amplitude in [0.5, 3]
+      P := Random * Pi;                 // phase in [0, pi)
+      Worker := Trainer.BeginTask();
+      AdaptToSineTask(Worker, A, P, cInnerSteps, cNumPts, cInnerLR);
+      Trainer.MergeTask();
+    end;
+
+    // Held-out task evaluation, averaged over several tasks.
+    MetaLoss := 0;
+    RandLoss := 0;
+    for T := 0 to 4 do
+    begin
+      A := 0.5 + Random * 2.5;
+      P := Random * Pi;
+      // Adapt from the Reptile meta-init.
+      MetaAdapt := BuildReptileNet();
+      MetaAdapt.CopyWeights(Meta);
+      AdaptToSineTask(MetaAdapt, A, P, cAdaptK, cNumPts, cInnerLR);
+      MetaLoss := MetaLoss + SineTaskLoss(MetaAdapt, A, P, cNumPts);
+      MetaAdapt.Free;
+      // Adapt the random init for the same k steps.
+      RandAdapt := BuildReptileNet();
+      RandAdapt.CopyWeights(RandInit);
+      AdaptToSineTask(RandAdapt, A, P, cAdaptK, cNumPts, cInnerLR);
+      RandLoss := RandLoss + SineTaskLoss(RandAdapt, A, P, cNumPts);
+      RandAdapt.Free;
+    end;
+    // (c) The meta-init must adapt to lower held-out loss at matched k.
+    // Loosely banded: require a clear margin on the fixed seed.
+    AssertTrue('Reptile meta-init beats random init at matched k ' +
+      '(meta=' + FloatToStrF(MetaLoss, ffFixed, 6, 4) +
+      ' rand=' + FloatToStrF(RandLoss, ffFixed, 6, 4) + ')',
+      MetaLoss < RandLoss * 0.9);
+  finally
+    Trainer.Free;
+    Meta.Free;
+    RandInit.Free;
   end;
 end;
 

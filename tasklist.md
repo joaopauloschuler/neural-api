@@ -206,7 +206,7 @@ rather than acted on.
       than GENERATING a fresh weight set), and from the Neural-ODE/Growing-CA entries
       (shared-weight time/space recurrence, weights still owned by the layer).
 
-- [ ] Reptile first-order meta-learning + examples/MetaLearningReptile/ (Nichol,
+- [X] Reptile first-order meta-learning + examples/MetaLearningReptile/ (Nichol,
       Achiam & Schulman 2018, "On First-Order Meta-Learning Algorithms",
       https://arxiv.org/abs/1803.02999) — a genuinely NEW training PARADIGM for this
       repo: nothing in the tree learns across a task DISTRIBUTION. Every existing

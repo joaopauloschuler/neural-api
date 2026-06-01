@@ -7513,6 +7513,48 @@ type
       property StepCount: integer read FStepCount;
   end;
 
+  { TNNetReptileMetaTrainer }
+  // Reptile first-order meta-learning (Nichol, Achiam & Schulman 2018,
+  // "On First-Order Meta-Learning Algorithms", https://arxiv.org/abs/1803.02999).
+  // Sibling to SWA/EMA/Lookahead: it performs the SAME weight-space interpolation
+  // those wrappers do, but for a different purpose. SWA/EMA average weights ACROSS
+  // TIME on ONE task; Reptile learns an INITIALIZATION theta such that a few SGD
+  // steps adapt it FAST to a freshly sampled task. The outer loop (driven by the
+  // caller) is:
+  //   1. sample a task T;
+  //   2. BeginTask -> a worker net seeded from the meta-weights (CopyWeights clone);
+  //   3. run k ordinary SGD steps on T to adapt the worker to phi;
+  //   4. MergeTask -> move the meta-weights toward phi:
+  //        theta := theta + eps*(phi - theta) = (1-eps)*theta + eps*phi
+  // The interpolation direction (phi - theta) is (Nichol et al. sec. 5) a first-order
+  // approximation of the gradient that maximises inner-task generalization.
+  // Edge cases pinned by tests: eps=0 leaves theta byte-for-byte unchanged; eps=1
+  // makes theta exactly the last task's adapted phi (a pure copy, no meta-learning).
+  TNNetReptileMetaTrainer = class(TMObject)
+    protected
+      FMetaNet: TNNet;       // the meta-init theta being learned (caller-owned)
+      FWorkerNet: TNNet;     // the per-task worker phi (owned by this trainer)
+      FEpsilon: TNeuralFloat;// outer step size eps
+    public
+      // pMetaNN = the net whose weights are the meta-init theta (NOT owned here).
+      // pEpsilon = outer interpolation step eps (typically small, e.g. 0.1).
+      constructor Create(pMetaNN: TNNet; pEpsilon: TNeuralFloat);
+      destructor Destroy; override;
+      // Seeds the worker from the current meta-weights (CopyWeights, NOT
+      // LoadFromFile, so the returned layer refs stay live for inner-loop SGD)
+      // and returns it. Run the k inner SGD steps on the returned net, then call
+      // MergeTask. The worker is owned by this trainer; do not free it.
+      function BeginTask: TNNet;
+      // Folds the adapted worker weights phi back into the meta-weights:
+      //   theta := (1-eps)*theta + eps*phi
+      procedure MergeTask;
+      // The meta-init network (theta), caller-owned.
+      function MetaNet: TNNet;
+      // The worker network (phi), owned by this trainer.
+      function WorkerNet: TNNet;
+      property Epsilon: TNeuralFloat read FEpsilon write FEpsilon;
+  end;
+
   { THistoricalNets }
   THistoricalNets = class(TNNet)
     public
@@ -50995,6 +51037,48 @@ end;
 function TNNetLookaheadWrapper.ShadowNet: TNNet;
 begin
   Result := FSlowNet;
+end;
+
+{ TNNetReptileMetaTrainer }
+
+constructor TNNetReptileMetaTrainer.Create(pMetaNN: TNNet; pEpsilon: TNeuralFloat);
+begin
+  inherited Create();
+  FMetaNet := pMetaNN;
+  FEpsilon := pEpsilon;
+  // Worker shares the meta architecture; weights are (re)seeded by BeginTask.
+  FWorkerNet := pMetaNN.Clone();
+end;
+
+destructor TNNetReptileMetaTrainer.Destroy;
+begin
+  FWorkerNet.Free;
+  inherited Destroy;
+end;
+
+function TNNetReptileMetaTrainer.BeginTask: TNNet;
+begin
+  // Seed phi from theta. CopyWeights (not LoadFromFile) keeps the worker's layer
+  // refs live so the caller can run inner-loop SGD on the returned net directly.
+  FWorkerNet.CopyWeights(FMetaNet);
+  Result := FWorkerNet;
+end;
+
+procedure TNNetReptileMetaTrainer.MergeTask;
+begin
+  // theta := theta + eps*(phi - theta) = (1-eps)*theta + eps*phi
+  // eps=0 -> theta unchanged; eps=1 -> theta := phi (pure copy).
+  FMetaNet.MulMulAddWeights(1 - FEpsilon, FEpsilon, FWorkerNet);
+end;
+
+function TNNetReptileMetaTrainer.MetaNet: TNNet;
+begin
+  Result := FMetaNet;
+end;
+
+function TNNetReptileMetaTrainer.WorkerNet: TNNet;
+begin
+  Result := FWorkerNet;
 end;
 
 function TNNet.ToGraphvizDot(const GraphName: string): string;

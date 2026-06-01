@@ -68,6 +68,7 @@ You can learn more about how to build and train simple neural networks at the fo
 * [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
 * [Training a neural network to learn boolean functions AND, OR and XOR without neuralfit unit](https://sourceforge.net/p/cai/svncode/HEAD/tree/trunk/lazarus/experiments/supersimple/supersimple.lpr)
+* [Reptile first-order meta-learning: learning an initialization that adapts to a new sine-regression task in a few SGD steps](https://github.com/joaopauloschuler/neural-api/tree/master/examples/MetaLearningReptile)
 
 ### Loading and Saving Neural Networks
 Loading is very easy:
