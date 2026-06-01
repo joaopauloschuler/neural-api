@@ -7495,7 +7495,7 @@ type
       FAddSkipConnection: boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(CacheSize, TestCount, OperationCount, AddSkipConnection: integer); overload;
+      constructor Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection: integer); overload;
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -7536,7 +7536,7 @@ type
       FInDepth: integer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(CacheSize, TestCount, OperationCount, AddSkipConnection: integer); overload;
+      constructor Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection: integer); overload;
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -17780,13 +17780,13 @@ begin
   FByteLearning.BytePred.FGeneralize := True;
 end;
 
-constructor TNNetByteProcessing.Create(CacheSize, TestCount,
-  OperationCount, AddSkipConnection: integer);
+constructor TNNetByteProcessing.Create(CacheSize, NeuronCount,
+  SearchBudget, AddSkipConnection: integer);
 begin
   inherited Create;
   FStruct[0] := CacheSize;
-  FStruct[1] := TestCount;
-  FStruct[2] := OperationCount;
+  FStruct[1] := NeuronCount;
+  FStruct[2] := SearchBudget;
   FStruct[3] := AddSkipConnection;
   FAddSkipConnection := (AddSkipConnection>0);
 end;
@@ -17937,10 +17937,10 @@ begin
   FByteLearning.BytePred.FGeneralize := True;
 end;
 
-constructor TNNetPointwiseByteProcessing.Create(CacheSize, TestCount,
-  OperationCount, AddSkipConnection: integer);
+constructor TNNetPointwiseByteProcessing.Create(CacheSize, NeuronCount,
+  SearchBudget, AddSkipConnection: integer);
 begin
-  inherited Create(CacheSize, TestCount, OperationCount, AddSkipConnection);
+  inherited Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection);
   FPosInput := TNNetVolume.Create;
   FPosOutput := TNNetVolume.Create;
 end;
