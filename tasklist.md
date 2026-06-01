@@ -229,7 +229,7 @@ rather than acted on.
       sibling demo (or extend it) that runs with `MaxThreadNum := 4` twice
       and prints which weights diverge first — useful starting point for any
       future "make TNeuralFit deterministic under parallelism" work.
-- [ ] CumSumPositionEncoding follow-up: actually train a tiny position-
+- [X] CumSumPositionEncoding follow-up: actually train a tiny position-
       dependent model with and without the CumSum feature concatenated and
       chart loss delta. Forward-only demo landed; the bake-off is still open.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
