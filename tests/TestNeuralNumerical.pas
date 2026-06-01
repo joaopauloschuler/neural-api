@@ -288,6 +288,7 @@ type
     procedure TestVectorQuantizerLoadFromString;
     procedure TestVectorQuantizerCommitmentGradient;
     procedure TestVectorQuantizerCodebookGradient;
+    procedure TestMixtureOfDepthsRouterGradient;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
     procedure TestArcFaceDegenerateIsCosineSoftmax;
@@ -24069,6 +24070,121 @@ begin
     for i := 0 to cD - 1 do
       AssertEquals('VQ unchosen code delta is zero at ' + IntToStr(i),
         0.0, LVQ.Neurons[1].Delta.Raw[i], 1e-9);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+// Mixture-of-Depths router-weight gradient. The top-Capacity token selection is
+// a hard discrete choice; the router stays on the gradient path ONLY through the
+// "router weight multiplies the block output" trick. This pins that path with a
+// central-difference check: perturb a single router PointwiseConvLinear weight,
+// central-difference the scalar squared-error loss, and compare to the
+// accumulated neuron delta (the -LR * dL/dw idiom under SetBatchUpdate(True)).
+// Capacity < SeqLen, with a deterministic input chosen so the top-Capacity set
+// has a wide margin and cannot flip under the small weight perturbation.
+procedure TTestNeuralNumerical.TestMixtureOfDepthsRouterGradient;
+const
+  cSeqLen   = 4;
+  cDModel   = 3;
+  cCapacity = 2;
+  cHidden   = 4;
+  cLR       = 0.1;
+  cEps      = 1e-4;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Router: TNNetLayer;
+  i, wIdx, nW: integer;
+  NumGrad, OldW, LossP, LossM: TNeuralFloat;
+  Deltas: array of TNeuralFloat;
+
+  // PointwiseConv keeps a packed copy of its weights for the forward dot
+  // product; perturbing Neurons[0].Weights does NOT reach the forward pass
+  // until AfterWeightUpdate re-packs them. UpdateWeights triggers that re-pack,
+  // and with a zero accumulated delta (cleared just before) it does not move
+  // the weights -- so this is a pure resync of the just-perturbed weight.
+  procedure SetRouterWeight(idx: integer; value: TNeuralFloat);
+  begin
+    Router.Neurons[0].Weights.Raw[idx] := value;
+    NN.ClearDeltas();
+    Router.UpdateWeights();
+  end;
+
+  function LossAt(): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Target.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSeqLen, 1, cDModel);
+  Target := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    // Wrapped block is a shape-preserving pointwise 2-layer FFN over Depth.
+    NN.AddMixtureOfDepths(nil,
+      [ TNNetPointwiseConvReLU.Create(cHidden),
+        TNNetPointwiseConvLinear.Create(cDModel) ], cCapacity);
+    NN.SetLearningRate(cLR, 0.0);
+    NN.SetBatchUpdate(True); // accumulate deltas without applying them
+
+    // The router is the first PointwiseConvLinear (1 output) the builder added,
+    // i.e. layer index 1.  Confirm it is the single-neuron projection.
+    Router := NN.Layers[1];
+    AssertTrue('MoD router is a PointwiseConvLinear(1)',
+      (Router is TNNetPointwiseConvLinear) and (Router.Output.Depth = 1));
+
+    // Deterministic input with a wide per-token magnitude spread so the
+    // top-Capacity router selection has a clear margin and stays fixed under
+    // the small weight perturbation.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.5 + 0.2;
+    NN.Compute(Input);
+    Target.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Target.Size - 1 do
+      Target.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    // Accumulate the router weight delta from one real backward pass and snapshot
+    // it BEFORE any perturbation (the FD loop below calls ClearDeltas to resync).
+    NN.Compute(Input);
+    NN.ClearDeltas();
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Target);
+    nW := Router.Neurons[0].Weights.Size;
+    SetLength(Deltas, nW);
+    for wIdx := 0 to nW - 1 do
+      Deltas[wIdx] := Router.Neurons[0].Delta.Raw[wIdx];
+
+    // Central-difference every router weight against its accumulated delta.
+    for wIdx := 0 to nW - 1 do
+    begin
+      OldW := Router.Neurons[0].Weights.Raw[wIdx];
+      SetRouterWeight(wIdx, OldW + cEps);
+      LossP := LossAt();
+      SetRouterWeight(wIdx, OldW - cEps);
+      LossM := LossAt();
+      SetRouterWeight(wIdx, OldW);
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      // Delta follows the -LR * dL/dw accumulation idiom; a nonzero delta also
+      // proves the router carries gradient through the top-k selection.
+      AssertEquals('MoD router weight delta at ' + IntToStr(wIdx),
+        -cLR * NumGrad, Deltas[wIdx], 1e-3);
+    end;
+    AssertTrue('MoD router carries a nonzero gradient (router on the path)',
+      Abs(Deltas[0]) + Abs(Deltas[1]) + Abs(Deltas[2]) > 1e-6);
   finally
     NN.Free;
     Input.Free;

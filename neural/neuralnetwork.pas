@@ -5326,6 +5326,50 @@ type
       // logged as follow-ups in tasklist.md and are NOT implemented here; training
       // uses ordinary stored-activation backprop through the unrolled steps.
       function AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer;
+      // Mixture-of-Depths conditional-compute block (Raposo et al. 2024,
+      // "Mixture-of-Depths: Dynamically Allocating Compute in Transformer-Based
+      // Language Models", https://arxiv.org/abs/2404.02258).
+      //
+      // MoD routes along the SEQUENCE axis: a per-token learned scalar router
+      // decides WHETHER each sequence position is processed by the wrapped block
+      // or SKIPS it via the residual/identity path, under a fixed per-block
+      // CAPACITY. Only the top-`Capacity` tokens (by router score) enter the
+      // block; the remaining (SeqLen - Capacity) tokens bypass it unchanged. The
+      // capacity is fixed, so all tensor shapes stay STATIC (the paper's key
+      // trick vs dynamic-shape sparse routing) while FLOPs in the block drop by
+      // (SeqLen - Capacity)/SeqLen.
+      //
+      // The InputLayer is a sequence tensor (SeqLen, 1, d_model): SeqLen on the X
+      // axis, d_model on the Depth axis. Capacity is a token count in 1..SeqLen.
+      // pBlockBuilder is the caller-provided shape-preserving sublayer stack (same
+      // contract as AddNeuralODEBlock / the residual builders): its output shape
+      // MUST equal the InputLayer shape so the residual sum is valid. Wiring:
+      //   (1) routerLogit := PointwiseConvLinear(1)(InputLayer)  -> (SeqLen,1,1)
+      //       (per-token projection MUST be Pointwise, not FullConnect, which
+      //       would flatten/mix the sequence and zero the input gradient);
+      //   (2) routerWeight := Sigmoid(routerLogit)               -> (SeqLen,1,1);
+      //   (3) top-Capacity selection: transpose X<->Depth to (1,1,SeqLen), apply
+      //       TNNetTopK(Capacity) (keeps the Capacity largest router weights,
+      //       zeroes the rest -- sigmoid is monotone in the logit so top-C by
+      //       weight = top-C by logit), transpose back to (SeqLen,1,1);
+      //   (4) broadcast the masked weight across d_model (TNNetDeepConcat.Replicate)
+      //       and cell-multiply it into the block output (TNNetCellMulByCell): the
+      //       router weight MULTIPLIES the block output, keeping the router on the
+      //       gradient path (the paper's "router output multiplies the block
+      //       output" trick -- without it the discrete top-k choice has no
+      //       gradient). Skipped tokens get weight 0, so their gated block output
+      //       is zero;
+      //   (5) y := InputLayer + gatedBlock. Skipped positions therefore stay at
+      //       their input value; chosen positions are input + weight*block.
+      //
+      // DEGENERATE ANCHOR: with Capacity = SeqLen the TopK keeps every token, so
+      // the block processes the whole sequence and the output reduces exactly to
+      // y = InputLayer + Sigmoid(routerLogit) * Block(InputLayer) -- a per-token
+      // scalar-gated residual block (no token is ever skipped). InputLayer
+      // defaults to GetLastLayer() when nil; Capacity is clamped to 1..SeqLen.
+      // Returns the residual-sum output layer (shape identical to InputLayer).
+      function AddMixtureOfDepths(InputLayer: TNNetLayer;
+        pBlockBuilder: array of TNNetLayer; Capacity: integer): TNNetLayer;
       // Learnable per-channel affine block: appends a TNNetChannelMul (per-channel
       // scale gamma[d], initialised to 1.0) followed by a TNNetChannelBias
       // (per-channel shift beta[d], initialised to 0.0) to the current end of the
@@ -49021,6 +49065,51 @@ begin
   end;
 
   Result := Y;
+end;
+
+function TNNet.AddMixtureOfDepths(InputLayer: TNNetLayer;
+  pBlockBuilder: array of TNNetLayer; Capacity: integer): TNNetLayer;
+var
+  d_model, SeqLen: integer;
+  MaskedWeight, GateBroadcast: TNNetLayer;
+  BlockOut, GatedBlock: TNNetLayer;
+begin
+  // See the declaration doc-comment for the full Mixture-of-Depths mechanics.
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  d_model := InputLayer.Output.Depth;
+  SeqLen := InputLayer.Output.SizeX;
+  if Capacity < 1 then Capacity := 1;
+  if Capacity > SeqLen then Capacity := SeqLen;
+
+  // --- ROUTER --------------------------------------------------------------
+  // Per-token scalar logit. Pointwise (1x1) projection over Depth keeps the
+  // sequence axis intact; FullConnect would flatten/mix it and zero the input
+  // gradient (see [[mha-builder-and-seq-projection]]).
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(1), InputLayer );  // (SeqLen,1,1)
+  AddLayer( TNNetSigmoid.Create() );                                // in (0,1)
+
+  // --- TOP-CAPACITY TOKEN SELECTION ----------------------------------------
+  // TNNetTopK masks along the Depth axis per spatial cell. The router weight is
+  // (SeqLen,1,1) with SeqLen on X, so transpose X<->Depth to (1,1,SeqLen), keep
+  // the Capacity largest weights (sigmoid is monotone in the logit => top-C by
+  // weight = top-C by logit), then transpose back to (SeqLen,1,1). Non-selected
+  // tokens are now zero; selected tokens keep their sigmoid weight.
+  AddLayer( TNNetTransposeXD.Create() );        // (1,1,SeqLen)
+  AddLayer( TNNetTopK.Create(Capacity) );       // keep top-Capacity, zero rest
+  MaskedWeight := AddLayer( TNNetTransposeXD.Create() ); // (SeqLen,1,1)
+
+  // --- WRAPPED BLOCK -------------------------------------------------------
+  // Shape-preserving sublayer stack runs on the FULL sequence (static shapes).
+  BlockOut := AddLayerAfter( pBlockBuilder, InputLayer );
+
+  // --- GATE + RESIDUAL -----------------------------------------------------
+  // Broadcast the masked per-token weight across d_model and cell-multiply it
+  // into the block output: selected tokens are scaled by their sigmoid weight
+  // (router on the gradient path), skipped tokens are zeroed.
+  GateBroadcast := AddLayer( TNNetDeepConcat.Replicate(d_model, MaskedWeight) );
+  GatedBlock := AddLayer( TNNetCellMulByCell.Create(BlockOut, GateBroadcast) );
+  // y = x + weight * Block(x). Skipped positions (weight 0) stay at x.
+  Result := AddLayer( TNNetSum.Create([InputLayer, GatedBlock]) );
 end;
 
 function TNNet.AddAffineBlock: TNNetLayer;

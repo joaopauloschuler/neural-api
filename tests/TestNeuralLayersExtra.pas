@@ -123,6 +123,7 @@ type
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
+    procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
   end;
 
@@ -5041,6 +5042,105 @@ begin
   Output.Free;
   Target.Free;
   NN.Free;
+end;
+
+// TNNet.AddMixtureOfDepths conditional-compute block. Asserts:
+//  1) the block is shape-preserving (drop-in residual over the sequence);
+//  2) DEGENERATE ANCHOR: with Capacity = SeqLen the top-K keeps every token, so
+//     the wrapper reduces EXACTLY to a per-token scalar-gated residual block
+//     y = x + Sigmoid(router)*Block(x). We build a reference net with the SAME
+//     ordered layers but the TopK replaced by a plain TNNetIdentity (which is
+//     exactly what TopK does when K >= Depth: it early-exits as a passthrough),
+//     copy the MoD weights into it, and assert bit-for-bit equal output;
+//  3) the wrapper wiring round-trips through SaveToString -> LoadFromString and
+//     reproduces the output exactly.
+procedure TTestNeuralLayersExtra.TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
+const
+  cSeqLen = 5;
+  cDModel = 4;
+  cHidden = 6;
+
+  // Wire the SAME layer sequence the AddMixtureOfDepths builder uses, but with
+  // the TopK swapped for an identity passthrough. With Capacity = SeqLen the
+  // real TopK is itself an identity passthrough, so this is an exact reference.
+  procedure BuildReference(ANN: TNNet);
+  var
+    Inp, Masked, Block, Gate, Gated: TNNetLayer;
+  begin
+    Inp := ANN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    ANN.AddLayerAfter(TNNetPointwiseConvLinear.Create(1), Inp);
+    ANN.AddLayer(TNNetSigmoid.Create());
+    ANN.AddLayer(TNNetTransposeXD.Create());
+    ANN.AddLayer(TNNetIdentity.Create()); // stands in for TopK(Capacity=SeqLen)
+    Masked := ANN.AddLayer(TNNetTransposeXD.Create());
+    ANN.AddLayerAfter(TNNetPointwiseConvReLU.Create(cHidden), Inp);
+    Block := ANN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    Gate := ANN.AddLayer(TNNetDeepConcat.Replicate(cDModel, Masked));
+    Gated := ANN.AddLayer(TNNetCellMulByCell.Create(Block, Gate));
+    ANN.AddLayer(TNNetSum.Create([Inp, Gated]));
+  end;
+
+var
+  NN, Ref: TNNet;
+  Saved: string;
+  NN2: TNNet;
+  Input: TNNetVolume;
+  MoDOut: TNNetLayer;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSeqLen, 1, cDModel);
+  try
+    NN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    MoDOut := NN.AddMixtureOfDepths(nil,
+      [ TNNetPointwiseConvReLU.Create(cHidden),
+        TNNetPointwiseConvLinear.Create(cDModel) ], cSeqLen);
+
+    // 1) Shape-preserving.
+    AssertEquals('MoD output SizeX preserved', cSeqLen, MoDOut.Output.SizeX);
+    AssertEquals('MoD output SizeY preserved', 1, MoDOut.Output.SizeY);
+    AssertEquals('MoD output depth matches d_model', cDModel, MoDOut.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.61) * 1.3 + 0.4;
+
+    // 2) Degenerate equality anchor (Capacity = SeqLen).
+    Ref := TNNet.Create();
+    try
+      BuildReference(Ref);
+      AssertEquals('MoD reference has same layer count',
+        NN.CountLayers(), Ref.CountLayers());
+      Ref.CopyWeights(NN); // copy router + block weights layer-by-layer
+      NN.Compute(Input);
+      Ref.Compute(Input);
+      AssertEquals('MoD degenerate output size matches reference',
+        NN.GetLastLayer.Output.Size, Ref.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MoD Capacity=SeqLen == gated residual block at ' + IntToStr(i),
+          Ref.GetLastLayer.Output.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      Ref.Free;
+    end;
+
+    // 3) SaveToString -> LoadFromString round-trip reproduces the output.
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('MoD round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MoD round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 // TNNetDropBlock (Ghiasi et al. 2018) structured spatial dropout. Asserts:

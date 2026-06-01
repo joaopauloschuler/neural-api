@@ -552,58 +552,6 @@ rather than acted on.
       onto one expert. Needs a top-k masking/dispatch mechanism on the gate plus
       an aux-loss head; left out of v1 to avoid shipping an untested router. (The
       TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
-- [ ] Mixture-of-Depths conditional-compute block (`TNNet.AddMixtureOfDepths` +
-      `examples/MixtureOfDepths/`) — reproduce the Raposo et al. 2024
-      "Mixture-of-Depths: Dynamically Allocating Compute in Transformer-Based
-      Language Models" idea on a TINY pure-CPU next-token target. MoD routes a
-      DIFFERENT axis than everything in tree: a per-token learned scalar router
-      decides WHETHER each sequence position is PROCESSED by a given block or
-      SKIPS it via the identity/residual path, under a fixed per-block CAPACITY
-      (only the top-C of SeqLen tokens by router score enter the block; the rest
-      bypass it unchanged). Compute is thus allocated dynamically per-token-
-      per-layer, and total FLOPs drop by `(SeqLen - C)/SeqLen` per wrapped block
-      at a STATIC, known cost (capacity is fixed, so the tensor shapes stay
-      static — the paper's key trick vs dynamic-shape sparse routing). Scope a
-      `TNNet.AddMixtureOfDepths(InputLayer, BlockBuilder, Capacity)` builder that:
-      (1) computes a per-token router logit (PointwiseConvLinear over Depth ->
-      (SeqLen,1,1), per the [[mha-builder-and-seq-projection]] rule that
-      per-token projection must be Pointwise, not FullConnect); (2) selects the
-      top-`Capacity` tokens (reuse the landed `TNNetTopK` masking primitive) and
-      multiplies the chosen tokens by the router's sigmoid/softmax WEIGHT so the
-      router stays on the gradient path (the paper's "router output multiplies
-      the block output" trick — without it the discrete top-k choice has no
-      gradient); (3) runs the wrapped shape-preserving block ONLY on selected
-      positions and adds it residually, leaving skipped positions at their input
-      value. Headline payoffs, both visible on the terminal and distinct from the
-      suite: (a) a FLOP/accuracy trade — sweep `Capacity in {SeqLen, SeqLen/2,
-      SeqLen/4}` on a tiny next-token task and chart final loss vs
-      processed-token fraction, showing graceful degradation as compute is cut
-      (the MoD selling point); (b) an INTERPRETABILITY view — print which token
-      POSITIONS the router consistently chooses to spend compute on, showing it
-      learns to skip "easy"/predictable positions. Built-in correctness anchor:
-      with `Capacity = SeqLen` the block is forced to process every token and the
-      net must be bit-for-bit equal to the same block wired WITHOUT the MoD
-      wrapper (router weight folds to a learned scalar gate per token) — pin that
-      degenerate case exactly, plus the LoadFromString round-trip of the wrapper
-      wiring, following the [[introspection-report-pattern]] test recipe.
-      Feasibility risks to settle honestly in v1, in the "what did NOT fit the
-      budget" style the [[Grokking]] entry uses: the top-k selection is a hard
-      discrete choice, so verify the router-weight-multiply path actually carries
-      gradient under the `SetBatchUpdate(True)` weight-accumulation idiom from
-      [[manual-gradient-and-snapshot-gotchas]] — pin it with a finite-difference
-      check that perturbs a router weight and central-differences the loss
-      against the scattered router delta (mirror the TNNetVectorQuantizer
-      codebook-delta test). Keep SeqLen/Depth tiny so the sweep fits the <5-min
-      pure-CPU budget. Genuinely DISTINCT from the open Hard-top-k MoE entry
-      above (MoE routes among N parallel EXPERT weight sets — "which expert
-      processes this token"; MoD routes a SINGLE block along the SEQUENCE axis —
-      "is this token processed at all", a conditional-compute / FLOP-saving
-      mechanism, not expert specialization), from `EarlyExitNetwork` (one whole
-      SAMPLE exits the net early at a fixed depth; MoD skips INDIVIDUAL TOKENS at
-      INDIVIDUAL blocks while the sample continues to the end), from
-      `TNNetDropPath` (STOCHASTIC whole-block drop, not a LEARNED capacity-limited
-      per-token route), and from the soft `AddMixtureOfExperts` (dense blend of
-      all experts, no token is ever skipped).
 #### Normalization primitives
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
       projection* (renormalize the previous layer's weights after each update,
