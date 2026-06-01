@@ -281,9 +281,6 @@ rather than acted on.
       sibling demo (or extend it) that runs with `MaxThreadNum := 4` twice
       and prints which weights diverge first — useful starting point for any
       future "make TNeuralFit deterministic under parallelism" work.
-- [X] CumSumPositionEncoding follow-up: actually train a tiny position-
-      dependent model with and without the CumSum feature concatenated and
-      chart loss delta. Forward-only demo landed; the bake-off is still open.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 ### Added ideas
@@ -408,17 +405,6 @@ rather than acted on.
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
       any future mixed-precision work.
-- [X] SoftCapping logit-stability micro-experiment: train a tiny classifier
-      with and without a `TNNetSoftCapping(c)` before the final softmax,
-      and print the rate of NaN/overflow events under an aggressive LR.
-      DONE in examples/SoftCappingStability/. FINDING for downstream tasks
-      (Causal-mask + SoftCapping study, numerical-precision study): the
-      in-tree SoftMax is internally hardened (subtracts the row max + clamps
-      range) and the cross-entropy gradient is bounded, so a literal float32
-      `Inf` essentially never materialises even at LR=5 (uncapped logits
-      reached ~1e4 but stayed finite). Count the physically-meaningful blow-up
-      instead — a logit past the exp-overflow point `|logit| > 88.7` — not raw
-      IsInfinite, or the contrast looks empty.
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
 - [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
@@ -446,14 +432,6 @@ rather than acted on.
 - [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
       gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
       max-error vs eps.
-- [X] Random-label memorization STRETCH follow-up: the landed
-      examples/RandomLabelMemorization/ does the binary true-vs-fully-shuffled
-      contrast; add the label-corruption-fraction sweep `p ∈ {0.0, 0.25, 0.5,
-      1.0}` and chart epochs-to-fit-train (rises with p) against the test gap
-      (widens with p) — the smooth interpolation between "real structure" and
-      "pure memorization". Fork the landed demo's net/data/training loop and add
-      a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
-      so 4 corruption levels still fit the <5-min budget.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
