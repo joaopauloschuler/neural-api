@@ -127,9 +127,12 @@ begin
   Fit := TNeuralFit.Create;
   try
     // Test clip properties
+    AssertEquals('ClipValue should default to 0.0 (disabled)', 0.0, Fit.ClipValue, 0.0);
     Fit.ClipDelta := 1.0;
     AssertEquals('ClipDelta should be 1.0', 1.0, Fit.ClipDelta, 0.0001);
-    
+    Fit.ClipValue := 0.5;
+    AssertEquals('ClipValue should be 0.5', 0.5, Fit.ClipValue, 0.0001);
+
     Fit.L2Decay := 0.0001;
     AssertEquals('L2Decay should be 0.0001', 0.0001, Fit.L2Decay, 0.00001);
   finally

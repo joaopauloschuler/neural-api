@@ -55,6 +55,10 @@ type
     procedure TestReptileEpsOneCopiesPhi;
     procedure TestReptileInterpolationExact;
     procedure TestReptileMetaInitBeatsRandom;
+
+    // Element-wise gradient clipping (ClipValue / ClipWeightGradientsToValue)
+    procedure TestClipValueDefaultIdentical;
+    procedure TestClipValueBoundsGradients;
   end;
 
 implementation
@@ -1315,6 +1319,139 @@ begin
     Trainer.Free;
     Meta.Free;
     RandInit.Free;
+  end;
+end;
+
+// ----------------------------------------------------------------------------
+// Element-wise gradient clipping (ClipValue / ClipWeightGradientsToValue)
+// ----------------------------------------------------------------------------
+
+// Returns the largest absolute weight-gradient (Delta) element across all
+// trainable neurons of NN. Only the public per-weight Delta tensors are
+// inspected (the bias delta is not exposed publicly).
+function MaxAbsGradient(NN: TNNet): TNeuralFloat;
+var
+  L, N, W: integer;
+  V: TNeuralFloat;
+begin
+  Result := 0;
+  for L := 0 to NN.GetLastLayerIdx() do
+    for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+      for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+      begin
+        V := Abs(NN.Layers[L].Neurons[N].Delta.Raw[W]);
+        if V > Result then Result := V;
+      end;
+end;
+
+// (a) ClipWeightGradientsToValue with a non-positive value is a no-op, so a
+// training run with ClipValue=0 must be byte-for-byte identical to one that
+// never calls the clip at all.
+procedure TTestNeuralTraining.TestClipValueDefaultIdentical;
+var
+  NNa, NNb: TNNet;
+  Input, Desired: TNNetVolume;
+  I: integer;
+begin
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+
+  RandSeed := 424242;
+  NNa := TNNet.Create();
+  NNa.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  NNa.SetLearningRate(0.1, 0.9);
+
+  RandSeed := 424242;
+  NNb := TNNet.Create();
+  NNb.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  NNb.SetLearningRate(0.1, 0.9);
+
+  try
+    Input.Fill(0.5);
+    Desired.Fill(0.8);
+    for I := 1 to 25 do
+    begin
+      // Run A: never touches the clip.
+      NNa.Compute(Input);
+      NNa.Backpropagate(Desired);
+      NNa.UpdateWeights();
+
+      // Run B: applies the disabled clip (ClipValue=0) before the same update.
+      NNb.Compute(Input);
+      NNb.Backpropagate(Desired);
+      NNb.ClipWeightGradientsToValue(0.0); // disabled -> no-op
+      NNb.UpdateWeights();
+    end;
+
+    // Identical seeds + identical data + disabled clip => identical weights.
+    AssertEquals('ClipValue=0 leaves training byte-for-byte identical', 0.0,
+      NetWeightDiff(NNa, NNb), 0.0);
+  finally
+    NNa.Free;
+    NNb.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// (b) With large gradients, ClipWeightGradientsToValue must bound every
+// gradient element to [-v, +v]. We also confirm that without clipping the
+// gradients genuinely exceed that bound (so the test is meaningful).
+procedure TTestNeuralTraining.TestClipValueBoundsGradients;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  PreClipMax, PostClipMax, ClipV: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  NN.SetLearningRate(0.1, 0.0);
+  // Batch mode keeps the accumulated per-weight gradient (Delta) alive after
+  // Backpropagate; in per-sample mode Delta is consumed/zeroed by the update.
+  NN.SetBatchUpdate(True);
+
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  try
+    // Large inputs and a far-away target produce sizeable gradients.
+    Input.Fill(5.0);
+    Desired.Fill(50.0);
+
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    PreClipMax := MaxAbsGradient(NN);
+    AssertTrue('Test setup should produce non-trivial gradients',
+      PreClipMax > 0.0);
+
+    // Self-calibrating clip bound strictly below the largest gradient, so the
+    // clip provably has work to do and the post-clip bound is meaningful.
+    ClipV := PreClipMax * 0.5;
+    NN.ClipWeightGradientsToValue(ClipV);
+    PostClipMax := MaxAbsGradient(NN);
+
+    AssertTrue('Pre-clip gradients must exceed the clip bound (clip is effective)',
+      PreClipMax > ClipV);
+    AssertTrue('All gradient magnitudes must be <= ClipValue after clipping',
+      PostClipMax <= ClipV + 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

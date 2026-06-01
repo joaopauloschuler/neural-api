@@ -258,6 +258,8 @@ type
       function MulWeights(V:TNeuralFloat): TNNetLayer;
       procedure MulInertia(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure MulDeltas(V:TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      // Clamps every weight (and bias) gradient element to [-MaxAbsValue, MaxAbsValue].
+      procedure ClipDeltasToValue(MaxAbsValue: TNeuralFloat);
       // Clear all biases from all neurons in the layer.
       procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
@@ -5667,6 +5669,7 @@ type
       function NormalizeMinAbsoluteDeltaPerLayer(MinDelta: TNeuralFloat = 0.001): TNeuralFloat;
       function NormalizeMinMaxAbsoluteDeltaPerLayer(MinDelta, MaxDelta: TNeuralFloat): TNeuralFloat;
       function NormalizeNormPerLayer(MaxNorm: TNeuralFloat): TNeuralFloat;
+      procedure ClipWeightGradientsToValue(MaxAbsValue: TNeuralFloat);
       procedure NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta: TNeuralFloat);
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
@@ -50227,6 +50230,24 @@ begin
   end;
 end;
 
+procedure TNNet.ClipWeightGradientsToValue(MaxAbsValue: TNeuralFloat);
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  if MaxAbsValue <= 0 then exit;
+  LastLayerIdx := GetLastLayerIdx();
+  if FLayers.Count > 0 then
+  begin
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      if not(FLayers[LayerCnt].LinkedNeurons) and (FLayers[LayerCnt].FCanNormalizeDelta) then
+      begin
+        FLayers[LayerCnt].ClipDeltasToValue(MaxAbsValue);
+      end;
+    end;
+  end;
+end;
+
 procedure TNNet.NormalizeMaxAbsoluteDeltaPerNeuron(MaxDelta: TNeuralFloat);
 var
   LayerCnt, LastLayerIdx: integer;
@@ -52104,6 +52125,34 @@ begin
     begin
       FNeurons[Cnt].Delta.Mul(V);
       FNeurons[Cnt].FBiasDelta := FNeurons[Cnt].FBiasDelta * V;
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.ClipDeltasToValue(MaxAbsValue: TNeuralFloat);
+var
+  Cnt, ElemCnt, MaxElem: integer;
+  V: TNeuralFloat;
+begin
+  if MaxAbsValue <= 0 then exit;
+  if FNeurons.Count > 0 then
+  begin
+    for Cnt := 0 to FNeurons.Count-1 do
+    begin
+      MaxElem := FNeurons[Cnt].Delta.Size - 1;
+      for ElemCnt := 0 to MaxElem do
+      begin
+        V := FNeurons[Cnt].Delta.FData[ElemCnt];
+        if V > MaxAbsValue then
+          FNeurons[Cnt].Delta.FData[ElemCnt] := MaxAbsValue
+        else if V < -MaxAbsValue then
+          FNeurons[Cnt].Delta.FData[ElemCnt] := -MaxAbsValue;
+      end;
+      if FNeurons[Cnt].FBiasDelta > MaxAbsValue then
+        FNeurons[Cnt].FBiasDelta := MaxAbsValue
+      else if FNeurons[Cnt].FBiasDelta < -MaxAbsValue then
+        FNeurons[Cnt].FBiasDelta := -MaxAbsValue;
     end;
   end;
   AfterWeightUpdate();

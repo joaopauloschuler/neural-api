@@ -124,6 +124,7 @@ type
       FFileNameBase: string;
       FClipDelta: single;
       FClipNorm: single;
+      FClipValue: single;
       FNaNGuard: boolean;
       FTargetAccuracy: single;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
@@ -162,6 +163,9 @@ type
       // This is useful for This is useful for making SGD numerically stable.
       property ClipDelta: single read FClipDelta write SetClipDelta;
       property ClipNorm: single read FClipNorm write SetClipNorm;
+      /// ClipValue clamps every weight gradient element-wise to [-ClipValue, +ClipValue]
+      // before the optimizer step. 0 (default) disables it. Independent of ClipNorm.
+      property ClipValue: single read FClipValue write FClipValue;
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentStep: integer read FCurrentStep;
       property CurrentLearningRate: single read FCurrentLearningRate;
@@ -943,6 +947,7 @@ begin
     MessageProc(
       'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
       ' Clip norm:' + FloatToStrF(FClipNorm,ffFixed,8,6) +
+      ' Clip value:' + FloatToStrF(FClipValue,ffFixed,8,6) +
       ' Clip delta:' + FloatToStrF(FClipDelta,ffFixed,8,6) +
       ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
@@ -1884,6 +1889,8 @@ procedure TNeuralOptimizer.ForceDeltaLimists();
 var
   MaxDelta: TNeuralFloat;
 begin
+  if FFit.ClipValue > 0 then
+    FNN.ClipWeightGradientsToValue(FFit.ClipValue);
   if FFit.ClipNorm > 0 then
   begin
     FNN.NormalizeNormPerLayer(FFit.ClipNorm);
@@ -1999,6 +2006,7 @@ begin
   FInertia := 0.9;
   FClipDelta := 0.0;
   FClipNorm := 1.0;
+  FClipValue := 0.0;
   FNaNGuard := false;
   FFileNameBase := 'autosave';
   FL2Decay := 0.0000001;
@@ -2127,6 +2135,7 @@ procedure TNeuralFitBase.SetClipDelta(Value: TNeuralFloat);
 begin
   FClipDelta := Value;
   FClipNorm  := 0.0;
+  FClipValue := 0.0;
 end;
 
 procedure TNeuralFitBase.SetClipNorm(Value: TNeuralFloat);
@@ -2295,6 +2304,7 @@ begin
     MessageProc(
       'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
       ' Clip norm:' + FloatToStrF(FClipNorm,ffFixed,8,6) +
+      ' Clip value:' + FloatToStrF(FClipValue,ffFixed,8,6) +
       ' Clip delta:' + FloatToStrF(FClipDelta,ffFixed,8,6) +
       ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
