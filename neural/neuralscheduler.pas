@@ -34,6 +34,7 @@ You should have received a copy of the GNU General Public License along
 with this program; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+Coded by Claude (AI).
 }
 unit neuralscheduler;
 
@@ -48,6 +49,7 @@ uses
 
 type
   { TNeuralLRScheduler: abstract base for all LR schedulers. }
+  // Coded by Claude (AI).
   TNeuralLRScheduler = class(TObject)
   public
     { Returns the learning rate for the given training position.
@@ -56,6 +58,7 @@ type
   end;
 
   { TStepLR: step decay. lr = baseLR * gamma^floor(t/stepSize). }
+  // Coded by Claude (AI).
   TStepLR = class(TNeuralLRScheduler)
   private
     FBaseLR: TNeuralFloat;
@@ -68,6 +71,7 @@ type
 
   { TCosineAnnealingLR: cosine anneal from etaMax (t=0) to etaMin (t=T).
     lr = etaMin + (etaMax-etaMin)*0.5*(1+cos(pi*t/T)). }
+  // Coded by Claude (AI).
   TCosineAnnealingLR = class(TNeuralLRScheduler)
   private
     FEtaMax: TNeuralFloat;
@@ -80,6 +84,7 @@ type
 
   { TWarmupCosineLR: linear warmup from 0 to etaMax over [0,warmup), then
     cosine anneal from etaMax to etaMin over [warmup,T]. }
+  // Coded by Claude (AI).
   TWarmupCosineLR = class(TNeuralLRScheduler)
   private
     FEtaMax: TNeuralFloat;
@@ -93,6 +98,7 @@ type
 
   { TPolyLR: polynomial decay. lr = baseLR * (1 - t/T)^power, clamped to 0
     for t >= T. }
+  // Coded by Claude (AI).
   TPolyLR = class(TNeuralLRScheduler)
   private
     FBaseLR: TNeuralFloat;

@@ -555,6 +555,7 @@ type
   // Typical caller usage:
   //   Penalty.Apply(Logits); tok := Sampler.GetToken(Logits);
   //   Penalty.RegisterToken(tok);
+  // Coded by Claude (AI).
   TNNetTokenHistoryPenalty = class(TObject)
     protected
       FRepetition: TNeuralFloat;
