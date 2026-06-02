@@ -22,6 +22,21 @@ Rules:
 - Human-authored hand-coding of new classes is no longer the norm here;
   new classes are Claude-authored and should be marked as such.
 
+### Example programs (`examples/**/*.lpr`)
+
+Every example program newly added by Claude (i.e. not present in the
+`../neural-master` baseline) carries the attribution `Coded by Claude (AI).`
+inserted with a blank-line separator immediately **before the closing `*)`**
+of the file's header `(* ... *)` license comment block.
+
+Rules:
+- One attribution per file, inside the header comment block (so it never
+  affects compilation).
+- Applies only to genuinely **new** example `.lpr` files; skip stray
+  `backup/` copies. Identify "new" by diffing `find examples -name '*.lpr'`
+  against the `../neural-master` baseline.
+- Audit with `grep -rl "Coded by Claude" examples --include='*.lpr' | wc -l`.
+
 ## DO NOT REINTRODUCE — removed by intent
 
 The following layer types were intentionally removed because they
