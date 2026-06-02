@@ -53,3 +53,8 @@ jobs:
       run: |
         cd bin
         ./RunTests --all --format=plain
+
+    - name: Build Examples
+      env:
+        LAZUTILS_PATH: ${{ steps.lazutils.outputs.path }}
+      run: bash scripts/BuildExamples.sh
