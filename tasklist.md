@@ -211,6 +211,19 @@ rather than acted on.
       (shared-weight time/space recurrence, weights still owned by the layer).
 
 ## Infrastructure / dev experience
+- [ ] **Gradient-verification coverage audit.** For a *scientific-discovery*
+      library the cardinal sin is a silently-wrong result, so every layer with
+      a backward pass must have a numerical-gradient test proving Compute's
+      analytic gradient matches a finite-difference estimate. Task: enumerate
+      all `TNNet*` layers (esp. the 165 Claude-added ones — see the Authorship
+      convention section), cross-reference against the cases in
+      `tests/TestNeuralNumerical.pas`, and produce a coverage list of which
+      layers are gradient-verified vs. compile-only. Then backfill tests for
+      the gaps, prioritising layers with hand-written backward passes (loss
+      heads, attention variants, sparsemax, the SSM) over thin activation
+      subclasses. Treat "has a numerical-gradient test" as the definition of
+      done for any future layer. Watch the shared-RNG ordering sensitivity in
+      that test unit (reseed `RandSeed := 424242`, don't loosen tolerances).
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] Model zoo loader that pulls pre-trained weights from the companion repo
