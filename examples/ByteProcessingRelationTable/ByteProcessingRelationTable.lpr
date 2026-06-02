@@ -36,6 +36,8 @@ rule would instead get stuck near f=0.5 -- the symbolic signature of an
 unresolvable collision.
 
 Designed to finish instantly on a single CPU.
+
+Coded by Claude (AI).
 *)
 {$mode objfpc}{$H+}
 uses SysUtils, neuralbyteprediction;

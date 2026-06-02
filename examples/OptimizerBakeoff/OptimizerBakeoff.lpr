@@ -34,6 +34,8 @@ This is a CPU-only, single-threaded demo; it finishes in a few seconds.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 Released under the GNU General Public License v2 or later.
+
+Coded by Claude (AI).
 *)
 
 {$mode objfpc}{$H+}

@@ -8,6 +8,8 @@ epochs. The point is to exercise AddSEBlock end-to-end (forward + backward
 through the channel gating) rather than to reach a competitive accuracy.
 
 License: LGPL with linking exception (same as the rest of neural-api).
+
+Coded by Claude (AI).
 *)
 
 {$mode objfpc}{$H+}
