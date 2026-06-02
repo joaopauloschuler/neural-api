@@ -1,5 +1,27 @@
 # Task List — Feature & Enhancement Ideas
 
+## Authorship convention (AI-coded classes)
+
+Every class that was newly added to `neural/neuralnetwork.pas` by Claude
+(i.e. not present in the upstream `../neural-master` baseline) carries an
+attribution comment as the **last comment line directly above the class
+declaration**, written exactly as:
+
+```
+  // Coded by Claude (AI).
+```
+
+Rules:
+- One attribution per **class** (not per method), placed immediately above
+  the `TNNet... = class(...)` line, after any `///`/`//` doc comment.
+- Use the literal text `// Coded by Claude (AI).` (plain `//`, not `///`,
+  trailing period) so it can be audited with
+  `grep -c "Coded by Claude" neural/neuralnetwork.pas`.
+- Applies only to genuinely **new** classes. Do NOT retrofit it onto
+  pre-existing upstream classes that were merely edited.
+- Human-authored hand-coding of new classes is no longer the norm here;
+  new classes are Claude-authored and should be marked as such.
+
 ## DO NOT REINTRODUCE — removed by intent
 
 The following layer types were intentionally removed because they
