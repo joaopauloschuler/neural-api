@@ -47,7 +47,7 @@ const
   TARGET_SCALE = 200.0;
   // Convergence threshold is on MSE in the ORIGINAL target scale (hypotenuse units, ~0..141).
   CONVERGE_THRESHOLD = 5.0;
-  TRAIN_SIZE         = 1000;
+  TRAIN_SIZE         = 10000;
   VAL_SIZE           = 200;
   TEST_SIZE          = 200;
   HIDDEN_UNITS       = 32;
