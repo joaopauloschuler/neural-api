@@ -2085,6 +2085,45 @@ type
     property CausalMask: boolean read FCausal;
   end;
 
+  /// Cross-Attention (single head, parameter-free) with SEPARATE query and
+  // key/value sources that may live on DIFFERENT sequence grids -- the
+  // building block of encoder-decoder attention. Unlike
+  // TNNetScaledDotProductAttention (which packs Q|K|V into ONE tensor and can
+  // therefore only ever form a SQUARE SeqLen x SeqLen score matrix), this layer
+  // reads queries from its previous layer and keys+values from an EXPLICIT
+  // second source, so the two sequence lengths are free to differ:
+  //   PrevLayer      (queries): SizeY=1, SizeX=QSeqLen,  Depth=d_k
+  //   KeyValueSource (K then V): SizeY=1, SizeX=KVSeqLen, Depth=2*d_k
+  // For every query position i (0..QSeqLen-1) over every key j (0..KVSeqLen-1):
+  //   scores[i,j] = dot(Q[i], K[j]) / sqrt(d_k)
+  //   (if CausalMask: scores[i,j] := -1e9 for j > i)
+  //   attn[i,:]   = softmax(scores[i,:])
+  //   out[i]      = sum_j attn[i,j] * V[j]
+  // Output shape: QSeqLen x 1 x d_k (lives on the QUERY grid). No trainable
+  // parameters. The Key|Value source layer index is serialized (like
+  // TNNetConcat) so the layer round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetCrossAttention = class(TNNetLayer)
+  private
+    FDk: integer;
+    FInvSqrtDk: TNeuralFloat;
+    FCausal: boolean;
+    FKVLayer: TNNetLayer; // explicit Key|Value source (width 2*d_k)
+    FAttn: TNNetVolume;   // attention weights [X=key j, Y=query i, 1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; CausalMask: boolean;
+      KeyValueSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property AttentionWeights: TNNetVolume read FAttn;
+    property Dk: integer read FDk;
+    property CausalMask: boolean read FCausal;
+    property KeyValueSource: TNNetLayer read FKVLayer;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -12979,6 +13018,189 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCrossAttention }
+
+constructor TNNetCrossAttention.Create(d_k: integer; CausalMask: boolean;
+  KeyValueSource: TNNetLayer);
+begin
+  inherited Create();
+  FDk := d_k;
+  FCausal := CausalMask;
+  if FDk < 1 then
+    FErrorProc('TNNetCrossAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  if KeyValueSource = nil then
+    FErrorProc('TNNetCrossAttention requires a non-nil KeyValueSource.');
+  FInvSqrtDk := pcr_rsqrtf(FDk);
+  FStruct[0] := FDk;
+  if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
+  FKVLayer := KeyValueSource;
+  FAttn := TNNetVolume.Create();
+  if FKVLayer is TNNetInput then TNNetInput(FKVLayer).EnableErrorCollection;
+  // This layer reads from TWO sources: its (later-wired) PrevLayer = queries,
+  // and this explicit Key|Value source. Register the extra departing branch on
+  // the K|V source so backprop reference-counting stays balanced (the query
+  // branch is incremented by AddLayer/AddLayerAfter the usual way).
+  FKVLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetCrossAttention.Destroy();
+begin
+  FAttn.Free;
+  inherited Destroy();
+end;
+
+function TNNetCrossAttention.SaveStructureToString(): string;
+begin
+  // Inject the Key|Value source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetConcatBase does, so CreateLayer /
+  // LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FKVLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCrossAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetCrossAttention requires query SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDk then
+    FErrorProc('TNNetCrossAttention requires query depth = d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  if FKVLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetCrossAttention requires Key|Value SizeY=1. SizeY=' +
+      IntToStr(FKVLayer.FOutput.SizeY));
+  if FKVLayer.FOutput.Depth <> 2 * FDk then
+    FErrorProc('TNNetCrossAttention requires Key|Value depth = 2*d_k. Got depth=' +
+      IntToStr(FKVLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // Attention weights: rows = queries (Y=i over QSeqLen), cols = keys
+  // (X=j over KVSeqLen).
+  FAttn.ReSize(FKVLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+end;
+
+procedure TNNetCrossAttention.Compute();
+var
+  StartTime: double;
+  QLen, KVLen, i, j, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Q, KV: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Q := FPrevLayer.FOutput;
+  KV := FKVLayer.FOutput;
+  QLen := Q.SizeX;
+  KVLen := KV.SizeX;
+  // K is packed at depth [0..d_k-1], V at depth [d_k..2*d_k-1]; both contiguous
+  // along depth so each Q[i].K[j] is an AVX dot product and the V mix an AVX
+  // MulAdd over FDk floats. For each query row i: scores, softmax, weighted V.
+  for i := 0 to QLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to KVLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := TNNetVolume.DotProduct(
+          Q.GetRawPtr(i, 0, 0), KV.GetRawPtr(j, 0, 0), FDk);
+        FAttn[j, i, 0] := Score * FInvSqrtDk;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    SumExp := 0;
+    for j := 0 to KVLen - 1 do
+    begin
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to KVLen - 1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to KVLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, KV.GetRawPtr(j, 0, FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCrossAttention.Backpropagate();
+var
+  StartTime: double;
+  QLen, KVLen, i, j, k: integer;
+  Q, KV, QErr, KVErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Q := FPrevLayer.FOutput;
+    KV := FKVLayer.FOutput;
+    QErr := FPrevLayer.FOutputError;
+    KVErr := FKVLayer.FOutputError;
+    QLen := Q.SizeX;
+    KVLen := KV.SizeX;
+    SetLength(dAttn, KVLen);
+    SetLength(dScore, KVLen);
+    for i := 0 to QLen - 1 do
+    begin
+      // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
+      // dV[j,d] += Attn[i,j] * dOut[i,d]   (V at depth FDk, AVX MulAdd)
+      // dAttn[j] = sum_d dOut[i,d] * V[j,d] (AVX dot product over FDk)
+      for j := 0 to KVLen - 1 do
+      begin
+        A := FAttn[j, i, 0];
+        TNNetVolume.MulAdd(KVErr.GetRawPtr(j, 0, FDk),
+          FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+        dAttn[j] := TNNetVolume.DotProduct(
+          FOutputError.GetRawPtr(i, 0, 0), KV.GetRawPtr(j, 0, FDk), FDk);
+      end;
+      // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
+      SumDAttnAttn := 0;
+      for k := 0 to KVLen - 1 do
+        SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
+      for j := 0 to KVLen - 1 do
+        dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+      // ---- Gradients w.r.t Q[i] and K[j] ----
+      // dQ[i,d] += invSqrtDk * dScore[j] * K[j,d]   (K at depth 0, AVX MulAdd)
+      // dK[j,d] += invSqrtDk * dScore[j] * Q[i,d]
+      for j := 0 to KVLen - 1 do
+      begin
+        dS := dScore[j] * FInvSqrtDk;
+        if dS <> 0 then
+        begin
+          TNNetVolume.MulAdd(QErr.GetRawPtr(i, 0, 0),
+            KV.GetRawPtr(j, 0, 0), dS, FDk);
+          TNNetVolume.MulAdd(KVErr.GetRawPtr(j, 0, 0),
+            Q.GetRawPtr(i, 0, 0), dS, FDk);
+        end;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  // Propagate into BOTH sources (the K|V branch then the query chain).
+  if Assigned(FKVLayer) and
+     (FKVLayer.OutputError.Size = FKVLayer.Output.Size) then
+    FKVLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -25985,7 +26207,7 @@ function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
 var
   d_k, HeadCnt, d: integer;
   QProj, KProj, VProj: TNNetLayer;
-  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   QChannels, KVChannels: array of integer;
 begin
@@ -26010,10 +26232,13 @@ begin
   SetLength(KVChannels, d_k);
   for HeadCnt := 0 to Heads - 1 do
   begin
-    // Slice this head's d_k channels out of each projection, then pack them as
-    // [Q_h | K_h | V_h] (width 3*d_k) exactly as TNNetScaledDotProductAttention
-    // expects. Q lives on the QuerySeqLen grid; K|V on the KeyValueSeqLen grid
-    // (the two sequence lengths may differ).
+    // Slice this head's d_k channels out of each projection. Q lives on the
+    // QuerySeqLen grid; K|V on the KeyValueSeqLen grid (the two sequence lengths
+    // may differ). Only K and V (both on the KV grid) are packed together as
+    // [K_h | V_h] (width 2*d_k); Q is handed to TNNetCrossAttention separately,
+    // which forms the rectangular QuerySeqLen x KeyValueSeqLen attention. (A
+    // single Q|K|V DeepConcat would be illegal here -- TNNetDeepConcat requires
+    // a shared X size, which the unequal sequence lengths violate.)
     for d := 0 to d_k - 1 do
     begin
       QChannels[d]  := HeadCnt * d_k + d;
@@ -26022,10 +26247,10 @@ begin
     QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
     KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
     VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
-    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    KVPack := AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
     HeadOutputs[HeadCnt] :=
-      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
-        HeadPack);
+      AddLayerAfter(TNNetCrossAttention.Create(d_k, CausalMask, KVPack),
+        QSlice);
   end;
   AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   // Token-wise linear out-projection (FullConnectLinear would flatten the
@@ -47880,7 +48105,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetCrossAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -48002,6 +48227,7 @@ begin
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
+      'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -48286,6 +48512,7 @@ begin
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
+      if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
