@@ -8285,6 +8285,9 @@ begin
     NN.Layers[0].OutputError.Fill(0);
     for i := 0 to NN.GetLastLayer.OutputError.Size - 1 do
       NN.GetLastLayer.OutputError.Raw[i] := i * 0.1 + 0.05;
+    // Last layer has no consumer (departing branch count 0); register the single
+    // branch before the manual backward pass to satisfy TestBackPropCallCurrCnt.
+    NN.GetLastLayer.IncDepartingBranchesCnt();
     NN.GetLastLayer.Backpropagate();
 
     for i := 0 to Input.Size - 1 do
@@ -24526,6 +24529,13 @@ begin
     Input.Raw[1] := -0.2;
     Input.Raw[2] :=  1.1;
     Input.Raw[3] :=  0.7;
+
+    // SoftLayer is the last layer, so nothing consumes its output and its
+    // departing branch count is 0. Backpropagate guards against over-counting
+    // (TestBackPropCallCurrCnt), so register the single consuming branch once,
+    // exactly as the framework does for the last layer. ResetBackpropCallCurrCnt
+    // below clears the per-pass call counter but leaves this count intact.
+    SoftLayer.IncDepartingBranchesCnt();
 
     for i := 0 to Input.Size - 1 do
     begin
