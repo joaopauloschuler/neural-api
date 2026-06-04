@@ -20,8 +20,12 @@ NEURAL_DIR="$ROOT_DIR/neural"
 EXAMPLES_DIR="$ROOT_DIR/examples"
 
 # LazUtils is optional for the examples (none use UTF8Process), but pass it
-# through when available so the flags mirror tests/RunAll.sh.
-LAZUTILS_PATH="${LAZUTILS_PATH:-/usr/share/lazarus/4.4.0/components/lazutils/lib/x86_64-linux}"
+# through when available so the flags mirror tests/RunAll.sh. Honour an
+# explicit LAZUTILS_PATH if set; otherwise auto-discover it the same way the
+# CI workflow and tests/RunAll.sh do, by finding the compiled utf8process.ppu.
+if [ -z "${LAZUTILS_PATH:-}" ]; then
+  LAZUTILS_PATH=$(find /usr/lib/lazarus /usr/share/lazarus -name "utf8process.ppu" -printf "%h\n" 2>/dev/null | head -1 || true)
+fi
 LAZ_FLAG=()
 if [ -d "$LAZUTILS_PATH" ]; then
   LAZ_FLAG=(-Fu"$LAZUTILS_PATH")
