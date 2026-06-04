@@ -14,7 +14,7 @@ if [ ! -d "$LAZUTILS_PATH" ]; then
 fi
 
 echo "==> Building RunTests (LAZUTILS_PATH=$LAZUTILS_PATH)"
-fpc -B -Fu../neural -Fu"$LAZUTILS_PATH" -Mobjfpc -Sh -O2 RunTests.lpr
+fpc -B -Fu../neural -Fu"$LAZUTILS_PATH" -Mobjfpc -Sh -O2 RunTests.pas
 
 echo "==> Running tests"
 exec ./RunTests -a -p
