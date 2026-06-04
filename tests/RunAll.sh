@@ -5,10 +5,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-LAZUTILS_PATH="${LAZUTILS_PATH:-/usr/share/lazarus/4.4.0/components/lazutils/lib/x86_64-linux}"
+# Locate LazUtils (needed for utf8process). Honour an explicit LAZUTILS_PATH
+# if set; otherwise auto-discover it the same way the CI workflow does, by
+# finding the compiled utf8process.ppu under the Lazarus install tree.
+if [ -z "${LAZUTILS_PATH:-}" ]; then
+  LAZUTILS_PATH=$(find /usr/lib/lazarus /usr/share/lazarus -name "utf8process.ppu" -printf "%h\n" 2>/dev/null | head -1 || true)
+fi
 
-if [ ! -d "$LAZUTILS_PATH" ]; then
-  echo "ERROR: lazutils path not found: $LAZUTILS_PATH" >&2
+if [ -z "$LAZUTILS_PATH" ] || [ ! -d "$LAZUTILS_PATH" ]; then
+  echo "ERROR: lazutils path not found (looked for utf8process.ppu under /usr/lib/lazarus and /usr/share/lazarus)" >&2
   echo "Override with LAZUTILS_PATH=/path/to/lazutils/lib/<arch> $0" >&2
   exit 2
 fi
