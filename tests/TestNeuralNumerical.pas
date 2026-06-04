@@ -5746,6 +5746,12 @@ begin
     KnownErr := 0.75;
     Pool.OutputError.Fill(0);
     Pool.OutputError[0, 0, 0] := KnownErr;
+    // Pool is the last layer, so nothing consumes its output and its departing
+    // branch count is 0. The inherited TNNetPoolBase.Backpropagate guards
+    // against over-counting (TestBackPropCallCurrCnt), so register the single
+    // consuming branch before the manual backward pass, exactly as the
+    // framework does for the last layer (see TNNet manual-backprop helpers).
+    Pool.IncDepartingBranchesCnt();
     Pool.Backpropagate();
 
     // Determine the sampled cell from the output value, then assert the
