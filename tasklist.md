@@ -557,10 +557,6 @@ rather than acted on.
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
       accuracy/agreement.
-- [ ] LabelSmoothing calibration check: train SimpleImageClassifier with
-      `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
-      each into the `neuralcalibration` ECE/Brier report — the textbook claim
-      is smoothing improves calibration at a small accuracy cost.
 - [ ] TNNetCenterLoss follow-up: a true SOFTMAX-JOINT variant (or an example)
       that wires the landed penalty head alongside a classification head and
       shows the headline Wen et al. result — center loss tightens intra-class
