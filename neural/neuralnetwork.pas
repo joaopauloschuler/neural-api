@@ -1552,6 +1552,35 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Joint MULTI-quantile pinball-loss output head.
+  // One N-wide output (Depth = N) predicts several quantiles jointly in a
+  // single forward pass: channel i is trained with its own pinball loss
+  // (quantile q_i) against the SAME scalar target replicated across all N
+  // channels of the target volume. The quantile list is a constructor
+  // parameter (array of TNeuralFloat, e.g. [0.1, 0.5, 0.9]); N is stored in
+  // FStruct[0] and the N quantiles in FFloatSt[0..N-1] so the layer
+  // round-trips via SaveStructureToString / LoadFromString. The forward pass
+  // is an identity passthrough; Backpropagate writes the per-channel pinball
+  // gradient (channel i = Idx mod N uses q_i): V > 0 -> (1 - q_i),
+  // V < 0 -> -q_i, V = 0 -> 0 (subgradient convention), where V = prediction -
+  // target as seeded by the framework. Class method SortAscending provides a
+  // non-differentiable inference-time monotonicity guard that removes quantile
+  // crossings by sorting each N-channel group in place. No trainable params;
+  // output shape equals input shape. N must be in [1, csNNetMaxParameterIdx+1]
+  // and every quantile in (0, 1).
+  // Coded by Claude (AI).
+  TNNetMultiQuantileLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(const Quantiles: array of TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+    function QuantileCount(): integer;
+    function GetQuantile(Index: integer): TNeuralFloat;
+    // Inference-time monotonicity guard: sorts each consecutive N-channel
+    // group of AOutput ascending in place so q_i predictions never cross.
+    class procedure SortAscending(AOutput: TNNetVolume; N: integer);
+  end;
+
   /// Focal loss output layer for class-imbalanced classification.
   // Operates on probability-space inputs (i.e. after a softmax) with one-hot
   // targets. The per-sample loss is
@@ -11780,6 +11809,105 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
+end;
+
+{ TNNetMultiQuantileLoss }
+
+constructor TNNetMultiQuantileLoss.Create();
+begin
+  // Default joint head: the classic 10% / 50% / 90% prediction-interval trio.
+  Create([0.1, 0.5, 0.9]);
+end;
+
+constructor TNNetMultiQuantileLoss.Create(const Quantiles: array of TNeuralFloat);
+var
+  I, N: integer;
+begin
+  inherited Create();
+  N := Length(Quantiles);
+  if (N < 1) or (N > csNNetMaxParameterIdx + 1) then
+    FErrorProc('TNNetMultiQuantileLoss needs 1..' +
+      IntToStr(csNNetMaxParameterIdx + 1) + ' quantiles.');
+  for I := 0 to N - 1 do
+    if (Quantiles[I] <= 0) or (Quantiles[I] >= 1) then
+      FErrorProc('TNNetMultiQuantileLoss quantiles must be in (0, 1).');
+  FStruct[0] := N;
+  for I := 0 to N - 1 do
+    FFloatSt[I] := Quantiles[I];
+end;
+
+function TNNetMultiQuantileLoss.QuantileCount(): integer;
+begin
+  Result := FStruct[0];
+  if (Result < 1) or (Result > csNNetMaxParameterIdx + 1) then Result := 1;
+end;
+
+function TNNetMultiQuantileLoss.GetQuantile(Index: integer): TNeuralFloat;
+begin
+  Result := FFloatSt[Index];
+  if (Result <= 0) or (Result >= 1) then Result := 0.5;
+end;
+
+procedure TNNetMultiQuantileLoss.Backpropagate();
+var
+  StartTime: double;
+  Idx, SizeM1, N, Ch: integer;
+  Q, V: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  N := QuantileCount();
+  SizeM1 := FOutputError.Size - 1;
+  for Idx := 0 to SizeM1 do
+  begin
+    // Data is depth-contiguous, so the channel (and thus the quantile) is the
+    // position within each consecutive N-wide group.
+    Ch := Idx mod N;
+    Q := GetQuantile(Ch);
+    // V = prediction - target = -e (e = target - prediction).
+    // e > 0 (V < 0): dL/dprediction = -q_i
+    // e < 0 (V > 0): dL/dprediction =  1 - q_i
+    // e = 0 (V = 0): subgradient 0
+    V := FOutputError.FData[Idx];
+    if V > 0 then
+      FOutputError.FData[Idx] := 1.0 - Q
+    else if V < 0 then
+      FOutputError.FData[Idx] := -Q
+    else
+      FOutputError.FData[Idx] := 0.0;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+class procedure TNNetMultiQuantileLoss.SortAscending(AOutput: TNNetVolume;
+  N: integer);
+var
+  Base, I, J, GroupCnt, G: integer;
+  Tmp: TNeuralFloat;
+begin
+  // Monotonicity guard (non-differentiable, inference-time): sort each
+  // consecutive N-channel group ascending so lower quantiles never exceed
+  // higher ones (removes "quantile crossing"). Insertion sort: N is tiny.
+  if N < 2 then exit;
+  GroupCnt := AOutput.Size div N;
+  for G := 0 to GroupCnt - 1 do
+  begin
+    Base := G * N;
+    for I := 1 to N - 1 do
+    begin
+      Tmp := AOutput.FData[Base + I];
+      J := I - 1;
+      while (J >= 0) and (AOutput.FData[Base + J] > Tmp) do
+      begin
+        AOutput.FData[Base + J + 1] := AOutput.FData[Base + J];
+        Dec(J);
+      end;
+      AOutput.FData[Base + J + 1] := Tmp;
+    end;
+  end;
 end;
 
 { TNNetFocalLoss }
@@ -50630,6 +50758,20 @@ begin
   end;
 end;
 
+// Rebuilds the variable-length quantile list of TNNetMultiQuantileLoss from a
+// serialized layer: N lives in St[0], the N quantiles in Ft[0..N-1].
+function BuildMultiQuantileLoss(N: integer;
+  const Ft: array of TNeuralFloat): TNNetMultiQuantileLoss;
+var
+  Qs: array of TNeuralFloat;
+  I: integer;
+begin
+  if (N < 1) or (N > csNNetMaxParameterIdx + 1) then N := 1;
+  SetLength(Qs, N);
+  for I := 0 to N - 1 do Qs[I] := Ft[I];
+  Result := TNNetMultiQuantileLoss.Create(Qs);
+end;
+
 function TNNet.CreateLayer(strData: string): TNNetLayer;
 var
   S, S2: TStringList;
@@ -50780,6 +50922,7 @@ begin
       'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
       'TNNetQuantileLoss' :         Result := TNNetQuantileLoss.Create(Ft[0]);
+      'TNNetMultiQuantileLoss' :    Result := BuildMultiQuantileLoss(St[0], Ft);
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
@@ -51072,6 +51215,7 @@ begin
       if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
       if S[0] = 'TNNetQuantileLoss' then Result := TNNetQuantileLoss.Create(Ft[0]) else
+      if S[0] = 'TNNetMultiQuantileLoss' then Result := BuildMultiQuantileLoss(St[0], Ft) else
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else

@@ -263,6 +263,9 @@ type
     procedure TestQuantileLossForwardPassthrough;
     procedure TestQuantileLossGradient;
     procedure TestQuantileLossLoadFromString;
+    procedure TestMultiQuantileLossGradient;
+    procedure TestMultiQuantileLossLoadFromString;
+    procedure TestMultiQuantileLossMonotonicityGuard;
     procedure TestFocalLossGradient;
     procedure TestFocalLossLoadFromString;
     procedure TestNLLLossGradient;
@@ -23340,6 +23343,119 @@ begin
   finally
     NN.Free;
     NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiQuantileLossGradient;
+const
+  Qs: array[0..2] of TNeuralFloat = (0.1, 0.5, 0.9);
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  AnaGrad, Q, E: TNeuralFloat;
+  i, Ch: integer;
+begin
+  // One 3-wide joint head trained against the SAME scalar target replicated
+  // across all 3 channels. Each channel i must produce exactly the per-channel
+  // pinball subgradient for quantile q_i (mirrors the single-quantile head).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);   // 3 channels = 3 quantiles
+  Target := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetMultiQuantileLoss.Create(Qs));
+
+    // Single scalar target (1.5) replicated across all 3 channels (joint-head
+    // contract). Channel 0 under-predicts (E>0); channels 1,2 over-predict (E<0).
+    Input.Raw[0] := 1.0;  Input.Raw[1] := 2.0;  Input.Raw[2] := 3.0;
+    Target.Raw[0] := 1.5; Target.Raw[1] := 1.5; Target.Raw[2] := 1.5;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      Ch := i mod 3;
+      Q := Qs[Ch];
+      AnaGrad := LMid.OutputError.Raw[i];
+      E := Target.Raw[i] - Input.Raw[i];
+      if E > 0 then
+        AssertEquals('MultiQuantile under-pred sign ch' + IntToStr(Ch),
+          -Q, AnaGrad, 0.00001)
+      else if E < 0 then
+        AssertEquals('MultiQuantile over-pred sign ch' + IntToStr(Ch),
+          1.0 - Q, AnaGrad, 0.00001)
+      else
+        AssertEquals('MultiQuantile zero-residual ch' + IntToStr(Ch),
+          0.0, AnaGrad, 0.00001);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiQuantileLossLoadFromString;
+const
+  Qs: array[0..3] of TNeuralFloat = (0.05, 0.25, 0.75, 0.95);  // non-default
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+  Layer: TNNetMultiQuantileLoss;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetMultiQuantileLoss.Create(Qs));
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetMultiQuantileLoss',
+      NN2.GetLastLayer is TNNetMultiQuantileLoss);
+    Layer := NN2.GetLastLayer as TNNetMultiQuantileLoss;
+    AssertEquals('MultiQuantile N round-trip', 4, Layer.QuantileCount());
+    AssertEquals('MultiQuantile q0 round-trip', 0.05, Layer.GetQuantile(0), 0.00001);
+    AssertEquals('MultiQuantile q3 round-trip', 0.95, Layer.GetQuantile(3), 0.00001);
+
+    Saved2 := NN2.SaveToString();
+    AssertEquals('MultiQuantile round-trip string equality', Saved, Saved2);
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiQuantileLossMonotonicityGuard;
+var
+  V: TNNetVolume;
+  i: integer;
+begin
+  // Two consecutive 3-channel groups deliberately crossed; guard must sort
+  // each group ascending so q_i predictions are non-decreasing in quantile.
+  V := TNNetVolume.Create(1, 1, 6);
+  try
+    V.Raw[0] := 0.9; V.Raw[1] := 0.5; V.Raw[2] := 0.1;   // descending (crossed)
+    V.Raw[3] := 2.0; V.Raw[4] := 5.0; V.Raw[5] := 1.0;   // unordered
+    TNNetMultiQuantileLoss.SortAscending(V, 3);
+    for i := 0 to 1 do
+    begin
+      AssertTrue('group ' + IntToStr(i) + ' c0<=c1',
+        V.Raw[i*3 + 0] <= V.Raw[i*3 + 1] + 1e-6);
+      AssertTrue('group ' + IntToStr(i) + ' c1<=c2',
+        V.Raw[i*3 + 1] <= V.Raw[i*3 + 2] + 1e-6);
+    end;
+    AssertEquals('group0 min', 0.1, V.Raw[0], 0.00001);
+    AssertEquals('group0 max', 0.9, V.Raw[2], 0.00001);
+    AssertEquals('group1 max', 5.0, V.Raw[5], 0.00001);
+  finally
+    V.Free;
   end;
 end;
 

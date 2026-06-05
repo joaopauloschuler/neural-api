@@ -13,6 +13,13 @@ The program then:
     calibrated 10%/90% pair this should be near 80%. A built-in PASS/FAIL check
     asserts coverage lands in a tolerant [0.65, 0.95] window.
 
+A second, JOINT arm then trains ONE model whose 3-wide output predicts all
+three quantiles jointly in a single forward pass via TNNetMultiQuantileLoss.
+It reports the same band coverage with a single model, counts quantile
+crossings with vs without the TNNetMultiQuantileLoss.SortAscending monotonicity
+guard (approach (a): non-differentiable inference-time sort), and shows the
+guard repairing a deliberately crossed prediction triple.
+
 Pure CPU, single-threaded for determinism, well under a minute.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
@@ -77,6 +84,65 @@ const
     NN.AddLayer(TNNetFullConnectLinear.Create(1));
     NN.AddLayer(TNNetQuantileLoss.Create(Quantile));
     NN.SetLearningRate(0.02, 0.9);
+  end;
+
+  // ONE model with a 3-wide output (Depth=3) predicting q={0.1,0.5,0.9}
+  // jointly in a single forward pass via TNNetMultiQuantileLoss.
+  procedure BuildJointModel(out NN: TNNet);
+  begin
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(1, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cHidden));
+    NN.AddLayer(TNNetHyperbolicTangent.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(cHidden));
+    NN.AddLayer(TNNetHyperbolicTangent.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));   // 3 quantile channels
+    NN.AddLayer(TNNetMultiQuantileLoss.Create([0.1, 0.5, 0.9]));
+    NN.SetLearningRate(0.02, 0.9);
+  end;
+
+  // Trains the joint head: the scalar target y is replicated across all 3
+  // output channels so each channel learns its own quantile in one pass.
+  procedure TrainJointModel(NN: TNNet; Xs, Ys: TNNetVolumeList; Epochs: integer);
+  var
+    Ep, K: integer;
+    Tgt: TNNetVolume;
+  begin
+    Tgt := TNNetVolume.Create(1, 1, 3);
+    try
+      for Ep := 1 to Epochs do
+        for K := 0 to Xs.Count - 1 do
+        begin
+          Tgt.Raw[0] := Ys[K].Raw[0];
+          Tgt.Raw[1] := Ys[K].Raw[0];
+          Tgt.Raw[2] := Ys[K].Raw[0];
+          NN.Compute(Xs[K]);
+          NN.Backpropagate(Tgt);
+        end;
+    finally
+      Tgt.Free;
+    end;
+  end;
+
+  // Joint-head inference with the monotonicity guard applied: returns the
+  // sorted (Lo, Mid, Hi) triple so q=0.1 never exceeds q=0.9.
+  procedure PredictJoint(NN: TNNet; X: TNeuralFloat;
+    Guard: boolean; out Lo, Mid, Hi: TNeuralFloat);
+  var
+    V: TNNetVolume;
+  begin
+    V := TNNetVolume.Create(1, 1, 1);
+    try
+      V.Raw[0] := X;
+      NN.Compute(V);
+      if Guard then
+        TNNetMultiQuantileLoss.SortAscending(NN.GetLastLayer.Output, 3);
+      Lo  := NN.GetLastLayer.Output.Raw[0];
+      Mid := NN.GetLastLayer.Output.Raw[1];
+      Hi  := NN.GetLastLayer.Output.Raw[2];
+    finally
+      V.Free;
+    end;
   end;
 
   // Build a fixed dataset (x, y) of size N with heteroscedastic noise.
@@ -191,10 +257,11 @@ const
   end;
 
 var
-  NetLo, NetMid, NetHi: TNNet;
+  NetLo, NetMid, NetHi, NetJoint: TNNet;
   TrainX, TrainY, TestX, TestY: TNNetVolumeList;
-  K, Inside: integer;
+  K, Inside, JInside, CrossRaw, CrossGuard: integer;
   Lo, Hi, Coverage: TNeuralFloat;
+  JLo, JMid, JHi, GLo, GMid, GHi, JCoverage: TNeuralFloat;
   Pass: boolean;
 begin
   // Mask FPU exceptions (log/exp/normal sampling) and force determinism.
@@ -248,6 +315,69 @@ begin
       begin
         WriteLn('RESULT: FAIL (coverage outside [65%, 95%] window).');
         Halt(1);
+      end;
+
+      // ---- Joint single-model arm -------------------------------------------
+      WriteLn;
+      WriteLn('=== JOINT HEAD: ONE model, 3-wide TNNetMultiQuantileLoss output ===');
+      WriteLn('Training a single model that predicts q={0.1,0.5,0.9} jointly...');
+      BuildJointModel(NetJoint);
+      try
+        NetJoint.InitWeights();
+        TrainJointModel(NetJoint, TrainX, TrainY, cEpochs);
+
+        // Coverage of the joint [q=0.1, q=0.9] band (with monotonicity guard),
+        // and crossing counts WITHOUT vs WITH the guard.
+        JInside := 0; CrossRaw := 0; CrossGuard := 0;
+        for K := 0 to TestX.Count - 1 do
+        begin
+          // Raw (no guard): count quantile crossings (lo > hi).
+          PredictJoint(NetJoint, TestX[K].Raw[0], False, JLo, JMid, JHi);
+          if JLo > JHi then Inc(CrossRaw);
+          // Guarded: sorted outputs, count any residual crossings (must be 0).
+          PredictJoint(NetJoint, TestX[K].Raw[0], True, GLo, GMid, GHi);
+          if GLo > GHi then Inc(CrossGuard);
+          if (TestY[K].Raw[0] >= GLo) and (TestY[K].Raw[0] <= GHi) then
+            Inc(JInside);
+        end;
+        JCoverage := JInside / TestX.Count;
+
+        WriteLn;
+        WriteLn('Joint head held-out coverage of [q=0.1, q=0.9] band: ',
+          (JCoverage * 100):0:1, '% (', JInside, '/', TestX.Count,
+          '), nominal ~80%.');
+        WriteLn('Quantile crossings (lo > hi) on test set:');
+        WriteLn('  without monotonicity guard: ', CrossRaw, '/', TestX.Count);
+        WriteLn('  with    monotonicity guard: ', CrossGuard, '/', TestX.Count,
+          ' (SortAscending removes all crossings)');
+
+        // Explicit guard demonstration on a deliberately CROSSED output triple
+        // (e.g. from an under-trained net): SortAscending repairs it.
+        NetJoint.GetLastLayer.Output.Raw[0] := 0.90;  // q=0.1 prediction
+        NetJoint.GetLastLayer.Output.Raw[1] := 0.40;  // q=0.5 prediction
+        NetJoint.GetLastLayer.Output.Raw[2] := 0.10;  // q=0.9 prediction (crossed!)
+        WriteLn('Guard demo - crossed triple before: [',
+          NetJoint.GetLastLayer.Output.Raw[0]:0:2, ', ',
+          NetJoint.GetLastLayer.Output.Raw[1]:0:2, ', ',
+          NetJoint.GetLastLayer.Output.Raw[2]:0:2, ']');
+        TNNetMultiQuantileLoss.SortAscending(NetJoint.GetLastLayer.Output, 3);
+        WriteLn('Guard demo - after SortAscending: [',
+          NetJoint.GetLastLayer.Output.Raw[0]:0:2, ', ',
+          NetJoint.GetLastLayer.Output.Raw[1]:0:2, ', ',
+          NetJoint.GetLastLayer.Output.Raw[2]:0:2, '] (non-decreasing)');
+
+        Pass := (JCoverage >= 0.65) and (JCoverage <= 0.95) and (CrossGuard = 0);
+        if Pass then
+          WriteLn('RESULT: PASS (one model matches the 3-MLP coverage; guard',
+            ' eliminated crossings).')
+        else
+        begin
+          WriteLn('RESULT: FAIL (joint coverage outside window or crossings',
+            ' remain after guard).');
+          Halt(1);
+        end;
+      finally
+        NetJoint.Free;
       end;
     finally
       NetLo.Free;
