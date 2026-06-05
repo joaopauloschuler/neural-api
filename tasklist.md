@@ -491,13 +491,21 @@ rather than acted on.
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
 #### Probability projections / sparsity
-- [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
+- [X] TNNetGumbelSoftmax follow-up: temperature-annealing
       micro-experiment — train a tiny discrete-latent autoencoder whose
       bottleneck is a `TNNetGumbelSoftmax`, anneal `tau` from ~2.0 down to
       ~0.1 over training, and chart reconstruction loss vs `tau` plus the
       bottleneck's output entropy (the categorical sharpens as tau drops).
       The layer + its soft/hard modes are in tree; this is the headline
       use case. Pairs with the open hard-top-k MoE routing gate.
+      PROGRESS: landed examples/GumbelAnnealingAutoencoder/ — discrete-latent
+      AE (encoder MLP -> K logits -> TNNetGumbelSoftmax -> decoder MLP) on a
+      K=6 well-separated-cluster synthetic set; tau annealed 2.0->1.0->0.5->
+      0.25->0.1 by rebuilding the net per phase with the lower tau and carrying
+      weights via TNNet.CopyWeights (tau is protected FFloatSt[0], no setter).
+      Prints a (tau, recon-MSE, bottleneck entropy) table + graded PASS verdict:
+      entropy collapses 0.064->0 nats while recon holds at the ~0.01 noise floor.
+      Pure CPU, ~2 s.
 - [ ] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
       soft `TNNet.AddMixtureOfExperts` block) — run only the k highest-gated experts per token (sparse
       dispatch) plus a load-balancing auxiliary loss so the gate does not collapse

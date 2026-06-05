@@ -14,6 +14,7 @@ backup/
 lib/
 tests/RunTests
 examples/ActivationBakeoff/ActivationBakeoff
+examples/GumbelAnnealingAutoencoder/GumbelAnnealingAutoencoder
 examples/BeamSearchDecode/BeamSearchDecode
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
