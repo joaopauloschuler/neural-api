@@ -324,9 +324,6 @@ rather than acted on.
       any future mixed-precision work.
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
-- [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
-      `base ∈ {1e2, 1e3, 1e4, 1e5}`, chart loss and qualitative sample
-      quality.
 - [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
       next-token task and chart loss + max-logit-norm.
@@ -344,9 +341,6 @@ rather than acted on.
       × activation functions on a fixed tiny MLP, report epochs-to-converge.
 - [ ] First-batch gradient-norm heatmap across (depth, width, init):
       enumerate a small grid, print one number per cell.
-- [ ] Train-time vs inference-time delta sweep for the noise layers
-      (TNNetDropout, TNNetDropPath, TNNetSpatialDropout1D/2D): same tiny
-      classifier, sweep `p ∈ {0.0, 0.1, 0.2, 0.4}`, chart train vs val loss.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
