@@ -195,50 +195,6 @@ rather than acted on.
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
-- [ ] HyperNetwork demo + `TNNetHyperLinear` weight-generating layer
-      (`examples/HyperNetwork/`) — reproduce the core Ha et al. 2016 "HyperNetworks"
-      idea on a TINY pure-CPU multi-task target: a small "generator" net consumes a
-      per-task CONTEXT vector (a learned task/class embedding) and EMITS the weights
-      of a "main" layer, which then applies those generated weights to the actual
-      input. One shared main network thus implements a whole FAMILY of input->output
-      maps, with the per-task behaviour carried entirely by the context-conditioned
-      generated weights. This is a genuinely new mechanism for this repo: every
-      existing layer OWNS its weights in `Neurons[].Weights` (fixed at construction),
-      so the headline engineering piece is a `TNNetHyperLinear` whose forward reads
-      its weight matrix from a LINKED generator layer's output volume each forward
-      pass (a runtime tensor, not stored Neuron weights) and whose backward scatters
-      the weight-gradient `dL/dW = outer(inputError-side, input)` back into that
-      generator's `OutputError` so the generator trains end-to-end. Headline payoff,
-      visibly distinct from the suite: on a multi-task toy (e.g. K in {3,4} different
-      target functions y=f_k(x), or K rotated/shifted classification tasks) show the
-      single shared main net + context-conditioned generated weights fits ALL tasks,
-      and contrast against a FiLM-conditioned baseline (`TNNetFiLM`/AddFiLMConditioned)
-      of matched budget — FiLM can only per-channel scale/shift activations, so it
-      should LOSE on tasks that need a genuinely different linear map per task, making
-      the "generate the weights, don't just modulate the features" point concrete.
-      Feasibility risks to settle honestly in v1, in the "what did NOT fit the budget"
-      style the Grokking entry uses: (1) the generated-weight forward/backward is a
-      hand-rolled gradient surgery path, so it needs the `SetBatchUpdate(True)` weight-
-      accumulation idiom and the layer-index-capture discipline from
-      [[manual-gradient-and-snapshot-gotchas]] — pin it with a finite-difference check
-      that perturbs a GENERATOR weight and central-differences the main-net loss
-      against the scattered generator delta (mirror the TNNetVectorQuantizer codebook-
-      delta and TNNetCenterLoss center-delta tests); (2) generating a FULL weight
-      matrix is O(in*out) generator outputs — keep the main layer tiny (e.g. 4->4) so
-      the generator stays small and the whole multi-task train fits the <5-min pure-CPU
-      budget; if a full matrix is too big, fall back to generating a low-rank or
-      per-channel-scaled weight factorisation and document it (Ha et al.'s own scaling
-      trick). A `TestHyperLinearSmoke` following the [[introspection-report-pattern]]
-      / [[loss-layer-pattern]] recipe should pin: a constant generator output makes
-      `TNNetHyperLinear` bit-for-bit equal to a plain `TNNetFullConnectLinear` with
-      those weights (the correctness anchor), plus the LoadFromString round-trip of the
-      generator-link wiring. Distinct from `TNNetFiLM`/AddFiLMConditioned (modulates
-      ACTIVATIONS per channel, does not synthesise weights), from AddLoRAAdapter (adds
-      a FIXED trained low-rank bypass, not a context-GENERATED weight), from the landed
-      TNNetMixtureOfExperts (SELECTS among N fixed expert weight sets via a gate rather
-      than GENERATING a fresh weight set), and from the Neural-ODE/Growing-CA entries
-      (shared-weight time/space recurrence, weights still owned by the layer).
-
 - [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
       landed 2026-06-01, sine-regression task distribution, manual inner-loop
       Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task

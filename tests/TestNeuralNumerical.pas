@@ -501,6 +501,9 @@ type
     procedure TestAffineGridSampleSourceGradientCheck;
     procedure TestAffineGridSampleThetaGradientCheck;
     procedure TestAffineGridSampleLoadFromString;
+    procedure TestHyperLinearMainInputGradientCheck;
+    procedure TestHyperLinearGeneratedWeightsGradientCheck;
+    procedure TestHyperLinearLoadFromString;
     procedure TestScatterToAffineForwardAndShearZero;
     procedure TestScatterToAffineInputGradientCheck;
     procedure TestScatterToAffineLoadFromString;
@@ -13223,6 +13226,209 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperLinearMainInputGradientCheck;
+// Finite-difference check of d(loss)/d(main input) through TNNetHyperLinear,
+// whose weight matrix is supplied entirely by a SECOND input branch (the
+// generated weights). This verifies dL/dx = W_gen^T . dL/dy flows into the
+// main feature input.
+var
+  NN: TNNet;
+  XInput, WInput: TNNetLayer;
+  XData, XPlus, WData, Desired: TNNetVolume;
+  Din, Dout, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AX: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(AX);
+    WInput.Output.Copy(WData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Din := 4; Dout := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(Din, 1, 1);
+  XPlus := TNNetVolume.Create(Din, 1, 1);
+  WData := TNNetVolume.Create(Din * Dout + Dout, 1, 1); // matrix + bias
+  Desired := TNNetVolume.Create(Dout, 1, 1);
+  epsilon := 0.001; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(Din, 1, 1, 1));
+    WInput := NN.AddLayerAfter(TNNetInput.Create(Din * Dout + Dout, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetHyperLinear.Create(Dout, true, WInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to WData.Size - 1 do WData.Raw[i] := Cos(i * 0.37) * 0.5;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to XData.Size - 1 do
+    begin
+      XPlus.Copy(XData);
+      XPlus.Raw[i] := XData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(XPlus);
+      XPlus.Raw[i] := XData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(XPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      WInput.Output.Copy(WData);
+      NN.Compute(XInput.Output);
+      XInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := XInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('HyperLinear main-input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestHyperLinearMainInputGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; XPlus.Free; WData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperLinearGeneratedWeightsGradientCheck;
+// The headline gradient: finite-difference check of d(loss)/d(generated
+// weights) (the weight-matrix AND bias entries). These live on the second
+// input branch so its OutputError holds dL/dW = dy (x) x and dL/db = dy. This
+// is what lets the upstream generator network train end-to-end.
+var
+  NN: TNNet;
+  XInput, WInput: TNNetLayer;
+  XData, WData, WPlus, Desired: TNNetVolume;
+  Din, Dout, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AW: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    WInput.Output.Copy(AW);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Din := 4; Dout := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(Din, 1, 1);
+  WData := TNNetVolume.Create(Din * Dout + Dout, 1, 1);
+  WPlus := TNNetVolume.Create(Din * Dout + Dout, 1, 1);
+  Desired := TNNetVolume.Create(Dout, 1, 1);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(Din, 1, 1, 1));
+    WInput := NN.AddLayerAfter(TNNetInput.Create(Din * Dout + Dout, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetHyperLinear.Create(Dout, true, WInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to WData.Size - 1 do WData.Raw[i] := Cos(i * 0.37) * 0.5;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to WData.Size - 1 do
+    begin
+      WPlus.Copy(WData);
+      WPlus.Raw[i] := WData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(WPlus);
+      WPlus.Raw[i] := WData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(WPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      WInput.Output.Copy(WData);
+      NN.Compute(XInput.Output);
+      WInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := WInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('HyperLinear gen-weights gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestHyperLinearGeneratedWeightsGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; WData.Free; WPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperLinearLoadFromString;
+// Serialization round-trip: the generated-weights source layer index (injected
+// like TNNetConcat) and the Dout/UseBias struct fields must survive
+// SaveToString -> LoadFromString, reproducing the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  XInput, WInput: TNNetLayer;
+  XData, WData: TNNetVolume;
+  Din, Dout, i: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  Din := 4; Dout := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(Din, 1, 1);
+  WData := TNNetVolume.Create(Din * Dout + Dout, 1, 1);
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(Din, 1, 1, 1));
+    WInput := NN.AddLayerAfter(TNNetInput.Create(Din * Dout + Dout, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetHyperLinear.Create(Dout, true, WInput), XInput);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to WData.Size - 1 do WData.Raw[i] := Cos(i * 0.37) * 0.5;
+    XInput.Output.Copy(XData);
+    WInput.Output.Copy(WData);
+    NN.Compute(XInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetHyperLinear then Found := true;
+    AssertTrue('HyperLinear layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HyperLinear SaveToString round-trip equality', Saved, Saved2);
+      NN2.Layers[0].Output.Copy(XData);
+      NN2.Layers[1].Output.Copy(WData);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('HyperLinear round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; XData.Free; WData.Free;
   end;
 end;
 

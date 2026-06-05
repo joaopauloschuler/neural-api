@@ -2252,6 +2252,54 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// HyperLinear -- a fully-connected (dense) layer whose weight matrix is NOT
+  // owned by the layer but is GENERATED on the fly by an upstream "generator"
+  // network (Ha, Dai & Le 2016, "HyperNetworks"). This is the headline
+  // mechanism: every other layer in this library stores its weights in
+  // Neurons[].Weights, fixed at construction; this layer has NO trainable
+  // weights of its own and instead reads its weight matrix from a SECOND input
+  // tensor (the generated-weights vector). One shared HyperLinear can thus
+  // implement a whole FAMILY of input->output maps, the per-task behaviour
+  // carried entirely by the context-conditioned generated weights.
+  // TWO sources (wired like TNNetCrossAttention / TNNetAffineGridSample):
+  //   PrevLayer (main features): any shape, flattened to a Din-vector.
+  //   WeightsSource (generated weights): a flat vector of size
+  //       Din*Dout            (no bias)   or
+  //       Din*Dout + Dout     (UseBias)
+  //     read in row-major order: the first Din*Dout values are the weight
+  //     matrix W[o,i] (o = output index outer, i = input index inner), the
+  //     trailing Dout values (if UseBias) are the generated bias b[o].
+  // Forward:  y[o] = sum_i W[o,i] * x[i] (+ b[o]).
+  // Backward: dL/dx[i]   = sum_o W[o,i] * dy[o]            (into main features)
+  //           dL/dW[o,i] = dy[o] * x[i]                    (into gen-weights)
+  //           dL/db[o]   = dy[o]                           (into gen-weights)
+  // Both gradient paths are written, so the upstream generator trains
+  // end-to-end. Output shape: Dout x 1 x 1. No owned trainable parameters
+  // (InitDefault / AddToWeightHistory are no-ops on an empty Neurons list).
+  // FStruct[0]=Dout, FStruct[1]=UseBias persist; the WeightsSource layer index
+  // is injected into the source slot (like TNNetConcat) so the layer
+  // round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetHyperLinear = class(TNNetLayer)
+  private
+    FDout: integer;
+    FDin: integer;
+    FUseBias: boolean;
+    FWeightsLayer: TNNetLayer; // explicit generated-weights source
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pOutputSize: integer; pUseBias: boolean;
+      WeightsSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property OutputSize: integer read FDout;
+    property InputSize: integer read FDin;
+    property UseBias: boolean read FUseBias;
+    property WeightsSource: TNNetLayer read FWeightsLayer;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -15589,6 +15637,133 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetHyperLinear }
+
+constructor TNNetHyperLinear.Create(pOutputSize: integer; pUseBias: boolean;
+  WeightsSource: TNNetLayer);
+begin
+  inherited Create();
+  FDout := pOutputSize;
+  FUseBias := pUseBias;
+  if FDout < 1 then
+    FErrorProc('TNNetHyperLinear requires output size >= 1. Got ' +
+      IntToStr(FDout));
+  if WeightsSource = nil then
+    FErrorProc('TNNetHyperLinear requires a non-nil WeightsSource.');
+  FStruct[0] := FDout;
+  if FUseBias then FStruct[1] := 1 else FStruct[1] := 0;
+  FWeightsLayer := WeightsSource;
+  if FWeightsLayer is TNNetInput then TNNetInput(FWeightsLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the generated-
+  // weights source (the main-features branch is incremented the usual way by
+  // AddLayer / AddLayerAfter).
+  FWeightsLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetHyperLinear.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetHyperLinear.SaveStructureToString(): string;
+begin
+  // Inject the generated-weights source layer index into the (otherwise empty)
+  // third ':'-delimited slot, exactly as TNNetConcatBase does, so CreateLayer /
+  // LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FWeightsLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetHyperLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Needed: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FDin := pPrevLayer.FOutput.Size;
+  Needed := FDin * FDout;
+  if FUseBias then Needed := Needed + FDout;
+  if FWeightsLayer.FOutput.Size <> Needed then
+    FErrorProc('TNNetHyperLinear requires a WeightsSource of size Din*Dout' +
+      BoolToStr(FUseBias, '+Dout', '') + ' = ' + IntToStr(Needed) +
+      ' (Din=' + IntToStr(FDin) + ', Dout=' + IntToStr(FDout) +
+      '). Got size=' + IntToStr(FWeightsLayer.FOutput.Size));
+  FOutput.ReSize(FDout, 1, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetHyperLinear.Compute();
+var
+  StartTime: double;
+  o, Base: integer;
+  X, Wgt: TNNetVolume;
+  Acc: TNeuralFloat;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  Wgt := FWeightsLayer.FOutput;
+  // y[o] = sum_i W[o,i] * x[i] (+ b[o]); W is read row-major from the generated
+  // weights vector (row o occupies [o*Din .. o*Din+Din-1]); the optional bias
+  // block follows the Din*Dout matrix block.
+  for o := 0 to FDout - 1 do
+  begin
+    Base := o * FDin;
+    Acc := TNNetVolume.DotProduct(
+      Wgt.GetRawPtr(Base), X.GetRawPtr(0), FDin);
+    if FUseBias then Acc := Acc + Wgt.FData[FDin * FDout + o];
+    FOutput.FData[o] := Acc;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetHyperLinear.Backpropagate();
+var
+  StartTime: double;
+  o, Base: integer;
+  X, Wgt, XErr, WgtErr: TNNetVolume;
+  Dy: TNeuralFloat;
+  PropMain: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  X := FPrevLayer.FOutput;
+  Wgt := FWeightsLayer.FOutput;
+  XErr := FPrevLayer.FOutputError;
+  WgtErr := FWeightsLayer.FOutputError;
+  PropMain := (X.Size > 0) and (X.Size = XErr.Size);
+  if PropMain or (WgtErr.Size = Wgt.Size) then
+  begin
+    StartTime := Now();
+    for o := 0 to FDout - 1 do
+    begin
+      Dy := FOutputError.FData[o];
+      if Dy = 0 then continue;
+      Base := o * FDin;
+      // dL/dx[i] += W[o,i] * dy[o]  (into the main features)
+      if PropMain then
+        TNNetVolume.MulAdd(
+          XErr.GetRawPtr(0), Wgt.GetRawPtr(Base), Dy, FDin);
+      // dL/dW[o,i] += dy[o] * x[i]  (into the generated weights)
+      if WgtErr.Size = Wgt.Size then
+      begin
+        TNNetVolume.MulAdd(
+          WgtErr.GetRawPtr(Base), X.GetRawPtr(0), Dy, FDin);
+        // dL/db[o] += dy[o]
+        if FUseBias then
+          WgtErr.FData[FDin * FDout + o] := WgtErr.FData[FDin * FDout + o] + Dy;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  // Propagate into BOTH sources (the generated-weights branch then the main
+  // feature chain).
+  if Assigned(FWeightsLayer) and
+     (FWeightsLayer.OutputError.Size = FWeightsLayer.Output.Size) then
+    FWeightsLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -54489,7 +54664,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetAffineGridSample') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -54615,6 +54790,7 @@ begin
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
+      'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -54920,6 +55096,7 @@ begin
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
+      if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
