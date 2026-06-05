@@ -611,12 +611,16 @@ rather than acted on.
       cheaper Grokfast-MA (windowed moving average) variant alongside the EMA form.
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
-- [ ] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
+- [X] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
       detector helper, not the in-LOOP abort. Add an end-to-end test that runs
       a short TNeuralFit with `NaNGuard := True` on a net rigged to produce a
       non-finite activation (e.g. an aggressive LR / a planted Inf weight) and
       assert training aborts (FShouldQuit set / FErrorProc fired) rather than
       running to the epoch budget.
+      DONE: tests/TestNeuralFit.pas TestNaNGuardAbortsTrainingOnInf (plants
+      +Inf in a hidden weight, masks FPU exceptions, asserts ErrorProc fired +
+      ShouldQuit set + CurrentEpoch < budget) and TestNaNGuardSilentOnHealthyNet
+      (same net/data, guard ON, well-behaved: no fire, runs full budget).
 - [ ] Mixup follow-up: the landed examples/Mixup/ toy is LINEARLY SEPARABLE so both
       the plain and mixup-augmented arms hit ~100% val accuracy — the helper is
       pinned by unit tests but the demo does not yet SHOW mixup winning. Add a

@@ -21,6 +21,17 @@ type
     function NextLR(Epoch, Step: integer): TNeuralFloat; override;
   end;
 
+  // Captures the in-loop NaNGuard ErrorProc callback. TNeuralFit.ErrorProc is a
+  // TGetStrProc (of object), so we hand it this object's HandleError method and
+  // assert the flag flips when the guard fires (and stays clear when it doesn't).
+  TNaNGuardProbe = class
+  public
+    Fired: boolean;
+    LastMsg: string;
+    constructor Create;
+    procedure HandleError(const S: string);
+  end;
+
   TTestNeuralFit = class(TTestCase)
   published
     // Optimizer tests
@@ -51,6 +62,10 @@ type
     procedure TestFirstLayerWithNonFiniteAllFinite;
     procedure TestFirstLayerWithNonFiniteDetectsLayer;
     procedure TestFirstLayerWithNonFiniteDetectsInf;
+    // End-to-end: NaNGuard aborts a live Fit on a rigged net, and stays silent
+    // on the same net/data when it is well-behaved.
+    procedure TestNaNGuardAbortsTrainingOnInf;
+    procedure TestNaNGuardSilentOnHealthyNet;
 
     // Scheduler wiring
     procedure TestSchedulerDefaultsNil;
@@ -58,6 +73,19 @@ type
   end;
 
 implementation
+
+constructor TNaNGuardProbe.Create;
+begin
+  inherited Create;
+  Fired := False;
+  LastMsg := '';
+end;
+
+procedure TNaNGuardProbe.HandleError(const S: string);
+begin
+  Fired := True;
+  LastMsg := S;
+end;
 
 constructor TConstantLR.Create(pLR: TNeuralFloat);
 begin
@@ -524,6 +552,104 @@ begin
     Sched.Free;
     NetA.Free;
     NetB.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestNaNGuardAbortsTrainingOnInf;
+var
+  Net: TNNet;
+  Pairs: TNNetVolumePairList;
+  Fit: TNeuralFit;
+  Probe: TNaNGuardProbe;
+  OldMask: TFPUExceptionMask;
+const
+  cEpochs = 20;
+begin
+  Net := BuildFitNet();
+  Pairs := BuildFitPairs();
+  Fit := TNeuralFit.Create;
+  Probe := TNaNGuardProbe.Create;
+  // Mask invalid-op/overflow/zero-divide so the planted Inf propagates as a
+  // value (the NaNGuard's job is to detect such non-finite values) instead of
+  // trapping as a hardware FP exception. Real training loops that rely on the
+  // guard run with these masked. Restored in the finally block.
+  OldMask := GetExceptionMask;
+  SetExceptionMask(OldMask + [exInvalidOp, exOverflow, exZeroDivide,
+    exDenormalized, exUnderflow, exPrecision]);
+  try
+    // Rig the net: plant a +Inf into a hidden-layer weight so the very first
+    // forward pass produces a non-finite activation. The guard scans after
+    // forward+backward, so it must fire on the first batch of epoch 0.
+    Net.Layers[1].Neurons[0].Weights.FData[0] := Infinity;
+
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;          // single thread, deterministic
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    Fit.NaNGuard := True;
+    // Capture the guard's ErrorProc so we can assert it actually fired.
+    Fit.ErrorProc := {$IFDEF FPC}@{$ENDIF}Probe.HandleError;
+
+    Fit.Fit(Net, Pairs, nil, nil, 4, cEpochs);
+
+    // Observable signals the guard documents: it fires FErrorProc and sets
+    // FShouldQuit (exposed as ShouldQuit), which breaks the epoch loop early.
+    AssertTrue('NaNGuard ErrorProc must fire on a non-finite net', Probe.Fired);
+    AssertTrue('NaNGuard message must mention non-finite/NaNGuard',
+      Pos('NaNGuard', Probe.LastMsg) > 0);
+    AssertTrue('NaNGuard must set ShouldQuit to abort training',
+      Fit.ShouldQuit);
+    AssertTrue('Training must abort before the full epoch budget',
+      Fit.CurrentEpoch < cEpochs);
+  finally
+    SetExceptionMask(OldMask);
+    Fit.Free;
+    Probe.Free;
+    Pairs.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestNaNGuardSilentOnHealthyNet;
+var
+  Net: TNNet;
+  Pairs: TNNetVolumePairList;
+  Fit: TNeuralFit;
+  Probe: TNaNGuardProbe;
+const
+  cEpochs = 20;
+begin
+  // Complement of the abort test: the SAME net/data, NaNGuard ON, but NOT
+  // rigged and with a sane LR must train to completion without firing.
+  Net := BuildFitNet();
+  Pairs := BuildFitPairs();
+  Fit := TNeuralFit.Create;
+  Probe := TNaNGuardProbe.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    Fit.NaNGuard := True;
+    Fit.ErrorProc := {$IFDEF FPC}@{$ENDIF}Probe.HandleError;
+
+    Fit.Fit(Net, Pairs, nil, nil, 4, cEpochs);
+
+    AssertFalse('NaNGuard must stay silent on a well-behaved net', Probe.Fired);
+    AssertFalse('Healthy training must not set ShouldQuit', Fit.ShouldQuit);
+    AssertEquals('Healthy training must run the full epoch budget',
+      cEpochs, Fit.CurrentEpoch);
+  finally
+    Fit.Free;
+    Probe.Free;
+    Pairs.Free;
+    Net.Free;
   end;
 end;
 
