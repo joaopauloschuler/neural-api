@@ -130,90 +130,29 @@ rather than acted on.
       the parallel and naive-recurrent forms both landed).
 
 - [ ] TNNetClosedFormContinuous follow-ups (leaf layer + examples/LiquidCfC/ +
-      gradient/serialization tests all LANDED 2026-06-05, full explicit-recurrence
-      BPTT over the unrolled steps). Deferred, each small + doable on its own:
-      (a) LANDED 2026-06-05: `TNNet.AddClosedFormContinuous` builder wraps the
-          cell in an RMSNorm pre-norm residual (y = x + CfC(RMSNorm(x))) so it
-          drops into a transformer-style block without manual wiring (mirrors
-          AddRetention / AddNeuralODEBlock); shape/forward/train-step/save-load
-          test in tests/TestNeuralNumerical.pas;
-      (b) a BIDIRECTIONAL variant (forward + reversed pass concatenated) for
+      gradient/serialization tests + the TNNet.AddClosedFormContinuous pre-norm
+      residual builder all LANDED 2026-06-05). Deferred, each small + doable on
+      its own:
+      (a) a BIDIRECTIONAL variant (forward + reversed pass concatenated) for
           non-causal sequence tasks — the landed cell is causal/left-to-right only;
-      (c) scale the examples/LiquidCfC/ recall toy to a slightly longer SeqLen /
+      (b) scale the examples/LiquidCfC/ recall toy to a slightly longer SeqLen /
           multi-cue variant to show the input-dependent time-constant advantage
           over a fixed-decay SSM (DiagonalSSM) at matched parameters, keeping
           runtime < 5 min.
 
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
-      + examples/HyperNetwork/ + two-path gradient tests all LANDED 2026-06-05;
-      first layer in the fork that owns zero trainable weights — reads its W from a
-      second input tensor). Deferred, each small + doable on its own:
+      + examples/HyperNetwork/ + two-path gradient tests + the
+      TNNet.AddHyperLinear(Din, Dout, ContextLayer) generator+HyperLinear builder
+      all LANDED 2026-06-05; first layer in the fork that owns zero trainable
+      weights — reads its W from a second input tensor). Deferred, each small +
+      doable on its own:
       (a) a `TNNetHyperConv` cousin that generates a small CONV kernel from the
           context instead of a dense matrix (same backward-into-the-generator idea,
           conv forward) — extends HyperNetworks to spatial tasks;
       (b) CHUNKED weight generation so the main layer can be larger than the
           generator's output width (generate W in tiles) — the landed layer
           generates the whole Din*Dout matrix in one shot, which caps main-layer
-          size; document the memory/param trade-off;
-      (c) a `TNNet.AddHyperLinear(Din, Dout, ContextLayer)` builder that wires the
-          generator + reshape + HyperLinear in one call (the demo wires it by hand).
-          LANDED 2026-06-05: TNNet.AddHyperLinear(Din, Dout, ContextLayer,
-          UseBias=true) — a FullConnectLinear generator (width Din*Dout[+Dout])
-          off ContextLayer + a weightless TNNetHyperLinear off GetLastLayer (no
-          reshape; W is read flat row-major). Test TestAddHyperLinearBuilder
-          (shape + zero-weight hyper layer + gradients reach the generator +
-          save/load round-trip) in tests/TestNeuralNumerical.pas.
-
-- [x] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
-      matrix W (n x n, n = Depth) is CIRCULANT: every row is a cyclic shift of a
-      single learned vector c of length n, so the layer stores O(n) weights
-      instead of O(n^2) and the map is `y = circular_convolution(c, x) (+ bias)`.
-      This is genuinely distinct from everything already in the tree — LoRA is
-      LOW-RANK, AddGroupedFullConnect is BLOCK-DIAGONAL, TNNetBitLinear quantizes
-      a full dense matrix, and TNNetSpectralNorm rescales one — none impose a
-      shift-invariant Toeplitz/circulant structure. Deliverables:
-      (a) the leaf layer in neuralnetwork.pas (mark `// Coded by Claude (AI).`),
-          forward as the direct O(n^2) circular sum first (clear + easy to verify),
-          backward distributing each output error back over the shared c entries
-          (the gradient for c[k] sums contributions from all n diagonals), with
-          LoadFromString wiring + AddToWeightHistory/InitDefault parity with the
-          other FullConnect-family layers;
-      (b) numerical-gradient + save/load round-trip tests in
-          TestNeuralNumerical.pas (reseed `RandSeed := 424242` per the
-          [[numerical-test-rng-ordering]] rule) plus a smoke test that a circulant
-          layer reproduces an exact known circular convolution to <1e-5;
-      (c) an OPT-IN FFT fast path (reuse the FFT plumbing the Hyena/FourierFeatures
-          work already pulls in) computing the forward/backward as a pointwise
-          product in the frequency domain — O(n log n) — gated so the direct path
-          stays the default, with a direct-vs-FFT equivalence assertion <1e-5;
-      (d) an examples/CirculantLinear/ parameter-efficiency bake-off: circulant vs
-          a param-matched dense TNNetFullConnectLinear on a small regression/recall
-          task, charting accuracy-per-weight (the headline win) and wall-clock of
-          the direct vs FFT forward as n grows.
-      PROGRESS: parts (a), (b) and (d) LANDED. (a) TNNetCirculantLinear ships in
-      neuralnetwork.pas (two length-n neurons: kernel c + per-output bias; direct
-      O(n^2) forward; backward distributes the error over the shared kernel; both
-      CreateLayer dispatch points wired so save/load round-trips). (b) three tests
-      in TestNeuralNumerical.pas (known-circular-convolution smoke <1e-5,
-      finite-difference gradient check for input + kernel + bias, byte-identical
-      save/load round-trip) — full suite green. (d) examples/CirculantLinear/
-      bake-off (circulant 2n weights vs dense n*n+n) prints accuracy-per-weight:
-      circulant ~8.5x fewer weights and ~500x more accurate-per-weight on n=16,
-      recovers the teacher kernel to ~5 decimals, runs in ~0.5s. (c) LANDED
-      2026-06-05: opt-in O(n log n) FFT fast path via `TNNetCirculantLinear.UseFFT`
-      (property, default false). A self-contained radix-2 Cooley-Tukey FFT
-      (helper CirculantFFT, double precision internally, power-of-two n required;
-      UseFFT errors clearly otherwise) computes BOTH forward
-      (y = IFFT(FFT(c).*FFT(x)) + bias) AND backward (input grad = circular
-      correlation IFFT(conj(FFT(c)).*FFT(e)); kernel grad
-      IFFT(conj(FFT(x)).*FFT(e)); bias grad = e). The direct O(n^2) path stays
-      the DEFAULT and is the numerical source of truth. Test
-      TestCirculantLinearFFTEquivalence in TestNeuralNumerical.pas asserts the
-      FFT path matches the direct forward output, input gradient and kernel/bias
-      deltas to <1e-5 (n=16); existing direct-path tests unchanged and green.
-      The example README documents UseFFT; the optional "FFT-vs-direct wall-clock
-      as n grows" chart was NOT added (the layer-level fast path + equivalence
-      test is the substantive deliverable). Full suite green.
+          size; document the memory/param trade-off.
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
