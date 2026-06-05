@@ -591,18 +591,6 @@ rather than acted on.
       test" experiment and the `examples/VQAutoencoder/` demo below.
 
 ### Training infrastructure (the "missing plumbing")
-- [X] TNeuralLRScheduler follow-up: WIRE the scheduler into the training loop —
-      have TNeuralFit/TNeuralImageFit call `NextLR(Epoch, Step)` each
-      epoch/step (gated behind an optional Scheduler property so the default
-      fixed-LR path is byte-for-byte unchanged), plus a regression test that a
-      net trained under a constant-valued scheduler matches the fixed-LR run.
-      The classes + math are landed; this is the integration the "missing
-      plumbing" entry ultimately wants.
-      DONE: TNeuralFitBase.Scheduler property (defaults nil); CheckLearningRate
-      calls Scheduler.NextLR(iEpochCount, FCurrentStep) as highest-priority
-      override branch (epoch granularity — both Optimize loops call
-      CheckLearningRate once per epoch); regression test
-      TestConstantSchedulerMatchesFixedLR in tests/TestNeuralFit.pas.
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
       (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
       TNeuralFit calls them yet. Wire an optional hook into the training loop (call
@@ -622,16 +610,6 @@ rather than acted on.
       cheaper Grokfast-MA (windowed moving average) variant alongside the EMA form.
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
-- [X] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
-      detector helper, not the in-LOOP abort. Add an end-to-end test that runs
-      a short TNeuralFit with `NaNGuard := True` on a net rigged to produce a
-      non-finite activation (e.g. an aggressive LR / a planted Inf weight) and
-      assert training aborts (FShouldQuit set / FErrorProc fired) rather than
-      running to the epoch budget.
-      DONE: tests/TestNeuralFit.pas TestNaNGuardAbortsTrainingOnInf (plants
-      +Inf in a hidden weight, masks FPU exceptions, asserts ErrorProc fired +
-      ShouldQuit set + CurrentEpoch < budget) and TestNaNGuardSilentOnHealthyNet
-      (same net/data, guard ON, well-behaved: no fire, runs full budget).
 - [ ] Mixup follow-up: the landed examples/Mixup/ toy is LINEARLY SEPARABLE so both
       the plain and mixup-augmented arms hit ~100% val accuracy — the helper is
       pinned by unit tests but the demo does not yet SHOW mixup winning. Add a
@@ -1348,8 +1326,9 @@ rather than acted on.
       TNNetCharbonnierLoss.
 - [ ] "Learning-rate schedulers" README subsection — one paragraph per
       schedule with a snippet showing how to wire it into TNeuralImageFit.
-      The scheduler classes (TNeuralLRScheduler family) have landed; the
-      Fit-integration is still the open follow-up under "Training infrastructure".
+      The scheduler classes (TNeuralLRScheduler family) and the TNeuralFit
+      integration (the optional Scheduler property driving NextLR each epoch)
+      have both landed; this is the remaining README write-up.
 - [ ] "Introspection" README subsection — group CountLayers/Neurons/Weights
       with the new PrintSummary / FLOPs / WeightHistogram / DeadNeuronReport
       utilities.
