@@ -15,6 +15,7 @@ lib/
 tests/RunTests
 examples/ActivationBakeoff/ActivationBakeoff
 examples/BeamSearchDecode/BeamSearchDecode
+examples/LotteryTicketIMP/LotteryTicketIMP
 link*.res
 autosave.csv
 autosave.nn

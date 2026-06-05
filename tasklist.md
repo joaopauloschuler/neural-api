@@ -344,13 +344,19 @@ rather than acted on.
 - [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
       next-token task and chart loss + max-logit-norm.
-- [ ] Lottery-ticket follow-up: ITERATIVE magnitude pruning (IMP, the paper's
+- [X] Lottery-ticket follow-up: ITERATIVE magnitude pruning (IMP, the paper's
       actual method) vs the landed one-shot prune. Loop: train -> prune the
       bottom p% of SURVIVING weights -> reset survivors to theta_0 -> retrain,
       for several rounds reaching the same final sparsity as one-shot. Fork
       examples/LotteryTicket and chart whether IMP finds a winning ticket at the
       95% sparsity where the landed one-shot run collapsed to ~67% (the headline
       "iterative beats one-shot at extreme sparsity" result). Pure CPU, &lt;5 min.
+      PROGRESS: landed examples/LotteryTicketIMP (5 rounds, prune 45%/round of
+      survivors -> (0.55)^5 ~= 95% sparsity, rewind to theta_0 each round),
+      graded head-to-head vs a budget-matched one-shot prune-to-95%. HONEST
+      negative: at a generous matched 540-epoch budget the one-shot ticket does
+      NOT collapse (sibling collapses only at 100 epochs/arm), so IMP shows no
+      advantage on this easy toy; reported plainly. Pure CPU ~140 s.
 - [ ] Init-scheme × depth heatmap: for depths {2, 4, 8, 16} and inits
       {Glorot, He, LeCun, plain N(0, 0.01)}, plot first-step gradient norm
       at the deepest layer.
