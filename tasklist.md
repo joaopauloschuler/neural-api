@@ -108,6 +108,33 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
+- [ ] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
+      matrix W (n x n, n = Depth) is CIRCULANT: every row is a cyclic shift of a
+      single learned vector c of length n, so the layer stores O(n) weights
+      instead of O(n^2) and the map is `y = circular_convolution(c, x) (+ bias)`.
+      This is genuinely distinct from everything already in the tree — LoRA is
+      LOW-RANK, AddGroupedFullConnect is BLOCK-DIAGONAL, TNNetBitLinear quantizes
+      a full dense matrix, and TNNetSpectralNorm rescales one — none impose a
+      shift-invariant Toeplitz/circulant structure. Deliverables:
+      (a) the leaf layer in neuralnetwork.pas (mark `// Coded by Claude (AI).`),
+          forward as the direct O(n^2) circular sum first (clear + easy to verify),
+          backward distributing each output error back over the shared c entries
+          (the gradient for c[k] sums contributions from all n diagonals), with
+          LoadFromString wiring + AddToWeightHistory/InitDefault parity with the
+          other FullConnect-family layers;
+      (b) numerical-gradient + save/load round-trip tests in
+          TestNeuralNumerical.pas (reseed `RandSeed := 424242` per the
+          [[numerical-test-rng-ordering]] rule) plus a smoke test that a circulant
+          layer reproduces an exact known circular convolution to <1e-5;
+      (c) an OPT-IN FFT fast path (reuse the FFT plumbing the Hyena/FourierFeatures
+          work already pulls in) computing the forward/backward as a pointwise
+          product in the frequency domain — O(n log n) — gated so the direct path
+          stays the default, with a direct-vs-FFT equivalence assertion <1e-5;
+      (d) an examples/CirculantLinear/ parameter-efficiency bake-off: circulant vs
+          a param-matched dense TNNetFullConnectLinear on a small regression/recall
+          task, charting accuracy-per-weight (the headline win) and wall-clock of
+          the direct vs FFT forward as n grows.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
       SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
