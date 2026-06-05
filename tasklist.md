@@ -148,6 +148,47 @@ rather than acted on.
       default; the example's "FFT-vs-direct wall-clock as n grows" chart depends
       on it and is deferred with it).
 
+- [ ] TNNetSelectiveSSM — an INPUT-DEPENDENT ("selective", Mamba/S6-style, Gu &
+      Dao 2023) diagonal state-space sequence mixer. This is genuinely distinct
+      from the landed TNNetDiagonalSSM, which is strictly LINEAR-TIME-INVARIANT:
+      its per-channel decay a[d], input gain b[d] and output gain c[d] are FIXED
+      learned scalars, so the recurrence cannot condition on content. The whole
+      point of selectivity is that the gates become FUNCTIONS OF THE INPUT at each
+      timestep, letting the layer choose what to remember vs forget per token —
+      the mechanism behind Mamba's selective-copy / induction-head wins that an
+      LTI SSM provably cannot do. Concretely, over a (SeqLen,1,Depth) sequence
+      (same SizeY=1 layout / depth-parallel sweep as TNNetDiagonalSSM), make the
+      step input-conditioned:
+        delta_t = softplus(x_t·W_d + b_d)       (per-channel positive timestep)
+        a_t[d]  = exp(-delta_t[d] * exp(A_raw[d]))   (discretized decay, in (0,1))
+        bbar_t[d] = delta_t[d] * b_t[d], with b_t = x_t·W_B, c_t = x_t·W_C
+        h_t = a_t (*) h_{t-1} + bbar_t (*) x_t
+        y_t = c_t (*) h_t + e[d]·x_t             (e = S4D feedthrough, keeps grads
+                                                 alive at init like DiagonalSSM)
+      Deliverables, mirroring the DiagonalSSM/Hyena/Circulant landings:
+      (a) the leaf layer in neuralnetwork.pas (mark `// Coded by Claude (AI).`),
+          with the three small input-projection weight sets (W_d, W_B, W_C) plus
+          per-channel A_raw and e. Forward is the direct O(SeqLen*Depth) causal
+          sweep; backward is backprop-through-time (right-to-left dL/dh sweep, as
+          in TNNetDiagonalSSM) that ALSO scatters into the projection weights and
+          chains through softplus(delta) and exp(decay). Init so the layer starts
+          as a benign leaky accumulator near the DiagonalSSM default (A_raw such
+          that a≈0.5 at unit delta, e=1), and wire both CreateLayer dispatch points
+          so save/load round-trips.
+      (b) numerical-gradient + save/load tests in TestNeuralNumerical.pas (reseed
+          `RandSeed := 424242` per [[numerical-test-rng-ordering]]): finite-diff
+          checks on the input AND every weight set (W_d/W_B/W_C/A_raw/e), a
+          byte-identical save/load round-trip, and a degeneracy check that with
+          the projection weights forced to constants the layer reduces to an LTI
+          DiagonalSSM-equivalent to <1e-5 (the correctness anchor).
+      (c) an examples/SelectiveSSM/ SELECTIVE-COPY bake-off: a content-addressed
+          copy/induction task where the model must reproduce tokens that followed a
+          marker — the canonical task an LTI SSM fails and a selective one solves.
+          Contrast TNNetSelectiveSSM vs a param-matched TNNetDiagonalSSM (headline:
+          selectivity clears the task, LTI plateaus) and note wall-clock. Pure CPU,
+          <5 min. Composes with the open [[KV-cache incremental-decode]] /
+          O(1)-per-step SSM follow-up (the recurrence is O(1)-per-step by nature).
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
