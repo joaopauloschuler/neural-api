@@ -72,8 +72,13 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetCapsule + routing-by-agreement (Sabour/Hinton/Frosst 2017, "Dynamic
-      Routing Between Capsules") — genuinely distinct from everything in tree:
+- [X] TNNetCapsule + routing-by-agreement (Sabour/Hinton/Frosst 2017, "Dynamic
+      Routing Between Capsules") — LANDED (tasklist was stale): TNNetCapsuleSquash +
+      TNNetCapsuleRouting are in neuralnetwork.pas with the squash nonlinearity,
+      the fixed-iteration routing loop, LoadFromString wiring, and numerical-gradient
+      + serialization tests in TestNeuralNumerical.pas. The reconstruction-decoder
+      pose-perturbation STRETCH goal remains open as a future example.
+      Original idea below — genuinely distinct from everything in tree:
       attention routes by scaled dot-product, MoE routes by a softmax gate, the
       open Modern-Hopfield entry retrieves by energy; capsules route by *iterative
       agreement* between vector-valued units, which nothing here does. Two pieces:
@@ -102,8 +107,20 @@ rather than acted on.
       attention), GatherChannelsRouting (static channel gather), the landed
       TNNet.AddMixtureOfExperts (scalar gate) and the landed Modern-Hopfield retrieval.
 
-- [ ] TNNet.AddDeepEquilibriumBlock + examples/DeepEquilibrium/ (Bai/Kolter/Koltun
-      2019, "Deep Equilibrium Models") — the IMPLICIT cousin of the landed NeuralODE
+- [X] TNNet.AddDeepEquilibriumBlock + examples/DeepEquilibrium/ (Bai/Kolter/Koltun
+      2019, "Deep Equilibrium Models") — LANDED 2026-06-05: builder iterates a
+      weight-tied f via z := f(z+x) to its fixed point (param count independent of
+      iters), backward is the jacobian-free PHANTOM gradient (Geng et al. 2021, last
+      iterate only, earlier iterates detached via TNNetIdentityWithoutBackprop). New
+      TNNetDeepEquilibriumSharedConv rebuilds its weight cache per forward (plain
+      TNNetConvolutionSharedWeights snapshots a STALE cache under init-after-build —
+      latent bug fixed here). Tests: shape, fixed-point convergence, gradient-flow,
+      save/load round-trip. Example reports per-epoch accuracy + mean iters-to-
+      converge vs a param-matched NeuralODE. OPEN follow-ups: (a) the EXACT
+      implicit-function-theorem gradient (inverse-Jacobian solve) vs the phantom
+      approx; (b) spectral/contraction constraints so convergence is guaranteed at
+      arbitrary init (v1 uses damped Picard + output bounding, not guaranteed).
+      Original idea below. — the IMPLICIT cousin of the landed NeuralODE
       block, and genuinely distinct from it: NeuralODE unrolls a FIXED number of
       explicit-Euler steps `y := y + h·f(y)` (a known-length forward graph), whereas
       a DEQ defines its output as the FIXED POINT `z* = f(z*, x)` of a shape-preserving
@@ -346,8 +363,18 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [ ] TNNet.AddMultiHeadLatentAttention builder + examples/LatentAttention/
-      (DeepSeek-V2 "Multi-head Latent Attention", MLA) — a genuinely distinct
+- [X] TNNet.AddMultiHeadLatentAttention builder + examples/LatentAttention/
+      (DeepSeek-V2 "Multi-head Latent Attention", MLA) — LANDED 2026-06-05:
+      AddMultiHeadLatentAttention(d_model, Heads, LatentDim, CausalMask) composes
+      existing layers (PointwiseConvLinear down-proj x->c_KV + per-head K/V
+      up-projections + per-head SDPA + DeepConcat + out-proj), no new class. Tests:
+      shape + numeric input-gradient check (max err ~6.9e-4) and SaveToString/
+      LoadFromString forward round-trip. Example: MLA-vs-param-matched-MHA next-token
+      copy bake-off reporting the cacheable-state saving d_c/(2*d_model). OPEN
+      follow-up: v1 is NoPE — the paper's DECOUPLED-RoPE slice (separate rope-only
+      Q/K slice concatenated to the content slice before the dot product) is still
+      open, as is the KV-cache win which needs the [[KV-cache incremental-decode]]
+      path. Original idea below — a genuinely distinct
       compression axis from the landed GQA. GQA shrinks the KV cache by SHARING
       full-width K/V across query-head GROUPS (fewer heads, each still d_head
       wide); MLA instead LOW-RANK-FACTORS the K/V projection: each token is first
@@ -729,9 +756,16 @@ rather than acted on.
       win is a flatter, better-generalising averaged solution). Mirror the open
       TNeuralLRScheduler-wiring follow-up's "opt-in, regression-test the default is
       unchanged" discipline.
-- [ ] TNNetGrokfastWrapper — accelerate grokking with a slow-gradient amplifier
+- [X] TNNetGrokfastWrapper — accelerate grokking with a slow-gradient amplifier
       (Lee et al. 2024, "Grokfast: Accelerated Grokking by Amplifying Slow
-      Gradients", https://arxiv.org/abs/2405.20233). The mechanism is a one-line
+      Gradients", https://arxiv.org/abs/2405.20233). LANDED 2026-06-05: caller-driven
+      wrapper (sibling to SWA/EMA/Lookahead) keeping a per-weight gradient EMA
+      mu := beta*mu + (1-beta)*g and rewriting live gradients g := g + lambda*mu in
+      place (operates on Neurons[*].Delta / FBiasDelta). Three tests in
+      TestNeuralTraining.pas: lambda=0 byte-for-byte identity, constant-stream
+      convergence to (1+lambda)*g, slow-gradient emphasis (unit-level EMA). OPEN
+      pairing: wire it into the still-open examples/Grokking/ demo as the Grokfast-on
+      vs -off grok-epoch contrast (the published fix for that demo's <5-min budget). The mechanism is a one-line
       idea with a striking payoff: delayed generalization ("grokking") is driven
       by the SLOW-varying (low-frequency) component of the gradient trajectory,
       while the fast-varying component is mostly overfitting noise. Grokfast keeps
