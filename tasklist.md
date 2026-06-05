@@ -304,12 +304,6 @@ rather than acted on.
       dot product (RoPE cannot be applied to the compressed latent because the
       up-projection would smear positions); (b) the headline KV-cache win, which
       needs the open [[KV-cache incremental-decode]] path.
-      equivalence to <1e-5 by copying identical weights. Deferred because
-      AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab (one
-      external projection) whereas AddMultiHeadGroupedQueryAttention does its own
-      three Q/K/V projections from a d_model input, so a weight-for-weight wiring
-      is fiddly; the landed test asserts equal output shape + the exact K/V
-      projection param saving instead.
 - [ ] GQA follow-up: wire AddMultiHeadGroupedQueryAttention into the downstream
       ../gpt-3-for-pascal decoder and compose with the open [[KV-cache
       incremental-decode]] task — the KV footprint shrinks by QueryHeads/KVHeads,
@@ -336,15 +330,6 @@ rather than acted on.
       Re-scope before attempting.
 
 ### Bake-off / experiment follow-ups
-- [ ] Position-encoding bake-off follow-up: the landed bake-off uses a
-      predict-the-PREVIOUS-token task on which ALiBi lands just above the
-      no-position baseline — a single head's `2^-8` slope is a weak recency
-      bias that under the causal mask favours the query's own position and
-      injects NO positional content into the values, so it cannot do
-      fixed-offset (-1) retrieval. Add an ALiBi-FAVOURABLE second task
-      (a long-context recency / "attend-to-the-nearest-recent-match" task)
-      and/or a multi-head variant with per-head slopes `2^(-8h/H)`, so the
-      arm where ALiBi's locality prior actually wins is also demonstrated.
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
