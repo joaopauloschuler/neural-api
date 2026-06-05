@@ -39,8 +39,6 @@ unit neuralvolume;
 {$mode objfpc}
 {$ENDIF}
 
-{$UNITPATH ./pas-core-math}
-
 interface
 
 uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32;
@@ -557,6 +555,7 @@ type
   // Typical caller usage:
   //   Penalty.Apply(Logits); tok := Sampler.GetToken(Logits);
   //   Penalty.RegisterToken(tok);
+  // Coded by Claude (AI).
   TNNetTokenHistoryPenalty = class(TObject)
     protected
       FRepetition: TNeuralFloat;

@@ -439,6 +439,7 @@ type
     procedure TestMultiHeadSDPAConcatGradientCheck;
     procedure TestMultiHeadSelfAttentionGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
+    procedure TestCrossAttentionLoadFromString;
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
     procedure TestTransformerEncoderBlockGradientCheck;
@@ -5987,6 +5988,12 @@ begin
     KnownErr := 0.75;
     Pool.OutputError.Fill(0);
     Pool.OutputError[0, 0, 0] := KnownErr;
+    // Pool is the last layer, so nothing consumes its output and its departing
+    // branch count is 0. The inherited TNNetPoolBase.Backpropagate guards
+    // against over-counting (TestBackPropCallCurrCnt), so register the single
+    // consuming branch before the manual backward pass, exactly as the
+    // framework does for the last layer (see TNNet manual-backprop helpers).
+    Pool.IncDepartingBranchesCnt();
     Pool.Backpropagate();
 
     // Determine the sampled cell from the output value, then assert the
@@ -8620,6 +8627,9 @@ begin
     NN.Layers[0].OutputError.Fill(0);
     for i := 0 to NN.GetLastLayer.OutputError.Size - 1 do
       NN.GetLastLayer.OutputError.Raw[i] := i * 0.1 + 0.05;
+    // Last layer has no consumer (departing branch count 0); register the single
+    // branch before the manual backward pass to satisfy TestBackPropCallCurrCnt.
+    NN.GetLastLayer.IncDepartingBranchesCnt();
     NN.GetLastLayer.Backpropagate();
 
     for i := 0 to Input.Size - 1 do
@@ -12325,6 +12335,70 @@ begin
     QPlus.Free;
     KVData.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossAttentionLoadFromString;
+// Round-trip a net whose decoder branch cross-attends a SEPARATE encoder
+// branch with a DIFFERENT sequence length (QSeqLen=3, KVSeqLen=4). This
+// exercises TNNetCrossAttention's serialization: the d_k / causal FStruct AND
+// the explicit Key|Value source layer index (injected into the structure
+// string like TNNetConcat) must survive SaveToString -> LoadFromString.
+var
+  NN, NN2: TNNet;
+  QueryInput, KVInput: TNNetLayer;
+  QData, KVData: TNNetVolume;
+  d_model, Heads, QSeqLen, KVSeqLen, i: integer;
+  Saved, Saved2: string;
+  FoundCross: boolean;
+begin
+  RandSeed := 424242;
+  d_model := 8; Heads := 2; QSeqLen := 3; KVSeqLen := 4;
+  NN := TNNet.Create();
+  QData := TNNetVolume.Create(QSeqLen, 1, d_model);
+  KVData := TNNetVolume.Create(KVSeqLen, 1, d_model);
+  try
+    QueryInput := NN.AddLayer(TNNetInput.Create(QSeqLen, 1, d_model, 1));
+    KVInput    := NN.AddLayerAfter(TNNetInput.Create(KVSeqLen, 1, d_model, 1), 0);
+    NN.AddMultiHeadCrossAttention(d_model, Heads, QueryInput, KVInput, false);
+
+    for i := 0 to QData.Size - 1 do QData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Cos(i * 0.37) * 0.8 - 0.2;
+    QueryInput.Output.Copy(QData);
+    KVInput.Output.Copy(KVData);
+    NN.Compute(QueryInput.Output);
+
+    // At least one TNNetCrossAttention layer must exist in the built net.
+    FoundCross := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetCrossAttention then FoundCross := true;
+    AssertTrue('cross-attention layer present', FoundCross);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CrossAttention SaveToString round-trip equality',
+        Saved, Saved2);
+
+      // Reloaded net must reproduce the forward pass bit-for-bit. Drive BOTH
+      // input branches, then compare the output on the QUERY grid.
+      NN2.Layers[0].Output.Copy(QData);
+      NN2.Layers[1].Output.Copy(KVData);
+      NN2.Compute(NN2.Layers[0].Output);
+      AssertTrue('reloaded output on query grid',
+        NN2.GetLastLayer.Output.SizeX = QSeqLen);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CrossAttention round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    QData.Free;
+    KVData.Free;
   end;
 end;
 
@@ -25318,6 +25392,13 @@ begin
     Input.Raw[1] := -0.2;
     Input.Raw[2] :=  1.1;
     Input.Raw[3] :=  0.7;
+
+    // SoftLayer is the last layer, so nothing consumes its output and its
+    // departing branch count is 0. Backpropagate guards against over-counting
+    // (TestBackPropCallCurrCnt), so register the single consuming branch once,
+    // exactly as the framework does for the last layer. ResetBackpropCallCurrCnt
+    // below clears the per-pass call counter but leaves this count intact.
+    SoftLayer.IncDepartingBranchesCnt();
 
     for i := 0 to Input.Size - 1 do
     begin

@@ -1,5 +1,42 @@
 # Task List — Feature & Enhancement Ideas
 
+## Authorship convention (AI-coded classes)
+
+Every class that was newly added to `neural/neuralnetwork.pas` by Claude
+(i.e. not present in the upstream `../neural-master` baseline) carries an
+attribution comment as the **last comment line directly above the class
+declaration**, written exactly as:
+
+```
+  // Coded by Claude (AI).
+```
+
+Rules:
+- One attribution per **class** (not per method), placed immediately above
+  the `TNNet... = class(...)` line, after any `///`/`//` doc comment.
+- Use the literal text `// Coded by Claude (AI).` (plain `//`, not `///`,
+  trailing period) so it can be audited with
+  `grep -c "Coded by Claude" neural/neuralnetwork.pas`.
+- Applies only to genuinely **new** classes. Do NOT retrofit it onto
+  pre-existing upstream classes that were merely edited.
+- Human-authored hand-coding of new classes is no longer the norm here;
+  new classes are Claude-authored and should be marked as such.
+
+### Example programs (`examples/**/*.lpr`)
+
+Every example program newly added by Claude (i.e. not present in the
+`../neural-master` baseline) carries the attribution `Coded by Claude (AI).`
+inserted with a blank-line separator immediately **before the closing `*)`**
+of the file's header `(* ... *)` license comment block.
+
+Rules:
+- One attribution per file, inside the header comment block (so it never
+  affects compilation).
+- Applies only to genuinely **new** example `.lpr` files; skip stray
+  `backup/` copies. Identify "new" by diffing `find examples -name '*.lpr'`
+  against the `../neural-master` baseline.
+- Audit with `grep -rl "Coded by Claude" examples --include='*.lpr' | wc -l`.
+
 ## DO NOT REINTRODUCE — removed by intent
 
 The following layer types were intentionally removed because they
@@ -273,6 +310,19 @@ rather than acted on.
       rediscover the divergence the hard way.
 
 ## Infrastructure / dev experience
+- [ ] **Gradient-verification coverage audit.** For a *scientific-discovery*
+      library the cardinal sin is a silently-wrong result, so every layer with
+      a backward pass must have a numerical-gradient test proving Compute's
+      analytic gradient matches a finite-difference estimate. Task: enumerate
+      all `TNNet*` layers (esp. the 165 Claude-added ones — see the Authorship
+      convention section), cross-reference against the cases in
+      `tests/TestNeuralNumerical.pas`, and produce a coverage list of which
+      layers are gradient-verified vs. compile-only. Then backfill tests for
+      the gaps, prioritising layers with hand-written backward passes (loss
+      heads, attention variants, sparsemax, the SSM) over thin activation
+      subclasses. Treat "has a numerical-gradient test" as the definition of
+      done for any future layer. Watch the shared-RNG ordering sensitivity in
+      that test unit (reseed `RandSeed := 424242`, don't loosen tolerances).
 - [ ] Mixed-precision (FP16) volumes for the OpenCL path
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] Model zoo loader that pulls pre-trained weights from the companion repo

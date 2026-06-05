@@ -85,7 +85,7 @@ or directly with fpc (mirroring the sibling examples' unit paths):
 ```
 cd examples/MuonOptimizer
 fpc -dRelease -dAVX2 -O3 -Mobjfpc -Sh \
-    -Fu../../neural -Fu../../neural/pas-core-math \
+    -Fu../../neural \
     -Fu<lazarus>/components/lazutils/lib/x86_64-linux \
     MuonOptimizer.lpr
 ./MuonOptimizer

@@ -13,6 +13,8 @@ The feature map is kept SQUARE (16x16) on purpose: the channel sub-module's
 global max-pool (TNNetMaxChannel) assumes SizeX = SizeY.
 
 License: LGPL with linking exception (same as the rest of neural-api).
+
+Coded by Claude (AI).
 *)
 
 {$mode objfpc}{$H+}

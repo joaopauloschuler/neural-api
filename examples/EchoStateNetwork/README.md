@@ -83,7 +83,7 @@ and finishes in a few seconds on one thread.
 Compile directly with FPC (units live in `../../neural`):
 
 ```
-fpc -O3 -Mobjfpc -Sc -Sh -Fu../../neural -Fu../../neural/pas-core-math EchoStateNetwork.lpr
+fpc -O3 -Mobjfpc -Sc -Sh -Fu../../neural EchoStateNetwork.lpr
 ./EchoStateNetwork
 ```
 

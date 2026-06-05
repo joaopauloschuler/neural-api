@@ -88,7 +88,7 @@ whole sequence and destroy the per-position structure.
 
 ```
 cd examples/InductionHeads
-fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural -Fu../../neural/pas-core-math InductionHeads.lpr
+fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural InductionHeads.lpr
 ./InductionHeads
 ```
 

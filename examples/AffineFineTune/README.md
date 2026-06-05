@@ -40,7 +40,7 @@ and are present from the start, frozen to identity during base training. Note:
 
 ```
 cd examples/AffineFineTune
-fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural -Fu../../neural/pas-core-math AffineFineTune.lpr
+fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural AffineFineTune.lpr
 ./AffineFineTune
 ```
 

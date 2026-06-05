@@ -601,6 +601,7 @@ type
   // default 1.25 is the paper's recommended value.
   // https://arxiv.org/abs/1801.07145 ("E-swish: Adjusting Activations to
   // Different Network Depths", Alcaide, 2018).
+  // Coded by Claude (AI).
   TNNetESwish = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -618,6 +619,7 @@ type
   // sigmoid derivative uses a sign branch to avoid Exp overflow.
   // The derivative is cached in FOutputErrorDeriv so TNNetReLUBase handles
   // the backward chain rule with one multiply.
+  // Coded by Claude (AI).
   TNNetSoftPlusBeta = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -642,6 +644,7 @@ type
   // The derivative is cached in FOutputErrorDeriv so TNNetReLUBase handles
   // the backward chain rule with one multiply.
   // https://arxiv.org/abs/1602.01321
+  // Coded by Claude (AI).
   TNNetSoftExponential = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -657,6 +660,7 @@ type
   // https://arxiv.org/abs/1710.09967 (Carlile, Delamarter, Kinney, Marti,
   // Whitney, 2017 - "Improving Deep Learning by Inverse Square Root Linear
   // Units (ISRLUs)").
+  // Coded by Claude (AI).
   TNNetISRU = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -672,6 +676,7 @@ type
   // https://arxiv.org/abs/1710.09967 (Carlile, Delamarter, Kinney, Marti,
   // Whitney, 2017 - "Improving Deep Learning by Inverse Square Root Linear
   // Units (ISRLUs)").
+  // Coded by Claude (AI).
   TNNetISRLU = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -682,6 +687,7 @@ type
   /// Squared ReLU activation function: relu(x)^2.
   // Derivative: 2*relu(x) for x>0, else 0.
   // https://arxiv.org/abs/2109.08668 (Primer)
+  // Coded by Claude (AI).
   TNNetSquaredReLU = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -727,6 +733,7 @@ type
   // FreePascal's Math unit does not ship erf. Cached into FOutputErrorDeriv
   // so TNNetReLUBase's backward handles the chain rule with one multiply.
   // Nag, Bhattacharyya (2021).
+  // Coded by Claude (AI).
   TNNetSerf = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -739,6 +746,7 @@ type
   //   dy/dx = t + x * (1 - t^2) * dL/dx.
   // https://arxiv.org/abs/2204.00746 ("Smish: A Novel Activation Function for
   // Deep Learning Methods", Wang et al., 2022).
+  // Coded by Claude (AI).
   TNNetSmish = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -757,6 +765,7 @@ type
   // chain rule with one multiply.
   // Naveen, "Phish: A Novel Hyper-Optimizable Activation Function" (2022),
   // https://arxiv.org/abs/2208.04458
+  // Coded by Claude (AI).
   TNNetPhish = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -771,6 +780,7 @@ type
   // because FreePascal's Math unit does not export erf. Cached into
   // FOutputErrorDeriv so TNNetReLUBase's backward handles the chain rule with
   // one multiply.
+  // Coded by Claude (AI).
   TNNetErf = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -785,6 +795,7 @@ type
   // https://arxiv.org/abs/2003.09855 ("TanhExp: A Smooth Activation Function
   // with High Convergence Speed for Lightweight Neural Networks", Liu &
   // Di, 2020).
+  // Coded by Claude (AI).
   TNNetTanhExp = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -799,6 +810,7 @@ type
   // Cached in FOutputErrorDeriv so TNNetReLUBase handles the backward chain
   // rule with one multiply.
   // Xu et al., "Revise Saturated Activations for Deep Networks" (2016).
+  // Coded by Claude (AI).
   TNNetPenalizedTanh = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -807,6 +819,7 @@ type
   /// SoftPlus activation function.
   // A smooth approximation of ReLU.
   // SoftPlus(x) = ln(1 + exp(x)), derivative is the sigmoid function.
+  // Coded by Claude (AI).
   TNNetSoftPlus = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -815,6 +828,7 @@ type
 
   /// Gaussian activation function.
   // Gaussian(x) = exp(-x^2), derivative is -2*x*exp(-x^2).
+  // Coded by Claude (AI).
   TNNetGaussianActivation = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -823,6 +837,7 @@ type
 
   /// TanhShrink activation function.
   // TanhShrink(x) = x - tanh(x), derivative is tanh(x)^2.
+  // Coded by Claude (AI).
   TNNetTanhShrink = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -834,6 +849,7 @@ type
   //   x <  0: y =  x - ln(1+exp(x))
   // Derivative is sigmoid(-x) = 1 - sigmoid(x), cached in FOutputErrorDeriv
   // so the TNNetReLUBase backward chain rule applies.
+  // Coded by Claude (AI).
   TNNetLogSigmoid = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -843,6 +859,7 @@ type
   // ShiftedReLU(x) = max(-1, x). Parameter-free. Derivative is 1 for x > -1,
   // else 0. Cached in FOutputErrorDeriv so TNNetReLUBase handles the
   // backward chain rule.
+  // Coded by Claude (AI).
   TNNetShiftedReLU = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -852,6 +869,7 @@ type
   // Abs(x) = |x|. Parameter-free. Derivative is sign(x): +1 for x > 0,
   // -1 for x < 0, 0 at x = 0. Cached in FOutputErrorDeriv so
   // TNNetReLUBase handles the backward chain rule.
+  // Coded by Claude (AI).
   TNNetAbs = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -861,6 +879,7 @@ type
   // Forward: sign(x) = +1 if x > 0, -1 if x < 0, 0 if x = 0.
   // Backward (saturated STE): pass gradient through only where |x| <= 1.
   // Cached in FOutputErrorDeriv so TNNetReLUBase handles the chain rule.
+  // Coded by Claude (AI).
   TNNetSign = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -869,6 +888,7 @@ type
   /// Square activation function.
   // Square(x) = x * x. Parameter-free. Derivative is 2*x. Cached in
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule.
+  // Coded by Claude (AI).
   TNNetSquare = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -879,6 +899,7 @@ type
   // Derivative is 1/(2*y) where y is the cached output, so backward
   // is a single multiply. Cached in FOutputErrorDeriv so TNNetReLUBase
   // handles the backward chain rule.
+  // Coded by Claude (AI).
   TNNetSqrt = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -889,6 +910,7 @@ type
   // (exp(30) ~ 1.07e13 is still finite). Parameter-free. Derivative is
   // the output itself (dy/dx = y); cached into FOutputErrorDeriv so
   // TNNetReLUBase handles the backward chain rule with one multiply.
+  // Coded by Claude (AI).
   TNNetExp = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -899,6 +921,7 @@ type
   // Parameter-free. Derivative is 1/max(x, 1e-8); cached into
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
   // with one multiply.
+  // Coded by Claude (AI).
   TNNetLog = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -910,6 +933,7 @@ type
   // unclamped region this is just y = 1/x, so dy/dx = -y*y; cached into
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
   // with one multiply.
+  // Coded by Claude (AI).
   TNNetReciprocal = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -919,6 +943,7 @@ type
   // Sin(x) = sin(x). Parameter-free. Derivative is cos(x); cached into
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
   // with one multiply. The SIREN paper's core periodic activation.
+  // Coded by Claude (AI).
   TNNetSin = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -928,6 +953,7 @@ type
   // Cos(x) = cos(x). Parameter-free. Derivative is -sin(x); cached into
   // FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
   // with one multiply. Sibling of TNNetSin (cos(x) = sin(x + pi/2)).
+  // Coded by Claude (AI).
   TNNetCos = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -939,6 +965,7 @@ type
   // one multiply. Rounds out the trig/hyperbolic family alongside TNNetSin,
   // TNNetCos and TNNetHyperbolicTangent. Note: grows exponentially, so it is
   // only appropriate for layers whose inputs are bounded.
+  // Coded by Claude (AI).
   TNNetSinhAct = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -951,6 +978,7 @@ type
   // grows like ln|x| for large |x|. A tanh sibling that never saturates and
   // a sinh sibling that never explodes. Sqrt argument is always >= 1, so no
   // special-case handling needed.
+  // Coded by Claude (AI).
   TNNetArcSinh = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -962,6 +990,7 @@ type
   // Parameter-free. Derivative is (2/3) * (1.7159 - y^2 / 1.7159), cached
   // into FOutputErrorDeriv so TNNetReLUBase handles the backward chain rule
   // with one multiply. Element-wise, smooth, bounded by +/-1.7159.
+  // Coded by Claude (AI).
   TNNetLeCunTanh = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -976,6 +1005,7 @@ type
   // log(cosh(x)) = |x| + log1p(exp(-2*|x|)) - ln(2) to avoid overflow
   // at large |x|, mirroring the stable-softplus trick used in
   // TNNetSoftPlus / TNNetSerf.
+  // Coded by Claude (AI).
   TNNetLogCoshActivation = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -988,6 +1018,7 @@ type
   // for serialization. From "Neural Networks Fail to Learn Periodic
   // Functions and How to Fix It" (Ziyin et al., 2020); models periodic
   // inductive bias while preserving monotonic identity-like behavior.
+  // Coded by Claude (AI).
   TNNetSnake = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -1001,6 +1032,7 @@ type
   // cached into FOutputErrorDeriv so TNNetReLUBase handles the backward
   // chain rule with one multiply. A small epsilon guards the |x|->0
   // branch to avoid division-by-zero.
+  // Coded by Claude (AI).
   TNNetSinc = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -1039,6 +1071,7 @@ type
   // unchanged) and TNNetAddPositionalEmbedding / TNNetSinusoidalPositionalEmbedding
   // (fixed deterministic sinusoids over sequence positions): the whole point
   // here is the fixed RANDOM LINEAR lift into a 2*M-dimensional cos/sin basis.
+  // Coded by Claude (AI).
   TNNetFourierFeatures = class(TNNetLayer)
   private
     FNumFeatures: integer;     // M
@@ -1070,6 +1103,7 @@ type
   // x/(2*sqrt(x^2+1)) + 1, cached into FOutputErrorDeriv so
   // TNNetReLUBase handles the backward chain rule with one multiply.
   // Sqrt argument is always >= 1, so no special-case handling needed.
+  // Coded by Claude (AI).
   TNNetBentIdentity = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -1081,6 +1115,7 @@ type
   // tanh(x) + x * (1 - tanh(x)^2), cached into FOutputErrorDeriv so
   // TNNetReLUBase handles the backward chain rule with one multiply.
   // tanh(x) is computed once per element and reused for forward + derivative.
+  // Coded by Claude (AI).
   TNNetLisht = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -1088,6 +1123,7 @@ type
 
   /// HardTanh activation function.
   // HardTanh(x) = clamp(x, -1, 1). Derivative is 1 for |x| < 1, else 0.
+  // Coded by Claude (AI).
   TNNetHardTanh = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -1097,6 +1133,7 @@ type
   // HardShrink(x) = x if |x| > lambda, else 0. The L1-prox activation.
   // Derivative is 1 for |x| > lambda, else 0. lambda is configurable,
   // default 0.5, and is stored in FFloatSt[0] for serialization.
+  // Coded by Claude (AI).
   TNNetHardShrink = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -1109,6 +1146,7 @@ type
   // else 0. L1-prox cousin of HardShrink. Derivative is 1 for |x| > lambda,
   // else 0. lambda is configurable, default 0.5, and is stored in
   // FFloatSt[0] for serialization.
+  // Coded by Claude (AI).
   TNNetSoftShrink = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -1122,6 +1160,7 @@ type
   // indicator function with a non-differentiable kink at x=theta).
   // theta is stored in FFloatSt[0] and value in FFloatSt[1] for
   // serialization, both defaulting to 0.
+  // Coded by Claude (AI).
   TNNetThreshold = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -1140,6 +1179,7 @@ type
   // else y + alpha (cached output). alpha is configurable, default 1.0,
   // and is stored in FFloatSt[0] for serialization.
   // https://arxiv.org/abs/1511.07289
+  // Coded by Claude (AI).
   TNNetELU = class(TNNetReLUBase)
   private
     FAlpha: TNeuralFloat;
@@ -1155,6 +1195,7 @@ type
   // Derivative is 1 for x > 0, else exp(x/alpha). alpha is configurable,
   // default 1.0, and is stored in FFloatSt[0] for serialization.
   // https://arxiv.org/abs/1704.07483
+  // Coded by Claude (AI).
   TNNetCELU = class(TNNetReLUBase)
   private
     FAlpha: TNeuralFloat;
@@ -1167,11 +1208,13 @@ type
   /// Sigmoid Linear Unit (SiLU) activation. This is a naming alias for
   // Swish with beta=1. Implemented as a thin subclass so the class name
   // round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
   TNNetSiLU = class(TNNetSwish)
   end;
 
   /// SoftSign activation function.
   // y = x / (1 + |x|). Derivative is 1 / (1 + |x|)^2. Parameter-free.
+  // Coded by Claude (AI).
   TNNetSoftSign = class(TNNetReLUBase)
   public
     procedure Compute(); override;
@@ -1182,6 +1225,7 @@ type
   // A and B and outputs A * GELU(B). Output depth = input depth / 2.
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/2002.05202
+  // Coded by Claude (AI).
   TNNetGEGLU = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1196,6 +1240,7 @@ type
   // elementwise maximum across the groups. Output depth = input depth / K.
   // This layer has no trainable parameter. Input depth must be divisible by K.
   // https://arxiv.org/abs/1302.4389
+  // Coded by Claude (AI).
   TNNetMaxOut = class(TNNetLayer)
   private
     FMaxPosArray: array of integer;
@@ -1213,6 +1258,7 @@ type
   // Output depth = input depth / 2.
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/2002.05202
+  // Coded by Claude (AI).
   TNNetSwiGLU = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1227,6 +1273,7 @@ type
   // A and B and outputs A * sigmoid(B). Output depth = input depth / 2.
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/1612.08083
+  // Coded by Claude (AI).
   TNNetGLU = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1241,6 +1288,7 @@ type
   // A and B and outputs ReLU(A) * B. Output depth = input depth / 2.
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/2002.05202
+  // Coded by Claude (AI).
   TNNetReGLU = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1255,6 +1303,7 @@ type
   // A and B and outputs A * tanh(B). Output depth = input depth / 2.
   // Parameter-free; the input depth must be even. Mirrors TNNetGLU with
   // the sigmoid gate swapped for tanh; tanh'(b) = 1 - tanh^2(b).
+  // Coded by Claude (AI).
   TNNetTanhGLU = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1274,6 +1323,7 @@ type
   //   dcos/da_i = b_i/(na*nb) - c * a_i/na^2
   //   dcos/db_i = a_i/(na*nb) - c * b_i/nb^2
   // with a small eps added to the denominators for numerical safety.
+  // Coded by Claude (AI).
   TNNetCosineSimilarity = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1307,6 +1357,7 @@ type
   // when X > Y + Offset (a larger Offset keeps a wider band around / above
   // the diagonal); with LowerTriangle=True (anti-causal) a position is
   // masked when X < Y - Offset.
+  // Coded by Claude (AI).
   TNNetMaskedFill = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1330,6 +1381,7 @@ type
   // TNNetScaledDotProductAttention for causal self-attention. No
   // trainable parameters; backward pass is a pure gradient passthrough
   // (inherited from TNNetIdentity).
+  // Coded by Claude (AI).
   TNNetTriangularCausalMask = class(TNNetIdentity)
   private
     FMask: TNNetVolume;
@@ -1354,6 +1406,7 @@ type
   // to TNNetMaskedFill (full causal). No trainable parameters; backward is a
   // pure gradient passthrough (inherited from TNNetIdentity) since the
   // forward only adds a constant.
+  // Coded by Claude (AI).
   TNNetSlidingWindowMaskedFill = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1377,6 +1430,7 @@ type
   // Parameter-free (no learnable weights). Useful for quantization-aware
   // training, binarization, and discrete bottlenecks (e.g. VQ-VAE-style
   // codebook lookups).
+  // Coded by Claude (AI).
   TNNetStraightThroughEstimator = class(TNNetIdentity)
   public
     constructor Create(); overload;
@@ -1392,6 +1446,7 @@ type
   // precomputed at SetPrevLayer time. No trainable parameters. Backward
   // pass is a pure gradient passthrough since the bias is constant w.r.t.
   // the input.
+  // Coded by Claude (AI).
   TNNetALiBi = class(TNNetIdentity)
   private
     FSlopes: TNNetVolume;
@@ -1407,6 +1462,7 @@ type
   // The cap value c is stored in FFloatSt[0] (default 30.0) and there are no
   // trainable parameters. Output shape equals input shape. The derivative is
   // dy/dx = 1 - tanh(x/c)^2 = 1 - (y/c)^2.
+  // Coded by Claude (AI).
   TNNetSoftCapping = class(TNNetIdentity)
   public
     constructor Create(); overload;
@@ -1427,6 +1483,7 @@ type
   // The delta hyperparameter is stored in FFloatSt[0] (default 1.0) and
   // round-trips via Save/Load. No trainable parameters; output shape
   // equals input shape.
+  // Coded by Claude (AI).
   TNNetHuberLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1436,6 +1493,7 @@ type
 
   /// Smooth L1 loss — Huber loss with delta = 1.0 (PyTorch's SmoothL1Loss
   // default). Inherits the gradient-clipping backward from TNNetHuberLoss.
+  // Coded by Claude (AI).
   TNNetSmoothL1Loss = class(TNNetHuberLoss)
   public
     constructor Create(); override;
@@ -1448,6 +1506,7 @@ type
   // each element V with tanh(V) before propagating. This is the gradient
   // of L = sum( log(cosh(output - target)) ): smooth everywhere and
   // bounded in [-1, 1]. No constructor parameter and no trainable state.
+  // Coded by Claude (AI).
   TNNetLogCoshLoss = class(TNNetIdentity)
   public
     constructor Create(); override;
@@ -1461,6 +1520,7 @@ type
   // everywhere and bounded in [-1, 1] regardless of residual magnitude.
   // The eps hyperparameter is stored in FFloatSt[0] (default 1e-3) and
   // round-trips via Save/Load.
+  // Coded by Claude (AI).
   TNNetCharbonnierLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1484,6 +1544,7 @@ type
   // maps V > 0 -> (1 - q), V < 0 -> -q, V = 0 -> 0. The quantile q is stored
   // in FFloatSt[0] (default 0.5 = median = MAE) and round-trips via Save/Load.
   // No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
   TNNetQuantileLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1504,6 +1565,7 @@ type
   // The alpha and gamma hyperparameters are stored in FFloatSt[0]/FFloatSt[1]
   // (defaults 0.25 and 2.0) and round-trip via Save/Load. p_t is clamped to
   // [eps, 1-eps] with eps=1e-7 to avoid log(0) / divide-by-zero.
+  // Coded by Claude (AI).
   TNNetFocalLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1532,6 +1594,7 @@ type
   // with (output - target) = (logp - target); Backpropagate recovers the
   // target as (logp - FOutputError) and replaces the residual with -target.
   // No constructor parameter and no trainable state.
+  // Coded by Claude (AI).
   TNNetNLLLoss = class(TNNetIdentity)
   public
     constructor Create(); override;
@@ -1556,6 +1619,7 @@ type
   // is clamped into [eps, 1] with eps = 1e-7 before the division, and any
   // target term with p_i <= eps contributes a zero gradient (the 0*log0 := 0
   // convention). No constructor parameter and no trainable state.
+  // Coded by Claude (AI).
   TNNetKLDivergence = class(TNNetIdentity)
   public
     constructor Create(); override;
@@ -1583,6 +1647,7 @@ type
   // convention of the sibling loss layers. alpha/beta/s are stored in
   // FFloatSt[0]/FFloatSt[1]/FFloatSt[2] (defaults 0.5/0.5/1.0) and round-trip
   // via Save/Load.
+  // Coded by Claude (AI).
   TNNetTverskyLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1595,6 +1660,7 @@ type
   // Inherits the forward passthrough and analytic backward from
   // TNNetTverskyLoss; the parameterless Create hardcodes alpha = beta = 0.5
   // and the default smoothing constant 1.0.
+  // Coded by Claude (AI).
   TNNetDiceLoss = class(TNNetTverskyLoss)
   public
     constructor Create(); override;
@@ -1620,6 +1686,7 @@ type
   // raw a|p|n embedding). margin is stored in FFloatSt[0] (default 1.0,
   // must be >= 0) and round-trips via Save/Load. No trainable parameters;
   // output shape equals input shape.
+  // Coded by Claude (AI).
   TNNetTripletLoss = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1650,6 +1717,7 @@ type
   // The a channels receive dL/dcos * dcos/da, the b channels receive
   // dL/dcos * dcos/db, and the y channel receives 0. margin round-trips via
   // Save/Load. No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
   TNNetCosineEmbeddingLoss = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1681,6 +1749,7 @@ type
   //   dL/dk_0    = (1/tau) * (p_0 - 1) * q
   //   dL/dk_j    = (1/tau) * p_j * q       (j > 0)
   // No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
   TNNetInfoNCELoss = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1721,6 +1790,7 @@ type
   // samples, so the classic cross-batch EMA center update of the paper is out
   // of scope; the centers are learned by the optimizer like any other weight.
   // Output shape equals input shape.
+  // Coded by Claude (AI).
   TNNetCenterLoss = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1754,6 +1824,7 @@ type
   //                     via the -FLearningRate idiom (FBatchUpdate respected
   //                     exactly like TNNetCenterLoss / TNNetGatedResidual),
   //                     pulling the code toward the encoder output.
+  // Coded by Claude (AI).
   TNNetVectorQuantizer = class(TNNetIdentity)
   private
     FChosenIdx: array of integer; // cached argmin index per (X,Y) position
@@ -1794,6 +1865,7 @@ type
   //   weight gradient   dL/dW_k accumulated into neuron[k]'s delta via the
   //                     -FLearningRate idiom (FBatchUpdate respected like
   //                     sibling trainable layers). Output shape == input shape.
+  // Coded by Claude (AI).
   TNNetArcFace = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -1818,6 +1890,7 @@ type
   //   dL/dr = sign(r)                     otherwise.
   // The w and eps hyperparameters are stored in FFloatSt[0]/FFloatSt[1]
   // (defaults 10.0 and 2.0; both validated > 0) and round-trip via Save/Load.
+  // Coded by Claude (AI).
   TNNetWingLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1836,6 +1909,7 @@ type
   // FOutputError := p - t'. The forward pass is an identity passthrough.
   // eps is stored in FFloatSt[0] (default 0.1; validated 0 <= eps < 1) and
   // round-trips via Save/Load.
+  // Coded by Claude (AI).
   TNNetLabelSmoothingLoss = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1853,6 +1927,7 @@ type
   // propagating to the previous layer. p_i is offset by eps = 1e-7 inside
   // the log to avoid NaN at p = 0. lambda is stored in FFloatSt[0] (default
   // 0.01) and round-trips via Save/Load.
+  // Coded by Claude (AI).
   TNNetEntropyRegularizer = class(TNNetIdentity)
   public
     constructor Create(); overload; override;
@@ -1877,6 +1952,7 @@ type
   // Save/Load alongside FStruct[0]. The exact backward applies the full
   // Jacobian (I - y y^T) / n over the chosen scope; the reciprocal 1/n is
   // cached on the forward pass.
+  // Coded by Claude (AI).
   TNNetL2Normalize = class(TNNetIdentity)
   protected
     FInvNorms: TNNetVolume;
@@ -1901,6 +1977,7 @@ type
   // Thin subclass of TNNetL2Normalize whose default Create() selects the
   // full-volume reduction scope (FStruct[0] = 1): the whole flattened sample
   // is normalized to unit L2 norm. Serializes under its own class name.
+  // Coded by Claude (AI).
   TNNetUnitNorm = class(TNNetL2Normalize)
   public
     constructor Create(); overload; override;
@@ -1917,6 +1994,7 @@ type
   // numerical stabilizer eps in FFloatSt[1] (default 1e-8). With tau=1
   // and eps=0 it reduces exactly to TNNetL2Normalize. No trainable
   // parameters; the exact backward is applied per spatial position.
+  // Coded by Claude (AI).
   TNNetLogitNormalize = class(TNNetIdentity)
   protected
     FInvDenoms: TNNetVolume; // 1 / (tau * N + eps)
@@ -1960,6 +2038,7 @@ type
   // hold one value per depth channel; the flat argmin/argmax index for each
   // channel is stored so the backward routing matches the full-volume case
   // scoped to that channel.
+  // Coded by Claude (AI).
   TNNetMinMaxNorm = class(TNNetIdentity)
   protected
     FArgMin: TNNetVolume;  // flat argmin index (one cell, or one per channel)
@@ -1981,6 +2060,7 @@ type
   // is 1 strictly inside (MinValue, MaxValue) and 0 outside. MinValue is
   // stored in FFloatSt[0] and MaxValue in FFloatSt[1] for serialization,
   // defaulting to -1 and +1 respectively. No trainable parameters.
+  // Coded by Claude (AI).
   TNNetClamp = class(TNNetReLUBase)
   public
     constructor Create(); overload;
@@ -1997,6 +2077,7 @@ type
   //   attn[i,:]   = softmax(scores[i,:])
   //   out[i]      = sum_j attn[i,j] * V[j]
   // Output shape: SizeX x 1 x d_k. No trainable parameters.
+  // Coded by Claude (AI).
   TNNetScaledDotProductAttention = class(TNNetLayer)
   private
     FDk: integer;
@@ -2017,6 +2098,45 @@ type
     property CausalMask: boolean read FCausal;
   end;
 
+  /// Cross-Attention (single head, parameter-free) with SEPARATE query and
+  // key/value sources that may live on DIFFERENT sequence grids -- the
+  // building block of encoder-decoder attention. Unlike
+  // TNNetScaledDotProductAttention (which packs Q|K|V into ONE tensor and can
+  // therefore only ever form a SQUARE SeqLen x SeqLen score matrix), this layer
+  // reads queries from its previous layer and keys+values from an EXPLICIT
+  // second source, so the two sequence lengths are free to differ:
+  //   PrevLayer      (queries): SizeY=1, SizeX=QSeqLen,  Depth=d_k
+  //   KeyValueSource (K then V): SizeY=1, SizeX=KVSeqLen, Depth=2*d_k
+  // For every query position i (0..QSeqLen-1) over every key j (0..KVSeqLen-1):
+  //   scores[i,j] = dot(Q[i], K[j]) / sqrt(d_k)
+  //   (if CausalMask: scores[i,j] := -1e9 for j > i)
+  //   attn[i,:]   = softmax(scores[i,:])
+  //   out[i]      = sum_j attn[i,j] * V[j]
+  // Output shape: QSeqLen x 1 x d_k (lives on the QUERY grid). No trainable
+  // parameters. The Key|Value source layer index is serialized (like
+  // TNNetConcat) so the layer round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetCrossAttention = class(TNNetLayer)
+  private
+    FDk: integer;
+    FInvSqrtDk: TNeuralFloat;
+    FCausal: boolean;
+    FKVLayer: TNNetLayer; // explicit Key|Value source (width 2*d_k)
+    FAttn: TNNetVolume;   // attention weights [X=key j, Y=query i, 1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; CausalMask: boolean;
+      KeyValueSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property AttentionWeights: TNNetVolume read FAttn;
+    property Dk: integer read FDk;
+    property CausalMask: boolean read FCausal;
+    property KeyValueSource: TNNetLayer read FKVLayer;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -2031,6 +2151,7 @@ type
   // (the depth axis is the concatenation Q | K | V, each of size d_k).
   // Output shape: SizeX x 1 x d_k. No trainable parameters; the scale is a
   // fixed float (default 1.0) stored in FFloatSt[0] so it round-trips.
+  // Coded by Claude (AI).
   TNNetCosineSimilarityAttention = class(TNNetScaledDotProductAttention)
   private
     FScale: TNeuralFloat;
@@ -2076,6 +2197,7 @@ type
   // the base neuron save/load. The sink-slot count K is stored in FStruct[2]
   // so it round-trips through SaveToString / LoadFromString. Sink keys are
   // initialised to small random values and sink values to zeros.
+  // Coded by Claude (AI).
   TNNetSinkAttention = class(TNNetScaledDotProductAttention)
   private
     FNumSinks: integer;
@@ -2121,6 +2243,7 @@ type
   // a FIXED scalar; Sink augments the key set with learnable sink slots; this
   // layer subtracts a SECOND learnable-weighted softmax map to denoise the first.
   // The CausalMask is honoured identically by BOTH maps.
+  // Coded by Claude (AI).
   TNNetDifferentialAttention = class(TNNetScaledDotProductAttention)
   private
     FLambdaInit: TNeuralFloat;
@@ -2212,6 +2335,7 @@ type
   // Because there is no softmax it does NOT subclass
   // TNNetScaledDotProductAttention; it only reuses the Q|K|V input-split
   // convention.
+  // Coded by Claude (AI).
   TNNetLinearAttention = class(TNNetLayer)
   private
     FDk: integer;
@@ -2241,6 +2365,7 @@ type
   //   Out_t = (phi(Q_t) . S_t) / (phi(Q_t) . Z_t)
   // Still O(SeqLen * d_k * d_v): there is no NxN score matrix. d_k is stored in
   // FStruct[0] so it round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
   TNNetCausalLinearAttention = class(TNNetLayer)
   private
     FDk: integer;
@@ -2273,6 +2398,7 @@ type
   //   gx0   =  cos(angle)*gy0 + sin(angle)*gy1
   //   gx1   = -sin(angle)*gy0 + cos(angle)*gy1
   // No trainable parameters. Output shape equals input shape.
+  // Coded by Claude (AI).
   TNNetRotaryEmbedding = class(TNNetIdentity)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -2352,6 +2478,7 @@ type
   // switch to the deterministic inference (fixed average slope) behaviour.
   // https://arxiv.org/abs/1505.00853 (Xu, Wang, Chen, Li, 2015 - "Empirical
   // Evaluation of Rectified Activations in Convolutional Network").
+  // Coded by Claude (AI).
   TNNetRReLU = class(TNNetReLUBase)
     protected
       FEnabled: boolean;
@@ -2408,6 +2535,7 @@ type
   // Domain-Adversarial Neural Networks (DANN). The scalar lambda is stored
   // in FFloatSt[0] so the layer round-trips through SaveToString /
   // LoadFromString like other parameter-carrying layers. Default lambda = 1.0.
+  // Coded by Claude (AI).
   TNNetGradientReversal = class(TNNetIdentity)
     public
       constructor Create(Lambda: TNeuralFloat = 1.0); reintroduce; overload;
@@ -2447,6 +2575,7 @@ type
   // is identity (no trainable parameters), so input gradients pass through
   // unchanged. The "base" hyper-parameter (default 10000) is serialized via
   // FStruct[0], mirroring TNNetAddPositionalEmbedding.
+  // Coded by Claude (AI).
   TNNetSinusoidalPositionalEmbedding = class(TNNetIdentity)
   private
     FPositionalEmbedding: TNNetVolume;
@@ -2477,6 +2606,7 @@ type
   // the gradient w.r.t. the input scalar t is mathematically defined but is
   // not propagated in this v1 (timestep is typically a fixed integer index
   // in diffusion pipelines and no upstream signal needs the derivative).
+  // Coded by Claude (AI).
   TNNetSinusoidalTimeEmbedding = class(TNNetLayer)
   private
     FEmbeddingSize: integer;
@@ -2561,6 +2691,7 @@ type
   // input is scaled by 1/(1-p) ("inverted dropout" so the expected magnitude
   // is preserved). At inference (FEnabled = false), the layer is the identity.
   // No trainable parameters. Used by stochastic-depth ResNets and ConvNeXt.
+  // Coded by Claude (AI).
   TNNetDropPath = class(TNNetAddNoiseBase)
     protected
       FScale: TNeuralFloat; // 0 if dropped, else 1/(1-p). Used by Backpropagate.
@@ -2576,6 +2707,7 @@ type
   // surviving channels are scaled by 1/(1-p) (inverted dropout). At
   // inference (FEnabled = false) the layer is the identity. The same
   // per-channel mask is reused on the backward pass. No trainable params.
+  // Coded by Claude (AI).
   TNNetSpatialDropout2D = class(TNNetAddNoiseBase)
     protected
       FChannelMask: TNNetVolume; // length = Depth, each entry 0 or 1/(1-p)
@@ -2593,6 +2725,7 @@ type
   // treats the full SizeX*SizeY slice per channel uniformly so it also
   // works for any volume; the "1D" name documents the intended usage on
   // sequence-shaped inputs (SizeX=seq_len, SizeY=1, Depth=channels)).
+  // Coded by Claude (AI).
   TNNetSpatialDropout1D = class(TNNetAddNoiseBase)
     protected
       FChannelMask: TNNetVolume; // length = Depth, each entry 0 or 1/(1-p)
@@ -2619,6 +2752,7 @@ type
   // keep mask is reused on the backward pass. At inference (FEnabled = false)
   // the layer is the identity. Block size is stored in FStruct[0] and the
   // drop probability in FFloatSt[0] for serialization. No trainable params.
+  // Coded by Claude (AI).
   TNNetDropBlock = class(TNNetAddNoiseBase)
     protected
       FBlockSize: integer;
@@ -2640,6 +2774,7 @@ type
   // N(0, sigma^2) noise per element: y = x + n. At inference (FEnabled = false)
   // the layer is the identity. Backward is identity (dL/dx = dL/dy) since
   // noise is independent of x. Sigma is stored in FFloatSt[0].
+  // Coded by Claude (AI).
   TNNetGaussianNoise = class(TNNetAddNoiseBase)
   public
     constructor Create(pSigma: TNeuralFloat = 0.1); overload;
@@ -2652,6 +2787,7 @@ type
   // y = x * m. At inference (FEnabled = false) the layer is the identity.
   // The per-element multipliers are captured for the backward pass so that
   // dL/dx = m * dL/dy. Sigma is stored in FFloatSt[0].
+  // Coded by Claude (AI).
   TNNetGaussianDropout = class(TNNetAddNoiseBase)
   protected
     FNoiseMask: TNNetVolume;
@@ -2720,6 +2856,7 @@ type
   // sample (all elements across SizeX*SizeY*Depth) is normalized to zero mean
   // and unit variance, then a learnable per-element scale (gamma) and bias
   // (beta) are applied. Output has the same shape as the input.
+  // Coded by Claude (AI).
   TNNetLayerNorm = class(TNNetIdentityWithoutL2)
     private
       FLayerNormEpsilon: TNeuralFloat;
@@ -2739,6 +2876,7 @@ type
   // root mean square of its elements (no mean subtraction), then a learnable
   // per-element scale (gamma) is applied. Output has the same shape as the
   // input. This is a cheaper, transformer-friendly variant of TNNetLayerNorm.
+  // Coded by Claude (AI).
   TNNetRMSNorm = class(TNNetIdentityWithoutL2)
     private
       FRMSNormEpsilon: TNeuralFloat;
@@ -2761,6 +2899,7 @@ type
   // Jacobian without affine:
   //   dX = (1/sigma) * (dY - mean(dY) - x_hat * mean(dY * x_hat))
   // where x_hat is the normalized forward activation.
+  // Coded by Claude (AI).
   TNNetZScore = class(TNNetIdentityWithoutL2)
     private
       FZScoreEpsilon: TNeuralFloat;
@@ -2779,6 +2918,7 @@ type
   // mean square over the depth axis, giving each pixel a unit-RMS feature
   // vector. Parameter-free (no learnable gamma/beta). Output has the same
   // shape as the input.
+  // Coded by Claude (AI).
   TNNetPixelNorm = class(TNNetIdentityWithoutL2)
     private
       FPixelNormEpsilon: TNeuralFloat;
@@ -2805,6 +2945,7 @@ type
   //   False (legacy): a per-element gamma/beta over the full output volume
   //         (one weight per SizeX*SizeY*Depth position). Kept for backward
   //         compatibility; ties the affine to a fixed spatial resolution.
+  // Coded by Claude (AI).
   TNNetGroupNorm = class(TNNetIdentityWithoutL2)
     private
       FGroupNormEpsilon: TNeuralFloat;
@@ -2828,6 +2969,7 @@ type
   // group count is resolved at SetPrevLayer time from the input depth.
   // Like TNNetGroupNorm, the affine defaults to the textbook per-channel form
   // (PerChannelAffine = True); pass False for the legacy per-element affine.
+  // Coded by Claude (AI).
   TNNetInstanceNorm = class(TNNetGroupNorm)
     public
       constructor Create(PerChannelAffine: boolean = True); overload;
@@ -2901,6 +3043,7 @@ type
   // this layer is just the scalar multiplier and does NOT add the skip.
   // Backward pass produces gradients for both the input and the scalar
   // weight (sum over all positions of OutputError * Input).
+  // Coded by Claude (AI).
   TNNetReZero = class(TNNetChannelTransformBase)
     private
       FInitialAlpha: TNeuralFloat;
@@ -2922,6 +3065,7 @@ type
   // the input and the per-channel weight vector
   // (gradAlpha[d] = sum over x,y of OutputError[x,y,d] * Input[x,y,d]).
   // Storage: FNeurons[0].Weights = alpha (Depth values).
+  // Coded by Claude (AI).
   TNNetGatedResidual = class(TNNetChannelTransformBase)
     private
       FInitialAlpha: TNeuralFloat;
@@ -3036,6 +3180,7 @@ type
   // training (the noisy logit is scaled by 1/beta) and s*(1-s) at inference
   // (deterministic gate, no 1/beta); it is 0 in the clipped regions.
   // FGate caches z[d]; FGateDeriv caches dz/dlog_alpha[d] for the backward.
+  // Coded by Claude (AI).
   TNNetHardConcrete = class(TNNetChannelTransformBase)
     protected
       FEnabled: boolean;
@@ -3071,6 +3216,7 @@ type
   // structure; the gate-logit gradient is
   //   dL/dg[d] = sum_{x,y} OutputError[x,y,d] * n[x,y,d] * s_d*(1 - s_d).
   // Storage: FNeurons[0].Weights = gate logits g (Depth values).
+  // Coded by Claude (AI).
   TNNetRMSNormGated = class(TNNetChannelTransformBase)
     private
       FRMSNormEpsilon: TNeuralFloat;
@@ -3109,6 +3255,7 @@ type
   //                 the 2-logit softmax Jacobian (d a_i / d w_j =
   //                 a_i*(delta_ij - a_j)) to get dL/dw_ln, dL/dw_rms.
   // Storage: FNeurons[0].Weights = the two logits [w_ln, w_rms].
+  // Coded by Claude (AI).
   TNNetSwitchableNorm = class(TNNetChannelTransformBase)
     private
       FNormEpsilon: TNeuralFloat;
@@ -3137,6 +3284,7 @@ type
   /// the layer is the identity at init (the ConvNeXt-V2 init).
   /// Storage: FNeurons[0].Weights = gamma (Depth values),
   ///          FNeurons[1].Weights = beta  (Depth values).
+  // Coded by Claude (AI).
   TNNetGRN = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3163,6 +3311,7 @@ type
   ///   dL/dgamma[c] = sum_{x,y} OutputError * t
   ///   dL/dbeta[c]  = sum_{x,y} OutputError
   ///   dL/dalpha    = sum_{x,y,c} OutputError * gamma[c] * x * dt
+  // Coded by Claude (AI).
   TNNetDyT = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3179,6 +3328,7 @@ type
   // 0.25 matching the original paper. Mirrors TNNetReZero's single-scalar
   // trainable pattern; descends from TNNetChannelTransformBase because the
   // weightless TNNetReLUBase activation hierarchy cannot store gradients.
+  // Coded by Claude (AI).
   TNNetPReLU = class(TNNetChannelTransformBase)
     private
       FInitialAlpha: TNeuralFloat;
@@ -3202,6 +3352,7 @@ type
   // weightless TNNetReLUBase activation hierarchy cannot store gradients).
   // Ramachandran, Zoph, Le 2017 - "Searching for Activation Functions",
   // https://arxiv.org/abs/1710.05941.
+  // Coded by Claude (AI).
   TNNetSwishLearnable = class(TNNetChannelTransformBase)
     private
       FInitialBeta: TNeuralFloat;
@@ -3228,6 +3379,7 @@ type
   // stable via sign branches on alpha*x to avoid Exp overflow.
   // Misra 2019 - "Mish: A Self Regularized Non-Monotonic Activation Function",
   // https://arxiv.org/abs/1908.08681.
+  // Coded by Claude (AI).
   TNNetMishLearnable = class(TNNetChannelTransformBase)
     private
       FInitialAlpha: TNeuralFloat;
@@ -3252,6 +3404,7 @@ type
   // TNNetChannelTransformBase because the weightless TNNetReLUBase activation
   // hierarchy cannot store gradients. Numerically stable via sign branches on
   // beta*x to avoid Exp overflow.
+  // Coded by Claude (AI).
   TNNetSoftPlusBetaLearnable = class(TNNetChannelTransformBase)
     private
       FInitialBeta: TNeuralFloat;
@@ -3268,6 +3421,7 @@ type
   // alpha[c] * min(0, x[c]) with one learnable alpha PER channel stored in
   // FNeurons[0].Weights (length = Depth). Default initial alpha is 0.25
   // matching the original paper.
+  // Coded by Claude (AI).
   TNNetPReLUChannel = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3306,6 +3460,7 @@ type
   // channel. Descends from TNNetChannelTransformBase to reuse its per-channel
   // weight storage (the weightless TNNetReLUBase hierarchy cannot store
   // gradients).
+  // Coded by Claude (AI).
   TNNetSReLU = class(TNNetChannelTransformBase)
     private
       FInitialTr, FInitialAr, FInitialTl, FInitialAl: TNeuralFloat;
@@ -3342,6 +3497,7 @@ type
   // channel. Descends from TNNetChannelTransformBase to reuse its per-channel
   // weight storage (the weightless TNNetReLUBase hierarchy cannot store
   // gradients), mirroring TNNetSReLU's multi-neuron layout.
+  // Coded by Claude (AI).
   TNNetAPL = class(TNNetChannelTransformBase)
     private
       FNumHinges: integer;
@@ -3386,6 +3542,7 @@ type
   // channel. Descends from TNNetChannelTransformBase to reuse its per-channel
   // weight storage (the weightless TNNetReLUBase hierarchy cannot store
   // gradients).
+  // Coded by Claude (AI).
   TNNetSplineActivation = class(TNNetChannelTransformBase)
     private
       FNumIntervals: integer;  // K (number of intervals -> K+1 control points)
@@ -3420,6 +3577,7 @@ type
   // Mirrors TNNetDyT's multi-parameter per-channel storage pattern (descends
   // from TNNetChannelTransformBase because the weightless TNNetReLUBase
   // activation hierarchy cannot store gradients).
+  // Coded by Claude (AI).
   TNNetAconC = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3463,6 +3621,7 @@ type
   //   dL/dgamma[c] += dL/dbeta[c] * beta*(1-beta) * m[c]
   //   dL/ddelta[c] += dL/dbeta[c] * beta*(1-beta)
   // Defaults p1=1, p2=0, gamma=0, delta=0 give beta=sigmoid(0)=0.5.
+  // Coded by Claude (AI).
   TNNetMetaAconC = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3480,6 +3639,7 @@ type
   // The single neuron stores a Depth-long learnable mix vector (init 0.5,
   // a neutral midpoint). Requires SizeY = 1 (1D sequence layout matching
   // TNNetRotaryEmbedding / TNNetSinusoidalPositionalEmbedding).
+  // Coded by Claude (AI).
   TNNetTokenShift = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3511,6 +3671,7 @@ type
   // in FStruct[0], FeatureSize (K) in FStruct[1], the bias-suppression flag in
   // FStruct[4] (matching the convolution layers' slot) and Dilation in FStruct[5]
   // for round-tripping.
+  // Coded by Claude (AI).
   TNNetCausalConv1D = class(TNNetLayer)
     private
       FFeatureSize: integer; // kernel size K
@@ -3550,6 +3711,7 @@ type
   //   dL/dh_t = c[d]*dL/dy_t + a[d]*dL/dh_{t+1}
   // which is then scattered into the input gradient and the four weight
   // gradients (a_raw via da/da_raw = a*(1-a)).
+  // Coded by Claude (AI).
   TNNetDiagonalSSM = class(TNNetChannelTransformBase)
     private
       FState: TNNetVolume;     // forward state cache h_t, shape (SeqLen,1,Depth)
@@ -3579,6 +3741,7 @@ type
   // dynamics. The analytic input gradient is dL/dx = dL/dy * (2*a*x + b)
   // and the weight gradients are the obvious finite-degree polynomial
   // moments summed over (x,y) and the batch.
+  // Coded by Claude (AI).
   TNNetPolynomialActivation = class(TNNetChannelTransformBase)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3726,6 +3889,7 @@ type
   // The selected channel must satisfy 0 <= Channel < Input.Depth; otherwise the
   // layer raises an error in SetPrevLayer. The parameterless constructor selects
   // channel 0 (so the serialization registry can round-trip the layer).
+  // Coded by Claude (AI).
   TNNetGather = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3756,6 +3920,7 @@ type
   // own structure-string segment (like TNNetSplitChannels), not in FStruct, so
   // there is no fixed cap on N. The parameterless constructor selects a single
   // channel 0 (so the serialization registry can always round-trip the layer).
+  // Coded by Claude (AI).
   TNNetGatherChannels = class(TNNetIdentity)
     private
       FChannels: TNeuralIntegerArray;
@@ -3782,6 +3947,7 @@ type
   // Groups (Depth mod Groups = 0); otherwise the layer raises an error.
   // Typical use: after a grouped convolution, mix information across the
   // otherwise-isolated groups (the ShuffleNet group-mixing trick).
+  // Coded by Claude (AI).
   TNNetChannelShuffle = class(TNNetIdentity)
     private
       ToChannels: TNeuralIntegerArray;
@@ -3797,6 +3963,7 @@ type
   /// Tiny parameter-free permutation layer that flips the channel (Depth)
   // axis: Output[X, Y, d] := Input[X, Y, Depth - 1 - d]. Backward applies
   // the same involution to OutputError.
+  // Coded by Claude (AI).
   TNNetReverseChannels = class(TNNetIdentity)
     public
       procedure Compute(); override;
@@ -3813,6 +3980,7 @@ type
   // are accumulated into the previous layer's OutputError. The parameterless
   // Create() defaults to the depth axis and is bit-identical to prior
   // behaviour.
+  // Coded by Claude (AI).
   TNNetCumSum = class(TNNetIdentity)
     public
       constructor Create(); overload;
@@ -3847,6 +4015,7 @@ type
   // code is mapped as 0 = Depth (legacy default), 1 = X, 2 = Y. The public
   // constructor maps Depth->0, X->1, Y->2 at construction time; Compute /
   // Backpropagate dispatch on the STORED value (else-branch = Depth).
+  // Coded by Claude (AI).
   TNNetRoll = class(TNNetIdentity)
     private
       // Builds the layer from the already-stored axis code (0 = Depth, 1 = X,
@@ -3864,6 +4033,7 @@ type
   /// Tiny parameter-free permutation layer that flips the spatial (X, Y)
   // axes 180°: Output[x, y, d] := Input[SizeX - 1 - x, SizeY - 1 - y, d].
   // Backward applies the same involution to OutputError.
+  // Coded by Claude (AI).
   TNNetReverseXY = class(TNNetIdentity)
     public
       procedure Compute(); override;
@@ -3873,6 +4043,7 @@ type
   /// Tiny parameter-free permutation layer that mirrors the width (X)
   // axis: Output[x, y, d] := Input[SizeX - 1 - x, y, d]. Backward applies
   // the same involution to OutputError.
+  // Coded by Claude (AI).
   TNNetFlipX = class(TNNetIdentity)
     public
       procedure Compute(); override;
@@ -3882,6 +4053,7 @@ type
   /// Tiny parameter-free permutation layer that mirrors the height (Y)
   // axis: Output[x, y, d] := Input[x, SizeY - 1 - y, d]. Backward applies
   // the same involution to OutputError.
+  // Coded by Claude (AI).
   TNNetFlipY = class(TNNetIdentity)
     public
       procedure Compute(); override;
@@ -3894,6 +4066,7 @@ type
   //   Output[ox, oy, (sx*P + sy)*C + ic] := Input[ox*P + sx, oy*P + sy, ic]
   // where 0<=sx,sy<P. This is the ViT "patchify" step. Backward applies the
   // inverse permutation (accumulating into FPrevLayer.OutputError).
+  // Coded by Claude (AI).
   TNNetSpaceToDepth = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3908,6 +4081,7 @@ type
   // (P*Hp, P*Wp, C) via the inverse of the SpaceToDepth mapping:
   //   Output[ix*P + sx, iy*P + sy, ic] := Input[ix, iy, (sx*P + sy)*C + ic].
   // Backward applies SpaceToDepth on OutputError.
+  // Coded by Claude (AI).
   TNNetDepthToSpace = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3934,6 +4108,7 @@ type
   // gives that convolution direct access to absolute (x, y) position
   // and dramatically improves performance on tasks where the response
   // is position-dependent.
+  // Coded by Claude (AI).
   TNNetCoordConv = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -3961,6 +4136,7 @@ type
   ///   grad_z[i] = grad_p[i] - mean_{j in S}(grad_p[j])   if i in S
   ///   grad_z[i] = 0                                       otherwise.
   /// No learnable parameters.
+  // Coded by Claude (AI).
   TNNetSparsemax = class(TNNetIdentity)
     public
       constructor Create(); override;
@@ -3999,6 +4175,7 @@ type
   // TNNetSqueeze after TNNetExpandDims round-trips back to (1,1,N)).
   // Use case: place a flat feature vector onto a chosen spatial/channel axis so
   // a following layer (e.g. a 1-D convolution) sees it on the expected axis.
+  // Coded by Claude (AI).
   TNNetExpandDims = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -4036,6 +4213,7 @@ type
   // 1 = single-axis) and FStruct[1] is pAxis. The no-arg form keeps FStruct[0]=0
   // so its serialized string is byte-identical to earlier versions.
   // Use case: flatten a (1,N,1)/(N,1,1) shape back to a plain feature vector.
+  // Coded by Claude (AI).
   TNNetSqueeze = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -4116,6 +4294,7 @@ type
   //   dL/dinput0[x,y,c] = gamma[c] * dOut[x,y,c]
   //   dL/dgamma[c]      = sum_{x,y} input0[x,y,c]*dOut[x,y,c]  (-> input1[c])
   //   dL/dbeta[c]       = sum_{x,y} dOut[x,y,c]                (-> input1[Depth+c])
+  // Coded by Claude (AI).
   TNNetFiLM = class(TNNetConcatBase)
   private
     FDepth: integer; // channel count of the modulated feature map (input0)
@@ -4320,6 +4499,7 @@ type
   // differences on both the input and the weights.
   // eps is stored in FFloatSt[0] (default 1e-5) so the layer round-trips
   // through SaveStructureToString / LoadFromString / CreateLayer.
+  // Coded by Claude (AI).
   TNNetWeightStandardization = class(TNNetFullConnectLinear)
   private
     FWSEpsilon: TNeuralFloat;
@@ -4361,6 +4541,7 @@ type
   //  appears for the mean/std standardization in TNNetWeightStandardization.)
   // eps is stored in FFloatSt[0] (default 1e-5) so the layer round-trips
   // through SaveStructureToString / LoadFromString / CreateLayer.
+  // Coded by Claude (AI).
   TNNetWeightNormLinear = class(TNNetFullConnectLinear)
   private
     FWNEpsilon: TNeuralFloat;
@@ -4395,6 +4576,7 @@ type
   // BackpropagateCPU operate on the latent FArrNeurons[].FWeights), so only
   // the forward pass is overridden. Reference: Ma et al. 2024, "The Era of
   // 1-bit LLMs: All Large Language Models are in 1.58 Bits", arXiv:2402.17764.
+  // Coded by Claude (AI).
   TNNetBitLinear = class(TNNetFullConnectLinear)
   private
     FQuantWeights: TNNetVolume;  // scratch: quantized weights of one neuron
@@ -4430,6 +4612,7 @@ type
   //     forward output error chain — kept as the plain inherited gradient, the
   //     same constant-sigma approximation used by reference implementations.
   // Only the dense case is implemented; a convolution variant is a follow-up.
+  // Coded by Claude (AI).
   TNNetSpectralNorm = class(TNNetFullConnectLinear)
   private
     FScaledWeights: TNNetVolume;  // scratch: W/sigma for one neuron
@@ -4488,6 +4671,7 @@ type
   /// numerical-stability profile (TNNetSoftMax subtracts the per-sample
   /// max; this variant subtracts the per-sample mean). Normalization scope
   /// matches TNNetSoftMax: the whole volume per sample.
+  // Coded by Claude (AI).
   TNNetCenteredSoftmax = class(TNNetSoftMax)
     public
       procedure Compute(); override;
@@ -4495,6 +4679,7 @@ type
 
   /// Softmax with a configurable temperature T: y = softmax(x / T).
   /// T is stored in FFloatSt[0]. Useful for sampling demos.
+  // Coded by Claude (AI).
   TNNetSoftmaxTemperature = class(TNNetSoftMax)
     public
       constructor Create(pTemperature: TNeuralFloat = 1.0); overload;
@@ -4527,6 +4712,7 @@ type
   /// deterministic: y = softmax(logits / tau), no noise.
   ///
   /// Normalization scope is the whole volume per sample, matching TNNetSoftMax.
+  // Coded by Claude (AI).
   TNNetGumbelSoftmax = class(TNNetAddNoiseBase)
     protected
       FSoftSample: TNNetVolume;
@@ -4541,6 +4727,7 @@ type
   /// Softmin layer: y = softmax(-x). Lower input scores receive higher
   /// probability mass. Output shape matches input; outputs sum to 1 over the
   /// whole volume (same normalization scope as TNNetSoftMax).
+  // Coded by Claude (AI).
   TNNetSoftMin = class(TNNetPointwiseSoftMax)
     protected
       FSoftTotalSum: TNeuralFloat;
@@ -4554,6 +4741,7 @@ type
   /// Outputs do NOT sum to 1; the leftover mass 1 - sum(y) >= 0 lets attention
   /// "attend to nothing" without an explicit sink token. Normalization scope is
   /// the whole volume, matching TNNetSoftMax.
+  // Coded by Claude (AI).
   TNNetSoftMaxOne = class(TNNetPointwiseSoftMax)
     public
       procedure Compute(); override;
@@ -4564,6 +4752,7 @@ type
   /// out[d] = (x[d] - max_d x) - log(sum_d exp(x - max_d x)).
   /// Backward simplifies to: dx[d] = dy[d] - softmax(x)[d] * sum_d dy[d],
   /// where softmax(x)[d] = exp(out[d]).
+  // Coded by Claude (AI).
   TNNetLogSoftMax = class(TNNetIdentity)
     public
       procedure Compute(); override;
@@ -4573,6 +4762,7 @@ type
   /// Keep only the top-K activations per spatial cell along the depth axis,
   /// zeroing the rest. Ties are broken by index order (first occurrence wins).
   /// K is stored in FStruct[0]. Gradient passes through only at kept positions.
+  // Coded by Claude (AI).
   TNNetTopK = class(TNNetIdentity)
     public
       constructor Create(K: integer); overload;
@@ -4979,6 +5169,7 @@ type
   // multiplied by the incoming OutputError. Contributions are guarded so that
   // windows whose output underflows to ~0 (and individual cells whose |x_i|
   // underflows to ~0) propagate no gradient, avoiding division by zero.
+  // Coded by Claude (AI).
   TNNetLpPool = class(TNNetPoolBase)
   private
     FP: TNeuralFloat;
@@ -5015,6 +5206,7 @@ type
   // so d(loss)/dx_i = OutputError * w_i * (1 + beta*(x_i - y)), accumulated
   // into the previous layer's error. The weights w_i and the output y are
   // recomputed from the cached input and FOutput during the backward pass.
+  // Coded by Claude (AI).
   TNNetSoftPool = class(TNNetPoolBase)
   private
     FBeta: TNeuralFloat;
@@ -5065,6 +5257,7 @@ type
   /// The integer pool/stride/padding parameters round-trip via FStruct[0..2]
   /// exactly like TNNetMaxPool. NOTE: like TNNetMaxPool the implementation
   /// assumes SQUARE feature maps (SizeX = SizeY); use square inputs.
+  // Coded by Claude (AI).
   TNNetStochasticPool = class(TNNetPoolBase)
   private
     // Train vs inference gate, mirroring TNNetAddNoiseBase. Default false
@@ -5107,6 +5300,7 @@ type
   // The integer pool/stride/padding parameters round-trip via FStruct[0..2]
   // exactly like TNNetMaxPool. NOTE: like TNNetMaxPool the implementation
   // assumes SQUARE feature maps (SizeX = SizeY); use square inputs.
+  // Coded by Claude (AI).
   TNNetMaxBlurPool = class(TNNetPoolBase)
   private
     // Dense (stride-1) per-channel max map; same spatial size as the input.
@@ -5147,6 +5341,7 @@ type
   // The integer pool/stride/padding parameters round-trip via FStruct[0..2]
   // exactly like TNNetMaxPool. NOTE: like TNNetMaxBlurPool the implementation
   // assumes SQUARE feature maps (SizeX = SizeY); use square inputs.
+  // Coded by Claude (AI).
   TNNetBlurPool = class(TNNetPoolBase)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -5160,6 +5355,7 @@ type
   /// Global Sum Pooling: parameter-free per-channel sum reduction over
   // (X, Y). Output shape is 1 x 1 x Depth. Backward broadcasts the
   // per-channel output error to every (X, Y) cell of that channel.
+  // Coded by Claude (AI).
   TNNetGlobalSumPool = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -5182,6 +5378,7 @@ type
   // cell may belong to several overlapping windows). OutX and OutY are
   // stored in FStruct[0] and FStruct[1] so they round-trip through
   // SaveToString / LoadFromString.
+  // Coded by Claude (AI).
   TNNetAdaptiveAvgPool = class(TNNetLayer)
   private
     FOutputSizeX, FOutputSizeY: integer;
@@ -5210,6 +5407,7 @@ type
   // (cheap, no extra serialized state). OutX and OutY are stored in
   // FStruct[0] and FStruct[1] so they round-trip through SaveToString /
   // LoadFromString.
+  // Coded by Claude (AI).
   TNNetAdaptiveMaxPool = class(TNNetLayer)
   private
     FOutputSizeX, FOutputSizeY: integer;
@@ -5227,6 +5425,7 @@ type
   // shape is (1, SizeY, Depth-1). If a row is fully masked-out, the
   // output is 0 and no gradient flows back through that row. The mask
   // channel itself receives zero gradient.
+  // Coded by Claude (AI).
   TNNetMaskedMean = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -5241,6 +5440,7 @@ type
   // is (1, SizeY, Depth-1). If a row is fully masked-out, the output is
   // 0 and no gradient flows back through that row. The mask channel
   // itself receives zero gradient.
+  // Coded by Claude (AI).
   TNNetMaskedMax = class(TNNetLayer)
   private
     FMaxIdx: TNNetVolume;
@@ -5281,6 +5481,7 @@ type
   /// Given upscale factor r, input (W, H, C) with C mod (r*r) = 0 is
   /// rearranged to (W*r, H*r, C/(r*r)). Parameter-free, deterministic.
   ///   output[r*x+i, r*y+j, c] = input[x, y, c*r*r + i*r + j]
+  // Coded by Claude (AI).
   TNNetPixelShuffle = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -7654,6 +7855,7 @@ type
   // Schedule ("every N steps after epoch W") is intentionally left to the
   // caller: see ShouldAccumulate() as a convenience predicate. The core
   // deliverable here is the correct averaging math + counter.
+  // Coded by Claude (AI).
   TNNetSWAWrapper = class(TMObject)
     protected
       FLiveNet: TNNet;
@@ -7686,6 +7888,7 @@ type
   // Decay close to 1 keeps a long memory (slow shadow); Decay=0 makes the
   // shadow equal to the live weights after a single Update. The shadow is
   // seeded from the live weights on Create.
+  // Coded by Claude (AI).
   TNNetEMAWrapper = class(TMObject)
     protected
       FLiveNet: TNNet;
@@ -7951,6 +8154,7 @@ type
   // (SaveDataToString/LoadDataFromString) and CopyWeights from
   // TNNetByteProcessing; only the spatial (per-position) forward/backward and
   // the scratch volumes differ.
+  // Coded by Claude (AI).
   TNNetPointwiseByteProcessing = class(TNNetByteProcessing)
     private
       FPosInput: TNNetVolume;   // scratch: one position's input Depth vector
@@ -13338,6 +13542,189 @@ begin
     SetLength(dScore, 0);
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCrossAttention }
+
+constructor TNNetCrossAttention.Create(d_k: integer; CausalMask: boolean;
+  KeyValueSource: TNNetLayer);
+begin
+  inherited Create();
+  FDk := d_k;
+  FCausal := CausalMask;
+  if FDk < 1 then
+    FErrorProc('TNNetCrossAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  if KeyValueSource = nil then
+    FErrorProc('TNNetCrossAttention requires a non-nil KeyValueSource.');
+  FInvSqrtDk := pcr_rsqrtf(FDk);
+  FStruct[0] := FDk;
+  if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
+  FKVLayer := KeyValueSource;
+  FAttn := TNNetVolume.Create();
+  if FKVLayer is TNNetInput then TNNetInput(FKVLayer).EnableErrorCollection;
+  // This layer reads from TWO sources: its (later-wired) PrevLayer = queries,
+  // and this explicit Key|Value source. Register the extra departing branch on
+  // the K|V source so backprop reference-counting stays balanced (the query
+  // branch is incremented by AddLayer/AddLayerAfter the usual way).
+  FKVLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetCrossAttention.Destroy();
+begin
+  FAttn.Free;
+  inherited Destroy();
+end;
+
+function TNNetCrossAttention.SaveStructureToString(): string;
+begin
+  // Inject the Key|Value source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetConcatBase does, so CreateLayer /
+  // LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FKVLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCrossAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetCrossAttention requires query SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDk then
+    FErrorProc('TNNetCrossAttention requires query depth = d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  if FKVLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetCrossAttention requires Key|Value SizeY=1. SizeY=' +
+      IntToStr(FKVLayer.FOutput.SizeY));
+  if FKVLayer.FOutput.Depth <> 2 * FDk then
+    FErrorProc('TNNetCrossAttention requires Key|Value depth = 2*d_k. Got depth=' +
+      IntToStr(FKVLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // Attention weights: rows = queries (Y=i over QSeqLen), cols = keys
+  // (X=j over KVSeqLen).
+  FAttn.ReSize(FKVLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+end;
+
+procedure TNNetCrossAttention.Compute();
+var
+  StartTime: double;
+  QLen, KVLen, i, j, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Q, KV: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Q := FPrevLayer.FOutput;
+  KV := FKVLayer.FOutput;
+  QLen := Q.SizeX;
+  KVLen := KV.SizeX;
+  // K is packed at depth [0..d_k-1], V at depth [d_k..2*d_k-1]; both contiguous
+  // along depth so each Q[i].K[j] is an AVX dot product and the V mix an AVX
+  // MulAdd over FDk floats. For each query row i: scores, softmax, weighted V.
+  for i := 0 to QLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to KVLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := TNNetVolume.DotProduct(
+          Q.GetRawPtr(i, 0, 0), KV.GetRawPtr(j, 0, 0), FDk);
+        FAttn[j, i, 0] := Score * FInvSqrtDk;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    SumExp := 0;
+    for j := 0 to KVLen - 1 do
+    begin
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to KVLen - 1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to KVLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, KV.GetRawPtr(j, 0, FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCrossAttention.Backpropagate();
+var
+  StartTime: double;
+  QLen, KVLen, i, j, k: integer;
+  Q, KV, QErr, KVErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Q := FPrevLayer.FOutput;
+    KV := FKVLayer.FOutput;
+    QErr := FPrevLayer.FOutputError;
+    KVErr := FKVLayer.FOutputError;
+    QLen := Q.SizeX;
+    KVLen := KV.SizeX;
+    SetLength(dAttn, KVLen);
+    SetLength(dScore, KVLen);
+    for i := 0 to QLen - 1 do
+    begin
+      // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
+      // dV[j,d] += Attn[i,j] * dOut[i,d]   (V at depth FDk, AVX MulAdd)
+      // dAttn[j] = sum_d dOut[i,d] * V[j,d] (AVX dot product over FDk)
+      for j := 0 to KVLen - 1 do
+      begin
+        A := FAttn[j, i, 0];
+        TNNetVolume.MulAdd(KVErr.GetRawPtr(j, 0, FDk),
+          FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+        dAttn[j] := TNNetVolume.DotProduct(
+          FOutputError.GetRawPtr(i, 0, 0), KV.GetRawPtr(j, 0, FDk), FDk);
+      end;
+      // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
+      SumDAttnAttn := 0;
+      for k := 0 to KVLen - 1 do
+        SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
+      for j := 0 to KVLen - 1 do
+        dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+      // ---- Gradients w.r.t Q[i] and K[j] ----
+      // dQ[i,d] += invSqrtDk * dScore[j] * K[j,d]   (K at depth 0, AVX MulAdd)
+      // dK[j,d] += invSqrtDk * dScore[j] * Q[i,d]
+      for j := 0 to KVLen - 1 do
+      begin
+        dS := dScore[j] * FInvSqrtDk;
+        if dS <> 0 then
+        begin
+          TNNetVolume.MulAdd(QErr.GetRawPtr(i, 0, 0),
+            KV.GetRawPtr(j, 0, 0), dS, FDk);
+          TNNetVolume.MulAdd(KVErr.GetRawPtr(j, 0, 0),
+            Q.GetRawPtr(i, 0, 0), dS, FDk);
+        end;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  // Propagate into BOTH sources (the K|V branch then the query chain).
+  if Assigned(FKVLayer) and
+     (FKVLayer.OutputError.Size = FKVLayer.Output.Size) then
+    FKVLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -26981,7 +27368,7 @@ function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
 var
   d_k, HeadCnt, d: integer;
   QProj, KProj, VProj: TNNetLayer;
-  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   QChannels, KVChannels: array of integer;
 begin
@@ -27006,10 +27393,13 @@ begin
   SetLength(KVChannels, d_k);
   for HeadCnt := 0 to Heads - 1 do
   begin
-    // Slice this head's d_k channels out of each projection, then pack them as
-    // [Q_h | K_h | V_h] (width 3*d_k) exactly as TNNetScaledDotProductAttention
-    // expects. Q lives on the QuerySeqLen grid; K|V on the KeyValueSeqLen grid
-    // (the two sequence lengths may differ).
+    // Slice this head's d_k channels out of each projection. Q lives on the
+    // QuerySeqLen grid; K|V on the KeyValueSeqLen grid (the two sequence lengths
+    // may differ). Only K and V (both on the KV grid) are packed together as
+    // [K_h | V_h] (width 2*d_k); Q is handed to TNNetCrossAttention separately,
+    // which forms the rectangular QuerySeqLen x KeyValueSeqLen attention. (A
+    // single Q|K|V DeepConcat would be illegal here -- TNNetDeepConcat requires
+    // a shared X size, which the unequal sequence lengths violate.)
     for d := 0 to d_k - 1 do
     begin
       QChannels[d]  := HeadCnt * d_k + d;
@@ -27018,10 +27408,10 @@ begin
     QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
     KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
     VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
-    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    KVPack := AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
     HeadOutputs[HeadCnt] :=
-      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
-        HeadPack);
+      AddLayerAfter(TNNetCrossAttention.Create(d_k, CausalMask, KVPack),
+        QSlice);
   end;
   AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   // Token-wise linear out-projection (FullConnectLinear would flatten the
@@ -48876,7 +49266,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -48998,6 +49388,7 @@ begin
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
+      'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -49287,6 +49678,7 @@ begin
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
+      if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else

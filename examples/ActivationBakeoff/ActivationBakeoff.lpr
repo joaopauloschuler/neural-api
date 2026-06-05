@@ -17,6 +17,8 @@ This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation; either version 2 of the License, or
 any later version.
+
+Coded by Claude (AI).
 *)
 
 {$mode objfpc}{$H+}
@@ -47,7 +49,7 @@ const
   TARGET_SCALE = 200.0;
   // Convergence threshold is on MSE in the ORIGINAL target scale (hypotenuse units, ~0..141).
   CONVERGE_THRESHOLD = 5.0;
-  TRAIN_SIZE         = 1000;
+  TRAIN_SIZE         = 10000;
   VAL_SIZE           = 200;
   TEST_SIZE          = 200;
   HIDDEN_UNITS       = 32;

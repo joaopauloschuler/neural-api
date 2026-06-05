@@ -101,7 +101,7 @@ degenerate case is exact.
 
 ```
 cd examples/SpeculativeDecoding
-fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural -Fu../../neural/pas-core-math SpeculativeDecoding.lpr
+fpc -O3 -Mobjfpc -Sc -Sh -veiq -Fu../../neural SpeculativeDecoding.lpr
 ./SpeculativeDecoding
 ```
 

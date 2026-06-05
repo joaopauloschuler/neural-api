@@ -1,3 +1,4 @@
+// This program requires the LazUtils package to run.
 program RunTests;
 
 {$mode objfpc}{$H+}
