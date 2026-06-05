@@ -6119,6 +6119,20 @@ type
       // is preserved (FullConnect would flatten it; see AddMultiHeadSelfAttention
       // header). Returns the residual-sum layer. Coded by Claude (AI).
       function AddgMLPBlock(pSeqLen, d_model, d_ffn: integer): TNNetLayer;
+      // Order-2 HYENA operator (Poli et al. 2023, "Hyena Hierarchy",
+      // arXiv:2302.10866): an attention-free, sub-quadratic sequence mixer built
+      // from existing primitives. Three short TOKEN-WISE input projections
+      // (PointwiseConvLinear, NOT FullConnect - see AddMultiHeadSelfAttention
+      // header) produce a value path v and two data-controlled gating signals
+      // g1, g2 from the block input; the order-2 recurrence interleaves the
+      // implicit long convolution TNNetImplicitLongConv with element-wise
+      // data-controlled gating (TNNetCellMulByCell):
+      //   y = OutProj( g2 (.) LongConv( g1 (.) v ) )
+      // Hidden is the implicit-MLP width of the long conv. Returns the
+      // out-projection layer (NOT residual-wrapped; compose with
+      // AddRMSNormResidual etc. like the attention builders). Coded by Claude (AI).
+      function AddHyenaOperator(d_model: integer;
+        Hidden: integer = 4): TNNetLayer;
       // Multi-head RETENTION block (RetNet, Sun et al. 2023) over a
       // (SeqLen,1,3*d_model) Q|K|V slab. Built exactly like
       // AddMultiHeadSelfAttention but with one softmax-free TNNetRetention per
@@ -28437,6 +28451,31 @@ begin
   // Channel-MLP down-projection (token-wise): d_ffn/2 -> d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddHyenaOperator(d_model: integer;
+  Hidden: integer = 4): TNNetLayer;
+var
+  BlockInput, ValuePath, Gate1, Gate2, Gated1, LongConvOut, Gated2: TNNetLayer;
+begin
+  if d_model < 1 then
+    FErrorProc('AddHyenaOperator requires d_model >= 1. d_model=' +
+      IntToStr(d_model));
+  BlockInput := GetLastLayer();
+  // Three short TOKEN-WISE input projections from the SAME block input. These
+  // are 1x1 convs (PointwiseConvLinear) so the (SeqLen,1,d_model) sequence axis
+  // is preserved; FullConnect would flatten/mix the tokens (see the
+  // AddMultiHeadSelfAttention header note).
+  ValuePath := AddLayerAfter( TNNetPointwiseConvLinear.Create(d_model), BlockInput );
+  Gate1 := AddLayerAfter( TNNetPointwiseConvLinear.Create(d_model), BlockInput );
+  Gate2 := AddLayerAfter( TNNetPointwiseConvLinear.Create(d_model), BlockInput );
+  // Order-2 recurrence: gate, long conv, gate.
+  //   u1 = g1 (.) v ; u2 = LongConv(u1) ; u3 = g2 (.) u2.
+  Gated1 := AddLayer( TNNetCellMulByCell.Create(Gate1, ValuePath) );
+  LongConvOut := AddLayerAfter( TNNetImplicitLongConv.Create(Hidden), Gated1 );
+  Gated2 := AddLayer( TNNetCellMulByCell.Create(Gate2, LongConvOut) );
+  // Token-wise out-projection.
+  Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(d_model), Gated2 );
 end;
 
 function TNNet.AddRetention(d_model, Heads: integer;

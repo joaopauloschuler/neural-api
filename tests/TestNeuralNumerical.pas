@@ -454,6 +454,7 @@ type
     procedure TestSplitQKVHeadsForwardLayout;
     procedure TestMultiHeadSDPAConcatGradientCheck;
     procedure TestMultiHeadSelfAttentionGradientCheck;
+    procedure TestHyenaOperatorShapeAndGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
@@ -12553,6 +12554,84 @@ begin
         ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyenaOperatorShapeAndGradientCheck;
+// AddHyenaOperator builder: three token-wise input projections -> data-controlled
+// gate -> implicit long conv -> data-controlled gate -> out-projection. Asserts
+// the output shape (SeqLen,1,d_model) is preserved AND numerically checks the
+// input gradient through the whole assembled block. d_model=4, seq=5.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  d_model, SeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 4;
+  SeqLen := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddHyenaOperator(d_model, 4);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Shape parity: the operator preserves the (SeqLen,1,d_model) layout.
+    AssertEquals('Hyena out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Hyena out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Hyena out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Hyena input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('HyenaOperator input gradient max abs error: ', maxErr:0:8);
   finally
     NN.Free;
     Input.Free;
