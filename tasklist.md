@@ -72,32 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetGraphAttention follow-up (single-head GAT layer + tests +
-      examples/GraphAttention/ bake-off all LANDED 2026-06-05): (a) MULTI-HEAD
-      GAT and (b) edge-DROPOUT/attention-dropout BOTH LANDED 2026-06-05.
-      (a) `TNNet.AddMultiHeadGraphAttention(Heads, HeadFeatures, Adjacency,
-      Concat=true, AttentionDropout=0, SourceLayer=nil)` builder — K independent
-      single-head TNNetGraphAttention layers sharing one adjacency, DeepConcat for
-      hidden layers (depth K*HeadFeatures) or Sum+1/K average for the output layer
-      (depth HeadFeatures); pure composition so save/load round-trips (re-call
-      SetAdjacency per head after load). (b) attention-dropout knob on
-      TNNetGraphAttention (new Create overload, rate in FFloatSt[0], inverted-
-      dropout on normalized per-edge coeffs, training-only via FEnabled, gated by
-      TNNet.EnableDropouts, masked backward). Example ablation (4-head, noisy SBM):
-      dropout off 92.5% → on (p=0.3) 97.5%; multi-head 1→4 heads 85→92.5%. Tests:
-      shape+save/load round-trip, inference-determinism. Suite green.
-- [X] TNNetAffineGridSample follow-up (parameter-free bilinear sampler + both
-      backward paths + tests + examples/SpatialTransformer/ all LANDED
-      2026-06-05): the learned-resampling DOWNSAMPLER glimpse LANDED 2026-06-05.
-      New helper TNNetScatterToAffine scatters a learned Size=4 head output
-      (s_x,s_y,t_x,t_y) into the Size=6 2x3 affine [s_x,0,t_x; 0,s_y,t_y] with the
-      two shear slots held at a literal 0 (they can never drift; backward gathers
-      only the 4 active slots). The landed sampler always outputs its image-source
-      dims, so the larger-input→smaller-output glimpse is: warp full 28x28 via
-      theta, then TNNetAvgPool(2) → 14x14 canonical patch. examples/Glimpse
-      Downsampler/ on cluttered offset digits: fixed center-crop 0.906 vs learned
-      glimpse 1.000 (+9.4pp). Tests: forward+shear-zero, FD input-gradient through
-      ScatterToAffine→AffineGridSample, save/load. Suite green.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
@@ -415,42 +389,6 @@ rather than acted on.
 - [ ] First-batch gradient-norm heatmap across (depth, width, init):
       enumerate a small grid, print one number per cell.
 ### Composite blocks / builders I'd enjoy shipping
-
-#### New leaf layers
-- [X] `TNNetKANLayer` — a true Kolmogorov-Arnold *dense layer* (Liu et al. 2024).
-      LANDED 2026-06-05: subclass of TNNetFullConnectLinear, D_out neurons each
-      holding D_in*(K+1) Chebyshev coeffs (layout i*(K+1)+k); forward
-      phi_{ij}(x)=sum_k c_{ijk} T_k(tanh x_i), y_j=sum_i phi_{ij}; analytic backward
-      (per-coeff grad gy_j*T_k(u_i); input grad (1-u^2)*sum_j gy_j sum_k c_{ijk}
-      T_k'(u) with T_k'=k*U_{k-1}); near-linear init; D_out in FStruct[0], K in
-      FStruct[5], both CreateLayer dispatch sites wired. Tests: input+coeff FD
-      gradient check, save/load round-trip (RandSeed:=424242). examples/KANLayer/
-      vs param-matched ReLU MLP on y=sin(3x)+0.3 sin(11x): 48 vs 48 weights, KAN
-      MSE 0.136 vs ReLU 0.186 (+26.9%); cross-linked with SplineActivationKAN.
-      Suite green (1024 tests). ORIGINAL SPEC BELOW for reference:
-      i.e. a drop-in replacement for `TNNetFullConnectLinear` rather than the
-      activation we already ship. The repo currently has KAN only as a
-      *per-channel learnable activation* (`TNNetSplineActivation`, one univariate
-      function per channel, depth-preserving). A KAN layer is structurally
-      different: it maps `D_in -> D_out` where EVERY input->output edge carries
-      its own learned univariate function `phi_{ij}`, and the output is
-      `y_j = sum_i phi_{ij}(x_i)` (no separate weight matrix — the "weights" ARE
-      the edge functions). Use a Chebyshev-polynomial basis of degree `K`
-      (`phi_{ij}(x) = sum_{k=0..K} c_{ijk} T_k(tanh(x))`) so the basis is fixed
-      and orthogonal and only the `D_in*D_out*(K+1)` coefficients train — this
-      also keeps it distinct from the FIXED-knot piecewise-linear spline used by
-      `TNNetSplineActivation`. Forward evaluates the recurrence
-      `T_0=1, T_1=u, T_{k}=2u*T_{k-1}-T_{k-2}` (with `u=tanh(x_i)`); backward
-      writes the analytic input gradient (chain through `T_k'` and `tanh'`) and
-      the per-coefficient gradient. Initialise so degree-1 coefficients give a
-      near-linear pass and higher orders ~0 (starts close to a plain linear
-      layer). Deliverables: the leaf layer with `// Coded by Claude (AI).`
-      attribution, registry round-trip (one `FStruct` slot for `D_out`, one for
-      `K`), a `TestNeuralNumerical.pas` input+coefficient numerical-gradient
-      test (reseed `RandSeed := 424242`), and `examples/KANLayer/` contrasting a
-      KAN-dense MLP vs a param-matched ReLU MLP on the existing wiggly-1D fit
-      (`y = sin(3x) + 0.3*sin(11x)`), cross-linking the SplineActivationKAN
-      example so readers see activation-KAN vs layer-KAN side by side.
 
 #### Attention / sequence
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
