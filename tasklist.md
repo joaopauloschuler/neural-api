@@ -435,6 +435,32 @@ rather than acted on.
       enumerate a small grid, print one number per cell.
 ### Composite blocks / builders I'd enjoy shipping
 
+#### New leaf layers
+- [ ] `TNNetKANLayer` — a true Kolmogorov-Arnold *dense layer* (Liu et al. 2024),
+      i.e. a drop-in replacement for `TNNetFullConnectLinear` rather than the
+      activation we already ship. The repo currently has KAN only as a
+      *per-channel learnable activation* (`TNNetSplineActivation`, one univariate
+      function per channel, depth-preserving). A KAN layer is structurally
+      different: it maps `D_in -> D_out` where EVERY input->output edge carries
+      its own learned univariate function `phi_{ij}`, and the output is
+      `y_j = sum_i phi_{ij}(x_i)` (no separate weight matrix — the "weights" ARE
+      the edge functions). Use a Chebyshev-polynomial basis of degree `K`
+      (`phi_{ij}(x) = sum_{k=0..K} c_{ijk} T_k(tanh(x))`) so the basis is fixed
+      and orthogonal and only the `D_in*D_out*(K+1)` coefficients train — this
+      also keeps it distinct from the FIXED-knot piecewise-linear spline used by
+      `TNNetSplineActivation`. Forward evaluates the recurrence
+      `T_0=1, T_1=u, T_{k}=2u*T_{k-1}-T_{k-2}` (with `u=tanh(x_i)`); backward
+      writes the analytic input gradient (chain through `T_k'` and `tanh'`) and
+      the per-coefficient gradient. Initialise so degree-1 coefficients give a
+      near-linear pass and higher orders ~0 (starts close to a plain linear
+      layer). Deliverables: the leaf layer with `// Coded by Claude (AI).`
+      attribution, registry round-trip (one `FStruct` slot for `D_out`, one for
+      `K`), a `TestNeuralNumerical.pas` input+coefficient numerical-gradient
+      test (reseed `RandSeed := 424242`), and `examples/KANLayer/` contrasting a
+      KAN-dense MLP vs a param-matched ReLU MLP on the existing wiggly-1D fit
+      (`y = sin(3x) + 0.3*sin(11x)`), cross-linking the SplineActivationKAN
+      example so readers see activation-KAN vs layer-KAN side by side.
+
 #### Attention / sequence
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
