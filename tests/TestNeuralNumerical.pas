@@ -147,6 +147,7 @@ type
     procedure TestCirculantLinearKnownConvolution;
     procedure TestCirculantLinearGradientCheck;
     procedure TestCirculantLinearSerializationRoundTrip;
+    procedure TestCirculantLinearFFTEquivalence;
     // TNNetKANLayer Kolmogorov-Arnold dense layer
     procedure TestKANLayerGradientCheck;
     procedure TestKANLayerSerializationRoundTrip;
@@ -32557,6 +32558,91 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearFFTEquivalence;
+var
+  NNDirect, NNFFT: TNNet;
+  Input, Desired: TNNetVolume;
+  CLDirect, CLFFT: TNNetCirculantLinear;
+  N, i: integer;
+begin
+  // The opt-in radix-2 FFT path (UseFFT := true) must reproduce the DEFAULT
+  // direct O(n^2) path for BOTH the forward output and the backward gradients
+  // (input error + kernel delta + bias delta) to < 1e-5 on a random
+  // kernel/input/error. n is a power of two (FFT requirement). Reseed the
+  // shared RNG per the numerical-test ordering rule.
+  RandSeed := 424242;
+  N := 16;
+  Input := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+
+  NNDirect := TNNet.Create();
+  NNFFT := TNNet.Create();
+  try
+    NNDirect.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    CLDirect := TNNetCirculantLinear.Create(N);
+    NNDirect.AddLayer(CLDirect);
+
+    NNFFT.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    CLFFT := TNNetCirculantLinear.Create(N);
+    NNFFT.AddLayer(CLFFT);
+    CLFFT.UseFFT := true; // opt-in fast path
+
+    // Identical random kernel/bias/input/target on both nets.
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1 - 0.3 * Cos(i * 1.9);
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5 - 0.2 * Sin(i * 1.1);
+      CLDirect.Neurons[0].Weights.Raw[i] := 0.25 - 0.15 * i + 0.35 * Sin(i * 1.3);
+      CLDirect.Neurons[1].Weights.Raw[i] := 0.05 * (i - 2);
+      CLFFT.Neurons[0].Weights.Raw[i] := CLDirect.Neurons[0].Weights.Raw[i];
+      CLFFT.Neurons[1].Weights.Raw[i] := CLDirect.Neurons[1].Weights.Raw[i];
+    end;
+
+    // Batch update so deltas accumulate -gradient and weights stay fixed.
+    NNDirect.SetLearningRate(1.0, 0.0);
+    NNDirect.SetBatchUpdate(true);
+    NNFFT.SetLearningRate(1.0, 0.0);
+    NNFFT.SetBatchUpdate(true);
+
+    // ---- Forward equivalence ----
+    NNDirect.Compute(Input);
+    NNFFT.Compute(Input);
+    for i := 0 to N - 1 do
+      AssertTrue('CirculantLinear FFT forward matches direct at ' + IntToStr(i) +
+        ' direct=' + FloatToStr(NNDirect.GetLastLayer.Output.Raw[i]) +
+        ' fft=' + FloatToStr(NNFFT.GetLastLayer.Output.Raw[i]),
+        Abs(NNDirect.GetLastLayer.Output.Raw[i] -
+            NNFFT.GetLastLayer.Output.Raw[i]) < 1e-5);
+
+    // ---- Backward equivalence (input error + kernel/bias deltas) ----
+    CLDirect.Neurons[0].ClearDelta; CLDirect.Neurons[1].ClearDelta;
+    NNDirect.Layers[0].OutputError.Fill(0);
+    NNDirect.Backpropagate(Desired);
+
+    CLFFT.Neurons[0].ClearDelta; CLFFT.Neurons[1].ClearDelta;
+    NNFFT.Layers[0].OutputError.Fill(0);
+    NNFFT.Backpropagate(Desired);
+
+    for i := 0 to N - 1 do
+    begin
+      AssertTrue('CirculantLinear FFT input-grad matches direct at ' + IntToStr(i),
+        Abs(NNDirect.Layers[0].OutputError.Raw[i] -
+            NNFFT.Layers[0].OutputError.Raw[i]) < 1e-5);
+      AssertTrue('CirculantLinear FFT kernel-delta matches direct at ' + IntToStr(i),
+        Abs(CLDirect.Neurons[0].Delta.Raw[i] -
+            CLFFT.Neurons[0].Delta.Raw[i]) < 1e-5);
+      AssertTrue('CirculantLinear FFT bias-delta matches direct at ' + IntToStr(i),
+        Abs(CLDirect.Neurons[1].Delta.Raw[i] -
+            CLFFT.Neurons[1].Delta.Raw[i]) < 1e-5);
+    end;
+  finally
+    NNDirect.Free;
+    NNFFT.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

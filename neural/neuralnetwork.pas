@@ -5083,11 +5083,23 @@ type
   // The kernel gradient is accumulated into FArrNeurons[0].Delta and the bias
   // gradient into FArrNeurons[1].Delta, so the ordinary inertia / Adam weight
   // update machinery applies unchanged.
-  // An O(n log n) FFT fast path is a follow-up (the direct path is the default).
+  // OPT-IN O(n log n) FFT FAST PATH (default OFF): set UseFFT := true to compute
+  // the forward AND backward in the frequency domain via a self-contained
+  // radix-2 Cooley-Tukey FFT. Circular convolution y = c (*) x becomes the
+  // pointwise complex product Y = FFT(c).*FFT(x), y = IFFT(Y); the input/kernel
+  // gradients are circular CORRELATIONS, computed with the conjugate spectrum.
+  // The radix-2 FFT requires n to be a power of two; UseFFT errors clearly if
+  // not. The direct O(n^2) time-domain path remains the DEFAULT and is the
+  // numerical source of truth (the FFT path matches it to < 1e-5).
   // Coded by Claude (AI).
   TNNetCirculantLinear = class(TNNetFullConnectLinear)
   private
+    FUseFFT: boolean;
     procedure ComputePreviousLayerErrorCPU(); override;
+    procedure ComputeFFT();
+    procedure ComputePreviousLayerErrorFFT();
+    procedure BackpropagateKernelBiasFFT();
+    procedure RequireFFTUsable();
   public
     procedure Compute(); override;
     procedure ComputeCPU(); override;
@@ -5096,6 +5108,8 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    // Opt-in O(n log n) frequency-domain path (default false = direct O(n^2)).
+    property UseFFT: boolean read FUseFFT write FUseFFT;
   end;
 
   /// Kolmogorov-Arnold Network DENSE layer (Liu et al. 2024,
@@ -31290,6 +31304,87 @@ end;
 
 { TNNetCirculantLinear }
 
+// --- Self-contained radix-2 Cooley-Tukey FFT (power-of-two length only) ----
+// Operates in place on parallel real/imag arrays of length N. Inverse=false is
+// the forward transform sum_n x[n] exp(-2*pi*i*k*n/N); Inverse=true uses +i in
+// the exponent and divides by N, so IFFT(FFT(x)) = x. Kept local to the
+// circulant layer's FFT fast path; not exported. Works in DOUBLE precision
+// internally (independent of TNeuralFloat) so the round-trip stays faithful to
+// the direct path to < 1e-5 even when TNeuralFloat is single.
+procedure CirculantFFT(var Re, Im: array of Double; N: integer; Inverse: boolean);
+var
+  i, j, len, half, k: integer;
+  ang, wRe, wIm, wpRe, wpIm, tmp: Double;
+  uRe, uIm, vRe, vIm: Double;
+begin
+  // Bit-reversal permutation.
+  j := 0;
+  for i := 1 to N - 1 do
+  begin
+    k := N shr 1;
+    while (j and k) <> 0 do
+    begin
+      j := j and (not k);
+      k := k shr 1;
+    end;
+    j := j or k;
+    if i < j then
+    begin
+      tmp := Re[i]; Re[i] := Re[j]; Re[j] := tmp;
+      tmp := Im[i]; Im[i] := Im[j]; Im[j] := tmp;
+    end;
+  end;
+  // Iterative Danielson-Lanczos butterflies.
+  len := 2;
+  while len <= N do
+  begin
+    half := len shr 1;
+    // Twiddle factor base exp(-/+ 2*pi*i / len).
+    if Inverse then
+      ang := 2 * Pi / len
+    else
+      ang := -2 * Pi / len;
+    wpRe := Cos(ang);
+    wpIm := Sin(ang);
+    i := 0;
+    while i < N do
+    begin
+      wRe := 1.0;
+      wIm := 0.0;
+      for k := 0 to half - 1 do
+      begin
+        uRe := Re[i + k];
+        uIm := Im[i + k];
+        // v = w * x[i+k+half]
+        vRe := wRe * Re[i + k + half] - wIm * Im[i + k + half];
+        vIm := wRe * Im[i + k + half] + wIm * Re[i + k + half];
+        Re[i + k]        := uRe + vRe;
+        Im[i + k]        := uIm + vIm;
+        Re[i + k + half] := uRe - vRe;
+        Im[i + k + half] := uIm - vIm;
+        // advance w *= wp
+        tmp := wRe * wpRe - wIm * wpIm;
+        wIm := wRe * wpIm + wIm * wpRe;
+        wRe := tmp;
+      end;
+      i := i + len;
+    end;
+    len := len shl 1;
+  end;
+  if Inverse then
+    for i := 0 to N - 1 do
+    begin
+      Re[i] := Re[i] / N;
+      Im[i] := Im[i] / N;
+    end;
+end;
+
+// True iff x is a power of two (and > 0).
+function CirculantIsPow2(x: integer): boolean;
+begin
+  Result := (x > 0) and ((x and (x - 1)) = 0);
+end;
+
 constructor TNNetCirculantLinear.Create(pSizeX, pSizeY, pDepth: integer;
   pSuppressBias: integer = 0);
 begin
@@ -31353,7 +31448,13 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  ComputeCPU();
+  if FUseFFT then
+  begin
+    RequireFFTUsable();
+    ComputeFFT();
+  end
+  else
+    ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -31410,6 +31511,11 @@ var
   LocalPrevError, Kernel: TNNetVolume;
   Err: TNeuralFloat;
 begin
+  if FUseFFT then
+  begin
+    ComputePreviousLayerErrorFFT();
+    exit;
+  end;
   LocalPrevError := FPrevLayer.OutputError;
   Kernel := FArrNeurons[0].FWeights;
   N := FOutput.Size;
@@ -31443,6 +31549,19 @@ begin
   KernelDelta := FArrNeurons[0].FDelta;
   BiasDelta := FArrNeurons[1].FDelta;
   PrevOut := FPrevLayer.FOutput;
+  if FUseFFT then
+  begin
+    // FFT path: fill kernel (and bias) deltas via the frequency domain, then
+    // fall through to the SAME per-sample update tail as the direct path.
+    BackpropagateKernelBiasFFT();
+    if not FBatchUpdate then
+    begin
+      FArrNeurons[0].UpdateWeightsWithoutInertia();
+      FArrNeurons[1].UpdateWeightsWithoutInertia();
+      AfterWeightUpdate();
+    end;
+    exit;
+  end;
   if (FBatchUpdate) then
   begin
     for OutIdx := 0 to N - 1 do
@@ -31486,6 +31605,132 @@ begin
     FArrNeurons[0].UpdateWeightsWithoutInertia();
     FArrNeurons[1].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
+  end;
+end;
+
+// Guards the opt-in FFT path: the radix-2 FFT only supports power-of-two n.
+procedure TNNetCirculantLinear.RequireFFTUsable();
+begin
+  if not CirculantIsPow2(FOutput.Size) then
+    FErrorProc
+    (
+      'TNNetCirculantLinear.UseFFT requires a power-of-two size; got '+
+      IntToStr(FOutput.Size)+'. Disable UseFFT to use the direct O(n^2) path.'
+    );
+end;
+
+// FFT forward: y = IFFT( FFT(c) .* FFT(x) ) + bias. This equals the direct
+// circular convolution y[i] = sum_k c[(i-k) mod n] * x[k] to < 1e-5.
+procedure TNNetCirculantLinear.ComputeFFT();
+var
+  N, i: integer;
+  Kernel, Bias, PrevOut: TNNetVolume;
+  cRe, cIm, xRe, xIm: array of Double;
+  yRe, yIm: Double;
+begin
+  N := FOutput.Size;
+  Kernel := FArrNeurons[0].FWeights;
+  Bias := FArrNeurons[1].FWeights;
+  PrevOut := FPrevLayer.FOutput;
+  SetLength(cRe, N); SetLength(cIm, N);
+  SetLength(xRe, N); SetLength(xIm, N);
+  for i := 0 to N - 1 do
+  begin
+    cRe[i] := Kernel.FData[i]; cIm[i] := 0;
+    xRe[i] := PrevOut.FData[i]; xIm[i] := 0;
+  end;
+  CirculantFFT(cRe, cIm, N, false);
+  CirculantFFT(xRe, xIm, N, false);
+  // Pointwise complex product C .* X.
+  for i := 0 to N - 1 do
+  begin
+    yRe := cRe[i] * xRe[i] - cIm[i] * xIm[i];
+    yIm := cRe[i] * xIm[i] + cIm[i] * xRe[i];
+    cRe[i] := yRe; cIm[i] := yIm;
+  end;
+  CirculantFFT(cRe, cIm, N, true);
+  for i := 0 to N - 1 do
+  begin
+    if FSuppressBias = 0 then
+      FOutput.FData[i] := cRe[i] + Bias.FData[i]
+    else
+      FOutput.FData[i] := cRe[i];
+  end;
+end;
+
+// FFT input gradient: dL/dx[k] = sum_i outErr[i] * c[(i-k) mod n] is the circular
+// CORRELATION of the error e with the kernel c. In the frequency domain a
+// correlation uses the conjugate spectrum: dX = IFFT( conj(FFT(c)) .* FFT(e) ).
+// The result is ADDED to the previous layer error (matching the direct path).
+procedure TNNetCirculantLinear.ComputePreviousLayerErrorFFT();
+var
+  N, i: integer;
+  Kernel, LocalPrevError: TNNetVolume;
+  cRe, cIm, eRe, eIm: array of Double;
+  gRe, gIm: Double;
+begin
+  N := FOutput.Size;
+  Kernel := FArrNeurons[0].FWeights;
+  LocalPrevError := FPrevLayer.OutputError;
+  SetLength(cRe, N); SetLength(cIm, N);
+  SetLength(eRe, N); SetLength(eIm, N);
+  for i := 0 to N - 1 do
+  begin
+    cRe[i] := Kernel.FData[i]; cIm[i] := 0;
+    eRe[i] := FOutputError.FData[i]; eIm[i] := 0;
+  end;
+  CirculantFFT(cRe, cIm, N, false);
+  CirculantFFT(eRe, eIm, N, false);
+  // conj(C) .* E
+  for i := 0 to N - 1 do
+  begin
+    gRe := cRe[i] * eRe[i] + cIm[i] * eIm[i];
+    gIm := cRe[i] * eIm[i] - cIm[i] * eRe[i];
+    cRe[i] := gRe; cIm[i] := gIm;
+  end;
+  CirculantFFT(cRe, cIm, N, true);
+  for i := 0 to N - 1 do
+    LocalPrevError.FData[i] := LocalPrevError.FData[i] + cRe[i];
+end;
+
+// FFT weight gradients. Kernel: dL/dc[j] = sum_i outErr[i] * x[(i-j) mod n] is
+// the circular CORRELATION of e with x, so dC = IFFT( conj(FFT(x)) .* FFT(e) ).
+// Bias: dL/dbias[i] = outErr[i] directly. Both are scaled by -FLearningRate and
+// ACCUMULATED into the neurons' Delta, exactly like the direct path.
+procedure TNNetCirculantLinear.BackpropagateKernelBiasFFT();
+var
+  N, i: integer;
+  KernelDelta, BiasDelta, PrevOut: TNNetVolume;
+  xRe, xIm, eRe, eIm: array of Double;
+  gRe, gIm, lr: Double;
+begin
+  N := FOutput.Size;
+  KernelDelta := FArrNeurons[0].FDelta;
+  BiasDelta := FArrNeurons[1].FDelta;
+  PrevOut := FPrevLayer.FOutput;
+  lr := -FLearningRate;
+  SetLength(xRe, N); SetLength(xIm, N);
+  SetLength(eRe, N); SetLength(eIm, N);
+  for i := 0 to N - 1 do
+  begin
+    xRe[i] := PrevOut.FData[i]; xIm[i] := 0;
+    eRe[i] := FOutputError.FData[i]; eIm[i] := 0;
+  end;
+  CirculantFFT(xRe, xIm, N, false);
+  CirculantFFT(eRe, eIm, N, false);
+  // conj(X) .* E
+  for i := 0 to N - 1 do
+  begin
+    gRe := xRe[i] * eRe[i] + xIm[i] * eIm[i];
+    gIm := xRe[i] * eIm[i] - xIm[i] * eRe[i];
+    xRe[i] := gRe; xIm[i] := gIm;
+  end;
+  CirculantFFT(xRe, xIm, N, true);
+  for i := 0 to N - 1 do
+  begin
+    KernelDelta.FData[i] := KernelDelta.FData[i] + lr * xRe[i];
+    if FSuppressBias = 0 then
+      BiasDelta.FData[i] := BiasDelta.FData[i] + lr * FOutputError.FData[i];
   end;
 end;
 

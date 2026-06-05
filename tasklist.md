@@ -143,7 +143,7 @@ rather than acted on.
           (shape + zero-weight hyper layer + gradients reach the generator +
           save/load round-trip) in tests/TestNeuralNumerical.pas.
 
-- [ ] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
+- [x] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
       matrix W (n x n, n = Depth) is CIRCULANT: every row is a cyclic shift of a
       single learned vector c of length n, so the layer stores O(n) weights
       instead of O(n^2) and the map is `y = circular_convolution(c, x) (+ bias)`.
@@ -178,10 +178,21 @@ rather than acted on.
       save/load round-trip) — full suite green. (d) examples/CirculantLinear/
       bake-off (circulant 2n weights vs dense n*n+n) prints accuracy-per-weight:
       circulant ~8.5x fewer weights and ~500x more accurate-per-weight on n=16,
-      recovers the teacher kernel to ~5 decimals, runs in ~0.5s. STILL OPEN:
-      part (c), the opt-in O(n log n) FFT fast path (the direct path is the
-      default; the example's "FFT-vs-direct wall-clock as n grows" chart depends
-      on it and is deferred with it).
+      recovers the teacher kernel to ~5 decimals, runs in ~0.5s. (c) LANDED
+      2026-06-05: opt-in O(n log n) FFT fast path via `TNNetCirculantLinear.UseFFT`
+      (property, default false). A self-contained radix-2 Cooley-Tukey FFT
+      (helper CirculantFFT, double precision internally, power-of-two n required;
+      UseFFT errors clearly otherwise) computes BOTH forward
+      (y = IFFT(FFT(c).*FFT(x)) + bias) AND backward (input grad = circular
+      correlation IFFT(conj(FFT(c)).*FFT(e)); kernel grad
+      IFFT(conj(FFT(x)).*FFT(e)); bias grad = e). The direct O(n^2) path stays
+      the DEFAULT and is the numerical source of truth. Test
+      TestCirculantLinearFFTEquivalence in TestNeuralNumerical.pas asserts the
+      FFT path matches the direct forward output, input gradient and kernel/bias
+      deltas to <1e-5 (n=16); existing direct-path tests unchanged and green.
+      The example README documents UseFFT; the optional "FFT-vs-direct wall-clock
+      as n grows" chart was NOT added (the layer-level fast path + equivalence
+      test is the substantive deliverable). Full suite green.
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
