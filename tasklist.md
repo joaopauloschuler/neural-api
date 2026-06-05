@@ -148,47 +148,6 @@ rather than acted on.
       default; the example's "FFT-vs-direct wall-clock as n grows" chart depends
       on it and is deferred with it).
 
-- [ ] TNNetSelectiveSSM — an INPUT-DEPENDENT ("selective", Mamba/S6-style, Gu &
-      Dao 2023) diagonal state-space sequence mixer. This is genuinely distinct
-      from the landed TNNetDiagonalSSM, which is strictly LINEAR-TIME-INVARIANT:
-      its per-channel decay a[d], input gain b[d] and output gain c[d] are FIXED
-      learned scalars, so the recurrence cannot condition on content. The whole
-      point of selectivity is that the gates become FUNCTIONS OF THE INPUT at each
-      timestep, letting the layer choose what to remember vs forget per token —
-      the mechanism behind Mamba's selective-copy / induction-head wins that an
-      LTI SSM provably cannot do. Concretely, over a (SeqLen,1,Depth) sequence
-      (same SizeY=1 layout / depth-parallel sweep as TNNetDiagonalSSM), make the
-      step input-conditioned:
-        delta_t = softplus(x_t·W_d + b_d)       (per-channel positive timestep)
-        a_t[d]  = exp(-delta_t[d] * exp(A_raw[d]))   (discretized decay, in (0,1))
-        bbar_t[d] = delta_t[d] * b_t[d], with b_t = x_t·W_B, c_t = x_t·W_C
-        h_t = a_t (*) h_{t-1} + bbar_t (*) x_t
-        y_t = c_t (*) h_t + e[d]·x_t             (e = S4D feedthrough, keeps grads
-                                                 alive at init like DiagonalSSM)
-      Deliverables, mirroring the DiagonalSSM/Hyena/Circulant landings:
-      (a) the leaf layer in neuralnetwork.pas (mark `// Coded by Claude (AI).`),
-          with the three small input-projection weight sets (W_d, W_B, W_C) plus
-          per-channel A_raw and e. Forward is the direct O(SeqLen*Depth) causal
-          sweep; backward is backprop-through-time (right-to-left dL/dh sweep, as
-          in TNNetDiagonalSSM) that ALSO scatters into the projection weights and
-          chains through softplus(delta) and exp(decay). Init so the layer starts
-          as a benign leaky accumulator near the DiagonalSSM default (A_raw such
-          that a≈0.5 at unit delta, e=1), and wire both CreateLayer dispatch points
-          so save/load round-trips.
-      (b) numerical-gradient + save/load tests in TestNeuralNumerical.pas (reseed
-          `RandSeed := 424242` per [[numerical-test-rng-ordering]]): finite-diff
-          checks on the input AND every weight set (W_d/W_B/W_C/A_raw/e), a
-          byte-identical save/load round-trip, and a degeneracy check that with
-          the projection weights forced to constants the layer reduces to an LTI
-          DiagonalSSM-equivalent to <1e-5 (the correctness anchor).
-      (c) an examples/SelectiveSSM/ SELECTIVE-COPY bake-off: a content-addressed
-          copy/induction task where the model must reproduce tokens that followed a
-          marker — the canonical task an LTI SSM fails and a selective one solves.
-          Contrast TNNetSelectiveSSM vs a param-matched TNNetDiagonalSSM (headline:
-          selectivity clears the task, LTI plateaus) and note wall-clock. Pure CPU,
-          <5 min. Composes with the open [[KV-cache incremental-decode]] /
-          O(1)-per-step SSM follow-up (the recurrence is O(1)-per-step by nature).
-
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
@@ -275,7 +234,7 @@ rather than acted on.
       those weights (the correctness anchor), plus the LoadFromString round-trip of the
       generator-link wiring. Distinct from `TNNetFiLM`/AddFiLMConditioned (modulates
       ACTIVATIONS per channel, does not synthesise weights), from AddLoRAAdapter (adds
-      a FIXED trained low-rank bypass, not a context-GENERATED weight), from the open
+      a FIXED trained low-rank bypass, not a context-GENERATED weight), from the landed
       TNNetMixtureOfExperts (SELECTS among N fixed expert weight sets via a gate rather
       than GENERATING a fresh weight set), and from the Neural-ODE/Growing-CA entries
       (shared-weight time/space recurrence, weights still owned by the layer).
@@ -427,40 +386,6 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [ ] Beam-search decoding + a decoding-strategy bake-off example
-      (examples/BeamSearchDecode/): the `TNNetSamplerBase` family is today
-      Greedy / TopK / TopP — all *per-token, stochastic* samplers that commit
-      to one token and never reconsider. Beam search is the missing
-      *deterministic, sequence-level* strategy: keep the `B` highest
-      log-probability partial sequences, expand each by every candidate next
-      token, then re-prune to the top `B` by CUMULATIVE log-prob — so it can
-      recover from a locally-greedy mistake that a single argmax locks in.
-      Because it scores whole sequences (not one token), it does NOT fit the
-      `GetToken(Origin)` sampler interface and should NOT be forced into a
-      `TNNetSamplerBeam` subclass (that would be a misfit re-skin); implement
-      it as a standalone `DecodeBeamSearch(NN, Prompt, MaxLen, BeamWidth,
-      LengthPenalty)` routine that drives the model's forward pass directly,
-      living either in the example or as a small `neuraldecode`-style helper.
-      Scope notes to settle honestly in v1, in the "what did NOT fit" style of
-      the Grokking/SpeculativeDecoding entries: (a) work in LOG space and SUM
-      log-probs (never multiply probabilities — underflow); (b) apply the
-      Wu et al. 2016 length-penalty `score = sum_logp / ((5+L)/6)^alpha` so
-      beams aren't biased toward short sequences, and show the `alpha=0`
-      (raw, short-biased) vs `alpha>0` contrast; (c) v1 re-encodes each
-      candidate prefix every step (O(L^2), same honest limitation the
-      SpeculativeDecoding demo carries) and explicitly defers the
-      [[KV-cache incremental-decode]] composition as the logged follow-up;
-      (d) terminate a beam when it emits the stop/EOS token and keep it in a
-      finished-pool ranked against still-growing beams. Headline experiment:
-      on a tiny char-level next-token model where greedy demonstrably
-      DEAD-ENDS (a deliberately constructed prompt whose locally-likeliest
-      first token leads to a globally worse continuation), print a table of
-      Greedy vs Beam(B=2,4,8) showing beam recovering the higher total
-      log-prob sequence, plus the diversity contrast against the existing TopK
-      / TopP stochastic samplers (beam = sharp/repetitive, sampling =
-      diverse/noisier). Composes with the existing samplers and the
-      ../gpt-3-for-pascal decoder; a genuinely new decoding capability, not a
-      variant of an existing TNNetSampler.
 - [ ] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
       fairly FLAT, so absolute accept rates are high even for a weak draft and
       the speedup headline is carried by the monotone accept-rate RISE, not the
