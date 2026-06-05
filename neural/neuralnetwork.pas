@@ -5942,6 +5942,29 @@ type
       // Returns the (SeqLen,1,d_model) out-projection layer.
       function AddMultiHeadGroupedQueryAttention(d_model, QueryHeads,
         KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
+      // Multi-head Latent Attention (MLA, DeepSeek-V2, Liu et al. 2024) over a
+      // (SeqLen,1,d_model) token tensor (source is GetLastLayer()). Unlike GQA
+      // -- which shrinks the KV cache by SHARING full-width K/V across query-head
+      // groups -- MLA LOW-RANK-FACTORS the K/V projection. Each token is first
+      // down-projected token-wise to a single tiny shared latent
+      //   c_KV := x . W_DKV   (width LatentDim, with LatentDim << d_model)
+      // and K and V for EVERY head are then reconstructed by token-wise
+      // up-projections K := c_KV . W_UK, V := c_KV . W_UV. In an incremental
+      // decoder c_KV (width LatentDim) is the ONLY per-token state that need be
+      // cached -- the rank-based saving (LatentDim) is orthogonal to head count.
+      // Q is projected token-wise from d_model directly (full d_model = Heads*d_k,
+      // d_k := d_model div Heads), as in plain MHA. Per head, [Q_h | K_h | V_h]
+      // (width 3*d_k) is fed to TNNetScaledDotProductAttention; head outputs are
+      // concatenated (TNNetDeepConcat) then out-projected token-wise to d_model.
+      // All projections are 1x1 convs (TNNetPointwiseConvLinear) so the sequence
+      // axis is preserved (a TNNetFullConnect* would flatten/mix tokens; see the
+      // AddMultiHeadSelfAttention header note). Cacheable-state saving vs plain
+      // MHA (which caches full-width K AND V, total 2*d_model per token) is
+      // LatentDim / (2*d_model). v1 is NoPE (no positional encoding): the paper's
+      // decoupled RoPE slice on Q/K is NOT yet carried (follow-up). Returns the
+      // (SeqLen,1,d_model) out-projection layer.
+      function AddMultiHeadLatentAttention(d_model, Heads,
+        LatentDim: integer; CausalMask: boolean = false): TNNetLayer;
       // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
       //   PreNorm=True  (default):
       //     x := x + MHA(LayerNorm(x));  x := x + SwiGLU-FFN(LayerNorm(x))
@@ -27659,6 +27682,63 @@ begin
     KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
     VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
     // Pack [Q_h | K_group | V_group] (width 3*d_k) as SDPA expects.
+    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
+        HeadPack);
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Token-wise linear out-projection (FullConnectLinear would flatten the
+  // sequence axis; see AddMultiHeadSelfAttention header note).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+  SetLength(KVChannels, 0);
+end;
+
+function TNNet.AddMultiHeadLatentAttention(d_model, Heads,
+  LatentDim: integer; CausalMask: boolean = false): TNNetLayer;
+var
+  d_k, HeadCnt, d: integer;
+  SourceLayer, QProj, CKV, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels, KVChannels: array of integer;
+begin
+  if Heads < 1 then
+    FErrorProc('AddMultiHeadLatentAttention requires Heads >= 1. Heads=' +
+      IntToStr(Heads));
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddMultiHeadLatentAttention requires d_model divisible by' +
+      ' Heads. d_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  if LatentDim < 1 then
+    FErrorProc('AddMultiHeadLatentAttention requires LatentDim >= 1.' +
+      ' LatentDim=' + IntToStr(LatentDim));
+  SourceLayer := GetLastLayer();
+  d_k := d_model div Heads;             // per-head dim
+  // Token-wise projections (1x1 conv preserves the sequence axis).
+  // Q is projected directly from d_model to the full d_model width (as in MHA).
+  QProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), SourceLayer);
+  // Low-rank K/V factoring: down-project each token to the SHARED latent c_KV
+  // (width LatentDim << d_model) -- the ONLY state a decoder would cache.
+  CKV := AddLayerAfter(TNNetPointwiseConvLinear.Create(LatentDim), SourceLayer);
+  // Up-project the latent back to full-width K and V (d_model = Heads*d_k each).
+  KProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), CKV);
+  VProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), CKV);
+  SetLength(HeadOutputs, Heads);
+  SetLength(QChannels, d_k);
+  SetLength(KVChannels, d_k);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    for d := 0 to d_k - 1 do
+    begin
+      QChannels[d]  := HeadCnt * d_k + d;
+      KVChannels[d] := HeadCnt * d_k + d;
+    end;
+    QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
+    KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
+    VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
+    // Pack [Q_h | K_h | V_h] (width 3*d_k) as SDPA expects.
     HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
     HeadOutputs[HeadCnt] :=
       AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),

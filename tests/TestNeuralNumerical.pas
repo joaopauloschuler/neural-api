@@ -445,6 +445,8 @@ type
     procedure TestCrossAttentionLoadFromString;
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
+    procedure TestMultiHeadLatentAttentionGradientCheck;
+    procedure TestMultiHeadLatentAttentionLoadFromString;
     procedure TestTransformerEncoderBlockGradientCheck;
     procedure TestTransformerDecoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
@@ -12632,6 +12634,136 @@ begin
   finally
     NNFull.Free;
     NNMQA.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadLatentAttentionGradientCheck;
+// MLA (DeepSeek-V2): numerical-gradient check on the input gradient flowing
+// through the AddMultiHeadLatentAttention builder. Heads=4, d_model=8 (d_k=2),
+// LatentDim=3 (the shared low-rank K/V latent c_KV), seq=3. The builder does
+// its own Q projection plus the c_KV down-projection and K/V up-projections
+// from a (SeqLen,1,d_model) token tensor. Also pins the output shape and reports
+// the cacheable-state saving LatentDim/(2*d_model) vs plain MHA.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  d_model, Heads, LatentDim, SeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 4;
+  LatentDim := 3;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddMultiHeadLatentAttention(d_model, Heads, LatentDim, false);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Output shape must match the (SeqLen,1,d_model) token grid.
+    AssertTrue('MLA output SizeX', NN.GetLastLayer.Output.SizeX = SeqLen);
+    AssertTrue('MLA output SizeY', NN.GetLastLayer.Output.SizeY = 1);
+    AssertTrue('MLA output Depth', NN.GetLastLayer.Output.Depth = d_model);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MLA input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestMultiHeadLatentAttentionGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+    WriteLn('  MLA cacheable-state saving LatentDim/(2*d_model) = ',
+      FloatToStr(LatentDim / (2 * d_model)));
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadLatentAttentionLoadFromString;
+// A net containing the AddMultiHeadLatentAttention builder round-trips through
+// SaveToString -> LoadFromString and reproduces an identical forward output
+// (the per-head SplitChannels / DeepConcat / SDPA slab is serialized like the
+// other multi-source attention builders).
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  d_model, Heads, LatentDim, SeqLen, i: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 4;
+  LatentDim := 3;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddMultiHeadLatentAttention(d_model, Heads, LatentDim, true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.8 + 0.2;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      AssertTrue('MLA round-trip output size matches',
+        NN.GetLastLayer.Output.Size = NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MLA round-trip forward output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
