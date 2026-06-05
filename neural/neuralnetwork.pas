@@ -5599,7 +5599,9 @@ type
       // concatenates the Heads per-head (SeqLen,1,d_k) outputs back to depth
       // d_model via TNNetDeepConcat. Returns the concat layer. SourceLayer = nil
       // uses GetLastLayer().
-      function AddMultiHeadSDPAConcat(d_model, Heads: integer;
+      // d_model is inferred from the source depth (the Q|K|V slab, so d_model =
+      // SourceLayer.Output.Depth div 3).
+      function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil): TNNetLayer;
       // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
       // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
@@ -5611,7 +5613,9 @@ type
       // The correct per-token linear projection here is
       // TNNetPointwiseConvLinear(d_model) (a 1x1 conv applied independently at
       // each sequence position), matching the existing AddSelfAttention block.
-      function AddMultiHeadSelfAttention(d_model, Heads: integer;
+      // d_model is inferred from the input depth (the Q|K|V slab, so d_model =
+      // GetLastLayer().Output.Depth div 3).
+      function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false): TNNetLayer;
       // Encoder-decoder multi-head CROSS-attention. The Query is projected from
       // QuerySource (the decoder stream, a (QSeqLen,1,d_model) token tensor) and
@@ -5643,7 +5647,8 @@ type
       // K/V parameter cost: full MHA K/V projections scale with QueryHeads, GQA
       // scales with KVHeads -- a factor QueryHeads/KVHeads fewer K/V params.
       // Returns the (SeqLen,1,d_model) out-projection layer.
-      function AddMultiHeadGroupedQueryAttention(d_model, QueryHeads,
+      // d_model is inferred from the input depth (GetLastLayer().Output.Depth).
+      function AddMultiHeadGroupedQueryAttention(QueryHeads,
         KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
       // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
       //   PreNorm=True  (default):
@@ -5659,7 +5664,8 @@ type
       // into one vector and destroy the token axis. The output shape is
       // (SeqLen,1,d_model), matching the input, so blocks can be stacked.
       // Returns the last layer of the block.
-      function AddTransformerEncoderBlock(d_model, Heads, d_ff: integer;
+      // d_model is inferred from the input depth (GetLastLayer().Output.Depth).
+      function AddTransformerEncoderBlock(Heads, d_ff: integer;
         PreNorm: boolean = true; CausalMask: boolean = false): TNNetLayer;
       // Composite builder assembling a standard transformer DECODER block by
       // stacking three residual sub-blocks on the current decoder stream:
@@ -5685,7 +5691,8 @@ type
       // sequence axis is preserved; output shape (SeqLen,1,d_model) matches the
       // decoder-stream input so blocks can be stacked. EncoderOutput must be a
       // non-nil (KVSeqLen,1,d_model) layer. Returns the last layer of the block.
-      function AddTransformerDecoderBlock(d_model, Heads, d_ff: integer;
+      // d_model is inferred from the decoder-stream depth (GetLastLayer().Output.Depth).
+      function AddTransformerDecoderBlock(Heads, d_ff: integer;
         EncoderOutput: TNNetLayer; PreNorm: boolean = true): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
@@ -26172,13 +26179,15 @@ begin
   SetLength(Channels, 0);
 end;
 
-function TNNet.AddMultiHeadSDPAConcat(d_model, Heads: integer;
+function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   CausalMask: boolean = false; SourceLayer: TNNetLayer = nil): TNNetLayer;
 var
-  d_k, HeadCnt: integer;
+  d_model, d_k, HeadCnt: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
 begin
   if SourceLayer = nil then SourceLayer := GetLastLayer();
+  // Source is the Q|K|V slab, so its depth is 3*d_model.
+  d_model := SourceLayer.Output.Depth div 3;
   d_k := d_model div Heads;
   SetLength(SliceLayers, Heads);
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
@@ -26192,10 +26201,14 @@ begin
   SetLength(HeadOutputs, 0);
 end;
 
-function TNNet.AddMultiHeadSelfAttention(d_model, Heads: integer;
+function TNNet.AddMultiHeadSelfAttention(Heads: integer;
   CausalMask: boolean = false): TNNetLayer;
+var
+  d_model: integer;
 begin
-  AddMultiHeadSDPAConcat(d_model, Heads, CausalMask, GetLastLayer());
+  // Input is the Q|K|V slab, so its depth is 3*d_model.
+  d_model := GetLastLayer().Output.Depth div 3;
+  AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer());
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
@@ -26261,15 +26274,17 @@ begin
   SetLength(KVChannels, 0);
 end;
 
-function TNNet.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads,
+function TNNet.AddMultiHeadGroupedQueryAttention(QueryHeads,
   KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
 var
-  d_k, d_kv, GroupSize, HeadCnt, KVGroup, d: integer;
+  d_model, d_k, d_kv, GroupSize, HeadCnt, KVGroup, d: integer;
   SourceLayer, QProj, KProj, VProj: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   QChannels, KVChannels: array of integer;
 begin
+  SourceLayer := GetLastLayer();
+  d_model := SourceLayer.Output.Depth;  // inferred stream width
   if QueryHeads < 1 then
     FErrorProc('AddMultiHeadGroupedQueryAttention requires QueryHeads >= 1.' +
       ' QueryHeads=' + IntToStr(QueryHeads));
@@ -26284,7 +26299,6 @@ begin
     FErrorProc('AddMultiHeadGroupedQueryAttention requires QueryHeads' +
       ' divisible by KVHeads. QueryHeads=' + IntToStr(QueryHeads) +
       ', KVHeads=' + IntToStr(KVHeads));
-  SourceLayer := GetLastLayer();
   d_k := d_model div QueryHeads;       // per-head dim
   d_kv := KVHeads * d_k;               // total K/V projection width (shrunken)
   GroupSize := QueryHeads div KVHeads; // query heads sharing one KV head
@@ -26325,21 +26339,23 @@ begin
   SetLength(KVChannels, 0);
 end;
 
-function TNNet.AddTransformerEncoderBlock(d_model, Heads, d_ff: integer;
+function TNNet.AddTransformerEncoderBlock(Heads, d_ff: integer;
   PreNorm: boolean = true; CausalMask: boolean = false): TNNetLayer;
 var
   BranchInput: TNNetLayer;
+  d_model: integer;
 begin
   // ---- Attention sub-block: residual around multi-head self-attention. ----
   // Replicated inline (not via AddPreNormResidual/AddPostNormResidual) because
   // the attention sublayer adds MANY layers through GetLastLayer() chaining and
   // cannot be expressed as a pre-built "array of TNNetLayer".
   BranchInput := GetLastLayer();
+  d_model := BranchInput.Output.Depth;  // inferred residual-stream width
   if PreNorm then AddLayer( TNNetLayerNorm.Create() );
   // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
-  AddMultiHeadSelfAttention(d_model, Heads, CausalMask);
+  AddMultiHeadSelfAttention(Heads, CausalMask);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
 
@@ -26357,10 +26373,11 @@ begin
   Result := GetLastLayer();
 end;
 
-function TNNet.AddTransformerDecoderBlock(d_model, Heads, d_ff: integer;
+function TNNet.AddTransformerDecoderBlock(Heads, d_ff: integer;
   EncoderOutput: TNNetLayer; PreNorm: boolean = true): TNNetLayer;
 var
   BranchInput, QuerySource: TNNetLayer;
+  d_model: integer;
 begin
   if EncoderOutput = nil then
     FErrorProc('AddTransformerDecoderBlock requires a non-nil EncoderOutput.');
@@ -26371,11 +26388,12 @@ begin
   // through GetLastLayer() chaining and cannot be expressed as a pre-built
   // "array of TNNetLayer".
   BranchInput := GetLastLayer();
+  d_model := BranchInput.Output.Depth;  // inferred decoder-stream width
   if PreNorm then AddLayer( TNNetLayerNorm.Create() );
   // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
-  AddMultiHeadSelfAttention(d_model, Heads, {CausalMask=}true);
+  AddMultiHeadSelfAttention(Heads, {CausalMask=}true);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
 

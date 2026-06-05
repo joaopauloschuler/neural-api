@@ -11229,7 +11229,7 @@ begin
   maxErr := 0;
   try
     NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
-    NN.AddMultiHeadSDPAConcat(d_model, Heads, false);
+    NN.AddMultiHeadSDPAConcat(Heads, false);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
 
@@ -11304,7 +11304,7 @@ var
     maxErr := 0;
     try
       NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
-      NN.AddTransformerEncoderBlock(d_model, Heads, d_ff, PreNorm, false);
+      NN.AddTransformerEncoderBlock(Heads, d_ff, PreNorm, false);
       NN.SetLearningRate(1.0, 0.0);
       NN.SetBatchUpdate(true);
 
@@ -11410,7 +11410,7 @@ var
       // Bring the active layer back to the decoder stream before building the
       // block (AddLayerAfter above left the encoder input as the last layer).
       NN.AddLayerAfter(TNNetIdentity.Create(), DecIn);
-      NN.AddTransformerDecoderBlock(d_model, Heads, d_ff, EncOut, PreNorm);
+      NN.AddTransformerDecoderBlock(Heads, d_ff, EncOut, PreNorm);
       NN.SetLearningRate(1.0, 0.0);
       NN.SetBatchUpdate(true);
 
@@ -11715,7 +11715,7 @@ begin
   maxErr := 0;
   try
     NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
-    NN.AddMultiHeadSelfAttention(d_model, Heads, false);
+    NN.AddMultiHeadSelfAttention(Heads, false);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
 
@@ -11957,7 +11957,7 @@ begin
   maxErr := 0;
   try
     NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
-    NN.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, KVHeads, false);
+    NN.AddMultiHeadGroupedQueryAttention(QueryHeads, KVHeads, false);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
 
@@ -12035,10 +12035,10 @@ begin
   try
     // Full MHA: KVHeads = QueryHeads (K/V projected to full d_model).
     NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
-    NNFull.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, QueryHeads, false);
+    NNFull.AddMultiHeadGroupedQueryAttention(QueryHeads, QueryHeads, false);
     // MQA: KVHeads = 1 (K/V projected to a single d_k-wide head).
     NNMQA.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
-    NNMQA.AddMultiHeadGroupedQueryAttention(d_model, QueryHeads, 1, false);
+    NNMQA.AddMultiHeadGroupedQueryAttention(QueryHeads, 1, false);
 
     // (a) Identical output shape regardless of head-sharing.
     AssertTrue('GQA/MHA full output SizeX',

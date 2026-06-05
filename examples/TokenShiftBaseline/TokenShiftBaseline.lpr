@@ -166,7 +166,7 @@ begin
         // token); AddMultiHeadSelfAttention consumes the Q|K|V slab and
         // out-projects back to d_model (see AddTransformerEncoderBlock).
         Result.AddLayer(TNNetPointwiseConvLinear.Create(3 * cDModel));
-        Result.AddMultiHeadSelfAttention(cDModel, cHeads, True);
+        Result.AddMultiHeadSelfAttention(cHeads, True);
       end;
   end;
 

@@ -213,7 +213,7 @@ begin
   Result.AddLayer(TNNetEmbedding.Create(cVocab, cTgtDModel, 1));
   Result.AddLayer(TNNetSinusoidalPositionalEmbedding.Create());
   Result.AddLayer(TNNetPointwiseConvLinear.Create(3 * cTgtDModel)); // Q|K|V slab
-  Result.AddMultiHeadSelfAttention(cTgtDModel, cTgtHeads, True);     // causal
+  Result.AddMultiHeadSelfAttention(cTgtHeads, True);     // causal
   Result.AddLayer(TNNetPointwiseConvLinear.Create(cTgtDFF));
   Result.AddLayer(TNNetReLU.Create());
   Result.AddLayer(TNNetPointwiseConvLinear.Create(cVocab));

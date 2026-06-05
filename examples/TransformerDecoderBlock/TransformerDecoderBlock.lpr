@@ -20,7 +20,7 @@ input.
 Wiring (two input branches):
   DecoderInput(SeqLen,1,d_model)   -- the decoder stream
   EncoderOutput(KVSeqLen,1,d_model)-- the (toy) encoder memory, K|V source
-  AddTransformerDecoderBlock(d_model, Heads, d_ff, EncoderOutput)
+  AddTransformerDecoderBlock(Heads, d_ff, EncoderOutput)  -- d_model inferred from the decoder stream
 
 Toy task: regress a deterministic function of both the decoder input
 and the encoder memory, just to show finite gradients flowing through
@@ -85,7 +85,7 @@ const
 
     // The whole decoder block in a single call. Q from the decoder stream,
     // K|V from EncOut. PreNorm=True (default).
-    BlockOut := NN.AddTransformerDecoderBlock(cDModel, cHeads, cDFF, EncOut);
+    BlockOut := NN.AddTransformerDecoderBlock(cHeads, cDFF, EncOut);
 
     NN.SetLearningRate(0.01, 0.0);
     NN.SetBatchUpdate(true);
