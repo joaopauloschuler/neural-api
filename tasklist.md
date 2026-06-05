@@ -108,13 +108,16 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
-- [ ] mLSTM matrix-memory variant (xLSTM follow-up to the landed scalar sLSTM):
-      outer-product key/value covariance update C_t = f_t C_{t-1} + i_t v_t k_t^T
-      with the same m/n running-max stabilizer, giving a parallelisable
-      attention-like form. Model after TNNetSLSTMCell (the scalar variant) for the
-      stabilizer/exp-gate machinery and serialization; the new piece is the
-      matrix memory state and the query read-out h_t = o_t * (C_t q_t / max(|n_t^T
-      q_t|, 1)). Needs its own numerical-gradient + save/load tests and a builder.
+- [X] mLSTM matrix-memory variant (xLSTM follow-up to the landed scalar sLSTM):
+      LANDED 2026-06-05 as TNNetMLSTMCell + TNNet.AddMLSTM. DepthxDepth covariance
+      memory C_t = f'_t C_{t-1} + i'_t v_t k_t^T, normalizer n_t, running-max m_t
+      stabilizer, read-out h_t = o_t * (C_t q_t / max(|n_t^T q_t|, 1)). Registered
+      in CreateLayer + LoadFromString; numerical-gradient (input+all-9-weights) and
+      save/load tests in TestNeuralNumerical.pas. KEY FINDING: unlike sLSTM, m_t is
+      NOT stop-gradient here — once the read-out denominator clamps at 1 the
+      exp(-m_t) scaling no longer cancels, so backward must propagate an exact
+      dL/dm_t through the running max (two earlier stop-grad attempts failed the
+      gradient check).
 
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
       + examples/HyperNetwork/ + two-path gradient tests + the
@@ -772,20 +775,14 @@ rather than acted on.
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
       a few seeds (mean +/- std) would show whether the bounce is a seed artifact
       or a real saturation/recovery transition.
-- [ ] `examples/Word2VecSkipGram/` — classic skip-gram word embeddings on a
-      tiny built-in corpus (a few hundred sentences, no download). Train a
-      `TNNetEmbedding` (vocab → d) against context words with negative
-      sampling (sample K random "not-a-context" words per positive pair and
-      push the dot-product apart with a sigmoid/BCE head), then show the
-      payoff: nearest-neighbour lists by cosine similarity and the textbook
-      analogy arithmetic `king - man + woman ≈ queen` solved purely from the
-      learned vectors. Distinct from SimpleNLP (char-level next-token LM) and
-      CharTokenizer (tokenisation) — this is the unsupervised distributional-
-      semantics demo the repo is missing, and it exercises TNNetEmbedding in a
-      non-transformer setting. Library note for the builder: build positive
-      (center, context) pairs as VolumePairs, draw negatives from a unigram^0.75
-      table, and reuse the existing InfoNCE/cosine machinery from
-      examples/InfoNCEContrastive for the similarity ranking.
+- [X] `examples/Word2VecSkipGram/` — LANDED 2026-06-05. Skip-gram with negative
+      sampling (SGNS) on a built-in corpus, no download, ~6s runtime. KEY FINDING:
+      a single SHARED embedding matrix drove every cosine to ~0 (failed); the
+      textbook TWO-matrix design (separate center/context TNNetEmbedding nets,
+      seeded via the "target = output - grad" loss-layer trick) fixed it. Negatives
+      drawn from a unigram^0.75 table. `king - man + woman ≈ queen` LANDED (queen
+      top at 0.74); the thinly-attested seniority analogy did NOT generalise
+      (documented honestly in the README). Nearest-neighbour lists all sensible.
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
@@ -1349,32 +1346,20 @@ rather than acted on.
       single-number window into the terminal phase / neural collapse. Pairs
       with the open grokking experiment and the landed lottery-ticket experiment
       ([[WeightSpectrumReport]]).
-- [ ] `TNNet.NeuralCollapseReport` + `examples/NeuralCollapse/` — measure the
-      four canonical Neural-Collapse metrics (Papyan, Han & Donoho 2020, "Prevalence
-      of neural collapse during the terminal phase of deep learning training") on a
-      probe set of penultimate-layer features. Genuinely distinct from the existing
-      `FeatureSeparabilityReport` and its line-1415 trajectory follow-up: those stop
-      at the `tr(Sw)` collapse + Fisher-ratio *magnitude* (a partial NC1), whereas the
-      headline NC result is the *simplex-ETF geometry* (NC2), which nothing in the tree
-      computes. Report all four: NC1 = within-class variability collapse
-      `tr(Sw·Sb^+)/C` → 0 (reuse FeatureSeparability's class-mean / scatter machinery,
-      do NOT re-derive it); NC2 = convergence to a simplex equiangular tight frame —
-      the centered class means become EQUINORM (coefficient of variation of `||mean_c −
-      global_mean||` → 0) and EQUIANGULAR (every pair's cosine → `−1/(C−1)`, so print
-      the mean and max deviation from that target — this angle check is the novel,
-      visually striking piece); NC3 = self-duality, cosine alignment between the
-      centered class-mean matrix and the final classifier weight rows (skip honestly,
-      flagged, if the head is not a width-matched `TNNetFullConnectLinear` /
-      `TNNetPointwiseConvLinear`); NC4 = classifier collapses to nearest-class-mean,
-      i.e. fraction of probe points whose argmax logit equals their nearest centered
-      class mean. The example trains a small classifier WELL past zero train-error
-      (the "terminal phase") and calls the report every N epochs on a fixed probe to
-      chart the C−1 pairwise cosines converging onto the `−1/(C−1)` line as an ASCII
-      trajectory — the simplex assembling itself. Pure CPU, no dataset download (a
-      synthetic few-class Gaussian-blob task is enough to exhibit collapse). Follow the
-      introspection-report recipe ([[introspection-report-pattern]]): decl + impl +
-      smoke test (pin NC2's equiangular target on a hand-built exact-simplex feature
-      set so the cosine math is verified independent of training) + README + docs row.
+- [X] `TNNet.NeuralCollapseReport` + `examples/NeuralCollapse/` — LANDED 2026-06-05.
+      All four Papyan/Han/Donoho 2020 metrics on penultimate-layer features, reusing
+      FeatureSeparabilityReport's class-mean/scatter machinery. NC1 uses the diagonal
+      trace-ratio surrogate `tr(Sw)/tr(Sb)` (no eigensolver dependency, documented in
+      the method comment) rather than a full pseudo-inverse `tr(Sw·Sb^+)/C`; NC2
+      equinorm-CV + equiangular mean/max deviation from the `-1/(C-1)` ETF target;
+      NC3 self-duality (computed when head is width-matched FullConnectLinear, else
+      honestly skipped — both branches smoke-tested); NC4 nearest-class-mean fraction.
+      Example: 4-class Gaussian blobs trained past zero train-error, ASCII trajectory
+      of pairwise cosine → `-1/(C-1)`, ~1.6s. Smoke test pins NC2 on a hand-built
+      exact simplex ETF to <1e-4 independent of training. Inherits the balanced-batch
+      caveat from FeatureSeparability (example uses balanced probes).
+      FOLLOW-UP STILL OPEN: a true `tr(Sw·Sb^+)/C` NC1 (full matrix pseudo-inverse)
+      would need an eigensolver/SVD helper — track if a second consumer wants it.
 - [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
       separated verdict robust when the endpoint losses are near zero. As
       landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
