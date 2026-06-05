@@ -72,85 +72,24 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetCapsule + routing-by-agreement (Sabour/Hinton/Frosst 2017, "Dynamic
-      Routing Between Capsules") — LANDED (tasklist was stale): TNNetCapsuleSquash +
-      TNNetCapsuleRouting are in neuralnetwork.pas with the squash nonlinearity,
-      the fixed-iteration routing loop, LoadFromString wiring, and numerical-gradient
-      + serialization tests in TestNeuralNumerical.pas. The reconstruction-decoder
-      pose-perturbation STRETCH goal remains open as a future example.
-      Original idea below — genuinely distinct from everything in tree:
-      attention routes by scaled dot-product, MoE routes by a softmax gate, the
-      open Modern-Hopfield entry retrieves by energy; capsules route by *iterative
-      agreement* between vector-valued units, which nothing here does. Two pieces:
-      (1) a `squash` nonlinearity `v = (||s||^2 / (1+||s||^2)) * (s/||s||)` that
-      compresses a capsule VECTOR's length into [0,1) while preserving its
-      orientation (new — the existing length-based code at neuralnetwork.pas only
-      squashes scalar margins, not vectors); and (2) a `TNNetCapsuleRouting` layer
-      that, given lower-level capsules, applies the per-pair transform matrices and
-      runs the fixed 3-iteration routing loop (softmax over coupling coefficients
-      `c_ij`, weighted sum, squash, update logits by agreement `u_hat . v`). Train
-      a tiny `CapsNet` on a small MNIST/Fashion-MNIST subset with the paper's
-      MARGIN loss (`T_k*max(0,m+-||v_k||)^2 + lambda*(1-T_k)*max(0,||v_k||-m-)^2`)
-      and report digit accuracy vs a param-matched plain CNN; stretch goal is the
-      capsule's headline property — perturb one dimension of the winning capsule's
-      output vector and show it varies an interpretable pose factor (stroke
-      thickness / skew) when fed to a small reconstruction decoder. Feasibility
-      risks to settle in v1, in the honest "what did NOT fit the CPU budget" style
-      the Grokking/CA entries use: the routing loop's softmax-over-coupling is an
-      INNER iteration that is NOT a gradient step, so the coupling logits `b_ij`
-      must be reset per forward pass and only the transform-matrix weights carry
-      gradients — verify the backward path under the `SetBatchUpdate(True)` idiom
-      from [[manual-gradient-and-snapshot-gotchas]], and keep the capsule count /
-      iteration count tiny (e.g. 8 primary-capsule types, 10 digit capsules, 3
-      routing iters) so a full forward/backward stays inside the <5-min pure-CPU
-      budget. Distinct from AttentionCopyTask/InductionHeads (dot-product
-      attention), GatherChannelsRouting (static channel gather), the landed
-      TNNet.AddMixtureOfExperts (scalar gate) and the landed Modern-Hopfield retrieval.
+- [ ] TNNetCapsule follow-up (TNNetCapsuleSquash + TNNetCapsuleRouting — the
+      squash nonlinearity, the fixed-iteration routing-by-agreement loop,
+      LoadFromString wiring, and numerical-gradient + serialization tests all
+      landed): the reconstruction-decoder pose-perturbation STRETCH goal — feed
+      the winning digit-capsule's output vector to a small reconstruction
+      decoder, perturb one dimension, and show it varies an interpretable pose
+      factor (stroke thickness / skew). Train the CapsNet with the paper's MARGIN
+      loss on a small MNIST/Fashion-MNIST subset and report digit accuracy vs a
+      param-matched plain CNN as the headline.
 
-- [X] TNNet.AddDeepEquilibriumBlock + examples/DeepEquilibrium/ (Bai/Kolter/Koltun
-      2019, "Deep Equilibrium Models") — LANDED 2026-06-05: builder iterates a
-      weight-tied f via z := f(z+x) to its fixed point (param count independent of
-      iters), backward is the jacobian-free PHANTOM gradient (Geng et al. 2021, last
-      iterate only, earlier iterates detached via TNNetIdentityWithoutBackprop). New
-      TNNetDeepEquilibriumSharedConv rebuilds its weight cache per forward (plain
-      TNNetConvolutionSharedWeights snapshots a STALE cache under init-after-build —
-      latent bug fixed here). Tests: shape, fixed-point convergence, gradient-flow,
-      save/load round-trip. Example reports per-epoch accuracy + mean iters-to-
-      converge vs a param-matched NeuralODE. OPEN follow-ups: (a) the EXACT
-      implicit-function-theorem gradient (inverse-Jacobian solve) vs the phantom
-      approx; (b) spectral/contraction constraints so convergence is guaranteed at
-      arbitrary init (v1 uses damped Picard + output bounding, not guaranteed).
-      Original idea below. — the IMPLICIT cousin of the landed NeuralODE
-      block, and genuinely distinct from it: NeuralODE unrolls a FIXED number of
-      explicit-Euler steps `y := y + h·f(y)` (a known-length forward graph), whereas
-      a DEQ defines its output as the FIXED POINT `z* = f(z*, x)` of a shape-preserving
-      transform `f` and finds it by iterating `z_{k+1} := f(z_k, x)` to convergence —
-      "infinite-depth weight-tied" with a data-dependent iteration count. Two pieces:
-      (1) a builder that wraps a caller-supplied shape-preserving sublayer block `f`
-      (same contract as AddNeuralODEBlock / the residual builders in
-      [[residual-builder-helpers]] — PointwiseConvLinear over Depth, not FullConnect,
-      so the input gradient survives per [[mha-builder-and-seq-projection]]) and, in
-      the forward pass, iterates it from `z_0 = 0` until `||z_{k+1} - z_k|| < tol` or a
-      `MaxIters` cap (stored in FStruct, e.g. tol=1e-4, MaxIters=30); (2) the backward
-      path. The HONEST feasibility call to settle in v1, in the same "what did NOT fit
-      the CPU/framework budget" style as the Capsule and Grokking entries: the exact
-      DEQ gradient needs the implicit-function theorem (an inverse-Jacobian solve via
-      a second fixed-point iteration), which is heavy and awkward under this API's
-      per-layer Backpropagate contract. So v1 should ship the JACOBIAN-FREE / phantom
-      gradient approximation (Geng et al. 2021): run the forward iteration to a fixed
-      point with weight updates suppressed, then backprop through only the LAST one
-      (or last few) `f` applications — i.e. detach the earlier iterates. This is the
-      standard tractable DEQ training trick, composes cleanly with the existing
-      SetBatchUpdate(True) gradient-surgery idiom from [[manual-gradient-and-snapshot-gotchas]],
-      and keeps the whole thing inside the <5-min pure-CPU budget. The example trains a
-      tiny classifier whose only trunk is one DEQ block and reports (a) accuracy at
-      constant weight count, (b) the mean forward iteration-count-to-convergence per
-      epoch (the "adaptive depth" signal — should fall as training stabilises `f`), and
-      (c) a side-by-side with a param-matched NeuralODE block to make the
-      explicit-unroll vs implicit-fixed-point contrast concrete. Distinct from NeuralODE
-      (fixed explicit steps), ReZero/GatedResidual (single residual hop), and the
-      Modern-Hopfield retrieval (single-step softmax, not iterated to a learned `f`'s
-      fixed point).
+- [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
+      landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
+      PHANTOM backward, TNNetDeepEquilibriumSharedConv per-forward weight cache,
+      and shape/convergence/gradient/save-load tests): (a) the EXACT
+      implicit-function-theorem gradient (inverse-Jacobian solve via a second
+      fixed-point iteration) vs the phantom approximation; (b) spectral /
+      contraction constraints so convergence is guaranteed at arbitrary init
+      (v1 uses damped Picard + output bounding, not guaranteed).
 
 - [ ] TNNetRetention follow-up (layer + TNNet.AddRetention builder +
       examples/RetentionDualForm/ all landed): (a) learn gamma via a direct
@@ -363,51 +302,14 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [X] TNNet.AddMultiHeadLatentAttention builder + examples/LatentAttention/
-      (DeepSeek-V2 "Multi-head Latent Attention", MLA) — LANDED 2026-06-05:
-      AddMultiHeadLatentAttention(d_model, Heads, LatentDim, CausalMask) composes
-      existing layers (PointwiseConvLinear down-proj x->c_KV + per-head K/V
-      up-projections + per-head SDPA + DeepConcat + out-proj), no new class. Tests:
-      shape + numeric input-gradient check (max err ~6.9e-4) and SaveToString/
-      LoadFromString forward round-trip. Example: MLA-vs-param-matched-MHA next-token
-      copy bake-off reporting the cacheable-state saving d_c/(2*d_model). OPEN
-      follow-up: v1 is NoPE — the paper's DECOUPLED-RoPE slice (separate rope-only
-      Q/K slice concatenated to the content slice before the dot product) is still
-      open, as is the KV-cache win which needs the [[KV-cache incremental-decode]]
-      path. Original idea below — a genuinely distinct
-      compression axis from the landed GQA. GQA shrinks the KV cache by SHARING
-      full-width K/V across query-head GROUPS (fewer heads, each still d_head
-      wide); MLA instead LOW-RANK-FACTORS the K/V projection: each token is first
-      down-projected to a tiny shared latent `c_KV = x·W_DKV` of width
-      `d_c << d_model` (this `c_KV` is the only thing a decoder would cache), then
-      K and V are reconstructed per head by up-projections `K = c_KV·W_UK`,
-      `V = c_KV·W_UV`. So the saving is rank-based (d_c), not head-count-based,
-      and is orthogonal to / composable with GQA. Per [[mha-builder-and-seq-projection]]
-      every per-token projection here MUST be PointwiseConvLinear over a
-      (SeqLen,1,d_model) tensor (FullConnect flattens the sequence and kills the
-      input gradient); the per-head scores reuse the existing
-      TNNetScaledDotProductAttention exactly as the MHA breakdown does (MLA =
-      H concatenated SDPA layers fed reconstructed K/V, NOT a head-axis tensor,
-      per [[multihead-no-head-axis-tensor]]). Two honest v1 scope calls in the
-      "what did NOT fit" style of the Capsule/DEQ entries: (1) ship the
-      DECOUPLED-RoPE detail from the paper — RoPE cannot be applied to the
-      compressed latent because the up-projection would smear positions, so K and
-      Q each carry a small SEPARATE rope-only slice (`d_rope` wide, RoPE'd via the
-      existing positional layer) concatenated to the content slice before the dot
-      product; v1 may start WITHOUT decoupled RoPE (NoPE / additive bias) and add
-      it as a flag if the <5-min pure-CPU budget holds. (2) the headline KV-cache
-      win only materialises with the open [[KV-cache incremental-decode]] path;
-      v1 proves the training-time equivalence instead — assert output shape +
-      report the exact cached-state param saving `d_c / (2·d_model)` vs plain MHA,
-      and a tiny next-token bake-off (val loss at matched param count) vs a
-      param-matched AddMultiHeadSelfAttention and AddMultiHeadGroupedQueryAttention
-      to show MLA holds quality while shrinking the cacheable state. Serialize the
-      multi-source projection slab like the two-source layers in
-      [[cross-attention-asymmetric-seqlen-bug]]. New builder is Claude-authored;
-      no new neuralnetwork.pas CLASS is required if it composes existing layers,
-      but if a thin TNNet* wrapper is added, mark it per [[claude-authorship-comment]].
-
-- [ ] GQA follow-up: exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention
+- [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
+      landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
+      per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load
+      tests, MLA-vs-MHA copy bake-off): (a) the paper's DECOUPLED-RoPE slice — a
+      separate rope-only Q/K slice concatenated to the content slice before the
+      dot product (RoPE cannot be applied to the compressed latent because the
+      up-projection would smear positions); (b) the headline KV-cache win, which
+      needs the open [[KV-cache incremental-decode]] path.
       equivalence to <1e-5 by copying identical weights. Deferred because
       AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab (one
       external projection) whereas AddMultiHeadGroupedQueryAttention does its own
@@ -795,52 +697,13 @@ rather than acted on.
       win is a flatter, better-generalising averaged solution). Mirror the open
       TNeuralLRScheduler-wiring follow-up's "opt-in, regression-test the default is
       unchanged" discipline.
-- [X] TNNetGrokfastWrapper — accelerate grokking with a slow-gradient amplifier
-      (Lee et al. 2024, "Grokfast: Accelerated Grokking by Amplifying Slow
-      Gradients", https://arxiv.org/abs/2405.20233). LANDED 2026-06-05: caller-driven
-      wrapper (sibling to SWA/EMA/Lookahead) keeping a per-weight gradient EMA
-      mu := beta*mu + (1-beta)*g and rewriting live gradients g := g + lambda*mu in
-      place (operates on Neurons[*].Delta / FBiasDelta). Three tests in
-      TestNeuralTraining.pas: lambda=0 byte-for-byte identity, constant-stream
-      convergence to (1+lambda)*g, slow-gradient emphasis (unit-level EMA). OPEN
-      pairing: wire it into the still-open examples/Grokking/ demo as the Grokfast-on
-      vs -off grok-epoch contrast (the published fix for that demo's <5-min budget). The mechanism is a one-line
-      idea with a striking payoff: delayed generalization ("grokking") is driven
-      by the SLOW-varying (low-frequency) component of the gradient trajectory,
-      while the fast-varying component is mostly overfitting noise. Grokfast keeps
-      a per-weight EMA of the gradient `mu := beta*mu + (1-beta)*g` and steps on
-      the AMPLIFIED filtered gradient `g_hat := g + lambda*mu` (the "Grokfast-EMA"
-      variant; lambda ~ 2..5, beta ~ 0.9..0.98). Boosting the low-frequency band
-      compresses the thousands-of-epochs grokking delay by up to ~50x. This is the
-      missing piece that makes the still-open `examples/Grokking/` demo (line ~1163)
-      actually FIT the <5-min pure-CPU budget — its logged ATTEMPTED note says the
-      clean weight-decay-driven val-accuracy jump needs more epochs than the budget
-      allows; Grokfast is the published fix for exactly that, so ship the two
-      together (Grokfast-on vs Grokfast-off grok-epoch contrast becomes the
-      example's headline chart). Mechanically a caller-driven wrapper in the SAME
-      family as the landed TNNetSWAWrapper / TNNetEMAWrapper / TNNetLookaheadWrapper
-      (neuralnetwork.pas): Create(pNN, pLambda, pBeta); call Filter (or Step) AFTER
-      the backward pass and BEFORE the optimizer update so it rewrites the live
-      weight gradients in place — using the SetBatchUpdate(True) gradient-accumulation
-      idiom from [[manual-gradient-and-snapshot-gotchas]] so per-sample deltas are
-      not zeroed before it reads them. It needs a per-weight EMA buffer the same
-      shape as the weights (a shadow TNNet or per-layer Volume, exactly like the
-      SWA/EMA shadow). Tests in the TestNeuralTraining.pas trio per the
-      [[loss-layer-pattern]]/[[introspection-report-pattern]] recipe: (a) lambda=0
-      leaves the gradient byte-for-byte unchanged (degenerates to plain SGD — the
-      correctness anchor, mirroring the "default path unchanged" discipline of the
-      LRScheduler/clip_value follow-ups); (b) on a constant-gradient stream the EMA
-      converges to that constant so `g_hat -> (1+lambda)*g`; (c) the filtered
-      gradient's low-frequency energy exceeds the raw gradient's on a rigged
-      slow+fast synthetic signal. Genuinely DISTINCT from the existing wrappers and
-      optimizers: SWA/EMA/Lookahead all average the WEIGHTS (post-step), whereas
-      Grokfast filters the GRADIENT (pre-step); Muon ORTHOGONALIZES the gradient
-      matrix (a spatial/spectral transform) whereas Grokfast is a TEMPORAL low-pass
-      across steps; and although momentum is also a gradient EMA, Grokfast's headline
-      is ADDING the amplified slow component back on top of the raw gradient
-      (lambda>0) to deliberately over-weight the grokking-relevant band, not to
-      smooth the step. The paper's cheaper Grokfast-MA (windowed moving average) is a
-      logged v2 follow-up; v1 ships the EMA form only.
+- [ ] TNNetGrokfastWrapper follow-up (caller-driven slow-gradient amplifier in
+      the SWA/EMA/Lookahead wrapper family landed 2026-06-05; per-weight gradient
+      EMA mu := beta*mu + (1-beta)*g rewriting live gradients g := g + lambda*mu,
+      three tests in TestNeuralTraining.pas): wire it into the still-open
+      examples/Grokking/ demo as the Grokfast-on vs -off grok-epoch contrast (the
+      published fix for that demo's <5-min pure-CPU budget). Also ship the paper's
+      cheaper Grokfast-MA (windowed moving average) variant alongside the EMA form.
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
 - [ ] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
