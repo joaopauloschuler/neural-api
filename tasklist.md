@@ -421,15 +421,6 @@ rather than acted on.
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
       targets, at matched final loss?
-- [X] SDPA all-masked-row policy decision and test: implemented the JAX/Flax
-      zero-row policy in TNNetScaledDotProductAttention.Compute. NOTE: the
-      original NaN claim did NOT reproduce — the existing `if SumExp > 0` guard
-      plus the additive -1e9 sentinel (not literal -inf) made an all-masked row
-      produce UNIFORM weights (exp(0)=1 each), not NaN. That uniform row still
-      leaks masked values, so we now detect the all-masked row via
-      "row max <= cMaskFloor (-1e8)" and emit a zero attention row (skip
-      softmax) matching JAX/Flax. Backward is consistent (FAttn=0 -> dScore=0,
-      no NaN). Pinning test: TestScaledDotProductAttentionAllMaskedRow.
 - [ ] "Attention numerical-gradient stress test" running the SDPA grad check
       across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
       tolerance at each. Pins shape-edge behavior the existing single-shape
@@ -1547,23 +1538,6 @@ rather than acted on.
       1e-2.
 
 ### Introspection (added)
-- [x] `TNNet.LRPReport` + `examples/LRP/` — Layer-wise Relevance Propagation
-      (Bach et al. 2015, "On Pixel-Wise Explanations for Non-Linear Classifier
-      Decisions by Layer-Wise Relevance Propagation"). Closes the last open gap in
-      the CNN-attribution family — `SaliencyReport` (vanilla + SmoothGrad + Integrated
-      Gradients) and `GradCAMReport` are already landed; LRP is genuinely distinct
-      because it is NOT a gradient method: it back-distributes the chosen output
-      logit's relevance through the net under a conservation rule so `sum(R_input)`
-      equals the predicted logit at every layer boundary. Implement the epsilon-rule
-      (`R_i = sum_j (a_i·w_ij)/(sum_i a_i·w_ij + eps·sign) · R_j`, eps in `FStruct`,
-      default 1e-2) over the linear/conv/pointwise + ReLU stack on a single probe;
-      print the layer-by-layer relevance-conservation residual (the headline LRP
-      sanity check — should stay ~0) plus the top-k most-relevant input positions,
-      and SKIP honestly through layers whose backward relevance rule is undefined
-      (attention, norm) rather than faking it. Follow the introspection-report recipe
-      ([[introspection-report-pattern]]): decl + impl + example + smoke test + docs;
-      reuse the per-token / per-channel walk machinery, do NOT re-derive forward
-      activations. See [[saliency-report-covers-ig]].
 - [ ] LRPReport follow-up (landed 2026-06-05): the shipped epsilon-rule only
       back-distributes through the DENSE (TNNetFullConnect family) + activation
       stack — conv / pointwise-conv layers are honestly SKIPPED. Add a CONV
