@@ -4755,16 +4755,39 @@ type
   // BackpropagateCPU operate on the latent FArrNeurons[].FWeights), so only
   // the forward pass is overridden. Reference: Ma et al. 2024, "The Era of
   // 1-bit LLMs: All Large Language Models are in 1.58 Bits", arXiv:2402.17764.
+  //
+  // OPT-IN ACTIVATION QUANTIZATION (BitNet b1.58 "fully-quantized linear"):
+  // when the activation-quant flag is enabled (FStruct[4] = 1, default 0/OFF),
+  // the layer INPUT is additionally rounded through a per-token (per-sample)
+  // absmax int8 quantization BEFORE the ternary matmul:
+  //   scale = absmax(x) / 127
+  //   x_q   = round(clip(x / scale, -127, +127)) * scale
+  // so both the weights AND the activations are quantized. BACKWARD keeps the
+  // STE: the activation round/clip is treated as the identity, so the input
+  // gradient is unchanged (exactly the same path as the weight-STE above). The
+  // flag DEFAULTS TO OFF, so the un-flagged class is bit-for-bit identical to
+  // the ternary-weights-only behavior and round-trips through
+  // SaveStructureToString / LoadFromString (old strings without the param load
+  // with the flag OFF).
   // Coded by Claude (AI).
   TNNetBitLinear = class(TNNetFullConnectLinear)
   private
     FQuantWeights: TNNetVolume;  // scratch: quantized weights of one neuron
+    FQuantInput: TNNetVolume;    // scratch: int8-quantized layer input (act-quant)
+    function GetQuantizeActivation(): boolean;
+    // Returns the (possibly activation-quantized) input volume the forward and
+    // input-gradient passes should multiply against. When the act-quant flag is
+    // OFF this is just FPrevLayer.FOutput; when ON it is the absmax-int8 copy.
+    function EffectiveInput(): TNNetVolume;
     procedure ComputePreviousLayerErrorCPU(); override;
   public
     procedure ComputeCPU(); override;
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSizeX, pSizeY, pDepth, pSuppressBias, pQuantizeActivation: integer); overload;
     destructor Destroy(); override;
+    // True when the opt-in absmax-int8 activation quantization is enabled.
+    property QuantizeActivation: boolean read GetQuantizeActivation;
   end;
 
   // Spectral-normalization wrapper around a dense (FullConnect) layer.
@@ -29358,18 +29381,69 @@ end;
 
 { TNNetBitLinear }
 
+function TNNetBitLinear.GetQuantizeActivation(): boolean;
+begin
+  Result := FStruct[4] = 1;
+end;
+
+// Returns the input volume the matmul should run against. With the act-quant
+// flag OFF this is simply the previous layer output. With it ON, the input is
+// copied into FQuantInput and quantized in place with the BitNet b1.58
+// per-token (per-sample) absmax int8 rule:
+//   scale = absmax(x) / 127; x_q = round(clip(x/scale, -127, +127)) * scale.
+// The quantization does NOT depend on the trainable weights, and BACKWARD uses
+// the STE (treats the round/clip as identity), so the input gradient path is
+// left unchanged and keeps using FPrevLayer.OutputError directly.
+function TNNetBitLinear.EffectiveInput(): TNNetVolume;
+var
+  WeightCnt, MaxWeights: integer;
+  AbsMax, Scale, InvScale, Xq: TNeuralFloat;
+begin
+  if FStruct[4] <> 1 then
+  begin
+    Result := FPrevLayer.FOutput;
+    Exit;
+  end;
+  FQuantInput.ReSize(FPrevLayer.FOutput);
+  MaxWeights := FPrevLayer.FOutput.Size - 1;
+  // Per-token absmax over the whole input vector of this sample.
+  AbsMax := FPrevLayer.FOutput.GetMaxAbs();
+  if AbsMax > 0 then
+  begin
+    Scale := AbsMax / 127.0;
+    InvScale := 1.0 / Scale;
+    for WeightCnt := 0 to MaxWeights do
+    begin
+      Xq := FPrevLayer.FOutput.FData[WeightCnt] * InvScale;
+      if Xq > 127.0 then Xq := 127.0
+      else if Xq < -127.0 then Xq := -127.0;
+      FQuantInput.FData[WeightCnt] := Scale * Round(Xq);
+    end;
+  end
+  else
+  begin
+    for WeightCnt := 0 to MaxWeights do
+      FQuantInput.FData[WeightCnt] := 0;
+  end;
+  Result := FQuantInput;
+end;
+
 // Quantize one neuron's latent weight vector into FQuantWeights using the
 // BitNet b1.58 per-neuron absmean rule:
 //   scale = mean(|w|); w_eff = scale * round(clip(w/scale, -1, +1)).
 // Effective weights (scale * {-1,0,+1}) are returned in FQuantWeights.
+// When the activation-quant flag is ON the dot-product runs against the
+// absmax-int8 quantized input (EffectiveInput) instead of the raw input.
 procedure TNNetBitLinear.ComputeCPU();
 var
   StartTime: double;
   Cnt, MaxCnt, WeightCnt, MaxWeights: integer;
   localNeuron: TNNetNeuron;
+  localInput: TNNetVolume;
   Scale, InvScale, FloatN, Acc, Wq: TNeuralFloat;
 begin
   StartTime := Now();
+  localInput := EffectiveInput();
   MaxCnt := FNeurons.Count - 1;
   MaxWeights := FNeurons[0].FWeights.Size - 1;
   FloatN := FNeurons[0].FWeights.Size;
@@ -29392,7 +29466,7 @@ begin
         Wq := Round(Wq);
         // Effective weight is scale * w_q.
         FQuantWeights.FData[WeightCnt] := Scale * Wq;
-        Acc := Acc + FQuantWeights.FData[WeightCnt] * FPrevLayer.FOutput.FData[WeightCnt];
+        Acc := Acc + FQuantWeights.FData[WeightCnt] * localInput.FData[WeightCnt];
       end;
     end
     else
@@ -29463,6 +29537,9 @@ begin
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FQuantWeights := TNNetVolume.Create();
+  FQuantInput := TNNetVolume.Create();
+  // Activation quantization defaults to OFF (FStruct[4] = 0) so the un-flagged
+  // class is bit-for-bit identical to the ternary-weights-only behavior.
 end;
 
 constructor TNNetBitLinear.Create(pSize: integer; pSuppressBias: integer = 0);
@@ -29470,8 +29547,19 @@ begin
   Self.Create(pSize, 1, 1, pSuppressBias);
 end;
 
+// Activation-quantization variant: pQuantizeActivation <> 0 enables the opt-in
+// absmax-int8 input quantization (the "fully-quantized linear" path). The flag
+// is stored in FStruct[4] so it round-trips through SaveStructureToString.
+constructor TNNetBitLinear.Create(pSizeX, pSizeY, pDepth, pSuppressBias, pQuantizeActivation: integer);
+begin
+  Self.Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  if pQuantizeActivation <> 0 then FStruct[4] := 1
+  else FStruct[4] := 0;
+end;
+
 destructor TNNetBitLinear.Destroy();
 begin
+  FQuantInput.Free;
   FQuantWeights.Free;
   inherited Destroy();
 end;
@@ -51917,7 +52005,7 @@ begin
       'TNNetLayerFullConnectReLU' : Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
-      'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
@@ -52215,7 +52303,7 @@ begin
       if S[0] = 'TNNetLayerFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
-      if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else

@@ -8,7 +8,11 @@ multi-class 2D blob task with the SAME fixed RandSeed (424242), same data
 and same init order:
 
   - once with full-precision FP32 heads (TNNetFullConnectLinear)
-  - once with ternary {-1,0,+1} heads (TNNetBitLinear)
+  - once with ternary {-1,0,+1} heads (TNNetBitLinear, weights only)
+  - once FULLY quantized: ternary {-1,0,+1} weights AND absmax-int8 activations
+    (TNNetBitLinear with the activation-quant flag ON) -- the BitNet b1.58
+    "fully-quantized linear" path, where the layer INPUT is also rounded
+    through a per-token absmax int8 quantization before the ternary matmul.
 
 at MATCHED layer sizes. For each variant the program reports final
 train/validation/test accuracy and the EFFECTIVE WEIGHT MEMORY: the exact
@@ -58,7 +62,7 @@ const
   TERNARY_BITS = 1.5849625007;  // log2(3): a ternary {-1,0,+1} symbol
 
 type
-  THeadKind = (hkFullPrecision, hkTernary);
+  THeadKind = (hkFullPrecision, hkTernary, hkFullyQuantized);
 
   TBakeOffResult = record
     Name: string;
@@ -120,14 +124,18 @@ begin
   case Kind of
     hkFullPrecision: NN.AddLayer(TNNetFullConnectLinear.Create(Units));
     hkTernary:       NN.AddLayer(TNNetBitLinear.Create(Units));
+    // Fully quantized: ternary weights + absmax-int8 activations (flag ON).
+    // Sized as (SizeX=Units, SizeY=1, Depth=1, SuppressBias=0, QuantAct=1).
+    hkFullyQuantized: NN.AddLayer(TNNetBitLinear.Create(Units, 1, 1, 0, 1));
   end;
 end;
 
 function HeadName(Kind: THeadKind): string;
 begin
   case Kind of
-    hkFullPrecision: Result := 'TNNetFullConnectLinear (FP32)';
-    hkTernary:       Result := 'TNNetBitLinear (ternary)';
+    hkFullPrecision:  Result := 'TNNetFullConnectLinear (FP32)';
+    hkTernary:        Result := 'TNNetBitLinear (ternary W)';
+    hkFullyQuantized: Result := 'TNNetBitLinear (ternary W + int8 act)';
   end;
 end;
 
@@ -151,7 +159,10 @@ begin
     NN.AddLayer(TNNetSoftMax.Create());
 
     Result.Weights := NN.CountWeights();
-    if Kind = hkTernary then
+    // Both ternary variants store ternary {-1,0,+1} weights, so they carry the
+    // same per-weight memory cost; the int8 activation quantization is a RUNTIME
+    // transform of the input and adds no stored weight memory.
+    if Kind in [hkTernary, hkFullyQuantized] then
       Result.BitsPerWeight := TERNARY_BITS
     else
       Result.BitsPerWeight := FP_BITS;
@@ -187,7 +198,8 @@ end;
 procedure RunAlgo();
 var
   TrainingPairs, ValidationPairs, TestPairs: TNNetVolumePairList;
-  FP, BL: TBakeOffResult;
+  FP, BL, FQ: TBakeOffResult;
+  FqGapPts: TNeuralFloat;
   StartTime, EndTime: TDateTime;
   AccGapPts, MemPct, FpBytes, BlBytes, Ratio: TNeuralFloat;
   GatePass: boolean;
@@ -196,6 +208,10 @@ const
   MAX_ACC_GAP_PTS = 8.0;   // BitLinear test acc must be within 8 pts of FP
   MAX_MEM_PCT     = 10.0;  // ...while using < 10% of FP weight memory
   MIN_BL_ACC      = 0.80;  // ...and still being a useful classifier
+  // The fully-quantized arm (ternary weights + int8 activations) loses a little
+  // more accuracy than weights-only; gate it on a looser but still useful bar.
+  MAX_FQ_GAP_PTS  = 15.0;  // fully-quant test acc must be within 15 pts of FP
+  MIN_FQ_ACC      = 0.70;  // ...and still be a useful classifier
 begin
   WriteLn('BitLinear bake-off: ternary {-1,0,+1} vs full-precision FP32 heads.');
   WriteLn('Task: ', NUM_CLASSES, '-class 2D Gaussian-blob classification.');
@@ -221,6 +237,10 @@ begin
     Write('Training ternary       (TNNetBitLinear)          head ...');
     BL := RunOne(hkTernary, TrainingPairs, ValidationPairs, TestPairs);
     WriteLn(' done.');
+
+    Write('Training fully-quant   (ternary W + int8 act)    head ...');
+    FQ := RunOne(hkFullyQuantized, TrainingPairs, ValidationPairs, TestPairs);
+    WriteLn(' done.');
   finally
     TestPairs.Free;
     ValidationPairs.Free;
@@ -235,18 +255,22 @@ begin
 
   WriteLn;
   WriteLn('=== Accuracy ===');
-  WriteLn('head                            train     val      test');
-  WriteLn(Format('%-30s  %6.2f%%  %6.2f%%  %6.2f%%',
+  WriteLn('head                                    train     val      test');
+  WriteLn(Format('%-38s  %6.2f%%  %6.2f%%  %6.2f%%',
     [FP.Name, FP.TrainAcc*100, FP.ValAcc*100, FP.TestAcc*100]));
-  WriteLn(Format('%-30s  %6.2f%%  %6.2f%%  %6.2f%%',
+  WriteLn(Format('%-38s  %6.2f%%  %6.2f%%  %6.2f%%',
     [BL.Name, BL.TrainAcc*100, BL.ValAcc*100, BL.TestAcc*100]));
+  WriteLn(Format('%-38s  %6.2f%%  %6.2f%%  %6.2f%%',
+    [FQ.Name, FQ.TrainAcc*100, FQ.ValAcc*100, FQ.TestAcc*100]));
   WriteLn;
   WriteLn('=== Effective weight memory ===');
-  WriteLn('head                            weights  bits/wt  bytes');
-  WriteLn(Format('%-30s  %7d  %6.2f   %9.1f',
+  WriteLn('head                                    weights  bits/wt  bytes');
+  WriteLn(Format('%-38s  %7d  %6.2f   %9.1f',
     [FP.Name, FP.Weights, FP.BitsPerWeight, FpBytes]));
-  WriteLn(Format('%-30s  %7d  %6.2f   %9.1f',
+  WriteLn(Format('%-38s  %7d  %6.2f   %9.1f',
     [BL.Name, BL.Weights, BL.BitsPerWeight, BlBytes]));
+  WriteLn(Format('%-38s  %7d  %6.2f   %9.1f',
+    [FQ.Name, FQ.Weights, FQ.BitsPerWeight, MemBytes(FQ)]));
   WriteLn;
   WriteLn(Format('Weight count is matched (%d vs %d).', [FP.Weights, BL.Weights]));
   WriteLn(Format('Compression ratio (FP bytes / ternary bytes): %.2fx', [Ratio]));
@@ -254,22 +278,29 @@ begin
 
   AccGapPts := (FP.TestAcc - BL.TestAcc) * 100.0;
   MemPct    := 100.0 * BlBytes / FpBytes;
+  FqGapPts  := (FP.TestAcc - FQ.TestAcc) * 100.0;
 
   WriteLn('=== Headline-claim gate ===');
-  WriteLn(Format('BitLinear test accuracy gap vs FP: %.2f pts (must be <= %.1f).',
+  WriteLn(Format('BitLinear (ternary W) test accuracy gap vs FP: %.2f pts (must be <= %.1f).',
     [AccGapPts, MAX_ACC_GAP_PTS]));
-  WriteLn(Format('BitLinear weight memory: %.2f%% of FP (must be < %.1f%%).',
+  WriteLn(Format('BitLinear (ternary W) weight memory: %.2f%% of FP (must be < %.1f%%).',
     [MemPct, MAX_MEM_PCT]));
-  WriteLn(Format('BitLinear test accuracy: %.2f%% (must be >= %.1f%%).',
+  WriteLn(Format('BitLinear (ternary W) test accuracy: %.2f%% (must be >= %.1f%%).',
     [BL.TestAcc*100, MIN_BL_ACC*100]));
+  WriteLn(Format('Fully-quantized (ternary W + int8 act) test accuracy gap vs FP: %.2f pts (must be <= %.1f).',
+    [FqGapPts, MAX_FQ_GAP_PTS]));
+  WriteLn(Format('Fully-quantized (ternary W + int8 act) test accuracy: %.2f%% (must be >= %.1f%%).',
+    [FQ.TestAcc*100, MIN_FQ_ACC*100]));
   WriteLn;
 
   GatePass := (AccGapPts <= MAX_ACC_GAP_PTS)
           and (MemPct < MAX_MEM_PCT)
-          and (BL.TestAcc >= MIN_BL_ACC);
+          and (BL.TestAcc >= MIN_BL_ACC)
+          and (FqGapPts <= MAX_FQ_GAP_PTS)
+          and (FQ.TestAcc >= MIN_FQ_ACC);
 
   if GatePass then
-    WriteLn('GATE: PASS -- near-FP accuracy at a fraction of the weight memory.')
+    WriteLn('GATE: PASS -- ternary weights AND fully-quantized stay near FP at a fraction of the weight memory.')
   else
     WriteLn('GATE: FAIL -- headline BitNet claim NOT met on this run.');
 

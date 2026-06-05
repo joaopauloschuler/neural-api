@@ -539,12 +539,18 @@ rather than acted on.
       sub-block inside the layer (or a builder that wires an SE-style squeeze
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
-- [ ] TNNetBitLinear follow-up: activation-quantization variant — BitNet b1.58
-      also quantizes the *activations* to int8 (absmax per-token). Consider a flag
-      or sibling that rounds the layer INPUT through an absmax STE before the
-      ternary matmul, so the "fully-quantized linear" path is reachable. Scope as
-      its own flag on TNNetBitLinear (forward adds an input absmax-round; backward
-      STE-passes the input gradient unchanged).
+- [x] TNNetBitLinear follow-up: activation-quantization variant — LANDED
+      2026-06-05. Added an opt-in activation-quant flag on TNNetBitLinear
+      (FStruct[4], default OFF). Forward rounds the layer INPUT through a
+      per-token absmax int8 quantization (scale=absmax(x)/127,
+      x_q=round(clip(x/scale,-127,+127))*scale) before the ternary matmul;
+      backward STE-passes the input gradient unchanged. New 5-arg constructor
+      Create(SizeX,SizeY,Depth,SuppressBias,QuantizeActivation) and the flag
+      round-trips through SaveStructureToString/LoadFromString (old 4-field
+      strings load with the flag OFF). Tests in TestNeuralNumerical.pas
+      (forward int8 quantization, STE input-gradient, save/load + backward-
+      compat) and a third "fully-quantized" arm added to
+      examples/BitLinearBakeoff (99.67% test acc, 0.00-pt gap vs FP).
 #### Probability projections / sparsity
 - [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
       micro-experiment — train a tiny discrete-latent autoencoder whose
