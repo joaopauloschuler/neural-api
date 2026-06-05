@@ -72,7 +72,7 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetGraphConvolution — a spectral Graph Convolutional Network layer
+- [X] TNNetGraphConvolution — a spectral Graph Convolutional Network layer
       (Kipf & Welling 2017, "Semi-Supervised Classification with GCN") opening
       a genuinely new domain for this tree: every existing layer assumes a
       grid (image) or a 1-D sequence; none does message passing over an
@@ -103,6 +103,31 @@ rather than acted on.
       rather than consuming a caller-supplied sparse adjacency). A clean
       follow-up once landed would be an attentional aggregator (GAT) reusing the
       SDPA softmax over graph edges, but ship the plain GCN first.
+      LANDED 2026-06-05: TNNetGraphConvolution ships in neuralnetwork.pas
+      (subclass of TNNetFullConnectLinear; per-node pointwise W over the feature
+      axis then a left-multiply by the constant symmetric-normalized adjacency;
+      SetAdjacency(A) takes raw 0/1 A and builds Ahat=D^-1/2(A+I)D^-1/2 internally;
+      adjacency NOT persisted, caller re-supplies after load; both CreateLayer
+      dispatch points wired). Two tests in TestNeuralNumerical.pas
+      (finite-difference input+weight+bias grad check on a fixed 5-node graph;
+      save/load round-trip) — full suite green (1011 tests). Also added writable
+      TNNetNeuron.BiasWeight + read-only BiasDelta accessors. examples/
+      GraphNodeClassification/ (2 GCN layers + SoftMax on a synthetic SBM graph):
+      GCN reaches 100% transductive accuracy vs 50% (chance) for the param-matched
+      features-only MLP baseline (identity adjacency). STILL OPEN: the GAT
+      attentional-aggregator follow-up below.
+- [ ] TNNetGraphAttention (GAT) follow-up to the landed TNNetGraphConvolution:
+      an ATTENTIONAL neighbour aggregator — replace the fixed Ahat weights with
+      learned per-edge attention coefficients (LeakyReLU over a shared
+      attentional vector applied to concatenated source/target node features,
+      softmax-normalized over each node's neighbourhood from the caller-supplied
+      sparse adjacency MASK). Reuse the SDPA softmax machinery but mask it to the
+      graph edges (Ahat's nonzero pattern) instead of a dense all-pairs affinity.
+      Deliverables mirror the GCN: leaf layer (or builder) with
+      `// Coded by Claude (AI).`, numerical-gradient + save/load tests reseeding
+      RandSeed := 424242, and an examples/GraphAttention/ arm contrasting GAT vs
+      the plain GCN on the same SBM node-classification graph (does learned edge
+      weighting help when the graph has noisy/heterophilous edges?).
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
@@ -518,7 +543,7 @@ rather than acted on.
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
 #### Probability projections / sparsity
-- [ ] TNNetGumbelSoftmax follow-up: add a public temperature SETTER (tau lives in
+- [X] TNNetGumbelSoftmax follow-up: add a public temperature SETTER (tau lives in
       the protected FFloatSt[0] with no setter, so the annealing example above has
       to REBUILD the net per phase and carry weights via CopyWeights). A
       SetTemperature(tau) (mirroring how other AddNoiseBase params are exposed)
@@ -526,6 +551,15 @@ rather than acted on.
       and the natural hook for any future TNeuralFit annealing schedule. Gate so
       the default path is byte-for-byte unchanged; add a tiny round-trip test.
       Then simplify examples/GumbelAnnealingAutoencoder to anneal in-place.
+      LANDED 2026-06-05: TNNetGumbelSoftmax.SetTemperature(tau) added (reuses the
+      constructor's tau>0 guard + FErrorProc message; Compute reads FFloatSt[0]
+      live so the setter is a guarded assignment; default path byte-for-byte
+      unchanged). Round-trip/behaviour test in TestNeuralNumerical.pas
+      (new tau surfaces in the structure string + survives save/reload; tau<=0
+      raises). examples/GumbelAnnealingAutoencoder refactored to build the net
+      ONCE and call SetTemperature per phase (no more rebuild + CopyWeights);
+      README updated; same annealing headline (entropy 0.064 -> 0.000, recon
+      preserved). Suite green.
 - [ ] TNNetGumbelSoftmax / annealing follow-up: re-run the annealing AE on a
       LESS-separated (overlapping) cluster set so the high-tau bottleneck entropy
       actually starts near uniform (~ln K) and the sharpening sweep spans the full
@@ -577,7 +611,7 @@ rather than acted on.
       cross-batch EMA of assigned encoder vectors per code. Needs the same
       batch-aware loss hook logged for cross-batch InfoNCE / CenterLoss-EMA; track
       alongside those.
-- [ ] VQ codebook-collapse STRESS test (unblocked by the shipped
+- [X] VQ codebook-collapse STRESS test (unblocked by the shipped
       ResetCodebookUsage/ActiveCodeCount/CodebookUsageCount probe on
       TNNetVectorQuantizer):
       deliberately DRIVE collapse — far more codes than clusters, high commitment /
@@ -586,6 +620,17 @@ rather than acted on.
       examples/VQCodebookUsage demo deliberately avoids). Then show ONE published
       mitigation (codebook re-init of dead codes, or the EMA update variant above)
       lifting the active-code count back up. Pure CPU, <5 min.
+      LANDED 2026-06-05: examples/VQCodebookCollapse/ (example-only, core
+      untouched). 64-code codebook on 16 Gaussian blobs; two arms share data+seed.
+      COLLAPSE arm uses a per-epoch encoder-weight contraction (x0.70) to shrink
+      the latent cloud — active codes fall 23 -> 5 of 64. MITIGATED arm adds
+      dead-code RE-INIT every 3 epochs (codes with zero CodebookUsageCount are
+      re-seeded to live encoder latents via the public LVQ.Neurons[code].Weights
+      accessor) — recovers to ~16 active (the true mode count). VERDICT: PASS.
+      Gotcha logged in README: build the encoder as Create(1,1,cEmb) so the
+      latent lives on the Depth axis (Create(cEmb) gives Depth=1 scalar codes).
+      Open VQ follow-ups (EMA codebook update, cross-batch hook) still need the
+      batch-aware loss hook and remain separate tasks above.
 ### Training infrastructure (the "missing plumbing")
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
       (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
