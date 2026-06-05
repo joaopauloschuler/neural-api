@@ -72,39 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetModernHopfield + TNNet.AddModernHopfieldRetrieval — a continuous
-      modern-Hopfield associative-memory layer (Ramsauer et al. 2020,
-      "Hopfield Networks is All You Need", arXiv:2008.02217). Distinct from the
-      single-pass attention layers already in tree (TNNetScaledDotProductAttention
-      and siblings) because it is an ENERGY-BASED associative memory that
-      ITERATES a softmax retrieval to a fixed point: given a learnable stored-
-      pattern bank X (shape (NumPatterns, d)) and a query state xi, repeatedly
-      apply xi := X^T * softmax(beta * X * xi) for K update steps (K configurable;
-      K=1 reduces to ordinary attention, K>1 sharpens toward the nearest stored
-      memory — the layer's whole point). Inverse-temperature beta controls the
-      metastable-vs-sharp retrieval regime. Forward stores the per-step softmax
-      weights; backward differentiates through the unrolled K steps (the softmax
-      Jacobian path already used by SDPA, summed over steps). Deliverables: leaf
-      layer with the authorship comment, the AddModernHopfieldRetrieval builder
-      that wires a (SeqLen,1,d) query against a learnable pattern bank, a
-      numerical-gradient test (small d/NumPatterns/K so central differences are
-      cheap), a save/load round-trip test (serialize the pattern bank like other
-      weight-carrying layers), and examples/HopfieldAssociativeMemory/ showing
-      one-shot recall: store a handful of binary/pixel patterns, present a
-      half-masked or noised query, and show K=3 iterations clean it back to the
-      stored pattern while K=1 does not — the classic associative-recall demo.
-      LANDED 2026-06-05 (leaf layer with `// Coded by Claude (AI).`, bank stored
-      in Neurons[0] as (NumPatterns,1,d); builder; input + weight numerical-
-      gradient tests; serialization round-trip; examples/HopfieldAssociativeMemory
-      shows K=1 Hamming 8 / L2 14.4 vs K=3 Hamming 0 / L2 7.5). Follow-ups worth
-      considering: (a) a per-step CONVERGENCE-based stopping criterion (iterate to
-      a fixed point / ||xi'-xi|| tolerance) instead of a fixed K, with the
-      phantom/implicit-function backward used by AddDeepEquilibriumBlock so the
-      step count adapts to the input; (b) a learnable beta (currently a fixed
-      hyperparameter) and an optional per-position pattern-bank PROJECTION (the
-      paper's W_K/W_Q/W_V "Hopfield layer" generalisation, vs the raw-state
-      retrieval implemented here); (c) wire it into ../gpt-3-for-pascal as an
-      attention-replacement block and contrast loss/wall-clock.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
@@ -181,49 +148,15 @@ rather than acted on.
       C_t = f_t C_{t-1} + i_t v_t k_t^T with the same m/n stabilizer), which gives
       a parallelisable attention-like form.
 
-- [X] TNNetClosedFormContinuous follow-ups (leaf layer + examples/LiquidCfC/ +
-      gradient/serialization tests + the TNNet.AddClosedFormContinuous pre-norm
-      residual builder all LANDED 2026-06-05). Both deferred sub-tasks LANDED
-      2026-06-05:
-      (a) [X] BIDIRECTIONAL variant — implemented as the builder
-          TNNet.AddBidirectionalClosedFormContinuous: forward CfC + a reverse
-          branch (FlipX -> CfC -> FlipX, reusing the existing parameter-free
-          TNNetFlipX involution over the SizeX=SeqLen axis) concatenated along
-          Depth via TNNetDeepConcat (output Depth = 2*Depth, two independent
-          cells). Builder chosen over a new leaf layer since existing pieces
-          compose. Tests: TestAddBidirectionalClosedFormContinuousBuilder
-          (shape/layer-count/train/save-load) +
-          TestBidirectionalClosedFormContinuousGradientCheck (numerical input
-          gradient through both branches) in tests/TestNeuralNumerical.pas.
-      (b) [X] scaled CfC-vs-DiagonalSSM toy — examples/LiquidCfCvsSSM/ (sibling
-          dir, .lpr+.lpi+README): longer SeqLen=16 multi-cue LAST-WRITE-WINS task
-          (2-4 cues, write-pulse marker channel, output the most-recently written
-          cue) that requires input-dependent forgetting. CfC reaches 100% recall
-          at 475 weights vs the fixed-decay TNNetDiagonalSSM ~94% at 639 weights
-          (SSM given a wider width / more params and still loses). Runtime ~10 s,
-          well under the 5-min budget.
-
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
       + examples/HyperNetwork/ + two-path gradient tests + the
       TNNet.AddHyperLinear(Din, Dout, ContextLayer) generator+HyperLinear builder
       all LANDED 2026-06-05; first layer in the fork that owns zero trainable
-      weights — reads its W from a second input tensor). Deferred, each small +
-      doable on its own:
-      (a) [X] a `TNNetHyperConv` cousin that generates a small CONV kernel from
-          the context instead of a dense matrix (same backward-into-the-generator
-          idea, conv forward) — extends HyperNetworks to spatial tasks. LANDED
-          2026-06-05: weightless leaf TNNetHyperConv (VALID conv, stride 1, no
-          pad; kernel layout W[o,ky,kx,i] flat from the 2nd input + optional
-          per-out-channel bias), builder TNNet.AddHyperConv(InC,OutC,K,Ctx),
-          serialization (3 dispatch sites), and 4 tests (both gradient paths +
-          save/load + builder train-end-to-end). The generator must emit the
-          WHOLE kernel in one shot, so its param count scales as OutC*K*K*InC —
-          documented in the layer doc comment; that cap is exactly what sub-task
-          (b) chunked generation would relax.
-      (b) CHUNKED weight generation so the main layer can be larger than the
-          generator's output width (generate W in tiles) — the landed layer
-          generates the whole Din*Dout matrix in one shot, which caps main-layer
-          size; document the memory/param trade-off.
+      weights — reads its W from a second input tensor). Deferred follow-up:
+      CHUNKED weight generation so the main layer can be larger than the
+      generator's output width (generate W in tiles) — the landed layer
+      generates the whole Din*Dout matrix in one shot, which caps main-layer
+      size; document the memory/param trade-off.
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
