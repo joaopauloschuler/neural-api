@@ -247,6 +247,9 @@ type
     procedure TestSelectiveSSMWeightGradientCheck;
     procedure TestSelectiveSSMSerializationRoundTrip;
     procedure TestSelectiveSSMLTIDegeneracy;
+    procedure TestClosedFormContinuousInputGradientCheck;
+    procedure TestClosedFormContinuousWeightGradientCheck;
+    procedure TestClosedFormContinuousSerializationRoundTrip;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -21776,6 +21779,175 @@ begin
   finally
     NN.Free; Input.Free;
   end;
+end;
+
+// --- TNNetClosedFormContinuous (CfC liquid recurrent cell) ------------------
+
+// Fill the CfC weight sets with deterministic, non-trivial values so every term
+// of the input-dependent time gate and the tanh pathway is exercised.
+procedure SeedClosedFormContinuous(LCfC: TNNetClosedFormContinuous; Depth: integer);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      LCfC.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.25; // Wt
+      LCfC.Neurons[2].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.3;  // Wg
+    end;
+    LCfC.Neurons[1].Weights.Raw[d] := Cos(d * 0.5) * 0.4;  // b_t
+    LCfC.Neurons[3].Weights.Raw[d] := Sin(d * 0.8) * 0.5;  // b_g
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestClosedFormContinuousInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LCfC: TNNetClosedFormContinuous;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // SHORT SeqLen (3) keeps the unrolled BPTT cheap.
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    LCfC := TNNetClosedFormContinuous.Create();
+    NN.AddLayer(LCfC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedClosedFormContinuous(LCfC, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('CfC input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('CfC input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestClosedFormContinuousWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LCfC: TNNetClosedFormContinuous;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..3] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'Wt'; Names[1] := 'b_t'; Names[2] := 'Wg'; Names[3] := 'b_g';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    LCfC := TNNetClosedFormContinuous.Create();
+    NN.AddLayer(LCfC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedClosedFormContinuous(LCfC, 3);
+
+    // Cover every weight tensor (the two DepthxDepth projections and the two
+    // Depth-long bias vectors). BPTT weight gradients are a classic place for a
+    // silent off-by-one between the t and t-1 (memory-path) terms.
+    for n := 0 to 3 do
+      for i := 0 to LCfC.Neurons[n].Weights.Size - 1 do
+      begin
+        LCfC.Neurons[n].Weights.Raw[i] := LCfC.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LCfC.Neurons[n].Weights.Raw[i] := LCfC.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LCfC.Neurons[n].Weights.Raw[i] := LCfC.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LCfC.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LCfC.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('CfC weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('CfC weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestClosedFormContinuousSerializationRoundTrip;
+begin
+  // CfC stores four learnable tensors (Wt/Wg DepthxDepth plus b_t/b_g
+  // Depth-long); the perturbed-weights helper pushes them away from defaults so
+  // the round trip exercises a non-trivial parameter set.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetClosedFormContinuous.Create(), 'ClosedFormContinuous', 4, 1, 3, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestImplicitLongConvInputGradientCheck;
