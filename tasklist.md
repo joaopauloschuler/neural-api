@@ -72,6 +72,37 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetGraphConvolution — a spectral Graph Convolutional Network layer
+      (Kipf & Welling 2017, "Semi-Supervised Classification with GCN") opening
+      a genuinely new domain for this tree: every existing layer assumes a
+      grid (image) or a 1-D sequence; none does message passing over an
+      arbitrary node graph. Model the input as a (NumNodes, 1, FeatureDim)
+      volume and store the symmetrically-normalized adjacency
+      `Ahat = D^-1/2 (A + I) D^-1/2` as a fixed (NumNodes x NumNodes) buffer
+      set once via a `SetAdjacency(A: TNNetVolume)` call (the layer normalizes
+      it). Forward is the two-step `H' = Ahat * (H * W) (+ bias)`: a per-node
+      learned linear map `H*W` (this is exactly a PointwiseConvLinear over
+      Depth, so reuse that weight layout / gradient path — do NOT FullConnect,
+      which would flatten and mix nodes) followed by neighbour aggregation
+      `Ahat *` (Ahat is constant, so its backward just multiplies the incoming
+      error by Ahat^T = Ahat). Deliverables to match the house pattern:
+      (a) the leaf layer with `// Coded by Claude (AI).`, LoadFromString /
+          SaveToString wiring (serialize like a Pointwise layer; the adjacency
+          is caller-supplied, not persisted — document that contract);
+      (b) a numerical-gradient test (input + weight) on a small fixed random
+          graph in TestNeuralNumerical.pas, reseeding RandSeed := 424242;
+      (c) `examples/GraphNodeClassification/` — semi-supervised node
+          classification on a tiny synthetic two-community (stochastic block
+          model) graph: 2 stacked GraphConvolution layers + SoftMax, train on a
+          handful of labelled nodes and report transductive accuracy on the
+          rest, contrasted against a label-agnostic per-node MLP baseline
+          (same params, identity adjacency) to show the message passing is what
+          carries the signal. This is the headline.
+      Distinct from TNNetCirculantLinear (a structured DENSE map, no graph) and
+      from the attention family (which builds its OWN dense affinity from Q*K^T
+      rather than consuming a caller-supplied sparse adjacency). A clean
+      follow-up once landed would be an attentional aggregator (GAT) reusing the
+      SDPA softmax over graph edges, but ship the plain GCN first.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
