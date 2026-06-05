@@ -140,6 +140,26 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
+- [ ] TNNetGraphAttention + TNNet.AddGraphAttention (GAT, Velickovic et al. 2018,
+      "Graph Attention Networks", arXiv:1710.10903) — an ATTENTION-based message-
+      passing layer over a caller-supplied adjacency, the learned-edge-weight
+      cousin of the landed spectral TNNetGraphConvolution (which uses a FIXED
+      symmetrically-normalized adjacency Ahat). Distinct mechanism, not a near-dup:
+      per node i project h_i (shared W), then for every edge (i,j) present in A
+      compute an attention logit e_ij = LeakyReLU(a^T[Wh_i || Wh_j]), softmax over
+      j IN i's neighbourhood ONLY (non-edges masked to -inf, like the causal mask
+      in SDPA), and read h'_i = sum_j alpha_ij (W h_j). Model the caller-supplied,
+      not-persisted adjacency wiring (SetAdjacency, rebuilt after LoadFromString)
+      and bias/feature-dim FStruct layout on TNNetGraphConvolution; the new pieces
+      are the per-edge attention scoring vector a (2*FeatureDim) and the
+      neighbourhood-masked softmax + its Jacobian in backward (reuse the SDPA
+      softmax-Jacobian path). Needs input + weight numerical-gradient tests
+      (RandSeed:=424242), a save/load round-trip (assert SetAdjacency required
+      after load), and a tiny node-classification example (examples/GraphAttention/
+      on a toy 2-community graph) contrasting GAT vs the existing GCN. Optional
+      follow-up: multi-head concatenation (H separate score vectors, like the
+      multi-head = H concatenated SDPA convention already used in this fork).
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
