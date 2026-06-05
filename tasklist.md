@@ -349,8 +349,19 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
-- [ ] gMLP Spatial Gating Unit — an attention-FREE sequence mixer (Liu et al.
-      2021, "Pay Attention to MLPs", https://arxiv.org/abs/2105.08315). Every
+- [X] gMLP Spatial Gating Unit — DONE 2026-06-05 (commit 7fefada). Leaf layer
+      TNNetSpatialGatingUnit (pins SeqLen, rejects SizeY<>1/odd-Depth/SeqLen
+      mismatch in SetPrevLayer, halves Depth, W [SeqLen x SeqLen] + bias in
+      Neurons[0/1], own Compute/Backpropagate with analytic input+W+bias grads,
+      near-identity init, both dispatch tables) + builders TNNet.AddSpatialGatingUnit
+      and TNNet.AddgMLPBlock (the gMLP-paper LayerNorms live in the block builder,
+      not the pure-primitive layer) + input/weight numerical-gradient + serialization
+      tests + examples/SpatialGatingUnit/ (gMLP vs same-budget single-head attention,
+      both 100% on a first-token-broadcast toy, ~13s). Follow-up: the gate-gradient
+      explosion that forced the two block-builder LayerNorms is worth a docs note for
+      the next multiplicative-gate layer; an aTGU/aMLP (tiny attention + SGU hybrid,
+      gMLP paper §3.3) arm could be a future bake-off.
+      OLD DESCRIPTION (kept for the aTGU/init context): Every
       sequence mixer in the repo today is built on token-token *content*
       scores: SDPA and its siblings compute Q.K^T, RetNet retention
       ([[retention-single-head]]) keeps the Q/K/V machinery and swaps softmax
@@ -586,12 +597,21 @@ rather than acted on.
       covers the headline use case.
 
 ### Loss layers
-- [ ] TNNetQuantileLoss follow-up (landed 2026-05-31, head + examples/QuantileRegression/):
-      a SINGLE-model multi-quantile head — emit a 3-wide output and train all three
-      quantiles q in {0.1,0.5,0.9} jointly (per-channel q) in one forward pass instead
-      of three separate models, then add the monotonicity guard (sort/penalize so the
-      q=0.1 prediction never exceeds q=0.9 — "quantile crossing"). The landed example
-      uses three independent tiny MLPs; the joint head is the headline production form.
+- [X] TNNetQuantileLoss SINGLE-model multi-quantile head — DONE 2026-06-05
+      (commit 6017aa9). TNNetMultiQuantileLoss (N-wide output, N + quantiles in
+      FStruct/FFloatSt, N capped at 8 = csNNetMaxParameterIdx+1; per-channel pinball
+      subgradient mirroring TNNetQuantileLoss; both dispatch tables). Monotonicity
+      guard shipped as approach (a): inference-only non-differentiable SortAscending
+      class method (zero gradient risk, no hyperparameter) rather than a soft penalty.
+      Test trio (gradient, LoadFromString round-trip with non-default quantiles,
+      guard) + joint-head arm in examples/QuantileRegression/ (joint head 83.3%
+      interval coverage vs 3-MLP 80.8%, ~40s). Open follow-up: the soft
+      monotonicity-penalty backward variant (b) was deliberately NOT shipped (to
+      protect the pinball gradient) — add it behind a flag if a differentiable
+      anti-crossing constraint is ever wanted; and the trained net produced 0 natural
+      crossings so the guard's effect is only shown on a forced-crossed triple — a
+      harder/heteroscedastic target where the raw joint head actually crosses would
+      make the guard's value land empirically.
 - [ ] ArcFaceEmbedding follow-up: contrast the landed examples/ArcFaceEmbedding/
       against an actual plain-softmax head arm side by side — the demo currently
       shows the separation trend WITHIN ArcFace across margins m in {0,0.3,0.5},
@@ -728,7 +748,25 @@ rather than acted on.
       `examples/NeuralTangentKernelReport/` to contrast a WIDE vs NARROW hidden
       layer and show the wide net's NTK drifts less. Reuse the snapshot machinery
       already proven in ModeConnectivity/PermutationAlign.
-- [ ] `TNNet.TunedLensReport` — the *learned* sibling of the already-landed
+- [X] `TNNet.TunedLensReport` — DONE 2026-06-05 (commit 4e97d84). Learned sibling
+      of LogitLensReport (Belrose 2023). Signature
+      `class function TunedLensReport(NN; pInput: TNNetVolumeList; HeadStartIdx=-1;
+      TrainIters=300; LearningRate=0.005): string`. Per lens-compatible layer builds
+      a throwaway `Input -> identity-seeded Translator(FCLinear) -> frozen head clone
+      (LR=0)` mini-net, fits only the translator by backpropagating p_final as the
+      soft KL-to-self target; model weights never stepped, live state restored on
+      exit. Prints tuned vs logit KL-to-final/entropy + 3 PASS/FAIL checks (head-input
+      translator stays identity; untrained translator ties raw lens; trained KL <
+      untrained). examples/TunedLens/ (forks LogitLens net/task; trained-model
+      headline tuned mean KL 1.20 < logit 2.72, ~1s) + TestTunedLensReportSmoke in
+      tests/TestNeuralLayersExtra.pas. Honest notes: translators share one reused
+      mini-net (ClearInertia/ClearDeltas on identity re-seed); LR lowered 0.01->0.005
+      because on an UNTRAINED net the translator can diverge — the "tuned beats logit"
+      win requires a trained model with real depth drift (both example and test
+      provide one); width-mismatched layers are SKIPPED like the logit lens. Original
+      scope text retained below for the deferred ideas (per-layer separate translators
+      instead of one reused net; applying to a transformer-shaped trunk).
+      `TNNet.TunedLensReport` — the *learned* sibling of the already-landed
       zero-parameter `LogitLensReport` (Belrose et al. 2023, "Eliciting Latent
       Predictions with the Tuned Lens"). The logit lens splices a raw hidden
       activation straight into the model's OWN frozen head; the tuned lens first
