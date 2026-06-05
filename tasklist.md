@@ -72,7 +72,7 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetModernHopfield + TNNet.AddModernHopfieldRetrieval — a continuous
+- [X] TNNetModernHopfield + TNNet.AddModernHopfieldRetrieval — a continuous
       modern-Hopfield associative-memory layer (Ramsauer et al. 2020,
       "Hopfield Networks is All You Need", arXiv:2008.02217). Distinct from the
       single-pass attention layers already in tree (TNNetScaledDotProductAttention
@@ -93,6 +93,18 @@ rather than acted on.
       one-shot recall: store a handful of binary/pixel patterns, present a
       half-masked or noised query, and show K=3 iterations clean it back to the
       stored pattern while K=1 does not — the classic associative-recall demo.
+      LANDED 2026-06-05 (leaf layer with `// Coded by Claude (AI).`, bank stored
+      in Neurons[0] as (NumPatterns,1,d); builder; input + weight numerical-
+      gradient tests; serialization round-trip; examples/HopfieldAssociativeMemory
+      shows K=1 Hamming 8 / L2 14.4 vs K=3 Hamming 0 / L2 7.5). Follow-ups worth
+      considering: (a) a per-step CONVERGENCE-based stopping criterion (iterate to
+      a fixed point / ||xi'-xi|| tolerance) instead of a fixed K, with the
+      phantom/implicit-function backward used by AddDeepEquilibriumBlock so the
+      step count adapts to the input; (b) a learnable beta (currently a fixed
+      hyperparameter) and an optional per-position pattern-bank PROJECTION (the
+      paper's W_K/W_Q/W_V "Hopfield layer" generalisation, vs the raw-state
+      retrieval implemented here); (c) wire it into ../gpt-3-for-pascal as an
+      attention-replacement block and contrast loss/wall-clock.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):

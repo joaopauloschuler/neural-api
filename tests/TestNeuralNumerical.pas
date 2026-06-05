@@ -252,6 +252,10 @@ type
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
     procedure TestAddClosedFormContinuousBuilder;
+    procedure TestModernHopfieldInputGradientCheck;
+    procedure TestModernHopfieldWeightGradientCheck;
+    procedure TestModernHopfieldSerializationRoundTrip;
+    procedure TestAddModernHopfieldRetrievalBuilder;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -22230,6 +22234,238 @@ begin
         NN2.GetLastLayer is TNNetSum);
       Saved2 := NN2.SaveToString();
       AssertEquals('AddClosedFormContinuous SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure SeedModernHopfield(LH: TNNetModernHopfield);
+var i: integer;
+begin
+  // Deterministic, non-trivial stored patterns so the softmax retrieval is far
+  // from the degenerate uniform-weight regime (where every gradient path is
+  // tiny and a check passes vacuously).
+  for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    LH.Neurons[0].Weights.Raw[i] := Sin(i * 0.83 + 0.2) * 1.1;
+end;
+
+procedure TTestNeuralNumerical.TestModernHopfieldInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LH: TNNetModernHopfield;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Small d=3, NumPatterns=4, K=3 keeps the unrolled-K central differences cheap.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 3);
+  InputPlus := TNNetVolume.Create(2, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 3, 1));
+    LH := TNNetModernHopfield.Create(4, 3, 3, 1.0);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedModernHopfield(LH);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ModernHopfield input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ModernHopfield input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModernHopfieldWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetModernHopfield;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 3, 1));
+    LH := TNNetModernHopfield.Create(4, 3, 3, 1.0);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedModernHopfield(LH);
+
+    // The pattern bank is the only weight tensor; differentiating through the
+    // unrolled K steps is the classic place for a missing accumulation term.
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ModernHopfield weight gradient check X[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ModernHopfield weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModernHopfieldSerializationRoundTrip;
+begin
+  // The learnable pattern bank (NumPatterns x d) must survive Save/LoadFromString
+  // along with the NumPatterns/d/K/beta hyperparameters.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetModernHopfield.Create(4, 3, 3, 1.5), 'ModernHopfield', 5, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddModernHopfieldRetrievalBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+  HasHopfield: boolean;
+  LH: TNNetModernHopfield;
+begin
+  // Exercise TNNet.AddModernHopfieldRetrieval end to end:
+  // (1) it appends a TNNetModernHopfield whose d is read from the prev layer and
+  //     whose output shape == the (SeqLen,1,d) input;
+  // (2) one training run reduces the loss (the bank trains);
+  // (3) SaveToString/LoadFromString round-trips bit-for-bit.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3));
+    LH := NN.AddModernHopfieldRetrieval(5, 3, 1.0) as TNNetModernHopfield;
+    NN.SetLearningRate(0.1, 0.0);
+
+    AssertTrue('AddModernHopfieldRetrieval last layer is TNNetModernHopfield',
+      NN.GetLastLayer is TNNetModernHopfield);
+    AssertEquals('AddModernHopfieldRetrieval NumPatterns', 5, LH.NumPatterns);
+    AssertEquals('AddModernHopfieldRetrieval Dim from prev layer', 3, LH.Dim);
+    AssertEquals('AddModernHopfieldRetrieval Steps', 3, LH.Steps);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.3) * 1.5;
+      Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    end;
+    NN.Compute(Input);
+    AssertEquals('AddModernHopfieldRetrieval output SizeX preserved',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddModernHopfieldRetrieval output Depth preserved',
+      3, NN.GetLastLayer.Output.Depth);
+
+    HasHopfield := false;
+    for i := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[i] is TNNetModernHopfield then HasHopfield := true;
+    AssertTrue('AddModernHopfieldRetrieval built a Hopfield layer', HasHopfield);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 99 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('AddModernHopfieldRetrieval training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddModernHopfieldRetrieval round-trip last layer type',
+        NN2.GetLastLayer is TNNetModernHopfield);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddModernHopfieldRetrieval SaveToString round-trip equality',
         Saved, Saved2);
     finally
       NN2.Free;

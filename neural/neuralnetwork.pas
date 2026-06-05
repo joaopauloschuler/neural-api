@@ -2300,6 +2300,65 @@ type
     property WeightsSource: TNNetLayer read FWeightsLayer;
   end;
 
+  /// Modern (continuous) Hopfield associative-memory layer (Ramsauer et al.
+  // 2020, "Hopfield Networks is All You Need", arXiv:2008.02217). Unlike the
+  // single-pass attention layers in this tree (TNNetScaledDotProductAttention
+  // and siblings) this is an ENERGY-BASED associative memory that ITERATES a
+  // softmax retrieval to a fixed point. It owns a LEARNABLE bank of stored
+  // patterns X (NumPatterns rows, each a d-vector) and, given a query state
+  // xi, repeatedly applies the continuous Hopfield update
+  //   p     = softmax(beta * X * xi)         (similarity of xi to each pattern)
+  //   xi'   = X^T * p                        (retrieve = weighted pattern sum)
+  // for K update steps. K=1 reduces to ordinary (parameter-banked) attention;
+  // K>1 SHARPENS the retrieval toward the single nearest stored memory (the
+  // whole point of the layer) -- the classic one-shot associative recall that
+  // cleans a masked/noised query back to the stored pattern. The inverse
+  // temperature beta sets the metastable-vs-sharp regime (small beta = blurry
+  // averaging over patterns; large beta = a one-hot pull to the nearest
+  // pattern).
+  //
+  // Input layout: a (SeqLen,1,d) sequence laid out along SizeX (SizeY must be
+  // 1), exactly like the attention / SSM layers; each of the SeqLen positions
+  // is an independent query xi run through the same K-step retrieval against
+  // the shared pattern bank. Output shape == input shape (SeqLen,1,d).
+  //
+  // Storage in Neurons[0].FWeights: the pattern bank X as (SizeX=NumPatterns,
+  // 1, Depth=d) so each pattern's d-vector is depth-contiguous (AVX dot/MulAdd
+  // friendly). FStruct[0]=NumPatterns, FStruct[1]=d, FStruct[2]=K(steps) and
+  // FFloatSt[0]=beta persist, the bank serializes like any other
+  // weight-carrying layer. Forward caches, per query and per step, both the
+  // softmax weights p and the iterate xi; backward differentiates through the
+  // unrolled K steps (the same softmax-Jacobian path used by SDPA, applied
+  // right-to-left and summed over steps) and scatters into both the bank X and
+  // the input query.
+  // Coded by Claude (AI).
+  TNNetModernHopfield = class(TNNetLayer)
+    private
+      FNumPatterns: integer;
+      FDim: integer;
+      FSteps: integer;
+      FBeta: TNeuralFloat;
+      // Forward caches for one query at a time (reused across SeqLen positions
+      // by re-running backward right after; instead we cache for ALL positions).
+      FXi: TNNetVolume;     // iterates xi: (SeqLen, Steps+1, d) -- xi[t,s] state
+      FP: TNNetVolume;      // softmax weights: (SeqLen, Steps, NumPatterns)
+      FGradX: TNNetVolume;  // (NumPatterns,1,d) bank-gradient accumulator
+      FdXi: TNNetVolume;    // d-long backward query-gradient scratch
+      FdP, FdScore: TNNetVolume; // NumPatterns-long backward scratch buffers
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(NumPatterns, d, KSteps: integer;
+        pBeta: TNeuralFloat = 1.0); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property NumPatterns: integer read FNumPatterns;
+      property Dim: integer read FDim;
+      property Steps: integer read FSteps;
+      property Beta: TNeuralFloat read FBeta;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -6871,6 +6930,16 @@ type
       // (Depth is taken from the previous layer). Returns the residual-sum
       // layer. See TNNetClosedFormContinuous for the cell math.
       function AddClosedFormContinuous(): TNNetLayer;
+      // Wires a continuous modern-Hopfield associative-memory retrieval over a
+      // (SeqLen,1,d) query tensor (GetLastLayer, SizeY=1, Depth=d) against a
+      // freshly created learnable pattern bank of NumPatterns d-vectors. Each
+      // of the SeqLen positions is run independently through KSteps Hopfield
+      // update steps xi := X^T*softmax(beta*X*xi); KSteps=1 is ordinary
+      // (banked) attention, KSteps>1 sharpens to the nearest stored memory.
+      // Output shape == input (SeqLen,1,d). Returns the TNNetModernHopfield
+      // layer. See TNNetModernHopfield for the math and serialization.
+      function AddModernHopfieldRetrieval(NumPatterns, KSteps: integer;
+        Beta: TNeuralFloat = 1.0): TNNetLayer;
       // One-call HyperNetwork wiring (Ha et al. 2016): a GENERATOR reads the
       // ContextLayer and EMITS the weight matrix (+ optional bias) of a linear
       // map that is then applied to the MAIN data path (GetLastLayer) by a
@@ -14719,6 +14788,236 @@ begin
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetModernHopfield }
+
+constructor TNNetModernHopfield.Create(NumPatterns, d, KSteps: integer;
+  pBeta: TNeuralFloat);
+begin
+  inherited Create();
+  FNumPatterns := NumPatterns;
+  FDim := d;
+  FSteps := KSteps;
+  FBeta := pBeta;
+  if FNumPatterns < 1 then
+    FErrorProc('TNNetModernHopfield requires NumPatterns >= 1. Got ' +
+      IntToStr(FNumPatterns));
+  if FDim < 1 then
+    FErrorProc('TNNetModernHopfield requires d >= 1. Got ' + IntToStr(FDim));
+  if FSteps < 1 then
+    FErrorProc('TNNetModernHopfield requires KSteps >= 1. Got ' +
+      IntToStr(FSteps));
+  FStruct[0] := FNumPatterns;
+  FStruct[1] := FDim;
+  FStruct[2] := FSteps;
+  FFloatSt[0] := FBeta;
+  FXi := TNNetVolume.Create();
+  FP := TNNetVolume.Create();
+  FGradX := TNNetVolume.Create();
+  FdXi := TNNetVolume.Create();
+  FdP := TNNetVolume.Create();
+  FdScore := TNNetVolume.Create();
+  AddMissingNeurons(1);
+end;
+
+destructor TNNetModernHopfield.Destroy();
+begin
+  FdScore.Free;
+  FdP.Free;
+  FdXi.Free;
+  FGradX.Free;
+  FP.Free;
+  FXi.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetModernHopfield.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetModernHopfield requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDim then
+    FErrorProc('TNNetModernHopfield requires input depth = d. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d=' + IntToStr(FDim));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  FOutput.ReSize(SeqLen, 1, FDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Pattern bank X: (NumPatterns, 1, d) -- each pattern d-vector is contiguous.
+  FNeurons[0].FWeights.ReSize(FNumPatterns, 1, FDim);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  // xi caches the iterate at every step boundary: index s in 0..Steps is the
+  // state BEFORE step s (s=0 is the input query, s=Steps is the output).
+  FXi.ReSize(SeqLen, FSteps + 1, FDim);
+  // p[t,s,*] are the softmax weights produced at step s for query t.
+  FP.ReSize(SeqLen, FSteps, FNumPatterns);
+  FGradX.ReSize(FNumPatterns, 1, FDim);
+  FdXi.ReSize(1, 1, FDim);
+  FdP.ReSize(FNumPatterns, 1, 1);
+  FdScore.ReSize(FNumPatterns, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetModernHopfield.Compute();
+var
+  StartTime: double;
+  X, Prev: TNNetVolume;
+  SeqLen, t, s, p, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  XiCur, XiNext: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  X := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  for t := 0 to SeqLen - 1 do
+  begin
+    // s=0 iterate is the raw input query.
+    XiCur := FXi.GetRawPtr(t, 0, 0);
+    for d := 0 to FDim - 1 do
+      XiCur^[d] := Prev.FData[(t * FDim) + d];
+    for s := 0 to FSteps - 1 do
+    begin
+      XiCur := FXi.GetRawPtr(t, s, 0);
+      XiNext := FXi.GetRawPtr(t, s + 1, 0);
+      // p = softmax(beta * X * xi). Score[p] = beta * (X[p] . xi).
+      MaxScore := -1e30;
+      for p := 0 to FNumPatterns - 1 do
+      begin
+        Score := FBeta * TNNetVolume.DotProduct(X.GetRawPtr(p, 0, 0), XiCur, FDim);
+        FP[t, s, p] := Score;
+        if Score > MaxScore then MaxScore := Score;
+      end;
+      SumExp := 0;
+      for p := 0 to FNumPatterns - 1 do
+      begin
+        Score := pcr_expf(FP[t, s, p] - MaxScore);
+        FP[t, s, p] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for p := 0 to FNumPatterns - 1 do
+          FP[t, s, p] := FP[t, s, p] / SumExp;
+      // xi' = X^T * p  (weighted sum of stored patterns).
+      for d := 0 to FDim - 1 do
+        XiNext^[d] := 0;
+      for p := 0 to FNumPatterns - 1 do
+        TNNetVolume.MulAdd(XiNext, X.GetRawPtr(p, 0, 0), FP[t, s, p], FDim);
+    end;
+    // Output is the final iterate.
+    XiCur := FXi.GetRawPtr(t, FSteps, 0);
+    XiNext := FOutput.GetRawPtr(t, 0, 0);
+    for d := 0 to FDim - 1 do
+      XiNext^[d] := XiCur^[d];
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetModernHopfield.Backpropagate();
+var
+  StartTime: double;
+  X, Prev, PrevErr: TNNetVolume;
+  SeqLen, t, s, p, d: integer;
+  hasInputGrad: boolean;
+  dXiPtr: TNeuralFloatArrPtr;
+  XiCur, Xp, GradXp: TNeuralFloatArrPtr;
+  SumDPP, ds, A: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  X := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGradX.Fill(0);
+  dXiPtr := FdXi.GetRawPtr(0, 0, 0);
+  for t := 0 to SeqLen - 1 do
+  begin
+    // dXi seeds with the output error (gradient w.r.t. the final iterate).
+    for d := 0 to FDim - 1 do
+      dXiPtr^[d] := FOutputError[t, 0, d];
+    // Unroll the K steps right-to-left.
+    for s := FSteps - 1 downto 0 do
+    begin
+      XiCur := FXi.GetRawPtr(t, s, 0); // iterate fed INTO step s
+      // xi' = sum_p p[s,p] * X[p].
+      //   dP[p]    = sum_d dXi'[d] * X[p,d]   (dot product)
+      //   dX[p,d] += p[s,p] * dXi'[d]         (MulAdd)
+      for p := 0 to FNumPatterns - 1 do
+      begin
+        A := FP[t, s, p];
+        FdP.FData[p] := TNNetVolume.DotProduct(dXiPtr, X.GetRawPtr(p, 0, 0), FDim);
+        TNNetVolume.MulAdd(FGradX.GetRawPtr(p, 0, 0), dXiPtr, A, FDim);
+      end;
+      // Softmax Jacobian: dScore[p] = p[p] * (dP[p] - sum_k dP[k]*p[k]).
+      SumDPP := 0;
+      for p := 0 to FNumPatterns - 1 do
+        SumDPP := SumDPP + FdP.FData[p] * FP[t, s, p];
+      for p := 0 to FNumPatterns - 1 do
+        FdScore.FData[p] := FP[t, s, p] * (FdP.FData[p] - SumDPP);
+      // score[p] = beta * (X[p] . xi).  Reset dXi to the gradient flowing into
+      // the step-s INPUT iterate, then accumulate both paths:
+      //   dXi[d]  += beta * sum_p dScore[p] * X[p,d]
+      //   dX[p,d] += beta * dScore[p] * xi[d]
+      for d := 0 to FDim - 1 do
+        dXiPtr^[d] := 0;
+      for p := 0 to FNumPatterns - 1 do
+      begin
+        ds := FBeta * FdScore.FData[p];
+        if ds <> 0 then
+        begin
+          Xp := X.GetRawPtr(p, 0, 0);
+          GradXp := FGradX.GetRawPtr(p, 0, 0);
+          TNNetVolume.MulAdd(dXiPtr, Xp, ds, FDim);
+          TNNetVolume.MulAdd(GradXp, XiCur, ds, FDim);
+        end;
+      end;
+    end;
+    // After unrolling all steps, dXi is the gradient w.r.t. the s=0 iterate,
+    // which is the raw input query for position t.
+    if hasInputGrad then
+      for d := 0 to FDim - 1 do
+        PrevErr.Add(t, 0, d, dXiPtr^[d]);
+  end;
+  // Flush bank gradient into the neuron delta (-LearningRate scaled).
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradX.GetRawPtr(),
+    -FLearningRate, X.Size);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetModernHopfield.InitDefault();
+var
+  p, d, oldSeed: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Small random stored patterns so retrieval starts unbiased; the caller
+  // (or training) sets the actual memories. Deterministic seed for reproducible
+  // initialisation independent of global RNG ordering.
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  for p := 0 to FNumPatterns - 1 do
+    for d := 0 to FDim - 1 do
+      FNeurons[0].FWeights[p, 0, d] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
 end;
 
 { TNNetRetention }
@@ -30253,6 +30552,19 @@ begin
   // residual sublayer (see the AddRMSNormResidual contract). Parameterless: the
   // cell reads Depth from the previous layer.
   Result := AddRMSNormResidual([TNNetClosedFormContinuous.Create()]);
+end;
+
+function TNNet.AddModernHopfieldRetrieval(NumPatterns, KSteps: integer;
+  Beta: TNeuralFloat): TNNetLayer;
+var
+  Query: TNNetLayer;
+begin
+  Query := GetLastLayer();
+  if Query.Output.SizeY <> 1 then
+    FErrorProc('AddModernHopfieldRetrieval requires a (SeqLen,1,d) query ' +
+      '(SizeY=1). SizeY=' + IntToStr(Query.Output.SizeY));
+  Result := AddLayer(
+    TNNetModernHopfield.Create(NumPatterns, Query.Output.Depth, KSteps, Beta));
 end;
 
 function TNNet.AddHyperLinear(Din, Dout: integer; ContextLayer: TNNetLayer;
@@ -55106,6 +55418,7 @@ begin
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0]);
+      'TNNetModernHopfield' :       Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -55412,6 +55725,7 @@ begin
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetModernHopfield' then Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
