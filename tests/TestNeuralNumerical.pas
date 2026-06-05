@@ -251,6 +251,10 @@ type
     procedure TestClosedFormContinuousInputGradientCheck;
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
+    procedure TestSLSTMCellInputGradientCheck;
+    procedure TestSLSTMCellWeightGradientCheck;
+    procedure TestSLSTMCellSerializationRoundTrip;
+    procedure TestAddSLSTMBuilder;
     procedure TestAddClosedFormContinuousBuilder;
     procedure TestAddBidirectionalClosedFormContinuousBuilder;
     procedure TestBidirectionalClosedFormContinuousGradientCheck;
@@ -22376,6 +22380,258 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetClosedFormContinuous.Create(), 'ClosedFormContinuous', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetSLSTMCell (xLSTM scalar-memory exp-gated recurrent cell) -----------
+
+// Fill the sLSTM weight sets with deterministic, non-trivial values so every
+// gate (exp input/forget, tanh cell input, sigmoid output) plus the recurrent
+// projections and the stabilizer are exercised.
+procedure SeedSLSTMCell(L: TNNetSLSTMCell; Depth: integer);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.25; // W_z
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.20; // W_i
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 + j * 0.3) * 0.20; // W_f
+      L.Neurons[3].Weights[d, 0, j] := Cos(d * 0.9 - j * 0.4) * 0.25; // W_o
+      L.Neurons[4].Weights[d, 0, j] := Sin(d * 0.3 - j * 0.8) * 0.15; // r_z
+      L.Neurons[5].Weights[d, 0, j] := Cos(d * 0.6 + j * 0.2) * 0.12; // r_i
+      L.Neurons[6].Weights[d, 0, j] := Sin(d * 0.8 - j * 0.5) * 0.12; // r_f
+      L.Neurons[7].Weights[d, 0, j] := Cos(d * 0.4 + j * 0.7) * 0.15; // r_o
+    end;
+    L.Neurons[8].Weights.Raw[d]  := Cos(d * 0.5) * 0.3;  // b_z
+    L.Neurons[9].Weights.Raw[d]  := Sin(d * 0.4) * 0.2;  // b_i
+    L.Neurons[10].Weights.Raw[d] := Cos(d * 0.6) * 0.2 + 0.5; // b_f
+    L.Neurons[11].Weights.Raw[d] := Sin(d * 0.7) * 0.3;  // b_o
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSLSTMCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetSLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // SHORT SeqLen (3) keeps the unrolled BPTT cheap.
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetSLSTMCell.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedSLSTMCell(L, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('sLSTM input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('sLSTM input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSLSTMCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetSLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..11] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'W_z'; Names[1] := 'W_i'; Names[2] := 'W_f'; Names[3] := 'W_o';
+  Names[4] := 'r_z'; Names[5] := 'r_i'; Names[6] := 'r_f'; Names[7] := 'r_o';
+  Names[8] := 'b_z'; Names[9] := 'b_i'; Names[10] := 'b_f'; Names[11] := 'b_o';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetSLSTMCell.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedSLSTMCell(L, 3);
+
+    // Cover all twelve weight tensors (eight DepthxDepth projections + four
+    // Depth-long biases). The stabilized exp gates and the recurrent r_* paths
+    // are classic places for a silent BPTT off-by-one.
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('sLSTM weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('sLSTM weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSLSTMCellSerializationRoundTrip;
+begin
+  // sLSTM stores twelve learnable tensors (eight DepthxDepth projections plus
+  // four Depth-long biases); the perturbed-weights helper pushes them away from
+  // defaults so the round trip exercises a non-trivial parameter set.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSLSTMCell.Create(), 'SLSTMCell', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddSLSTMBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+  HasRMSNorm, HasCell: boolean;
+begin
+  // Exercise TNNet.AddSLSTM end to end: it wraps the sLSTM cell in an RMSNorm
+  // pre-norm residual (last layer = residual TNNetSum, shape-preserving), the
+  // block contains an RMSNorm and a TNNetSLSTMCell, one training run reduces the
+  // loss, and SaveToString/LoadFromString round-trips to an identical string.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3));
+    NN.AddSLSTM();
+    NN.SetLearningRate(0.1, 0.0);
+
+    AssertTrue('AddSLSTM last layer is residual TNNetSum',
+      NN.GetLastLayer is TNNetSum);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.3) * 1.5;
+      Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    end;
+    NN.Compute(Input);
+    AssertEquals('AddSLSTM output SizeX preserved', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddSLSTM output Depth preserved', 3, NN.GetLastLayer.Output.Depth);
+
+    HasRMSNorm := false;
+    HasCell := false;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i] is TNNetRMSNorm then HasRMSNorm := true;
+      if NN.Layers[i] is TNNetSLSTMCell then HasCell := true;
+    end;
+    AssertTrue('AddSLSTM built an RMSNorm', HasRMSNorm);
+    AssertTrue('AddSLSTM built an sLSTM cell', HasCell);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('AddSLSTM training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddSLSTM round-trip last layer is TNNetSum',
+        NN2.GetLastLayer is TNNetSum);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddSLSTM SaveToString round-trip equality', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestAddClosedFormContinuousBuilder;
