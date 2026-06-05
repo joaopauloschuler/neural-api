@@ -1663,3 +1663,32 @@ rather than acted on.
       < random-init) is the robust, reproducible signal. Pairs with
       [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
       degeneracy-aware generalization of "effective parameter count").
+
+### Nested / multi-granularity embeddings (Matryoshka Representation Learning)
+- [ ] `examples/MatryoshkaEmbedding/` — train a SINGLE embedding head whose
+      nested prefixes are *each independently usable*, following Matryoshka
+      Representation Learning (Kusupati et al., NeurIPS 2022). One encoder
+      produces a d-dim embedding (say d=64); the loss is the SUM of the
+      classification/retrieval losses computed on the truncated prefixes
+      {8, 16, 32, 64} so that early coordinates pack the coarsest, most
+      important information and later coordinates only refine. This is
+      genuinely DIFFERENT from every existing embedding example here —
+      [[TripletEmbedding]], [[InfoNCEContrastive]], [[ArcFaceEmbedding]],
+      [[CosineEmbeddingSiamese]] all train ONE fixed-width vector; the
+      Matryoshka novelty is the elastic, sub-dimension-addressable
+      representation, not the metric/loss family. Implementation reuses the
+      existing prefix-slice + a per-granularity classifier head (share or
+      tie the heads); no new layer class is strictly required, but if a
+      clean reusable piece falls out it should be a `TNNet.AddMatryoshka...`
+      builder rather than a near-duplicate layer. CPU-only on MNIST or a
+      tiny synthetic dataset. Headline experiment (in the honest
+      "what fit the budget" style): a single Matryoshka run gives a whole
+      accuracy-vs-embedding-width curve from ONE model; contrast its 8-dim
+      and 16-dim prefix accuracy against separately-trained fixed-8 and
+      fixed-16 baselines to show the nested prefixes lose little vs. the
+      dedicated low-dim models — i.e. you get adaptive-cost retrieval
+      (cheap coarse search, optional fine re-rank) for free. Document the
+      known pitfall: prefix losses must be weighted/normalised so the
+      smallest prefix does not dominate the gradient. Pairs naturally with
+      the existing [[IntrinsicDimension]] / FeatureSeparability reports for
+      reading how information is distributed across the coordinate axis.
