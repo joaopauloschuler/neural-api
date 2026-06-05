@@ -250,64 +250,6 @@ rather than acted on.
       future "make TNeuralFit deterministic under parallelism" work.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
-### Added ideas
-- [X] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
-      attribution via TracIn-CP (Pruthi et al. 2020, "Estimating Training Data
-      Influence by Tracing Gradient Descent"). Answers a question NOTHING in the
-      tree currently answers: "which TRAINING examples are most responsible for
-      THIS test prediction?" — i.e. attribution back to the *data*, not to
-      activations (ActivationPatchingReport is causal tracing over layers at
-      inference) and not to the input pixels (SaliencyReport is input-space
-      gradient). TracIn is the CPU-friendly form of influence functions: it
-      needs NO Hessian inverse (unlike Koh & Liang 2017), only first-order
-      gradient dot products, which this API already computes per sample during
-      Backpropagate. Influence of a training point `z_train` on a test point
-      `z_test` is `I(z_train, z_test) = sum over saved checkpoints k of
-      eta_k * <grad_loss(z_train; theta_k), grad_loss(z_test; theta_k)>`
-      (TracIn-CP — one term per checkpoint, scaled by that interval's LR).
-      Mechanics in this library: run a single backward pass per example with
-      `SetBatchUpdate(True)` so per-sample weight gradients are NOT zeroed
-      (the [[manual-gradient-and-snapshot-gotchas]] idiom), read the flattened
-      gradient out of each trainable layer (`Neurons[].Delta`-derived weight
-      grads / the layer delta volumes), and take the dot product against the
-      cached test-point gradient — summed over a handful of `.nn` checkpoints
-      saved across training. Report: top-k PROPONENTS (most positive influence,
-      "examples that pushed the model toward this prediction") and top-k
-      OPPONENTS (most negative). The example should be GRADED by construction so
-      it is self-checking in the house style: train a tiny classifier on a 2-D
-      blob task where each test point has an obvious same-class cluster, then
-      mislabel ONE planted training example and show TracIn ranks that planted
-      mislabel as the top OPPONENT of test points it corrupts — the textbook
-      "TracIn surfaces mislabelled data" result (the paper's headline
-      self-influence application). Feasibility notes to settle in v1, honestly
-      logged like the Grokking/Capsule entries: (a) checkpoint storage — start
-      with the FINAL weights only (1-checkpoint TracIn ≈ a single gradient-dot
-      similarity / "TracInLast") and ADD multi-checkpoint summation only if the
-      single-checkpoint ranking is too noisy on the toy; (b) cost is O(N_train)
-      backward passes per test point, so cap N_train small (a few hundred) and
-      say so; (c) confirm reading per-sample weight gradients out of a layer
-      after one backward pass actually works under `SetBatchUpdate(True)` before
-      committing to the full report — that is the one true unknown. Distinct
-      from every existing `TNNet.*Report` (none touch the training set) and a
-      natural companion to the landed Mahalanobis-OOD / ConformalPrediction
-      data-quality tooling.
-      LANDED 2026-06-05: shipped `examples/TracInfluence/` (TracInfluence.lpr +
-      .lpi + README.md) as an example-only **TracInLast** demo — single
-      checkpoint (final trained weights only), influence = a single gradient-dot
-      similarity `<grad_loss(z_train), grad_loss(z_test)>`. The one true unknown
-      is CONFIRMED: per-sample weight gradients read out cleanly under
-      `SetBatchUpdate(true)` via `Neuron.Delta` (divided back out by the layer
-      LR; bias delta is private so omitted — weights alone rank fine), exactly
-      the `FisherImportanceReport`/`GradientConflictReport` idiom; net is frozen
-      (never `UpdateWeights`). Graded self-check: plants ONE mislabel
-      (class-0 boundary point flipped to class 1) on a 300-point 2-D blob task
-      and ASSERTS it lands in the top-K most-negative opponents — it comes out
-      as the single most-negative opponent (the ONLY training point with
-      negative influence), printing top-K proponents/opponents + a PASS line.
-      Runs in <1s. DEFERRED: multi-checkpoint TracIn-CP summation (single
-      checkpoint already gives a clean, unambiguous ranking on the toy, logged
-      honestly in the README) and a reusable `TNNet.TracInReport` method (the
-      inline gradient-dot logic in the example was enough; no new class added).
 
 ### Ideas from JP
 - [ ] Better integrate TBytePredictionViaNNet and TEasyBytePredictionViaNNet with
@@ -357,30 +299,6 @@ rather than acted on.
       a BUILDER that inserts the HxH mix between the per-head logit slabs
       inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
       Re-scope before attempting.
-- [X] TNNetSlidingWindowMaskedFill follow-up (landed 2026-06-05): a tiny
-      next-token bake-off — full causal (TNNetMaskedFill / TriangularCausalMask)
-      vs sliding-window at W in {2, 4, full} on a task whose answer lives within
-      the window, charting loss + per-query key count. Shows the long-context
-      cost/quality trade the layer enables. Fork PositionEncodingBakeoff's
-      tiny next-token harness.
-      LANDED 2026-06-05 as examples/SlidingWindowBakeoff: forks the
-      PositionEncodingBakeoff harness; three arms (W=2, W=4, FULL causal)
-      swap ONLY the mask layer (TNNetSlidingWindowMaskedFill(2)/(4) vs
-      TNNetMaskedFill) on a content-gated copy rule (even token -> copy
-      current, odd -> copy previous) whose answer lives in a width-2 window.
-      All arms reach val-CE ~0 / 100% accuracy; the table charts per-query
-      mean/last key count (W=2: 1.92/2, W=4: 3.50/4, FULL: 6.50/12), making
-      the cost saving visible at matched quality. Graded PASS/FAIL (sliding
-      arms within tolerance of FULL, all arms val-CE<0.5); prints RESULT:
-      PASS. ~11s, pure CPU.
-- [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
-      SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
-      `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
-      targets, at matched final loss?
-- [X] "Attention numerical-gradient stress test" (landed 2026-06-05: SeqLen {1,2,3,5,8} stress test) running the SDPA grad check
-      across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
-      tolerance at each. Pins shape-edge behavior the existing single-shape
-      test can't see.
 
 ### Bake-off / experiment follow-ups
 - [ ] Position-encoding bake-off follow-up: the landed bake-off uses a
