@@ -1566,6 +1566,23 @@ rather than acted on.
       1e-2.
 
 ### Introspection (added)
+- [ ] `TNNet.LRPReport` + `examples/LRP/` — Layer-wise Relevance Propagation
+      (Bach et al. 2015, "On Pixel-Wise Explanations for Non-Linear Classifier
+      Decisions by Layer-Wise Relevance Propagation"). Closes the last open gap in
+      the CNN-attribution family — `SaliencyReport` (vanilla + SmoothGrad + Integrated
+      Gradients) and `GradCAMReport` are already landed; LRP is genuinely distinct
+      because it is NOT a gradient method: it back-distributes the chosen output
+      logit's relevance through the net under a conservation rule so `sum(R_input)`
+      equals the predicted logit at every layer boundary. Implement the epsilon-rule
+      (`R_i = sum_j (a_i·w_ij)/(sum_i a_i·w_ij + eps·sign) · R_j`, eps in `FStruct`,
+      default 1e-2) over the linear/conv/pointwise + ReLU stack on a single probe;
+      print the layer-by-layer relevance-conservation residual (the headline LRP
+      sanity check — should stay ~0) plus the top-k most-relevant input positions,
+      and SKIP honestly through layers whose backward relevance rule is undefined
+      (attention, norm) rather than faking it. Follow the introspection-report recipe
+      ([[introspection-report-pattern]]): decl + impl + example + smoke test + docs;
+      reuse the per-token / per-channel walk machinery, do NOT re-derive forward
+      activations. See [[saliency-report-covers-ig]].
 - [ ] FeatureSeparabilityReport follow-up: the scatter-
       decomposition identity `tr(Stot)=tr(Sw)+tr(Sb)` is only exact for
       class-balanced batches (the report uses class-balanced `mean_c`
