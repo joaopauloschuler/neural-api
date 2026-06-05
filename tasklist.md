@@ -458,11 +458,12 @@ rather than acted on.
 - [ ] TNNetReversibleBlock follow-up: stack N reversible blocks into a deep net
       and show constant activation memory vs a plain residual stack of equal depth
       (the headline RevNet scaling claim) — depends on the recompute path above.
-- [ ] TNNetSpectralNorm — CONVOLUTION variant (still open). The dense wrapper
-      landed; add a convolution-layer spectral-norm wrapper (largest singular
-      value of the flattened conv weight matrix per output channel / full
-      kernel) on top of `TNNet.EstimateSpectralNorm`, mirroring the dense
-      forward/backward (scale by 1/sigma, sigma treated constant in backward).
+- [ ] TNNetSpectralNormConv follow-up: the landed wrapper normalizes by sigma_1
+      of the FLATTENED kernel matrix (out_channels x in*kx*ky), a single scalar
+      that BOUNDS but does not equal the true conv-OPERATOR spectral norm. Add a
+      true-operator variant (Sedghi et al. 2019 FFT-based conv spectral norm, or
+      a per-output-channel sigma) plus a small conv-SN bake-off / example vs the
+      flattened-matrix version.
 - [ ] TNNetStochasticPool follow-up: a bake-off vs TNNetMaxPool / TNNetAvgPool /
       TNNetSoftPool on a tiny image-classifier stub — does the stochastic
       regularisation lower the train/val gap at matched architecture? Fork an

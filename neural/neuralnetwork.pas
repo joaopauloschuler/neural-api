@@ -5323,6 +5323,58 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Spectral-normalization wrapper around a CONVOLUTION (linear, no-activation)
+  /// layer -- the convolution sibling of the dense TNNetSpectralNorm. The latent
+  /// (trainable) weights live in FNeurons and are stored / serialized exactly
+  /// like a TNNetConvolutionLinear (no custom Save/Load).
+  ///
+  /// SIGMA DEFINITION: the convolution weights flatten to a matrix of shape
+  ///   (out_channels) x (in_channels * kernelX * kernelY)
+  /// because each neuron holds the flattened filter of one output channel, and
+  /// there is one neuron per output channel. TNN.EstimateSpectralNorm already
+  /// treats Neurons[] as the ROWS of exactly that matrix, so its power iteration
+  /// yields sigma_1 of the FULL flattened kernel matrix (a single SCALAR for the
+  /// whole layer). This is the simplest faithful conv spectral norm; it BOUNDS
+  /// (does not equal) the true spectral norm of the conv OPERATOR, which would
+  /// additionally depend on the spatial structure -- a per-output-channel /
+  /// true-operator variant is a follow-up.
+  ///
+  /// FORWARD divides the whole weight tensor by sigma (so the effective filter
+  /// matrix W/sigma has matrix spectral norm ~1):
+  ///   sigma = max(TNNet.EstimateSpectralNorm(Self, Iters), eps)
+  ///   w_eff = W / sigma
+  ///   y     = conv(w_eff, x) + b
+  /// Iters (power-iteration steps) is stored in FStruct[5] exactly as the dense
+  /// TNNetSpectralNorm stores it (FStruct[0..4] carry the convolution params, so
+  /// FStruct[5] is free for a plain convolution). Reference: Miyato et al. 2018,
+  /// "Spectral Normalization for Generative Adversarial Networks",
+  /// arXiv:1802.05957.
+  ///
+  /// BACKWARD: sigma is treated as a CONSTANT w.r.t. the gradient (the standard
+  /// SpectralNorm approximation -- the power iteration is NOT differentiated).
+  /// The forward scaled the weights by 1/sigma in place and ran the optimized
+  /// inherited conv backprop on them, so the INPUT gradient (which uses w_eff)
+  /// is already correct. The per-call weight Delta increment is the gradient
+  /// w.r.t. w_eff; since w_eff = W/sigma with sigma constant,
+  ///   dL/dW = (1/sigma) * dL/dw_eff,
+  /// so that increment is rescaled by 1/sigma to recover the RAW-weight gradient
+  /// (mirrors the per-call Delta remap of TNNetWeightStandardizationConv).
+  // Coded by Claude (AI).
+  TNNetSpectralNormConv = class(TNNetConvolutionLinear)
+  private
+    FRawFilters: TNNetVolumeList;  // per-neuron raw (latent) weight scratch
+    FPreDelta: TNNetVolumeList;    // per-neuron Delta snapshot before backprop
+    FSigma: TNeuralFloat;          // last estimated largest singular value
+    procedure ScaleFilters();
+    procedure RestoreRawFilters();
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias, pIters: integer); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Convolutional layer with ReLU activation function.
   TNNetConvolutionReLU = class(TNNetConvolution)
   public
@@ -30527,6 +30579,149 @@ begin
   end;
 end;
 
+{ TNNetSpectralNormConv }
+
+constructor TNNetSpectralNormConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FRawFilters := TNNetVolumeList.Create();
+  FPreDelta := TNNetVolumeList.Create();
+  FSigma := 1.0;
+  // Default power-iteration steps: 10 (a stable estimate). Iters=1 reproduces
+  // the task's "one power-iteration step per forward pass". Stored in FStruct[5]
+  // exactly like the dense TNNetSpectralNorm (FStruct[0..4] hold the conv params).
+  if FStruct[5] < 1 then FStruct[5] := 10;
+end;
+
+constructor TNNetSpectralNormConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride, pSuppressBias, pIters: integer);
+begin
+  Self.Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  if pIters < 1 then pIters := 1;
+  FStruct[5] := pIters;
+end;
+
+destructor TNNetSpectralNormConv.Destroy();
+begin
+  FRawFilters.Free;
+  FPreDelta.Free;
+  inherited Destroy();
+end;
+
+// Estimate sigma_1 of the flattened kernel matrix (FStruct[5] power-iteration
+// steps), keep a raw copy of every filter in FRawFilters, then divide all
+// filters by max(sigma, eps) IN PLACE and refresh the concatenated-weight cache
+// the optimized conv kernels read from. Mirrors TNNetWeightStandardizationConv's
+// StandardizeFilters, but the transform is a single shared scalar 1/sigma.
+procedure TNNetSpectralNormConv.ScaleFilters();
+const
+  cEps = 1e-12;
+var
+  NeuronCnt, MaxNeurons: integer;
+  InvSigma: TNeuralFloat;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  while FRawFilters.Count <= MaxNeurons do
+    FRawFilters.Add(TNNetVolume.Create());
+  FSigma := TNNet.EstimateSpectralNorm(Self, FStruct[5]);
+  if FSigma < cEps then FSigma := cEps;
+  InvSigma := 1.0 / FSigma;
+  for NeuronCnt := 0 to MaxNeurons do
+  begin
+    // Keep the raw (trainable) weights so they can be restored afterwards.
+    FRawFilters[NeuronCnt].Copy(FArrNeurons[NeuronCnt].FWeights);
+    FArrNeurons[NeuronCnt].FWeights.Mul(InvSigma);
+  end;
+  RefreshNeuronWeightList();
+  AfterWeightUpdate();
+end;
+
+// Restore the raw (trainable) weights saved by ScaleFilters and refresh the
+// concatenated-weight cache.
+procedure TNNetSpectralNormConv.RestoreRawFilters();
+var
+  NeuronCnt, MaxNeurons: integer;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeurons do
+    FArrNeurons[NeuronCnt].FWeights.Copy(FRawFilters[NeuronCnt]);
+  RefreshNeuronWeightList();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSpectralNormConv.Compute();
+begin
+  if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
+  ScaleFilters();
+  inherited Compute();
+  RestoreRawFilters();
+end;
+
+procedure TNNetSpectralNormConv.Backpropagate();
+const
+  cEps = 1e-12;
+var
+  NeuronCnt, MaxNeurons, WeightCnt, MaxWeights: integer;
+  localNeuron: TNNetNeuron;
+  InvSigma, dwEff: TNeuralFloat;
+begin
+  // Only do the (expensive) scale / remap work on the LAST departing branch.
+  // The inherited Backpropagate re-tests this counter, so we only peek here.
+  if (FBackPropCallCurrentCnt + 1) < FDepartingBranchesCnt then
+  begin
+    inherited Backpropagate(); // just advances the counter and exits
+    exit;
+  end;
+
+  if FNeurons.Count > 0 then
+  begin
+    if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
+    MaxNeurons := FNeurons.Count - 1;
+
+    // Snapshot each neuron's Delta BEFORE the inherited conv backprop so the
+    // per-call increment (= -LearningRate * dL/dw_eff) can be isolated and
+    // rescaled to the RAW-weight gradient.
+    while FPreDelta.Count <= MaxNeurons do
+      FPreDelta.Add(TNNetVolume.Create());
+    for NeuronCnt := 0 to MaxNeurons do
+      FPreDelta[NeuronCnt].Copy(FArrNeurons[NeuronCnt].FDelta);
+
+    // Run the optimized conv backprop with the SCALED filters: correct input
+    // gradient (uses w_eff) and accumulates -LearningRate * dL/dw_eff into each
+    // neuron's Delta. ScaleFilters re-estimates sigma (constant in backward).
+    ScaleFilters();
+    inherited Backpropagate();
+    RestoreRawFilters();
+
+    // Remap the per-call Delta increment from dL/dw_eff to dL/dW = (1/sigma) *
+    // dL/dw_eff (sigma treated CONSTANT). The input gradient and bias delta are
+    // already correct and are left untouched.
+    if FLearningRate <> 0.0 then
+    begin
+      if FSigma < cEps then FSigma := cEps;
+      InvSigma := 1.0 / FSigma;
+      for NeuronCnt := 0 to MaxNeurons do
+      begin
+        localNeuron := FArrNeurons[NeuronCnt];
+        MaxWeights := localNeuron.FWeights.Size - 1;
+        for WeightCnt := 0 to MaxWeights do
+        begin
+          // increment = (-LearningRate) * dL/dw_eff; rescale dL/dw_eff by 1/sigma.
+          dwEff := localNeuron.FDelta.FData[WeightCnt] -
+            FPreDelta[NeuronCnt].FData[WeightCnt];
+          localNeuron.FDelta.FData[WeightCnt] :=
+            FPreDelta[NeuronCnt].FData[WeightCnt] + dwEff * InvSigma;
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    inherited Backpropagate();
+  end;
+end;
+
 { TNNetWeightNormLinear }
 
 constructor TNNetWeightNormLinear.Create(pSizeX, pSizeY, pDepth: integer;
@@ -52324,6 +52519,7 @@ begin
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetWeightStandardizationConv' : Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]);
+      'TNNetSpectralNormConv' :     Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionHardSwish' : Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
@@ -52623,6 +52819,7 @@ begin
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetWeightStandardizationConv' then Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]) else
+      if S[0] = 'TNNetSpectralNormConv' then Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionHardSwish' then Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
