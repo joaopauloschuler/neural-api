@@ -25,13 +25,11 @@ floor is roughly the noise variance, `0.10^2 = 0.01`.
 
 ## How `tau` is annealed
 
-`TNNetGumbelSoftmax` stores its temperature in a **protected** field
-(`FFloatSt[0]`) that is set at construction and has **no public setter**. So we
-anneal by **rebuilding the network with the new (lower) `tau` at the start of
-each phase and carrying the learned encoder/decoder weights forward** via
-`TNNet.CopyWeights`. The Gumbel layer has no trainable weights of its own, so
-nothing is lost in the hand-off. This is the simplest correct way to vary `tau`
-per phase without modifying the core library.
+The network is built **once**. At the start of each phase we lower the Gumbel
+bottleneck's temperature **in place** with
+`TNNetGumbelSoftmax.SetTemperature(tau)`. `tau` is read live by `Compute` on
+every forward pass, so the learned encoder/decoder weights carry forward
+automatically — no rebuild, no `CopyWeights`.
 
 Schedule: `tau = 2.0 -> 1.0 -> 0.5 -> 0.25 -> 0.1`, 30 SGD epochs per phase.
 
@@ -46,10 +44,10 @@ Representative run (`RandSeed = 424242`):
 ```
   phase    tau    recon-MSE    entropy   entropy/ln(K)
       0   2.00     0.010323    0.06444         0.0360
-      1   1.00     0.010382    0.00016         0.0001
-      2   0.50     0.010373    0.00000         0.0000
-      3   0.25     0.010363    0.00000         0.0000
-      4   0.10     0.010353    0.00000         0.0000
+      1   1.00     0.010374    0.00062         0.0003
+      2   0.50     0.010372    0.00000         0.0000
+      3   0.25     0.010362    0.00000         0.0000
+      4   0.10     0.010352    0.00000         0.0000
 
 VERDICT: PASS - annealing sharpened the categorical while keeping recon.
 ```

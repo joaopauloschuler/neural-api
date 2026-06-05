@@ -20,13 +20,11 @@ the prototype.
 
 Temperature annealing
 ---------------------
-We anneal tau from ~2.0 down to ~0.1 across a handful of training PHASES. Because
-TNNetGumbelSoftmax stores tau in a PROTECTED field (FFloatSt[0]) set at
-construction and exposes no public setter, we anneal by rebuilding the network
-with the new tau at the start of each phase and copying the learned encoder /
-decoder weights forward via TNNet.CopyWeights (the Gumbel layer itself has no
-trainable weights, so nothing is lost). This is the simplest correct way to vary
-tau per phase without touching the core library.
+We anneal tau from ~2.0 down to ~0.1 across a handful of training PHASES. The
+network is built ONCE; at the start of each phase we lower the Gumbel
+bottleneck's tau IN PLACE via TNNetGumbelSoftmax.SetTemperature. tau is read
+live by Compute every forward pass, so the learned encoder/decoder weights carry
+forward automatically — no rebuild, no CopyWeights.
 
 Headline output
 ---------------
@@ -134,7 +132,8 @@ end;
 
 // ---- model ------------------------------------------------------------------
 
-function BuildAutoencoder(Tau: TNeuralFloat; out GumbelIdx: integer): TNNet;
+function BuildAutoencoder(Tau: TNeuralFloat; out GumbelIdx: integer;
+  out Gumbel: TNNetGumbelSoftmax): TNNet;
 begin
   Result := TNNet.Create();
   Result.AddLayer(TNNetInput.Create(1, 1, D));
@@ -144,7 +143,8 @@ begin
   // Discrete-latent bottleneck. Soft mode (hard=0) keeps a smooth gradient; the
   // Gumbel noise is added only while EnableDropouts(true) is set (training).
   GumbelIdx := Result.GetLastLayerIdx() + 1;
-  Result.AddLayer(TNNetGumbelSoftmax.Create(Tau, 0));
+  Gumbel := TNNetGumbelSoftmax.Create(Tau, 0);
+  Result.AddLayer(Gumbel);
   // Decoder MLP -> reconstruction.
   Result.AddLayer(TNNetFullConnectReLU.Create(Hidden));
   Result.AddLayer(TNNetFullConnectLinear.Create(D));
@@ -222,7 +222,8 @@ end;
 
 var
   DS: TDataset;
-  NN, NextNN: TNNet;
+  NN: TNNet;
+  Gumbel: TNNetGumbelSoftmax;
   Phase, GumbelIdx: integer;
   Tau, MSE, Ent, MaxLnK: TNeuralFloat;
   EntFirst, EntLast, MseFirst, MseLast: TNeuralFloat;
@@ -239,24 +240,19 @@ begin
   BuildPrototypes();
   BuildDataset(DS);
 
-  WriteLn('Annealing schedule (tau falls; weights carried forward via CopyWeights):');
+  WriteLn('Annealing schedule (tau lowered in place via SetTemperature):');
   WriteLn('  phase    tau    recon-MSE    entropy   entropy/ln(K)');
   WriteLn('  -----  -----  -----------  ---------  -------------');
 
-  NN := BuildAutoencoder(TauSched[0], GumbelIdx);
+  NN := BuildAutoencoder(TauSched[0], GumbelIdx, Gumbel);
   EntFirst := 0; EntLast := 0; MseFirst := 0; MseLast := 0;
 
   for Phase := 0 to High(TauSched) do
   begin
     Tau := TauSched[Phase];
-    if Phase > 0 then
-    begin
-      // Rebuild with the lower tau and carry encoder/decoder weights forward.
-      NextNN := BuildAutoencoder(Tau, GumbelIdx);
-      NextNN.CopyWeights(NN);
-      NN.Free;
-      NN := NextNN;
-    end;
+    // Lower the bottleneck temperature in place; tau is read live each forward
+    // pass, so the learned encoder/decoder weights carry forward untouched.
+    Gumbel.SetTemperature(Tau);
 
     TrainPhase(NN, DS);
 

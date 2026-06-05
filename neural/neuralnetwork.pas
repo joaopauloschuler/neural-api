@@ -5155,6 +5155,10 @@ type
       constructor Create(); overload; override;
       constructor Create(pTemperature: TNeuralFloat; pHard: integer); overload;
       destructor Destroy(); override;
+      // Updates the stored temperature (tau) in-place. tau is read live each
+      // forward pass (Compute), so this guarded assignment is all that is
+      // needed to anneal tau across epochs without rebuilding the network.
+      procedure SetTemperature(pTemperature: TNeuralFloat);
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -35552,6 +35556,13 @@ destructor TNNetGumbelSoftmax.Destroy();
 begin
   FSoftSample.Free();
   inherited Destroy();
+end;
+
+procedure TNNetGumbelSoftmax.SetTemperature(pTemperature: TNeuralFloat);
+begin
+  if pTemperature <= 0 then
+    FErrorProc('TNNetGumbelSoftmax temperature (tau) must be > 0.');
+  FFloatSt[0] := pTemperature;
 end;
 
 procedure TNNetGumbelSoftmax.Compute();

@@ -521,6 +521,7 @@ type
     procedure TestGumbelSoftmaxHardForwardIsOneHot;
     procedure TestGumbelSoftmaxGradientCheck;
     procedure TestGumbelSoftmaxSerializationRoundTrip;
+    procedure TestGumbelSoftmaxSetTemperature;
     procedure TestPointwiseSoftMaxExactJacobianGradientCheck;
     procedure TestSoftMaxExactJacobianGradientCheck;
     procedure TestSoftMinSumsToOne;
@@ -16170,6 +16171,51 @@ begin
   finally
     NN.Free;
     NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGumbelSoftmaxSetTemperature;
+var
+  NN, NN2: TNNet;
+  Gumbel, GumbelReloaded: TNNetGumbelSoftmax;
+  Capture: TErrorCapture;
+  Str1: string;
+begin
+  // Shared RNG: reseed so this test block is deterministic regardless of
+  // neighbouring tests' draws.
+  RandSeed := 424242;
+
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    Gumbel := NN.AddLayer(TNNetGumbelSoftmax.Create(1.0, 0)) as TNNetGumbelSoftmax;
+
+    // In-place anneal: SetTemperature must update the stored tau (FFloatSt[0])
+    // live. The only public window onto FFloatSt[0] is the structure string,
+    // so assert the new tau surfaces there (proving the in-place update took)
+    // and survives a save/load round-trip.
+    Gumbel.SetTemperature(0.25);
+    Str1 := NN.SaveStructureToString();
+    AssertTrue('SetTemperature surfaces the new tau in the structure string',
+      Pos('::0.25;', Str1) > 0);
+
+    NN2.LoadStructureFromString(Str1);
+    GumbelReloaded := NN2.Layers[1] as TNNetGumbelSoftmax;
+    AssertEquals('Reloaded layer reports the SetTemperature tau in its struct '
+      + 'string', Str1, NN2.SaveStructureToString());
+
+    // tau <= 0 must fire the same guard the constructor uses.
+    Gumbel.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    Gumbel.SetTemperature(0.0);
+    AssertTrue('SetTemperature(0) must fire FErrorProc', Capture.Triggered);
+    AssertTrue('SetTemperature guard message mentions "tau"',
+      Pos('tau', Capture.Message) > 0);
+  finally
+    NN.Free;
+    NN2.Free;
+    Capture.Free;
   end;
 end;
 
