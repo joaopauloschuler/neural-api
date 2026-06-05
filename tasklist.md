@@ -72,7 +72,7 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [x] TNNetGraphAttention (GAT) follow-up to the landed TNNetGraphConvolution:
+- [X] TNNetGraphAttention (GAT) follow-up to the landed TNNetGraphConvolution:
       an ATTENTIONAL neighbour aggregator — replace the fixed Ahat weights with
       learned per-edge attention coefficients (LeakyReLU over a shared
       attentional vector applied to concatenated source/target node features,
@@ -84,7 +84,25 @@ rather than acted on.
       RandSeed := 424242, and an examples/GraphAttention/ arm contrasting GAT vs
       the plain GCN on the same SBM node-classification graph (does learned edge
       weighting help when the graph has noisy/heterophilous edges?).
-- [x] TNNetAffineGridSample — a differentiable bilinear grid-sampling layer, the
+- [ ] TNNetGraphAttention follow-up (single-head GAT layer + tests +
+      examples/GraphAttention/ bake-off all LANDED 2026-06-05): (a) MULTI-HEAD
+      GAT — K independent attention heads concatenated along the feature axis
+      (and averaged at the output layer per the paper), exposing a head-count
+      knob; reuse the single-head per-edge softmax already in
+      TNNetGraphAttention. (b) an edge-DROPOUT / attention-dropout regulariser on
+      the per-edge coefficients (the paper applies dropout to the normalized
+      attention) and a short ablation in the example showing it helps on the
+      noisy-edge SBM regime.
+- [ ] TNNetAffineGridSample follow-up (parameter-free bilinear sampler + both
+      backward paths + tests + examples/SpatialTransformer/ all LANDED
+      2026-06-05): the learned-resampling DOWNSAMPLER glimpse — restrict theta to
+      a learned crop/zoom (scale + translate, no rotation/shear) as an
+      attention-free "hard" visual-attention glimpse that reads a small canonical
+      patch from a larger input; contrast classifier accuracy reading the learned
+      glimpse vs a fixed center-crop of the same size on jittered/cluttered
+      digits. Reuse the landed sampler; the only new piece is the restricted
+      localization head + the larger-input → smaller-output wiring.
+- [X] TNNetAffineGridSample — a differentiable bilinear grid-sampling layer, the
       core of a Spatial Transformer Network (Jaderberg, Simonyan, Zisserman &
       Kavukcuoglu 2015, "Spatial Transformer Networks"). This opens a genuinely
       new capability for this tree: every existing spatial op (conv, pool,
