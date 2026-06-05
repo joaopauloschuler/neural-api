@@ -159,13 +159,22 @@ rather than acted on.
 - [ ] Neural ODE follow-ups (builder `TNNet.AddNeuralODEBlock` + `examples/NeuralODE/`
       landed 2026-05-31, Euler-only, trains via stored-activation backprop through the
       unrolled steps). Deferred:
-        - [ ] RK2/midpoint integrator behind an optional `Method` param (v1 Euler-only).
+        - [X] RK2/midpoint integrator behind an optional `Method` param (v1 Euler-only).
+              DONE 2026-06-05: `TNNetODEMethod = (odeEuler, odeMidpoint)`; 4-arg
+              `AddNeuralODEBlock` overload (3-arg delegates to odeEuler, bit-for-bit
+              unchanged). Midpoint reuses the step-1 shared weights for both f-evals →
+              zero extra params, count independent of Steps and Method.
+              Test: `TestNeuralODEBlockMidpoint`.
         - [ ] Adjoint-sensitivity O(1)-in-Steps backward (integrate the adjoint ODE
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
-        - [ ] 2-D trajectory ASCII-frame visualisation of the learned flow untangling
-              the two classes (the textbook Neural-ODE picture).
+        - [X] 2-D trajectory ASCII-frame visualisation of the learned flow untangling
+              the two classes (the textbook Neural-ODE picture). DONE 2026-06-05:
+              `RunTrajectoryViz` in examples/NeuralODE trains a 2-D (d_model=2)
+              odeMidpoint trunk on two interleaving half-moons and renders per-step
+              ASCII frames (half-moons, since a 2-D autonomous flow cannot unknot
+              concentric rings — that topological limit is noted in the README).
 - [ ] HyperNetwork demo + `TNNetHyperLinear` weight-generating layer
       (`examples/HyperNetwork/`) — reproduce the core Ha et al. 2016 "HyperNetworks"
       idea on a TINY pure-CPU multi-task target: a small "generator" net consumes a
@@ -331,9 +340,14 @@ rather than acted on.
 - [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
       `base ∈ {1e2, 1e3, 1e4, 1e5}`, chart loss and qualitative sample
       quality.
-- [ ] ALiBi slope-base sweep: vary slope from `2^(-8h/H)` to `2^(-kh/H)` for
+- [X] ALiBi slope-base sweep: vary slope from `2^(-8h/H)` to `2^(-kh/H)` for
       `k ∈ {4, 6, 8, 12}` on a tiny next-token task and chart loss.
-      Empirical check of the cargo-culted "8" constant.
+      Empirical check of the cargo-culted "8" constant. DONE 2026-06-05:
+      examples/ALiBiSlopeSweep/. Added a backward-compatible `TNNetALiBi.Create(Base)`
+      overload (default 8.0, serialized via Ft[0]) since the base was hard-coded.
+      On a recency-sensitive "copy-most-recent-vowel" task, the cargo-culted 8 is
+      BEATEN by k=4 and k=6 (gentler decay wins when the signal sits a few tokens
+      back) — 8 is a tunable knob, not sacred.
 - [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
       next-token task and chart loss + max-logit-norm.
@@ -354,9 +368,12 @@ rather than acted on.
 - [ ] Train-time vs inference-time delta sweep for the noise layers
       (TNNetDropout, TNNetDropPath, TNNetSpatialDropout1D/2D): same tiny
       classifier, sweep `p ∈ {0.0, 0.1, 0.2, 0.4}`, chart train vs val loss.
-- [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
+- [X] Numerical-gradient eps sweep: pick one well-tested layer, run the
       gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
-      max-error vs eps.
+      max-error vs eps. DONE 2026-06-05: examples/GradCheckEpsSweep/
+      (FullConnectLinear + Tanh head, fully deterministic, no RNG). Shows the
+      textbook U-curve; in FP32 the central-difference sweet spot lands at
+      eps≈1e-2..1e-3 (not 1e-8 as in FP64), explaining the suite's eps choice.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
