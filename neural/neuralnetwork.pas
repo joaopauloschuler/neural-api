@@ -1868,12 +1868,21 @@ type
   TNNetVectorQuantizer = class(TNNetIdentity)
   private
     FChosenIdx: array of integer; // cached argmin index per (X,Y) position
+    // Runtime codebook-usage probe (NOT serialized): how many times each code
+    // index has won an argmin across forward Compute() calls since the last
+    // ResetCodebookUsage. Exposes codebook collapse (only a few codes ever
+    // used) without touching the quantization math or any gradient.
+    FUsageCount: array of integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
     constructor Create(NumCodes: integer; Commitment: TNeuralFloat); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    // Codebook-usage diagnostics (runtime probe state, not saved/loaded).
+    procedure ResetCodebookUsage(); // zero every per-code selection counter
+    function ActiveCodeCount(): integer; // # distinct codes selected >= once
+    function CodebookUsageCount(Index: integer): integer; // wins for one code
   end;
 
   /// ArcFace additive angular-margin softmax output layer (Deng et al. 2019,
@@ -12930,6 +12939,9 @@ begin
   InitDefault();
   // One cached argmin index per spatial (X,Y) position.
   SetLength(FChosenIdx, FOutput.SizeX * FOutput.SizeY);
+  // One usage counter per code; allocate and zero (runtime probe, not saved).
+  SetLength(FUsageCount, K);
+  ResetCodebookUsage();
 end;
 
 procedure TNNetVectorQuantizer.Compute();
@@ -12971,6 +12983,10 @@ begin
       end;
       PosIdx := X * FOutput.SizeY + Y;
       FChosenIdx[PosIdx] := BestCode;
+      // Accumulate codebook-usage probe (pure bookkeeping: does not affect the
+      // quantization math, the cached argmin, or any gradient).
+      if (BestCode >= 0) and (BestCode < Length(FUsageCount)) then
+        Inc(FUsageCount[BestCode]);
       // Write the chosen code z_q into the output at this position.
       W := FNeurons[BestCode].FWeights;
       for I := 0 to D - 1 do
@@ -13035,6 +13051,31 @@ begin
   // added to the previous layer's error unchanged — z_q's gradient flows to
   // z_e as identity, like TNNetBitLinear treats round/clip in backward.
   inherited BackpropagateNoTest();
+end;
+
+procedure TNNetVectorQuantizer.ResetCodebookUsage();
+var
+  I: integer;
+begin
+  for I := 0 to Length(FUsageCount) - 1 do
+    FUsageCount[I] := 0;
+end;
+
+function TNNetVectorQuantizer.ActiveCodeCount(): integer;
+var
+  I: integer;
+begin
+  Result := 0;
+  for I := 0 to Length(FUsageCount) - 1 do
+    if FUsageCount[I] > 0 then Inc(Result);
+end;
+
+function TNNetVectorQuantizer.CodebookUsageCount(Index: integer): integer;
+begin
+  if (Index >= 0) and (Index < Length(FUsageCount)) then
+    Result := FUsageCount[Index]
+  else
+    Result := 0;
 end;
 
 { TNNetArcFace }

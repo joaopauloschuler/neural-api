@@ -543,10 +543,13 @@ rather than acted on.
       cross-batch EMA of assigned encoder vectors per code. Needs the same
       batch-aware loss hook logged for cross-batch InfoNCE / CenterLoss-EMA; track
       alongside those.
-- [ ] TNNetVectorQuantizer follow-up: report active-codebook usage (count of codes
+- [X] TNNetVectorQuantizer follow-up: report active-codebook usage (count of codes
       selected at least once over a probe batch) to expose codebook collapse — the
       headline VQ-VAE failure mode. Pairs with the open "VQ codebook collapse stress
       test" experiment and the `examples/VQAutoencoder/` demo below.
+      PROGRESS: added runtime probe ResetCodebookUsage/ActiveCodeCount/CodebookUsageCount
+      to TNNetVectorQuantizer (counter incremented in Compute, not serialized, math/grads
+      unchanged) + TestVectorQuantizerCodebookUsage regression test + examples/VQCodebookUsage.
 
 ### Training infrastructure (the "missing plumbing")
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper

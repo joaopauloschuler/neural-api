@@ -332,6 +332,7 @@ type
     procedure TestVectorQuantizerLoadFromString;
     procedure TestVectorQuantizerCommitmentGradient;
     procedure TestVectorQuantizerCodebookGradient;
+    procedure TestVectorQuantizerCodebookUsage;
     procedure TestMixtureOfDepthsRouterGradient;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
@@ -26422,6 +26423,83 @@ begin
     NN.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerCodebookUsage;
+const
+  cK = 5;
+  cD = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LVQ: TNNetVectorQuantizer;
+  i: integer;
+begin
+  // Codebook-usage probe: ResetCodebookUsage / ActiveCodeCount /
+  // CodebookUsageCount must track which code indices win argmin across forward
+  // passes (exposes codebook collapse) WITHOUT altering quantization. With
+  // 5 codes but inputs clustered near only codes 0 and 2, exactly two distinct
+  // codes get used.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cD, 1));
+    LVQ := TNNetVectorQuantizer.Create(cK, 0.25);
+    NN.AddLayer(LVQ);
+
+    // Five well-separated codes.
+    LVQ.Neurons[0].Weights.Raw[0] :=  0.0; LVQ.Neurons[0].Weights.Raw[1] :=  0.0;
+    LVQ.Neurons[1].Weights.Raw[0] := 10.0; LVQ.Neurons[1].Weights.Raw[1] := 10.0;
+    LVQ.Neurons[2].Weights.Raw[0] := -8.0; LVQ.Neurons[2].Weights.Raw[1] := -8.0;
+    LVQ.Neurons[3].Weights.Raw[0] := 20.0; LVQ.Neurons[3].Weights.Raw[1] :=  0.0;
+    LVQ.Neurons[4].Weights.Raw[0] :=  0.0; LVQ.Neurons[4].Weights.Raw[1] := 20.0;
+
+    // Fresh layers start with zeroed counters.
+    AssertEquals('VQ usage starts at zero', 0, LVQ.ActiveCodeCount());
+
+    // Drive several forward passes near codes 0 and 2 only (ground truth: 2).
+    LVQ.ResetCodebookUsage();
+    for i := 0 to 2 do
+    begin
+      Input[0, 0, 0] := 0.1; Input[0, 0, 1] := -0.2; NN.Compute(Input); // code 0
+    end;
+    for i := 0 to 3 do
+    begin
+      Input[0, 0, 0] := -7.6; Input[0, 0, 1] := -8.3; NN.Compute(Input); // code 2
+    end;
+
+    AssertEquals('VQ active code count = 2 distinct winners', 2,
+      LVQ.ActiveCodeCount());
+    AssertEquals('VQ code 0 used 3 times', 3, LVQ.CodebookUsageCount(0));
+    AssertEquals('VQ code 2 used 4 times', 4, LVQ.CodebookUsageCount(2));
+    AssertEquals('VQ unused code 1 has zero count', 0,
+      LVQ.CodebookUsageCount(1));
+    AssertEquals('VQ unused code 3 has zero count', 0,
+      LVQ.CodebookUsageCount(3));
+    // Out-of-range index is safe and returns 0.
+    AssertEquals('VQ out-of-range usage is zero', 0,
+      LVQ.CodebookUsageCount(cK));
+
+    // Reset zeroes everything.
+    LVQ.ResetCodebookUsage();
+    AssertEquals('VQ reset zeroes active count', 0, LVQ.ActiveCodeCount());
+    AssertEquals('VQ reset zeroes per-code count', 0,
+      LVQ.CodebookUsageCount(0));
+
+    // Collapse signal: all inputs near one code => ActiveCodeCount = 1.
+    for i := 0 to 9 do
+    begin
+      Input[0, 0, 0] := 9.7; Input[0, 0, 1] := 10.2; NN.Compute(Input); // code 1
+    end;
+    AssertEquals('VQ collapse to one code => active count 1', 1,
+      LVQ.ActiveCodeCount());
+    AssertEquals('VQ collapsed code 1 used 10 times', 10,
+      LVQ.CodebookUsageCount(1));
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

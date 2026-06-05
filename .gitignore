@@ -16,6 +16,7 @@ tests/RunTests
 examples/ActivationBakeoff/ActivationBakeoff
 examples/BeamSearchDecode/BeamSearchDecode
 examples/LotteryTicketIMP/LotteryTicketIMP
+examples/VQCodebookUsage/VQCodebookUsage
 link*.res
 autosave.csv
 autosave.nn
