@@ -127,6 +127,8 @@ type
 
       property Weights: TNNetVolume read FWeights;
       property Bias: TNeuralFloat read FBiasWeight;
+      property BiasWeight: TNeuralFloat read FBiasWeight write FBiasWeight;
+      property BiasDelta: TNeuralFloat read FBiasDelta;
       property BackInertia: TNNetVolume read FBackInertia;
       property Delta: TNNetVolume read FDelta;
   end;
@@ -4929,6 +4931,69 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+  end;
+
+  // Spectral Graph Convolutional Network layer (Kipf & Welling 2017,
+  // "Semi-Supervised Classification with Graph Convolutional Networks").
+  //
+  // The input is modelled as a graph signal of shape (NumNodes, 1, FeatureDim):
+  // one length-FeatureDim feature vector per node, laid out along the Depth axis.
+  // The layer computes the GCN propagation rule
+  //
+  //     H' = Ahat * (H * W) (+ bias)
+  //
+  // in two steps:
+  //   (1) a per-NODE learned linear map  Z = H*W (+bias) over the FEATURE axis.
+  //       This reuses the POINTWISE / 1x1-conv weight layout and gradient path
+  //       (one neuron per OUTPUT feature, each holding FeatureDim_in weights +
+  //       a scalar bias). It does NOT FullConnect: every node sees the SAME W
+  //       and nodes are never mixed by W.
+  //   (2) neighbour aggregation Y = Ahat * Z, a left-multiply by the constant
+  //       symmetrically-normalized adjacency Ahat (NumNodes x NumNodes); this is
+  //       the only step that mixes ACROSS nodes.
+  //
+  // ADJACENCY: Ahat = D^-1/2 (A + I) D^-1/2 is built ONCE from the raw 0/1
+  // adjacency A (WITHOUT self-loops) supplied by the caller via SetAdjacency;
+  // the layer adds the self-loop identity I and symmetrically normalizes
+  // internally. Ahat is a FIXED buffer (no gradient flows into it) and is held
+  // in FAhat (NumNodes x NumNodes). SetAdjacency MUST be called before the first
+  // forward pass; if it was never called, or NumNodes disagrees with the input,
+  // the layer raises via FErrorProc.
+  //
+  // STORAGE / SERIALIZATION: the learned operator is exactly the pointwise W +
+  // bias, stored in the standard per-output-feature neuron layout, so it
+  // round-trips through the ordinary per-neuron SaveDataToString /
+  // LoadDataFromString with no custom serialization (FStruct[0]=output
+  // FeatureDim, FStruct[3]=suppress-bias). The ADJACENCY IS CALLER-SUPPLIED AND
+  // IS NOT PERSISTED: after LoadFromString the caller must call SetAdjacency
+  // again before computing (see the comment near SaveToString contract below).
+  //
+  // BACKWARD: Ahat is constant and SYMMETRIC, so the aggregation step's backward
+  // just left-multiplies the incoming error by Ahat^T = Ahat:
+  //     dL/dZ = Ahat * dL/dY
+  // and then the error flows back through the pointwise linear map exactly as a
+  // 1x1 conv / pointwise FullConnect would (input gradient via W^T, weight
+  // gradient via the node-summed outer product, bias gradient via the
+  // node-summed error).
+  // Coded by Claude (AI).
+  TNNetGraphConvolution = class(TNNetFullConnectLinear)
+  private
+    FAhat: TNNetVolume;     // constant symm-normalized adjacency (NumNodes x NumNodes)
+    FNumNodes: integer;     // number of graph nodes (rows of the input signal)
+    FInFeat: integer;       // input feature dimension (Depth of the input)
+    FAggIn: TNNetVolume;    // cached Z = H*W (+bias) of the last forward (pre-aggregation)
+    FAggErr: TNNetVolume;   // scratch for dL/dZ = Ahat*dL/dY during backward
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure SetAdjacency(A: TNNetVolume);
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
   end;
 
   // Highway-network layer (Srivastava, Greff & Schmidhuber 2015, "Training Very
@@ -30388,6 +30453,264 @@ begin
   end;
 end;
 
+{ TNNetGraphConvolution }
+
+constructor TNNetGraphConvolution.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  // pDepth is the OUTPUT feature dimension; the spatial map is collapsed to
+  // (1,1) at construction (the true node count is learned from the input in
+  // SetPrevLayer). The base FullConnect ctor lays down pDepth neurons which we
+  // reuse one-per-output-feature (pointwise layout).
+  inherited Create(1, 1, pDepth, pSuppressBias);
+  FAhat := TNNetVolume.Create();
+  FAggIn := TNNetVolume.Create();
+  FAggErr := TNNetVolume.Create();
+  FNumNodes := 0;
+  FInFeat := 0;
+end;
+
+constructor TNNetGraphConvolution.Create(pNumFeatures: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(1, 1, pNumFeatures, pSuppressBias);
+end;
+
+destructor TNNetGraphConvolution.Destroy();
+begin
+  FAhat.Free;
+  FAggIn.Free;
+  FAggErr.Free;
+  inherited Destroy();
+end;
+
+// Build and store Ahat = D^-1/2 (A + I) D^-1/2 from the raw 0/1 adjacency A
+// (NumNodes x NumNodes, WITHOUT self-loops). The self-loop identity and the
+// symmetric normalization are applied here. Ahat is constant (no gradient) and
+// is NOT serialized: re-call SetAdjacency after LoadFromString.
+procedure TNNetGraphConvolution.SetAdjacency(A: TNNetVolume);
+var
+  N, i, j: integer;
+  Deg: array of TNeuralFloat;
+  InvSqrt: array of TNeuralFloat;
+  Aij, Sum: TNeuralFloat;
+begin
+  if A.SizeX <> A.SizeY then
+    FErrorProc('TNNetGraphConvolution.SetAdjacency requires a square adjacency, got '+
+      IntToStr(A.SizeX)+'x'+IntToStr(A.SizeY)+'.');
+  N := A.SizeX;
+  FNumNodes := N;
+  FAhat.ReSize(N, N, 1);
+  SetLength(Deg, N);
+  SetLength(InvSqrt, N);
+  // Degrees of (A + I): row sums including the added self-loop.
+  for i := 0 to N - 1 do
+  begin
+    Sum := 1; // the +I self-loop
+    for j := 0 to N - 1 do
+      if i <> j then
+        Sum := Sum + A.FData[A.GetRawPos(i, j, 0)];
+    Deg[i] := Sum;
+    if Sum > 0 then InvSqrt[i] := 1.0 / Sqrt(Sum) else InvSqrt[i] := 0;
+  end;
+  for i := 0 to N - 1 do
+    for j := 0 to N - 1 do
+    begin
+      if i = j then
+        Aij := 1 // (A + I) diagonal
+      else
+        Aij := A.FData[A.GetRawPos(i, j, 0)];
+      FAhat.FData[FAhat.GetRawPos(i, j, 0)] := InvSqrt[i] * Aij * InvSqrt[j];
+    end;
+end;
+
+procedure TNNetGraphConvolution.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N: integer;
+begin
+  // The input signal is (NumNodes, 1, FeatureDim_in). Each output-feature neuron
+  // holds FeatureDim_in pointwise weights + a scalar bias (the 1x1-conv layout).
+  // Bypass TNNetFullConnect.SetPrevLayer (it would size each neuron to the WHOLE
+  // flattened input, mixing nodes).
+  FPrevLayer := pPrevLayer;
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetGraphConvolution expects a (NumNodes,1,FeatureDim) input; SizeY must be 1, got '+
+      IntToStr(pPrevLayer.Output.SizeY)+'.');
+  FNumNodes := pPrevLayer.Output.SizeX;
+  FInFeat := pPrevLayer.Output.Depth;
+  // Output is (NumNodes, 1, OutFeat).
+  FOutput.ReSize(FNumNodes, 1, FOutput.Depth);
+  FOutputRaw.ReSize(FNumNodes, 1, FOutput.Depth);
+  FOutputError.ReSize(FNumNodes, 1, FOutput.Depth);
+  FOutputErrorDeriv.ReSize(FNumNodes, 1, FOutput.Depth);
+  FAggIn.ReSize(FNumNodes, 1, FOutput.Depth);
+  FAggErr.ReSize(FNumNodes, 1, FOutput.Depth);
+  N := FInFeat;
+  SetNumWeightsForAllNeurons(N);
+  FVectorSize := FNeurons[0].Weights.Size;
+  InitDefault();
+  BuildArrNeurons();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetGraphConvolution.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward, two steps:
+//   (1) per-node pointwise map  Z[n,f] = bias[f] + sum_g W[f,g] * H[n,g]
+//   (2) aggregation             Y[i,f] = sum_n Ahat[i,n] * Z[n,f]
+procedure TNNetGraphConvolution.ComputeCPU();
+var
+  OutFeat, NodeIdx, FeatOut, InIdx, NbrIdx: integer;
+  Acc: TNeuralFloat;
+  Neuron: TNNetNeuron;
+  PrevOut: TNNetVolume;
+  AhatVal: TNeuralFloat;
+begin
+  if (FAhat.Size = 0) or (FNumNodes = 0) then
+    FErrorProc('TNNetGraphConvolution: SetAdjacency must be called before Compute.');
+  if FAhat.SizeX <> FPrevLayer.Output.SizeX then
+    FErrorProc('TNNetGraphConvolution: adjacency NumNodes ('+IntToStr(FAhat.SizeX)+
+      ') does not match input NumNodes ('+IntToStr(FPrevLayer.Output.SizeX)+').');
+  OutFeat := FOutput.Depth;
+  PrevOut := FPrevLayer.FOutput;
+  // (1) pointwise linear map into FAggIn.
+  for NodeIdx := 0 to FNumNodes - 1 do
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      Neuron := FArrNeurons[FeatOut];
+      Acc := 0;
+      for InIdx := 0 to FInFeat - 1 do
+        Acc := Acc + Neuron.FWeights.FData[InIdx] *
+          PrevOut.FData[NodeIdx * FInFeat + InIdx];
+      if FSuppressBias = 0 then Acc := Acc + Neuron.FBiasWeight;
+      FAggIn.FData[NodeIdx * OutFeat + FeatOut] := Acc;
+    end;
+  // (2) neighbour aggregation  Y = Ahat * Z.
+  for NodeIdx := 0 to FNumNodes - 1 do
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      Acc := 0;
+      for NbrIdx := 0 to FNumNodes - 1 do
+      begin
+        AhatVal := FAhat.FData[NodeIdx * FNumNodes + NbrIdx];
+        if AhatVal <> 0.0 then
+          Acc := Acc + AhatVal * FAggIn.FData[NbrIdx * OutFeat + FeatOut];
+      end;
+      FOutput.FData[NodeIdx * OutFeat + FeatOut] := Acc;
+    end;
+  // Linear activation: raw output equals output.
+  FOutputRaw.Copy(FOutput);
+end;
+
+procedure TNNetGraphConvolution.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    // dL/dZ = Ahat^T * dL/dY = Ahat * dL/dY (Ahat is symmetric). Computed once
+    // here and reused by both the weight-gradient and the input-gradient paths.
+    FAggErr.Fill(0);
+    BackpropagateCPU();   // computes FAggErr and the weight/bias gradients
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Aggregation backward + weight/bias gradients.
+//   dL/dZ[m,f] = sum_i Ahat[i,m] * dL/dY[i,f]     (Ahat symmetric)
+//   dL/dW[f,g] = sum_m dL/dZ[m,f] * H[m,g]
+//   dL/dbias[f] = sum_m dL/dZ[m,f]
+procedure TNNetGraphConvolution.BackpropagateCPU();
+var
+  OutFeat, NodeIdx, FeatOut, NbrIdx, InIdx: integer;
+  Err, AhatVal, dZ, Scale: TNeuralFloat;
+  Neuron: TNNetNeuron;
+  PrevOut: TNNetVolume;
+begin
+  OutFeat := FOutput.Depth;
+  PrevOut := FPrevLayer.FOutput;
+  // dL/dZ = Ahat * dL/dY (stored in FAggErr).
+  for NodeIdx := 0 to FNumNodes - 1 do          // m
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      dZ := 0;
+      for NbrIdx := 0 to FNumNodes - 1 do       // i
+      begin
+        AhatVal := FAhat.FData[NbrIdx * FNumNodes + NodeIdx]; // Ahat[i,m]
+        if AhatVal <> 0.0 then
+        begin
+          Err := FOutputError.FData[NbrIdx * OutFeat + FeatOut];
+          dZ := dZ + AhatVal * Err;
+        end;
+      end;
+      FAggErr.FData[NodeIdx * OutFeat + FeatOut] := dZ;
+    end;
+  if FLearningRate = 0.0 then exit;
+  Scale := -FLearningRate;
+  // Accumulate weight/bias deltas (the standard inertia/Adam update consumes
+  // these, so they carry the -LearningRate factor like the rest of the tree).
+  for FeatOut := 0 to OutFeat - 1 do
+  begin
+    Neuron := FArrNeurons[FeatOut];
+    for NodeIdx := 0 to FNumNodes - 1 do
+    begin
+      dZ := FAggErr.FData[NodeIdx * OutFeat + FeatOut];
+      if dZ <> 0.0 then
+      begin
+        for InIdx := 0 to FInFeat - 1 do
+          Neuron.FDelta.FData[InIdx] := Neuron.FDelta.FData[InIdx] +
+            Scale * dZ * PrevOut.FData[NodeIdx * FInFeat + InIdx];
+        if FSuppressBias = 0 then
+          Neuron.FBiasDelta := Neuron.FBiasDelta + Scale * dZ;
+      end;
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for FeatOut := 0 to OutFeat - 1 do
+      FArrNeurons[FeatOut].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
+// Input gradient through the pointwise map:
+//   dL/dH[m,g] = sum_f dL/dZ[m,f] * W[f,g]
+procedure TNNetGraphConvolution.ComputePreviousLayerErrorCPU();
+var
+  OutFeat, NodeIdx, FeatOut, InIdx: integer;
+  dZ: TNeuralFloat;
+  Neuron: TNNetNeuron;
+  LocalPrevError: TNNetVolume;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  OutFeat := FOutput.Depth;
+  for NodeIdx := 0 to FNumNodes - 1 do
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      dZ := FAggErr.FData[NodeIdx * OutFeat + FeatOut];
+      if dZ <> 0.0 then
+      begin
+        Neuron := FArrNeurons[FeatOut];
+        for InIdx := 0 to FInFeat - 1 do
+          LocalPrevError.FData[NodeIdx * FInFeat + InIdx] :=
+            LocalPrevError.FData[NodeIdx * FInFeat + InIdx] +
+            dZ * Neuron.FWeights.FData[InIdx];
+      end;
+    end;
+end;
+
 { TNNetHighway }
 
 constructor TNNetHighway.Create(pSizeX, pSizeY, pDepth: integer;
@@ -52898,6 +53221,7 @@ begin
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
       'TNNetHighway' :              Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
@@ -53199,6 +53523,7 @@ begin
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetHighway' then Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
