@@ -251,7 +251,7 @@ rather than acted on.
 - [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
 ### Added ideas
-- [ ] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
+- [X] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
       attribution via TracIn-CP (Pruthi et al. 2020, "Estimating Training Data
       Influence by Tracing Gradient Descent"). Answers a question NOTHING in the
       tree currently answers: "which TRAINING examples are most responsible for
@@ -291,6 +291,23 @@ rather than acted on.
       from every existing `TNNet.*Report` (none touch the training set) and a
       natural companion to the landed Mahalanobis-OOD / ConformalPrediction
       data-quality tooling.
+      LANDED 2026-06-05: shipped `examples/TracInfluence/` (TracInfluence.lpr +
+      .lpi + README.md) as an example-only **TracInLast** demo — single
+      checkpoint (final trained weights only), influence = a single gradient-dot
+      similarity `<grad_loss(z_train), grad_loss(z_test)>`. The one true unknown
+      is CONFIRMED: per-sample weight gradients read out cleanly under
+      `SetBatchUpdate(true)` via `Neuron.Delta` (divided back out by the layer
+      LR; bias delta is private so omitted — weights alone rank fine), exactly
+      the `FisherImportanceReport`/`GradientConflictReport` idiom; net is frozen
+      (never `UpdateWeights`). Graded self-check: plants ONE mislabel
+      (class-0 boundary point flipped to class 1) on a 300-point 2-D blob task
+      and ASSERTS it lands in the top-K most-negative opponents — it comes out
+      as the single most-negative opponent (the ONLY training point with
+      negative influence), printing top-K proponents/opponents + a PASS line.
+      Runs in <1s. DEFERRED: multi-checkpoint TracIn-CP summation (single
+      checkpoint already gives a clean, unambiguous ranking on the toy, logged
+      honestly in the README) and a reusable `TNNet.TracInReport` method (the
+      inline gradient-dot logic in the example was enough; no new class added).
 
 ### Ideas from JP
 - [ ] Better integrate TBytePredictionViaNNet and TEasyBytePredictionViaNNet with
