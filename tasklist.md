@@ -499,20 +499,6 @@ rather than acted on.
 - [ ] TNNetReversibleBlock follow-up: stack N reversible blocks into a deep net
       and show constant activation memory vs a plain residual stack of equal depth
       (the headline RevNet scaling claim) — depends on the recompute path above.
-- [x] TNNetWeightStandardization follow-up: a CONVOLUTION variant
-      (standardize a conv layer's filters per output channel). LANDED as
-      TNNetWeightStandardizationConv (subclass of TNNetConvolutionLinear in
-      neuralnetwork.pas; standardizes each output channel's full filter to
-      zero-mean/unit-std before the convolution, exact per-output-channel
-      standardization Jacobian in backward, both CreateLayer dispatch points
-      + eps in FFloatSt[0] for round-trip). Tests in
-      tests/TestNeuralNumerical.pas: forward per-filter mean≈0/std≈1 smoke,
-      finite-difference vs analytic input+weight gradient check, save/load
-      round-trip. Bake-off at examples/WeightStandardizationConv/ (WS+GroupNorm
-      vs AddMovingNorm-BatchNorm on a tiny synthetic small-batch image task,
-      pure CPU ~65 s, graded PASS/FAIL: both train to a healthy classifier and
-      WS+GroupNorm is competitive — MATCHES BatchNorm within tolerance on this
-      easy toy).
 - [ ] TNNetSpectralNorm — CONVOLUTION variant (still open). The dense wrapper
       landed; add a convolution-layer spectral-norm wrapper (largest singular
       value of the flattened conv weight matrix per output channel / full
@@ -580,18 +566,6 @@ rather than acted on.
       sub-block inside the layer (or a builder that wires an SE-style squeeze
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
-- [x] TNNetBitLinear follow-up: activation-quantization variant — LANDED
-      2026-06-05. Added an opt-in activation-quant flag on TNNetBitLinear
-      (FStruct[4], default OFF). Forward rounds the layer INPUT through a
-      per-token absmax int8 quantization (scale=absmax(x)/127,
-      x_q=round(clip(x/scale,-127,+127))*scale) before the ternary matmul;
-      backward STE-passes the input gradient unchanged. New 5-arg constructor
-      Create(SizeX,SizeY,Depth,SuppressBias,QuantizeActivation) and the flag
-      round-trips through SaveStructureToString/LoadFromString (old 4-field
-      strings load with the flag OFF). Tests in TestNeuralNumerical.pas
-      (forward int8 quantization, STE input-gradient, save/load + backward-
-      compat) and a third "fully-quantized" arm added to
-      examples/BitLinearBakeoff (99.67% test acc, 0.00-pt gap vs FP).
 #### Probability projections / sparsity
 - [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
       micro-experiment — train a tiny discrete-latent autoencoder whose
