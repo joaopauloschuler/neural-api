@@ -108,6 +108,15 @@ identity (`y(0) = -0.705`, not `0`) — and it fits the wiggly target to a much
 lower MSE. That is the KAN fixed-width / matched-param win, achieved here with a
 strikingly **sparse** solution (one active channel).
 
+## See also
+
+[KANLayer](../KANLayer) is the **weight-space** counterpart: instead of a
+per-channel learnable *activation*, it uses the true Kolmogorov-Arnold *dense
+layer* `TNNetKANLayer`, where every input→output **edge** carries its own learned
+Chebyshev univariate function `phi_{ij}(x)`. The two examples run the same wiggly
+1D fit at matched parameter count, so activation-KAN and layer-KAN can be read
+side by side.
+
 ## Build & run
 
 ```
