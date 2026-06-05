@@ -108,6 +108,7 @@ type
     procedure TestFisherImportanceReportSmoke;
     procedure TestLinearProbeReportSmoke;
     procedure TestLogitLensReportSmoke;
+    procedure TestTunedLensReportSmoke;
     procedure TestFeatureSeparabilityReportSmoke;
     procedure TestRepresentationSimilarityReportSmoke;
     procedure TestEnableInputGradient;
@@ -3005,6 +3006,137 @@ begin
     AssertTrue('single-head note present',
       Pos('single-layer head', Report) > 0);
     AssertTrue('single-head still PASSes', Pos('PASS', Report) > 0);
+  finally
+    Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestTunedLensReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  X, Y: TNNetVolume;
+  Report: string;
+  I, C, Ep, B, Cls: integer;
+  PStart, PEnd: integer;
+  KLPreStr, KLPostStr: string;
+  KLPre, KLPost: TNeuralFloat;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-1.5, -1.5), (1.5, 1.5), (1.5, -1.5));
+begin
+  // Shared-RNG safety (this unit reseeds before order-sensitive tests).
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN / empty probes handled gracefully.
+  Report := TNNet.TunedLensReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    Report := TNNet.TunedLensReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Train so the early layers genuinely differ from the final answer (gives
+    // the tuned lens room to win).
+    for Ep := 1 to 60 do
+      for B := 1 to 40 do
+      begin
+        Cls := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        Y.Fill(0); Y.Raw[Cls] := 1.0;
+        X.FData[0] := Centers[Cls][0] + (Random - 0.5);
+        X.FData[1] := Centers[Cls][1] + (Random - 0.5);
+        NN.Compute(X);
+        NN.Backpropagate(Y);
+        X.Free; Y.Free;
+      end;
+
+    // Unlabelled probe batch.
+    for C := 0 to 2 do
+      for I := 1 to 30 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Probes.Add(X);
+      end;
+
+    Report := TNNet.TunedLensReport(NN, Probes, -1, 600, 0.005);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('TunedLensReport', Report) > 0);
+    AssertTrue('side-by-side table present', Pos('tunedKL', Report) > 0);
+    AssertTrue('KL curve present', Pos('logit lens (.) vs TUNED', Report) > 0);
+    AssertTrue('SKIPPED section present', Pos('SKIPPED layers', Report) > 0);
+    AssertTrue('input layer reported as SKIPPED', Pos('TNNetInput', Report) > 0);
+
+    // CORRECTNESS SIGNAL 1: an UNTRAINED translator does NO better than the raw
+    // logit lens (check 1 PASSes).
+    AssertTrue('correctness check 1 present',
+      Pos('Correctness check 1', Report) > 0);
+    AssertTrue('untrained translator ties the raw lens (no free lunch)',
+      Pos('no free lunch before fitting', Report) > 0);
+
+    // CORRECTNESS SIGNAL: KL-to-final DECREASES after training (check 2 PASSes).
+    AssertTrue('correctness check 2 present',
+      Pos('Correctness check 2', Report) > 0);
+    AssertTrue('training lowered mean KL-to-final',
+      Pos('fitting the translators reduced', Report) > 0);
+
+    // Parse the untrained vs trained mean KL-to-final and assert trained <= pre.
+    PStart := Pos('UNTRAINED (identity) = ', Report);
+    AssertTrue('untrained mean KL token found', PStart > 0);
+    PStart := PStart + Length('UNTRAINED (identity) = ');
+    PEnd := PosEx(';', Report, PStart);
+    AssertTrue('untrained KL terminator found', PEnd > PStart);
+    KLPreStr := Trim(Copy(Report, PStart, PEnd - PStart));
+    KLPre := StrToFloatDef(KLPreStr, -1, FS);
+    AssertTrue('untrained mean KL parsed', KLPre >= 0);
+
+    PStart := Pos('tuned lens TRAINED = ', Report);
+    AssertTrue('trained mean KL token found', PStart > 0);
+    PStart := PStart + Length('tuned lens TRAINED = ');
+    PEnd := PosEx('.', Report, PStart);
+    // grab the full float (digits + one dot + digits)
+    PEnd := PosEx(' ', Report, PStart);
+    if PEnd <= PStart then PEnd := Length(Report);
+    KLPostStr := Trim(Copy(Report, PStart, PEnd - PStart));
+    while (Length(KLPostStr) > 0) and
+          not (KLPostStr[Length(KLPostStr)] in ['0'..'9']) do
+      KLPostStr := Copy(KLPostStr, 1, Length(KLPostStr) - 1);
+    KLPost := StrToFloatDef(KLPostStr, -1, FS);
+    AssertTrue('trained mean KL parsed', KLPost >= 0);
+    AssertTrue('trained KL-to-final <= untrained KL-to-final',
+      KLPost <= KLPre + 1e-6);
+    AssertTrue('training strictly lowered KL on a trained net (tuned wins)',
+      KLPost < KLPre);
+
+    // CORRECTNESS SIGNAL 2: at the LAST compatible layer (head input) the
+    // translator collapses to identity => tuned == logit == final (check 3).
+    AssertTrue('correctness check 3 present',
+      Pos('Correctness check 3', Report) > 0);
+    AssertTrue('head-input tuned==logit==final (identity translator)',
+      Pos('reproduces the final distribution exactly', Report) > 0);
+
+    // Headline Belrose verdict must hold on a trained net.
+    AssertTrue('HEADLINE: tuned lens beats the raw lens',
+      Pos('the Belrose result', Report) > 0);
   finally
     Probes.Free;
     NN.Free;

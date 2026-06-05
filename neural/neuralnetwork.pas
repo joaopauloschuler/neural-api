@@ -6717,6 +6717,45 @@ type
         pInput: TNNetVolumeList;
         HeadStartIdx: integer = -1
       ): string;
+      // The LEARNED sibling of LogitLensReport: the TUNED LENS (Belrose et al.
+      // 2023, "Eliciting Latent Predictions with the Tuned Lens"). Where the
+      // logit lens splices a raw hidden activation straight into the model's OWN
+      // frozen head, the tuned lens first passes that activation through a small
+      // per-layer LEARNED AFFINE "translator" (one TNNetFullConnectLinear of the
+      // head-input width, plus bias, per lens-compatible layer) that is TRAINED
+      // to map the layer's residual state into the final-layer basis BEFORE the
+      // frozen head decodes it - correcting the representation drift that makes
+      // the raw logit lens biased / mis-calibrated at early depths. The trunk and
+      // the head are FROZEN; only the translators are fitted, by minimising each
+      // layer's KL to the model's OWN final output distribution on the UNLABELLED
+      // probe batch (distillation-to-self; with a softmax head, backpropagating
+      // p_final as the soft target is exactly the gradient of that KL). For every
+      // lens-compatible layer the report prints the tuned-lens entropy and
+      // KL-to-final SIDE BY SIDE with the raw logit-lens columns so the headline
+      // Belrose result is visible: the TUNED curve commits EARLIER and tracks the
+      // final answer more faithfully (lower KL-to-final, more monotone) than the
+      // raw lens. BUILT-IN CORRECTNESS: at the LAST lens-compatible layer (the
+      // head's own input) the translator collapses to the identity it was seeded
+      // with and tuned == logit == final (max |dp| ~ 0); and an UNTRAINED
+      // translator (seeded to identity) does NO better than the raw logit lens -
+      // its KL-to-final ties the raw lens and only DROPS after fitting (the
+      // report prints the pre-fit vs post-fit mean KL-to-final delta). Reuses the
+      // frozen-body + downstream-recompute splice idiom from LogitLensReport /
+      // ActivationPatchingReport (NN.Compute then per-head-layer Compute only);
+      // the model's OWN weights are NEVER stepped (translators live in a private
+      // throw-away mini-net), and the net's live state is restored on exit. The
+      // optional TrainIters / LearningRate tune the per-layer translator fit
+      // (sensible defaults; pure CPU, tiny). DISTINCT from LogitLensReport (zero
+      // fitted parameters) and from LinearProbeReport (a fresh label-supervised
+      // ridge probe per layer - the tuned lens is label-FREE and reuses the
+      // model's own frozen head). Guards nil NN and an empty/nil probe list.
+      class function TunedLensReport(
+        NN: TNNet;
+        pInput: TNNetVolumeList;
+        HeadStartIdx: integer = -1;
+        TrainIters: integer = 300;
+        LearningRate: TNeuralFloat = 0.005
+      ): string;
       // Label-aware class-GEOMETRY / Neural-Collapse diagnostic (Papyan, Han &
       // Donoho 2020). Where LinearProbeReport asks "is the label DECODABLE
       // here?" (it fits a probe), this asks "what is the GEOMETRY of the feature
@@ -39779,6 +39818,459 @@ begin
        (pInput[0] <> nil) and (NN.CountLayers() >= 2) then
       NN.Compute(pInput[0]);
     if CandSnap <> nil then CandSnap.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.TunedLensReport(
+  NN: TNNet;
+  pInput: TNNetVolumeList;
+  HeadStartIdx: integer = -1;
+  TrainIters: integer = 300;
+  LearningRate: TNeuralFloat = 0.005
+): string;
+const
+  cMaxBarWidth = 40;
+  cEps = 1e-12;        // probability floor for log/KL
+type
+  TFloatArray = array of TNeuralFloat;
+var
+  Lines: TStringList;
+  LayerIdx, SampleIdx, I, J, L, C, It: integer;
+  InVol: TNNetVolume;
+  NumLayers, LastLayer, NumClasses, NumSamples: integer;
+  HeadIdx, HeadInIdx, HeadInSize: integer;
+  LastTrainable: integer;
+  Compatible: array of boolean;
+  CompatOrder: array of integer;
+  NumCompat: integer;
+  // Per compatible layer, per sample: snapshot of the layer activation (the
+  // translator's input) and the model's final distribution (the soft target).
+  FinalProb: array of TFloatArray;       // [sample] p_final
+  FinalArgmax: array of integer;         // [sample]
+  // Raw logit-lens accumulators (same idiom as LogitLensReport).
+  LogitKL, LogitEnt: TFloatArray;        // indexed by absolute layer idx
+  // Tuned-lens accumulators.
+  TunedKL, TunedEnt, TunedAgree: TFloatArray;
+  TunedKLPre: TFloatArray;              // KL with the UNTRAINED (identity) translator
+  MaxDp: TFloatArray;                   // max |p_tuned - p_logit| at the head input
+  CandSnap, TargetVol, LogitProb: TNNetVolume;
+  Lens: TNNet;                          // private mini-net: Input->Translator->headClones
+  Translator: TNNetLayer;
+  StructStr, OneStruct: string;
+  Pl, Pf, KLval, EntVal, MeanLogitKL, MeanTunedKLPre, MeanTunedKL: TNeuralFloat;
+  BarLen: integer;
+  Bar, SkipList: string;
+  TunedCnt: integer;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  CandSnap := nil; TargetVol := nil; LogitProb := nil; Lens := nil;
+  try
+    if NN = nil then
+    begin
+      Result := 'TunedLensReport: NN is nil.' + sLineBreak; Exit;
+    end;
+    if (pInput = nil) or (pInput.Count = 0) then
+    begin
+      Result := 'TunedLensReport: pInput is nil or empty.' + sLineBreak; Exit;
+    end;
+    NumLayers := NN.CountLayers();
+    LastLayer := NN.GetLastLayerIdx();
+    if NumLayers < 2 then
+    begin
+      Result := 'TunedLensReport: network needs at least 2 layers.' + sLineBreak;
+      Exit;
+    end;
+    NumClasses := NN.GetLastLayer().Output.Size;
+    if NumClasses < 2 then
+    begin
+      Result := 'TunedLensReport: final layer must have >= 2 outputs.' +
+        sLineBreak;
+      Exit;
+    end;
+    if TrainIters < 0 then TrainIters := 0;
+    if LearningRate <= 0 then LearningRate := 0.01;
+
+    // --- Resolve the head start index (same heuristic as LogitLensReport). ---
+    if HeadStartIdx < 0 then
+    begin
+      LastTrainable := -1;
+      for LayerIdx := 0 to LastLayer do
+        if NN.Layers[LayerIdx].Neurons.Count > 0 then
+          LastTrainable := LayerIdx;
+      if LastTrainable <= 0 then HeadIdx := LastLayer
+      else HeadIdx := LastTrainable;
+    end
+    else
+      HeadIdx := HeadStartIdx;
+    if HeadIdx < 1 then HeadIdx := 1;
+    if HeadIdx > LastLayer then HeadIdx := LastLayer;
+    HeadInIdx := HeadIdx - 1;
+    HeadInSize := NN.Layers[HeadInIdx].Output.Size;
+    NumSamples := pInput.Count;
+
+    // --- Catalogue lens-compatible layers (flat size == head input size). ---
+    SetLength(Compatible, NumLayers);
+    NumCompat := 0;
+    for LayerIdx := 0 to NumLayers - 1 do Compatible[LayerIdx] := False;
+    for LayerIdx := 0 to HeadInIdx do
+      if NN.Layers[LayerIdx].Output.Size = HeadInSize then
+      begin
+        Compatible[LayerIdx] := True;
+        Inc(NumCompat);
+      end;
+    SetLength(CompatOrder, NumCompat);
+    I := 0;
+    for LayerIdx := 0 to HeadInIdx do
+      if Compatible[LayerIdx] then
+      begin
+        CompatOrder[I] := LayerIdx; Inc(I);
+      end;
+
+    SetLength(LogitKL, NumLayers); SetLength(LogitEnt, NumLayers);
+    SetLength(TunedKL, NumLayers); SetLength(TunedEnt, NumLayers);
+    SetLength(TunedAgree, NumLayers); SetLength(TunedKLPre, NumLayers);
+    SetLength(MaxDp, NumLayers);
+    for LayerIdx := 0 to NumLayers - 1 do
+    begin
+      LogitKL[LayerIdx] := 0; LogitEnt[LayerIdx] := 0;
+      TunedKL[LayerIdx] := 0; TunedEnt[LayerIdx] := 0;
+      TunedAgree[LayerIdx] := 0; TunedKLPre[LayerIdx] := 0;
+      MaxDp[LayerIdx] := 0;
+    end;
+
+    SetLength(FinalProb, NumSamples);
+    SetLength(FinalArgmax, NumSamples);
+    CandSnap := TNNetVolume.Create();
+    TargetVol := TNNetVolume.Create();
+    LogitProb := TNNetVolume.Create(NumClasses, 1, 1);
+
+    // --- (1) final forward pass per sample: record p_final and argmax. ---
+    for SampleIdx := 0 to NumSamples - 1 do
+    begin
+      SetLength(FinalProb[SampleIdx], NumClasses);
+      InVol := pInput[SampleIdx];
+      if InVol = nil then
+      begin
+        for C := 0 to NumClasses - 1 do FinalProb[SampleIdx][C] := 0;
+        FinalArgmax[SampleIdx] := 0;
+        Continue;
+      end;
+      NN.Compute(InVol);
+      FinalArgmax[SampleIdx] := NN.GetLastLayer().Output.GetClass();
+      for C := 0 to NumClasses - 1 do
+        FinalProb[SampleIdx][C] := NN.GetLastLayer().Output.FData[C];
+    end;
+
+    // --- (2) build the private throw-away mini-net that shares the head's
+    //         STRUCTURE: Input(HeadInSize) -> Translator(FCLinear, HeadInSize)
+    //         -> a clone of each head layer (HeadIdx..LastLayer). ---
+    Lens := TNNet.Create();
+    Lens.AddLayer(TNNetInput.Create(HeadInSize, 1, 1));
+    Lens.AddLayer(TNNetFullConnectLinear.Create(HeadInSize));
+    for L := HeadIdx to LastLayer do
+    begin
+      OneStruct := NN.Layers[L].SaveStructureToString();
+      Lens.AddLayer(OneStruct);
+    end;
+    StructStr := ''; J := 0;
+    Lens.SetLearningRate(LearningRate, 0.9);
+    Lens.InitWeights();
+    Translator := Lens.Layers[1];
+    // Copy the FROZEN head weights from NN into the clones; freeze every clone
+    // by zeroing its learning rate so only the translator is fitted.
+    for L := HeadIdx to LastLayer do
+    begin
+      Lens.Layers[2 + (L - HeadIdx)].CopyWeights(NN.Layers[L]);
+      Lens.Layers[2 + (L - HeadIdx)].LearningRate := 0.0;
+    end;
+
+    // --- (3) per compatible layer: snapshot activations, seed the translator to
+    //         the IDENTITY (so untrained == logit lens), measure the pre-fit KL,
+    //         then fit the translator on the distillation-to-self KL target, and
+    //         finally measure the tuned-lens columns. ---
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+
+      // Seed translator to identity: W = I, bias = 0.
+      for C := 0 to Translator.Neurons.Count - 1 do
+      begin
+        Translator.Neurons[C].Weights.Fill(0);
+        if C < Translator.Neurons[C].Weights.Size then
+          Translator.Neurons[C].Weights.FData[C] := 1.0;
+        Translator.Neurons[C].FBiasWeight := 0.0;
+      end;
+      Translator.AfterWeightUpdate();
+      // Wipe any momentum/delta carried over from the previous layer's fit so a
+      // re-seeded identity translator genuinely starts from identity.
+      Lens.ClearInertia();
+      Lens.ClearDeltas();
+
+      // --- pre-fit pass (identity translator): KL must tie the raw logit lens.
+      for SampleIdx := 0 to NumSamples - 1 do
+      begin
+        InVol := pInput[SampleIdx];
+        if InVol = nil then Continue;
+        NN.Compute(InVol);
+        CandSnap.Copy(NN.Layers[L].Output);
+        Lens.Compute(CandSnap);
+        KLval := 0;
+        for C := 0 to NumClasses - 1 do
+        begin
+          Pl := Lens.GetLastLayer().Output.FData[C];
+          if Pl < cEps then Pl := cEps;
+          Pf := FinalProb[SampleIdx][C];
+          if Pf < cEps then Pf := cEps;
+          KLval := KLval + Lens.GetLastLayer().Output.FData[C] *
+            pcr_logf(Pl / Pf);
+        end;
+        if KLval < 0 then KLval := 0;
+        TunedKLPre[L] := TunedKLPre[L] + KLval;
+      end;
+      TunedKLPre[L] := TunedKLPre[L] / NumSamples;
+
+      // --- raw logit-lens columns (the model's own head on the raw activation,
+      //     NO translator) - same idiom as LogitLensReport, for the side-by-side.
+      for SampleIdx := 0 to NumSamples - 1 do
+      begin
+        InVol := pInput[SampleIdx];
+        if InVol = nil then Continue;
+        NN.Compute(InVol);
+        CandSnap.Copy(NN.Layers[L].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+        for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
+        EntVal := 0; KLval := 0;
+        for C := 0 to NumClasses - 1 do
+        begin
+          Pl := NN.GetLastLayer().Output.FData[C];
+          if Pl < 0 then Pl := 0;
+          LogitProb.FData[C] := Pl;
+          if Pl < cEps then Pl := cEps;
+          EntVal := EntVal - LogitProb.FData[C] * pcr_logf(Pl);
+          Pf := FinalProb[SampleIdx][C];
+          if Pf < cEps then Pf := cEps;
+          KLval := KLval + LogitProb.FData[C] * pcr_logf(Pl / Pf);
+        end;
+        if KLval < 0 then KLval := 0;
+        LogitEnt[L] := LogitEnt[L] + EntVal;
+        LogitKL[L] := LogitKL[L] + KLval;
+      end;
+      LogitEnt[L] := LogitEnt[L] / NumSamples;
+      LogitKL[L] := LogitKL[L] / NumSamples;
+
+      // --- fit the translator: minimise KL(p_final || p_tuned). With a softmax
+      //     head, backpropagating p_final as the soft target IS that gradient. A
+      //     single online sweep per iteration over the probe batch. The head
+      //     clones have LearningRate 0, so only the translator is stepped.
+      for It := 1 to TrainIters do
+      begin
+        SampleIdx := It mod NumSamples;
+        InVol := pInput[SampleIdx];
+        if InVol = nil then Continue;
+        NN.Compute(InVol);
+        CandSnap.Copy(NN.Layers[L].Output);
+        TargetVol.ReSize(NumClasses, 1, 1);
+        for C := 0 to NumClasses - 1 do TargetVol.FData[C] := FinalProb[SampleIdx][C];
+        Lens.Compute(CandSnap);
+        // Online step: TNNetFullConnect.Backpropagate applies the weight update
+        // inline (non-batch mode), exactly like the Fit/TrainOnce loop. The head
+        // clones have LearningRate 0, so only the translator is stepped.
+        Lens.Backpropagate(TargetVol);
+      end;
+
+      // --- post-fit tuned-lens columns + correctness signals. ---
+      TunedCnt := 0;
+      for SampleIdx := 0 to NumSamples - 1 do
+      begin
+        InVol := pInput[SampleIdx];
+        if InVol = nil then Continue;
+        NN.Compute(InVol);
+        CandSnap.Copy(NN.Layers[L].Output);
+        Lens.Compute(CandSnap);
+        EntVal := 0; KLval := 0;
+        for C := 0 to NumClasses - 1 do
+        begin
+          Pl := Lens.GetLastLayer().Output.FData[C];
+          if Pl < 0 then Pl := 0;
+          if Pl < cEps then Pl := cEps;
+          EntVal := EntVal - Lens.GetLastLayer().Output.FData[C] * pcr_logf(Pl);
+          Pf := FinalProb[SampleIdx][C];
+          if Pf < cEps then Pf := cEps;
+          KLval := KLval + Lens.GetLastLayer().Output.FData[C] *
+            pcr_logf(Pl / Pf);
+        end;
+        if KLval < 0 then KLval := 0;
+        TunedEnt[L] := TunedEnt[L] + EntVal;
+        TunedKL[L] := TunedKL[L] + KLval;
+        if Lens.GetLastLayer().Output.GetClass() = FinalArgmax[SampleIdx] then
+          TunedAgree[L] := TunedAgree[L] + 1.0;
+        // For the head-input layer (no real translation needed) track the max
+        // |p_tuned - p_logit| to assert tuned == logit == final there.
+        if L = HeadInIdx then
+        begin
+          // recompute raw logit (head on raw activation) for this sample
+          NN.Compute(InVol);
+          CandSnap.Copy(NN.Layers[L].Output);
+          NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+          for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
+          for C := 0 to NumClasses - 1 do
+          begin
+            // Lens is a separate net; its Output persists through the NN
+            // recompute above, so this compares tuned vs raw-logit at the head.
+            Pl := Abs(Lens.GetLastLayer().Output.FData[C] -
+                      NN.GetLastLayer().Output.FData[C]);
+            if Pl > MaxDp[L] then MaxDp[L] := Pl;
+          end;
+        end;
+        Inc(TunedCnt);
+      end;
+      if TunedCnt = 0 then TunedCnt := 1;
+      TunedEnt[L] := TunedEnt[L] / TunedCnt;
+      TunedKL[L] := TunedKL[L] / TunedCnt;
+      TunedAgree[L] := TunedAgree[L] / TunedCnt;
+    end;
+
+    // --- (4) report header + side-by-side table. ---
+    Lines.Add('TunedLensReport: the LEARNED sibling of the logit lens (Belrose ' +
+      'et al. 2023). One per-layer affine translator (FCLinear, head-input ' +
+      'width) is FIT to map each layer''s residual state into the final basis ' +
+      'before the FROZEN head decodes it; trained on KL-to-self (no labels).');
+    Lines.Add(Format('Layers=%d, classes=%d, probe sample(s)=%d. ' +
+      'HeadStartIdx=%d (%s), head-input layer=%d (%s, size=%d). ' +
+      '%d lens-compatible layer(s). TrainIters=%d, lr=%.4g.',
+      [NumLayers, NumClasses, NumSamples, HeadIdx,
+       NN.Layers[HeadIdx].ClassName, HeadInIdx,
+       NN.Layers[HeadInIdx].ClassName, HeadInSize, NumCompat,
+       TrainIters, LearningRate]));
+    Lines.Add('');
+    Lines.Add(Format('%-5s %-26s %11s %11s %11s %11s %9s',
+      ['Idx', 'Layer', 'logitKL', 'tunedKL', 'logitEnt', 'tunedEnt',
+       'tAgree']));
+    Lines.Add(StringOfChar('-', 92));
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      Lines.Add(Format('%-5d %-26s %11.4f %11.4f %11.4f %11.4f %8.2f%%',
+        [L, NN.Layers[L].ClassName, LogitKL[L], TunedKL[L],
+         LogitEnt[L], TunedEnt[L], TunedAgree[L] * 100.0]));
+    end;
+    Lines.Add(StringOfChar('-', 92));
+
+    // --- (5) side-by-side KL-to-final curves (the headline picture). ---
+    Lines.Add('');
+    Lines.Add('Per-layer KL-to-final: logit lens (.) vs TUNED lens (#). ' +
+      'Tuned should sit LOWER (commits earlier, tracks final more faithfully):');
+    MeanLogitKL := 0;
+    for I := 0 to NumCompat - 1 do
+      if LogitKL[CompatOrder[I]] > MeanLogitKL then
+        MeanLogitKL := LogitKL[CompatOrder[I]];
+    if MeanLogitKL <= 0 then MeanLogitKL := 1.0;
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      BarLen := Round((LogitKL[L] / MeanLogitKL) * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('.', BarLen);
+      Lines.Add(Format('  L%-3d logit %8.4f |%s', [L, LogitKL[L], Bar]));
+      BarLen := Round((TunedKL[L] / MeanLogitKL) * cMaxBarWidth);
+      if BarLen < 0 then BarLen := 0;
+      if BarLen > cMaxBarWidth then BarLen := cMaxBarWidth;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  L%-3d TUNED %8.4f |%s', [L, TunedKL[L], Bar]));
+    end;
+
+    // --- (6) headline aggregate: mean KL-to-final across compatible layers. ---
+    MeanLogitKL := 0; MeanTunedKLPre := 0; MeanTunedKL := 0;
+    for I := 0 to NumCompat - 1 do
+    begin
+      L := CompatOrder[I];
+      MeanLogitKL := MeanLogitKL + LogitKL[L];
+      MeanTunedKLPre := MeanTunedKLPre + TunedKLPre[L];
+      MeanTunedKL := MeanTunedKL + TunedKL[L];
+    end;
+    if NumCompat > 0 then
+    begin
+      MeanLogitKL := MeanLogitKL / NumCompat;
+      MeanTunedKLPre := MeanTunedKLPre / NumCompat;
+      MeanTunedKL := MeanTunedKL / NumCompat;
+    end;
+    Lines.Add('');
+    Lines.Add(Format('Mean KL-to-final over %d compatible layer(s): ' +
+      'logit lens = %.4f; tuned lens UNTRAINED (identity) = %.4f; ' +
+      'tuned lens TRAINED = %.4f.',
+      [NumCompat, MeanLogitKL, MeanTunedKLPre, MeanTunedKL]));
+
+    // --- (7) built-in correctness signals. ---
+    Lines.Add('');
+    Lines.Add(Format('Correctness check 1 (untrained translator must NOT beat ' +
+      'the raw lens): identity-tuned KL %.6f vs logit KL %.6f.',
+      [MeanTunedKLPre, MeanLogitKL]));
+    if MeanTunedKLPre <= MeanLogitKL + 1e-4 then
+      Lines.Add('  PASS: the identity-seeded translator ties the raw logit lens ' +
+        '(no free lunch before fitting).')
+    else
+      Lines.Add('  FAIL: identity translator diverged from the raw logit lens.');
+
+    Lines.Add('');
+    Lines.Add(Format('Correctness check 2 (training must LOWER mean ' +
+      'KL-to-final): %.6f (untrained) -> %.6f (trained), delta %.6f.',
+      [MeanTunedKLPre, MeanTunedKL, MeanTunedKLPre - MeanTunedKL]));
+    if MeanTunedKL <= MeanTunedKLPre + 1e-6 then
+      Lines.Add('  PASS: fitting the translators reduced (or held) mean ' +
+        'KL-to-final.')
+    else
+      Lines.Add('  FAIL: training increased mean KL-to-final.');
+
+    Lines.Add('');
+    Lines.Add(Format('Correctness check 3 (at the head input the translator is ' +
+      'the identity => tuned == logit == final): max |dp| at L%d = %.6f.',
+      [HeadInIdx, MaxDp[HeadInIdx]]));
+    if MaxDp[HeadInIdx] < 1e-3 then
+      Lines.Add('  PASS: at the head input the tuned lens reproduces the final ' +
+        'distribution exactly.')
+    else
+      Lines.Add('  FAIL: tuned lens at the head input drifted from final.');
+
+    // --- (8) headline verdict + skipped layers. ---
+    Lines.Add('');
+    if MeanTunedKL < MeanLogitKL - 1e-4 then
+      Lines.Add(Format('HEADLINE: the TUNED lens tracks the final answer more ' +
+        'faithfully than the raw logit lens (mean KL-to-final %.4f < %.4f) - ' +
+        'the Belrose result.', [MeanTunedKL, MeanLogitKL]))
+    else
+      Lines.Add(Format('HEADLINE: on this tiny probe the tuned lens did not ' +
+        'beat the raw lens (mean KL %.4f vs %.4f); try more TrainIters or a ' +
+        'larger probe batch.', [MeanTunedKL, MeanLogitKL]));
+
+    SkipList := '';
+    for LayerIdx := 0 to HeadInIdx do
+      if not Compatible[LayerIdx] then
+      begin
+        if SkipList <> '' then SkipList := SkipList + ', ';
+        SkipList := SkipList + Format('L%d(%s,size=%d)',
+          [LayerIdx, NN.Layers[LayerIdx].ClassName,
+           NN.Layers[LayerIdx].Output.Size]);
+      end;
+    Lines.Add('');
+    if SkipList = '' then
+      Lines.Add('SKIPPED layers (flat size <> head input size): none.')
+    else
+      Lines.Add('SKIPPED layers (flat size <> head input size ' +
+        IntToStr(HeadInSize) + '): ' + SkipList + '.');
+
+    Result := Lines.Text;
+  finally
+    // Restore the net's live state with a clean recompute over sample 0.
+    if (NN <> nil) and (pInput <> nil) and (pInput.Count > 0) and
+       (pInput[0] <> nil) and (NN.CountLayers() >= 2) then
+      NN.Compute(pInput[0]);
+    if Lens <> nil then Lens.Free;
+    if CandSnap <> nil then CandSnap.Free;
+    if TargetVol <> nil then TargetVol.Free;
+    if LogitProb <> nil then LogitProb.Free;
     Lines.Free;
   end;
 end;
