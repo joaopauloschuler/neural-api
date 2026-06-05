@@ -108,6 +108,33 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
+- [ ] TNNetClosedFormContinuous follow-ups (leaf layer + examples/LiquidCfC/ +
+      gradient/serialization tests all LANDED 2026-06-05, full explicit-recurrence
+      BPTT over the unrolled steps). Deferred, each small + doable on its own:
+      (a) a `TNNet.AddClosedFormContinuous`/CfC builder that stacks the cell with
+          a residual + norm wrapper (mirror AddRetention / AddNeuralODEBlock) so it
+          drops into a transformer-style block without manual wiring;
+      (b) a BIDIRECTIONAL variant (forward + reversed pass concatenated) for
+          non-causal sequence tasks — the landed cell is causal/left-to-right only;
+      (c) scale the examples/LiquidCfC/ recall toy to a slightly longer SeqLen /
+          multi-cue variant to show the input-dependent time-constant advantage
+          over a fixed-decay SSM (DiagonalSSM) at matched parameters, keeping
+          runtime < 5 min.
+
+- [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
+      + examples/HyperNetwork/ + two-path gradient tests all LANDED 2026-06-05;
+      first layer in the fork that owns zero trainable weights — reads its W from a
+      second input tensor). Deferred, each small + doable on its own:
+      (a) a `TNNetHyperConv` cousin that generates a small CONV kernel from the
+          context instead of a dense matrix (same backward-into-the-generator idea,
+          conv forward) — extends HyperNetworks to spatial tasks;
+      (b) CHUNKED weight generation so the main layer can be larger than the
+          generator's output width (generate W in tiles) — the landed layer
+          generates the whole Din*Dout matrix in one shot, which caps main-layer
+          size; document the memory/param trade-off;
+      (c) a `TNNet.AddHyperLinear(Din, Dout, ContextLayer)` builder that wires the
+          generator + reshape + HyperLinear in one call (the demo wires it by hand).
+
 - [ ] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
       matrix W (n x n, n = Depth) is CIRCULANT: every row is a cyclic shift of a
       single learned vector c of length n, so the layer stores O(n) weights
