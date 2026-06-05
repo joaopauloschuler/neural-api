@@ -6930,6 +6930,21 @@ type
       // (Depth is taken from the previous layer). Returns the residual-sum
       // layer. See TNNetClosedFormContinuous for the cell math.
       function AddClosedFormContinuous(): TNNetLayer;
+      // BIDIRECTIONAL CfC over a (SeqLen,1,Depth) token tensor (GetLastLayer,
+      // SizeY=1) for NON-causal sequence tasks: the base TNNetClosedFormContinuous
+      // cell sweeps left-to-right only, so this builder runs TWO independent CfC
+      // cells - a forward one over x and a reverse one over the time-reversed x -
+      // and concatenates their per-token outputs along Depth:
+      //   fwd = CfC(x)
+      //   rev = FlipX( CfC( FlipX(x) ) )   (reverse, sweep, flip back to align t)
+      //   y   = DeepConcat([fwd, rev])     -> output Depth = 2*Depth
+      // The reversal uses the existing parameter-free involution TNNetFlipX (over
+      // the SizeX=SeqLen axis), so no new leaf layer is introduced. Each direction
+      // owns its own learnable cell (their weights are NOT shared). NOT
+      // residual-wrapped (the depth doubles, so it is not shape-preserving); add a
+      // token-wise projection back to Depth afterwards if a residual is wanted.
+      // Returns the DeepConcat layer. Coded by Claude (AI).
+      function AddBidirectionalClosedFormContinuous(): TNNetLayer;
       // Wires a continuous modern-Hopfield associative-memory retrieval over a
       // (SeqLen,1,d) query tensor (GetLastLayer, SizeY=1, Depth=d) against a
       // freshly created learnable pattern bank of NumPatterns d-vectors. Each
@@ -30552,6 +30567,28 @@ begin
   // residual sublayer (see the AddRMSNormResidual contract). Parameterless: the
   // cell reads Depth from the previous layer.
   Result := AddRMSNormResidual([TNNetClosedFormContinuous.Create()]);
+end;
+
+function TNNet.AddBidirectionalClosedFormContinuous(): TNNetLayer;
+var
+  SourceLayer, ForwardCell, ReverseCell: TNNetLayer;
+begin
+  // Bidirectional CfC: one forward cell over x and one reverse cell over the
+  // time-reversed x, concatenated along Depth (see header). For a (SeqLen,1,d)
+  // token tensor the SizeX axis is time, so TNNetFlipX reverses the sequence.
+  SourceLayer := GetLastLayer();
+  if SourceLayer.Output.SizeY <> 1 then
+    FErrorProc('AddBidirectionalClosedFormContinuous requires a (SeqLen,1,d) ' +
+      'token tensor (SizeY=1). SizeY=' + IntToStr(SourceLayer.Output.SizeY));
+  // Forward direction: a plain left-to-right CfC over the source.
+  ForwardCell := AddLayerAfter(TNNetClosedFormContinuous.Create(), SourceLayer);
+  // Reverse direction: flip time -> sweep left-to-right (= original right-to-left)
+  // -> flip back so the t-th reverse output aligns with the t-th forward output.
+  AddLayerAfter(TNNetFlipX.Create(), SourceLayer);
+  AddLayer(TNNetClosedFormContinuous.Create());
+  ReverseCell := AddLayer(TNNetFlipX.Create());
+  // Concatenate the two directions along Depth -> output Depth = 2*d.
+  Result := AddLayer(TNNetDeepConcat.Create([ForwardCell, ReverseCell]));
 end;
 
 function TNNet.AddModernHopfieldRetrieval(NumPatterns, KSteps: integer;

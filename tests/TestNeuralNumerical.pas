@@ -252,6 +252,8 @@ type
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
     procedure TestAddClosedFormContinuousBuilder;
+    procedure TestAddBidirectionalClosedFormContinuousBuilder;
+    procedure TestBidirectionalClosedFormContinuousGradientCheck;
     procedure TestModernHopfieldInputGradientCheck;
     procedure TestModernHopfieldWeightGradientCheck;
     procedure TestModernHopfieldSerializationRoundTrip;
@@ -22242,6 +22244,148 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddBidirectionalClosedFormContinuousBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, CfCCount, FlipCount: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // Exercise TNNet.AddBidirectionalClosedFormContinuous end to end:
+  // (1) it wires TWO CfC cells (forward + reverse) and TWO TNNetFlipX layers
+  //     (reverse, flip-back), merged by a DeepConcat that DOUBLES Depth;
+  // (2) the (SeqLen,1,2*Depth) output preserves SeqLen; (3) one short training
+  //     run reduces the loss; (4) SaveToString round-trips identically.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 3);
+  Desired := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 3));
+    NN.AddBidirectionalClosedFormContinuous();
+    NN.SetLearningRate(0.1, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 1.5;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    NN.Compute(Input);
+    AssertEquals('Bidirectional CfC output SizeX preserved',
+      5, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Bidirectional CfC output Depth doubled',
+      6, NN.GetLastLayer.Output.Depth);
+    AssertTrue('Bidirectional CfC last layer is a DeepConcat',
+      NN.GetLastLayer is TNNetDeepConcat);
+
+    CfCCount := 0;
+    FlipCount := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i] is TNNetClosedFormContinuous then Inc(CfCCount);
+      if NN.Layers[i] is TNNetFlipX then Inc(FlipCount);
+    end;
+    AssertEquals('Bidirectional CfC built two CfC cells', 2, CfCCount);
+    AssertEquals('Bidirectional CfC built two FlipX layers', 2, FlipCount);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('Bidirectional CfC training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('Bidirectional CfC round-trip last layer is DeepConcat',
+        NN2.GetLastLayer is TNNetDeepConcat);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Bidirectional CfC SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBidirectionalClosedFormContinuousGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Numerical input-gradient check for the whole bidirectional block (forward
+  // CfC + FlipX/CfC/FlipX reverse branch + DeepConcat). Both branches share the
+  // same input layer, so its OutputError accumulates the two directions; this
+  // verifies the FlipX involution backward and the DeepConcat split route the
+  // gradient correctly through both cells. Same MSE-loss convention as the base
+  // CfC input-gradient check above.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  InputPlus := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    NN.AddBidirectionalClosedFormContinuous();
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1 + 0.3) * 1.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.9 - 0.2) * 0.6;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Bidirectional CfC input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('Bidirectional CfC input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
   end;
 end;
 

@@ -141,16 +141,27 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
-- [ ] TNNetClosedFormContinuous follow-ups (leaf layer + examples/LiquidCfC/ +
+- [X] TNNetClosedFormContinuous follow-ups (leaf layer + examples/LiquidCfC/ +
       gradient/serialization tests + the TNNet.AddClosedFormContinuous pre-norm
-      residual builder all LANDED 2026-06-05). Deferred, each small + doable on
-      its own:
-      (a) a BIDIRECTIONAL variant (forward + reversed pass concatenated) for
-          non-causal sequence tasks — the landed cell is causal/left-to-right only;
-      (b) scale the examples/LiquidCfC/ recall toy to a slightly longer SeqLen /
-          multi-cue variant to show the input-dependent time-constant advantage
-          over a fixed-decay SSM (DiagonalSSM) at matched parameters, keeping
-          runtime < 5 min.
+      residual builder all LANDED 2026-06-05). Both deferred sub-tasks LANDED
+      2026-06-05:
+      (a) [X] BIDIRECTIONAL variant — implemented as the builder
+          TNNet.AddBidirectionalClosedFormContinuous: forward CfC + a reverse
+          branch (FlipX -> CfC -> FlipX, reusing the existing parameter-free
+          TNNetFlipX involution over the SizeX=SeqLen axis) concatenated along
+          Depth via TNNetDeepConcat (output Depth = 2*Depth, two independent
+          cells). Builder chosen over a new leaf layer since existing pieces
+          compose. Tests: TestAddBidirectionalClosedFormContinuousBuilder
+          (shape/layer-count/train/save-load) +
+          TestBidirectionalClosedFormContinuousGradientCheck (numerical input
+          gradient through both branches) in tests/TestNeuralNumerical.pas.
+      (b) [X] scaled CfC-vs-DiagonalSSM toy — examples/LiquidCfCvsSSM/ (sibling
+          dir, .lpr+.lpi+README): longer SeqLen=16 multi-cue LAST-WRITE-WINS task
+          (2-4 cues, write-pulse marker channel, output the most-recently written
+          cue) that requires input-dependent forgetting. CfC reaches 100% recall
+          at 475 weights vs the fixed-decay TNNetDiagonalSSM ~94% at 639 weights
+          (SSM given a wider width / more params and still loses). Runtime ~10 s,
+          well under the 5-min budget.
 
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
       + examples/HyperNetwork/ + two-path gradient tests + the
