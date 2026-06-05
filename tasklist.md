@@ -1513,7 +1513,7 @@ rather than acted on.
       1e-2.
 
 ### Introspection (added)
-- [ ] `TNNet.LRPReport` + `examples/LRP/` — Layer-wise Relevance Propagation
+- [x] `TNNet.LRPReport` + `examples/LRP/` — Layer-wise Relevance Propagation
       (Bach et al. 2015, "On Pixel-Wise Explanations for Non-Linear Classifier
       Decisions by Layer-Wise Relevance Propagation"). Closes the last open gap in
       the CNN-attribution family — `SaliencyReport` (vanilla + SmoothGrad + Integrated

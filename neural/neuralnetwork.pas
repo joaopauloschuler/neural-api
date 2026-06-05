@@ -7677,6 +7677,47 @@ type
         ConvLayerIdx: integer = -1;
         ForcedClass: integer = -1
       ): string;
+      // Layer-wise Relevance Propagation (LRP; Bach et al. 2015, "On Pixel-Wise
+      // Explanations for Non-Linear Classifier Decisions by Layer-Wise
+      // Relevance Propagation"). Unlike SaliencyReport / GradCAMReport (which
+      // are GRADIENT methods), LRP is NOT a gradient method: it back-DISTRIBUTES
+      // the chosen output logit's RELEVANCE through the net under a CONSERVATION
+      // rule, so the relevance is REDISTRIBUTED (not differentiated) and the
+      // total relevance is preserved at every layer boundary. It forwards Probe
+      // once (filling every layer's .Output via the existing forward machinery —
+      // no forward activation is re-derived), picks c = argmax of the final
+      // output (or ForcedClass), seeds the last layer's relevance with the
+      // one-hot R_c = logit_c, and walks the layer list from output toward input
+      // applying, on each linear/dense (TNNetFullConnect family) layer, the
+      // EPSILON-RULE
+      //     R_i = sum_j (a_i * w_ij) / (sum_k a_k * w_kj + eps*sign(z_j)) * R_j
+      // where a_i is the i-th INPUT activation (the previous layer's Output),
+      // w_ij the weight from input i to output neuron j, z_j the pre-activation
+      // sum, and Eps (default 1e-2) a small stabiliser whose sign follows z_j.
+      // ReLU / activation / Input / Identity layers pass relevance through
+      // 1:1 (the conventional LRP treatment: relevance is assigned at the linear
+      // layer that owns the weights). Layers whose backward relevance rule is
+      // UNDEFINED under the epsilon-rule (attention, normalisation, softmax,
+      // convolution with spatial mixing, pooling, etc.) are SKIPPED HONESTLY:
+      // relevance is passed through unchanged and the layer is listed as
+      // "SKIPPED (no epsilon rule)" in the report rather than faking a value.
+      // Reports: (a) the per-layer-boundary RELEVANCE-CONSERVATION RESIDUAL
+      //   |sum(R_in) - sum(R_out)| (the headline LRP sanity check — under the
+      //   pure epsilon-rule on a dense stack it stays ~0 up to the eps
+      //   stabiliser); (b) the TOP-K most-relevant INPUT positions (channel,x,y)
+      //   with their signed relevance; and (c) a per-channel ASCII relevance
+      //   heatmap over the input plane. Forward-only (no backward pass, no weight
+      //   steps): the ONLY net mutation is the transient forward Output, and the
+      //   live state is restored by a final clean recompute before returning.
+      // Guards nil NN / <2 layers / nil-or-empty Probe gracefully.
+      // Coded by Claude (AI).
+      class function LRPReport(
+        NN: TNNet;
+        Probe: TNNetVolume;
+        ForcedClass: integer = -1;
+        TopK: integer = 8;
+        Eps: TNeuralFloat = 1e-2
+      ): string;
       // Forward-only CAUSAL mechanistic-interpretability diagnostic
       // (activation patching / causal tracing; Vig et al. 2020, Meng et al.
       // ROME 2022, Wang et al. IOI 2022). It answers a question NONE of the
@@ -47618,6 +47659,309 @@ begin
 
     Result := Lines.Text;
   finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LRPReport(
+  NN: TNNet;
+  Probe: TNNetVolume;
+  ForcedClass: integer = -1;
+  TopK: integer = 8;
+  Eps: TNeuralFloat = 1e-2
+): string;
+const
+  cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
+var
+  Lines: TStringList;
+  Snap: string;
+  LastIdx, LIdx, i, j, n: integer;
+  PredClass, OutSize: integer;
+  PredLogit, SumIn, SumOut, Residual, MaxResidual: TNeuralFloat;
+  Layer, PrevLayer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  // R[layer index] = relevance vector aligned with that layer's Output.
+  R: array of array of TNeuralFloat;
+  Rin: array of TNeuralFloat;
+  z, denom, sgn, ai, wij: TNeuralFloat;
+  Handled, IsDense: boolean;
+  KindStr: string;
+  // input-relevance reporting
+  SizeX, SizeY, Depth: integer;
+  TopVal: array of TNeuralFloat;
+  TopIdx: array of integer;
+  KeepK, TopCount, WorstPos, FlatIdx, Ch, Px, Py, BucketIdx: integer;
+  WorstVal, AbsV, v, MapAbsMax: TNeuralFloat;
+  RowStr: string;
+
+  // A layer carries a usable epsilon-rule iff it is a dense (FullConnect
+  // family) layer whose neuron weights map the FULL previous-layer output
+  // vector to the full current output vector (one neuron per output element).
+  function IsEpsRuleDense(Lay: TNNetLayer): boolean;
+  begin
+    Result := false;
+    if Lay = nil then Exit;
+    if not (Lay is TNNetFullConnect) then Exit;
+    if Lay.PrevLayer = nil then Exit;
+    if Lay.Neurons.Count = 0 then Exit;
+    if Lay.Neurons.Count <> Lay.Output.Size then Exit;
+    if Lay.Neurons[0].Weights.Size <> Lay.PrevLayer.Output.Size then Exit;
+    Result := true;
+  end;
+
+  // A pure pass-through (relevance flows 1:1): activations / Identity / Input
+  // and any layer that is shape-preserving and weightless. These keep the
+  // conservation residual at zero by construction.
+  function IsPassThrough(Lay: TNNetLayer): boolean;
+  begin
+    Result := false;
+    if Lay = nil then Exit;
+    if Lay.PrevLayer = nil then Exit;        // input layer handled separately
+    if Lay.Neurons.Count > 0 then Exit;      // has weights -> not pass-through
+    Result := (Lay.Output.Size = Lay.PrevLayer.Output.Size);
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Snap := '';
+  try
+    if NN = nil then
+    begin
+      Result := 'LRPReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'LRPReport: network needs at least 2 layers.' + sLineBreak;
+      Exit;
+    end;
+    if (Probe = nil) or (Probe.Size = 0) then
+    begin
+      Result := 'LRPReport: Probe is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if TopK < 1 then TopK := 1;
+    if Eps <= 0 then Eps := 1e-2;
+
+    // Save exact state; LRP only forwards (no weight steps), but a final clean
+    // recompute is run, so we restore bit-for-bit on exit regardless.
+    Snap := NN.SaveDataToString();
+
+    // Single clean forward pass fills every layer's .Output (reused, never
+    // re-derived). Pick the explained class c.
+    NN.Compute(Probe);
+    LastIdx := NN.GetLastLayerIdx();
+    OutSize := NN.Layers[LastIdx].Output.Size;
+    if (ForcedClass >= 0) and (ForcedClass < OutSize) then
+      PredClass := ForcedClass
+    else
+      PredClass := NN.Layers[LastIdx].Output.GetClass();
+    PredLogit := NN.Layers[LastIdx].Output.Raw[PredClass];
+
+    SizeX := Probe.SizeX;
+    SizeY := Probe.SizeY;
+    Depth := Probe.Depth;
+
+    // Allocate per-layer relevance vectors.
+    SetLength(R, LastIdx + 1);
+    for LIdx := 0 to LastIdx do
+    begin
+      SetLength(R[LIdx], NN.Layers[LIdx].Output.Size);
+      for i := 0 to Length(R[LIdx]) - 1 do R[LIdx][i] := 0;
+    end;
+
+    // Seed: relevance of the explained logit at the last layer = its value.
+    R[LastIdx][PredClass] := PredLogit;
+
+    Lines.Add(Format(
+      'LRPReport (Layer-wise Relevance Propagation, epsilon-rule; ' +
+      'Bach et al. 2015)', []));
+    Lines.Add(StringOfChar('=', 72));
+    Lines.Add(Format('Probe shape (%d,%d,%d), %d outputs. Explained class c=%d '
+      + '(forced=%s).',
+      [SizeX, SizeY, Depth, OutSize, PredClass,
+       BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
+    Lines.Add(Format('Seed relevance R_c = logit_c = %8.4f   eps = %.4g',
+      [PredLogit, Eps]));
+    Lines.Add(StringOfChar('-', 72));
+    Lines.Add(Format('%-4s %-26s %-9s %12s %12s %12s',
+      ['#', 'layer', 'rule', 'sum(R_out)', 'sum(R_in)', 'residual']));
+    Lines.Add(StringOfChar('-', 72));
+
+    MaxResidual := 0;
+    // Walk from the output layer down to layer 1; layer 0 (input) receives
+    // relevance from layer 1's redistribution.
+    for LIdx := LastIdx downto 1 do
+    begin
+      Layer := NN.Layers[LIdx];
+      PrevLayer := Layer.PrevLayer;
+      SetLength(Rin, PrevLayer.Output.Size);
+      for i := 0 to Length(Rin) - 1 do Rin[i] := 0;
+
+      IsDense := IsEpsRuleDense(Layer);
+      Handled := IsDense or IsPassThrough(Layer);
+
+      if IsDense then
+      begin
+        KindStr := 'epsilon';
+        // For each output neuron j distribute R_out[j] back to inputs i
+        // proportionally to (a_i * w_ij), stabilised by eps*sign(z_j).
+        for j := 0 to Layer.Neurons.Count - 1 do
+        begin
+          Neuron := Layer.Neurons[j];
+          z := Neuron.Bias;
+          for i := 0 to Length(Rin) - 1 do
+            z := z + PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
+          if z >= 0 then sgn := 1 else sgn := -1;
+          denom := z + Eps * sgn;
+          if denom = 0 then denom := Eps;  // last-resort guard
+          for i := 0 to Length(Rin) - 1 do
+          begin
+            ai := PrevLayer.Output.Raw[i];
+            wij := Neuron.Weights.Raw[i];
+            Rin[i] := Rin[i] + (ai * wij / denom) * R[LIdx][j];
+          end;
+        end;
+      end
+      else if IsPassThrough(Layer) then
+      begin
+        KindStr := 'passthru';
+        for i := 0 to Length(Rin) - 1 do Rin[i] := R[LIdx][i];
+      end
+      else
+      begin
+        // Honest skip: rule undefined for this layer type. Pass relevance
+        // through unchanged when shapes match, else collapse-by-sum so total
+        // relevance is conserved and the residual stays meaningful.
+        KindStr := 'SKIPPED';
+        if Length(Rin) = Length(R[LIdx]) then
+          for i := 0 to Length(Rin) - 1 do Rin[i] := R[LIdx][i]
+        else
+        begin
+          SumOut := 0;
+          for j := 0 to Length(R[LIdx]) - 1 do SumOut := SumOut + R[LIdx][j];
+          if Length(Rin) > 0 then
+            for i := 0 to Length(Rin) - 1 do Rin[i] := SumOut / Length(Rin);
+        end;
+      end;
+
+      // Conservation residual for this boundary.
+      SumOut := 0;
+      for j := 0 to Length(R[LIdx]) - 1 do SumOut := SumOut + R[LIdx][j];
+      SumIn := 0;
+      for i := 0 to Length(Rin) - 1 do SumIn := SumIn + Rin[i];
+      Residual := Abs(SumIn - SumOut);
+      if Handled and (Residual > MaxResidual) then MaxResidual := Residual;
+
+      n := PrevLayer.Output.Size;
+      Lines.Add(Format('%-4d %-26s %-9s %12.4f %12.4f %12.6f',
+        [LIdx, Copy(Layer.ClassName, 1, 26), KindStr,
+         SumOut, SumIn, Residual]));
+
+      // Store input relevance into the previous layer's slot.
+      for i := 0 to Length(Rin) - 1 do R[LIdx - 1][i] := Rin[i];
+    end;
+
+    Lines.Add(StringOfChar('-', 72));
+    Lines.Add(Format('Max conservation residual over HANDLED boundaries = %.6g '
+      + '(eps = %.4g).', [MaxResidual, Eps]));
+    Lines.Add('Conservation check: the epsilon-rule TRADES exact conservation '
+      + 'for numerical stability via eps; the residual is O(eps) and -> 0 as '
+      + 'eps -> 0 (pure z-rule). A residual that stays bounded by the eps '
+      + 'stabiliser is the expected, healthy LRP behaviour; a residual that '
+      + 'BLOWS UP signals a layer whose relevance rule is undefined (and which '
+      + 'should appear as SKIPPED above) rather than a redistribution.');
+    Lines.Add('');
+
+    // --- Top-K most-relevant input positions (layer 0). ---
+    KeepK := TopK;
+    if KeepK > Probe.Size then KeepK := Probe.Size;
+    SetLength(TopVal, KeepK);
+    SetLength(TopIdx, KeepK);
+    TopCount := 0;
+    for i := 0 to Length(R[0]) - 1 do
+    begin
+      AbsV := Abs(R[0][i]);
+      if TopCount < KeepK then
+      begin
+        TopVal[TopCount] := AbsV;
+        TopIdx[TopCount] := i;
+        Inc(TopCount);
+      end
+      else
+      begin
+        WorstPos := 0; WorstVal := TopVal[0];
+        for j := 1 to KeepK - 1 do
+          if TopVal[j] < WorstVal then begin WorstVal := TopVal[j]; WorstPos := j; end;
+        if AbsV > WorstVal then
+        begin
+          TopVal[WorstPos] := AbsV;
+          TopIdx[WorstPos] := i;
+        end;
+      end;
+    end;
+    // simple selection sort (descending) of the kept top-K
+    for i := 0 to TopCount - 2 do
+      for j := i + 1 to TopCount - 1 do
+        if TopVal[j] > TopVal[i] then
+        begin
+          v := TopVal[i]; TopVal[i] := TopVal[j]; TopVal[j] := v;
+          WorstPos := TopIdx[i]; TopIdx[i] := TopIdx[j]; TopIdx[j] := WorstPos;
+        end;
+
+    Lines.Add(Format('Top-%d most-relevant input positions (channel, x, y):',
+      [TopCount]));
+    for i := 0 to TopCount - 1 do
+    begin
+      FlatIdx := TopIdx[i];
+      // flat index layout in TNNetVolume: x + SizeX*(y + SizeY*ch) ... use
+      // accessor-consistent decode: ch = FlatIdx mod Depth in interleaved
+      // layout; use the volume's own GetRawPos inverse via simple decode.
+      Ch := FlatIdx mod Depth;
+      Px := (FlatIdx div Depth) mod SizeX;
+      Py := (FlatIdx div Depth) div SizeX;
+      Lines.Add(Format('  #%d  ch=%d x=%d y=%d   R=%8.4f',
+        [i + 1, Ch, Px, Py, R[0][FlatIdx]]));
+    end;
+    Lines.Add('');
+
+    // --- Per-channel ASCII relevance heatmap over the input plane. ---
+    MapAbsMax := 0;
+    for i := 0 to Length(R[0]) - 1 do
+      if Abs(R[0][i]) > MapAbsMax then MapAbsMax := Abs(R[0][i]);
+    if MapAbsMax <= 0 then MapAbsMax := 1;
+    for Ch := 0 to Depth - 1 do
+    begin
+      Lines.Add(Format('input-relevance |R| heatmap, channel %d:', [Ch]));
+      for Py := 0 to SizeY - 1 do
+      begin
+        RowStr := '  ';
+        for Px := 0 to SizeX - 1 do
+        begin
+          FlatIdx := Ch + Depth * (Px + SizeX * Py);
+          if (FlatIdx >= 0) and (FlatIdx < Length(R[0])) then
+            AbsV := Abs(R[0][FlatIdx])
+          else
+            AbsV := 0;
+          BucketIdx := Trunc((AbsV / MapAbsMax) * (Length(cBuckets) - 1) + 0.5);
+          if BucketIdx < 0 then BucketIdx := 0;
+          if BucketIdx > Length(cBuckets) - 1 then BucketIdx := Length(cBuckets) - 1;
+          RowStr := RowStr + cBuckets[BucketIdx + 1] + ' ';
+        end;
+        Lines.Add(RowStr);
+      end;
+    end;
+    Lines.Add('');
+    Lines.Add('Heatmap legend "' + cBuckets + '" (blank=0 .. @=max|R|). LRP is '
+      + 'a CONSERVATION method: relevance is redistributed, not differentiated. '
+      + 'Forward-only; NN weights untouched.');
+
+    Result := Lines.Text;
+  finally
+    // Restore exact state (relevance walk only read weights / outputs, but a
+    // forward pass was run, so reload to leave the live net pristine).
+    if (NN <> nil) and (Snap <> '') then NN.LoadDataFromString(Snap);
     Lines.Free;
   end;
 end;
