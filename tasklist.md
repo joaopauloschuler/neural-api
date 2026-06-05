@@ -108,45 +108,27 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
-- [ ] TNNetSLSTMCell + TNNet.AddSLSTM — the xLSTM scalar-memory recurrent cell
-      (Beck et al. 2024, "xLSTM: Extended Long Short-Term Memory",
-      arXiv:2405.04517). Genuinely DISTINCT from every recurrent block already in
-      tree: TNNetClosedFormContinuous (continuous-time ODE cell),
-      TNNetDiagonalSSM / TNNetSelectiveSSM (linear state-space), and
-      TNNetRetention (fixed/learned exponential decay) are all LINEAR-state or
-      decay-based — none has the classic LSTM's input/forget/output multiplicative
-      GATES, and the repo has no LSTM/GRU at all (confirmed: no TNNet*LSTM/*GRU/
-      *Cell-gate recurrent layer exists; only TNNetCellMul/CellBias arithmetic
-      helpers). The novel sLSTM ingredients that make this NOT a plain-LSTM
-      re-skin: (1) EXPONENTIAL input/forget gates i_t = exp(W_i x_t + ...),
-      f_t = exp(...) instead of sigmoid, which lets the cell revise storage
-      decisions far more sharply; (2) a STABILIZER state m_t = max(log f_t + m_{t-1},
-      log i_t) with the gates renormalised i'_t = exp(log i_t - m_t),
-      f'_t = exp(log f_t + m_{t-1} - m_t) so the unbounded exp gates never
-      overflow — this running-max stabilizer is the paper's key trick and the
-      whole reason exp gating is trainable; (3) a normalizer state n_t = f'_t
-      n_{t-1} + i'_t with hidden h_t = o_t * (c_t / n_t). Scope v1 to the SCALAR
-      sLSTM (head dim = Depth, recurrence along SizeX = SeqLen) and DEFER the
-      mLSTM matrix-memory variant to a follow-up bullet. Deliverables, following
-      the established recurrent-cell recipe (cf. CfC): the leaf layer with
-      `// Coded by Claude (AI).`, packing W_z/W_i/W_f/W_o + recurrent r_* weights
-      into Neurons[] and serialized like other weight-carriers; a forward that
-      walks t = 0..SeqLen-1 carrying (c, n, h, m), CACHING per-step gate
-      activations and m_t for backward; a backprop-through-time pass that
-      differentiates the stabilized exp gates (note d/dx exp(x-m) with m treated
-      as a stop-gradient running max, matching the reference) and is checked with
-      a small-d/short-SeqLen numerical-gradient test (input + weights) added with
-      `RandSeed := 424242`; a save/load round-trip test; the TNNet.AddSLSTM
-      pre-norm residual builder over a (SeqLen,1,Depth) tensor (shape-preserving,
-      same pattern as AddClosedFormContinuous); and examples/SLSTMvsCfC/
-      (.lpr+.lpi+README) contrasting sLSTM against the existing CfC and
-      DiagonalSSM on a long-range gating task where SHARP exp-gated forgetting
-      should help — e.g. a copy/state-reset task with an explicit "clear memory"
-      pulse channel — reporting recall accuracy and weight count for each. Keep
-      runtime well under the 5-min budget. Follow-up (defer, do not start now):
-      the mLSTM matrix-memory variant (outer-product key/value covariance update
-      C_t = f_t C_{t-1} + i_t v_t k_t^T with the same m/n stabilizer), which gives
-      a parallelisable attention-like form.
+- [X] TNNetSLSTMCell + TNNet.AddSLSTM — the xLSTM scalar-memory recurrent cell
+      (Beck et al. 2024, "xLSTM", arXiv:2405.04517) LANDED 2026-06-05 (commit
+      3bdea3e). Scalar sLSTM over (SeqLen,1,Depth): exp input/forget gates,
+      running-max stabilizer m_t (stop-gradient), normalizer n_t, sigmoid output
+      gate, h_t = o_t*(c_t/n_t); twelve neuron tensors (W_z/W_i/W_f/W_o,
+      r_z/r_i/r_f/r_o Depth×Depth, b_z/b_i/b_f/b_o, b_f init +1); BPTT carrying
+      dL/dc,dL/dn,dL/dh; serialized like other weight-carriers. TNNet.AddSLSTM is
+      a pre-norm RMSNorm residual builder. Tests in TestNeuralNumerical.pas
+      (input + weight numerical-gradient with RandSeed:=424242, save/load
+      round-trip, builder); examples/SLSTMvsCfC/ contrasts sLSTM vs CfC vs
+      DiagonalSSM on a copy/state-reset task (all reach 100% on the easy toy at
+      950/330/150 weights — honest framing, no manufactured win). Caught+fixed a
+      forward bug where in-place FH update leaked current-step h_t into later
+      channels' gates. Follow-up below.
+- [ ] mLSTM matrix-memory variant (xLSTM follow-up to the landed scalar sLSTM):
+      outer-product key/value covariance update C_t = f_t C_{t-1} + i_t v_t k_t^T
+      with the same m/n running-max stabilizer, giving a parallelisable
+      attention-like form. Model after TNNetSLSTMCell (the scalar variant) for the
+      stabilizer/exp-gate machinery and serialization; the new piece is the
+      matrix memory state and the query read-out h_t = o_t * (C_t q_t / max(|n_t^T
+      q_t|, 1)). Needs its own numerical-gradient + save/load tests and a builder.
 
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
       + examples/HyperNetwork/ + two-path gradient tests + the
@@ -307,9 +289,14 @@ rather than acted on.
       any future mixed-precision work.
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
-- [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
+- [X] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
-      next-token task and chart loss + max-logit-norm.
+      next-token task and chart loss + max-logit-norm. LANDED 2026-06-05 (commit
+      d9a556e) as examples/SoftCappingSweep/. Reports TWO norms — effective
+      post-cap (always ≤ c) and raw pre-cap — because a tight cap makes the net
+      INFLATE its raw logits (raw-norm ~51 at c=5 vs ~5 uncapped) while the
+      softmax input stays bounded; the headline is "logit norm depends on where
+      you measure". Runs all 5 arms in ~10s.
 - [ ] Lottery-ticket IMP follow-up (make the headline land): the landed
       examples/LotteryTicketIMP showed NO IMP advantage because the toy is too
       easy and the budget too generous (one-shot never collapses). Build the
