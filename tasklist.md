@@ -502,6 +502,45 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
+- [ ] gMLP Spatial Gating Unit — an attention-FREE sequence mixer (Liu et al.
+      2021, "Pay Attention to MLPs", https://arxiv.org/abs/2105.08315). Every
+      sequence mixer in the repo today is built on token-token *content*
+      scores: SDPA and its siblings compute Q.K^T, RetNet retention
+      ([[retention-single-head]]) keeps the Q/K/V machinery and swaps softmax
+      for a fixed decay mask, and TNNetDiagonalSSM is a per-channel linear
+      recurrence. The Spatial Gating Unit (SGU) mixes tokens with NONE of
+      these — no queries, no keys, no values, no per-pair dot product. Over a
+      (SeqLen, 1, d) tensor it: (a) splits the channels in half into u and v;
+      (b) applies a single LEARNED, content-independent SeqLen x SeqLen weight
+      matrix W (plus bias) ACROSS the sequence axis of v — i.e. v'[n] =
+      sum_m W[n,m] * v[m], the same static spatial projection for every
+      channel; (c) gates multiplicatively, out = u (cell-multiply) v'. The
+      mixing weights are fixed after training and do not depend on the input,
+      which is exactly what makes it a distinct primitive rather than a
+      re-skin of attention. Honest scope notes in the "what did NOT fit"
+      style of the neighbouring entries: (i) the cross-token projection is a
+      genuine SeqLen x SeqLen matrix and so is FIXED-length — pin SeqLen at
+      construction and reject a mismatched input in SetPrevLayer, the same
+      contract TNNetDiagonalSSM already enforces on SizeY=1; (ii) it must be a
+      per-token projection over the sequence axis, NOT a TNNetFullConnect
+      (which flattens and mixes channels too) — reuse the lesson from
+      [[mha-builder-and-seq-projection]] that per-token sequence projection is
+      the PointwiseConv-shaped operation, here transposed to act along SeqLen;
+      (iii) ship it as a leaf layer TNNetSpatialGatingUnit (Coded by Claude
+      (AI). per [[claude-authorship-comment]]) with its own Compute/
+      Backpropagate and serialization, PLUS a TNNet.AddSpatialGatingUnit
+      builder and a full gMLP block builder AddgMLPBlock (channel-MLP up ->
+      split+SGU -> channel-MLP down, residual) so it composes like the other
+      builders; (iv) initialise W near-identity / small so the block starts
+      close to a no-op, the standard gMLP init trick. Deliverables: the leaf
+      layer + both builders, a numerical-gradient test (reseed RandSeed :=
+      424242 per [[numerical-test-rng-ordering]]), a serialization round-trip
+      test, and a tiny examples/SpatialGatingUnit/ that trains a gMLP block on
+      a long-range sequence task (e.g. the parity / copy toy used elsewhere)
+      and prints it matching a same-parameter-budget single-head attention
+      baseline — demonstrating attention-free token mixing actually learns the
+      dependency. A genuinely new sequence-mixing family, not a sibling of the
+      existing attention/SSM layers.
 - [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
