@@ -73,6 +73,13 @@ type
     procedure TestGatherChannelsLoadFromString;
     procedure TestAddGatherChannelsBuilder;
 
+    // TNNetFourierMix (FNet parameter-free Fourier token mixer) tests
+    procedure TestFourierMixGradientCheck;
+    procedure TestFourierMixGradientCheckNonPow2;
+    procedure TestFourierMixLoadFromString;
+    procedure TestFourierMixFFTMatchesDirect;
+    procedure TestFourierMixForwardKnownValue;
+
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
     procedure TestSigmoidNumericalPrecision;
@@ -6034,6 +6041,215 @@ begin
   // threshold, so central differences match the analytic gradient.
   LayerInputGradientCheck(Self, TNNetLpPool.Create(2, 0, 0, 3.0),
     'LpPool(p=3)', 4, 4, 2, 0.01);
+end;
+
+procedure FourierMixGradCheck(ATestCase: TTestCase; L, D: integer;
+  UseFFT: integer; const AName: string);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Self-contained input-gradient check for TNNetFourierMix. y = Re(2D-DFT(x))
+  // is a fixed REAL linear operator M with M[(a,b),(s,h)]=cos(2*pi*(a*s/L+b*h/D));
+  // M is self-adjoint so the analytic input gradient (M dL/dy) must equal the
+  // central finite-difference gradient. Unlike the shared LayerInputGradientCheck
+  // this scales inputs DOWN (the DFT amplifies magnitudes by ~sqrt(L*D), and the
+  // squared loss on those large outputs causes float32 cancellation in the
+  // central difference) so an absolute tolerance is meaningful.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(L, 1, D);
+  InputPlus := TNNetVolume.Create(L, 1, D);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+    NN.AddLayer(TNNetFourierMix.Create(UseFFT));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    // Small-magnitude, smooth inputs keep the DFT outputs O(1).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.1 * (Sin(i * 0.7) + 0.3);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 * Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-4);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierMixGradientCheck;
+begin
+  // Power-of-two shape (4,1,4) on the default direct path; also exercise the
+  // self-adjoint adjoint via the FFT fast path on the same shape.
+  // Reseed: this unit shares one RNG across ordering-sensitive tests.
+  RandSeed := 424242;
+  FourierMixGradCheck(Self, 4, 4, 0, 'FourierMix(4,1,4) direct');
+  FourierMixGradCheck(Self, 4, 4, 1, 'FourierMix(4,1,4) FFT');
+end;
+
+procedure TTestNeuralNumerical.TestFourierMixGradientCheckNonPow2;
+begin
+  // NON-power-of-two shape (3,1,5) proving the direct O(n^2) path and its adjoint
+  // are exact for arbitrary SeqLen/Depth.
+  RandSeed := 424242;
+  FourierMixGradCheck(Self, 3, 5, 0, 'FourierMix(3,1,5) direct');
+end;
+
+procedure TTestNeuralNumerical.TestFourierMixLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing TNNetFourierMix with the non-default UseFFT flag set, proving
+  // FStruct[0] survives serialization and the reloaded layer reproduces output.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddLayer(TNNetFourierMix.Create(1)); // UseFFT = true (power-of-two shape)
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('FourierMix round-trip class identity',
+        NN2.GetLastLayer is TNNetFourierMix);
+      AssertTrue('FourierMix UseFFT flag survives',
+        (NN2.GetLastLayer as TNNetFourierMix).UseFFT);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('FourierMix SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FourierMix round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierMixFFTMatchesDirect;
+var
+  NNDirect, NNFFT: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // The opt-in radix-2 FFT fast path must reproduce the direct O(n^2) path to
+  // < 1e-5 on a power-of-two (8,1,4) shape.
+  RandSeed := 424242;
+  NNDirect := TNNet.Create();
+  NNFFT := TNNet.Create();
+  Input := TNNetVolume.Create(8, 1, 4);
+  try
+    NNDirect.AddLayer(TNNetInput.Create(8, 1, 4, 1));
+    NNDirect.AddLayer(TNNetFourierMix.Create(0)); // direct
+    NNFFT.AddLayer(TNNetInput.Create(8, 1, 4, 1));
+    NNFFT.AddLayer(TNNetFourierMix.Create(1));     // FFT
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NNDirect.Compute(Input);
+    NNFFT.Compute(Input);
+
+    for i := 0 to NNDirect.GetLastLayer.Output.Size - 1 do
+      AssertEquals('FourierMix FFT vs direct at ' + IntToStr(i),
+        NNDirect.GetLastLayer.Output.Raw[i],
+        NNFFT.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NNDirect.Free;
+    NNFFT.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierMixForwardKnownValue;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  L, D, a, b, s, h: integer;
+  Expected, Acc: Double;
+begin
+  // Independently recompute y[a,b] = sum_{s,h} x[s,h]*cos(2*pi*(a*s/L+b*h/D))
+  // and confirm the layer's forward output matches it everywhere.
+  RandSeed := 424242;
+  L := 5; D := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(L, 1, D);
+  try
+    NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+    NN.AddLayer(TNNetFourierMix.Create());
+    for s := 0 to Input.Size - 1 do
+      Input.Raw[s] := Sin(s * 1.3) - 0.2;
+    NN.Compute(Input);
+
+    for a := 0 to L - 1 do
+      for b := 0 to D - 1 do
+      begin
+        Acc := 0;
+        for s := 0 to L - 1 do
+          for h := 0 to D - 1 do
+            Acc := Acc + Input.Raw[s * D + h] *
+              Cos(2 * Pi * (a * s) / L + 2 * Pi * (b * h) / D);
+        Expected := Acc;
+        AssertEquals('FourierMix forward at (' + IntToStr(a) + ',' + IntToStr(b) + ')',
+          Expected, NN.GetLastLayer.Output.Raw[a * D + b], 1e-4);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestLpPoolLoadFromString;

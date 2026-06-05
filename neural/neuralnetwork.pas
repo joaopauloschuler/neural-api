@@ -2034,6 +2034,40 @@ type
     constructor Create(); overload; override;
   end;
 
+  /// FNet-style parameter-free Fourier token mixer (Lee-Thorp et al. 2021).
+  // Over a (SeqLen, 1, d) sequence tensor this replaces self-attention with
+  // an UNPARAMETERISED 2D discrete Fourier transform applied across the
+  // sequence (x) axis and the hidden (depth) axis, keeping only the real
+  // part:
+  //   y[a,b] = Re( sum_{s,h} x[s,h] * exp(-2*pi*i*(a*s/L + b*h/D)) )
+  //          = sum_{s,h} x[s,h] * cos( 2*pi*(a*s/L + b*h/D) )
+  // The layer owns NO trainable weights. Because Re(DFT) is a fixed REAL
+  // linear operator M with M[(a,b),(s,h)] = cos(2*pi*(a*s/L + b*h/D)), and M
+  // is symmetric under swapping the (a,b) index with the (s,h) index, the
+  // adjoint M^T equals M. Hence the exact input gradient is the SAME real
+  // 2D-DFT operator applied to dL/dy:
+  //   dL/dx[s,h] = sum_{a,b} cos(2*pi*(a*s/L + b*h/D)) * dL/dy[a,b]
+  // The default O(n^2) direct path works for arbitrary SeqLen and d. An
+  // opt-in radix-2 FFT fast path (UseFFT, default FALSE) is available when
+  // both SeqLen and d are powers of two; it is checked against the direct
+  // path to < 1e-5. UseFFT round-trips via FStruct[0].
+  // Coded by Claude (AI).
+  TNNetFourierMix = class(TNNetIdentity)
+  protected
+    procedure ApplyRealDFT(Src, Dst: TNNetVolume);
+    procedure ApplyRealDFTDirect(Src, Dst: TNNetVolume);
+    procedure ApplyRealDFTFFT(Src, Dst: TNNetVolume);
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    function GetUseFFT(): boolean;
+    procedure SetUseFFT(AValue: boolean);
+  public
+    constructor Create(); overload; override;
+    constructor Create(pUseFFT: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property UseFFT: boolean read GetUseFFT write SetUseFFT;
+  end;
+
   /// Per-sample logit normalization (Wei et al. 2022).
   // Pre-softmax regularizer that divides logits by a tau-scaled L2 norm
   // along the depth axis at each spatial position (X,Y):
@@ -14454,6 +14488,249 @@ constructor TNNetUnitNorm.Create();
 begin
   // Keras "UnitNorm": full-volume L2 normalization by default.
   inherited Create(1, 1e-8);
+end;
+
+{ TNNetFourierMix }
+
+// --- Self-contained radix-2 Cooley-Tukey FFT (power-of-two length only) -----
+// Same algorithm proven in TNNetCirculantLinear's FFT fast path (CirculantFFT,
+// see far below), replicated here because that routine is defined later in the
+// implementation section and Pascal forbids forward use. The inverse path
+// conjugates the exponent and divides by N. Double precision throughout.
+procedure FourierMixFFT(var Re, Im: array of Double; N: integer; Inverse: boolean);
+var
+  i, j, len, half, k: integer;
+  ang, wRe, wIm, wpRe, wpIm, tmp: Double;
+  uRe, uIm, vRe, vIm: Double;
+begin
+  // Bit-reversal permutation.
+  j := 0;
+  for i := 1 to N - 1 do
+  begin
+    k := N shr 1;
+    while (j and k) <> 0 do
+    begin
+      j := j and (not k);
+      k := k shr 1;
+    end;
+    j := j or k;
+    if i < j then
+    begin
+      tmp := Re[i]; Re[i] := Re[j]; Re[j] := tmp;
+      tmp := Im[i]; Im[i] := Im[j]; Im[j] := tmp;
+    end;
+  end;
+  len := 2;
+  while len <= N do
+  begin
+    half := len shr 1;
+    if Inverse then
+      ang := 2 * Pi / len
+    else
+      ang := -2 * Pi / len;
+    wpRe := Cos(ang);
+    wpIm := Sin(ang);
+    i := 0;
+    while i < N do
+    begin
+      wRe := 1.0;
+      wIm := 0.0;
+      for k := 0 to half - 1 do
+      begin
+        uRe := Re[i + k];
+        uIm := Im[i + k];
+        vRe := wRe * Re[i + k + half] - wIm * Im[i + k + half];
+        vIm := wRe * Im[i + k + half] + wIm * Re[i + k + half];
+        Re[i + k]        := uRe + vRe;
+        Im[i + k]        := uIm + vIm;
+        Re[i + k + half] := uRe - vRe;
+        Im[i + k + half] := uIm - vIm;
+        tmp := wRe * wpRe - wIm * wpIm;
+        wIm := wRe * wpIm + wIm * wpRe;
+        wRe := tmp;
+      end;
+      i := i + len;
+    end;
+    len := len shl 1;
+  end;
+  if Inverse then
+    for i := 0 to N - 1 do
+    begin
+      Re[i] := Re[i] / N;
+      Im[i] := Im[i] / N;
+    end;
+end;
+
+function FourierMixIsPow2(x: integer): boolean;
+begin
+  Result := (x > 0) and ((x and (x - 1)) = 0);
+end;
+
+constructor TNNetFourierMix.Create();
+begin
+  Create(0);
+end;
+
+constructor TNNetFourierMix.Create(pUseFFT: integer);
+begin
+  inherited Create();
+  if pUseFFT <> 0 then FStruct[0] := 1 else FStruct[0] := 0;
+end;
+
+function TNNetFourierMix.GetUseFFT(): boolean;
+begin
+  Result := FStruct[0] <> 0;
+end;
+
+procedure TNNetFourierMix.SetUseFFT(AValue: boolean);
+begin
+  if AValue then FStruct[0] := 1 else FStruct[0] := 0;
+end;
+
+procedure TNNetFourierMix.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FOutput.SizeY <> 1 then
+    FErrorProc('TNNetFourierMix requires SizeY=1 (a (SeqLen,1,d) sequence); got SizeY=' +
+      IntToStr(FOutput.SizeY) + '.');
+  if GetUseFFT() and
+     not (FourierMixIsPow2(FOutput.SizeX) and FourierMixIsPow2(FOutput.Depth)) then
+    FErrorProc('TNNetFourierMix.UseFFT requires power-of-two SeqLen and Depth; got SeqLen=' +
+      IntToStr(FOutput.SizeX) + ', Depth=' + IntToStr(FOutput.Depth) +
+      '. Disable UseFFT for the direct O(n^2) path.');
+end;
+
+// Direct O(n^2) real 2D-DFT operator, valid for arbitrary L and D:
+//   Dst[a,b] = sum_{s,h} Src[s,h] * cos( 2*pi*(a*s/L + b*h/D) )
+// This is both the forward map (FNet Re(DFT)) AND its own adjoint, so the same
+// routine serves Compute (Src=input) and Backpropagate (Src=dL/dy).
+procedure TNNetFourierMix.ApplyRealDFTDirect(Src, Dst: TNNetVolume);
+var
+  L, D, a, b, s, h: integer;
+  Acc, TwoPi, AngS: Double;
+begin
+  L := Src.SizeX;
+  D := Src.Depth;
+  TwoPi := 2 * Pi;
+  for a := 0 to L - 1 do
+    for b := 0 to D - 1 do
+    begin
+      Acc := 0;
+      for s := 0 to L - 1 do
+      begin
+        AngS := TwoPi * (a * s) / L;
+        for h := 0 to D - 1 do
+          Acc := Acc + Src.FData[s * D + h] * Cos(AngS + TwoPi * (b * h) / D);
+      end;
+      Dst.FData[a * D + b] := Acc;
+    end;
+end;
+
+// FFT fast path: a separable 2D FFT. We FFT along the hidden axis (length D),
+// then along the sequence axis (length L), and keep the real part. The result
+// equals Re(DFT_seq(DFT_hidden(x))) exactly. Both axes must be powers of two.
+procedure TNNetFourierMix.ApplyRealDFTFFT(Src, Dst: TNNetVolume);
+var
+  L, D, s, h: integer;
+  reRows, imRows: array of array of Double; // [s][h] after hidden-axis FFT
+  colRe, colIm: array of Double;
+begin
+  L := Src.SizeX;
+  D := Src.Depth;
+  SetLength(reRows, L, D);
+  SetLength(imRows, L, D);
+  // FFT each row across the hidden (depth) axis.
+  for s := 0 to L - 1 do
+  begin
+    for h := 0 to D - 1 do
+    begin
+      reRows[s][h] := Src.FData[s * D + h];
+      imRows[s][h] := 0;
+    end;
+    FourierMixFFT(reRows[s], imRows[s], D, false);
+  end;
+  // FFT each column across the sequence axis, keep real part.
+  SetLength(colRe, L);
+  SetLength(colIm, L);
+  for h := 0 to D - 1 do
+  begin
+    for s := 0 to L - 1 do
+    begin
+      colRe[s] := reRows[s][h];
+      colIm[s] := imRows[s][h];
+    end;
+    FourierMixFFT(colRe, colIm, L, false);
+    for s := 0 to L - 1 do
+      Dst.FData[s * D + h] := colRe[s];
+  end;
+end;
+
+procedure TNNetFourierMix.ApplyRealDFT(Src, Dst: TNNetVolume);
+{$IFDEF Debug}
+var
+  RefVol: TNNetVolume;
+  i: integer;
+  MaxDiff, Diff: Double;
+{$ENDIF}
+begin
+  if GetUseFFT() then
+  begin
+    ApplyRealDFTFFT(Src, Dst);
+    {$IFDEF Debug}
+    // Internal correctness guard: FFT path must match the direct path < 1e-5.
+    RefVol := TNNetVolume.Create(Src.SizeX, Src.SizeY, Src.Depth);
+    try
+      ApplyRealDFTDirect(Src, RefVol);
+      MaxDiff := 0;
+      for i := 0 to Dst.Size - 1 do
+      begin
+        Diff := Abs(Dst.FData[i] - RefVol.FData[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      if MaxDiff > 1e-5 then
+        FErrorProc('TNNetFourierMix FFT vs direct mismatch: ' + FloatToStr(MaxDiff));
+    finally
+      RefVol.Free;
+    end;
+    {$ENDIF}
+  end
+  else
+    ApplyRealDFTDirect(Src, Dst);
+end;
+
+procedure TNNetFourierMix.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ApplyRealDFT(FPrevLayer.FOutput, FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFourierMix.Backpropagate();
+var
+  StartTime: double;
+  GradVol: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FOutputError.Size) then
+  begin
+    // dL/dx = M^T dL/dy = M dL/dy (M is self-adjoint), same operator as forward.
+    GradVol := TNNetVolume.Create(FOutput.SizeX, FOutput.SizeY, FOutput.Depth);
+    try
+      ApplyRealDFT(FOutputError, GradVol);
+      FPrevLayer.FOutputError.Add(GradVol);
+    finally
+      GradVol.Free;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetMinMaxNorm }
@@ -57037,6 +57314,7 @@ begin
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
       'TNNetUnitNorm' :             Result := TNNetUnitNorm.Create();
       'TNNetMinMaxNorm' :           Result := TNNetMinMaxNorm.Create(Ft[0], St[0] = 1);
+      'TNNetFourierMix' :           Result := TNNetFourierMix.Create(St[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
@@ -57347,6 +57625,7 @@ begin
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetUnitNorm' then Result := TNNetUnitNorm.Create() else
       if S[0] = 'TNNetMinMaxNorm' then Result := TNNetMinMaxNorm.Create(Ft[0], St[0] = 1) else
+      if S[0] = 'TNNetFourierMix' then Result := TNNetFourierMix.Create(St[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else

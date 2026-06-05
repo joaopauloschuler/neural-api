@@ -18,6 +18,7 @@ examples/GumbelAnnealingAutoencoder/GumbelAnnealingAutoencoder
 examples/BeamSearchDecode/BeamSearchDecode
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
+examples/FourierMix/FourierMix
 link*.res
 autosave.csv
 autosave.nn
