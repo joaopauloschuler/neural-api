@@ -134,7 +134,15 @@ type
       TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02, 0.01)
     ]);
 
-    for I := 1 to 2 do FNN.AddTransformerBlockCAI(8, 2048, true, false, false);
+    for I := 1 to 2 do
+    begin
+      // Modern stack (LayerNorm + true SDPA + SwiGLU FFN, causal):
+      FNN.AddTransformerEncoderBlock(8, 2048, {PreNorm=}true, {CausalMask=}true);
+      // Baseline: CAI transformer decoder block (signed-sqrt norm, ReLU FFN).
+      // FNN.AddTransformerBlockCAI(8, 2048, true, false, false);
+      // GELU activations in the CAI block instead of signed-sqrt:
+      // FNN.AddTransformerBlockCAI(8, 2048, true, false, false, TNNetGELU);
+    end;
 
     FNN.AddLayer([
       TNNetPointwiseConvLinear.Create(csEmbedDim),
