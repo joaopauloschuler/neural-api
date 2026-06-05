@@ -134,6 +134,34 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
+- [ ] TNNetClosedFormContinuous — a CfC "liquid" recurrent cell (Hasani et al.
+      2022, "Closed-form Continuous-time Neural Networks", Nature MI). A sequence
+      mixer over a (SeqLen,1,Depth) tensor that updates a hidden state with the
+      analytic closed-form solution of a liquid time-constant ODE rather than a
+      numerical integrator: per step `h_t = sigmoid(-(W_t·x + b_t)·t)⊙g(x) +
+      (1 - sigmoid(...))⊙h_prev`, i.e. an INPUT-DEPENDENT, per-channel time
+      constant gating between a fast pathway and the previous state. This is
+      genuinely distinct from everything already in the tree: the landed
+      TNNet.AddNeuralODEBlock INTEGRATES a residual field numerically (Euler/RK),
+      TNNetRetention / TNNetDiagonalSSM / Hyena use FIXED or
+      input-independent decay kernels, and Highway/GatedResidual gates are
+      depthwise but NOT recurrent over time. The CfC's defining feature is the
+      learned per-channel continuous-time constant that varies with the input at
+      every step — closed-form, so no ODE solver and no BPTT-through-an-integrator.
+      Deliverables:
+      (a) the leaf layer in neuralnetwork.pas (mark `// Coded by Claude (AI).`),
+          forward as the explicit per-timestep recurrence first (clear + easy to
+          verify), backprop-through-time over the unrolled steps, with
+          LoadFromString wiring + InitDefault/AddToWeightHistory parity with the
+          other gated layers;
+      (b) a TestNeuralNumerical.pas gradient check (reseed RandSeed := 424242 per
+          the shared-RNG ordering rule) on a short SeqLen so the unroll stays cheap;
+      (c) a one-screen examples/LiquidCfC/ "remember-then-recall" toy (copy or
+          delayed-XOR over a short sequence) contrasting the CfC cell against a
+          plain SDPA head at matched parameter count, plus a README;
+      (d) a short docs note placing CfC next to Neural ODE / Retention / SSM in the
+          sequence-mixer family table.
+
 - [ ] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
       matrix W (n x n, n = Depth) is CIRCULANT: every row is a cyclic shift of a
       single learned vector c of length n, so the layer stores O(n) weights
