@@ -503,6 +503,32 @@ rather than acted on.
       shows the separation trend WITHIN ArcFace across margins m in {0,0.3,0.5},
       not ArcFace-vs-softmax head to head. Pairs with [[FeatureSeparability]] and
       the open TNNetCenterLoss SOFTMAX-JOINT follow-up.
+- [ ] `TNNetMixtureDensityOutput` + `examples/MixtureDensityNetwork/` —
+      a Mixture Density Network output head (Bishop 1994) for PROBABILISTIC,
+      MULTIMODAL regression. This is genuinely new: the only probabilistic
+      regression head in the tree is `TNNetQuantileLoss` (predicts fixed
+      quantiles via the pinball loss); an MDN instead predicts a full
+      conditional Gaussian mixture `p(y|x) = Σ_k π_k(x) N(y; μ_k(x), σ_k(x))`
+      and so can represent one-to-many / branching targets that any single-
+      mode head (MSE, MAE, Huber, even quantiles) collapses or averages out.
+      Plan: a leaf head taking a flat input of width `K*(2*Dout+1)` and
+      splitting it into K mixing logits, K*Dout means, K*Dout (log-)stddevs.
+      Forward = identity passthrough (the head just LABELS the layout); the
+      NLL and its gradient are computed in `Backpropagate` against the target
+      volume, exactly the TNNetIdentity-passthrough + backward-rewrite loss-
+      layer recipe in [[loss-layer-pattern]] (mixing weights via softmax over
+      the K logits, σ via softplus/exp for positivity, responsibilities
+      γ_k = π_k N_k / Σ_j π_j N_j giving the clean closed-form grads:
+      dL/dlogit = π_k - γ_k, dL/dμ = γ_k (μ_k - y)/σ_k², dL/dlogσ =
+      γ_k (1 - (y-μ_k)²/σ_k²)). Wire into both dispatch tables, add the
+      LoadFromString round-trip and a standalone numerical-gradient test (the
+      analytic γ grads vs central differences) per [[loss-layer-pattern]] and
+      the [[numerical-test-rng-ordering]] reseed convention. The example fits
+      the canonical Bishop INVERSE problem `x = y + 0.3 sin(2πy) + ε` (a
+      one-to-many map): show plain-MSE regression collapsing to the conditional
+      mean (a useless average of the branches) vs the MDN recovering all
+      branches, dumping an ASCII scatter of sampled (x, ŷ) draws. `// Coded by
+      Claude (AI).` on the class per [[claude-authorship-comment]].
 - [ ] TNNetKLDivergence distillation follow-up
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
