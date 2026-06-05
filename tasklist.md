@@ -580,13 +580,18 @@ rather than acted on.
       test" experiment and the `examples/VQAutoencoder/` demo below.
 
 ### Training infrastructure (the "missing plumbing")
-- [ ] TNeuralLRScheduler follow-up: WIRE the scheduler into the training loop —
+- [X] TNeuralLRScheduler follow-up: WIRE the scheduler into the training loop —
       have TNeuralFit/TNeuralImageFit call `NextLR(Epoch, Step)` each
       epoch/step (gated behind an optional Scheduler property so the default
       fixed-LR path is byte-for-byte unchanged), plus a regression test that a
       net trained under a constant-valued scheduler matches the fixed-LR run.
       The classes + math are landed; this is the integration the "missing
       plumbing" entry ultimately wants.
+      DONE: TNeuralFitBase.Scheduler property (defaults nil); CheckLearningRate
+      calls Scheduler.NextLR(iEpochCount, FCurrentStep) as highest-priority
+      override branch (epoch granularity — both Optimize loops call
+      CheckLearningRate once per epoch); regression test
+      TestConstantSchedulerMatchesFixedLR in tests/TestNeuralFit.pas.
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
       (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
       TNeuralFit calls them yet. Wire an optional hook into the training loop (call

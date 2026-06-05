@@ -5,9 +5,22 @@ unit TestNeuralFit;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume, neuralfit;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
+  neuralfit, neuralscheduler;
 
 type
+  // A scheduler whose NextLR always returns the same fixed value, regardless
+  // of Epoch/Step. Used to prove the scheduler hook composes as a clean
+  // override: assigning a constant scheduler equal to the fixed LR must
+  // reproduce the no-scheduler run exactly.
+  TConstantLR = class(TNeuralLRScheduler)
+  private
+    FLR: TNeuralFloat;
+  public
+    constructor Create(pLR: TNeuralFloat);
+    function NextLR(Epoch, Step: integer): TNeuralFloat; override;
+  end;
+
   TTestNeuralFit = class(TTestCase)
   published
     // Optimizer tests
@@ -38,9 +51,24 @@ type
     procedure TestFirstLayerWithNonFiniteAllFinite;
     procedure TestFirstLayerWithNonFiniteDetectsLayer;
     procedure TestFirstLayerWithNonFiniteDetectsInf;
+
+    // Scheduler wiring
+    procedure TestSchedulerDefaultsNil;
+    procedure TestConstantSchedulerMatchesFixedLR;
   end;
 
 implementation
+
+constructor TConstantLR.Create(pLR: TNeuralFloat);
+begin
+  inherited Create();
+  FLR := pLR;
+end;
+
+function TConstantLR.NextLR(Epoch, Step: integer): TNeuralFloat;
+begin
+  Result := FLR;
+end;
 
 procedure TTestNeuralFit.TestSGDOptimizerCreation;
 var
@@ -384,6 +412,118 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestSchedulerDefaultsNil;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // The scheduler must be OPTIONAL and unset by default so the legacy
+    // fixed/decay/cyclical LR path stays byte-for-byte unchanged.
+    AssertTrue('Scheduler should default to nil', Fit.Scheduler = nil);
+  finally
+    Fit.Free;
+  end;
+end;
+
+// Builds a fresh tiny regression net under a fixed seed so two builds are
+// bit-identical at initialization.
+function BuildFitNet: TNNet;
+begin
+  RandSeed := 424242;
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(2),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(1)
+  ]);
+  Result.SetLearningRate(0.01, 0.9);
+end;
+
+// Builds the tiny XOR-ish training set used by the scheduler regression test.
+function BuildFitPairs: TNNetVolumePairList;
+var
+  I: integer;
+  Pair: TNNetVolumePair;
+begin
+  Result := TNNetVolumePairList.Create();
+  for I := 0 to 3 do
+  begin
+    Pair := TNNetVolumePair.Create();
+    Pair.A.ReSize(2, 1, 1);
+    Pair.B.ReSize(1, 1, 1);
+    Pair.A.Raw[0] := (I and 1);
+    Pair.A.Raw[1] := ((I shr 1) and 1);
+    Pair.B.Raw[0] := (I and 1) xor ((I shr 1) and 1);
+    Result.Add(Pair);
+  end;
+end;
+
+// Trains Net with an OPTIONAL scheduler and returns the last-layer weight
+// vector after training (no best-model reload, so weights are the live ones).
+procedure RunFit(Net: TNNet; Sched: TNeuralLRScheduler; out W: TNNetVolume);
+var
+  Fit: TNeuralFit;
+  Pairs: TNNetVolumePairList;
+begin
+  Pairs := BuildFitPairs();
+  // Reseed immediately before Fit so both runs see the same RNG stream
+  // (Fit shuffles batches off the global RNG); the only difference between
+  // the baseline and scheduler runs is then the scheduler hook itself.
+  RandSeed := 100;
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    // Single thread so the only difference between the two runs is the
+    // scheduler hook (thread-reduction order is otherwise nondeterministic).
+    Fit.MaxThreadNum := 1;
+    // Hold the built-in LR constant (decay 0) so the no-scheduler path keeps
+    // a fixed LR equal to the constant scheduler's value.
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False; // keep live trained weights, avoid reload
+    Fit.Scheduler := Sched;     // nil for the baseline run
+    Fit.Fit(Net, Pairs, nil, nil, 4, 20);
+    W := TNNetVolume.Create();
+    W.Copy(Net.GetLastLayer.Neurons[0].Weights);
+  finally
+    Fit.Free;
+    Pairs.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestConstantSchedulerMatchesFixedLR;
+var
+  NetA, NetB: TNNet;
+  WA, WB: TNNetVolume;
+  Sched: TConstantLR;
+  I: integer;
+begin
+  WA := nil;
+  WB := nil;
+  Sched := nil;
+  NetA := BuildFitNet();          // baseline: no scheduler, fixed LR 0.01
+  NetB := BuildFitNet();          // same seed -> identical init weights
+  try
+    Sched := TConstantLR.Create(0.01);
+    RunFit(NetA, nil, WA);        // legacy fixed-LR path
+    RunFit(NetB, Sched, WB);      // scheduler path, same constant LR
+
+    AssertEquals('Weight vector size must match', WA.Size, WB.Size);
+    for I := 0 to WA.Size - 1 do
+      AssertEquals('Constant-scheduler weights must match fixed-LR weights',
+        WA.FData[I], WB.FData[I], 1e-6);
+  finally
+    WA.Free;
+    WB.Free;
+    Sched.Free;
+    NetA.Free;
+    NetB.Free;
   end;
 end;
 
