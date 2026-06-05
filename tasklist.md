@@ -127,17 +127,6 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
-- [X] mLSTM matrix-memory variant (xLSTM follow-up to the landed scalar sLSTM):
-      LANDED 2026-06-05 as TNNetMLSTMCell + TNNet.AddMLSTM. DepthxDepth covariance
-      memory C_t = f'_t C_{t-1} + i'_t v_t k_t^T, normalizer n_t, running-max m_t
-      stabilizer, read-out h_t = o_t * (C_t q_t / max(|n_t^T q_t|, 1)). Registered
-      in CreateLayer + LoadFromString; numerical-gradient (input+all-9-weights) and
-      save/load tests in TestNeuralNumerical.pas. KEY FINDING: unlike sLSTM, m_t is
-      NOT stop-gradient here — once the read-out denominator clamps at 1 the
-      exp(-m_t) scaling no longer cancels, so backward must propagate an exact
-      dL/dm_t through the running max (two earlier stop-grad attempts failed the
-      gradient check).
-
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
       + examples/HyperNetwork/ + two-path gradient tests + the
       TNNet.AddHyperLinear(Din, Dout, ContextLayer) generator+HyperLinear builder
@@ -794,14 +783,6 @@ rather than acted on.
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
       a few seeds (mean +/- std) would show whether the bounce is a seed artifact
       or a real saturation/recovery transition.
-- [X] `examples/Word2VecSkipGram/` — LANDED 2026-06-05. Skip-gram with negative
-      sampling (SGNS) on a built-in corpus, no download, ~6s runtime. KEY FINDING:
-      a single SHARED embedding matrix drove every cosine to ~0 (failed); the
-      textbook TWO-matrix design (separate center/context TNNetEmbedding nets,
-      seeded via the "target = output - grad" loss-layer trick) fixed it. Negatives
-      drawn from a unigram^0.75 table. `king - man + woman ≈ queen` LANDED (queen
-      top at 0.74); the thinly-attested seniority analogy did NOT generalise
-      (documented honestly in the README). Nearest-neighbour lists all sensible.
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
@@ -1365,20 +1346,10 @@ rather than acted on.
       single-number window into the terminal phase / neural collapse. Pairs
       with the open grokking experiment and the landed lottery-ticket experiment
       ([[WeightSpectrumReport]]).
-- [X] `TNNet.NeuralCollapseReport` + `examples/NeuralCollapse/` — LANDED 2026-06-05.
-      All four Papyan/Han/Donoho 2020 metrics on penultimate-layer features, reusing
-      FeatureSeparabilityReport's class-mean/scatter machinery. NC1 uses the diagonal
-      trace-ratio surrogate `tr(Sw)/tr(Sb)` (no eigensolver dependency, documented in
-      the method comment) rather than a full pseudo-inverse `tr(Sw·Sb^+)/C`; NC2
-      equinorm-CV + equiangular mean/max deviation from the `-1/(C-1)` ETF target;
-      NC3 self-duality (computed when head is width-matched FullConnectLinear, else
-      honestly skipped — both branches smoke-tested); NC4 nearest-class-mean fraction.
-      Example: 4-class Gaussian blobs trained past zero train-error, ASCII trajectory
-      of pairwise cosine → `-1/(C-1)`, ~1.6s. Smoke test pins NC2 on a hand-built
-      exact simplex ETF to <1e-4 independent of training. Inherits the balanced-batch
-      caveat from FeatureSeparability (example uses balanced probes).
-      FOLLOW-UP STILL OPEN: a true `tr(Sw·Sb^+)/C` NC1 (full matrix pseudo-inverse)
-      would need an eigensolver/SVD helper — track if a second consumer wants it.
+- [ ] NeuralCollapseReport follow-up: the landed NC1 uses the diagonal trace-ratio
+      surrogate `tr(Sw)/tr(Sb)`. A true `tr(Sw·Sb^+)/C` NC1 (full matrix
+      pseudo-inverse) would need an eigensolver/SVD helper — track if a second
+      consumer wants it.
 - [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
       separated verdict robust when the endpoint losses are near zero. As
       landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
