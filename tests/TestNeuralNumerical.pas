@@ -211,6 +211,9 @@ type
     procedure TestDiagonalSSMWeightGradientCheck;
     procedure TestDiagonalSSMSeqLen1Feedthrough;
     procedure TestDiagonalSSMSerializationRoundTrip;
+    procedure TestSpatialGatingUnitInputGradientCheck;
+    procedure TestSpatialGatingUnitWeightGradientCheck;
+    procedure TestSpatialGatingUnitSerializationRoundTrip;
     procedure TestCausalConv1DInputGradientCheck;
     procedure TestCausalConv1DWeightGradientCheck;
     procedure TestCausalConv1DCausality;
@@ -20813,6 +20816,193 @@ begin
   // SizeX=4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDiagonalSSM.Create(), 'DiagonalSSM', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSpatialGatingUnitInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSGU: TNNetSpatialGatingUnit;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+  SeqLen, Depth: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Deterministic init so this finite-difference check is ordering-independent
+  // (see numerical-test-rng-ordering memory).
+  RandSeed := 424242;
+  SeqLen := 4; Depth := 4; // even Depth; output Depth = 2.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Depth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Depth div 2);
+  // The SGU output is bilinear in the input (u .* (W*v)), so central
+  // differences are mathematically exact for any epsilon; a larger epsilon
+  // just suppresses single-precision catastrophic cancellation.
+  epsilon := 0.01;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    LSGU := TNNetSpatialGatingUnit.Create(SeqLen);
+    NN.AddLayer(LSGU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+
+    // Non-trivial spatial matrix + bias so both gate halves and the cross-token
+    // mix are exercised (default init is near-identity which hides off-diagonal
+    // bugs).
+    for i := 0 to LSGU.Neurons[0].Weights.Size - 1 do
+      LSGU.Neurons[0].Weights.Raw[i] :=
+        LSGU.Neurons[0].Weights.Raw[i] + Sin(i * 0.7 + 0.3) * 0.4;
+    for i := 0 to LSGU.Neurons[1].Weights.Size - 1 do
+      LSGU.Neurons[1].Weights.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SpatialGatingUnit input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('SpatialGatingUnit input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialGatingUnitWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSGU: TNNetSpatialGatingUnit;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  SeqLen, Depth: integer;
+  Names: array[0..1] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 4; Depth := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Depth div 2);
+  // Output is linear in W and bias, so central differences are exact; a larger
+  // epsilon suppresses single-precision cancellation (see the input-grad test).
+  epsilon := 0.01;
+  maxErr := 0;
+  Names[0] := 'W';
+  Names[1] := 'bias';
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    LSGU := TNNetSpatialGatingUnit.Create(SeqLen);
+    NN.AddLayer(LSGU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+
+    for i := 0 to LSGU.Neurons[0].Weights.Size - 1 do
+      LSGU.Neurons[0].Weights.Raw[i] :=
+        LSGU.Neurons[0].Weights.Raw[i] + Sin(i * 0.6 + 0.2) * 0.4;
+    for i := 0 to LSGU.Neurons[1].Weights.Size - 1 do
+      LSGU.Neurons[1].Weights.Raw[i] := Cos(i * 0.4) * 0.3;
+
+    // Cover both weight tensors (W = SeqLen*SeqLen, bias = SeqLen).
+    for n := 0 to 1 do
+      for i := 0 to LSGU.Neurons[n].Weights.Size - 1 do
+      begin
+        LSGU.Neurons[n].Weights.Raw[i] := LSGU.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LSGU.Neurons[n].Weights.Raw[i] := LSGU.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LSGU.Neurons[n].Weights.Raw[i] := LSGU.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LSGU.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // With LearningRate = 1 and batch update on, analytical = -Delta.
+        analyticalGrad := -LSGU.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('SpatialGatingUnit weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('SpatialGatingUnit weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpatialGatingUnitSerializationRoundTrip;
+begin
+  // TNNetSpatialGatingUnit stores a SeqLen x SeqLen spatial matrix W and a
+  // SeqLen-long bias; the perturbed-weights helper pushes both away from the
+  // near-identity default so the round trip exercises a non-trivial parameter
+  // set. SizeY=1, SizeX=4 (the pinned sequence length), even Depth=4.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSpatialGatingUnit.Create(4), 'SpatialGatingUnit', 4, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestCausalConv1DInputGradientCheck;

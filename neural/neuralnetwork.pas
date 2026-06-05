@@ -3743,6 +3743,57 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetSpatialGatingUnit: the attention-free sequence mixer of the gMLP
+  // block (Liu et al. 2021, "Pay Attention to MLPs", arXiv:2105.08315). Input
+  // is a (SeqLen, 1, Depth) sequence laid out along SizeX exactly like the
+  // attention / TNNetDiagonalSSM layers (SizeY must be 1) with Depth EVEN. The
+  // unit:
+  //   (a) splits the Depth channels in half -> u = first Depth/2, v = last
+  //       Depth/2;
+  //   (b) applies a single LEARNED, content-independent SeqLen x SeqLen weight
+  //       matrix W (plus a per-position bias) ACROSS the sequence axis of v -
+  //       the SAME static spatial projection shared by every one of the Depth/2
+  //       channels:  v'[n,c] = bias[n] + sum_m W[n,m] * v[m,c];
+  //   (c) gates multiplicatively:  out[n,c] = u[n,c] * v'[n,c].
+  // Output shape is (SeqLen, 1, Depth/2). The mixing weights W are FIXED after
+  // training (they do not depend on the input) - that static cross-token
+  // projection is what makes the SGU a distinct primitive rather than a
+  // re-skin of attention. Because W is genuinely SeqLen x SeqLen the sequence
+  // length is FIXED: it is pinned at construction (pSeqLen) and a mismatched
+  // input is rejected in SetPrevLayer, mirroring TNNetDiagonalSSM's SizeY=1
+  // contract. Storage (descends straight from TNNetLayer because the output
+  // Depth differs from the input Depth, so TNNetChannelTransformBase does not
+  // apply):
+  //   FNeurons[0].Weights = W    (SeqLen rows x 1 x SeqLen cols; index [m,0,n]
+  //                               holds W[n,m] so a row of v can be reduced with
+  //                               one AVX MulAdd over the contiguous col run)
+  //   FNeurons[1].Weights = bias (SeqLen-long, one per output position)
+  // W is initialised near the identity (1 on the diagonal, small off-diagonal)
+  // and bias to zero - the standard gMLP near-no-op init that keeps the block
+  // close to the identity at the start of training. Backprop:
+  //   dL/du[n,c]  = gy[n,c] * v'[n,c]
+  //   dL/dv'[n,c] = gy[n,c] * u[n,c]
+  //   dL/dv[m,c] += sum_n W[n,m] * dL/dv'[n,c]
+  //   dL/dW[n,m] += sum_c dL/dv'[n,c] * v[m,c]
+  //   dL/dbias[n]+= sum_c dL/dv'[n,c]
+  // Coded by Claude (AI).
+  TNNetSpatialGatingUnit = class(TNNetLayer)
+    private
+      FSeqLen: integer;
+      FHalf: integer;          // Depth/2
+      FVProj: TNNetVolume;     // forward cache v' = bias + W*v, (SeqLen,1,Half)
+      FGradW: TNNetVolume;     // weight-grad accumulator, shape of W
+      FGradBias: TNNetVolume;  // bias-grad accumulator, SeqLen-long
+      FGVProj: TNNetVolume;    // dL/dv', (SeqLen,1,Half)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pSeqLen: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetPolynomialActivation: per-channel learnable quadratic activation.
   // For each channel c:
   //   y[x,y,c] = a[c] * Input[x,y,c]^2 + b[c] * Input[x,y,c] + c0[c].
@@ -5949,6 +6000,22 @@ type
       // each sequence position), matching the existing AddSelfAttention block.
       function AddMultiHeadSelfAttention(d_model, Heads: integer;
         CausalMask: boolean = false): TNNetLayer;
+      // Spatial Gating Unit (Liu et al. 2021, gMLP) over a (pSeqLen,1,d) input
+      // with d EVEN: split channels in half, project the second half across the
+      // sequence with a static learned pSeqLen x pSeqLen matrix + bias, gate it
+      // multiplicatively against the first half. Returns the SGU layer of shape
+      // (pSeqLen,1,d/2). Attention-free cross-token mixer (the matrix is fixed
+      // after training). Coded by Claude (AI).
+      function AddSpatialGatingUnit(pSeqLen: integer): TNNetLayer;
+      // Full gMLP block (Liu et al. 2021): channel-MLP up-projection ->
+      // split+SGU sequence mix -> channel-MLP down-projection, wrapped in a
+      // pre-LayerNorm residual. d_model is the residual-stream width, d_ffn the
+      // (even) hidden width of the channel MLP; the SGU halves d_ffn so the
+      // down-projection sees d_ffn/2. All channel projections are token-wise
+      // (TNNetPointwiseConvLinear / 1x1 conv) so the (SeqLen,1,*) sequence axis
+      // is preserved (FullConnect would flatten it; see AddMultiHeadSelfAttention
+      // header). Returns the residual-sum layer. Coded by Claude (AI).
+      function AddgMLPBlock(pSeqLen, d_model, d_ffn: integer): TNNetLayer;
       // Multi-head RETENTION block (RetNet, Sun et al. 2023) over a
       // (SeqLen,1,3*d_model) Q|K|V slab. Built exactly like
       // AddMultiHeadSelfAttention but with one softmax-free TNNetRetention per
@@ -23961,6 +24028,188 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetSpatialGatingUnit }
+constructor TNNetSpatialGatingUnit.Create(pSeqLen: integer);
+begin
+  inherited Create();
+  if pSeqLen < 1 then
+    FErrorProc('TNNetSpatialGatingUnit requires pSeqLen >= 1. pSeqLen=' +
+      IntToStr(pSeqLen));
+  FSeqLen := pSeqLen;
+  FStruct[0] := FSeqLen;
+  FHalf := 0;
+  FVProj := TNNetVolume.Create();
+  FGradW := TNNetVolume.Create();
+  FGradBias := TNNetVolume.Create();
+  FGVProj := TNNetVolume.Create();
+  // W: SeqLen rows x 1 x SeqLen cols, stored as [m,0,n] = W[n,m]; bias: SeqLen.
+  AddMissingNeurons(2);
+  FNeurons[0].FWeights.ReSize(FSeqLen, 1, FSeqLen);
+  FNeurons[0].FDelta.ReSize(FSeqLen, 1, FSeqLen);
+  FNeurons[1].FWeights.ReSize(FSeqLen, 1, 1);
+  FNeurons[1].FDelta.ReSize(FSeqLen, 1, 1);
+  FGradW.ReSize(FSeqLen, 1, FSeqLen);
+  FGradBias.ReSize(FSeqLen, 1, 1);
+  InitDefault();
+end;
+
+destructor TNNetSpatialGatingUnit.Destroy();
+begin
+  FGVProj.Free;
+  FGradBias.Free;
+  FGradW.Free;
+  FVProj.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSpatialGatingUnit.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetSpatialGatingUnit requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.SizeX <> FSeqLen then
+    FErrorProc('TNNetSpatialGatingUnit pinned to SeqLen=' + IntToStr(FSeqLen) +
+      ' but input SizeX=' + IntToStr(pPrevLayer.FOutput.SizeX));
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+    FErrorProc('TNNetSpatialGatingUnit requires an EVEN input Depth, got ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FHalf := pPrevLayer.FOutput.Depth div 2;
+  FOutput.ReSize(FSeqLen, 1, FHalf);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  FVProj.ReSize(FSeqLen, 1, FHalf);
+  FGVProj.ReSize(FSeqLen, 1, FHalf);
+end;
+
+procedure TNNetSpatialGatingUnit.Compute();
+var
+  StartTime: double;
+  Prev, W, Bias: TNNetVolume;
+  n, m: integer;
+  BiasN: TNeuralFloat;
+  VProjPtr, VmPtr, UPtr, OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  W := FNeurons[0].FWeights;
+  Bias := FNeurons[1].FWeights;
+  // v lives at depth [FHalf .. 2*FHalf-1]; u at [0 .. FHalf-1].
+  // v'[n,c] = bias[n] + sum_m W[n,m] * v[m,c]; out[n,c] = u[n,c] * v'[n,c].
+  for n := 0 to FSeqLen - 1 do
+  begin
+    VProjPtr := FVProj.GetRawPtr(n, 0, 0);
+    BiasN := Bias.FData[n];
+    for m := 0 to FHalf - 1 do VProjPtr^[m] := BiasN;
+    for m := 0 to FSeqLen - 1 do
+    begin
+      VmPtr := Prev.GetRawPtr(m, 0, FHalf);
+      TNNetVolume.MulAdd(VProjPtr, VmPtr, W[m, 0, n], FHalf);
+    end;
+    UPtr := Prev.GetRawPtr(n, 0, 0);
+    OutPtr := FOutput.GetRawPtr(n, 0, 0);
+    system.Move(UPtr^, OutPtr^, FHalf * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(OutPtr, VProjPtr, FHalf);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSpatialGatingUnit.Backpropagate();
+var
+  StartTime: double;
+  Nw, Nb: TNNetNeuron;
+  Prev, PrevErr, W: TNNetVolume;
+  n, m, c: integer;
+  GyPtr, VProjPtr, UPtr, GVProjPtr, VmPtr, GUPtr, GVmPtr: TNeuralFloatArrPtr;
+  Acc, Wnm: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Nw := FNeurons[0];
+  Nb := FNeurons[1];
+  W := Nw.FWeights;
+  Prev := FPrevLayer.FOutput;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = Prev.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGradW.Fill(0);
+  FGradBias.Fill(0);
+  // (1) gate gradients: dL/du = gy .* v',  dL/dv' = gy .* u; also input-grad
+  //     for the u half (du flows straight back into depth [0..FHalf-1]).
+  for n := 0 to FSeqLen - 1 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(n, 0, 0);
+    VProjPtr := FVProj.GetRawPtr(n, 0, 0);
+    UPtr := Prev.GetRawPtr(n, 0, 0);
+    GVProjPtr := FGVProj.GetRawPtr(n, 0, 0);
+    // dL/dv'[n] = gy[n] .* u[n]
+    system.Move(GyPtr^, GVProjPtr^, FHalf * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(GVProjPtr, UPtr, FHalf);
+    // dL/dbias[n] = sum_c dL/dv'[n,c]
+    Acc := 0;
+    for c := 0 to FHalf - 1 do Acc := Acc + GVProjPtr^[c];
+    FGradBias.FData[n] := Acc;
+    if hasInputGrad then
+    begin
+      // dL/du[n] = gy[n] .* v' -> into depth [0..FHalf-1]
+      GUPtr := PrevErr.GetRawPtr(n, 0, 0);
+      TNNetVolume.MulAdd(GUPtr, GyPtr, VProjPtr, FHalf);
+    end;
+  end;
+  // (2) weight grad and input-grad for the v half. v'[n] depends on every v[m]:
+  //   dL/dW[n,m] += sum_c dL/dv'[n,c] * v[m,c]
+  //   dL/dv[m,c] += sum_n W[n,m] * dL/dv'[n,c]
+  for n := 0 to FSeqLen - 1 do
+  begin
+    GVProjPtr := FGVProj.GetRawPtr(n, 0, 0);
+    for m := 0 to FSeqLen - 1 do
+    begin
+      VmPtr := Prev.GetRawPtr(m, 0, FHalf);
+      FGradW[m, 0, n] := TNNetVolume.DotProduct(GVProjPtr, VmPtr, FHalf);
+      if hasInputGrad then
+      begin
+        Wnm := W[m, 0, n];
+        GVmPtr := PrevErr.GetRawPtr(m, 0, FHalf);
+        TNNetVolume.MulAdd(GVmPtr, GVProjPtr, Wnm, FHalf);
+      end;
+    end;
+  end;
+  // Flush -FLearningRate-scaled grads into the neuron deltas (SetBatchUpdate
+  // safe: accumulate into FDelta, only apply when not batching).
+  TNNetVolume.MulAdd(Nw.FDelta.GetRawPtr(), FGradW.GetRawPtr(),
+    -FLearningRate, Nw.FDelta.Size);
+  TNNetVolume.MulAdd(Nb.FDelta.GetRawPtr(), FGradBias.GetRawPtr(),
+    -FLearningRate, Nb.FDelta.Size);
+  if (not FBatchUpdate) then
+  begin
+    Nw.UpdateWeights(FInertia);
+    Nb.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSpatialGatingUnit.InitDefault();
+var
+  n, m: integer;
+begin
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  // gMLP near-no-op init: W near identity, bias zero. v' ~= v at the start, so
+  // the gate is u .* v -> the block behaves like a plain channel-split product.
+  FNeurons[0].FWeights.Fill(0);
+  for n := 0 to FSeqLen - 1 do
+    for m := 0 to FSeqLen - 1 do
+      if n = m then FNeurons[0].FWeights[m, 0, n] := 1.0
+      else FNeurons[0].FWeights[m, 0, n] := 0.01 * (Random - 0.5);
+  FNeurons[1].FWeights.Fill(0);
+  AfterWeightUpdate();
+end;
+
 { TNNetPolynomialActivation }
 constructor TNNetPolynomialActivation.Create();
 begin
@@ -27603,6 +27852,42 @@ begin
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddSpatialGatingUnit(pSeqLen: integer): TNNetLayer;
+begin
+  Result := AddLayer(TNNetSpatialGatingUnit.Create(pSeqLen));
+end;
+
+function TNNet.AddgMLPBlock(pSeqLen, d_model, d_ffn: integer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // gMLP block (Liu et al. 2021): y = x + Down(SGU(Up(LayerNorm(x)))).
+  if (d_ffn mod 2) <> 0 then
+    FErrorProc('AddgMLPBlock requires an EVEN d_ffn. d_ffn=' + IntToStr(d_ffn));
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetLayerNorm.Create() );
+  // Channel-MLP up-projection (token-wise 1x1 conv): d_model -> d_ffn.
+  AddLayer( TNNetPointwiseConvReLU.Create(d_ffn) );
+  // Normalize the up-projection before the multiplicative gate. The SGU gate
+  // multiplies two activation halves, so without bounding the gated branch the
+  // product (and its weight gradient) can run away during training; this is
+  // exactly the per-channel LayerNorm the gMLP paper applies to the spatial
+  // branch (their s(Z) = Z_1 (.) f(LayerNorm(Z_2))). The SGU layer itself stays
+  // a pure spatial-gating primitive - the normalization lives in the block.
+  AddLayer( TNNetLayerNorm.Create() );
+  // Spatial Gating Unit: splits d_ffn in half, static sequence mix, gate.
+  // Output width is d_ffn/2.
+  AddLayer( TNNetSpatialGatingUnit.Create(pSeqLen) );
+  // Normalize the gated product before the down-projection. The gate is a
+  // product of two activation halves; bounding its magnitude here keeps the
+  // backward signal into the up-projection from running away, which makes the
+  // block trainable at ordinary learning rates.
+  AddLayer( TNNetLayerNorm.Create() );
+  // Channel-MLP down-projection (token-wise): d_ffn/2 -> d_model.
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
 function TNNet.AddRetention(d_model, Heads: integer;
@@ -50198,6 +50483,7 @@ begin
       'TNNetMetaAconC':             Result := TNNetMetaAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
+      'TNNetSpatialGatingUnit':     Result := TNNetSpatialGatingUnit.Create(St[0]);
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
       'TNNetCellBias':              Result := TNNetCellBias.Create();
@@ -50491,6 +50777,7 @@ begin
       if S[0] = 'TNNetMetaAconC' then Result := TNNetMetaAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else
+      if S[0] = 'TNNetSpatialGatingUnit' then Result := TNNetSpatialGatingUnit.Create(St[0]) else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
