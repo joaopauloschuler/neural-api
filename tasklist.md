@@ -357,6 +357,15 @@ rather than acted on.
       negative: at a generous matched 540-epoch budget the one-shot ticket does
       NOT collapse (sibling collapses only at 100 epochs/arm), so IMP shows no
       advantage on this easy toy; reported plainly. Pure CPU ~140 s.
+- [ ] Lottery-ticket IMP follow-up (make the headline land): the landed
+      examples/LotteryTicketIMP showed NO IMP advantage because the toy is too
+      easy and the budget too generous (one-shot never collapses). Build the
+      regime where IMP provably wins: either (a) STARVE the per-arm epoch budget
+      (e.g. ~100 epochs/arm, matching the sibling that collapses) so one-shot
+      buckles at 95% while IMP's rewind+retrain recovers, or (b) a harder task
+      (overlapping/noisier classes or a deeper net) where the extreme-sparsity
+      ticket is genuinely hard to find one-shot. Reuse the existing IMP harness;
+      just swap the dataset/budget and re-grade. Pure CPU, <5 min.
 - [ ] Init-scheme × depth heatmap: for depths {2, 4, 8, 16} and inits
       {Glorot, He, LeCun, plain N(0, 0.01)}, plot first-step gradient norm
       at the deepest layer.
@@ -505,6 +514,19 @@ rather than acted on.
       weights via TNNet.CopyWeights (tau is protected FFloatSt[0], no setter).
       Prints a (tau, recon-MSE, bottleneck entropy) table + graded PASS verdict:
       entropy collapses 0.064->0 nats while recon holds at the ~0.01 noise floor.
+- [ ] TNNetGumbelSoftmax follow-up: add a public temperature SETTER (tau lives in
+      the protected FFloatSt[0] with no setter, so the annealing example above has
+      to REBUILD the net per phase and carry weights via CopyWeights). A
+      SetTemperature(tau) (mirroring how other AddNoiseBase params are exposed)
+      would let a single net anneal tau in-place across epochs — simpler example,
+      and the natural hook for any future TNeuralFit annealing schedule. Gate so
+      the default path is byte-for-byte unchanged; add a tiny round-trip test.
+      Then simplify examples/GumbelAnnealingAutoencoder to anneal in-place.
+- [ ] TNNetGumbelSoftmax / annealing follow-up: re-run the annealing AE on a
+      LESS-separated (overlapping) cluster set so the high-tau bottleneck entropy
+      actually starts near uniform (~ln K) and the sharpening sweep spans the full
+      entropy range — the current well-separated toy lives in the confident-routing
+      regime where even tau=2.0 is already near one-hot (honest caveat in its README).
       Pure CPU, ~2 s.
 - [ ] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
       soft `TNNet.AddMixtureOfExperts` block) — run only the k highest-gated experts per token (sparse
@@ -558,7 +580,13 @@ rather than acted on.
       PROGRESS: added runtime probe ResetCodebookUsage/ActiveCodeCount/CodebookUsageCount
       to TNNetVectorQuantizer (counter incremented in Compute, not serialized, math/grads
       unchanged) + TestVectorQuantizerCodebookUsage regression test + examples/VQCodebookUsage.
-
+- [ ] VQ codebook-collapse STRESS test (now unblocked by the usage probe above):
+      deliberately DRIVE collapse — far more codes than clusters, high commitment /
+      high LR, or poorly-scaled encoder — and use ActiveCodeCount/CodebookUsageCount
+      to chart the active-code count falling over training (the failure the healthy
+      examples/VQCodebookUsage demo deliberately avoids). Then show ONE published
+      mitigation (codebook re-init of dead codes, or the EMA update variant above)
+      lifting the active-code count back up. Pure CPU, <5 min.
 ### Training infrastructure (the "missing plumbing")
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
       (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
