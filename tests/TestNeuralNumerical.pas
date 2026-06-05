@@ -148,6 +148,8 @@ type
     procedure TestReversibleBlockRoundTrip;
     // AddNeuralODEBlock builder (shared-weight Euler-integrated residual)
     procedure TestNeuralODEBlockSmoke;
+    // AddNeuralODEBlock midpoint/RK2 integrator (odeMidpoint)
+    procedure TestNeuralODEBlockMidpoint;
     // AddDeepEquilibriumBlock builder (weight-tied fixed-point, phantom gradient)
     procedure TestDeepEquilibriumBlock;
     // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
@@ -3304,6 +3306,130 @@ begin
       AssertTrue('ODE Steps=2 neuron count > 0', n > 0);
     finally
       NN4.Free;
+    end;
+  finally
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNeuralODEBlockMidpoint;
+const
+  W = 3; H = 1; C = 4; HID = 5;
+var
+  NNmid, NNeuler: TNNet;
+  Input, Desired: TNNetVolume;
+  MidOut, EulOut: TNNetLayer;
+  K1, MidState, K2: TNNetLayer;
+  i, n, nEuler, diffCount: integer;
+  outVal, x, expected: TNeuralFloat;
+begin
+  // Smoke + invariant test for the midpoint (RK2) integrator of
+  // AddNeuralODEBlock. Reseed: this file shares one RNG (see
+  // [[numerical-test-rng-ordering]]).
+  RandSeed := 424242;
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create(W, H, C);
+  for i := 0 to Input.Size - 1 do
+    Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+  try
+    // ---- (1) CORRECTNESS ANCHOR -------------------------------------------
+    // Steps=1, h=1, midpoint: y = x + h*k2 where k1 = f(x), k2 = f(x + (h/2)*k1).
+    // Verify the RK2 wiring directly off the builder's OWN intermediate layers
+    // (no weight copying, which interacts badly with shared-weight caches): the
+    // layer order for Steps=1 midpoint is
+    //   [0]=Input
+    //   [1]=ConvReLU  [2]=ConvLinear(=k1)
+    //   [3]=MulByConst(h/2) [4]=Sum(=x+0.5h*k1)
+    //   [5]=SharedReLU [6]=SharedLinear(=k2)
+    //   [7]=MulByConst(h)  [8]=Sum(=x+h*k2)=output
+    NNmid := TNNet.Create();
+    try
+      NNmid.AddLayer(TNNetInput.Create(W, H, C));
+      MidOut := NNmid.AddNeuralODEBlock(NNmid.GetLastLayer(), HID, 1, odeMidpoint);
+      NNmid.SetLearningRate(0.01, 0.9);
+      NNmid.InitWeights();
+
+      AssertEquals('midpoint output Depth', C, MidOut.Output.Depth);
+      AssertEquals('midpoint output SizeX', W, MidOut.Output.SizeX);
+      AssertTrue('midpoint k2-ReLU is shared-weights',
+        NNmid.Layers[5] is TNNetConvolutionSharedWeights);
+      AssertTrue('midpoint k2-Linear is shared-weights',
+        NNmid.Layers[6] is TNNetConvolutionSharedWeights);
+
+      NNmid.Compute(Input);
+      K1 := NNmid.Layers[2];        // k1 = f(x)
+      MidState := NNmid.Layers[4];  // x + 0.5*h*k1   (h = 1)
+      K2 := NNmid.Layers[6];        // k2 = f(midstate)
+
+      // (1a) midpoint state really is x + (h/2)*k1, h = 1.
+      for i := 0 to MidState.Output.Size - 1 do
+        AssertEquals('midpoint state = x + 0.5*k1 at ' + IntToStr(i),
+          Input.Raw[i] + 0.5 * K1.Output.Raw[i], MidState.Output.Raw[i], 1e-6);
+
+      // (1b) output really is x + h*k2 (h = 1) -- the RK2 update.
+      for i := 0 to MidOut.Output.Size - 1 do
+      begin
+        x := Input.Raw[i];
+        expected := x + K2.Output.Raw[i];
+        AssertEquals('midpoint output = x + h*k2 at ' + IntToStr(i),
+          expected, MidOut.Output.Raw[i], 1e-6);
+      end;
+    finally
+      NNmid.Free;
+    end;
+
+    // ---- (2) MIDPOINT DIFFERS FROM EULER (same weights) -------------------
+    // With identical f weights, Euler (y=x+h*f(x)) and midpoint
+    // (y=x+h*f(x+0.5h*f(x))) must produce DIFFERENT outputs (f is nonlinear).
+    // Also: param count must be identical and independent of Method.
+    NNmid := TNNet.Create();
+    NNeuler := TNNet.Create();
+    try
+      NNmid.AddLayer(TNNetInput.Create(W, H, C));
+      MidOut := NNmid.AddNeuralODEBlock(NNmid.GetLastLayer(), HID, 2, odeMidpoint);
+      NNmid.SetLearningRate(0.01, 0.9);
+      NNmid.InitWeights();
+
+      NNeuler.AddLayer(TNNetInput.Create(W, H, C));
+      EulOut := NNeuler.AddNeuralODEBlock(NNeuler.GetLastLayer(), HID, 2, odeEuler);
+      NNeuler.SetLearningRate(0.01, 0.9);
+      NNeuler.InitWeights();
+      // Same f weights in both.
+      NNeuler.Layers[1].CopyWeights(NNmid.Layers[1]);
+      NNeuler.Layers[2].CopyWeights(NNmid.Layers[2]);
+
+      n := NNmid.CountNeurons();
+      nEuler := NNeuler.CountNeurons();
+      AssertEquals('midpoint param count == euler param count (Method-independent)',
+        nEuler, n);
+      AssertEquals('midpoint weight count == euler weight count',
+        NNeuler.CountWeights(), NNmid.CountWeights());
+
+      NNmid.Compute(Input);
+      NNeuler.Compute(Input);
+      diffCount := 0;
+      for i := 0 to MidOut.Output.Size - 1 do
+      begin
+        outVal := MidOut.Output.Raw[i];
+        AssertFalse('midpoint forward NaN at ' + IntToStr(i), IsNaN(outVal));
+        AssertFalse('midpoint forward Inf at ' + IntToStr(i), IsInfinite(outVal));
+        if Abs(outVal - EulOut.Output.Raw[i]) > 1e-5 then Inc(diffCount);
+      end;
+      AssertTrue('midpoint output differs from euler (same weights)', diffCount > 0);
+
+      // Backward must stay finite.
+      Desired.Fill(0);
+      NNmid.Backpropagate(Desired);
+      for i := 0 to NNmid.Layers[1].OutputError.Size - 1 do
+      begin
+        outVal := NNmid.Layers[1].OutputError.Raw[i];
+        AssertFalse('midpoint backward NaN at ' + IntToStr(i), IsNaN(outVal));
+        AssertFalse('midpoint backward Inf at ' + IntToStr(i), IsInfinite(outVal));
+      end;
+    finally
+      NNmid.Free;
+      NNeuler.Free;
     end;
   finally
     Input.Free;

@@ -61,6 +61,14 @@ type
   TNNetLayer = class;
   TNNet = class;
 
+  // Integrator selector for TNNet.AddNeuralODEBlock.
+  //   odeEuler    : explicit Euler step   y := y + h*f(y)            (1 f / step)
+  //   odeMidpoint : RK2 / midpoint step   k1:=f(y); k2:=f(y+(h/2)*k1);
+  //                                        y := y + h*k2             (2 f / step)
+  // Both share the SAME step-1 f weights, so the parameter count stays
+  // independent of Steps AND of Method.
+  TNNetODEMethod = (odeEuler, odeMidpoint);
+
   { TNNetNeuron }
   TNNetNeuron = class(TMObject)
     protected
@@ -5927,11 +5935,22 @@ type
       // and HiddenDim to >= 1. Returns the final integrated layer (shape identical
       // to InputLayer.Output).
       //
-      // v1 is EULER-ONLY: an RK2/midpoint integrator (Method param) and the
-      // O(1)-memory adjoint-sensitivity backward pass (Chen et al. sec. 2) are
-      // logged as follow-ups in tasklist.md and are NOT implemented here; training
+      // INTEGRATOR: the 3-arg overload uses explicit Euler (odeEuler). The 4-arg
+      // overload selects the integrator via Method:
+      //   odeEuler    : y := y + h*f(y)                       (1 f-eval / step)
+      //   odeMidpoint : k1 := f(y); k2 := f(y + (h/2)*k1);
+      //                 y := y + h*k2                         (2 f-evals / step)
+      // Midpoint (RK2) is 2nd-order accurate vs Euler's 1st-order. Every f-eval in
+      // EVERY step (both k1 and k2, every step) REUSES the step-1 weights via
+      // TNNetConvolutionSharedWeights, so the trainable parameter count is
+      // INDEPENDENT of both Steps and Method (midpoint just doubles the number of
+      // shared-weight conv pairs; it adds ZERO new trainable weights).
+      //
+      // The O(1)-memory adjoint-sensitivity backward pass (Chen et al. sec. 2) is
+      // logged as a follow-up in tasklist.md and is NOT implemented here; training
       // uses ordinary stored-activation backprop through the unrolled steps.
-      function AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer;
+      function AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer; overload;
+      function AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer; Method: TNNetODEMethod): TNNetLayer; overload;
       // Deep Equilibrium block (Bai, Kolter, Koltun 2019, "Deep Equilibrium
       // Models", https://arxiv.org/abs/1909.01377).
       //
@@ -52557,15 +52576,43 @@ begin
 end;
 
 function TNNet.AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer;
+begin
+  // Backward-compatible 3-arg overload: explicit Euler (unchanged behaviour).
+  Result := AddNeuralODEBlock(InputLayer, HiddenDim, Steps, odeEuler);
+end;
+
+function TNNet.AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer; Method: TNNetODEMethod): TNNetLayer;
 var
   d_model, step: integer;
   h: TNeuralFloat;
-  Y: TNNetLayer;
+  Y, EvalInput: TNNetLayer;
   Step1ReLUConv, Step1LinearConv: TNNetLayer;
-  FOut, ScaledFOut: TNNetLayer;
+  K1, K2, ScaledK1, MidInput, ScaledFOut: TNNetLayer;
+
+  // Evaluate f(Inp) reusing the step-1 weights for every call after the very
+  // first. Returns the linear-conv output layer f(Inp). The FIRST call creates
+  // the two REAL conv layers (the only trainable weights of the whole block);
+  // all later calls (k2's f, and every later step) reuse them via
+  // TNNetConvolutionSharedWeights, so the parameter count is independent of
+  // Steps AND of Method.
+  function EvalF(Inp: TNNetLayer): TNNetLayer;
+  begin
+    if Step1ReLUConv = nil then
+    begin
+      Step1ReLUConv := AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), Inp );
+      Step1LinearConv := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+      Result := Step1LinearConv;
+    end
+    else
+    begin
+      AddLayerAfter( TNNetConvolutionSharedWeights.Create(Step1ReLUConv), Inp );
+      Result := AddLayer( TNNetConvolutionSharedWeights.Create(Step1LinearConv) );
+    end;
+  end;
+
 begin
-  // Continuous-depth residual block: integrate dx/dt = f(x) with `Steps` explicit
-  // Euler sub-steps of size h = 1/Steps, reusing ONE shared f at every step.
+  // Continuous-depth residual block: integrate dx/dt = f(x) with `Steps`
+  // sub-steps of size h = 1/Steps, reusing ONE shared f at every f-evaluation.
   if InputLayer = nil then InputLayer := GetLastLayer();
   if Steps < 1 then Steps := 1;
   if HiddenDim < 1 then HiddenDim := 1;
@@ -52578,26 +52625,26 @@ begin
 
   for step := 1 to Steps do
   begin
-    // f(y): shape-preserving pointwise 2-layer residual function over Depth.
-    if step = 1 then
-    begin
-      // Step 1 creates the two REAL convolution layers (the only trainable
-      // weights of the whole block).
-      Step1ReLUConv := AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), Y );
-      Step1LinearConv := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
-      FOut := Step1LinearConv;
-    end
+    case Method of
+      odeMidpoint:
+      begin
+        // RK2 / midpoint:
+        //   k1 := f(y)
+        //   k2 := f(y + (h/2)*k1)
+        //   y  := y + h*k2
+        K1 := EvalF(Y);
+        ScaledK1 := AddLayer( TNNetMulByConstant.Create(h * 0.5) );
+        MidInput := AddLayer( TNNetSum.Create([ScaledK1, Y]) );
+        K2 := EvalF(MidInput);
+        ScaledFOut := AddLayerAfter( TNNetMulByConstant.Create(h), K2 );
+        Y := AddLayer( TNNetSum.Create([ScaledFOut, Y]) );
+      end;
     else
-    begin
-      // Later steps REUSE the step-1 weights via shared-weight convolutions
-      // (same FNeurons + activation fn). This is what makes param count
-      // independent of Steps.
-      AddLayerAfter( TNNetConvolutionSharedWeights.Create(Step1ReLUConv), Y );
-      FOut := AddLayer( TNNetConvolutionSharedWeights.Create(Step1LinearConv) );
+      // odeEuler: y := y + h*f(y).
+      EvalInput := EvalF(Y);
+      ScaledFOut := AddLayerAfter( TNNetMulByConstant.Create(h), EvalInput );
+      Y := AddLayer( TNNetSum.Create([ScaledFOut, Y]) );
     end;
-    // Euler update: y := y + h * f(y).
-    ScaledFOut := AddLayer( TNNetMulByConstant.Create(h) );
-    Y := AddLayer( TNNetSum.Create([ScaledFOut, Y]) );
   end;
 
   Result := Y;
