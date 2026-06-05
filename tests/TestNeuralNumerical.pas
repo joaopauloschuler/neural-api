@@ -232,6 +232,10 @@ type
     procedure TestDiagonalSSMWeightGradientCheck;
     procedure TestDiagonalSSMSeqLen1Feedthrough;
     procedure TestDiagonalSSMSerializationRoundTrip;
+    procedure TestSelectiveSSMInputGradientCheck;
+    procedure TestSelectiveSSMWeightGradientCheck;
+    procedure TestSelectiveSSMSerializationRoundTrip;
+    procedure TestSelectiveSSMLTIDegeneracy;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -21047,6 +21051,259 @@ begin
   // SizeX=4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDiagonalSSM.Create(), 'DiagonalSSM', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetSelectiveSSM (input-dependent Mamba/S6-style) ---------------------
+
+// Fill the SelectiveSSM weight sets with deterministic, non-trivial values so
+// that every term of the input-conditioned recurrence and feedthrough is
+// exercised (selectivity => the projections W_d/W_B/W_C must be non-zero).
+procedure SeedSelectiveSSM(LSSM: TNNetSelectiveSSM; Depth: integer);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      LSSM.Neurons[0].Weights[d, 0, j] := Sin(d * 1.3 + j * 0.7) * 0.15; // W_d
+      LSSM.Neurons[1].Weights[d, 0, j] := Cos(d * 0.9 + j * 1.1) * 0.18; // W_B
+      LSSM.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 - j * 0.8) * 0.2;  // W_C
+    end;
+    LSSM.Neurons[3].Weights.Raw[d] := Cos(d * 0.6) * 0.3;   // b_d
+    LSSM.Neurons[4].Weights.Raw[d] := Sin(d * 0.4) * 0.5;   // A_raw
+    LSSM.Neurons[5].Weights.Raw[d] := 0.4 + d * 0.2;        // e
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSSM: TNNetSelectiveSSM;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LSSM := TNNetSelectiveSSM.Create();
+    NN.AddLayer(LSSM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedSelectiveSSM(LSSM, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SelectiveSSM input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('SelectiveSSM input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSSM: TNNetSelectiveSSM;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..5] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'W_d'; Names[1] := 'W_B'; Names[2] := 'W_C';
+  Names[3] := 'b_d'; Names[4] := 'A_raw'; Names[5] := 'e';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LSSM := TNNetSelectiveSSM.Create();
+    NN.AddLayer(LSSM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedSelectiveSSM(LSSM, 3);
+
+    // Cover every weight tensor (the two DepthxDepth projection matrices and
+    // the three Depth-long per-channel vectors). BPTT weight gradients are a
+    // classic place for a silent off-by-one between the t and t-1 terms.
+    for n := 0 to 5 do
+      for i := 0 to LSSM.Neurons[n].Weights.Size - 1 do
+      begin
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LSSM.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LSSM.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('SelectiveSSM weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('SelectiveSSM weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMSerializationRoundTrip;
+begin
+  // SelectiveSSM stores six learnable tensors (W_d/W_B/W_C DepthxDepth plus
+  // b_d/A_raw/e Depth-long); the perturbed-weights helper pushes them away from
+  // defaults so the round trip exercises a non-trivial parameter set.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSelectiveSSM.Create(), 'SelectiveSSM', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMLTIDegeneracy;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LSSM: TNNetSelectiveSSM;
+  SeqLen, Depth, t, d: integer;
+  // Reference LTI state-space recurrence with constant (position-independent)
+  // per-channel a, b, c, e.
+  delta_c, bconst, cconst, econst, expA, a_d, bbar, x, hprev, refOut: TNeuralFloat;
+  href: array of TNeuralFloat;
+begin
+  // DEGENERACY ANCHOR: force the input projections to ZERO so the input-
+  // conditioned quantities collapse to CONSTANTS per channel:
+  //   delta_t = softplus(b_d)              (position-independent)
+  //   a_t[d]  = exp(-delta*exp(A_raw))     (constant per channel)
+  //   b_t = 0, c_t = 0  ... that would kill the recurrence, so instead we set
+  // W_B/W_C to zero too but give b/c their effect via a deterministic constant
+  // by injecting it through the bias-free projections is impossible. Instead we
+  // make delta/b/c constant by zeroing the projection matrices AND feeding a
+  // CONSTANT input vector. With x_t == x0 for all t, x_t.W is the same every
+  // step, so delta_t, b_t, c_t are all position-independent => the layer is an
+  // exact LTI DiagonalSSM-equivalent. We compare against a hand-rolled LTI sweep.
+  RandSeed := 424242;
+  SeqLen := 5; Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    LSSM := TNNetSelectiveSSM.Create();
+    NN.AddLayer(LSSM);
+    SeedSelectiveSSM(LSSM, Depth);
+
+    // Constant input across time -> selectivity is inert, layer is LTI.
+    for t := 0 to SeqLen - 1 do
+    begin
+      Input[t, 0, 0] := 0.7;
+      Input[t, 0, 1] := -1.1;
+      Input[t, 0, 2] := 0.5;
+    end;
+    NN.Compute(Input);
+
+    SetLength(href, Depth);
+    for d := 0 to Depth - 1 do
+    begin
+      // Constant projected quantities from x0 (same for every timestep).
+      x := Input[0, 0, d];
+      // delta_d = softplus(b_d + sum_j Wd[d,j]*x0_j)
+      delta_c := LSSM.Neurons[3].Weights.Raw[d];
+      bconst := 0; cconst := 0;
+      // recompute the three projections by hand
+      delta_c := delta_c +
+        LSSM.Neurons[0].Weights[d, 0, 0] * Input[0, 0, 0] +
+        LSSM.Neurons[0].Weights[d, 0, 1] * Input[0, 0, 1] +
+        LSSM.Neurons[0].Weights[d, 0, 2] * Input[0, 0, 2];
+      delta_c := Ln(1 + Exp(delta_c));  // softplus
+      bconst :=
+        LSSM.Neurons[1].Weights[d, 0, 0] * Input[0, 0, 0] +
+        LSSM.Neurons[1].Weights[d, 0, 1] * Input[0, 0, 1] +
+        LSSM.Neurons[1].Weights[d, 0, 2] * Input[0, 0, 2];
+      cconst :=
+        LSSM.Neurons[2].Weights[d, 0, 0] * Input[0, 0, 0] +
+        LSSM.Neurons[2].Weights[d, 0, 1] * Input[0, 0, 1] +
+        LSSM.Neurons[2].Weights[d, 0, 2] * Input[0, 0, 2];
+      econst := LSSM.Neurons[5].Weights.Raw[d];
+      expA := Exp(LSSM.Neurons[4].Weights.Raw[d]);
+      a_d := Exp(-delta_c * expA);
+      bbar := delta_c * bconst;
+      hprev := 0;
+      for t := 0 to SeqLen - 1 do
+      begin
+        hprev := a_d * hprev + bbar * x;          // h_t = a*h_{t-1} + bbar*x
+        refOut := cconst * hprev + econst * x;    // y_t = c*h + e*x
+        AssertEquals('SelectiveSSM LTI degeneracy t=' + IntToStr(t) +
+          ' d=' + IntToStr(d), refOut, LSSM.Output[t, 0, d], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestImplicitLongConvInputGradientCheck;
