@@ -13,6 +13,7 @@ bin/
 backup/
 lib/
 tests/RunTests
+examples/ActivationBakeoff/ActivationBakeoff
 link*.res
 autosave.csv
 autosave.nn
