@@ -6846,6 +6846,17 @@ type
       // FullConnect would flatten the sequence). Returns the out-projection.
       function AddRetention(d_model, Heads: integer;
         GammaMinExp: TNeuralFloat = 5.0): TNNetLayer;
+      // Drops a CfC ("Closed-form Continuous-time") "liquid" recurrent
+      // sequence-mixer into a transformer-style block: wraps a single
+      // TNNetClosedFormContinuous cell in an RMSNorm pre-norm residual
+      //   y = x + CfC(RMSNorm(x))
+      // exactly like AddRetention / AddMultiHeadSelfAttention can be wrapped.
+      // The CfC cell is shape-preserving (output (SeqLen,1,Depth) == input), so
+      // it is a legal residual sublayer. Operates on GetLastLayer (a
+      // (SeqLen,1,Depth) token tensor, SizeY=1); the cell is parameterless
+      // (Depth is taken from the previous layer). Returns the residual-sum
+      // layer. See TNNetClosedFormContinuous for the cell math.
+      function AddClosedFormContinuous(): TNNetLayer;
       // Encoder-decoder multi-head CROSS-attention. The Query is projected from
       // QuerySource (the decoder stream, a (QSeqLen,1,d_model) token tensor) and
       // the Keys+Values are projected from KeyValueSource (the encoder output, a
@@ -30203,6 +30214,14 @@ begin
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
   SetLength(SliceLayers, 0);
   SetLength(HeadOutputs, 0);
+end;
+
+function TNNet.AddClosedFormContinuous(): TNNetLayer;
+begin
+  // y = x + CfC(RMSNorm(x)). The CfC cell is shape-preserving, so it is a legal
+  // residual sublayer (see the AddRMSNormResidual contract). Parameterless: the
+  // cell reads Depth from the previous layer.
+  Result := AddRMSNormResidual([TNNetClosedFormContinuous.Create()]);
 end;
 
 function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;

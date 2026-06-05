@@ -250,6 +250,7 @@ type
     procedure TestClosedFormContinuousInputGradientCheck;
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
+    procedure TestAddClosedFormContinuousBuilder;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -22154,6 +22155,88 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetClosedFormContinuous.Create(), 'ClosedFormContinuous', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddClosedFormContinuousBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+  HasRMSNorm, HasCfC: boolean;
+begin
+  // Exercise the TNNet.AddClosedFormContinuous builder end to end:
+  // (1) the builder wraps the CfC cell in an RMSNorm pre-norm residual, so the
+  //     last layer must be the residual TNNetSum and the output shape must equal
+  //     the (SeqLen,1,Depth) input shape (shape-preserving residual block);
+  // (2) the block must contain a TNNetRMSNorm and a TNNetClosedFormContinuous;
+  // (3) one training step on a tiny target must run without error and reduce the
+  //     loss (the builder produces a trainable block);
+  // (4) SaveToString/LoadFromString round-trips to an identical string.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3));
+    NN.AddClosedFormContinuous();
+    NN.SetLearningRate(0.1, 0.0);
+
+    AssertTrue('AddClosedFormContinuous last layer is residual TNNetSum',
+      NN.GetLastLayer is TNNetSum);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.3) * 1.5;
+      Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    end;
+    NN.Compute(Input);
+    AssertEquals('AddClosedFormContinuous output SizeX preserved',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddClosedFormContinuous output Depth preserved',
+      3, NN.GetLastLayer.Output.Depth);
+
+    // The builder must have inserted both the RMSNorm and the CfC cell.
+    HasRMSNorm := false;
+    HasCfC := false;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i] is TNNetRMSNorm then HasRMSNorm := true;
+      if NN.Layers[i] is TNNetClosedFormContinuous then HasCfC := true;
+    end;
+    AssertTrue('AddClosedFormContinuous built an RMSNorm', HasRMSNorm);
+    AssertTrue('AddClosedFormContinuous built a ClosedFormContinuous cell', HasCfC);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('AddClosedFormContinuous training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddClosedFormContinuous round-trip last layer is TNNetSum',
+        NN2.GetLastLayer is TNNetSum);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddClosedFormContinuous SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestImplicitLongConvInputGradientCheck;

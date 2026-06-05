@@ -111,9 +111,11 @@ rather than acted on.
 - [ ] TNNetClosedFormContinuous follow-ups (leaf layer + examples/LiquidCfC/ +
       gradient/serialization tests all LANDED 2026-06-05, full explicit-recurrence
       BPTT over the unrolled steps). Deferred, each small + doable on its own:
-      (a) a `TNNet.AddClosedFormContinuous`/CfC builder that stacks the cell with
-          a residual + norm wrapper (mirror AddRetention / AddNeuralODEBlock) so it
-          drops into a transformer-style block without manual wiring;
+      (a) LANDED 2026-06-05: `TNNet.AddClosedFormContinuous` builder wraps the
+          cell in an RMSNorm pre-norm residual (y = x + CfC(RMSNorm(x))) so it
+          drops into a transformer-style block without manual wiring (mirrors
+          AddRetention / AddNeuralODEBlock); shape/forward/train-step/save-load
+          test in tests/TestNeuralNumerical.pas;
       (b) a BIDIRECTIONAL variant (forward + reversed pass concatenated) for
           non-causal sequence tasks — the landed cell is causal/left-to-right only;
       (c) scale the examples/LiquidCfC/ recall toy to a slightly longer SeqLen /
