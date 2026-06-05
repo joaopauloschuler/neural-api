@@ -1051,6 +1051,50 @@ rather than acted on.
       absolute MI values are estimator-dependent — the robust, reproducible
       signal is the SHAPE of the trajectory and the tanh-vs-ReLU difference,
       not the nats. Pure CPU, tiny MLP, <5-min budget.
+- [ ] `examples/MaximalUpdateParametrization/` (optionally backed by a
+      `TNNet.CoordinateCheckReport` introspection method,
+      [[introspection-report-pattern]]) — demonstrate **muP / hyperparameter
+      transfer across width** (Yang & Hu 2021, "Tensor Programs V: Tuning Large
+      Neural Networks via Zero-Shot Hyperparameter Transfer"). Train the SAME
+      tiny MLP at a ladder of hidden widths (e.g. 32 / 128 / 512 / 2048) and
+      sweep the learning rate at each width, under two parametrizations:
+      (a) standard parametrization (SP) — the usual `1/sqrt(fan_in)` init the
+      library already uses, plain global LR; (b) muP — input/output-layer and
+      hidden-layer init variances and per-layer LR multipliers rescaled by
+      width per the muP table (hidden LR scaled `1/width`, output logits scaled
+      `1/width`, input untouched). The headline is the LR-vs-loss curve: under
+      SP the loss-minimizing LR DRIFTS leftward as width grows (the optimum you
+      tuned on the narrow net is wrong for the wide one), while under muP the
+      curves' minima stay ALIGNED at a single width-invariant LR — so you can
+      tune on width-32 and transfer the winner straight to width-2048 with no
+      re-tuning. Ship the *coordinate check* as the mechanistic diagnostic that
+      explains WHY: log each layer's mean absolute activation (`GetAvgAbs`) at
+      init and after a handful of SGD steps across the width ladder (mean abs =
+      `GetSumAbs/Size` on each layer's `Output`) — under muP
+      every layer's coordinate magnitude stays O(1) / flat vs width, under SP
+      the pre-logit activations grow (or the updates do), which is exactly the
+      mechanism that shifts the stable LR. This is a DIFFERENT axis from
+      everything shipped: it's about *parametrization & width-scaling of
+      training dynamics*, not representation geometry
+      ([[RepresentationSimilarity]]), posterior degeneracy / curvature
+      (LocalLearningCoefficient, HessianCurvature, FisherImportance), or the
+      single-width LR-stability threshold of [[EdgeOfStability]] (EoS asks "how
+      large can LR be before divergence at ONE width"; muP asks "does the GOOD
+      LR stay put as width changes" — orthogonal questions). HONEST headline in
+      the house "what did NOT fit the budget" style: the clean transfer needs
+      the full muP recipe (init scaling AND per-layer LR multipliers AND the
+      `1/width` output scaling) — ship a built-in ablation arm that applies only
+      the init half and show the minima still drift, so the example proves all
+      three pieces are load-bearing rather than overclaiming from a partial
+      implementation. Note the pitfall to document: the alignment is most
+      visible when the narrowest rung is already wide enough to be in the
+      asymptotic regime (width >= 32) and the LR grid is logarithmic and shared
+      across widths; state that the robust, reproducible signal is the
+      *alignment of the minima* and the flat coordinate-check, not the absolute
+      loss values. Pure CPU, tiny MLPs, no new gradient machinery — only
+      per-layer LR/init scaling (the per-layer `TNNetLayer.LearningRate`
+      property and weight-init knobs already exist) plus forward-pass
+      `GetSumAbs` activation collection.
 - [ ] LogSoftMax+NLL vs SoftMax+CE convergence parity test: same seed,
       same tiny classifier, plot val-loss curves.
 - [ ] Shrink-activation sparsity sweep: ReLU / SoftShrink / HardShrink as
