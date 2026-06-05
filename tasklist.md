@@ -128,6 +128,49 @@ rather than acted on.
       RandSeed := 424242, and an examples/GraphAttention/ arm contrasting GAT vs
       the plain GCN on the same SBM node-classification graph (does learned edge
       weighting help when the graph has noisy/heterophilous edges?).
+- [ ] TNNetAffineGridSample — a differentiable bilinear grid-sampling layer, the
+      core of a Spatial Transformer Network (Jaderberg, Simonyan, Zisserman &
+      Kavukcuoglu 2015, "Spatial Transformer Networks"). This opens a genuinely
+      new capability for this tree: every existing spatial op (conv, pool,
+      TNNetUpsample/DeMaxPool, deconvolution) resamples on a FIXED integer grid;
+      none warps the feature map by a CONTINUOUS, input-conditioned geometric
+      transform. The layer consumes two inputs — an image-shaped source
+      (SizeX, SizeY, Depth) and a 6-value affine theta (a 2x3 matrix, supplied as
+      a (1,1,6) or (6,1,1) volume, typically the output of a small "localization"
+      head) — and emits a same-HxW output whose pixel (x,y) is read from the
+      source at the back-warped continuous coordinate (x',y') = theta * [x_n; y_n; 1]
+      (normalized coords in [-1,1]) via BILINEAR interpolation of the 4 nearest
+      source pixels. Both backward paths are well defined and BOTH must be
+      implemented and finite-difference checked: (i) d/d(source) scatters each
+      output error back to its 4 neighbours with the bilinear weights, and (ii)
+      d/d(theta) — the headline gradient that lets the transform be LEARNED — sums
+      output_error * d(sampled)/d(x',y') * d(x',y')/d(theta) over all pixels
+      (the standard STN sampler partials). Two-source wiring + serialization
+      should follow the same recipe the recent TNNetCrossAttention used (separate
+      sources, serialize like Concat; the affine input is caller-wired, not a
+      persisted weight). Distinct from CoordConv (which only APPENDS fixed
+      coordinate channels — see examples/CoordConvSpiral — it never resamples)
+      and from the attention family (which reweights by content affinity, not by
+      a parametric coordinate map). Deliverables to match the house pattern:
+      (a) the leaf layer with `// Coded by Claude (AI).`, LoadFromString/
+          SaveToString wiring at both CreateLayer dispatch points;
+      (b) numerical-gradient tests in TestNeuralNumerical.pas (finite-difference
+          check of BOTH the source-input grad and the theta grad on a small fixed
+          image, reseeding RandSeed := 424242), plus the identity-theta sanity
+          case (theta = [[1,0,0],[0,1,0]] must reproduce the source exactly);
+      (c) examples/SpatialTransformer/ — the headline: prepend a tiny
+          localization head (a few conv/pool layers -> FullConnectLinear(6),
+          bias-initialised to the identity affine as the paper prescribes) +
+          this sampler in front of a small MNIST/Fashion-MNIST classifier, train
+          end-to-end on RANDOMLY ROTATED/TRANSLATED digits, and show the STN
+          front-end learns to canonicalize (de-rotate/re-center) the input —
+          report test accuracy vs the identical classifier WITHOUT the STN
+          front-end to demonstrate the learned geometric normalization is what
+          recovers the accuracy lost to the input jitter, and dump a few
+          before/after warped images so the canonicalization is visible.
+      A clean follow-up once landed would be a learned-resampling DOWNSAMPLER
+      (theta restricted to a learned crop/zoom) as an attention-free "hard"
+      visual-attention glimpse, but ship the plain affine sampler first.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
