@@ -7962,6 +7962,61 @@ type
         RandomRatio: TNeuralFloat = 0.05;
         MaxFeatDim: integer = 256
       ): string;
+      // Forward-only NEURAL-COLLAPSE diagnostic (Papyan, Han & Donoho 2020,
+      // "Prevalence of neural collapse during the terminal phase of deep
+      // learning training"). Given a classifier NN, a class-BALANCED labelled
+      // probe batch Samples (input + one-hot target pairs; the integer label is
+      // O.GetClass) and NumClasses, it measures the four canonical NC metrics on
+      // the PENULTIMATE-layer features (the activations feeding the final linear
+      // classifier head). FeatureLayerIdx selects the feature layer; -1 (the
+      // default) auto-picks the trainable layer immediately before the final
+      // linear head (its PrevLayer), i.e. the classifier's input features. It
+      // does ONE forward pass per probe, flattens the chosen layer's Output to a
+      // row x_i (random-projected down to MaxFeatDim when wider, exactly as
+      // FeatureSeparabilityReport does), and REUSES that report's class-mean /
+      // within-class scatter S_w / between-class scatter S_b machinery. Reports:
+      //   NC1 = within-class variability collapse tr(S_w * S_b^+)/C -> 0. Here
+      //         S_b^+ is approximated by the trace-ratio surrogate tr(S_w)/tr(S_b)
+      //         (the diagonal pseudo-inverse contraction; -> 0 as clusters
+      //         collapse), reported alongside tr(S_w), tr(S_b) and the Fisher
+      //         ratio so the collapse magnitude is explicit.
+      //   NC2 = convergence to a simplex EQUIANGULAR TIGHT FRAME (ETF). The
+      //         class means are CENTERED (subtract the global mean) and the
+      //         report prints (a) EQUINORM: the coefficient of variation of the
+      //         centered-mean norms ||mu_c - mu|| (-> 0), and (b) EQUIANGULAR:
+      //         every pair's cosine should equal the ETF target -1/(C-1); it
+      //         prints the mean pairwise cosine and the MEAN and MAX absolute
+      //         deviation of the pairwise cosines from that target (-> 0), plus
+      //         a glyph heatmap of the centered-mean cosines. This simplex-angle
+      //         check is the headline NC2 geometry.
+      //   NC3 = SELF-DUALITY: the cosine alignment between the centered
+      //         class-mean matrix (rows mu_c - mu) and the final classifier
+      //         weight rows. Computed only when the head is a width-matched
+      //         TNNetFullConnectLinear or TNNetPointwiseConvLinear (one neuron
+      //         per class, weight dim == feature dim); otherwise it is HONESTLY
+      //         SKIPPED with a printed flag (no fabricated number). Reports the
+      //         mean per-class |cosine(mu_c - mu, w_c)| (-> 1 at self-duality).
+      //   NC4 = classifier -> NEAREST-CLASS-MEAN: the fraction of probe points
+      //         whose argmax NN logit equals the index of their nearest CENTERED
+      //         class mean (squared-Euclidean). At collapse the trained
+      //         classifier behaves as a nearest-class-mean decision rule (-> 1).
+      // Built-in correctness: on a perfect simplex-ETF feature set the NC2
+      // pairwise cosines all equal -1/(C-1) and the deviations are ~0 (pinned by
+      // the smoke test). The scatter identity is exact only for class-balanced
+      // batches, so pass a balanced probe (the example does). Pure forward-only:
+      // NN.Compute only, weights read but never modified, no backward pass, no
+      // new layer types. nil NN / empty Samples / NumClasses<2 are reported
+      // gracefully. DISTINCT from FeatureSeparabilityReport (which stops at the
+      // tr(S_w) collapse + Fisher MAGNITUDE, a partial NC1) - this computes the
+      // full simplex-ETF geometry (NC2), self-duality (NC3) and the
+      // nearest-class-mean classifier collapse (NC4).
+      class function NeuralCollapseReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        NumClasses: integer;
+        FeatureLayerIdx: integer = -1;
+        MaxFeatDim: integer = 256
+      ): string;
       // Forward-only representation-geometry diagnostic. Answers "how does the
       // representation reshape itself with depth, and which layers do redundant
       // work?" by computing the linear Centered Kernel Alignment (CKA,
@@ -46495,6 +46550,429 @@ begin
       'Flags: C=collapse (tr(Sw)<=1e-6, tight cluster), S=well-separated ' +
       '(Fisher ratio >=%.2f), R=near-random (Fisher ratio <=%.2f).',
       [SeparatedRatio, RandomRatio]));
+
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.NeuralCollapseReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  NumClasses: integer;
+  FeatureLayerIdx: integer = -1;
+  MaxFeatDim: integer = 256
+): string;
+const
+  cGlyphs = ' .:-=+*#%@';   // 10 cosine bands, brightest = most similar
+  cProjSeed = 7654321;
+type
+  TDoubleArray = array of Double;
+  TDoubleMatrix = array of TDoubleArray;
+var
+  Lines: TStringList;
+  Layer, HeadLayer: TNNetLayer;
+  Pair: TNNetVolumePair;
+  N, D, FlatSz, FeatLayer, HeadIdx: integer;
+  SampleIdx, I, J, C, F, NValid, UsedClasses, TrueCls, OtherCls: integer;
+  Projected: boolean;
+  ProjSrc: array of integer;
+  ProjSign: array of Double;
+  Labels: array of integer;
+  ClassCount: array of integer;
+  Feats: TDoubleMatrix;        // N x D
+  ClassMean: TDoubleMatrix;    // NumClasses x D
+  Centered: TDoubleMatrix;     // NumClasses x D (mu_c - mu)
+  GlobalMean: TDoubleArray;    // D
+  CenNorm: TDoubleArray;       // NumClasses (||mu_c - mu||)
+  SwSum, SbSum, Acc, Diff, DotV, CosV, ETFTarget: Double;
+  NC1, NC2NormCV, NC2CosMean, NC2DevMean, NC2DevMax: Double;
+  NormMean, NormSd, AbsDev: Double;
+  CosMat: TDoubleMatrix;       // NumClasses x NumClasses
+  HeadIsLinear: boolean;
+  NC3Mean: Double; NC3Count: integer;
+  WRow: TNNetVolume;
+  WDot, WNc, WNw, NC3Cos: Double;
+  NC4Correct: integer; ArgLogit, NearCls: integer;
+  BestDist, Dist: Double;
+  Line, Glyph, ProjStr: string;
+  FisherVal: Double;
+  GlyphIdx: integer;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'NeuralCollapseReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'NeuralCollapseReport: Samples is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NumClasses < 2 then
+    begin
+      Result := 'NeuralCollapseReport: NumClasses must be >= 2.' + sLineBreak;
+      Exit;
+    end;
+    if MaxFeatDim < 1 then MaxFeatDim := 1;
+    N := Samples.Count;
+
+    // --- locate the final linear classifier HEAD and the feature layer. ---
+    // The head is the last trainable layer (Neurons.Count>0); a trailing
+    // SoftMax / non-trainable layer is skipped over.
+    HeadIdx := -1;
+    for I := NN.GetLastLayerIdx() downto 0 do
+      if NN.Layers[I].Neurons.Count > 0 then
+      begin
+        HeadIdx := I;
+        Break;
+      end;
+    if HeadIdx < 0 then
+    begin
+      Result := 'NeuralCollapseReport: no trainable layers to probe.' +
+        sLineBreak;
+      Exit;
+    end;
+    HeadLayer := NN.Layers[HeadIdx];
+
+    // feature layer: explicit FeatureLayerIdx, else the trainable layer feeding
+    // the head (search backward from HeadIdx-1 for a non-zero Output layer).
+    if FeatureLayerIdx >= 0 then
+      FeatLayer := FeatureLayerIdx
+    else
+    begin
+      FeatLayer := -1;
+      for I := HeadIdx - 1 downto 0 do
+        if NN.Layers[I].Output.Size > 0 then
+        begin
+          FeatLayer := I;
+          Break;
+        end;
+      if FeatLayer < 0 then FeatLayer := HeadIdx; // degenerate one-layer net
+    end;
+    if (FeatLayer < 0) or (FeatLayer > NN.GetLastLayerIdx()) then
+    begin
+      Result := 'NeuralCollapseReport: FeatureLayerIdx out of range.' +
+        sLineBreak;
+      Exit;
+    end;
+    Layer := NN.Layers[FeatLayer];
+    FlatSz := Layer.Output.Size;
+    if FlatSz = 0 then
+    begin
+      Result := 'NeuralCollapseReport: feature layer has empty Output.' +
+        sLineBreak;
+      Exit;
+    end;
+
+    // --- integer labels + per-class counts. ---
+    SetLength(Labels, N);
+    SetLength(ClassCount, NumClasses);
+    for C := 0 to NumClasses - 1 do ClassCount[C] := 0;
+    NValid := 0;
+    for SampleIdx := 0 to N - 1 do
+    begin
+      Pair := Samples[SampleIdx];
+      if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then
+      begin
+        Labels[SampleIdx] := -1; Continue;
+      end;
+      TrueCls := Pair.O.GetClass();
+      if (TrueCls < 0) or (TrueCls >= NumClasses) then
+      begin
+        Labels[SampleIdx] := -1; Continue;
+      end;
+      Labels[SampleIdx] := TrueCls;
+      Inc(ClassCount[TrueCls]);
+      Inc(NValid);
+    end;
+    if NValid = 0 then
+    begin
+      Result := 'NeuralCollapseReport: no valid labelled samples.' + sLineBreak;
+      Exit;
+    end;
+    UsedClasses := 0;
+    for C := 0 to NumClasses - 1 do
+      if ClassCount[C] > 0 then Inc(UsedClasses);
+
+    // --- feature dimension + deterministic sign-random projection if wide
+    //     (same trick as FeatureSeparabilityReport). ---
+    if FlatSz > MaxFeatDim then
+    begin
+      D := MaxFeatDim;
+      Projected := true;
+      SetLength(ProjSrc, D);
+      SetLength(ProjSign, D);
+      RandSeed := cProjSeed + FeatLayer;
+      for J := 0 to D - 1 do
+      begin
+        ProjSrc[J] := Random(FlatSz);
+        if Random(2) = 0 then ProjSign[J] := 1.0 else ProjSign[J] := -1.0;
+      end;
+    end
+    else
+    begin
+      D := FlatSz;
+      Projected := false;
+    end;
+
+    // --- one forward pass per probe: snapshot N x D feature matrix AND the
+    //     argmax of the FINAL-layer logits (for NC4). ---
+    SetLength(Feats, N);
+    NC4Correct := 0;
+    for SampleIdx := 0 to N - 1 do
+    begin
+      if Labels[SampleIdx] < 0 then begin Feats[SampleIdx] := nil; Continue; end;
+      Pair := Samples[SampleIdx];
+      NN.Compute(Pair.I);
+      SetLength(Feats[SampleIdx], D);
+      if Projected then
+        for F := 0 to D - 1 do
+          Feats[SampleIdx][F] := ProjSign[F] * Layer.Output.FData[ProjSrc[F]]
+      else
+        for F := 0 to D - 1 do
+          Feats[SampleIdx][F] := Layer.Output.FData[F];
+    end;
+
+    // --- class means + global mean (REUSED FeatureSeparability machinery). ---
+    SetLength(ClassMean, NumClasses);
+    SetLength(GlobalMean, D);
+    for F := 0 to D - 1 do GlobalMean[F] := 0;
+    for C := 0 to NumClasses - 1 do
+    begin
+      SetLength(ClassMean[C], D);
+      for F := 0 to D - 1 do ClassMean[C][F] := 0;
+    end;
+    for SampleIdx := 0 to N - 1 do
+    begin
+      if Labels[SampleIdx] < 0 then Continue;
+      C := Labels[SampleIdx];
+      for F := 0 to D - 1 do
+      begin
+        ClassMean[C][F] := ClassMean[C][F] + Feats[SampleIdx][F];
+        GlobalMean[F] := GlobalMean[F] + Feats[SampleIdx][F];
+      end;
+    end;
+    for F := 0 to D - 1 do GlobalMean[F] := GlobalMean[F] / NValid;
+    for C := 0 to NumClasses - 1 do
+      if ClassCount[C] > 0 then
+        for F := 0 to D - 1 do ClassMean[C][F] := ClassMean[C][F] / ClassCount[C];
+
+    // --- tr(S_w), tr(S_b) (FeatureSeparability definitions). ---
+    SwSum := 0;
+    for C := 0 to NumClasses - 1 do
+    begin
+      if ClassCount[C] = 0 then Continue;
+      Acc := 0;
+      for SampleIdx := 0 to N - 1 do
+      begin
+        if Labels[SampleIdx] <> C then Continue;
+        for F := 0 to D - 1 do
+        begin
+          Diff := Feats[SampleIdx][F] - ClassMean[C][F];
+          Acc := Acc + Diff * Diff;
+        end;
+      end;
+      SwSum := SwSum + (Acc / ClassCount[C]);
+    end;
+    SwSum := SwSum / UsedClasses;
+    SbSum := 0;
+    for C := 0 to NumClasses - 1 do
+    begin
+      if ClassCount[C] = 0 then Continue;
+      for F := 0 to D - 1 do
+      begin
+        Diff := ClassMean[C][F] - GlobalMean[F];
+        SbSum := SbSum + Diff * Diff;
+      end;
+    end;
+    SbSum := SbSum / UsedClasses;
+
+    // NC1: tr(Sw * Sb^+)/C, trace-ratio surrogate tr(Sw)/tr(Sb) -> 0.
+    if SbSum > 1e-30 then NC1 := SwSum / SbSum else NC1 := 0;
+
+    // --- NC2: centered class means -> simplex ETF. ---
+    SetLength(Centered, NumClasses);
+    SetLength(CenNorm, NumClasses);
+    for C := 0 to NumClasses - 1 do
+    begin
+      SetLength(Centered[C], D);
+      Acc := 0;
+      for F := 0 to D - 1 do
+      begin
+        Centered[C][F] := ClassMean[C][F] - GlobalMean[F];
+        Acc := Acc + Centered[C][F] * Centered[C][F];
+      end;
+      CenNorm[C] := Sqrt(Acc);
+    end;
+    // equinorm: coefficient of variation of CenNorm over occupied classes.
+    NormMean := 0;
+    for C := 0 to NumClasses - 1 do
+      if ClassCount[C] > 0 then NormMean := NormMean + CenNorm[C];
+    NormMean := NormMean / UsedClasses;
+    NormSd := 0;
+    for C := 0 to NumClasses - 1 do
+      if ClassCount[C] > 0 then
+        NormSd := NormSd + Sqr(CenNorm[C] - NormMean);
+    NormSd := Sqrt(NormSd / UsedClasses);
+    if NormMean > 1e-30 then NC2NormCV := NormSd / NormMean else NC2NormCV := 0;
+
+    // equiangular: centered-mean pairwise cosines vs ETF target -1/(C-1).
+    ETFTarget := -1.0 / (UsedClasses - 1);
+    SetLength(CosMat, NumClasses);
+    for I := 0 to NumClasses - 1 do
+    begin
+      SetLength(CosMat[I], NumClasses);
+      for J := 0 to NumClasses - 1 do CosMat[I][J] := 0;
+    end;
+    DotV := 0; OtherCls := 0; NC2DevMean := 0; NC2DevMax := 0;
+    for I := 0 to NumClasses - 1 do
+    begin
+      if ClassCount[I] = 0 then Continue;
+      for J := 0 to NumClasses - 1 do
+      begin
+        if ClassCount[J] = 0 then Continue;
+        if (CenNorm[I] > 1e-30) and (CenNorm[J] > 1e-30) then
+        begin
+          CosV := 0;
+          for F := 0 to D - 1 do CosV := CosV + Centered[I][F] * Centered[J][F];
+          CosV := CosV / (CenNorm[I] * CenNorm[J]);
+        end
+        else
+          CosV := 0;
+        CosMat[I][J] := CosV;
+        if I <> J then
+        begin
+          DotV := DotV + CosV;
+          AbsDev := Abs(CosV - ETFTarget);
+          NC2DevMean := NC2DevMean + AbsDev;
+          if AbsDev > NC2DevMax then NC2DevMax := AbsDev;
+          Inc(OtherCls);
+        end;
+      end;
+    end;
+    if OtherCls > 0 then
+    begin
+      NC2CosMean := DotV / OtherCls;
+      NC2DevMean := NC2DevMean / OtherCls;
+    end
+    else
+    begin
+      NC2CosMean := 0; NC2DevMean := 0;
+    end;
+
+    // --- NC3: self-duality. Head must be width-matched linear classifier. ---
+    HeadIsLinear :=
+      ((HeadLayer is TNNetFullConnectLinear) or
+       (HeadLayer is TNNetPointwiseConvLinear)) and
+      (HeadLayer.Neurons.Count = NumClasses) and
+      (not Projected) and
+      (HeadLayer.Neurons.Count > 0) and
+      (HeadLayer.Neurons[0].Weights.Size = D);
+    NC3Mean := 0; NC3Count := 0;
+    if HeadIsLinear then
+    begin
+      for C := 0 to NumClasses - 1 do
+      begin
+        if ClassCount[C] = 0 then Continue;
+        WRow := HeadLayer.Neurons[C].Weights;
+        WDot := 0; WNw := 0;
+        for F := 0 to D - 1 do
+        begin
+          WDot := WDot + Centered[C][F] * WRow.FData[F];
+          WNw := WNw + WRow.FData[F] * WRow.FData[F];
+        end;
+        WNc := CenNorm[C];
+        WNw := Sqrt(WNw);
+        if (WNc > 1e-30) and (WNw > 1e-30) then
+        begin
+          NC3Cos := WDot / (WNc * WNw);
+          NC3Mean := NC3Mean + Abs(NC3Cos);
+          Inc(NC3Count);
+        end;
+      end;
+      if NC3Count > 0 then NC3Mean := NC3Mean / NC3Count;
+    end;
+
+    // --- NC4: classifier argmax == nearest centered class mean. ---
+    NC4Correct := 0;
+    for SampleIdx := 0 to N - 1 do
+    begin
+      if Labels[SampleIdx] < 0 then Continue;
+      Pair := Samples[SampleIdx];
+      NN.Compute(Pair.I);
+      ArgLogit := NN.GetLastLayer.Output.GetClass();
+      // nearest CENTERED class mean to this point's centered feature.
+      NearCls := -1; BestDist := 1e300;
+      for C := 0 to NumClasses - 1 do
+      begin
+        if ClassCount[C] = 0 then Continue;
+        Dist := 0;
+        for F := 0 to D - 1 do
+        begin
+          Diff := (Feats[SampleIdx][F] - GlobalMean[F]) - Centered[C][F];
+          Dist := Dist + Diff * Diff;
+        end;
+        if Dist < BestDist then begin BestDist := Dist; NearCls := C; end;
+      end;
+      if ArgLogit = NearCls then Inc(NC4Correct);
+    end;
+
+    // --- assemble report. ---
+    if Projected then ProjStr := ', projected' else ProjStr := '';
+    if SwSum > 1e-30 then FisherVal := SbSum / SwSum else FisherVal := 0;
+    Lines.Add(Format(
+      'NeuralCollapseReport: feature layer L%d (%s, FeatDim=%d%s), head L%d ' +
+      '(%s), %d class(es) (%d occupied), %d probe(s) (%d valid).',
+      [FeatLayer, Layer.ClassName, D, ProjStr, HeadIdx, HeadLayer.ClassName,
+       NumClasses, UsedClasses, N, NValid]));
+    Lines.Add(StringOfChar('-', 78));
+    Lines.Add(Format(
+      'NC1 within-class variability collapse tr(Sw.Sb^+)/C ~= tr(Sw)/tr(Sb) = ' +
+      '%.6f  (-> 0)', [NC1]));
+    Lines.Add(Format(
+      '    tr(Sw)=%.6f  tr(Sb)=%.6f  Fisher tr(Sb)/tr(Sw)=%.4f',
+      [SwSum, SbSum, FisherVal]));
+    Lines.Add(Format(
+      'NC2 simplex-ETF: equinorm CV(||mu_c-mu||)=%.6f (-> 0); ' +
+      'equiangular target -1/(C-1)=%.4f', [NC2NormCV, ETFTarget]));
+    Lines.Add(Format(
+      '    mean pairwise cosine=%.4f  mean|dev|=%.6f  max|dev|=%.6f  (-> 0)',
+      [NC2CosMean, NC2DevMean, NC2DevMax]));
+    if HeadIsLinear then
+      Lines.Add(Format(
+        'NC3 self-duality: mean |cos(mu_c-mu, w_c)| = %.4f  (-> 1)', [NC3Mean]))
+    else
+      Lines.Add('NC3 self-duality: SKIPPED (head is not a width-matched ' +
+        'TNNetFullConnectLinear / TNNetPointwiseConvLinear).');
+    Lines.Add(Format(
+      'NC4 classifier -> nearest-class-mean: %.4f of probes (%d/%d)  (-> 1)',
+      [NC4Correct / NValid, NC4Correct, NValid]));
+
+    // centered-mean cosine heatmap (the simplex assembling).
+    Lines.Add('');
+    Lines.Add('Centered class-mean pairwise-cosine heatmap (glyphs " .:-=+*#%@"' +
+      ', off-diagonals -> ' + Format('%.4f', [ETFTarget]) + '):');
+    Line := '       ';
+    for J := 0 to NumClasses - 1 do Line := Line + Format('%4d', [J]);
+    Lines.Add(Line);
+    for I := 0 to NumClasses - 1 do
+    begin
+      Line := Format('  c%-4d ', [I]);
+      for J := 0 to NumClasses - 1 do
+      begin
+        GlyphIdx := Round((CosMat[I][J] + 1.0) * 0.5 * (Length(cGlyphs) - 1));
+        if GlyphIdx < 0 then GlyphIdx := 0;
+        if GlyphIdx > Length(cGlyphs) - 1 then GlyphIdx := Length(cGlyphs) - 1;
+        Glyph := cGlyphs[GlyphIdx + 1];
+        Line := Line + '   ' + Glyph;
+      end;
+      Lines.Add(Line);
+    end;
 
     Result := Lines.Text;
   finally

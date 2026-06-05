@@ -110,6 +110,7 @@ type
     procedure TestLogitLensReportSmoke;
     procedure TestTunedLensReportSmoke;
     procedure TestFeatureSeparabilityReportSmoke;
+    procedure TestNeuralCollapseReportSmoke;
     procedure TestRepresentationSimilarityReportSmoke;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
@@ -3303,6 +3304,157 @@ begin
     Samples.Free;
     SingleCls.Free;
     Identical.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestNeuralCollapseReportSmoke;
+const
+  cC = 4;   // number of classes / feature dim for the exact-simplex pin
+  cReps = 8; // identical copies per class
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  Report: string;
+  I, J, C, Rep: integer;
+  Vert: array[0..cC - 1, 0..cC - 1] of TNeuralFloat;
+  Scale, DevMean, DevMax, NormCV: TNeuralFloat;
+  FS: TFormatSettings;
+
+  function ExtractAfter(const REp, Marker: string): TNeuralFloat;
+  var
+    A, B: integer;
+    S: string;
+  begin
+    Result := -999;
+    A := Pos(Marker, Rep);
+    if A <= 0 then Exit;
+    A := A + Length(Marker);
+    while (A <= Length(Rep)) and (Rep[A] = ' ') do Inc(A);
+    B := A;
+    while (B <= Length(Rep)) and
+          (Rep[B] in ['0'..'9', '.', '-', '+', 'e', 'E']) do Inc(B);
+    S := Trim(Copy(Rep, A, B - A));
+    Result := StrToFloatDef(S, -999, FS);
+  end;
+
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN / empty / NumClasses<2 handled gracefully.
+  Report := TNNet.NeuralCollapseReport(nil, nil, cC);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  // --- EXACT SIMPLEX-ETF PIN (verifies NC2 cosine math independent of any
+  //     training). Construct cC class means that form a perfect simplex ETF:
+  //     rows of sqrt(C/(C-1)) * (I - (1/C) J). Their pairwise cosine is EXACTLY
+  //     -1/(C-1) and they sum to zero (so the global mean is 0 and the centered
+  //     means equal the vertices). Feed them through an IDENTITY linear feature
+  //     layer so the penultimate features equal the vertices exactly. ---
+  Scale := Sqrt(cC / (cC - 1.0));
+  for I := 0 to cC - 1 do
+    for J := 0 to cC - 1 do
+      if I = J then Vert[I][J] := Scale * (1.0 - 1.0 / cC)
+      else Vert[I][J] := Scale * (-1.0 / cC);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    // Input(cC) -> FCLinear(cC) [identity feature layer] -> FCLinear(cC) [head]
+    // -> SoftMax. The first FCLinear is the auto-selected feature layer.
+    NN.AddLayer(TNNetInput.Create(cC, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cC));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cC));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    // make layer 1 the identity map (weights = I, bias = 0).
+    for I := 0 to cC - 1 do
+    begin
+      for J := 0 to cC - 1 do
+        if I = J then NN.Layers[1].Neurons[I].Weights.FData[J] := 1.0
+        else NN.Layers[1].Neurons[I].Weights.FData[J] := 0.0;
+      NN.Layers[1].Neurons[I].BiasWeight := 0.0;
+    end;
+
+    // class-balanced batch: each class fed its exact simplex vertex (repeated).
+    for C := 0 to cC - 1 do
+      for Rep := 1 to cReps do
+      begin
+        X := TNNetVolume.Create(cC, 1, 1);
+        Y := TNNetVolume.Create(cC, 1, 1);
+        for J := 0 to cC - 1 do X.FData[J] := Vert[C][J];
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    Report := TNNet.NeuralCollapseReport(NN, Samples, cC);
+    AssertTrue('Report non-empty', Length(Report) > 0);
+    AssertTrue('header present', Pos('NeuralCollapseReport', Report) > 0);
+    AssertTrue('NC1 line present', Pos('NC1 within-class', Report) > 0);
+    AssertTrue('NC2 line present', Pos('NC2 simplex-ETF', Report) > 0);
+    AssertTrue('NC3 line present', Pos('NC3 self-duality', Report) > 0);
+    AssertTrue('NC4 line present',
+      Pos('NC4 classifier -> nearest-class-mean', Report) > 0);
+    AssertTrue('heatmap present', Pos('pairwise-cosine heatmap', Report) > 0);
+
+    // PIN: mean pairwise cosine == -1/(C-1) within tight tolerance.
+    AssertTrue('mean pairwise cosine == -1/(C-1) (exact simplex)',
+      Abs(ExtractAfter(Report, 'mean pairwise cosine=') -
+          (-1.0 / (cC - 1))) < 1e-4);
+    // PIN: NC2 equiangular deviations ~ 0 on the exact simplex.
+    DevMean := ExtractAfter(Report, 'mean|dev|=');
+    DevMax := ExtractAfter(Report, 'max|dev|=');
+    AssertTrue('NC2 mean|dev| ~ 0 on exact simplex', Abs(DevMean) < 1e-4);
+    AssertTrue('NC2 max|dev| ~ 0 on exact simplex', Abs(DevMax) < 1e-4);
+    // PIN: equinorm CV ~ 0 (all vertices have equal norm).
+    NormCV := ExtractAfter(Report, 'CV(||mu_c-mu||)=');
+    AssertTrue('NC2 equinorm CV ~ 0 on exact simplex', Abs(NormCV) < 1e-4);
+    // The identity feature layer means tr(Sw)=0 (identical per-class inputs):
+    // NC1 -> 0.
+    AssertTrue('NC1 ~ 0 (identical per-class features)',
+      Abs(ExtractAfter(Report, 'tr(Sw)/tr(Sb) = ')) < 1e-4);
+
+    // NC3 here: the SoftMax-terminated head IS a width-matched FCLinear, so NC3
+    // is COMPUTED (not skipped). Verify the computed-branch text appears.
+    AssertTrue('NC3 computed (width-matched linear head)',
+      Pos('mean |cos(mu_c-mu, w_c)|', Report) > 0);
+  finally
+    Samples.Free;
+    NN.Free;
+  end;
+
+  // --- NC3 HONEST SKIP: a head that is NOT a width-matched linear classifier.
+  //     TNNetFullConnect (non-linear base, NOT a TNNetFullConnectLinear
+  //     descendant) as the head triggers the honest skip branch. ---
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(cC, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnect.Create(cC)); // non-linear head -> not linear
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for C := 0 to cC - 1 do
+      for Rep := 1 to cReps do
+      begin
+        X := TNNetVolume.Create(cC, 1, 1);
+        Y := TNNetVolume.Create(cC, 1, 1);
+        for J := 0 to cC - 1 do X.FData[J] := Vert[C][J];
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+    Report := TNNet.NeuralCollapseReport(NN, Samples, cC);
+    AssertTrue('NC3 honestly skipped on non-linear head',
+      Pos('NC3 self-duality: SKIPPED', Report) > 0);
+  finally
+    Samples.Free;
     NN.Free;
   end;
 end;
