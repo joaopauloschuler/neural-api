@@ -123,6 +123,9 @@ type
     procedure TestWeightStandardizationForward;
     procedure TestWeightStandardizationGradientCheck;
     procedure TestWeightStandardizationSerializationRoundTrip;
+    procedure TestWeightStandardizationConvForward;
+    procedure TestWeightStandardizationConvGradientCheck;
+    procedure TestWeightStandardizationConvSerializationRoundTrip;
     procedure TestWeightNormLinearForward;
     procedure TestWeightNormLinearGradientCheck;
     procedure TestWeightNormLinearSerializationRoundTrip;
@@ -28956,6 +28959,214 @@ begin
       AssertEquals('WeightStandardization SaveToString round-trip', Saved, Saved2);
       AssertTrue('WeightStandardization eps token present in serialized string',
         Pos('TNNetWeightStandardization', Saved) > 0);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWeightStandardizationConvForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  WS: TNNetWeightStandardizationConv;
+  o, i: integer;
+  Mean, Variance, Std, StdMean, StdVar: TNeuralFloat;
+  N: integer;
+begin
+  // After standardization each output FILTER (all SizeX*SizeY*Depth weights of
+  // an output channel) must have ~zero mean and ~unit standard deviation.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 3, 1));
+    // 4 filters, 3x3, padding 1, stride 1 -> each filter has 3*3*3 = 27 weights.
+    WS := TNNetWeightStandardizationConv.Create(4, 3, 1, 1);
+    NN.AddLayer(WS);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.31) * 0.5 + 0.2;
+
+    // Non-trivial, non-standardized raw filter weights.
+    for o := 0 to WS.Neurons.Count - 1 do
+      for i := 0 to WS.Neurons[o].Weights.Size - 1 do
+        WS.Neurons[o].Weights.Raw[i] := (o + 1) * 0.9 + i * 0.13 - 1.7;
+
+    NN.Compute(Input);
+
+    // Compute() restores the RAW weights, so we re-derive w_hat here.
+    for o := 0 to WS.Neurons.Count - 1 do
+    begin
+      N := WS.Neurons[o].Weights.Size;
+      Mean := WS.Neurons[o].Weights.GetSum() / N;
+      Variance := 0;
+      for i := 0 to N - 1 do
+        Variance := Variance + Sqr(WS.Neurons[o].Weights.Raw[i] - Mean);
+      Variance := Variance / N;
+      Std := Sqrt(Variance + 1e-5);
+
+      StdMean := 0;
+      for i := 0 to N - 1 do
+        StdMean := StdMean + (WS.Neurons[o].Weights.Raw[i] - Mean) / Std;
+      StdMean := StdMean / N;
+      StdVar := 0;
+      for i := 0 to N - 1 do
+        StdVar := StdVar +
+          Sqr((WS.Neurons[o].Weights.Raw[i] - Mean) / Std - StdMean);
+      StdVar := StdVar / N;
+
+      AssertEquals('WeightStandardizationConv filter mean neuron ' + IntToStr(o),
+        0.0, StdMean, 1e-5);
+      AssertEquals('WeightStandardizationConv filter std neuron ' + IntToStr(o),
+        1.0, Sqrt(StdVar), 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWeightStandardizationConvGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  WS: TNNetWeightStandardizationConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, o: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  epsilon := 0.0001;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  InputPlus := TNNetVolume.Create(3, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 2, 1)); // pError=1 resizes error volumes
+    // 3 filters, 3x3, padding 0, stride 1 -> 1x1x3 output, 3*3*2=18 weights/filter.
+    // A single output position keeps the input-gradient magnitude small so the
+    // single-precision finite-difference check is accurate, while still
+    // exercising standardization over each filter's full 18-weight tensor.
+    WS := TNNetWeightStandardizationConv.Create(3, 3, 0, 1);
+    NN.AddLayer(WS);
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    // Learning rate 1, batch update on: deltas accumulate -1*gradient and the
+    // raw weights are NOT modified, so finite-difference checks stay valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Small inputs / targets keep the loss and its gradients O(1) so the
+    // single-precision finite-difference check stays accurate.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Sin(i * 0.41) * 0.5 + 0.1) * 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.1;
+
+    // A wide per-filter spread keeps the variance comfortably above eps so the
+    // standardization scale (1/std) stays moderate for the single-precision FD.
+    for o := 0 to WS.Neurons.Count - 1 do
+      for i := 0 to WS.Neurons[o].Weights.Size - 1 do
+        WS.Neurons[o].Weights.Raw[i] := 0.4 + o * 0.35 + i * 0.21 - 1.6;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('WeightStandardizationConv input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the RAW weights ----
+    for o := 0 to WS.Neurons.Count - 1 do
+      for i := 0 to WS.Neurons[o].Weights.Size - 1 do
+      begin
+        WS.Neurons[o].Weights.Raw[i] := WS.Neurons[o].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        WS.Neurons[o].Weights.Raw[i] := WS.Neurons[o].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        WS.Neurons[o].Weights.Raw[i] := WS.Neurons[o].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        WS.Neurons[o].ClearDelta;
+        NN.Backpropagate(Desired);
+        // Backprop accumulates Delta := Delta - LearningRate*gradient.
+        // With LearningRate = 1, analytical gradient = -Delta.
+        analyticalGrad := -WS.Neurons[o].Delta.Raw[i];
+
+        AssertTrue('WeightStandardizationConv weight gradient check (' +
+          IntToStr(o) + ',' + IntToStr(i) + ') num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWeightStandardizationConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  WS: TNNetWeightStandardizationConv;
+  Saved, Saved2: string;
+  o, i: integer;
+begin
+  // Round-trip with a NON-default eps: SaveToString -> LoadFromString ->
+  // SaveToString must be string-equal (eps survives via FFloatSt[0]).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 3, 1));
+    WS := TNNetWeightStandardizationConv.Create({pNumFeatures=}4, {pFeatureSize=}3,
+      {pInputPadding=}1, {pStride=}1, {pSuppressBias=}0, {pEpsilon=}7.5e-3);
+    NN.AddLayer(WS);
+
+    for o := 0 to WS.Neurons.Count - 1 do
+      for i := 0 to WS.Neurons[o].Weights.Size - 1 do
+        WS.Neurons[o].Weights.Raw[i] := 0.11 * (o + 1) - 0.05 * i;
+
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('WeightStandardizationConv SaveToString round-trip', Saved, Saved2);
+      AssertTrue('WeightStandardizationConv class token present in serialized string',
+        Pos('TNNetWeightStandardizationConv', Saved) > 0);
     finally
       NN2.Free;
     end;

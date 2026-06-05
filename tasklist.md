@@ -458,12 +458,20 @@ rather than acted on.
 - [ ] TNNetReversibleBlock follow-up: stack N reversible blocks into a deep net
       and show constant activation memory vs a plain residual stack of equal depth
       (the headline RevNet scaling claim) — depends on the recompute path above.
-- [ ] TNNetWeightStandardization follow-up: a CONVOLUTION variant
-      (standardize a conv layer's filters per output channel). The dense
-      form landed; the conv form is the headline WS use case (Qiao et al.
-      pair it with GroupNorm in a conv stack). Mirror the dense Jacobian
-      per output-channel filter. Pairs with a tiny WS+GroupNorm vs
-      BatchNorm CIFAR-stub bake-off.
+- [x] TNNetWeightStandardization follow-up: a CONVOLUTION variant
+      (standardize a conv layer's filters per output channel). LANDED as
+      TNNetWeightStandardizationConv (subclass of TNNetConvolutionLinear in
+      neuralnetwork.pas; standardizes each output channel's full filter to
+      zero-mean/unit-std before the convolution, exact per-output-channel
+      standardization Jacobian in backward, both CreateLayer dispatch points
+      + eps in FFloatSt[0] for round-trip). Tests in
+      tests/TestNeuralNumerical.pas: forward per-filter mean≈0/std≈1 smoke,
+      finite-difference vs analytic input+weight gradient check, save/load
+      round-trip. Bake-off at examples/WeightStandardizationConv/ (WS+GroupNorm
+      vs AddMovingNorm-BatchNorm on a tiny synthetic small-batch image task,
+      pure CPU ~65 s, graded PASS/FAIL: both train to a healthy classifier and
+      WS+GroupNorm is competitive — MATCHES BatchNorm within tolerance on this
+      easy toy).
 - [ ] TNNetSpectralNorm — CONVOLUTION variant (still open). The dense wrapper
       landed; add a convolution-layer spectral-norm wrapper (largest singular
       value of the flattened conv weight matrix per output channel / full

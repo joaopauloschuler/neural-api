@@ -5194,6 +5194,47 @@ type
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
+  /// Weight Standardization CONVOLUTION layer (Qiao et al. 2019,
+  /// "Micro-Batch Training with Batch-Channel Normalization and Weight
+  /// Standardization", arXiv:1903.10520). This is the convolution sibling of
+  /// the dense TNNetWeightStandardization: it behaves like a plain linear
+  /// (no-activation) convolution, but BEFORE the forward convolution the full
+  /// weight tensor of EACH output channel / filter (all SizeX*SizeY*Depth
+  /// weights of that filter) is standardized to zero-mean / unit-std:
+  ///   w_hat = (w - mean(w)) / sqrt(var(w) + eps)
+  /// The raw weights remain the trainable parameters; the standardization is
+  /// applied on the fly and its EXACT per-output-channel Jacobian (the same
+  /// centering+scaling Jacobian used by batch/layer norm, applied over each
+  /// filter's weight tensor) is propagated in the backward pass, so the
+  /// reported weight gradient is the gradient w.r.t. the RAW weights. This is
+  /// the headline WS use case: WS pairs with GroupNorm in conv stacks to match
+  /// or beat BatchNorm at small batch sizes.
+  /// Implementation: the standardized filters are written into the neuron
+  /// weights in place (raw copy kept in scratch), the concatenated-weight cache
+  /// is refreshed, the highly-optimized inherited convolution Compute/Backprop
+  /// run unchanged on the standardized filters, then the raw weights are
+  /// restored and the accumulated per-filter weight delta is remapped through
+  /// the standardization Jacobian.
+  /// eps is stored in FFloatSt[0] (default 1e-5); FStruct[0..4] carry the usual
+  /// convolution parameters so the layer round-trips through
+  /// SaveStructureToString / LoadFromString / CreateLayer.
+  // Coded by Claude (AI).
+  TNNetWeightStandardizationConv = class(TNNetConvolutionLinear)
+  private
+    FWSEpsilon: TNeuralFloat;
+    FRawFilters: TNNetVolumeList;  // per-neuron raw-weight scratch copies
+    FStdFilter: TNNetVolume;       // standardized weights of one neuron
+    FPreDelta: TNNetVolumeList;    // per-neuron Delta snapshot before backprop
+    procedure StandardizeFilters();
+    procedure RestoreRawFilters();
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias: integer; pEpsilon: TNeuralFloat); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Convolutional layer with ReLU activation function.
   TNNetConvolutionReLU = class(TNNetConvolution)
   public
@@ -29923,6 +29964,192 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetWeightStandardizationConv }
+
+constructor TNNetWeightStandardizationConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FWSEpsilon := 1e-5;
+  FFloatSt[0] := FWSEpsilon;
+  FRawFilters := TNNetVolumeList.Create();
+  FStdFilter := TNNetVolume.Create();
+  FPreDelta := TNNetVolumeList.Create();
+end;
+
+constructor TNNetWeightStandardizationConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride, pSuppressBias: integer; pEpsilon: TNeuralFloat);
+begin
+  Self.Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  FWSEpsilon := pEpsilon;
+  FFloatSt[0] := FWSEpsilon;
+end;
+
+destructor TNNetWeightStandardizationConv.Destroy();
+begin
+  FRawFilters.Free;
+  FStdFilter.Free;
+  FPreDelta.Free;
+  inherited Destroy();
+end;
+
+// Standardize every output channel's filter (w_hat = (w-mean)/sqrt(var+eps))
+// IN PLACE, keeping a raw copy of each filter in FRawFilters so the trainable
+// raw weights can be restored after the forward/backward pass.
+procedure TNNetWeightStandardizationConv.StandardizeFilters();
+var
+  NeuronCnt, MaxNeurons, WeightCnt, MaxWeights: integer;
+  Mean, Variance, InvStd, FloatN: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  // Make sure the raw-filter scratch list has one volume per neuron.
+  while FRawFilters.Count <= MaxNeurons do
+    FRawFilters.Add(TNNetVolume.Create());
+  for NeuronCnt := 0 to MaxNeurons do
+  begin
+    localNeuron := FArrNeurons[NeuronCnt];
+    MaxWeights := localNeuron.FWeights.Size - 1;
+    FloatN := localNeuron.FWeights.Size;
+    // Keep the raw weights so they can be restored.
+    FRawFilters[NeuronCnt].Copy(localNeuron.FWeights);
+    Mean := localNeuron.FWeights.GetSum() / FloatN;
+    Variance := 0;
+    for WeightCnt := 0 to MaxWeights do
+      Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
+    Variance := Variance / FloatN;
+    InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
+    for WeightCnt := 0 to MaxWeights do
+      localNeuron.FWeights.FData[WeightCnt] :=
+        (localNeuron.FWeights.FData[WeightCnt] - Mean) * InvStd;
+  end;
+  // Refresh the concatenated-weight cache used by the optimized conv kernels.
+  RefreshNeuronWeightList();
+  AfterWeightUpdate();
+end;
+
+// Restore the raw (trainable) weights saved by StandardizeFilters and refresh
+// the concatenated-weight cache.
+procedure TNNetWeightStandardizationConv.RestoreRawFilters();
+var
+  NeuronCnt, MaxNeurons: integer;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeurons do
+    FArrNeurons[NeuronCnt].FWeights.Copy(FRawFilters[NeuronCnt]);
+  RefreshNeuronWeightList();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetWeightStandardizationConv.Compute();
+begin
+  if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
+  StandardizeFilters();
+  inherited Compute();
+  RestoreRawFilters();
+end;
+
+procedure TNNetWeightStandardizationConv.Backpropagate();
+var
+  NeuronCnt, MaxNeurons, WeightCnt, MaxWeights: integer;
+  Mean, Variance, InvStd, FloatN: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+  SumDwHat, SumDwHatWHat, dwHat, gradRaw, InvNegLR: TNeuralFloat;
+begin
+  // Mirror the guard the inherited conv Backpropagate uses, so we only do the
+  // (expensive) standardize / remap work on the LAST departing branch. The
+  // inherited Backpropagate re-tests this counter, so we do NOT increment it
+  // here; we only peek at it.
+  if (FBackPropCallCurrentCnt + 1) < FDepartingBranchesCnt then
+  begin
+    inherited Backpropagate(); // just advances the counter and exits
+    exit;
+  end;
+
+  if FNeurons.Count > 0 then
+  begin
+    if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
+    MaxNeurons := FNeurons.Count - 1;
+
+    // Snapshot each neuron's Delta BEFORE the inherited convolution backprop so
+    // the per-call increment (= -LearningRate * dL/dw_hat) can be isolated and
+    // remapped through the standardization Jacobian.
+    while FPreDelta.Count <= MaxNeurons do
+      FPreDelta.Add(TNNetVolume.Create());
+    for NeuronCnt := 0 to MaxNeurons do
+      FPreDelta[NeuronCnt].Copy(FArrNeurons[NeuronCnt].FDelta);
+
+    // Run the optimized conv backprop with the STANDARDIZED filters: this gives
+    // the correct input gradient (which uses w_hat) and accumulates
+    // -LearningRate * dL/dw_hat into each neuron's Delta. It also cascades into
+    // the previous layer.
+    StandardizeFilters();
+    inherited Backpropagate();
+    RestoreRawFilters();
+
+    // Remap the per-call Delta increment from the w_hat gradient to the RAW
+    // weight gradient, neuron by neuron. The input gradient and bias delta are
+    // already correct and are left untouched.
+    if FLearningRate <> 0.0 then
+    begin
+      InvNegLR := 1.0 / (-FLearningRate);
+      for NeuronCnt := 0 to MaxNeurons do
+      begin
+        localNeuron := FArrNeurons[NeuronCnt];
+        MaxWeights := localNeuron.FWeights.Size - 1;
+        FloatN := localNeuron.FWeights.Size;
+
+        // Recompute this filter's standardization statistics from the raw
+        // (restored) weights.
+        Mean := localNeuron.FWeights.GetSum() / FloatN;
+        Variance := 0;
+        for WeightCnt := 0 to MaxWeights do
+          Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
+        Variance := Variance / FloatN;
+        InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
+
+        // Standardized weights w_hat (needed by the Jacobian).
+        FStdFilter.ReSize(localNeuron.FWeights);
+        for WeightCnt := 0 to MaxWeights do
+          FStdFilter.FData[WeightCnt] :=
+            (localNeuron.FWeights.FData[WeightCnt] - Mean) * InvStd;
+
+        // The inherited backprop stored, in Delta, the value
+        //   pre + (-LearningRate) * dL/dw_hat
+        // Recover dL/dw_hat from the increment.
+        SumDwHat := 0;
+        SumDwHatWHat := 0;
+        for WeightCnt := 0 to MaxWeights do
+        begin
+          dwHat := (localNeuron.FDelta.FData[WeightCnt] -
+            FPreDelta[NeuronCnt].FData[WeightCnt]) * InvNegLR;
+          SumDwHat := SumDwHat + dwHat;
+          SumDwHatWHat := SumDwHatWHat + dwHat * FStdFilter.FData[WeightCnt];
+        end;
+        SumDwHat := SumDwHat / FloatN;
+        SumDwHatWHat := SumDwHatWHat / FloatN;
+
+        // dL/dw_i = invStd*( dwHat_i - mean(dwHat) - w_hat_i*mean(dwHat*w_hat) )
+        // Rewrite Delta as pre + (-LearningRate) * gradRaw (the EXACT gradient
+        // w.r.t. the RAW weights).
+        for WeightCnt := 0 to MaxWeights do
+        begin
+          dwHat := (localNeuron.FDelta.FData[WeightCnt] -
+            FPreDelta[NeuronCnt].FData[WeightCnt]) * InvNegLR;
+          gradRaw := InvStd * ( dwHat - SumDwHat -
+            FStdFilter.FData[WeightCnt] * SumDwHatWHat );
+          localNeuron.FDelta.FData[WeightCnt] :=
+            FPreDelta[NeuronCnt].FData[WeightCnt] + (-FLearningRate) * gradRaw;
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    inherited Backpropagate();
+  end;
+end;
+
 { TNNetWeightNormLinear }
 
 constructor TNNetWeightNormLinear.Create(pSizeX, pSizeY, pDepth: integer;
@@ -51718,6 +51945,7 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetWeightStandardizationConv' : Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]);
       'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionHardSwish' : Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
@@ -52015,6 +52243,7 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetWeightStandardizationConv' then Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]) else
       if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionHardSwish' then Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
