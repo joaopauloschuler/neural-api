@@ -375,19 +375,6 @@ rather than acted on.
 - [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
       `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
       next-token task and chart loss + max-logit-norm.
-- [X] Lottery-ticket follow-up: ITERATIVE magnitude pruning (IMP, the paper's
-      actual method) vs the landed one-shot prune. Loop: train -> prune the
-      bottom p% of SURVIVING weights -> reset survivors to theta_0 -> retrain,
-      for several rounds reaching the same final sparsity as one-shot. Fork
-      examples/LotteryTicket and chart whether IMP finds a winning ticket at the
-      95% sparsity where the landed one-shot run collapsed to ~67% (the headline
-      "iterative beats one-shot at extreme sparsity" result). Pure CPU, &lt;5 min.
-      PROGRESS: landed examples/LotteryTicketIMP (5 rounds, prune 45%/round of
-      survivors -> (0.55)^5 ~= 95% sparsity, rewind to theta_0 each round),
-      graded head-to-head vs a budget-matched one-shot prune-to-95%. HONEST
-      negative: at a generous matched 540-epoch budget the one-shot ticket does
-      NOT collapse (sibling collapses only at 100 epochs/arm), so IMP shows no
-      advantage on this easy toy; reported plainly. Pure CPU ~140 s.
 - [ ] Lottery-ticket IMP follow-up (make the headline land): the landed
       examples/LotteryTicketIMP showed NO IMP advantage because the toy is too
       easy and the budget too generous (one-shot never collapses). Build the
@@ -531,20 +518,6 @@ rather than acted on.
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
 #### Probability projections / sparsity
-- [X] TNNetGumbelSoftmax follow-up: temperature-annealing
-      micro-experiment — train a tiny discrete-latent autoencoder whose
-      bottleneck is a `TNNetGumbelSoftmax`, anneal `tau` from ~2.0 down to
-      ~0.1 over training, and chart reconstruction loss vs `tau` plus the
-      bottleneck's output entropy (the categorical sharpens as tau drops).
-      The layer + its soft/hard modes are in tree; this is the headline
-      use case. Pairs with the open hard-top-k MoE routing gate.
-      PROGRESS: landed examples/GumbelAnnealingAutoencoder/ — discrete-latent
-      AE (encoder MLP -> K logits -> TNNetGumbelSoftmax -> decoder MLP) on a
-      K=6 well-separated-cluster synthetic set; tau annealed 2.0->1.0->0.5->
-      0.25->0.1 by rebuilding the net per phase with the lower tau and carrying
-      weights via TNNet.CopyWeights (tau is protected FFloatSt[0], no setter).
-      Prints a (tau, recon-MSE, bottleneck entropy) table + graded PASS verdict:
-      entropy collapses 0.064->0 nats while recon holds at the ~0.01 noise floor.
 - [ ] TNNetGumbelSoftmax follow-up: add a public temperature SETTER (tau lives in
       the protected FFloatSt[0] with no setter, so the annealing example above has
       to REBUILD the net per phase and carry weights via CopyWeights). A
@@ -604,14 +577,9 @@ rather than acted on.
       cross-batch EMA of assigned encoder vectors per code. Needs the same
       batch-aware loss hook logged for cross-batch InfoNCE / CenterLoss-EMA; track
       alongside those.
-- [X] TNNetVectorQuantizer follow-up: report active-codebook usage (count of codes
-      selected at least once over a probe batch) to expose codebook collapse — the
-      headline VQ-VAE failure mode. Pairs with the open "VQ codebook collapse stress
-      test" experiment and the `examples/VQAutoencoder/` demo below.
-      PROGRESS: added runtime probe ResetCodebookUsage/ActiveCodeCount/CodebookUsageCount
-      to TNNetVectorQuantizer (counter incremented in Compute, not serialized, math/grads
-      unchanged) + TestVectorQuantizerCodebookUsage regression test + examples/VQCodebookUsage.
-- [ ] VQ codebook-collapse STRESS test (now unblocked by the usage probe above):
+- [ ] VQ codebook-collapse STRESS test (unblocked by the shipped
+      ResetCodebookUsage/ActiveCodeCount/CodebookUsageCount probe on
+      TNNetVectorQuantizer):
       deliberately DRIVE collapse — far more codes than clusters, high commitment /
       high LR, or poorly-scaled encoder — and use ActiveCodeCount/CodebookUsageCount
       to chart the active-code count falling over training (the failure the healthy
