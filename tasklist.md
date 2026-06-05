@@ -134,6 +134,19 @@ rather than acted on.
           a param-matched dense TNNetFullConnectLinear on a small regression/recall
           task, charting accuracy-per-weight (the headline win) and wall-clock of
           the direct vs FFT forward as n grows.
+      PROGRESS: parts (a), (b) and (d) LANDED. (a) TNNetCirculantLinear ships in
+      neuralnetwork.pas (two length-n neurons: kernel c + per-output bias; direct
+      O(n^2) forward; backward distributes the error over the shared kernel; both
+      CreateLayer dispatch points wired so save/load round-trips). (b) three tests
+      in TestNeuralNumerical.pas (known-circular-convolution smoke <1e-5,
+      finite-difference gradient check for input + kernel + bias, byte-identical
+      save/load round-trip) — full suite green. (d) examples/CirculantLinear/
+      bake-off (circulant 2n weights vs dense n*n+n) prints accuracy-per-weight:
+      circulant ~8.5x fewer weights and ~500x more accurate-per-weight on n=16,
+      recovers the teacher kernel to ~5 decimals, runs in ~0.5s. STILL OPEN:
+      part (c), the opt-in O(n log n) FFT fast path (the direct path is the
+      default; the example's "FFT-vs-direct wall-clock as n grows" chart depends
+      on it and is deferred with it).
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is

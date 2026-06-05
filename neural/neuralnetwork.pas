@@ -4805,6 +4805,51 @@ type
     destructor Destroy(); override;
   end;
 
+  // Structured-matrix dense (linear) layer whose square weight matrix W (n x n,
+  // n = Depth) is CIRCULANT: every row is a cyclic shift of a single learned
+  // vector c of length n, so the layer stores only O(n) weights (the kernel c
+  // and an optional length-n bias) instead of the O(n^2) of a full dense layer.
+  // The map is the circular convolution of c with the input x:
+  //   y[i] = bias[i] + sum_{k=0..n-1} c[(i-k) mod n] * x[k].
+  // This is genuinely distinct from the other structured dense layers in the
+  // tree: LoRA is LOW-RANK, AddGroupedFullConnect is BLOCK-DIAGONAL,
+  // TNNetBitLinear quantizes a full dense matrix and TNNetSpectralNorm rescales
+  // one -- none impose this shift-invariant Toeplitz/circulant structure.
+  //
+  // STORAGE: the layer keeps exactly two neurons of length n (so it round-trips
+  // through the ordinary per-neuron SaveDataToString / LoadDataFromString with
+  // no custom serialization):
+  //   FArrNeurons[0].Weights = c     (the shared circulant kernel)
+  //   FArrNeurons[1].Weights = bias  (the per-output bias, length n)
+  // The neurons' own scalar FBiasWeight is unused (kept 0); the per-output bias
+  // lives in the second neuron's weight vector. If pSuppressBias<>0 the bias
+  // vector is held at 0 and not learned.
+  //
+  // FORWARD is the direct O(n^2) circular sum above (clear and easy to verify).
+  // BACKWARD distributes each output error back over the SHARED kernel entries:
+  //   - kernel gradient   dL/dc[j] = sum_i outErr[i] * x[(i-j) mod n]
+  //                        (every diagonal that uses c[j] contributes),
+  //   - input gradient    dL/dx[k] = sum_i outErr[i] * c[(i-k) mod n]
+  //                        (the circular correlation of the error with c),
+  //   - bias gradient     dL/dbias[i] = outErr[i].
+  // The kernel gradient is accumulated into FArrNeurons[0].Delta and the bias
+  // gradient into FArrNeurons[1].Delta, so the ordinary inertia / Adam weight
+  // update machinery applies unchanged.
+  // An O(n log n) FFT fast path is a follow-up (the direct path is the default).
+  // Coded by Claude (AI).
+  TNNetCirculantLinear = class(TNNetFullConnectLinear)
+  private
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+  end;
+
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   protected
@@ -29489,6 +29534,207 @@ begin
   inherited Destroy();
 end;
 
+{ TNNetCirculantLinear }
+
+constructor TNNetCirculantLinear.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  // The circulant map is square (n -> n) and stored as exactly two length-n
+  // neurons: [0] = kernel c, [1] = per-output bias. The base FullConnect
+  // constructor added FOutput.Size neurons; trim down to the two we keep.
+  while FNeurons.Count > 2 do
+  begin
+    // FNeurons owns its objects, so Delete frees the neuron; do NOT Free first.
+    FNeurons.Delete(FNeurons.Count - 1);
+  end;
+  while FNeurons.Count < 2 do
+  begin
+    FNeurons.Add(TNNetNeuron.Create());
+  end;
+  BuildArrNeurons();
+end;
+
+constructor TNNetCirculantLinear.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+procedure TNNetCirculantLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N: integer;
+begin
+  // Bypass TNNetFullConnect.SetPrevLayer (which would resize EVERY neuron to the
+  // input size and run BuildArrNeurons for FOutput.Size neurons). The circulant
+  // layer keeps exactly two length-n neurons: kernel c and per-output bias.
+  // The TNNetLayer base just records FPrevLayer.
+  FPrevLayer := pPrevLayer;
+  N := pPrevLayer.Output.Size;
+  if N <> FOutput.Size then
+  begin
+    FErrorProc
+    (
+      'TNNetCirculantLinear requires a square map: input size '+IntToStr(N)+
+      ' must equal output size '+IntToStr(FOutput.Size)+'.'
+    );
+  end;
+  SetNumWeightsForAllNeurons(N);
+  FVectorSize := FNeurons[0].Weights.Size;
+  InitDefault();
+  // The kernel c is the only learned operator; keep the bias neuron at 0 so the
+  // layer starts as a (near-)identity-magnitude circular convolution.
+  FArrNeurons[1].Weights.Fill(0);
+  FArrNeurons[0].FBiasWeight := 0;
+  FArrNeurons[1].FBiasWeight := 0;
+  BuildArrNeurons();
+  AfterWeightUpdate();
+end;
+
+// Compute / Backpropagate are overridden (rather than inherited from
+// TNNetFullConnect) because the inherited versions guard on
+// FNeurons.Count = FOutput.Size; this layer keeps only two neurons regardless
+// of the (n-sized) output, so the guard would otherwise reject it.
+procedure TNNetCirculantLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCirculantLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Forward: direct O(n^2) circular convolution
+//   y[i] = bias[i] + sum_k c[(i-k) mod n] * x[k].
+procedure TNNetCirculantLinear.ComputeCPU();
+var
+  N, OutIdx, InIdx, KernelIdx: integer;
+  Acc: TNeuralFloat;
+  Kernel, Bias, PrevOut: TNNetVolume;
+begin
+  N := FOutput.Size;
+  Kernel := FArrNeurons[0].FWeights;
+  Bias := FArrNeurons[1].FWeights;
+  PrevOut := FPrevLayer.FOutput;
+  for OutIdx := 0 to N - 1 do
+  begin
+    Acc := 0;
+    for InIdx := 0 to N - 1 do
+    begin
+      KernelIdx := OutIdx - InIdx;
+      if KernelIdx < 0 then KernelIdx := KernelIdx + N;
+      Acc := Acc + Kernel.FData[KernelIdx] * PrevOut.FData[InIdx];
+    end;
+    if FSuppressBias = 0 then
+      FOutput.FData[OutIdx] := Acc + Bias.FData[OutIdx]
+    else
+      FOutput.FData[OutIdx] := Acc;
+  end;
+end;
+
+// Input gradient: dL/dx[k] = sum_i outErr[i] * c[(i-k) mod n]
+// (circular correlation of the output error with the kernel c).
+procedure TNNetCirculantLinear.ComputePreviousLayerErrorCPU();
+var
+  N, OutIdx, InIdx, KernelIdx: integer;
+  LocalPrevError, Kernel: TNNetVolume;
+  Err: TNeuralFloat;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  Kernel := FArrNeurons[0].FWeights;
+  N := FOutput.Size;
+  for OutIdx := 0 to N - 1 do
+  begin
+    Err := FOutputError.FData[OutIdx];
+    if Err <> 0.0 then
+    begin
+      for InIdx := 0 to N - 1 do
+      begin
+        KernelIdx := OutIdx - InIdx;
+        if KernelIdx < 0 then KernelIdx := KernelIdx + N;
+        LocalPrevError.FData[InIdx] :=
+          LocalPrevError.FData[InIdx] + Err * Kernel.FData[KernelIdx];
+      end;
+    end;
+  end;
+end;
+
+// Weight gradients accumulated into the two neurons' Delta:
+//   kernel: dL/dc[j] = sum_i outErr[i] * x[(i-j) mod n]   -> FArrNeurons[0].Delta
+//   bias  : dL/dbias[i] = outErr[i]                       -> FArrNeurons[1].Delta
+// (both scaled by -FLearningRate so the ordinary update machinery applies).
+procedure TNNetCirculantLinear.BackpropagateCPU();
+var
+  N, OutIdx, InIdx, KernelIdx: integer;
+  KernelDelta, BiasDelta, PrevOut: TNNetVolume;
+  localErrorDeriv, Err: TNeuralFloat;
+begin
+  N := FOutput.Size;
+  KernelDelta := FArrNeurons[0].FDelta;
+  BiasDelta := FArrNeurons[1].FDelta;
+  PrevOut := FPrevLayer.FOutput;
+  if (FBatchUpdate) then
+  begin
+    for OutIdx := 0 to N - 1 do
+    begin
+      Err := FOutputError.FData[OutIdx];
+      localErrorDeriv := -FLearningRate * Err;
+      if localErrorDeriv <> 0.0 then
+      begin
+        for InIdx := 0 to N - 1 do
+        begin
+          KernelIdx := OutIdx - InIdx;
+          if KernelIdx < 0 then KernelIdx := KernelIdx + N;
+          KernelDelta.FData[KernelIdx] :=
+            KernelDelta.FData[KernelIdx] + localErrorDeriv * PrevOut.FData[InIdx];
+        end;
+        if FSuppressBias = 0 then
+          BiasDelta.FData[OutIdx] := BiasDelta.FData[OutIdx] + localErrorDeriv;
+      end;
+    end;
+  end
+  else
+  begin
+    // Per-sample update: fold the gradient through the neurons' inertia path.
+    for OutIdx := 0 to N - 1 do
+    begin
+      Err := FOutputError.FData[OutIdx];
+      localErrorDeriv := -FLearningRate * Err;
+      if localErrorDeriv <> 0.0 then
+      begin
+        for InIdx := 0 to N - 1 do
+        begin
+          KernelIdx := OutIdx - InIdx;
+          if KernelIdx < 0 then KernelIdx := KernelIdx + N;
+          KernelDelta.FData[KernelIdx] :=
+            KernelDelta.FData[KernelIdx] + localErrorDeriv * PrevOut.FData[InIdx];
+        end;
+        if FSuppressBias = 0 then
+          BiasDelta.FData[OutIdx] := BiasDelta.FData[OutIdx] + localErrorDeriv;
+      end;
+    end;
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    FArrNeurons[1].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetWeightStandardization }
 
 constructor TNNetWeightStandardization.Create(pSizeX, pSizeY, pDepth: integer;
@@ -51445,6 +51691,7 @@ begin
       'TNNetFullConnectReLU' :      Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetWeightNormLinear':      Result := TNNetWeightNormLinear.Create(St[0], St[1], St[2], St[3], Ft[0]);
@@ -51741,6 +51988,7 @@ begin
       if S[0] = 'TNNetFullConnectReLU' then Result := TNNetFullConnectReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetWeightNormLinear' then Result := TNNetWeightNormLinear.Create(St[0], St[1], St[2], St[3], Ft[0]) else

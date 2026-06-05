@@ -132,6 +132,10 @@ type
     procedure TestSpectralNormForward;
     procedure TestSpectralNormInputGradientCheck;
     procedure TestSpectralNormSerializationRoundTrip;
+    // TNNetCirculantLinear structured-matrix dense layer
+    procedure TestCirculantLinearKnownConvolution;
+    procedure TestCirculantLinearGradientCheck;
+    procedure TestCirculantLinearSerializationRoundTrip;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
     procedure TestRMSNormGatedForward;
@@ -30243,6 +30247,231 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearKnownConvolution;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CL: TNNetCirculantLinear;
+  N, i, kk, idx: integer;
+  c, x, Expected: array[0..4] of TNeuralFloat;
+  Acc: TNeuralFloat;
+begin
+  // Smoke test: a circulant layer with a KNOWN kernel c and KNOWN bias must
+  // reproduce the exact circular convolution y[i] = bias[i] + sum_k c[(i-k) mod n]*x[k].
+  RandSeed := 424242;
+  N := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    CL := TNNetCirculantLinear.Create(N);
+    NN.AddLayer(CL);
+
+    c[0] := 0.5; c[1] := -1.2; c[2] := 0.3; c[3] := 2.0; c[4] := -0.7;
+    x[0] := 1.0; x[1] := 0.4; x[2] := -2.1; x[3] := 0.9; x[4] := 1.7;
+    for i := 0 to N - 1 do
+    begin
+      CL.Neurons[0].Weights.Raw[i] := c[i];          // kernel c
+      CL.Neurons[1].Weights.Raw[i] := 0.11 * (i + 1); // per-output bias
+      Input.Raw[i] := x[i];
+    end;
+
+    NN.Compute(Input);
+
+    for i := 0 to N - 1 do
+    begin
+      Acc := 0;
+      for kk := 0 to N - 1 do
+      begin
+        idx := (i - kk) mod N;
+        if idx < 0 then idx := idx + N;
+        Acc := Acc + c[idx] * x[kk];
+      end;
+      Expected[i] := Acc + 0.11 * (i + 1);
+      AssertEquals('CirculantLinear known circular convolution pos ' + IntToStr(i),
+        Expected[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  CL: TNNetCirculantLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for both the INPUT and the shared
+  // kernel c (and the per-output bias). Reseed the shared RNG per the
+  // numerical-test ordering rule.
+  RandSeed := 424242;
+  N := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputPlus := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    CL := TNNetCirculantLinear.Create(N);
+    NN.AddLayer(CL);
+    // LearningRate 1 + batch update: deltas accumulate -gradient, weights stay
+    // fixed, so finite differences remain valid.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+      CL.Neurons[0].Weights.Raw[i] := 0.25 - 0.15 * i + 0.35 * Sin(i * 1.3); // kernel c
+      CL.Neurons[1].Weights.Raw[i] := 0.05 * (i - 2);                        // bias
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to N - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('CirculantLinear input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the shared kernel c (neuron 0) ----
+    for i := 0 to N - 1 do
+    begin
+      CL.Neurons[0].Weights.Raw[i] := CL.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      CL.Neurons[0].Weights.Raw[i] := CL.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      CL.Neurons[0].Weights.Raw[i] := CL.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      CL.Neurons[0].ClearDelta;
+      CL.Neurons[1].ClearDelta;
+      NN.Backpropagate(Desired);
+      // Delta := Delta - LearningRate*gradient with LR=1 => grad = -Delta.
+      analyticalGrad := -CL.Neurons[0].Delta.Raw[i];
+
+      AssertTrue('CirculantLinear kernel gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the per-output bias (neuron 1) ----
+    for i := 0 to N - 1 do
+    begin
+      CL.Neurons[1].Weights.Raw[i] := CL.Neurons[1].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      CL.Neurons[1].Weights.Raw[i] := CL.Neurons[1].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      CL.Neurons[1].Weights.Raw[i] := CL.Neurons[1].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      CL.Neurons[0].ClearDelta;
+      CL.Neurons[1].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -CL.Neurons[1].Delta.Raw[i];
+
+      AssertTrue('CirculantLinear bias gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  CL: TNNetCirculantLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, N: integer;
+begin
+  // CirculantLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match (proving the
+  // two-neuron kernel/bias storage round-trips through the standard per-neuron
+  // serialization and both dispatch points).
+  RandSeed := 424242;
+  N := 6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    CL := TNNetCirculantLinear.Create(N);
+    NN.AddLayer(CL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+      CL.Neurons[0].Weights.Raw[i] := 0.17 * (i + 1) - 0.4;
+      CL.Neurons[1].Weights.Raw[i] := 0.05 - 0.03 * i;
+    end;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CirculantLinear SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('CirculantLinear token present in serialized string',
+        Pos('TNNetCirculantLinear', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CirculantLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
