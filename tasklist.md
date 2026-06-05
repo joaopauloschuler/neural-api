@@ -1051,6 +1051,20 @@ rather than acted on.
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
       a few seeds (mean +/- std) would show whether the bounce is a seed artifact
       or a real saturation/recovery transition.
+- [ ] `examples/Word2VecSkipGram/` — classic skip-gram word embeddings on a
+      tiny built-in corpus (a few hundred sentences, no download). Train a
+      `TNNetEmbedding` (vocab → d) against context words with negative
+      sampling (sample K random "not-a-context" words per positive pair and
+      push the dot-product apart with a sigmoid/BCE head), then show the
+      payoff: nearest-neighbour lists by cosine similarity and the textbook
+      analogy arithmetic `king - man + woman ≈ queen` solved purely from the
+      learned vectors. Distinct from SimpleNLP (char-level next-token LM) and
+      CharTokenizer (tokenisation) — this is the unsupervised distributional-
+      semantics demo the repo is missing, and it exercises TNNetEmbedding in a
+      non-transformer setting. Library note for the builder: build positive
+      (center, context) pairs as VolumePairs, draw negatives from a unigram^0.75
+      table, and reuse the existing InfoNCE/cosine machinery from
+      examples/InfoNCEContrastive for the similarity ranking.
 - [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
       digit "0", evaluate reconstruction error on all 10 digits, print
       AUROC.
