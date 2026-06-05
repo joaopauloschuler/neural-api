@@ -149,14 +149,6 @@ rather than acted on.
       on it and is deferred with it).
 
 ## Interesting applications / examples
-- [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
-      SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
-      overlap. Add a HARDER near-OOD variant (OOD blobs closer to the in-dist
-      manifold, or a held-out-CLASS split rather than a far-away region) so the
-      AUROC lands in a discriminating 0.8–0.99 band and the curve actually moves.
-- [ ] MahalanobisOOD follow-up: contrast TIED (single pooled) covariance vs
-      PER-CLASS (untied) covariance and chart the AUROC delta — the tied form is
-      the paper's default but the untied form is the obvious ablation.
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
       report, anomaly autoencoder, etc.), promote it to a public function in
