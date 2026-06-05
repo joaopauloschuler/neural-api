@@ -72,6 +72,27 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetModernHopfield + TNNet.AddModernHopfieldRetrieval — a continuous
+      modern-Hopfield associative-memory layer (Ramsauer et al. 2020,
+      "Hopfield Networks is All You Need", arXiv:2008.02217). Distinct from the
+      single-pass attention layers already in tree (TNNetScaledDotProductAttention
+      and siblings) because it is an ENERGY-BASED associative memory that
+      ITERATES a softmax retrieval to a fixed point: given a learnable stored-
+      pattern bank X (shape (NumPatterns, d)) and a query state xi, repeatedly
+      apply xi := X^T * softmax(beta * X * xi) for K update steps (K configurable;
+      K=1 reduces to ordinary attention, K>1 sharpens toward the nearest stored
+      memory — the layer's whole point). Inverse-temperature beta controls the
+      metastable-vs-sharp retrieval regime. Forward stores the per-step softmax
+      weights; backward differentiates through the unrolled K steps (the softmax
+      Jacobian path already used by SDPA, summed over steps). Deliverables: leaf
+      layer with the authorship comment, the AddModernHopfieldRetrieval builder
+      that wires a (SeqLen,1,d) query against a learnable pattern bank, a
+      numerical-gradient test (small d/NumPatterns/K so central differences are
+      cheap), a save/load round-trip test (serialize the pattern bank like other
+      weight-carrying layers), and examples/HopfieldAssociativeMemory/ showing
+      one-shot recall: store a handful of binary/pixel patterns, present a
+      half-masked or noised query, and show K=3 iterations clean it back to the
+      stored pattern while K=1 does not — the classic associative-recall demo.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
