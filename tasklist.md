@@ -72,6 +72,17 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
+      order-2 builder, numerical-gradient + save/load tests, and the
+      examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
+      (a) FFT-based O(L log L) forward/backward path as an opt-in fast mode for
+          long sequences — the current forward is the direct O(L^2) causal
+          time-domain sum, fine for small sizes but quadratic in SeqLen. Gate it
+          so the exact time-domain path stays the default and assert FFT-vs-direct
+          equivalence to <1e-5.
+      (b) wire AddHyenaOperator into the downstream ../gpt-3-for-pascal decoder as
+          an attention-free block option and contrast its loss / wall-clock vs the
+          attention decoder on the existing tiny corpus.
 - [ ] TNNetCapsule follow-up (TNNetCapsuleSquash + TNNetCapsuleRouting — the
       squash nonlinearity, the fixed-iteration routing-by-agreement loop,
       LoadFromString wiring, and numerical-gradient + serialization tests all
