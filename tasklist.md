@@ -136,6 +136,12 @@ rather than acted on.
           size; document the memory/param trade-off;
       (c) a `TNNet.AddHyperLinear(Din, Dout, ContextLayer)` builder that wires the
           generator + reshape + HyperLinear in one call (the demo wires it by hand).
+          LANDED 2026-06-05: TNNet.AddHyperLinear(Din, Dout, ContextLayer,
+          UseBias=true) — a FullConnectLinear generator (width Din*Dout[+Dout])
+          off ContextLayer + a weightless TNNetHyperLinear off GetLastLayer (no
+          reshape; W is read flat row-major). Test TestAddHyperLinearBuilder
+          (shape + zero-weight hyper layer + gradients reach the generator +
+          save/load round-trip) in tests/TestNeuralNumerical.pas.
 
 - [ ] TNNetCirculantLinear — a STRUCTURED-MATRIX dense layer whose square weight
       matrix W (n x n, n = Depth) is CIRCULANT: every row is a cyclic shift of a

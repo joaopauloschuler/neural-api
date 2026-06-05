@@ -505,6 +505,7 @@ type
     procedure TestHyperLinearMainInputGradientCheck;
     procedure TestHyperLinearGeneratedWeightsGradientCheck;
     procedure TestHyperLinearLoadFromString;
+    procedure TestAddHyperLinearBuilder;
     procedure TestScatterToAffineForwardAndShearZero;
     procedure TestScatterToAffineInputGradientCheck;
     procedure TestScatterToAffineLoadFromString;
@@ -22236,6 +22237,125 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddHyperLinearBuilder;
+// Exercise the TNNet.AddHyperLinear one-call builder end to end:
+// (1) it wires a TNNetFullConnectLinear generator (width Din*Dout+Dout) reading
+//     the context branch + a weightless TNNetHyperLinear on the main branch;
+// (2) the output shape is (Dout) and the hyper layer owns ZERO trainable
+//     weights;
+// (3) training reduces the loss AND the generator's FullConnectLinear weights
+//     actually change -- i.e. gradients flow back through the hyper layer into
+//     the generator (the whole point of a HyperNetwork);
+// (4) SaveToString/LoadFromString round-trips bit-for-bit.
+var
+  NN, NN2: TNNet;
+  FeatIn, CtxIn, HyperLayer, GenW: TNNetLayer;
+  FeatV, CtxV, TargetV: TNNetVolume;
+  Din, Dout, Ctx, i, Step: integer;
+  Saved, Saved2: string;
+  LossBefore, LossAfter, WeightDelta: TNeuralFloat;
+  GenW0: TNNetVolume;
+begin
+  RandSeed := 424242;
+  Din := 3; Dout := 2; Ctx := 4;
+  NN := TNNet.Create();
+  FeatV := TNNetVolume.Create(Din, 1, 1);
+  CtxV := TNNetVolume.Create(Ctx, 1, 1);
+  TargetV := TNNetVolume.Create(Dout, 1, 1);
+  GenW0 := TNNetVolume.Create();
+  try
+    // Context branch first (its own Input), then the main (feature) Input so
+    // that GetLastLayer = the main branch when the builder is called. The
+    // builder reads the context from the explicit ContextLayer param and wires
+    // the generator + weightless hyper layer off GetLastLayer in one call.
+    CtxIn := NN.AddLayer(TNNetInput.Create(Ctx, 1, 1));
+    FeatIn := NN.AddLayerAfter(TNNetInput.Create(Din, 1, 1), -1);
+    HyperLayer := NN.AddHyperLinear(Din, Dout, CtxIn, {UseBias=}true);
+    NN.SetLearningRate(0.05, 0.0);
+
+    AssertTrue('AddHyperLinear last layer is TNNetHyperLinear',
+      HyperLayer is TNNetHyperLinear);
+    AssertEquals('AddHyperLinear output size = Dout', Dout,
+      HyperLayer.Output.Size);
+    AssertEquals('AddHyperLinear hyper layer owns zero weights', 0,
+      HyperLayer.CountWeights);
+
+    // Locate the generator (the FullConnectLinear reading the context branch).
+    GenW := nil;
+    for i := 0 to NN.GetLastLayerIdx do
+      if (NN.Layers[i] is TNNetFullConnectLinear) and
+         (NN.Layers[i].Output.Size = Din * Dout + Dout) then GenW := NN.Layers[i];
+    AssertTrue('AddHyperLinear built a generator FullConnectLinear',
+      GenW <> nil);
+    AssertTrue('AddHyperLinear generator owns trainable weights',
+      GenW.CountWeights > 0);
+
+    for i := 0 to Din - 1 do FeatV.Raw[i] := Sin(i * 0.7) + 0.2;
+    for i := 0 to Ctx - 1 do CtxV.Raw[i] := Cos(i * 0.5) * 0.6;
+    for i := 0 to Dout - 1 do TargetV.Raw[i] := 0.3 * (i + 1);
+
+    // Both branches have their own Input layer; set both branch outputs by hand
+    // and recompute the whole net via the layer-0 output (a no-op copy that
+    // simply triggers a full forward pass over both branches).
+    FeatIn.Output.Copy(FeatV);
+    CtxIn.Output.Copy(CtxV);
+    NN.Compute(NN.Layers[0].Output);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(TargetV);
+    // Snapshot the generator's weights before training.
+    GenW0.Copy(GenW.Neurons[0].Weights);
+
+    for Step := 0 to 199 do
+    begin
+      FeatIn.Output.Copy(FeatV);
+      CtxIn.Output.Copy(CtxV);
+      NN.Compute(NN.Layers[0].Output);
+      NN.Backpropagate(TargetV);
+    end;
+
+    FeatIn.Output.Copy(FeatV);
+    CtxIn.Output.Copy(CtxV);
+    NN.Compute(NN.Layers[0].Output);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(TargetV);
+    AssertTrue('AddHyperLinear training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    // The generator's weights must have moved -- proves gradients flowed back
+    // through the weightless hyper layer into the generator.
+    WeightDelta := 0;
+    for i := 0 to GenW0.Size - 1 do
+      WeightDelta := WeightDelta +
+        Abs(GenW.Neurons[0].Weights.Raw[i] - GenW0.Raw[i]);
+    AssertTrue('AddHyperLinear gradients reached the generator weights ' +
+      '(delta=' + FloatToStr(WeightDelta) + ')', WeightDelta > 1e-4);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddHyperLinear round-trip last layer is TNNetHyperLinear',
+        NN2.GetLastLayer is TNNetHyperLinear);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddHyperLinear SaveToString round-trip equality',
+        Saved, Saved2);
+      NN2.Layers[0].Output.Copy(CtxV);   // layer 0 = context branch Input
+      NN2.Layers[1].Output.Copy(FeatV);  // layer 1 = feature branch Input
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('AddHyperLinear round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    FeatV.Free;
+    CtxV.Free;
+    TargetV.Free;
+    GenW0.Free;
   end;
 end;
 

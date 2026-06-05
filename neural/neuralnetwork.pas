@@ -6857,6 +6857,23 @@ type
       // (Depth is taken from the previous layer). Returns the residual-sum
       // layer. See TNNetClosedFormContinuous for the cell math.
       function AddClosedFormContinuous(): TNNetLayer;
+      // One-call HyperNetwork wiring (Ha et al. 2016): a GENERATOR reads the
+      // ContextLayer and EMITS the weight matrix (+ optional bias) of a linear
+      // map that is then applied to the MAIN data path (GetLastLayer) by a
+      // weightless TNNetHyperLinear. The generator is a single
+      // TNNetFullConnectLinear over ContextLayer whose output width is exactly
+      // what TNNetHyperLinear expects as its WeightsSource:
+      //   Din*Dout            (UseBias = false), or
+      //   Din*Dout + Dout     (UseBias = true; the Dout bias block follows the
+      //                        row-major Din*Dout matrix block).
+      // No reshape is needed -- TNNetHyperLinear reads its W tensor flat (row o
+      // occupies [o*Din .. o*Din+Din-1]). The main input (GetLastLayer) must be
+      // a Din-element tensor (its total Output.Size must equal Din). The whole
+      // stack (generator + hyper layer) trains end-to-end: the hyper layer's
+      // backward pushes dL/dW into the generator's output, so gradients flow
+      // into the generator's trainable weights. Returns the TNNetHyperLinear.
+      function AddHyperLinear(Din, Dout: integer; ContextLayer: TNNetLayer;
+        UseBias: boolean = true): TNNetLayer;
       // Encoder-decoder multi-head CROSS-attention. The Query is projected from
       // QuerySource (the decoder stream, a (QSeqLen,1,d_model) token tensor) and
       // the Keys+Values are projected from KeyValueSource (the encoder output, a
@@ -30222,6 +30239,36 @@ begin
   // residual sublayer (see the AddRMSNormResidual contract). Parameterless: the
   // cell reads Depth from the previous layer.
   Result := AddRMSNormResidual([TNNetClosedFormContinuous.Create()]);
+end;
+
+function TNNet.AddHyperLinear(Din, Dout: integer; ContextLayer: TNNetLayer;
+  UseBias: boolean = true): TNNetLayer;
+var
+  MainLayer, GenW: TNNetLayer;
+  GenWidth: integer;
+begin
+  if ContextLayer = nil then
+    FErrorProc('AddHyperLinear requires a non-nil ContextLayer.');
+  if Din < 1 then
+    FErrorProc('AddHyperLinear requires Din >= 1. Din=' + IntToStr(Din));
+  if Dout < 1 then
+    FErrorProc('AddHyperLinear requires Dout >= 1. Dout=' + IntToStr(Dout));
+  MainLayer := GetLastLayer();
+  if MainLayer = nil then
+    FErrorProc('AddHyperLinear requires an existing main input layer.');
+  if MainLayer.Output.Size <> Din then
+    FErrorProc('AddHyperLinear: the main input (GetLastLayer) size must equal ' +
+      'Din=' + IntToStr(Din) + '. Got size=' + IntToStr(MainLayer.Output.Size));
+  // Generator: a single linear map from the context to the flat weight tensor.
+  // Width is exactly what TNNetHyperLinear reads as its WeightsSource.
+  GenWidth := Din * Dout;
+  if UseBias then GenWidth := GenWidth + Dout;
+  GenW := AddLayerAfter(TNNetFullConnectLinear.Create(GenWidth), ContextLayer);
+  // The hyper layer: main input = MainLayer (the data path), weight source =
+  // GenW (the generated weights). No reshape needed -- the leaf layer reads W
+  // flat (row-major) by raw pointer.
+  Result := AddLayerAfter(TNNetHyperLinear.Create(Dout, UseBias, GenW),
+    MainLayer);
 end;
 
 function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
