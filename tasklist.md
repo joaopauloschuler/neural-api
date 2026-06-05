@@ -72,24 +72,32 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetGraphAttention follow-up (single-head GAT layer + tests +
+- [X] TNNetGraphAttention follow-up (single-head GAT layer + tests +
       examples/GraphAttention/ bake-off all LANDED 2026-06-05): (a) MULTI-HEAD
-      GAT — K independent attention heads concatenated along the feature axis
-      (and averaged at the output layer per the paper), exposing a head-count
-      knob; reuse the single-head per-edge softmax already in
-      TNNetGraphAttention. (b) an edge-DROPOUT / attention-dropout regulariser on
-      the per-edge coefficients (the paper applies dropout to the normalized
-      attention) and a short ablation in the example showing it helps on the
-      noisy-edge SBM regime.
-- [ ] TNNetAffineGridSample follow-up (parameter-free bilinear sampler + both
+      GAT and (b) edge-DROPOUT/attention-dropout BOTH LANDED 2026-06-05.
+      (a) `TNNet.AddMultiHeadGraphAttention(Heads, HeadFeatures, Adjacency,
+      Concat=true, AttentionDropout=0, SourceLayer=nil)` builder — K independent
+      single-head TNNetGraphAttention layers sharing one adjacency, DeepConcat for
+      hidden layers (depth K*HeadFeatures) or Sum+1/K average for the output layer
+      (depth HeadFeatures); pure composition so save/load round-trips (re-call
+      SetAdjacency per head after load). (b) attention-dropout knob on
+      TNNetGraphAttention (new Create overload, rate in FFloatSt[0], inverted-
+      dropout on normalized per-edge coeffs, training-only via FEnabled, gated by
+      TNNet.EnableDropouts, masked backward). Example ablation (4-head, noisy SBM):
+      dropout off 92.5% → on (p=0.3) 97.5%; multi-head 1→4 heads 85→92.5%. Tests:
+      shape+save/load round-trip, inference-determinism. Suite green.
+- [X] TNNetAffineGridSample follow-up (parameter-free bilinear sampler + both
       backward paths + tests + examples/SpatialTransformer/ all LANDED
-      2026-06-05): the learned-resampling DOWNSAMPLER glimpse — restrict theta to
-      a learned crop/zoom (scale + translate, no rotation/shear) as an
-      attention-free "hard" visual-attention glimpse that reads a small canonical
-      patch from a larger input; contrast classifier accuracy reading the learned
-      glimpse vs a fixed center-crop of the same size on jittered/cluttered
-      digits. Reuse the landed sampler; the only new piece is the restricted
-      localization head + the larger-input → smaller-output wiring.
+      2026-06-05): the learned-resampling DOWNSAMPLER glimpse LANDED 2026-06-05.
+      New helper TNNetScatterToAffine scatters a learned Size=4 head output
+      (s_x,s_y,t_x,t_y) into the Size=6 2x3 affine [s_x,0,t_x; 0,s_y,t_y] with the
+      two shear slots held at a literal 0 (they can never drift; backward gathers
+      only the 4 active slots). The landed sampler always outputs its image-source
+      dims, so the larger-input→smaller-output glimpse is: warp full 28x28 via
+      theta, then TNNetAvgPool(2) → 14x14 canonical patch. examples/Glimpse
+      Downsampler/ on cluttered offset digits: fixed center-crop 0.906 vs learned
+      glimpse 1.000 (+9.4pp). Tests: forward+shear-zero, FD input-gradient through
+      ScatterToAffine→AffineGridSample, save/load. Suite green.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
@@ -381,7 +389,17 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### New leaf layers
-- [ ] `TNNetKANLayer` — a true Kolmogorov-Arnold *dense layer* (Liu et al. 2024),
+- [X] `TNNetKANLayer` — a true Kolmogorov-Arnold *dense layer* (Liu et al. 2024).
+      LANDED 2026-06-05: subclass of TNNetFullConnectLinear, D_out neurons each
+      holding D_in*(K+1) Chebyshev coeffs (layout i*(K+1)+k); forward
+      phi_{ij}(x)=sum_k c_{ijk} T_k(tanh x_i), y_j=sum_i phi_{ij}; analytic backward
+      (per-coeff grad gy_j*T_k(u_i); input grad (1-u^2)*sum_j gy_j sum_k c_{ijk}
+      T_k'(u) with T_k'=k*U_{k-1}); near-linear init; D_out in FStruct[0], K in
+      FStruct[5], both CreateLayer dispatch sites wired. Tests: input+coeff FD
+      gradient check, save/load round-trip (RandSeed:=424242). examples/KANLayer/
+      vs param-matched ReLU MLP on y=sin(3x)+0.3 sin(11x): 48 vs 48 weights, KAN
+      MSE 0.136 vs ReLU 0.186 (+26.9%); cross-linked with SplineActivationKAN.
+      Suite green (1024 tests). ORIGINAL SPEC BELOW for reference:
       i.e. a drop-in replacement for `TNNetFullConnectLinear` rather than the
       activation we already ship. The repo currently has KAN only as a
       *per-channel learnable activation* (`TNNetSplineActivation`, one univariate
