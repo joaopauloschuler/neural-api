@@ -1046,6 +1046,44 @@ rather than acted on.
       absolute MI values are estimator-dependent — the robust, reproducible
       signal is the SHAPE of the trajectory and the tanh-vs-ReLU difference,
       not the nats. Pure CPU, tiny MLP, <5-min budget.
+- [ ] `examples/CurriculumLearning/` — does **sample ordering by difficulty**
+      help? Reproduce the curriculum-learning effect (Bengio et al. 2009,
+      "Curriculum Learning") on a tiny self-contained task and, crucially, ship
+      the contrast arm that shows when it does NOT, in the house "what did NOT
+      reproduce" style. Pipeline, no new layer/gradient machinery: (1) build a
+      small synthetic classification set with a controllable difficulty signal
+      per sample — e.g. 2-D two-spirals or concentric-rings where difficulty =
+      radius / closeness to the decision boundary, OR a noisy-label task where a
+      known fraction of labels are corrupted (corrupted = hardest). (2) Score
+      every training sample's difficulty ONCE up front with a cheap proxy
+      already in the library: the per-sample loss / classification margin from a
+      brief warm-up model (reuse the margin/difficulty scoring that
+      [[MarginReport]] and the "hardest examples" pool already compute — do NOT
+      invent a new scorer). (3) Train four arms from the SAME seed/init/budget,
+      differing only in the order/schedule in which samples enter the minibatch
+      stream: **easy->hard** (curriculum, difficulty threshold relaxed over
+      epochs — "baby steps" pacing), **hard->easy** (anti-curriculum),
+      **random** (the honest baseline), and **easy-only** (drop the hardest
+      tail entirely — a difficulty-based data-pruning control). Headline plot is
+      an ASCII val-accuracy-vs-epoch curve per arm plus final test accuracy, so
+      the reader sees both the convergence-SPEED story (curriculum's main
+      documented win is faster early progress / better optimization on hard,
+      structured tasks) and the final-accuracy story (often a wash on easy
+      tasks). HONEST framing, because the literature is genuinely mixed: cite
+      Hacohen & Weinshall 2019 ("On the Power of Curriculum Learning") for when
+      ordering helps, and state plainly that on a clean, easily-separable task
+      random order frequently ties or beats curriculum — the robust,
+      reproducible signal here is (a) curriculum's faster EARLY epochs and (b)
+      anti-curriculum's reliably WORSE early epochs, not a final-accuracy
+      miracle. On the noisy-label variant, the expected and most useful result
+      is the opposite-of-naive one: feeding the hardest (mislabeled) samples
+      first hurts, and easy-only data-pruning can match full-data training —
+      tying this experiment to the label-noise / [[FisherImportance]] /
+      RandomLabelMemorization thread already in the repo. This is a DIFFERENT
+      axis from everything shipped: it varies the DATA ORDER at fixed
+      architecture/optimizer, whereas the scheduler/optimizer bake-offs vary the
+      training rule and the pruning experiments vary the weights. Pure CPU, tiny
+      MLP, deterministic seed, <5-min budget.
 - [ ] `examples/MaximalUpdateParametrization/` (optionally backed by a
       `TNNet.CoordinateCheckReport` introspection method,
       [[introspection-report-pattern]]) — demonstrate **muP / hyperparameter
