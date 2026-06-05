@@ -59,6 +59,11 @@ type
     // Element-wise gradient clipping (ClipValue / ClipWeightGradientsToValue)
     procedure TestClipValueDefaultIdentical;
     procedure TestClipValueBoundsGradients;
+
+    // Grokfast slow-gradient amplifier (TNNetGrokfastWrapper)
+    procedure TestGrokfastLambdaZeroIdentity;
+    procedure TestGrokfastConstantStreamAmplifies;
+    procedure TestGrokfastSlowGradientEmphasis;
   end;
 
 implementation
@@ -1453,6 +1458,202 @@ begin
     Input.Free;
     Desired.Free;
   end;
+end;
+
+// Builds a small net wired for gradient inspection (batch update on so the
+// accumulated per-weight gradient survives in Delta after Backpropagate).
+function BuildGrokfastNet: TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(6),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  Result.SetLearningRate(0.1, 0.0);
+  Result.SetBatchUpdate(True);
+end;
+
+// (a) lambda=0 must leave every gradient element byte-for-byte unchanged
+// (Grokfast degenerates to plain SGD: g_hat = g + 0*mu = g).
+procedure TTestNeuralTraining.TestGrokfastLambdaZeroIdentity;
+var
+  NN: TNNet;
+  GF: TNNetGrokfastWrapper;
+  Input, Desired: TNNetVolume;
+  Before: array of TNeuralFloat;
+  Idx, L, N, W: integer;
+  AllEqual: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildGrokfastNet();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  GF := TNNetGrokfastWrapper.Create(NN, 0.0, 0.94);
+  try
+    Input.Fill(2.0);
+    Desired.Fill(7.0);
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    // Snapshot every gradient element before filtering.
+    SetLength(Before, 0);
+    Idx := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+      for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+        for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+        begin
+          SetLength(Before, Idx + 1);
+          Before[Idx] := NN.Layers[L].Neurons[N].Delta.Raw[W];
+          Inc(Idx);
+        end;
+
+    GF.Filter; // lambda=0 -> must be a no-op on the gradients
+
+    AllEqual := True;
+    Idx := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+      for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+        for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+        begin
+          if NN.Layers[L].Neurons[N].Delta.Raw[W] <> Before[Idx] then
+            AllEqual := False;
+          Inc(Idx);
+        end;
+
+    AssertTrue('lambda=0 leaves gradients byte-for-byte unchanged', AllEqual);
+    AssertTrue('test exercised some gradient elements', Idx > 0);
+  finally
+    GF.Free;
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// (b) On a constant-gradient stream the EMA converges so that after many
+// Filter() calls g_hat -> (1+lambda)*g. Weights are never updated, so each
+// Backpropagate reproduces the SAME raw gradient g; the filter's mu locks onto
+// it and the amplified gradient equals (1+lambda)*g.
+procedure TTestNeuralTraining.TestGrokfastConstantStreamAmplifies;
+var
+  NN: TNNet;
+  GF: TNNetGrokfastWrapper;
+  Input, Desired: TNNetVolume;
+  RawGrad, FilteredGrad, Lambda, V: TNeuralFloat;
+  I, L, N, W, BestL, BestN, BestW: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildGrokfastNet();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  Lambda := 3.0;
+  GF := TNNetGrokfastWrapper.Create(NN, Lambda, 0.9);
+  try
+    Input.Fill(2.0);
+    Desired.Fill(7.0);
+
+    // Capture the raw (unfiltered) gradient once. Track the single weight with
+    // the largest gradient magnitude so the amplification check is meaningful
+    // (an arbitrary fixed element can legitimately be ~0 through a ReLU).
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+    RawGrad := 0; BestL := 0; BestN := 0; BestW := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+      for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+        for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+        begin
+          V := NN.Layers[L].Neurons[N].Delta.Raw[W];
+          if Abs(V) > Abs(RawGrad) then
+          begin
+            RawGrad := V; BestL := L; BestN := N; BestW := W;
+          end;
+        end;
+    AssertTrue('test setup produces a non-trivial gradient', Abs(RawGrad) > 1e-6);
+
+    // Drive the constant-gradient stream through the filter many times.
+    for I := 1 to 60 do
+    begin
+      NN.ClearDeltas();
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      GF.Filter;
+    end;
+    FilteredGrad := NN.Layers[BestL].Neurons[BestN].Delta.Raw[BestW];
+
+    AssertEquals('g_hat converges to (1+lambda)*g on a constant stream',
+      (1 + Lambda) * RawGrad, FilteredGrad, Abs(RawGrad) * 1e-3 + 1e-6);
+    AssertEquals('Filter step counter', 60, GF.StepCount);
+  finally
+    GF.Free;
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// (c) The filter amplifies the SLOW (low-frequency) gradient component more than
+// the FAST (high-frequency) one. Driving a full net through a controlled
+// slow+fast gradient signal is fiddly, so we test the EMA math directly at the
+// unit level on a synthetic stream g_t = slow + (-1)^t * fast, mirroring the
+// exact recurrence Filter() applies per weight (mu := beta*mu + (1-beta)*g;
+// g_hat := g + lambda*mu). The slow (constant) part is amplified toward
+// (1+lambda)*slow, while the alternating fast part largely cancels in mu, so the
+// filtered signal's mean grows much more than its swing: the ratio of
+// low-frequency (mean) to high-frequency (half-swing) energy increases.
+procedure TTestNeuralTraining.TestGrokfastSlowGradientEmphasis;
+const
+  Slow = 1.0;
+  Fast = 1.0;
+  Beta = 0.9;
+  Lambda = 4.0;
+  Steps = 200;
+var
+  Mu, G, GHat, Sign: TNeuralFloat;
+  RawMean, RawSwing, FiltMean, FiltSwing: TNeuralFloat;
+  FiltMin, FiltMax: TNeuralFloat;
+  RawLowToHigh, FiltLowToHigh: TNeuralFloat;
+  T: integer;
+begin
+  // Seed mu with the first gradient (matches Filter()'s first-call behaviour).
+  Sign := 1.0;
+  Mu := Slow + Sign * Fast;
+  FiltMin := 1e30; FiltMax := -1e30;
+  // Settle the EMA, then measure over the last two steps (one full fast period).
+  for T := 1 to Steps do
+  begin
+    Sign := -Sign;
+    G := Slow + Sign * Fast;
+    Mu := Beta * Mu + (1 - Beta) * G;
+    GHat := G + Lambda * Mu;
+    if T > Steps - 2 then
+    begin
+      if GHat < FiltMin then FiltMin := GHat;
+      if GHat > FiltMax then FiltMax := GHat;
+    end;
+  end;
+
+  // Raw signal: mean = Slow, half-swing (high-freq amplitude) = Fast.
+  RawMean := Slow;
+  RawSwing := Fast;
+  RawLowToHigh := Abs(RawMean) / RawSwing;
+
+  // Filtered signal over the last fast period.
+  FiltMean := (FiltMax + FiltMin) / 2;
+  FiltSwing := (FiltMax - FiltMin) / 2;
+  AssertTrue('filtered signal must still carry high-frequency energy',
+    FiltSwing > 1e-6);
+  FiltLowToHigh := Abs(FiltMean) / FiltSwing;
+
+  // The slow component is amplified far more than the fast one, so the
+  // low-to-high energy ratio of the filtered signal exceeds that of the raw.
+  AssertTrue('filter increases low-frequency (slow) gradient emphasis',
+    FiltLowToHigh > RawLowToHigh);
+  // Sanity: the slow mean is amplified toward (1+lambda)*Slow.
+  AssertTrue('slow component is amplified above the raw slow level',
+    Abs(FiltMean) > Abs(RawMean));
 end;
 
 initialization

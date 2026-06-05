@@ -8000,6 +8000,56 @@ type
       property StepCount: integer read FStepCount;
   end;
 
+  { TNNetGrokfastWrapper }
+  // Grokfast slow-gradient amplifier (Lee et al. 2024, "Grokfast: Accelerated
+  // Grokking by Amplifying Slow Gradients", https://arxiv.org/abs/2405.20233).
+  // Sibling to SWA/EMA/Lookahead, but it filters GRADIENTS, not weights. It
+  // keeps a per-weight exponential moving average of the gradient
+  //   mu := beta*mu + (1-beta)*g
+  // and amplifies the slow (low-frequency) component, stepping the optimizer on
+  //   g_hat := g + lambda*mu        ("Grokfast-EMA" variant).
+  // Typical lambda ~ 2..5 and beta ~ 0.9..0.98. Call Filter() AFTER the backward
+  // pass and BEFORE the optimizer update; it rewrites the live weight gradients
+  // IN PLACE. The live net's gradients are stored as Delta = -LR*g in
+  // Neurons[*].Delta / FBiasDelta (the SetBatchUpdate(True) idiom must be active
+  // so Backpropagate accumulates the gradient there instead of consuming it
+  // inline). Because the EMA and the g+lambda*mu amplification are both linear,
+  // operating in this scaled Delta space is exactly equivalent to operating in
+  // raw-gradient space: the steady-state amplification g_hat -> (1+lambda)*g and
+  // the lambda=0 no-op both hold byte-for-byte.
+  // The mu buffer is a shadow set of Volumes shaped exactly like the gradients
+  // (one TNNetVolume per neuron, plus a parallel per-neuron bias scalar),
+  // allocated lazily on the first Filter() once the Delta shapes have settled.
+  // Coded by Claude (AI).
+  TNNetGrokfastWrapper = class(TMObject)
+    protected
+      FLiveNet: TNNet;           // net whose gradients are filtered (caller-owned)
+      FLambda: TNeuralFloat;     // slow-gradient amplification factor
+      FBeta: TNeuralFloat;       // EMA decay of the gradient
+      FMu: TNNetVolumeList;      // EMA buffer mu, one volume per neuron (owned)
+      FBiasMu: array of TNeuralFloat; // EMA buffer for the per-neuron bias grad
+      FInitialised: boolean;     // mu seeded from the first gradient yet?
+      FStepCount: integer;       // number of Filter() calls performed
+      // Allocates FMu/FBiasMu to match the live net's current gradient shapes,
+      // zero-filled. Called lazily on the first Filter().
+      procedure AllocBuffers;
+    public
+      // pLambda = slow-gradient amplification (>=0; 0 degenerates to plain SGD).
+      // pBeta   = EMA decay in [0,1) (closer to 1 = slower/longer memory).
+      constructor Create(pNN: TNNet; pLambda: TNeuralFloat = 2.0;
+        pBeta: TNeuralFloat = 0.94);
+      destructor Destroy; override;
+      // Call AFTER backward, BEFORE the optimizer update. For every trainable
+      // weight: mu := beta*mu + (1-beta)*g; g := g + lambda*mu, written back in
+      // place into Neurons[*].Delta / FBiasDelta.
+      procedure Filter;
+      // Resets the EMA buffer (next Filter() re-seeds mu from the gradient).
+      procedure Reset;
+      property Lambda: TNeuralFloat read FLambda write FLambda;
+      property Beta: TNeuralFloat read FBeta write FBeta;
+      property StepCount: integer read FStepCount;
+  end;
+
   { TNNetReptileMetaTrainer }
   // Reptile first-order meta-learning (Nichol, Achiam & Schulman 2018,
   // "On First-Order Meta-Learning Algorithms", https://arxiv.org/abs/1803.02999).
@@ -52941,6 +52991,123 @@ end;
 function TNNetLookaheadWrapper.ShadowNet: TNNet;
 begin
   Result := FSlowNet;
+end;
+
+{ TNNetGrokfastWrapper }
+
+constructor TNNetGrokfastWrapper.Create(pNN: TNNet; pLambda: TNeuralFloat;
+  pBeta: TNeuralFloat);
+begin
+  inherited Create();
+  FLiveNet := pNN;
+  if pLambda < 0 then pLambda := 0;
+  FLambda := pLambda;
+  FBeta := pBeta;
+  // The mu buffer is owned and frees its volumes on Destroy.
+  FMu := TNNetVolumeList.Create(true);
+  FInitialised := false;
+  FStepCount := 0;
+end;
+
+destructor TNNetGrokfastWrapper.Destroy;
+begin
+  FMu.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetGrokfastWrapper.AllocBuffers;
+var
+  LayerIdx, NeuronIdx, MuIdx: integer;
+  Layer: TNNetLayer;
+  MuVol: TNNetVolume;
+begin
+  FMu.Clear;
+  MuIdx := 0;
+  // One mu volume per neuron plus one bias slot per neuron, flattened across
+  // all layers in iteration order. AllocBuffers and Filter walk the layers in
+  // the SAME order, so the flat index lines up.
+  for LayerIdx := 0 to FLiveNet.GetLastLayerIdx() do
+  begin
+    Layer := FLiveNet.Layers[LayerIdx];
+    Inc(MuIdx, Layer.Neurons.Count);
+  end;
+  SetLength(FBiasMu, MuIdx);
+  for NeuronIdx := 0 to MuIdx - 1 do FBiasMu[NeuronIdx] := 0;
+
+  for LayerIdx := 0 to FLiveNet.GetLastLayerIdx() do
+  begin
+    Layer := FLiveNet.Layers[LayerIdx];
+    for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+    begin
+      MuVol := TNNetVolume.Create();
+      MuVol.ReSize(Layer.Neurons[NeuronIdx].Delta);
+      MuVol.Fill(0);
+      FMu.Add(MuVol);
+    end;
+  end;
+end;
+
+procedure TNNetGrokfastWrapper.Filter;
+var
+  LayerIdx, NeuronIdx, MuIdx: integer;
+  Layer: TNNetLayer;
+  GradVol, MuVol: TNNetVolume;
+  BiasGrad: TNeuralFloat;
+begin
+  if not FInitialised then AllocBuffers;
+  MuIdx := 0;
+  for LayerIdx := 0 to FLiveNet.GetLastLayerIdx() do
+  begin
+    Layer := FLiveNet.Layers[LayerIdx];
+    for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+    begin
+      GradVol := Layer.Neurons[NeuronIdx].Delta;
+      MuVol := FMu[MuIdx];
+      // Defensive: if a Delta changed shape since AllocBuffers, re-fit.
+      if MuVol.Size <> GradVol.Size then
+      begin
+        MuVol.ReSize(GradVol);
+        MuVol.Fill(0);
+        if FInitialised then MuVol.Copy(GradVol);
+      end;
+      if GradVol.Size > 0 then
+      begin
+        if not FInitialised then
+        begin
+          // Seed the EMA with the first observed gradient (mu := g), so a
+          // constant-gradient stream is at steady state from step one.
+          MuVol.Copy(GradVol);
+        end
+        else
+        begin
+          // mu := beta*mu + (1-beta)*g
+          MuVol.MulMulAdd(FBeta, 1 - FBeta, GradVol);
+        end;
+        // g := g + lambda*mu  (in place)
+        if FLambda <> 0 then GradVol.MulAdd(FLambda, MuVol);
+      end;
+
+      // Same filter applied to the per-neuron bias gradient.
+      BiasGrad := Layer.Neurons[NeuronIdx].FBiasDelta;
+      if not FInitialised then
+        FBiasMu[MuIdx] := BiasGrad
+      else
+        FBiasMu[MuIdx] := FBeta * FBiasMu[MuIdx] + (1 - FBeta) * BiasGrad;
+      if FLambda <> 0 then
+        Layer.Neurons[NeuronIdx].FBiasDelta :=
+          BiasGrad + FLambda * FBiasMu[MuIdx];
+
+      Inc(MuIdx);
+    end;
+  end;
+  FInitialised := true;
+  Inc(FStepCount);
+end;
+
+procedure TNNetGrokfastWrapper.Reset;
+begin
+  FInitialised := false;
+  FStepCount := 0;
 end;
 
 { TNNetReptileMetaTrainer }
