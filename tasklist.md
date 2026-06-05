@@ -72,6 +72,39 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetImplicitLongConv + TNNet.AddHyenaOperator — an attention-free,
+      sub-quadratic sequence mixer (Poli et al. 2023, "Hyena Hierarchy"). The
+      novel primitive is a CAUSAL depthwise long convolution whose per-channel
+      filter spans the WHOLE sequence (length SeqLen) and is generated IMPLICITLY
+      by a tiny shared MLP over positional features, then multiplied by a
+      learnable exponential-decay window so far-past taps shrink smoothly. This
+      is genuinely distinct from what already exists: `TNNetCausalConv1D`
+      (3718) learns a SHORT fixed-length kernel directly, and `TNNetDiagonalSSM`
+      is a per-channel linear RECURRENCE — neither parametrizes a full-length
+      filter from positions, which is exactly the Hyena trick that lets one set
+      of weights cover any SeqLen. Scope:
+      (a) leaf layer `TNNetImplicitLongConv` over a (SeqLen,1,Depth) tensor —
+          forward builds the filter from the implicit MLP + decay window then
+          does the causal convolution (direct O(L^2) time-domain sum is fine for
+          the tiny test/example sizes; note FFT O(L log L) as a stretch); analytic
+          backward into both the input and the implicit-MLP/decay weights; both
+          dispatch tables; near-identity (small-filter) init; `// Coded by
+          Claude (AI).` attribution; input + filter-weight numerical-gradient
+          tests and a save/load round-trip (reseed RandSeed:=424242 per
+          [[numerical-test-rng-ordering]]).
+      (b) builder `TNNet.AddHyenaOperator` assembling the order-2 Hyena recurrence
+          from existing primitives — short input projections producing the value
+          path + gating signals, the long conv above, and element-wise
+          data-controlled gating (`TNNetMul`) — following the residual-builder
+          conventions in [[residual-builder-helpers]] and the per-token
+          projection rule (PointwiseConvLinear, not FullConnect) in
+          [[mha-builder-and-seq-projection]].
+      (c) `examples/HyenaOperator/` bake-off: Hyena vs a param-matched
+          single-head attention on a long-range copy/recall toy where the
+          implicit filter's global receptive field should shine; chart loss and
+          report the param/compute comparison. Pairs naturally with the
+          downstream ../gpt-3-for-pascal decoder as an attention-free block.
+
 - [ ] TNNetCapsule follow-up (TNNetCapsuleSquash + TNNetCapsuleRouting — the
       squash nonlinearity, the fixed-iteration routing-by-agreement loop,
       LoadFromString wiring, and numerical-gradient + serialization tests all
