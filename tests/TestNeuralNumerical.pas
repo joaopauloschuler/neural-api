@@ -148,6 +148,8 @@ type
     procedure TestReversibleBlockRoundTrip;
     // AddNeuralODEBlock builder (shared-weight Euler-integrated residual)
     procedure TestNeuralODEBlockSmoke;
+    // AddDeepEquilibriumBlock builder (weight-tied fixed-point, phantom gradient)
+    procedure TestDeepEquilibriumBlock;
     // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
     procedure TestAddAffineBlockForwardWiring;
     procedure TestAddAffineBlockGradientCheck;
@@ -3290,6 +3292,154 @@ begin
       AssertTrue('ODE Steps=2 neuron count > 0', n > 0);
     finally
       NN4.Free;
+    end;
+  finally
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeepEquilibriumBlock;
+const
+  W = 3; H = 1; C = 4; HID = 6; MAXITERS = 25;
+  TOL = 1e-3;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  DEQOut, FeedLayer: TNNetLayer;
+  IterLayers: array of TNNetLayer;
+  i, li, nIter, convergedAt: integer;
+  resid, v, sumWDelta: TNeuralFloat;
+  s: string;
+  inErrNonZero, wDeltaNonZero: boolean;
+begin
+  // Smoke + invariant test for AddDeepEquilibriumBlock. Reseed because this file
+  // shares one RNG (see [[numerical-test-rng-ordering]]).
+  RandSeed := 424242;
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create(W, H, C);
+  for i := 0 to Input.Size - 1 do
+    Input.Raw[i] := Sin(i * 0.7) * 0.3 - 0.1;  // small => f a mild contraction
+  try
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(W, H, C));
+      // A trainable feeder layer in front of the block: TNNetInput discards its
+      // OutputError, so to observe the gradient that flows back INTO the block's
+      // input we read this layer's OutputError instead.
+      FeedLayer := NN.AddLayer(TNNetPointwiseConvLinear.Create(C));
+      DEQOut := NN.AddDeepEquilibriumBlock(NN.GetLastLayer(), HID, MAXITERS);
+      NN.SetLearningRate(0.01, 0.9);
+      NN.InitWeights();
+
+      // (a) FORWARD SHAPE is preserved.
+      AssertEquals('DEQ output Depth', C, DEQOut.Output.Depth);
+      AssertEquals('DEQ output SizeX', W, DEQOut.Output.SizeX);
+      AssertEquals('DEQ output SizeY', H, DEQOut.Output.SizeY);
+
+      // Collect the per-iteration f-output layers f(u_k) = BETA*g(u_k): the
+      // TNNetMulByConstant(BETA) that directly follows each convolution. At the
+      // fixed point z* = f(z*+x), so u_k and hence f(u_k) converge iff the
+      // iteration converges -- these are a faithful convergence probe, one per
+      // iteration, in graph order. (The builder also emits ALPHA / (1-ALPHA)
+      // damping muls, which is why we key on "MulByConstant right after a conv".)
+      SetLength(IterLayers, 0);
+      for li := 1 to NN.CountLayers() - 1 do
+        if (NN.Layers[li] is TNNetMulByConstant) and
+           (NN.Layers[li - 1] is TNNetConvolution) then
+        begin
+          SetLength(IterLayers, Length(IterLayers) + 1);
+          IterLayers[High(IterLayers)] := NN.Layers[li];
+        end;
+      AssertEquals('DEQ collected MAXITERS f-output layers', MAXITERS, Length(IterLayers));
+
+      NN.Compute(Input);
+
+      // Forward must stay finite.
+      for i := 0 to DEQOut.Output.Size - 1 do
+      begin
+        v := DEQOut.Output.Raw[i];
+        AssertFalse('DEQ forward NaN at ' + IntToStr(i), IsNaN(v));
+        AssertFalse('DEQ forward Inf at ' + IntToStr(i), IsInfinite(v));
+      end;
+
+      // (b) CONVERGENCE: ||z_{k+1} - z_k|| must fall below TOL before MAXITERS, OR
+      // the cap was reached. Find the first such iteration (the "adaptive depth").
+      convergedAt := -1;
+      for nIter := 1 to High(IterLayers) do
+      begin
+        resid := 0;
+        for i := 0 to IterLayers[nIter].Output.Size - 1 do
+        begin
+          v := IterLayers[nIter].Output.Raw[i] - IterLayers[nIter - 1].Output.Raw[i];
+          resid := resid + v * v;
+        end;
+        resid := Sqrt(resid);
+        if (convergedAt < 0) and (resid < TOL) then convergedAt := nIter;
+      end;
+      // The final residual must be below TOL (mild map on small input converges
+      // well within MAXITERS).
+      AssertTrue('DEQ converged within MaxIters (||z_{k+1}-z_k|| < tol)',
+        convergedAt > 0);
+
+      // (c) GRADIENTS FLOW (phantom / detached backward). A strict finite-diff
+      // check is NOT applied here: the analytic backward is the 1-step phantom
+      // gradient (all iterates except the last are detached via
+      // TNNetIdentityWithoutBackprop), so FD through the full forward graph would
+      // NOT match the truncated analytic gradient. Instead pin that (i) the input
+      // receives a non-zero error and (ii) f's shared weights receive non-zero
+      // deltas -- i.e. the phantom gradient is alive, not silently zero.
+      NN.SetBatchUpdate(True);  // keep per-sample deltas (see manual-gradient gotchas)
+      for i := 0 to NN.CountLayers() - 1 do NN.Layers[i].ClearDeltas();
+      Desired.Fill(0);
+      for i := 0 to Desired.Size - 1 do Desired.Raw[i] := 0.5;  // non-trivial target
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+
+      inErrNonZero := false;
+      for i := 0 to FeedLayer.OutputError.Size - 1 do
+      begin
+        v := FeedLayer.OutputError.Raw[i];
+        AssertFalse('DEQ input-grad NaN at ' + IntToStr(i), IsNaN(v));
+        if Abs(v) > 1e-12 then inErrNonZero := true;
+      end;
+      AssertTrue('DEQ input gradient is non-zero (gradient flows back into block input)',
+        inErrNonZero);
+
+      // f's trainable weights live in the iter-1 real convs (ReLU + Linear).
+      sumWDelta := 0;
+      for li := 1 to NN.CountLayers() - 1 do
+        if ( (NN.Layers[li] is TNNetPointwiseConvReLU) or
+             (NN.Layers[li] is TNNetPointwiseConvLinear) ) and
+           (NN.Layers[li].Neurons.Count > 0) then
+          for i := 0 to NN.Layers[li].Neurons[0].Delta.Size - 1 do
+            sumWDelta := sumWDelta + Abs(NN.Layers[li].Neurons[0].Delta.Raw[i]);
+      wDeltaNonZero := sumWDelta > 1e-12;
+      AssertTrue('DEQ f-block weights receive non-zero deltas (phantom grad alive)',
+        wDeltaNonZero);
+
+      // (d) SERIALIZATION round-trip reproduces identical forward output.
+      s := NN.SaveToString();
+    finally
+      // keep NN alive until after we reload for the compare below
+    end;
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(s);
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      AssertEquals('DEQ reload: same output Depth',
+        NN.GetLastLayer().Output.Depth, NN2.GetLastLayer().Output.Depth);
+      AssertEquals('DEQ reload: same output Size',
+        NN.GetLastLayer().Output.Size, NN2.GetLastLayer().Output.Size);
+      for i := 0 to NN.GetLastLayer().Output.Size - 1 do
+        AssertEquals('DEQ reload identical forward at ' + IntToStr(i),
+          NN.GetLastLayer().Output.Raw[i],
+          NN2.GetLastLayer().Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+      NN.Free;
     end;
   finally
     Input.Free;

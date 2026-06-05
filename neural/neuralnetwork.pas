@@ -4964,6 +4964,20 @@ type
       destructor Destroy; override;
   end;
 
+  /// Weight-tied convolution that REBUILDS its concatenated-weight cache from the
+  /// shared neuron list on every forward pass. Plain TNNetConvolutionSharedWeights
+  /// snapshots FConcatedWeights/FBiasOutput at construction time; if the linked
+  /// layer is (re)initialised LATER (the usual InitWeights-after-build flow), that
+  /// snapshot goes stale and the shared layer silently computes with the old
+  /// weights. A Deep Equilibrium block applies the SAME f dozens of times and only
+  /// reaches a fixed point if every application is byte-identical, so it needs the
+  /// always-fresh variant. Used by TNNet.AddDeepEquilibriumBlock.
+  // Coded by Claude (AI).
+  TNNetDeepEquilibriumSharedConv = class(TNNetConvolutionSharedWeights)
+    public
+      procedure Compute(); override;
+  end;
+
   /// Convolutional layer without activation function.
   TNNetConvolutionLinear = class(TNNetConvolution)
   public
@@ -5764,6 +5778,47 @@ type
       // logged as follow-ups in tasklist.md and are NOT implemented here; training
       // uses ordinary stored-activation backprop through the unrolled steps.
       function AddNeuralODEBlock(InputLayer: TNNetLayer; HiddenDim, Steps: integer): TNNetLayer;
+      // Deep Equilibrium block (Bai, Kolter, Koltun 2019, "Deep Equilibrium
+      // Models", https://arxiv.org/abs/1909.01377).
+      //
+      // Where AddNeuralODEBlock unrolls a FIXED number of explicit-Euler steps
+      // y := y + h*f(y) (a known-length forward graph), a DEQ defines its output
+      // as the FIXED POINT z* = f(z*; x) of a shape-preserving transform f, found
+      // by iterating the weight-tied map
+      //     z_0 := 0
+      //     z_{k+1} := f(z_k + x)        (input x injected additively each iter)
+      // until ||z_{k+1} - z_k|| < tol or a MaxIters cap is hit. Because the SAME f
+      // (the SAME weights) is reused at every iteration, the parameter count is
+      // INDEPENDENT of MaxIters -- "infinite-depth, weight-tied".
+      //
+      // f is the same shape-preserving pointwise 2-layer function over Depth used
+      // by AddNeuralODEBlock (d_model = InputLayer.Output.Depth):
+      //     f(u) := PointwiseConvLinear(d_model)( PointwiseConvReLU(HiddenDim)(u) )
+      // 1x1/pointwise convs keep the sequence axis intact (FullConnect would
+      // flatten it and zero the input gradient -- see [[mha-builder-and-seq-projection]]).
+      //
+      // WEIGHT SHARING: iteration 1 creates the two real convolution layers; every
+      // later iteration reuses their weights via TNNetConvolutionSharedWeights.
+      //
+      // BACKWARD = JACOBIAN-FREE / PHANTOM GRADIENT (Geng et al. 2021,
+      // https://arxiv.org/abs/2103.12803). The exact DEQ gradient needs the
+      // implicit-function theorem (an inverse-Jacobian solve) which is awkward
+      // under this API's per-layer Backpropagate contract. v1 ships the tractable
+      // approximation: the forward iteration drives z toward the fixed point, but
+      // every iteration EXCEPT the last has its (z+x) input wrapped in
+      // TNNetIdentityWithoutBackprop, so the gradient flows through only the FINAL
+      // f application (earlier iterates are detached). This is the 1-step phantom
+      // gradient; it is an approximation, not the exact implicit gradient (logged
+      // as a follow-up in tasklist.md).
+      //
+      // The unrolled graph always runs MaxIters f-applications (static shapes); the
+      // ACHIEVED convergence is read off the per-iteration residual trajectory:
+      // the layers feeding consecutive iterates are exposed so a caller can measure
+      // ||z_{k+1} - z_k|| (the demo reports the first iter at which it drops below
+      // tol as the "adaptive depth" signal). InputLayer defaults to GetLastLayer();
+      // MaxIters is clamped to >= 1, HiddenDim to >= 1. Returns the final iterate
+      // layer (shape identical to InputLayer.Output).
+      function AddDeepEquilibriumBlock(InputLayer: TNNetLayer; HiddenDim, MaxIters: integer): TNNetLayer;
       // Mixture-of-Depths conditional-compute block (Raposo et al. 2024,
       // "Mixture-of-Depths: Dynamically Allocating Compute in Transformer-Based
       // Language Models", https://arxiv.org/abs/2404.02258).
@@ -19305,6 +19360,17 @@ begin
   // recreate a new neural list to allow the destroy to work.
   FNeurons := TNNetNeuronList.Create();
   inherited Destroy;
+end;
+
+{ TNNetDeepEquilibriumSharedConv }
+procedure TNNetDeepEquilibriumSharedConv.Compute();
+begin
+  // Refresh the concatenated-weight / bias cache from the (shared) neuron list
+  // BEFORE convolving, so a fixed-point iteration always applies exactly the
+  // current f even when the linked weights were initialised after this layer was
+  // built. Cheap for the tiny pointwise convs a DEQ block uses.
+  AfterWeightUpdate();
+  inherited Compute();
 end;
 
 { TNNetPad }
@@ -50041,6 +50107,7 @@ begin
       'TNNetGroupedPointwiseConvReLU'      : Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
       'TNNetGroupedPointwiseConvHardSwish' : Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
       'TNNetConvolutionSharedWeights' : Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]);
+      'TNNetDeepEquilibriumSharedConv' : Result := TNNetDeepEquilibriumSharedConv.Create(FLayers[St[5]]);
       'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
       'TNNetDepthwiseConvLinear' :  Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]);
@@ -50333,6 +50400,7 @@ begin
       if S[0] = 'TNNetGroupedPointwiseConvReLU' then Result := TNNetGroupedPointwiseConvReLU.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
       if S[0] = 'TNNetGroupedPointwiseConvHardSwish' then Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
+      if S[0] = 'TNNetDeepEquilibriumSharedConv' then Result := TNNetDeepEquilibriumSharedConv.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetDepthwiseConvLinear' then Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]) else
@@ -51187,6 +51255,100 @@ begin
   end;
 
   Result := Y;
+end;
+
+function TNNet.AddDeepEquilibriumBlock(InputLayer: TNNetLayer; HiddenDim, MaxIters: integer): TNNetLayer;
+const
+  BETA = 0.5;    // fixed output scale that bounds f's Lipschitz constant
+  ALPHA = 0.5;   // damping / Picard under-relaxation factor in (0,1]
+var
+  d_model, iter: integer;
+  Z, Injected, FInput, FOut, DampedF, DampedZ: TNNetLayer;
+  Iter1ReLUConv, Iter1LinearConv: TNNetLayer;
+begin
+  // Fixed-point block: iterate the weight-tied map z := f(z + x) from z_0 = 0
+  // toward the equilibrium z* = f(z*; x). The input x is injected additively at
+  // every iteration. The SAME f (the SAME weights) is reused at every step, so
+  // the parameter count is INDEPENDENT of MaxIters.
+  //
+  // STABILITY: a fixed-point iteration only converges when f is a CONTRACTION
+  // (Lipschitz constant < 1). Two devices encourage this WITHOUT changing the
+  // weight count (neither is a trainable parameter):
+  //   1. f's output is scaled by a fixed BETA in (0,1) (here 0.5) -- the
+  //      "bounded residual" trick (cf. invertible/Lipschitz ResNets) -- so the
+  //      effective map is z := BETA*g(z+x) with Lipschitz BETA*Lip(g);
+  //   2. the iterates are UNDER-RELAXED (damped Picard), averaging consecutive
+  //      iterates to damp the period-2 orbits a raw map can fall into.
+  // These HELP but do NOT GUARANTEE contraction at arbitrary weights (real DEQs
+  // use spectral constraints / root-finders not implemented here); on
+  // well-behaved / trained f the residual ||z_{k+1}-z_k|| falls and the iteration
+  // converges within MaxIters. See the declaration doc-comment for weight
+  // sharing, input injection, and the jacobian-free / phantom-gradient backward.
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if MaxIters < 1 then MaxIters := 1;
+  if HiddenDim < 1 then HiddenDim := 1;
+  d_model := InputLayer.Output.Depth;
+
+  Iter1ReLUConv := nil;
+  Iter1LinearConv := nil;
+  // z_0 := 0, so iteration 1's injected input z_0 + x is just x. Z stays nil
+  // until the first iterate is produced (avoids a MulByConstant(0) zero layer).
+  Z := nil;
+
+  for iter := 1 to MaxIters do
+  begin
+    // Additive input injection: u := z_{k-1} + x (= x at iteration 1, z_0 = 0).
+    if Z = nil then
+      Injected := InputLayer
+    else
+      Injected := AddLayer( TNNetSum.Create([Z, InputLayer]) );
+
+    // PHANTOM GRADIENT: detach every iterate except the last by passing its
+    // injected input through a stop-gradient identity. The final iteration is
+    // left on the live gradient path, so backprop traverses only the LAST f.
+    if iter < MaxIters then
+      FInput := AddLayerAfter( TNNetIdentityWithoutBackprop.Create(), Injected )
+    else
+      FInput := Injected;
+
+    // g(u): shape-preserving pointwise 2-layer function over Depth.
+    if iter = 1 then
+    begin
+      // Iteration 1 creates the two REAL convolution layers (the only trainable
+      // weights of the whole block).
+      Iter1ReLUConv := AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), FInput );
+      Iter1LinearConv := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+      FOut := Iter1LinearConv;
+    end
+    else
+    begin
+      // Later iterations REUSE the iter-1 weights via always-fresh weight-tied
+      // convolutions (same FNeurons + activation fn): param count is independent
+      // of MaxIters. The DEQ variant rebuilds its weight cache each forward so
+      // every application of f is byte-identical (required for a true fixed point).
+      AddLayerAfter( TNNetDeepEquilibriumSharedConv.Create(Iter1ReLUConv), FInput );
+      FOut := AddLayer( TNNetDeepEquilibriumSharedConv.Create(Iter1LinearConv) );
+    end;
+
+    // f(u) := BETA * g(u): the fixed output scale BETA in (0,1) bounds f's
+    // Lipschitz constant, helping (but at random init NOT guaranteeing -- see the
+    // declaration doc-comment) the Picard iteration contract toward z* = f(z*+x).
+    FOut := AddLayer( TNNetMulByConstant.Create(BETA) );
+
+    if Z = nil then
+      Z := FOut          // z_1 := f(x)
+    else
+    begin
+      // z_k := (1-ALPHA)*z_{k-1} + ALPHA*f(u_k): under-relaxed (damped) Picard.
+      // Averaging consecutive iterates damps the period-2 orbits a raw fixed-point
+      // map can fall into, so the residual decays more reliably.
+      DampedF := AddLayerAfter( TNNetMulByConstant.Create(ALPHA), FOut );
+      DampedZ := AddLayerAfter( TNNetMulByConstant.Create(1.0 - ALPHA), Z );
+      Z := AddLayer( TNNetSum.Create([DampedF, DampedZ]) );
+    end;
+  end;
+
+  Result := Z;
 end;
 
 function TNNet.AddMixtureOfDepths(InputLayer: TNNetLayer;
