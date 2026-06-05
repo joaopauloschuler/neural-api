@@ -3772,6 +3772,80 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetImplicitLongConv: the Hyena Hierarchy (Poli et al. 2023,
+  // "Hyena Hierarchy", arXiv:2302.10866) implicit long-convolution primitive -
+  // an attention-free, sub-quadratic sequence mixer. The input is a
+  // (SeqLen, 1, Depth) sequence laid out along SizeX exactly like the
+  // attention / TNNetDiagonalSSM / TNNetCausalConv1D layers (SizeY must be 1).
+  // Output shape == input shape.
+  //
+  // It is a CAUSAL DEPTHWISE long convolution whose per-channel filter spans
+  // the WHOLE sequence (length SeqLen). Unlike TNNetCausalConv1D (which learns
+  // a SHORT fixed-length kernel directly) and TNNetDiagonalSSM (a per-channel
+  // linear recurrence), the full-length filter h[p,c] (offset p = 0..SeqLen-1,
+  // channel c) is generated IMPLICITLY by a tiny shared MLP over positional
+  // features, then multiplied by a learnable exponential-decay window so
+  // far-past taps shrink smoothly:
+  //   phi[p]   = [1, p_norm, sin(2*pi*p_norm)]      (F=3 fixed posn features,
+  //              p_norm = p/(SeqLen-1); a frozen non-trainable buffer)
+  //   pre[p,j] = sum_f W1[j,f]*phi[p,f] + b1[j]     (j = 0..H-1 hidden units)
+  //   act[p,j] = tanh(pre[p,j])
+  //   base[p,c]= sum_j W2[c,j]*act[p,j] + b2[c]
+  //   decay[p,c] = exp(-softplus(logDecay[c]) * p_norm)   (in (0,1], =1 at p=0)
+  //   h[p,c]   = base[p,c] * decay[p,c]
+  // and the causal time-domain convolution (direct O(SeqLen^2*Depth) sum; an
+  // FFT O(L log L) path is a documented stretch goal) is
+  //   y[t,c] = sum_{p=0}^{t} h[p,c] * x[t-p,c].
+  // Because the filter is PARAMETRIZED FROM POSITIONS rather than stored per
+  // tap, ONE set of weights covers any SeqLen - the Hyena trick.
+  //
+  // Storage (H = hidden width in FStruct[0], F = 3 in FStruct[1]; weight
+  // shapes that depend on Depth are sized in SetPrevLayer):
+  //   FNeurons[0].Weights = W1       (H rows x 1 x F cols; [j,0,f])
+  //   FNeurons[1].Weights = b1       (H-long)
+  //   FNeurons[2].Weights = W2       (Depth rows x 1 x H cols; [c,0,j])
+  //   FNeurons[3].Weights = b2       (Depth-long)
+  //   FNeurons[4].Weights = logDecay (Depth-long; decay rate via softplus)
+  // All five vectors serialize automatically via the base neuron save/load.
+  // Init is a SMALL-FILTER (near-no-op) init: W1/W2 small random, biases 0 and
+  // logDecay = 0 (a gentle decay) so the produced filter - and hence the
+  // layer output - starts small, which composes safely inside the residual
+  // builders / the Hyena operator block.
+  //
+  // Backward routes the analytic gradient into BOTH the input AND every
+  // implicit-MLP / decay weight:
+  //   dL/dh[p,c]   = sum_{t>=p} gy[t,c]*x[t-p,c]
+  //   dL/dx[s,c]   = sum_{p=0}^{SeqLen-1-s} gy[s+p,c]*h[p,c]
+  //   dL/dbase     = dL/dh .* decay ;  dL/ddecay = dL/dh .* base
+  //   dL/dlogDecay[c] = sum_p dL/ddecay[p,c]*decay[p,c]*(-p_norm)*sigmoid(logDecay[c])
+  //   dL/dW2[c,j] += sum_p dL/dbase[p,c]*act[p,j] ; dL/db2[c] += sum_p dL/dbase[p,c]
+  //   dL/dact[p,j] = sum_c dL/dbase[p,c]*W2[c,j] ; dL/dpre = dL/dact*(1-act^2)
+  //   dL/dW1[j,f] += sum_p dL/dpre[p,j]*phi[p,f] ; dL/db1[j] += sum_p dL/dpre[p,j]
+  // with the -FLearningRate convention applied to the accumulated weight deltas
+  // (matching TNNetDiagonalSSM / TNNetCausalConv1D).
+  // Coded by Claude (AI).
+  TNNetImplicitLongConv = class(TNNetLayer)
+    private
+      FHidden: integer;        // H, implicit-MLP hidden width
+      FNumFeat: integer;       // F, positional feature count (fixed 3)
+      FSeqLen: integer;        // cached input SeqLen (== SizeX)
+      FPhi: TNNetVolume;       // frozen positional features, (SeqLen,1,F)
+      FPre: TNNetVolume;       // forward cache pre, (SeqLen,1,H)
+      FAct: TNNetVolume;       // forward cache tanh(pre), (SeqLen,1,H)
+      FBaseV: TNNetVolume;     // forward cache base, (SeqLen,1,Depth)
+      FDecayV: TNNetVolume;    // forward cache decay window, (SeqLen,1,Depth)
+      FFilter: TNNetVolume;    // forward cache h = base.*decay, (SeqLen,1,Depth)
+      procedure BuildPhi();
+      procedure BuildFilter();
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pHidden: integer = 4); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetSpatialGatingUnit: the attention-free sequence mixer of the gMLP
   // block (Liu et al. 2021, "Pay Attention to MLPs", arXiv:2105.08315). Input
   // is a (SeqLen, 1, Depth) sequence laid out along SizeX exactly like the
@@ -24192,6 +24266,314 @@ begin
   FNeurons[1].FWeights.Fill(1);
   FNeurons[2].FWeights.Fill(1);
   FNeurons[3].FWeights.Fill(1);
+  AfterWeightUpdate();
+end;
+
+{ TNNetImplicitLongConv }
+constructor TNNetImplicitLongConv.Create(pHidden: integer = 4);
+begin
+  inherited Create();
+  FHidden := Max(pHidden, 1);
+  FNumFeat := 3; // [1, p_norm, sin(2*pi*p_norm)]
+  FSeqLen := 0;
+  FStruct[0] := FHidden;
+  FStruct[1] := FNumFeat;
+  FPhi := TNNetVolume.Create();
+  FPre := TNNetVolume.Create();
+  FAct := TNNetVolume.Create();
+  FBaseV := TNNetVolume.Create();
+  FDecayV := TNNetVolume.Create();
+  FFilter := TNNetVolume.Create();
+  // The implicit MLP needs five learnable tensors with DIFFERENT shapes, so we
+  // size each neuron individually in SetPrevLayer (Depth/SeqLen are not known
+  // yet here). AddMissingNeurons gives us the five neuron slots.
+  AddMissingNeurons(5);
+end;
+
+destructor TNNetImplicitLongConv.Destroy();
+begin
+  FFilter.Free;
+  FDecayV.Free;
+  FBaseV.Free;
+  FAct.Free;
+  FPre.Free;
+  FPhi.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetImplicitLongConv.BuildPhi();
+var
+  p: integer;
+  pn: TNeuralFloat;
+begin
+  // Frozen, non-trainable positional features over offsets 0..SeqLen-1.
+  FPhi.ReSize(FSeqLen, 1, FNumFeat);
+  for p := 0 to FSeqLen - 1 do
+  begin
+    if FSeqLen > 1
+      then pn := p / (FSeqLen - 1)
+      else pn := 0;
+    FPhi[p, 0, 0] := 1.0;
+    FPhi[p, 0, 1] := pn;
+    FPhi[p, 0, 2] := Sin(2 * Pi * pn);
+  end;
+end;
+
+procedure TNNetImplicitLongConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Depth, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetImplicitLongConv requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FSeqLen := pPrevLayer.FOutput.SizeX;
+  Depth := pPrevLayer.FOutput.Depth;
+  // Causal long conv preserves the sequence layout.
+  FOutput.ReSize(FSeqLen, 1, Depth);
+  FOutputError.ReSize(FSeqLen, 1, Depth);
+  FOutputErrorDeriv.ReSize(FSeqLen, 1, Depth);
+  if FNeurons.Count < 5 then AddMissingNeurons(5);
+  // Per-neuron weight shapes:
+  //   [0] W1 (H,1,F)  [1] b1 (H,1,1)  [2] W2 (Depth,1,H)
+  //   [3] b2 (Depth,1,1)  [4] logDecay (Depth,1,1)
+  FNeurons[0].FWeights.ReSize(FHidden, 1, FNumFeat);
+  FNeurons[1].FWeights.ReSize(FHidden, 1, 1);
+  FNeurons[2].FWeights.ReSize(Depth, 1, FHidden);
+  FNeurons[3].FWeights.ReSize(Depth, 1, 1);
+  FNeurons[4].FWeights.ReSize(Depth, 1, 1);
+  for ii := 0 to 4 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FPre.ReSize(FSeqLen, 1, FHidden);
+  FAct.ReSize(FSeqLen, 1, FHidden);
+  FBaseV.ReSize(FSeqLen, 1, Depth);
+  FDecayV.ReSize(FSeqLen, 1, Depth);
+  FFilter.ReSize(FSeqLen, 1, Depth);
+  BuildPhi();
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetImplicitLongConv.BuildFilter();
+var
+  W1, B1, W2, B2, WLog: TNNetVolume;
+  Depth, p, j, f, c: integer;
+  pn, s, sp, dec: TNeuralFloat;
+begin
+  // Generate the full-length implicit filter h[p,c] = base[p,c]*decay[p,c] and
+  // cache every intermediate (pre, act, base, decay) for the backward pass.
+  W1 := FNeurons[0].FWeights;
+  B1 := FNeurons[1].FWeights;
+  W2 := FNeurons[2].FWeights;
+  B2 := FNeurons[3].FWeights;
+  WLog := FNeurons[4].FWeights;
+  Depth := FOutput.Depth;
+  for p := 0 to FSeqLen - 1 do
+  begin
+    if FSeqLen > 1 then pn := p / (FSeqLen - 1) else pn := 0;
+    // Hidden layer: pre = W1*phi + b1, act = tanh(pre).
+    for j := 0 to FHidden - 1 do
+    begin
+      s := B1.FData[j];
+      for f := 0 to FNumFeat - 1 do
+        s := s + W1[j, 0, f] * FPhi[p, 0, f];
+      FPre[p, 0, j] := s;
+      FAct[p, 0, j] := TanH(s);
+    end;
+    // Output: base = W2*act + b2; decay = exp(-softplus(logDecay)*p_norm).
+    for c := 0 to Depth - 1 do
+    begin
+      s := B2.FData[c];
+      for j := 0 to FHidden - 1 do
+        s := s + W2[c, 0, j] * FAct[p, 0, j];
+      FBaseV[p, 0, c] := s;
+      sp := Ln(1 + Exp(-Abs(WLog.FData[c]))) + Max(WLog.FData[c], 0); // softplus, stable
+      dec := Exp(-sp * pn);
+      FDecayV[p, 0, c] := dec;
+      FFilter[p, 0, c] := s * dec;
+    end;
+  end;
+end;
+
+procedure TNNetImplicitLongConv.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  Depth, t, p, c: integer;
+  sum: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Depth := FOutput.Depth;
+  BuildFilter();
+  // Causal depthwise long conv: y[t,c] = sum_{p=0..t} h[p,c]*x[t-p,c].
+  for c := 0 to Depth - 1 do
+    for t := 0 to FSeqLen - 1 do
+    begin
+      sum := 0;
+      for p := 0 to t do
+        sum := sum + FFilter[p, 0, c] * Prev[t - p, 0, c];
+      FOutput[t, 0, c] := sum;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetImplicitLongConv.Backpropagate();
+var
+  StartTime: double;
+  N0, N1, N2, N3, N4: TNNetNeuron;
+  W2, WLog: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  Depth, t, p, c, j, f, s: integer;
+  gy, gh, gbase, gdec, gpre, pn, dsp_dlog, gAccum: TNeuralFloat;
+  GdH, GdBase, GdAct, GdPre: TNNetVolume;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  N0 := FNeurons[0]; N1 := FNeurons[1]; N2 := FNeurons[2];
+  N3 := FNeurons[3]; N4 := FNeurons[4];
+  W2 := N2.FWeights; WLog := N4.FWeights;
+  Prev := FPrevLayer.FOutput;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = Prev.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+
+  // Scratch grad volumes (filter, base, act, pre) over the filter axis.
+  GdH := TNNetVolume.Create(FSeqLen, 1, Depth);
+  GdBase := TNNetVolume.Create(FSeqLen, 1, Depth);
+  GdAct := TNNetVolume.Create(FSeqLen, 1, FHidden);
+  GdPre := TNNetVolume.Create(FSeqLen, 1, FHidden);
+  try
+    GdH.Fill(0); GdBase.Fill(0); GdAct.Fill(0); GdPre.Fill(0);
+    // dL/dh[p,c] = sum_{t>=p} gy[t,c]*x[t-p,c]
+    // dL/dx[s,c] = sum_{p=0..SeqLen-1-s} gy[s+p,c]*h[p,c]   (s = t-p)
+    for c := 0 to Depth - 1 do
+      for t := 0 to FSeqLen - 1 do
+      begin
+        gy := FOutputError[t, 0, c];
+        if gy = 0 then continue;
+        for p := 0 to t do
+        begin
+          s := t - p;
+          GdH[p, 0, c] := GdH[p, 0, c] + gy * Prev[s, 0, c];
+          if hasInputGrad then
+            PrevErr[s, 0, c] := PrevErr[s, 0, c] + gy * FFilter[p, 0, c];
+        end;
+      end;
+
+    // h = base.*decay -> dL/dbase = dL/dh.*decay ; dL/ddecay = dL/dh.*base.
+    // logDecay grad: decay = exp(-sp*pn), sp = softplus(logDecay),
+    //   d decay/d logDecay = decay*(-pn)*sigmoid(logDecay).
+    for c := 0 to Depth - 1 do
+    begin
+      dsp_dlog := Sigmoid(WLog.FData[c]);
+      gAccum := 0;
+      for p := 0 to FSeqLen - 1 do
+      begin
+        if FSeqLen > 1 then pn := p / (FSeqLen - 1) else pn := 0;
+        gh := GdH[p, 0, c];
+        GdBase[p, 0, c] := gh * FDecayV[p, 0, c];
+        gdec := gh * FBaseV[p, 0, c];
+        gAccum := gAccum + gdec * FDecayV[p, 0, c] * (-pn) * dsp_dlog;
+      end;
+      // dL/db2[c] += sum_p dL/dbase[p,c] ; dL/dlogDecay[c] += gAccum.
+      gbase := 0;
+      for p := 0 to FSeqLen - 1 do
+        gbase := gbase + GdBase[p, 0, c];
+      N3.FDelta.FData[c] := N3.FDelta.FData[c] + (-FLearningRate) * gbase;
+      N4.FDelta.FData[c] := N4.FDelta.FData[c] + (-FLearningRate) * gAccum;
+    end;
+
+    // base = W2*act + b2:
+    //   dL/dW2[c,j] += sum_p dL/dbase[p,c]*act[p,j]
+    //   dL/dact[p,j] = sum_c dL/dbase[p,c]*W2[c,j]
+    for c := 0 to Depth - 1 do
+      for j := 0 to FHidden - 1 do
+      begin
+        gAccum := 0;
+        for p := 0 to FSeqLen - 1 do
+        begin
+          gbase := GdBase[p, 0, c];
+          gAccum := gAccum + gbase * FAct[p, 0, j];
+          GdAct[p, 0, j] := GdAct[p, 0, j] + gbase * W2[c, 0, j];
+        end;
+        N2.FDelta[c, 0, j] := N2.FDelta[c, 0, j] + (-FLearningRate) * gAccum;
+      end;
+
+    // act = tanh(pre) -> dL/dpre = dL/dact*(1-act^2).
+    for p := 0 to FSeqLen - 1 do
+      for j := 0 to FHidden - 1 do
+        GdPre[p, 0, j] := GdAct[p, 0, j] *
+          (1 - FAct[p, 0, j] * FAct[p, 0, j]);
+
+    // pre = W1*phi + b1:
+    //   dL/dW1[j,f] += sum_p dL/dpre[p,j]*phi[p,f]
+    //   dL/db1[j]   += sum_p dL/dpre[p,j]
+    for j := 0 to FHidden - 1 do
+    begin
+      gpre := 0;
+      for p := 0 to FSeqLen - 1 do
+        gpre := gpre + GdPre[p, 0, j];
+      N1.FDelta.FData[j] := N1.FDelta.FData[j] + (-FLearningRate) * gpre;
+      for f := 0 to FNumFeat - 1 do
+      begin
+        gAccum := 0;
+        for p := 0 to FSeqLen - 1 do
+          gAccum := gAccum + GdPre[p, 0, j] * FPhi[p, 0, f];
+        N0.FDelta[j, 0, f] := N0.FDelta[j, 0, f] + (-FLearningRate) * gAccum;
+      end;
+    end;
+  finally
+    GdPre.Free;
+    GdAct.Free;
+    GdBase.Free;
+    GdH.Free;
+  end;
+
+  if (not FBatchUpdate) then
+  begin
+    N0.UpdateWeights(FInertia);
+    N1.UpdateWeights(FInertia);
+    N2.UpdateWeights(FInertia);
+    N3.UpdateWeights(FInertia);
+    N4.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetImplicitLongConv.InitDefault();
+var
+  Depth, j, f, c: integer;
+  oldSeed: integer;
+begin
+  if FNeurons.Count < 5 then AddMissingNeurons(5);
+  // Small-filter (near-no-op) init: small random W1/W2 from a seeded RNG, zero
+  // biases, logDecay=0 (a gentle exponential decay). The produced filter -
+  // and hence the layer output - therefore starts small, which composes safely
+  // inside the residual builders / the Hyena operator block.
+  oldSeed := RandSeed;
+  RandSeed := 270101;
+  for j := 0 to FNeurons[0].FWeights.SizeX - 1 do
+    for f := 0 to FNeurons[0].FWeights.Depth - 1 do
+      FNeurons[0].FWeights[j, 0, f] := FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+  FNeurons[1].FWeights.Fill(0);
+  Depth := FNeurons[2].FWeights.SizeX;
+  for c := 0 to Depth - 1 do
+    for j := 0 to FNeurons[2].FWeights.Depth - 1 do
+      FNeurons[2].FWeights[c, 0, j] := FNeurons[2].FWeights.RandomGaussianValue() * 0.1;
+  FNeurons[3].FWeights.Fill(0);
+  FNeurons[4].FWeights.Fill(0);
+  RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
 
@@ -51118,6 +51500,7 @@ begin
       'TNNetMetaAconC':             Result := TNNetMetaAconC.Create();
       'TNNetTokenShift':            Result := TNNetTokenShift.Create();
       'TNNetDiagonalSSM':           Result := TNNetDiagonalSSM.Create();
+      'TNNetImplicitLongConv':      Result := TNNetImplicitLongConv.Create(Max(St[0], 1));
       'TNNetSpatialGatingUnit':     Result := TNNetSpatialGatingUnit.Create(St[0]);
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
       'TNNetChannelMulByLayer':     Result := TNNetChannelMulByLayer.Create(St[0], St[1]);
@@ -51413,6 +51796,7 @@ begin
       if S[0] = 'TNNetMetaAconC' then Result := TNNetMetaAconC.Create() else
       if S[0] = 'TNNetTokenShift' then Result := TNNetTokenShift.Create() else
       if S[0] = 'TNNetDiagonalSSM' then Result := TNNetDiagonalSSM.Create() else
+      if S[0] = 'TNNetImplicitLongConv' then Result := TNNetImplicitLongConv.Create(Max(St[0], 1)) else
       if S[0] = 'TNNetSpatialGatingUnit' then Result := TNNetSpatialGatingUnit.Create(St[0]) else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
       if S[0] = 'TNNetChannelMulByLayer' then Result := TNNetChannelMulByLayer.Create(St[0], St[1]) else

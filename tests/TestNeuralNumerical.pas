@@ -211,6 +211,10 @@ type
     procedure TestDiagonalSSMWeightGradientCheck;
     procedure TestDiagonalSSMSeqLen1Feedthrough;
     procedure TestDiagonalSSMSerializationRoundTrip;
+    procedure TestImplicitLongConvInputGradientCheck;
+    procedure TestImplicitLongConvWeightGradientCheck;
+    procedure TestImplicitLongConvCausality;
+    procedure TestImplicitLongConvSerializationRoundTrip;
     procedure TestSpatialGatingUnitInputGradientCheck;
     procedure TestSpatialGatingUnitWeightGradientCheck;
     procedure TestSpatialGatingUnitSerializationRoundTrip;
@@ -20819,6 +20823,233 @@ begin
   // SizeX=4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDiagonalSSM.Create(), 'DiagonalSSM', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestImplicitLongConvInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetImplicitLongConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // SeqLen=5, Depth=3 sequence (SizeY=1) - the Hyena layout.
+  Input := TNNetVolume.Create(5, 1, 3);
+  InputPlus := TNNetVolume.Create(5, 1, 3);
+  Desired := TNNetVolume.Create(5, 1, 3);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 3, 1));
+    LConv := TNNetImplicitLongConv.Create(4);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+
+    // Push the filter away from its small default so the conv is non-trivial.
+    for i := 0 to LConv.Neurons[2].Weights.Size - 1 do
+      LConv.Neurons[2].Weights.Raw[i] :=
+        LConv.Neurons[2].Weights.Raw[i] + Sin(i * 1.3 + 0.5) * 0.6;
+    for i := 0 to LConv.Neurons[4].Weights.Size - 1 do
+      LConv.Neurons[4].Weights.Raw[i] := 0.4;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ImplicitLongConv input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ImplicitLongConv input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestImplicitLongConvWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LConv: TNNetImplicitLongConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..4] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 3);
+  Desired := TNNetVolume.Create(5, 1, 3);
+  epsilon := 0.001;
+  maxErr := 0;
+  Names[0] := 'W1'; Names[1] := 'b1'; Names[2] := 'W2';
+  Names[3] := 'b2'; Names[4] := 'logDecay';
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 3, 1));
+    LConv := TNNetImplicitLongConv.Create(4);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+
+    // Move every tensor off its default so all five gradient paths fire.
+    for i := 0 to LConv.Neurons[0].Weights.Size - 1 do
+      LConv.Neurons[0].Weights.Raw[i] := Sin(i * 0.9 + 0.2) * 0.5;
+    for i := 0 to LConv.Neurons[1].Weights.Size - 1 do
+      LConv.Neurons[1].Weights.Raw[i] := Cos(i * 0.7) * 0.3;
+    for i := 0 to LConv.Neurons[2].Weights.Size - 1 do
+      LConv.Neurons[2].Weights.Raw[i] := Sin(i * 1.1 + 0.4) * 0.6;
+    for i := 0 to LConv.Neurons[3].Weights.Size - 1 do
+      LConv.Neurons[3].Weights.Raw[i] := 0.2 - 0.1 * i;
+    for i := 0 to LConv.Neurons[4].Weights.Size - 1 do
+      LConv.Neurons[4].Weights.Raw[i] := 0.3 + 0.2 * i;
+
+    for n := 0 to 4 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // LearningRate = 1, batch update on => analytical = -Delta.
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('ImplicitLongConv weight gradient ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('ImplicitLongConv weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestImplicitLongConvCausality;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetImplicitLongConv;
+  baseOut: TNNetVolume;
+  i, t, perturbT, c: integer;
+begin
+  // Causality: perturbing input position perturbT must leave every output
+  // position t < perturbT unchanged (no future leakage).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 2);
+  baseOut := TNNetVolume.Create(5, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 2, 1));
+    LConv := TNNetImplicitLongConv.Create(4);
+    NN.AddLayer(LConv);
+    // Non-trivial filter.
+    for i := 0 to LConv.Neurons[2].Weights.Size - 1 do
+      LConv.Neurons[2].Weights.Raw[i] :=
+        LConv.Neurons[2].Weights.Raw[i] + Sin(i * 1.7) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.55) * 1.2;
+    NN.Compute(Input);
+    baseOut.Copy(LConv.Output);
+
+    for perturbT := 1 to 4 do
+    begin
+      NN.Compute(Input); // reset
+      Input[perturbT, 0, 0] := Input[perturbT, 0, 0] + 0.5;
+      NN.Compute(Input);
+      for t := 0 to perturbT - 1 do
+        for c := 0 to 1 do
+          AssertEquals('ImplicitLongConv causality: perturb t=' +
+            IntToStr(perturbT) + ' must not change out t=' + IntToStr(t) +
+            ' c=' + IntToStr(c),
+            baseOut[t, 0, c], LConv.Output[t, 0, c], 1e-6);
+      Input[perturbT, 0, 0] := Input[perturbT, 0, 0] - 0.5; // restore
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    baseOut.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestImplicitLongConvSerializationRoundTrip;
+begin
+  // TNNetImplicitLongConv stores five learnable tensors of differing shapes
+  // (W1, b1, W2, b2, logDecay); the perturbed-weights helper pushes them off
+  // defaults so the round trip exercises a non-trivial implicit filter.
+  // SizeY=1 (sequence layout), SizeX=5 as the time axis, Depth=3.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetImplicitLongConv.Create(4), 'ImplicitLongConv', 5, 1, 3, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestSpatialGatingUnitInputGradientCheck;
