@@ -72,7 +72,7 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetGraphAttention (GAT) follow-up to the landed TNNetGraphConvolution:
+- [x] TNNetGraphAttention (GAT) follow-up to the landed TNNetGraphConvolution:
       an ATTENTIONAL neighbour aggregator — replace the fixed Ahat weights with
       learned per-edge attention coefficients (LeakyReLU over a shared
       attentional vector applied to concatenated source/target node features,

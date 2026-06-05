@@ -150,6 +150,9 @@ type
     // TNNetGraphConvolution spectral GCN layer
     procedure TestGraphConvolutionGradientCheck;
     procedure TestGraphConvolutionSerializationRoundTrip;
+    // TNNetGraphAttention (GAT) attentional aggregator
+    procedure TestGraphAttentionGradientCheck;
+    procedure TestGraphAttentionSerializationRoundTrip;
     // TNNetHighway input-dependent learned-gate layer
     procedure TestHighwayGradientCheck;
     procedure TestHighwaySerializationRoundTrip;
@@ -31759,6 +31762,245 @@ begin
         Pos('TNNetGraphConvolution', Saved) > 0);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('GraphConvolution Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Adj.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGraphAttentionGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired, Adj: TNNetVolume;
+  GA: TNNetGraphAttention;
+  AttN: TNNetNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, f, n, NumNodes, InFeat, OutFeat, AttLen: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure SetEdge(a, b: integer);
+  begin
+    Adj.Raw[Adj.GetRawPos(a, b, 0)] := 1;
+    Adj.Raw[Adj.GetRawPos(b, a, 0)] := 1;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT, the pointwise weights
+  // W, the bias, AND the shared attention vector a on a small fixed 5-node graph.
+  RandSeed := 424242;
+  NumNodes := 5;
+  InFeat := 3;
+  OutFeat := 2;
+  AttLen := 2 * OutFeat;
+  epsilon := 0.0001;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NumNodes, 1, InFeat);
+  InputPlus := TNNetVolume.Create(NumNodes, 1, InFeat);
+  Adj := TNNetVolume.Create(NumNodes, NumNodes, 1);
+  Desired := TNNetVolume.Create(NumNodes, 1, OutFeat);
+  try
+    NN.AddLayer(TNNetInput.Create(NumNodes, 1, InFeat, 1)); // enable input error collection
+    GA := TNNetGraphAttention.Create(OutFeat);
+    NN.AddLayer(GA);
+    Adj.Fill(0);
+    SetEdge(0, 1); SetEdge(1, 2); SetEdge(2, 3); SetEdge(3, 4);
+    SetEdge(0, 2); SetEdge(1, 4);
+    GA.SetAdjacency(Adj);
+
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for n := 0 to NumNodes - 1 do
+    begin
+      for f := 0 to InFeat - 1 do
+        Input.Raw[n * InFeat + f] := Sin(n * 0.7 + f * 1.1) * 0.6 + 0.1;
+      for f := 0 to OutFeat - 1 do
+        Desired.Raw[n * OutFeat + f] := Cos(n * 0.5 + f * 0.9) * 0.5;
+    end;
+    for f := 0 to OutFeat - 1 do
+    begin
+      for i := 0 to InFeat - 1 do
+        GA.Neurons[f].Weights.Raw[i] := 0.25 - 0.13 * i + 0.21 * Sin((f + 1) * (i + 1) * 0.8);
+      GA.Neurons[f].BiasWeight := 0.05 * (f - 0.5);
+    end;
+    // The shared attention vector lives in the extra neuron at index OutFeat.
+    AttN := GA.Neurons[OutFeat];
+    for i := 0 to AttLen - 1 do
+      AttN.Weights.Raw[i] := 0.3 * Sin((i + 1) * 1.7) - 0.1;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GraphAttention input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the pointwise weights W ----
+    for f := 0 to OutFeat - 1 do
+      for i := 0 to InFeat - 1 do
+      begin
+        GA.Neurons[f].Weights.Raw[i] := GA.Neurons[f].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        GA.Neurons[f].Weights.Raw[i] := GA.Neurons[f].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        GA.Neurons[f].Weights.Raw[i] := GA.Neurons[f].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        for n := 0 to OutFeat do GA.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -GA.Neurons[f].Delta.Raw[i];
+
+        AssertTrue('GraphAttention weight gradient check f=' + IntToStr(f) +
+          ' g=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the bias ----
+    for f := 0 to OutFeat - 1 do
+    begin
+      GA.Neurons[f].BiasWeight := GA.Neurons[f].Bias + epsilon;
+      lossPlus := ComputeLoss(Input);
+      GA.Neurons[f].BiasWeight := GA.Neurons[f].Bias - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      GA.Neurons[f].BiasWeight := GA.Neurons[f].Bias + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      for n := 0 to OutFeat do GA.Neurons[n].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -GA.Neurons[f].BiasDelta;
+
+      AssertTrue('GraphAttention bias gradient check f=' + IntToStr(f) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the shared attention vector a ----
+    for i := 0 to AttLen - 1 do
+    begin
+      AttN.Weights.Raw[i] := AttN.Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      AttN.Weights.Raw[i] := AttN.Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      AttN.Weights.Raw[i] := AttN.Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      for n := 0 to OutFeat do GA.Neurons[n].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -AttN.Delta.Raw[i];
+
+      AssertTrue('GraphAttention attention-vector gradient check i=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Adj.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGraphAttentionSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  GA, GA2: TNNetGraphAttention;
+  Input, Adj: TNNetVolume;
+  Saved, Saved2: string;
+  i, f, n, NumNodes, InFeat, OutFeat: integer;
+
+  procedure SetEdge(Av: TNNetVolume; a, b: integer);
+  begin
+    Av.Raw[Av.GetRawPos(a, b, 0)] := 1;
+    Av.Raw[Av.GetRawPos(b, a, 0)] := 1;
+  end;
+
+begin
+  // GAT layer save/load: the learned W+bias AND the shared attention vector
+  // round-trip byte-identically; the adjacency mask is NOT persisted, so it must
+  // be re-supplied to the reloaded net before computing.
+  RandSeed := 424242;
+  NumNodes := 4;
+  InFeat := 3;
+  OutFeat := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NumNodes, 1, InFeat);
+  Adj := TNNetVolume.Create(NumNodes, NumNodes, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(NumNodes, 1, InFeat));
+    GA := TNNetGraphAttention.Create(OutFeat);
+    NN.AddLayer(GA);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    Adj.Fill(0);
+    SetEdge(Adj, 0, 1); SetEdge(Adj, 1, 2); SetEdge(Adj, 2, 3); SetEdge(Adj, 0, 3);
+    GA.SetAdjacency(Adj);
+
+    for n := 0 to NumNodes - 1 do
+      for f := 0 to InFeat - 1 do
+        Input.Raw[n * InFeat + f] := Sin(n * 0.9 + f * 0.7) * 1.3 - 0.2;
+    for f := 0 to OutFeat - 1 do
+    begin
+      for i := 0 to InFeat - 1 do
+        GA.Neurons[f].Weights.Raw[i] := 0.17 * (i + 1) - 0.4 + 0.1 * f;
+      GA.Neurons[f].BiasWeight := 0.05 - 0.03 * f;
+    end;
+    for i := 0 to 2 * OutFeat - 1 do
+      GA.Neurons[OutFeat].Weights.Raw[i] := 0.2 * Cos((i + 1) * 1.3) + 0.05;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      GA2 := NN2.Layers[1] as TNNetGraphAttention;
+      GA2.SetAdjacency(Adj);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GraphAttention SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('GraphAttention token present in serialized string',
+        Pos('TNNetGraphAttention', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GraphAttention Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

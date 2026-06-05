@@ -4996,6 +4996,60 @@ type
     procedure BackpropagateCPU(); override;
   end;
 
+  // Graph Attention Network layer (Velickovic et al. 2018, "Graph Attention
+  // Networks") — a SINGLE-HEAD attentional neighbour aggregator. Like
+  // TNNetGraphConvolution it takes a (NumNodes,1,FeatureDim_in) node-feature
+  // tensor and emits a (NumNodes,1,OutFeat) tensor, but it REPLACES the fixed
+  // symmetrically-normalized adjacency weights with LEARNED per-edge attention
+  // coefficients computed from the transformed node features.
+  //
+  // The caller supplies the sparse adjacency MASK (the graph's edge set, raw
+  // 0/1, WITHOUT self-loops) via SetAdjacency exactly as the GCN does; the layer
+  // adds the +I self-loop and from then on attends ONLY over each node's masked
+  // neighbourhood (the mask's nonzero pattern), never over all node pairs.
+  //
+  // Mechanics (per the GAT paper, single head):
+  //   (1) per-NODE pointwise linear map  Z[n,f] = sum_g W[f,g]*H[n,g] (+bias[f]);
+  //       same 1x1-conv weight layout / gradient path as the GCN (W stored as
+  //       OutFeat neurons of FeatureDim_in weights each; nodes never mixed by W).
+  //   (2) for every masked edge i<-j (including the self-loop j=i) the attention
+  //       logit  e[i,j] = LeakyReLU( a_src . Z[i] + a_dst . Z[j] )  where the
+  //       SHARED attentional vector a = [a_src | a_dst] has length 2*OutFeat and
+  //       LeakyReLU uses slope cGATLeakySlope for x<0.
+  //   (3) softmax over each node's neighbourhood:  alpha[i,j] = softmax_j e[i,j].
+  //   (4) aggregate:  Y[i,f] = sum_j alpha[i,j] * Z[j,f].
+  //
+  // STORAGE / SERIALIZATION: W lives in the first OutFeat neurons (pointwise
+  // layout, FStruct[0]=OutFeat, FStruct[3]=suppress-bias); the attention vector a
+  // lives in ONE EXTRA appended neuron (FArrNeurons[OutFeat].Weights, length
+  // 2*OutFeat, BiasWeight unused). Both round-trip through the ordinary per-neuron
+  // SaveDataToString / LoadDataFromString with no custom serialization. The
+  // adjacency MASK is caller-supplied and is NOT persisted: re-call SetAdjacency
+  // after LoadFromString before computing.
+  //
+  // Coded by Claude (AI).
+  TNNetGraphAttention = class(TNNetFullConnectLinear)
+  private
+    FMask: TNNetVolume;     // 0/1 neighbourhood mask incl. self-loops (NxN)
+    FNumNodes: integer;     // number of graph nodes
+    FInFeat: integer;       // input feature dimension (Depth of the input)
+    FAggIn: TNNetVolume;    // cached Z = H*W (+bias) (NumNodes,1,OutFeat)
+    FAggErr: TNNetVolume;   // dL/dZ accumulator (NumNodes,1,OutFeat)
+    FAlpha: TNNetVolume;    // cached attention coefficients alpha[i,j] (NxN)
+    FLeakNeg: TNNetVolume;  // 1 where pre-LeakyReLU logit was negative, else 0 (NxN)
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure SetAdjacency(A: TNNetVolume);
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+  end;
+
   // Highway-network layer (Srivastava, Greff & Schmidhuber 2015, "Training Very
   // Deep Networks"):
   //   y = T(x) (.) H(x) + (1 - T(x)) (.) x
@@ -30715,6 +30769,391 @@ begin
     end;
 end;
 
+{ TNNetGraphAttention }
+
+const
+  cGATLeakySlope = 0.2; // LeakyReLU negative slope used inside the attention logit.
+
+constructor TNNetGraphAttention.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  // pDepth is the OUTPUT feature dimension. The base FullConnect ctor lays down
+  // pDepth neurons (reused one-per-output-feature for the pointwise W); the extra
+  // attention-vector neuron is appended in SetPrevLayer.
+  inherited Create(1, 1, pDepth, pSuppressBias);
+  FMask := TNNetVolume.Create();
+  FAggIn := TNNetVolume.Create();
+  FAggErr := TNNetVolume.Create();
+  FAlpha := TNNetVolume.Create();
+  FLeakNeg := TNNetVolume.Create();
+  FNumNodes := 0;
+  FInFeat := 0;
+end;
+
+constructor TNNetGraphAttention.Create(pNumFeatures: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(1, 1, pNumFeatures, pSuppressBias);
+end;
+
+destructor TNNetGraphAttention.Destroy();
+begin
+  FMask.Free;
+  FAggIn.Free;
+  FAggErr.Free;
+  FAlpha.Free;
+  FLeakNeg.Free;
+  inherited Destroy();
+end;
+
+// Store the neighbourhood mask = (A + I): the caller-supplied raw 0/1 adjacency A
+// (WITHOUT self-loops) plus the self-loop diagonal. Unlike the GCN this is NOT
+// degree-normalized (the attention softmax provides the normalization). The mask
+// is constant (no gradient) and is NOT serialized: re-call after LoadFromString.
+procedure TNNetGraphAttention.SetAdjacency(A: TNNetVolume);
+var
+  N, i, j: integer;
+begin
+  if A.SizeX <> A.SizeY then
+    FErrorProc('TNNetGraphAttention.SetAdjacency requires a square adjacency, got '+
+      IntToStr(A.SizeX)+'x'+IntToStr(A.SizeY)+'.');
+  N := A.SizeX;
+  FNumNodes := N;
+  FMask.ReSize(N, N, 1);
+  for i := 0 to N - 1 do
+    for j := 0 to N - 1 do
+    begin
+      if i = j then
+        FMask.FData[FMask.GetRawPos(i, j, 0)] := 1 // self-loop
+      else if A.FData[A.GetRawPos(i, j, 0)] <> 0 then
+        FMask.FData[FMask.GetRawPos(i, j, 0)] := 1
+      else
+        FMask.FData[FMask.GetRawPos(i, j, 0)] := 0;
+    end;
+end;
+
+procedure TNNetGraphAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  OutFeat: integer;
+begin
+  // Input is (NumNodes,1,FeatureDim_in). W lives in the first OutFeat neurons
+  // (pointwise layout, FeatureDim_in weights each); ONE extra neuron holds the
+  // shared attention vector a = [a_src | a_dst] of length 2*OutFeat.
+  FPrevLayer := pPrevLayer;
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetGraphAttention expects a (NumNodes,1,FeatureDim) input; SizeY must be 1, got '+
+      IntToStr(pPrevLayer.Output.SizeY)+'.');
+  FNumNodes := pPrevLayer.Output.SizeX;
+  FInFeat := pPrevLayer.Output.Depth;
+  OutFeat := FOutput.Depth;
+  FOutput.ReSize(FNumNodes, 1, OutFeat);
+  FOutputRaw.ReSize(FNumNodes, 1, OutFeat);
+  FOutputError.ReSize(FNumNodes, 1, OutFeat);
+  FOutputErrorDeriv.ReSize(FNumNodes, 1, OutFeat);
+  FAggIn.ReSize(FNumNodes, 1, OutFeat);
+  FAggErr.ReSize(FNumNodes, 1, OutFeat);
+  // Size the W neurons (one per output feature) to FeatureDim_in.
+  SetNumWeightsForAllNeurons(FInFeat);
+  // Append the attention-vector neuron (length 2*OutFeat) if not present yet.
+  if FNeurons.Count = OutFeat then
+    FNeurons.Add(TNNetNeuron.Create());
+  FNeurons[OutFeat].Weights.ReSize(2 * OutFeat, 1, 1);
+  FNeurons[OutFeat].BackInertia.ReSize(2 * OutFeat, 1, 1);
+  FNeurons[OutFeat].Delta.ReSize(2 * OutFeat, 1, 1);
+  FVectorSize := FNeurons[0].Weights.Size;
+  InitDefault();
+  BuildArrNeurons();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetGraphAttention.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: (1) pointwise map Z = H*W (+bias); (2) per-edge attention logits with
+// LeakyReLU; (3) masked softmax over each node's neighbourhood; (4) aggregate.
+procedure TNNetGraphAttention.ComputeCPU();
+var
+  OutFeat, NodeIdx, FeatOut, InIdx, NbrIdx: integer;
+  Acc, Pre, MaxE, SumE, alphaVal: TNeuralFloat;
+  Neuron, AttNeuron: TNNetNeuron;
+  PrevOut: TNNetVolume;
+  SrcScore, DstScore: array of TNeuralFloat;
+begin
+  if (FMask.Size = 0) or (FNumNodes = 0) then
+    FErrorProc('TNNetGraphAttention: SetAdjacency must be called before Compute.');
+  if FMask.SizeX <> FPrevLayer.Output.SizeX then
+    FErrorProc('TNNetGraphAttention: adjacency NumNodes ('+IntToStr(FMask.SizeX)+
+      ') does not match input NumNodes ('+IntToStr(FPrevLayer.Output.SizeX)+').');
+  OutFeat := FOutput.Depth;
+  PrevOut := FPrevLayer.FOutput;
+  AttNeuron := FArrNeurons[OutFeat];
+  FAlpha.ReSize(FNumNodes, FNumNodes, 1);
+  FLeakNeg.ReSize(FNumNodes, FNumNodes, 1);
+  FAlpha.Fill(0);
+  FLeakNeg.Fill(0);
+  // (1) pointwise linear map into FAggIn.
+  for NodeIdx := 0 to FNumNodes - 1 do
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      Neuron := FArrNeurons[FeatOut];
+      Acc := 0;
+      for InIdx := 0 to FInFeat - 1 do
+        Acc := Acc + Neuron.FWeights.FData[InIdx] *
+          PrevOut.FData[NodeIdx * FInFeat + InIdx];
+      if FSuppressBias = 0 then Acc := Acc + Neuron.FBiasWeight;
+      FAggIn.FData[NodeIdx * OutFeat + FeatOut] := Acc;
+    end;
+  // Per-node attention partial scores: src[n] = a_src.Z[n], dst[n] = a_dst.Z[n].
+  SetLength(SrcScore, FNumNodes);
+  SetLength(DstScore, FNumNodes);
+  for NodeIdx := 0 to FNumNodes - 1 do
+  begin
+    SrcScore[NodeIdx] := 0;
+    DstScore[NodeIdx] := 0;
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      SrcScore[NodeIdx] := SrcScore[NodeIdx] +
+        AttNeuron.FWeights.FData[FeatOut] * FAggIn.FData[NodeIdx * OutFeat + FeatOut];
+      DstScore[NodeIdx] := DstScore[NodeIdx] +
+        AttNeuron.FWeights.FData[OutFeat + FeatOut] * FAggIn.FData[NodeIdx * OutFeat + FeatOut];
+    end;
+  end;
+  // (2)+(3): for each node, LeakyReLU logits over its masked neighbourhood, then
+  // a numerically-stable softmax. Store alpha and the LeakyReLU negative mask.
+  for NodeIdx := 0 to FNumNodes - 1 do
+  begin
+    MaxE := -1e30;
+    for NbrIdx := 0 to FNumNodes - 1 do
+      if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+      begin
+        Pre := SrcScore[NodeIdx] + DstScore[NbrIdx];
+        if Pre < 0 then
+        begin
+          FLeakNeg.FData[NodeIdx * FNumNodes + NbrIdx] := 1;
+          Pre := cGATLeakySlope * Pre;
+        end;
+        FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] := Pre; // temporarily store e
+        if Pre > MaxE then MaxE := Pre;
+      end;
+    SumE := 0;
+    for NbrIdx := 0 to FNumNodes - 1 do
+      if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+      begin
+        alphaVal := Exp(FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] - MaxE);
+        FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] := alphaVal;
+        SumE := SumE + alphaVal;
+      end;
+    if SumE > 0 then
+      for NbrIdx := 0 to FNumNodes - 1 do
+        if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+          FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] :=
+            FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] / SumE;
+  end;
+  // (4) aggregate Y[i,f] = sum_j alpha[i,j] * Z[j,f].
+  for NodeIdx := 0 to FNumNodes - 1 do
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      Acc := 0;
+      for NbrIdx := 0 to FNumNodes - 1 do
+      begin
+        alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx];
+        if alphaVal <> 0.0 then
+          Acc := Acc + alphaVal * FAggIn.FData[NbrIdx * OutFeat + FeatOut];
+      end;
+      FOutput.FData[NodeIdx * OutFeat + FeatOut] := Acc;
+    end;
+  FOutputRaw.Copy(FOutput);
+end;
+
+procedure TNNetGraphAttention.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    FAggErr.Fill(0);
+    BackpropagateCPU();   // computes FAggErr and the W/bias/attention gradients
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Backward through aggregation + masked softmax + LeakyReLU + attention vector,
+// accumulating dL/dZ into FAggErr and the W/bias/attention gradients.
+procedure TNNetGraphAttention.BackpropagateCPU();
+var
+  OutFeat, NodeIdx, FeatOut, NbrIdx, InIdx: integer;
+  Err, alphaVal, dZ, Scale, gP, gPRowSum, leak, gAij, dotg: TNeuralFloat;
+  Neuron, AttNeuron: TNNetNeuron;
+  PrevOut: TNNetVolume;
+  gAlpha, gPmat: TNNetVolume;
+  gAttSrc, gAttDst, gColDst: array of TNeuralFloat;
+begin
+  OutFeat := FOutput.Depth;
+  PrevOut := FPrevLayer.FOutput;
+  AttNeuron := FArrNeurons[OutFeat];
+  gAlpha := TNNetVolume.Create(FNumNodes, FNumNodes, 1);
+  gPmat := TNNetVolume.Create(FNumNodes, FNumNodes, 1);
+  try
+    // (A) direct aggregation path into dL/dZ:
+    //     dL/dZ[j,f] += sum_i alpha[i,j] * gY[i,f].
+    for NbrIdx := 0 to FNumNodes - 1 do            // j
+      for FeatOut := 0 to OutFeat - 1 do
+      begin
+        dZ := 0;
+        for NodeIdx := 0 to FNumNodes - 1 do       // i
+        begin
+          alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx];
+          if alphaVal <> 0.0 then
+          begin
+            Err := FOutputError.FData[NodeIdx * OutFeat + FeatOut];
+            dZ := dZ + alphaVal * Err;
+          end;
+        end;
+        FAggErr.FData[NbrIdx * OutFeat + FeatOut] :=
+          FAggErr.FData[NbrIdx * OutFeat + FeatOut] + dZ;
+      end;
+    // gAlpha[i,j] = sum_f gY[i,f] * Z[j,f].
+    for NodeIdx := 0 to FNumNodes - 1 do
+      for NbrIdx := 0 to FNumNodes - 1 do
+        if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+        begin
+          gAij := 0;
+          for FeatOut := 0 to OutFeat - 1 do
+            gAij := gAij + FOutputError.FData[NodeIdx * OutFeat + FeatOut] *
+              FAggIn.FData[NbrIdx * OutFeat + FeatOut];
+          gAlpha.FData[NodeIdx * FNumNodes + NbrIdx] := gAij;
+        end;
+    // softmax backward: gE[i,j] = alpha[i,j]*(gAlpha[i,j] - sum_k alpha[i,k]gAlpha[i,k]);
+    // then LeakyReLU backward into gP[i,j].
+    for NodeIdx := 0 to FNumNodes - 1 do
+    begin
+      dotg := 0;
+      for NbrIdx := 0 to FNumNodes - 1 do
+        if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+          dotg := dotg + FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] *
+            gAlpha.FData[NodeIdx * FNumNodes + NbrIdx];
+      for NbrIdx := 0 to FNumNodes - 1 do
+        if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+        begin
+          alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx];
+          gP := alphaVal * (gAlpha.FData[NodeIdx * FNumNodes + NbrIdx] - dotg);
+          if FLeakNeg.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+            leak := cGATLeakySlope else leak := 1;
+          gPmat.FData[NodeIdx * FNumNodes + NbrIdx] := gP * leak;
+        end;
+    end;
+    // Attention-vector gradients and the dL/dZ contributions from the logits.
+    //   dL/da_src[f] = sum_{i,j} gP[i,j] Z[i,f]
+    //   dL/da_dst[f] = sum_{i,j} gP[i,j] Z[j,f]
+    //   dL/dZ[i,f] += (sum_j gP[i,j]) a_src[f] + (sum_{i'} gP[i',i]) a_dst[f]
+    SetLength(gAttSrc, OutFeat);
+    SetLength(gAttDst, OutFeat);
+    SetLength(gColDst, FNumNodes); // gColDst[j] = sum_i gP[i,j]
+    for FeatOut := 0 to OutFeat - 1 do begin gAttSrc[FeatOut] := 0; gAttDst[FeatOut] := 0; end;
+    for NbrIdx := 0 to FNumNodes - 1 do gColDst[NbrIdx] := 0;
+    for NodeIdx := 0 to FNumNodes - 1 do
+    begin
+      gPRowSum := 0;
+      for NbrIdx := 0 to FNumNodes - 1 do
+        if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
+        begin
+          gP := gPmat.FData[NodeIdx * FNumNodes + NbrIdx];
+          gPRowSum := gPRowSum + gP;
+          gColDst[NbrIdx] := gColDst[NbrIdx] + gP;
+          for FeatOut := 0 to OutFeat - 1 do
+          begin
+            gAttSrc[FeatOut] := gAttSrc[FeatOut] + gP * FAggIn.FData[NodeIdx * OutFeat + FeatOut];
+            gAttDst[FeatOut] := gAttDst[FeatOut] + gP * FAggIn.FData[NbrIdx * OutFeat + FeatOut];
+          end;
+        end;
+      // src contribution to dL/dZ[NodeIdx,:]
+      for FeatOut := 0 to OutFeat - 1 do
+        FAggErr.FData[NodeIdx * OutFeat + FeatOut] :=
+          FAggErr.FData[NodeIdx * OutFeat + FeatOut] +
+          gPRowSum * AttNeuron.FWeights.FData[FeatOut];
+    end;
+    // dst contribution to dL/dZ[j,:]
+    for NbrIdx := 0 to FNumNodes - 1 do
+      for FeatOut := 0 to OutFeat - 1 do
+        FAggErr.FData[NbrIdx * OutFeat + FeatOut] :=
+          FAggErr.FData[NbrIdx * OutFeat + FeatOut] +
+          gColDst[NbrIdx] * AttNeuron.FWeights.FData[OutFeat + FeatOut];
+
+    if FLearningRate = 0.0 then exit;
+    Scale := -FLearningRate;
+    // Accumulate attention-vector deltas.
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      AttNeuron.FDelta.FData[FeatOut] :=
+        AttNeuron.FDelta.FData[FeatOut] + Scale * gAttSrc[FeatOut];
+      AttNeuron.FDelta.FData[OutFeat + FeatOut] :=
+        AttNeuron.FDelta.FData[OutFeat + FeatOut] + Scale * gAttDst[FeatOut];
+    end;
+    // Accumulate W/bias deltas from dL/dZ (pointwise map, same as the GCN).
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      Neuron := FArrNeurons[FeatOut];
+      for NodeIdx := 0 to FNumNodes - 1 do
+      begin
+        dZ := FAggErr.FData[NodeIdx * OutFeat + FeatOut];
+        if dZ <> 0.0 then
+        begin
+          for InIdx := 0 to FInFeat - 1 do
+            Neuron.FDelta.FData[InIdx] := Neuron.FDelta.FData[InIdx] +
+              Scale * dZ * PrevOut.FData[NodeIdx * FInFeat + InIdx];
+          if FSuppressBias = 0 then
+            Neuron.FBiasDelta := Neuron.FBiasDelta + Scale * dZ;
+        end;
+      end;
+    end;
+    if not FBatchUpdate then
+    begin
+      for FeatOut := 0 to FNeurons.Count - 1 do
+        FNeurons[FeatOut].UpdateWeightsWithoutInertia();
+      AfterWeightUpdate();
+    end;
+  finally
+    gAlpha.Free;
+    gPmat.Free;
+  end;
+end;
+
+// Input gradient through the pointwise map: dL/dH[m,g] = sum_f dL/dZ[m,f]*W[f,g].
+procedure TNNetGraphAttention.ComputePreviousLayerErrorCPU();
+var
+  OutFeat, NodeIdx, FeatOut, InIdx: integer;
+  dZ: TNeuralFloat;
+  Neuron: TNNetNeuron;
+  LocalPrevError: TNNetVolume;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  OutFeat := FOutput.Depth;
+  for NodeIdx := 0 to FNumNodes - 1 do
+    for FeatOut := 0 to OutFeat - 1 do
+    begin
+      dZ := FAggErr.FData[NodeIdx * OutFeat + FeatOut];
+      if dZ <> 0.0 then
+      begin
+        Neuron := FArrNeurons[FeatOut];
+        for InIdx := 0 to FInFeat - 1 do
+          LocalPrevError.FData[NodeIdx * FInFeat + InIdx] :=
+            LocalPrevError.FData[NodeIdx * FInFeat + InIdx] +
+            dZ * Neuron.FWeights.FData[InIdx];
+      end;
+    end;
+end;
+
 { TNNetHighway }
 
 constructor TNNetHighway.Create(pSizeX, pSizeY, pDepth: integer;
@@ -53233,6 +53672,7 @@ begin
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
+      'TNNetGraphAttention' :       Result := TNNetGraphAttention.Create(St[0], St[1], St[2], St[3]);
       'TNNetHighway' :              Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
@@ -53535,6 +53975,7 @@ begin
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetGraphAttention' then Result := TNNetGraphAttention.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetHighway' then Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
