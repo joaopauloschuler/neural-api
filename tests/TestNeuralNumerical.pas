@@ -399,6 +399,8 @@ type
     procedure TestCosineSimilarityAttentionGradientCheck;
     procedure TestCosineSimilarityAttentionCausalGradientCheck;
     procedure TestCosineSimilarityAttentionSerializationRoundTrip;
+    procedure TestCosineSimilarityAttentionLearnableScaleGradientCheck;
+    procedure TestCosineSimilarityAttentionLearnableScaleSerializationRoundTrip;
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
@@ -12552,6 +12554,133 @@ begin
   // d_k = 4, causal, non-default scale = 2.5. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetCosineSimilarityAttention.Create(4, true, 2.5),
     'CosineSimilarityAttention', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityAttentionLearnableScaleGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetCosineSimilarityAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, scale0: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AScale: TNeuralFloat): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    // Set the (single) learnable scale weight then forward.
+    Attn.Neurons[0].Weights.Raw[0] := AScale;
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Shared-RNG ordering safety: reseed (do not loosen tolerances).
+  RandSeed := 424242;
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    // Learnable scale, initialised to 1.5.
+    Attn := TNNetCosineSimilarityAttention.Create(Dk, false, 1.5, true);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertTrue('Learnable cosine attn allocates one scale weight',
+      Attn.Neurons[0].Weights.Size = 1);
+    AssertEquals('Learnable scale initialised to fixed default', 1.5,
+      Attn.Neurons[0].Weights.Raw[0], 1e-6);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    scale0 := 1.5;
+    // ---- Numerical gradient of loss w.r.t. the scale scalar ----
+    lossPlus := ComputeLoss(scale0 + epsilon);
+    lossMinus := ComputeLoss(scale0 - epsilon);
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    // ---- Analytical gradient: BatchUpdate keeps Delta = -lr*grad; lr=1 ----
+    ComputeLoss(scale0);
+    Attn.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -Attn.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('CosineAttn scale gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+
+    // Also confirm the input-gradient path still matches numerically with the
+    // learnable scale active (perturb input, scale held at scale0).
+    Attn.Neurons[0].Weights.Raw[0] := scale0;
+    for i := 0 to Input.Size - 1 do
+    begin
+      NN.Compute(Input);
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      Attn.Neurons[0].Weights.Raw[0] := scale0;
+      lossPlus := ComputeLoss(scale0);
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(scale0);
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      Attn.Neurons[0].Weights.Raw[0] := scale0;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('CosineAttn (learnable) input grad at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCosineSimilarityAttentionLearnableScaleSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Attn, Attn2: TNNetCosineSimilarityAttention;
+  S: string;
+begin
+  NN := TNNet.Create();
+  NN2 := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Attn := TNNetCosineSimilarityAttention.Create(4, true, 2.5, true);
+    NN.AddLayer(Attn);
+    // Simulate a trained scale so we verify the WEIGHT (not just the flag).
+    Attn.Neurons[0].Weights.Raw[0] := 3.75;
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+    Attn2 := NN2.Layers[1] as TNNetCosineSimilarityAttention;
+
+    AssertTrue('LearnableScale flag round-trips', Attn2.LearnableScale);
+    AssertEquals('Trained scale weight round-trips', 3.75,
+      Attn2.Neurons[0].Weights.Raw[0], 1e-5);
+    AssertEquals('Live Scale property reflects weight', 3.75,
+      Attn2.Scale, 1e-5);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestLinearAttentionSerializationRoundTrip;

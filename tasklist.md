@@ -387,10 +387,6 @@ rather than acted on.
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
       targets, at matched final loss?
-- [ ] TNNetCosineSimilarityAttention follow-up: make `scale` a learnable scalar
-      (sibling to ReZero's single-weight pattern) instead of a fixed FFloatSt[0]
-      constant, and check whether training drives it toward the cargo-culted
-      `1/τ` temperatures used in cosine-attention papers.
 - [ ] SDPA all-masked-row policy decision and test: currently a row where
       every key is masked produces NaN (softmax of all -inf). Concrete
       proposal: detect the all-masked row in Compute, output a zero row,

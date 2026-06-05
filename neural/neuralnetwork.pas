@@ -2149,27 +2149,41 @@ type
   // of dot-product attention.
   // Input layout: SizeY = 1, SizeX = sequence length, Depth = 3 * d_k
   // (the depth axis is the concatenation Q | K | V, each of size d_k).
-  // Output shape: SizeX x 1 x d_k. No trainable parameters; the scale is a
-  // fixed float (default 1.0) stored in FFloatSt[0] so it round-trips.
+  // Output shape: SizeX x 1 x d_k.
+  // The scale may be EITHER a fixed float (default; stored in FFloatSt[0]) OR a
+  // single LEARNABLE scalar (pLearnableScale = true; one trainable weight in
+  // FNeurons[0], wired exactly like TNNetReZero's alpha). When learnable the
+  // weight is initialised to pScale so training starts from the fixed default,
+  // and Backpropagate accumulates d(loss)/d(scale) = sum over (i,j) of the
+  // pre-scale cosine score times the score-gradient. FStruct[2] persists the
+  // learnable flag so the layer round-trips through Save/LoadFromString.
   // Coded by Claude (AI).
   TNNetCosineSimilarityAttention = class(TNNetScaledDotProductAttention)
   private
     FScale: TNeuralFloat;
     FEps: TNeuralFloat;
+    FLearnableScale: boolean;
     // Cached per-row normalized vectors and reciprocal norms from Compute(),
     // reused by Backpropagate(). Layout: X = sequence position, Depth = d_k.
     FQNorm: TNNetVolume; // normalized query rows
     FKNorm: TNNetVolume; // normalized key rows
     FInvQNorm: TNNetVolume; // 1/||Q[i]|| per query row, [SizeX,1,1]
     FInvKNorm: TNNetVolume; // 1/||K[j]|| per key row, [SizeX,1,1]
+    function CurrentScale(): TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(d_k: integer; pCausalMask: boolean = false;
       pScale: TNeuralFloat = 1.0); overload;
+    constructor Create(d_k: integer; pCausalMask: boolean;
+      pScale: TNeuralFloat; pLearnableScale: boolean); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
-    property Scale: TNeuralFloat read FScale;
+    procedure InitDefault(); override;
+    // When LearnableScale, the live (trained) value lives in FNeurons[0]; this
+    // returns that, else the fixed FScale.
+    property Scale: TNeuralFloat read CurrentScale;
+    property LearnableScale: boolean read FLearnableScale;
   end;
 
   /// Attention with learnable "attention sink" slots (StreamingLLM,
@@ -14166,9 +14180,17 @@ end;
 constructor TNNetCosineSimilarityAttention.Create(d_k: integer;
   pCausalMask: boolean; pScale: TNeuralFloat);
 begin
+  Create(d_k, pCausalMask, pScale, false);
+end;
+
+constructor TNNetCosineSimilarityAttention.Create(d_k: integer;
+  pCausalMask: boolean; pScale: TNeuralFloat; pLearnableScale: boolean);
+begin
   inherited Create(d_k, pCausalMask);
   FScale := pScale;
   FFloatSt[0] := FScale;
+  FLearnableScale := pLearnableScale;
+  if FLearnableScale then FStruct[2] := 1 else FStruct[2] := 0;
   FEps := 1e-12;
   FQNorm := TNNetVolume.Create();
   FKNorm := TNNetVolume.Create();
@@ -14185,6 +14207,17 @@ begin
   inherited Destroy();
 end;
 
+// Live scale: when learnable it is the single trained weight in FNeurons[0],
+// otherwise the fixed FScale set at Create.
+function TNNetCosineSimilarityAttention.CurrentScale(): TNeuralFloat;
+begin
+  if FLearnableScale and (FNeurons.Count > 0) and
+     (FNeurons[0].FWeights.Size = 1) then
+    Result := FNeurons[0].FWeights.Raw[0]
+  else
+    Result := FScale;
+end;
+
 procedure TNNetCosineSimilarityAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -14193,19 +14226,37 @@ begin
   FKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
   FInvQNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
   FInvKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+  if FLearnableScale then
+  begin
+    // Exactly one learnable scalar (like TNNetReZero), initialised to FScale.
+    SetNumWeightsForAllNeurons(1, 1, 1);
+    InitDefault();
+  end;
+end;
+
+procedure TNNetCosineSimilarityAttention.InitDefault();
+begin
+  if not FLearnableScale then exit;
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  if FNeurons[0].FWeights.Size = 1 then
+  begin
+    FNeurons[0].Weights.Fill(FScale);
+    AfterWeightUpdate();
+  end;
 end;
 
 procedure TNNetCosineSimilarityAttention.Compute();
 var
   StartTime: double;
   SeqLen, i, j, d: integer;
-  Score, MaxScore, SumExp, SumSq, InvN: TNeuralFloat;
+  Score, MaxScore, SumExp, SumSq, InvN, LiveScale: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  LiveScale := CurrentScale();
   // 1) Precompute the L2-normalized query and key rows (over the d_k feature
   // dimension) plus their reciprocal norms. score uses qn.kn instead of q.k.
   // The depth axis is contiguous, so sum-of-squares is an AVX self dot product
@@ -14244,7 +14295,7 @@ begin
         // score = scale * (qn[i] . kn[j]); AVX dot product over FDk floats.
         Score := TNNetVolume.DotProduct(
           FQNorm.GetRawPtr(i, 0, 0), FKNorm.GetRawPtr(j, 0, 0), FDk);
-        Score := Score * FScale;
+        Score := Score * LiveScale;
         FAttn[j, i, 0] := Score;
       end;
       if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
@@ -14284,12 +14335,14 @@ var
   // sequence position; converted to raw-input gradients via the L2-normalize
   // Jacobian after all (i,j) score contributions are summed.
   gQn, gKn: TNNetVolume;
-  SumDAttnAttn, A, dS, Dot, InvN: TNeuralFloat;
+  SumDAttnAttn, A, dS, Dot, InvN, LiveScale, GradScale, Cos: TNeuralFloat;
   RawPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  LiveScale := CurrentScale();
+  GradScale := 0;
   if (FPrevLayer.Output.Size > 0) and
      (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
@@ -14335,7 +14388,12 @@ begin
         // AVX MulAdd over FDk floats.
         for j := 0 to SeqLen - 1 do
         begin
-          dS := dScore[j] * FScale;
+          // score[i,j] = scale * cos[i,j], cos[i,j] = qn[i].kn[j].
+          // d(loss)/d(scale) += dScore[j] * cos[i,j] (accumulated over i,j).
+          Cos := TNNetVolume.DotProduct(
+            FQNorm.GetRawPtr(i, 0, 0), FKNorm.GetRawPtr(j, 0, 0), FDk);
+          GradScale := GradScale + dScore[j] * Cos;
+          dS := dScore[j] * LiveScale;
           if dS <> 0 then
           begin
             TNNetVolume.MulAdd(gQn.GetRawPtr(i, 0, 0),
@@ -14372,6 +14430,19 @@ begin
     finally
       gQn.Free;
       gKn.Free;
+    end;
+    // ---- Step the learnable scale like TNNetReZero ----
+    // delta += -LearningRate * grad; applied now unless in batch-update mode.
+    if FLearnableScale and (FNeurons.Count > 0) and
+       (FNeurons[0].FWeights.Size = 1) then
+    begin
+      FNeurons[0].FDelta.Raw[0] := FNeurons[0].FDelta.Raw[0] +
+        (-FLearningRate) * GradScale;
+      if (not FBatchUpdate) then
+      begin
+        FNeurons[0].UpdateWeights(FInertia);
+        AfterWeightUpdate();
+      end;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -49733,7 +49804,7 @@ begin
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
-      'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]);
+      'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0]);
@@ -50023,7 +50094,7 @@ begin
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
-      if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0]) else
+      if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0]) else
