@@ -13339,6 +13339,12 @@ begin
 end;
 
 procedure TNNetScaledDotProductAttention.Compute();
+const
+  // Floor used to detect a fully-masked query row. The additive mask sentinel
+  // is -1e9; real scaled dot products of normal activations are O(1), so any
+  // row whose maximum score is <= -1e8 can only have come from every key being
+  // masked. Picked an order of magnitude above the sentinel for robustness.
+  cMaskFloor = -1e8;
 var
   StartTime: double;
   SeqLen, i, j, d: integer;
@@ -13372,16 +13378,35 @@ begin
       if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
     end;
     // 2) Softmax (numerically stable).
-    SumExp := 0;
-    for j := 0 to SeqLen - 1 do
+    // All-masked-row policy: if EVERY key for this query is masked, the row
+    // max sits at the additive mask sentinel (-1e9). A naive stable softmax of
+    // an all-equal row would still produce uniform weights (exp(0)=1 each,
+    // SumExp=SeqLen), which leaks the (masked) values into the output. JAX/Flax
+    // MHA instead emit a ZERO attention row for a fully-masked query (the
+    // softmax is skipped and the output for that position is zero). We follow
+    // that convention: detect the all-masked row via "row max at or below the
+    // mask floor" (cMaskFloor, far below any real scaled dot product yet well
+    // above the -1e9 sentinel so it is robust to a few exp underflows), zero
+    // the row, and skip the softmax. The matching backward (FAttn all zero ->
+    // dScore all zero) then produces zero gradient through that row, no NaN.
+    if MaxScore <= cMaskFloor then
     begin
-      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
-      FAttn[j, i, 0] := Score;
-      SumExp := SumExp + Score;
-    end;
-    if SumExp > 0 then
       for j := 0 to SeqLen - 1 do
-        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLen - 1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
     // 3) Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d]. V is contiguous along
     //    depth, so accumulate j-outer with AVX MulAdd over FDk floats (the old
     //    d-outer / j-inner order was strided over j and not vectorizable).

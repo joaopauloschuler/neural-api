@@ -395,6 +395,7 @@ type
     procedure TestScaledDotProductAttentionForward;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
+    procedure TestScaledDotProductAttentionAllMaskedRow;
     procedure TestCosineSimilarityAttentionForward;
     procedure TestCosineSimilarityAttentionGradientCheck;
     procedure TestCosineSimilarityAttentionCausalGradientCheck;
@@ -9703,6 +9704,91 @@ begin
     NN.Free;
     Input.Free;
     InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionAllMaskedRow;
+// Pinning test for the SDPA all-masked-row policy. We build an SDPA layer and
+// arrange the input so that query row 0 has EVERY key masked: its scaled
+// dot-product scores all fall at or below the mask floor (-1e8). The JAX/Flax
+// convention (which TNNetScaledDotProductAttention.Compute implements) is to
+// emit a ZERO attention row for such a query -> a zero output row -> zero
+// gradient, instead of NaN (0/0 softmax) or a uniform "leak" row.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  SeqLen, Dk, i, d, k: integer;
+  HasNaN: boolean;
+  RowSum: TNeuralFloat;
+begin
+  // Self-contained RNG: these tests share one RNG and some checks are
+  // ordering-sensitive, so reseed (do NOT loosen tolerances to compensate).
+  RandSeed := 424242;
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk, false);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Modest finite values everywhere by default.
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := 0.2;           // Q[i,d]
+        Input[i, 0, Dk + d] := 0.2;      // K[i,d]
+        Input[i, 0, 2 * Dk + d] := i + 0.1 * d; // V[i,d]
+      end;
+
+    // Fully mask query row 0: make Q[0] . K[j] hugely negative for EVERY j.
+    // Q[0] = -1e5, all K = 1e4 -> each score = Dk*(-1e5)(1e4)*InvSqrtDk, far
+    // below the -1e8 mask floor, so row 0 is detected as all-masked.
+    for d := 0 to Dk - 1 do
+      Input[0, 0, d] := -1e5;            // Q[0,d]
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+        Input[i, 0, Dk + d] := 1e4;      // K[i,d]
+
+    NN.Compute(Input);
+
+    // (a) Output contains no NaN/Inf anywhere.
+    HasNaN := false;
+    for i := 0 to Attn.Output.Size - 1 do
+      if (Attn.Output.Raw[i] <> Attn.Output.Raw[i]) or
+         (Abs(Attn.Output.Raw[i]) > 1e30) then HasNaN := true;
+    AssertFalse('SDPA all-masked-row: forward output has no NaN/Inf', HasNaN);
+
+    // (b) The fully-masked query row (row 0) output is all zeros.
+    RowSum := 0;
+    for d := 0 to Dk - 1 do
+    begin
+      AssertEquals('SDPA all-masked-row: output[0,0,' + IntToStr(d) + '] is zero',
+        0.0, Attn.Output[0, 0, d], 1e-6);
+      RowSum := RowSum + Abs(Attn.Output[0, 0, d]);
+    end;
+    AssertEquals('SDPA all-masked-row: zero row L1', 0.0, RowSum, 1e-6);
+
+    // (c) Backpropagate produces no NaN/Inf in the input gradient.
+    for k := 0 to Desired.Size - 1 do
+      Desired.Raw[k] := Cos(k * 0.31);
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    HasNaN := false;
+    for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+      if (NN.Layers[0].OutputError.Raw[i] <> NN.Layers[0].OutputError.Raw[i]) or
+         (Abs(NN.Layers[0].OutputError.Raw[i]) > 1e30) then HasNaN := true;
+    AssertFalse('SDPA all-masked-row: backward gradient has no NaN/Inf', HasNaN);
+  finally
+    NN.Free;
+    Input.Free;
     Desired.Free;
   end;
 end;

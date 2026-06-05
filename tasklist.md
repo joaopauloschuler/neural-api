@@ -387,11 +387,15 @@ rather than acted on.
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
       targets, at matched final loss?
-- [ ] SDPA all-masked-row policy decision and test: currently a row where
-      every key is masked produces NaN (softmax of all -inf). Concrete
-      proposal: detect the all-masked row in Compute, output a zero row,
-      skip the softmax for that row (what JAX/Flax MHA does). Document
-      the choice in code and add the pinning test.
+- [X] SDPA all-masked-row policy decision and test: implemented the JAX/Flax
+      zero-row policy in TNNetScaledDotProductAttention.Compute. NOTE: the
+      original NaN claim did NOT reproduce — the existing `if SumExp > 0` guard
+      plus the additive -1e9 sentinel (not literal -inf) made an all-masked row
+      produce UNIFORM weights (exp(0)=1 each), not NaN. That uniform row still
+      leaks masked values, so we now detect the all-masked row via
+      "row max <= cMaskFloor (-1e8)" and emit a zero attention row (skip
+      softmax) matching JAX/Flax. Backward is consistent (FAttn=0 -> dScore=0,
+      no NaN). Pinning test: TestScaledDotProductAttentionAllMaskedRow.
 - [ ] "Attention numerical-gradient stress test" running the SDPA grad check
       across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
       tolerance at each. Pins shape-edge behavior the existing single-shape
