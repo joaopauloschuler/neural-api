@@ -2300,6 +2300,61 @@ type
     property WeightsSource: TNNetLayer read FWeightsLayer;
   end;
 
+  /// HyperConv -- the spatial cousin of TNNetHyperLinear. A weightless 2-D
+  // convolution whose CONVOLUTION KERNEL is not owned by the layer but is
+  // GENERATED on the fly by an upstream generator network (Ha, Dai & Le 2016,
+  // "HyperNetworks"). Like TNNetHyperLinear it owns ZERO trainable weights and
+  // reads its kernel from a SECOND input tensor; the same backward-into-the-
+  // generator gradient path is written so the generator trains end-to-end. This
+  // extends the HyperNetwork idea from a dense map to spatial tasks.
+  // TWO sources (wired like TNNetHyperLinear / TNNetCrossAttention):
+  //   PrevLayer (main features): a (SizeX, SizeY, InputChannels) image tensor.
+  //   WeightsSource (generated kernel): a FLAT vector of size
+  //       OutChannels*K*K*InputChannels             (no bias)   or
+  //       OutChannels*K*K*InputChannels + OutChannels (UseBias)
+  //     where K = FeatureSize (a square KxK kernel). The kernel is read in
+  //     row-major order with index layout
+  //       W[o, ky, kx, i] at flat offset
+  //         ((o*K + ky)*K + kx)*InputChannels + i
+  //     (o = output channel outer-most, then kernel-row ky, kernel-col kx,
+  //     input-channel i inner-most). The optional trailing OutChannels block is
+  //     the per-output-channel bias b[o].
+  // Forward (VALID convolution, stride 1, no padding):
+  //   y[ox,oy,o] = sum_{ky,kx,i} W[o,ky,kx,i] * x[ox+kx, oy+ky, i] (+ b[o])
+  //   output size = (SizeX-K+1, SizeY-K+1, OutChannels).
+  // Backward: dL/dx and dL/dW both accumulated (the kernel-gradient flows into
+  // the generated-kernel source so the upstream generator trains end-to-end).
+  // MEMORY / PARAM TRADE-OFF: the generator must emit the WHOLE flattened
+  // kernel in ONE shot, so the generator's output width (and thus its parameter
+  // count) grows as OutChannels*K*K*InputChannels. This caps the practical
+  // kernel size / channel count for v1; chunked (tiled) kernel generation is a
+  // deferred follow-up (tasklist sub-task (b)).
+  // FStruct[0]=OutChannels, FStruct[1]=FeatureSize, FStruct[2]=UseBias persist;
+  // the WeightsSource layer index is injected into the source slot (like
+  // TNNetConcat) so the layer round-trips through SaveToString/LoadFromString.
+  // Coded by Claude (AI).
+  TNNetHyperConv = class(TNNetLayer)
+  private
+    FOutChannels: integer;
+    FFeatureSize: integer;
+    FInChannels: integer;
+    FUseBias: boolean;
+    FWeightsLayer: TNNetLayer; // explicit generated-kernel source
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pNumFeatures, pFeatureSize: integer; pUseBias: boolean;
+      WeightsSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property OutChannels: integer read FOutChannels;
+    property FeatureSize: integer read FFeatureSize;
+    property InChannels: integer read FInChannels;
+    property UseBias: boolean read FUseBias;
+    property WeightsSource: TNNetLayer read FWeightsLayer;
+  end;
+
   /// Modern (continuous) Hopfield associative-memory layer (Ramsauer et al.
   // 2020, "Hopfield Networks is All You Need", arXiv:2008.02217). Unlike the
   // single-pass attention layers in this tree (TNNetScaledDotProductAttention
@@ -6972,6 +7027,24 @@ type
       // into the generator's trainable weights. Returns the TNNetHyperLinear.
       function AddHyperLinear(Din, Dout: integer; ContextLayer: TNNetLayer;
         UseBias: boolean = true): TNNetLayer;
+      // Spatial cousin of AddHyperLinear: a GENERATOR reads ContextLayer and
+      // EMITS the flattened convolution kernel of a VALID (stride-1, no-pad)
+      // conv that is then applied to the MAIN data path (GetLastLayer, a
+      // (SizeX,SizeY,InChannels) image) by a weightless TNNetHyperConv. The
+      // generator is a single TNNetFullConnectLinear over ContextLayer whose
+      // output width is exactly what TNNetHyperConv reads as its WeightsSource:
+      //   OutChannels*K*K*InChannels            (UseBias = false), or
+      //   OutChannels*K*K*InChannels + OutChannels (UseBias = true; the
+      //                        OutChannels bias block follows the kernel block).
+      // The kernel is read flat with layout W[o,ky,kx,i] (see TNNetHyperConv).
+      // The whole stack trains end-to-end: HyperConv's backward pushes the
+      // kernel gradient into the generator's output. NOTE the memory/param
+      // trade-off: the generator emits the WHOLE kernel in one shot, so its
+      // parameter count scales with OutChannels*K*K*InChannels -- keep K and
+      // the channel counts small (chunked generation is a deferred follow-up).
+      // Returns the TNNetHyperConv.
+      function AddHyperConv(InChannels, OutChannels, FeatureSize: integer;
+        ContextLayer: TNNetLayer; UseBias: boolean = true): TNNetLayer;
       // Encoder-decoder multi-head CROSS-attention. The Query is projected from
       // QuerySource (the decoder stream, a (QSeqLen,1,d_model) token tensor) and
       // the Keys+Values are projected from KeyValueSource (the encoder output, a
@@ -16117,6 +16190,165 @@ begin
   end;
   // Propagate into BOTH sources (the generated-weights branch then the main
   // feature chain).
+  if Assigned(FWeightsLayer) and
+     (FWeightsLayer.OutputError.Size = FWeightsLayer.Output.Size) then
+    FWeightsLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetHyperConv }
+
+constructor TNNetHyperConv.Create(pNumFeatures, pFeatureSize: integer;
+  pUseBias: boolean; WeightsSource: TNNetLayer);
+begin
+  inherited Create();
+  FOutChannels := pNumFeatures;
+  FFeatureSize := pFeatureSize;
+  FUseBias := pUseBias;
+  if FOutChannels < 1 then
+    FErrorProc('TNNetHyperConv requires NumFeatures >= 1. Got ' +
+      IntToStr(FOutChannels));
+  if FFeatureSize < 1 then
+    FErrorProc('TNNetHyperConv requires FeatureSize >= 1. Got ' +
+      IntToStr(FFeatureSize));
+  if WeightsSource = nil then
+    FErrorProc('TNNetHyperConv requires a non-nil WeightsSource.');
+  FStruct[0] := FOutChannels;
+  FStruct[1] := FFeatureSize;
+  if FUseBias then FStruct[2] := 1 else FStruct[2] := 0;
+  FWeightsLayer := WeightsSource;
+  if FWeightsLayer is TNNetInput then TNNetInput(FWeightsLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the generated-
+  // kernel source (the main-features branch is incremented the usual way by
+  // AddLayer / AddLayerAfter).
+  FWeightsLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetHyperConv.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetHyperConv.SaveStructureToString(): string;
+begin
+  // Inject the generated-kernel source layer index into the (otherwise empty)
+  // third ':'-delimited slot, exactly as TNNetConcatBase / TNNetHyperLinear do,
+  // so CreateLayer / LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FWeightsLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetHyperConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Needed, OutX, OutY: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInChannels := pPrevLayer.FOutput.Depth;
+  if (pPrevLayer.FOutput.SizeX < FFeatureSize) or
+     (pPrevLayer.FOutput.SizeY < FFeatureSize) then
+    FErrorProc('TNNetHyperConv requires an input at least FeatureSize=' +
+      IntToStr(FFeatureSize) + ' on each spatial axis. Got (' +
+      IntToStr(pPrevLayer.FOutput.SizeX) + ',' +
+      IntToStr(pPrevLayer.FOutput.SizeY) + ').');
+  // VALID convolution, stride 1, no padding.
+  OutX := pPrevLayer.FOutput.SizeX - FFeatureSize + 1;
+  OutY := pPrevLayer.FOutput.SizeY - FFeatureSize + 1;
+  Needed := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
+  if FUseBias then Needed := Needed + FOutChannels;
+  if FWeightsLayer.FOutput.Size <> Needed then
+    FErrorProc('TNNetHyperConv requires a WeightsSource of size ' +
+      'OutChannels*K*K*InChannels' + BoolToStr(FUseBias, '+OutChannels', '') +
+      ' = ' + IntToStr(Needed) + ' (OutChannels=' + IntToStr(FOutChannels) +
+      ', K=' + IntToStr(FFeatureSize) + ', InChannels=' +
+      IntToStr(FInChannels) + '). Got size=' +
+      IntToStr(FWeightsLayer.FOutput.Size));
+  FOutput.ReSize(OutX, OutY, FOutChannels);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetHyperConv.Compute();
+var
+  StartTime: double;
+  X, Wgt: TNNetVolume;
+  o, ox, oy, ky, kx, i, Base, BiasBase: integer;
+  Acc: TNeuralFloat;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  Wgt := FWeightsLayer.FOutput;
+  BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
+  FOutput.Fill(0);
+  for o := 0 to FOutChannels - 1 do
+    for oy := 0 to FOutput.SizeY - 1 do
+      for ox := 0 to FOutput.SizeX - 1 do
+      begin
+        Acc := 0;
+        for ky := 0 to FFeatureSize - 1 do
+          for kx := 0 to FFeatureSize - 1 do
+          begin
+            // flat kernel offset for W[o,ky,kx, i=0]
+            Base := ((o * FFeatureSize + ky) * FFeatureSize + kx) * FInChannels;
+            for i := 0 to FInChannels - 1 do
+              Acc := Acc + Wgt.FData[Base + i] * X.Get(ox + kx, oy + ky, i);
+          end;
+        if FUseBias then Acc := Acc + Wgt.FData[BiasBase + o];
+        FOutput.Add(ox, oy, o, Acc);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetHyperConv.Backpropagate();
+var
+  StartTime: double;
+  X, Wgt, XErr, WgtErr: TNNetVolume;
+  o, ox, oy, ky, kx, i, Base, BiasBase: integer;
+  Dy, Xv: TNeuralFloat;
+  PropMain, PropGen: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  X := FPrevLayer.FOutput;
+  Wgt := FWeightsLayer.FOutput;
+  XErr := FPrevLayer.FOutputError;
+  WgtErr := FWeightsLayer.FOutputError;
+  PropMain := (X.Size > 0) and (X.Size = XErr.Size);
+  PropGen := (WgtErr.Size = Wgt.Size);
+  BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
+  if PropMain or PropGen then
+  begin
+    StartTime := Now();
+    for o := 0 to FOutChannels - 1 do
+      for oy := 0 to FOutput.SizeY - 1 do
+        for ox := 0 to FOutput.SizeX - 1 do
+        begin
+          Dy := FOutputError.Get(ox, oy, o);
+          if Dy = 0 then continue;
+          for ky := 0 to FFeatureSize - 1 do
+            for kx := 0 to FFeatureSize - 1 do
+            begin
+              Base := ((o * FFeatureSize + ky) * FFeatureSize + kx) * FInChannels;
+              for i := 0 to FInChannels - 1 do
+              begin
+                // dL/dx[ox+kx,oy+ky,i] += W[o,ky,kx,i] * dy
+                if PropMain then
+                  XErr.Add(ox + kx, oy + ky, i, Wgt.FData[Base + i] * Dy);
+                // dL/dW[o,ky,kx,i] += x[ox+kx,oy+ky,i] * dy
+                if PropGen then
+                begin
+                  Xv := X.Get(ox + kx, oy + ky, i);
+                  WgtErr.FData[Base + i] := WgtErr.FData[Base + i] + Xv * Dy;
+                end;
+              end;
+            end;
+          // dL/db[o] += dy
+          if PropGen and FUseBias then
+            WgtErr.FData[BiasBase + o] := WgtErr.FData[BiasBase + o] + Dy;
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  // Propagate into BOTH sources (generated-kernel branch then main features).
   if Assigned(FWeightsLayer) and
      (FWeightsLayer.OutputError.Size = FWeightsLayer.Output.Size) then
     FWeightsLayer.Backpropagate();
@@ -30632,6 +30864,40 @@ begin
   // flat (row-major) by raw pointer.
   Result := AddLayerAfter(TNNetHyperLinear.Create(Dout, UseBias, GenW),
     MainLayer);
+end;
+
+function TNNet.AddHyperConv(InChannels, OutChannels, FeatureSize: integer;
+  ContextLayer: TNNetLayer; UseBias: boolean): TNNetLayer;
+var
+  MainLayer, GenW: TNNetLayer;
+  GenWidth: integer;
+begin
+  if ContextLayer = nil then
+    FErrorProc('AddHyperConv requires a non-nil ContextLayer.');
+  if InChannels < 1 then
+    FErrorProc('AddHyperConv requires InChannels >= 1. Got ' +
+      IntToStr(InChannels));
+  if OutChannels < 1 then
+    FErrorProc('AddHyperConv requires OutChannels >= 1. Got ' +
+      IntToStr(OutChannels));
+  if FeatureSize < 1 then
+    FErrorProc('AddHyperConv requires FeatureSize >= 1. Got ' +
+      IntToStr(FeatureSize));
+  MainLayer := GetLastLayer();
+  if MainLayer = nil then
+    FErrorProc('AddHyperConv requires an existing main input layer.');
+  if MainLayer.Output.Depth <> InChannels then
+    FErrorProc('AddHyperConv: the main input (GetLastLayer) Depth must equal ' +
+      'InChannels=' + IntToStr(InChannels) + '. Got Depth=' +
+      IntToStr(MainLayer.Output.Depth));
+  // Generator: a single linear map from the context to the flat kernel tensor.
+  // Width is exactly what TNNetHyperConv reads as its WeightsSource.
+  GenWidth := OutChannels * FeatureSize * FeatureSize * InChannels;
+  if UseBias then GenWidth := GenWidth + OutChannels;
+  GenW := AddLayerAfter(TNNetFullConnectLinear.Create(GenWidth), ContextLayer);
+  // The hyper conv: main input = MainLayer (image), kernel source = GenW.
+  Result := AddLayerAfter(
+    TNNetHyperConv.Create(OutChannels, FeatureSize, UseBias, GenW), MainLayer);
 end;
 
 function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
@@ -55324,7 +55590,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -55451,6 +55717,7 @@ begin
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
+      'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -55758,6 +56025,7 @@ begin
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
+      if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else

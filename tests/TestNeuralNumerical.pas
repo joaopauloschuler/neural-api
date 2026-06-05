@@ -513,6 +513,10 @@ type
     procedure TestHyperLinearGeneratedWeightsGradientCheck;
     procedure TestHyperLinearLoadFromString;
     procedure TestAddHyperLinearBuilder;
+    procedure TestHyperConvMainInputGradientCheck;
+    procedure TestHyperConvGeneratedKernelGradientCheck;
+    procedure TestHyperConvLoadFromString;
+    procedure TestAddHyperConvBuilder;
     procedure TestScatterToAffineForwardAndShearZero;
     procedure TestScatterToAffineInputGradientCheck;
     procedure TestScatterToAffineLoadFromString;
@@ -13441,6 +13445,215 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestHyperConvMainInputGradientCheck;
+// Finite-difference check of d(loss)/d(main image input) through the weightless
+// TNNetHyperConv, whose KxK conv kernel is supplied entirely by a SECOND input
+// branch (the generated kernel). Verifies the convolution dL/dx path.
+var
+  NN: TNNet;
+  XInput, WInput: TNNetLayer;
+  XData, XPlus, WData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, WSize, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AX: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(AX);
+    WInput.Output.Copy(WData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 2;
+  WSize := OutC * KSz * KSz * InC + OutC; // kernel + bias
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  XPlus := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  WData := TNNetVolume.Create(WSize, 1, 1);
+  Desired := TNNetVolume.Create((SizeXY - KSz + 1), (SizeXY - KSz + 1), OutC);
+  epsilon := 0.001; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    WInput := NN.AddLayerAfter(TNNetInput.Create(WSize, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetHyperConv.Create(OutC, KSz, true, WInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to WData.Size - 1 do WData.Raw[i] := Cos(i * 0.37) * 0.5;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to XData.Size - 1 do
+    begin
+      XPlus.Copy(XData);
+      XPlus.Raw[i] := XData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(XPlus);
+      XPlus.Raw[i] := XData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(XPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      WInput.Output.Copy(WData);
+      NN.Compute(XInput.Output);
+      XInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := XInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('HyperConv main-input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestHyperConvMainInputGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; XPlus.Free; WData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperConvGeneratedKernelGradientCheck;
+// The headline gradient: finite-difference check of d(loss)/d(generated kernel)
+// (kernel AND bias entries) through TNNetHyperConv. The kernel lives on the
+// second input branch, so its OutputError carries dL/dW -- this is what lets
+// the upstream generator network train end-to-end on a spatial task.
+var
+  NN: TNNet;
+  XInput, WInput: TNNetLayer;
+  XData, WData, WPlus, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, WSize, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AW: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    WInput.Output.Copy(AW);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 2;
+  WSize := OutC * KSz * KSz * InC + OutC;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  WData := TNNetVolume.Create(WSize, 1, 1);
+  WPlus := TNNetVolume.Create(WSize, 1, 1);
+  Desired := TNNetVolume.Create((SizeXY - KSz + 1), (SizeXY - KSz + 1), OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    WInput := NN.AddLayerAfter(TNNetInput.Create(WSize, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetHyperConv.Create(OutC, KSz, true, WInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to WData.Size - 1 do WData.Raw[i] := Cos(i * 0.37) * 0.5;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to WData.Size - 1 do
+    begin
+      WPlus.Copy(WData);
+      WPlus.Raw[i] := WData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(WPlus);
+      WPlus.Raw[i] := WData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(WPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      WInput.Output.Copy(WData);
+      NN.Compute(XInput.Output);
+      WInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := WInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('HyperConv gen-kernel gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestHyperConvGeneratedKernelGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; WData.Free; WPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperConvLoadFromString;
+// Serialization round-trip: the generated-kernel source layer index (injected
+// like TNNetConcat) and the OutChannels/FeatureSize/UseBias struct fields must
+// survive SaveToString -> LoadFromString, reproducing the forward pass.
+var
+  NN, NN2: TNNet;
+  XInput, WInput: TNNetLayer;
+  XData, WData: TNNetVolume;
+  SizeXY, InC, OutC, KSz, WSize, i: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 2;
+  WSize := OutC * KSz * KSz * InC + OutC;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  WData := TNNetVolume.Create(WSize, 1, 1);
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    WInput := NN.AddLayerAfter(TNNetInput.Create(WSize, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetHyperConv.Create(OutC, KSz, true, WInput), XInput);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to WData.Size - 1 do WData.Raw[i] := Cos(i * 0.37) * 0.5;
+    XInput.Output.Copy(XData);
+    WInput.Output.Copy(WData);
+    NN.Compute(XInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetHyperConv then Found := true;
+    AssertTrue('HyperConv layer present', Found);
+    AssertEquals('HyperConv owns zero trainable weights', 0,
+      NN.GetLastLayer.CountWeights());
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HyperConv SaveToString round-trip equality', Saved, Saved2);
+      AssertTrue('HyperConv round-trip last layer is TNNetHyperConv',
+        NN2.GetLastLayer is TNNetHyperConv);
+      NN2.Layers[0].Output.Copy(XData);
+      NN2.Layers[1].Output.Copy(WData);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('HyperConv round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; XData.Free; WData.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestScatterToAffineForwardAndShearZero;
 // TNNetScatterToAffine maps (s_x, s_y, t_x, t_y) -> [s_x,0,t_x, 0,s_y,t_y].
 // The two shear slots (b=index 1, d=index 3) must be a HARD zero.
@@ -22737,6 +22950,104 @@ begin
     CtxV.Free;
     TargetV.Free;
     GenW0.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddHyperConvBuilder;
+// Exercise the TNNet.AddHyperConv one-call builder end to end: it must wire a
+// generator (FullConnectLinear over the context) emitting the flat conv kernel
+// + a weightless TNNetHyperConv on the main image branch, train end-to-end
+// (gradients reach the generator), and round-trip through Save/LoadFromString.
+var
+  NN, NN2: TNNet;
+  CtxIn, FeatIn, HyperLayer, GenW: TNNetLayer;
+  FeatV, CtxV, TargetV, GenW0: TNNetVolume;
+  SizeXY, InC, OutC, KSz, Ctx, KernelW, OutSize, i, Step: integer;
+  Saved, Saved2: string;
+  LossBefore, LossAfter, WeightDelta: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 2; Ctx := 5;
+  KernelW := OutC * KSz * KSz * InC + OutC; // kernel + bias
+  OutSize := (SizeXY - KSz + 1) * (SizeXY - KSz + 1) * OutC;
+  NN := TNNet.Create();
+  FeatV := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  CtxV := TNNetVolume.Create(Ctx, 1, 1);
+  TargetV := TNNetVolume.Create((SizeXY - KSz + 1), (SizeXY - KSz + 1), OutC);
+  GenW0 := TNNetVolume.Create();
+  try
+    CtxIn := NN.AddLayer(TNNetInput.Create(Ctx, 1, 1));
+    FeatIn := NN.AddLayerAfter(TNNetInput.Create(SizeXY, SizeXY, InC, 1), -1);
+    HyperLayer := NN.AddHyperConv(InC, OutC, KSz, CtxIn, {UseBias=}true);
+    NN.SetLearningRate(0.02, 0.0);
+
+    AssertTrue('AddHyperConv last layer is TNNetHyperConv',
+      HyperLayer is TNNetHyperConv);
+    AssertEquals('AddHyperConv output size', OutSize, HyperLayer.Output.Size);
+    AssertEquals('AddHyperConv hyper layer owns zero weights', 0,
+      HyperLayer.CountWeights);
+
+    GenW := nil;
+    for i := 0 to NN.GetLastLayerIdx do
+      if (NN.Layers[i] is TNNetFullConnectLinear) and
+         (NN.Layers[i].Output.Size = KernelW) then GenW := NN.Layers[i];
+    AssertTrue('AddHyperConv built a generator FullConnectLinear', GenW <> nil);
+    AssertTrue('AddHyperConv generator owns trainable weights',
+      GenW.CountWeights > 0);
+
+    for i := 0 to FeatV.Size - 1 do FeatV.Raw[i] := Sin(i * 0.7) + 0.2;
+    for i := 0 to Ctx - 1 do CtxV.Raw[i] := Cos(i * 0.5) * 0.6;
+    for i := 0 to TargetV.Size - 1 do TargetV.Raw[i] := 0.2 * (i + 1);
+
+    FeatIn.Output.Copy(FeatV);
+    CtxIn.Output.Copy(CtxV);
+    NN.Compute(NN.Layers[0].Output);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(TargetV);
+    GenW0.Copy(GenW.Neurons[0].Weights);
+
+    for Step := 0 to 199 do
+    begin
+      FeatIn.Output.Copy(FeatV);
+      CtxIn.Output.Copy(CtxV);
+      NN.Compute(NN.Layers[0].Output);
+      NN.Backpropagate(TargetV);
+    end;
+
+    FeatIn.Output.Copy(FeatV);
+    CtxIn.Output.Copy(CtxV);
+    NN.Compute(NN.Layers[0].Output);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(TargetV);
+    AssertTrue('AddHyperConv training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    WeightDelta := 0;
+    for i := 0 to GenW0.Size - 1 do
+      WeightDelta := WeightDelta +
+        Abs(GenW.Neurons[0].Weights.Raw[i] - GenW0.Raw[i]);
+    AssertTrue('AddHyperConv gradients reached the generator weights ' +
+      '(delta=' + FloatToStr(WeightDelta) + ')', WeightDelta > 1e-4);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddHyperConv round-trip last layer is TNNetHyperConv',
+        NN2.GetLastLayer is TNNetHyperConv);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddHyperConv SaveToString round-trip equality',
+        Saved, Saved2);
+      NN2.Layers[0].Output.Copy(CtxV);
+      NN2.Layers[1].Output.Copy(FeatV);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('AddHyperConv round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; FeatV.Free; CtxV.Free; TargetV.Free; GenW0.Free;
   end;
 end;
 

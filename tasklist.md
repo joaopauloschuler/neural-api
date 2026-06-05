@@ -169,9 +169,17 @@ rather than acted on.
       all LANDED 2026-06-05; first layer in the fork that owns zero trainable
       weights — reads its W from a second input tensor). Deferred, each small +
       doable on its own:
-      (a) a `TNNetHyperConv` cousin that generates a small CONV kernel from the
-          context instead of a dense matrix (same backward-into-the-generator idea,
-          conv forward) — extends HyperNetworks to spatial tasks;
+      (a) [X] a `TNNetHyperConv` cousin that generates a small CONV kernel from
+          the context instead of a dense matrix (same backward-into-the-generator
+          idea, conv forward) — extends HyperNetworks to spatial tasks. LANDED
+          2026-06-05: weightless leaf TNNetHyperConv (VALID conv, stride 1, no
+          pad; kernel layout W[o,ky,kx,i] flat from the 2nd input + optional
+          per-out-channel bias), builder TNNet.AddHyperConv(InC,OutC,K,Ctx),
+          serialization (3 dispatch sites), and 4 tests (both gradient paths +
+          save/load + builder train-end-to-end). The generator must emit the
+          WHOLE kernel in one shot, so its param count scales as OutC*K*K*InC —
+          documented in the layer doc comment; that cap is exactly what sub-task
+          (b) chunked generation would relax.
       (b) CHUNKED weight generation so the main layer can be larger than the
           generator's output width (generate W in tiles) — the landed layer
           generates the whole Din*Dout matrix in one shot, which caps main-layer
