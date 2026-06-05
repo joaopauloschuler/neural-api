@@ -102,12 +102,6 @@ rather than acted on.
       attention), GatherChannelsRouting (static channel gather), the landed
       TNNet.AddMixtureOfExperts (scalar gate) and the landed Modern-Hopfield retrieval.
 
-- [x] DropBlock follow-up (TNNetDropBlock landed 2026-05-31): bake-off landed
-      2026-06-01 as examples/DropBlockBakeoff/ — a synthetic-image CNN trained
-      three ways (none / TNNetDropout / TNNetDropBlock) at a matched drop rate,
-      charting the train/test gap. Honest invariant-gated self-check (trains,
-      finite, deterministic eval); ~144 s CPU.
-
 - [ ] TNNet.AddDeepEquilibriumBlock + examples/DeepEquilibrium/ (Bai/Kolter/Koltun
       2019, "Deep Equilibrium Models") — the IMPLICIT cousin of the landed NeuralODE
       block, and genuinely distinct from it: NeuralODE unrolls a FIXED number of
@@ -141,58 +135,11 @@ rather than acted on.
       Modern-Hopfield retrieval (single-step softmax, not iterated to a learned `f`'s
       fixed point).
 
-- [X] TNNet.AddRetention (RetNet, Sun et al. 2023, "Retentive Network: A Successor
-      to Transformer for Large Language Models") + examples/RetentionDualForm/ —
-      DONE. TNNetRetention layer (parallel decay-masked form, forward+backward,
-      gamma in FFloatSt[0]/d_k in FStruct[0], registered in both dispatch tables)
-      + TNNet.AddRetention builder (H concatenated single-head TNNetRetention,
-      geometric per-head gamma schedule, pointwise out-proj). Tests:
-      TestRetentionGradientCheck (max err ~3e-4), TestRetentionRecurrentEquivalence
-      (max diff ~6e-8), TestRetentionSerializationRoundTrip. Example trains the
-      parallel form then asserts a hand-rolled recurrent loop matches it
-      (max abs diff ~9.5e-6 < 1e-4 gate). Follow-ups:
-      (a) learn gamma via direct gradient (currently a fixed constant);
-      (b) chunkwise-recurrent hybrid form (throughput optimisation, skipped in v1).
-      Original spec below.
-- [ ] (superseded by the [X] above; kept for context) TNNet.AddRetention (RetNet,
-      Sun et al. 2023, "Retentive Network: A Successor
-      to Transformer for Large Language Models") + examples/RetentionDualForm/ — a
-      token mixer that is genuinely distinct from everything already in tree, and
-      whose headline property (one mechanism, two mathematically-equal forms) is
-      exactly the kind of contrast the SequenceMixerBakeoff / TokenShiftBaseline
-      examples are built to make concrete. Retention replaces softmax attention's
-      `softmax(QKᵀ)V` with a softmax-FREE, content-AND-position mixer: the PARALLEL
-      (training) form is `(Q Kᵀ ⊙ D) V` where `D_nm = γ^(n-m)` for `n≥m` and `0`
-      otherwise — a causal mask whose lower triangle is a fixed multiplicative
-      *exponential decay* by relative distance (`γ` a per-head constant in `(0,1)`,
-      no normalising softmax). The RECURRENT (inference) form is the linear-attention
-      state recurrence `S_n = γ·S_{n-1} + Kₙᵀ Vₙ`, `out_n = Qₙ S_n`, which produces
-      the SAME output token-for-token at O(1) state per step. Two pieces: (1) a
-      builder that wires Q/K/V projections (PointwiseConvLinear over Depth, never
-      FullConnect, so the per-token input gradient survives — see
-      [[mha-builder-and-seq-projection]]) and applies the parallel decay-masked
-      retention over a `(SeqLen,1,d)` tensor; multi-head follows the existing
-      "H concatenated single-head layers, no head-axis tensor" pattern from
-      [[multihead-no-head-axis-tensor]], one `γ` per head (the paper's geometric
-      `γ` schedule across heads is the obvious knob). (2) The example trains the
-      parallel form on the same tiny char-level next-token task the bake-offs use,
-      then — the whole point — runs the trained weights through a hand-rolled
-      RECURRENT loop and asserts the two forward passes agree to within fp tolerance
-      (a mandatory `Halt(1)` equality gate in the SpeculativeDecoding `draft==target`
-      style), proving the dual form. HONEST feasibility calls to settle in v1, in the
-      "what did NOT fit the CPU budget" style of the Capsule/DEQ/Grokking entries:
-      ship only the parallel + naive-recurrent forms (skip the chunkwise-recurrent
-      hybrid — it is a throughput optimisation, not a new capability), keep d/heads/
-      SeqLen tiny so a full forward/backward stays inside the <5-min pure-CPU budget,
-      and verify the decay-mask backward path under the SetBatchUpdate(True) idiom
-      from [[manual-gradient-and-snapshot-gotchas]] (`γ` itself can be a fixed
-      constant in v1 — learning it via the STE-free direct gradient is a logged
-      follow-up). Distinct from TNNetDiagonalSSM (per-channel SCALAR linear
-      recurrence, no Q·K content interaction — retention's state is an outer-product
-      `KᵀV` matrix mixed by content), from AddMultiHeadSelfAttention (softmax
-      normalisation + no built-in positional decay), and from TNNetTokenShift
-      (fixed lag-1 mix). Stretch goal: a SequenceMixerBakeoff-style long-range-reach
-      column placing retention between the O(n) recurrences and full attention.
+- [ ] TNNetRetention follow-up (layer + TNNet.AddRetention builder +
+      examples/RetentionDualForm/ all landed): (a) learn gamma via a direct
+      gradient instead of the current fixed per-head constant; (b) the
+      chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
+      the parallel and naive-recurrent forms both landed).
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
