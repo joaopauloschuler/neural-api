@@ -1530,6 +1530,25 @@ rather than acted on.
       ([[introspection-report-pattern]]): decl + impl + example + smoke test + docs;
       reuse the per-token / per-channel walk machinery, do NOT re-derive forward
       activations. See [[saliency-report-covers-ig]].
+- [ ] LRPReport follow-up (landed 2026-06-05): the shipped epsilon-rule only
+      back-distributes through the DENSE (TNNetFullConnect family) + activation
+      stack — conv / pointwise-conv layers are honestly SKIPPED. Add a CONV
+      relevance rule (epsilon-rule over the conv receptive field, distributing
+      R_j across the input patch that produced output j) so the report works
+      end-to-end on a real SimpleImage-style CNN, not just an MLP. Reuse the
+      conv Compute's patch-iteration; assert conservation residual stays O(eps)
+      on a tiny conv probe in the smoke test.
+- [ ] LRPReport follow-up: add the gamma-rule and alpha-beta (LRP-αβ) variants
+      alongside the epsilon-rule (selectable via a parameter), which separate
+      positive/negative contributions and are the standard "explanation-quality"
+      upgrade over plain epsilon. Contrast their input-relevance maps vs epsilon
+      on the existing examples/LRP probe.
+- [ ] TNNetCosineSimilarityAttention bake-off (now easier — learnable scale
+      landed 2026-06-05): plain SDPA vs cosine-attn (fixed scale) vs cosine-attn
+      (learnable scale) vs SDPA+TNNetSoftCapping on the PositionEncodingBakeoff
+      tiny next-token harness — does the bounded `[-scale,+scale]` logit remove
+      the NaN/overflow events SoftCapping targets, at matched final loss, and
+      does the learnable scale beat the fixed one?
 - [ ] FeatureSeparabilityReport follow-up: the scatter-
       decomposition identity `tr(Stot)=tr(Sw)+tr(Sb)` is only exact for
       class-balanced batches (the report uses class-balanced `mean_c`
