@@ -72,6 +72,25 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetFourierMix — FNet-style parameter-free token mixer (Lee-Thorp et al.
+      2021, "FNet: Mixing Tokens with Fourier Transforms"). Over a (SeqLen,1,d)
+      sequence, replace self-attention with an UNPARAMETERISED 2D DFT applied
+      across the sequence axis and the hidden axis, keeping only the real part:
+      y = Re( DFT_seq( DFT_hidden( x ) ) ). This is genuinely distinct from every
+      existing mixer here: it owns NO weights (unlike gMLP's SGU AddSpatialGatingUnit,
+      whose cross-token matrix is learned), it is NOT a decay/kernel mix (contrast
+      TNNetRetention / TNNetDiagonalSSM / TNNetSelectiveSSM), and it is not a
+      circular convolution over a single learned kernel (contrast TNNetCirculantLinear).
+      Because Re(DFT) is a fixed LINEAR operator, the backward pass is just the
+      adjoint transform applied to dL/dy (another DFT, real part) — clean and
+      exact, a satisfying contrast to the softmax-Jacobian attention backward.
+      Reuse the existing radix-2 FFT fast path already proven in TNNetCirculantLinear
+      (UseFFT) for power-of-two SeqLen/d, with a direct O(n^2) DFT fallback for
+      arbitrary sizes; assert FFT-vs-direct equivalence to <1e-5. Ship the leaf
+      layer + numerical-gradient + save/load tests, plus an examples/FourierMix/
+      bake-off that swaps FNet mixing in for attention on the same tiny sequence
+      task and contrasts loss / wall-clock (the paper's selling point is ~attention
+      accuracy at a fraction of the cost on short sequences).
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
