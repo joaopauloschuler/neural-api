@@ -148,6 +148,47 @@ rather than acted on.
       default; the example's "FFT-vs-direct wall-clock as n grows" chart depends
       on it and is deferred with it).
 
+- [ ] TNNetHighway — a Highway-network layer (Srivastava, Greff & Schmidhuber 2015,
+      "Training Very Deep Networks"), the input-dependent learned-gate ancestor of
+      the ResNet skip connection: `y = T(x) ⊙ H(x) + (1 - T(x)) ⊙ x`, where the
+      transform gate `T(x) = sigmoid(W_T·x + b_T)` is computed FROM THE INPUT each
+      forward pass and `H(x) = activation(W_H·x + b_H)` is a learned transform.
+      This is genuinely distinct from everything already in the tree — and I want
+      to be careful here because the gated-residual family is crowded:
+      `TNNetReZero` is a single learned SCALAR on the residual, `AddGatedResidual`
+      is a learned per-CHANNEL constant gate, and both are input-INDEPENDENT (the
+      gate value does not depend on the activation flowing through). `TNNetGLU` /
+      `TNNetSwiGLU` gate a projection and emit ONLY the transformed branch with NO
+      identity carry. Highway's defining feature is the input-dependent gate that
+      also CARRIES the identity `(1 - T)·x` — the literal pre-ResNet construct, and
+      the natural "should this layer transform or pass through?" knob for very deep
+      MLP/conv stacks. Because the carry needs the gate, its complement, two
+      Hadamard products and a sum (and there is no public element-wise two-layer
+      multiply layer to chain cleanly), a single leaf layer that owns the gate +
+      transform weights is cleaner than a builder. Deliverables:
+      (a) the leaf layer in neuralnetwork.pas (mark `// Coded by Claude (AI).` per
+          [[claude-authorship-comment]]) shape-preserving over `Depth` (gate and
+          transform are per-channel pointwise so it composes inside the residual
+          builders — see [[residual-builder-helpers]]); two weight sets (transform
+          W_H/b_H, gate W_T/b_T), forward as above, backward routing error through
+          both branches AND the gate's sigmoid (the `x` appears in three places —
+          carry, transform input, gate input — so accumulate all three input-error
+          contributions); bias the gate toward the CARRY at init (b_T ≈ -1..-2, the
+          paper's trick) so a fresh deep stack starts near identity and trains;
+          LoadFromString wiring + InitDefault/AddToWeightHistory parity with the
+          FullConnect family, both CreateLayer dispatch points wired for save/load;
+      (b) numerical-gradient + byte-identical save/load round-trip tests in
+          TestNeuralNumerical.pas (reseed `RandSeed := 424242` per the
+          [[numerical-test-rng-ordering]] rule), plus a smoke test that with the
+          gate forced fully closed (`T≈0`) the layer is an exact identity map and
+          with it fully open (`T≈1`) it equals the bare transform;
+      (c) an examples/HighwayDepth/ experiment: train plain-MLP vs Highway-MLP
+          stacks at increasing depth {2, 5, 10, 20, 40} on a small task and chart
+          final loss vs depth — the headline being that the plain stack degrades
+          with depth while the Highway stack stays trainable (the paper's result),
+          and report the mean learned gate `T` per layer to show which layers chose
+          to transform vs carry.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
       SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
