@@ -37,6 +37,14 @@ The headline is the held-out accuracy gap on the corrupted graph: the GAT's
 learned edge weighting should be MORE ROBUST to the injected noisy edges than the
 GCN's fixed averaging.
 
+This example also includes two GAT follow-ups:
+  (C) MULTI-HEAD GAT (TNNet.AddMultiHeadGraphAttention): K independent attention
+      heads CONCATENATED in the hidden layer and AVERAGED at the output layer
+      (the paper's eq. 5 / eq. 6 split), single head vs 4 heads.
+  (D) ATTENTION-DROPOUT ablation: the per-edge dropout regulariser (paper Sec
+      2.2) applied to the normalized coefficients at training time only, off vs
+      on (p=0.3) on the noisy-edge SBM regime.
+
 Everything is generated on the fly; no external dataset. Pure CPU, single thread,
 well under five minutes (a couple of seconds in practice).
 
@@ -139,7 +147,7 @@ begin
       GIsTrain[c * cNodesPerClass + i] := true;
 end;
 
-// kind = 0 -> GCN (TNNetGraphConvolution), kind = 1 -> GAT (TNNetGraphAttention).
+// kind = 0 -> GCN (TNNetGraphConvolution), kind = 1 -> single-head GAT.
 function BuildNet(kind: integer): TNNet;
 var
   NN: TNNet;
@@ -173,6 +181,25 @@ begin
   Result := NN;
 end;
 
+// Multi-head GAT (TNNet.AddMultiHeadGraphAttention): Heads CONCAT heads in the
+// hidden layer (each cHidden wide -> Heads*cHidden), then Heads AVERAGED heads at
+// the 2-class output (the paper's eq. 5 / eq. 6 split). pAttDrop applies the
+// per-edge attention-dropout regulariser to every head (training time only).
+function BuildMultiHeadNet(Heads: integer; pAttDrop: TNeuralFloat): TNNet;
+var
+  NN: TNNet;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(cNumNodes, 1, cFeat));
+  // Hidden: Heads concatenated single-head GAT layers.
+  NN.AddMultiHeadGraphAttention(Heads, cHidden, GAdj, {Concat=}true, pAttDrop);
+  NN.AddLayer(TNNetReLU.Create());
+  // Output: Heads averaged single-head GAT layers (2 classes).
+  NN.AddMultiHeadGraphAttention(Heads, 2, GAdj, {Concat=}false, pAttDrop);
+  NN.AddLayer(TNNetPointwiseSoftMax.Create(1));
+  Result := NN;
+end;
+
 procedure TrainNet(NN: TNNet);
 var
   epoch, n, k, OutFeat: integer;
@@ -184,6 +211,7 @@ begin
   OutFeat := 2;
   ErrV := TNNetVolume.Create(cNumNodes, 1, OutFeat);
   NN.GetLastLayer.IncDepartingBranchesCnt();
+  NN.EnableDropouts(true); // activate GAT attention-dropout for training (no-op if rate=0)
   for epoch := 1 to cEpochs do
   begin
     NN.Compute(GFeat);
@@ -212,6 +240,7 @@ var
   Pred: TNNetVolume;
 begin
   OutFeat := 2;
+  NN.EnableDropouts(false); // deterministic inference (disable attention-dropout)
   NN.Compute(GFeat);
   Pred := NN.GetLastLayer.Output;
   correct := 0; total := 0;
@@ -226,9 +255,21 @@ begin
   if total > 0 then Result := correct / total else Result := 0;
 end;
 
+// Train a freshly-built multi-head GAT (rebuilds the net so RNG / init are
+// deterministic per call) and return its held-out accuracy.
+function RunMultiHead(Heads: integer; pAttDrop: TNeuralFloat): TNeuralFloat;
+var
+  NN: TNNet;
+begin
+  NN := BuildMultiHeadNet(Heads, pAttDrop);
+  TrainNet(NN);
+  Result := EvalHeldOut(NN);
+  NN.Free;
+end;
+
 var
   GatNet, GcnNet: TNNet;
-  GatAcc, GcnAcc: TNeuralFloat;
+  GatAcc, GcnAcc, Mh1, Mh4, AblOff, AblOn: TNeuralFloat;
   CleanEdges, NoisyEdges, i, j: integer;
 begin
   RandSeed := 424242;
@@ -278,6 +319,42 @@ begin
 
   GatNet.Free;
   GcnNet.Free;
+
+  // -------------------------------------------------------------------------
+  // (C) MULTI-HEAD GAT: K independent attention heads (concat in the hidden
+  // layer, averaged at the output) via TNNet.AddMultiHeadGraphAttention. More
+  // heads = more independent edge-weighting views averaged together, which is
+  // more robust on the noisy graph than a single head.
+  // -------------------------------------------------------------------------
+  Mh1 := RunMultiHead(1, 0.0);   // single-head (built via the multi-head builder)
+  Mh4 := RunMultiHead(4, 0.0);   // 4 heads
+  WriteLn('Multi-head GAT (concat hidden, averaged output)');
+  WriteLn('  1 head                     : ', (Mh1 * 100):6:2, ' %');
+  WriteLn('  4 heads                    : ', (Mh4 * 100):6:2, ' %');
+  WriteLn('  gain (4 heads - 1 head)    : ', ((Mh4 - Mh1) * 100):6:2, ' pp');
+  WriteLn;
+
+  // -------------------------------------------------------------------------
+  // (D) ATTENTION-DROPOUT ABLATION on the noisy-edge SBM regime: the per-edge
+  // dropout regulariser (paper Sec 2.2) randomly drops normalized attention
+  // coefficients during training only. On this noisy graph it discourages the
+  // model from over-committing to any single (possibly cross-community) edge.
+  // -------------------------------------------------------------------------
+  AblOff := RunMultiHead(4, 0.0);  // 4 heads, no attention-dropout
+  AblOn  := RunMultiHead(4, 0.3);  // 4 heads, attention-dropout p=0.3
+  WriteLn('Attention-dropout ablation (4-head GAT on the noisy graph)');
+  WriteLn('  dropout OFF (p=0.0)        : ', (AblOff * 100):6:2, ' %');
+  WriteLn('  dropout ON  (p=0.3)        : ', (AblOn * 100):6:2, ' %');
+  WriteLn('  effect (on - off)          : ', ((AblOn - AblOff) * 100):6:2, ' pp');
+  WriteLn;
+  if AblOn > AblOff + 0.01 then
+    WriteLn('=> Attention-dropout helps on the noisy graph: dropping per-edge',
+            sLineBreak, '   coefficients during training regularises the edge weighting.')
+  else if AblOn > AblOff - 0.01 then
+    WriteLn('=> Attention-dropout roughly neutral on this run.')
+  else
+    WriteLn('=> NOTE: attention-dropout did not help this run.');
+
   GAdj.Free;
   GFeat.Free;
 end.

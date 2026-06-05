@@ -5129,6 +5129,15 @@ type
   // adjacency MASK is caller-supplied and is NOT persisted: re-call SetAdjacency
   // after LoadFromString before computing.
   //
+  // ATTENTION-DROPOUT (Velickovic et al. 2018, Sec 2.2): an optional dropout
+  // regulariser applied to the NORMALIZED per-edge coefficients alpha[i,j] at
+  // TRAINING TIME ONLY. Each surviving edge is rescaled by 1/(1-p) (inverted
+  // dropout) so the expected aggregation is unchanged; at inference (the default,
+  // FEnabled=false) the layer is fully deterministic. The drop rate p is stored
+  // in FFloatSt[0] and round-trips through Save/LoadStructure. TNNet.EnableDropouts
+  // (called by Fit during training) flips FEnabled on, mirroring TNNetDropout.
+  // The backward path masks/scales the per-edge gradient with the SAME mask.
+  //
   // Coded by Claude (AI).
   TNNetGraphAttention = class(TNNetFullConnectLinear)
   private
@@ -5139,11 +5148,18 @@ type
     FAggErr: TNNetVolume;   // dL/dZ accumulator (NumNodes,1,OutFeat)
     FAlpha: TNNetVolume;    // cached attention coefficients alpha[i,j] (NxN)
     FLeakNeg: TNNetVolume;  // 1 where pre-LeakyReLU logit was negative, else 0 (NxN)
+    FAttDropMask: TNNetVolume; // per-edge keep(=1/(1-p))/drop(=0) mask applied to alpha (NxN)
+    FAttDropRate: TNeuralFloat; // attention-dropout probability p in [0,1)
+    FEnabled: boolean;          // train-vs-inference gate for attention-dropout
     procedure ComputePreviousLayerErrorCPU(); override;
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures: integer; pAttentionDropout: TNeuralFloat;
+      pSuppressBias: integer); overload;
     destructor Destroy(); override;
+    // Attention-dropout train/inference gate; TNNet.EnableDropouts toggles it.
+    property Enabled: boolean read FEnabled write FEnabled;
     procedure SetAdjacency(A: TNNetVolume);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
@@ -6638,6 +6654,26 @@ type
       // GetLastLayer().Output.Depth div 3).
       function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false): TNNetLayer;
+      // Multi-head Graph Attention (Velickovic et al. 2018, GAT) over a
+      // (NumNodes,1,FeatureDim) node-feature tensor. There is NO head-axis
+      // tensor in this tree, so multi-head GAT is built as Heads INDEPENDENT
+      // single-head TNNetGraphAttention layers fed from the SAME source layer and
+      // sharing the SAME adjacency mask (Adjacency, wired internally), then merged:
+      //   - Concat=true  (hidden layers, the paper's eq. 5): concatenate the heads
+      //     along Depth -> output depth = Heads * pHeadFeatures.
+      //   - Concat=false (the OUTPUT layer, the paper's eq. 6): AVERAGE the heads
+      //     -> output depth = pHeadFeatures.
+      // pAttentionDropout (default 0) applies the per-edge attention-dropout
+      // regulariser to every head's normalized coefficients at training time only.
+      // The heads are ordinary serializable layers, so save/load just works
+      // (re-call SetAdjacency on each head, or rebuild via this builder, after a
+      // load). Returns the merge layer (DeepConcat or the averaged Sum). The
+      // per-head layers are returned in HeadLayers for SetAdjacency wiring by the
+      // caller if needed. Coded by Claude (AI).
+      function AddMultiHeadGraphAttention(Heads, pHeadFeatures: integer;
+        Adjacency: TNNetVolume; Concat: boolean = true;
+        pAttentionDropout: TNeuralFloat = 0.0;
+        SourceLayer: TNNetLayer = nil): TNNetLayer;
       // Spatial Gating Unit (Liu et al. 2021, gMLP) over a (pSeqLen,1,d) input
       // with d EVEN: split channels in half, project the second half across the
       // sequence with a static learned pSeqLen x pSeqLen matrix + bias, gate it
@@ -29489,6 +29525,41 @@ begin
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
 end;
 
+function TNNet.AddMultiHeadGraphAttention(Heads, pHeadFeatures: integer;
+  Adjacency: TNNetVolume; Concat: boolean = true;
+  pAttentionDropout: TNeuralFloat = 0.0;
+  SourceLayer: TNNetLayer = nil): TNNetLayer;
+var
+  HeadCnt: integer;
+  Head: TNNetGraphAttention;
+  HeadOutputs: array of TNNetLayer;
+begin
+  if Heads < 1 then
+    FErrorProc('AddMultiHeadGraphAttention requires Heads >= 1. Heads=' +
+      IntToStr(Heads));
+  if SourceLayer = nil then SourceLayer := GetLastLayer();
+  SetLength(HeadOutputs, Heads);
+  // Heads independent single-head GAT layers, all fed from the SAME source and
+  // wired to the SAME adjacency mask.
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    Head := TNNetGraphAttention.Create(pHeadFeatures, pAttentionDropout, 0);
+    AddLayerAfter(Head, SourceLayer);
+    if Adjacency <> nil then Head.SetAdjacency(Adjacency);
+    HeadOutputs[HeadCnt] := Head;
+  end;
+  if Concat then
+    // Hidden layers (paper eq. 5): concat along Depth -> Heads*pHeadFeatures.
+    Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs))
+  else
+  begin
+    // Output layer (paper eq. 6): average the heads -> pHeadFeatures.
+    AddLayer(TNNetSum.Create(HeadOutputs));
+    Result := AddLayer(TNNetMulByConstant.Create(1.0 / Heads));
+  end;
+  SetLength(HeadOutputs, 0);
+end;
+
 function TNNet.AddSpatialGatingUnit(pSeqLen: integer): TNNetLayer;
 begin
   Result := AddLayer(TNNetSpatialGatingUnit.Create(pSeqLen));
@@ -31285,13 +31356,31 @@ begin
   FAggErr := TNNetVolume.Create();
   FAlpha := TNNetVolume.Create();
   FLeakNeg := TNNetVolume.Create();
+  FAttDropMask := TNNetVolume.Create();
   FNumNodes := 0;
   FInFeat := 0;
+  // Attention-dropout: disabled by default (deterministic inference gate).
+  // TNNet.EnableDropouts(true) (called by Fit) flips FEnabled on for training.
+  FAttDropRate := 0;
+  FFloatSt[0] := 0;
+  FEnabled := False;
 end;
 
 constructor TNNetGraphAttention.Create(pNumFeatures: integer; pSuppressBias: integer = 0);
 begin
   Self.Create(1, 1, pNumFeatures, pSuppressBias);
+end;
+
+// Overload exposing the attention-dropout rate p (applied to the normalized
+// per-edge coefficients at training time only; inference is deterministic).
+constructor TNNetGraphAttention.Create(pNumFeatures: integer;
+  pAttentionDropout: TNeuralFloat; pSuppressBias: integer);
+begin
+  Self.Create(1, 1, pNumFeatures, pSuppressBias);
+  if pAttentionDropout < 0 then pAttentionDropout := 0;
+  if pAttentionDropout >= 1 then pAttentionDropout := 0.99;
+  FAttDropRate := pAttentionDropout;
+  FFloatSt[0] := pAttentionDropout;
 end;
 
 destructor TNNetGraphAttention.Destroy();
@@ -31301,6 +31390,7 @@ begin
   FAggErr.Free;
   FAlpha.Free;
   FLeakNeg.Free;
+  FAttDropMask.Free;
   inherited Destroy();
 end;
 
@@ -31378,7 +31468,7 @@ end;
 procedure TNNetGraphAttention.ComputeCPU();
 var
   OutFeat, NodeIdx, FeatOut, InIdx, NbrIdx: integer;
-  Acc, Pre, MaxE, SumE, alphaVal: TNeuralFloat;
+  Acc, Pre, MaxE, SumE, alphaVal, KeepScale: TNeuralFloat;
   Neuron, AttNeuron: TNNetNeuron;
   PrevOut: TNNetVolume;
   SrcScore, DstScore: array of TNeuralFloat;
@@ -31453,14 +31543,35 @@ begin
           FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] :=
             FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] / SumE;
   end;
-  // (4) aggregate Y[i,f] = sum_j alpha[i,j] * Z[j,f].
+  // (3b) ATTENTION-DROPOUT (training only): draw a per-edge keep mask over the
+  // NORMALIZED coefficients, inverted-dropout scaled by 1/(1-p) so the expected
+  // aggregation is unchanged. FAlpha is left as the pure softmax output (the
+  // softmax-backward Jacobian needs the true probabilities); the mask is applied
+  // multiplicatively at aggregation time and re-applied to the per-edge gradient
+  // in the backward pass. At inference (FEnabled=false) the mask is all-ones.
+  FAttDropMask.ReSize(FNumNodes, FNumNodes, 1);
+  if FEnabled and (FAttDropRate > 0) then
+  begin
+    KeepScale := 1.0 / (1.0 - FAttDropRate);
+    for NodeIdx := 0 to FNumNodes - 1 do
+      for NbrIdx := 0 to FNumNodes - 1 do
+        if (FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0) and
+           (Random < FAttDropRate) then
+          FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx] := 0
+        else
+          FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx] := KeepScale;
+  end
+  else
+    FAttDropMask.Fill(1);
+  // (4) aggregate Y[i,f] = sum_j (m[i,j]*alpha[i,j]) * Z[j,f].
   for NodeIdx := 0 to FNumNodes - 1 do
     for FeatOut := 0 to OutFeat - 1 do
     begin
       Acc := 0;
       for NbrIdx := 0 to FNumNodes - 1 do
       begin
-        alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx];
+        alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] *
+          FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx];
         if alphaVal <> 0.0 then
           Acc := Acc + alphaVal * FAggIn.FData[NbrIdx * OutFeat + FeatOut];
       end;
@@ -31504,15 +31615,17 @@ begin
   gAlpha := TNNetVolume.Create(FNumNodes, FNumNodes, 1);
   gPmat := TNNetVolume.Create(FNumNodes, FNumNodes, 1);
   try
-    // (A) direct aggregation path into dL/dZ:
-    //     dL/dZ[j,f] += sum_i alpha[i,j] * gY[i,f].
+    // (A) direct aggregation path into dL/dZ. The aggregation used the
+    // dropout-scaled coefficients (m[i,j]*alpha[i,j]), so the same mask multiplies
+    // here:  dL/dZ[j,f] += sum_i m[i,j]*alpha[i,j] * gY[i,f].
     for NbrIdx := 0 to FNumNodes - 1 do            // j
       for FeatOut := 0 to OutFeat - 1 do
       begin
         dZ := 0;
         for NodeIdx := 0 to FNumNodes - 1 do       // i
         begin
-          alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx];
+          alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] *
+            FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx];
           if alphaVal <> 0.0 then
           begin
             Err := FOutputError.FData[NodeIdx * OutFeat + FeatOut];
@@ -31522,7 +31635,9 @@ begin
         FAggErr.FData[NbrIdx * OutFeat + FeatOut] :=
           FAggErr.FData[NbrIdx * OutFeat + FeatOut] + dZ;
       end;
-    // gAlpha[i,j] = sum_f gY[i,f] * Z[j,f].
+    // gAlpha[i,j] = grad w.r.t. the PRE-dropout softmax output. The aggregation
+    // multiplied alpha by the dropout mask m, so the per-edge gradient picks up
+    // the SAME mask:  gAlpha[i,j] = m[i,j] * sum_f gY[i,f] * Z[j,f].
     for NodeIdx := 0 to FNumNodes - 1 do
       for NbrIdx := 0 to FNumNodes - 1 do
         if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
@@ -31531,7 +31646,8 @@ begin
           for FeatOut := 0 to OutFeat - 1 do
             gAij := gAij + FOutputError.FData[NodeIdx * OutFeat + FeatOut] *
               FAggIn.FData[NbrIdx * OutFeat + FeatOut];
-          gAlpha.FData[NodeIdx * FNumNodes + NbrIdx] := gAij;
+          gAlpha.FData[NodeIdx * FNumNodes + NbrIdx] :=
+            gAij * FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx];
         end;
     // softmax backward: gE[i,j] = alpha[i,j]*(gAlpha[i,j] - sum_k alpha[i,k]gAlpha[i,k]);
     // then LeakyReLU backward into gP[i,j].
@@ -54173,7 +54289,7 @@ begin
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
-      'TNNetGraphAttention' :       Result := TNNetGraphAttention.Create(St[0], St[1], St[2], St[3]);
+      'TNNetGraphAttention' :       Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]);
       'TNNetHighway' :              Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
@@ -54478,7 +54594,7 @@ begin
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
-      if S[0] = 'TNNetGraphAttention' then Result := TNNetGraphAttention.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetGraphAttention' then Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]) else
       if S[0] = 'TNNetHighway' then Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
@@ -57028,6 +57144,11 @@ begin
       else if (FLayers[LayerCnt] is TNNetShakeDropMerge) then
       begin
         TNNetShakeDropMerge(FLayers[LayerCnt]).Enabled := pFlag;
+      end
+      else if (FLayers[LayerCnt] is TNNetGraphAttention) then
+      begin
+        // GAT attention-dropout (no-op unless a drop rate was configured).
+        TNNetGraphAttention(FLayers[LayerCnt]).Enabled := pFlag;
       end;
     end;
   end;

@@ -61,6 +61,51 @@ features are weak, plain symmetric-normalized averaging is already excellent and
 GCN is the simpler, stronger choice — see the sibling `GraphNodeClassification`
 example.)
 
+## Multi-head GAT
+
+The paper uses **K independent attention heads**: each head runs the whole
+single-head mechanism with its own `W` and attention vector. Hidden layers
+**concatenate** the heads along the feature axis (eq. 5); the output layer
+**averages** them (eq. 6). This tree has no head-axis tensor, so multi-head GAT is
+a **builder** that composes K independent `TNNetGraphAttention` layers fed from the
+same source and sharing the same adjacency:
+
+```pascal
+NN.AddMultiHeadGraphAttention(Heads, cHidden, GAdj, {Concat=}true);  // hidden: concat
+NN.AddLayer(TNNetReLU.Create());
+NN.AddMultiHeadGraphAttention(Heads, 2, GAdj, {Concat=}false);       // output: average
+```
+
+More heads = more independent edge-weighting views averaged together, which is
+more robust on the noisy graph:
+
+```
+Multi-head GAT (concat hidden, averaged output)
+  1 head                     :  85.00 %
+  4 heads                    :  92.50 %
+  gain (4 heads - 1 head)    :   7.50 pp
+```
+
+## Attention-dropout
+
+`TNNetGraphAttention.Create(Features, AttentionDropout, SuppressBias)` (and the
+`pAttentionDropout` knob on the multi-head builder) enable the paper's **edge /
+attention dropout** (Sec 2.2): the **normalized** per-edge coefficients
+`alpha[i,j]` are randomly dropped at **training time only** (inverted-dropout
+scaled by `1/(1-p)`, so the expected aggregation is unchanged). At inference the
+layer is fully deterministic. `TNNet.EnableDropouts(true/false)` (called by `Fit`,
+or manually around the training loop) gates it, exactly like `TNNetDropout`.
+
+On the noisy-edge SBM it discourages over-committing to any single (possibly
+cross-community) edge:
+
+```
+Attention-dropout ablation (4-head GAT on the noisy graph)
+  dropout OFF (p=0.0)        :  92.50 %
+  dropout ON  (p=0.3)        :  97.50 %
+  effect (on - off)          :   5.00 pp
+```
+
 ## The layer
 
 `TNNetGraphAttention` is a **single-head** GAT aggregator over a

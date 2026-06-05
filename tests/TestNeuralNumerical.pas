@@ -156,6 +156,8 @@ type
     // TNNetGraphAttention (GAT) attentional aggregator
     procedure TestGraphAttentionGradientCheck;
     procedure TestGraphAttentionSerializationRoundTrip;
+    procedure TestMultiHeadGraphAttentionShapes;
+    procedure TestGraphAttentionDropoutInferenceDeterministic;
     // TNNetHighway input-dependent learned-gate layer
     procedure TestHighwayGradientCheck;
     procedure TestHighwaySerializationRoundTrip;
@@ -32432,6 +32434,162 @@ begin
     NN.Free;
     Input.Free;
     Adj.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadGraphAttentionShapes;
+var
+  NN, NN2: TNNet;
+  Input, Adj: TNNetVolume;
+  Saved: string;
+  ConcatLayer, AvgLayer: TNNetLayer;
+  f, n, NumNodes, InFeat, HeadFeat, Heads: integer;
+
+  procedure SetEdge(Av: TNNetVolume; a, b: integer);
+  begin
+    Av.Raw[Av.GetRawPos(a, b, 0)] := 1;
+    Av.Raw[Av.GetRawPos(b, a, 0)] := 1;
+  end;
+
+begin
+  // Multi-head GAT builder shapes + save/load round-trip:
+  //   - Concat hidden head  -> output depth = Heads * HeadFeat.
+  //   - Averaged output head -> output depth = HeadFeat.
+  // The builder composes ordinary serializable layers, so SaveToString round-trips
+  // byte-identically (re-supply adjacency to each head after load).
+  RandSeed := 424242;
+  NumNodes := 5;
+  InFeat := 3;
+  HeadFeat := 4;
+  Heads := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NumNodes, 1, InFeat);
+  Adj := TNNetVolume.Create(NumNodes, NumNodes, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(NumNodes, 1, InFeat));
+    Adj.Fill(0);
+    SetEdge(Adj, 0, 1); SetEdge(Adj, 1, 2); SetEdge(Adj, 2, 3);
+    SetEdge(Adj, 3, 4); SetEdge(Adj, 0, 4);
+
+    // Concat hidden multi-head layer.
+    ConcatLayer := NN.AddMultiHeadGraphAttention(Heads, HeadFeat, Adj, {Concat=}true);
+    NN.AddLayer(TNNetReLU.Create());
+    // Averaged output multi-head layer (2 classes).
+    AvgLayer := NN.AddMultiHeadGraphAttention(Heads, 2, Adj, {Concat=}false);
+    NN.AddLayer(TNNetPointwiseSoftMax.Create(1));
+
+    AssertEquals('Concat multi-head GAT depth = Heads*HeadFeat',
+      Heads * HeadFeat, ConcatLayer.Output.Depth);
+    AssertEquals('Concat multi-head GAT NumNodes preserved',
+      NumNodes, ConcatLayer.Output.SizeX);
+    AssertEquals('Averaged multi-head GAT depth = HeadFeat (per-head, not summed)',
+      2, AvgLayer.Output.Depth);
+    AssertEquals('Averaged multi-head GAT NumNodes preserved',
+      NumNodes, AvgLayer.Output.SizeX);
+
+    for n := 0 to NumNodes - 1 do
+      for f := 0 to InFeat - 1 do
+        Input.Raw[n * InFeat + f] := Sin(n * 0.7 + f * 1.1) * 0.9 - 0.1;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    // Round-trip: re-wire adjacency to every reloaded GAT head, recompute, compare.
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      for n := 0 to NN2.GetLastLayerIdx() do
+        if NN2.Layers[n] is TNNetGraphAttention then
+          TNNetGraphAttention(NN2.Layers[n]).SetAdjacency(Adj);
+      NN2.Compute(Input);
+      AssertTrue('Multi-head GAT token present in serialized string',
+        Pos('TNNetGraphAttention', Saved) > 0);
+      for n := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Multi-head GAT Compute matches after round-trip pos ' +
+          IntToStr(n), NN.GetLastLayer.Output.Raw[n],
+          NN2.GetLastLayer.Output.Raw[n], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Adj.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGraphAttentionDropoutInferenceDeterministic;
+var
+  NN: TNNet;
+  GA: TNNetGraphAttention;
+  Input, Adj, Out1, Out2: TNNetVolume;
+  i, f, n, NumNodes, InFeat, OutFeat, diffCnt: integer;
+
+  procedure SetEdge(Av: TNNetVolume; a, b: integer);
+  begin
+    Av.Raw[Av.GetRawPos(a, b, 0)] := 1;
+    Av.Raw[Av.GetRawPos(b, a, 0)] := 1;
+  end;
+
+begin
+  // Attention-dropout must be a NO-OP at inference (deterministic: two forward
+  // passes are bit-identical) and ACTIVE during training (EnableDropouts(true)
+  // makes the per-edge mask stochastic, so two training-mode passes differ).
+  RandSeed := 424242;
+  NumNodes := 8;
+  InFeat := 4;
+  OutFeat := 6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NumNodes, 1, InFeat);
+  Adj := TNNetVolume.Create(NumNodes, NumNodes, 1);
+  Out1 := TNNetVolume.Create();
+  Out2 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(NumNodes, 1, InFeat));
+    GA := TNNetGraphAttention.Create(OutFeat, {AttentionDropout=}0.5, {SuppressBias=}0);
+    NN.AddLayer(GA);
+
+    Adj.Fill(0);
+    SetEdge(Adj, 0, 1); SetEdge(Adj, 1, 2); SetEdge(Adj, 2, 3);
+    SetEdge(Adj, 3, 4); SetEdge(Adj, 4, 5); SetEdge(Adj, 5, 6);
+    SetEdge(Adj, 6, 7); SetEdge(Adj, 0, 7); SetEdge(Adj, 1, 5); SetEdge(Adj, 2, 6);
+    GA.SetAdjacency(Adj);
+
+    for n := 0 to NumNodes - 1 do
+      for f := 0 to InFeat - 1 do
+        Input.Raw[n * InFeat + f] := Sin(n * 0.6 + f * 0.8) * 1.1 - 0.15;
+
+    // Inference (default): dropout disabled -> two passes identical.
+    NN.EnableDropouts(false);
+    NN.Compute(Input); Out1.Copy(NN.GetLastLayer.Output);
+    NN.Compute(Input); Out2.Copy(NN.GetLastLayer.Output);
+    for i := 0 to Out1.Size - 1 do
+      AssertEquals('GAT attention-dropout inference deterministic pos ' +
+        IntToStr(i), Out1.Raw[i], Out2.Raw[i], 1e-7);
+
+    // Training: dropout enabled -> stochastic, two passes should differ somewhere.
+    NN.EnableDropouts(true);
+    NN.Compute(Input); Out1.Copy(NN.GetLastLayer.Output);
+    NN.Compute(Input); Out2.Copy(NN.GetLastLayer.Output);
+    diffCnt := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.Raw[i] - Out2.Raw[i]) > 1e-6 then Inc(diffCnt);
+    AssertTrue('GAT attention-dropout active during training (passes differ)',
+      diffCnt > 0);
+
+    // Back to inference: deterministic again.
+    NN.EnableDropouts(false);
+    NN.Compute(Input); Out1.Copy(NN.GetLastLayer.Output);
+    NN.Compute(Input); Out2.Copy(NN.GetLastLayer.Output);
+    for i := 0 to Out1.Size - 1 do
+      AssertEquals('GAT attention-dropout deterministic again after disable pos ' +
+        IntToStr(i), Out1.Raw[i], Out2.Raw[i], 1e-7);
+  finally
+    NN.Free;
+    Input.Free;
+    Adj.Free;
+    Out1.Free;
+    Out2.Free;
   end;
 end;
 
