@@ -357,12 +357,22 @@ rather than acted on.
       a BUILDER that inserts the HxH mix between the per-head logit slabs
       inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
       Re-scope before attempting.
-- [ ] TNNetSlidingWindowMaskedFill follow-up (landed 2026-05-31): a tiny
+- [X] TNNetSlidingWindowMaskedFill follow-up (landed 2026-06-05): a tiny
       next-token bake-off — full causal (TNNetMaskedFill / TriangularCausalMask)
       vs sliding-window at W in {2, 4, full} on a task whose answer lives within
       the window, charting loss + per-query key count. Shows the long-context
       cost/quality trade the layer enables. Fork PositionEncodingBakeoff's
       tiny next-token harness.
+      LANDED 2026-06-05 as examples/SlidingWindowBakeoff: forks the
+      PositionEncodingBakeoff harness; three arms (W=2, W=4, FULL causal)
+      swap ONLY the mask layer (TNNetSlidingWindowMaskedFill(2)/(4) vs
+      TNNetMaskedFill) on a content-gated copy rule (even token -> copy
+      current, odd -> copy previous) whose answer lives in a width-2 window.
+      All arms reach val-CE ~0 / 100% accuracy; the table charts per-query
+      mean/last key count (W=2: 1.92/2, W=4: 3.50/4, FULL: 6.50/12), making
+      the cost saving visible at matched quality. Graded PASS/FAIL (sliding
+      arms within tolerance of FULL, all arms val-CE<0.5); prints RESULT:
+      PASS. ~11s, pure CPU.
 - [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
