@@ -498,6 +498,9 @@ type
     procedure TestAffineGridSampleSourceGradientCheck;
     procedure TestAffineGridSampleThetaGradientCheck;
     procedure TestAffineGridSampleLoadFromString;
+    procedure TestScatterToAffineForwardAndShearZero;
+    procedure TestScatterToAffineInputGradientCheck;
+    procedure TestScatterToAffineLoadFromString;
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
     procedure TestMultiHeadLatentAttentionGradientCheck;
@@ -13217,6 +13220,167 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScatterToAffineForwardAndShearZero;
+// TNNetScatterToAffine maps (s_x, s_y, t_x, t_y) -> [s_x,0,t_x, 0,s_y,t_y].
+// The two shear slots (b=index 1, d=index 3) must be a HARD zero.
+var
+  NN: TNNet;
+  Inp: TNNetVolume;
+  Scatter: TNNetLayer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Inp := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    Scatter := NN.AddLayer(TNNetScatterToAffine.Create());
+    Inp.Raw[0] := 0.7;  // s_x
+    Inp.Raw[1] := 0.4;  // s_y
+    Inp.Raw[2] := -0.3; // t_x
+    Inp.Raw[3] := 0.2;  // t_y
+    NN.Compute(Inp);
+    AssertEquals('Scatter output size', 6, Scatter.Output.Size);
+    AssertEquals('a = s_x', 0.7,  Scatter.Output.Raw[0], 1e-6);
+    AssertEquals('b = 0 (shear)', 0.0, Scatter.Output.Raw[1], 1e-6);
+    AssertEquals('c = t_x', -0.3, Scatter.Output.Raw[2], 1e-6);
+    AssertEquals('d = 0 (shear)', 0.0, Scatter.Output.Raw[3], 1e-6);
+    AssertEquals('e = s_y', 0.4,  Scatter.Output.Raw[4], 1e-6);
+    AssertEquals('f = t_y', 0.2,  Scatter.Output.Raw[5], 1e-6);
+  finally
+    NN.Free; Inp.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScatterToAffineInputGradientCheck;
+// Finite-difference check of d(loss)/d(input) through the full glimpse path
+// Input(4) -> ScatterToAffine -> AffineGridSample(over a small image). This
+// exercises the scatter's backward gather against the sampler's d(theta).
+var
+  NN: TNNet;
+  ImgInput, ParamInput: TNNetLayer;
+  Img, ParamData, ParamPlus, Desired: TNNetVolume;
+  W, H, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AParam: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(Img);
+    ParamInput.Output.Copy(AParam);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  ParamData := TNNetVolume.Create(4, 1, 1);
+  ParamPlus := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ParamInput := NN.AddLayerAfter(TNNetInput.Create(4, 1, 1, 1), 0);
+    NN.AddLayer(TNNetScatterToAffine.Create());
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(NN.GetLastLayer), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // scale + translate (s_x, s_y, t_x, t_y)
+    ParamData.Raw[0] := 0.80;  ParamData.Raw[1] := 0.75;
+    ParamData.Raw[2] := 0.12;  ParamData.Raw[3] := -0.10;
+
+    for i := 0 to 3 do
+    begin
+      ParamPlus.Copy(ParamData);
+      ParamPlus.Raw[i] := ParamData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ParamPlus);
+      ParamPlus.Raw[i] := ParamData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ParamPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(Img);
+      ParamInput.Output.Copy(ParamData);
+      NN.Compute(ImgInput.Output);
+      ParamInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ParamInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ScatterToAffine input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.02);
+    end;
+    WriteLn('  TestScatterToAffineInputGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Img.Free; ParamData.Free; ParamPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScatterToAffineLoadFromString;
+// Save/load round-trip of the scatter layer (no params) inside the glimpse
+// path; the reloaded net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ImgInput, ParamInput: TNNetLayer;
+  Img, Param: TNNetVolume;
+  W, H, D, i: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Param := TNNetVolume.Create(4, 1, 1);
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ParamInput := NN.AddLayerAfter(TNNetInput.Create(4, 1, 1, 1), 0);
+    NN.AddLayer(TNNetScatterToAffine.Create());
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(NN.GetLastLayer), ImgInput);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    Param.Raw[0] := 0.80; Param.Raw[1] := 0.75; Param.Raw[2] := 0.12; Param.Raw[3] := -0.10;
+    ImgInput.Output.Copy(Img);
+    ParamInput.Output.Copy(Param);
+    NN.Compute(ImgInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetScatterToAffine then Found := true;
+    AssertTrue('ScatterToAffine layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ScatterToAffine SaveToString round-trip equality', Saved, Saved2);
+      NN2.Layers[0].Output.Copy(Img);
+      NN2.Layers[1].Output.Copy(Param);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ScatterToAffine round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Img.Free; Param.Free;
   end;
 end;
 

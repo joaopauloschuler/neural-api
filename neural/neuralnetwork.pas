@@ -2227,6 +2227,31 @@ type
     property ThetaSource: TNNetLayer read FThetaLayer;
   end;
 
+  /// Scale + translate ONLY affine assembler for a "hard" visual-attention
+  // glimpse. Takes a Size=4 input vector (s_x, s_y, t_x, t_y) from a
+  // localization head and SCATTERS it into the Size=6, 2x3 affine matrix
+  //   theta = [ s_x   0   t_x ]
+  //           [  0   s_y  t_y ]
+  // i.e. the two off-diagonal (rotation/shear) entries b,d are held at a
+  // hard zero. Feeding this layer's Size=6 output to TNNetAffineGridSample
+  // restricts the learned warp to a crop/zoom (scale + translate) — an
+  // attention-free downsampler glimpse: the localization head learns WHERE
+  // and how much to zoom, and the sampler reads a canonical patch. The shear
+  // slots can never become non-zero because no parameter ever lands in them.
+  // No trainable parameters. Forward scatters the 4 inputs to positions
+  // {0,4,2,5}; backward gathers the gradients of exactly those 4 positions
+  // back to the 4 inputs (the b,d gradients are discarded). Pure shape/route
+  // layer, round-trips through Save/LoadFromString with no extra state.
+  // Coded by Claude (AI).
+  TNNetScatterToAffine = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -15059,6 +15084,67 @@ begin
      (FThetaLayer.OutputError.Size = FThetaLayer.Output.Size) then
     FThetaLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetScatterToAffine }
+
+constructor TNNetScatterToAffine.Create();
+begin
+  inherited Create();
+  FOutput.ReSize(6, 1, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetScatterToAffine.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.Size <> 4 then
+    FErrorProc('TNNetScatterToAffine requires a Size=4 source (s_x, s_y, t_x, '
+      + 't_y). Got Size=' + IntToStr(pPrevLayer.FOutput.Size));
+  FOutput.ReSize(6, 1, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetScatterToAffine.Compute();
+var
+  StartTime: double;
+  Src: TNNetVolume;
+begin
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  // theta = [ s_x 0 t_x ; 0 s_y t_y ] laid out as [a b c d e f]
+  FOutput.FData[0] := Src.FData[0]; // a = s_x
+  FOutput.FData[1] := 0;            // b = 0 (no shear)
+  FOutput.FData[2] := Src.FData[2]; // c = t_x
+  FOutput.FData[3] := 0;            // d = 0 (no shear)
+  FOutput.FData[4] := Src.FData[1]; // e = s_y
+  FOutput.FData[5] := Src.FData[3]; // f = t_y
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetScatterToAffine.Backpropagate();
+var
+  StartTime: double;
+  Err: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size then
+  begin
+    Err := FPrevLayer.FOutputError;
+    // gather the 4 active affine-slot gradients back to (s_x, s_y, t_x, t_y);
+    // the b,d (shear) slots carry no parameter, so their gradient is dropped.
+    Err.FData[0] := Err.FData[0] + FOutputError.FData[0]; // s_x <- a
+    Err.FData[1] := Err.FData[1] + FOutputError.FData[4]; // s_y <- e
+    Err.FData[2] := Err.FData[2] + FOutputError.FData[2]; // t_x <- c
+    Err.FData[3] := Err.FData[3] + FOutputError.FData[5]; // t_y <- f
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
 end;
 
 { TNNetLinearAttention }
@@ -54210,6 +54296,7 @@ begin
       'TNNetALiBi' :                Result := TNNetALiBi.Create(Ft[0]);
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetHuberLoss' :            Result := TNNetHuberLoss.Create(Ft[0]);
+      'TNNetScatterToAffine' :      Result := TNNetScatterToAffine.Create();
       'TNNetSmoothL1Loss' :         Result := TNNetSmoothL1Loss.Create();
       'TNNetLogCoshLoss' :          Result := TNNetLogCoshLoss.Create();
       'TNNetCharbonnierLoss' :      Result := TNNetCharbonnierLoss.Create(Ft[0]);
@@ -54513,6 +54600,7 @@ begin
       if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create(Ft[0]) else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetHuberLoss' then Result := TNNetHuberLoss.Create(Ft[0]) else
+      if S[0] = 'TNNetScatterToAffine' then Result := TNNetScatterToAffine.Create() else
       if S[0] = 'TNNetSmoothL1Loss' then Result := TNNetSmoothL1Loss.Create() else
       if S[0] = 'TNNetLogCoshLoss' then Result := TNNetLogCoshLoss.Create() else
       if S[0] = 'TNNetCharbonnierLoss' then Result := TNNetCharbonnierLoss.Create(Ft[0]) else
