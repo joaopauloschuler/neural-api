@@ -1450,17 +1450,20 @@ type
   // Treats the input as a (SizeX, SizeY) attention score matrix replicated
   // over Depth heads. SizeX indexes the key position, SizeY indexes the
   // query position. For each head h the layer adds slope[h] * (X - Y) to
-  // every score where slope[h] = 2^(-8 * (h + 1) / Depth). Slopes are
-  // precomputed at SetPrevLayer time. No trainable parameters. Backward
-  // pass is a pure gradient passthrough since the bias is constant w.r.t.
-  // the input.
+  // every score where slope[h] = 2^(-Base * (h + 1) / Depth). The slope
+  // base (default 8.0, the standard ALiBi constant) is stored in
+  // FFloatSt[0] and may be overridden via the parametric constructor.
+  // Slopes are precomputed at SetPrevLayer time. No trainable parameters.
+  // Backward pass is a pure gradient passthrough since the bias is constant
+  // w.r.t. the input.
   // Coded by Claude (AI).
   TNNetALiBi = class(TNNetIdentity)
   private
     FSlopes: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(); override;
+    constructor Create(); overload; override;
+    constructor Create(pBase: TNeuralFloat); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
   end;
@@ -11651,7 +11654,15 @@ end;
 
 constructor TNNetALiBi.Create();
 begin
+  Create(8.0);
+end;
+
+constructor TNNetALiBi.Create(pBase: TNeuralFloat);
+begin
   inherited Create();
+  if pBase = 0 then
+    FErrorProc('TNNetALiBi slope base can not be zero.');
+  FFloatSt[0] := pBase;
   FSlopes := TNNetVolume.Create();
 end;
 
@@ -11668,8 +11679,9 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   Depth := FOutput.Depth;
   FSlopes.ReSize(1, 1, Depth);
+  if FFloatSt[0] = 0 then FFloatSt[0] := 8.0;
   for H := 0 to Depth - 1 do
-    FSlopes.Raw[H] := pcr_exp2f(-8 * (H + 1) / Depth);
+    FSlopes.Raw[H] := pcr_exp2f(-FFloatSt[0] * (H + 1) / Depth);
 end;
 
 procedure TNNetALiBi.Compute();
@@ -51355,7 +51367,7 @@ begin
       'TNNetTriangularCausalMask' : Result := TNNetTriangularCausalMask.Create(St[0]);
       'TNNetSlidingWindowMaskedFill' : Result := TNNetSlidingWindowMaskedFill.Create(St[0], Ft[0]);
       'TNNetStraightThroughEstimator' : Result := TNNetStraightThroughEstimator.Create(Ft[0]);
-      'TNNetALiBi' :                Result := TNNetALiBi.Create();
+      'TNNetALiBi' :                Result := TNNetALiBi.Create(Ft[0]);
       'TNNetSoftCapping' :          Result := TNNetSoftCapping.Create(Ft[0]);
       'TNNetHuberLoss' :            Result := TNNetHuberLoss.Create(Ft[0]);
       'TNNetSmoothL1Loss' :         Result := TNNetSmoothL1Loss.Create();
@@ -51649,7 +51661,7 @@ begin
       if S[0] = 'TNNetTriangularCausalMask' then Result := TNNetTriangularCausalMask.Create(St[0]) else
       if S[0] = 'TNNetSlidingWindowMaskedFill' then Result := TNNetSlidingWindowMaskedFill.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetStraightThroughEstimator' then Result := TNNetStraightThroughEstimator.Create(Ft[0]) else
-      if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create() else
+      if S[0] = 'TNNetALiBi' then Result := TNNetALiBi.Create(Ft[0]) else
       if S[0] = 'TNNetSoftCapping' then Result := TNNetSoftCapping.Create(Ft[0]) else
       if S[0] = 'TNNetHuberLoss' then Result := TNNetHuberLoss.Create(Ft[0]) else
       if S[0] = 'TNNetSmoothL1Loss' then Result := TNNetSmoothL1Loss.Create() else
