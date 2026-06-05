@@ -489,6 +489,10 @@ type
     procedure TestHyenaOperatorShapeAndGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
+    procedure TestAffineGridSampleIdentity;
+    procedure TestAffineGridSampleSourceGradientCheck;
+    procedure TestAffineGridSampleThetaGradientCheck;
+    procedure TestAffineGridSampleLoadFromString;
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
     procedure TestMultiHeadLatentAttentionGradientCheck;
@@ -12962,6 +12966,252 @@ begin
     NN.Free;
     QData.Free;
     KVData.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineGridSampleIdentity;
+// Identity theta = [[1,0,0],[0,1,0]] must reproduce the source EXACTLY.
+var
+  NN: TNNet;
+  ImgInput, ThetaInput: TNNetLayer;
+  Img, Theta: TNNetVolume;
+  W, H, D, i: integer;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Theta := TNNetVolume.Create(6, 1, 1);
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ThetaInput := NN.AddLayerAfter(TNNetInput.Create(6, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(ThetaInput), ImgInput);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.7) * 0.9 + 0.1;
+    // identity affine in raster order [a b c d e f] = [1 0 0 0 1 0]
+    Theta.Fill(0);
+    Theta.Raw[0] := 1.0; Theta.Raw[4] := 1.0;
+
+    ImgInput.Output.Copy(Img);
+    ThetaInput.Output.Copy(Theta);
+    NN.Compute(ImgInput.Output);
+
+    AssertTrue('AffineGridSample identity output shape',
+      (NN.GetLastLayer.Output.SizeX = W) and
+      (NN.GetLastLayer.Output.SizeY = H) and
+      (NN.GetLastLayer.Output.Depth = D));
+    for i := 0 to Img.Size - 1 do
+      AssertTrue('AffineGridSample identity reproduces source at ' + IntToStr(i),
+        Abs(NN.GetLastLayer.Output.Raw[i] - Img.Raw[i]) < 1e-5);
+  finally
+    NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineGridSampleSourceGradientCheck;
+// Finite-difference check of d(loss)/d(source) through the bilinear sampler,
+// using a non-trivial (scale+shift) theta so all 4 neighbours are active.
+var
+  NN: TNNet;
+  ImgInput, ThetaInput: TNNetLayer;
+  ImgData, ImgPlus, Theta, Desired: TNNetVolume;
+  W, H, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AImg: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(AImg);
+    ThetaInput.Output.Copy(Theta);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  ImgData := TNNetVolume.Create(W, H, D);
+  ImgPlus := TNNetVolume.Create(W, H, D);
+  Theta := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ThetaInput := NN.AddLayerAfter(TNNetInput.Create(6, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(ThetaInput), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to ImgData.Size - 1 do ImgData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // scale 0.7, shift (0.2,-0.15): coords land between pixels (all 4 weights nonzero)
+    Theta.Fill(0);
+    Theta.Raw[0] := 0.7; Theta.Raw[2] := 0.2;
+    Theta.Raw[4] := 0.7; Theta.Raw[5] := -0.15;
+
+    for i := 0 to ImgData.Size - 1 do
+    begin
+      ImgPlus.Copy(ImgData);
+      ImgPlus.Raw[i] := ImgData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ImgPlus);
+      ImgPlus.Raw[i] := ImgData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ImgPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(ImgData);
+      ThetaInput.Output.Copy(Theta);
+      NN.Compute(ImgInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ImgInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AffineGridSample source gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestAffineGridSampleSourceGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; ImgData.Free; ImgPlus.Free; Theta.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineGridSampleThetaGradientCheck;
+// The headline gradient: finite-difference check of d(loss)/d(theta), the 6
+// affine parameters. Theta is supplied by a second input branch so its
+// OutputError holds the accumulated d(loss)/d(theta).
+var
+  NN: TNNet;
+  ImgInput, ThetaInput: TNNetLayer;
+  Img, ThetaData, ThetaPlus, Desired: TNNetVolume;
+  W, H, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(ATheta: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(Img);
+    ThetaInput.Output.Copy(ATheta);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  ThetaData := TNNetVolume.Create(6, 1, 1);
+  ThetaPlus := TNNetVolume.Create(6, 1, 1);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ThetaInput := NN.AddLayerAfter(TNNetInput.Create(6, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(ThetaInput), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // a generic affine (rotation-ish + shift), all 4 neighbours active
+    ThetaData.Raw[0] := 0.85;  ThetaData.Raw[1] := -0.20; ThetaData.Raw[2] := 0.13;
+    ThetaData.Raw[3] := 0.18;  ThetaData.Raw[4] := 0.80;  ThetaData.Raw[5] := -0.10;
+
+    for i := 0 to 5 do
+    begin
+      ThetaPlus.Copy(ThetaData);
+      ThetaPlus.Raw[i] := ThetaData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ThetaPlus);
+      ThetaPlus.Raw[i] := ThetaData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ThetaPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(Img);
+      ThetaInput.Output.Copy(ThetaData);
+      NN.Compute(ImgInput.Output);
+      ThetaInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ThetaInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AffineGridSample theta gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.02);
+    end;
+    WriteLn('  TestAffineGridSampleThetaGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Img.Free; ThetaData.Free; ThetaPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineGridSampleLoadFromString;
+// Serialization round-trip: the theta source layer index (injected like
+// TNNetConcat) must survive SaveToString -> LoadFromString, and the reloaded
+// net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ImgInput, ThetaInput: TNNetLayer;
+  Img, Theta: TNNetVolume;
+  W, H, D, i: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Theta := TNNetVolume.Create(6, 1, 1);
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ThetaInput := NN.AddLayerAfter(TNNetInput.Create(6, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(ThetaInput), ImgInput);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    Theta.Raw[0] := 0.85;  Theta.Raw[1] := -0.20; Theta.Raw[2] := 0.13;
+    Theta.Raw[3] := 0.18;  Theta.Raw[4] := 0.80;  Theta.Raw[5] := -0.10;
+    ImgInput.Output.Copy(Img);
+    ThetaInput.Output.Copy(Theta);
+    NN.Compute(ImgInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetAffineGridSample then Found := true;
+    AssertTrue('AffineGridSample layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AffineGridSample SaveToString round-trip equality',
+        Saved, Saved2);
+      NN2.Layers[0].Output.Copy(Img);
+      NN2.Layers[1].Output.Copy(Theta);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('AffineGridSample round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Img.Free; Theta.Free;
   end;
 end;
 

@@ -84,7 +84,7 @@ rather than acted on.
       RandSeed := 424242, and an examples/GraphAttention/ arm contrasting GAT vs
       the plain GCN on the same SBM node-classification graph (does learned edge
       weighting help when the graph has noisy/heterophilous edges?).
-- [ ] TNNetAffineGridSample — a differentiable bilinear grid-sampling layer, the
+- [x] TNNetAffineGridSample — a differentiable bilinear grid-sampling layer, the
       core of a Spatial Transformer Network (Jaderberg, Simonyan, Zisserman &
       Kavukcuoglu 2015, "Spatial Transformer Networks"). This opens a genuinely
       new capability for this tree: every existing spatial op (conv, pool,

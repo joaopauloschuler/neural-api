@@ -2188,6 +2188,45 @@ type
     property KeyValueSource: TNNetLayer read FKVLayer;
   end;
 
+  /// Affine Grid Sampler -- the differentiable bilinear grid-sampling core of a
+  // Spatial Transformer Network (Jaderberg, Simonyan, Zisserman & Kavukcuoglu
+  // 2015). It warps an image-shaped source by a CONTINUOUS, input-conditioned
+  // affine transform (unlike conv/pool/upsample which resample on a fixed
+  // integer grid). TWO sources:
+  //   PrevLayer (source image): SizeX=W, SizeY=H, Depth=D
+  //   ThetaSource (affine 2x3): a 6-value volume (any shape whose Size=6); the
+  //     6 values are read in raster order as [a b c d e f], i.e. the matrix
+  //       [ a b c ]
+  //       [ d e f ]
+  //     This is caller-wired (typically a localization head's FullConnect(6)),
+  //     NOT a persisted weight of this layer.
+  // For each OUTPUT pixel (ox,oy) the normalized grid coord is
+  //   x_n = 2*ox/(W-1) - 1,  y_n = 2*oy/(H-1) - 1   (in [-1,1]),
+  // the back-warped sample coord is
+  //   x' = a*x_n + b*y_n + c,  y' = d*x_n + e*y_n + f,
+  // mapped to source pixel space sx=(x'+1)*(W-1)/2, sy=(y'+1)*(H-1)/2, and the
+  // output is the BILINEAR interpolation of the 4 source pixels around (sx,sy)
+  // (out-of-range neighbours contribute 0, i.e. zero-padding). Output shape =
+  // source shape. No trainable parameters. Both backward paths are implemented:
+  // d/d(source) scatters each output error to its 4 neighbours by the bilinear
+  // weights; d/d(theta) accumulates output_error * d(sample)/d(x',y') *
+  // d(x',y')/d(theta) over every pixel and channel (the standard STN sampler
+  // partials). The theta source layer index is serialized like TNNetConcat so
+  // the layer round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetAffineGridSample = class(TNNetLayer)
+  private
+    FThetaLayer: TNNetLayer; // explicit 6-value affine source (Size=6)
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(ThetaSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property ThetaSource: TNNetLayer read FThetaLayer;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -14732,6 +14771,194 @@ begin
   if Assigned(FKVLayer) and
      (FKVLayer.OutputError.Size = FKVLayer.Output.Size) then
     FKVLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetAffineGridSample }
+
+constructor TNNetAffineGridSample.Create(ThetaSource: TNNetLayer);
+begin
+  inherited Create();
+  if ThetaSource = nil then
+    FErrorProc('TNNetAffineGridSample requires a non-nil ThetaSource.');
+  FThetaLayer := ThetaSource;
+  if FThetaLayer is TNNetInput then TNNetInput(FThetaLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the theta source
+  // (the image branch is incremented the usual way by AddLayer/AddLayerAfter).
+  FThetaLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetAffineGridSample.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetAffineGridSample.SaveStructureToString(): string;
+begin
+  // Inject the theta source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetConcatBase does, so CreateLayer /
+  // LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FThetaLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetAffineGridSample.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FThetaLayer.FOutput.Size <> 6 then
+    FErrorProc('TNNetAffineGridSample requires a theta source of Size=6 (a 2x3 '
+      + 'affine matrix). Got Size=' + IntToStr(FThetaLayer.FOutput.Size));
+  FOutput.ReSize(pPrevLayer.FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetAffineGridSample.Compute();
+var
+  StartTime: double;
+  W, H, D, ox, oy, dd: integer;
+  x0, y0, x1, y1: integer;
+  th: array[0..5] of TNeuralFloat;
+  Theta, Src: TNNetVolume;
+  xn, yn, xp, yp, sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
+  acc: TNeuralFloat;
+  inX0, inX1, inY0, inY1: boolean;
+begin
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  Theta := FThetaLayer.FOutput;
+  W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  for dd := 0 to 5 do th[dd] := Theta.FData[dd];
+  for oy := 0 to H - 1 do
+  begin
+    if H > 1 then yn := 2.0 * oy / (H - 1) - 1.0 else yn := 0.0;
+    for ox := 0 to W - 1 do
+    begin
+      if W > 1 then xn := 2.0 * ox / (W - 1) - 1.0 else xn := 0.0;
+      // back-warp normalized coord, then map to source pixel space
+      xp := th[0] * xn + th[1] * yn + th[2];
+      yp := th[3] * xn + th[4] * yn + th[5];
+      if W > 1 then sx := (xp + 1.0) * (W - 1) * 0.5 else sx := 0.0;
+      if H > 1 then sy := (yp + 1.0) * (H - 1) * 0.5 else sy := 0.0;
+      x0 := Floor(sx); y0 := Floor(sy);
+      x1 := x0 + 1;    y1 := y0 + 1;
+      fx := sx - x0;   fy := sy - y0;
+      w00 := (1 - fx) * (1 - fy);
+      w10 := fx * (1 - fy);
+      w01 := (1 - fx) * fy;
+      w11 := fx * fy;
+      inX0 := (x0 >= 0) and (x0 < W);
+      inX1 := (x1 >= 0) and (x1 < W);
+      inY0 := (y0 >= 0) and (y0 < H);
+      inY1 := (y1 >= 0) and (y1 < H);
+      for dd := 0 to D - 1 do
+      begin
+        acc := 0;
+        if inX0 and inY0 then acc := acc + w00 * Src.Get(x0, y0, dd);
+        if inX1 and inY0 then acc := acc + w10 * Src.Get(x1, y0, dd);
+        if inX0 and inY1 then acc := acc + w01 * Src.Get(x0, y1, dd);
+        if inX1 and inY1 then acc := acc + w11 * Src.Get(x1, y1, dd);
+        FOutput.Store(ox, oy, dd, acc);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAffineGridSample.Backpropagate();
+var
+  StartTime: double;
+  W, H, D, ox, oy, dd: integer;
+  x0, y0, x1, y1: integer;
+  th: array[0..5] of TNeuralFloat;
+  dth: array[0..5] of TNeuralFloat;
+  Theta, ThetaErr, Src, SrcErr: TNNetVolume;
+  xn, yn, xp, yp, sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
+  gOut, halfWm1, halfHm1: TNeuralFloat;
+  dSdx, dSdy: TNeuralFloat;     // d(sampled)/d(sx), d(sampled)/d(sy)
+  v00, v01, v10, v11: TNeuralFloat;
+  dLdxp, dLdyp: TNeuralFloat;   // d(loss)/d(x'), d(loss)/d(y')
+  inX0, inX1, inY0, inY1: boolean;
+  HasSrcErr: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  SrcErr := FPrevLayer.FOutputError;
+  Theta := FThetaLayer.FOutput;
+  ThetaErr := FThetaLayer.FOutputError;
+  W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  HasSrcErr := (SrcErr.Size = Src.Size);
+  if W > 1 then halfWm1 := (W - 1) * 0.5 else halfWm1 := 0.0;
+  if H > 1 then halfHm1 := (H - 1) * 0.5 else halfHm1 := 0.0;
+  for dd := 0 to 5 do
+  begin
+    th[dd] := Theta.FData[dd];
+    dth[dd] := 0;
+  end;
+  for oy := 0 to H - 1 do
+  begin
+    if H > 1 then yn := 2.0 * oy / (H - 1) - 1.0 else yn := 0.0;
+    for ox := 0 to W - 1 do
+    begin
+      if W > 1 then xn := 2.0 * ox / (W - 1) - 1.0 else xn := 0.0;
+      xp := th[0] * xn + th[1] * yn + th[2];
+      yp := th[3] * xn + th[4] * yn + th[5];
+      if W > 1 then sx := (xp + 1.0) * halfWm1 else sx := 0.0;
+      if H > 1 then sy := (yp + 1.0) * halfHm1 else sy := 0.0;
+      x0 := Floor(sx); y0 := Floor(sy);
+      x1 := x0 + 1;    y1 := y0 + 1;
+      fx := sx - x0;   fy := sy - y0;
+      w00 := (1 - fx) * (1 - fy);
+      w10 := fx * (1 - fy);
+      w01 := (1 - fx) * fy;
+      w11 := fx * fy;
+      inX0 := (x0 >= 0) and (x0 < W);
+      inX1 := (x1 >= 0) and (x1 < W);
+      inY0 := (y0 >= 0) and (y0 < H);
+      inY1 := (y1 >= 0) and (y1 < H);
+      dLdxp := 0; dLdyp := 0;
+      for dd := 0 to D - 1 do
+      begin
+        gOut := FOutputError.Get(ox, oy, dd);
+        if gOut = 0 then continue;
+        // (i) scatter to the 4 source neighbours by the bilinear weights
+        if HasSrcErr then
+        begin
+          if inX0 and inY0 then SrcErr.Add(x0, y0, dd, w00 * gOut);
+          if inX1 and inY0 then SrcErr.Add(x1, y0, dd, w10 * gOut);
+          if inX0 and inY1 then SrcErr.Add(x0, y1, dd, w01 * gOut);
+          if inX1 and inY1 then SrcErr.Add(x1, y1, dd, w11 * gOut);
+        end;
+        // (ii) sampler partials d(sampled)/d(sx), d(sampled)/d(sy)
+        if inX0 and inY0 then v00 := Src.Get(x0, y0, dd) else v00 := 0;
+        if inX1 and inY0 then v10 := Src.Get(x1, y0, dd) else v10 := 0;
+        if inX0 and inY1 then v01 := Src.Get(x0, y1, dd) else v01 := 0;
+        if inX1 and inY1 then v11 := Src.Get(x1, y1, dd) else v11 := 0;
+        dSdx := (1 - fy) * (v10 - v00) + fy * (v11 - v01);
+        dSdy := (1 - fx) * (v01 - v00) + fx * (v11 - v10);
+        dLdxp := dLdxp + gOut * dSdx * halfWm1; // d sx/d x' = halfWm1
+        dLdyp := dLdyp + gOut * dSdy * halfHm1; // d sy/d y' = halfHm1
+      end;
+      // d(x',y')/d(theta): x' = a*xn + b*yn + c ; y' = d*xn + e*yn + f
+      dth[0] := dth[0] + dLdxp * xn;
+      dth[1] := dth[1] + dLdxp * yn;
+      dth[2] := dth[2] + dLdxp;
+      dth[3] := dth[3] + dLdyp * xn;
+      dth[4] := dth[4] + dLdyp * yn;
+      dth[5] := dth[5] + dLdyp;
+    end;
+  end;
+  if ThetaErr.Size = Theta.Size then
+    for dd := 0 to 5 do
+      ThetaErr.FData[dd] := ThetaErr.FData[dd] + dth[dd];
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Propagate into BOTH sources (theta branch then the image chain).
+  if Assigned(FThetaLayer) and
+     (FThetaLayer.OutputError.Size = FThetaLayer.Output.Size) then
+    FThetaLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -53498,7 +53725,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetAffineGridSample') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -53622,6 +53849,7 @@ begin
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
+      'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -53923,6 +54151,7 @@ begin
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
+      if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
