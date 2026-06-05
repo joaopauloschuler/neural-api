@@ -346,6 +346,40 @@ rather than acted on.
 
 ### Attention variants / siblings
 
+- [ ] TNNet.AddMultiHeadLatentAttention builder + examples/LatentAttention/
+      (DeepSeek-V2 "Multi-head Latent Attention", MLA) — a genuinely distinct
+      compression axis from the landed GQA. GQA shrinks the KV cache by SHARING
+      full-width K/V across query-head GROUPS (fewer heads, each still d_head
+      wide); MLA instead LOW-RANK-FACTORS the K/V projection: each token is first
+      down-projected to a tiny shared latent `c_KV = x·W_DKV` of width
+      `d_c << d_model` (this `c_KV` is the only thing a decoder would cache), then
+      K and V are reconstructed per head by up-projections `K = c_KV·W_UK`,
+      `V = c_KV·W_UV`. So the saving is rank-based (d_c), not head-count-based,
+      and is orthogonal to / composable with GQA. Per [[mha-builder-and-seq-projection]]
+      every per-token projection here MUST be PointwiseConvLinear over a
+      (SeqLen,1,d_model) tensor (FullConnect flattens the sequence and kills the
+      input gradient); the per-head scores reuse the existing
+      TNNetScaledDotProductAttention exactly as the MHA breakdown does (MLA =
+      H concatenated SDPA layers fed reconstructed K/V, NOT a head-axis tensor,
+      per [[multihead-no-head-axis-tensor]]). Two honest v1 scope calls in the
+      "what did NOT fit" style of the Capsule/DEQ entries: (1) ship the
+      DECOUPLED-RoPE detail from the paper — RoPE cannot be applied to the
+      compressed latent because the up-projection would smear positions, so K and
+      Q each carry a small SEPARATE rope-only slice (`d_rope` wide, RoPE'd via the
+      existing positional layer) concatenated to the content slice before the dot
+      product; v1 may start WITHOUT decoupled RoPE (NoPE / additive bias) and add
+      it as a flag if the <5-min pure-CPU budget holds. (2) the headline KV-cache
+      win only materialises with the open [[KV-cache incremental-decode]] path;
+      v1 proves the training-time equivalence instead — assert output shape +
+      report the exact cached-state param saving `d_c / (2·d_model)` vs plain MHA,
+      and a tiny next-token bake-off (val loss at matched param count) vs a
+      param-matched AddMultiHeadSelfAttention and AddMultiHeadGroupedQueryAttention
+      to show MLA holds quality while shrinking the cacheable state. Serialize the
+      multi-source projection slab like the two-source layers in
+      [[cross-attention-asymmetric-seqlen-bug]]. New builder is Claude-authored;
+      no new neuralnetwork.pas CLASS is required if it composes existing layers,
+      but if a thin TNNet* wrapper is added, mark it per [[claude-authorship-comment]].
+
 - [ ] GQA follow-up: exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention
       equivalence to <1e-5 by copying identical weights. Deferred because
       AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab (one
