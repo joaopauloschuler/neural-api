@@ -397,6 +397,7 @@ type
     procedure TestScaledDotProductAttentionForward;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
+    procedure TestScaledDotProductAttentionSeqLenStressGradientCheck;
     procedure TestScaledDotProductAttentionAllMaskedRow;
     procedure TestCosineSimilarityAttentionForward;
     procedure TestCosineSimilarityAttentionGradientCheck;
@@ -9857,6 +9858,82 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionSeqLenStressGradientCheck;
+const
+  SeqLens: array[0..4] of integer = (1, 2, 3, 5, 8);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  SeqLen, Dk, s: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Dk := 4;
+  epsilon := 0.001;
+  for s := Low(SeqLens) to High(SeqLens) do
+  begin
+    SeqLen := SeqLens[s];
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+    try
+      NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+      Attn := TNNetScaledDotProductAttention.Create(Dk, false);
+      NN.AddLayer(Attn);
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(true);
+
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+      for i := 0 to Desired.Size - 1 do
+        Desired.Raw[i] := Cos(i * 0.31);
+
+      maxErr := 0;
+      for i := 0 to Input.Size - 1 do
+      begin
+        InputPlus.Copy(Input);
+        InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(InputPlus);
+        InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+        lossMinus := ComputeLoss(InputPlus);
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+      end;
+
+      AssertTrue('SDPA SeqLen stress gradient at SeqLen=' + IntToStr(SeqLen) +
+        ' maxErr=' + FloatToStr(maxErr), maxErr < 0.01);
+    finally
+      NN.Free;
+      Input.Free;
+      InputPlus.Free;
+      Desired.Free;
+    end;
   end;
 end;
 

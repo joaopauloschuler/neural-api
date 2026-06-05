@@ -350,7 +350,7 @@ rather than acted on.
       SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
       `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
       targets, at matched final loss?
-- [ ] "Attention numerical-gradient stress test" running the SDPA grad check
+- [X] "Attention numerical-gradient stress test" (landed 2026-06-05: SeqLen {1,2,3,5,8} stress test) running the SDPA grad check
       across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
       tolerance at each. Pins shape-edge behavior the existing single-shape
       test can't see.
