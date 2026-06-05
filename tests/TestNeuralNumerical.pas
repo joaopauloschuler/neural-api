@@ -144,6 +144,10 @@ type
     procedure TestCirculantLinearKnownConvolution;
     procedure TestCirculantLinearGradientCheck;
     procedure TestCirculantLinearSerializationRoundTrip;
+    // TNNetHighway input-dependent learned-gate layer
+    procedure TestHighwayGradientCheck;
+    procedure TestHighwaySerializationRoundTrip;
+    procedure TestHighwayGateLimitsIdentityAndTransform;
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
     procedure TestRMSNormGatedForward;
@@ -30970,6 +30974,245 @@ begin
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
       NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHighwayGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  HW: TNNetHighway;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT (which enters in THREE
+  // places: carry, transform input, gate input) and for both weight sets
+  // (transform W_H = neurons[0..N-1], gate W_T = neurons[N..2N-1]). Reseed the
+  // shared RNG per the numerical-test ordering rule.
+  RandSeed := 424242;
+  N := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputPlus := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HW := TNNetHighway.Create(N);
+    NN.AddLayer(HW);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    // Pin both weight matrices so the gate sits in its sensitive mid-range
+    // (not saturated) for the probe.
+    for i := 0 to N - 1 do
+    begin
+      HW.Neurons[i].Weights.Raw[i] := 0.20 + 0.10 * i;          // W_H diagonal
+      HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] := 0.30;     // W_T off-diag
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to N - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Highway input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. transform weights W_H (neurons 0..N-1) ----
+    for i := 0 to N - 1 do
+    begin
+      HW.Neurons[i].Weights.Raw[i] := HW.Neurons[i].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      HW.Neurons[i].Weights.Raw[i] := HW.Neurons[i].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      HW.Neurons[i].Weights.Raw[i] := HW.Neurons[i].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      HW.ClearDeltas();
+      NN.Backpropagate(Desired);
+      analyticalGrad := -HW.Neurons[i].Delta.Raw[i];
+
+      AssertTrue('Highway transform-weight gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. gate weights W_T (neurons N..2N-1) ----
+    for i := 0 to N - 1 do
+    begin
+      HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] :=
+        HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] :=
+        HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] :=
+        HW.Neurons[N + i].Weights.Raw[(i + 1) mod N] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      HW.ClearDeltas();
+      NN.Backpropagate(Desired);
+      analyticalGrad := -HW.Neurons[N + i].Delta.Raw[(i + 1) mod N];
+
+      AssertTrue('Highway gate-weight gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHighwaySerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  HW: TNNetHighway;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, N: integer;
+begin
+  // Highway in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match (proving the
+  // 2*N-neuron transform/gate storage round-trips through the standard
+  // per-neuron serialization and both CreateLayer dispatch points).
+  RandSeed := 424242;
+  N := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HW := TNNetHighway.Create(N);
+    NN.AddLayer(HW);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+      HW.Neurons[i].Weights.Raw[i] := 0.17 * (i + 1) - 0.4;
+      HW.Neurons[N + i].Weights.Raw[i] := 0.05 - 0.03 * i;
+    end;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Highway SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('Highway token present in serialized string',
+        Pos('TNNetHighway', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Highway Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHighwayGateLimitsIdentityAndTransform;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  HW: TNNetHighway;
+  i, N: integer;
+  Hi: TNeuralFloat;
+begin
+  // Smoke test of the two gate limits:
+  //  (1) gate forced CLOSED (b_T very negative => T~0): y == x exactly (identity)
+  //  (2) gate forced OPEN   (b_T very positive => T~1): y == H(x) (bare transform)
+  RandSeed := 424242;
+  N := 4;
+
+  // ---- (1) Closed gate => exact identity ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HW := TNNetHighway.Create(N, {pInitGateBias=}-60.0);
+    NN.AddLayer(HW);
+    for i := 0 to N - 1 do Input.Raw[i] := Sin(i * 1.1) * 0.8 - 0.3;
+    NN.Compute(Input);
+    for i := 0 to N - 1 do
+      AssertEquals('Highway closed-gate identity carry pos ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // ---- (2) Open gate => bare transform H(x) = tanh(W_H.x + b_H) ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HW := TNNetHighway.Create(N, {pInitGateBias=}+60.0);
+    NN.AddLayer(HW);
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.1) * 0.8 - 0.3;
+      // Pin W_H to a pure diagonal (zero the random off-diagonal init) so that
+      // H[i] = tanh(W_H[i,i] * x[i]) is exactly predictable.
+      HW.Neurons[i].Weights.Fill(0);
+      HW.Neurons[i].Weights.Raw[i] := 0.5 + 0.1 * i;
+    end;
+    NN.Compute(Input);
+    for i := 0 to N - 1 do
+    begin
+      // H[i] = tanh(W_H[i].x) with diagonal-only weights here.
+      Hi := HiperbolicTangent(HW.Neurons[i].Weights.Raw[i] * Input.Raw[i]);
+      AssertEquals('Highway open-gate bare-transform pos ' + IntToStr(i),
+        Hi, NN.GetLastLayer.Output.Raw[i], 1e-4);
     end;
   finally
     NN.Free;

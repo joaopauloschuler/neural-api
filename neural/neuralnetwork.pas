@@ -4873,6 +4873,71 @@ type
     constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
   end;
 
+  // Highway-network layer (Srivastava, Greff & Schmidhuber 2015, "Training Very
+  // Deep Networks"):
+  //   y = T(x) (.) H(x) + (1 - T(x)) (.) x
+  // where the TRANSFORM GATE T(x) = sigmoid(W_T.x + b_T) is computed FROM THE
+  // INPUT on every forward pass and H(x) = tanh(W_H.x + b_H) is a learned
+  // transform. This is the input-dependent learned-gate ancestor of the ResNet
+  // skip connection, and is genuinely distinct from the other gated-residual
+  // mechanisms in this tree:
+  //   - TNNetReZero        : a single LEARNED SCALAR gate, input-independent.
+  //   - TNNetGatedResidual : a per-channel LEARNED CONSTANT gate, input-indep.
+  //   - TNNetGLU / SwiGLU  : multiplicative gating with NO identity carry.
+  // Only Highway makes the gate a function of the input AND keeps an explicit
+  // (1 - T) identity carry of x.
+  //
+  // SHAPE: square map (output size = input size); the transform and gate are
+  // per-channel pointwise, so the layer is shape-preserving over Depth and
+  // composes inside the residual builders. The carry term x[i] is the SAME-INDEX
+  // input element (so x must have the layer's own size, i.e. the layer is wired
+  // input->same-size output).
+  //
+  // STORAGE: 2*N neurons (N = output size), each of length N:
+  //   FArrNeurons[0   .. N-1 ] = transform rows W_H (BiasWeight = b_H)
+  //   FArrNeurons[N   .. 2N-1] = gate rows      W_T (BiasWeight = b_T)
+  // so the layer round-trips through the ordinary per-neuron Save/Load with no
+  // custom serialization. The gate biases b_T are initialised NEGATIVE
+  // (default -1.5, the paper's trick) so a fresh deep stack starts near identity
+  // (T ~ 0 => y ~ x). The negative-bias magnitude is stored in FFloatSt[0] so it
+  // round-trips.
+  //
+  // FORWARD (per output i):
+  //   preH = W_H[i].x + b_H[i];  H = tanh(preH)
+  //   preT = W_T[i].x + b_T[i];  T = sigmoid(preT)
+  //   y[i] = T*H + (1 - T)*x[i]
+  // BACKWARD: routes the output error dy[i] through BOTH branches and the gate's
+  // sigmoid. x appears in THREE places (carry, transform input, gate input), so
+  // all three input-error contributions are accumulated:
+  //   dpreH[i] = dy[i] * T[i] * (1 - H[i]^2)          (tanh')
+  //   dpreT[i] = dy[i] * (H[i] - x[i]) * T[i]*(1-T[i])(sigmoid')
+  //   dL/dx   = (1 - T[i])*dy[i]            (carry, same index)
+  //             + sum_i dpreH[i] * W_H[i]   (through the transform)
+  //             + sum_i dpreT[i] * W_T[i]   (through the gate)
+  //   dL/dW_H[i] = dpreH[i] * x ; dL/db_H[i] = dpreH[i]
+  //   dL/dW_T[i] = dpreT[i] * x ; dL/db_T[i] = dpreT[i]
+  // Coded by Claude (AI).
+  TNNetHighway = class(TNNetFullConnectLinear)
+  private
+    FH: TNNetVolume;       // cached tanh transform H(x) of last forward
+    FT: TNNetVolume;       // cached sigmoid gate T(x) of last forward
+    FInitGateBias: TNeuralFloat; // negative gate-bias init (paper's carry trick)
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSizeX, pSizeY, pDepth, pSuppressBias: integer; pInitGateBias: TNeuralFloat); overload;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSize: integer; pInitGateBias: TNeuralFloat); overload;
+    destructor Destroy(); override;
+    property TransformGate: TNNetVolume read FT;
+  end;
+
   // Pointwise softmax operation.
   TNNetPointwiseSoftMax = class(TNNetIdentity)
   protected
@@ -29864,6 +29929,230 @@ begin
   end;
 end;
 
+{ TNNetHighway }
+
+constructor TNNetHighway.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  // H is a tanh transform (the paper's choice). The inherited FullConnectLinear
+  // constructor forced Identity; restore tanh for the H branch.
+  FActivationFn := @HiperbolicTangent;
+  FActivationFnDerivative := @HiperbolicTangentDerivative;
+  FH := TNNetVolume.Create();
+  FT := TNNetVolume.Create();
+  // Paper's carry trick: bias the gate toward the identity carry at init.
+  FInitGateBias := -1.5;
+  FFloatSt[0] := FInitGateBias;
+end;
+
+constructor TNNetHighway.Create(pSizeX, pSizeY, pDepth, pSuppressBias: integer;
+  pInitGateBias: TNeuralFloat);
+begin
+  Self.Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  FInitGateBias := pInitGateBias;
+  FFloatSt[0] := pInitGateBias;
+end;
+
+constructor TNNetHighway.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+constructor TNNetHighway.Create(pSize: integer; pInitGateBias: TNeuralFloat);
+begin
+  Self.Create(pSize, 1, 1, 0);
+  FInitGateBias := pInitGateBias;
+  FFloatSt[0] := pInitGateBias;
+end;
+
+destructor TNNetHighway.Destroy();
+begin
+  FH.Free;
+  FT.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetHighway.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N: integer;
+begin
+  // Bypass TNNetFullConnect.SetPrevLayer: it sizes EVERY neuron to the input
+  // size and runs BuildArrNeurons for FOutput.Size neurons. Highway keeps 2*N
+  // neurons (N transform rows + N gate rows), each of length N (a SQUARE map).
+  FPrevLayer := pPrevLayer;
+  N := pPrevLayer.Output.Size;
+  if N <> FOutput.Size then
+  begin
+    FErrorProc
+    (
+      'TNNetHighway requires a square map: input size '+IntToStr(N)+
+      ' must equal output size '+IntToStr(FOutput.Size)+'.'
+    );
+  end;
+  while FNeurons.Count > 2*N do FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 2*N do FNeurons.Add(TNNetNeuron.Create());
+  SetNumWeightsForAllNeurons(N);
+  FVectorSize := FNeurons[0].Weights.Size;
+  InitDefault();
+  BuildArrNeurons();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetHighway.InitDefault();
+var
+  N, i: integer;
+begin
+  inherited InitDefault();
+  N := FOutput.Size;
+  // Bias the gate's pre-activation NEGATIVE so sigmoid(b_T) ~ 0 and a fresh
+  // stack starts near the identity carry y ~ x. Transform biases start at 0.
+  for i := 0 to N - 1 do
+  begin
+    if FNeurons.Count > i then FNeurons[i].FBiasWeight := 0;
+    if FNeurons.Count > N + i then FNeurons[N + i].FBiasWeight := FInitGateBias;
+  end;
+end;
+
+// Compute / Backpropagate are overridden (not inherited from TNNetFullConnect)
+// because the inherited versions guard on FNeurons.Count = FOutput.Size; this
+// layer keeps 2*N neurons regardless of the N-sized output.
+procedure TNNetHighway.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetHighway.ComputeCPU();
+var
+  N, i: integer;
+  preH, preT, Hi, Ti, xi: TNeuralFloat;
+  PrevOut: TNNetVolume;
+begin
+  N := FOutput.Size;
+  PrevOut := FPrevLayer.FOutput;
+  FH.ReSize(FOutput);
+  FT.ReSize(FOutput);
+  for i := 0 to N - 1 do
+  begin
+    preH := FArrNeurons[i].FWeights.DotProduct(PrevOut);
+    preT := FArrNeurons[N + i].FWeights.DotProduct(PrevOut);
+    if FSuppressBias = 0 then
+    begin
+      preH := preH + FArrNeurons[i].FBiasWeight;
+      preT := preT + FArrNeurons[N + i].FBiasWeight;
+    end;
+    Hi := FActivationFn(preH);          // tanh transform
+    Ti := Sigmoid(preT);                // transform gate
+    xi := PrevOut.FData[i];
+    FH.FData[i] := Hi;
+    FT.FData[i] := Ti;
+    FOutput.FData[i] := Ti * Hi + (1.0 - Ti) * xi;
+  end;
+end;
+
+procedure TNNetHighway.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Input gradient: x appears in THREE places, so accumulate all three.
+//   dL/dx = (1-T).*dy                         (carry, same index)
+//         + sum_i dpreH[i]*W_H[i]             (through tanh transform)
+//         + sum_i dpreT[i]*W_T[i]             (through the gate sigmoid)
+// where dpreH[i] = dy[i]*T[i]*tanh'(preH)  and
+//       dpreT[i] = dy[i]*(H[i]-x[i])*T[i]*(1-T[i]).
+procedure TNNetHighway.ComputePreviousLayerErrorCPU();
+var
+  N, i: integer;
+  LocalPrevError, PrevOut: TNNetVolume;
+  dy, Ti, Hi, xi, dpreH, dpreT, hDeriv: TNeuralFloat;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  PrevOut := FPrevLayer.FOutput;
+  N := FOutput.Size;
+  for i := 0 to N - 1 do
+  begin
+    dy := FOutputError.FData[i];
+    if dy = 0.0 then continue;
+    Ti := FT.FData[i];
+    Hi := FH.FData[i];
+    xi := PrevOut.FData[i];
+    // tanh'(preH) = 1 - H^2 (H is already tanh(preH)).
+    hDeriv := 1.0 - Hi * Hi;
+    dpreH := dy * Ti * hDeriv;
+    dpreT := dy * (Hi - xi) * Ti * (1.0 - Ti);
+    // Carry term (same index).
+    LocalPrevError.FData[i] := LocalPrevError.FData[i] + (1.0 - Ti) * dy;
+    // Through the transform and the gate (full rows over the input).
+    LocalPrevError.MulAdd(dpreH, FArrNeurons[i].FWeights);
+    LocalPrevError.MulAdd(dpreT, FArrNeurons[N + i].FWeights);
+  end;
+end;
+
+// Weight gradients:
+//   dL/dW_H[i] = dpreH[i]*x ; dL/db_H[i] = dpreH[i]
+//   dL/dW_T[i] = dpreT[i]*x ; dL/db_T[i] = dpreT[i]
+// accumulated into the neurons' Delta (scaled by -FLearningRate) so the
+// ordinary inertia / Adam update machinery applies unchanged.
+procedure TNNetHighway.BackpropagateCPU();
+var
+  N, i: integer;
+  PrevOut: TNNetVolume;
+  dy, Ti, Hi, xi, dpreH, dpreT, hDeriv, gH, gT: TNeuralFloat;
+  nH, nT: TNNetNeuron;
+begin
+  N := FOutput.Size;
+  PrevOut := FPrevLayer.FOutput;
+  for i := 0 to N - 1 do
+  begin
+    dy := FOutputError.FData[i];
+    nH := FArrNeurons[i];
+    nT := FArrNeurons[N + i];
+    if dy <> 0.0 then
+    begin
+      Ti := FT.FData[i];
+      Hi := FH.FData[i];
+      xi := PrevOut.FData[i];
+      hDeriv := 1.0 - Hi * Hi;
+      dpreH := dy * Ti * hDeriv;
+      dpreT := dy * (Hi - xi) * Ti * (1.0 - Ti);
+      gH := -FLearningRate * dpreH;
+      gT := -FLearningRate * dpreT;
+      if gH <> 0.0 then
+      begin
+        nH.FDelta.MulAdd(gH, PrevOut);
+        if FSuppressBias = 0 then nH.FBiasDelta := nH.FBiasDelta + gH;
+      end;
+      if gT <> 0.0 then
+      begin
+        nT.FDelta.MulAdd(gT, PrevOut);
+        if FSuppressBias = 0 then nT.FBiasDelta := nT.FBiasDelta + gT;
+      end;
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for i := 0 to 2*N - 1 do FArrNeurons[i].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetWeightStandardization }
 
 constructor TNNetWeightStandardization.Create(pSizeX, pSizeY, pDepth: integer;
@@ -52007,6 +52296,7 @@ begin
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetHighway' :              Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetSpectralNorm' :         Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]);
       'TNNetWeightStandardization': Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]);
       'TNNetWeightNormLinear':      Result := TNNetWeightNormLinear.Create(St[0], St[1], St[2], St[3], Ft[0]);
@@ -52305,6 +52595,7 @@ begin
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetHighway' then Result := TNNetHighway.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetSpectralNorm' then Result := TNNetSpectralNorm.Create(St[0], St[1], St[2], St[3], St[5]) else
       if S[0] = 'TNNetWeightStandardization' then Result := TNNetWeightStandardization.Create(St[0], St[1], St[2], St[3], Ft[0]) else
       if S[0] = 'TNNetWeightNormLinear' then Result := TNNetWeightNormLinear.Create(St[0], St[1], St[2], St[3], Ft[0]) else
