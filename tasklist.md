@@ -108,20 +108,6 @@ rather than acted on.
       chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
       the parallel and naive-recurrent forms both landed).
 
-- [X] TNNetSLSTMCell + TNNet.AddSLSTM — the xLSTM scalar-memory recurrent cell
-      (Beck et al. 2024, "xLSTM", arXiv:2405.04517) LANDED 2026-06-05 (commit
-      3bdea3e). Scalar sLSTM over (SeqLen,1,Depth): exp input/forget gates,
-      running-max stabilizer m_t (stop-gradient), normalizer n_t, sigmoid output
-      gate, h_t = o_t*(c_t/n_t); twelve neuron tensors (W_z/W_i/W_f/W_o,
-      r_z/r_i/r_f/r_o Depth×Depth, b_z/b_i/b_f/b_o, b_f init +1); BPTT carrying
-      dL/dc,dL/dn,dL/dh; serialized like other weight-carriers. TNNet.AddSLSTM is
-      a pre-norm RMSNorm residual builder. Tests in TestNeuralNumerical.pas
-      (input + weight numerical-gradient with RandSeed:=424242, save/load
-      round-trip, builder); examples/SLSTMvsCfC/ contrasts sLSTM vs CfC vs
-      DiagonalSSM on a copy/state-reset task (all reach 100% on the easy toy at
-      950/330/150 weights — honest framing, no manufactured win). Caught+fixed a
-      forward bug where in-place FH update leaked current-step h_t into later
-      channels' gates. Follow-up below.
 - [ ] mLSTM matrix-memory variant (xLSTM follow-up to the landed scalar sLSTM):
       outer-product key/value covariance update C_t = f_t C_{t-1} + i_t v_t k_t^T
       with the same m/n running-max stabilizer, giving a parallelisable
@@ -139,26 +125,6 @@ rather than acted on.
       generator's output width (generate W in tiles) — the landed layer
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
-
-- [ ] TNNetGraphAttention + TNNet.AddGraphAttention (GAT, Velickovic et al. 2018,
-      "Graph Attention Networks", arXiv:1710.10903) — an ATTENTION-based message-
-      passing layer over a caller-supplied adjacency, the learned-edge-weight
-      cousin of the landed spectral TNNetGraphConvolution (which uses a FIXED
-      symmetrically-normalized adjacency Ahat). Distinct mechanism, not a near-dup:
-      per node i project h_i (shared W), then for every edge (i,j) present in A
-      compute an attention logit e_ij = LeakyReLU(a^T[Wh_i || Wh_j]), softmax over
-      j IN i's neighbourhood ONLY (non-edges masked to -inf, like the causal mask
-      in SDPA), and read h'_i = sum_j alpha_ij (W h_j). Model the caller-supplied,
-      not-persisted adjacency wiring (SetAdjacency, rebuilt after LoadFromString)
-      and bias/feature-dim FStruct layout on TNNetGraphConvolution; the new pieces
-      are the per-edge attention scoring vector a (2*FeatureDim) and the
-      neighbourhood-masked softmax + its Jacobian in backward (reuse the SDPA
-      softmax-Jacobian path). Needs input + weight numerical-gradient tests
-      (RandSeed:=424242), a save/load round-trip (assert SetAdjacency required
-      after load), and a tiny node-classification example (examples/GraphAttention/
-      on a toy 2-community graph) contrasting GAT vs the existing GCN. Optional
-      follow-up: multi-head concatenation (H separate score vectors, like the
-      multi-head = H concatenated SDPA convention already used in this fork).
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
@@ -309,14 +275,6 @@ rather than acted on.
       any future mixed-precision work.
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
-- [X] Causal-mask + SoftCapping interaction study: with logits clipped via
-      `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
-      next-token task and chart loss + max-logit-norm. LANDED 2026-06-05 (commit
-      d9a556e) as examples/SoftCappingSweep/. Reports TWO norms — effective
-      post-cap (always ≤ c) and raw pre-cap — because a tight cap makes the net
-      INFLATE its raw logits (raw-norm ~51 at c=5 vs ~5 uncapped) while the
-      softmax input stays bounded; the headline is "logit norm depends on where
-      you measure". Runs all 5 arms in ~10s.
 - [ ] Lottery-ticket IMP follow-up (make the headline land): the landed
       examples/LotteryTicketIMP showed NO IMP advantage because the toy is too
       easy and the budget too generous (one-shot never collapses). Build the
