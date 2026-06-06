@@ -26,7 +26,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 // Enable this flag if you intend to use OpenCL
 //{$Define OpenCL}
-
 {$DEFINE HASTHREADS}
 
 {$IFDEF FPC}

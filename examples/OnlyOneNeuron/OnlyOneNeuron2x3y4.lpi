@@ -53,10 +53,10 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dDebug
--dAVX"/>
+-dAVX2"/>
             <OtherDefines Count="2">
               <Define0 Value="Debug"/>
-              <Define1 Value="AVX"/>
+              <Define1 Value="AVX2"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -86,13 +86,12 @@
             <LinkSmart Value="True"/>
           </Linking>
           <Other>
-            <OtherDefines Count="6">
+            <OtherDefines Count="5">
               <Define0 Value="Release"/>
               <Define1 Value="Debug"/>
               <Define2 Value="CheckRange"/>
               <Define3 Value="AVX2"/>
-              <Define4 Value="AVX"/>
-              <Define5 Value="OpenCL"/>
+              <Define4 Value="OpenCL"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -107,11 +106,6 @@
         <Mode0 Name="default"/>
       </Modes>
     </RunParams>
-    <RequiredPackages Count="1">
-      <Item1>
-        <PackageName Value="multithreadprocslaz"/>
-      </Item1>
-    </RequiredPackages>
     <Units Count="1">
       <Unit0>
         <Filename Value="OnlyOneNeuron2x3y4.lpr"/>
@@ -141,10 +135,10 @@
       </Debugging>
     </Linking>
     <Other>
-      <CustomOptions Value="-dAVX
+      <CustomOptions Value="-dAVX2
 -dRelease"/>
       <OtherDefines Count="2">
-        <Define0 Value="AVX"/>
+        <Define0 Value="AVX2"/>
         <Define1 Value="Release"/>
       </OtherDefines>
     </Other>

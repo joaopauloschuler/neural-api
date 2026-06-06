@@ -1,2 +1,20 @@
 */backup
 */*.lps
+
+# Compiled example executables (Linux, no extension)
+ActivationStatsReport/ActivationStatsReport
+CausalMaskSanity/CausalMaskSanity
+CoordConvSpiral/CoordConvSpiral
+CumSumPositionEncoding/CumSumPositionEncoding
+DomainAdversarial/DomainAdversarial
+DropPathAblation/DropPathAblation
+EchoStateNetwork/EchoStateNetwork
+EuclideanNormHead/EuclideanNormHead
+GatherChannelsRouting/GatherChannelsRouting
+HardConcreteSparsity/HardConcreteSparsity
+ModelSummaryDemo/ModelSummaryDemo
+MuonOptimizer/MuonOptimizer
+PerplexityEval/PerplexityEval
+QuantileRegression/QuantileRegression
+RandomLabelMemorization/RandomLabelMemorization
+SpeculativeDecoding/SpeculativeDecoding

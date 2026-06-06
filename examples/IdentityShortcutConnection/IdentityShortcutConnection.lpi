@@ -53,11 +53,11 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dDebug
--dAVX
+-dAVX2
 -dOpenCL"/>
             <OtherDefines Count="4">
               <Define0 Value="Debug"/>
-              <Define1 Value="AVX"/>
+              <Define1 Value="AVX2"/>
               <Define2 Value="MakeQuick"/>
               <Define3 Value="OpenCL"/>
             </OtherDefines>
@@ -90,15 +90,14 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dRelease
--dAVX
+-dAVX2
 -dOpenCL"/>
-            <OtherDefines Count="6">
+            <OtherDefines Count="5">
               <Define0 Value="Release"/>
               <Define1 Value="Debug"/>
               <Define2 Value="CheckRange"/>
               <Define3 Value="AVX2"/>
-              <Define4 Value="AVX"/>
-              <Define5 Value="OpenCL"/>
+              <Define4 Value="OpenCL"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -120,11 +119,6 @@
         </Mode0>
       </Modes>
     </RunParams>
-    <RequiredPackages Count="1">
-      <Item1>
-        <PackageName Value="multithreadprocslaz"/>
-      </Item1>
-    </RequiredPackages>
     <Units Count="1">
       <Unit0>
         <Filename Value="IdentityShortcutConnection.pas"/>
@@ -154,11 +148,11 @@
       </Debugging>
     </Linking>
     <Other>
-      <CustomOptions Value="-dAVX
+      <CustomOptions Value="-dAVX2
 -dRelease
 -dOpenCL"/>
       <OtherDefines Count="3">
-        <Define0 Value="AVX"/>
+        <Define0 Value="AVX2"/>
         <Define1 Value="Release"/>
         <Define2 Value="OpenCL"/>
       </OtherDefines>

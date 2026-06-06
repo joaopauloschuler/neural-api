@@ -485,7 +485,7 @@ begin
   if (NG.TestNeuronLayer.N > 10) then
   begin
     NG.TestNeuronLayer.TestThreshold :=
-    NG.TestNeuronLayer.N - Random(NG.TestNeuronLayer.N div 10);
+    NG.TestNeuronLayer.N - Random(Integer(NG.TestNeuronLayer.N div 10));
   end
   else
   begin

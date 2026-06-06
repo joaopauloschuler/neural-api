@@ -41,7 +41,7 @@ unit neuralvolume;
 
 interface
 
-uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils;
+uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32;
 
 {$include neuralnetwork.inc}
 
@@ -191,6 +191,8 @@ type
     procedure ForceMaxRange(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxMagnitude(Value: T); {$IFDEF Release} inline; {$ENDIF}
     procedure ForceMaxAbs(Value: T); {$IFDEF Release} inline; {$ENDIF}
+    // Returns true if any element is NaN or +/-Inf (non-finite).
+    function HasNonFinite(): boolean;
     procedure ForcePositive(); {$IFDEF Release} inline; {$ENDIF}
     procedure Randomize(a:integer=10000; b:integer=5000; c:integer=5000); {$IFDEF Release} inline; {$ENDIF}
     procedure RandomizeGaussian(pMul: TNeuralFloat = 1.0); {$IFDEF Release} inline; {$ENDIF}
@@ -536,6 +538,44 @@ type
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
 
+  { TNNetTokenHistoryPenalty }
+  // Stateful logit processor that sits BETWEEN the model output and the
+  // TNNetSamplerBase family (Greedy / TopK / TopP). It is NOT a sampler: it
+  // owns a per-token occurrence count over the tokens emitted so far and
+  // rewrites the next-step logit volume in place (Apply) before a sampler
+  // reads it, implementing three standard, distinct knobs:
+  // (a) repetition penalty (Keskar et al. CTRL 2019) - divide a logit by
+  //     FRepetition>1 if its token has appeared, in the sign-correct CTRL
+  //     form (l := l/r for l>0, l := l*r for l<0) so a penalty always lowers
+  //     the score;
+  // (b) frequency penalty - subtract FFrequency * count[t] (scales with how
+  //     OFTEN the token was used);
+  // (c) presence penalty - subtract FPresence once for any token used at
+  //     least once (a flat "encourage new tokens" push).
+  // Typical caller usage:
+  //   Penalty.Apply(Logits); tok := Sampler.GetToken(Logits);
+  //   Penalty.RegisterToken(tok);
+  // Coded by Claude (AI).
+  TNNetTokenHistoryPenalty = class(TObject)
+    protected
+      FRepetition: TNeuralFloat;
+      FFrequency: TNeuralFloat;
+      FPresence: TNeuralFloat;
+      FCounts: array of integer;
+      procedure EnsureSize(NewSize: integer);
+    public
+      // Defaults are NO-OP: r=1.0, alpha_f=0.0, alpha_p=0.0.
+      constructor Create(Repetition: TNeuralFloat = 1.0;
+        Frequency: TNeuralFloat = 0.0; Presence: TNeuralFloat = 0.0);
+      destructor Destroy(); override;
+      // Increments the occurrence count of TokenId (call after each emit).
+      procedure RegisterToken(TokenId: integer);
+      // Clears all counts for a fresh sequence.
+      procedure ResetHistory();
+      // Mutates the logit volume in place; each element index is a token id.
+      procedure Apply(Logits: TNNetVolume);
+  end;
+
   /// Implements a pair of volumes
   TNNetVolumePair = class(TObject)
     protected
@@ -874,6 +914,34 @@ type
   function NeuralFloatToStr(V: TNeuralFloat): string;
   function NeuralStrToFloat(V: String): TNeuralFloat;
 
+  { AssertFinite scans every element of V for NaN/Inf and raises a
+    labelled exception on the first offending value. Useful for catching
+    numerical instability in forward/backward passes. }
+  procedure AssertFinite(V: TNNetVolume; const Where: string);
+
+  { RandomBetaValue draws a sample from a Beta(Alpha, Alpha) distribution
+    using the repo's global Random RNG. Implemented via two Gamma(Alpha,1)
+    draws: Beta = Ga/(Ga+Gb). For Alpha=1 this reduces to Uniform(0,1), the
+    common practical Mixup default. The Gamma sampler uses the Marsaglia &
+    Tsang (2000) method, supporting any Alpha > 0. }
+  function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
+  function RandomBetaValue(Alpha: TNeuralFloat): TNeuralFloat;
+
+  { MixVolumes computes the convex combination
+      Output := Lambda*A + (1-Lambda)*B
+    Output is resized to match A. A and B must have matching sizes. }
+  procedure MixVolumes(Output, A, B: TNNetVolume; Lambda: TNeuralFloat);
+
+  { CreateMixedVolumePairList returns a NEW TNNetVolumePairList (owning copies)
+    where each pair is the Mixup convex combination of an original pair with a
+    randomly-permuted partner pair. Lambda is drawn per pair from
+    Beta(Alpha, Alpha). The input list is NOT mutated. The caller owns the
+    result and must Free it. Pass a fixed FixedLambda >= 0 to override the
+    Beta draw (handy for tests / deterministic runs); FixedLambda < 0 (default)
+    uses the Beta sampler. }
+  function CreateMixedVolumePairList(Original: TNNetVolumePairList;
+    Alpha: TNeuralFloat = 1.0; FixedLambda: TNeuralFloat = -1.0): TNNetVolumePairList;
+
   function GetLastChars(const InputStr: string; LenStr: Integer): string;
 
   procedure TestTNNetVolume();
@@ -982,11 +1050,11 @@ var
 begin
   if x > 0 then
   begin
-    Result := 1 / ( 1 + Exp(-x) )
+    Result := 1 / ( 1 + pcr_expf(-x) )
   end
   else
   begin
-    S := Exp(x);
+    S := pcr_expf(x);
     Result := S / (1 + S);
   end;
 end;
@@ -1530,11 +1598,153 @@ begin
   Result := StrToFloat(V,LocalFormatSettings);
 end;
 
+procedure AssertFinite(V: TNNetVolume; const Where: string);
+var
+  I: integer;
+  Val: TNeuralFloat;
+begin
+  if V = nil then
+    raise Exception.Create('AssertFinite(' + Where + '): volume is nil');
+  for I := 0 to V.Size - 1 do
+  begin
+    Val := V.FData[I];
+    if IsNan(Val) then
+      raise Exception.Create('AssertFinite(' + Where +
+        '): non-finite value at index ' + IntToStr(I) +
+        ': NaN (' + FloatToStr(Val) + ')');
+    if IsInfinite(Val) then
+      raise Exception.Create('AssertFinite(' + Where +
+        '): non-finite value at index ' + IntToStr(I) +
+        ': Inf (' + FloatToStr(Val) + ')');
+  end;
+end;
+
 procedure WriteLnPassIfZero(x: TNeuralFloat; Tolerance: TNeuralFloat=0.0001);
 begin
   if Abs(x) < Tolerance
   then WriteLn(' Passed.')
   else WriteLn(' FAILED.');
+end;
+
+// Marsaglia & Tsang (2000) "A Simple Method for Generating Gamma Variables".
+// Generates a Gamma(Alpha, 1) sample using the repo's global Random RNG.
+// Standard normal sample (Marsaglia polar) using the global Random RNG.
+function RandomStdNormal(): TNeuralFloat;
+var
+  r, x, y: TNeuralFloat;
+begin
+  r := 0;
+  while (r > 1) or (r = 0) do
+  begin
+    x := 2.0 * Random() - 1.0;
+    y := 2.0 * Random() - 1.0;
+    r := x * x + y * y;
+  end;
+  Result := x * Sqrt(-2.0 * Ln(r) / r);
+end;
+
+function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
+var
+  d, c, x, v, u: TNeuralFloat;
+begin
+  Result := 0;
+  if Alpha <= 0 then Exit;
+  // Boost: for Alpha < 1 use Gamma(Alpha) = Gamma(Alpha+1) * U^(1/Alpha).
+  if Alpha < 1 then
+  begin
+    u := Random();
+    // Guard against log(0) below by avoiding a zero draw.
+    while u <= 0 do u := Random();
+    Result := RandomGammaValue(Alpha + 1.0) * Power(u, 1.0 / Alpha);
+    Exit;
+  end;
+  d := Alpha - 1.0 / 3.0;
+  c := 1.0 / Sqrt(9.0 * d);
+  while True do
+  begin
+    repeat
+      x := RandomStdNormal();
+      v := 1.0 + c * x;
+    until v > 0;
+    v := v * v * v;
+    u := Random();
+    if u < 1.0 - 0.0331 * (x * x) * (x * x) then
+    begin
+      Result := d * v;
+      Exit;
+    end;
+    if Ln(u) < 0.5 * x * x + d * (1.0 - v + Ln(v)) then
+    begin
+      Result := d * v;
+      Exit;
+    end;
+  end;
+end;
+
+function RandomBetaValue(Alpha: TNeuralFloat): TNeuralFloat;
+var
+  ga, gb: TNeuralFloat;
+begin
+  // Beta(1,1) == Uniform(0,1): fast path and exact.
+  if Alpha = 1.0 then
+  begin
+    Result := Random();
+    Exit;
+  end;
+  ga := RandomGammaValue(Alpha);
+  gb := RandomGammaValue(Alpha);
+  if ga + gb <= 0
+  then Result := 0.5
+  else Result := ga / (ga + gb);
+end;
+
+procedure MixVolumes(Output, A, B: TNNetVolume; Lambda: TNeuralFloat);
+begin
+  // Output := Lambda*A + (1-Lambda)*B, reusing AVX-backed volume ops.
+  Output.Copy(A);
+  Output.Mul(Lambda);
+  Output.MulAdd(1.0 - Lambda, B);
+end;
+
+function CreateMixedVolumePairList(Original: TNNetVolumePairList;
+  Alpha: TNeuralFloat; FixedLambda: TNeuralFloat): TNNetVolumePairList;
+var
+  Cnt, I, J, Tmp, Partner: integer;
+  Perm: array of integer;
+  Lambda: TNeuralFloat;
+  MixedA, MixedB: TNNetVolume;
+  PartnerPair: TNNetVolumePair;
+begin
+  Result := TNNetVolumePairList.Create();
+  if Original = nil then Exit;
+  Cnt := Original.Count;
+  if Cnt = 0 then Exit;
+
+  // Build a random derangement-ish permutation (Fisher-Yates) so each sample
+  // is paired with another sample from the same list (minibatch mixup).
+  SetLength(Perm, Cnt);
+  for I := 0 to Cnt - 1 do Perm[I] := I;
+  for I := Cnt - 1 downto 1 do
+  begin
+    J := Random(I + 1);
+    Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
+  end;
+
+  for I := 0 to Cnt - 1 do
+  begin
+    Partner := Perm[I];
+    PartnerPair := Original[Partner];
+    if FixedLambda >= 0
+    then Lambda := FixedLambda
+    else Lambda := RandomBetaValue(Alpha);
+
+    MixedA := TNNetVolume.Create();
+    MixedB := TNNetVolume.Create();
+    MixVolumes(MixedA, Original[I].A, PartnerPair.A, Lambda);
+    MixVolumes(MixedB, Original[I].B, PartnerPair.B, Lambda);
+    // TNNetVolumePair.Create takes ownership of the volumes.
+    Result.Add(TNNetVolumePair.Create(MixedA, MixedB));
+  end;
 end;
 
 // https://machinelearningmastery.com/a-gentle-introduction-to-positional-encoding-in-transformer-models-part-1/
@@ -1856,14 +2066,14 @@ end;
 
 function Swish(x: TNeuralFloat): TNeuralFloat;
 begin
-  Result := x / ( 1 + Exp(-x) );
+  Result := x / ( 1 + pcr_expf(-x) );
 end;
 
 function SwishDerivative(x: TNeuralFloat): TNeuralFloat;
 var
   SigmoidValue, OutputValue: TNeuralFloat;
 begin
-  SigmoidValue := 1 / ( 1 + Exp(-x) ); {Swish(x)}
+  SigmoidValue := 1 / ( 1 + pcr_expf(-x) ); {Swish(x)}
   OutputValue := x * SigmoidValue;
   Result :=  OutputValue + SigmoidValue * (1-OutputValue);
 end;
@@ -2033,6 +2243,80 @@ function TNNetSamplerGreedy.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
   Result := Origin.GetClassOnPixel(PixelX, PixelY);
+end;
+
+{ TNNetTokenHistoryPenalty }
+
+constructor TNNetTokenHistoryPenalty.Create(Repetition: TNeuralFloat = 1.0;
+  Frequency: TNeuralFloat = 0.0; Presence: TNeuralFloat = 0.0);
+begin
+  inherited Create();
+  FRepetition := Repetition;
+  FFrequency := Frequency;
+  FPresence := Presence;
+  SetLength(FCounts, 0);
+end;
+
+destructor TNNetTokenHistoryPenalty.Destroy();
+begin
+  SetLength(FCounts, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetTokenHistoryPenalty.EnsureSize(NewSize: integer);
+var
+  OldSize, I: integer;
+begin
+  OldSize := Length(FCounts);
+  if NewSize > OldSize then
+  begin
+    SetLength(FCounts, NewSize);
+    for I := OldSize to NewSize - 1 do FCounts[I] := 0;
+  end;
+end;
+
+procedure TNNetTokenHistoryPenalty.RegisterToken(TokenId: integer);
+begin
+  if TokenId < 0 then exit;
+  EnsureSize(TokenId + 1);
+  Inc(FCounts[TokenId]);
+end;
+
+procedure TNNetTokenHistoryPenalty.ResetHistory();
+var
+  I, MaxI: integer;
+begin
+  MaxI := Length(FCounts) - 1;
+  for I := 0 to MaxI do FCounts[I] := 0;
+end;
+
+procedure TNNetTokenHistoryPenalty.Apply(Logits: TNNetVolume);
+var
+  I, MaxToken, Count: integer;
+  Logit: TNeuralFloat;
+begin
+  // The history can never be larger than the logit volume of interest.
+  MaxToken := Length(FCounts) - 1;
+  if MaxToken >= Logits.Size then MaxToken := Logits.Size - 1;
+  for I := 0 to MaxToken do
+  begin
+    Count := FCounts[I];
+    if Count > 0 then
+    begin
+      Logit := Logits.FData[I];
+      // (a) repetition penalty - sign-correct CTRL form.
+      if FRepetition <> 1.0 then
+      begin
+        if Logit > 0 then Logit := Logit / FRepetition
+        else Logit := Logit * FRepetition;
+      end;
+      // (b) frequency penalty - scales with the occurrence count.
+      Logit := Logit - FFrequency * Count;
+      // (c) presence penalty - flat push for any token used at least once.
+      Logit := Logit - FPresence;
+      Logits.FData[I] := Logit;
+    end;
+  end;
 end;
 
 { TStringVolumeList }
@@ -3682,7 +3966,7 @@ begin
     r := x*x + y*y;
   end;
 
-  RandomGaussianValue := x * Sqrt(-2.0 * Ln(r) / r);
+  RandomGaussianValue := x * Sqrt(-2.0 * pcr_logf(r) / r);
 end;
 
 procedure TVolume.Add(Original: TVolume);
@@ -4264,7 +4548,7 @@ begin
   begin
     vHigh := High(FData);
     for I := 0 to vHigh do
-      FData[I] := Power(FData[I],Value);
+      FData[I] := pcr_powf(FData[I],Value);
   end;
 end;
 
@@ -4542,6 +4826,21 @@ begin
     VFix := Value/VMaxAbs;
     Self.Mul( VFix );
     WriteLn(VMaxAbs:6:2);
+  end;
+end;
+
+function TVolume.HasNonFinite(): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FSize - 1 do
+  begin
+    if IsNan(FData[I]) or IsInfinite(FData[I]) then
+    begin
+      Result := true;
+      Exit;
+    end;
   end;
 end;
 
@@ -5725,7 +6024,7 @@ end;
 
 function TVolume.GetPerplexity: T;
 begin
-  Result := Power(2, GetEntropy());
+  Result := pcr_exp2f(GetEntropy());
 end;
 
 procedure TVolume.FlipX();
@@ -6124,8 +6423,10 @@ begin
 
     for I := 0 to vHigh do
     begin
-      // LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
-      LocalValue := Exp( FData[I] );
+      // FData has already been shifted by Sub(MaxValue) above, so do not
+      // subtract MaxValue again here (that would underflow Exp to zero).
+      LocalValue := Exp( NeuronForceRange(FData[I], 4000) );
+      // LocalValue := pcr_expf( FData[I] );
       FData[I] := LocalValue;
       TotalSum := TotalSum + FData[I];
     end;
@@ -6183,6 +6484,7 @@ begin
         I := StartPointPos;
         for CountD := 0 to MaxD do
         begin
+          // LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
           LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
           FData[I] := LocalValue;
           TotalSum := TotalSum + LocalValue;
@@ -6296,6 +6598,7 @@ begin
           I := StartPointPos;
           for CountD := 0 to ChannelsPerGroup - 1 do
           begin
+            //LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
             LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
             FData[I] := LocalValue;
             TotalSum := TotalSum + LocalValue;
@@ -6607,13 +6910,13 @@ begin
       end
       else
       begin
-        WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncoding.');
+        WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncodingReversed.');
       end;
     end;
   end
   else
   begin
-    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncoding.');
+    WriteLn('Token length '+IntToStr(MaxToken + 1)+' is bigger than Size X '+IntToStr(SizeX)+' at OneHotEncodingReversed.');
   end;
 end;
 
@@ -6631,15 +6934,15 @@ begin
   MaxDepth := FDepth - 1;
   for CntDepth := 0 to MaxDepth do
   begin
-    divTerm := Power(n, (2 * (CntDepth div 2)) / EmbeddingSize);
+    divTerm := pcr_powf(n, (2 * (CntDepth div 2)) / EmbeddingSize);
     for CntX := 0 to MaxX do
     begin
       for CntY := 0 to MaxY do
       begin
         Position := CntY*FSizeX + CntX;
         if CntDepth mod 2 = 0
-          then Self[CntX, CntY, CntDepth] := Sin(Position / divTerm)
-          else Self[CntX, CntY, CntDepth] := Cos(Position / divTerm);
+          then Self[CntX, CntY, CntDepth] := pcr_sinf(Position / divTerm)
+          else Self[CntX, CntY, CntDepth] := pcr_cosf(Position / divTerm);
       end;
     end;
   end;

@@ -37,6 +37,14 @@ type
     
     // Overfitting detection
     procedure TestSmallNetworkFitsData;
+
+    // Weight-averaging wrappers (SWA / EMA)
+    procedure TestSWAMeanOfConstant;
+    procedure TestSWAMeanOfTwo;
+    procedure TestSWAMeanOfThree;
+    procedure TestEMADecayZeroEqualsLive;
+    procedure TestEMADecayOneKeepsShadow;
+    procedure TestEMAConvergesToConstant;
   end;
 
 implementation
@@ -797,6 +805,163 @@ begin
   finally
     NN.Free;
     TrainPairs.Free;
+  end;
+end;
+
+// --- Helpers for SWA / EMA tests ---------------------------------------------
+
+// Builds a tiny deterministic net (Input(2) -> FullConnectLinear(2)).
+function BuildTinyNet: TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(2),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+end;
+
+// Sets every trainable weight (and bias) of NN to constant V.
+procedure FillNetWeights(NN: TNNet; V: TNeuralFloat);
+var
+  LayerCnt, NeuronCnt: integer;
+begin
+  for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    for NeuronCnt := 0 to NN.Layers[LayerCnt].Neurons.Count - 1 do
+      NN.Layers[LayerCnt].Neurons[NeuronCnt].Fill(V);
+end;
+
+// Returns a representative weight (first weight of the first neuron of the
+// last layer) to pin invariants against.
+function SampleWeight(NN: TNNet): TNeuralFloat;
+begin
+  Result := NN.GetLastLayer.Neurons[0].Weights.Raw[0];
+end;
+
+procedure TTestNeuralTraining.TestSWAMeanOfConstant;
+var
+  Live: TNNet;
+  SWA: TNNetSWAWrapper;
+  I: integer;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 3.0);
+  SWA := TNNetSWAWrapper.Create(Live);
+  try
+    // Accumulating the SAME weights K times -> mean equals those weights.
+    for I := 1 to 5 do SWA.Accumulate;
+    AssertEquals('SWA mean of constant equals constant', 3.0,
+      SampleWeight(SWA.ShadowNet), 0.0001);
+    AssertEquals('SWA counter', 5, SWA.Count);
+  finally
+    SWA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestSWAMeanOfTwo;
+var
+  Live: TNNet;
+  SWA: TNNetSWAWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  SWA := TNNetSWAWrapper.Create(Live);
+  try
+    FillNetWeights(Live, 2.0);
+    SWA.Accumulate;
+    FillNetWeights(Live, 4.0);
+    SWA.Accumulate;
+    // mean of 2 and 4 = 3
+    AssertEquals('SWA mean of A,B = (A+B)/2', 3.0,
+      SampleWeight(SWA.ShadowNet), 0.0001);
+  finally
+    SWA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestSWAMeanOfThree;
+var
+  Live: TNNet;
+  SWA: TNNetSWAWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  SWA := TNNetSWAWrapper.Create(Live);
+  try
+    FillNetWeights(Live, 1.0); SWA.Accumulate;
+    FillNetWeights(Live, 2.0); SWA.Accumulate;
+    FillNetWeights(Live, 6.0); SWA.Accumulate;
+    // mean of 1,2,6 = 3
+    AssertEquals('SWA mean of A,B,C = (A+B+C)/3', 3.0,
+      SampleWeight(SWA.ShadowNet), 0.0001);
+  finally
+    SWA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestEMADecayZeroEqualsLive;
+var
+  Live: TNNet;
+  EMA: TNNetEMAWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  EMA := TNNetEMAWrapper.Create(Live, 0.0);
+  try
+    FillNetWeights(Live, 7.5);
+    EMA.Update; // shadow := 0*shadow + 1*live = live
+    AssertEquals('EMA Decay=0 -> shadow == live', 7.5,
+      SampleWeight(EMA.ShadowNet), 0.0);
+  finally
+    EMA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestEMADecayOneKeepsShadow;
+var
+  Live: TNNet;
+  EMA: TNNetEMAWrapper;
+  Seeded: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 5.0);
+  EMA := TNNetEMAWrapper.Create(Live, 1.0); // shadow seeded from live = 5.0
+  try
+    Seeded := SampleWeight(EMA.ShadowNet);
+    FillNetWeights(Live, 99.0);
+    EMA.Update; // shadow := 1*shadow + 0*live = shadow (unchanged)
+    AssertEquals('EMA Decay=1 leaves shadow unchanged', Seeded,
+      SampleWeight(EMA.ShadowNet), 0.0);
+  finally
+    EMA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestEMAConvergesToConstant;
+var
+  Live: TNNet;
+  EMA: TNNetEMAWrapper;
+  I: integer;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 0.0);
+  EMA := TNNetEMAWrapper.Create(Live, 0.5); // shadow seeded at 0
+  try
+    FillNetWeights(Live, 10.0); // constant live target
+    for I := 1 to 50 do EMA.Update;
+    // EMA of a constant live net converges to that constant.
+    AssertEquals('EMA converges to constant live value', 10.0,
+      SampleWeight(EMA.ShadowNet), 0.001);
+  finally
+    EMA.Free;
+    Live.Free;
   end;
 end;
 

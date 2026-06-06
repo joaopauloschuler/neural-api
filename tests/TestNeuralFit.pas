@@ -5,7 +5,7 @@ unit TestNeuralFit;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, neuralnetwork, neuralvolume, neuralfit;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume, neuralfit;
 
 type
   TTestNeuralFit = class(TTestCase)
@@ -32,6 +32,12 @@ type
     procedure TestRegressionCompare;
     procedure TestRegressionCompareWide;
     procedure TestEnableRegressionComparison;
+
+    // NaN/Inf guard tests
+    procedure TestNaNGuardDefaultOff;
+    procedure TestFirstLayerWithNonFiniteAllFinite;
+    procedure TestFirstLayerWithNonFiniteDetectsLayer;
+    procedure TestFirstLayerWithNonFiniteDetectsInf;
   end;
 
 implementation
@@ -281,6 +287,100 @@ begin
     AssertTrue('InferHitFn should be assigned for wide comparison', Fit.InferHitFn <> nil);
   finally
     Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestNaNGuardDefaultOff;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // The guard must be OFF by default so the default training path is unchanged.
+    AssertFalse('NaNGuard should be False by default', Fit.NaNGuard);
+    Fit.NaNGuard := True;
+    AssertTrue('NaNGuard should be settable to True', Fit.NaNGuard);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestFirstLayerWithNonFiniteAllFinite;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    // On an all-finite net the helper must return -1.
+    AssertEquals('All-finite net should return -1', -1,
+      NN.FirstLayerWithNonFinite());
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestFirstLayerWithNonFiniteDetectsLayer;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  TargetIdx: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    AssertEquals('Net should be finite before poking NaN', -1,
+      NN.FirstLayerWithNonFinite());
+
+    // Deliberately seed a NaN into a chosen layer's Output volume.
+    TargetIdx := 1;
+    NN.Layers[TargetIdx].Output.FData[0] := NaN;
+    AssertEquals('Helper should detect the poked NaN layer', TargetIdx,
+      NN.FirstLayerWithNonFinite());
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestFirstLayerWithNonFiniteDetectsInf;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  TargetIdx: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    // Seed a +Inf into the last layer's Output and confirm it is detected.
+    TargetIdx := NN.GetLastLayerIdx();
+    NN.Layers[TargetIdx].Output.FData[0] := Infinity;
+    AssertEquals('Helper should detect the poked Inf layer', TargetIdx,
+      NN.FirstLayerWithNonFinite());
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

@@ -53,10 +53,10 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dDebug
--dAVX"/>
+-dAVX2"/>
             <OtherDefines Count="3">
               <Define0 Value="Debug"/>
-              <Define1 Value="AVX"/>
+              <Define1 Value="AVX2"/>
               <Define2 Value="MakeQuick"/>
             </OtherDefines>
           </Other>
@@ -88,13 +88,12 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dRelease
--dAVX"/>
-            <OtherDefines Count="5">
+-dAVX2"/>
+            <OtherDefines Count="4">
               <Define0 Value="Release"/>
               <Define1 Value="Debug"/>
               <Define2 Value="CheckRange"/>
               <Define3 Value="AVX2"/>
-              <Define4 Value="AVX"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -116,11 +115,6 @@
         </Mode0>
       </Modes>
     </RunParams>
-    <RequiredPackages Count="1">
-      <Item1>
-        <PackageName Value="multithreadprocslaz"/>
-      </Item1>
-    </RequiredPackages>
     <Units Count="1">
       <Unit0>
         <Filename Value="CaiResNet20.lpr"/>
@@ -150,10 +144,10 @@
       </Debugging>
     </Linking>
     <Other>
-      <CustomOptions Value="-dAVX
+      <CustomOptions Value="-dAVX2
 -dRelease"/>
       <OtherDefines Count="2">
-        <Define0 Value="AVX"/>
+        <Define0 Value="AVX2"/>
         <Define1 Value="Release"/>
       </OtherDefines>
     </Other>

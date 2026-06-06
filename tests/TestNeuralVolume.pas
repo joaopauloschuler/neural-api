@@ -5,7 +5,7 @@ unit TestNeuralVolume;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralvolume;
 
 type
   TTestNeuralVolume = class(TTestCase)
@@ -40,6 +40,11 @@ type
     procedure TestVolumeShift;
     procedure TestVolumeRawPosAndPtr;
     procedure TestVolumeDepthOperations;
+    // AssertFinite tests
+    procedure TestAssertFiniteAllFinite;
+    procedure TestAssertFiniteDetectsNaN;
+    procedure TestAssertFiniteDetectsInf;
+    procedure TestAssertFiniteNilVolume;
   end;
 
 implementation
@@ -695,6 +700,102 @@ begin
   finally
     V.Free;
   end;
+end;
+
+procedure TTestNeuralVolume.TestAssertFiniteAllFinite;
+var
+  V: TNNetVolume;
+  I: integer;
+begin
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    for I := 0 to V.Size - 1 do
+      V.Raw[I] := I * 0.5;
+    try
+      AssertFinite(V, 'AllFinite');
+    except
+      on E: Exception do
+        Fail('AssertFinite raised on finite values: ' + E.Message);
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestAssertFiniteDetectsNaN;
+var
+  V: TNNetVolume;
+  Raised: boolean;
+  Msg: string;
+begin
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    V.Fill(1.0);
+    V.FData[3] := NaN;
+    Raised := False;
+    Msg := '';
+    try
+      AssertFinite(V, 'NaNCheck');
+    except
+      on E: Exception do
+      begin
+        Raised := True;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('Exception should have been raised for NaN', Raised);
+    AssertTrue('Message should contain label NaNCheck: ' + Msg,
+      Pos('NaNCheck', Msg) > 0);
+    AssertTrue('Message should contain NaN: ' + Msg,
+      Pos('NaN', Msg) > 0);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestAssertFiniteDetectsInf;
+var
+  V: TNNetVolume;
+  Raised: boolean;
+  Msg: string;
+begin
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    V.Fill(1.0);
+    V.FData[5] := Infinity;
+    Raised := False;
+    Msg := '';
+    try
+      AssertFinite(V, 'InfCheck');
+    except
+      on E: Exception do
+      begin
+        Raised := True;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('Exception should have been raised for Inf', Raised);
+    AssertTrue('Message should contain label InfCheck: ' + Msg,
+      Pos('InfCheck', Msg) > 0);
+    AssertTrue('Message should contain Inf: ' + Msg,
+      Pos('Inf', Msg) > 0);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestAssertFiniteNilVolume;
+var
+  Raised: boolean;
+begin
+  Raised := False;
+  try
+    AssertFinite(nil, 'NilCheck');
+  except
+    on E: Exception do
+      Raised := True;
+  end;
+  AssertTrue('Exception should have been raised for nil volume', Raised);
 end;
 
 initialization

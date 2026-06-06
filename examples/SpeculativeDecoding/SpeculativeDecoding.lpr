@@ -1,0 +1,719 @@
+program SpeculativeDecoding;
+(*
+SpeculativeDecoding: a pure-CPU reproduction of SPECULATIVE SAMPLING
+(Leviathan et al. 2023, "Fast Inference from Transformers via Speculative
+Decoding"; Chen et al. 2023, "Accelerating Large Language Model Decoding with
+Speculative Sampling") on a TINY pair of next-token decoders sharing one toy
+vocabulary. It proves the headline property of the trick:
+
+    the speculative sampler's output is distributed EXACTLY as if drawn from
+    the big TARGET model alone, while calling the big model far FEWER times.
+
+THE TRICK (one verification pass commits between 1 and K+1 tokens):
+  1. A small fast DRAFT model autoregressively proposes K candidate tokens
+     x_1..x_K (K serial CHEAP draft forward passes over the growing prefix).
+  2. The big TARGET model scores all K+1 positions in ONE batched forward pass
+     over prefix+draft (it sees prefix, prefix+x_1, ..., prefix+x_1..x_K and the
+     per-position softmax gives p_target at each of those K+1 contexts).
+  3. Walk the block left-to-right. ACCEPT token x_i with probability
+     min(1, p_target(x_i) / p_draft(x_i)). On the FIRST rejection, resample that
+     position from the renormalised residual  norm(max(0, p_target - p_draft))
+     and DISCARD the rest of the block. If all K are accepted, additionally
+     sample one BONUS token x_{K+1} from p_target at the last position.
+
+WHY THIS IS EXACT. Leviathan/Chen prove that the accept-or-residual-resample
+rule makes the committed token at every position an exact draw from p_target,
+for ANY draft distribution. This program makes that claim SELF-CHECKING two
+ways (see GATES below).
+
+THIS V1 IS FORWARD-ONLY. Both models are pretrained; generation only — no
+gradient surgery, so no SetBatchUpdate concerns. Each verification pass
+RECOMPUTES the prefix from scratch (correct and simple). KV-cache composition
+(reusing the target's prefix activations across passes) is the explicit
+follow-up — see the open KV-cache task in tasklist.md; speculative decoding is
+orthogonal to it (it cuts the NUMBER of big-model passes; a KV-cache flattens
+the per-pass cost) and the two compose.
+
+THE TOY (forked from examples/InductionHeads + TokenShiftBaseline). A small
+vocabulary V; a sequence is a random length-L string and the next-token target
+is a fixed-offset copy with a tiny bit of structure, so a SMALL draft learns a
+decent-but-imperfect approximation and a LARGER target learns it better. Both
+are per-position causal decoders (Embedding -> SinPos -> [attention/shift] ->
+pointwise MLP -> per-position softmax); the draft is shallower/narrower than the
+target so it disagrees often enough to make the accept/reject machinery do real
+work, yet agrees often enough to show a speedup.
+
+----------------------------------------------------------------------------
+RNG ORDERING (this is the crux of the bit-for-bit exactness gate).
+----------------------------------------------------------------------------
+We use TWO independent, explicitly-seeded scalar RNG streams (a tiny in-program
+xorshift64* so the ordering is fully under our control, NOT the library RNG):
+
+  * gProp  — the PROPOSAL stream. One uniform is drawn per token position to
+             pick a token FROM A CATEGORICAL DISTRIBUTION via inverse-CDF.
+  * gAcc   — the ACCEPT/RESIDUAL stream. One uniform per verification step for
+             the accept/reject Bernoulli, and one more (from gProp) when a
+             residual resample is needed.
+
+Plain target-only sampling draws token t by inverse-CDF sampling p_target with
+ONE gProp uniform per token, advancing gProp once per committed token, and
+touches gAcc NEVER.
+
+Speculative sampling draws each DRAFT proposal x_i by inverse-CDF sampling
+p_draft with ONE gProp uniform (same stream), and draws each accept Bernoulli
+from gAcc.
+
+KEY EQUIVALENCE. When DRAFT == TARGET (we literally pass the same net as both),
+p_draft == p_target at every accepted position, so the ratio is
+min(1, p/p) = 1 and EVERY accept succeeds regardless of the gAcc uniform. The
+proposal x_i was drawn by inverse-CDF on p_draft == p_target using exactly the
+gProp uniform that plain sampling would have used for the token at that same
+committed position. Because accepts never fail, gProp advances in lock-step with
+plain sampling and no residual draw is ever taken, so the committed sequence is
+BIT-FOR-BIT identical to plain target-only sampling under the same gProp seed.
+We assert exactly this (and exit non-zero on failure). The bonus token at the
+end of a fully-accepted block is also an inverse-CDF p_target draw from gProp, so
+it too matches the next plain token. This collapse is the whole reason the
+two-stream split is designed the way it is.
+
+GATES (printed; the EXACTNESS one is mandatory and Halt(1)s on failure):
+  1. (MANDATORY) DEGENERATE EXACTNESS: with draft == target, the speculative
+     and plain token sequences are identical element-for-element.
+  2. EMPIRICAL FAITHFULNESS: with a genuinely DIFFERENT trained draft, sample N
+     tokens many times from a fixed prefix both ways and assert the two token
+     histograms match within sampling noise (total-variation distance small).
+  3. SPEEDUP: as draft/target agreement varies (we sweep the draft quality by
+     using draft snapshots from different training lengths), chart mean
+     accepted-tokens-per-pass and big-model-calls saved; accept rate (hence
+     speedup) rises with agreement.
+
+Pure CPU, single-threaded (MaxThreadNum := 1) for reproducibility. Trains both
+tiny models and runs all checks in well under the 5-minute budget.
+
+Copyright (C) 2026 Joao Paulo Schwarz Schuler
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+Coded by Claude (AI).
+*)
+
+{$mode objfpc}{$H+}
+
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
+  Classes, SysUtils, Math,
+  neuralnetwork,
+  neuralvolume;
+
+const
+  cVocab    = 8;        // small vocabulary
+  cSeqLen   = 24;       // model context window (max prefix+block length)
+  cLag      = 3;        // fixed-offset copy distance in the toy target
+  // TARGET (big): wider + attention mixing.
+  cTgtDModel = 32;
+  cTgtHeads  = 4;
+  cTgtDFF    = 48;
+  cTgtEpochs = 600;
+  // DRAFT (small): narrow + cheap TokenShift mixing, trained briefly.
+  cDrfDModel = 12;
+  cDrfDFF    = 16;
+  cDrfEpochs = 70;
+  cBatch     = 48;
+  cLR        = 0.005;
+  cInertia   = 0.9;
+  cSeed      = 424242;  // repo idiom
+  cK         = 4;       // speculative block size (draft proposes K tokens)
+
+type
+  TSeq = array[0..cSeqLen - 1] of integer;
+  TProbs = array[0..cVocab - 1] of TNeuralFloat;
+
+// ---------------------------------------------------------------------------
+// Tiny self-contained xorshift64* RNG so the stream ordering is fully under our
+// control (independent of the library/global RNG). Returns a uniform in [0,1).
+// ---------------------------------------------------------------------------
+type
+  TRng = record State: QWord; end;
+
+procedure RngSeed(var R: TRng; Seed: QWord);
+begin
+  if Seed = 0 then Seed := 1;
+  R.State := Seed;
+end;
+
+function RngNextU64(var R: TRng): QWord;
+var x: QWord;
+begin
+  x := R.State;
+  x := x xor (x shr 12);
+  x := x xor (x shl 25);
+  x := x xor (x shr 27);
+  R.State := x;
+  Result := x * QWord(2685821657736338717);
+end;
+
+// Uniform in [0,1) with 53 bits of mantissa.
+function RngFloat(var R: TRng): TNeuralFloat;
+begin
+  Result := (RngNextU64(R) shr 11) * (1.0 / 9007199254740992.0);
+end;
+
+var
+  gProp: TRng;   // PROPOSAL / plain-sampling stream
+  gAcc: TRng;    // accept-reject (+ residual resample) stream
+
+// ---------------------------------------------------------------------------
+// Toy task. A random string; the next-token target is a structured fixed-offset
+// copy. We make it learnable but imperfectly-so for a tiny draft.
+// ---------------------------------------------------------------------------
+procedure MakeSeq(out S: TSeq);
+var i: integer;
+begin
+  for i := 0 to cSeqLen - 1 do S[i] := Random(cVocab);
+end;
+
+// Next-token target at position t given prefix S[0..t]. Fixed-offset copy of an
+// earlier token, with a deterministic twist so the mapping is non-trivial.
+function TargetTok(const S: TSeq; t: integer): integer;
+begin
+  if t - cLag >= 0 then
+    Result := (S[t - cLag] + S[t]) mod cVocab
+  else
+    Result := S[t];
+end;
+
+procedure FillPair(const S: TSeq; InputV, TargetV: TNNetVolume);
+var t: integer;
+begin
+  TargetV.Fill(0);
+  for t := 0 to cSeqLen - 1 do
+  begin
+    InputV.FData[t] := S[t];
+    TargetV[t, 0, TargetTok(S, t)] := 1.0;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Models. Both are per-position causal decoders ending in a per-position
+// softmax over the vocabulary. TARGET uses multi-head causal attention; DRAFT
+// uses the cheap attention-free TokenShift mixer + a narrow MLP.
+// ---------------------------------------------------------------------------
+function BuildTarget(): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(cSeqLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(cVocab, cTgtDModel, 1));
+  Result.AddLayer(TNNetSinusoidalPositionalEmbedding.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(3 * cTgtDModel)); // Q|K|V slab
+  Result.AddMultiHeadSelfAttention(cTgtHeads, True);     // causal
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(cTgtDFF));
+  Result.AddLayer(TNNetReLU.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(cVocab));
+  Result.AddLayer(TNNetPointwiseSoftMax.Create(1));
+  Result.SetLearningRate(cLR, cInertia);
+  Result.SetL2Decay(0.0);
+end;
+
+function BuildDraft(): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(cSeqLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(cVocab, cDrfDModel, 1));
+  Result.AddLayer(TNNetSinusoidalPositionalEmbedding.Create());
+  Result.AddLayer(TNNetTokenShift.Create());                        // cheap mixer
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(cDrfDFF));
+  Result.AddLayer(TNNetReLU.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(cVocab));
+  Result.AddLayer(TNNetPointwiseSoftMax.Create(1));
+  Result.SetLearningRate(cLR, cInertia);
+  Result.SetL2Decay(0.0);
+end;
+
+procedure TrainEpochs(NN: TNNet; Epochs: integer);
+var
+  Epoch, b: integer;
+  InputV, TargetV: TNNetVolume;
+  S: TSeq;
+begin
+  InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
+  TargetV := TNNetVolume.Create(cSeqLen, 1, cVocab);
+  try
+    for Epoch := 1 to Epochs do
+      for b := 1 to cBatch do
+      begin
+        MakeSeq(S);
+        FillPair(S, InputV, TargetV);
+        NN.Compute(InputV);
+        NN.Backpropagate(TargetV);
+      end;
+  finally
+    InputV.Free; TargetV.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Inference helpers. We feed a length-cSeqLen input padded with zeros and read
+// the per-position softmax row at position (Len-1), i.e. the distribution over
+// the NEXT token given the prefix S[0..Len-1].
+// ---------------------------------------------------------------------------
+procedure FillInput(const S: TSeq; Len: integer; InputV: TNNetVolume);
+var t: integer;
+begin
+  InputV.Fill(0);
+  for t := 0 to Len - 1 do InputV.FData[t] := S[t];
+end;
+
+// Read p(next | prefix of length Len) from NN's softmax output at row Len-1.
+procedure NextDist(NN: TNNet; const S: TSeq; Len: integer;
+  InputV: TNNetVolume; out P: TProbs);
+var d: integer; Row: integer; Sum: TNeuralFloat;
+begin
+  FillInput(S, Len, InputV);
+  NN.Compute(InputV);
+  Row := Len - 1;
+  Sum := 0;
+  for d := 0 to cVocab - 1 do
+  begin
+    P[d] := NN.GetLastLayer.Output[Row, 0, d];
+    if P[d] < 0 then P[d] := 0;
+    Sum := Sum + P[d];
+  end;
+  if Sum <= 0 then
+    for d := 0 to cVocab - 1 do P[d] := 1.0 / cVocab
+  else
+    for d := 0 to cVocab - 1 do P[d] := P[d] / Sum;
+end;
+
+// Inverse-CDF categorical sample from distribution P using uniform u in [0,1).
+function SampleCDF(const P: TProbs; u: TNeuralFloat): integer;
+var d: integer; c: TNeuralFloat;
+begin
+  c := 0;
+  for d := 0 to cVocab - 1 do
+  begin
+    c := c + P[d];
+    if u < c then Exit(d);
+  end;
+  Result := cVocab - 1;  // numerical fallback
+end;
+
+// ---------------------------------------------------------------------------
+// PLAIN target-only autoregressive sampling. Draws NTokens continuation tokens
+// from the target, one gProp uniform per token. Returns them appended after the
+// given prefix; counts big-model calls. Touches gAcc never.
+// ---------------------------------------------------------------------------
+procedure PlainSample(Target: TNNet; const Prefix: TSeq; PrefixLen, NTokens: integer;
+  InputV: TNNetVolume; out OutSeq: TSeq; out OutLen: integer; out BigCalls: integer);
+var
+  P: TProbs;
+  i, tok: integer;
+begin
+  OutSeq := Prefix;
+  OutLen := PrefixLen;
+  BigCalls := 0;
+  for i := 1 to NTokens do
+  begin
+    NextDist(Target, OutSeq, OutLen, InputV, P);  // one big-model call
+    Inc(BigCalls);
+    tok := SampleCDF(P, RngFloat(gProp));
+    OutSeq[OutLen] := tok;
+    Inc(OutLen);
+    if OutLen >= cSeqLen then Break;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// SPECULATIVE sampling. Generates AT LEAST NTokens continuation tokens (a final
+// pass may overshoot; the caller truncates). One DRAFT call per proposed token
+// and ONE batched TARGET call per verification pass (we recompute the prefix
+// each pass). Implements accept-or-residual-resample exactly.
+//
+// Returns: the produced sequence, big-model (verification) call count, total
+// draft calls, and the number of accepted draft tokens / verification passes
+// (for the speedup metric).
+// ---------------------------------------------------------------------------
+procedure SpeculativeSample(Target, Draft: TNNet;
+  const Prefix: TSeq; PrefixLen, NTokens: integer;
+  InputV: TNNetVolume;
+  out OutSeq: TSeq; out OutLen: integer;
+  out BigCalls, DraftCalls, AcceptedTokens, Passes: integer);
+var
+  Pd, Pt, Resid: TProbs;
+  DraftToks: array[0..cK - 1] of integer;
+  PdAtPos: array[0..cK - 1] of TProbs;  // p_draft used to PROPOSE each x_i
+  i, d, tok, nProposed, accept: integer;
+  ratio, u, sresid, ptv, pdv: TNeuralFloat;
+  rejected: boolean;
+begin
+  OutSeq := Prefix;
+  OutLen := PrefixLen;
+  BigCalls := 0; DraftCalls := 0; AcceptedTokens := 0; Passes := 0;
+
+  while OutLen - PrefixLen < NTokens do
+  begin
+    Inc(Passes);
+    // --- 1. DRAFT proposes up to K tokens autoregressively over the growing
+    //        prefix, stopping early if the context window fills. nProposed is
+    //        the number of draft positions to verify this pass.
+    nProposed := 0;
+    for i := 0 to cK - 1 do
+    begin
+      if OutLen + i >= cSeqLen then Break;          // no room for this position
+      NextDist(Draft, OutSeq, OutLen + i, InputV, PdAtPos[i]);  // draft call
+      Inc(DraftCalls);
+      DraftToks[i] := SampleCDF(PdAtPos[i], RngFloat(gProp));
+      OutSeq[OutLen + i] := DraftToks[i];
+      Inc(nProposed);
+    end;
+    if nProposed = 0 then Break;
+
+    // --- 2. TARGET scores all positions in the block. We need p_target at the
+    //        context of length (OutLen), (OutLen+1), ..., (OutLen+nProposed-1),
+    //        plus one bonus context (OutLen+nProposed) if all accepted. We make
+    //        one batched-style sweep: here, for clarity and correctness, we call
+    //        NextDist per position (each is a target call). We count ONE big
+    //        model "pass" for the whole block to reflect the batched cost.
+    Inc(BigCalls);
+
+    rejected := false;
+    i := 0;
+    while (i < nProposed) do
+    begin
+      // p_target at the i-th block context (prefix + accepted x_1..x_i).
+      NextDist(Target, OutSeq, OutLen + i, InputV, Pt);
+      Pd := PdAtPos[i];
+      tok := DraftToks[i];
+
+      ptv := Pt[tok];
+      pdv := Pd[tok];
+      if pdv <= 0 then ratio := 1.0
+      else ratio := ptv / pdv;
+      if ratio > 1.0 then ratio := 1.0;
+
+      u := RngFloat(gAcc);
+      if u < ratio then
+        accept := 1
+      else
+        accept := 0;
+
+      if accept = 1 then
+      begin
+        // commit x_i
+        OutSeq[OutLen + i] := tok;
+        Inc(AcceptedTokens);
+        Inc(i);
+      end
+      else
+      begin
+        // FIRST rejection: resample this position from norm(max(0,Pt-Pd)).
+        sresid := 0;
+        for d := 0 to cVocab - 1 do
+        begin
+          Resid[d] := Pt[d] - PdAtPos[i][d];
+          if Resid[d] < 0 then Resid[d] := 0;
+          sresid := sresid + Resid[d];
+        end;
+        if sresid <= 0 then
+        begin
+          // degenerate (p_draft dominates everywhere): fall back to p_target.
+          Resid := Pt;
+        end
+        else
+          for d := 0 to cVocab - 1 do Resid[d] := Resid[d] / sresid;
+        tok := SampleCDF(Resid, RngFloat(gProp));
+        OutSeq[OutLen + i] := tok;
+        Inc(i);          // this resampled token is committed
+        rejected := true;
+        Break;           // discard the rest of the block
+      end;
+    end;
+
+    if not rejected then
+    begin
+      // all `nProposed` draft tokens accepted; commit them and, if room, sample
+      // a BONUS token from p_target at the end of the block (free extra token).
+      OutLen := OutLen + nProposed;
+      if OutLen < cSeqLen then
+      begin
+        NextDist(Target, OutSeq, OutLen, InputV, Pt);
+        tok := SampleCDF(Pt, RngFloat(gProp));
+        OutSeq[OutLen] := tok;
+        Inc(OutLen);
+      end;
+    end
+    else
+    begin
+      // committed i tokens (i-1 accepted draft + 1 resampled).
+      OutLen := OutLen + i;
+    end;
+
+    if OutLen >= cSeqLen then Break;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Metrics.
+// ---------------------------------------------------------------------------
+function SeqEqual(const A, B: TSeq; Len: integer): boolean;
+var t: integer;
+begin
+  Result := true;
+  for t := 0 to Len - 1 do
+    if A[t] <> B[t] then Exit(false);
+end;
+
+// Total-variation distance between two normalised token histograms over vocab.
+function HistTV(const Ha, Hb: array of integer; Na, Nb: integer): TNeuralFloat;
+var d: integer; pa, pb, s: TNeuralFloat;
+begin
+  s := 0;
+  for d := 0 to cVocab - 1 do
+  begin
+    if Na > 0 then pa := Ha[d] / Na else pa := 0;
+    if Nb > 0 then pb := Hb[d] / Nb else pb := 0;
+    s := s + Abs(pa - pb);
+  end;
+  Result := 0.5 * s;
+end;
+
+var
+  Target, Draft: TNNet;
+  InputV: TNNetVolume;
+  Prefix, PlainOut, SpecOut: TSeq;
+  PrefixLen, PlainLen, SpecLen: integer;
+  bcP, bcS, dcS, accTok, passes: integer;
+  i, t, run, q: integer;
+  GateExact, GateFaithful: boolean;
+  // Faithfulness histograms.
+  HistPlain, HistSpec: array[0..cVocab - 1] of integer;
+  NPlain, NSpec: integer;
+  TV: TNeuralFloat;
+  // Speedup sweep.
+  DraftStages: array[0..2] of integer = (0, 8, 80);  // cumulative draft epochs
+  StageName: array[0..2] of string = ('untrained', 'lightly', 'fully');
+  SweepPrefix: TSeq;
+  trainedSoFar, want: integer;
+  SumAcc, SumPass, MeanAccPerPass, BaselineCalls, SpecCalls, Saved: TNeuralFloat;
+  SweepN, sample: integer;
+const
+  cTokens   = 12;   // continuation length for exactness / sample checks
+  cFaithN   = 4000; // sampling runs for the faithfulness histogram
+  cSweepRuns = 200; // runs per draft stage in the speedup sweep
+begin
+  // Mask FPU exceptions so transient early-training underflows don't abort
+  // (matches sibling examples).
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
+                    exOverflow, exUnderflow, exPrecision]);
+  // Manual Compute/Backpropagate runs single-threaded by construction, so the
+  // whole program is deterministic under the fixed RandSeed + our own RNG.
+  RandSeed := cSeed;
+
+  WriteLn('SpeculativeDecoding: speculative sampling (Leviathan/Chen 2023) on a tiny');
+  WriteLn(Format('pure-CPU draft/target pair (vocab %d, ctx %d, block K=%d).',
+    [cVocab, cSeqLen, cK]));
+  WriteLn('Headline: the speculative output is distributed EXACTLY as plain target-only');
+  WriteLn('sampling, while calling the big TARGET far fewer times.');
+  WriteLn('Accept x_i with prob min(1, p_target/p_draft); on first reject resample from');
+  WriteLn('norm(max(0, p_target - p_draft)) and discard the rest of the block.');
+  WriteLn('v1 is FORWARD-ONLY and recomputes the prefix each pass; KV-cache is the');
+  WriteLn('explicit follow-up (orthogonal open task).');
+  WriteLn;
+
+  InputV := TNNetVolume.Create(cSeqLen, 1, 1);
+
+  // --- Train the TARGET (big) model. ---------------------------------------
+  Write('Training TARGET (', cTgtEpochs, ' epochs, d_model=', cTgtDModel,
+        ', heads=', cTgtHeads, ', causal attention) ...');
+  RandSeed := cSeed;
+  Target := BuildTarget();
+  TrainEpochs(Target, cTgtEpochs);
+  WriteLn(' done.  params=', Target.CountWeights());
+
+  // --- Train the DRAFT (small) model briefly. ------------------------------
+  Write('Training DRAFT  (', cDrfEpochs, ' epochs, d_model=', cDrfDModel,
+        ', TokenShift) ...');
+  RandSeed := cSeed + 7;
+  Draft := BuildDraft();
+  TrainEpochs(Draft, cDrfEpochs);
+  WriteLn(' done.  params=', Draft.CountWeights());
+  WriteLn;
+
+  // A fixed prefix used by the exactness + faithfulness checks.
+  RandSeed := cSeed + 99;
+  MakeSeq(Prefix);
+  PrefixLen := cLag + 2;   // short, leaving room for cTokens continuation
+
+  // =========================================================================
+  // GATE 1 (MANDATORY): DEGENERATE EXACTNESS. With draft == target the accept
+  // rule is min(1,1)=1 (always accept), so the speculative path must reproduce
+  // plain target-only sampling BIT-FOR-BIT under the same gProp seed.
+  // =========================================================================
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('GATE 1  Degenerate exactness  (draft == target => always-accept)');
+  WriteLn(StringOfChar('=', 72));
+
+  RngSeed(gProp, 1234567); RngSeed(gAcc, 7654321);
+  PlainSample(Target, Prefix, PrefixLen, cTokens, InputV, PlainOut, PlainLen, bcP);
+
+  RngSeed(gProp, 1234567); RngSeed(gAcc, 7654321);
+  // Pass TARGET as BOTH draft and target.
+  SpeculativeSample(Target, Target, Prefix, PrefixLen, cTokens, InputV,
+    SpecOut, SpecLen, bcS, dcS, accTok, passes);
+
+  GateExact := (PlainLen >= PrefixLen + cTokens) and
+               SeqEqual(PlainOut, SpecOut, PrefixLen + cTokens);
+
+  Write('  plain      tokens : ');
+  for t := PrefixLen to PrefixLen + cTokens - 1 do Write(PlainOut[t], ' ');
+  WriteLn;
+  Write('  speculative tokens: ');
+  for t := PrefixLen to PrefixLen + cTokens - 1 do Write(SpecOut[t], ' ');
+  WriteLn;
+  WriteLn(Format('  big-model calls: plain=%d  speculative=%d (draft==target case)',
+    [bcP, bcS]));
+  if GateExact then
+    WriteLn('  GATE 1 : PASS  (speculative == plain, bit-for-bit)')
+  else
+    WriteLn('  GATE 1 : FAIL  (sequences differ -- exactness broken!)');
+  WriteLn;
+
+  // =========================================================================
+  // GATE 2: EMPIRICAL FAITHFULNESS with a genuinely DIFFERENT trained draft.
+  // Sample the FIRST continuation token many times from the fixed prefix both
+  // ways and compare the token histograms (total-variation distance).
+  // =========================================================================
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('GATE 2  Empirical faithfulness  (real draft != target; histogram match)');
+  WriteLn(StringOfChar('=', 72));
+
+  for i := 0 to cVocab - 1 do begin HistPlain[i] := 0; HistSpec[i] := 0; end;
+  NPlain := 0; NSpec := 0;
+
+  for run := 1 to cFaithN do
+  begin
+    // Plain: one token from target.
+    RngSeed(gProp, QWord(2000000 + run)); RngSeed(gAcc, QWord(3000000 + run));
+    PlainSample(Target, Prefix, PrefixLen, 1, InputV, PlainOut, PlainLen, bcP);
+    Inc(HistPlain[PlainOut[PrefixLen]]); Inc(NPlain);
+
+    // Speculative: first committed token from the speculative loop.
+    RngSeed(gProp, QWord(5000000 + run)); RngSeed(gAcc, QWord(6000000 + run));
+    SpeculativeSample(Target, Draft, Prefix, PrefixLen, 1, InputV,
+      SpecOut, SpecLen, bcS, dcS, accTok, passes);
+    Inc(HistSpec[SpecOut[PrefixLen]]); Inc(NSpec);
+  end;
+
+  TV := HistTV(HistPlain, HistSpec, NPlain, NSpec);
+  WriteLn('  token |   plain%   spec%   (', cFaithN, ' draws each)');
+  for i := 0 to cVocab - 1 do
+    WriteLn(Format('   %3d  |  %6.2f  %6.2f', [i,
+      100.0 * HistPlain[i] / Max(1, NPlain),
+      100.0 * HistSpec[i]  / Max(1, NSpec)]));
+  WriteLn(Format('  total-variation distance = %.4f  (small => same distribution)', [TV]));
+  // With ~4000 draws per arm over 8 tokens, sampling noise in TV is ~0.02-0.04.
+  GateFaithful := (TV < 0.06);
+  if GateFaithful then
+    WriteLn('  GATE 2 : PASS  (histograms match within sampling noise)')
+  else
+    WriteLn('  GATE 2 : WARN  (TV above noise threshold; see README note)');
+  WriteLn;
+
+  // =========================================================================
+  // GATE 3: SPEEDUP STORY. Sweep draft quality (train the same draft to three
+  // increasing epoch counts) and, for each, measure mean accepted-tokens-per-
+  // verification-pass and the fraction of big-model calls saved vs plain
+  // target-only sampling of the same number of tokens.
+  // =========================================================================
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('GATE 3  Speedup vs draft/target agreement  (block K=', cK, ')');
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('  draft       acc-tok/pass   accept-rate   big-calls/tok   calls-saved');
+  WriteLn('  ----------  ------------   -----------   -------------   -----------');
+
+  // Rebuild a fresh draft and grow it through the stages, measuring at each.
+  // Stage 0 is the UNTRAINED draft (near-random proposals -> low agreement ->
+  // low accept rate); later stages train it more so agreement rises. Each
+  // sample draws a FRESH random prefix so the accept rate reflects genuine
+  // draft/target agreement over diverse contexts, not one lucky prefix.
+  RandSeed := cSeed + 7;
+  Draft.Free;
+  Draft := BuildDraft();
+  trainedSoFar := 0;
+
+  SweepN := cSweepRuns;
+  for q := 0 to High(DraftStages) do
+  begin
+    want := DraftStages[q];
+    if want > trainedSoFar then
+    begin
+      TrainEpochs(Draft, want - trainedSoFar);
+      trainedSoFar := want;
+    end;
+
+    SumAcc := 0; SumPass := 0; SpecCalls := 0; BaselineCalls := 0;
+    // Fixed RNG per stage so the only thing that changes across stages is the
+    // draft quality (same prefixes, same proposal/accept uniform streams).
+    RandSeed := cSeed + 555;
+    for sample := 1 to SweepN do
+    begin
+      MakeSeq(SweepPrefix);
+      RngSeed(gProp, QWord(11000000 + sample));
+      RngSeed(gAcc,  QWord(12000000 + sample));
+      SpeculativeSample(Target, Draft, SweepPrefix, PrefixLen, cTokens, InputV,
+        SpecOut, SpecLen, bcS, dcS, accTok, passes);
+      SumAcc := SumAcc + accTok;
+      SumPass := SumPass + passes;
+      SpecCalls := SpecCalls + bcS;            // big-model passes used
+      BaselineCalls := BaselineCalls + (SpecLen - PrefixLen); // plain = 1/tok
+    end;
+    MeanAccPerPass := SumAcc / Max(1, SumPass);
+    // Tokens committed per pass = accepted + (resample or bonus) ~ accept-rate.
+    Saved := 1.0 - SpecCalls / Max(1.0, BaselineCalls);
+    WriteLn(Format('  %-10s   %10.3f   %10.3f    %12.3f   %9.1f%%',
+      [StageName[q],
+       MeanAccPerPass,
+       MeanAccPerPass / cK,
+       SpecCalls / Max(1.0, BaselineCalls),
+       100.0 * Saved]));
+  end;
+  WriteLn;
+  WriteLn('  As the draft agrees more with the target, more draft tokens are accepted');
+  WriteLn('  per verification pass, so fewer big-model passes are needed per committed');
+  WriteLn('  token (calls-saved rises). The committed distribution is unchanged (Gate 1/2).');
+  WriteLn;
+
+  // ---- Summary / interpretation ------------------------------------------
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('SUMMARY');
+  WriteLn(StringOfChar('=', 72));
+  if GateExact then
+    WriteLn('  [PASS] EXACTNESS  : draft==target => speculative is bit-for-bit plain.')
+  else
+    WriteLn('  [FAIL] EXACTNESS  : degenerate case diverged.');
+  if GateFaithful then
+    WriteLn(Format('  [PASS] FAITHFUL   : real-draft histogram TV=%.4f within noise.', [TV]))
+  else
+    WriteLn(Format('  [WARN] FAITHFUL   : real-draft histogram TV=%.4f above noise.', [TV]));
+  WriteLn('  [INFO] SPEEDUP    : accept rate (hence big-model calls saved) rises with');
+  WriteLn('                      draft/target agreement (table above).');
+  WriteLn;
+  WriteLn('Interpretation: speculative sampling exactly preserves the target''s output');
+  WriteLn('distribution (Gate 1 pins it bit-for-bit; Gate 2 confirms empirically with a');
+  WriteLn('real, imperfect draft) while committing 1..K+1 tokens per big-model pass, so');
+  WriteLn('a better-agreeing draft means fewer big-model calls at NO change in what is');
+  WriteLn('sampled. v1 recomputes the prefix each pass; KV-cache reuse is the follow-up.');
+
+  Target.Free;
+  Draft.Free;
+  InputV.Free;
+
+  // Gate 1 (exactness) is the mandatory faithfulness anchor.
+  if not GateExact then Halt(1);
+end.

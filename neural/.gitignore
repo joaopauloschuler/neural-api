@@ -1,1 +1,7 @@
 backup
+*.o
+*.ppu
+tests/RunTests
+*.exe
+.claude
+.claude/*

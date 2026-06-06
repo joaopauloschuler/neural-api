@@ -27,6 +27,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 unit neuralabfun;
 {$IFDEF FPC}
 {$mode objfpc}
+{$H+} // long (Ansi) strings: ToString/LoadFromString serialize neuron test
+      // layers that exceed the 255-char ShortString cap; without this the
+      // engine's saved relations are silently truncated mid-operation and
+      // fail to reload (EConvertError in TOperation.LoadFromString).
 {$ENDIF}
 interface
 
@@ -403,9 +407,12 @@ begin
     Self.TestBasePosition := StrToInt(S[0]);
     Self.TestThreshold := StrToInt(S[1]);
     Self.N := S.Count - 2;
+    // Tests are emitted by ToString starting at T[0] (S[2]); load back from
+    // T[0], not T[1] -- the previous T[NCount-1] left T[0] zeroed and dropped
+    // the last test, corrupting every reloaded relation.
     for NCount := 2 to S.Count - 1 do
     begin
-      Self.T[NCount-1].LoadFromString(S[NCount]);
+      Self.T[NCount-2].LoadFromString(S[NCount]);
     end;
     S.Free;
   end;

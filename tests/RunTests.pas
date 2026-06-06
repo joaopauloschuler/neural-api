@@ -1,3 +1,4 @@
+// This program requires the LazUtils package to run.
 program RunTests;
 
 {$mode objfpc}{$H+}
@@ -9,7 +10,8 @@ uses
   Classes, consoletestrunner,
   TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
   TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
-  TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical;
+  TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
+  TestNeuralScheduler;
 
 type
   TMyTestRunner = class(TTestRunner)
