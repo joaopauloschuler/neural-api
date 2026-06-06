@@ -5375,6 +5375,80 @@ type
     property UseFFT: boolean read FUseFFT write FUseFFT;
   end;
 
+  // QUATERNION-VALUED dense (linear) layer -- the first hypercomplex layer in
+  // this fork (Parcollet et al. 2019, "Quaternion Recurrent Neural Networks",
+  // arXiv:1806.04418; Gaudet & Maida 2018, "Deep Quaternion Networks",
+  // arXiv:1712.04604).
+  //
+  // The input Depth (MUST be a multiple of 4) is reinterpreted as InQ = In/4
+  // packed quaternions and the output Depth as OutQ = Out/4 quaternions. The
+  // layer learns an (OutQ x InQ) grid of quaternion weights q = r + x i + y j +
+  // z k and computes the Hamilton product
+  //     y_oq = bias_oq + sum_{iq} q_{oq,iq} (x) x_iq
+  // where (x) is the quaternion (Hamilton) product. Writing each input
+  // quaternion as the real 4-vector x_iq = (a,b,c,d), the Hamilton product
+  // q (x) x equals the real 4x4 matrix-vector product M(q) * x_iq with
+  //     M(q) = [[ r,-x,-y,-z],
+  //             [ x, r,-z, y],
+  //             [ y, z, r,-x],
+  //             [ z,-y, x, r]].
+  // STRUCTURED WEIGHT SHARING: one quaternion's 4 reals drive a whole 4x4
+  // block, so the layer stores ~1/4 the weights of a dense
+  // TNNetFullConnectLinear of equal width (OutQ*InQ*4 weights vs Out*In) while
+  // still mixing all four components of every input quaternion.
+  //
+  // STORAGE / SERIALIZATION (round-trips through the ordinary per-neuron
+  // SaveDataToString / LoadDataFromString -- no custom weight serialization):
+  //   FArrNeurons[0..OutQ-1].FWeights : the InQ quaternion weights of output
+  //       block-row oq, laid out as FWeights[iq*4 + c] with
+  //       c = 0->r, 1->x, 2->y, 3->z (4 reals per (oq,iq) block).
+  //   FArrNeurons[OutQ].FWeights       : the per-output bias, length Out=OutQ*4
+  //       (held at 0 and not learned when pSuppressBias<>0).
+  // The neurons' own scalar FBiasWeight is unused (kept 0). Output shape is the
+  // vector (Out,1,1); Out round-trips via FStruct[0] (pSizeX) and the
+  // suppress-bias flag via FStruct[3], so CreateLayer wires both back through
+  // Create(St[0], St[3]) -- identical dispatch shape to TNNetCirculantLinear.
+  //
+  // BACKWARD propagates into BOTH the input and the four real weight components
+  // per block. With dy_oq the output error of block oq:
+  //   - INPUT gradient  dL/dx_iq += M(q_{oq,iq})^T * dy_oq  (the transpose block
+  //     is the conjugate quaternion's Hamilton matrix, i.e. W^H (x) dy);
+  //   - WEIGHT gradient, using the four basis derivatives dM/dr=I,
+  //     dM/dx, dM/dy, dM/dz and x_iq = (a,b,c,d):
+  //       dL/dr += a*dy0 + b*dy1 + c*dy2 + d*dy3
+  //       dL/dx += -b*dy0 + a*dy1 - d*dy2 + c*dy3
+  //       dL/dy += -c*dy0 + d*dy1 + a*dy2 - b*dy3
+  //       dL/dz += -d*dy0 - c*dy1 + b*dy2 + a*dy3
+  //     (a silent component-sign error in this 4x4 layout is exactly the bug the
+  //     numerical-gradient test catches);
+  //   - BIAS gradient  dL/dbias_o += dy_o.
+  // The block weight deltas accumulate into FArrNeurons[oq].Delta and the bias
+  // delta into FArrNeurons[OutQ].Delta, so the ordinary inertia / Adam weight
+  // update machinery applies unchanged.
+  //
+  // INIT: each block starts near a scaled rotation -- the real part r is given a
+  // small random value and the three imaginary parts x,y,z smaller random
+  // values, so an untrained block is close to a (shrunken) scalar multiple of
+  // the identity rotation rather than an arbitrary mixing matrix.
+  // Coded by Claude (AI).
+  TNNetQuaternionLinear = class(TNNetFullConnectLinear)
+  private
+    FInQuaternions: integer;   // InQ = input Depth / 4
+    FOutQuaternions: integer;  // OutQ = output Depth / 4
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    procedure InitDefault(); override;
+    property InQuaternions: integer read FInQuaternions;
+    property OutQuaternions: integer read FOutQuaternions;
+  end;
+
   /// Kolmogorov-Arnold Network DENSE layer (Liu et al. 2024,
   // "KAN: Kolmogorov-Arnold Networks", arXiv:2404.19756).
   //
@@ -33604,6 +33678,270 @@ begin
   end;
 end;
 
+{ TNNetQuaternionLinear }
+
+constructor TNNetQuaternionLinear.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  // The base FullConnect constructor added FOutput.Size neurons. The quaternion
+  // layer keeps OutQ block-row neurons plus ONE bias neuron (set up in
+  // SetPrevLayer once OutQ is known). Trim to a single neuron for now; the real
+  // count is fixed in SetPrevLayer.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+constructor TNNetQuaternionLinear.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+procedure TNNetQuaternionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  InSize, OutSize, Cnt: integer;
+begin
+  // Bypass TNNetFullConnect.SetPrevLayer (which resizes EVERY neuron to the
+  // input size for FOutput.Size neurons). We keep OutQ block-row neurons (each
+  // InQ*4 weights) plus one bias neuron (length OutSize).
+  FPrevLayer := pPrevLayer;
+  InSize := pPrevLayer.Output.Size;
+  OutSize := FOutput.Size;
+  if (InSize mod 4 <> 0) or (OutSize mod 4 <> 0) then
+  begin
+    FErrorProc
+    (
+      'TNNetQuaternionLinear requires input and output Depth to be multiples '+
+      'of 4: input '+IntToStr(InSize)+', output '+IntToStr(OutSize)+'.'
+    );
+  end;
+  FInQuaternions := InSize div 4;
+  FOutQuaternions := OutSize div 4;
+
+  // OutQ weight neurons + 1 bias neuron.
+  while FNeurons.Count > FOutQuaternions + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FOutQuaternions + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  // Each block-row neuron holds InQ*4 weights (4 reals per (oq,iq) quaternion).
+  for Cnt := 0 to FOutQuaternions - 1 do
+  begin
+    FNeurons[Cnt].Weights.ReSize(FInQuaternions * 4, 1, 1);
+    FNeurons[Cnt].BackInertia.ReSize(FInQuaternions * 4, 1, 1);
+    FNeurons[Cnt].Delta.ReSize(FInQuaternions * 4, 1, 1);
+  end;
+  // Bias neuron: one bias per output channel.
+  FNeurons[FOutQuaternions].Weights.ReSize(OutSize, 1, 1);
+  FNeurons[FOutQuaternions].BackInertia.ReSize(OutSize, 1, 1);
+  FNeurons[FOutQuaternions].Delta.ReSize(OutSize, 1, 1);
+
+  FVectorSize := FNeurons[0].Weights.Size;
+  BuildArrNeurons();  // FArrNeurons must match the new neuron count before InitDefault
+  InitDefault();
+  FNeurons[FOutQuaternions].Weights.Fill(0);  // bias starts at 0
+  for Cnt := 0 to FOutQuaternions do
+    FNeurons[Cnt].FBiasWeight := 0;
+  AfterWeightUpdate();
+end;
+
+// Each block starts near a scaled rotation: real part r gets a small random
+// value, imaginary parts x,y,z smaller ones, so an untrained block is close to
+// a shrunken scalar multiple of the identity rotation.
+procedure TNNetQuaternionLinear.InitDefault();
+var
+  oq, iq, base: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FOutQuaternions <= 0 then exit;
+  scale := Sqrt(2.0 / (FInQuaternions * 4 + 1));
+  for oq := 0 to FOutQuaternions - 1 do
+  begin
+    W := FArrNeurons[oq].FWeights;
+    for iq := 0 to FInQuaternions - 1 do
+    begin
+      base := iq * 4;
+      W.FData[base + 0] := scale * (Random - 0.5) * 2;        // r
+      W.FData[base + 1] := scale * (Random - 0.5) * 2 * 0.25; // x
+      W.FData[base + 2] := scale * (Random - 0.5) * 2 * 0.25; // y
+      W.FData[base + 3] := scale * (Random - 0.5) * 2 * 0.25; // z
+    end;
+  end;
+end;
+
+procedure TNNetQuaternionLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: y_oq = bias_oq + sum_iq M(q_{oq,iq}) * x_iq.
+procedure TNNetQuaternionLinear.ComputeCPU();
+var
+  oq, iq, base, oBase, iBase: integer;
+  r, qx, qy, qz, a, b, c, d: TNeuralFloat;
+  y0, y1, y2, y3: TNeuralFloat;
+  W, PrevOut, Bias: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FOutQuaternions].FWeights;
+  for oq := 0 to FOutQuaternions - 1 do
+  begin
+    W := FArrNeurons[oq].FWeights;
+    y0 := 0; y1 := 0; y2 := 0; y3 := 0;
+    for iq := 0 to FInQuaternions - 1 do
+    begin
+      base := iq * 4;
+      r  := W.FData[base + 0];
+      qx := W.FData[base + 1];
+      qy := W.FData[base + 2];
+      qz := W.FData[base + 3];
+      iBase := iq * 4;
+      a := PrevOut.FData[iBase + 0];
+      b := PrevOut.FData[iBase + 1];
+      c := PrevOut.FData[iBase + 2];
+      d := PrevOut.FData[iBase + 3];
+      // M(q) * (a,b,c,d)
+      y0 := y0 + r*a  - qx*b - qy*c - qz*d;
+      y1 := y1 + qx*a + r*b  - qz*c + qy*d;
+      y2 := y2 + qy*a + qz*b + r*c  - qx*d;
+      y3 := y3 + qz*a - qy*b + qx*c + r*d;
+    end;
+    oBase := oq * 4;
+    if FSuppressBias = 0 then
+    begin
+      FOutput.FData[oBase + 0] := y0 + Bias.FData[oBase + 0];
+      FOutput.FData[oBase + 1] := y1 + Bias.FData[oBase + 1];
+      FOutput.FData[oBase + 2] := y2 + Bias.FData[oBase + 2];
+      FOutput.FData[oBase + 3] := y3 + Bias.FData[oBase + 3];
+    end
+    else
+    begin
+      FOutput.FData[oBase + 0] := y0;
+      FOutput.FData[oBase + 1] := y1;
+      FOutput.FData[oBase + 2] := y2;
+      FOutput.FData[oBase + 3] := y3;
+    end;
+  end;
+end;
+
+procedure TNNetQuaternionLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Input gradient: dL/dx_iq += M(q_{oq,iq})^T * dy_oq, summed over oq.
+procedure TNNetQuaternionLinear.ComputePreviousLayerErrorCPU();
+var
+  oq, iq, base, oBase, iBase: integer;
+  r, qx, qy, qz: TNeuralFloat;
+  e0, e1, e2, e3: TNeuralFloat;
+  W, LocalPrevError: TNNetVolume;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  for oq := 0 to FOutQuaternions - 1 do
+  begin
+    W := FArrNeurons[oq].FWeights;
+    oBase := oq * 4;
+    e0 := FOutputError.FData[oBase + 0];
+    e1 := FOutputError.FData[oBase + 1];
+    e2 := FOutputError.FData[oBase + 2];
+    e3 := FOutputError.FData[oBase + 3];
+    if (e0 = 0) and (e1 = 0) and (e2 = 0) and (e3 = 0) then continue;
+    for iq := 0 to FInQuaternions - 1 do
+    begin
+      base := iq * 4;
+      r  := W.FData[base + 0];
+      qx := W.FData[base + 1];
+      qy := W.FData[base + 2];
+      qz := W.FData[base + 3];
+      iBase := iq * 4;
+      // M(q)^T * (e0,e1,e2,e3)
+      LocalPrevError.FData[iBase + 0] := LocalPrevError.FData[iBase + 0]
+        + ( r*e0  + qx*e1 + qy*e2 + qz*e3);
+      LocalPrevError.FData[iBase + 1] := LocalPrevError.FData[iBase + 1]
+        + (-qx*e0 + r*e1  + qz*e2 - qy*e3);
+      LocalPrevError.FData[iBase + 2] := LocalPrevError.FData[iBase + 2]
+        + (-qy*e0 - qz*e1 + r*e2  + qx*e3);
+      LocalPrevError.FData[iBase + 3] := LocalPrevError.FData[iBase + 3]
+        + (-qz*e0 + qy*e1 - qx*e2 + r*e3);
+    end;
+  end;
+end;
+
+// Weight gradient (per block-row neuron) and bias gradient, accumulated into
+// the neurons' Delta scaled by -LearningRate (so the ordinary update applies).
+procedure TNNetQuaternionLinear.BackpropagateCPU();
+var
+  oq, iq, base, oBase, iBase: integer;
+  a, b, c, d: TNeuralFloat;
+  e0, e1, e2, e3, lr: TNeuralFloat;
+  WDelta, BiasDelta, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  BiasDelta := FArrNeurons[FOutQuaternions].FDelta;
+  for oq := 0 to FOutQuaternions - 1 do
+  begin
+    WDelta := FArrNeurons[oq].FDelta;
+    oBase := oq * 4;
+    e0 := -FLearningRate * FOutputError.FData[oBase + 0];
+    e1 := -FLearningRate * FOutputError.FData[oBase + 1];
+    e2 := -FLearningRate * FOutputError.FData[oBase + 2];
+    e3 := -FLearningRate * FOutputError.FData[oBase + 3];
+    if FSuppressBias = 0 then
+    begin
+      BiasDelta.FData[oBase + 0] := BiasDelta.FData[oBase + 0] + e0;
+      BiasDelta.FData[oBase + 1] := BiasDelta.FData[oBase + 1] + e1;
+      BiasDelta.FData[oBase + 2] := BiasDelta.FData[oBase + 2] + e2;
+      BiasDelta.FData[oBase + 3] := BiasDelta.FData[oBase + 3] + e3;
+    end;
+    if (e0 = 0) and (e1 = 0) and (e2 = 0) and (e3 = 0) then continue;
+    for iq := 0 to FInQuaternions - 1 do
+    begin
+      iBase := iq * 4;
+      a := PrevOut.FData[iBase + 0];
+      b := PrevOut.FData[iBase + 1];
+      c := PrevOut.FData[iBase + 2];
+      d := PrevOut.FData[iBase + 3];
+      base := iq * 4;
+      // dL/dr, dL/dx, dL/dy, dL/dz (e* already carries -LearningRate).
+      WDelta.FData[base + 0] := WDelta.FData[base + 0]
+        + ( a*e0 + b*e1 + c*e2 + d*e3);
+      WDelta.FData[base + 1] := WDelta.FData[base + 1]
+        + (-b*e0 + a*e1 - d*e2 + c*e3);
+      WDelta.FData[base + 2] := WDelta.FData[base + 2]
+        + (-c*e0 + d*e1 + a*e2 - b*e3);
+      WDelta.FData[base + 3] := WDelta.FData[base + 3]
+        + (-d*e0 - c*e1 + b*e2 + a*e3);
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for oq := 0 to FOutQuaternions do
+      FArrNeurons[oq].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetKANLayer }
 
 constructor TNNetKANLayer.Create(pSizeX, pSizeY, pDepth: integer;
@@ -57447,6 +57785,7 @@ begin
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
       'TNNetGraphAttention' :       Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]);
@@ -57760,6 +58099,7 @@ begin
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetGraphAttention' then Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]) else

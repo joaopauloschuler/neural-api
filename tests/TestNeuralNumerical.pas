@@ -155,6 +155,9 @@ type
     procedure TestCirculantLinearGradientCheck;
     procedure TestCirculantLinearSerializationRoundTrip;
     procedure TestCirculantLinearFFTEquivalence;
+    // TNNetQuaternionLinear hypercomplex dense layer
+    procedure TestQuaternionLinearGradientCheck;
+    procedure TestQuaternionLinearSerializationRoundTrip;
     // TNNetKANLayer Kolmogorov-Arnold dense layer
     procedure TestKANLayerGradientCheck;
     procedure TestKANLayerSerializationRoundTrip;
@@ -34073,6 +34076,188 @@ begin
         Pos('TNNetCirculantLinear', Saved) > 0);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CirculantLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQuaternionLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  QL: TNNetQuaternionLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, oq, InQ, OutQ, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT, the four real weight
+  // components per Hamilton block, AND the per-output bias. A sign error in the
+  // 4x4 Hamilton layout shows up here. Reseed the shared RNG per the
+  // numerical-test ordering rule.
+  RandSeed := 424242;
+  InQ := 2;  OutQ := 3;
+  InSize := InQ * 4;  OutSize := OutQ * 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  InputPlus := TNNetVolume.Create(1, 1, InSize);
+  Desired := TNNetVolume.Create(1, 1, OutSize);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    QL := TNNetQuaternionLinear.Create(OutSize);
+    NN.AddLayer(QL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    // Deterministic, non-trivial quaternion weights and biases.
+    for oq := 0 to OutQ - 1 do
+    begin
+      for i := 0 to InSize - 1 do
+        QL.Neurons[oq].Weights.Raw[i] := 0.2 - 0.07 * i + 0.3 * Sin(i * 1.1 + oq);
+      QL.Neurons[OutQ].Weights.Raw[oq * 4 + 0] := 0.0; // (filled below)
+    end;
+    for i := 0 to OutSize - 1 do
+      QL.Neurons[OutQ].Weights.Raw[i] := 0.05 * (i - 3); // bias
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('QuaternionLinear input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. each block-row's quaternion weight components ----
+    for oq := 0 to OutQ - 1 do
+      for i := 0 to InSize - 1 do
+      begin
+        QL.Neurons[oq].Weights.Raw[i] := QL.Neurons[oq].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        QL.Neurons[oq].Weights.Raw[i] := QL.Neurons[oq].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        QL.Neurons[oq].Weights.Raw[i] := QL.Neurons[oq].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        QL.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -QL.Neurons[oq].Delta.Raw[i];
+
+        AssertTrue('QuaternionLinear weight gradient check oq=' + IntToStr(oq) +
+          ' c=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the per-output bias (bias neuron = OutQ) ----
+    for i := 0 to OutSize - 1 do
+    begin
+      QL.Neurons[OutQ].Weights.Raw[i] := QL.Neurons[OutQ].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      QL.Neurons[OutQ].Weights.Raw[i] := QL.Neurons[OutQ].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      QL.Neurons[OutQ].Weights.Raw[i] := QL.Neurons[OutQ].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      QL.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -QL.Neurons[OutQ].Delta.Raw[i];
+
+      AssertTrue('QuaternionLinear bias gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQuaternionLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  QL: TNNetQuaternionLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, oq, InQ, OutQ, InSize, OutSize: integer;
+begin
+  // QuaternionLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the
+  // (OutQ block-row + bias) neuron storage round-trips through the standard
+  // per-neuron serialization and both dispatch points.
+  RandSeed := 424242;
+  InQ := 3;  OutQ := 2;
+  InSize := InQ * 4;  OutSize := OutQ * 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    QL := TNNetQuaternionLinear.Create(OutSize);
+    NN.AddLayer(QL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for oq := 0 to OutQ - 1 do
+      for i := 0 to InSize - 1 do
+        QL.Neurons[oq].Weights.Raw[i] := 0.13 * (i + 1) - 0.3 + 0.1 * oq;
+    for i := 0 to OutSize - 1 do
+      QL.Neurons[OutQ].Weights.Raw[i] := 0.04 - 0.02 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('QuaternionLinear SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('QuaternionLinear token present in serialized string',
+        Pos('TNNetQuaternionLinear', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('QuaternionLinear Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
