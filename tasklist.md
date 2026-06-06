@@ -149,6 +149,41 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
+- [ ] TNNetHyperbolicLinear — a Poincaré-ball **hyperbolic** dense layer (Ganea,
+      Bécigneul & Hofmann 2018, "Hyperbolic Neural Networks"; Nickel & Kiela 2017).
+      The layer treats its `Depth`-vector input as a point inside the open
+      Poincaré ball (radius `1/sqrt(c)`, curvature `c>0`) and computes the
+      Möbius matrix–vector product `y = exp_0( M · log_0(x) )` followed by a
+      hyperbolic (Möbius) bias translation `y := y ⊕_c b`, where `log_0`/`exp_0`
+      are the curvature-`c` logarithmic/exponential maps at the origin
+      (`log_0(x) = (1/sqrt(c))·atanh(sqrt(c)·‖x‖)·x/‖x‖`, `exp_0(v) =
+      (1/sqrt(c))·tanh(sqrt(c)·‖v‖)·v/‖v‖`) and `⊕_c` is Möbius addition. This is
+      genuinely distinct from every existing structured/exotic dense layer
+      (`TNNetQuaternionLinear`/`TNNetOctonionLinear` = hypercomplex algebra,
+      `TNNetTropicalLinear` = max-plus semiring, `TNNetMonarch`/`TNNetKronecker`/
+      `TNNetCirculant`/`TNNetHouseholderLinear` = structured/orthogonal real
+      matrices) — it operates in **negatively-curved Riemannian geometry**, the
+      natural embedding space for trees/hierarchies/graphs (exponentially growing
+      neighbourhoods), and nothing in `neural/neuralnetwork.pas` currently does
+      hyperbolic geometry (only an `ArcSinh` activation exists). Scope for v1:
+      forward + exact analytic backward through the log/exp maps and Möbius
+      add (chain-rule the radial `atanh`/`tanh` scalars; guard `‖x‖→1/sqrt(c)`
+      boundary and `‖x‖→0` origin with the usual `EPS`/series fallback so the
+      Jacobian stays finite); curvature `c` a fixed `Create` arg (optionally a
+      single trainable scalar via the `gamma=sigmoid(raw)` constrained-scalar
+      pattern, later). Reuse the `TNNetFullConnectLinear` weight/neuron layout for
+      `M` and bias. Deliverables: the class + `// Coded by Claude (AI).`
+      attribution, numerical-gradient + shape + save/load tests in
+      TestNeuralNumerical.pas (reseed `RandSeed := 424242`; keep input strictly
+      inside the ball, e.g. norm ≤ 0.6/sqrt(c), so FD doesn't straddle the
+      boundary singularity), a README "Fully Connected layers" table row, and a
+      tiny `examples/HyperbolicEmbedding/` demo that embeds a small synthetic
+      tree's node ids and shows hyperbolic distance recovers tree path length
+      better than a param-matched Euclidean dense layer. Possible follow-up:
+      `TNNetHyperbolicDistance` (a Poincaré-distance readout head) once the linear
+      layer lands. See [[octonion-linear-layer]], [[tropical-linear-layer]],
+      [[constrained-learnable-scalar-sigmoid]].
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
