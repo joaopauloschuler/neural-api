@@ -107,22 +107,11 @@ rather than acted on.
       on a small function-fit / classification task (the headline "structured =
       fewer params, comparable accuracy" claim), plus a check that an
       untrained-from-DFT-init Monarch reproduces `TNNetFourierMixFFT`'s transform.
-- [ ] TNNetTropicalConv follow-up (TNNetTropicalLinear max-plus/min-plus
-      morphological DENSE layer + examples/TropicalMorphology/ + gradient/forward/
-      save-load tests all LANDED 2026-06-06 on a2): the SPATIAL sibling — a
-      grayscale morphological dilation/erosion conv with a learnable structuring
-      element over a (SizeX,SizeY,Depth) patch, `y[x,y,co] = max_{dx,dy,ci}
-      (input[x+dx,y+dy,ci] + SE[dx,dy,ci,co])` (erode = min). Reuse the verified
-      arg-max/arg-min one-hot subgradient from the dense layer (cache the winning
-      (dx,dy,ci) per output, route dy to that single input cell + structuring-
-      element tap). Erode flag round-trips via an FStruct slot. Deliverables per
-      [[loss-layer-pattern]]: leaf class + both CreateLayer tables + LoadFromString,
-      numerical-gradient test on input AND structuring element (well-separated
-      inputs, away from the tie kink), a hand-computed tiny forward-equality test
-      for both modes, a save/load round-trip with the erode flag set, and a tiny
-      example contrasting it with a same-size linear conv on a morphological
-      target (thin/thicken a binary glyph). Distinct from parameter-free
-      TNNetMaxPool (learnable additive SE, not a fixed window).
+- [ ] TNNetTropicalConv example follow-up (the SPATIAL TNNetTropicalConv layer +
+      gradient/forward/save-load tests LANDED 2026-06-06 on a2): add an
+      examples/TropicalMorphology/ demo contrasting TNNetTropicalConv with a
+      same-size linear conv on a morphological target (thin/thicken a binary
+      glyph), showcasing the learnable additive structuring element.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT

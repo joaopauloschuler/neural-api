@@ -181,6 +181,11 @@ type
     procedure TestTropicalLinearGradientCheck;
     procedure TestTropicalLinearForwardKnownValue;
     procedure TestTropicalLinearSerializationRoundTrip;
+    // TNNetTropicalConv max-plus / min-plus morphological convolution layer
+    procedure TestTropicalConvInputGradientCheck;
+    procedure TestTropicalConvWeightGradientCheck;
+    procedure TestTropicalConvForwardKnownValue;
+    procedure TestTropicalConvSerializationRoundTrip;
     // TNNetMonarchLinear sub-quadratic structured (block-diagonal) dense layer
     procedure TestMonarchLinearInputGradientCheck;
     procedure TestMonarchLinearWeightGradientCheck;
@@ -37150,6 +37155,294 @@ begin
         (NN2.Layers[1] as TNNetTropicalLinear).Erode);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('TropicalLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTropicalConvInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  TC: TNNetTropicalConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic subgradient w.r.t. the INPUT of a spatial
+  // tropical (max-plus) convolution. The morphological winner is a hard one-hot
+  // arg-max per output cell (like max-pool), so the input is WELL-SEPARATED to
+  // keep every winner unambiguous, away from the kink. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  // 4x4 input, 2 channels; 3x3 SE, padding 1, stride 1; 2 output features.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  InputPlus := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1)); // 1 = collect input error
+    TC := TNNetTropicalConv.Create(2, 3, 1, 1, 0); // dilation
+    NN.AddLayer(TC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    InSize := Input.Size;
+
+    // Well-separated inputs: distinct, widely-spread values so no two candidate
+    // sums (x + SE) tie at any output cell. Magnitudes kept modest so the
+    // squared-loss finite difference (lossPlus - lossMinus) does not suffer
+    // single-precision catastrophic cancellation.
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.37 * i - 3.0;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+    // Distinct, bounded SE taps.
+    for i := 0 to TC.Neurons[0].Weights.Size - 1 do
+      TC.Neurons[0].Weights.Raw[i] := 0.011 * i - 0.2;
+
+    // The tropical forward is EXACTLY piecewise-linear, so a larger epsilon adds
+    // zero finite-difference truncation error (winners are separated by ~0.37,
+    // well beyond epsilon) while reducing single-precision cancellation in the
+    // squared-loss difference (lossPlus - lossMinus).
+    epsilon := 0.05;
+    maxErr := 0;
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('TropicalConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.001);
+    end;
+    WriteLn('  TropicalConv input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTropicalConvWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  TC: TNNetTropicalConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, WCount: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic subgradient w.r.t. the STRUCTURING ELEMENT in
+  // ERODE (min-plus) mode. Well-separated inputs/weights keep the winner
+  // unambiguous; the SE taps are kept bounded rather than loosening the tolerance.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    TC := TNNetTropicalConv.Create(2, 3, 1, 1, 1); // erosion (min-plus)
+    NN.AddLayer(TC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.37 * i - 3.0;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+    WCount := TC.Neurons[0].Weights.Size;
+    for i := 0 to WCount - 1 do
+      TC.Neurons[0].Weights.Raw[i] := 0.011 * i - 0.2;
+
+    // Piecewise-linear forward: larger epsilon adds no truncation error while
+    // cutting single-precision cancellation in the squared-loss difference.
+    epsilon := 0.05;
+    maxErr := 0;
+    for i := 0 to WCount - 1 do
+    begin
+      TC.Neurons[0].Weights.Raw[i] := TC.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      TC.Neurons[0].Weights.Raw[i] := TC.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      TC.Neurons[0].Weights.Raw[i] := TC.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      TC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -TC.Neurons[0].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('TropicalConv weight gradient check w=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.001);
+    end;
+    WriteLn('  TropicalConv weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTropicalConvForwardKnownValue;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  TC: TNNetTropicalConv;
+  W: array[0..8] of TNeuralFloat;
+  i: integer;
+  expDil, expEro: TNeuralFloat;
+begin
+  // Hand-computed tiny single-channel example. 3x3 input, 3x3 SE, NO padding,
+  // stride 1 -> a single 1x1 output of one feature. The SE tap (fx,fy,0,0) at
+  // flat index fy*3+fx aligns with input pixel (fx,fy):
+  //   x =            SE =
+  //     0 1 2          0.0  -1.0   3.0
+  //     3 4 5         -0.5   2.0   0.2
+  //     6 7 8          1.0  -2.0   0.5
+  // DILATION y = max over the 9 (x + SE):
+  //   0+0.0=0  1-1.0=0  2+3.0=5  3-0.5=2.5  4+2.0=6  5+0.2=5.2
+  //   6+1.0=7  7-2.0=5  8+0.5=8.5  -> max = 8.5
+  // EROSION  y = min over the 9 (x - SE):
+  //   0-0.0=0  1+1.0=2  2-3.0=-1  3+0.5=3.5  4-2.0=2  5-0.2=4.8
+  //   6-1.0=5  7+2.0=9  8-0.5=7.5  -> min = -1
+  RandSeed := 424242;
+  W[0] := 0.0; W[1] := -1.0; W[2] := 3.0;
+  W[3] := -0.5; W[4] := 2.0; W[5] := 0.2;
+  W[6] := 1.0; W[7] := -2.0; W[8] := 0.5;
+
+  // ---- Dilation (max-plus) ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 1));
+    TC := TNNetTropicalConv.Create(1, 3, 0, 1, 0);
+    NN.AddLayer(TC);
+    for i := 0 to 8 do Input.Raw[i] := i;
+    for i := 0 to 8 do TC.Neurons[0].Weights.Raw[i] := W[i];
+    NN.Compute(Input);
+    AssertEquals('TropicalConv output is 1x1x1 (dilation)', 1,
+      NN.GetLastLayer.Output.Size);
+    expDil := 8.5;
+    AssertEquals('TropicalConv dilation y', expDil,
+      NN.GetLastLayer.Output.Raw[0], 1e-6);
+  finally
+    NN.Free; Input.Free;
+  end;
+
+  // ---- Erosion (min-plus) ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 1));
+    TC := TNNetTropicalConv.Create(1, 3, 0, 1, 1); // erode flag
+    NN.AddLayer(TC);
+    for i := 0 to 8 do Input.Raw[i] := i;
+    for i := 0 to 8 do TC.Neurons[0].Weights.Raw[i] := W[i];
+    NN.Compute(Input);
+    expEro := -1.0;
+    AssertEquals('TropicalConv erosion y', expEro,
+      NN.GetLastLayer.Output.Raw[0], 1e-6);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTropicalConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  TC: TNNetTropicalConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // TropicalConv in the MIDDLE of a net with the NON-DEFAULT erode flag set and
+  // non-trivial kernel/padding/stride: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the
+  // erode flag (FStruct[6]) and the conv params (FStruct[0..3]) round-trip
+  // through both dispatch points and the SE weight neuron survives.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    TC := TNNetTropicalConv.Create(3, 3, 1, 2, 1); // 3 feat, 3x3, pad 1, stride 2, erode
+    NN.AddLayer(TC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+    for i := 0 to TC.Neurons[0].Weights.Size - 1 do
+      TC.Neurons[0].Weights.Raw[i] := 0.017 * (i + 1) - 0.3;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('TropicalConv SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('TropicalConv token present in serialized string',
+        Pos('TNNetTropicalConv', Saved) > 0);
+      AssertEquals('TropicalConv erode flag round-trips', 1,
+        (NN2.Layers[1] as TNNetTropicalConv).Erode);
+      AssertEquals('TropicalConv output SizeX preserved',
+        NN.Layers[1].Output.SizeX, NN2.Layers[1].Output.SizeX);
+      AssertEquals('TropicalConv output SizeY preserved',
+        NN.Layers[1].Output.SizeY, NN2.Layers[1].Output.SizeY);
+      AssertEquals('TropicalConv output Depth preserved',
+        NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('TropicalConv Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

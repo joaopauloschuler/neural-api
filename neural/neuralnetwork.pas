@@ -6632,6 +6632,59 @@ type
     property Erode: integer read FErode;
   end;
 
+  /// TROPICAL (max-plus / min-plus) morphological CONVOLUTION layer -- the
+  /// SPATIAL sibling of the dense TNNetTropicalLinear. It is a grayscale
+  /// morphological dilation/erosion convolution with a LEARNABLE structuring
+  /// element (SE). Like the dense version it computes in the tropical semiring
+  /// (the "product" is ADDITION, the "sum" is MAX for dilation / MIN for
+  /// erosion) instead of the multiply-accumulate ring of an ordinary conv:
+  ///   DILATION (default):
+  ///     y[ox,oy,co] = max_{fx,fy,ci} ( x[px,py,ci] + SE[fx,fy,ci,co] )
+  ///   ERODE   (flag set):
+  ///     y[ox,oy,co] = min_{fx,fy,ci} ( x[px,py,ci] - SE[fx,fy,ci,co] )
+  /// with px = ox*Stride + fx - Padding, py = oy*Stride + fy - Padding. The sign
+  /// of the SE in erode mode matches TNNetTropicalLinear's min-plus convention.
+  /// Out-of-range (padded) input positions are skipped (they never win).
+  ///
+  /// Backward is the SAME hard one-hot SUBGRADIENT that max-pooling uses: for
+  /// each output cell (ox,oy,co) cache the WINNING (fx,fy,ci) tap (arg-max for
+  /// dilation, arg-min for erosion) and route the upstream error to exactly that
+  /// one input cell AND that one SE tap:
+  ///   dL/dx[px*,py*,ci*] += dy           dL/dSE[fx*,fy*,ci*,co] += dy (dilation)
+  ///   dL/dx[px*,py*,ci*] += dy           dL/dSE[fx*,fy*,ci*,co] -= dy (erosion)
+  /// Non-differentiable at ties (same convention as TNNetMaxPool /
+  /// TNNetTropicalLinear) -- gradient tests must use well-separated inputs so the
+  /// winner is unambiguous, away from the kink.
+  ///
+  /// Constructor mirrors a normal conv: Create(NumFeatures, FeatureSize, Padding,
+  /// Stride, Erode). The convolution machinery (TNNetConvolutionLinear) sizes the
+  /// output (SizeX/SizeY/Depth=NumFeatures), the feature window and the padded-
+  /// error buffer; a single weight neuron holds the SE laid out as
+  ///   SE[((fy*FeatureSizeX + fx)*InDepth + ci)*OutDepth + co].
+  /// FStruct[0..4] carry the usual conv params (features, kernel, padding, stride,
+  /// suppress-bias) and FStruct[6] the erode flag (0 = dilation, 1 = erosion), so
+  /// the layer round-trips through SaveStructureToString / LoadFromString /
+  /// CreateLayer with kernel/padding/stride/erode preserved.
+  // Coded by Claude (AI).
+  TNNetTropicalConv = class(TNNetConvolutionLinear)
+  private
+    FInDepth: integer;     // input Depth (ci count)
+    FOutDepth: integer;    // output features (co count)
+    FErode: integer;       // 0 = dilation (max), 1 = erosion (min)
+    FWinner: array of integer;  // cached winning tap (flat fx,fy,ci) per output cell
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pErode: integer = 0); reintroduce; overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property InDepth: integer read FInDepth;
+    property OutDepth: integer read FOutDepth;
+    property Erode: integer read FErode;
+  end;
+
   /// MONARCH structured DENSE layer (Dao et al. 2022, "Monarch: Expressive
   /// Structured Matrices for Efficient and Accurate Training", arXiv:2204.00595).
   /// A square n -> n linear map whose n x n weight is a MONARCH matrix -- a
@@ -36661,6 +36714,216 @@ begin
   end;
 end;
 
+{ TNNetTropicalConv }
+
+// Tropical (max-plus / min-plus) morphological convolution: the spatial sibling
+// of TNNetTropicalLinear. Per output cell (ox,oy,co):
+//   dilation: y = max_{fx,fy,ci} ( x[px,py,ci] + SE[fx,fy,ci,co] )
+//   erosion : y = min_{fx,fy,ci} ( x[px,py,ci] - SE[fx,fy,ci,co] )
+// FWinner caches the winning flat tap (fx,fy,ci) per output cell so the backward
+// pass routes the upstream error to exactly that one input cell and one SE tap --
+// the same hard subgradient that max-pooling uses.
+
+constructor TNNetTropicalConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pErode: integer = 0);
+begin
+  // Identity activation + conv output sizing come from TNNetConvolutionLinear.
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, 1);
+  if pErode <> 0 then FErode := 1 else FErode := 0;
+  FStruct[6] := FErode;
+  // The single SE weight neuron is sized in SetPrevLayer once InDepth is known.
+end;
+
+procedure TNNetTropicalConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WeightCount: integer;
+begin
+  // Let the convolution machinery size FOutput / FOutputError / FOutputSizeX/Y /
+  // FFeatureSizeX/Y and the padded-error buffer. We then discard its full conv
+  // neuron layout and install one structuring-element neuron.
+  inherited SetPrevLayer(pPrevLayer);
+
+  FInDepth := pPrevLayer.Output.Depth;
+  FOutDepth := FStruct[0];
+  if FInDepth <= 0 then
+    FErrorProc('TNNetTropicalConv requires a non-empty input.');
+
+  // One weight neuron holds the whole SE:
+  //   SE[((fy*FeatureSizeX + fx)*InDepth + ci)*OutDepth + co]
+  WeightCount := FFeatureSizeX * FFeatureSizeY * FInDepth * FOutDepth;
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
+  FNeurons[0].BackInertia.ReSize(WeightCount, 1, 1);
+  FNeurons[0].Delta.ReSize(WeightCount, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+
+  FVectorSize := WeightCount;
+  FShouldConcatWeights := false;
+  FShouldInterleaveWeights := false;
+  BuildArrNeurons();
+
+  SetLength(FWinner, FOutputSizeX * FOutputSizeY * FOutDepth);
+
+  InitDefault();
+  RefreshCalculatePrevLayerError();
+  AfterWeightUpdate();
+end;
+
+// Small symmetric random structuring element near zero, so the initial output is
+// a mild perturbation of the plain morphological dilation/erosion of the patch.
+procedure TNNetTropicalConv.InitDefault();
+var
+  i, WeightCount: integer;
+  W: TNNetVolume;
+begin
+  if FInDepth <= 0 then exit;
+  W := FArrNeurons[0].FWeights;
+  WeightCount := W.Size;
+  for i := 0 to WeightCount - 1 do
+    W.FData[i] := 0.1 * (Random - 0.5) * 2;
+end;
+
+procedure TNNetTropicalConv.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTropicalConv.ComputeCPU();
+var
+  ox, oy, co, fx, fy, ci, tap, best, outIdx: integer;
+  prevX, prevY: integer;
+  prevSizeX, prevSizeY: integer;
+  PrevOut, W: TNNetVolume;
+  cand, bestVal, sgn: TNeuralFloat;
+  hasCand: boolean;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  W := FArrNeurons[0].FWeights;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  // Erosion uses x - SE (sgn = -1); dilation uses x + SE (sgn = +1).
+  if FErode = 0 then sgn := 1 else sgn := -1;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for co := 0 to FOutDepth - 1 do
+    begin
+      best := 0;
+      bestVal := 0;
+      hasCand := false;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ci := 0 to FInDepth - 1 do
+          begin
+            tap := ((fy * FFeatureSizeX + fx) * FInDepth + ci) * FOutDepth + co;
+            cand := PrevOut.Get(prevX, prevY, ci) + sgn * W.FData[tap];
+            if not hasCand then
+            begin
+              bestVal := cand;
+              best := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+              hasCand := true;
+            end
+            else if FErode = 0 then
+            begin
+              if cand > bestVal then
+              begin
+                bestVal := cand;
+                best := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+              end;
+            end
+            else
+            begin
+              if cand < bestVal then
+              begin
+                bestVal := cand;
+                best := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+              end;
+            end;
+          end;
+        end;
+      end;
+      outIdx := (oy * FOutputSizeX + ox) * FOutDepth + co;
+      FWinner[outIdx] := best;
+      FOutput.FData[FOutput.GetRawPos(ox, oy, co)] := bestVal;
+    end;
+  end;
+end;
+
+procedure TNNetTropicalConv.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Subgradient: route each output error dy only to the cached winning tap.
+//   dL/dx[px*,py*,ci*] += dy ; dL/dSE[fx*,fy*,ci*,co] += sgn*dy
+// (Delta carries -LearningRate*grad; sgn = +1 dilation, -1 erosion.)
+procedure TNNetTropicalConv.BackpropagateCPU();
+var
+  ox, oy, co, win, fxy, ci, fx, fy, tap, outIdx: integer;
+  prevX, prevY: integer;
+  W, WDelta, LocalPrevError: TNNetVolume;
+  dy, sgn: TNeuralFloat;
+  HasPrevError: boolean;
+begin
+  W := FArrNeurons[0].FWeights;
+  WDelta := FArrNeurons[0].FDelta;
+  HasPrevError := FCalculatePrevLayerError;
+  LocalPrevError := FPrevLayer.OutputError;
+  if FErode = 0 then sgn := 1 else sgn := -1;
+
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for co := 0 to FOutDepth - 1 do
+    begin
+      dy := FOutputError.Get(ox, oy, co);
+      if dy = 0 then continue;
+      outIdx := (oy * FOutputSizeX + ox) * FOutDepth + co;
+      win := FWinner[outIdx];                 // flat (fx,fy,ci) winning tap
+      ci := win mod FInDepth;
+      fxy := win div FInDepth;                 // fy*FeatureSizeX + fx
+      fx := fxy mod FFeatureSizeX;
+      fy := fxy div FFeatureSizeX;
+      prevX := ox * FStride + fx - FPadding;
+      prevY := oy * FStride + fy - FPadding;
+      tap := fxy * FInDepth * FOutDepth + ci * FOutDepth + co;
+      WDelta.FData[tap] := WDelta.FData[tap] + (-FLearningRate) * sgn * dy;
+      if HasPrevError then
+        LocalPrevError.Add(prevX, prevY, ci, dy);
+    end;
+  end;
+
+  if not FBatchUpdate then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetMonarchLinear }
 
 // Monarch structured dense layer: y = P^T*(L*(P*(R*x))) (+bias). R and L are
@@ -61650,6 +61913,7 @@ begin
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
+      'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
@@ -61975,6 +62239,7 @@ begin
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
+      if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
