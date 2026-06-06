@@ -1251,9 +1251,6 @@ rather than acted on.
       The scheduler classes (TNeuralLRScheduler family) and the TNeuralFit
       integration (the optional Scheduler property driving NextLR each epoch)
       have both landed; this is the remaining README write-up.
-- [ ] "Introspection" README subsection — group CountLayers/Neurons/Weights
-      with the new PrintSummary / FLOPs / WeightHistogram / DeadNeuronReport
-      utilities.
 - [ ] "Layer index by family" README appendix — alphabetical-within-family
       table (Convolution / Pooling / Activation / Normalization / Attention
       / Loss / Shape / Regularization).
