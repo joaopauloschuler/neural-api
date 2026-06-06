@@ -76,6 +76,28 @@ lazbuild HyperbolicEmbedding.lpi
 ../../bin/x86_64-linux/bin/HyperbolicEmbedding
 ```
 
+## Trainable curvature (optional)
+
+This demo fixes the ball curvature `c` to `CURVATURE`. `TNNetHyperbolicLinear`
+also supports learning `c` as a single trainable scalar — pass the extra
+`pLearnCurvature` flag:
+
+```pascal
+// fixed c (default, exactly as used in this demo):
+TNNetHyperbolicLinear.Create(DIM, CURVATURE, 1);
+// trainable c, starting from CURVATURE:
+TNNetHyperbolicLinear.Create(DIM, CURVATURE, 1, {pLearnCurvature=}true);
+```
+
+In learnable mode `c = CMIN + (CMAX-CMIN)·sigmoid(raw)` (bounded to `(0.01, 4.0)`
+so it stays strictly positive), stored as one extra 1-weight neuron that the
+ordinary optimizer / save-load machinery handles transparently. The exact
+`dL/draw` is back-propagated through the `log₀ → matmul → exp₀ → Möbius-add`
+chain, so curvature is learned jointly with the matrix and bias. (This demo
+keeps `c` fixed because its hand-coded distance loss reads `CURVATURE` as a
+constant; in a model where the layer's own output drives the loss, just flip the
+flag.)
+
 ## Related layers
 
 * `TNNetHyperbolicLinear` — the Poincaré-ball hyperbolic dense layer used as the

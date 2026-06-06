@@ -5837,9 +5837,26 @@ type
   // origin are guarded by an EPS / small-norm series so the radial coefficients
   // and their derivatives stay finite.
   // Coded by Claude (AI).
+  //
+  // OPTIONAL TRAINABLE CURVATURE: pass LearnCurvature=true (a THIRD constructor
+  // flag, so the existing 2-arg fixed-c signature and its serialization format
+  // are untouched) to make c a single learned scalar. It is stored UNCONSTRAINED
+  // as one extra 1-weight neuron appended past the D_out matrix-row neurons
+  // (FNeurons[D_out]), wired exactly like TNNetRetention's learnable gamma /
+  // TNNetReZero's alpha so it round-trips through the ordinary per-neuron
+  // save/load and is stepped by the standard UpdateWeights / Adam machinery. The
+  // effective curvature is a BOUNDED-positive sigmoid map of that raw scalar,
+  //     c = CMIN + (CMAX-CMIN)*sigmoid(raw),
+  // so c can never leave (CMIN,CMAX) under any gradient step. InitDefault seeds
+  // raw = logit((c0-CMIN)/(CMAX-CMIN)) so training starts at the requested c0.
+  // Backward accumulates the EXACT dL/draw (forward-mode tangent of y w.r.t. c,
+  // chained through dc/draw) into that neuron's Delta. The trainable flag
+  // round-trips through FStruct[4]. Coded by Claude (AI).
   TNNetHyperbolicLinear = class(TNNetFullConnectLinear)
   private
-    FCurvature: TNeuralFloat;            // c > 0
+    FCurvature: TNeuralFloat;            // c > 0 (effective; live in learn mode)
+    FLearnCurvature: boolean;           // when true, c = bounded-sigmoid(raw)
+    FInitCurvature: TNeuralFloat;       // requested c0 (for InitDefault seeding)
     // Forward caches (per-sample), all length D_in or D_out as noted.
     FCacheX: TNNetVolume;                // input x                     (D_in)
     FCacheU: TNNetVolume;                // u = log_0(x)                (D_in)
@@ -5853,16 +5870,30 @@ type
     function LogGamma(const n: TNeuralFloat): TNeuralFloat;  // alpha'(n)/n
     function ExpCoef(const n: TNeuralFloat): TNeuralFloat;   // beta(||v||)
     function ExpGamma(const n: TNeuralFloat): TNeuralFloat;  // beta'(n)/n
+    // d(LogCoef)/dc and d(ExpCoef)/dc as a function of the (fixed) norm n, used
+    // by the trainable-curvature forward-mode tangent. Series-guarded like above.
+    function LogCoefDc(const n: TNeuralFloat): TNeuralFloat;
+    function ExpCoefDc(const n: TNeuralFloat): TNeuralFloat;
+    // Curvature neuron index (= D_out) and the dc/draw chain factor.
+    function CurvatureNeuronIdx(): integer;
+    procedure SyncCurvatureFromRaw();    // c = bounded-sigmoid(raw)
+    procedure SeedCurvatureRaw();        // raw := logit((c0-CMIN)/(CMAX-CMIN))
+    procedure AccumulateCurvatureGradient(); // dL/draw -> curvature neuron Delta
   public
     // pSizeX carries D_out (the map is D_in -> D_out). pCurvature is the fixed
-    // ball curvature c > 0 (default 1.0). pSuppressBias<>0 drops the Mobius bias.
-    constructor Create(pSizeX: integer; pCurvature: TNeuralFloat = 1.0; pSuppressBias: integer = 0); reintroduce; overload;
+    // (or, when pLearnCurvature, the INITIAL) ball curvature c > 0 (default 1.0).
+    // pSuppressBias<>0 drops the Mobius bias. pLearnCurvature<>false makes c a
+    // single trainable scalar (see class header); default false keeps c fixed.
+    constructor Create(pSizeX: integer; pCurvature: TNeuralFloat = 1.0; pSuppressBias: integer = 0; pLearnCurvature: boolean = false); reintroduce; overload;
     destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
     procedure Backpropagate(); override;
     procedure BackpropagateCPU(); override;
     property Curvature: TNeuralFloat read FCurvature;
+    property LearnCurvature: boolean read FLearnCurvature;
   end;
 
   /// Poincare-ball hyperbolic DISTANCE readout head (companion to
@@ -39495,21 +39526,98 @@ end;
 // Floor guarding the various norms / radii in the Poincare maps.
 const
   HYPERBOLIC_EPS = 1e-7;
+  // Bounded-positive range for the trainable curvature: c = CMIN + (CMAX-CMIN)*
+  // sigmoid(raw). Wide enough to cover the usual c in [0.1, 2] regime while
+  // keeping c strictly positive and finite under any gradient step.
+  HYPERBOLIC_CMIN = 0.01;
+  HYPERBOLIC_CMAX = 4.0;
 
 constructor TNNetHyperbolicLinear.Create(pSizeX: integer;
-  pCurvature: TNeuralFloat = 1.0; pSuppressBias: integer = 0);
+  pCurvature: TNeuralFloat = 1.0; pSuppressBias: integer = 0;
+  pLearnCurvature: boolean = false);
 begin
   inherited Create(pSizeX, 1, 1, pSuppressBias);
   if pCurvature <= 0 then
     FErrorProc('TNNetHyperbolicLinear requires curvature c > 0. c=' +
       FloatToStr(pCurvature));
+  FLearnCurvature := pLearnCurvature;
+  if FLearnCurvature and
+     ( (pCurvature <= HYPERBOLIC_CMIN) or (pCurvature >= HYPERBOLIC_CMAX) ) then
+    FErrorProc('TNNetHyperbolicLinear trainable curvature must start in (' +
+      FloatToStr(HYPERBOLIC_CMIN) + ',' + FloatToStr(HYPERBOLIC_CMAX) +
+      '). c=' + FloatToStr(pCurvature));
   FCurvature := pCurvature;
+  FInitCurvature := pCurvature;
   FFloatSt[0] := pCurvature;
+  if FLearnCurvature then FStruct[4] := 1 else FStruct[4] := 0;
   FCacheX := TNNetVolume.Create();
   FCacheU := TNNetVolume.Create();
   FCacheV := TNNetVolume.Create();
   FCacheZ := TNNetVolume.Create();
   FCacheB := TNNetVolume.Create();
+end;
+
+// Index of the extra 1-weight curvature neuron (appended past the D_out
+// matrix-row neurons) in the learnable-curvature case.
+function TNNetHyperbolicLinear.CurvatureNeuronIdx(): integer;
+begin
+  Result := FOutput.Size;
+end;
+
+// c = CMIN + (CMAX-CMIN)*sigmoid(raw) from the live raw scalar.
+procedure TNNetHyperbolicLinear.SyncCurvatureFromRaw();
+var
+  raw, sig: TNeuralFloat;
+begin
+  if not FLearnCurvature then exit;
+  if FNeurons.Count <= CurvatureNeuronIdx() then exit;
+  raw := FNeurons[CurvatureNeuronIdx()].FWeights.FData[0];
+  sig := Sigmoid(raw);
+  FCurvature := HYPERBOLIC_CMIN + (HYPERBOLIC_CMAX - HYPERBOLIC_CMIN) * sig;
+  // Keep FFloatSt[0] tracking the live curvature for introspection / a valid
+  // c>0 fallback for the reconstruction ctor.
+  FFloatSt[0] := FCurvature;
+end;
+
+procedure TNNetHyperbolicLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Append ONE extra 1-weight neuron holding the raw (pre-sigmoid) curvature,
+  // wired like TNNetRetention's learnable gamma. The matrix-row backward loops
+  // only touch FArrNeurons[0..D_out-1], so this neuron is invisible to them but
+  // visible to the ordinary FNeurons-iterating UpdateWeights / save / load.
+  if FLearnCurvature then
+  begin
+    AddNeurons(1);
+    BuildArrNeurons();
+    FNeurons[CurvatureNeuronIdx()].FWeights.ReSize(1, 1, 1);
+    FNeurons[CurvatureNeuronIdx()].FBackInertia.ReSize(1, 1, 1);
+    FNeurons[CurvatureNeuronIdx()].FDelta.ReSize(1, 1, 1);
+    // Seed only the curvature neuron (the matrix rows were already initialised by
+    // the inherited SetPrevLayer); avoids re-drawing the whole weight init.
+    SeedCurvatureRaw();
+    AfterWeightUpdate();
+  end;
+end;
+
+// Seed raw so c = CMIN + (CMAX-CMIN)*sigmoid(raw) = FInitCurvature, i.e.
+// raw = logit((c0-CMIN)/(CMAX-CMIN)). The optimizer steps this unconstrained
+// scalar while the effective curvature stays inside (CMIN,CMAX).
+procedure TNNetHyperbolicLinear.SeedCurvatureRaw();
+begin
+  if FNeurons.Count <= CurvatureNeuronIdx() then exit;
+  FNeurons[CurvatureNeuronIdx()].FWeights.FData[0] :=
+    Ln( (FInitCurvature - HYPERBOLIC_CMIN) /
+        (HYPERBOLIC_CMAX - FInitCurvature) );
+  FNeurons[CurvatureNeuronIdx()].FBiasWeight := 0;
+  SyncCurvatureFromRaw();
+end;
+
+procedure TNNetHyperbolicLinear.InitDefault();
+begin
+  inherited InitDefault();
+  if not FLearnCurvature then exit;
+  SeedCurvatureRaw();
 end;
 
 destructor TNNetHyperbolicLinear.Destroy();
@@ -39594,11 +39702,49 @@ begin
   end;
 end;
 
+// d(LogCoef)/dc at a FIXED norm n. With t=s*n (s=sqrt(c)), alpha=atanh(t)/t and
+// dt/dc = n/(2s): d alpha/dc = ( (t/(1-t^2) - atanh(t))/t^2 ) * n/(2s).
+// Series near n=0: -> n^2/3.
+function TNNetHyperbolicLinear.LogCoefDc(const n: TNeuralFloat): TNeuralFloat;
+var
+  s, t, datanh: TNeuralFloat;
+begin
+  s := Sqrt(FCurvature);
+  t := s * n;
+  if t < HYPERBOLIC_EPS then
+    Result := n * n / 3.0
+  else
+  begin
+    if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
+    datanh := ( t / (1.0 - t * t) - ArcTanh(t) ) / (t * t);
+    Result := datanh * n / (2.0 * s);
+  end;
+end;
+
+// d(ExpCoef)/dc at a FIXED norm n. With t=s*n, beta=tanh(t)/t and dt/dc=n/(2s):
+// d beta/dc = ( (t*(1-th^2) - th)/t^2 ) * n/(2s).  Series near n=0: -> -n^2/3.
+function TNNetHyperbolicLinear.ExpCoefDc(const n: TNeuralFloat): TNeuralFloat;
+var
+  s, t, th, dbeta: TNeuralFloat;
+begin
+  s := Sqrt(FCurvature);
+  t := s * n;
+  if t < HYPERBOLIC_EPS then
+    Result := -n * n / 3.0
+  else
+  begin
+    th := Tanh(t);
+    dbeta := ( t * (1.0 - th * th) - th ) / (t * t);
+    Result := dbeta * n / (2.0 * s);
+  end;
+end;
+
 procedure TNNetHyperbolicLinear.Compute();
 var
   StartTime: double;
 begin
   StartTime := Now();
+  if FLearnCurvature then SyncCurvatureFromRaw();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -39669,6 +39815,116 @@ begin
     FOutput.FData[jOut] := (p * Z.FData[jOut] + qq * B.FData[jOut]) / Den;
 end;
 
+// Accumulates dL/draw into the curvature neuron's Delta (learnable-c mode only).
+// Uses a forward-mode tangent of y w.r.t. c through the cached x,u,v,z,b chain
+// (log_0 -> M -> exp_0 -> Mobius bias add), then chains dc/draw of the bounded
+// sigmoid map. dL/dc = <g, dy/dc>, g = dL/dy = FOutputError.
+procedure TNNetHyperbolicLinear.AccumulateCurvatureGradient();
+var
+  nIn, nOut, i, jOut: integer;
+  c, nx, nv, alpha, beta, dalpha_dc, dnv, dbeta_dc: TNeuralFloat;
+  Acoef, nz2, nb2, p, qq, Den: TNeuralFloat;
+  dA, dnz2, dp, dq, dDen, Numj, dNumj, dydc: TNeuralFloat;
+  dLdc, sig, dc_draw: TNeuralFloat;
+  X, U, V, Z, B, WRow: TNNetVolume;
+  du, dv, dz: array of TNeuralFloat;
+begin
+  if not FLearnCurvature then exit;
+  if FNeurons.Count <= CurvatureNeuronIdx() then exit;
+  c := FCurvature;
+  X := FCacheX; U := FCacheU; V := FCacheV; Z := FCacheZ; B := FCacheB;
+  nIn := U.Size;
+  nOut := FOutput.Size;
+
+  // du = dalpha/dc * x  (u = alpha(||x||,c)*x; x fixed w.r.t. c).
+  nx := 0;
+  for i := 0 to nIn - 1 do nx := nx + X.FData[i] * X.FData[i];
+  nx := Sqrt(nx);
+  alpha := LogCoef(nx);
+  dalpha_dc := LogCoefDc(nx);
+  SetLength(du, nIn);
+  for i := 0 to nIn - 1 do du[i] := dalpha_dc * X.FData[i];
+
+  // dv = M.du  (v = M.u, M fixed w.r.t. c).
+  SetLength(dv, nOut);
+  for jOut := 0 to nOut - 1 do
+  begin
+    WRow := FArrNeurons[jOut].FWeights;
+    dv[jOut] := 0;
+    for i := 0 to nIn - 1 do dv[jOut] := dv[jOut] + WRow.FData[i] * du[i];
+  end;
+
+  // beta total derivative: dbeta/dc = ExpCoefDc(nv) + (dbeta/dn)*dnv/dc, with
+  // dbeta/dn = ExpGamma(nv)*nv and dnv/dc = <v,dv>/nv.
+  nv := 0;
+  for jOut := 0 to nOut - 1 do nv := nv + V.FData[jOut] * V.FData[jOut];
+  nv := Sqrt(nv);
+  beta := ExpCoef(nv);
+  if nv < HYPERBOLIC_EPS then
+    dnv := 0
+  else
+  begin
+    dnv := 0;
+    for jOut := 0 to nOut - 1 do dnv := dnv + V.FData[jOut] * dv[jOut];
+    dnv := dnv / nv;
+  end;
+  dbeta_dc := ExpCoefDc(nv) + ExpGamma(nv) * nv * dnv;
+
+  // dz = dbeta/dc * v + beta * dv.
+  SetLength(dz, nOut);
+  for jOut := 0 to nOut - 1 do
+    dz[jOut] := dbeta_dc * V.FData[jOut] + beta * dv[jOut];
+
+  // Mobius forward tangent. y_j = (p z_j + q b_j)/Den. b is constant w.r.t. c,
+  // but z, and the explicit c in p,q,Den, all vary.
+  Acoef := 0; nz2 := 0; nb2 := 0;
+  for jOut := 0 to nOut - 1 do
+  begin
+    Acoef := Acoef + Z.FData[jOut] * B.FData[jOut];
+    nz2 := nz2 + Z.FData[jOut] * Z.FData[jOut];
+    nb2 := nb2 + B.FData[jOut] * B.FData[jOut];
+  end;
+  p := 1.0 + 2.0 * c * Acoef + c * nb2;
+  qq := 1.0 - c * nz2;
+  Den := 1.0 + 2.0 * c * Acoef + c * c * nz2 * nb2;
+  if Abs(Den) < HYPERBOLIC_EPS then
+    Den := HYPERBOLIC_EPS * Sign(Den + HYPERBOLIC_EPS);
+  // dA/dc = <dz,b>, dnz2/dc = 2<z,dz>, dnb2/dc = 0.
+  dA := 0; dnz2 := 0;
+  for jOut := 0 to nOut - 1 do
+  begin
+    dA := dA + dz[jOut] * B.FData[jOut];
+    dnz2 := dnz2 + Z.FData[jOut] * dz[jOut];
+  end;
+  dnz2 := 2.0 * dnz2;
+  dp := 2.0 * Acoef + 2.0 * c * dA + nb2;
+  dq := -nz2 - c * dnz2;
+  dDen := 2.0 * Acoef + 2.0 * c * dA + 2.0 * c * nz2 * nb2 + c * c * dnz2 * nb2;
+
+  dLdc := 0;
+  for jOut := 0 to nOut - 1 do
+  begin
+    Numj := p * Z.FData[jOut] + qq * B.FData[jOut];
+    dNumj := dp * Z.FData[jOut] + p * dz[jOut] + dq * B.FData[jOut];
+    dydc := (dNumj * Den - Numj * dDen) / (Den * Den);
+    dLdc := dLdc + FOutputError.FData[jOut] * dydc;
+  end;
+
+  // Chain the bounded-sigmoid map: c = CMIN + (CMAX-CMIN)*sigmoid(raw), so
+  // dc/draw = (CMAX-CMIN)*sig*(1-sig) with sig = (c-CMIN)/(CMAX-CMIN).
+  sig := (c - HYPERBOLIC_CMIN) / (HYPERBOLIC_CMAX - HYPERBOLIC_CMIN);
+  dc_draw := (HYPERBOLIC_CMAX - HYPERBOLIC_CMIN) * sig * (1.0 - sig);
+
+  FNeurons[CurvatureNeuronIdx()].FDelta.FData[0] :=
+    FNeurons[CurvatureNeuronIdx()].FDelta.FData[0] +
+    (-FLearningRate) * dLdc * dc_draw;
+  if not FBatchUpdate then
+  begin
+    FNeurons[CurvatureNeuronIdx()].UpdateWeightsWithoutInertia();
+    SyncCurvatureFromRaw();
+  end;
+end;
+
 procedure TNNetHyperbolicLinear.Backpropagate();
 var
   StartTime: double;
@@ -39679,7 +39935,11 @@ begin
   if (FPrevLayer.FOutput.Size > 0) then
   begin
     StartTime := Now();
-    if FLearningRate <> 0.0 then BackpropagateCPU();
+    if FLearningRate <> 0.0 then
+    begin
+      BackpropagateCPU();
+      if FLearnCurvature then AccumulateCurvatureGradient();
+    end;
     ComputePreviousLayerError();
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -64586,7 +64846,7 @@ begin
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
       'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
-      'TNNetHyperbolicLinear' :     Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3]);
+      'TNNetHyperbolicLinear' :     Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3], St[4] = 1);
       'TNNetHyperbolicDistance' :   Result := TNNetHyperbolicDistance.Create(St[0], Ft[0]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
@@ -64919,7 +65179,7 @@ begin
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else
       if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
-      if S[0] = 'TNNetHyperbolicLinear' then Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3]) else
+      if S[0] = 'TNNetHyperbolicLinear' then Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3], St[4] = 1) else
       if S[0] = 'TNNetHyperbolicDistance' then Result := TNNetHyperbolicDistance.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else

@@ -163,6 +163,8 @@ type
     procedure TestHyperbolicLinearGradientCheck;
     procedure TestHyperbolicLinearShape;
     procedure TestHyperbolicLinearSerializationRoundTrip;
+    procedure TestHyperbolicLinearCurvatureGradientCheck;
+    procedure TestHyperbolicLinearTrainableCurvatureRoundTrip;
     // TNNetHyperbolicDistance Poincare-ball prototype-distance readout head
     procedure TestHyperbolicDistanceGradientCheck;
     procedure TestHyperbolicDistanceShape;
@@ -36685,6 +36687,171 @@ begin
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertTrue('HyperbolicLinear reloaded output matches at ' + IntToStr(i),
           Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicLinearCurvatureGradientCheck;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Desired: TNNetVolume;
+  HL: TNNetHyperbolicLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  rawSaved, c0, sig, dc_draw, dLdraw, dLdc: TNeuralFloat;
+  i, j, NIn, NOut, idx: integer;
+  cmin, cmax: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // FD vs analytic gradient of the loss w.r.t. the TRAINABLE curvature's RAW
+  // (pre-sigmoid) scalar. Perturb the raw weight, central-difference the loss,
+  // and compare with the analytic dL/draw the backward accumulates into the
+  // curvature neuron's Delta. Reseed the shared RNG per the ordering rule.
+  RandSeed := 424242;
+  cmin := 0.01; cmax := 4.0; // mirror HYPERBOLIC_CMIN / HYPERBOLIC_CMAX
+  c0 := 1.3;
+  NIn := 4;
+  NOut := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, NIn);
+  Desired := TNNetVolume.Create(1, 1, NOut);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, NIn, 1));
+    HL := TNNetHyperbolicLinear.Create(NOut, c0, 0, true); // trainable curvature
+    NN.AddLayer(HL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to NIn - 1 do
+      Input.Raw[i] := Sin(i * 0.7 + 0.3) * 0.18 + 0.04;
+    for j := 0 to NOut - 1 do
+      Desired.Raw[j] := Cos(j * 0.5) * 0.1;
+    for j := 0 to NOut - 1 do
+    begin
+      for i := 0 to NIn - 1 do
+        HL.Neurons[j].Weights.Raw[i] := 0.15 * Sin(i * 1.1 + j * 0.6) + 0.05;
+      HL.Neurons[j].BiasWeight := 0.04 * (j - 1);
+    end;
+
+    idx := HL.Output.Size; // curvature neuron index (= D_out)
+    rawSaved := HL.Neurons[idx].Weights.Raw[0];
+
+    // FD on the raw scalar.
+    HL.Neurons[idx].Weights.Raw[0] := rawSaved + epsilon;
+    lossPlus := ComputeLoss();
+    HL.Neurons[idx].Weights.Raw[0] := rawSaved - epsilon;
+    lossMinus := ComputeLoss();
+    HL.Neurons[idx].Weights.Raw[0] := rawSaved;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    // Analytic dL/draw = -Delta (LR=1, batch update so Delta accumulates raw grad).
+    NN.Compute(Input);
+    HL.Neurons[idx].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -HL.Neurons[idx].Delta.Raw[0];
+
+    AssertTrue('HyperbolicLinear curvature-raw gradient num=' +
+      FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.005);
+
+    // Sanity: effective curvature equals the bounded-sigmoid map of the raw.
+    NN.Compute(Input);
+    sig := 1.0 / (1.0 + Exp(-rawSaved));
+    AssertTrue('HyperbolicLinear effective curvature matches sigmoid map',
+      Abs(HL.Curvature - (cmin + (cmax - cmin) * sig)) < 1e-5);
+
+    // Sanity: dc/draw chain factor is positive and finite (constrained scalar).
+    c0 := HL.Curvature;
+    sig := (c0 - cmin) / (cmax - cmin);
+    dc_draw := (cmax - cmin) * sig * (1.0 - sig);
+    AssertTrue('HyperbolicLinear dc/draw positive', dc_draw > 0);
+    dLdc := numericalGrad / dc_draw;
+    dLdraw := dLdc * dc_draw;
+    AssertTrue('HyperbolicLinear dL/draw consistency',
+      Abs(dLdraw - numericalGrad) < 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicLinearTrainableCurvatureRoundTrip;
+var
+  NN, NN2: TNNet;
+  HL, HL2: TNNetHyperbolicLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, j, idx: integer;
+begin
+  // A net with a TRAINABLE-curvature HyperbolicLinear must round-trip: the extra
+  // raw-curvature neuron and the LearnCurvature flag (FStruct[4]) survive
+  // SaveToString -> LoadFromString -> SaveToString byte-identically, the reloaded
+  // layer is still in learnable mode, its effective curvature matches, and
+  // Compute matches. Also reconfirm the DEFAULT (fixed-c) path is unchanged.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    HL := TNNetHyperbolicLinear.Create(4, 1.7, 0, true);
+    NN.AddLayer(HL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    // Move the raw curvature scalar off its init value to prove it persists.
+    idx := HL.Output.Size;
+    HL.Neurons[idx].Weights.Raw[0] := HL.Neurons[idx].Weights.Raw[0] + 0.37;
+
+    for i := 0 to 4 do Input.Raw[i] := Sin(i * 0.8) * 0.12 - 0.03;
+    for j := 0 to 3 do
+    begin
+      for i := 0 to 4 do
+        HL.Neurons[j].Weights.Raw[i] := 0.13 * (i + 1) - 0.3 + 0.2 * j;
+      HL.Neurons[j].BiasWeight := 0.05 - 0.02 * j;
+    end;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Trainable-curvature serialization byte-identical',
+        Saved, Saved2);
+
+      HL2 := NN2.Layers[1] as TNNetHyperbolicLinear;
+      AssertTrue('Reloaded layer is in learnable-curvature mode',
+        HL2.LearnCurvature);
+
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      AssertTrue('Reloaded trainable curvature matches',
+        Abs(HL.Curvature - HL2.Curvature) < 1e-6);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('Trainable-curvature reloaded output matches at ' +
+          IntToStr(i),
+          Abs(NN.GetLastLayer.Output.Raw[i] -
+              NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
     finally
       NN2.Free;
     end;
