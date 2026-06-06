@@ -8178,6 +8178,25 @@ type
       // (Depth is read from the previous layer). Returns the residual-sum layer.
       // See TNNetMLSTMCell for the gate/covariance math. Coded by Claude (AI).
       function AddMLSTM(): TNNetLayer;
+      // Stacks Levels single-level TNNetDWT1D layers into a dyadic
+      // multi-resolution WAVELET PACKET pyramid over a (SeqLen,1,Depth)
+      // sequence (GetLastLayer must have SizeY=1). One level maps
+      //   (L,1,D) -> (L div 2, 1, 2*D)   (approx band in the first D channels,
+      // detail band in the next D). Because TNNetDWT1D transforms EVERY input
+      // channel, re-applying it recursively decomposes BOTH the approximation
+      // AND the detail subbands -- i.e. the full balanced binary packet tree
+      // (Coifman-Wickerhauser wavelet packet transform), NOT the Mallat
+      // pyramid (which would recurse the approximation band only). This keeps
+      // the result a single dense tensor with no channel split/concat plumbing:
+      // after Levels levels the shape is
+      //   (SeqLen div 2^Levels, 1, (2^Levels)*Depth),
+      // every channel being one leaf packet coefficient band. SeqLen must be
+      // divisible by 2 at each level for a clean dyadic split (odd lengths are
+      // symmetric-extended by the layer). Filter is the csDWT1D* selector
+      // (0=Haar, 1=CDF53, 2=Daub4); Learnable makes the lifting taps trainable
+      // at every level. Returns the last (deepest) DWT layer.
+      function AddWaveletPacketTransform(Levels, Filter: integer;
+        Learnable: boolean = false): TNNetLayer;
       // Wires a continuous modern-Hopfield associative-memory retrieval over a
       // (SeqLen,1,d) query tensor (GetLastLayer, SizeY=1, Depth=d) against a
       // freshly created learnable pattern bank of NumPatterns d-vectors. Each
@@ -33990,6 +34009,25 @@ begin
   // legal residual sublayer (see the AddRMSNormResidual contract). Parameterless:
   // the cell reads Depth from the previous layer.
   Result := AddRMSNormResidual([TNNetMLSTMCell.Create()]);
+end;
+
+function TNNet.AddWaveletPacketTransform(Levels, Filter: integer;
+  Learnable: boolean = false): TNNetLayer;
+var
+  LevelCnt: integer;
+begin
+  // Balanced binary wavelet-packet tree: stack Levels single-level DWTs. Each
+  // TNNetDWT1D transforms every channel, so re-applying it recursively splits
+  // both the approximation and the detail subbands (full packet tree). The
+  // shape after each level halves SeqLen and doubles Depth; after Levels levels:
+  //   (SeqLen div 2^Levels, 1, (2^Levels)*Depth).
+  // See the interface doc comment for the chosen semantics (packet, not Mallat).
+  if Levels < 1 then
+    FErrorProc('AddWaveletPacketTransform requires Levels >= 1; got ' +
+      IntToStr(Levels) + '.');
+  Result := GetLastLayer();
+  for LevelCnt := 0 to Levels - 1 do
+    Result := AddLayer(TNNetDWT1D.Create(Filter, Learnable));
 end;
 
 function TNNet.AddBidirectionalClosedFormContinuous(): TNNetLayer;

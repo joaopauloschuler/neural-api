@@ -78,6 +78,7 @@ type
     procedure TestAddAutoGroupedPointwiseConv2UsesInstanceNorm;
     procedure TestAddChannelMovingNormUsesInstanceNorm;
     procedure TestAddMovingNormShapeAndForward;
+    procedure TestAddWaveletPacketTransformShapeAndForward;
 
     // Introspection
     procedure TestPrintSummary;
@@ -1275,6 +1276,37 @@ begin
       4, NN.GetLastLayer.Output.SizeX);
     AssertEquals('AddMovingNorm preserves depth',
       8, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAddWaveletPacketTransformShapeAndForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // AddWaveletPacketTransform stacks Levels single-level DWTs into a balanced
+  // packet tree: each level halves SeqLen and doubles Depth, transforming every
+  // channel. From (16,1,3): L1 -> (8,1,6), L2 -> (4,1,12), L3 -> (2,1,24).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(16, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(16, 1, 3));
+    NN.AddWaveletPacketTransform({Levels=}3, {Filter=}csDWT1DCDF53);
+
+    AssertEquals('Packet transform halves SeqLen per level (16/2^3)',
+      2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Packet transform keeps SizeY=1',
+      1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Packet transform doubles Depth per level (3*2^3)',
+      24, NN.GetLastLayer.Output.Depth);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+    AssertTrue('Packet transform forward produces finite output',
+      NN.GetLastLayer.Output.GetSum() = NN.GetLastLayer.Output.GetSum());
   finally
     NN.Free;
     Input.Free;
