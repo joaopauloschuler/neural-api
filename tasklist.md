@@ -72,39 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetRandomFourierFeatures — LANDED 2026-06-06 on a2. RBF-kernel random
-      features (frozen `W ~ N(0,1/sigma²)`, output Depth `2*D`, `sqrt(1/D)`
-      scale, `<phi(x),phi(y)> ≈ exp(-‖x-y‖²/2sigma²)`); optional trainable-W
-      "deep kernel learning" flag. Wired both CreateLayer tables + LoadFromString
-      (`Create(St[0],Ft[0],St[6],St[5])`: D / sigma / trainable / seed); W in
-      neuron 0 reloads identically. Tests: input-gradient (frozen) + W-gradient
-      (trainable) FD checks, Gram-vs-closed-form-RBF convergence (err 0.083→0.013
-      as D 64→4096), save/load round-trip. Example `examples/RandomFourierFeatures/`
-      (concentric rings: frozen RFF+linear = 1.0 acc, raw linear = 0.47, MLP =
-      1.0; ≈5 s). SCOPE NOTE: sigma is kept a FIXED scalar — `dL/dsigma` is NOT
-      propagated (only `dL/dx` and, in trainable mode, `dL/dW`); the deep-kernel
-      learnable-bandwidth variant is left for a follow-up. Coexists with the
-      pre-existing fixed-only Tancik-style `TNNetFourierFeatures` (that one has no
-      `sqrt(1/D)` kernel scale, uses a `2π` factor, and no trainable mode).
-- [X] TNNetMonarchLinear example follow-up (the core layer + gradient/forward/
-      save-load tests LANDED 2026-06-06): an `examples/MonarchLinear/`
-      param-vs-accuracy bake-off contrasting a Monarch dense layer against a
-      param-matched plain `TNNetFullConnectLinear` and a `TNNetCirculantLinear`
-      on a small function-fit / classification task (the headline "structured =
-      fewer params, comparable accuracy" claim), plus a check that an
-      untrained-from-DFT-init Monarch reproduces `TNNetFourierMixFFT`'s transform.
-      LANDED 2026-06-06 on a2 (examples/MonarchLinear/: 64->64 mixer bake-off,
-      Monarch 1088 wts MSE ~0.004 vs Dense 4096 wts vs Circulant 128 wts; DFT
-      sub-check SKIPPED — layer has no DFT-init path, noted in program/README).
-- [X] TNNetTropicalConv example follow-up (the SPATIAL TNNetTropicalConv layer +
-      gradient/forward/save-load tests LANDED 2026-06-06 on a2): add an
-      examples/TropicalMorphology/ demo contrasting TNNetTropicalConv with a
-      same-size linear conv on a morphological target (thin/thicken a binary
-      glyph), showcasing the learnable additive structuring element.
-      LANDED 2026-06-06 on a2 (examples/TropicalMorphology/TropicalMorphologyConv.lpr:
-      learns 3x3 dilation/erosion of a 12x12 cross glyph; tropical conv beats the
-      linear conv on per-pixel MSE on both targets — dilation an exact MSE-0/100%
-      win — via its learnable additive SE; ~1 s).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
