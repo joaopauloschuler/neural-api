@@ -197,6 +197,11 @@ type
     procedure TestMonarchLinearWeightGradientCheck;
     procedure TestMonarchLinearForwardKnownValue;
     procedure TestMonarchLinearSerializationRoundTrip;
+    // TNNetKroneckerLinear sub-quadratic structured (Kronecker-product) dense layer
+    procedure TestKroneckerLinearInputGradientCheck;
+    procedure TestKroneckerLinearWeightGradientCheck;
+    procedure TestKroneckerLinearForwardKnownValue;
+    procedure TestKroneckerLinearSerializationRoundTrip;
     // TNNetRandomFourierFeatures RBF-kernel random-feature projection layer
     procedure TestRandomFourierFeaturesInputGradientCheck;
     procedure TestRandomFourierFeaturesWeightGradientCheck;
@@ -38079,6 +38084,287 @@ begin
         (NN2.Layers[1] as TNNetMonarchLinear).Blocks);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('MonarchLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKroneckerLinearInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  KL: TNNetKroneckerLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for the Kronecker layer. n = 12
+  // (rectangular split p=3, q=4 -> A is 3x3, B is 4x4). Factor weights are bounded
+  // to a small range so FD truncation never dominates (do NOT loosen tolerance).
+  RandSeed := 424242;
+  N := 12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputPlus := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    KL := TNNetKroneckerLinear.Create(0, 3); // pin p = 3 -> rectangular q = 4
+    NN.AddLayer(KL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    // Bounded A, B factor weights and a small bias.
+    for i := 0 to KL.Neurons[0].Weights.Size - 1 do
+      KL.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+    for i := 0 to KL.Neurons[1].Weights.Size - 1 do
+      KL.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    for i := 0 to N - 1 do
+      KL.Neurons[2].Weights.Raw[i] := 0.05 * (i - 5);
+
+    for i := 0 to N - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('KroneckerLinear input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKroneckerLinearWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  KL: TNNetKroneckerLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, d, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // FD vs analytic gradient on BOTH Kronecker factors A (neuron 0) and B
+  // (neuron 1) -- this checks dA and dB. n = 12 (p=3, q=4). Weights bounded to a
+  // small range to avoid FD truncation error (do NOT loosen tolerance).
+  RandSeed := 424242;
+  N := 12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    KL := TNNetKroneckerLinear.Create(0, 3);
+    NN.AddLayer(KL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    for i := 0 to KL.Neurons[0].Weights.Size - 1 do
+      KL.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+    for i := 0 to KL.Neurons[1].Weights.Size - 1 do
+      KL.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    for i := 0 to N - 1 do
+      KL.Neurons[2].Weights.Raw[i] := 0.05 * (i - 5);
+
+    // d = 0 -> A (dA), d = 1 -> B (dB).
+    for d := 0 to 1 do
+      for i := 0 to KL.Neurons[d].Weights.Size - 1 do
+      begin
+        KL.Neurons[d].Weights.Raw[i] := KL.Neurons[d].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        KL.Neurons[d].Weights.Raw[i] := KL.Neurons[d].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        KL.Neurons[d].Weights.Raw[i] := KL.Neurons[d].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        KL.Neurons[0].ClearDelta;
+        KL.Neurons[1].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -KL.Neurons[d].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('KroneckerLinear factor ' + IntToStr(d) + ' weight gradient w=' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('  KroneckerLinear weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKroneckerLinearForwardKnownValue;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  KL: TNNetKroneckerLinear;
+  i, ii, jj, kk, ll, p, q, N: integer;
+  expected, acc: TNeuralFloat;
+begin
+  // (1) Identity A and identity B -> W = I (x) I = I, so y == x exactly.
+  // (2) Arbitrary A, B (no bias) compared against the explicit double sum
+  //     y[i*p+j] = sum_{k,l} B[i,k]*A[j,l]*x[k*p+l], i.e. (A (x) B)*x materialized.
+  RandSeed := 424242;
+  N := 12; p := 3; q := 4; // n = p*q
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    KL := TNNetKroneckerLinear.Create(1, 3); // suppress bias, pin p = 3
+    NN.AddLayer(KL);
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 1.1) * 1.7 - 0.3;
+
+    // ---- (1) Identity A and B -> output == input ----
+    KL.Neurons[0].Weights.Fill(0);
+    KL.Neurons[1].Weights.Fill(0);
+    for jj := 0 to p - 1 do
+      KL.Neurons[0].Weights.Raw[jj * p + jj] := 1.0; // A = I (p x p)
+    for ii := 0 to q - 1 do
+      KL.Neurons[1].Weights.Raw[ii * q + ii] := 1.0; // B = I (q x q)
+    NN.Compute(Input);
+    for i := 0 to N - 1 do
+      AssertEquals('KroneckerLinear identity (I (x) I = I) y=x at ' + IntToStr(i),
+        Input.Raw[i], KL.Output.Raw[i], 1e-6);
+
+    // ---- (2) Arbitrary A, B -> explicit Kronecker matvec ----
+    for i := 0 to KL.Neurons[0].Weights.Size - 1 do
+      KL.Neurons[0].Weights.Raw[i] := 0.2 * Sin(i * 0.8 + 1.0) + 0.1;
+    for i := 0 to KL.Neurons[1].Weights.Size - 1 do
+      KL.Neurons[1].Weights.Raw[i] := 0.15 * Cos(i * 0.6 - 0.4) - 0.05;
+    NN.Compute(Input);
+    for ii := 0 to q - 1 do
+      for jj := 0 to p - 1 do
+      begin
+        acc := 0;
+        for kk := 0 to q - 1 do
+          for ll := 0 to p - 1 do
+            acc := acc +
+              KL.Neurons[1].Weights.Raw[ii * q + kk] *
+              KL.Neurons[0].Weights.Raw[jj * p + ll] *
+              Input.Raw[kk * p + ll];
+        expected := acc;
+        AssertEquals('KroneckerLinear (A(x)B)x at (' + IntToStr(ii) + ',' +
+          IntToStr(jj) + ')', expected, KL.Output.Raw[ii * p + jj], 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKroneckerLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  KL: TNNetKroneckerLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, N: integer;
+begin
+  // KroneckerLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the factor
+  // split p round-trips and both factor neurons + bias survive both dispatch
+  // points.
+  RandSeed := 424242;
+  N := 12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    KL := TNNetKroneckerLinear.Create(0, 3);
+    NN.AddLayer(KL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for i := 0 to KL.Neurons[0].Weights.Size - 1 do
+      KL.Neurons[0].Weights.Raw[i] := 0.17 * (i + 1) - 0.4;
+    for i := 0 to KL.Neurons[1].Weights.Size - 1 do
+      KL.Neurons[1].Weights.Raw[i] := 0.11 * (i + 1) - 0.3;
+    for i := 0 to N - 1 do
+      KL.Neurons[2].Weights.Raw[i] := 0.05 - 0.03 * i;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('KroneckerLinear SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('KroneckerLinear token present in serialized string',
+        Pos('TNNetKroneckerLinear', Saved) > 0);
+      AssertEquals('KroneckerLinear factor p round-trips', 3,
+        (NN2.Layers[1] as TNNetKroneckerLinear).FactorP);
+      AssertEquals('KroneckerLinear factor q round-trips', 4,
+        (NN2.Layers[1] as TNNetKroneckerLinear).FactorQ);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('KroneckerLinear Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

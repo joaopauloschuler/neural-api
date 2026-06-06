@@ -6808,6 +6808,45 @@ type
     property BlockSize: integer read FBlockSize;
   end;
 
+  /// Kronecker structured dense layer: the n x n weight matrix is a single
+  /// Kronecker product W = A (x) B of two small learned factors A (p x p) and
+  /// B (q x q), with n = p*q. Stores only O(p^2 + q^2) ~ O(n) weights instead of
+  /// O(n^2), and the dense n x n matrix is NEVER materialized. Forward reshapes
+  /// the flat input x (length n) into a q x p matrix X with the row-major vec
+  /// convention X[i,j] = x[i*p + j], computes Y = B*X*A^T as two small GEMMs
+  /// (O(n*(p+q)) = O(n^1.5)), and flattens y[i*p+j] = Y[i,j] (+ optional bias).
+  /// Under this vec convention y = vec(B*X*A^T) exactly equals (A (x) B)*x.
+  /// Backward is the exact transpose chain (all small GEMMs):
+  ///   dL/dX = B^T*dY*A,  dL/dA = dY^T*(B*X),  dL/dB = dY*(X*A^T)^T.
+  /// Square map: n is inferred from the previous layer's flat size. The factor
+  /// split p defaults to round(sqrt(n)) (the largest divisor <= sqrt(n) when n is
+  /// not a perfect square) and round-trips through FStruct[1]; q = n div p.
+  /// Weight layout: neuron 0 holds A (p*p reals, A[j,l] at j*p+l), neuron 1 holds
+  /// B (q*q reals, B[i,k] at i*q+k), neuron 2 is the optional bias (length n).
+  /// Constructor: Create(pSuppressBias, pP) -- pP=0 auto-picks the split;
+  /// FSuppressBias round-trips through FStruct[3]. The output is an (n,1,1) vector.
+  // Coded by Claude (AI).
+  TNNetKroneckerLinear = class(TNNetLayer)
+  private
+    FDim: integer;   // n (flat input/output size), n = FP * FQ
+    FP: integer;     // p (A is p x p)
+    FQ: integer;     // q (B is q x q)
+    FPinP: integer;  // requested factor split (0 = auto); resolved p (FP) round-trips via FStruct[1]
+    FCacheBX: TNNetVolume; // B*X (q x p), reused by both A-grad and X-grad
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pSuppressBias: integer = 0; pP: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Dim: integer read FDim;
+    property FactorP: integer read FP;
+    property FactorQ: integer read FQ;
+  end;
+
   /// Random Fourier Features kernel-approximation layer (Rahimi & Recht 2007,
   /// "Random Features for Large-Scale Kernel Machines"). Maps a Din-vector input
   /// x to a 2*D-vector feature map that approximates the RBF / Gaussian kernel:
@@ -37604,6 +37643,265 @@ begin
   end;
 end;
 
+{ TNNetKroneckerLinear }
+
+// Kronecker structured dense layer: y = (A (x) B)*x (+bias) computed without ever
+// forming the dense n x n matrix. With x reshaped to X (q x p), X[i,j]=x[i*p+j],
+//   Y = B*X*A^T,   y[i*p+j] = Y[i,j].
+// A is p x p, B is q x q, n = p*q.
+
+constructor TNNetKroneckerLinear.Create(pSuppressBias: integer = 0; pP: integer = 0);
+begin
+  inherited Create();
+  if pSuppressBias <> 0 then FSuppressBias := 1 else FSuppressBias := 0;
+  FStruct[3] := FSuppressBias;
+  if pP < 0 then pP := 0;
+  FPinP := pP;
+  FCacheBX := TNNetVolume.Create();
+  // A, B (and optional bias) neurons are sized in SetPrevLayer once n is known.
+  while FNeurons.Count > 3 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 3 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+destructor TNNetKroneckerLinear.Destroy();
+begin
+  FCacheBX.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetKroneckerLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N, pp: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  N := pPrevLayer.Output.Size;
+  if N <= 0 then
+    FErrorProc('TNNetKroneckerLinear requires a non-empty input.');
+  FDim := N;
+
+  // Factor n = p*q. If a split was requested and divides n, honor it; otherwise
+  // prefer p = round(sqrt(n)) (perfect square), else the largest divisor of n
+  // that is <= sqrt(n).
+  pp := FPinP;
+  if (pp < 1) or (pp > N) or (N mod pp <> 0) then
+  begin
+    pp := Trunc(Sqrt(N) + 0.5);
+    if pp * pp <> N then
+    begin
+      pp := Trunc(Sqrt(N));
+      if pp < 1 then pp := 1;
+      while (pp > 1) and (N mod pp <> 0) do Dec(pp);
+    end;
+  end;
+  FP := pp;
+  FQ := N div pp;
+  FStruct[1] := FP;
+
+  FOutput.ReSize(N, 1, 1);
+  FOutputError.ReSize(N, 1, 1);
+  FOutputErrorDeriv.ReSize(N, 1, 1);
+  FCacheBX.ReSize(N, 1, 1); // B*X is q x p = n reals
+
+  // neuron 0 = A (p*p), neuron 1 = B (q*q), neuron 2 = bias (n).
+  FNeurons[0].Weights.ReSize(FP * FP, 1, 1);
+  FNeurons[0].BackInertia.ReSize(FP * FP, 1, 1);
+  FNeurons[0].Delta.ReSize(FP * FP, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+  FNeurons[1].Weights.ReSize(FQ * FQ, 1, 1);
+  FNeurons[1].BackInertia.ReSize(FQ * FQ, 1, 1);
+  FNeurons[1].Delta.ReSize(FQ * FQ, 1, 1);
+  FNeurons[1].FBiasWeight := 0;
+  FNeurons[2].Weights.ReSize(N, 1, 1);
+  FNeurons[2].BackInertia.ReSize(N, 1, 1);
+  FNeurons[2].Delta.ReSize(N, 1, 1);
+  FNeurons[2].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Small random factor weights; bias starts at zero. Each factor uses the usual
+// 1/sqrt(fan_in) scale on its own dimension so the composed product is well
+// conditioned at init.
+procedure TNNetKroneckerLinear.InitDefault();
+var
+  i: integer;
+  scaleA, scaleB: TNeuralFloat;
+  WA, WB, Bias: TNNetVolume;
+begin
+  if FDim <= 0 then exit;
+  WA := FArrNeurons[0].FWeights;
+  WB := FArrNeurons[1].FWeights;
+  Bias := FArrNeurons[2].FWeights;
+  if FP > 0 then scaleA := 1.0 / Sqrt(FP) else scaleA := 0.1;
+  if FQ > 0 then scaleB := 1.0 / Sqrt(FQ) else scaleB := 0.1;
+  for i := 0 to WA.Size - 1 do
+    WA.FData[i] := scaleA * (Random - 0.5) * 2;
+  for i := 0 to WB.Size - 1 do
+    WB.FData[i] := scaleB * (Random - 0.5) * 2;
+  Bias.Fill(0);
+end;
+
+procedure TNNetKroneckerLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: X (q x p) with X[i,j]=x[i*p+j]; compute BX = B*X (q x p), cache it for
+// backward, then Y = BX*A^T (q x p) and y[i*p+j] = Y[i,j] (+bias).
+//   BX[i,l] = sum_k B[i,k]*X[k,l]
+//   Y[i,j]  = sum_l BX[i,l]*A[j,l]
+// Index maps: x/X at i*p+j, A[j,l] at j*p+l, B[i,k] at i*q+k, BX[i,l] at i*p+l.
+procedure TNNetKroneckerLinear.ComputeCPU();
+var
+  p, q, i, j, l, w: integer;
+  PrevOut, WA, WB, Bias: TNNetVolume;
+  acc: TNeuralFloat;
+begin
+  p := FP;
+  q := FQ;
+  PrevOut := FPrevLayer.FOutput;
+  WA := FArrNeurons[0].FWeights;
+  WB := FArrNeurons[1].FWeights;
+  Bias := FArrNeurons[2].FWeights;
+
+  // BX[i,l] = sum_k B[i,k]*X[k,l]  (X[k,l] = x[k*p+l]).
+  for i := 0 to q - 1 do
+    for l := 0 to p - 1 do
+    begin
+      acc := 0;
+      for w := 0 to q - 1 do
+        acc := acc + WB.FData[i * q + w] * PrevOut.FData[w * p + l];
+      FCacheBX.FData[i * p + l] := acc;
+    end;
+
+  // Y[i,j] = sum_l BX[i,l]*A[j,l]; y[i*p+j] = Y[i,j].
+  for i := 0 to q - 1 do
+    for j := 0 to p - 1 do
+    begin
+      acc := 0;
+      for l := 0 to p - 1 do
+        acc := acc + FCacheBX.FData[i * p + l] * WA.FData[j * p + l];
+      FOutput.FData[i * p + j] := acc;
+    end;
+
+  if FSuppressBias = 0 then
+    FOutput.Add(Bias);
+end;
+
+procedure TNNetKroneckerLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact transpose chain. dY (q x p) is the output error, dY[i,j]=dy[i*p+j].
+// Using the cached BX = B*X (q x p) and the input X (q x p):
+//   dA[j,l] = sum_i dY[i,j]*BX[i,l]                    (dA = dY^T * BX)
+//   dB[i,k] = sum_{l} (sum_j dY[i,j]*A[j,l]) * X[k,l]  (dB = dY*(X*A^T)^T = (dY*A)*X^T)
+//   dX[k,l] = sum_i B[i,k] * (sum_j dY[i,j]*A[j,l])    (dX = B^T*(dY*A))
+// Let G[i,l] = sum_j dY[i,j]*A[j,l]  (= dY*A, q x p). Then
+//   dB[i,k] = sum_l G[i,l]*X[k,l],  dX[k,l] = sum_i B[i,k]*G[i,l].
+// All accumulations are small GEMMs. Deltas carry -LR*grad.
+procedure TNNetKroneckerLinear.BackpropagateCPU();
+var
+  p, q, i, j, k, l, w: integer;
+  PrevOut, WA, WB, WADelta, WBDelta, BiasDelta, LocalPrevError: TNNetVolume;
+  acc, dyij, glil: TNeuralFloat;
+  HasPrevError: boolean;
+  G: array of TNeuralFloat; // dY*A, q x p, index i*p+l
+begin
+  p := FP;
+  q := FQ;
+  PrevOut := FPrevLayer.FOutput;
+  WA := FArrNeurons[0].FWeights;
+  WB := FArrNeurons[1].FWeights;
+  WADelta := FArrNeurons[0].FDelta;
+  WBDelta := FArrNeurons[1].FDelta;
+  BiasDelta := FArrNeurons[2].FDelta;
+  HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  LocalPrevError := FPrevLayer.OutputError;
+
+  // Bias grad.
+  if FSuppressBias = 0 then
+    for i := 0 to FDim - 1 do
+      BiasDelta.FData[i] := BiasDelta.FData[i] - FLearningRate * FOutputError.FData[i];
+
+  // dA[j,l] += sum_i dY[i,j]*BX[i,l].
+  for j := 0 to p - 1 do
+    for l := 0 to p - 1 do
+    begin
+      acc := 0;
+      for i := 0 to q - 1 do
+        acc := acc + FOutputError.FData[i * p + j] * FCacheBX.FData[i * p + l];
+      WADelta.FData[j * p + l] := WADelta.FData[j * p + l] - FLearningRate * acc;
+    end;
+
+  // G[i,l] = sum_j dY[i,j]*A[j,l]  (= dY*A).
+  SetLength(G, q * p);
+  for i := 0 to q - 1 do
+    for l := 0 to p - 1 do
+    begin
+      acc := 0;
+      for j := 0 to p - 1 do
+      begin
+        dyij := FOutputError.FData[i * p + j];
+        acc := acc + dyij * WA.FData[j * p + l];
+      end;
+      G[i * p + l] := acc;
+    end;
+
+  // dB[i,k] += sum_l G[i,l]*X[k,l]   (X[k,l] = x[k*p+l]).
+  for i := 0 to q - 1 do
+    for k := 0 to q - 1 do
+    begin
+      acc := 0;
+      for l := 0 to p - 1 do
+        acc := acc + G[i * p + l] * PrevOut.FData[k * p + l];
+      WBDelta.FData[i * q + k] := WBDelta.FData[i * q + k] - FLearningRate * acc;
+    end;
+
+  // dX[k,l] = sum_i B[i,k]*G[i,l]; dx[k*p+l] = dX[k,l].
+  if HasPrevError then
+    for k := 0 to q - 1 do
+      for l := 0 to p - 1 do
+      begin
+        acc := 0;
+        for i := 0 to q - 1 do
+        begin
+          glil := G[i * p + l];
+          acc := acc + WB.FData[i * q + k] * glil;
+        end;
+        LocalPrevError.FData[k * p + l] := LocalPrevError.FData[k * p + l] + acc;
+      end;
+
+  if not FBatchUpdate then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    FArrNeurons[1].UpdateWeightsWithoutInertia();
+    if FSuppressBias = 0 then FArrNeurons[2].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetRandomFourierFeatures }
 
 // Rahimi & Recht (2007) random features for the RBF kernel. The forward pass is
@@ -62495,6 +62793,7 @@ begin
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
+      'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
       'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
@@ -62823,6 +63122,7 @@ begin
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
+      if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else
       if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else

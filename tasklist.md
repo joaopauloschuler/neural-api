@@ -72,30 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetKroneckerLinear — a sub-quadratic STRUCTURED dense layer whose `n×n`
-      weight is a single KRONECKER PRODUCT `W = A ⊗ B` of two small learned
-      factors `A (p×p)` and `B (q×q)` with `n = p·q` (default `p ≈ q ≈ √n`,
-      both round-tripping via `FStruct`). Stores `O(p²+q²) ≈ O(n)` weights
-      instead of `O(n²)` yet, crucially, the matvec NEVER materializes the dense
-      `n×n` Kronecker matrix: reshape `x` to a `q×p` matrix `X`, compute
-      `Y = B·X·Aᵀ` as two small GEMMs (`O(n·(p+q)) = O(n^1.5)`), flatten back to
-      `y` (+ optional bias via base `FSuppressBias`). Backward is the exact
-      transpose chain — `dL/dX = Bᵀ·dY·A`, `dL/dB = dY·(X·Aᵀ)ᵀ`,
-      `dL/dA = (B·X)ᵀ·dY` — all small GEMMs, every gradient numerically
-      gradient-checked (see docs/layer-authoring.md). This is a genuinely
-      DIFFERENT structured operator from the layers already in tree: distinct
-      from `TNNetMonarchLinear` (two block-diagonal factors + a fixed
-      reshape-transpose permutation), `TNNetCirculantLinear` (one cyclic kernel),
-      `TNNetHouseholderLinear` (orthogonal reflection product), LoRA (low-rank
-      additive) and `AddGroupedFullConnect` (single block-diagonal, no factor
-      coupling) — a Kronecker product couples ALL output channels through the
-      outer product of two factors, the classic Tensorizing-Neural-Networks /
-      KFAC structure. Square map, so `n` is inferred from the previous layer's
-      size; created with `TNNetKroneckerLinear.Create()` (or `Create(1)` to
-      suppress bias), optional `Create(0, p)` to pin the factor split. Ship with
-      shape/save-load/numerical-gradient tests and an `examples/KroneckerLinear/`
-      param-count-vs-accuracy demo on a tiny MNIST-shaped task (Kronecker dense
-      vs equal-width full dense at matched/at-lower parameter budget).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
