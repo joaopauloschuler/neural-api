@@ -1518,7 +1518,7 @@ rather than acted on.
       selection boundary), reseed `RandSeed := 424242`. Stretch: the paper's
       batch-norm-on-query trick to spread key usage (the example already prints
       the per-slot read histogram that exposes usage collapse).
-- [ ] TNNetHouseholderLinear — an EXACTLY-orthogonal dense layer whose `n×n`
+- [X] TNNetHouseholderLinear — an EXACTLY-orthogonal dense layer whose `n×n`
       weight is parameterized as a product of `K` Householder reflections,
       `Q = H_1·H_2·…·H_K` with `H_i = I − 2·(v_i·v_iᵀ)/(v_iᵀ·v_i)`. The trainable
       parameters are the `K` reflection vectors `v_i ∈ ℝ^n` (stored as `K`

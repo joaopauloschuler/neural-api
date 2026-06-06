@@ -155,6 +155,10 @@ type
     procedure TestCirculantLinearGradientCheck;
     procedure TestCirculantLinearSerializationRoundTrip;
     procedure TestCirculantLinearFFTEquivalence;
+    // TNNetHouseholderLinear exactly-orthogonal dense layer
+    procedure TestHouseholderLinearGradientCheck;
+    procedure TestHouseholderLinearOrthogonality;
+    procedure TestHouseholderLinearSerializationRoundTrip;
     // TNNetQuaternionLinear hypercomplex dense layer
     procedure TestQuaternionLinearGradientCheck;
     procedure TestQuaternionLinearSerializationRoundTrip;
@@ -35165,6 +35169,251 @@ begin
         AssertEquals('CirculantLinear Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHouseholderLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  HL: TNNetHouseholderLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, r, N, NumRefl: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT and ALL K reflection
+  // vectors (plus the bias). Reseed the shared RNG per the numerical-test
+  // ordering rule. Reflection vectors are bounded well away from zero so the
+  // 1/(v.v) denominator never amplifies FD truncation error (do NOT loosen tol).
+  RandSeed := 424242;
+  N := 5;
+  NumRefl := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputPlus := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HL := TNNetHouseholderLinear.Create(N, NumRefl, 1, 0);
+    NN.AddLayer(HL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    // Bounded reflection vectors (each near a distinct unit coordinate + noise).
+    for r := 0 to NumRefl - 1 do
+    begin
+      for i := 0 to N - 1 do
+        HL.Neurons[r].Weights.Raw[i] := 0.2 * Sin(i * 1.3 + r);
+      HL.Neurons[r].Weights.Raw[r mod N] := HL.Neurons[r].Weights.Raw[r mod N] + 1.0;
+    end;
+    for i := 0 to N - 1 do
+      HL.Neurons[NumRefl].Weights.Raw[i] := 0.05 * (i - 2); // bias
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to N - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('HouseholderLinear input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. each reflection vector v_r ----
+    for r := 0 to NumRefl - 1 do
+      for i := 0 to N - 1 do
+      begin
+        HL.Neurons[r].Weights.Raw[i] := HL.Neurons[r].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        HL.Neurons[r].Weights.Raw[i] := HL.Neurons[r].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        HL.Neurons[r].Weights.Raw[i] := HL.Neurons[r].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        HL.Neurons[r].ClearDelta;
+        HL.Neurons[NumRefl].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -HL.Neurons[r].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        AssertTrue('HouseholderLinear v[' + IntToStr(r) + '] gradient at ' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the per-output bias ----
+    for i := 0 to N - 1 do
+    begin
+      HL.Neurons[NumRefl].Weights.Raw[i] := HL.Neurons[NumRefl].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      HL.Neurons[NumRefl].Weights.Raw[i] := HL.Neurons[NumRefl].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      HL.Neurons[NumRefl].Weights.Raw[i] := HL.Neurons[NumRefl].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      HL.Neurons[NumRefl].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -HL.Neurons[NumRefl].Delta.Raw[i];
+
+      AssertTrue('HouseholderLinear bias gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHouseholderLinearOrthogonality;
+var
+  NN: TNNet;
+  Input, Y, X2: TNNetVolume;
+  HL: TNNetHouseholderLinear;
+  i, r, N, NumRefl: integer;
+  normIn, normY, dot: TNeuralFloat;
+begin
+  // Q is orthogonal for ANY reflection vectors: ||Q*x|| = ||x|| (bias off) and
+  // Q^T * Q * x = x to < 1e-5. The inverse Q^T is the SAME reflections in
+  // reverse, which is exactly the input-error path (ComputePreviousLayerError),
+  // so feeding y as the output error recovers x.
+  RandSeed := 424242;
+  N := 6;
+  NumRefl := N; // full orthogonal group element
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  Y := TNNetVolume.Create(1, 1, N);
+  X2 := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HL := TNNetHouseholderLinear.Create(N, NumRefl, 1, 1); // suppress bias
+    NN.AddLayer(HL);
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 1.1) * 1.7 - 0.3;
+    // Arbitrary (unconstrained) reflection vectors -> Q still orthogonal.
+    for r := 0 to NumRefl - 1 do
+      for i := 0 to N - 1 do
+        HL.Neurons[r].Weights.Raw[i] := 0.4 * Cos(i * 0.9 + r * 1.7) + 0.1 * r + 0.3;
+
+    NN.Compute(Input);
+    Y.Copy(HL.Output);
+
+    normIn := 0; normY := 0;
+    for i := 0 to N - 1 do
+    begin
+      normIn := normIn + Input.Raw[i] * Input.Raw[i];
+      normY := normY + Y.Raw[i] * Y.Raw[i];
+    end;
+    normIn := Sqrt(normIn);
+    normY := Sqrt(normY);
+    AssertTrue('HouseholderLinear ||Q*x|| (' + FloatToStr(normY) +
+      ') ~ ||x|| (' + FloatToStr(normIn) + ')', Abs(normY - normIn) < 1e-5);
+
+    // Q^T * Q * x = x: backprop with Desired=0 so the output error equals y
+    // (half-MSE derivative), then the input gradient is Q^T * y = Q^T * Q * x.
+    NN.SetLearningRate(0.0, 0.0); // freeze weights; we only want the input grad
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    X2.Fill(0); // Desired = 0
+    NN.Backpropagate(X2);
+    X2.Copy(NN.Layers[0].OutputError); // = Q^T * y = Q^T * Q * x
+    dot := 0;
+    for i := 0 to N - 1 do
+      dot := Max(dot, Abs(X2.Raw[i] - Input.Raw[i]));
+    AssertTrue('HouseholderLinear Q^T*Q*x ~ x, max err=' + FloatToStr(dot),
+      dot < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+    Y.Free;
+    X2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHouseholderLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  HL: TNNetHouseholderLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, r, N, NumRefl: integer;
+begin
+  // HouseholderLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match (proving the K
+  // reflection vectors + bias round-trip through both dispatch points).
+  RandSeed := 424242;
+  N := 6;
+  NumRefl := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    HL := TNNetHouseholderLinear.Create(N, NumRefl, 1, 0);
+    NN.AddLayer(HL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for r := 0 to NumRefl - 1 do
+      for i := 0 to N - 1 do
+        HL.Neurons[r].Weights.Raw[i] := 0.17 * (i + 1) - 0.4 + 0.3 * r;
+    for i := 0 to N - 1 do
+      HL.Neurons[NumRefl].Weights.Raw[i] := 0.05 - 0.03 * i;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HouseholderLinear serialization byte-identical', Saved, Saved2);
+
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('HouseholderLinear reloaded output matches at ' + IntToStr(i),
+          Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
     finally
       NN2.Free;
     end;

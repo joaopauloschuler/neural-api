@@ -5645,6 +5645,83 @@ type
     property OutQuaternions: integer read FOutQuaternions;
   end;
 
+  // EXACTLY-ORTHOGONAL dense (linear) layer. The n x n weight is parameterized
+  // as a product of K Householder reflections
+  //     Q = H_1 * H_2 * ... * H_K,   H_i = I - 2 * (v_i v_i^T) / (v_i^T v_i),
+  // and the layer computes y = Q * x (+ optional bias) with n = input/output
+  // Depth. Each H_i is a reflection: symmetric, its own inverse, and orthogonal
+  // for ANY v_i, so Q is orthogonal for ANY values of the reflection vectors --
+  // NO constrained optimization, re-projection or normalization is ever needed,
+  // yet the map is exactly norm/volume preserving (||y|| = ||x|| with bias off)
+  // and exactly invertible (Q^T = H_K * ... * H_1, the reflections in reverse).
+  //
+  // This is structurally DISTINCT from everything else here: TNNetSpectralNorm
+  // only bounds the largest singular value (the rest stay free -> not
+  // orthogonal); TNNetCirculantLinear / Toeplitz constrain the matrix FORM, not
+  // its orthogonality; Muon-style work orthogonalizes the gradient UPDATE, not
+  // the weight. Why it matters: an exactly orthogonal Jacobian is an isometry,
+  // so deep plain stacks neither explode nor vanish, and an invertible
+  // norm-preserving block is the building block for normalizing flows /
+  // reversible nets.
+  //
+  // FORWARD never materializes Q: it applies the reflections one at a time from
+  // H_K to H_1 in O(K*n) per sample. With c_i = 2*(v_i . x_{i+1}) / (v_i . v_i),
+  //     x_{K+1} = x,   x_i = x_{i+1} - c_i * v_i,   y = x_1 (+ bias).
+  // (If v_i^T v_i underflows to ~0 the reflection degenerates to the identity;
+  // the denominator is guarded so a near-zero vector acts as a no-op H_i = I.)
+  //
+  // STORAGE / SERIALIZATION (round-trips through the ordinary per-neuron
+  // SaveDataToString / LoadDataFromString -- no custom weight serialization):
+  //   FArrNeurons[0..K-1].FWeights : the K reflection vectors v_i (length n).
+  //   FArrNeurons[K].FWeights      : the per-output bias (length n; held at 0
+  //       and not learned when pSuppressBias<>0).
+  // n round-trips via FStruct[0] (pSizeX), the reflection count K via FStruct[4]
+  // and the suppress-bias flag via FStruct[3], so CreateLayer wires all three
+  // back through Create(St[0], St[4], St[3]).
+  //
+  // BACKWARD differentiates through the reflection product. The forward caches
+  // every intermediate x_{i+1} (the input to reflection H_i). Walking i = 1..K
+  // (outer-most reflection first, matching the forward output side), with the
+  // running error g (initialized to dL/dy and updated to dL/dx_{i+1} = H_i * g):
+  //   beta = v_i . v_i  (guarded), s = 2/beta,
+  //   dot_gv = v_i . g,  dot_xv = v_i . x_{i+1},
+  //   per-vector gradient (standard Householder derivative, O(n)):
+  //     dL/dv_i = -s * ( dot_gv * x_{i+1} + dot_xv * g
+  //                      - 2*dot_xv*dot_gv/beta * v_i ),
+  //   then g <- g - s*dot_gv*v_i  (= H_i * g, advancing to the next reflection).
+  // After the loop g = Q^T * dL/dy = dL/dx is added to the previous layer error;
+  // bias gradient is dL/dy. Deltas accumulate into FArrNeurons[i].Delta scaled
+  // by -LearningRate so the ordinary inertia / Adam update machinery applies.
+  //
+  // INIT: each reflection vector starts as small random noise around a single
+  // unit coordinate, so every H_i is a small, well-conditioned reflection and
+  // the initial Q is a mild orthogonal perturbation of the identity.
+  // Coded by Claude (AI).
+  TNNetHouseholderLinear = class(TNNetFullConnectLinear)
+  private
+    FNumReflections: integer;  // K
+    FDim: integer;             // n = Depth
+    FCache: TNNetVolume;       // x_{i+1} stacked: row i holds the input to H_i
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    // pSizeY carries the reflection count K (this is a vector n->n map, so the
+    // SizeY output axis is otherwise unused); K<=0 defaults to K=n. pDepth is
+    // forced to 1. pSuppressBias<>0 disables the bias. This single 4-argument
+    // constructor is what both CreateLayer dispatch points and the
+    // AddHouseholderLinear builder use; there is deliberately no 3-integer
+    // overload (it would be ambiguous with the inherited FullConnect signature).
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    procedure InitDefault(); override;
+    property NumReflections: integer read FNumReflections;
+    property Dim: integer read FDim;
+  end;
+
   /// Kolmogorov-Arnold Network DENSE layer (Liu et al. 2024,
   // "KAN: Kolmogorov-Arnold Networks", arXiv:2404.19756).
   //
@@ -7412,6 +7489,13 @@ type
       // (pSeqLen,1,d/2). Attention-free cross-token mixer (the matrix is fixed
       // after training). Coded by Claude (AI).
       function AddSpatialGatingUnit(pSeqLen: integer): TNNetLayer;
+      // Exactly-orthogonal dense block: a TNNetHouseholderLinear that maps the
+      // length-N input through Q = product of NumReflections Householder
+      // reflections (+ optional bias). NumReflections <= 0 defaults to K = N (a
+      // full-rank orthogonal group element); a smaller K is cheaper and spans a
+      // sub-group. Returns the layer. Coded by Claude (AI).
+      function AddHouseholderLinear(N: integer; NumReflections: integer = -1;
+        UseBias: boolean = True): TNNetLayer;
       // Full gMLP block (Liu et al. 2021): channel-MLP up-projection ->
       // split+SGU sequence mix -> channel-MLP down-projection, wrapped in a
       // pre-LayerNorm residual. d_model is the residual-stream width, d_ffn the
@@ -33205,6 +33289,17 @@ begin
   Result := AddRMSNormResidual([TNNetClosedFormContinuous.Create()]);
 end;
 
+function TNNet.AddHouseholderLinear(N: integer; NumReflections: integer = -1;
+  UseBias: boolean = True): TNNetLayer;
+var
+  SuppressBias, NumRefl: integer;
+begin
+  NumRefl := NumReflections;
+  if NumRefl <= 0 then NumRefl := N; // default K = n: full orthogonal group element
+  if UseBias then SuppressBias := 0 else SuppressBias := 1;
+  Result := AddLayer(TNNetHouseholderLinear.Create(N, NumRefl, 1, SuppressBias));
+end;
+
 function TNNet.AddSLSTM(): TNNetLayer;
 begin
   // y = x + sLSTM(RMSNorm(x)). The sLSTM cell is shape-preserving, so it is a
@@ -35088,6 +35183,254 @@ begin
       FArrNeurons[oq].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
   end;
+end;
+
+{ TNNetHouseholderLinear }
+
+// Floor used to guard the v_i^T v_i denominator: below this a reflection is
+// treated as the identity (degenerate near-zero reflection vector).
+const
+  HOUSEHOLDER_MIN_BETA = 1e-12;
+
+constructor TNNetHouseholderLinear.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  // pSizeY carries the reflection count K (K<=0 -> default K=n, fixed once n is
+  // known in SetPrevLayer). The layer is a square vector n->n map, so the output
+  // is (n,1,1); call the base with pDepth forced to 1 and pSizeY=1.
+  inherited Create(pSizeX, 1, 1, pSuppressBias);
+  FNumReflections := pSizeY;        // may be <=0 here (defaulted in SetPrevLayer)
+  FStruct[4] := pSizeY;             // K round-trips through FStruct[4]
+  FCache := TNNetVolume.Create();
+  // Real neuron layout (K reflection neurons + 1 bias neuron, each length n) is
+  // fixed in SetPrevLayer once n is known; trim to a single neuron for now.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+destructor TNNetHouseholderLinear.Destroy();
+begin
+  FCache.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetHouseholderLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N, ReflIdx: integer;
+begin
+  // Bypass TNNetFullConnect.SetPrevLayer (which resizes EVERY neuron to the
+  // input size for FOutput.Size neurons). The Householder layer is a square
+  // n -> n map and keeps K reflection neurons + 1 bias neuron (each length n).
+  FPrevLayer := pPrevLayer;
+  N := pPrevLayer.Output.Size;
+  if N <> FOutput.Size then
+    FErrorProc
+    (
+      'TNNetHouseholderLinear requires a square map: input size '+IntToStr(N)+
+      ' must equal output size '+IntToStr(FOutput.Size)+'.'
+    );
+  FDim := N;
+  if FNumReflections <= 0 then FNumReflections := N;
+  FStruct[4] := FNumReflections;
+
+  while FNeurons.Count > FNumReflections + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FNumReflections + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  for ReflIdx := 0 to FNumReflections do
+  begin
+    FNeurons[ReflIdx].Weights.ReSize(N, 1, 1);
+    FNeurons[ReflIdx].BackInertia.ReSize(N, 1, 1);
+    FNeurons[ReflIdx].Delta.ReSize(N, 1, 1);
+  end;
+  FCache.ReSize(FNumReflections, 1, N); // row r (depth axis) = input to H_r
+
+  FVectorSize := FNeurons[0].Weights.Size;
+  BuildArrNeurons();
+  InitDefault();
+  // Bias neuron starts at 0 so the layer begins as a pure orthogonal map.
+  FArrNeurons[FNumReflections].Weights.Fill(0);
+  for ReflIdx := 0 to FNumReflections do
+    FArrNeurons[ReflIdx].FBiasWeight := 0;
+  AfterWeightUpdate();
+end;
+
+// Each reflection vector starts as a single unit coordinate plus small noise,
+// so every H_i is a small well-conditioned reflection and Q starts as a mild
+// orthogonal perturbation of the identity.
+procedure TNNetHouseholderLinear.InitDefault();
+var
+  ReflIdx, j: integer;
+  W: TNNetVolume;
+begin
+  if FNumReflections <= 0 then exit;
+  for ReflIdx := 0 to FNumReflections - 1 do
+  begin
+    W := FArrNeurons[ReflIdx].FWeights;
+    for j := 0 to FDim - 1 do
+      W.FData[j] := 0.05 * (Random - 0.5) * 2;
+    // Bias one coordinate to keep v_i^T v_i comfortably away from zero.
+    W.FData[ReflIdx mod FDim] := W.FData[ReflIdx mod FDim] + 1.0;
+  end;
+end;
+
+procedure TNNetHouseholderLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: x_{K+1} = x; for i = K downto 1: x_i = H_i * x_{i+1}; y = x_1 (+bias)
+// where H_i * u = u - (2 * (v_i.u) / (v_i.v_i)) * v_i. FCache row i stores the
+// input x_{i+1} fed into reflection H_i (needed by backward).
+procedure TNNetHouseholderLinear.ComputeCPU();
+var
+  N, ReflIdx, j: integer;
+  beta, dot, scale: TNeuralFloat;
+  V, Bias, PrevOut: TNNetVolume;
+begin
+  N := FDim;
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FNumReflections].FWeights;
+  // Initialize working vector with the input.
+  for j := 0 to N - 1 do
+    FOutput.FData[j] := PrevOut.FData[j];
+  // Apply H_K, then H_{K-1}, ... , H_1 (so Q = H_1*...*H_K acts left-to-right).
+  for ReflIdx := FNumReflections - 1 downto 0 do
+  begin
+    V := FArrNeurons[ReflIdx].FWeights;
+    // Cache the input to this reflection BEFORE applying it.
+    for j := 0 to N - 1 do
+      FCache.FData[ReflIdx + j * FNumReflections] := FOutput.FData[j];
+    beta := 0;
+    dot := 0;
+    for j := 0 to N - 1 do
+    begin
+      beta := beta + V.FData[j] * V.FData[j];
+      dot := dot + V.FData[j] * FOutput.FData[j];
+    end;
+    if beta < HOUSEHOLDER_MIN_BETA then continue; // degenerate -> identity
+    scale := 2.0 * dot / beta;
+    for j := 0 to N - 1 do
+      FOutput.FData[j] := FOutput.FData[j] - scale * V.FData[j];
+  end;
+  if FSuppressBias = 0 then
+    for j := 0 to N - 1 do
+      FOutput.FData[j] := FOutput.FData[j] + Bias.FData[j];
+end;
+
+procedure TNNetHouseholderLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Weight (reflection-vector) and bias gradients, accumulated into the neurons'
+// Delta scaled by -LearningRate. Walks the reflections in forward (output-side
+// first) order i = 1..K, maintaining the running error g = dL/dx_i. For each
+// H_i (cached input u = x_{i+1}):
+//   beta = v.v, s = 2/beta, dgv = v.g, duv = v.u,
+//   dL/dv = -s*( dgv*u + duv*g - 2*duv*dgv/beta * v ),
+//   g <- g - s*dgv*v   (= H_i * g, since H_i is symmetric).
+procedure TNNetHouseholderLinear.BackpropagateCPU();
+var
+  N, ReflIdx, j: integer;
+  beta, s, dgv, duv, coef: TNeuralFloat;
+  V, VDelta, BiasDelta, U: TNNetVolume;
+  g: array of TNeuralFloat;
+begin
+  N := FDim;
+  BiasDelta := FArrNeurons[FNumReflections].FDelta;
+  if FSuppressBias = 0 then
+    for j := 0 to N - 1 do
+      BiasDelta.FData[j] := BiasDelta.FData[j] - FLearningRate * FOutputError.FData[j];
+
+  SetLength(g, N);
+  for j := 0 to N - 1 do
+    g[j] := FOutputError.FData[j];
+
+  for ReflIdx := 0 to FNumReflections - 1 do
+  begin
+    V := FArrNeurons[ReflIdx].FWeights;
+    VDelta := FArrNeurons[ReflIdx].FDelta;
+    U := FCache; // row ReflIdx along depth axis = u = x_{i+1}
+    beta := 0; dgv := 0; duv := 0;
+    for j := 0 to N - 1 do
+    begin
+      beta := beta + V.FData[j] * V.FData[j];
+      dgv := dgv + V.FData[j] * g[j];
+      duv := duv + V.FData[j] * U.FData[ReflIdx + j * FNumReflections];
+    end;
+    if beta < HOUSEHOLDER_MIN_BETA then continue; // identity -> no grad, g unchanged
+    s := 2.0 / beta;
+    coef := 2.0 * duv * dgv / beta;
+    // dL/dv accumulated (Delta carries -LearningRate * gradient).
+    for j := 0 to N - 1 do
+      VDelta.FData[j] := VDelta.FData[j]
+        - FLearningRate *
+          ( -s * ( dgv * U.FData[ReflIdx + j * FNumReflections]
+                   + duv * g[j] - coef * V.FData[j] ) );
+    // Advance g <- H_i * g.
+    for j := 0 to N - 1 do
+      g[j] := g[j] - s * dgv * V.FData[j];
+  end;
+
+  if not FBatchUpdate then
+  begin
+    for ReflIdx := 0 to FNumReflections do
+      FArrNeurons[ReflIdx].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
+// Input gradient: dL/dx = Q^T * dL/dy = H_K * ... * H_1 * dL/dy. Reuses the SAME
+// reflection walk as BackpropagateCPU (g ends as Q^T*dL/dy) but recomputes it
+// here so the layer works with LearningRate = 0 too.
+procedure TNNetHouseholderLinear.ComputePreviousLayerErrorCPU();
+var
+  N, ReflIdx, j: integer;
+  beta, dgv, s: TNeuralFloat;
+  V, LocalPrevError: TNNetVolume;
+  g: array of TNeuralFloat;
+begin
+  N := FDim;
+  LocalPrevError := FPrevLayer.OutputError;
+  SetLength(g, N);
+  for j := 0 to N - 1 do
+    g[j] := FOutputError.FData[j];
+  for ReflIdx := 0 to FNumReflections - 1 do
+  begin
+    V := FArrNeurons[ReflIdx].FWeights;
+    beta := 0; dgv := 0;
+    for j := 0 to N - 1 do
+    begin
+      beta := beta + V.FData[j] * V.FData[j];
+      dgv := dgv + V.FData[j] * g[j];
+    end;
+    if beta < HOUSEHOLDER_MIN_BETA then continue;
+    s := 2.0 / beta;
+    for j := 0 to N - 1 do
+      g[j] := g[j] - s * dgv * V.FData[j];
+  end;
+  for j := 0 to N - 1 do
+    LocalPrevError.FData[j] := LocalPrevError.FData[j] + g[j];
 end;
 
 { TNNetQuaternionConv }
@@ -59251,6 +59594,7 @@ begin
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
+      'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
       'TNNetGraphAttention' :       Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]);
@@ -59569,6 +59913,7 @@ begin
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
+      if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetGraphAttention' then Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]) else
