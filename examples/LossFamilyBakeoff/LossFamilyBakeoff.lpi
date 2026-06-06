@@ -107,11 +107,6 @@
         <Mode0 Name="default"/>
       </Modes>
     </RunParams>
-    <RequiredPackages Count="1">
-      <Item1>
-        <PackageName Value="multithreadprocslaz"/>
-      </Item1>
-    </RequiredPackages>
     <Units Count="1">
       <Unit0>
         <Filename Value="LossFamilyBakeoff.lpr"/>
