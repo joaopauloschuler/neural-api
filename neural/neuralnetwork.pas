@@ -5803,6 +5803,60 @@ type
     property Curvature: TNeuralFloat read FCurvature;
   end;
 
+  /// Poincare-ball hyperbolic DISTANCE readout head (companion to
+  // TNNetHyperbolicLinear). The input x is a point inside the Poincare ball of
+  // curvature c (a Depth-vector, D_in = input Size). The layer owns K LEARNABLE
+  // "prototype" points p_0..p_{K-1} (also ball points) stored exactly like the
+  // weight rows of a TNNetFullConnectLinear (one neuron per prototype k, whose
+  // FWeights of length D_in IS the prototype vector p_k; the per-neuron bias is
+  // unused / suppressed). It outputs a K-vector of curvature-c Poincare
+  // distances from x to each prototype:
+  //     d_k = dist_c(x, p_k) = (2/s) * atanh( s * || (-x) (+)_c p_k || ),
+  // with s = sqrt(c) and Mobius addition (+)_c exactly as in
+  // TNNetHyperbolicLinear. This is a usable classification / metric readout head
+  // (small d_k => x close to prototype k on the manifold).
+  //
+  // STORAGE / SERIALIZATION: reuses the TNNetFullConnectLinear weight layout, so
+  // the prototypes round-trip through the standard neuron-weight save/load. The
+  // curvature c round-trips through FFloatSt[0] and the prototype count K through
+  // FStruct[0] (CreateLayer wires Create(St[0], Ft[0])). Output is (K,1,1).
+  //
+  // FORWARD caches, per prototype k, the Mobius vector m_k = (-x) (+)_c p_k, its
+  // radius r_k and the scalar Den_k, all needed by the EXACT analytic backward.
+  // The backward chains dL/dd_k through the atanh radial scalar
+  //   dd_k/dr_k = 2 / (1 - c r_k^2)
+  // and then through the SAME Mobius-addition Jacobian used by the linear layer
+  // (first arg a = -x => dL/dx = -dL/da; second arg b = p_k => dL/dp_k). The
+  // ball boundary (r_k -> 1/s) and origin (r_k -> 0) are guarded by the shared
+  // HYPERBOLIC_EPS clamp / small-radius series so every coefficient stays finite.
+  // Coded by Claude (AI).
+  TNNetHyperbolicDistance = class(TNNetFullConnectLinear)
+  private
+    FCurvature: TNeuralFloat;            // c > 0
+    // Per-prototype forward caches (filled by ComputeCPU, read by backward).
+    FCacheX: TNNetVolume;                // input x                       (D_in)
+    FCacheM: TNNetVolume;                // m_k = (-x)(+)_c p_k, k-th row  (K x D_in)
+    FCacheR: TNNetVolume;                // radius r_k = ||m_k||           (K)
+    FCacheDen: TNNetVolume;              // Mobius denominator Den_k       (K)
+    procedure ComputePreviousLayerErrorCPU(); override;
+    // Accumulates dL/da and dL/dp_k for ONE prototype given the radial seed
+    // dLdm = (dL/dr_k / r_k) * m_k. Shared by the weight- and input-gradient
+    // paths so the layer is correct at LearningRate = 0 too.
+    procedure MobiusAddBack(const c: TNeuralFloat; const A: TNNetVolume;
+      const Bvec: TNNetVolume; const M: TNNetVolume; const kk: integer;
+      const dLdm: array of TNeuralFloat; var dLda, dLdb: array of TNeuralFloat);
+  public
+    // pNumProto carries K (the number of learnable prototypes => output Size).
+    // pCurvature is the fixed ball curvature c > 0 (default 1.0).
+    constructor Create(pNumProto: integer; pCurvature: TNeuralFloat = 1.0); reintroduce; overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    property Curvature: TNeuralFloat read FCurvature;
+  end;
+
   /// Kolmogorov-Arnold Network DENSE layer (Liu et al. 2024,
   // "KAN: Kolmogorov-Arnold Networks", arXiv:2404.19756).
   //
@@ -39467,6 +39521,274 @@ begin
       + alpha * dLdu[i] + gammaLog * X.FData[i] * dotUX;
 end;
 
+{ TNNetHyperbolicDistance }
+
+constructor TNNetHyperbolicDistance.Create(pNumProto: integer;
+  pCurvature: TNeuralFloat = 1.0);
+begin
+  // K prototypes => K output dims. Suppress the per-neuron bias (the prototype
+  // IS the full weight row; there is no scalar bias in a distance readout).
+  inherited Create(pNumProto, 1, 1, 1);
+  if pCurvature <= 0 then
+    FErrorProc('TNNetHyperbolicDistance requires curvature c > 0. c=' +
+      FloatToStr(pCurvature));
+  FCurvature := pCurvature;
+  FFloatSt[0] := pCurvature;
+  FStruct[0] := pNumProto;
+  FCacheX := TNNetVolume.Create();
+  FCacheM := TNNetVolume.Create();
+  FCacheR := TNNetVolume.Create();
+  FCacheDen := TNNetVolume.Create();
+end;
+
+destructor TNNetHyperbolicDistance.Destroy();
+begin
+  FCacheX.Free;
+  FCacheM.Free;
+  FCacheR.Free;
+  FCacheDen.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetHyperbolicDistance.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: for each prototype p_k, m_k = (-x) (+)_c p_k, r_k = ||m_k||,
+//   d_k = (2/s) * atanh(s * r_k), s = sqrt(c).
+procedure TNNetHyperbolicDistance.ComputeCPU();
+var
+  nIn, nProto, i, kk: integer;
+  c, s, na2, Acoef, nb2, pco, qco, Den, r, t, dist: TNeuralFloat;
+  PrevOut, Pk: TNNetVolume;
+begin
+  c := FCurvature;
+  s := Sqrt(c);
+  PrevOut := FPrevLayer.FOutput;
+  nIn := PrevOut.Size;
+  nProto := FOutput.Size;
+
+  // Cache the raw input x.
+  FCacheX.ReSize(nIn, 1, 1);
+  for i := 0 to nIn - 1 do FCacheX.FData[i] := PrevOut.FData[i];
+
+  FCacheM.ReSize(nProto, 1, nIn);   // one row of length nIn per prototype
+  FCacheR.ReSize(nProto, 1, 1);
+  FCacheDen.ReSize(nProto, 1, 1);
+
+  // ||x||^2 (= ||a||^2 with a = -x) is shared across prototypes.
+  na2 := 0;
+  for i := 0 to nIn - 1 do na2 := na2 + FCacheX.FData[i] * FCacheX.FData[i];
+
+  for kk := 0 to nProto - 1 do
+  begin
+    Pk := FArrNeurons[kk].FWeights;  // prototype p_k, length nIn
+    // a = -x, b = p_k. A=<a,b>=-<x,p_k>; nb2=||p_k||^2.
+    Acoef := 0; nb2 := 0;
+    for i := 0 to nIn - 1 do
+    begin
+      Acoef := Acoef - FCacheX.FData[i] * Pk.FData[i];
+      nb2 := nb2 + Pk.FData[i] * Pk.FData[i];
+    end;
+    pco := 1.0 + 2.0 * c * Acoef + c * nb2;
+    qco := 1.0 - c * na2;
+    Den := 1.0 + 2.0 * c * Acoef + c * c * na2 * nb2;
+    if Abs(Den) < HYPERBOLIC_EPS then
+      Den := HYPERBOLIC_EPS * Sign(Den + HYPERBOLIC_EPS);
+    FCacheDen.FData[kk] := Den;
+    // m_k[i] = (pco*(-x_i) + qco*p_k_i)/Den.
+    r := 0;
+    for i := 0 to nIn - 1 do
+    begin
+      FCacheM.FData[kk * nIn + i] :=
+        (pco * (-FCacheX.FData[i]) + qco * Pk.FData[i]) / Den;
+      r := r + FCacheM.FData[kk * nIn + i] * FCacheM.FData[kk * nIn + i];
+    end;
+    r := Sqrt(r);
+    FCacheR.FData[kk] := r;
+    // d_k = (2/s) atanh(s r). Series near r=0: atanh(t)/t -> 1 => d -> 2 r.
+    t := s * r;
+    if t < HYPERBOLIC_EPS then
+      dist := (2.0 / s) * t * (1.0 + t * t / 3.0)   // ~ 2 r
+    else
+    begin
+      if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
+      dist := (2.0 / s) * ArcTanh(t);
+    end;
+    FOutput.FData[kk] := dist;
+  end;
+end;
+
+procedure TNNetHyperbolicDistance.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Mobius-addition Jacobian for prototype kk. a = -x (||a||^2 = na2), b = p_k.
+// Given the radial seed dLdm (= dL/dm_k), accumulate dL/da and dL/dp_k. Same
+// structure as ComputeHyperbolicMobiusBack's z<->a, b<->b block (no exp_0 step).
+procedure TNNetHyperbolicDistance.MobiusAddBack(const c: TNeuralFloat;
+  const A: TNNetVolume; const Bvec: TNNetVolume; const M: TNNetVolume;
+  const kk: integer; const dLdm: array of TNeuralFloat;
+  var dLda, dLdb: array of TNeuralFloat);
+var
+  nIn, i: integer;
+  Acoef, na2, nb2, pco, qco, Den, ha, hb, Gm: TNeuralFloat;
+begin
+  nIn := A.Size;
+  Acoef := 0; na2 := 0; nb2 := 0;
+  for i := 0 to nIn - 1 do
+  begin
+    Acoef := Acoef + A.FData[i] * Bvec.FData[i];
+    na2 := na2 + A.FData[i] * A.FData[i];
+    nb2 := nb2 + Bvec.FData[i] * Bvec.FData[i];
+  end;
+  pco := 1.0 + 2.0 * c * Acoef + c * nb2;
+  qco := 1.0 - c * na2;
+  Den := FCacheDen.FData[kk];
+  // ha=<dLdm,a>, hb=<dLdm,b>, Gm=<dLdm,Num>=Den*<dLdm,m>.
+  ha := 0; hb := 0; Gm := 0;
+  for i := 0 to nIn - 1 do
+  begin
+    ha := ha + dLdm[i] * A.FData[i];
+    hb := hb + dLdm[i] * Bvec.FData[i];
+    Gm := Gm + dLdm[i] * (pco * A.FData[i] + qco * Bvec.FData[i]);
+  end;
+  // dL/da_l = (1/Den)[2c b_l ha + pco dLdm_l - 2c a_l hb]
+  //           - (Gm/Den^2)[2c b_l + 2c^2 nb2 a_l].
+  // dL/db_l = (1/Den)[(2c a_l + 2c b_l) ha + qco dLdm_l]
+  //           - (Gm/Den^2)[2c a_l + 2c^2 na2 b_l].
+  for i := 0 to nIn - 1 do
+  begin
+    dLda[i] := dLda[i]
+      + ( 2.0*c*Bvec.FData[i]*ha + pco*dLdm[i] - 2.0*c*A.FData[i]*hb ) / Den
+      - Gm / (Den*Den) * ( 2.0*c*Bvec.FData[i] + 2.0*c*c*nb2*A.FData[i] );
+    dLdb[i] := dLdb[i]
+      + ( (2.0*c*A.FData[i] + 2.0*c*Bvec.FData[i])*ha + qco*dLdm[i] ) / Den
+      - Gm / (Den*Den) * ( 2.0*c*A.FData[i] + 2.0*c*c*na2*Bvec.FData[i] );
+  end;
+end;
+
+// Prototype-weight gradients: dL/dp_k accumulated into neuron k's Delta.
+procedure TNNetHyperbolicDistance.BackpropagateCPU();
+var
+  nIn, nProto, i, kk: integer;
+  c, s, r, t, ddr, rscale: TNeuralFloat;
+  Avec, Mk, WDelta: TNNetVolume;
+  dLdm, dLda, dLdb: array of TNeuralFloat;
+begin
+  c := FCurvature;
+  s := Sqrt(c);
+  nIn := FCacheX.Size;
+  nProto := FOutput.Size;
+
+  // a = -x.
+  Avec := TNNetVolume.Create(nIn, 1, 1);
+  Mk := TNNetVolume.Create(nIn, 1, 1);
+  try
+    for i := 0 to nIn - 1 do Avec.FData[i] := -FCacheX.FData[i];
+    SetLength(dLdm, nIn); SetLength(dLda, nIn); SetLength(dLdb, nIn);
+
+    for kk := 0 to nProto - 1 do
+    begin
+      r := FCacheR.FData[kk];
+      // dd_k/dr = 2/(1 - c r^2); dL/dr = g_k * that. dL/dm = (dL/dr / r)*m_k.
+      t := s * r;
+      if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
+      ddr := 2.0 / (1.0 - c * r * r);
+      if r < HYPERBOLIC_EPS then
+        rscale := 0    // m_k ~ 0; radial direction vanishes, gradient -> 0
+      else
+        rscale := FOutputError.FData[kk] * ddr / r;
+      for i := 0 to nIn - 1 do
+      begin
+        Mk.FData[i] := FCacheM.FData[kk * nIn + i];
+        dLdm[i] := rscale * Mk.FData[i];
+        dLda[i] := 0; dLdb[i] := 0;
+      end;
+      MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, dLdm, dLda, dLdb);
+      // dL/dp_k = dLdb. Accumulate into neuron delta scaled by -LearningRate.
+      WDelta := FArrNeurons[kk].FDelta;
+      for i := 0 to nIn - 1 do
+        WDelta.FData[i] := WDelta.FData[i] - FLearningRate * dLdb[i];
+    end;
+
+    if not FBatchUpdate then
+    begin
+      for kk := 0 to nProto - 1 do
+        FArrNeurons[kk].UpdateWeightsWithoutInertia();
+      AfterWeightUpdate();
+    end;
+  finally
+    Avec.Free;
+    Mk.Free;
+  end;
+end;
+
+// Input gradient dL/dx = -dL/da, summed over all prototypes.
+procedure TNNetHyperbolicDistance.ComputePreviousLayerErrorCPU();
+var
+  nIn, nProto, i, kk: integer;
+  c, s, r, t, ddr, rscale: TNeuralFloat;
+  Avec, Mk, LocalPrevError: TNNetVolume;
+  dLdm, dLda, dLdb: array of TNeuralFloat;
+begin
+  c := FCurvature;
+  s := Sqrt(c);
+  nIn := FCacheX.Size;
+  nProto := FOutput.Size;
+  LocalPrevError := FPrevLayer.OutputError;
+
+  Avec := TNNetVolume.Create(nIn, 1, 1);
+  Mk := TNNetVolume.Create(nIn, 1, 1);
+  try
+    for i := 0 to nIn - 1 do Avec.FData[i] := -FCacheX.FData[i];
+    SetLength(dLdm, nIn); SetLength(dLda, nIn); SetLength(dLdb, nIn);
+
+    for kk := 0 to nProto - 1 do
+    begin
+      r := FCacheR.FData[kk];
+      t := s * r;
+      if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
+      ddr := 2.0 / (1.0 - c * r * r);
+      if r < HYPERBOLIC_EPS then
+        rscale := 0
+      else
+        rscale := FOutputError.FData[kk] * ddr / r;
+      for i := 0 to nIn - 1 do
+      begin
+        Mk.FData[i] := FCacheM.FData[kk * nIn + i];
+        dLdm[i] := rscale * Mk.FData[i];
+        dLda[i] := 0; dLdb[i] := 0;
+      end;
+      MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, dLdm, dLda, dLdb);
+      // x = -a => dL/dx = -dL/da. Accumulate across prototypes.
+      for i := 0 to nIn - 1 do
+        LocalPrevError.FData[i] := LocalPrevError.FData[i] - dLda[i];
+    end;
+  finally
+    Avec.Free;
+    Mk.Free;
+  end;
+end;
+
 { TNNetQuaternionConv }
 
 constructor TNNetQuaternionConv.Create(pNumFeatures, pFeatureSize,
@@ -63943,6 +64265,7 @@ begin
       'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetHyperbolicLinear' :     Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3]);
+      'TNNetHyperbolicDistance' :   Result := TNNetHyperbolicDistance.Create(St[0], Ft[0]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
       'TNNetGraphAttention' :       Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]);
@@ -64274,6 +64597,7 @@ begin
       if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetHyperbolicLinear' then Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3]) else
+      if S[0] = 'TNNetHyperbolicDistance' then Result := TNNetHyperbolicDistance.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetGraphAttention' then Result := TNNetGraphAttention.Create(St[2], Ft[0], St[3]) else

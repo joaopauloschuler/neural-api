@@ -163,6 +163,10 @@ type
     procedure TestHyperbolicLinearGradientCheck;
     procedure TestHyperbolicLinearShape;
     procedure TestHyperbolicLinearSerializationRoundTrip;
+    // TNNetHyperbolicDistance Poincare-ball prototype-distance readout head
+    procedure TestHyperbolicDistanceGradientCheck;
+    procedure TestHyperbolicDistanceShape;
+    procedure TestHyperbolicDistanceSerializationRoundTrip;
     // TNNetQuaternionLinear hypercomplex dense layer
     procedure TestQuaternionLinearGradientCheck;
     procedure TestQuaternionLinearSerializationRoundTrip;
@@ -36453,6 +36457,211 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertTrue('HyperbolicLinear reloaded output matches at ' + IntToStr(i),
+          Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicDistanceGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  HD: TNNetHyperbolicDistance;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, j, NIn, NProto: integer;
+  c, nrm, bound: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient through the prototype-distance head:
+  // d_k = (2/s) atanh(s || (-x) (+)_c p_k ||). Check BOTH the input x and the
+  // prototype weights p_k. Input and prototypes are kept strictly inside the
+  // ball (||.|| <= 0.6/sqrt(c)) so FD never straddles the boundary; with both
+  // points well inside, (-x)(+)_c p_k stays inside too. Do NOT loosen tol.
+  RandSeed := 424242;
+  c := 1.3;
+  NIn := 4;
+  NProto := 3;
+  bound := 0.6 / Sqrt(c);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, NIn);
+  InputPlus := TNNetVolume.Create(1, 1, NIn);
+  Desired := TNNetVolume.Create(1, 1, NProto);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, NIn, 1));
+    HD := TNNetHyperbolicDistance.Create(NProto, c);
+    NN.AddLayer(HD);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded input strictly inside the ball.
+    for i := 0 to NIn - 1 do
+      Input.Raw[i] := Sin(i * 0.7 + 0.3) * 0.2 + 0.05;
+    nrm := 0;
+    for i := 0 to NIn - 1 do nrm := nrm + Input.Raw[i] * Input.Raw[i];
+    nrm := Sqrt(nrm);
+    if nrm > bound then
+      for i := 0 to NIn - 1 do Input.Raw[i] := Input.Raw[i] * bound / nrm;
+
+    for j := 0 to NProto - 1 do
+      Desired.Raw[j] := 0.3 + 0.1 * j;
+
+    // Bounded prototypes strictly inside the ball.
+    for j := 0 to NProto - 1 do
+    begin
+      for i := 0 to NIn - 1 do
+        HD.Neurons[j].Weights.Raw[i] := 0.18 * Sin(i * 1.1 + j * 0.9) - 0.04;
+      nrm := 0;
+      for i := 0 to NIn - 1 do
+        nrm := nrm + HD.Neurons[j].Weights.Raw[i] * HD.Neurons[j].Weights.Raw[i];
+      nrm := Sqrt(nrm);
+      if nrm > bound then
+        for i := 0 to NIn - 1 do
+          HD.Neurons[j].Weights.Raw[i] := HD.Neurons[j].Weights.Raw[i] * bound / nrm;
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to NIn - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('HyperbolicDistance input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.005);
+    end;
+
+    // ---- Gradient w.r.t. each prototype p_k ----
+    for j := 0 to NProto - 1 do
+      for i := 0 to NIn - 1 do
+      begin
+        HD.Neurons[j].Weights.Raw[i] := HD.Neurons[j].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        HD.Neurons[j].Weights.Raw[i] := HD.Neurons[j].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        HD.Neurons[j].Weights.Raw[i] := HD.Neurons[j].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        HD.Neurons[j].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -HD.Neurons[j].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        AssertTrue('HyperbolicDistance p[' + IntToStr(j) + '] gradient at ' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.005);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicDistanceShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  HD: TNNetHyperbolicDistance;
+  i: integer;
+begin
+  // The head maps a D_in vector to a K-vector of NON-NEGATIVE Poincare distances.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 7);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 7, 1));
+    HD := TNNetHyperbolicDistance.Create(5, 2.0); // K=5, c=2.0
+    NN.AddLayer(HD);
+
+    for i := 0 to 6 do Input.Raw[i] := Sin(i * 0.9) * 0.15;
+    NN.Compute(Input);
+
+    AssertEquals('HyperbolicDistance output Size', 5, HD.Output.Size);
+    AssertEquals('HyperbolicDistance output SizeY', 1, HD.Output.SizeY);
+    AssertEquals('HyperbolicDistance output Depth', 1, HD.Output.Depth);
+
+    for i := 0 to HD.Output.Size - 1 do
+      AssertTrue('HyperbolicDistance d[' + IntToStr(i) + '] >= 0 d=' +
+        FloatToStr(HD.Output.Raw[i]), HD.Output.Raw[i] >= -1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicDistanceSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  HD: TNNetHyperbolicDistance;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, j: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical and
+  // Compute must match (prototypes round-trip via neuron weights, curvature via
+  // FFloatSt[0] and K via FStruct[0] through both CreateLayer dispatch points).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    HD := TNNetHyperbolicDistance.Create(4, 1.7);
+    NN.AddLayer(HD);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to 4 do Input.Raw[i] := Sin(i * 0.8) * 0.12 - 0.03;
+    for j := 0 to 3 do
+      for i := 0 to 4 do
+        HD.Neurons[j].Weights.Raw[i] := 0.1 * (i + 1) - 0.25 + 0.15 * j;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HyperbolicDistance serialization byte-identical', Saved, Saved2);
+
+      AssertTrue('HyperbolicDistance curvature round-trips',
+        Abs((NN2.Layers[1] as TNNetHyperbolicDistance).Curvature - 1.7) < 1e-6);
+      AssertEquals('HyperbolicDistance K round-trips', 4,
+        NN2.Layers[1].Output.Size);
+
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('HyperbolicDistance reloaded output matches at ' + IntToStr(i),
           Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
     finally
       NN2.Free;
