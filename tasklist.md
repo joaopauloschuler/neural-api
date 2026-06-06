@@ -72,36 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetMixtureDensity — a probabilistic regression OUTPUT HEAD (Bishop 1994,
-      "Mixture Density Networks") that maps the previous layer to the parameters of
-      a K-component diagonal-Gaussian mixture over a D-dim target: K mixing weights
-      (softmax over components), K*D means, and K*D per-dim standard deviations
-      (softplus/exp positivity). Forward is an identity-style passthrough of the
-      packed parameter vector (like the existing loss heads — see [[loss-layer-pattern]]);
-      the layer owns the negative-log-likelihood loss of the target under the mixture
-      and rewrites its own Backpropagate to emit the exact dNLL/dparam gradients
-      (responsibility-weighted; the log-sum-exp over components is the numerically
-      stable form). This is genuinely distinct from every existing head: it is the
-      first layer that predicts a full conditional DISTRIBUTION (multi-modal,
-      heteroscedastic) rather than a point estimate or a single-class softmax, so it
-      can model one-to-many / inverse problems where MSE collapses to the mean.
-      Deliverables: TNNetMixtureDensity leaf (K, D, packing layout in FStruct) with
-      `// Coded by Claude (AI).` per [[claude-authorship-comment]]; both dispatch-table
-      registrations; numerical-gradient + shape + save/load test trio; a sampling
-      helper (draw a sample from the predicted mixture for inference); and an
-      examples/MixtureDensity/ demo on a deliberately one-to-many toy map (e.g. the
-      classic inverse `x = y + 0.3*sin(2*pi*y) + noise`, where for a single x there
-      are several valid y) showing the mixture recovers the multiple branches while a
-      plain MSE head averages them into the gap.
-      LANDED 2026-06-06 on a2 (cf8bb69): softmax mixing weights + softplus scales,
-      stable log-sum-exp NLL backward (dNLL/da_k = pi_k - gamma_k), SampleMixture/
-      MixtureNLL helpers, gradient+shape+save/load tests, examples/MixtureDensity/.
-      Gotchas: head packs over the Depth axis so the trunk must emit
-      FullConnectLinear(1,1,HEAD_DEPTH); a method param named `y` collides with a `Y`
-      param (case-insensitive); needed mean-bias init spread + mean-gradient batch
-      scaling to avoid mode collapse. Follow-up: a wider-x or 2-D-target demo where
-      the mixture params vary more sharply with x (the current folded-region demo
-      proves multimodal-vs-gap but params are near-constant across nearby x probes).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
@@ -157,23 +127,6 @@ rather than acted on.
       generator's output width (generate W in tiles) — the landed layer
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
-
-- [X] TNNetHyperbolicLinear follow-up (the Poincaré-ball hyperbolic dense layer +
-      the TNNetHyperbolicDistance prototype-distance readout head +
-      examples/HyperbolicEmbedding/ tree-distance demo all LANDED 2026-06-06 on a2;
-      exact analytic backward through log_0/exp_0 + Möbius add, curvature c in
-      FFloatSt[0], gradient+shape+save/load tests, README row): make curvature `c`
-      a single trainable scalar via the `gamma=sigmoid(raw)` constrained-scalar
-      pattern. See [[constrained-learnable-scalar-sigmoid]],
-      [[octonion-linear-layer]], [[tropical-linear-layer]].
-      LANDED 2026-06-06 on a2 (0435448): optional 4th constructor flag
-      `pLearnCurvature` (default off → fixed-c path byte-for-byte unchanged), one
-      extra 1-weight curvature neuron at index D_out, bounded map
-      c = 0.01 + 3.99*sigmoid(raw), exact dL/draw via a forward-mode tangent of y
-      through log_0/exp_0/Möbius-add, FStruct[4] round-trip, gradient + save/load
-      tests. The HyperbolicEmbedding example was left fixed-c (its hand-coded
-      distance loss reads CURVATURE as a constant, not the layer output) — only a
-      README note was added; a clean trainable-c demo arm is still open.
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
