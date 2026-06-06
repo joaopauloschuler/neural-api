@@ -64,8 +64,7 @@ Coded by Claude (AI).
 
 {$mode objfpc}{$H+}
 
-uses {$IFDEF UNIX} {$IFDEF UseCThreads}
-  cthreads, {$ENDIF} {$ENDIF}
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
   neuralvolume;

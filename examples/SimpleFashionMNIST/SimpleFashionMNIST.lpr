@@ -11,8 +11,7 @@ program SimpleFashionMNIST;
 *)
 {$mode objfpc}{$H+}
 
-uses {$IFDEF UNIX} {$IFDEF UseCThreads}
-  cthreads, {$ENDIF} {$ENDIF}
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets, neuralfit;
 
 type

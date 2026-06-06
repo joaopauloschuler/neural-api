@@ -24,8 +24,7 @@ unzip TinyStories4Pascal-Tokenized-v2/tinystories-vocab-3k-cai.csv.zip
 
 {$mode objfpc}{$H+}
 
-uses {$IFDEF UNIX} {$IFDEF UseCThreads}
-  cthreads, {$ENDIF} {$ENDIF}
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes,
   neuralnetwork,
   neuralvolume,
