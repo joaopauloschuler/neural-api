@@ -227,19 +227,20 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [ ] Set Transformer follow-up (multi-head + learnable-projection MAB): the
-      landed v1 `TNNetInducedSetAttention` / `TNNetAttentionPooling` use
-      single-head MABs with IDENTITY Q/K/V projections (only the bank is
-      learnable). Add (a) per-MAB learnable `W_Q`/`W_K`/`W_V` (+ optional
-      out-projection / residual + FFN, the full SAB/ISAB block from the paper),
-      and (b) genuine multi-head MABs (the builders already accept `Heads` but
-      only `Heads=1` is implemented — currently they raise for `Heads<>1`). Reuse
-      the multi-head concat-of-H-SDPA wiring (H separate heads along Depth, no
-      head-axis tensor in this repo — see [[multihead-no-head-axis-tensor]]).
-      Each new learnable projection needs its weight-gradient added to the
-      numerical-gradient tests; keep the exact softmax-Jacobian backward. Watch
-      the FD-truncation gotcha (bound weights, don't loosen tol) and reseed
-      `RandSeed := 424242`.
+- [ ] Set Transformer SAB-block follow-up (residual + FFN around the MAB): the
+      multi-head + learnable-projection MAB landed (`AddInducedSetAttention` /
+      `AddAttentionPooling` with `Heads>1` now build a genuine multi-head MAB:
+      per-head learnable input projection -> single-head ISAB/PMA with its own
+      bank -> DeepConcat -> learnable out-projection; `Heads=1` keeps the bare v1
+      layer). STILL OPEN: the paper's full SAB wraps the MAB in
+      `LayerNorm(X + MAB(...))` then a row-wise feed-forward
+      `LayerNorm(H + FFN(H))`. Add an opt-in `Residual`/`UseFFN` flag (or a new
+      `AddSAB` builder) that wraps the existing multi-head MAB output in a
+      pre/post-norm residual + a token-wise FFN (PointwiseConv up/down, NOT
+      FullConnect — keeps the (N,1,*) set axis). NOTE: the ISAB residual is only
+      legal when output shape == input shape (true for ISAB, NOT for PMA which
+      changes N->k, so the residual applies to ISAB only / the PMA query bank).
+      Add shape + input-gradient + save/load tests; reseed `RandSeed := 424242`.
 - [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
       landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
       per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load

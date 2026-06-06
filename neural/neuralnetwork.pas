@@ -7602,20 +7602,45 @@ type
       function AddModernHopfieldRetrieval(NumPatterns, KSteps: integer;
         Beta: TNeuralFloat = 1.0): TNNetLayer;
       // Wires an Induced Set Attention Block (ISAB; Set Transformer, Lee et al.
-      // 2019) over a (N,1,d) set (GetLastLayer, SizeY=1, Depth=d) using
+      // 2019) over a (N,1,d) set (GetLastLayer, SizeY=1, Depth=d=d_model) using
       // InducingPoints learnable inducing vectors. Output shape == input
       // (N,1,d); the inputs route through the M inducing points for O(N*M)
-      // (vs O(N^2)) attention. Heads is reserved for a multi-head follow-up;
-      // only Heads=1 is implemented (other values raise). Returns the
-      // TNNetInducedSetAttention layer. Coded by Claude (AI).
+      // (vs O(N^2)) attention.
+      // Heads=1 emits the bare single-head TNNetInducedSetAttention layer (no
+      // projections; only the inducing bank is learnable) -- the v1 behaviour.
+      // Heads>1 builds a genuine MULTI-HEAD MAB by the repo's concat-of-H idiom
+      // (there is NO head-axis tensor -- see [[multihead-no-head-axis-tensor]]):
+      // d_model is split into Heads subspaces of width d_head=d_model div Heads,
+      // each head gets its OWN learnable per-token input projection
+      // (TNNetPointwiseConvLinear, NOT FullConnect -- a 1x1 conv keeps the
+      // (N,1,*) set axis; FullConnect would flatten/mix the set, see the
+      // AddMultiHeadSelfAttention header) feeding a single-head
+      // TNNetInducedSetAttention(M,d_head) with its own inducing bank, the Heads
+      // outputs are concatenated back to d_model (TNNetDeepConcat) and passed
+      // through a learnable per-token OUT-projection (TNNetPointwiseConvLinear).
+      // So the learnable params per head are W^h (the Q/K/V input projection,
+      // shared across the head's query/key/value paths) + the head's bank, plus
+      // a shared output projection -- the SAB/ISAB block's projection family,
+      // each head keeping the EXACT single-head softmax-Jacobian backward.
+      // Requires d_model divisible by Heads. Returns the out-projection layer
+      // (Heads>1) or the TNNetInducedSetAttention layer (Heads=1).
+      // Coded by Claude (AI).
       function AddInducedSetAttention(InducingPoints: integer;
         Heads: integer = 1): TNNetLayer;
       // Wires Pooling by Multihead Attention (PMA; Set Transformer, Lee et al.
-      // 2019) over a (N,1,d) set, collapsing it to a FIXED (NumSeeds,1,d) output
-      // by letting NumSeeds learnable seed vectors cross-attend over the inputs.
-      // Permutation-invariant. Heads reserved for a follow-up (only Heads=1
-      // implemented). Returns the TNNetAttentionPooling layer.
-      // Coded by Claude (AI).
+      // 2019) over a (N,1,d=d_model) set, collapsing it to a FIXED
+      // (NumSeeds,1,d) output by letting NumSeeds learnable seed vectors
+      // cross-attend over the inputs. Permutation-invariant.
+      // Heads=1 emits the bare single-head TNNetAttentionPooling (v1: only the
+      // seed bank is learnable). Heads>1 builds a genuine multi-head MAB exactly
+      // as AddInducedSetAttention does (per-head learnable input projection ->
+      // single-head TNNetAttentionPooling(k,d_head) with its own seed bank ->
+      // DeepConcat to d_model -> learnable out-projection); the per-token 1x1
+      // convs preserve the set axis and each head keeps the exact
+      // softmax-Jacobian backward. Permutation invariance is preserved (every
+      // op is per-token except the symmetric softmax-over-n pool). Requires
+      // d_model divisible by Heads. Returns the out-projection (Heads>1) or the
+      // TNNetAttentionPooling layer (Heads=1). Coded by Claude (AI).
       function AddAttentionPooling(NumSeeds: integer;
         Heads: integer = 1): TNNetLayer;
       // Wires a Product-Key Memory (Lample et al. 2019) over a
@@ -33403,32 +33428,87 @@ function TNNet.AddInducedSetAttention(InducingPoints: integer;
   Heads: integer): TNNetLayer;
 var
   SetLayer: TNNetLayer;
+  d_model, d_head, HeadCnt: integer;
+  HeadOutputs: array of TNNetLayer;
 begin
   SetLayer := GetLastLayer();
   if SetLayer.Output.SizeY <> 1 then
     FErrorProc('AddInducedSetAttention requires a (N,1,d) set (SizeY=1). SizeY=' +
       IntToStr(SetLayer.Output.SizeY));
-  if Heads <> 1 then
-    FErrorProc('AddInducedSetAttention: only Heads=1 is implemented (v1). Got ' +
+  if Heads < 1 then
+    FErrorProc('AddInducedSetAttention requires Heads >= 1. Got ' +
       IntToStr(Heads));
-  Result := AddLayer(
-    TNNetInducedSetAttention.Create(InducingPoints, SetLayer.Output.Depth));
+  d_model := SetLayer.Output.Depth;
+  if Heads = 1 then
+  begin
+    // v1 single-head: the bare layer (only the inducing bank is learnable).
+    Result := AddLayer(TNNetInducedSetAttention.Create(InducingPoints, d_model));
+    exit;
+  end;
+  // Multi-head MAB: Heads independent heads concatenated along Depth (no
+  // head-axis tensor in this tree). Each head has its OWN learnable per-token
+  // input projection W^h (d_model -> d_head) feeding a single-head ISAB with
+  // its own inducing bank; the heads are concatenated and run through a learnable
+  // per-token out-projection. The 1x1 convs keep the (N,1,*) set axis.
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddInducedSetAttention requires d_model divisible by Heads. ' +
+      'd_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  d_head := d_model div Heads;
+  SetLength(HeadOutputs, Heads);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    // Learnable per-token input projection of the SAME set into this head's
+    // d_head subspace (Q/K/V share this projection; values are mixed by the
+    // out-projection after concat).
+    AddLayerAfter(TNNetPointwiseConvLinear.Create(d_head), SetLayer);
+    HeadOutputs[HeadCnt] :=
+      AddLayer(TNNetInducedSetAttention.Create(InducingPoints, d_head));
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Learnable per-token out-projection mixing the Heads*d_head = d_model concat.
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(HeadOutputs, 0);
 end;
 
 function TNNet.AddAttentionPooling(NumSeeds: integer;
   Heads: integer): TNNetLayer;
 var
   SetLayer: TNNetLayer;
+  d_model, d_head, HeadCnt: integer;
+  HeadOutputs: array of TNNetLayer;
 begin
   SetLayer := GetLastLayer();
   if SetLayer.Output.SizeY <> 1 then
     FErrorProc('AddAttentionPooling requires a (N,1,d) set (SizeY=1). SizeY=' +
       IntToStr(SetLayer.Output.SizeY));
-  if Heads <> 1 then
-    FErrorProc('AddAttentionPooling: only Heads=1 is implemented (v1). Got ' +
-      IntToStr(Heads));
-  Result := AddLayer(
-    TNNetAttentionPooling.Create(NumSeeds, SetLayer.Output.Depth));
+  if Heads < 1 then
+    FErrorProc('AddAttentionPooling requires Heads >= 1. Got ' + IntToStr(Heads));
+  d_model := SetLayer.Output.Depth;
+  if Heads = 1 then
+  begin
+    // v1 single-head: the bare layer (only the seed bank is learnable).
+    Result := AddLayer(TNNetAttentionPooling.Create(NumSeeds, d_model));
+    exit;
+  end;
+  // Multi-head PMA: Heads independent poolers concatenated along Depth. Each
+  // head learnably projects the set into a d_head subspace, pools it to NumSeeds
+  // rows with its own seed bank; the heads are concatenated (NumSeeds,1,d_model)
+  // and passed through a learnable per-token out-projection. Permutation
+  // invariance is preserved (every op is per-token except the symmetric pool).
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddAttentionPooling requires d_model divisible by Heads. ' +
+      'd_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  d_head := d_model div Heads;
+  SetLength(HeadOutputs, Heads);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    AddLayerAfter(TNNetPointwiseConvLinear.Create(d_head), SetLayer);
+    HeadOutputs[HeadCnt] :=
+      AddLayer(TNNetAttentionPooling.Create(NumSeeds, d_head));
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(HeadOutputs, 0);
 end;
 
 function TNNet.AddProductKeyMemory(NumKeys, ValueDim, TopK,

@@ -294,6 +294,10 @@ type
     procedure TestAttentionPoolingPermutationInvariance;
     procedure TestAttentionPoolingSerializationRoundTrip;
     procedure TestAddAttentionPoolingBuilder;
+    procedure TestMultiHeadInducedSetAttentionBuilder;
+    procedure TestMultiHeadInducedSetAttentionInputGradientCheck;
+    procedure TestMultiHeadAttentionPoolingBuilder;
+    procedure TestMultiHeadAttentionPoolingPermutationInvariance;
     procedure TestProductKeyMemoryInputGradientCheck;
     procedure TestProductKeyMemoryWeightGradientCheck;
     procedure TestProductKeyMemoryTopK1GradientCheck;
@@ -24934,6 +24938,254 @@ begin
     end;
   finally
     NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadInducedSetAttentionBuilder;
+// Multi-head ISAB (Heads=2 over d_model=4): the composite builder must
+// preserve the (N,1,d_model) shape, contain Heads single-head
+// TNNetInducedSetAttention layers + per-head input projections + a concat +
+// an out-projection, train (loss drops), and round-trip through Save/Load.
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, isabCnt, pwCnt: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  Desired := TNNetVolume.Create(6, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4));
+    NN.AddInducedSetAttention(2, 2); // 2 inducing points, 2 heads
+    NN.SetLearningRate(0.05, 0.0);
+
+    AssertEquals('MultiHead ISAB output SizeX preserved',
+      6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MultiHead ISAB output Depth preserved (d_model)',
+      4, NN.GetLastLayer.Output.Depth);
+    AssertTrue('MultiHead ISAB last layer is the out-projection',
+      NN.GetLastLayer is TNNetPointwiseConvLinear);
+
+    isabCnt := 0; pwCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+    begin
+      if NN.Layers[i] is TNNetInducedSetAttention then Inc(isabCnt);
+      if NN.Layers[i] is TNNetPointwiseConvLinear then Inc(pwCnt);
+    end;
+    AssertEquals('MultiHead ISAB has Heads single-head ISAB layers', 2, isabCnt);
+    // 2 per-head input projections + 1 out-projection.
+    AssertEquals('MultiHead ISAB pointwise-conv projection count', 3, pwCnt);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.3) * 1.2;
+      Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    end;
+    NN.Compute(Input);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 299 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('MultiHead ISAB training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('MultiHead ISAB SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadInducedSetAttentionInputGradientCheck;
+// End-to-end finite-difference input-gradient check on the multi-head ISAB
+// composite (input projections -> single-head ISAB heads -> concat ->
+// out-projection). Validates that every sublayer's backward chains correctly.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // N=4 set, d_model=4, Heads=2 (d_head=2), M=2 inducing points.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  InputPlus := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddInducedSetAttention(2, 2);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MultiHead ISAB input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('MultiHead ISAB input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadAttentionPoolingBuilder;
+// Multi-head PMA (Heads=2 over d_model=4): collapses an N=6 set to NumSeeds=2
+// rows of width d_model=4, contains Heads single-head TNNetAttentionPooling
+// layers + projections + concat + out-projection, trains, and round-trips.
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, pmaCnt: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4));
+    NN.AddAttentionPooling(2, 2); // 2 seeds, 2 heads
+    NN.SetLearningRate(0.05, 0.0);
+
+    AssertTrue('MultiHead PMA last layer is the out-projection',
+      NN.GetLastLayer is TNNetPointwiseConvLinear);
+    pmaCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetAttentionPooling then Inc(pmaCnt);
+    AssertEquals('MultiHead PMA has Heads single-head PMA layers', 2, pmaCnt);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 1.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    NN.Compute(Input);
+    AssertEquals('MultiHead PMA output SizeX = NumSeeds',
+      2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MultiHead PMA output Depth = d_model',
+      4, NN.GetLastLayer.Output.Depth);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 299 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('MultiHead PMA training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('MultiHead PMA SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadAttentionPoolingPermutationInvariance;
+// Multi-head PMA must stay permutation-INVARIANT: every op is per-token except
+// the symmetric softmax-over-n pool, so shuffling the input rows must leave the
+// pooled output unchanged.
+var
+  NN: TNNet;
+  Input, Shuffled, Out1: TNNetVolume;
+  i, d, n, Dim, Nrows: integer;
+  perm: array of integer;
+  tmp, maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Dim := 4; Nrows := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Nrows, 1, Dim);
+  Shuffled := TNNetVolume.Create(Nrows, 1, Dim);
+  Out1 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(Nrows, 1, Dim));
+    NN.AddAttentionPooling(2, 2);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.91) * 1.3 + 0.1;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+
+    // Reverse the rows (a non-trivial permutation).
+    SetLength(perm, Nrows);
+    for n := 0 to Nrows - 1 do perm[n] := Nrows - 1 - n;
+    for n := 0 to Nrows - 1 do
+      for d := 0 to Dim - 1 do
+        Shuffled[n, 0, d] := Input[perm[n], 0, d];
+    NN.Compute(Shuffled);
+
+    maxErr := 0;
+    for i := 0 to Out1.Size - 1 do
+    begin
+      tmp := Abs(Out1.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if tmp > maxErr then maxErr := tmp;
+    end;
+    AssertTrue('MultiHead PMA permutation invariance (maxErr=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-5);
+    WriteLn('MultiHead PMA permutation-invariance max abs error: ', maxErr:0:8);
+    SetLength(perm, 0);
+  finally
+    NN.Free; Input.Free; Shuffled.Free; Out1.Free;
   end;
 end;
 
