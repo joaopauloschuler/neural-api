@@ -22,8 +22,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 {$mode objfpc}{$H+}
 
-uses {$IFDEF UNIX} {$IFDEF UseCThreads}
-  cthreads, {$ENDIF} {$ENDIF}
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes,
   neuralnetwork,
   neuralvolume,

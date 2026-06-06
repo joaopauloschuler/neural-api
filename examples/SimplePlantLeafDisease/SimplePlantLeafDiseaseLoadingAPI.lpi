@@ -117,13 +117,10 @@
         </Mode0>
       </Modes>
     </RunParams>
-    <RequiredPackages Count="2">
+    <RequiredPackages Count="1">
       <Item1>
         <PackageName Value="FCL"/>
       </Item1>
-      <Item2>
-        <PackageName Value="multithreadprocslaz"/>
-      </Item2>
     </RequiredPackages>
     <Units Count="1">
       <Unit0>

@@ -518,6 +518,7 @@ type
     procedure TestMultiHeadSDPAConcatGradientCheck;
     procedure TestMultiHeadSelfAttentionGradientCheck;
     procedure TestHyenaOperatorShapeAndGradientCheck;
+    procedure TestMultiHeadSelfAttentionRoPEGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
     procedure TestAffineGridSampleIdentity;
@@ -540,6 +541,7 @@ type
     procedure TestMultiHeadLatentAttentionGradientCheck;
     procedure TestMultiHeadLatentAttentionLoadFromString;
     procedure TestTransformerEncoderBlockGradientCheck;
+    procedure TestTransformerEncoderBlockCustomNorm;
     procedure TestTransformerDecoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
     procedure TestHardConcreteGradientCheck;
@@ -12585,6 +12587,37 @@ begin
   RunOne(false);
 end;
 
+procedure TTestNeuralNumerical.TestTransformerEncoderBlockCustomNorm;
+// Verifies the NormClass parameter of AddTransformerEncoderBlock actually swaps
+// the normalization layer class. Builds a block with NormClass=TNNetRMSNorm and
+// asserts the block contains TNNetRMSNorm norm layers and NO TNNetLayerNorm.
+var
+  NN: TNNet;
+  i, rmsCount, lnCount: integer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 8));
+    NN.AddTransformerEncoderBlock(2, 16, {PreNorm=}true, {CausalMask=}false,
+      {UseRoPE=}false, {NormClass=}TNNetRMSNorm);
+    rmsCount := 0;
+    lnCount := 0;
+    for i := 0 to NN.CountLayers - 1 do
+    begin
+      if NN.Layers[i] is TNNetRMSNorm then Inc(rmsCount);
+      // TNNetRMSNorm does not descend from TNNetLayerNorm, so this counts only
+      // genuine LayerNorm instances.
+      if NN.Layers[i] is TNNetLayerNorm then Inc(lnCount);
+    end;
+    AssertTrue('Encoder block with NormClass=TNNetRMSNorm must contain RMSNorm ' +
+      'layers, got ' + IntToStr(rmsCount), rmsCount = 2);
+    AssertEquals('Encoder block with NormClass=TNNetRMSNorm must contain NO ' +
+      'LayerNorm layers', 0, lnCount);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestTransformerDecoderBlockGradientCheck;
 // AddTransformerDecoderBlock builder: CAUSAL self-attention residual ->
 // cross-attention residual (Q from decoder stream, K|V from a SEPARATE encoder
@@ -13044,6 +13077,79 @@ begin
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
     WriteLn('HyenaOperator input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionRoPEGradientCheck;
+// Same numerical input-gradient check as TestMultiHeadSelfAttentionGradientCheck
+// but with UseRoPE=True: the builder inserts a per-head TNNetRotaryEmbedding on
+// Q and K (d_k = d_model div Heads = 4, even) before SDPA. Verifies the rotary
+// branch's gradient flows correctly through the whole self-attention block.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  d_model, Heads, SeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, false, {UseRoPE=}true);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MHSA-RoPE input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
   finally
     NN.Free;
     Input.Free;

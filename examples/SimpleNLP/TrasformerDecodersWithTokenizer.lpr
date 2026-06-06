@@ -24,8 +24,7 @@ unzip TinyStories4Pascal-Tokenized-v2/tinystories-vocab-3k-cai.csv.zip
 
 {$mode objfpc}{$H+}
 
-uses {$IFDEF UNIX} {$IFDEF UseCThreads}
-  cthreads, {$ENDIF} {$ENDIF}
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes,
   neuralnetwork,
   neuralvolume,
@@ -45,6 +44,25 @@ const
   csMinSampleSize = 3; // Minimum of 3 tokens.
   csEmbedDim = 512;
   csModelVocabSize = 3000;
+
+// ===== Tier-1 norm bake-off selector =====
+// Swap this ONE class to run a norm variant (recompile per variant, ~4:30):
+//   TNNetLayerNorm  -- baseline (per-sample mean/var normalization)
+//   TNNetRMSNorm    -- LLaMA-style RMS (no mean subtraction), cheaper
+//   TNNetDyT        -- Dynamic Tanh, learnable per-channel, no norm statistics
+const
+  csNormClass: TNNetLayerClass = TNNetLayerNorm;
+  csPreNorm = True; // flip to False for a Pre/Post-norm placement experiment
+
+// ===== Positional-scheme experiment =====
+// False = baseline: learned ABSOLUTE positions (TokenAndPositionalEmbedding),
+//                   plain SDPA attention.
+// True  = RoPE: token-only embedding (no absolute positions) + per-head rotary
+//               embedding applied to Q and K inside attention. This is the
+//               literature-valid "RoPE vs learned-absolute" comparison: it
+//               swaps the WHOLE positional scheme, not RoPE-on-top-of-absolute.
+const
+  csUseRoPE = False;
 
 type
   TTestFitLoading = class(TCustomApplication)
@@ -129,12 +147,23 @@ type
     NFit := TNeuralDataLoadingFit.Create();
     FMaxPredictCharPos := csContextLen;
     FSampler := TNNetSamplerTopP.Create(0.4);
-    FNN.AddLayer([
-      TNNetInput.Create(csContextLen, 1, 1),
-      TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02, 0.01)
-    ]);
+    FNN.AddLayer( TNNetInput.Create(csContextLen, 1, 1) );
+    if csUseRoPE then
+      // Token-only embedding: position is injected by RoPE inside attention.
+      FNN.AddLayer( TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02) )
+    else
+      // Learned absolute positions added at the input (baseline).
+      FNN.AddLayer( TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02, 0.01) );
 
-    for I := 1 to 2 do FNN.AddTransformerBlockCAI(8, 2048, true, false, false);
+    for I := 1 to 2 do
+    begin
+      // Library transformer encoder block. Experiment knobs map directly to its
+      // parameters: norm placement (csPreNorm), positional scheme (csUseRoPE),
+      // and norm class (csNormClass: LayerNorm/RMSNorm/DyT). FFN is SwiGLU.
+      FNN.AddTransformerEncoderBlock(8, 2048,
+        {PreNorm=}csPreNorm, {CausalMask=}true,
+        {UseRoPE=}csUseRoPE, {NormClass=}csNormClass);
+    end;
 
     FNN.AddLayer([
       TNNetPointwiseConvLinear.Create(csEmbedDim),
@@ -147,7 +176,7 @@ type
     FNN.DebugWeights();
 
     WriteLn('Computing...');
-    NFit.LogEveryBatches := 10;
+    NFit.LogEveryBatches := 1;
     NFit.CustomLearningRateScheduleFn:=@CyclicalAdvLRScheduler25b;
     NFit.Optimizer := Opt;
     NFit.LearningRateDecay := 0.00;
@@ -164,7 +193,7 @@ type
       {TrainingVolumesCount=}48000*1,
       {ValidationVolumesCount=}48000*1 div 20,
       {TestVolumesCount=}48000*1 div 20,
-      {batchsize=}48,
+      {batchsize=}32,
       {epochs=}500,
       @GetTrainingPair, @GetValidationPair, @GetTestPair
     );

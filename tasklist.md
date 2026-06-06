@@ -118,6 +118,35 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
+- [ ] TNNetQuaternionLinear — a quaternion-valued dense layer (Parcollet et al.
+      2019, "Quaternion Recurrent Neural Networks"; Gaudet & Maida 2018). The
+      first hypercomplex layer in the fork. Treat the input Depth (must be a
+      multiple of 4) as a vector of D/4 quaternions, and learn an (Out/4 x In/4)
+      grid of quaternion weights q = r + xi + yj + zk. The forward pass is the
+      Hamilton product y = W (x) x — equivalently a real 4x4-block matrix where
+      each block is the antisymmetric Hamilton matrix of one learned quaternion
+      [[r,-x,-y,-z],[x,r,-z,y],[y,z,r,-x],[z,-y,x,r]]. The headline is STRUCTURED
+      WEIGHT SHARING: one quaternion's 4 reals drive a whole 4x4 block, so the
+      layer stores ~1/4 the weights of a dense TNNetFullConnectLinear of equal
+      width while still mixing all four components (the cross-channel coupling a
+      block-diagonal AddGroupedFullConnect cannot express, and an algebra unlike
+      the cyclic-shift sharing of TNNetCirculantLinear or the quantized-dense
+      TNNetBitLinear). Backward must propagate into BOTH the input (W^H (x) dy via
+      the conjugate/transpose block) and the four real weight components per
+      block (the Hamilton-product Jacobian) — this is the part to numerically
+      gradient-check, since a silent component-sign error in the 4x4 layout is
+      exactly the diagonal-only-style bug class the audit tasks warn about.
+      Scope v1: real input/output reinterpreted as packed quaternions (no
+      separate imaginary tensor), bias optional, default init so each block
+      starts near a scaled rotation. Ship the leaf layer + LoadFromString
+      registration + numerical-gradient + save/load tests, and an
+      examples/QuaternionLinear/ param-matched bake-off vs TNNetFullConnectLinear
+      and AddGroupedFullConnect on a small signal/colour-rotation task where the
+      4-component coupling should help at equal parameter count. Distinct from
+      every existing structured-dense layer (circulant, grouped, BitLinear, KAN,
+      HyperLinear). STRETCH: a quaternion conv (TNNetQuaternionConv) reusing the
+      same Hamilton-block once the dense layer's gradient is trusted.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
