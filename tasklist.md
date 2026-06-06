@@ -239,6 +239,46 @@ rather than acted on.
 
 ### Attention variants / siblings
 
+- [ ] Set Transformer family — inducing-point attention (`TNNetInducedSetAttention`)
+      + pooling-by-multihead-attention (`TNNetAttentionPooling`) (Lee et al. 2019,
+      "Set Transformer", ICML). Two structurally NEW primitives for permutation-
+      invariant set inputs, both DISTINCT from everything already here:
+      * `TNNetInducedSetAttention` (ISAB): instead of full O(N^2) self-attention
+        over the N input tokens, keep a small bank of `M` LEARNABLE inducing
+        points `I` (shape `(M, d)`). The block is two stacked cross-attentions:
+        `H = MAB(I, X)` (the M inducing points attend over the N inputs ->
+        `(M, d)`), then `Y = MAB(X, H)` (the N inputs attend back over the M
+        summaries -> `(N, d)`), giving an O(N*M) shape-preserving set-to-set map
+        that still mixes all N tokens but through the M-wide bottleneck. The
+        inducing points are trainable Neurons, NOT read from the input — so this
+        is NOT the existing `TNNetCrossAttention` (two external sources) nor a
+        plain stack of `TNNetScaledDotProductAttention` (O(N^2), no bank).
+      * `TNNetAttentionPooling` (PMA): pool a variable-length set `(N, d)` down to
+        a FIXED `k` outputs `(k, d)` by letting `k` LEARNABLE seed vectors `S`
+        cross-attend over the N inputs (`PMA = MAB(S, X)`). This is a TRAINABLE,
+        content-addressed, permutation-invariant readout — categorically unlike
+        the existing fixed reductions `TNNetAvgChannel` / `TNNetMaxChannel`
+        (parameter-free mean/max) and unlike `TNNetModernHopfield` (iterates a
+        softmax to a fixed point against a stored-pattern bank; here it is a
+        single cross-attention with learnable QUERIES, `k=1` collapses to a
+        weighted-sum attention pool).
+      Forward caches the per-block softmax weights; backward differentiates the
+      MAB cross-attention Jacobian (reuse the SDPA softmax-Jacobian path already
+      proven by `TNNetScaledDotProductAttention` / `TNNetCrossAttention`) and
+      scatters the gradient into BOTH the input set and the learnable
+      inducing-point / seed banks so they train end-to-end. Ship the usual trio
+      for each class (declaration with the `// Coded by Claude (AI).` comment,
+      dispatch-table + save/load wiring like `TNNetCrossAttention` since both
+      own a learnable bank, numerical-gradient test exercising the two-stage MAB
+      and the `k=1`/`M=1` edge cases), plus composite builders
+      `TNNet.AddInducedSetAttention(InducingPoints, Heads)` and
+      `TNNet.AddAttentionPooling(NumSeeds, Heads)`. Capstone
+      `examples/SetTransformer/`: a permutation-invariance smoke test (shuffle
+      the input rows -> identical pooled output to <1e-5) plus a tiny
+      max-of-set / amortized-clustering toy task showing ISAB+PMA beats a
+      mean-pool baseline AND that ISAB with `M << N` matches full self-attention
+      pooling at a fraction of the score-matrix size. Pairs naturally with the
+      open [[Product-Key Memory]] task as the set-structured-input cluster.
 - [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
       landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
       per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load
