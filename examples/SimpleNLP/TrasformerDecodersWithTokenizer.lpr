@@ -46,6 +46,25 @@ const
   csEmbedDim = 512;
   csModelVocabSize = 3000;
 
+// ===== Tier-1 norm bake-off selector =====
+// Swap this ONE class to run a norm variant (recompile per variant, ~4:30):
+//   TNNetLayerNorm  -- baseline (per-sample mean/var normalization)
+//   TNNetRMSNorm    -- LLaMA-style RMS (no mean subtraction), cheaper
+//   TNNetDyT        -- Dynamic Tanh, learnable per-channel, no norm statistics
+const
+  csNormClass: TNNetLayerClass = TNNetLayerNorm;
+  csPreNorm = True; // flip to False for a Pre/Post-norm placement experiment
+
+// ===== Positional-scheme experiment =====
+// False = baseline: learned ABSOLUTE positions (TokenAndPositionalEmbedding),
+//                   plain SDPA attention.
+// True  = RoPE: token-only embedding (no absolute positions) + per-head rotary
+//               embedding applied to Q and K inside attention. This is the
+//               literature-valid "RoPE vs learned-absolute" comparison: it
+//               swaps the WHOLE positional scheme, not RoPE-on-top-of-absolute.
+const
+  csUseRoPE = False;
+
 type
   TTestFitLoading = class(TCustomApplication)
   protected
@@ -116,6 +135,34 @@ type
     end;
   end;
 
+  // Norm-parameterized copy of TNNet.AddTransformerEncoderBlock so each Tier-1
+  // experiment is a single-class swap (csNormClass) against an identical block.
+  // RoPE (csUseRoPE) is delegated to the library UseRoPE flag on
+  // TNNet.AddMultiHeadSelfAttention.
+  procedure AddEncoderBlockVariant(NN: TNNet; Heads, d_ff: integer;
+    NormClass: TNNetLayerClass; PreNorm, CausalMask: boolean);
+  var
+    BranchInput: TNNetLayer;
+    d_model: integer;
+  begin
+    // ---- Attention sub-block ----
+    BranchInput := NN.GetLastLayer();
+    d_model := BranchInput.Output.Depth;
+    if PreNorm then NN.AddLayer( NormClass.Create() );
+    NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
+    NN.AddMultiHeadSelfAttention(Heads, CausalMask, {UseRoPE=}csUseRoPE);
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    if not PreNorm then NN.AddLayer( NormClass.Create() );
+    // ---- Feed-forward sub-block (SwiGLU, held fixed for the norm bake-off) ----
+    BranchInput := NN.GetLastLayer();
+    if PreNorm then NN.AddLayer( NormClass.Create() );
+    NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
+    NN.AddLayer( TNNetSwiGLU.Create() );
+    NN.AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    if not PreNorm then NN.AddLayer( NormClass.Create() );
+  end;
+
   procedure TTestFitLoading.DoRun;
   var
     W: TNNetLayer;
@@ -129,19 +176,19 @@ type
     NFit := TNeuralDataLoadingFit.Create();
     FMaxPredictCharPos := csContextLen;
     FSampler := TNNetSamplerTopP.Create(0.4);
-    FNN.AddLayer([
-      TNNetInput.Create(csContextLen, 1, 1),
-      TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02, 0.01)
-    ]);
+    FNN.AddLayer( TNNetInput.Create(csContextLen, 1, 1) );
+    if csUseRoPE then
+      // Token-only embedding: position is injected by RoPE inside attention.
+      FNN.AddLayer( TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02) )
+    else
+      // Learned absolute positions added at the input (baseline).
+      FNN.AddLayer( TNNetTokenAndPositionalEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02, 0.01) );
 
     for I := 1 to 2 do
     begin
-      // Modern stack (LayerNorm + true SDPA + SwiGLU FFN, causal):
-      FNN.AddTransformerEncoderBlock(8, 2048, {PreNorm=}true, {CausalMask=}true);
-      // Baseline: CAI transformer decoder block (signed-sqrt norm, ReLU FFN).
-      // FNN.AddTransformerBlockCAI(8, 2048, true, false, false);
-      // GELU activations in the CAI block instead of signed-sqrt:
-      // FNN.AddTransformerBlockCAI(8, 2048, true, false, false, TNNetGELU);
+      // Tier-1 norm bake-off: norm type chosen by csNormClass, placement by
+      // csPreNorm. Attention (SDPA) + SwiGLU FFN held fixed across variants.
+      AddEncoderBlockVariant(FNN, 8, 2048, csNormClass, csPreNorm, {CausalMask=}true);
     end;
 
     FNN.AddLayer([
@@ -155,7 +202,7 @@ type
     FNN.DebugWeights();
 
     WriteLn('Computing...');
-    NFit.LogEveryBatches := 10;
+    NFit.LogEveryBatches := 1;
     NFit.CustomLearningRateScheduleFn:=@CyclicalAdvLRScheduler25b;
     NFit.Optimizer := Opt;
     NFit.LearningRateDecay := 0.00;
@@ -172,7 +219,7 @@ type
       {TrainingVolumesCount=}48000*1,
       {ValidationVolumesCount=}48000*1 div 20,
       {TestVolumesCount=}48000*1 div 20,
-      {batchsize=}48,
+      {batchsize=}32,
       {epochs=}500,
       @GetTrainingPair, @GetValidationPair, @GetTestPair
     );
