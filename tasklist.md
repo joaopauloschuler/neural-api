@@ -741,10 +741,14 @@ rather than acted on.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
 ### Examples I'd enjoy writing
-- [ ] `examples/TinyGPT/` — char-level transformer end-to-end demo on
-      a short text snippet (Tiny Shakespeare or repeated arithmetic).
-      Highest-value example missing from the repo; natural capstone for
-      the transformer-building-blocks line of work.
+- [X] `examples/TinyGPT/` — LANDED 2026-06-06 (commit ad0478d): char-level
+      decoder-only GPT (one-hot -> PointwiseConvLinear token proj -> AddPositionalEmbedding
+      -> 2x AddTransformerEncoderBlock with CausalMask=true + SwiGLU FFN -> softmax head),
+      trains on a small embedded corpus and generates autoregressively. ~1.3-2 min pure CPU,
+      val loss 4.49->3.28 / next-char acc ~0.30 at the budget config; honestly documented as
+      "memorizes the tiny corpus, under-trained for the 5-min budget" (a clean idle box reaches
+      loss <1.0 with more epochs). Used AddTransformerEncoderBlock (NOT the encoder-decoder
+      AddTransformerDecoderBlock which needs cross-attention).
 - [ ] EchoStateNetwork follow-up: add a `TNNetSpectralRadius` helper (power
       iteration on W·v only, no W^T step) so reservoirs can target the true
       spectral RADIUS rather than the conservative spectral-norm upper bound
