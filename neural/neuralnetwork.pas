@@ -7128,6 +7128,71 @@ type
     property FactorQ: integer read FQ;
   end;
 
+  /// Soft (oblique) decision tree layer -- a single differentiable, balanced
+  /// binary decision tree of fixed depth D (Kontschieder et al. 2015, "Deep
+  /// Neural Decision Forests"; Frosst & Hinton 2017, "Distilling a Neural
+  /// Network Into a Soft Decision Tree"). This is a HIERARCHICAL SOFT-ROUTING
+  /// paradigm distinct from every other layer family here (matrix factorization,
+  /// attention, recurrence, kernel methods): each inner node is a learnable
+  /// linear gate and the output is a path-probability-weighted mixture of leaf
+  /// vectors.
+  ///
+  /// A balanced binary tree of depth D has 2^D - 1 inner (decision) nodes and
+  /// 2^D leaves, heap-indexed: node i has children 2i+1 (left) / 2i+2 (right).
+  /// Each inner node i computes a routing probability
+  ///   p_i = sigmoid(beta * (w_i . x + b_i))      (probability of going LEFT)
+  /// where x is the flat input feature vector (Din inferred from the previous
+  /// layer's Output.Size) and beta is a FIXED inverse-temperature hyperparameter
+  /// (a Create arg; NOT trainable in v1). A sample reaches leaf l with
+  /// probability P_l = product over the root-to-leaf path of p_i (left) or
+  /// (1 - p_i) (right). Each leaf l holds a learnable output vector phi_l of
+  /// length OutputDepth. The layer output (shape (1,1,OutputDepth)) is the soft
+  /// mixture
+  ///   y = sum_l P_l * phi_l .
+  ///
+  /// Weight layout in Neurons[]: the first 2^D - 1 neurons are the gate neurons
+  /// (neuron i holds w_i: Din weights, plus bias b_i in FBiasWeight). The next
+  /// 2^D neurons are the leaf neurons (each holds phi_l: OutputDepth weights, no
+  /// bias). All weights round-trip via the ordinary per-neuron save/load. D is
+  /// stored in FStruct[0], OutputDepth in FStruct[1], and beta in FFloatSt[0].
+  ///
+  /// Backward is EXACT and cheap (no diagonal/approximate path). With per-output
+  /// error g (FOutputError) define the per-leaf responsibility
+  ///   r_l = (sum_d g_d * phi_l[d]) * P_l .
+  /// For inner node i, let A_i = sum over left-subtree leaves of r_l and
+  /// B_i = sum over right-subtree leaves of r_l. Then the gradient w.r.t. the
+  /// node pre-activation z_i = w_i.x + b_i collapses (the p_i / (1-p_i)
+  /// divisions cancel against dp_i/dz_i = beta*p_i*(1-p_i)) to
+  ///   dL/dz_i = beta * ( A_i*(1 - p_i) - B_i*p_i ) .
+  /// Hence dL/dw_i = dz_i * x, dL/db_i = dz_i, dL/dphi_l[d] = P_l * g_d, and the
+  /// input gradient dL/dx = sum_i dz_i * w_i. Deltas carry -LR*grad as usual.
+  // Coded by Claude (AI).
+  TNNetSoftDecisionTree = class(TNNetLayer)
+  private
+    FTreeDepth: integer;   // D
+    FOutDepth: integer;    // OutputDepth (leaf vector length)
+    FInSize: integer;      // Din (flat input size)
+    FBeta: TNeuralFloat;   // fixed inverse temperature
+    FNumInner: integer;    // 2^D - 1
+    FNumLeaves: integer;   // 2^D
+    FCacheP: TNNetVolume;  // p_i per inner node, cached for backward (len FNumInner)
+    FCacheLeaf: TNNetVolume; // P_l per leaf, cached for backward (len FNumLeaves)
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(TreeDepth, OutputDepth: integer; Beta: TNeuralFloat = 1.0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property TreeDepth: integer read FTreeDepth;
+    property OutputDepth: integer read FOutDepth;
+    property Beta: TNeuralFloat read FBeta;
+    property LeafCount: integer read FNumLeaves;
+    property InnerCount: integer read FNumInner;
+  end;
+
   /// Random Fourier Features kernel-approximation layer (Rahimi & Recht 2007,
   /// "Random Features for Large-Scale Kernel Machines"). Maps a Din-vector input
   /// x to a 2*D-vector feature map that approximates the RBF / Gaussian kernel:
@@ -39101,6 +39166,263 @@ begin
   end;
 end;
 
+{ TNNetSoftDecisionTree }
+
+constructor TNNetSoftDecisionTree.Create(TreeDepth, OutputDepth: integer;
+  Beta: TNeuralFloat);
+begin
+  inherited Create();
+  if TreeDepth < 1 then
+    FErrorProc('TNNetSoftDecisionTree requires TreeDepth >= 1. Got ' +
+      IntToStr(TreeDepth) + '.');
+  if OutputDepth < 1 then
+    FErrorProc('TNNetSoftDecisionTree requires OutputDepth >= 1. Got ' +
+      IntToStr(OutputDepth) + '.');
+  if Beta <= 0 then
+    FErrorProc('TNNetSoftDecisionTree requires Beta > 0.');
+  FTreeDepth := TreeDepth;
+  FOutDepth := OutputDepth;
+  FBeta := Beta;
+  FNumLeaves := 1 shl TreeDepth;   // 2^D
+  FNumInner := FNumLeaves - 1;     // 2^D - 1
+  FStruct[0] := FTreeDepth;
+  FStruct[1] := FOutDepth;
+  FFloatSt[0] := FBeta;
+  FCacheP := TNNetVolume.Create();
+  FCacheLeaf := TNNetVolume.Create();
+  // Allocate the (2^D - 1) gate neurons followed by the 2^D leaf neurons; they
+  // are sized in SetPrevLayer once Din is known.
+  while FNeurons.Count > FNumInner + FNumLeaves do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FNumInner + FNumLeaves do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+destructor TNNetSoftDecisionTree.Destroy();
+begin
+  FCacheP.Free;
+  FCacheLeaf.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSoftDecisionTree.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  i: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  FInSize := pPrevLayer.Output.Size;
+  if FInSize <= 0 then
+    FErrorProc('TNNetSoftDecisionTree requires a non-empty input.');
+
+  FOutput.ReSize(1, 1, FOutDepth);
+  FOutputError.ReSize(1, 1, FOutDepth);
+  FOutputErrorDeriv.ReSize(1, 1, FOutDepth);
+  FCacheP.ReSize(FNumInner, 1, 1);
+  FCacheLeaf.ReSize(FNumLeaves, 1, 1);
+
+  // Gate neurons: Din weights + bias each.
+  for i := 0 to FNumInner - 1 do
+  begin
+    FNeurons[i].Weights.ReSize(FInSize, 1, 1);
+    FNeurons[i].BackInertia.ReSize(FInSize, 1, 1);
+    FNeurons[i].Delta.ReSize(FInSize, 1, 1);
+  end;
+  // Leaf neurons: OutputDepth weights, no bias.
+  for i := 0 to FNumLeaves - 1 do
+  begin
+    FNeurons[FNumInner + i].Weights.ReSize(FOutDepth, 1, 1);
+    FNeurons[FNumInner + i].BackInertia.ReSize(FOutDepth, 1, 1);
+    FNeurons[FNumInner + i].Delta.ReSize(FOutDepth, 1, 1);
+  end;
+  BuildArrNeurons();
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Small random gate weights (1/sqrt(fan_in) scale) with zero bias, so every
+// node starts near the p=0.5 balanced-routing regime; small random leaf vectors.
+procedure TNNetSoftDecisionTree.InitDefault();
+var
+  i, j: integer;
+  scaleGate: TNeuralFloat;
+begin
+  if FInSize <= 0 then exit;
+  scaleGate := 1.0 / Sqrt(FInSize);
+  for i := 0 to FNumInner - 1 do
+  begin
+    for j := 0 to FInSize - 1 do
+      FArrNeurons[i].FWeights.FData[j] := scaleGate * (Random - 0.5) * 2;
+    FArrNeurons[i].FBiasWeight := 0;
+  end;
+  for i := 0 to FNumLeaves - 1 do
+  begin
+    for j := 0 to FOutDepth - 1 do
+      FArrNeurons[FNumInner + i].FWeights.FData[j] := 0.1 * (Random - 0.5) * 2;
+    FArrNeurons[FNumInner + i].FBiasWeight := 0;
+  end;
+end;
+
+procedure TNNetSoftDecisionTree.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: gate every inner node p_i = sigmoid(beta*(w_i.x+b_i)); accumulate the
+// root-to-leaf path probability P_l (heap layout, leaf l's path bits read MSB
+// first = root decision, bit=0 -> left -> factor p_i, bit=1 -> right -> 1-p_i),
+// then y = sum_l P_l * phi_l. p_i and P_l are cached for the exact backward.
+procedure TNNetSoftDecisionTree.ComputeCPU();
+var
+  i, l, level, node, bit: integer;
+  zi, pp, prob: TNeuralFloat;
+  PrevOut, Leaf: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+
+  // Inner-node routing probabilities.
+  for i := 0 to FNumInner - 1 do
+  begin
+    zi := FArrNeurons[i].FWeights.DotProduct(PrevOut) + FArrNeurons[i].FBiasWeight;
+    pp := 1.0 / (1.0 + Exp(-FBeta * zi));
+    FCacheP.FData[i] := pp;
+  end;
+
+  // Per-leaf path probability and output mixture.
+  FOutput.Fill(0);
+  for l := 0 to FNumLeaves - 1 do
+  begin
+    prob := 1.0;
+    node := 0;
+    for level := FTreeDepth - 1 downto 0 do
+    begin
+      bit := (l shr level) and 1; // 0 = left, 1 = right
+      pp := FCacheP.FData[node];
+      if bit = 0 then
+      begin
+        prob := prob * pp;
+        node := 2 * node + 1;
+      end
+      else
+      begin
+        prob := prob * (1.0 - pp);
+        node := 2 * node + 2;
+      end;
+    end;
+    FCacheLeaf.FData[l] := prob;
+    Leaf := FArrNeurons[FNumInner + l].FWeights;
+    FOutput.MulAdd(prob, Leaf);
+  end;
+end;
+
+procedure TNNetSoftDecisionTree.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact backward (see class doc). g_d = FOutputError[d]. Per leaf the
+// responsibility r_l = (sum_d g_d*phi_l[d]) * P_l also gives the leaf grad
+// dL/dphi_l[d] = P_l*g_d. For each inner node i, A_i / B_i = sum of r_l over its
+// left / right subtree leaves, and dL/dz_i = beta*(A_i*(1-p_i) - B_i*p_i). Then
+// dL/dw_i = dz_i*x, dL/db_i = dz_i, dL/dx = sum_i dz_i*w_i. Deltas carry -LR*grad.
+procedure TNNetSoftDecisionTree.BackpropagateCPU();
+var
+  i, l, d, level, node, bit: integer;
+  PrevOut, LocalPrevError, GateW, GateDelta, LeafW, LeafDelta: TNNetVolume;
+  gd, rl, pp, dzi, lr: TNeuralFloat;
+  HasPrevError: boolean;
+  r: array of TNeuralFloat;    // per-leaf responsibility r_l
+  A, B: array of TNeuralFloat; // per-inner-node left / right subtree sums
+begin
+  PrevOut := FPrevLayer.FOutput;
+  HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  LocalPrevError := FPrevLayer.OutputError;
+  lr := FLearningRate;
+
+  // Per-leaf responsibility and leaf-vector gradient.
+  SetLength(r, FNumLeaves);
+  for l := 0 to FNumLeaves - 1 do
+  begin
+    gd := 0;
+    LeafW := FArrNeurons[FNumInner + l].FWeights;
+    for d := 0 to FOutDepth - 1 do
+      gd := gd + FOutputError.FData[d] * LeafW.FData[d];
+    r[l] := gd * FCacheLeaf.FData[l];
+    // dL/dphi_l[d] = P_l * g_d.
+    LeafDelta := FArrNeurons[FNumInner + l].FDelta;
+    pp := FCacheLeaf.FData[l];
+    for d := 0 to FOutDepth - 1 do
+      LeafDelta.FData[d] := LeafDelta.FData[d] - lr * (pp * FOutputError.FData[d]);
+  end;
+
+  // Accumulate A_i / B_i: walk each leaf's path and add r_l to the left/right
+  // bucket of every node on the path according to the branch taken.
+  SetLength(A, FNumInner);
+  SetLength(B, FNumInner);
+  for i := 0 to FNumInner - 1 do
+  begin
+    A[i] := 0;
+    B[i] := 0;
+  end;
+  for l := 0 to FNumLeaves - 1 do
+  begin
+    node := 0;
+    for level := FTreeDepth - 1 downto 0 do
+    begin
+      bit := (l shr level) and 1;
+      if bit = 0 then
+      begin
+        A[node] := A[node] + r[l];
+        node := 2 * node + 1;
+      end
+      else
+      begin
+        B[node] := B[node] + r[l];
+        node := 2 * node + 2;
+      end;
+    end;
+  end;
+
+  // Per inner node: dz_i, then gate weight/bias grads and input-error scatter.
+  for i := 0 to FNumInner - 1 do
+  begin
+    pp := FCacheP.FData[i];
+    dzi := FBeta * (A[i] * (1.0 - pp) - B[i] * pp);
+    GateW := FArrNeurons[i].FWeights;
+    GateDelta := FArrNeurons[i].FDelta;
+    // dL/dw_i = dz_i * x ; dL/db_i = dz_i.
+    if dzi <> 0.0 then
+      GateDelta.MulAdd(-lr * dzi, PrevOut);
+    FArrNeurons[i].FBiasDelta := FArrNeurons[i].FBiasDelta - lr * dzi;
+    // dL/dx += dz_i * w_i.
+    if HasPrevError and (dzi <> 0.0) then
+      LocalPrevError.MulAdd(dzi, GateW);
+  end;
+
+  if not FBatchUpdate then
+  begin
+    for i := 0 to FNumInner + FNumLeaves - 1 do
+      FArrNeurons[i].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetRandomFourierFeatures }
 
 // Rahimi & Recht (2007) random features for the RBF kernel. The forward pass is
@@ -64768,6 +65090,7 @@ begin
       'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetMixtureDensity' :       Result := TNNetMixtureDensity.Create(St[0], St[1]);
+      'TNNetSoftDecisionTree' :     Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -65099,6 +65422,7 @@ begin
       if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetMixtureDensity' then Result := TNNetMixtureDensity.Create(St[0], St[1]) else
+      if S[0] = 'TNNetSoftDecisionTree' then Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else

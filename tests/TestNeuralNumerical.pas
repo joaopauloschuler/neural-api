@@ -221,6 +221,10 @@ type
     procedure TestKroneckerLinearWeightGradientCheck;
     procedure TestKroneckerLinearForwardKnownValue;
     procedure TestKroneckerLinearSerializationRoundTrip;
+    // TNNetSoftDecisionTree differentiable soft (oblique) decision tree layer
+    procedure TestSoftDecisionTreeInputGradientCheck;
+    procedure TestSoftDecisionTreeWeightGradientCheck;
+    procedure TestSoftDecisionTreeSerializationRoundTrip;
     // TNNetRandomFourierFeatures RBF-kernel random-feature projection layer
     procedure TestRandomFourierFeaturesInputGradientCheck;
     procedure TestRandomFourierFeaturesWeightGradientCheck;
@@ -39792,6 +39796,274 @@ begin
         (NN2.Layers[1] as TNNetKroneckerLinear).FactorQ);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('KroneckerLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftDecisionTreeInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  SDT: TNNetSoftDecisionTree;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, Din, OutD: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for the soft decision tree.
+  // Small tree (D=2 -> 3 inner nodes, 4 leaves), Din=3, OutputDepth=2, beta=1.5.
+  // Gate weights bounded so FD truncation never dominates (do NOT loosen tol).
+  RandSeed := 424242;
+  Din := 3; OutD := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, Din);
+  InputPlus := TNNetVolume.Create(1, 1, Din);
+  Desired := TNNetVolume.Create(1, 1, OutD);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Din, 1));
+    SDT := TNNetSoftDecisionTree.Create(2, OutD, 1.5);
+    NN.AddLayer(SDT);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Din - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to OutD - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    // Bounded gate weights/biases.
+    for i := 0 to SDT.InnerCount - 1 do
+    begin
+      SDT.Neurons[i].Weights.Raw[0] := 0.3 * Sin(i * 1.3 + 0.2);
+      SDT.Neurons[i].Weights.Raw[1] := 0.3 * Cos(i * 0.9 - 0.1);
+      SDT.Neurons[i].Weights.Raw[2] := 0.2 * Sin(i * 0.5 + 0.4);
+      SDT.Neurons[i].BiasWeight := 0.1 * (i - 1);
+    end;
+    // Bounded leaf vectors.
+    for i := 0 to SDT.LeafCount - 1 do
+    begin
+      SDT.Neurons[SDT.InnerCount + i].Weights.Raw[0] := 0.4 * Sin(i * 1.1);
+      SDT.Neurons[SDT.InnerCount + i].Weights.Raw[1] := 0.4 * Cos(i * 0.7);
+    end;
+
+    for i := 0 to Din - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SoftDecisionTree input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftDecisionTreeWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  SDT: TNNetSoftDecisionTree;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n, Din, OutD: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  // FD-check one weight of neuron n at index wIdx (use -1 for the bias).
+  procedure CheckOne(neuronIdx, wIdx: integer; const tag: string);
+  var
+    plus: TNeuralFloat;
+    cc: integer;
+  begin
+    if wIdx >= 0 then
+    begin
+      SDT.Neurons[neuronIdx].Weights.Raw[wIdx] :=
+        SDT.Neurons[neuronIdx].Weights.Raw[wIdx] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      SDT.Neurons[neuronIdx].Weights.Raw[wIdx] :=
+        SDT.Neurons[neuronIdx].Weights.Raw[wIdx] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      SDT.Neurons[neuronIdx].Weights.Raw[wIdx] :=
+        SDT.Neurons[neuronIdx].Weights.Raw[wIdx] + epsilon;
+    end
+    else
+    begin
+      plus := SDT.Neurons[neuronIdx].BiasWeight;
+      SDT.Neurons[neuronIdx].BiasWeight := plus + epsilon;
+      lossPlus := ComputeLoss(Input);
+      SDT.Neurons[neuronIdx].BiasWeight := plus - epsilon;
+      lossMinus := ComputeLoss(Input);
+      SDT.Neurons[neuronIdx].BiasWeight := plus;
+    end;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    for cc := 0 to SDT.InnerCount + SDT.LeafCount - 1 do
+      SDT.Neurons[cc].ClearDelta;
+    NN.Backpropagate(Desired);
+    if wIdx >= 0 then
+      analyticalGrad := -SDT.Neurons[neuronIdx].Delta.Raw[wIdx] // LR=1 => grad=-Delta
+    else
+      analyticalGrad := -SDT.Neurons[neuronIdx].BiasDelta;
+
+    maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+    AssertTrue(tag + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+      FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+  end;
+
+begin
+  // FD vs analytic gradient covering BOTH gate weights/biases AND leaf phi
+  // vectors. D=2, Din=3, OutputDepth=2, beta=1.5. Weights bounded (do NOT loosen).
+  RandSeed := 424242;
+  Din := 3; OutD := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, Din);
+  Desired := TNNetVolume.Create(1, 1, OutD);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Din, 1));
+    SDT := TNNetSoftDecisionTree.Create(2, OutD, 1.5);
+    NN.AddLayer(SDT);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Din - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to OutD - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    for i := 0 to SDT.InnerCount - 1 do
+    begin
+      SDT.Neurons[i].Weights.Raw[0] := 0.3 * Sin(i * 1.3 + 0.2);
+      SDT.Neurons[i].Weights.Raw[1] := 0.3 * Cos(i * 0.9 - 0.1);
+      SDT.Neurons[i].Weights.Raw[2] := 0.2 * Sin(i * 0.5 + 0.4);
+      SDT.Neurons[i].BiasWeight := 0.1 * (i - 1);
+    end;
+    for i := 0 to SDT.LeafCount - 1 do
+    begin
+      SDT.Neurons[SDT.InnerCount + i].Weights.Raw[0] := 0.4 * Sin(i * 1.1);
+      SDT.Neurons[SDT.InnerCount + i].Weights.Raw[1] := 0.4 * Cos(i * 0.7);
+    end;
+
+    // Gate neurons: all weights + bias.
+    for n := 0 to SDT.InnerCount - 1 do
+    begin
+      for i := 0 to Din - 1 do
+        CheckOne(n, i, 'SoftDecisionTree gate ' + IntToStr(n) + ' weight ' + IntToStr(i));
+      CheckOne(n, -1, 'SoftDecisionTree gate ' + IntToStr(n) + ' bias');
+    end;
+    // Leaf neurons: phi vectors.
+    for n := 0 to SDT.LeafCount - 1 do
+      for i := 0 to OutD - 1 do
+        CheckOne(SDT.InnerCount + n, i,
+          'SoftDecisionTree leaf ' + IntToStr(n) + ' phi ' + IntToStr(i));
+
+    WriteLn('  SoftDecisionTree weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftDecisionTreeSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  SDT: TNNetSoftDecisionTree;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, Din, OutD: integer;
+begin
+  // SoftDecisionTree with NON-default beta/depth/output-depth in the MIDDLE of a
+  // net: SaveToString -> LoadFromString -> SaveToString must be byte-identical and
+  // Compute must match, proving D/OutputDepth/beta and all gate+leaf neurons
+  // survive BOTH serialization dispatch points.
+  RandSeed := 424242;
+  Din := 4; OutD := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, Din);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Din, 1));
+    SDT := TNNetSoftDecisionTree.Create(3, OutD, 2.5); // D=3, beta=2.5 (non-default)
+    NN.AddLayer(SDT);
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+
+    for i := 0 to Din - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for i := 0 to SDT.InnerCount - 1 do
+    begin
+      SDT.Neurons[i].Weights.Raw[i mod Din] := 0.17 * (i + 1) - 0.4;
+      SDT.Neurons[i].BiasWeight := 0.05 - 0.02 * i;
+    end;
+    for i := 0 to SDT.LeafCount - 1 do
+      SDT.Neurons[SDT.InnerCount + i].Weights.Raw[i mod OutD] := 0.11 * (i + 1) - 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('SoftDecisionTree SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('SoftDecisionTree token present in serialized string',
+        Pos('TNNetSoftDecisionTree', Saved) > 0);
+      AssertEquals('SoftDecisionTree depth round-trips', 3,
+        (NN2.Layers[1] as TNNetSoftDecisionTree).TreeDepth);
+      AssertEquals('SoftDecisionTree output depth round-trips', OutD,
+        (NN2.Layers[1] as TNNetSoftDecisionTree).OutputDepth);
+      AssertEquals('SoftDecisionTree beta round-trips', 2.5,
+        (NN2.Layers[1] as TNNetSoftDecisionTree).Beta, 1e-6);
+      AssertEquals('SoftDecisionTree leaf count round-trips', 8,
+        (NN2.Layers[1] as TNNetSoftDecisionTree).LeafCount);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SoftDecisionTree Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

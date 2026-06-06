@@ -1468,7 +1468,7 @@ rather than acted on.
       degeneracy-aware generalization of "effective parameter count").
 
 ### Differentiable hierarchical routing (a genuinely new paradigm)
-- [ ] `TNNetSoftDecisionTree` — a single differentiable *soft (oblique)
+- [x] (DONE 2026-06-06) `TNNetSoftDecisionTree` — a single differentiable *soft (oblique)
       decision tree* layer (Kontschieder et al. 2015, "Deep Neural Decision
       Forests"; Frosst & Hinton 2017, "Distilling a Neural Network Into a
       Soft Decision Tree"). This is a structurally NEW paradigm for this
@@ -1507,3 +1507,19 @@ rather than acted on.
       human-readable decision path, which the MLP cannot. Follow-up (NOT this
       task): a `TNNet.AddNeuralDecisionForest` builder that averages an
       ensemble of these trees with bagged feature subsets.
+- [ ] `TNNet.RoutingEntropyReport` — forward-only introspection diagnostic for a
+      `TNNetSoftDecisionTree` layer (DEFERRED from the SoftDecisionTree task,
+      done 2026-06-06). Over a probe batch, recompute each inner gate
+      `p_i = sigmoid(beta*(w_i.x+b_i))` and the per-leaf path probabilities
+      `P_l`; report (a) per-leaf OCCUPANCY = mean `P_l` over the batch (is the
+      tree using all `2^D` leaves or collapsing onto a few?), (b) average per-gate
+      BINARY ENTROPY `H(p_i) = -p_i·log2(p_i)-(1-p_i)·log2(1-p_i)` (are splits
+      crisp ≈0 or mushy ≈1?), and (c) average per-sample path entropy /
+      effective-leaf-count (`exp(-sum_l P_l·ln P_l)`). Follow
+      [[introspection-report-pattern]] (class function returning a string, ASCII
+      bars, nil/empty guards) and add a smoke test in TestNeuralLayersExtra.pas.
+      The example already prints a single-point decision path by hand; this is the
+      batch-level statistical companion. Locate the layer by `is
+      TNNetSoftDecisionTree` and read gate weights via
+      `Neurons[i].Weights`/`.BiasWeight`, leaf vectors via
+      `Neurons[InnerCount+l].Weights`.
