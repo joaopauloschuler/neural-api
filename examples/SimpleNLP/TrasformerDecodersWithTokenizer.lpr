@@ -135,34 +135,6 @@ type
     end;
   end;
 
-  // Norm-parameterized copy of TNNet.AddTransformerEncoderBlock so each Tier-1
-  // experiment is a single-class swap (csNormClass) against an identical block.
-  // RoPE (csUseRoPE) is delegated to the library UseRoPE flag on
-  // TNNet.AddMultiHeadSelfAttention.
-  procedure AddEncoderBlockVariant(NN: TNNet; Heads, d_ff: integer;
-    NormClass: TNNetLayerClass; PreNorm, CausalMask: boolean);
-  var
-    BranchInput: TNNetLayer;
-    d_model: integer;
-  begin
-    // ---- Attention sub-block ----
-    BranchInput := NN.GetLastLayer();
-    d_model := BranchInput.Output.Depth;
-    if PreNorm then NN.AddLayer( NormClass.Create() );
-    NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
-    NN.AddMultiHeadSelfAttention(Heads, CausalMask, {UseRoPE=}csUseRoPE);
-    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-    if not PreNorm then NN.AddLayer( NormClass.Create() );
-    // ---- Feed-forward sub-block (SwiGLU, held fixed for the norm bake-off) ----
-    BranchInput := NN.GetLastLayer();
-    if PreNorm then NN.AddLayer( NormClass.Create() );
-    NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
-    NN.AddLayer( TNNetSwiGLU.Create() );
-    NN.AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
-    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-    if not PreNorm then NN.AddLayer( NormClass.Create() );
-  end;
-
   procedure TTestFitLoading.DoRun;
   var
     W: TNNetLayer;
@@ -186,9 +158,12 @@ type
 
     for I := 1 to 2 do
     begin
-      // Tier-1 norm bake-off: norm type chosen by csNormClass, placement by
-      // csPreNorm. Attention (SDPA) + SwiGLU FFN held fixed across variants.
-      AddEncoderBlockVariant(FNN, 8, 2048, csNormClass, csPreNorm, {CausalMask=}true);
+      // Library transformer encoder block. Experiment knobs map directly to its
+      // parameters: norm placement (csPreNorm), positional scheme (csUseRoPE),
+      // and norm class (csNormClass: LayerNorm/RMSNorm/DyT). FFN is SwiGLU.
+      FNN.AddTransformerEncoderBlock(8, 2048,
+        {PreNorm=}csPreNorm, {CausalMask=}true,
+        {UseRoPE=}csUseRoPE, {NormClass=}csNormClass);
     end;
 
     FNN.AddLayer([

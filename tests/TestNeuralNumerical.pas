@@ -430,6 +430,7 @@ type
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
     procedure TestTransformerEncoderBlockGradientCheck;
+    procedure TestTransformerEncoderBlockCustomNorm;
     procedure TestTransformerDecoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
     procedure TestHardConcreteGradientCheck;
@@ -11362,6 +11363,37 @@ begin
   d_ff := 16;
   RunOne(true);
   RunOne(false);
+end;
+
+procedure TTestNeuralNumerical.TestTransformerEncoderBlockCustomNorm;
+// Verifies the NormClass parameter of AddTransformerEncoderBlock actually swaps
+// the normalization layer class. Builds a block with NormClass=TNNetRMSNorm and
+// asserts the block contains TNNetRMSNorm norm layers and NO TNNetLayerNorm.
+var
+  NN: TNNet;
+  i, rmsCount, lnCount: integer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 8));
+    NN.AddTransformerEncoderBlock(2, 16, {PreNorm=}true, {CausalMask=}false,
+      {UseRoPE=}false, {NormClass=}TNNetRMSNorm);
+    rmsCount := 0;
+    lnCount := 0;
+    for i := 0 to NN.CountLayers - 1 do
+    begin
+      if NN.Layers[i] is TNNetRMSNorm then Inc(rmsCount);
+      // TNNetRMSNorm does not descend from TNNetLayerNorm, so this counts only
+      // genuine LayerNorm instances.
+      if NN.Layers[i] is TNNetLayerNorm then Inc(lnCount);
+    end;
+    AssertTrue('Encoder block with NormClass=TNNetRMSNorm must contain RMSNorm ' +
+      'layers, got ' + IntToStr(rmsCount), rmsCount = 2);
+    AssertEquals('Encoder block with NormClass=TNNetRMSNorm must contain NO ' +
+      'LayerNorm layers', 0, lnCount);
+  finally
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestTransformerDecoderBlockGradientCheck;

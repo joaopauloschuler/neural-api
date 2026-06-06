@@ -5454,19 +5454,23 @@ type
       // implemented here.
       function AddMixtureOfExperts(InputLayer: TNNetLayer;
         NumExperts, ExpertHiddenDim: integer): TNNetLayer;
-      // Pre-norm residual block:  y = x + Sublayer(LayerNorm(x)).
+      // Pre-norm residual block:  y = x + Sublayer(Norm(x)).
       // pSublayers is the caller-provided sublayer stack; its output shape MUST
       // match the block input shape so the residual sum is valid. Returns the
-      // residual-sum layer.
-      function AddPreNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // residual-sum layer. NormClass selects the normalization layer class
+      // (nil defaults to TNNetLayerNorm; e.g. TNNetRMSNorm or TNNetDyT).
+      function AddPreNormResidual(pSublayers: array of TNNetLayer;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Pre-norm residual block (LLaMA-style):  y = x + Sublayer(RMSNorm(x)).
       // Same contract as AddPreNormResidual but uses TNNetRMSNorm. Returns the
       // residual-sum layer.
       function AddRMSNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
-      // Post-norm residual block:  y = LayerNorm(Sublayer(x) + x).
-      // The sublayer runs on the raw input, the residual sum is taken, then
-      // LayerNorm is applied. Returns the final LayerNorm layer.
-      function AddPostNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+      // Post-norm residual block:  y = Norm(Sublayer(x) + x).
+      // The sublayer runs on the raw input, the residual sum is taken, then the
+      // norm is applied. Returns the final norm layer. NormClass selects the
+      // normalization layer class (nil defaults to TNNetLayerNorm).
+      function AddPostNormResidual(pSublayers: array of TNNetLayer;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Gated residual block:  y = x + GatedResidual(Sublayer(x)).
       // Unlike the norm-based siblings above, this block applies NO
       // normalization. Instead it inserts a TNNetGatedResidual after the
@@ -5682,9 +5686,12 @@ type
       // TOKEN-ONLY input embedding (TNNetEmbedding), not the absolute-position
       // TNNetTokenAndPositionalEmbedding -- the block owns only the attention,
       // not the embedding.
+      // NormClass selects the normalization layer class used at every norm slot
+      // in the block (nil defaults to TNNetLayerNorm; e.g. TNNetRMSNorm,
+      // TNNetDyT). It must be a shape-preserving, parameterless-Create norm.
       function AddTransformerEncoderBlock(Heads, d_ff: integer;
         PreNorm: boolean = true; CausalMask: boolean = false;
-        UseRoPE: boolean = false): TNNetLayer;
+        UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Composite builder assembling a standard transformer DECODER block by
       // stacking three residual sub-blocks on the current decoder stream:
       //   1. CAUSAL multi-head self-attention (same idiom as the encoder block
@@ -5714,9 +5721,11 @@ type
       // self-attention sub-block (the cross-attention is left unchanged). CAVEAT:
       // pair UseRoPE=True with a TOKEN-ONLY decoder input embedding
       // (TNNetEmbedding), not TNNetTokenAndPositionalEmbedding.
+      // NormClass selects the normalization layer class used at every norm slot
+      // in the block (nil defaults to TNNetLayerNorm).
       function AddTransformerDecoderBlock(Heads, d_ff: integer;
         EncoderOutput: TNNetLayer; PreNorm: boolean = true;
-        UseRoPE: boolean = false): TNNetLayer;
+        UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
@@ -26403,48 +26412,50 @@ end;
 
 function TNNet.AddTransformerEncoderBlock(Heads, d_ff: integer;
   PreNorm: boolean = true; CausalMask: boolean = false;
-  UseRoPE: boolean = false): TNNetLayer;
+  UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
 var
   BranchInput: TNNetLayer;
   d_model: integer;
 begin
+  if NormClass = nil then NormClass := TNNetLayerNorm;
   // ---- Attention sub-block: residual around multi-head self-attention. ----
   // Replicated inline (not via AddPreNormResidual/AddPostNormResidual) because
   // the attention sublayer adds MANY layers through GetLastLayer() chaining and
   // cannot be expressed as a pre-built "array of TNNetLayer".
   BranchInput := GetLastLayer();
   d_model := BranchInput.Output.Depth;  // inferred residual-stream width
-  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if PreNorm then AddLayer( NormClass.Create() );
   // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
   AddMultiHeadSelfAttention(Heads, CausalMask, UseRoPE);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
-  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if not PreNorm then AddLayer( NormClass.Create() );
 
   // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
   BranchInput := GetLastLayer();
-  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if PreNorm then AddLayer( NormClass.Create() );
   // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
   // the depth channel-wise, so the inner projection must be 2*d_ff.
   AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
   AddLayer( TNNetSwiGLU.Create() );
   AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
-  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if not PreNorm then AddLayer( NormClass.Create() );
 
   Result := GetLastLayer();
 end;
 
 function TNNet.AddTransformerDecoderBlock(Heads, d_ff: integer;
   EncoderOutput: TNNetLayer; PreNorm: boolean = true;
-  UseRoPE: boolean = false): TNNetLayer;
+  UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
 var
   BranchInput, QuerySource: TNNetLayer;
   d_model: integer;
 begin
   if EncoderOutput = nil then
     FErrorProc('AddTransformerDecoderBlock requires a non-nil EncoderOutput.');
+  if NormClass = nil then NormClass := TNNetLayerNorm;
 
   // ---- Self-attention sub-block: residual around CAUSAL multi-head ----
   // self-attention. Replicated inline (not via AddPreNormResidual/
@@ -26453,13 +26464,13 @@ begin
   // "array of TNNetLayer".
   BranchInput := GetLastLayer();
   d_model := BranchInput.Output.Depth;  // inferred decoder-stream width
-  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if PreNorm then AddLayer( NormClass.Create() );
   // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
   AddMultiHeadSelfAttention(Heads, {CausalMask=}true, UseRoPE);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
-  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if not PreNorm then AddLayer( NormClass.Create() );
 
   // ---- Cross-attention sub-block: residual around multi-head ----
   // cross-attention. Query comes from the (optionally normed) decoder stream;
@@ -26467,23 +26478,23 @@ begin
   // does its own token-wise Q/K/V projections, so we hand it the source layers
   // directly (it takes EXPLICIT source refs).
   BranchInput := GetLastLayer();
-  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if PreNorm then AddLayer( NormClass.Create() );
   QuerySource := GetLastLayer();
   AddMultiHeadCrossAttention(d_model, Heads, QuerySource, EncoderOutput,
     {CausalMask=}false);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
-  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if not PreNorm then AddLayer( NormClass.Create() );
 
   // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
   BranchInput := GetLastLayer();
-  if PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if PreNorm then AddLayer( NormClass.Create() );
   // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
   // the depth channel-wise, so the inner projection must be 2*d_ff.
   AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
   AddLayer( TNNetSwiGLU.Create() );
   AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
-  if not PreNorm then AddLayer( TNNetLayerNorm.Create() );
+  if not PreNorm then AddLayer( NormClass.Create() );
 
   Result := GetLastLayer();
 end;
@@ -49368,13 +49379,15 @@ begin
   SetLength(WeightedExperts, 0);
 end;
 
-function TNNet.AddPreNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+function TNNet.AddPreNormResidual(pSublayers: array of TNNetLayer;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
 var
   BranchInput: TNNetLayer;
 begin
-  // y = x + Sublayer(LayerNorm(x))
+  // y = x + Sublayer(Norm(x))
+  if NormClass = nil then NormClass := TNNetLayerNorm;
   BranchInput := GetLastLayer();
-  AddLayer( TNNetLayerNorm.Create() );
+  AddLayer( NormClass.Create() );
   AddLayer(pSublayers);
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
@@ -49390,15 +49403,17 @@ begin
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
-function TNNet.AddPostNormResidual(pSublayers: array of TNNetLayer): TNNetLayer;
+function TNNet.AddPostNormResidual(pSublayers: array of TNNetLayer;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
 var
   BranchInput: TNNetLayer;
 begin
-  // y = LayerNorm(Sublayer(x) + x)  (post-norm)
+  // y = Norm(Sublayer(x) + x)  (post-norm)
+  if NormClass = nil then NormClass := TNNetLayerNorm;
   BranchInput := GetLastLayer();
   AddLayer(pSublayers);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
-  Result := AddLayer( TNNetLayerNorm.Create() );
+  Result := AddLayer( NormClass.Create() );
 end;
 
 function TNNet.AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
