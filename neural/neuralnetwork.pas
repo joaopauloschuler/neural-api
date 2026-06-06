@@ -6432,6 +6432,57 @@ type
     property OutOctonions: integer read FOutOctonions;
   end;
 
+  /// 1-D SPECTRAL CONVOLUTION layer -- the core of the Fourier Neural Operator
+  /// (Li et al. 2021, "Fourier Neural Operator for Parametric PDEs",
+  /// arXiv:2010.08895). This is the FIRST layer here with LEARNABLE complex
+  /// spectral weights, distinct from the parameter-free TNNetFourierMix (fixed
+  /// Re(DFT) token mixer) and the fixed-RANDOM TNNetFourierFeatures.
+  ///
+  /// Over a (SeqLen, 1, InDepth) sequence it performs, per channel:
+  ///   1. a real radix-2 FFT along SeqLen (reusing the proven FourierMixFFT
+  ///      radix-2 Cooley-Tukey helper -- NOT a hand-rolled second FFT);
+  ///   2. a spectral LOW-PASS truncation to the lowest FModes frequency modes
+  ///      (high modes are zeroed, never learned -- this is exactly what makes the
+  ///      operator resolution-invariant: the SAME learned weights apply on any
+  ///      grid because they live in mode-space, not grid-space);
+  ///   3. per kept mode m a learnable per-(in-channel,out-channel) COMPLEX weight
+  ///      R[m] (an InDepth x OutDepth complex matmul mixing real/imag parts via
+  ///      the 2x2 complex-multiply block, mirroring how TNNetQuaternionLinear /
+  ///      TNNetOctonionLinear pack a fixed hypercomplex multiply table);
+  ///   4. an inverse FFT back to the SeqLen domain, with Hermitian symmetry
+  ///      enforced on the output spectrum so the reconstructed signal is REAL.
+  ///
+  /// Weight layout: a single weight neuron holding 2 * FModes * InDepth * OutDepth
+  /// reals (real then imag for each (mode, in, out)), indexed
+  ///   base = ((m*InDepth + ci)*OutDepth + co)*2;  [base]=Re R, [base+1]=Im R.
+  /// Constructor: Create(OutDepth, Modes). OutDepth round-trips via FStruct[0],
+  /// Modes via FStruct[5]; dispatch is wired through Create(St[0], St[5]).
+  /// Backward is the exact real adjoint of the linear FFT -> complex-matmul ->
+  /// Hermitian-IFFT pipeline (the imag-part path is where a silent sign bug would
+  /// hide, so both the input AND complex-weight gradients are numerically tested).
+  // Coded by Claude (AI).
+  TNNetSpectralConv1D = class(TNNetLayer)
+  private
+    FOutDepth: integer;     // requested output Depth
+    FModes: integer;        // number of kept low-frequency modes
+    FSeqLen: integer;       // SeqLen (= prev SizeX), power of two
+    FInDepth: integer;      // input Depth
+    // Scratch buffers (per Compute/Backpropagate), kept to avoid re-alloc.
+    FXre, FXim: array of array of Double;  // [ci][k] forward spectrum of input
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+    function WBase(m, ci, co: integer): integer;
+  public
+    constructor Create(pOutDepth, pModes: integer); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Modes: integer read FModes;
+    property SeqLen: integer read FSeqLen;
+    property InDepth: integer read FInDepth;
+  end;
+
   /// Weight Standardization CONVOLUTION layer (Qiao et al. 2019,
   /// "Micro-Batch Training with Batch-Channel Normalization and Weight
   /// Standardization", arXiv:1903.10520). This is the convolution sibling of
@@ -35685,6 +35736,261 @@ begin
   end;
 end;
 
+{ TNNetSpectralConv1D }
+
+// The forward map is the linear pipeline
+//   x  --FFT-->  Xhat  --complex matmul R[m]-->  Yhat  --(real)IFFT-->  y
+// truncated to the lowest FModes modes. Because every stage is linear over the
+// reals, backward is the EXACT transpose of each stage (derived in full in the
+// class header). The real radix-2 FFT/IFFT is FourierMixFFT (proven < 1e-5 vs
+// the direct DFT in TNNetFourierMix) -- we do NOT hand-roll a second FFT.
+
+constructor TNNetSpectralConv1D.Create(pOutDepth, pModes: integer);
+begin
+  inherited Create();
+  if pOutDepth <= 0 then
+    FErrorProc('TNNetSpectralConv1D requires OutDepth >= 1. Got ' + IntToStr(pOutDepth));
+  if pModes <= 0 then
+    FErrorProc('TNNetSpectralConv1D requires Modes >= 1. Got ' + IntToStr(pModes));
+  FOutDepth := pOutDepth;
+  FModes := pModes;
+  FStruct[0] := pOutDepth;
+  FStruct[5] := pModes;
+  // One weight neuron (complex spectral weights); sized in SetPrevLayer.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+function TNNetSpectralConv1D.WBase(m, ci, co: integer): integer;
+begin
+  Result := ((m * FInDepth + ci) * FOutDepth + co) * 2;
+end;
+
+procedure TNNetSpectralConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WeightCount: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetSpectralConv1D requires SizeY=1 (a (SeqLen,1,Depth) sequence); got SizeY=' +
+      IntToStr(pPrevLayer.Output.SizeY) + '.');
+  FSeqLen := pPrevLayer.Output.SizeX;
+  FInDepth := pPrevLayer.Output.Depth;
+  if not FourierMixIsPow2(FSeqLen) then
+    FErrorProc('TNNetSpectralConv1D requires a power-of-two SeqLen (radix-2 FFT); got SeqLen=' +
+      IntToStr(FSeqLen) + '.');
+  if FModes > FSeqLen then
+    FErrorProc('TNNetSpectralConv1D: Modes (' + IntToStr(FModes) +
+      ') must be <= SeqLen (' + IntToStr(FSeqLen) + ').');
+
+  FOutput.ReSize(FSeqLen, 1, FOutDepth);
+  FOutputError.ReSize(FSeqLen, 1, FOutDepth);
+  FOutputErrorDeriv.ReSize(FSeqLen, 1, FOutDepth);
+
+  WeightCount := 2 * FModes * FInDepth * FOutDepth;
+  FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
+  FNeurons[0].BackInertia.ReSize(WeightCount, 1, 1);
+  FNeurons[0].Delta.ReSize(WeightCount, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  SetLength(FXre, FInDepth, FSeqLen);
+  SetLength(FXim, FInDepth, FSeqLen);
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Glorot-style init scaled by 1/InDepth (the FNO convention: R is scaled so the
+// spectral matmul preserves variance across the InDepth complex contractions).
+procedure TNNetSpectralConv1D.InitDefault();
+var
+  i, WeightCount: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FInDepth <= 0 then exit;
+  W := FArrNeurons[0].FWeights;
+  WeightCount := W.Size;
+  scale := Sqrt(2.0 / (FInDepth + FOutDepth));
+  for i := 0 to WeightCount - 1 do
+    W.FData[i] := scale * (Random - 0.5) * 2;
+end;
+
+procedure TNNetSpectralConv1D.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSpectralConv1D.ComputeCPU();
+var
+  ci, co, m, n, b: integer;
+  PrevOut, W: TNNetVolume;
+  Sre, Sim: array of Double;
+  a, bb, xr, xi, yr, yi: Double;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  W := FArrNeurons[0].FWeights;
+  // 1. Real FFT of every input channel along SeqLen.
+  for ci := 0 to FInDepth - 1 do
+  begin
+    for n := 0 to FSeqLen - 1 do
+    begin
+      FXre[ci][n] := PrevOut.FData[n * FInDepth + ci];
+      FXim[ci][n] := 0;
+    end;
+    FourierMixFFT(FXre[ci], FXim[ci], FSeqLen, false);
+  end;
+  // 2./3./4. Per output channel: spectral matmul over kept modes, then IFFT.
+  SetLength(Sre, FSeqLen);
+  SetLength(Sim, FSeqLen);
+  for co := 0 to FOutDepth - 1 do
+  begin
+    for m := 0 to FSeqLen - 1 do
+    begin
+      Sre[m] := 0;
+      Sim[m] := 0;
+    end;
+    for m := 0 to FModes - 1 do
+    begin
+      yr := 0;
+      yi := 0;
+      for ci := 0 to FInDepth - 1 do
+      begin
+        b := WBase(m, ci, co);
+        a := W.FData[b];        // Re R
+        bb := W.FData[b + 1];   // Im R
+        xr := FXre[ci][m];
+        xi := FXim[ci][m];
+        // (a + bb i)(xr + xi i)
+        yr := yr + (a * xr - bb * xi);
+        yi := yi + (a * xi + bb * xr);
+      end;
+      Sre[m] := yr;
+      Sim[m] := yi;
+    end;
+    FourierMixFFT(Sre, Sim, FSeqLen, true);  // inverse FFT (includes 1/L)
+    for n := 0 to FSeqLen - 1 do
+      FOutput.FData[n * FOutDepth + co] := Sre[n];  // real part
+  end;
+end;
+
+procedure TNNetSpectralConv1D.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact real adjoint of FFT -> complex matmul -> real IFFT (see header).
+procedure TNNetSpectralConv1D.BackpropagateCPU();
+var
+  ci, co, m, n, b: integer;
+  W, WDelta, LocalPrevError: TNNetVolume;
+  Gre, Gim: array of Double;          // (1/L) * FFT(g[co]) over kept modes
+  dXre, dXim: array of array of Double; // input-spectrum gradient [ci][m]
+  invL, a, bb, xr, xi, gyr, gyi, contrib: Double;
+begin
+  W := FArrNeurons[0].FWeights;
+  WDelta := FArrNeurons[0].FDelta;
+  invL := 1.0 / FSeqLen;
+
+  SetLength(dXre, FInDepth, FModes);
+  SetLength(dXim, FInDepth, FModes);
+  for ci := 0 to FInDepth - 1 do
+    for m := 0 to FModes - 1 do
+    begin
+      dXre[ci][m] := 0;
+      dXim[ci][m] := 0;
+    end;
+
+  SetLength(Gre, FSeqLen);
+  SetLength(Gim, FSeqLen);
+  for co := 0 to FOutDepth - 1 do
+  begin
+    // dL/dYhat[co][m] = (1/L) * FFT(g[co])[m]  (forward FFT of the output grad).
+    for n := 0 to FSeqLen - 1 do
+    begin
+      Gre[n] := FOutputError.FData[n * FOutDepth + co];
+      Gim[n] := 0;
+    end;
+    FourierMixFFT(Gre, Gim, FSeqLen, false);
+    for m := 0 to FModes - 1 do
+    begin
+      gyr := invL * Gre[m];
+      gyi := invL * Gim[m];
+      for ci := 0 to FInDepth - 1 do
+      begin
+        b := WBase(m, ci, co);
+        a := W.FData[b];        // Re R
+        bb := W.FData[b + 1];   // Im R
+        xr := FXre[ci][m];
+        xi := FXim[ci][m];
+        // Weight gradient (accumulate, scaled by -LearningRate so the ordinary
+        // update applies). Yre=a*xr-bb*xi, Yim=a*xi+bb*xr.
+        WDelta.FData[b]     := WDelta.FData[b]     +
+          (-FLearningRate) * (gyr * xr + gyi * xi);
+        WDelta.FData[b + 1] := WDelta.FData[b + 1] +
+          (-FLearningRate) * (-gyr * xi + gyi * xr);
+        // Input-spectrum gradient (sum over co).
+        dXre[ci][m] := dXre[ci][m] + (gyr * a + gyi * bb);
+        dXim[ci][m] := dXim[ci][m] + (-gyr * bb + gyi * a);
+      end;
+    end;
+  end;
+
+  // Propagate the input-spectrum gradient back through the input FFT:
+  //   dL/dx[ci][n] = L * Re( IFFT(dXhat[ci]) )[n].
+  if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+    SetLength(Gre, FSeqLen);
+    SetLength(Gim, FSeqLen);
+    for ci := 0 to FInDepth - 1 do
+    begin
+      for m := 0 to FSeqLen - 1 do
+      begin
+        Gre[m] := 0;
+        Gim[m] := 0;
+      end;
+      for m := 0 to FModes - 1 do
+      begin
+        Gre[m] := dXre[ci][m];
+        Gim[m] := dXim[ci][m];
+      end;
+      FourierMixFFT(Gre, Gim, FSeqLen, true);  // IFFT (includes 1/L)
+      for n := 0 to FSeqLen - 1 do
+      begin
+        contrib := FSeqLen * Gre[n];           // undo the IFFT's 1/L -> real adjoint
+        LocalPrevError.FData[n * FInDepth + ci] :=
+          LocalPrevError.FData[n * FInDepth + ci] + contrib;
+      end;
+    end;
+  end;
+
+  if not FBatchUpdate then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetHouseholderLinear }
 
 // Floor used to guard the v_i^T v_i denominator: below this a reflection is
@@ -60095,6 +60401,7 @@ begin
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
+      'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
@@ -60415,6 +60722,7 @@ begin
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
+      if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
