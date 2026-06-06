@@ -76,31 +76,10 @@ rather than acted on.
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
       reusing FourierMixFFT, ModesX*ModesY low-pass truncation, exact complex
-      adjoint backward):
-      [X] (a) shared 1-D+2-D builder pass — TNNet.AddFourierNeuralOperator1D /
-          AddFourierNeuralOperator2D LANDED 2026-06-06 on a2 (commit dd44089):
-          wrap the spectral leaf in `y = ActFn(SpectralConv(x) + W1x1(x))`
-          (TNNetPointwiseConvLinear residual branch from the same origin, summed
-          via TNNetSum), optional activation (nil = none). Shape + composition
-          input-gradient tests in TestNeuralNumerical.pas.
-          GOTCHA found while testing: TNNetSpectralConv2D's radix-2 FFT asserts
-          power-of-two SizeX/SizeY. Feeding a non-power-of-two grid trips FErrorProc
-          AND leaves the spectral output in a bad state, which then HEAP-CORRUPTS
-          when summed in a builder (malloc unsorted-double-linked-list). Builder
-          callers/tests must use power-of-two grids. Consider hardening
-          TNNetSpectralConv2D to fail safe (zero its output / raise cleanly)
-          instead of leaving a corrupt buffer.
-      [ ] (b) wire it into a small PDE-surrogate example (Darcy-flow-like
-          coefficient→solution map on a tiny grid) to show the headline FNO use case
-          beyond the synthetic diffusion-operator demo. (The builder now exists,
-          so this is just an example using AddFourierNeuralOperator2D.)
-- [X] TNNet.AddMLPMixerBlock builder — MLP-Mixer (Tolstikhin et al. 2021) all-MLP
-      token-mixing + channel-mixing block over a (Tokens,1,Channels) sequence,
-      each sub-block a pre-LayerNorm residual (token-mix via TransposeXD +
-      pointwise MLP over the token axis, channel-mix via pointwise MLP over Depth).
-      LANDED 2026-06-06 on a2 (commit f75a2c9): builder + 3 tests (shape /
-      input-gradient / save-load round-trip) in TestNeuralNumerical.pas +
-      examples/MLPMixer/ (which-half token-classification toy, 100% acc, 6 s, 4.6 MB).
+      adjoint backward): wire it into a small PDE-surrogate example (Darcy-flow-like
+      coefficient→solution map on a tiny grid) to show the headline FNO use case
+      beyond the synthetic diffusion-operator demo (using the landed
+      AddFourierNeuralOperator2D builder).
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
