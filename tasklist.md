@@ -72,6 +72,14 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetOctonionConv: the convolution analogue of TNNetOctonionLinear
+      (which LANDED on a2 — 8D Cayley-Dickson dense layer with the verified
+      octonion multiplication table, norm-multiplicativity + gradient + save/load
+      tests, and the examples/OctonionLinear/ bake-off). Mirror TNNetQuaternionConv:
+      input Depth and feature count multiples of 8, an (OutO x InO) octonion
+      weight grid per kernel tap applied by the SAME 8x8 block as the dense layer,
+      ~1/8 the weights of a real conv of equal width; numerical-gradient +
+      save/load tests and a small examples/OctonionConv/ image bake-off.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):

@@ -165,6 +165,10 @@ type
     // TNNetQuaternionConv hypercomplex convolution layer
     procedure TestQuaternionConvGradientCheck;
     procedure TestQuaternionConvSerializationRoundTrip;
+    // TNNetOctonionLinear 8D hypercomplex dense layer
+    procedure TestOctonionNormMultiplicativity;
+    procedure TestOctonionLinearGradientCheck;
+    procedure TestOctonionLinearSerializationRoundTrip;
     // TNNetKANLayer Kolmogorov-Arnold dense layer
     procedure TestKANLayerGradientCheck;
     procedure TestKANLayerSerializationRoundTrip;
@@ -36180,6 +36184,279 @@ begin
         Pos('TNNetQuaternionLinear', Saved) > 0);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('QuaternionLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Reference octonion product via the Cayley-Dickson doubling of quaternions
+//   (a,b)(c,d) = (a c - d* b, d a + b c*).  This is INDEPENDENT of the layer's
+// hard-coded multiplication table, so comparing the layer's forward output to
+// this reference (and checking |W.X| = |W|.|X|) proves the layer's table.
+procedure RefQMul(const p, q: array of TNeuralFloat; var r: array of TNeuralFloat);
+begin
+  r[0] := p[0]*q[0] - p[1]*q[1] - p[2]*q[2] - p[3]*q[3];
+  r[1] := p[0]*q[1] + p[1]*q[0] + p[2]*q[3] - p[3]*q[2];
+  r[2] := p[0]*q[2] - p[1]*q[3] + p[2]*q[0] + p[3]*q[1];
+  r[3] := p[0]*q[3] + p[1]*q[2] - p[2]*q[1] + p[3]*q[0];
+end;
+
+procedure RefOMul(const w, x: array of TNeuralFloat; var y: array of TNeuralFloat);
+var
+  a, b, c, d, ac, dconj, db, da, ccon, bcc: array[0..3] of TNeuralFloat;
+  i: integer;
+begin
+  for i := 0 to 3 do begin a[i] := w[i]; b[i] := w[i+4]; c[i] := x[i]; d[i] := x[i+4]; end;
+  RefQMul(a, c, ac);
+  dconj[0] := d[0]; dconj[1] := -d[1]; dconj[2] := -d[2]; dconj[3] := -d[3];
+  RefQMul(dconj, b, db);
+  for i := 0 to 3 do y[i] := ac[i] - db[i];                 // a c - d* b
+  RefQMul(d, a, da);
+  ccon[0] := c[0]; ccon[1] := -c[1]; ccon[2] := -c[2]; ccon[3] := -c[3];
+  RefQMul(b, ccon, bcc);
+  for i := 0 to 3 do y[i+4] := da[i] + bcc[i];              // d a + b c*
+end;
+
+procedure TTestNeuralNumerical.TestOctonionNormMultiplicativity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  OL: TNNetOctonionLinear;
+  W, X, Yref: array[0..7] of TNeuralFloat;
+  trial, i: integer;
+  nW, nX, nY, refNorm, outNorm, maxDiff: TNeuralFloat;
+begin
+  // Proves the hard-coded octonion multiplication table is correct two ways:
+  //  (1) the layer's forward output M(W)*X matches the independent
+  //      Cayley-Dickson reference product, and
+  //  (2) |W.X| = |W|.|X| (norm multiplicativity), which only holds for the
+  //      genuine octonion algebra.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 8);
+  maxDiff := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    OL := TNNetOctonionLinear.Create(8, {SuppressBias}1);  // InO=OutO=1, no bias
+    NN.AddLayer(OL);
+    for trial := 0 to 19 do
+    begin
+      for i := 0 to 7 do
+      begin
+        W[i] := (Random - 0.5) * 2.0;
+        X[i] := (Random - 0.5) * 2.0;
+      end;
+      // The single block-row neuron holds the one weight octonion W.
+      for i := 0 to 7 do OL.Neurons[0].Weights.Raw[i] := W[i];
+      for i := 0 to 7 do Input.Raw[i] := X[i];
+      NN.Compute(Input);
+
+      RefOMul(W, X, Yref);
+      // (1) layer forward == reference product
+      for i := 0 to 7 do
+        maxDiff := Max(maxDiff, Abs(NN.GetLastLayer.Output.Raw[i] - Yref[i]));
+
+      // (2) norm multiplicativity on the layer output
+      nW := 0; nX := 0; nY := 0;
+      for i := 0 to 7 do
+      begin
+        nW := nW + W[i]*W[i];
+        nX := nX + X[i]*X[i];
+        nY := nY + Sqr(NN.GetLastLayer.Output.Raw[i]);
+      end;
+      refNorm := Sqrt(nW) * Sqrt(nX);
+      outNorm := Sqrt(nY);
+      AssertTrue('Octonion norm multiplicativity trial ' + IntToStr(trial) +
+        ' (|W.X|=' + FloatToStr(outNorm) + ' |W||X|=' + FloatToStr(refNorm) + ')',
+        Abs(outNorm - refNorm) < 1e-4);
+    end;
+    AssertTrue('Octonion layer forward matches Cayley-Dickson reference (maxDiff=' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOctonionLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  OL: TNNetOctonionLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, oo, InO, OutO, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT, the eight real weight
+  // components per octonion block, AND the per-output bias. A sign error in the
+  // 8x8 Cayley-Dickson layout shows up here. Magnitudes are bounded to keep
+  // finite-difference truncation small (per the hypercomplex FD-truncation
+  // gotcha -- do NOT loosen the tolerance).
+  RandSeed := 424242;
+  InO := 2;  OutO := 2;
+  InSize := InO * 8;  OutSize := OutO * 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  InputPlus := TNNetVolume.Create(1, 1, InSize);
+  Desired := TNNetVolume.Create(1, 1, OutSize);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    OL := TNNetOctonionLinear.Create(OutSize);
+    NN.AddLayer(OL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+    for oo := 0 to OutO - 1 do
+      for i := 0 to InSize - 1 do
+        OL.Neurons[oo].Weights.Raw[i] := 0.15 - 0.03 * i + 0.2 * Sin(i * 1.1 + oo);
+    for i := 0 to OutSize - 1 do
+      OL.Neurons[OutO].Weights.Raw[i] := 0.03 * (i - 4); // bias
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('OctonionLinear input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. each block-row's octonion weight components ----
+    for oo := 0 to OutO - 1 do
+      for i := 0 to InSize - 1 do
+      begin
+        OL.Neurons[oo].Weights.Raw[i] := OL.Neurons[oo].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        OL.Neurons[oo].Weights.Raw[i] := OL.Neurons[oo].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        OL.Neurons[oo].Weights.Raw[i] := OL.Neurons[oo].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        OL.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -OL.Neurons[oo].Delta.Raw[i];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+        AssertTrue('OctonionLinear weight gradient check oo=' + IntToStr(oo) +
+          ' c=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the per-output bias (bias neuron = OutO) ----
+    for i := 0 to OutSize - 1 do
+    begin
+      OL.Neurons[OutO].Weights.Raw[i] := OL.Neurons[OutO].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      OL.Neurons[OutO].Weights.Raw[i] := OL.Neurons[OutO].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      OL.Neurons[OutO].Weights.Raw[i] := OL.Neurons[OutO].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      OL.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -OL.Neurons[OutO].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('OctonionLinear bias gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  OctonionLinear gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOctonionLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  OL: TNNetOctonionLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, oo, InO, OutO, InSize, OutSize: integer;
+begin
+  // OctonionLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the
+  // (OutO block-row + bias) neuron storage round-trips through both dispatch
+  // points.
+  RandSeed := 424242;
+  InO := 3;  OutO := 2;
+  InSize := InO * 8;  OutSize := OutO * 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    OL := TNNetOctonionLinear.Create(OutSize);
+    NN.AddLayer(OL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for oo := 0 to OutO - 1 do
+      for i := 0 to InSize - 1 do
+        OL.Neurons[oo].Weights.Raw[i] := 0.07 * (i + 1) - 0.3 + 0.1 * oo;
+    for i := 0 to OutSize - 1 do
+      OL.Neurons[OutO].Weights.Raw[i] := 0.04 - 0.02 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('OctonionLinear SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('OctonionLinear token present in serialized string',
+        Pos('TNNetOctonionLinear', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('OctonionLinear Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

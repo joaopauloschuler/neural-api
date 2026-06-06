@@ -6391,6 +6391,47 @@ type
     property OutQuaternions: integer read FOutQuaternions;
   end;
 
+  /// 8-DIMENSIONAL HYPERCOMPLEX (octonion / Cayley-Dickson) DENSE layer.
+  /// This is the octonion sibling of TNNetQuaternionLinear: it reinterprets the
+  /// input/output Depth (both multiples of 8) as packed OCTONIONS and learns an
+  /// (OutO x InO) grid of octonion-valued weights, where each learned octonion's
+  /// 8 real components (o0 + o1 e1 + ... + o7 e7) drive a whole 8x8 real block
+  /// via the fixed octonion multiplication table -- so ONE octonion's 8 reals
+  /// control 64 matrix entries, giving ~1/8 the parameters of a dense layer of
+  /// the same real width while still mixing all eight components of every input
+  /// octonion (the 8x analogue of the quaternion layer's 4x saving).
+  ///
+  /// The 8x8 block M(W) acting on input octonion X is built from the
+  /// Cayley-Dickson product W . X = M(W) * X, with
+  ///   M(W)[i][j] = SGN[i][j] * W[SRC[i][j]],  SRC[i][j] = i XOR j.
+  /// The (auditable) SGN / SRC tables are hard-coded in the implementation and
+  /// were derived (and verified by norm multiplicativity |W.X| = |W|.|X|) from
+  /// the standard octonion = pair-of-quaternions doubling
+  ///   (a,b)(c,d) = (a c - d* b, d a + b c*).
+  ///
+  /// Neuron layout mirrors TNNetQuaternionLinear: OutO block-row weight neurons
+  /// (each holding InO*8 shared reals) plus ONE bias neuron (length OutSize).
+  /// Out round-trips via FStruct[0]; SuppressBias via FStruct[3] -- identical
+  /// dispatch shape to TNNetQuaternionLinear, wired through Create(St[0], St[3]).
+  // Coded by Claude (AI).
+  TNNetOctonionLinear = class(TNNetFullConnectLinear)
+  private
+    FInOctonions: integer;   // InO = input Depth / 8
+    FOutOctonions: integer;  // OutO = output Depth / 8
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    procedure InitDefault(); override;
+    property InOctonions: integer read FInOctonions;
+    property OutOctonions: integer read FOutOctonions;
+  end;
+
   /// Weight Standardization CONVOLUTION layer (Qiao et al. 2019,
   /// "Micro-Batch Training with Batch-Channel Normalization and Weight
   /// Standardization", arXiv:1903.10520). This is the convolution sibling of
@@ -35368,6 +35409,282 @@ begin
   end;
 end;
 
+{ TNNetOctonionLinear }
+
+// Octonion multiplication table, derived from the Cayley-Dickson doubling of
+// quaternions  (a,b)(c,d) = (a c - d* b, d a + b c*)  and INDEPENDENTLY verified
+// by norm multiplicativity |W.X| = |W|.|X| (see the matching unit test).
+// For weight octonion W and input octonion X, the product W . X = M(W) * X with
+//   M(W)[i][j] = OCT_SGN[i][j] * W[ OCT_SRC[i][j] ],  and OCT_SRC[i][j] = i XOR j.
+// SRC index table (= i xor j):           SGN sign table:
+//   (0 1 2 3 4 5 6 7)                       ( 1 -1 -1 -1 -1 -1 -1 -1)
+//   (1 0 3 2 5 4 7 6)                       ( 1  1 -1  1 -1  1  1 -1)
+//   (2 3 0 1 6 7 4 5)                       ( 1  1  1 -1 -1 -1  1  1)
+//   (3 2 1 0 7 6 5 4)                       ( 1 -1  1  1 -1  1 -1  1)
+//   (4 5 6 7 0 1 2 3)                       ( 1  1  1  1  1 -1 -1 -1)
+//   (5 4 7 6 1 0 3 2)                       ( 1 -1  1 -1  1  1  1 -1)
+//   (6 7 4 5 2 3 0 1)                       ( 1 -1 -1  1  1 -1  1  1)
+//   (7 6 5 4 3 2 1 0)                       ( 1  1 -1 -1  1  1 -1  1)
+// SRC is symmetric (src[i][j]=src[j][i]); SGN is NOT (octonions are
+// non-commutative). Forward uses M, the input gradient uses M^T (so it sums
+// over i with the SAME tables but transposed indexing), and the weight gradient
+// scatters SGN[i][j]*X[j]*E[i] into component SRC[i][j].
+const
+  OCT_SRC: array[0..7, 0..7] of integer =
+  (
+    (0, 1, 2, 3, 4, 5, 6, 7),
+    (1, 0, 3, 2, 5, 4, 7, 6),
+    (2, 3, 0, 1, 6, 7, 4, 5),
+    (3, 2, 1, 0, 7, 6, 5, 4),
+    (4, 5, 6, 7, 0, 1, 2, 3),
+    (5, 4, 7, 6, 1, 0, 3, 2),
+    (6, 7, 4, 5, 2, 3, 0, 1),
+    (7, 6, 5, 4, 3, 2, 1, 0)
+  );
+  OCT_SGN: array[0..7, 0..7] of TNeuralFloat =
+  (
+    ( 1, -1, -1, -1, -1, -1, -1, -1),
+    ( 1,  1, -1,  1, -1,  1,  1, -1),
+    ( 1,  1,  1, -1, -1, -1,  1,  1),
+    ( 1, -1,  1,  1, -1,  1, -1,  1),
+    ( 1,  1,  1,  1,  1, -1, -1, -1),
+    ( 1, -1,  1, -1,  1,  1,  1, -1),
+    ( 1, -1, -1,  1,  1, -1,  1,  1),
+    ( 1,  1, -1, -1,  1,  1, -1,  1)
+  );
+
+constructor TNNetOctonionLinear.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  // The base FullConnect constructor added FOutput.Size neurons. The octonion
+  // layer keeps OutO block-row neurons plus ONE bias neuron (set up in
+  // SetPrevLayer once OutO is known). Trim to a single neuron for now.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+constructor TNNetOctonionLinear.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+procedure TNNetOctonionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  InSize, OutSize, Cnt: integer;
+begin
+  // Bypass TNNetFullConnect.SetPrevLayer (which resizes EVERY neuron to the
+  // input size for FOutput.Size neurons). We keep OutO block-row neurons (each
+  // InO*8 weights) plus one bias neuron (length OutSize).
+  FPrevLayer := pPrevLayer;
+  InSize := pPrevLayer.Output.Size;
+  OutSize := FOutput.Size;
+  if (InSize mod 8 <> 0) or (OutSize mod 8 <> 0) then
+  begin
+    FErrorProc
+    (
+      'TNNetOctonionLinear requires input and output Depth to be multiples '+
+      'of 8: input '+IntToStr(InSize)+', output '+IntToStr(OutSize)+'.'
+    );
+  end;
+  FInOctonions := InSize div 8;
+  FOutOctonions := OutSize div 8;
+
+  // OutO weight neurons + 1 bias neuron.
+  while FNeurons.Count > FOutOctonions + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FOutOctonions + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  // Each block-row neuron holds InO*8 weights (8 reals per (oo,io) octonion).
+  for Cnt := 0 to FOutOctonions - 1 do
+  begin
+    FNeurons[Cnt].Weights.ReSize(FInOctonions * 8, 1, 1);
+    FNeurons[Cnt].BackInertia.ReSize(FInOctonions * 8, 1, 1);
+    FNeurons[Cnt].Delta.ReSize(FInOctonions * 8, 1, 1);
+  end;
+  // Bias neuron: one bias per output channel.
+  FNeurons[FOutOctonions].Weights.ReSize(OutSize, 1, 1);
+  FNeurons[FOutOctonions].BackInertia.ReSize(OutSize, 1, 1);
+  FNeurons[FOutOctonions].Delta.ReSize(OutSize, 1, 1);
+
+  FVectorSize := FNeurons[0].Weights.Size;
+  BuildArrNeurons();  // FArrNeurons must match the new neuron count before InitDefault
+  InitDefault();
+  FNeurons[FOutOctonions].Weights.Fill(0);  // bias starts at 0
+  for Cnt := 0 to FOutOctonions do
+    FNeurons[Cnt].FBiasWeight := 0;
+  AfterWeightUpdate();
+end;
+
+// Each block starts near a scaled identity: real part o0 gets a small random
+// value, the seven imaginary parts smaller ones, so an untrained block is close
+// to a shrunken scalar multiple of the identity rather than an arbitrary mix.
+procedure TNNetOctonionLinear.InitDefault();
+var
+  oo, io, base, c: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FOutOctonions <= 0 then exit;
+  scale := Sqrt(2.0 / (FInOctonions * 8 + 1));
+  for oo := 0 to FOutOctonions - 1 do
+  begin
+    W := FArrNeurons[oo].FWeights;
+    for io := 0 to FInOctonions - 1 do
+    begin
+      base := io * 8;
+      W.FData[base + 0] := scale * (Random - 0.5) * 2;          // real part o0
+      for c := 1 to 7 do
+        W.FData[base + c] := scale * (Random - 0.5) * 2 * 0.25; // imaginary parts
+    end;
+  end;
+end;
+
+procedure TNNetOctonionLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: y_oo = bias_oo + sum_io M(o_{oo,io}) * x_io, where
+//   y[i] = sum_j OCT_SGN[i][j] * W[OCT_SRC[i][j]] * x[j].
+procedure TNNetOctonionLinear.ComputeCPU();
+var
+  oo, io, wBase, oBase, iBase, i, j: integer;
+  acc: TNeuralFloat;
+  W, PrevOut, Bias: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FOutOctonions].FWeights;
+  for oo := 0 to FOutOctonions - 1 do
+  begin
+    W := FArrNeurons[oo].FWeights;
+    oBase := oo * 8;
+    for i := 0 to 7 do
+    begin
+      acc := 0;
+      for io := 0 to FInOctonions - 1 do
+      begin
+        wBase := io * 8;
+        iBase := io * 8;
+        for j := 0 to 7 do
+          acc := acc + OCT_SGN[i, j] * W.FData[wBase + OCT_SRC[i, j]]
+                       * PrevOut.FData[iBase + j];
+      end;
+      if FSuppressBias = 0 then
+        FOutput.FData[oBase + i] := acc + Bias.FData[oBase + i]
+      else
+        FOutput.FData[oBase + i] := acc;
+    end;
+  end;
+end;
+
+procedure TNNetOctonionLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Input gradient: dL/dx_io += M(o_{oo,io})^T * dy_oo, summed over oo, i.e.
+//   dL/dx[j] += sum_i OCT_SGN[i][j] * W[OCT_SRC[i][j]] * e[i].
+procedure TNNetOctonionLinear.ComputePreviousLayerErrorCPU();
+var
+  oo, io, wBase, oBase, iBase, i, j: integer;
+  e: array[0..7] of TNeuralFloat;
+  allZero: boolean;
+  contrib: TNeuralFloat;
+  W, LocalPrevError: TNNetVolume;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  for oo := 0 to FOutOctonions - 1 do
+  begin
+    W := FArrNeurons[oo].FWeights;
+    oBase := oo * 8;
+    allZero := True;
+    for i := 0 to 7 do
+    begin
+      e[i] := FOutputError.FData[oBase + i];
+      if e[i] <> 0 then allZero := False;
+    end;
+    if allZero then continue;
+    for io := 0 to FInOctonions - 1 do
+    begin
+      wBase := io * 8;
+      iBase := io * 8;
+      for j := 0 to 7 do
+      begin
+        contrib := 0;
+        for i := 0 to 7 do
+          contrib := contrib + OCT_SGN[i, j] * W.FData[wBase + OCT_SRC[i, j]] * e[i];
+        LocalPrevError.FData[iBase + j] := LocalPrevError.FData[iBase + j] + contrib;
+      end;
+    end;
+  end;
+end;
+
+// Weight gradient (per block-row neuron) and bias gradient, accumulated into the
+// neurons' Delta scaled by -LearningRate (so the ordinary update applies):
+//   dL/dW[OCT_SRC[i][j]] += OCT_SGN[i][j] * x[j] * e[i].
+procedure TNNetOctonionLinear.BackpropagateCPU();
+var
+  oo, io, wBase, oBase, iBase, i, j: integer;
+  e: array[0..7] of TNeuralFloat;
+  allZero: boolean;
+  WDelta, BiasDelta, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  BiasDelta := FArrNeurons[FOutOctonions].FDelta;
+  for oo := 0 to FOutOctonions - 1 do
+  begin
+    WDelta := FArrNeurons[oo].FDelta;
+    oBase := oo * 8;
+    allZero := True;
+    for i := 0 to 7 do
+    begin
+      e[i] := -FLearningRate * FOutputError.FData[oBase + i];
+      if e[i] <> 0 then allZero := False;
+    end;
+    if FSuppressBias = 0 then
+      for i := 0 to 7 do
+        BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
+    if allZero then continue;
+    for io := 0 to FInOctonions - 1 do
+    begin
+      wBase := io * 8;
+      iBase := io * 8;
+      for i := 0 to 7 do
+        for j := 0 to 7 do
+          WDelta.FData[wBase + OCT_SRC[i, j]] :=
+            WDelta.FData[wBase + OCT_SRC[i, j]]
+            + OCT_SGN[i, j] * PrevOut.FData[iBase + j] * e[i];
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for oo := 0 to FOutOctonions do
+      FArrNeurons[oo].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetHouseholderLinear }
 
 // Floor used to guard the v_i^T v_i denominator: below this a reflection is
@@ -59777,6 +60094,7 @@ begin
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
+      'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
@@ -60096,6 +60414,7 @@ begin
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
+      if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
