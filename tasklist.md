@@ -277,6 +277,19 @@ rather than acted on.
       bank is learnable) — keeps the two-stage softmax-Jacobian backward exact
       and gradient-checkable. DEFERRED follow-ups: multi-head MABs, and per-MAB
       learnable W_Q/W_K/W_V + residual/feed-forward (the full SAB/ISAB block).
+- [ ] Set Transformer follow-up (multi-head + learnable-projection MAB): the
+      landed v1 `TNNetInducedSetAttention` / `TNNetAttentionPooling` use
+      single-head MABs with IDENTITY Q/K/V projections (only the bank is
+      learnable). Add (a) per-MAB learnable `W_Q`/`W_K`/`W_V` (+ optional
+      out-projection / residual + FFN, the full SAB/ISAB block from the paper),
+      and (b) genuine multi-head MABs (the builders already accept `Heads` but
+      only `Heads=1` is implemented — currently they raise for `Heads<>1`). Reuse
+      the multi-head concat-of-H-SDPA wiring (H separate heads along Depth, no
+      head-axis tensor in this repo — see [[multihead-no-head-axis-tensor]]).
+      Each new learnable projection needs its weight-gradient added to the
+      numerical-gradient tests; keep the exact softmax-Jacobian backward. Watch
+      the FD-truncation gotcha (bound weights, don't loosen tol) and reseed
+      `RandSeed := 424242`.
 - [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
       landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
       per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load
@@ -1586,3 +1599,15 @@ rather than acted on.
       (other values raise); a follow-up should split the query into H
       independent product-key lookups concatenated along Depth, mirroring the
       multi-head attention wiring.
+- [ ] TNNetProductKeyMemory follow-up (multi-head): the landed v1 is
+      single-head (`Heads=1`; the builder raises for other values). Implement H
+      independent product-key lookups — split the `QueryDim` query into H
+      sub-queries, run one product-key retrieval per head against its own (or a
+      shared) half-key/value banks, and concatenate the H `ValueDim`-wide
+      outputs along Depth (no head-axis tensor in this repo — see
+      [[multihead-no-head-axis-tensor]]). Extend the numerical-gradient tests to
+      `Heads>1` (input + all bank weight grads), keep the exact softmax-Jacobian
+      and the unambiguous-top-k test inputs (no near-ties across the non-diff
+      selection boundary), reseed `RandSeed := 424242`. Stretch: the paper's
+      batch-norm-on-query trick to spread key usage (the example already prints
+      the per-slot read histogram that exposes usage collapse).
