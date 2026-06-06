@@ -147,6 +147,22 @@ rather than acted on.
       HyperLinear). STRETCH: a quaternion conv (TNNetQuaternionConv) reusing the
       same Hamilton-block once the dense layer's gradient is trusted.
 
+- [ ] TNNetQuaternionConv follow-up (now doable — TNNetQuaternionLinear LANDED
+      2026-06-06 with a gradient-checked Hamilton-product block and a
+      param-matched bake-off in examples/QuaternionLinear/). Build the spatial
+      sibling: a convolution whose per-output-channel filter taps are quaternion
+      weights, so each 4-channel input patch is Hamilton-multiplied by a learned
+      quaternion and accumulated — ~1/4 the weights of an equal-width real conv
+      while coupling the four channel components. Reuse the trusted 4x4 Hamilton
+      forward/backward kernel from TNNetQuaternionLinear (input Depth and filter
+      count both multiples of 4). Ship: leaf layer + LoadFromString registration
+      (both dispatch points) + the mandatory numerical-gradient test (input AND
+      the four weight components per quaternion tap — same sign-error bug class)
+      + a save/load round-trip test, all in tests/TestNeuralNumerical.pas
+      (reseed RandSeed := 424242). Optionally extend examples/QuaternionLinear/
+      (or a new examples/QuaternionConv/) with a tiny colour-image rotation/
+      filtering arm vs a param-matched real conv. Pure CPU, <5 min, no binaries.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
