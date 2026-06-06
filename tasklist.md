@@ -132,7 +132,18 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [ ] TNNetCondConv — CONDITIONALLY-PARAMETERIZED ("dynamic") convolution
+- [X] TNNetCondConv — CONDITIONALLY-PARAMETERIZED ("dynamic") convolution
+      LANDED 2026-06-06 on a2 (commit cf3fe23): leaf layer subclassing
+      TNNetConvolutionLinear (neuron bank = K expert kernels + routing FC weights
+      + routing biases), both CreateLayer dispatch tables + LoadFromString wired
+      (K/Features/FeatureSize/Padding/Stride round-trip via FStruct[0..5]), input
+      + expert-bank-weight + routing-head numerical-gradient tests + shape-inference
+      + non-default serialization round-trip in tests/TestNeuralNumerical.pas (full
+      suite 1124 tests green), examples/CondConv/ input-dependent-filtering bake-off
+      (K=2 CondConv val-MSE ~0.02 at 22 weights / single-conv inference vs wider
+      plain conv ~1.96 at 80 weights). NOTE: the conv part carries NO per-channel
+      output bias (only the routing head is biased) — documented in the class header.
+      Original spec below.
       (Yang et al. 2019, "CondConv: Conditionally Parameterized Convolutions for
       Efficient Inference", NeurIPS): the layer owns a BANK of `K` expert
       convolution kernels `W_1..W_K` (each a normal `Features x FeatureSize x
@@ -1502,7 +1513,20 @@ rather than acted on.
       degeneracy-aware generalization of "effective parameter count").
 
 ### Nested / multi-granularity embeddings (Matryoshka Representation Learning)
-- [ ] `examples/MatryoshkaEmbedding/` — train a SINGLE embedding head whose
+- [X] `examples/MatryoshkaEmbedding/` — LANDED 2026-06-06 on a2 (commit 85e55e2):
+      one shared MLP encoder → single d=64 embedding; K classifier heads each read a
+      prefix {8,16,32,64} via `TNNetSplitChannels(0,p) → TNNetFullConnectLinear →
+      TNNetSoftMax`, all `TNNetDeepConcat`'d with a K-stacked-one-hot target so
+      softmax+CE backward sums the per-prefix losses (no new layer class needed —
+      TNNetSplitChannels(0,p) is the prefix-slice primitive). Synthetic 8-class
+      Gaussian-blob task (MNIST would blow the budget given 3 models trained), ~6.5s,
+      fixed RandSeed. Observed: prefix accuracy d=8→0.913 / d=16→0.925 matches the
+      separately-trained dedicated fixed-8 (0.913) / fixed-16 (0.909) baselines —
+      headline lands. README documents the prefix-loss-weighting pitfall. Possible
+      follow-up: a true MNIST version with a PGM scatter of the learned embedding,
+      and an adaptive-cost retrieval timing demo (cheap coarse search on the 8-dim
+      prefix + optional fine re-rank on the 64-dim). Original spec below.
+- [ ] `examples/MatryoshkaEmbedding/` (ORIGINAL SPEC, superseded by landing above) — train a SINGLE embedding head whose
       nested prefixes are *each independently usable*, following Matryoshka
       Representation Learning (Kusupati et al., NeurIPS 2022). One encoder
       produces a d-dim embedding (say d=64); the loss is the SUM of the
