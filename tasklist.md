@@ -72,6 +72,41 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetMonarchLinear — a sub-quadratic STRUCTURED dense layer whose `n×n`
+      weight is a MONARCH matrix (Dao et al. 2022, "Monarch: Expressive
+      Structured Matrices for Efficient and Accurate Training"): a product of two
+      block-diagonal factors interleaved by a fixed stride/transpose permutation,
+      `y = P^T · (L · (P · (R · x)))`, where `R` and `L` are block-diagonal with
+      `b` blocks of size `m×m` (`n = b·m`, e.g. `b = m = sqrt(n)`) and `P` is the
+      fixed `(b,m)→(m,b)` reshape-transpose permutation. Stores `O(n^1.5)` weights
+      and runs in `O(n^1.5)` instead of `O(n^2)`, yet the class is more expressive
+      than circulant/low-rank — it provably contains the DFT, the Hadamard
+      transform and ordinary convolutions, so it is a genuinely different structured
+      operator from `TNNetCirculantLinear` (single cyclic kernel), `AddLoRAAdapter`
+      (low-rank bypass), `AddGroupedFullConnect` (one block-diagonal, no
+      permutation mixing) and `TNNetHouseholderLinear` (orthogonal). The two
+      block-diagonal factors are the only trainable parameters (plus optional
+      bias); the permutation is a fixed index gather (no weights). Forward applies
+      `R`, permute, `L`, un-permute as four cheap passes (never materialize the
+      dense `n×n`); backward is the exact transpose chain — `dL/dx`, `dL/dR` and
+      `dL/dL` are all block-local matmuls, so both factor gradients are
+      numerically gradient-checkable. Pick `b = m = round(sqrt(n))` by default and
+      require `n` to be a perfect square (or factor `n = b·m` and store `b` in an
+      FStruct slot so non-square `n` round-trips). Deliverables per
+      [[loss-layer-pattern]] / [[layer-authoring-extras]]: leaf class
+      (`// Coded by Claude (AI).`) + both CreateLayer dispatch tables +
+      LoadFromString wiring with the block-count round-tripped, a numerical-
+      gradient test on the INPUT and on BOTH block-diagonal factors (bound the
+      weights, don't loosen tol — the FD-truncation gotcha from
+      [[octonion-conv-layer]]), a hand-computed tiny forward-equality test
+      (assert a Monarch built from two identity factors is the pure permutation,
+      and one built from identity `R` + a single `L` block matches a plain
+      block matmul), and a save/load round-trip. Stretch: an `examples/MonarchLinear/`
+      param-vs-accuracy bake-off contrasting a Monarch dense layer against a
+      param-matched plain `TNNetFullConnectLinear` and a `TNNetCirculantLinear`
+      on a small function-fit / classification task (the headline "structured =
+      fewer params, comparable accuracy" claim), plus a check that an
+      untrained-from-DFT-init Monarch reproduces `TNNetFourierMixFFT`'s transform.
 - [ ] TNNetTropicalConv follow-up (TNNetTropicalLinear max-plus/min-plus
       morphological DENSE layer + examples/TropicalMorphology/ + gradient/forward/
       save-load tests all LANDED 2026-06-06 on a2): the SPATIAL sibling — a
