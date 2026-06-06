@@ -156,43 +156,6 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [X] TNNetCondConv — CONDITIONALLY-PARAMETERIZED ("dynamic") convolution
-      LANDED 2026-06-06 on a2 (commit cf3fe23): leaf layer subclassing
-      TNNetConvolutionLinear (neuron bank = K expert kernels + routing FC weights
-      + routing biases), both CreateLayer dispatch tables + LoadFromString wired
-      (K/Features/FeatureSize/Padding/Stride round-trip via FStruct[0..5]), input
-      + expert-bank-weight + routing-head numerical-gradient tests + shape-inference
-      + non-default serialization round-trip in tests/TestNeuralNumerical.pas (full
-      suite 1124 tests green), examples/CondConv/ input-dependent-filtering bake-off
-      (K=2 CondConv val-MSE ~0.02 at 22 weights / single-conv inference vs wider
-      plain conv ~1.96 at 80 weights). NOTE: the conv part carries NO per-channel
-      output bias (only the routing head is biased) — documented in the class header.
-      Original spec below.
-      (Yang et al. 2019, "CondConv: Conditionally Parameterized Convolutions for
-      Efficient Inference", NeurIPS): the layer owns a BANK of `K` expert
-      convolution kernels `W_1..W_K` (each a normal `Features x FeatureSize x
-      FeatureSize x InChannels` kernel) plus a tiny per-sample ROUTING head
-      (global-avg-pool over the spatial map -> FullConnect -> sigmoid) that emits
-      `K` mixing coefficients `alpha_1..alpha_K` PER INPUT SAMPLE. The effective
-      kernel is the per-sample convex-ish blend `W_eff = sum_k alpha_k * W_k`,
-      applied as ONE ordinary convolution — so inference cost stays that of a
-      single conv regardless of `K`, while capacity grows with the bank. This is
-      genuinely DISTINCT from the existing fork members: `TNNetHyperConv`
-      GENERATES the whole kernel from a second tensor in one shot (no fixed
-      expert bank, caps kernel size), and the soft `TNNet.AddMixtureOfExperts`
-      mixes K expert MLP/branch OUTPUTS post-hoc (K forward passes), whereas
-      CondConv mixes K kernels BEFORE the conv (one forward pass). Forward: pool
-      -> route -> blend kernels -> conv. Backward (the interesting part, worth a
-      careful numerical-gradient test): route `dL/dW_k = alpha_k * dL/dW_eff`,
-      and the routing coefficients receive `dL/dalpha_k = <dL/dW_eff, W_k>`
-      chained back through the sigmoid + FC + pool into the input. Wire both
-      CreateLayer tables + LoadFromString (K / Features / FeatureSize / Padding /
-      Stride round-trip via FStruct), add input + weight + routing-head
-      gradient checks, and ship an `examples/CondConv/` bake-off showing a
-      K-expert CondConv matching a much wider plain conv at single-conv inference
-      cost on a small CIFAR-10 / synthetic-texture task. Mark the new class with
-      `// Coded by Claude (AI).` per the authorship convention.
-
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
@@ -1535,45 +1498,3 @@ rather than acted on.
       < random-init) is the robust, reproducible signal. Pairs with
       [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
       degeneracy-aware generalization of "effective parameter count").
-
-### Nested / multi-granularity embeddings (Matryoshka Representation Learning)
-- [X] `examples/MatryoshkaEmbedding/` — LANDED 2026-06-06 on a2 (commit 85e55e2):
-      one shared MLP encoder → single d=64 embedding; K classifier heads each read a
-      prefix {8,16,32,64} via `TNNetSplitChannels(0,p) → TNNetFullConnectLinear →
-      TNNetSoftMax`, all `TNNetDeepConcat`'d with a K-stacked-one-hot target so
-      softmax+CE backward sums the per-prefix losses (no new layer class needed —
-      TNNetSplitChannels(0,p) is the prefix-slice primitive). Synthetic 8-class
-      Gaussian-blob task (MNIST would blow the budget given 3 models trained), ~6.5s,
-      fixed RandSeed. Observed: prefix accuracy d=8→0.913 / d=16→0.925 matches the
-      separately-trained dedicated fixed-8 (0.913) / fixed-16 (0.909) baselines —
-      headline lands. README documents the prefix-loss-weighting pitfall. Possible
-      follow-up: a true MNIST version with a PGM scatter of the learned embedding,
-      and an adaptive-cost retrieval timing demo (cheap coarse search on the 8-dim
-      prefix + optional fine re-rank on the 64-dim). Original spec below.
-- [ ] `examples/MatryoshkaEmbedding/` (ORIGINAL SPEC, superseded by landing above) — train a SINGLE embedding head whose
-      nested prefixes are *each independently usable*, following Matryoshka
-      Representation Learning (Kusupati et al., NeurIPS 2022). One encoder
-      produces a d-dim embedding (say d=64); the loss is the SUM of the
-      classification/retrieval losses computed on the truncated prefixes
-      {8, 16, 32, 64} so that early coordinates pack the coarsest, most
-      important information and later coordinates only refine. This is
-      genuinely DIFFERENT from every existing embedding example here —
-      [[TripletEmbedding]], [[InfoNCEContrastive]], [[ArcFaceEmbedding]],
-      [[CosineEmbeddingSiamese]] all train ONE fixed-width vector; the
-      Matryoshka novelty is the elastic, sub-dimension-addressable
-      representation, not the metric/loss family. Implementation reuses the
-      existing prefix-slice + a per-granularity classifier head (share or
-      tie the heads); no new layer class is strictly required, but if a
-      clean reusable piece falls out it should be a `TNNet.AddMatryoshka...`
-      builder rather than a near-duplicate layer. CPU-only on MNIST or a
-      tiny synthetic dataset. Headline experiment (in the honest
-      "what fit the budget" style): a single Matryoshka run gives a whole
-      accuracy-vs-embedding-width curve from ONE model; contrast its 8-dim
-      and 16-dim prefix accuracy against separately-trained fixed-8 and
-      fixed-16 baselines to show the nested prefixes lose little vs. the
-      dedicated low-dim models — i.e. you get adaptive-cost retrieval
-      (cheap coarse search, optional fine re-rank) for free. Document the
-      known pitfall: prefix losses must be weighted/normalised so the
-      smallest prefix does not dominate the gradient. Pairs naturally with
-      the existing [[IntrinsicDimension]] / FeatureSeparability reports for
-      reading how information is distributed across the coordinate axis.
