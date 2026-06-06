@@ -7643,6 +7643,22 @@ type
       // TNNetAttentionPooling layer (Heads=1). Coded by Claude (AI).
       function AddAttentionPooling(NumSeeds: integer;
         Heads: integer = 1): TNNetLayer;
+      // Wires a Set Attention Block (SAB; Set Transformer, Lee et al. 2019)
+      // over a (N,1,d=d_model) set (GetLastLayer, SizeY=1). The SAB wraps the
+      // multi-head MAB (built exactly as AddInducedSetAttention -- H heads, each
+      // a per-token input projection feeding a single-head ISAB with its own
+      // inducing bank, DeepConcat, per-token out-projection) in two post-norm
+      // residual sublayers:
+      //   H   = LayerNorm(X + MAB(X, X))            (attention sublayer)
+      //   out = LayerNorm(H + FFN(H))               (row-wise FFN sublayer)
+      // FFN is a token-wise 2-layer MLP: TNNetPointwiseConvReLU(DFF) ->
+      // TNNetPointwiseConvLinear(d_model). Both residuals add over the (N,1,d)
+      // set axis with shape-preserving 1x1 (pointwise) convs, so they keep the
+      // exact input gradient (TNNetFullConnect* would flatten/mix the set and
+      // zero it). InducingPoints is the ISAB inducing-bank size; Heads must
+      // divide d_model. Permutation-equivariant. Returns the final LayerNorm
+      // layer. Coded by Claude (AI).
+      function AddSAB(InducingPoints, Heads, DFF: integer): TNNetLayer;
       // Wires a Product-Key Memory (Lample et al. 2019) over a
       // (SeqLen,1,QueryDim) query (GetLastLayer, SizeY=1, even Depth=QueryDim).
       // A sparse top-k key->value lookup into a memory of NumKeys slots scored
@@ -33509,6 +33525,38 @@ begin
   AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
   SetLength(HeadOutputs, 0);
+end;
+
+function TNNet.AddSAB(InducingPoints, Heads, DFF: integer): TNNetLayer;
+var
+  SetLayer, MabOut, AttnResidual, MabPlusX, FfnOut, FfnPlusH: TNNetLayer;
+  d_model: integer;
+begin
+  SetLayer := GetLastLayer();
+  if SetLayer.Output.SizeY <> 1 then
+    FErrorProc('AddSAB requires a (N,1,d) set (SizeY=1). SizeY=' +
+      IntToStr(SetLayer.Output.SizeY));
+  if Heads < 1 then
+    FErrorProc('AddSAB requires Heads >= 1. Got ' + IntToStr(Heads));
+  d_model := SetLayer.Output.Depth;
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddSAB requires d_model divisible by Heads. d_model=' +
+      IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  // Attention sublayer (post-norm residual): H = LayerNorm(X + MAB(X, X)).
+  // MAB is the shape-preserving (N,1,d_model) multi-head ISAB block. We wire
+  // the residual inline (not via AddPostNormResidual) because the MAB sublayer
+  // forks into many branches from X via AddLayerAfter, which the array-of-layers
+  // residual helper cannot express.
+  MabOut := AddInducedSetAttention(InducingPoints, Heads);
+  MabPlusX := AddLayer( TNNetSum.Create([MabOut, SetLayer]) );
+  AttnResidual := AddLayer( TNNetLayerNorm.Create() );
+  // Row-wise FFN sublayer (post-norm residual): out = LayerNorm(H + FFN(H)).
+  // FFN is a token-wise 2-layer MLP over the Depth axis (1x1 convs preserve the
+  // (N,1,*) set axis and keep the exact per-token input gradient).
+  AddLayer( TNNetPointwiseConvReLU.Create(DFF, 1) );
+  FfnOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model, 1) );
+  FfnPlusH := AddLayer( TNNetSum.Create([FfnOut, AttnResidual]) );
+  Result := AddLayer( TNNetLayerNorm.Create() );
 end;
 
 function TNNet.AddProductKeyMemory(NumKeys, ValueDim, TopK,

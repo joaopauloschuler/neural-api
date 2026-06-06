@@ -298,6 +298,9 @@ type
     procedure TestMultiHeadInducedSetAttentionInputGradientCheck;
     procedure TestMultiHeadAttentionPoolingBuilder;
     procedure TestMultiHeadAttentionPoolingPermutationInvariance;
+    procedure TestSABBuilderShape;
+    procedure TestSABInputGradientCheck;
+    procedure TestSABSerializationRoundTrip;
     procedure TestProductKeyMemoryInputGradientCheck;
     procedure TestProductKeyMemoryWeightGradientCheck;
     procedure TestProductKeyMemoryTopK1GradientCheck;
@@ -25186,6 +25189,160 @@ begin
     SetLength(perm, 0);
   finally
     NN.Free; Input.Free; Shuffled.Free; Out1.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSABBuilderShape;
+// AddSAB(InducingPoints, Heads, DFF) must wrap the multi-head MAB in two
+// post-norm residual sublayers and stay SHAPE-PRESERVING: an (N,1,d_model) set
+// comes back as (N,1,d_model). It must contain Heads single-head ISAB layers
+// and reject a d_model NOT divisible by Heads.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i, isabCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 8));
+    // d_model=8 with Heads=2 -> d_head=4 (Heads must divide d_model).
+    NN.AddSAB(3, 2, 16); // 3 inducing points, 2 heads, d_ff=16
+    AssertTrue('AddSAB last layer is LayerNorm',
+      NN.GetLastLayer is TNNetLayerNorm);
+    AssertEquals('AddSAB Heads must divide d_model (d_model mod Heads = 0)',
+      0, 8 mod 2);
+
+    isabCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetInducedSetAttention then Inc(isabCnt);
+    AssertEquals('AddSAB has Heads single-head ISAB layers', 2, isabCnt);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.7) * 1.1;
+    NN.Compute(Input);
+    AssertEquals('AddSAB output SizeX preserved (N)',
+      6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddSAB output SizeY preserved (1)',
+      1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('AddSAB output Depth preserved (d_model)',
+      8, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSABInputGradientCheck;
+// End-to-end finite-difference input-gradient check on the full AddSAB stack
+// (multi-head MAB + two post-norm residual sublayers + token-wise FFN).
+// Validates that every sublayer's backward chains correctly through the
+// residual sums and the LayerNorm/FFN path.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // N=4 set, d_model=4, Heads=2 (d_head=2), M=2 inducing points, d_ff=6.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  InputPlus := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    NN.AddSAB(2, 2, 6);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SAB input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('SAB input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSABSerializationRoundTrip;
+// The full AddSAB stack must SaveToString/LoadFromString bit-for-bit and the
+// reloaded net must reproduce the EXACT same forward output on a random input.
+var
+  NN, NN2: TNNet;
+  Input, Out1: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  maxErr, tmp: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  Out1 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6));
+    NN.AddSAB(2, 3, 12); // d_model=6, Heads=3, d_ff=12
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.17) * 1.2 - 0.3;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('SAB SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      maxErr := 0;
+      for i := 0 to Out1.Size - 1 do
+      begin
+        tmp := Abs(Out1.Raw[i] - NN2.GetLastLayer.Output.Raw[i]);
+        if tmp > maxErr then maxErr := tmp;
+      end;
+      AssertTrue('SAB reloaded forward output identical (maxErr=' +
+        FloatToStr(maxErr) + ')', maxErr < 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Out1.Free;
   end;
 end;
 

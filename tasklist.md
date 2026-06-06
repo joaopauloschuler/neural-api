@@ -227,20 +227,6 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [ ] Set Transformer SAB-block follow-up (residual + FFN around the MAB): the
-      multi-head + learnable-projection MAB landed (`AddInducedSetAttention` /
-      `AddAttentionPooling` with `Heads>1` now build a genuine multi-head MAB:
-      per-head learnable input projection -> single-head ISAB/PMA with its own
-      bank -> DeepConcat -> learnable out-projection; `Heads=1` keeps the bare v1
-      layer). STILL OPEN: the paper's full SAB wraps the MAB in
-      `LayerNorm(X + MAB(...))` then a row-wise feed-forward
-      `LayerNorm(H + FFN(H))`. Add an opt-in `Residual`/`UseFFN` flag (or a new
-      `AddSAB` builder) that wraps the existing multi-head MAB output in a
-      pre/post-norm residual + a token-wise FFN (PointwiseConv up/down, NOT
-      FullConnect — keeps the (N,1,*) set axis). NOTE: the ISAB residual is only
-      legal when output shape == input shape (true for ISAB, NOT for PMA which
-      changes N->k, so the residual applies to ISAB only / the PMA query bank).
-      Add shape + input-gradient + save/load tests; reseed `RandSeed := 424242`.
 - [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
       landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
       per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load
