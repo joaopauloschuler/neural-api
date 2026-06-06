@@ -450,6 +450,9 @@ type
     procedure TestWingLossForwardPassthrough;
     procedure TestWingLossGradient;
     procedure TestWingLossLoadFromString;
+    procedure TestMixtureDensityForwardTransform;
+    procedure TestMixtureDensityGradient;
+    procedure TestMixtureDensitySampleAndLoadFromString;
     procedure TestLabelSmoothingLossForwardPassthrough;
     procedure TestLabelSmoothingLossTransform;
     procedure TestLabelSmoothingLossLoadFromString;
@@ -29684,6 +29687,230 @@ begin
     NN2.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMixtureDensityForwardTransform;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  OutV: TNNetVolume;
+  i, kk: integer;
+  SumPi, Sigma: TNeuralFloat;
+begin
+  // K=3 components over D=2 -> depth = 3*(1+2*2) = 15.
+  // Forward must transform: pi=softmax (sum to 1, in (0,1)), sigma=softplus>0,
+  // means untouched.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 15);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 15, 1));
+    NN.AddLayer(TNNetMixtureDensity.Create(3, 2));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 1.5 - 0.3;
+    NN.Compute(Input);
+    OutV := NN.GetLastLayer.Output;
+    // Mixing weights (channels 0..2) sum to 1 and lie in (0,1).
+    SumPi := 0;
+    for kk := 0 to 2 do
+    begin
+      AssertTrue('pi in (0,1) at ' + IntToStr(kk),
+        (OutV.Raw[kk] > 0) and (OutV.Raw[kk] < 1));
+      SumPi := SumPi + OutV.Raw[kk];
+    end;
+    AssertEquals('mixing weights sum to 1', 1.0, SumPi, 1e-5);
+    // Means (channels 3..8) are untransformed.
+    for i := 3 to 8 do
+      AssertEquals('mean passthrough at ' + IntToStr(i),
+        Input.Raw[i], OutV.Raw[i], 1e-5);
+    // Scales (channels 9..14) = softplus(raw) > 0.
+    for i := 9 to 14 do
+    begin
+      Sigma := Ln(1 + Exp(Input.Raw[i]));
+      AssertTrue('sigma > 0 at ' + IntToStr(i), OutV.Raw[i] > 0);
+      AssertEquals('sigma = softplus(raw) at ' + IntToStr(i),
+        Sigma, OutV.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMixtureDensityGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  MD: TNNetMixtureDensity;
+  Yt: array[0..1] of TNeuralFloat;
+  AnaGrad, NumGrad, OldP, LossP, LossM, Eps: TNeuralFloat;
+  i, Kc, Dim, Depth: integer;
+
+  // NLL of the mixture as a function of the RAW parameters (Input here, since
+  // the previous layer is identity). Recomputes the softmax/softplus transform
+  // exactly as Compute does, then the stable log-sum-exp NLL of Yt.
+  function MixNLL(ARaw: TNNetVolume): TNeuralFloat;
+  var
+    j, dd, BaseMu, BaseS: integer;
+    MaxLogit, SumExp, MaxB: TNeuralFloat;
+    PiArr, LogComp: array of TNeuralFloat;
+    Mu, Sigma, Diff, RawS: TNeuralFloat;
+  const
+    cLog2Pi = 1.8378770664093453;
+  begin
+    BaseMu := Kc;
+    BaseS := Kc + Kc * Dim;
+    SetLength(PiArr, Kc);
+    SetLength(LogComp, Kc);
+    // softmax over first Kc channels
+    MaxLogit := ARaw.Raw[0];
+    for j := 1 to Kc - 1 do
+      if ARaw.Raw[j] > MaxLogit then MaxLogit := ARaw.Raw[j];
+    SumExp := 0;
+    for j := 0 to Kc - 1 do
+    begin
+      PiArr[j] := Exp(ARaw.Raw[j] - MaxLogit);
+      SumExp := SumExp + PiArr[j];
+    end;
+    for j := 0 to Kc - 1 do PiArr[j] := PiArr[j] / SumExp;
+    // log-components
+    MaxB := -1e30;
+    for j := 0 to Kc - 1 do
+    begin
+      LogComp[j] := Ln(PiArr[j] + 1e-30);
+      for dd := 0 to Dim - 1 do
+      begin
+        Mu := ARaw.Raw[BaseMu + j * Dim + dd];
+        RawS := ARaw.Raw[BaseS + j * Dim + dd];
+        Sigma := Ln(1 + Exp(RawS));
+        Diff := Yt[dd] - Mu;
+        LogComp[j] := LogComp[j] -
+          (0.5 * cLog2Pi + Ln(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
+      end;
+      if LogComp[j] > MaxB then MaxB := LogComp[j];
+    end;
+    SumExp := 0;
+    for j := 0 to Kc - 1 do SumExp := SumExp + Exp(LogComp[j] - MaxB);
+    Result := -(MaxB + Ln(SumExp));
+  end;
+
+begin
+  // Reseed to make the (unused-here) RNG state deterministic and avoid the
+  // shared-RNG ordering sensitivity documented for this file.
+  RandSeed := 424242;
+  Kc := 3;
+  Dim := 2;
+  Depth := Kc * (1 + 2 * Dim); // 15
+  Yt[0] := 0.4;
+  Yt[1] := -0.7;
+  Eps := 1e-3;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, Depth);
+  Target := TNNetVolume.Create(1, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Depth, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    MD := TNNetMixtureDensity.Create(Kc, Dim);
+    NN.AddLayer(MD);
+
+    // Well-separated raw params so all components carry meaningful
+    // responsibility (avoids a degenerate near-zero gamma where the FD step
+    // straddles a flat region).
+    Input.Raw[0] :=  0.5; Input.Raw[1] := -0.2; Input.Raw[2] := 0.1; // logits
+    Input.Raw[3] :=  0.3; Input.Raw[4] := -0.5; // mu_0
+    Input.Raw[5] := -0.6; Input.Raw[6] :=  0.8; // mu_1
+    Input.Raw[7] :=  0.9; Input.Raw[8] := -0.1; // mu_2
+    Input.Raw[9]  := 0.2; Input.Raw[10] := 0.4; // raw s_0
+    Input.Raw[11] := 0.1; Input.Raw[12] := 0.6; // raw s_1
+    Input.Raw[13] := 0.5; Input.Raw[14] := 0.3; // raw s_2
+
+    NN.Compute(Input);
+    // The framework seeds FOutputError := output - target, and the head recovers
+    // the regression target as y = output - FOutputError = target (first D
+    // channels). So the target's first D channels must hold Yt directly; the
+    // remaining channels are don't-care (set them equal to output so their
+    // seeded residual is 0 and only the first D drive the recovery).
+    Target.Copy(NN.GetLastLayer.Output);
+    for i := 0 to Dim - 1 do
+      Target.Raw[i] := Yt[i];
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + Eps;
+      LossP := MixNLL(Input);
+      Input.Raw[i] := OldP - Eps;
+      LossM := MixNLL(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * Eps);
+      AssertEquals('MixtureDensity grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMixtureDensitySampleAndLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  MD: TNNetMixtureDensity;
+  Saved: string;
+  Sample: array[0..1] of TNeuralFloat;
+  i, n, hits: integer;
+  Mean: TNeuralFloat;
+begin
+  // Save/Load must preserve K (FStruct[0]) and D (FStruct[1]).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 15);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 15, 1));
+    NN.AddLayer(TNNetMixtureDensity.Create(3, 2));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetMixtureDensity',
+      NN2.GetLastLayer is TNNetMixtureDensity);
+    MD := NN2.GetLastLayer as TNNetMixtureDensity;
+    AssertEquals('Loaded K', 3, MD.ComponentCount());
+    AssertEquals('Loaded D', 2, MD.TargetDimension());
+
+    // Build params with a single dominant component (pi ~ [~0,~1,~0]) whose
+    // mean is (5, -3) and tiny sigma, so samples concentrate near that mean.
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0;
+    Input.Raw[1] := 10.0;        // logit for component 1 huge -> pi_1 ~ 1
+    Input.Raw[3 + 1 * 2 + 0] := 5.0;   // mu_1,0
+    Input.Raw[3 + 1 * 2 + 1] := -3.0;  // mu_1,1
+    // raw scales 0 -> sigma = softplus(0) = ln2 ~ 0.693 for all (small enough)
+    NN2.Compute(Input);
+
+    hits := 0;
+    Mean := 0;
+    for n := 0 to 199 do
+    begin
+      MD.SampleMixture(Sample, 0, 0);
+      Mean := Mean + Sample[0];
+      if (Abs(Sample[0] - 5.0) < 3.0) and (Abs(Sample[1] + 3.0) < 3.0) then
+        Inc(hits);
+    end;
+    Mean := Mean / 200;
+    AssertTrue('most samples near dominant component mean (hits=' +
+      IntToStr(hits) + ')', hits > 180);
+    AssertEquals('sample mean ~ mu_1,0', 5.0, Mean, 0.5);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
   end;
 end;
 

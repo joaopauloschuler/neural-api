@@ -1935,6 +1935,68 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Mixture Density Network output head (Bishop 1994, "Mixture Density
+  // Networks"). Turns the previous layer's raw output into the parameters of a
+  // K-component diagonal-Gaussian mixture over a D-dimensional target and OWNS
+  // the negative-log-likelihood (NLL) loss of the target under that mixture.
+  // The previous layer must produce exactly K*(1 + 2*D) raw channels, packed
+  // per spatial cell as:
+  //   [ a_0 .. a_{K-1} | mu_0,0 .. mu_{K-1,D-1} | s_0,0 .. s_{K-1,D-1} ]
+  // i.e. K mixing logits a_k, then K*D means mu_{k,d}, then K*D raw scales
+  // s_{k,d}. Forward (Compute) TRANSFORMS the raw params in place so that
+  // Net.Compute returns USABLE mixture parameters at inference:
+  //   pi_k    = softmax_k(a)             (mixing weights, sum to 1)
+  //   mu_{k,d}= mu_{k,d}                 (means, untransformed)
+  //   sigma_{k,d} = softplus(s_{k,d}) = ln(1+exp(s_{k,d}))   (positive scales)
+  // (softplus is chosen over exp for numerical robustness; documented here.)
+  // K is stored in FStruct[0] and D in FStruct[1]; both round-trip via
+  // Save/Load. No trainable params of its own (the parameters come from the
+  // previous layer).
+  //
+  // Training: the framework seeds FOutputError := output - target where target
+  // is a full K*(1+2D) volume; this head reads the D-dimensional regression
+  // target y from the FIRST D channels of the recovered target
+  // (y_d = output[d] - FOutputError[d], d = 0..D-1) and ignores the remaining
+  // target channels (so a caller only needs to fill the first D target
+  // entries). Backpropagate OVERWRITES the whole FOutputError with the EXACT
+  // gradient of the NLL w.r.t. the RAW parameters (chaining through the
+  // softmax/softplus transforms), using the numerically-stable log-sum-exp
+  // form over components. With responsibilities
+  //   gamma_k = softmax_k( log pi_k + log N(y|mu_k,sigma_k) ),
+  //   dNLL/da_k    = pi_k - gamma_k
+  //   dNLL/dmu_{k,d} = gamma_k * (mu_{k,d} - y_d) / sigma_{k,d}^2
+  //   dNLL/ds_{k,d}  = gamma_k * (1/sigma_{k,d} - (y_d-mu_{k,d})^2/sigma_{k,d}^3)
+  //                    * sigmoid(s_{k,d})        (softplus chain term)
+  // The stored gradient is the +gradient so the optimizer descends the NLL,
+  // matching the sign convention of the sibling loss heads.
+  //
+  // Inference helper: SampleMixture draws one D-dim sample from the predicted
+  // mixture for one spatial cell (pick a component by its pi weights, then
+  // sample that diagonal Gaussian via a Box-Muller normal deviate).
+  // Coded by Claude (AI).
+  TNNetMixtureDensity = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(NumComponents, TargetDim: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Number of mixture components K and target dimension D.
+    function ComponentCount(): integer;
+    function TargetDimension(): integer;
+    // Negative log-likelihood of target y (D values) under the mixture
+    // parameters currently in FOutput at spatial cell (X,Y). Reads the
+    // already-transformed (pi, mu, sigma) params; used by tests / monitoring.
+    function MixtureNLL(const yTarget: array of TNeuralFloat; X: integer = 0;
+      Y: integer = 0): TNeuralFloat;
+    // Draw one D-dim sample from the predicted mixture at cell (X,Y).
+    // Reads the transformed params from FOutput, so call after Compute().
+    // The result array is (re)sized to D.
+    procedure SampleMixture(var Sample: array of TNeuralFloat;
+      X: integer = 0; Y: integer = 0);
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -15344,6 +15406,265 @@ begin
     UpdateWeights();
     AfterWeightUpdate();
   end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetMixtureDensity }
+
+constructor TNNetMixtureDensity.Create();
+begin
+  // Default: K = 2 mixture components over a D = 1 dimensional target.
+  Create(2, 1);
+end;
+
+constructor TNNetMixtureDensity.Create(NumComponents, TargetDim: integer);
+begin
+  inherited Create();
+  if NumComponents < 1 then
+    FErrorProc('TNNetMixtureDensity number of components must be >= 1.');
+  if TargetDim < 1 then
+    FErrorProc('TNNetMixtureDensity target dimension must be >= 1.');
+  FStruct[0] := NumComponents;
+  FStruct[1] := TargetDim;
+end;
+
+procedure TNNetMixtureDensity.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Kcomp, Dim, Expected: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Kcomp := FStruct[0];
+  Dim := FStruct[1];
+  if Kcomp < 1 then
+    FErrorProc('TNNetMixtureDensity number of components must be >= 1.');
+  if Dim < 1 then
+    FErrorProc('TNNetMixtureDensity target dimension must be >= 1.');
+  Expected := Kcomp * (1 + 2 * Dim);
+  if pPrevLayer.FOutput.Depth <> Expected then
+    FErrorProc('TNNetMixtureDensity requires input depth = K*(1+2*D) = ' +
+      IntToStr(Expected) + ' (K=' + IntToStr(Kcomp) + ', D=' + IntToStr(Dim) +
+      '), got ' + IntToStr(pPrevLayer.FOutput.Depth) + '.');
+end;
+
+function TNNetMixtureDensity.ComponentCount(): integer;
+begin
+  Result := FStruct[0];
+end;
+
+function TNNetMixtureDensity.TargetDimension(): integer;
+begin
+  Result := FStruct[1];
+end;
+
+procedure TNNetMixtureDensity.Compute();
+var
+  StartTime: double;
+  Kcomp, Dim, X, Y, kk, dd, MaxX, MaxY, BaseS: integer;
+  MaxLogit, SumExp, Ex, RawS: TNeuralFloat;
+begin
+  StartTime := Now();
+  // Start from the raw parameter vector (identity passthrough), then transform
+  // the mixing logits (softmax) and raw scales (softplus) in place.
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Kcomp := FStruct[0];
+  Dim := FStruct[1];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  BaseS := Kcomp + Kcomp * Dim; // start of the K*D raw-scale block
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      // Mixing weights: numerically-stable softmax over the first K channels.
+      MaxLogit := FOutput[X, Y, 0];
+      for kk := 1 to Kcomp - 1 do
+        if FOutput[X, Y, kk] > MaxLogit then MaxLogit := FOutput[X, Y, kk];
+      SumExp := 0;
+      for kk := 0 to Kcomp - 1 do
+      begin
+        Ex := Exp(FOutput[X, Y, kk] - MaxLogit);
+        FOutput[X, Y, kk] := Ex;
+        SumExp := SumExp + Ex;
+      end;
+      if SumExp <= 0 then SumExp := 1e-30;
+      for kk := 0 to Kcomp - 1 do
+        FOutput[X, Y, kk] := FOutput[X, Y, kk] / SumExp;
+      // Means (channels K .. K+K*D-1) are left untransformed.
+      // Scales: softplus over the last K*D channels -> strictly positive sigma.
+      for dd := 0 to Kcomp * Dim - 1 do
+      begin
+        RawS := FOutput[X, Y, BaseS + dd];
+        // softplus(s) = ln(1+exp(s)); guard the exp for large s (== s there).
+        if RawS > 30 then
+          FOutput[X, Y, BaseS + dd] := RawS
+        else
+          FOutput[X, Y, BaseS + dd] := Ln(1 + Exp(RawS));
+      end;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+function TNNetMixtureDensity.MixtureNLL(const yTarget: array of TNeuralFloat;
+  X: integer = 0; Y: integer = 0): TNeuralFloat;
+var
+  Kcomp, Dim, kk, dd, BaseMu, BaseS: integer;
+  LogPi, Sigma, Mu, Diff, MaxB, SumExp: TNeuralFloat;
+  LogComp: array of TNeuralFloat;
+const
+  cLog2Pi = 1.8378770664093453; // ln(2*pi)
+  cSigEps = 1e-6;
+begin
+  Kcomp := FStruct[0];
+  Dim := FStruct[1];
+  BaseMu := Kcomp;
+  BaseS := Kcomp + Kcomp * Dim;
+  SetLength(LogComp, Kcomp);
+  MaxB := -1e30;
+  for kk := 0 to Kcomp - 1 do
+  begin
+    LogPi := Ln(FOutput[X, Y, kk] + 1e-30);
+    LogComp[kk] := LogPi;
+    for dd := 0 to Dim - 1 do
+    begin
+      Mu := FOutput[X, Y, BaseMu + kk * Dim + dd];
+      Sigma := FOutput[X, Y, BaseS + kk * Dim + dd];
+      if Sigma < cSigEps then Sigma := cSigEps;
+      Diff := yTarget[dd] - Mu;
+      LogComp[kk] := LogComp[kk] -
+        (0.5 * cLog2Pi + Ln(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
+    end;
+    if LogComp[kk] > MaxB then MaxB := LogComp[kk];
+  end;
+  SumExp := 0;
+  for kk := 0 to Kcomp - 1 do
+    SumExp := SumExp + Exp(LogComp[kk] - MaxB);
+  Result := -(MaxB + Ln(SumExp));
+end;
+
+procedure TNNetMixtureDensity.SampleMixture(var Sample: array of TNeuralFloat;
+  X: integer = 0; Y: integer = 0);
+var
+  Kcomp, Dim, kk, dd, Chosen, BaseMu, BaseS: integer;
+  R, Acc, Mu, Sigma: TNeuralFloat;
+begin
+  Kcomp := FStruct[0];
+  Dim := FStruct[1];
+  BaseMu := Kcomp;
+  BaseS := Kcomp + Kcomp * Dim;
+  // Pick a component by its (transformed) mixing weights.
+  R := Random;
+  Acc := 0;
+  Chosen := Kcomp - 1;
+  for kk := 0 to Kcomp - 1 do
+  begin
+    Acc := Acc + FOutput[X, Y, kk];
+    if R <= Acc then
+    begin
+      Chosen := kk;
+      break;
+    end;
+  end;
+  // Sample the chosen diagonal Gaussian.
+  for dd := 0 to Dim - 1 do
+  begin
+    if dd > High(Sample) then break;
+    Mu := FOutput[X, Y, BaseMu + Chosen * Dim + dd];
+    Sigma := FOutput[X, Y, BaseS + Chosen * Dim + dd];
+    Sample[dd] := Mu + Sigma * FOutput.RandomGaussianValue();
+  end;
+end;
+
+procedure TNNetMixtureDensity.Backpropagate();
+var
+  StartTime: double;
+  Kcomp, Dim, X, Y, kk, dd, MaxX, MaxY, BaseMu, BaseS: integer;
+  LogPi, Sigma, Mu, Diff, MaxB, SumExp, RawS, SigmoidS: TNeuralFloat;
+  Gamma, Pi_k, InvS2, GMu, GSigma: TNeuralFloat;
+  Yt, LogComp, GammaArr, PiArr: array of TNeuralFloat;
+const
+  cLog2Pi = 1.8378770664093453; // ln(2*pi)
+  cSigEps = 1e-6;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Kcomp := FStruct[0];
+  Dim := FStruct[1];
+  BaseMu := Kcomp;
+  BaseS := Kcomp + Kcomp * Dim;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  SetLength(Yt, Dim);
+  SetLength(LogComp, Kcomp);
+  SetLength(GammaArr, Kcomp);
+  SetLength(PiArr, Kcomp);
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      // Recover the D-dim regression target from the first D channels:
+      // framework seeded FOutputError := output - target.
+      for dd := 0 to Dim - 1 do
+        Yt[dd] := FOutput[X, Y, dd] - FOutputError[X, Y, dd];
+      // Log-responsibilities (stable log-sum-exp over components).
+      MaxB := -1e30;
+      for kk := 0 to Kcomp - 1 do
+      begin
+        Pi_k := FOutput[X, Y, kk];
+        PiArr[kk] := Pi_k;
+        LogPi := Ln(Pi_k + 1e-30);
+        LogComp[kk] := LogPi;
+        for dd := 0 to Dim - 1 do
+        begin
+          Mu := FOutput[X, Y, BaseMu + kk * Dim + dd];
+          Sigma := FOutput[X, Y, BaseS + kk * Dim + dd];
+          if Sigma < cSigEps then Sigma := cSigEps;
+          Diff := Yt[dd] - Mu;
+          LogComp[kk] := LogComp[kk] -
+            (0.5 * cLog2Pi + Ln(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
+        end;
+        if LogComp[kk] > MaxB then MaxB := LogComp[kk];
+      end;
+      SumExp := 0;
+      for kk := 0 to Kcomp - 1 do
+      begin
+        GammaArr[kk] := Exp(LogComp[kk] - MaxB);
+        SumExp := SumExp + GammaArr[kk];
+      end;
+      if SumExp <= 0 then SumExp := 1e-30;
+      for kk := 0 to Kcomp - 1 do
+        GammaArr[kk] := GammaArr[kk] / SumExp;
+      // Write the exact dNLL/d(raw param) into FOutputError.
+      for kk := 0 to Kcomp - 1 do
+      begin
+        Gamma := GammaArr[kk];
+        Pi_k := PiArr[kk];
+        // Mixing logit: dNLL/da_k = pi_k - gamma_k.
+        FOutputError[X, Y, kk] := Pi_k - Gamma;
+        for dd := 0 to Dim - 1 do
+        begin
+          Mu := FOutput[X, Y, BaseMu + kk * Dim + dd];
+          Sigma := FOutput[X, Y, BaseS + kk * Dim + dd];
+          if Sigma < cSigEps then Sigma := cSigEps;
+          Diff := Yt[dd] - Mu;
+          InvS2 := 1 / (Sigma * Sigma);
+          // Mean: dNLL/dmu = gamma * (mu - y) / sigma^2.
+          GMu := Gamma * (Mu - Yt[dd]) * InvS2;
+          FOutputError[X, Y, BaseMu + kk * Dim + dd] := GMu;
+          // Scale: dNLL/dsigma = gamma*(1/sigma - diff^2/sigma^3); then chain
+          // softplus' = sigmoid(rawS), rawS recovered as sigmoid via sigma.
+          GSigma := Gamma * (1 / Sigma - (Diff * Diff) * InvS2 / Sigma);
+          // softplus: sigma = ln(1+exp(rawS)) => exp(rawS) = exp(sigma)-1,
+          // sigmoid(rawS) = (exp(sigma)-1)/exp(sigma) = 1 - exp(-sigma).
+          SigmoidS := 1 - Exp(-Sigma);
+          // (equivalently recompute from the raw input for large-s safety)
+          RawS := FPrevLayer.FOutput[X, Y, BaseS + kk * Dim + dd];
+          if RawS > 30 then SigmoidS := 1
+          else SigmoidS := 1 / (1 + Exp(-RawS));
+          FOutputError[X, Y, BaseS + kk * Dim + dd] := GSigma * SigmoidS;
+        end;
+      end;
+    end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -64186,6 +64507,7 @@ begin
       'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
+      'TNNetMixtureDensity' :       Result := TNNetMixtureDensity.Create(St[0], St[1]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
       'TNNetL2Normalize' :          Result := TNNetL2Normalize.Create(St[0], Ft[0]);
@@ -64516,6 +64838,7 @@ begin
       if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
+      if S[0] = 'TNNetMixtureDensity' then Result := TNNetMixtureDensity.Create(St[0], St[1]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetL2Normalize' then Result := TNNetL2Normalize.Create(St[0], Ft[0]) else
