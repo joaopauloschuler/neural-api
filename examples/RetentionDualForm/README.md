@@ -60,6 +60,10 @@ fp tolerance (`1e-4`, single precision) the program `Halt(1)`s — in the style 
 // Single layer (one head), gamma fixed:
 NN.AddLayer(TNNetRetention.Create(d_k, {gamma=}0.90));
 
+// Single layer with a LEARNABLE gamma (gamma = sigmoid(raw), raw a trained
+// scalar weight; effective decay always in (0,1) under plain SGD):
+NN.AddLayer(TNNetRetention.Create(d_k, {init gamma=}0.90, {LearnGamma=}true));
+
 // Multi-head builder over a (SeqLen,1,3*d_model) Q|K|V slab:
 //   per-head split -> per-head TNNetRetention -> concat -> pointwise out-proj.
 // One gamma per head, following the paper's geometric schedule
@@ -68,14 +72,27 @@ NN.AddRetention(d_model, Heads {, GammaMinExp});
 ```
 
 `TNNetRetention` reuses the same `Q|K|V` depth-slab convention as
-`TNNetScaledDotProductAttention` (input depth `3*d_k`, `SizeY=1`). It has no
-trainable parameters; `d_k` is stored in `FStruct[0]` and `γ` in `FFloatSt[0]`
-so it round-trips through save/load.
+`TNNetScaledDotProductAttention` (input depth `3*d_k`, `SizeY=1`). `d_k` is
+stored in `FStruct[0]`, the `LearnGamma` flag in `FStruct[1]`, and `γ` in
+`FFloatSt[0]` so it round-trips through save/load. With the fixed-gamma default
+it has NO trainable parameters; with `LearnGamma:=true` it has exactly one — the
+raw pre-sigmoid scalar in `FNeurons[0]`, stepped by the standard optimizer and
+serialized through the per-neuron save/load (init `raw = logit(γ)` so the
+effective decay starts at the requested value).
 
-## Honest v1 scope
+## Learnable-gamma arm
 
-- **γ is a fixed constant**, not learned (the paper's geometric per-head
-  schedule). Learning γ via direct gradient is a logged follow-up.
+The program's second arm initialises gamma DELIBERATELY WRONG (0.50, well below
+the ~0.90 decay the copy task rewards) on a `LearnGamma:=true` head and trains.
+Backward accumulates `dL/dγ` through `D[n,m]=γ^(n-m)` (using
+`d/dγ γ^k = k·γ^(k-1)`) then chains the sigmoid (`dγ/draw = γ(1−γ)`), so the
+unconstrained raw scalar is updated while the effective decay stays inside
+`(0,1)`. A `Halt(1)` gate asserts gamma moved UP from 0.50 (observed ≈0.78).
+
+## Honest scope
+
+- The MAIN arm uses a fixed gamma (the paper's geometric per-head schedule); the
+  separate learnable-gamma arm above exercises the gradient-learned variant.
 - **Only the parallel + naive-recurrent forms ship.** The chunkwise-recurrent
   hybrid (a throughput optimisation, not a new capability) is skipped.
 - The demo uses a **single head** so the hand-rolled recurrent replay is simple;

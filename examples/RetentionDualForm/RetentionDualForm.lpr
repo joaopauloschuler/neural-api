@@ -38,8 +38,10 @@ to the parallel TNNetRetention.Output. If the max abs difference exceeds an fp
 tolerance the program Halt(1)s.
 
 HONEST v1 SCOPE (like the Grokking / SpeculativeDecoding READMEs).
-  - gamma is a FIXED per-head constant (the paper's geometric schedule across
-    heads). Learning gamma via direct gradient is a logged follow-up.
+  - The main arm uses a FIXED per-head gamma (the paper's geometric schedule
+    across heads). A second LEARNABLE-GAMMA arm at the end shows the follow-up:
+    TNNetRetention.Create(..., LearnGamma:=true) makes gamma=sigmoid(raw) a
+    trained scalar; we init it wrong (0.50) and watch gradient move it up.
   - Only the parallel + naive-recurrent forms ship. The chunkwise-recurrent
     hybrid (a throughput optimisation, not a new capability) is skipped.
   - Single head here keeps the hand-rolled recurrent replay simple; the
@@ -264,6 +266,62 @@ begin
 
   InputV.Free; TargetV.Free; NN.Free;
 
+  // ===================================================================
+  // LEARNABLE-GAMMA ARM (the logged follow-up: learn gamma by gradient).
+  // -------------------------------------------------------------------
+  // TNNetRetention's third Create argument LearnGamma=true stores an
+  // UNCONSTRAINED raw scalar (1 neuron weight) and uses gamma=sigmoid(raw),
+  // so the effective decay is always in (0,1) under plain SGD. Backward
+  // accumulates dL/dgamma through D[n,m]=gamma^(n-m) (d/dgamma gamma^k =
+  // k*gamma^(k-1)) and chains the sigmoid (dgamma/draw = gamma*(1-gamma)).
+  // Here we DELIBERATELY init gamma wrong (0.50, far below the cGamma=0.90
+  // schedule the task rewards) and show training moves it back up.
+  // ===================================================================
+  WriteLn;
+  WriteLn('--- Learnable-gamma arm: init gamma WRONG (0.50), train, watch it move ---');
+  RandSeed := cSeed;
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(cSeqLen, 1, 1));
+  NN.AddLayer(TNNetEmbedding.Create(cVocab, cDModel, 1));
+  NN.AddLayer(TNNetSinusoidalPositionalEmbedding.Create());
+  NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * cDModel));
+  // Single learnable-gamma retention head, init gamma = 0.50 (intentionally low).
+  RetLayer := NN.AddLayerAfter(
+    TNNetRetention.Create(cDModel, 0.50, {LearnGamma=}true), NN.GetLastLayer());
+  NN.AddLayer(TNNetPointwiseConvLinear.Create(cDFF));
+  NN.AddLayer(TNNetReLU.Create());
+  NN.AddLayer(TNNetPointwiseConvLinear.Create(cVocab));
+  NN.AddLayer(TNNetPointwiseSoftMax.Create(1));
+  NN.SetLearningRate(cLR, cInertia);
+  NN.SetL2Decay(0.0);
+
+  WriteLn(Format('Initial effective gamma = %.4f (raw = logit, learnable).',
+    [TNNetRetention(RetLayer).Gamma]));
+
+  InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
+  TargetV := TNNetVolume.Create(cSeqLen, 1, cVocab);
+  RandSeed := cSeed;
+  for Epoch := 1 to cEpochs do
+    for b := 1 to cBatch do
+    begin
+      MakeSeq(S);
+      FillPair(S, InputV, TargetV);
+      NN.Compute(InputV);
+      NN.Backpropagate(TargetV);
+    end;
+
+  RecOut := TNNetRetention(RetLayer).Gamma; // reuse RecOut as "final gamma"
+  WriteLn(Format('Final   effective gamma = %.4f (after %d epochs).',
+    [RecOut, cEpochs]));
+  if RecOut > 0.50 + 1e-3 then
+    WriteLn('[PASS] learnable gamma moved UP from 0.50 toward the rewarded decay.')
+  else
+    WriteLn('[NOTE] learnable gamma did not increase (still a valid (0,1) value).');
+
+  InputV.Free; TargetV.Free; NN.Free;
+
   // Mandatory equality gate (style of examples/SpeculativeDecoding).
   if not (MaxDiff < cGateTol) then Halt(1);
+  // Gate the learnable arm too: gamma must stay in (0,1) and have moved up.
+  if not (RecOut > 0.50 + 1e-3) then Halt(1);
 end.

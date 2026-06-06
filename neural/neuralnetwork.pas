@@ -2620,11 +2620,16 @@ type
   private
     FDk: integer;
     FGamma: TNeuralFloat;
+    FLearnGamma: boolean; // when true, gamma = sigmoid(raw weight) is trained
     FScore: TNNetVolume; // raw masked scores (Q.K^T) (.) D, [X=key m, Y=query n, 1]
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Effective decay: fixed FGamma, or sigmoid(FNeurons[0].Weights[0]) when learned.
+    function EffectiveGamma(): TNeuralFloat;
   public
-    constructor Create(d_k: integer; pGamma: TNeuralFloat = 0.96); overload;
+    constructor Create(d_k: integer; pGamma: TNeuralFloat = 0.96;
+      pLearnGamma: boolean = false); overload;
     destructor Destroy(); override;
+    procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     // Read-only access to the decay-masked score matrix populated by Compute().
@@ -2632,7 +2637,10 @@ type
     // triangle (m<=n) holds (Q[n].K[m])*gamma^(n-m), the strict upper triangle 0.
     property RetentionScores: TNNetVolume read FScore;
     property Dk: integer read FDk;
-    property Gamma: TNeuralFloat read FGamma;
+    // The EFFECTIVE decay actually applied this forward pass (always in (0,1)).
+    // When LearnGamma it is sigmoid(raw); otherwise the fixed constructor value.
+    property Gamma: TNeuralFloat read EffectiveGamma;
+    property LearnGamma: boolean read FLearnGamma;
   end;
 
   /// Linear (kernelized / softmax-free) Attention, non-causal variant
@@ -15717,16 +15725,19 @@ end;
 
 { TNNetRetention }
 
-constructor TNNetRetention.Create(d_k: integer; pGamma: TNeuralFloat);
+constructor TNNetRetention.Create(d_k: integer; pGamma: TNeuralFloat;
+  pLearnGamma: boolean);
 begin
   inherited Create();
   FDk := d_k;
   FGamma := pGamma;
+  FLearnGamma := pLearnGamma;
   if FDk < 1 then
     FErrorProc('TNNetRetention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if (FGamma <= 0) or (FGamma >= 1) then
     FErrorProc('TNNetRetention requires gamma in (0,1). gamma=' + FloatToStr(FGamma));
   FStruct[0] := FDk;
+  if FLearnGamma then FStruct[1] := 1 else FStruct[1] := 0;
   FFloatSt[0] := FGamma;
   FScore := TNNetVolume.Create();
 end;
@@ -15735,6 +15746,27 @@ destructor TNNetRetention.Destroy();
 begin
   FScore.Free;
   inherited Destroy();
+end;
+
+function TNNetRetention.EffectiveGamma(): TNeuralFloat;
+begin
+  if FLearnGamma and (FNeurons.Count > 0) then
+    // gamma = sigmoid(raw): unconstrained raw weight -> decay always in (0,1).
+    Result := Sigmoid(FNeurons[0].FWeights.FData[0])
+  else
+    Result := FGamma;
+end;
+
+procedure TNNetRetention.InitDefault();
+begin
+  if not FLearnGamma then exit;
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  inherited InitDefault();
+  // Store the raw (pre-sigmoid) decay so sigmoid(raw) = FGamma, i.e. raw =
+  // logit(FGamma) = ln(gamma/(1-gamma)). The optimizer updates this unconstrained
+  // scalar while the effective decay stays inside (0,1).
+  FNeurons[0].FWeights.FData[0] := Ln(FGamma / (1.0 - FGamma));
+  AfterWeightUpdate();
 end;
 
 procedure TNNetRetention.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -15751,19 +15783,28 @@ begin
   FOutputErrorDeriv.ReSize(FOutput);
   // Score matrix: rows = queries (n), cols = keys (m). Use X=key, Y=query.
   FScore.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+  // One learnable raw scalar (gamma = sigmoid(raw)) lives in FNeurons[0], wired
+  // like TNNetReZero's alpha so it round-trips through the base neuron save/load
+  // and is stepped by the optimizer via UpdateWeights.
+  if FLearnGamma then
+  begin
+    SetNumWeightsForAllNeurons(1, 1, 1);
+    InitDefault();
+  end;
 end;
 
 procedure TNNetRetention.Compute();
 var
   StartTime: double;
   SeqLen, n, m, d: integer;
-  Decay, Dot: TNeuralFloat;
+  Decay, Dot, GammaVal: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  GammaVal := EffectiveGamma();
   // For each query row n: masked scores then decay-weighted sum of V.
   for n := 0 to SeqLen - 1 do
   begin
@@ -15784,7 +15825,7 @@ begin
       // out[n] += score[n,m] * V[m]; V contiguous along depth -> AVX MulAdd.
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(m, 0, 2 * FDk),
         FScore[m, n, 0], FDk);
-      Decay := Decay * FGamma;
+      Decay := Decay * GammaVal;
     end;
     // Strict upper triangle (m > n) is hard-masked to 0.
     for m := n + 1 to SeqLen - 1 do
@@ -15798,12 +15839,14 @@ var
   StartTime: double;
   SeqLen, n, m, d: integer;
   Prev, PrevErr: TNNetVolume;
-  Decay, dScoreNM, dS: TNeuralFloat;
+  Decay, dScoreNM, dS, GammaVal, gradGamma: TNeuralFloat;
   dScore: array of TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  GammaVal := EffectiveGamma();
+  gradGamma := 0; // dL/dgamma, accumulated over all (n,m) cells (learned case)
   if (FPrevLayer.Output.Size > 0) and
      (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
@@ -15827,10 +15870,10 @@ begin
           FOutputError.GetRawPtr(n, 0, 0), Prev.GetRawPtr(m, 0, 2 * FDk), FDk);
       end;
       // ---- dQ[n] and dK[m] through score[n,m] = D[n,m] * (Q[n].K[m]) ----
-      // The decay mask D[n,m] is a FIXED elementwise multiplier on the raw dot
-      // product, so dRawScore[n,m] = dScore[m] * D[n,m] (same structure as the
-      // SDPA backward but with the softmax Jacobian replaced by the constant D).
-      // dQ[n,d] += dRawScore[n,m] * K[m,d];  dK[m,d] += dRawScore[n,m] * Q[n,d].
+      // The decay mask D[n,m] is a FIXED (per forward pass) elementwise multiplier
+      // on the raw dot product, so dRawScore[n,m] = dScore[m] * D[n,m] (same
+      // structure as the SDPA backward but with the softmax Jacobian replaced by
+      // the constant D). dQ[n,d] += dRawScore[n,m]*K[m,d]; dK[m,d] += dRawScore*Q.
       Decay := 1.0; // gamma^(n-m), m = n downto 0
       for m := n downto 0 do
       begin
@@ -15843,11 +15886,35 @@ begin
           TNNetVolume.MulAdd(PrevErr.GetRawPtr(m, 0, FDk),
             Prev.GetRawPtr(n, 0, 0), dS, FDk);
         end;
-        Decay := Decay * FGamma;
+        // ---- dL/dgamma through D[n,m] = gamma^(n-m) ----
+        // d/dgamma gamma^k = k*gamma^(k-1), k=n-m. With rawDot = FScore/Decay and
+        // Decay = gamma^k, the cell contribution dScore[m]*rawDot*k*gamma^(k-1)
+        // simplifies to dScore[m]*FScore[m,n,0]*(n-m)/gamma (no extra Power()).
+        if FLearnGamma and (n > m) then
+          gradGamma := gradGamma +
+            dScore[m] * FScore[m, n, 0] * (n - m) / GammaVal;
+        Decay := Decay * GammaVal;
       end;
     end;
     SetLength(dScore, 0);
     FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if FLearnGamma and (FNeurons.Count > 0) then
+  begin
+    // Chain through gamma = sigmoid(raw): dgamma/draw = gamma*(1-gamma). Step the
+    // raw scalar like TNNetReZero (delta += -FLearningRate * dL/draw).
+    gradGamma := gradGamma * GammaVal * (1.0 - GammaVal);
+    FNeurons[0].FDelta.FData[0] := FNeurons[0].FDelta.FData[0] +
+      (-FLearningRate) * gradGamma;
+    if (not FBatchUpdate) then
+    begin
+      FNeurons[0].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
+    // Keep FFloatSt[0] in sync with the live effective gamma so the structure
+    // string also carries the current value (informational; reload uses the raw
+    // neuron weight via St[1]=1).
+    FFloatSt[0] := EffectiveGamma();
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
@@ -58094,7 +58161,7 @@ begin
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
-      'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0]);
+      'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
       'TNNetModernHopfield' :       Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
@@ -58407,7 +58474,7 @@ begin
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
-      if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else
       if S[0] = 'TNNetModernHopfield' then Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else

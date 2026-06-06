@@ -103,10 +103,12 @@ rather than acted on.
       (v1 uses damped Picard + output bounding, not guaranteed).
 
 - [ ] TNNetRetention follow-up (layer + TNNet.AddRetention builder +
-      examples/RetentionDualForm/ all landed): (a) learn gamma via a direct
-      gradient instead of the current fixed per-head constant; (b) the
-      chunkwise-recurrent hybrid form (a throughput optimisation skipped in v1 —
-      the parallel and naive-recurrent forms both landed).
+      examples/RetentionDualForm/ all landed; learnable-gamma variant
+      TNNetRetention.Create(d_k, gamma, LearnGamma:=true) — gamma=sigmoid(raw)
+      trained scalar — LANDED 2026-06-06 with gradient + serialization tests and
+      a learnable-gamma example arm). Remaining: the chunkwise-recurrent hybrid
+      form (a throughput optimisation skipped in v1 — the parallel and
+      naive-recurrent forms both landed).
 
 - [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
       + examples/HyperNetwork/ + two-path gradient tests + the

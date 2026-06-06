@@ -494,6 +494,8 @@ type
     procedure TestRetentionGradientCheck;
     procedure TestRetentionRecurrentEquivalence;
     procedure TestRetentionSerializationRoundTrip;
+    procedure TestRetentionLearnableGammaGradientCheck;
+    procedure TestRetentionLearnableGammaSerializationRoundTrip;
     procedure TestLinearAttentionGradientCheck;
     procedure TestLinearAttentionSeqLen1Degeneracy;
     procedure TestLinearAttentionSerializationRoundTrip;
@@ -12363,6 +12365,147 @@ begin
   // d_k = 4, gamma = 0.93. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetRetention.Create(4, 0.93),
     'Retention', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestRetentionLearnableGammaGradientCheck;
+// Learnable-gamma RetNet head: gamma = sigmoid(raw), raw the single weight of
+// neuron 0. Two checks in one block (shared RNG):
+//   (1) central-difference of the TRAINABLE raw scalar vs analytic -Delta[0]
+//       (delta accumulates -FLearningRate * dL/draw, batch update),
+//   (2) the INPUT gradient still checks out with the learnable variant.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Rtn: TNNetRetention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, MaxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242; // ordering-sensitive shared RNG (see memory note)
+  SeqLen := 4;
+  Dk := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  MaxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Rtn := TNNetRetention.Create(Dk, 0.9, {LearnGamma=}true);
+    NN.AddLayer(Rtn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Effective gamma must equal the constructor value at init (raw=logit(0.9)).
+    AssertTrue('Retention learnable effective gamma=' + FloatToStr(Rtn.Gamma),
+      Abs(Rtn.Gamma - 0.9) < 1e-5);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // (1) gamma raw-scalar gradient.
+    Rtn.Neurons[0].Weights.Raw[0] := Rtn.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    Rtn.Neurons[0].Weights.Raw[0] := Rtn.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    Rtn.Neurons[0].Weights.Raw[0] := Rtn.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    NN.Compute(Input);
+    Rtn.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -Rtn.Neurons[0].Delta.Raw[0];
+    WriteLn('  TestRetentionLearnableGammaGradientCheck raw num=',
+      numericalGrad:0:8, ' ana=', analyticalGrad:0:8);
+    AssertTrue('Retention gamma raw gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+
+    // (2) input gradient with the learnable variant present.
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > MaxErr then
+        MaxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Retention learnable input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestRetentionLearnableGammaGradientCheck max input grad error: ',
+      MaxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRetentionLearnableGammaSerializationRoundTrip;
+// save -> load -> save string equality, and the learned raw decay scalar
+// survives the round-trip (neuron weight + St[1]=1 learn flag).
+var
+  NN, NN2: TNNet;
+  Rtn, Rtn2: TNNetRetention;
+  Saved, Saved2: string;
+  RawVal: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Rtn := TNNetRetention.Create(4, 0.93, {LearnGamma=}true);
+    NN.AddLayer(Rtn);
+
+    // Move the raw scalar away from its init so we know the value round-trips.
+    Rtn.Neurons[0].Weights.Raw[0] := Rtn.Neurons[0].Weights.Raw[0] + 0.37;
+    RawVal := Rtn.Neurons[0].Weights.Raw[0];
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Retention learnable save->load->save string equality',
+        Saved, Saved2);
+
+      Rtn2 := NN2.Layers[1] as TNNetRetention;
+      AssertTrue('Retention learn flag survived round-trip', Rtn2.LearnGamma);
+      AssertEquals('Retention gamma raw survived round-trip', RawVal,
+        Rtn2.Neurons[0].Weights.Raw[0], 1e-6);
+      AssertEquals('Retention effective gamma matches', Rtn.Gamma,
+        Rtn2.Gamma, 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestSplitQKVHeadsForwardLayout;
