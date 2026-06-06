@@ -1541,3 +1541,40 @@ rather than acted on.
       smallest prefix does not dominate the gradient. Pairs naturally with
       the existing [[IntrinsicDimension]] / FeatureSeparability reports for
       reading how information is distributed across the coordinate axis.
+
+### Product-Key Memory layer (large sparse key-value memory)
+- [ ] `TNNetProductKeyMemory` — a large, sparsely-accessed key-value memory
+      layer (Lample et al., NeurIPS 2019, "Large Memory Layers with Product
+      Keys"). The point is a memory bank far too large to address with a flat
+      softmax: instead of one set of `|K|` keys, keep TWO small half-key
+      subsets `K1`, `K2` (each `sqrt(|K|)` keys of half-dimension), so the
+      effective key set is their Cartesian product `K1 x K2` of size
+      `sqrt(|K|)^2`. A query is split into two half-queries; each is scored
+      against its own half-key subset, the top-`k` per half are taken, and the
+      `k x k` candidate combinations are re-scored to pick the global top-`k`
+      product keys in `O(sqrt(|K|))` work instead of `O(|K|)`. The selected
+      keys' softmax weights gate a weighted sum over the corresponding learned
+      VALUE vectors (an `EmbeddingBag`-style sparse lookup) to produce the
+      output. Forward caches the chosen indices + softmax weights; backward
+      scatters the value-gradient into only the touched value rows and pushes
+      the score-gradient back through the two half-key dot-products into the
+      query (multi-head: split the query into H independent product-key
+      lookups and concatenate, like the existing multi-head attention wiring).
+      This is structurally DISTINCT from everything already here:
+      [[modern-hopfield-layer]] (`TNNetModernHopfield`) iterates a DENSE
+      softmax to a fixed point over a SMALL fully-retrieved learnable bank;
+      `TNNetEmbedding` is a one-hot index lookup; MoE routes to a few expert
+      MLPs, not to rows of a value table. The novelty here is the PRODUCT-KEY
+      factorization enabling sparse top-k retrieval from a memory with
+      millions of slots at sub-linear cost — a different primitive, not a
+      near-duplicate. Ship with the usual trio (declaration with the
+      `// Coded by Claude (AI).` comment, dispatch-table wiring,
+      numerical-gradient test that exercises the sparse top-k path including
+      the tie/`k=1` edge case) plus a `TNNet.AddProductKeyMemory(NumKeys,
+      ValueDim, TopK, Heads)` composite builder. Capstone
+      `examples/ProductKeyMemory/`: a tiny associative-recall / synthetic
+      key->value retrieval task showing that a product-key memory matches a
+      same-capacity flat memory's accuracy while touching only top-k rows per
+      step, and a short note on the known failure mode (key-usage collapse —
+      a handful of slots hog all reads — and the batch-norm-on-query trick
+      the paper uses to spread usage).
