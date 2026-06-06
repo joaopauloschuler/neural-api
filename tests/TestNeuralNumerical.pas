@@ -257,6 +257,10 @@ type
     // AddAffineBlock builder (per-channel y = gamma[d]*x + beta[d])
     procedure TestAddAffineBlockForwardWiring;
     procedure TestAddAffineBlockGradientCheck;
+    // AddMLPMixerBlock builder (MLP-Mixer, two pre-norm residual MLP sub-blocks)
+    procedure TestMLPMixerBlockForwardShape;
+    procedure TestMLPMixerBlockGradientCheck;
+    procedure TestMLPMixerBlockLoadFromString;
     // AddLoRAAdapter builder (low-rank residual bypass over a frozen projection)
     procedure TestLoRAAdapterSmoke;
     procedure TestSwitchableNormForward;
@@ -3904,6 +3908,169 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMLPMixerBlockForwardShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  MixerOut: TNNetLayer;
+  i: integer;
+begin
+  // AddMLPMixerBlock must be shape-preserving: (Tokens,1,Channels) in ==
+  // (Tokens,1,Channels) out. Probe a (6,1,4) sequence with token hidden 8 and
+  // channel hidden 16; the output must stay (6,1,4).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4));
+    MixerOut := NN.AddMLPMixerBlock(8, 16, TNNetReLU);
+
+    AssertEquals('MLPMixer output SizeX (Tokens)', 6, MixerOut.Output.SizeX);
+    AssertEquals('MLPMixer output SizeY', 1, MixerOut.Output.SizeY);
+    AssertEquals('MLPMixer output Depth (Channels)', 4, MixerOut.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    // Output must be finite.
+    for i := 0 to MixerOut.Output.Size - 1 do
+      AssertTrue('MLPMixer forward finite at ' + IntToStr(i),
+        not IsNan(MixerOut.Output.Raw[i]) and not IsInfinite(MixerOut.Output.Raw[i]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMLPMixerBlockGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr, maxAbsGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Composition-level input gradient check of AddMLPMixerBlock. The two
+  // pre-norm residual MLP sub-blocks (LayerNorm, TransposeXD, PointwiseConvLinear,
+  // Sum) are each individually gradient-verified; this checks the block as a
+  // whole via central differences against backprop. Probe a tiny (3,1,2)
+  // sequence so the float32 finite difference stays well within tolerance.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  maxAbsGrad := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1)); // pError=1 resizes error volumes
+    NN.AddMLPMixerBlock(4, 4, TNNetReLU);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      if Abs(analyticalGrad) > maxAbsGrad then
+        maxAbsGrad := Abs(analyticalGrad);
+
+      AssertTrue('MLPMixer input gradient finite at ' + IntToStr(i),
+        not IsNan(analyticalGrad) and not IsInfinite(analyticalGrad));
+      AssertTrue('MLPMixer input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    AssertTrue('MLPMixer gradient is non-zero (maxAbs=' + FloatToStr(maxAbsGrad) + ')',
+      maxAbsGrad > 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMLPMixerBlockLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing an AddMLPMixerBlock, and the reloaded net must reproduce the
+  // same layer count, output shape and forward output.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4));
+    NN.AddMLPMixerBlock(8, 16, TNNetReLU);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('MLPMixer round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      AssertEquals('MLPMixer round-trip output SizeX',
+        NN.GetLastLayer.Output.SizeX, NN2.GetLastLayer.Output.SizeX);
+      AssertEquals('MLPMixer round-trip output Depth',
+        NN.GetLastLayer.Output.Depth, NN2.GetLastLayer.Output.Depth);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('MLPMixer SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MLPMixer round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

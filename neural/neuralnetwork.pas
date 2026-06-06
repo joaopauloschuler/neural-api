@@ -8139,6 +8139,24 @@ type
       // AddFourierNeuralOperator1D; the pointwise residual works per-pixel.
       function AddFourierNeuralOperator2D(pOutDepth, pModesX, pModesY: integer;
         pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      // MLP-Mixer block (Tolstikhin et al. 2021,
+      // https://arxiv.org/abs/2105.01601) over a (Tokens,1,Channels) sequence.
+      // Replaces self-attention with two pre-LayerNorm residual MLP sub-blocks:
+      //   1) TOKEN-mixing MLP: mixes information ACROSS tokens, sharing the same
+      //      MLP over every channel. Implemented by transposing the token and
+      //      channel axes (TNNetTransposeXD: (T,1,C)->(C,1,T)), running a
+      //      pointwise 2-layer MLP over the new Depth axis (=Tokens)
+      //      Linear(pTokensHidden) -> pActFn -> Linear(T), then transposing back
+      //      to (T,1,C). Shape-preserving, wrapped in AddPreNormResidual.
+      //   2) CHANNEL-mixing MLP: a standard per-token pointwise FFN over the
+      //      Channels axis Linear(pChannelsHidden) -> pActFn -> Linear(C).
+      //      Shape-preserving, wrapped in AddPreNormResidual.
+      // Pointwise (1x1) convs keep the sequence axis intact (FullConnect would
+      // flatten/mix the whole sequence). Both T (=SizeX) and C (=Depth) are read
+      // from the current last layer. pActFn = nil defaults to TNNetReLU.
+      // Returns the final residual-sum layer.
+      function AddMLPMixerBlock(pTokensHidden, pChannelsHidden: integer;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
       // Multi-head RETENTION block (RetNet, Sun et al. 2023) over a
       // (SeqLen,1,3*d_model) Q|K|V slab. Built exactly like
       // AddMultiHeadSelfAttention but with one softmax-free TNNetRetention per
@@ -34004,6 +34022,40 @@ begin
   Result := AddLayer( TNNetSum.Create([SpectralBranch, PointwiseBranch]) );
   if pActFn <> nil then
     Result := AddLayer( pActFn.Create() );
+end;
+
+function TNNet.AddMLPMixerBlock(pTokensHidden, pChannelsHidden: integer;
+  pActFn: TNNetActivationFunctionClass): TNNetLayer;
+var
+  Tokens, Channels: integer;
+begin
+  // MLP-Mixer (Tolstikhin et al. 2021) over a (Tokens,1,Channels) sequence.
+  if pActFn = nil then pActFn := TNNetReLU;
+  Tokens   := GetLastLayer().Output.SizeX;
+  Channels := GetLastLayer().Output.Depth;
+  if pTokensHidden < 1 then
+    FErrorProc('AddMLPMixerBlock requires TokensHidden >= 1. Got ' +
+      IntToStr(pTokensHidden));
+  if pChannelsHidden < 1 then
+    FErrorProc('AddMLPMixerBlock requires ChannelsHidden >= 1. Got ' +
+      IntToStr(pChannelsHidden));
+  // Token-mixing sub-block (pre-norm residual). Transpose token<->channel axes
+  // so the shared per-channel MLP mixes ACROSS tokens via pointwise convs over
+  // the new Depth (=Tokens) axis, then transpose back. Shape-preserving.
+  AddPreNormResidual([
+    TNNetTransposeXD.Create(),
+    TNNetPointwiseConvLinear.Create(pTokensHidden),
+    pActFn.Create(),
+    TNNetPointwiseConvLinear.Create(Tokens),
+    TNNetTransposeXD.Create()
+  ]);
+  // Channel-mixing sub-block (pre-norm residual): standard per-token pointwise
+  // FFN over the Channels axis. Shape-preserving (T,1,C)->(T,1,C).
+  Result := AddPreNormResidual([
+    TNNetPointwiseConvLinear.Create(pChannelsHidden),
+    pActFn.Create(),
+    TNNetPointwiseConvLinear.Create(Channels)
+  ]);
 end;
 
 function TNNet.AddRetention(d_model, Heads: integer;
