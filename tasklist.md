@@ -72,6 +72,40 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetSpectralConv1D (Fourier Neural Operator layer; Li et al. 2021,
+      "Fourier Neural Operator for Parametric Partial Differential Equations",
+      arXiv:2010.08895): the FIRST learnable-spectral-weight layer — genuinely
+      distinct from the two existing Fourier layers, which both have ZERO
+      spectral parameters: TNNetFourierMix is a parameter-free DFT token mixer,
+      and TNNetFourierFeatures is a FIXED random projection. The FNO operator,
+      by contrast, learns a complex weight tensor in the frequency domain and is
+      the key building block for neural operator / PDE-surrogate learning, a
+      family this repo has none of. Forward over a (SeqLen,1,Depth) tensor:
+      (1) real radix-2 FFT along SeqLen per channel — REUSE the existing
+      ApplyRealDFTFFT / ComputeFFT radix-2 helpers already proven in
+      TNNetFourierMix and TNNetSignalConvolution (FFT-vs-direct asserted to
+      <1e-5 there), do NOT hand-roll a second FFT; (2) TRUNCATE to the lowest
+      FModes frequency modes (the spectral low-pass that makes FNO resolution-
+      invariant and cheap — high modes are zeroed, not learned); (3) per kept
+      mode apply a learnable per-(in-channel,out-channel) COMPLEX weight
+      R[mode] (an InDepth x OutDepth complex matmul, i.e. real/imag parts mixed
+      by the 2x2 complex-multiply block, mirroring how TNNetQuaternionLinear
+      packs its 4x4 Hamilton block); (4) inverse FFT back to the SeqLen domain.
+      Weight layout: 2 * FModes * InDepth * OutDepth reals (real+imag).
+      Constructor TNNetSpectralConv1D.Create(OutDepth, Modes); Modes round-trips
+      via FStruct, save/load registered in both dispatch tables and the
+      LoadFromString cascade. Tests: numerical-gradient on BOTH the input and
+      the complex spectral weights (the imag-part path is exactly where a silent
+      sign bug would hide — see the Quaternion/Octonion FD-truncation gotcha,
+      bound the weights, don't loosen tolerance), a Modes-truncation forward
+      check (modes above FModes must not affect the output), and a save/load
+      round-trip with NON-default Modes. Headline example examples/FourierNeuralOperator/:
+      learn the solution operator of a tiny 1-D PDE (e.g. the antiderivative /
+      1-D Burgers or diffusion step) mapping an input function sampled on a grid
+      to the output function, and show the trained FNO GENERALISES to a finer
+      grid resolution it never trained on (the resolution-invariance headline an
+      ordinary conv stack cannot match). Pure CPU, <5 min, no binaries committed.
+      Mark the class `// Coded by Claude (AI).` per the authorship convention.
 - [ ] TNNetOctonionConv: the convolution analogue of TNNetOctonionLinear
       (which LANDED on a2 — 8D Cayley-Dickson dense layer with the verified
       octonion multiplication table, norm-multiplicativity + gradient + save/load
