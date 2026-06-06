@@ -72,6 +72,39 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetDWT1D — learnable lifting-scheme Discrete Wavelet Transform layer (a
+      LOCALIZED multi-resolution time-frequency primitive, the missing complement
+      to the existing GLOBAL-frequency FFT/Fourier family — FourierMixFFT,
+      TNNetSpectralConv1D/2D, TNNetImplicitLongConv all operate on global Fourier
+      modes and cannot represent a transient localized in BOTH time and scale,
+      which is exactly what a wavelet basis captures). Confirmed absent: no
+      `wavelet`/`lifting`/`haar`/`daubechies` anywhere in neural/*.pas. Scope a
+      single-level 1-D DWT along SeqLen (SizeX) that splits each channel into an
+      approximation (low-pass) and detail (high-pass) half-band via the second-
+      generation LIFTING SCHEME (split into even/odd samples -> predict -> update),
+      which is (a) exactly invertible by construction (the inverse just runs the
+      same steps in reverse with signs flipped — a free correctness oracle: assert
+      `IDWT(DWT(x)) == x` to <1e-6), (b) trivially differentiable since predict/
+      update are linear filters (the backward pass is the adjoint lifting, no FFT
+      machinery needed), and (c) O(L) not O(L log L). Ship it with a fixed-filter
+      mode (Haar / CDF 5-3 / Daubechies-4 coefficients as the default, giving an
+      orthonormal/biorthogonal transform out of the box) AND an opt-in LEARNABLE
+      predict/update filter mode (a handful of trainable taps per lifting step,
+      constrained so perfect reconstruction is preserved — this is the "learnable
+      wavelet" / wavelet-scattering-net idea and is what makes it a NEURAL layer
+      rather than a fixed transform, structurally distinct from TNNetSpectralConv's
+      learnable global complex modes). Output layout: concatenate [approx | detail]
+      along Depth (or stack along a new SizeY band axis) so a downstream conv/MLP
+      sees both subbands. Tests: numerical-gradient on input + learnable taps,
+      LoadFromString round-trip with non-default filter (FStruct taps), the
+      reconstruction-identity oracle above, and a shape check that odd SeqLen is
+      handled (symmetric edge extension). Stretch: stack K levels into a builder
+      `TNNet.AddWaveletPacketTransform` (recurse the DWT on the approximation band
+      for a dyadic multi-resolution pyramid) and an examples/WaveletDenoise/ demo —
+      soft-threshold the detail coefficients (the classic Donoho-Johnstone wavelet
+      shrinkage) to denoise a noisy synthetic 1-D signal end-to-end, charting
+      reconstruction SNR vs a same-param plain conv autoencoder to show the
+      multi-resolution inductive bias pays off on transient/spiky signals.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
