@@ -72,40 +72,20 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetRandomFourierFeatures — a kernel-approximation projection layer
-      (Rahimi & Recht 2007, "Random Features for Large-Scale Kernel Machines",
-      NeurIPS). Maps a `Din`-vector to a `2*D`-vector of paired cosine/sine
-      features `phi(x) = sqrt(1/D) * [cos(Wx+b_unused?), ...]`; concretely the
-      standard RFF for an RBF/Gaussian kernel is
-      `phi_k(x) = sqrt(1/D) * [cos(w_k·x), sin(w_k·x)]` with the `w_k` drawn
-      i.i.d. from `N(0, 1/sigma^2)` so that `<phi(x),phi(y)> ≈ exp(-||x-y||^2 /
-      (2*sigma^2))`. The headline is that this gives a FIXED (non-learned)
-      finite-dimensional feature map under which a downstream LINEAR layer
-      approximates an RBF-kernel machine — i.e. it lets the API do
-      kernel-method/RBF-SVM-flavoured learning, a family that is currently
-      ENTIRELY ABSENT from this very deep-learning-centric repo. This is
-      mathematically DISTINCT from the existing Fourier/spectral layers
-      (`TNNetFourierMixFFT`, `TNNetSpectralConv1D/2D`, `TNNetCirculantLinear`'s
-      FFT path), all of which are LEARNABLE FFTs over the data axis: RFF is a
-      fixed random GAUSSIAN projection approximating a shift-invariant kernel,
-      not a transform along the signal. Design notes: store the frozen random
-      projection `W` (shape `D x Din`) + the bandwidth `sigma` so they
-      serialize/round-trip (a deterministic RandSeed in FStruct so the same map
-      reloads), forward is one matmul + cos/sin + `sqrt(1/D)` scale, output
-      Depth `= 2*D`. Make the projection OPTIONALLY trainable via a flag
-      (frozen by default = classic RFF; trainable = the "deep kernel learning"
-      / learnable-bandwidth variant) — when frozen, backward only needs
-      `dL/dx` (no weight update); when trainable, also accumulate `dL/dW` and
-      `dL/dsigma`. Mark the leaf class `// Coded by Claude (AI).`, wire both
-      CreateLayer tables + LoadFromString, add a numerical-gradient test on the
-      input (and on `W` in the trainable mode), a kernel-approximation
-      sanity test (Gram matrix of `phi` vs the closed-form RBF kernel for a
-      handful of random point pairs converges as `D` grows), and a save/load
-      round-trip. Then an `examples/RandomFourierFeatures/` demo: fit a 2D
-      non-linearly-separable blob (e.g. concentric rings / XOR-in-2D) with
-      `RFF -> TNNetFullConnectLinear -> SoftMax` and contrast accuracy/params
-      against a plain ReLU MLP, showing that a single random-feature layer +
-      linear head already separates the rings (the RBF-kernel headline).
+- [X] TNNetRandomFourierFeatures — LANDED 2026-06-06 on a2. RBF-kernel random
+      features (frozen `W ~ N(0,1/sigma²)`, output Depth `2*D`, `sqrt(1/D)`
+      scale, `<phi(x),phi(y)> ≈ exp(-‖x-y‖²/2sigma²)`); optional trainable-W
+      "deep kernel learning" flag. Wired both CreateLayer tables + LoadFromString
+      (`Create(St[0],Ft[0],St[6],St[5])`: D / sigma / trainable / seed); W in
+      neuron 0 reloads identically. Tests: input-gradient (frozen) + W-gradient
+      (trainable) FD checks, Gram-vs-closed-form-RBF convergence (err 0.083→0.013
+      as D 64→4096), save/load round-trip. Example `examples/RandomFourierFeatures/`
+      (concentric rings: frozen RFF+linear = 1.0 acc, raw linear = 0.47, MLP =
+      1.0; ≈5 s). SCOPE NOTE: sigma is kept a FIXED scalar — `dL/dsigma` is NOT
+      propagated (only `dL/dx` and, in trainable mode, `dL/dW`); the deep-kernel
+      learnable-bandwidth variant is left for a follow-up. Coexists with the
+      pre-existing fixed-only Tancik-style `TNNetFourierFeatures` (that one has no
+      `sqrt(1/D)` kernel scale, uses a `2π` factor, and no trainable mode).
 - [ ] TNNetMonarchLinear example follow-up (the core layer + gradient/forward/
       save-load tests LANDED 2026-06-06): an `examples/MonarchLinear/`
       param-vs-accuracy bake-off contrasting a Monarch dense layer against a

@@ -191,6 +191,11 @@ type
     procedure TestMonarchLinearWeightGradientCheck;
     procedure TestMonarchLinearForwardKnownValue;
     procedure TestMonarchLinearSerializationRoundTrip;
+    // TNNetRandomFourierFeatures RBF-kernel random-feature projection layer
+    procedure TestRandomFourierFeaturesInputGradientCheck;
+    procedure TestRandomFourierFeaturesWeightGradientCheck;
+    procedure TestRandomFourierFeaturesKernelApproximation;
+    procedure TestRandomFourierFeaturesSerializationRoundTrip;
     // TNNetOctonionConv 8D hypercomplex convolution layer
     procedure TestOctonionConvGradientCheck;
     procedure TestOctonionConvSerializationRoundTrip;
@@ -37732,6 +37737,289 @@ begin
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('MonarchLinear Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRandomFourierFeaturesInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  RFF: TNNetRandomFourierFeatures;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize, D: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient w.r.t. the INPUT in the frozen
+  // (classic RFF) mode. The forward is smooth (cos/sin of a linear projection),
+  // so a moderate epsilon stays well inside the FD truncation regime. Inputs and
+  // the projection rows are kept bounded so w.x stays moderate and single
+  // precision does not lose the (lossPlus-lossMinus) difference. Reseed the
+  // shared RNG per the numerical-test ordering rule.
+  RandSeed := 424242;
+  InSize := 4; D := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InSize, 1, 1);
+  InputPlus := TNNetVolume.Create(InSize, 1, 1);
+  Desired := TNNetVolume.Create(2 * D, 1, 1);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(InSize, 1, 1, 1)); // 1 = collect input error
+    RFF := TNNetRandomFourierFeatures.Create(D, {sigma}1.5, {trainable}0, {seed}7);
+    NN.AddLayer(RFF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.3 * Sin(i * 1.7) - 0.15;
+    for i := 0 to 2 * D - 1 do
+      Desired.Raw[i] := 0.1 * i - 0.25;
+    // Bound the projection weights so the cos/sin arguments stay moderate.
+    for i := 0 to RFF.Neurons[0].Weights.Size - 1 do
+      RFF.Neurons[0].Weights.Raw[i] := 0.4 * Sin(i * 0.7);
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('RandomFourierFeatures input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.001);
+    end;
+    WriteLn('  RandomFourierFeatures input gradient max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRandomFourierFeaturesWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  RFF: TNNetRandomFourierFeatures;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize, D, WCount: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient w.r.t. EVERY projection weight in the
+  // TRAINABLE ("deep kernel learning") mode. A sign error in the cos/sin chain
+  // rule (dz = scale*(-sin*dC + cos*dS), dW row += dz*x) is exactly what this
+  // catches. Reseed the shared RNG per the numerical-test ordering rule.
+  RandSeed := 424242;
+  InSize := 4; D := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InSize, 1, 1);
+  Desired := TNNetVolume.Create(2 * D, 1, 1);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(InSize, 1, 1, 1));
+    RFF := TNNetRandomFourierFeatures.Create(D, {sigma}1.2, {trainable}1, {seed}11);
+    NN.AddLayer(RFF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.35 * Cos(i * 1.3) + 0.1;
+    for i := 0 to 2 * D - 1 do
+      Desired.Raw[i] := 0.08 * i - 0.2;
+    WCount := RFF.Neurons[0].Weights.Size;
+    for i := 0 to WCount - 1 do
+      RFF.Neurons[0].Weights.Raw[i] := 0.45 * Sin(i * 0.9);
+
+    for i := 0 to WCount - 1 do
+    begin
+      RFF.Neurons[0].Weights.Raw[i] := RFF.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      RFF.Neurons[0].Weights.Raw[i] := RFF.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      RFF.Neurons[0].Weights.Raw[i] := RFF.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      RFF.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -RFF.Neurons[0].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('RandomFourierFeatures weight gradient check w=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.001);
+    end;
+    WriteLn('  RandomFourierFeatures weight gradient max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRandomFourierFeaturesKernelApproximation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  RFF: TNNetRandomFourierFeatures;
+  InSize, p, q, NPts: integer;
+  sigma, errSmall, errLarge: TNeuralFloat;
+  Phi: array of array of TNeuralFloat; // [point][2D]
+  Pts: array of array of TNeuralFloat; // [point][InSize]
+
+  function MaxKernelError(ANumFeatures: integer): TNeuralFloat;
+  var
+    a, b, kk: integer;
+    approx, exact, d2: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(InSize, 1, 1);
+    try
+      NN.AddLayer(TNNetInput.Create(InSize, 1, 1));
+      RFF := TNNetRandomFourierFeatures.Create(ANumFeatures, sigma, 0, 12345);
+      NN.AddLayer(RFF);
+      SetLength(Phi, NPts, 2 * ANumFeatures);
+      for a := 0 to NPts - 1 do
+      begin
+        for kk := 0 to InSize - 1 do Input.Raw[kk] := Pts[a][kk];
+        NN.Compute(Input);
+        for kk := 0 to 2 * ANumFeatures - 1 do
+          Phi[a][kk] := NN.GetLastLayer.Output.Raw[kk];
+      end;
+      Result := 0;
+      for a := 0 to NPts - 1 do
+        for b := a to NPts - 1 do
+        begin
+          approx := 0;
+          for kk := 0 to 2 * ANumFeatures - 1 do
+            approx := approx + Phi[a][kk] * Phi[b][kk];
+          d2 := 0;
+          for kk := 0 to InSize - 1 do
+            d2 := d2 + Sqr(Pts[a][kk] - Pts[b][kk]);
+          exact := Exp(-d2 / (2 * sigma * sigma));
+          Result := Max(Result, Abs(approx - exact));
+        end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+
+begin
+  // <phi(x),phi(y)> approximates the RBF kernel exp(-||x-y||^2/(2 sigma^2)).
+  // The Gram-matrix vs closed-form error must SHRINK as D grows (Monte-Carlo
+  // convergence of the random-feature estimator). Reseed the shared RNG.
+  RandSeed := 424242;
+  InSize := 3;
+  sigma := 1.0;
+  NPts := 6;
+  // A handful of fixed point pairs spanning a range of pairwise distances.
+  SetLength(Pts, NPts, InSize);
+  for p := 0 to NPts - 1 do
+    for q := 0 to InSize - 1 do
+      Pts[p][q] := 0.6 * Sin(p * 1.3 + q * 0.7) - 0.2 * q;
+
+  errSmall := MaxKernelError(64);
+  errLarge := MaxKernelError(4096);
+
+  WriteLn('  RandomFourierFeatures kernel error D=64: ', errSmall:0:5,
+          '  D=4096: ', errLarge:0:5);
+  AssertTrue('RFF kernel error shrinks as D grows (small=' +
+    FloatToStr(errSmall) + ' large=' + FloatToStr(errLarge) + ')',
+    errLarge < errSmall);
+  AssertTrue('RFF kernel approximation accurate at large D (err=' +
+    FloatToStr(errLarge) + ')', errLarge < 0.05);
+end;
+
+procedure TTestNeuralNumerical.TestRandomFourierFeaturesSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  RFF: TNNetRandomFourierFeatures;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, InSize, D: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical and
+  // Compute must match, proving D / sigma / seed / trainable-flag all round-trip
+  // through BOTH dispatch points and the random map W reloads identically.
+  RandSeed := 424242;
+  InSize := 5; D := 6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InSize, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(InSize, 1, 1, 1));
+    RFF := TNNetRandomFourierFeatures.Create(D, {sigma}1.7, {trainable}1, {seed}99);
+    NN.AddLayer(RFF);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Cos(i * 0.8) * 0.7 - 0.1;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('RandomFourierFeatures SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('RandomFourierFeatures token present in serialized string',
+        Pos('TNNetRandomFourierFeatures', Saved) > 0);
+      AssertEquals('RandomFourierFeatures D round-trips (output Depth=2D)',
+        2 * D, NN2.Layers[1].Output.Size);
+      AssertEquals('RandomFourierFeatures sigma round-trips', 1.7,
+        (NN2.Layers[1] as TNNetRandomFourierFeatures).Sigma, 1e-6);
+      AssertEquals('RandomFourierFeatures trainable flag round-trips', 1,
+        (NN2.Layers[1] as TNNetRandomFourierFeatures).Trainable);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('RandomFourierFeatures Compute matches after round-trip pos '
+          + IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
       NN2.Free;

@@ -6739,6 +6739,57 @@ type
     property BlockSize: integer read FBlockSize;
   end;
 
+  /// Random Fourier Features kernel-approximation layer (Rahimi & Recht 2007,
+  /// "Random Features for Large-Scale Kernel Machines"). Maps a Din-vector input
+  /// x to a 2*D-vector feature map that approximates the RBF / Gaussian kernel:
+  ///   phi_k(x) = sqrt(1/D) * [ cos(w_k . x) , sin(w_k . x) ]   for k = 1..D
+  /// where the projection rows w_k (the D x Din matrix W) are drawn i.i.d. from
+  /// N(0, 1/sigma^2). Then  <phi(x),phi(y)> -> exp(-||x-y||^2 / (2*sigma^2)) as
+  /// D grows, so a downstream LINEAR head over phi(x) approximates an RBF-kernel
+  /// machine. Output Depth = 2*D (the D cos channels followed by the D sin
+  /// channels). This is DISTINCT from the learnable FFT layers
+  /// (TNNetFourierMixFFT, TNNetSpectralConv1D/2D): RFF is a FIXED random Gaussian
+  /// projection approximating a shift-invariant kernel, not a transform along a
+  /// signal axis.
+  ///
+  /// W is held in neuron 0 (D rows of Din weights, row k at k*Din). sigma lives
+  /// in FFloatSt[0]. D round-trips via FStruct[0], the RandSeed used to draw W via
+  /// FStruct[5], and the trainable flag via FStruct[6]. W is also written out by
+  /// the ordinary per-neuron SaveDataToString so a save/load round-trip reloads
+  /// the SAME random map exactly (the seed only matters for the fresh-draw path).
+  ///
+  /// FROZEN (default, FTrainable = 0): classic RFF -- backward propagates only
+  /// dL/dx (no weight update), so W stays the fixed random map. The Jacobian of
+  /// channel k is:  d phi_cos_k/dx = -sqrt(1/D)*sin(w_k.x)*w_k ,
+  ///                d phi_sin_k/dx =  sqrt(1/D)*cos(w_k.x)*w_k .
+  /// TRAINABLE (FTrainable = 1): "deep kernel learning" variant -- ALSO
+  /// accumulates dL/dW (each row gets dL/d(w_k.x) * x). sigma is kept FIXED (a
+  /// frozen scalar) to limit scope; dL/dsigma is NOT propagated.
+  // Coded by Claude (AI).
+  TNNetRandomFourierFeatures = class(TNNetLayer)
+  private
+    FNumFeatures: integer; // D (output Depth is 2*D)
+    FInSize: integer;      // Din (flat input size)
+    FSigma: TNeuralFloat;  // RBF kernel bandwidth
+    FSeed: integer;        // RandSeed used to draw W
+    FTrainable: integer;   // 0 = frozen (classic RFF), 1 = trainable W
+    FScale: TNeuralFloat;  // sqrt(1/D)
+    FCacheProj: TNNetVolume; // w_k . x  (length D), cached for backward
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pNumFeatures: integer; pSigma: TNeuralFloat = 1.0;
+      pTrainable: integer = 0; pSeed: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property NumFeatures: integer read FNumFeatures;
+    property Sigma: TNeuralFloat read FSigma;
+    property Trainable: integer read FTrainable;
+  end;
+
   /// Weight Standardization CONVOLUTION layer (Qiao et al. 2019,
   /// "Micro-Batch Training with Batch-Channel Normalization and Weight
   /// Standardization", arXiv:1903.10520). This is the convolution sibling of
@@ -37197,6 +37248,178 @@ begin
   end;
 end;
 
+{ TNNetRandomFourierFeatures }
+
+// Rahimi & Recht (2007) random features for the RBF kernel. The forward pass is
+// one matmul z = W*x followed by the cos/sin lift scaled by sqrt(1/D):
+//   phi[k]   = sqrt(1/D)*cos(z[k])   (channels 0..D-1)
+//   phi[D+k] = sqrt(1/D)*sin(z[k])   (channels D..2D-1)
+// W (D x Din) is drawn once from N(0,1/sigma^2) under a deterministic seed and,
+// by default, frozen.
+
+constructor TNNetRandomFourierFeatures.Create(pNumFeatures: integer;
+  pSigma: TNeuralFloat = 1.0; pTrainable: integer = 0; pSeed: integer = 0);
+begin
+  inherited Create();
+  if pNumFeatures < 1 then pNumFeatures := 1;
+  if pSigma <= 0 then pSigma := 1.0;
+  FNumFeatures := pNumFeatures;
+  FSigma := pSigma;
+  if pTrainable <> 0 then FTrainable := 1 else FTrainable := 0;
+  FSeed := pSeed;
+  FStruct[0] := FNumFeatures;
+  FStruct[5] := FSeed;
+  FStruct[6] := FTrainable;
+  FFloatSt[0] := FSigma;
+  FCacheProj := TNNetVolume.Create();
+  // The single weight neuron (W) is sized in SetPrevLayer once Din is known.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+destructor TNNetRandomFourierFeatures.Destroy();
+begin
+  FCacheProj.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRandomFourierFeatures.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  FPrevLayer := pPrevLayer;
+  FInSize := pPrevLayer.Output.Size;
+  if FInSize <= 0 then
+    FErrorProc('TNNetRandomFourierFeatures requires a non-empty input.');
+  FScale := Sqrt(1.0 / FNumFeatures);
+
+  FOutput.ReSize(2 * FNumFeatures, 1, 1);
+  FOutputError.ReSize(2 * FNumFeatures, 1, 1);
+  FOutputErrorDeriv.ReSize(2 * FNumFeatures, 1, 1);
+  FCacheProj.ReSize(FNumFeatures, 1, 1);
+
+  // neuron 0 = W (D rows of Din weights; row k at k*Din). No bias.
+  FNeurons[0].Weights.ReSize(FNumFeatures * FInSize, 1, 1);
+  FNeurons[0].BackInertia.ReSize(FNumFeatures * FInSize, 1, 1);
+  FNeurons[0].Delta.ReSize(FNumFeatures * FInSize, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// W rows drawn i.i.d. from N(0, 1/sigma^2) under a deterministic, restorable
+// seed so the SAME random map is reproducible. RandomGaussianValue() is N(0,1),
+// scaled by 1/sigma to get N(0,1/sigma^2).
+procedure TNNetRandomFourierFeatures.InitDefault();
+var
+  i: integer;
+  W: TNNetVolume;
+  oldSeed: integer;
+  invSigma: TNeuralFloat;
+begin
+  if FInSize <= 0 then exit;
+  W := FArrNeurons[0].FWeights;
+  invSigma := 1.0 / FSigma;
+  oldSeed := RandSeed;
+  // Seed = 0 leaves the global RandSeed alone (non-reproducible draw); a non-zero
+  // seed makes the random map deterministic and restorable on reload.
+  if FSeed <> 0 then RandSeed := FSeed;
+  for i := 0 to W.Size - 1 do
+    W.FData[i] := W.RandomGaussianValue() * invSigma;
+  if FSeed <> 0 then RandSeed := oldSeed;
+end;
+
+procedure TNNetRandomFourierFeatures.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRandomFourierFeatures.ComputeCPU();
+var
+  k, j, base, D, Din: integer;
+  acc: TNeuralFloat;
+  PrevOut, W: TNNetVolume;
+begin
+  D := FNumFeatures;
+  Din := FInSize;
+  PrevOut := FPrevLayer.FOutput;
+  W := FArrNeurons[0].FWeights;
+  for k := 0 to D - 1 do
+  begin
+    base := k * Din;
+    acc := 0;
+    for j := 0 to Din - 1 do
+      acc := acc + W.FData[base + j] * PrevOut.FData[j];
+    FCacheProj.FData[k] := acc;
+    FOutput.FData[k]     := FScale * Cos(acc);  // cos channels 0..D-1
+    FOutput.FData[D + k] := FScale * Sin(acc);  // sin channels D..2D-1
+  end;
+end;
+
+procedure TNNetRandomFourierFeatures.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// For each feature k let z = w_k.x. With dC = output error on the cos channel and
+// dS on the sin channel:
+//   dz_k = scale * ( -sin(z)*dC + cos(z)*dS )
+// Then dx += sum_k dz_k * w_k  and (trainable) dW row k += dz_k * x.
+procedure TNNetRandomFourierFeatures.BackpropagateCPU();
+var
+  k, j, base, D, Din: integer;
+  z, dz, sc: TNeuralFloat;
+  PrevOut, W, WDelta, LocalPrevError: TNNetVolume;
+  HasPrevError: boolean;
+begin
+  D := FNumFeatures;
+  Din := FInSize;
+  sc := FScale;
+  PrevOut := FPrevLayer.FOutput;
+  W := FArrNeurons[0].FWeights;
+  WDelta := FArrNeurons[0].FDelta;
+  HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  LocalPrevError := FPrevLayer.OutputError;
+
+  for k := 0 to D - 1 do
+  begin
+    z := FCacheProj.FData[k];
+    dz := sc * (-Sin(z) * FOutputError.FData[k] + Cos(z) * FOutputError.FData[D + k]);
+    base := k * Din;
+    if HasPrevError then
+      for j := 0 to Din - 1 do
+        LocalPrevError.FData[j] := LocalPrevError.FData[j] + dz * W.FData[base + j];
+    if FTrainable <> 0 then
+      for j := 0 to Din - 1 do
+        WDelta.FData[base + j] := WDelta.FData[base + j]
+          - FLearningRate * dz * PrevOut.FData[j];
+  end;
+
+  if (FTrainable <> 0) and (not FBatchUpdate) then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetHouseholderLinear }
 
 // Floor used to guard the v_i^T v_i denominator: below this a reflection is
@@ -61915,6 +62138,7 @@ begin
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
+      'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
@@ -62241,6 +62465,7 @@ begin
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
+      if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
