@@ -72,6 +72,34 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetTropicalConv follow-up (TNNetTropicalLinear max-plus/min-plus
+      morphological DENSE layer + examples/TropicalMorphology/ + gradient/forward/
+      save-load tests all LANDED 2026-06-06 on a2): the SPATIAL sibling — a
+      grayscale morphological dilation/erosion conv with a learnable structuring
+      element over a (SizeX,SizeY,Depth) patch, `y[x,y,co] = max_{dx,dy,ci}
+      (input[x+dx,y+dy,ci] + SE[dx,dy,ci,co])` (erode = min). Reuse the verified
+      arg-max/arg-min one-hot subgradient from the dense layer (cache the winning
+      (dx,dy,ci) per output, route dy to that single input cell + structuring-
+      element tap). Erode flag round-trips via an FStruct slot. Deliverables per
+      [[loss-layer-pattern]]: leaf class + both CreateLayer tables + LoadFromString,
+      numerical-gradient test on input AND structuring element (well-separated
+      inputs, away from the tie kink), a hand-computed tiny forward-equality test
+      for both modes, a save/load round-trip with the erode flag set, and a tiny
+      example contrasting it with a same-size linear conv on a morphological
+      target (thin/thicken a binary glyph). Distinct from parameter-free
+      TNNetMaxPool (learnable additive SE, not a fixed window).
+- [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
+      + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
+      shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
+      reusing FourierMixFFT, ModesX*ModesY low-pass truncation, exact complex
+      adjoint backward): (a) a TNNet.AddFourierNeuralOperator2D builder that wraps
+      the spectral path in the paper's `spectral + pointwise-residual` block
+      (`y = SpectralConv2D(x) + W1x1(x)`, then activation) so it drops into a
+      U-net-style PDE-surrogate stack in one call — the 1-D layer is still a raw
+      leaf with no block builder either, so consider a shared 1-D+2-D builder
+      pass; (b) wire it into a small PDE-surrogate example (Darcy-flow-like
+      coefficient→solution map on a tiny grid) to show the headline FNO use case
+      beyond the synthetic diffusion-operator demo.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
