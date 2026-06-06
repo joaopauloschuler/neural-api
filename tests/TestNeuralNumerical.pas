@@ -173,6 +173,10 @@ type
     procedure TestSpectralConv1DGradientCheck;
     procedure TestSpectralConv1DModesTruncation;
     procedure TestSpectralConv1DSerializationRoundTrip;
+    // TNNetSpectralConv2D 2-D Fourier Neural Operator spectral conv layer
+    procedure TestSpectralConv2DGradientCheck;
+    procedure TestSpectralConv2DShapeAndTruncation;
+    procedure TestSpectralConv2DSerializationRoundTrip;
     // TNNetTropicalLinear max-plus / min-plus morphological dense layer
     procedure TestTropicalLinearGradientCheck;
     procedure TestTropicalLinearForwardKnownValue;
@@ -36681,6 +36685,222 @@ begin
         (NN2.Layers[1] as TNNetSpectralConv1D).Modes);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SpectralConv1D Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  SC: TNNetSpectralConv2D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY, InSize, OutSize, WCount: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for BOTH the input AND every complex
+  // 2-D spectral weight (real + imag). Weights are BOUNDED (small magnitude) to
+  // keep finite-difference truncation small -- tolerance is NOT loosened to mask
+  // a bug. (Shared RNG; reseed to avoid tripping ordering-sensitive checks.)
+  RandSeed := 424242;
+  SizeX := 4; SizeY := 4; InDepth := 2; OutDepth := 2; ModesX := 2; ModesY := 3;
+  InSize := SizeX * SizeY * InDepth;
+  OutSize := SizeX * SizeY * OutDepth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  InputPlus := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  Desired := TNNetVolume.Create(SizeX, SizeY, OutDepth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1)); // 1 = collect input error
+    SC := TNNetSpectralConv2D.Create(OutDepth, ModesX, ModesY);
+    NN.AddLayer(SC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+    WCount := SC.Neurons[0].Weights.Size;
+    for i := 0 to WCount - 1 do
+      SC.Neurons[0].Weights.Raw[i] := 0.1 * Sin(i * 1.3 + 0.4); // bounded
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('SpectralConv2D input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. every complex spectral weight (real + imag) ----
+    for i := 0 to WCount - 1 do
+    begin
+      SC.Neurons[0].Weights.Raw[i] := SC.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      SC.Neurons[0].Weights.Raw[i] := SC.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      SC.Neurons[0].Weights.Raw[i] := SC.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      SC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -SC.Neurons[0].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('SpectralConv2D weight gradient check c=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  SpectralConv2D gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DShapeAndTruncation;
+var
+  NN: TNNet;
+  InputA, InputB, OutA, OutB: TNNetVolume;
+  SC: TNNetSpectralConv2D;
+  SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY, i, x, y: integer;
+  maxDiff, d: TNeuralFloat;
+begin
+  // Shape smoke test on an 8x8 image AND the 2-D low-pass property: adding a pure
+  // high-frequency component (above the kept band in BOTH axes) must not change
+  // the output -- the defining resolution-invariance of a 2-D FNO spectral conv.
+  RandSeed := 424242;
+  SizeX := 8; SizeY := 8; InDepth := 1; OutDepth := 3; ModesX := 2; ModesY := 2;
+  NN := TNNet.Create();
+  InputA := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  InputB := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  OutA := TNNetVolume.Create(SizeX, SizeY, OutDepth);
+  OutB := TNNetVolume.Create(SizeX, SizeY, OutDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth));
+    SC := TNNetSpectralConv2D.Create(OutDepth, ModesX, ModesY);
+    NN.AddLayer(SC);
+    for i := 0 to SC.Neurons[0].Weights.Size - 1 do
+      SC.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 0.9 + 0.2);
+
+    for y := 0 to SizeY - 1 do
+      for x := 0 to SizeX - 1 do
+      begin
+        InputA[x, y, 0] := Cos(2 * Pi * 1 * x / SizeX) + 0.5 * Cos(2 * Pi * 1 * y / SizeY);
+        // add a high-freq mode (mode 5 in both axes, well above ModesX/ModesY)
+        InputB[x, y, 0] := InputA[x, y, 0] +
+          0.7 * Cos(2 * Pi * 5 * x / SizeX) * Cos(2 * Pi * 5 * y / SizeY);
+      end;
+
+    NN.Compute(InputA);
+    AssertEquals('SpectralConv2D output SizeX', SizeX, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('SpectralConv2D output SizeY', SizeY, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('SpectralConv2D output Depth', OutDepth, NN.GetLastLayer.Output.Depth);
+    OutA.Copy(NN.GetLastLayer.Output);
+    NN.Compute(InputB);
+    OutB.Copy(NN.GetLastLayer.Output);
+
+    maxDiff := 0;
+    for i := 0 to OutA.Size - 1 do
+    begin
+      d := Abs(OutA.Raw[i] - OutB.Raw[i]);
+      if d > maxDiff then maxDiff := d;
+    end;
+    WriteLn('  SpectralConv2D modes-truncation max output diff: ', maxDiff:0:10);
+    AssertTrue('SpectralConv2D: high-mode input must not affect output (diff=' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-4);
+  finally
+    NN.Free;
+    InputA.Free; InputB.Free; OutA.Free; OutB.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  SC: TNNetSpectralConv2D;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY: integer;
+begin
+  // SpectralConv2D in the MIDDLE of a net with NON-default and DIFFERENT
+  // ModesX!=ModesY: SaveToString -> LoadFromString -> SaveToString must be
+  // byte-identical and Compute must match, proving ModesX/ModesY round-trip via
+  // FStruct[1]/FStruct[2] through both dispatch points.
+  RandSeed := 424242;
+  SizeX := 8; SizeY := 4; InDepth := 2; OutDepth := 3; ModesX := 3; ModesY := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth));
+    SC := TNNetSpectralConv2D.Create(OutDepth, ModesX, ModesY);
+    NN.AddLayer(SC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for i := 0 to SC.Neurons[0].Weights.Size - 1 do
+      SC.Neurons[0].Weights.Raw[i] := 0.07 * (i + 1) - 0.3;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('SpectralConv2D SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('SpectralConv2D token present in serialized string',
+        Pos('TNNetSpectralConv2D', Saved) > 0);
+      AssertEquals('SpectralConv2D ModesX round-trips', ModesX,
+        (NN2.Layers[1] as TNNetSpectralConv2D).ModesX);
+      AssertEquals('SpectralConv2D ModesY round-trips', ModesY,
+        (NN2.Layers[1] as TNNetSpectralConv2D).ModesY);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('SpectralConv2D Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

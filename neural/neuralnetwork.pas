@@ -61,6 +61,10 @@ type
   TNNetLayer = class;
   TNNet = class;
 
+  // 2-D dynamic double matrix used by TNNetSpectralConv2D's separable 2-D FFT
+  // (open arrays cannot be multi-dimensional, so a named type is required).
+  TSpectralConv2DMatrix = array of array of Double;
+
   // Integrator selector for TNNet.AddNeuralODEBlock.
   //   odeEuler    : explicit Euler step   y := y + h*f(y)            (1 f / step)
   //   odeMidpoint : RK2 / midpoint step   k1:=f(y); k2:=f(y+(h/2)*k1);
@@ -6522,6 +6526,62 @@ type
     procedure Backpropagate(); override;
     property Modes: integer read FModes;
     property SeqLen: integer read FSeqLen;
+    property InDepth: integer read FInDepth;
+  end;
+
+  /// TWO-DIMENSIONAL Fourier Neural Operator (FNO) SPECTRAL CONVOLUTION layer:
+  /// the natural 2-D extension of TNNetSpectralConv1D. Over a (SizeX, SizeY,
+  /// InDepth) image it performs, per channel:
+  ///   1. a 2-D real radix-2 FFT (FFT along X for every row, then along Y for
+  ///      every column -- both reuse the proven FourierMixFFT helper, NOT a
+  ///      hand-rolled second FFT);
+  ///   2. a spectral LOW-PASS truncation to the lowest FModesX x FModesY 2-D
+  ///      frequency modes (high modes are zeroed, never learned -- exactly what
+  ///      makes the operator resolution-invariant: the SAME learned weights apply
+  ///      on any grid because they live in 2-D mode-space, not grid-space);
+  ///   3. per kept mode (mx,my) a learnable per-(in-channel,out-channel) COMPLEX
+  ///      weight R[mx,my] (an InDepth x OutDepth complex matmul mixing real/imag
+  ///      via the 2x2 complex-multiply block);
+  ///   4. an inverse 2-D FFT (IFFT along Y then along X) back to the (SizeX,SizeY)
+  ///      domain; the real part is the output.
+  ///
+  /// Weight layout: a single weight neuron holding
+  ///   2 * FModesX * FModesY * InDepth * OutDepth reals (real then imag for each
+  ///   (mx,my,in,out)), indexed
+  ///   base = (((mx*FModesY + my)*InDepth + ci)*OutDepth + co)*2;
+  ///   [base]=Re R, [base+1]=Im R.
+  /// Constructor: Create(OutDepth, ModesX, ModesY). OutDepth round-trips via
+  /// FStruct[0], ModesX via FStruct[1], ModesY via FStruct[2]; dispatch is wired
+  /// through Create(St[0], St[1], St[2]).
+  /// Backward is the exact real adjoint of the linear 2-D FFT -> complex-matmul
+  /// -> 2-D IFFT pipeline; both the input AND complex-weight gradients are
+  /// numerically tested.
+  // Coded by Claude (AI).
+  TNNetSpectralConv2D = class(TNNetLayer)
+  private
+    FOutDepth: integer;     // requested output Depth
+    FModesX: integer;       // number of kept low-frequency modes along X
+    FModesY: integer;       // number of kept low-frequency modes along Y
+    FSizeX: integer;        // input SizeX, power of two
+    FSizeY: integer;        // input SizeY, power of two
+    FInDepth: integer;      // input Depth
+    // Scratch: forward 2-D spectrum of the input, [ci][x][y].
+    FXre, FXim: array of TSpectralConv2DMatrix;
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+    function WBase(mx, my, ci, co: integer): integer;
+    // 2-D FFT helpers on a [x][y] grid (in-place); reuse FourierMixFFT per axis.
+    procedure FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
+  public
+    constructor Create(pOutDepth, pModesX, pModesY: integer); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property ModesX: integer read FModesX;
+    property ModesY: integer read FModesY;
+    property SizeX: integer read FSizeX;
+    property SizeY: integer read FSizeY;
     property InDepth: integer read FInDepth;
   end;
 
@@ -36080,6 +36140,322 @@ begin
   end;
 end;
 
+{ TNNetSpectralConv2D }
+
+// The forward map is the linear 2-D pipeline
+//   x --FFT2D--> Xhat --complex matmul R[mx,my]--> Yhat --(real)IFFT2D--> y
+// truncated to the lowest FModesX x FModesY 2-D modes. Every stage is linear over
+// the reals, so backward is the EXACT transpose of each stage. The radix-2 FFT is
+// FourierMixFFT applied per axis -- we do NOT hand-roll a second FFT.
+
+constructor TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY: integer);
+begin
+  inherited Create();
+  if pOutDepth <= 0 then
+    FErrorProc('TNNetSpectralConv2D requires OutDepth >= 1. Got ' + IntToStr(pOutDepth));
+  if pModesX <= 0 then
+    FErrorProc('TNNetSpectralConv2D requires ModesX >= 1. Got ' + IntToStr(pModesX));
+  if pModesY <= 0 then
+    FErrorProc('TNNetSpectralConv2D requires ModesY >= 1. Got ' + IntToStr(pModesY));
+  FOutDepth := pOutDepth;
+  FModesX := pModesX;
+  FModesY := pModesY;
+  FStruct[0] := pOutDepth;
+  FStruct[1] := pModesX;
+  FStruct[2] := pModesY;
+  // One weight neuron (complex spectral weights); sized in SetPrevLayer.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+function TNNetSpectralConv2D.WBase(mx, my, ci, co: integer): integer;
+begin
+  Result := (((mx * FModesY + my) * FInDepth + ci) * FOutDepth + co) * 2;
+end;
+
+// In-place 2-D FFT on a [x][y] grid: FFT along X (each row of fixed y) then along
+// Y (each column of fixed x). Inverse reverses nothing structurally (the FFT is
+// separable); FourierMixFFT's Inverse flag already applies the 1/N per axis, so a
+// full inverse 2-D FFT divides by FSizeX*FSizeY overall.
+procedure TNNetSpectralConv2D.FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
+var
+  ix, iy: integer;
+  rowRe, rowIm, colRe, colIm: array of Double;
+begin
+  // FFT along X for each y.
+  SetLength(rowRe, FSizeX);
+  SetLength(rowIm, FSizeX);
+  for iy := 0 to FSizeY - 1 do
+  begin
+    for ix := 0 to FSizeX - 1 do
+    begin
+      rowRe[ix] := Re[ix][iy];
+      rowIm[ix] := Im[ix][iy];
+    end;
+    FourierMixFFT(rowRe, rowIm, FSizeX, Inverse);
+    for ix := 0 to FSizeX - 1 do
+    begin
+      Re[ix][iy] := rowRe[ix];
+      Im[ix][iy] := rowIm[ix];
+    end;
+  end;
+  // FFT along Y for each x.
+  SetLength(colRe, FSizeY);
+  SetLength(colIm, FSizeY);
+  for ix := 0 to FSizeX - 1 do
+  begin
+    for iy := 0 to FSizeY - 1 do
+    begin
+      colRe[iy] := Re[ix][iy];
+      colIm[iy] := Im[ix][iy];
+    end;
+    FourierMixFFT(colRe, colIm, FSizeY, Inverse);
+    for iy := 0 to FSizeY - 1 do
+    begin
+      Re[ix][iy] := colRe[iy];
+      Im[ix][iy] := colIm[iy];
+    end;
+  end;
+end;
+
+procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WeightCount: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  FSizeX := pPrevLayer.Output.SizeX;
+  FSizeY := pPrevLayer.Output.SizeY;
+  FInDepth := pPrevLayer.Output.Depth;
+  if not FourierMixIsPow2(FSizeX) then
+    FErrorProc('TNNetSpectralConv2D requires a power-of-two SizeX (radix-2 FFT); got SizeX=' +
+      IntToStr(FSizeX) + '.');
+  if not FourierMixIsPow2(FSizeY) then
+    FErrorProc('TNNetSpectralConv2D requires a power-of-two SizeY (radix-2 FFT); got SizeY=' +
+      IntToStr(FSizeY) + '.');
+  if FModesX > FSizeX then
+    FErrorProc('TNNetSpectralConv2D: ModesX (' + IntToStr(FModesX) +
+      ') must be <= SizeX (' + IntToStr(FSizeX) + ').');
+  if FModesY > FSizeY then
+    FErrorProc('TNNetSpectralConv2D: ModesY (' + IntToStr(FModesY) +
+      ') must be <= SizeY (' + IntToStr(FSizeY) + ').');
+
+  FOutput.ReSize(FSizeX, FSizeY, FOutDepth);
+  FOutputError.ReSize(FSizeX, FSizeY, FOutDepth);
+  FOutputErrorDeriv.ReSize(FSizeX, FSizeY, FOutDepth);
+
+  WeightCount := 2 * FModesX * FModesY * FInDepth * FOutDepth;
+  FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
+  FNeurons[0].BackInertia.ReSize(WeightCount, 1, 1);
+  FNeurons[0].Delta.ReSize(WeightCount, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  SetLength(FXre, FInDepth, FSizeX, FSizeY);
+  SetLength(FXim, FInDepth, FSizeX, FSizeY);
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Glorot-style init scaled by 1/(InDepth+OutDepth) (the FNO convention).
+procedure TNNetSpectralConv2D.InitDefault();
+var
+  i, WeightCount: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FInDepth <= 0 then exit;
+  W := FArrNeurons[0].FWeights;
+  WeightCount := W.Size;
+  scale := Sqrt(2.0 / (FInDepth + FOutDepth));
+  for i := 0 to WeightCount - 1 do
+    W.FData[i] := scale * (Random - 0.5) * 2;
+end;
+
+procedure TNNetSpectralConv2D.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSpectralConv2D.ComputeCPU();
+var
+  ci, co, mx, my, ix, iy: integer;
+  PrevOut, W: TNNetVolume;
+  Sre, Sim: TSpectralConv2DMatrix;
+  a, bb, xr, xi, yr, yi: Double;
+  b: integer;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  W := FArrNeurons[0].FWeights;
+  // 1. 2-D FFT of every input channel.
+  for ci := 0 to FInDepth - 1 do
+  begin
+    for ix := 0 to FSizeX - 1 do
+      for iy := 0 to FSizeY - 1 do
+      begin
+        FXre[ci][ix][iy] := PrevOut.FData[((FSizeX * iy) + ix) * FInDepth + ci];
+        FXim[ci][ix][iy] := 0;
+      end;
+    FFT2D(FXre[ci], FXim[ci], false);
+  end;
+  // 2./3./4. Per output channel: spectral matmul over kept 2-D modes, then IFFT.
+  SetLength(Sre, FSizeX, FSizeY);
+  SetLength(Sim, FSizeX, FSizeY);
+  for co := 0 to FOutDepth - 1 do
+  begin
+    for ix := 0 to FSizeX - 1 do
+      for iy := 0 to FSizeY - 1 do
+      begin
+        Sre[ix][iy] := 0;
+        Sim[ix][iy] := 0;
+      end;
+    for mx := 0 to FModesX - 1 do
+      for my := 0 to FModesY - 1 do
+      begin
+        yr := 0;
+        yi := 0;
+        for ci := 0 to FInDepth - 1 do
+        begin
+          b := WBase(mx, my, ci, co);
+          a := W.FData[b];        // Re R
+          bb := W.FData[b + 1];   // Im R
+          xr := FXre[ci][mx][my];
+          xi := FXim[ci][mx][my];
+          // (a + bb i)(xr + xi i)
+          yr := yr + (a * xr - bb * xi);
+          yi := yi + (a * xi + bb * xr);
+        end;
+        Sre[mx][my] := yr;
+        Sim[mx][my] := yi;
+      end;
+    FFT2D(Sre, Sim, true);  // inverse 2-D FFT (includes 1/(FSizeX*FSizeY))
+    for ix := 0 to FSizeX - 1 do
+      for iy := 0 to FSizeY - 1 do
+        FOutput.FData[((FSizeX * iy) + ix) * FOutDepth + co] := Sre[ix][iy];  // real part
+  end;
+end;
+
+procedure TNNetSpectralConv2D.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact real adjoint of 2-D FFT -> complex matmul -> real 2-D IFFT.
+procedure TNNetSpectralConv2D.BackpropagateCPU();
+var
+  ci, co, mx, my, ix, iy: integer;
+  W, WDelta, LocalPrevError: TNNetVolume;
+  Gre, Gim: TSpectralConv2DMatrix;           // (1/(L)) * FFT2D(g[co]) over modes
+  dXre, dXim: array of TSpectralConv2DMatrix; // input-spectrum grad [ci][mx][my]
+  invL, a, bb, xr, xi, gyr, gyi, contrib: Double;
+  b, L: integer;
+begin
+  W := FArrNeurons[0].FWeights;
+  WDelta := FArrNeurons[0].FDelta;
+  L := FSizeX * FSizeY;
+  invL := 1.0 / L;
+
+  SetLength(dXre, FInDepth, FModesX, FModesY);
+  SetLength(dXim, FInDepth, FModesX, FModesY);
+  for ci := 0 to FInDepth - 1 do
+    for mx := 0 to FModesX - 1 do
+      for my := 0 to FModesY - 1 do
+      begin
+        dXre[ci][mx][my] := 0;
+        dXim[ci][mx][my] := 0;
+      end;
+
+  SetLength(Gre, FSizeX, FSizeY);
+  SetLength(Gim, FSizeX, FSizeY);
+  for co := 0 to FOutDepth - 1 do
+  begin
+    // dL/dYhat[co][mx,my] = (1/L) * FFT2D(g[co])[mx,my].
+    for ix := 0 to FSizeX - 1 do
+      for iy := 0 to FSizeY - 1 do
+      begin
+        Gre[ix][iy] := FOutputError.FData[((FSizeX * iy) + ix) * FOutDepth + co];
+        Gim[ix][iy] := 0;
+      end;
+    FFT2D(Gre, Gim, false);
+    for mx := 0 to FModesX - 1 do
+      for my := 0 to FModesY - 1 do
+      begin
+        gyr := invL * Gre[mx][my];
+        gyi := invL * Gim[mx][my];
+        for ci := 0 to FInDepth - 1 do
+        begin
+          b := WBase(mx, my, ci, co);
+          a := W.FData[b];        // Re R
+          bb := W.FData[b + 1];   // Im R
+          xr := FXre[ci][mx][my];
+          xi := FXim[ci][mx][my];
+          // Weight gradient. Yre=a*xr-bb*xi, Yim=a*xi+bb*xr.
+          WDelta.FData[b]     := WDelta.FData[b]     +
+            (-FLearningRate) * (gyr * xr + gyi * xi);
+          WDelta.FData[b + 1] := WDelta.FData[b + 1] +
+            (-FLearningRate) * (-gyr * xi + gyi * xr);
+          // Input-spectrum gradient (sum over co).
+          dXre[ci][mx][my] := dXre[ci][mx][my] + (gyr * a + gyi * bb);
+          dXim[ci][mx][my] := dXim[ci][mx][my] + (-gyr * bb + gyi * a);
+        end;
+      end;
+  end;
+
+  // Propagate the input-spectrum gradient back through the input 2-D FFT:
+  //   dL/dx[ci] = L * Re( IFFT2D(dXhat[ci]) ).
+  if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+    for ci := 0 to FInDepth - 1 do
+    begin
+      for ix := 0 to FSizeX - 1 do
+        for iy := 0 to FSizeY - 1 do
+        begin
+          Gre[ix][iy] := 0;
+          Gim[ix][iy] := 0;
+        end;
+      for mx := 0 to FModesX - 1 do
+        for my := 0 to FModesY - 1 do
+        begin
+          Gre[mx][my] := dXre[ci][mx][my];
+          Gim[mx][my] := dXim[ci][mx][my];
+        end;
+      FFT2D(Gre, Gim, true);  // IFFT2D (includes 1/L)
+      for ix := 0 to FSizeX - 1 do
+        for iy := 0 to FSizeY - 1 do
+        begin
+          contrib := L * Gre[ix][iy];  // undo the IFFT's 1/L -> real adjoint
+          LocalPrevError.FData[((FSizeX * iy) + ix) * FInDepth + ci] :=
+            LocalPrevError.FData[((FSizeX * iy) + ix) * FInDepth + ci] + contrib;
+        end;
+    end;
+  end;
+
+  if not FBatchUpdate then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetTropicalLinear }
 
 // Tropical (max-plus / min-plus) dense layer. The forward map per output i is
@@ -60945,6 +61321,7 @@ begin
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
+      'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
@@ -61268,6 +61645,7 @@ begin
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
+      if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
