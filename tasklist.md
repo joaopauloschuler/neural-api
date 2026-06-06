@@ -165,6 +165,32 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
+- [ ] TNNetCondConv — CONDITIONALLY-PARAMETERIZED ("dynamic") convolution
+      (Yang et al. 2019, "CondConv: Conditionally Parameterized Convolutions for
+      Efficient Inference", NeurIPS): the layer owns a BANK of `K` expert
+      convolution kernels `W_1..W_K` (each a normal `Features x FeatureSize x
+      FeatureSize x InChannels` kernel) plus a tiny per-sample ROUTING head
+      (global-avg-pool over the spatial map -> FullConnect -> sigmoid) that emits
+      `K` mixing coefficients `alpha_1..alpha_K` PER INPUT SAMPLE. The effective
+      kernel is the per-sample convex-ish blend `W_eff = sum_k alpha_k * W_k`,
+      applied as ONE ordinary convolution — so inference cost stays that of a
+      single conv regardless of `K`, while capacity grows with the bank. This is
+      genuinely DISTINCT from the existing fork members: `TNNetHyperConv`
+      GENERATES the whole kernel from a second tensor in one shot (no fixed
+      expert bank, caps kernel size), and the soft `TNNet.AddMixtureOfExperts`
+      mixes K expert MLP/branch OUTPUTS post-hoc (K forward passes), whereas
+      CondConv mixes K kernels BEFORE the conv (one forward pass). Forward: pool
+      -> route -> blend kernels -> conv. Backward (the interesting part, worth a
+      careful numerical-gradient test): route `dL/dW_k = alpha_k * dL/dW_eff`,
+      and the routing coefficients receive `dL/dalpha_k = <dL/dW_eff, W_k>`
+      chained back through the sigmoid + FC + pool into the input. Wire both
+      CreateLayer tables + LoadFromString (K / Features / FeatureSize / Padding /
+      Stride round-trip via FStruct), add input + weight + routing-head
+      gradient checks, and ship an `examples/CondConv/` bake-off showing a
+      K-expert CondConv matching a much wider plain conv at single-conv inference
+      cost on a small CIFAR-10 / synthetic-texture task. Mark the new class with
+      `// Coded by Claude (AI).` per the authorship convention.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
