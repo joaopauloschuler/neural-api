@@ -227,56 +227,6 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [X] Set Transformer family — inducing-point attention (`TNNetInducedSetAttention`)
-      + pooling-by-multihead-attention (`TNNetAttentionPooling`) (Lee et al. 2019,
-      "Set Transformer", ICML). Two structurally NEW primitives for permutation-
-      invariant set inputs, both DISTINCT from everything already here:
-      * `TNNetInducedSetAttention` (ISAB): instead of full O(N^2) self-attention
-        over the N input tokens, keep a small bank of `M` LEARNABLE inducing
-        points `I` (shape `(M, d)`). The block is two stacked cross-attentions:
-        `H = MAB(I, X)` (the M inducing points attend over the N inputs ->
-        `(M, d)`), then `Y = MAB(X, H)` (the N inputs attend back over the M
-        summaries -> `(N, d)`), giving an O(N*M) shape-preserving set-to-set map
-        that still mixes all N tokens but through the M-wide bottleneck. The
-        inducing points are trainable Neurons, NOT read from the input — so this
-        is NOT the existing `TNNetCrossAttention` (two external sources) nor a
-        plain stack of `TNNetScaledDotProductAttention` (O(N^2), no bank).
-      * `TNNetAttentionPooling` (PMA): pool a variable-length set `(N, d)` down to
-        a FIXED `k` outputs `(k, d)` by letting `k` LEARNABLE seed vectors `S`
-        cross-attend over the N inputs (`PMA = MAB(S, X)`). This is a TRAINABLE,
-        content-addressed, permutation-invariant readout — categorically unlike
-        the existing fixed reductions `TNNetAvgChannel` / `TNNetMaxChannel`
-        (parameter-free mean/max) and unlike `TNNetModernHopfield` (iterates a
-        softmax to a fixed point against a stored-pattern bank; here it is a
-        single cross-attention with learnable QUERIES, `k=1` collapses to a
-        weighted-sum attention pool).
-      Forward caches the per-block softmax weights; backward differentiates the
-      MAB cross-attention Jacobian (reuse the SDPA softmax-Jacobian path already
-      proven by `TNNetScaledDotProductAttention` / `TNNetCrossAttention`) and
-      scatters the gradient into BOTH the input set and the learnable
-      inducing-point / seed banks so they train end-to-end. Ship the usual trio
-      for each class (declaration with the `// Coded by Claude (AI).` comment,
-      dispatch-table + save/load wiring like `TNNetCrossAttention` since both
-      own a learnable bank, numerical-gradient test exercising the two-stage MAB
-      and the `k=1`/`M=1` edge cases), plus composite builders
-      `TNNet.AddInducedSetAttention(InducingPoints, Heads)` and
-      `TNNet.AddAttentionPooling(NumSeeds, Heads)`. Capstone
-      `examples/SetTransformer/`: a permutation-invariance smoke test (shuffle
-      the input rows -> identical pooled output to <1e-5) plus a tiny
-      max-of-set / amortized-clustering toy task showing ISAB+PMA beats a
-      mean-pool baseline AND that ISAB with `M << N` matches full self-attention
-      pooling at a fraction of the score-matrix size. Pairs naturally with the
-      open [[Product-Key Memory]] task as the set-structured-input cluster.
-      LANDED 2026-06-06: both classes (self-contained, owning the learnable
-      bank, serialized like `TNNetModernHopfield` — NO source-index injection),
-      both builders (`Heads` accepted for API stability but only `Heads=1`
-      implemented), 12 numerical/serialization tests (ISAB+PMA input/weight
-      gradient checks incl. M=1/k=1 edge cases, PMA permutation invariance,
-      round-trips, builder end-to-end), and `examples/SetTransformer/` all green.
-      DESIGN CHOICE: v1 uses IDENTITY Q/K/V projections (only the inducing/seed
-      bank is learnable) — keeps the two-stage softmax-Jacobian backward exact
-      and gradient-checkable. DEFERRED follow-ups: multi-head MABs, and per-MAB
-      learnable W_Q/W_K/W_V + residual/feed-forward (the full SAB/ISAB block).
 - [ ] Set Transformer follow-up (multi-head + learnable-projection MAB): the
       landed v1 `TNNetInducedSetAttention` / `TNNetAttentionPooling` use
       single-head MABs with IDENTITY Q/K/V projections (only the bank is
@@ -1556,49 +1506,6 @@ rather than acted on.
       reading how information is distributed across the coordinate axis.
 
 ### Product-Key Memory layer (large sparse key-value memory)
-- [X] `TNNetProductKeyMemory` — a large, sparsely-accessed key-value memory
-      layer (Lample et al., NeurIPS 2019, "Large Memory Layers with Product
-      Keys"). The point is a memory bank far too large to address with a flat
-      softmax: instead of one set of `|K|` keys, keep TWO small half-key
-      subsets `K1`, `K2` (each `sqrt(|K|)` keys of half-dimension), so the
-      effective key set is their Cartesian product `K1 x K2` of size
-      `sqrt(|K|)^2`. A query is split into two half-queries; each is scored
-      against its own half-key subset, the top-`k` per half are taken, and the
-      `k x k` candidate combinations are re-scored to pick the global top-`k`
-      product keys in `O(sqrt(|K|))` work instead of `O(|K|)`. The selected
-      keys' softmax weights gate a weighted sum over the corresponding learned
-      VALUE vectors (an `EmbeddingBag`-style sparse lookup) to produce the
-      output. Forward caches the chosen indices + softmax weights; backward
-      scatters the value-gradient into only the touched value rows and pushes
-      the score-gradient back through the two half-key dot-products into the
-      query (multi-head: split the query into H independent product-key
-      lookups and concatenate, like the existing multi-head attention wiring).
-      This is structurally DISTINCT from everything already here:
-      [[modern-hopfield-layer]] (`TNNetModernHopfield`) iterates a DENSE
-      softmax to a fixed point over a SMALL fully-retrieved learnable bank;
-      `TNNetEmbedding` is a one-hot index lookup; MoE routes to a few expert
-      MLPs, not to rows of a value table. The novelty here is the PRODUCT-KEY
-      factorization enabling sparse top-k retrieval from a memory with
-      millions of slots at sub-linear cost — a different primitive, not a
-      near-duplicate. Ship with the usual trio (declaration with the
-      `// Coded by Claude (AI).` comment, dispatch-table wiring,
-      numerical-gradient test that exercises the sparse top-k path including
-      the tie/`k=1` edge case) plus a `TNNet.AddProductKeyMemory(NumKeys,
-      ValueDim, TopK, Heads)` composite builder. Capstone
-      `examples/ProductKeyMemory/`: a tiny associative-recall / synthetic
-      key->value retrieval task showing that a product-key memory matches a
-      same-capacity flat memory's accuracy while touching only top-k rows per
-      step, and a short note on the known failure mode (key-usage collapse —
-      a handful of slots hog all reads — and the batch-norm-on-query trick
-      the paper uses to spread usage).
-      DONE (single-head v1): `TNNetProductKeyMemory` +
-      `TNNet.AddProductKeyMemory(NumKeys, ValueDim, TopK, Heads)` landed with
-      dispatch wiring, 5 numerical/serialization tests, and
-      `examples/ProductKeyMemory/`. MULTI-HEAD is DEFERRED — the builder
-      exposes `Heads` for API stability but only `Heads=1` is implemented
-      (other values raise); a follow-up should split the query into H
-      independent product-key lookups concatenated along Depth, mirroring the
-      multi-head attention wiring.
 - [ ] TNNetProductKeyMemory follow-up (multi-head): the landed v1 is
       single-head (`Heads=1`; the builder raises for other values). Implement H
       independent product-key lookups — split the `QueryDim` query into H
