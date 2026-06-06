@@ -128,8 +128,16 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [ ] TNNetHyperbolicLinear — a Poincaré-ball **hyperbolic** dense layer (Ganea,
+- [X] TNNetHyperbolicLinear — a Poincaré-ball **hyperbolic** dense layer (Ganea,
       Bécigneul & Hofmann 2018, "Hyperbolic Neural Networks"; Nickel & Kiela 2017).
+      LANDED 2026-06-06 on a2 (81c35c2): subclasses TNNetFullConnectLinear, exact
+      analytic backward through log_0/exp_0 + Möbius add, curvature c in FFloatSt[0],
+      gradient+shape+save/load tests, README row. Follow-up TNNetHyperbolicDistance
+      prototype-distance readout head LANDED too (3253213) plus
+      examples/HyperbolicEmbedding/ tree-distance demo (fae6f51, hyperbolic beats
+      param-matched Euclidean: MSE 0.052/corr 0.94 vs 0.155/0.83). Remaining open
+      follow-up: make curvature `c` a single trainable scalar via the
+      `gamma=sigmoid(raw)` constrained-scalar pattern.
       The layer treats its `Depth`-vector input as a point inside the open
       Poincaré ball (radius `1/sqrt(c)`, curvature `c>0`) and computes the
       Möbius matrix–vector product `y = exp_0( M · log_0(x) )` followed by a
