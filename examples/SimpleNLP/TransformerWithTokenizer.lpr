@@ -1,4 +1,4 @@
-program TrasformerDecodersWithTokenizer;
+program TransformerWithTokenizer;
 (*
 Copyright (C) 2023 Joao Paulo Schwarz Schuler
 

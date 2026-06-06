@@ -25,7 +25,7 @@
           <Version Value="11"/>
           <PathDelim Value="\"/>
           <Target>
-            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TrasformerDecodersWithTokenizer"/>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TransformerWithTokenizer"/>
           </Target>
           <SearchPaths>
             <IncludeFiles Value="..\neural;$(ProjOutDir)"/>
@@ -69,7 +69,7 @@
           <Version Value="11"/>
           <PathDelim Value="\"/>
           <Target>
-            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TrasformerDecodersWithTokenizer"/>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TransformerWithTokenizer"/>
           </Target>
           <SearchPaths>
             <IncludeFiles Value="..\..\neural;$(ProjOutDir)"/>
@@ -114,7 +114,7 @@
     </RunParams>
     <Units Count="1">
       <Unit0>
-        <Filename Value="TrasformerDecodersWithTokenizer.lpr"/>
+        <Filename Value="TransformerWithTokenizer.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit0>
     </Units>
@@ -123,7 +123,7 @@
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TrasformerDecodersWithTokenizer"/>
+      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TransformerWithTokenizer"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="..\..\experiments\neural;$(ProjOutDir)"/>

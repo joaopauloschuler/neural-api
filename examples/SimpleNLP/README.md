@@ -134,7 +134,7 @@ Finally, an output layer with one output per input in the context can be added w
       TNNetPointwiseSoftMax.Create(1)
     ]);
 ```
-The full source code can be found at [NLP with Vocabulary](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/TrasformerDecodersWithTokenizer.ipynb).
+The full source code can be found at [NLP with Vocabulary](https://colab.research.google.com/github/joaopauloschuler/neural-api/blob/master/examples/SimpleNLP/TransformerWithTokenizer.ipynb).
 
 After training, this model produces sentences such as:
 * one day, a little girl named lucy went to the park with her mom. lucy saw a big tree with a hole in it. she wanted to climb the tree and see what was on the other .
