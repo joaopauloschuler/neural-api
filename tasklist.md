@@ -120,6 +120,37 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
+- [ ] TNNetGraphConv — first GRAPH-neural-network primitive in the fork (no graph /
+      message-passing / adjacency support exists anywhere today; grep for
+      graph|adjacency|GCN|message.passing returns nothing). A spatial graph
+      convolution (Kipf & Welling 2017, "Semi-Supervised Classification with Graph
+      Convolutional Networks", arXiv:1609.02907) that reuses the established
+      TWO-SOURCE wiring pattern of TNNetHyperLinear / TNNetCrossAttention: it reads
+      NODE FEATURES from its main input (shape (NumNodes, 1, Fin)) and the GRAPH
+      STRUCTURE from a SECOND input tensor (a NumNodes x NumNodes adjacency / message
+      matrix A, packed like TNNetCrossAttention's K|V source). Forward computes the
+      one-hop aggregation H' = activation( A_hat . X . W (+ b) ) where W is the only
+      trainable weight (Fin x Fout, owned in Neurons[]) and A_hat is the supplied
+      message matrix (caller normalizes; the GCN symmetric D^-1/2 (A+I) D^-1/2
+      renormalization can be precomputed upstream or offered as a builder option).
+      Backward must propagate into BOTH sources: dL/dX = A_hat^T . (dL/dH' . W^T) into
+      the node-feature input and dL/dA contributes the message-matrix gradient
+      (= (dL/dH' . W^T) . X^T) when the adjacency is itself learned/produced upstream,
+      plus the ordinary dL/dW = (A_hat . X)^T . dL/dH'. This is structurally distinct
+      from every landed layer: TNNetHyperLinear reads WEIGHTS from a 2nd tensor (here
+      the 2nd tensor is the graph TOPOLOGY, and W stays a normal trainable parameter);
+      attention computes its own NxN affinity from Q.K^T whereas here the NxN mixing
+      matrix is GIVEN; convolution mixes a fixed spatial grid, not an arbitrary graph.
+      Deliverables: the leaf layer with LoadFromString serialization (two-source like
+      TNNetCrossAttention), a TNNet.AddGraphConv(Fin, Fout, AdjacencyLayer, UseBias)
+      composite helper, input + weight + adjacency-source numerical-gradient tests
+      (reseed RandSeed:=424242 per the RNG-ordering rule), a save/load round-trip
+      test, and an examples/GraphConv/ node-classification demo on a tiny synthetic
+      two-community / Karate-club-style graph (stack 2 GraphConv layers + softmax,
+      show it separates the communities vs a no-graph FullConnect baseline). Opens the
+      whole GNN family (a later GAT-style attention-over-edges variant can subclass
+      this once the message-matrix plumbing exists). // Coded by Claude (AI).
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
