@@ -120,21 +120,17 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [ ] TNNetQuaternionConv follow-up (now doable — TNNetQuaternionLinear LANDED
-      2026-06-06 with a gradient-checked Hamilton-product block and a
-      param-matched bake-off in examples/QuaternionLinear/). Build the spatial
-      sibling: a convolution whose per-output-channel filter taps are quaternion
-      weights, so each 4-channel input patch is Hamilton-multiplied by a learned
-      quaternion and accumulated — ~1/4 the weights of an equal-width real conv
-      while coupling the four channel components. Reuse the trusted 4x4 Hamilton
-      forward/backward kernel from TNNetQuaternionLinear (input Depth and filter
-      count both multiples of 4). Ship: leaf layer + LoadFromString registration
-      (both dispatch points) + the mandatory numerical-gradient test (input AND
-      the four weight components per quaternion tap — same sign-error bug class)
-      + a save/load round-trip test, all in tests/TestNeuralNumerical.pas
-      (reseed RandSeed := 424242). Optionally extend examples/QuaternionLinear/
-      (or a new examples/QuaternionConv/) with a tiny colour-image rotation/
-      filtering arm vs a param-matched real conv. Pure CPU, <5 min, no binaries.
+- [X] TNNetQuaternionConv — LANDED 2026-06-06. Spatial sibling of
+      TNNetQuaternionLinear: a convolution whose per-output-channel filter taps
+      are quaternion weights (each 4-channel input patch Hamilton-multiplied by a
+      learned quaternion and accumulated; ~1/4 the weights of an equal-width real
+      conv), reusing the trusted 4x4 Hamilton forward/backward kernel. Shipped:
+      leaf layer (subclass of TNNetConvolutionLinear) with padding/stride +
+      multiple-of-4 Depth/feature validation, LoadFromString registration at both
+      dispatch points, numerical-gradient test (input AND the four weight
+      components per tap + bias) and save/load round-trip test in
+      tests/TestNeuralNumerical.pas, and examples/QuaternionConv/ (colour-rotation
+      + blur bake-off, 40 weights vs a 72-weight real-conv bottleneck).
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
@@ -363,10 +359,13 @@ rather than acted on.
       true-operator variant (Sedghi et al. 2019 FFT-based conv spectral norm, or
       a per-output-channel sigma) plus a small conv-SN bake-off / example vs the
       flattened-matrix version.
-- [ ] TNNetStochasticPool follow-up: a bake-off vs TNNetMaxPool / TNNetAvgPool /
-      TNNetSoftPool on a tiny image-classifier stub — does the stochastic
-      regularisation lower the train/val gap at matched architecture? Fork an
-      existing pooling example (examples/PoolingBakeoff/) and add the new arm.
+- [X] TNNetStochasticPool follow-up — LANDED 2026-06-06. Added a StochasticPool
+      arm to examples/PoolingBakeoff/ plus a train/val-gap metric column
+      (EnableDropouts toggled so train pools stochastically and both accuracies
+      are measured in deterministic-expectation inference mode). Verdict: the toy
+      task overfits too little for any arm to show a gap-narrowing advantage —
+      documented honestly in the README; a true demonstration needs a harder,
+      overfit-prone task (left as a possible deeper follow-up).
 - [ ] ShakeShake follow-up (a): PER-SAMPLE alpha/beta grain — the landed
       TNNetShakeShakeMerge / TNNetShakeDropMerge sample one alpha/beta/b_l per
       forward/backward PASS (per-batch). Sample an independent coefficient per

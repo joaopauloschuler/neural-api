@@ -361,6 +361,7 @@ The CAI Neural API offers several types of convolutional layers:
 1. `TNNetConvolution`: the standard convolutional layer.
 2. `TNNetConvolutionLinear`: a convolutional layer without an activation function.
 3. `TNNetConvolutionReLU`: a convolutional layer with a ReLU activation function.
+4. `TNNetQuaternionConv`: a **hypercomplex** convolution whose per-output-channel filter taps are quaternion weights — each 4-channel input patch is Hamilton-multiplied by a learned quaternion and accumulated, so the four channel components are coupled (rotation/scaling in quaternion space) using only ~1/4 the weights of an equal-width real convolution. Input `Depth` and the feature count must both be multiples of 4. It reuses the gradient-checked 4×4 Hamilton forward/backward kernel of its dense sibling `TNNetQuaternionLinear` (the library's first hypercomplex layer). See `examples/QuaternionConv/` and `examples/QuaternionLinear/`.
 
 Convolutional layers are crucial in neural networks because they:
 1. Automatically learn hierarchical features from data.
