@@ -86,13 +86,16 @@ rather than acted on.
       learnable-bandwidth variant is left for a follow-up. Coexists with the
       pre-existing fixed-only Tancik-style `TNNetFourierFeatures` (that one has no
       `sqrt(1/D)` kernel scale, uses a `2π` factor, and no trainable mode).
-- [ ] TNNetMonarchLinear example follow-up (the core layer + gradient/forward/
+- [X] TNNetMonarchLinear example follow-up (the core layer + gradient/forward/
       save-load tests LANDED 2026-06-06): an `examples/MonarchLinear/`
       param-vs-accuracy bake-off contrasting a Monarch dense layer against a
       param-matched plain `TNNetFullConnectLinear` and a `TNNetCirculantLinear`
       on a small function-fit / classification task (the headline "structured =
       fewer params, comparable accuracy" claim), plus a check that an
       untrained-from-DFT-init Monarch reproduces `TNNetFourierMixFFT`'s transform.
+      LANDED 2026-06-06 on a2 (examples/MonarchLinear/: 64->64 mixer bake-off,
+      Monarch 1088 wts MSE ~0.004 vs Dense 4096 wts vs Circulant 128 wts; DFT
+      sub-check SKIPPED — layer has no DFT-init path, noted in program/README).
 - [ ] TNNetTropicalConv example follow-up (the SPATIAL TNNetTropicalConv layer +
       gradient/forward/save-load tests LANDED 2026-06-06 on a2): add an
       examples/TropicalMorphology/ demo contrasting TNNetTropicalConv with a
