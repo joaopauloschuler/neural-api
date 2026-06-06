@@ -8124,6 +8124,21 @@ type
       // AddRMSNormResidual etc. like the attention builders). Coded by Claude (AI).
       function AddHyenaOperator(d_model: integer;
         Hidden: integer = 4): TNNetLayer;
+      // Canonical Fourier Neural Operator (FNO) Fourier layer (Li et al. 2021,
+      // https://arxiv.org/abs/2010.08895) over a (SeqLen,1,Depth) signal:
+      //   y = Activation( SpectralConv1D(x) + W_1x1(x) )
+      // The spectral branch (TNNetSpectralConv1D, keeps the lowest pModes
+      // Fourier modes) is summed with a local pointwise 1x1 residual branch
+      // (TNNetPointwiseConvLinear) in grid space, then an optional activation.
+      // Both branches map Depth -> pOutDepth so their (SeqLen,1,pOutDepth)
+      // shapes match for the sum. pActFn = nil means no activation.
+      function AddFourierNeuralOperator1D(pOutDepth, pModes: integer;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      // 2-D Fourier Neural Operator Fourier layer over a (SizeX,SizeY,Depth)
+      // grid: y = Activation( SpectralConv2D(x) + W_1x1(x) ). 2-D sibling of
+      // AddFourierNeuralOperator1D; the pointwise residual works per-pixel.
+      function AddFourierNeuralOperator2D(pOutDepth, pModesX, pModesY: integer;
+        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
       // Multi-head RETENTION block (RetNet, Sun et al. 2023) over a
       // (SeqLen,1,3*d_model) Q|K|V slab. Built exactly like
       // AddMultiHeadSelfAttention but with one softmax-free TNNetRetention per
@@ -33941,6 +33956,54 @@ begin
   Gated2 := AddLayer( TNNetCellMulByCell.Create(Gate2, LongConvOut) );
   // Token-wise out-projection.
   Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(d_model), Gated2 );
+end;
+
+function TNNet.AddFourierNeuralOperator1D(pOutDepth, pModes: integer;
+  pActFn: TNNetActivationFunctionClass): TNNetLayer;
+var
+  Origin, SpectralBranch, PointwiseBranch: TNNetLayer;
+begin
+  if pOutDepth < 1 then
+    FErrorProc('AddFourierNeuralOperator1D requires OutDepth >= 1. Got ' +
+      IntToStr(pOutDepth));
+  if pModes < 1 then
+    FErrorProc('AddFourierNeuralOperator1D requires Modes >= 1. Got ' +
+      IntToStr(pModes));
+  Origin := GetLastLayer();
+  // Spectral branch: low-pass mode mix in Fourier space (Depth -> pOutDepth).
+  SpectralBranch :=
+    AddLayerAfter( TNNetSpectralConv1D.Create(pOutDepth, pModes), Origin );
+  // Local pointwise 1x1 residual branch from the SAME origin (Depth->pOutDepth).
+  PointwiseBranch :=
+    AddLayerAfter( TNNetPointwiseConvLinear.Create(pOutDepth), Origin );
+  // y = SpectralConv(x) + W_1x1(x). Both branches are (SeqLen,1,pOutDepth).
+  Result := AddLayer( TNNetSum.Create([SpectralBranch, PointwiseBranch]) );
+  if pActFn <> nil then
+    Result := AddLayer( pActFn.Create() );
+end;
+
+function TNNet.AddFourierNeuralOperator2D(pOutDepth, pModesX, pModesY: integer;
+  pActFn: TNNetActivationFunctionClass): TNNetLayer;
+var
+  Origin, SpectralBranch, PointwiseBranch: TNNetLayer;
+begin
+  if pOutDepth < 1 then
+    FErrorProc('AddFourierNeuralOperator2D requires OutDepth >= 1. Got ' +
+      IntToStr(pOutDepth));
+  if (pModesX < 1) or (pModesY < 1) then
+    FErrorProc('AddFourierNeuralOperator2D requires ModesX,ModesY >= 1. Got ' +
+      IntToStr(pModesX) + ',' + IntToStr(pModesY));
+  Origin := GetLastLayer();
+  // Spectral branch: separable 2-D low-pass mode mix (Depth -> pOutDepth).
+  SpectralBranch :=
+    AddLayerAfter( TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY), Origin );
+  // Local per-pixel 1x1 residual branch from the SAME origin (Depth->pOutDepth).
+  PointwiseBranch :=
+    AddLayerAfter( TNNetPointwiseConvLinear.Create(pOutDepth), Origin );
+  // y = SpectralConv(x) + W_1x1(x). Both branches are (SizeX,SizeY,pOutDepth).
+  Result := AddLayer( TNNetSum.Create([SpectralBranch, PointwiseBranch]) );
+  if pActFn <> nil then
+    Result := AddLayer( pActFn.Create() );
 end;
 
 function TNNet.AddRetention(d_model, Heads: integer;

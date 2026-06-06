@@ -182,6 +182,10 @@ type
     procedure TestSpectralConv2DGradientCheck;
     procedure TestSpectralConv2DShapeAndTruncation;
     procedure TestSpectralConv2DSerializationRoundTrip;
+    // AddFourierNeuralOperator1D/2D block builders (spectral + pointwise residual)
+    procedure TestFourierNeuralOperator1DShape;
+    procedure TestFourierNeuralOperator2DShape;
+    procedure TestFourierNeuralOperator1DInputGradientCheck;
     // TNNetTropicalLinear max-plus / min-plus morphological dense layer
     procedure TestTropicalLinearGradientCheck;
     procedure TestTropicalLinearForwardKnownValue;
@@ -37221,6 +37225,140 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierNeuralOperator1DShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // FNO 1-D Fourier layer: Input(8,1,3) -> AddFourierNeuralOperator1D(4,3,ReLU)
+  // must yield an (8,1,4) output (spectral + pointwise residual, then ReLU).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 1, 3));
+    NN.AddFourierNeuralOperator1D(4, 3, TNNetReLU);
+    Input.Fill(0.3);
+    NN.Compute(Input);
+    AssertEquals('FNO1D output SizeX', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('FNO1D output SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('FNO1D output Depth', 4, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierNeuralOperator2DShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // FNO 2-D Fourier layer: Input(8,8,2) -> AddFourierNeuralOperator2D(3,2,2,ReLU)
+  // must yield an (8,8,3) output. (TNNetSpectralConv2D's radix-2 FFT requires a
+  // power-of-two grid, so the grid is 8x8 rather than 6x6.)
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 2));
+    NN.AddFourierNeuralOperator2D(3, 2, 2, TNNetReLU);
+    Input.Fill(0.25);
+    NN.Compute(Input);
+    AssertEquals('FNO2D output SizeX', 8, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('FNO2D output SizeY', 8, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('FNO2D output Depth', 3, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierNeuralOperator1DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr,
+    gradNorm: TNeuralFloat;
+  i, SeqLen, InDepth, OutDepth, Modes, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Composition-level central-difference input-gradient check for the multi-branch
+  // AddFourierNeuralOperator1D builder. The two leaf branches are individually
+  // gradient-verified; this confirms the TNNetSum of the spectral + pointwise
+  // branches wires the backward path correctly. Linear builder (no activation)
+  // so the central difference is exact up to FD truncation. The grid is small and
+  // inputs are bounded; tolerance is NOT loosened. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  SeqLen := 8; InDepth := 3; OutDepth := 4; Modes := 3;
+  InSize := SeqLen * InDepth;
+  OutSize := SeqLen * OutDepth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, OutDepth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  gradNorm := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1)); // 1 = collect input error
+    NN.AddFourierNeuralOperator1D(OutDepth, Modes, nil);   // linear, no activation
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      gradNorm := gradNorm + Abs(analyticalGrad);
+
+      AssertTrue('FNO1D input gradient finite at ' + IntToStr(i),
+        (not IsNan(analyticalGrad)) and (not IsInfinite(analyticalGrad)));
+      AssertTrue('FNO1D input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    AssertTrue('FNO1D input gradient is non-zero (norm=' +
+      FloatToStr(gradNorm) + ')', gradNorm > 1e-6);
+    WriteLn('  FNO1D builder input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 
