@@ -32,19 +32,19 @@ You can get A.I. powered help from these tools:
  
 ## Documentation
 The documentation covers: 
-* Easy examples.
-* Simple image classification examples.
-* Youtube videos.
-* Advanced examples.
-* Data structures (Volumes).
-* Neural network layers.
-* Dataset support.
-* Training (fitting) your neural network.
-* Parallel computing.
+* [Easy examples](#easy-examples-first-please).
+* [Simple image classification examples](#simple-image-classification-examples).
+* [Youtube videos](#youtube-videos).
+* [Advanced examples](#advanced-examples).
+* [Data structures (Volumes)](#volumes).
+* [Neural network layers](#neural-network-layers).
+* [Dataset support](#dataset-support).
+* [Training (fitting) your neural network](#fitting-your-neural-network).
+* [Parallel computing](#parallel-computing---the-neuralthreadpas).
 * [Full set of examples](examples/README.md).
 * [Normalization Cheat Sheet](docs/normalization.md).
 * [Layer Authoring Guide](docs/layer-authoring.md) — checklist for adding a new layer plus mini-guides on reading numerical-gradient failures and picking a tolerance.
-* Other scientific publications from the same author.
+* [Other scientific publications from the same author](#publications-from-the-author).
 
 ### Easy Examples First Please!
 [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
