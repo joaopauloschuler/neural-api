@@ -118,7 +118,7 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [ ] TNNetQuaternionLinear — a quaternion-valued dense layer (Parcollet et al.
+- [x] TNNetQuaternionLinear — a quaternion-valued dense layer (Parcollet et al.
       2019, "Quaternion Recurrent Neural Networks"; Gaudet & Maida 2018). The
       first hypercomplex layer in the fork. Treat the input Depth (must be a
       multiple of 4) as a vector of D/4 quaternions, and learn an (Out/4 x In/4)
