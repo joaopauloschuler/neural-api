@@ -106,18 +106,6 @@ rather than acted on.
       `RFF -> TNNetFullConnectLinear -> SoftMax` and contrast accuracy/params
       against a plain ReLU MLP, showing that a single random-feature layer +
       linear head already separates the rings (the RBF-kernel headline).
-- [X] TNNetMonarchLinear — sub-quadratic STRUCTURED dense layer whose `n×n` weight
-      is a MONARCH matrix (Dao et al. 2022) — LANDED 2026-06-06 on a2 (commit
-      ccc67a6). `y = P^T·(L·(P·(R·x)))` with block-diagonal `R`,`L` (`n=b·m`,
-      `b=round(sqrt(n))` perfect square, else largest divisor ≤ sqrt(n), `b`
-      round-trips via FStruct[1]; suppress-bias FStruct[3]), `P` the fixed
-      `(b,m)→(m,b)` index-gather permutation (no weights). Four-pass forward (never
-      materializes the dense `n×n`), exact transpose-chain backward. Leaf class with
-      `// Coded by Claude (AI).`, both CreateLayer tables + LoadFromString wired;
-      numerical-gradient tests on INPUT and on BOTH factors (max-abs-err 7.3e-4,
-      bounded weights), identity-factor=pure-permutation + identity-R+single-L
-      forward-equality test, and a save/load round-trip — all pass in
-      tests/TestNeuralNumerical.pas.
 - [ ] TNNetMonarchLinear example follow-up (the core layer + gradient/forward/
       save-load tests LANDED 2026-06-06): an `examples/MonarchLinear/`
       param-vs-accuracy bake-off contrasting a Monarch dense layer against a
