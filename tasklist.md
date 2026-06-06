@@ -72,38 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetTropicalLinear (max-plus / morphological dense layer) — a dense layer
-      that computes in the TROPICAL (max-plus) semiring instead of the usual
-      multiply-accumulate ring: `y_i = max_j (x_j + W[i,j])` (a morphological
-      DILATION), with a paired ERODE mode `y_i = min_j (x_j + W[i,j])` selected by
-      a constructor flag (round-trips via an FStruct slot). This is a genuinely
-      DIFFERENT operator from everything in the suite — `TNNetFullConnect*` use
-      `sum_j W*x` (ring), the structured-linear family (`TNNetCirculantLinear`,
-      `TNNetHouseholderLinear`, `TNNetBitLinear`, `AddGroupedFullConnect`) all
-      still multiply-accumulate, and max/min POOLING is parameterless; here the
-      weights are learnable ADDITIVE thresholds and the combine op is max/min, so
-      the layer learns piecewise-linear convex (dilation) / concave (erosion)
-      functions and tropical polynomials. Forward is `O(Din*Dout)` like a dense
-      layer. Backward is the subgradient that maxpool already uses: cache the
-      arg-max (arg-min) `j*` per output `i` and route the upstream error to
-      exactly `dL/dx[j*] += dy_i` and `dL/dW[i,j*] += dy_i` (a hard one-hot
-      selection per output — non-differentiable at ties, same convention as
-      `TNNetMaxPool`/`TNNetMaxChannel`, so tests must use well-separated inputs to
-      avoid the tie boundary, mirroring the [[product-key-memory-layer]] top-k
-      caveat). Deliverables following [[loss-layer-pattern]]/the layer-authoring
-      checklist: the leaf class with `// Coded by Claude (AI).`, registration in
-      both CreateLayer dispatch tables + the LoadFromString cascade, a
-      numerical-gradient test on BOTH input and weights (perturb only the clearly
-      winning entry, away from the kink), a forward-equality test against a
-      hand-computed tiny max-plus example for BOTH dilation and erosion, a
-      save/load round-trip with the non-default erode flag set, and a small
-      `examples/TropicalMorphology/` bake-off showing a max-plus stack fitting a
-      piecewise-linear / convex-envelope target that a same-width single linear
-      layer cannot (the headline "different algebra, different hypothesis class"
-      payoff). Stretch follow-up: a `TNNetTropicalConv` spatial sibling (grayscale
-      morphological dilation/erosion with a learnable structuring element) reusing
-      the same arg-select backward — track it as a follow-up, do NOT add a second
-      task now.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):

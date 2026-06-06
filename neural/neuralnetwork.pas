@@ -6525,6 +6525,53 @@ type
     property InDepth: integer read FInDepth;
   end;
 
+  /// TROPICAL (max-plus / min-plus) morphological DENSE layer. This is a
+  /// genuinely DIFFERENT operator from the rest of the suite: instead of the
+  /// multiply-accumulate ring used by TNNetFullConnect* and the structured-linear
+  /// family (sum_j W[i,j]*x_j), it computes in the tropical semiring where the
+  /// "product" is ADDITION and the "sum" is MAX (dilation) or MIN (erosion):
+  ///   DILATION (default): y_i = max_j ( x_j + W[i,j] )
+  ///   ERODE   (flag set): y_i = min_j ( x_j + W[i,j] )
+  /// The weights W are learnable ADDITIVE thresholds (a structuring element), so
+  /// the layer learns piecewise-linear CONVEX (dilation) / CONCAVE (erosion)
+  /// functions and tropical polynomials -- a different hypothesis class from any
+  /// linear layer of the same width.
+  ///
+  /// Forward is O(Din*Dout) like a dense layer. Backward is the SUBGRADIENT that
+  /// max-pooling already uses: for each output i cache the winning index j* (the
+  /// arg-max for dilation, arg-min for erosion) and route the upstream error to
+  /// exactly that one input and one weight:
+  ///   dL/dx[j*] += dy_i      and      dL/dW[i,j*] += dy_i
+  /// This is a hard one-hot selection per output, non-differentiable at ties
+  /// (same convention as TNNetMaxPool / TNNetMaxChannel) -- gradient tests must
+  /// use well-separated inputs so the winner is unambiguous, away from the kink.
+  ///
+  /// Weight layout: a single weight neuron holds Dout*Din reals, indexed
+  ///   W[i*FInDepth + j]   (output i, input j).
+  /// The input is read flat over the previous layer's whole Output (Size = Din);
+  /// the output is a (1,1,Dout) vector. Constructor: Create(OutDepth, Erode).
+  /// OutDepth round-trips via FStruct[0]; the erode flag via FStruct[6] (0 =
+  /// dilation/max, 1 = erosion/min) so save/load preserves the non-default mode.
+  // Coded by Claude (AI).
+  TNNetTropicalLinear = class(TNNetLayer)
+  private
+    FOutDepth: integer;   // Dout
+    FInDepth: integer;    // Din (flat input size)
+    FErode: integer;      // 0 = dilation (max), 1 = erosion (min)
+    FWinner: array of integer;  // cached arg-max/arg-min j* per output i
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pOutDepth: integer; pErode: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property OutDepth: integer read FOutDepth;
+    property InDepth: integer read FInDepth;
+    property Erode: integer read FErode;
+  end;
+
   /// Weight Standardization CONVOLUTION layer (Qiao et al. 2019,
   /// "Micro-Batch Training with Batch-Channel Normalization and Weight
   /// Standardization", arXiv:1903.10520). This is the convolution sibling of
@@ -36033,6 +36080,157 @@ begin
   end;
 end;
 
+{ TNNetTropicalLinear }
+
+// Tropical (max-plus / min-plus) dense layer. The forward map per output i is
+//   dilation: y_i = max_j (x_j + W[i,j]);  erosion: y_i = min_j (x_j + W[i,j]).
+// FWinner[i] caches the winning j* (arg-max / arg-min) so the backward pass can
+// route the upstream error to exactly that one input and one weight -- the same
+// hard subgradient that max-pooling uses.
+
+constructor TNNetTropicalLinear.Create(pOutDepth: integer; pErode: integer);
+begin
+  inherited Create();
+  if pOutDepth <= 0 then
+    FErrorProc('TNNetTropicalLinear requires OutDepth >= 1. Got ' + IntToStr(pOutDepth));
+  FOutDepth := pOutDepth;
+  if pErode <> 0 then FErode := 1 else FErode := 0;
+  FStruct[0] := FOutDepth;
+  FStruct[6] := FErode;
+  // One weight neuron (the additive structuring element); sized in SetPrevLayer.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+procedure TNNetTropicalLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WeightCount: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  FInDepth := pPrevLayer.Output.Size;
+  if FInDepth <= 0 then
+    FErrorProc('TNNetTropicalLinear requires a non-empty input.');
+
+  FOutput.ReSize(1, 1, FOutDepth);
+  FOutputError.ReSize(1, 1, FOutDepth);
+  FOutputErrorDeriv.ReSize(1, 1, FOutDepth);
+
+  WeightCount := FOutDepth * FInDepth;
+  FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
+  FNeurons[0].BackInertia.ReSize(WeightCount, 1, 1);
+  FNeurons[0].Delta.ReSize(WeightCount, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  SetLength(FWinner, FOutDepth);
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Small symmetric random thresholds: the structuring element starts near zero so
+// the initial output is a mild perturbation of max_j x_j / min_j x_j.
+procedure TNNetTropicalLinear.InitDefault();
+var
+  i, WeightCount: integer;
+  W: TNNetVolume;
+begin
+  if FInDepth <= 0 then exit;
+  W := FArrNeurons[0].FWeights;
+  WeightCount := W.Size;
+  for i := 0 to WeightCount - 1 do
+    W.FData[i] := 0.1 * (Random - 0.5) * 2;
+end;
+
+procedure TNNetTropicalLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTropicalLinear.ComputeCPU();
+var
+  i, j, jbase, best: integer;
+  PrevOut, W: TNNetVolume;
+  cand, bestVal: TNeuralFloat;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  W := FArrNeurons[0].FWeights;
+  for i := 0 to FOutDepth - 1 do
+  begin
+    jbase := i * FInDepth;
+    best := 0;
+    bestVal := PrevOut.FData[0] + W.FData[jbase];
+    for j := 1 to FInDepth - 1 do
+    begin
+      cand := PrevOut.FData[j] + W.FData[jbase + j];
+      if FErode = 0 then
+      begin
+        if cand > bestVal then begin bestVal := cand; best := j; end;
+      end
+      else
+      begin
+        if cand < bestVal then begin bestVal := cand; best := j; end;
+      end;
+    end;
+    FWinner[i] := best;
+    FOutput.FData[i] := bestVal;
+  end;
+end;
+
+procedure TNNetTropicalLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Subgradient: route each output error dy_i only to the cached winner j*.
+//   dL/dx[j*] += dy_i ;  dL/dW[i,j*] += dy_i  (Delta carries -LearningRate*grad)
+procedure TNNetTropicalLinear.BackpropagateCPU();
+var
+  i, jstar: integer;
+  W, WDelta, LocalPrevError: TNNetVolume;
+  dy: TNeuralFloat;
+  HasPrevError: boolean;
+begin
+  W := FArrNeurons[0].FWeights;
+  WDelta := FArrNeurons[0].FDelta;
+  HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  LocalPrevError := FPrevLayer.OutputError;
+
+  for i := 0 to FOutDepth - 1 do
+  begin
+    dy := FOutputError.FData[i];
+    jstar := FWinner[i];
+    WDelta.FData[i * FInDepth + jstar] :=
+      WDelta.FData[i * FInDepth + jstar] + (-FLearningRate) * dy;
+    if HasPrevError then
+      LocalPrevError.FData[jstar] := LocalPrevError.FData[jstar] + dy;
+  end;
+
+  if not FBatchUpdate then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetHouseholderLinear }
 
 // Floor used to guard the v_i^T v_i denominator: below this a reflection is
@@ -60747,6 +60945,7 @@ begin
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
+      'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
@@ -61069,6 +61268,7 @@ begin
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
+      if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else
