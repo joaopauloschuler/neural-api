@@ -173,6 +173,11 @@ type
     procedure TestSpectralConv1DGradientCheck;
     procedure TestSpectralConv1DModesTruncation;
     procedure TestSpectralConv1DSerializationRoundTrip;
+    // TNNetDWT1D lifting-scheme single-level 1-D discrete wavelet transform
+    procedure TestDWT1DInputGradientCheck;
+    procedure TestDWT1DLearnableTapGradientCheck;
+    procedure TestDWT1DSerializationRoundTrip;
+    procedure TestDWT1DReconstructionOracle;
     // TNNetSpectralConv2D 2-D Fourier Neural Operator spectral conv layer
     procedure TestSpectralConv2DGradientCheck;
     procedure TestSpectralConv2DShapeAndTruncation;
@@ -36720,6 +36725,287 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestDWT1DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  DW: TNNetDWT1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, SeqLen, Depth, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for the fixed-filter DWT. The
+  // lifting steps are exactly linear, so the central difference is accurate and
+  // the default 1e-2 tolerance is comfortable. CDF53 exercises a multi-tap
+  // predict+update (the non-trivial filter). Shared RNG -> reseed.
+  RandSeed := 424242;
+  SeqLen := 8; Depth := 2;
+  InSize := SeqLen * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Depth);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1)); // 1 = collect input error
+    DW := TNNetDWT1D.Create(csDWT1DCDF53);
+    NN.AddLayer(DW);
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create(OutSize, 1, 1);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('DWT1D input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  DWT1D input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDWT1DLearnableTapGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  DW: TNNetDWT1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, SeqLen, Depth, InSize, OutSize, WCount: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the LEARNABLE lifting taps. The
+  // taps are bounded to a small range around the Daub4 init so finite-difference
+  // truncation stays small -- tolerance is NOT loosened to hide a bug. Daub4 is
+  // the richest filter (3 steps, scaling), so it stresses the adjoint most.
+  RandSeed := 424242;
+  SeqLen := 8; Depth := 2;
+  InSize := SeqLen * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    DW := TNNetDWT1D.Create(csDWT1DDaub4, true);  // learnable
+    NN.AddLayer(DW);
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create(OutSize, 1, 1);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    WCount := DW.Neurons[0].Weights.Size;
+    AssertTrue('DWT1D learnable mode must have trainable taps', WCount > 0);
+    // Bound taps near their init (small perturbation) to control truncation.
+    for i := 0 to WCount - 1 do
+      DW.Neurons[0].Weights.Raw[i] :=
+        DW.Neurons[0].Weights.Raw[i] + 0.05 * Sin(i * 1.7 + 0.3);
+
+    for i := 0 to WCount - 1 do
+    begin
+      DW.Neurons[0].Weights.Raw[i] := DW.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      DW.Neurons[0].Weights.Raw[i] := DW.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      DW.Neurons[0].Weights.Raw[i] := DW.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      DW.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -DW.Neurons[0].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('DWT1D learnable tap gradient check t=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  DWT1D learnable-tap gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDWT1DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  DW: TNNetDWT1D;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, SeqLen, Depth: integer;
+begin
+  // DWT1D with a NON-default filter (CDF53) AND learnable flag set: SaveToString
+  // -> LoadFromString -> SaveToString must be byte-identical and Compute must
+  // match, proving the filter selector / learnable flag / tap count round-trip
+  // via FStruct[0..2] through both dispatch points.
+  RandSeed := 424242;
+  SeqLen := 8; Depth := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    DW := TNNetDWT1D.Create(csDWT1DCDF53, true);  // non-default filter + learnable
+    NN.AddLayer(DW);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for i := 0 to DW.Neurons[0].Weights.Size - 1 do
+      DW.Neurons[0].Weights.Raw[i] := DW.Neurons[0].Weights.Raw[i] + 0.03 * (i + 1);
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('DWT1D SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('DWT1D token present in serialized string',
+        Pos('TNNetDWT1D', Saved) > 0);
+      AssertEquals('DWT1D filter round-trips', csDWT1DCDF53,
+        (NN2.Layers[1] as TNNetDWT1D).Filter);
+      AssertEquals('DWT1D learnable flag round-trips', 1,
+        (NN2.Layers[1] as TNNetDWT1D).Learnable);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('DWT1D Compute matches after round-trip pos ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDWT1DReconstructionOracle;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  DW: TNNetDWT1D;
+  s, d, recon: array of Double;
+  filt, SeqLen, Depth, c, i, Half, maxIdx: integer;
+  maxErr, orig: TNeuralFloat;
+const
+  Filters: array[0..2] of integer = (csDWT1DHaar, csDWT1DCDF53, csDWT1DDaub4);
+  Lens: array[0..1] of integer = (8, 7);  // even AND odd SeqLen
+begin
+  // IDWT(DWT(x)) == x to < 1e-6 for every fixed filter, for both EVEN and ODD
+  // SeqLen. This is the free correctness oracle of the lifting scheme: the
+  // inverse runs the same steps reversed with flipped signs. For odd SeqLen the
+  // reconstruction reproduces the symmetrically-extended sequence, so we only
+  // compare the original (non-padded) samples.
+  RandSeed := 424242;
+  Depth := 2;
+  maxErr := 0;
+  for filt := 0 to 2 do
+  for SeqLen := Low(Lens) to High(Lens) do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(Lens[SeqLen], 1, Depth);
+    try
+      NN.AddLayer(TNNetInput.Create(Lens[SeqLen], 1, Depth));
+      DW := TNNetDWT1D.Create(Filters[filt]);
+      NN.AddLayer(DW);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Sin(i * 0.83 + 0.2) * 0.7 - 0.1 * i;
+      NN.Compute(Input);
+
+      Half := DW.Output.SizeX;
+      SetLength(s, Half);
+      SetLength(d, Half);
+      SetLength(recon, 2 * Half);
+      for c := 0 to Depth - 1 do
+      begin
+        for i := 0 to Half - 1 do
+        begin
+          s[i] := DW.Output.Raw[i * (2 * Depth) + c];
+          d[i] := DW.Output.Raw[i * (2 * Depth) + Depth + c];
+        end;
+        DW.InverseChannel(s, d, recon);
+        // compare only the original (non-padded) samples
+        if (Lens[SeqLen] and 1) = 0 then maxIdx := Lens[SeqLen] - 1
+        else maxIdx := Lens[SeqLen] - 1;
+        for i := 0 to maxIdx do
+        begin
+          orig := Input.Raw[i * Depth + c];
+          maxErr := Max(maxErr, Abs(recon[i] - orig));
+          AssertTrue('DWT1D reconstruction filter=' + IntToStr(Filters[filt]) +
+            ' len=' + IntToStr(Lens[SeqLen]) + ' c=' + IntToStr(c) +
+            ' i=' + IntToStr(i) + ' recon=' + FloatToStr(recon[i]) +
+            ' orig=' + FloatToStr(orig),
+            Abs(recon[i] - orig) < 1e-6);
+        end;
+      end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+  WriteLn('  DWT1D reconstruction-oracle max-abs-error: ', maxErr:0:10);
 end;
 
 procedure TTestNeuralNumerical.TestSpectralConv2DGradientCheck;

@@ -57,6 +57,11 @@ const
   csNNetMaxParameterIdx = 7;
   csErrorOverflowBackpropProtection = 100;
 
+  // TNNetDWT1D lifting-scheme wavelet filter selectors.
+  csDWT1DHaar  = 0;   // unnormalised Haar (default)
+  csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
+  csDWT1DDaub4 = 2;   // Daubechies-4 (db2) lifting
+
 type
   TNNetLayer = class;
   TNNet = class;
@@ -6583,6 +6588,81 @@ type
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property InDepth: integer read FInDepth;
+  end;
+
+  /// SINGLE-LEVEL 1-D DISCRETE WAVELET TRANSFORM layer implemented with the
+  /// SECOND-GENERATION LIFTING SCHEME (Sweldens). Over a (SeqLen,1,Depth)
+  /// sequence it transforms EACH channel independently along the SeqLen axis:
+  ///   1. SPLIT  the sequence into even samples e[i]=x[2i] and odd o[i]=x[2i+1];
+  ///   2. a fixed ordered list of PREDICT steps (detail d -= P(approx s)) and
+  ///      UPDATE steps (approx s += U(detail d)), optionally followed by a
+  ///      per-band SCALING (s*=Ks, d*=Kd).
+  /// Because every step is an elementary linear shear (and scaling is diagonal),
+  /// the whole map is invertible BY CONSTRUCTION for ANY tap values: the inverse
+  /// (IDWT) runs the same steps in reverse with predict/update signs flipped and
+  /// scalings inverted. IDWT(DWT(x)) == x to < 1e-6 -- this is the correctness
+  /// oracle exercised by the tests. Every step is linear, so Backpropagate is the
+  /// exact adjoint: it walks the SAME step list in reverse, transposing each step
+  /// (no FFT machinery); cost is O(SeqLen) per channel.
+  ///
+  /// FILTERS (pFilter): csDWT1DHaar (default), csDWT1DCDF53 (LeGall 5/3),
+  /// csDWT1DDaub4 (Daubechies-4 lifting). Each ships fixed lifting coefficients.
+  ///
+  /// LEARNABLE mode (pLearnable=true): the predict/update TAPS become trainable
+  /// (stored in one weight neuron, initialised to the selected filter's taps and
+  /// trained through the normal weight path). The lifting STRUCTURE is fixed, so
+  /// invertibility (and the IDWT helper) is preserved for any learned tap values.
+  /// Fixed mode has ZERO trainable weights (the neuron is sized 0).
+  ///
+  /// OUTPUT LAYOUT: a (SeqLen,1,Depth) input -> a (SeqLen div 2, 1, 2*Depth)
+  /// output. For every spatial position i the first Depth channels hold the
+  /// APPROX (low-pass s) band and the next Depth channels hold the DETAIL
+  /// (high-pass d) band:  Output[i, 0, c]        = approx_c[i]
+  ///                      Output[i, 0, Depth + c] = detail_c[i].
+  ///
+  /// ODD SeqLen: the sequence is whole-sample SYMMETRICALLY extended by one
+  /// sample (x[L] := x[L-2]) to an even length before splitting; the same
+  /// reflection is used for neighbour indices at both edges. The forward pads,
+  /// the input-gradient folds the reflected contribution back onto x[L-2].
+  ///
+  /// FStruct[0] = filter selector, FStruct[1] = learnable flag (0/1),
+  /// FStruct[2] = trainable tap count; dispatch is Create(St[0], St[1] <> 0).
+  // Coded by Claude (AI).
+  TNNetDWT1D = class(TNNetLayer)
+  private
+    FFilter: integer;       // csDWT1DHaar / csDWT1DCDF53 / csDWT1DDaub4
+    FLearnable: integer;    // 0 = fixed taps, 1 = trainable taps
+    FSeqLen: integer;       // input SizeX
+    FHalf: integer;         // output SizeX = ceil(SeqLen/2) padded length / 2
+    FExtLen: integer;       // even working length (SeqLen or SeqLen+1)
+    FDepth: integer;        // input Depth
+    FTapCount: integer;     // number of trainable taps (= total taps in step list)
+    // Lifting step list. One entry per step. Kind: 0=predict, 1=update.
+    FStepKind: array of integer;
+    FStepTapOfs: array of integer;   // index into the flat tap array for this step
+    FStepTapCnt: array of integer;   // number of taps in this step
+    FStepOffs: array of array of integer; // neighbour offsets per step
+    FScaleS, FScaleD: TNeuralFloat;  // final per-band scaling (1 if none)
+    FFixedTaps: array of TNeuralFloat;   // fixed-mode tap values (flat)
+    procedure BuildFilter();
+    function TapPtr(): TNNetVolume;     // weights when learnable, nil otherwise
+    function GetTap(idx: integer): TNeuralFloat;
+    procedure ForwardLift(var s, d: array of Double);  // in-place forward lifting
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pFilter: integer; pLearnable: boolean = false); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Public IDWT helper: reconstruct one channel sequence from packed
+    // [approx|detail] bands using the CURRENT taps (the invertibility oracle).
+    procedure InverseChannel(const s, d: array of Double; var x: array of Double);
+    property Filter: integer read FFilter;
+    property Learnable: integer read FLearnable;
+    property SeqLen: integer read FSeqLen;
+    property TapCount: integer read FTapCount;
   end;
 
   /// TROPICAL (max-plus / min-plus) morphological DENSE layer. This is a
@@ -36406,6 +36486,512 @@ begin
   end;
 end;
 
+{ TNNetDWT1D }
+
+// Lifting-scheme single-level 1-D DWT. Forward/inverse share ONE step list so
+// invertibility holds for any taps; backward is the exact linear adjoint of the
+// same list walked in reverse. See the class header for layout/conventions.
+
+// Symmetric (mirror) reflection of an index into the valid half-band [0, n-1].
+function DWT1DReflect(j, n: integer): integer;
+begin
+  if n <= 1 then begin Result := 0; exit; end;
+  // Reflect repeatedly into range (whole-sample symmetry).
+  while (j < 0) or (j > n - 1) do
+  begin
+    if j < 0 then j := -j;
+    if j > n - 1 then j := 2 * (n - 1) - j;
+  end;
+  Result := j;
+end;
+
+constructor TNNetDWT1D.Create(pFilter: integer; pLearnable: boolean = false);
+begin
+  inherited Create();
+  if (pFilter < csDWT1DHaar) or (pFilter > csDWT1DDaub4) then
+    FErrorProc('TNNetDWT1D: unknown filter selector ' + IntToStr(pFilter) +
+      ' (expected 0=Haar, 1=CDF53, 2=Daub4).');
+  FFilter := pFilter;
+  if pLearnable then FLearnable := 1 else FLearnable := 0;
+  BuildFilter();   // populates step list + FFixedTaps + FTapCount + scalings
+  FStruct[0] := FFilter;
+  FStruct[1] := FLearnable;
+  FStruct[2] := FTapCount;
+  // One weight neuron; non-empty only in learnable mode (sized in SetPrevLayer).
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+// Append one lifting step. AKind: 0=predict (d-=P s), 1=update (s+=U d).
+procedure TNNetDWT1D.BuildFilter();
+var
+  StepCnt, TapCursor: integer;
+
+  procedure AddStep(AKind: integer; const ATaps: array of TNeuralFloat;
+    const AOffs: array of integer);
+  var
+    t, n: integer;
+  begin
+    n := Length(ATaps);
+    SetLength(FStepKind, StepCnt + 1);
+    SetLength(FStepTapOfs, StepCnt + 1);
+    SetLength(FStepTapCnt, StepCnt + 1);
+    SetLength(FStepOffs, StepCnt + 1);
+    FStepKind[StepCnt] := AKind;
+    FStepTapOfs[StepCnt] := TapCursor;
+    FStepTapCnt[StepCnt] := n;
+    SetLength(FStepOffs[StepCnt], n);
+    SetLength(FFixedTaps, TapCursor + n);
+    for t := 0 to n - 1 do
+    begin
+      FFixedTaps[TapCursor + t] := ATaps[t];
+      FStepOffs[StepCnt][t] := AOffs[t];
+    end;
+    Inc(StepCnt);
+    Inc(TapCursor, n);
+  end;
+
+const
+  sqrt3 = 1.7320508075688772;
+begin
+  StepCnt := 0;
+  TapCursor := 0;
+  SetLength(FStepKind, 0);
+  SetLength(FStepTapOfs, 0);
+  SetLength(FStepTapCnt, 0);
+  SetLength(FStepOffs, 0);
+  SetLength(FFixedTaps, 0);
+  FScaleS := 1.0;
+  FScaleD := 1.0;
+  case FFilter of
+    csDWT1DHaar:
+      begin
+        // d[i] = o[i] - e[i];  s[i] = e[i] + d[i]/2  (unnormalised Haar).
+        AddStep(0, [TNeuralFloat(1.0)], [0]);
+        AddStep(1, [TNeuralFloat(0.5)], [0]);
+      end;
+    csDWT1DCDF53:
+      begin
+        // LeGall 5/3:
+        //   d[i] = o[i] - (s[i] + s[i+1]) / 2
+        //   s[i] = e[i] + (d[i-1] + d[i]) / 4
+        AddStep(0, [TNeuralFloat(0.5), TNeuralFloat(0.5)], [0, 1]);
+        AddStep(1, [TNeuralFloat(0.25), TNeuralFloat(0.25)], [-1, 0]);
+      end;
+    csDWT1DDaub4:
+      begin
+        // Daubechies-4 (db2) lifting (Daubechies & Sweldens 1998):
+        //   d[i] -= sqrt3 * s[i]
+        //   s[i] += sqrt3/4 * d[i] + (sqrt3-2)/4 * d[i-1]
+        //   d[i] -= s[i+1]
+        // followed by band scaling  s *= (sqrt3-1)/sqrt2,  d *= (sqrt3+1)/sqrt2.
+        AddStep(0, [TNeuralFloat(sqrt3)], [0]);
+        AddStep(1, [TNeuralFloat(sqrt3 / 4.0), TNeuralFloat((sqrt3 - 2.0) / 4.0)], [0, -1]);
+        AddStep(0, [TNeuralFloat(1.0)], [1]);
+        FScaleS := (sqrt3 - 1.0) / Sqrt(2.0);
+        FScaleD := (sqrt3 + 1.0) / Sqrt(2.0);
+      end;
+  end;
+  FTapCount := TapCursor;
+end;
+
+function TNNetDWT1D.TapPtr(): TNNetVolume;
+begin
+  if (FLearnable = 1) and (FArrNeurons <> nil) then
+    Result := FArrNeurons[0].FWeights
+  else
+    Result := nil;
+end;
+
+function TNNetDWT1D.GetTap(idx: integer): TNeuralFloat;
+var
+  W: TNNetVolume;
+begin
+  W := TapPtr();
+  if (W <> nil) and (idx < W.Size) then
+    Result := W.FData[idx]
+  else
+    Result := FFixedTaps[idx];
+end;
+
+// In-place forward lifting of one channel: s = approx (even), d = detail (odd),
+// each length FHalf. Walks the step list in order.
+procedure TNNetDWT1D.ForwardLift(var s, d: array of Double);
+var
+  st, t, i, jj: integer;
+  tap, acc: Double;
+begin
+  for st := 0 to Length(FStepKind) - 1 do
+  begin
+    if FStepKind[st] = 0 then
+    begin
+      // predict: d[i] -= sum_t tap[t] * s[i + off[t]]
+      for i := 0 to FHalf - 1 do
+      begin
+        acc := 0;
+        for t := 0 to FStepTapCnt[st] - 1 do
+        begin
+          tap := GetTap(FStepTapOfs[st] + t);
+          jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+          acc := acc + tap * s[jj];
+        end;
+        d[i] := d[i] - acc;
+      end;
+    end
+    else
+    begin
+      // update: s[i] += sum_t tap[t] * d[i + off[t]]
+      for i := 0 to FHalf - 1 do
+      begin
+        acc := 0;
+        for t := 0 to FStepTapCnt[st] - 1 do
+        begin
+          tap := GetTap(FStepTapOfs[st] + t);
+          jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+          acc := acc + tap * d[jj];
+        end;
+        s[i] := s[i] + acc;
+      end;
+    end;
+  end;
+  // final band scaling
+  for i := 0 to FHalf - 1 do
+  begin
+    s[i] := s[i] * FScaleS;
+    d[i] := d[i] * FScaleD;
+  end;
+end;
+
+// Inverse lifting (IDWT) of one channel using the CURRENT taps: exact algebraic
+// inverse of ForwardLift -- undo scaling, then walk steps in reverse with the
+// predict/update sign flipped. Invertibility holds for ANY tap values.
+procedure TNNetDWT1D.InverseChannel(const s, d: array of Double; var x: array of Double);
+var
+  st, t, i, jj: integer;
+  tap, acc: Double;
+  ls, ld: array of Double;
+begin
+  SetLength(ls, FHalf);
+  SetLength(ld, FHalf);
+  for i := 0 to FHalf - 1 do
+  begin
+    ls[i] := s[i] / FScaleS;
+    ld[i] := d[i] / FScaleD;
+  end;
+  for st := Length(FStepKind) - 1 downto 0 do
+  begin
+    if FStepKind[st] = 0 then
+    begin
+      // inverse of predict: d[i] += sum_t tap[t] * s[i + off[t]]
+      for i := 0 to FHalf - 1 do
+      begin
+        acc := 0;
+        for t := 0 to FStepTapCnt[st] - 1 do
+        begin
+          tap := GetTap(FStepTapOfs[st] + t);
+          jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+          acc := acc + tap * ls[jj];
+        end;
+        ld[i] := ld[i] + acc;
+      end;
+    end
+    else
+    begin
+      // inverse of update: s[i] -= sum_t tap[t] * d[i + off[t]]
+      for i := 0 to FHalf - 1 do
+      begin
+        acc := 0;
+        for t := 0 to FStepTapCnt[st] - 1 do
+        begin
+          tap := GetTap(FStepTapOfs[st] + t);
+          jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+          acc := acc + tap * ld[jj];
+        end;
+        ls[i] := ls[i] - acc;
+      end;
+    end;
+  end;
+  // merge even/odd back into x (length FExtLen)
+  for i := 0 to FHalf - 1 do
+  begin
+    x[2 * i] := ls[i];
+    x[2 * i + 1] := ld[i];
+  end;
+end;
+
+procedure TNNetDWT1D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WeightCount, t: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetDWT1D requires SizeY=1 (a (SeqLen,1,Depth) sequence); got SizeY=' +
+      IntToStr(pPrevLayer.Output.SizeY) + '.');
+  FSeqLen := pPrevLayer.Output.SizeX;
+  FDepth := pPrevLayer.Output.Depth;
+  if FSeqLen < 2 then
+    FErrorProc('TNNetDWT1D requires SeqLen >= 2; got ' + IntToStr(FSeqLen) + '.');
+  // Odd SeqLen -> symmetric whole-sample extension by one sample to an even length.
+  if (FSeqLen and 1) = 0 then
+    FExtLen := FSeqLen
+  else
+    FExtLen := FSeqLen + 1;
+  FHalf := FExtLen div 2;
+
+  FOutput.ReSize(FHalf, 1, 2 * FDepth);
+  FOutputError.ReSize(FHalf, 1, 2 * FDepth);
+  FOutputErrorDeriv.ReSize(FHalf, 1, 2 * FDepth);
+
+  if FLearnable = 1 then
+    WeightCount := FTapCount
+  else
+    WeightCount := 0;
+  FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
+  FNeurons[0].BackInertia.ReSize(WeightCount, 1, 1);
+  FNeurons[0].Delta.ReSize(WeightCount, 1, 1);
+  FNeurons[0].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  InitDefault();
+  AfterWeightUpdate();
+  if FLearnable = 1 then
+    for t := 0 to FTapCount - 1 do
+      FArrNeurons[0].FWeights.FData[t] := FFixedTaps[t];
+end;
+
+// Learnable taps start at the selected fixed filter's coefficients (so an
+// untrained learnable layer behaves exactly like the fixed one). Fixed mode has
+// no weights.
+procedure TNNetDWT1D.InitDefault();
+var
+  t: integer;
+  W: TNNetVolume;
+begin
+  if FLearnable <> 1 then exit;
+  W := FArrNeurons[0].FWeights;
+  if W.Size < FTapCount then exit;
+  for t := 0 to FTapCount - 1 do
+    W.FData[t] := FFixedTaps[t];
+end;
+
+procedure TNNetDWT1D.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDWT1D.ComputeCPU();
+var
+  c, i: integer;
+  PrevOut: TNNetVolume;
+  s, d: array of Double;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  SetLength(s, FHalf);
+  SetLength(d, FHalf);
+  for c := 0 to FDepth - 1 do
+  begin
+    // split even/odd over the (possibly symmetrically extended) sequence
+    for i := 0 to FHalf - 1 do
+    begin
+      s[i] := PrevOut.FData[(2 * i) * FDepth + c];
+      if 2 * i + 1 < FSeqLen then
+        d[i] := PrevOut.FData[(2 * i + 1) * FDepth + c]
+      else
+        // odd SeqLen padding: x[FSeqLen] := x[FSeqLen-2] (whole-sample symmetry)
+        d[i] := PrevOut.FData[(FSeqLen - 2) * FDepth + c];
+    end;
+    ForwardLift(s, d);
+    for i := 0 to FHalf - 1 do
+    begin
+      FOutput.FData[i * (2 * FDepth) + c]          := s[i];  // approx band
+      FOutput.FData[i * (2 * FDepth) + FDepth + c] := d[i];  // detail band
+    end;
+  end;
+end;
+
+procedure TNNetDWT1D.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact linear adjoint of the forward lifting. The forward map y = M x is a
+// product of elementary shears and a diagonal scaling; the adjoint applies the
+// transposed factors in reverse order. We accumulate dL/d(s,d), back through the
+// scaling and each step (predict/update transpose scatters), then dL/d(taps).
+procedure TNNetDWT1D.BackpropagateCPU();
+var
+  c, i, st, t, jj: integer;
+  PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
+  gs, gd, sF, dF, oddIn: array of Double;
+  // per-step cached forward state of s,d BEFORE that step (for weight grads)
+  histS, histD: array of array of Double;
+  tap, g, contrib: Double;
+  haveTapGrad, havePrev: boolean;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  W := TapPtr();
+  haveTapGrad := (FLearnable = 1) and (W <> nil);
+  if haveTapGrad then WDelta := FArrNeurons[0].FDelta else WDelta := nil;
+  havePrev := FPrevLayer.OutputError.Size = FPrevLayer.Output.Size;
+  if havePrev then LocalPrevError := FPrevLayer.OutputError else LocalPrevError := nil;
+
+  SetLength(gs, FHalf);
+  SetLength(gd, FHalf);
+  SetLength(sF, FHalf);
+  SetLength(dF, FHalf);
+  SetLength(oddIn, FHalf);
+  SetLength(histS, Length(FStepKind));
+  SetLength(histD, Length(FStepKind));
+  for st := 0 to Length(FStepKind) - 1 do
+  begin
+    SetLength(histS[st], FHalf);
+    SetLength(histD[st], FHalf);
+  end;
+
+  for c := 0 to FDepth - 1 do
+  begin
+    // --- recompute forward, caching pre-step state for weight gradients ---
+    for i := 0 to FHalf - 1 do
+    begin
+      sF[i] := PrevOut.FData[(2 * i) * FDepth + c];
+      if 2 * i + 1 < FSeqLen then
+        oddIn[i] := PrevOut.FData[(2 * i + 1) * FDepth + c]
+      else
+        oddIn[i] := PrevOut.FData[(FSeqLen - 2) * FDepth + c];
+      dF[i] := oddIn[i];
+    end;
+    for st := 0 to Length(FStepKind) - 1 do
+    begin
+      for i := 0 to FHalf - 1 do
+      begin
+        histS[st][i] := sF[i];
+        histD[st][i] := dF[i];
+      end;
+      if FStepKind[st] = 0 then
+        for i := 0 to FHalf - 1 do
+        begin
+          contrib := 0;
+          for t := 0 to FStepTapCnt[st] - 1 do
+          begin
+            tap := GetTap(FStepTapOfs[st] + t);
+            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+            contrib := contrib + tap * sF[jj];
+          end;
+          dF[i] := dF[i] - contrib;
+        end
+      else
+        for i := 0 to FHalf - 1 do
+        begin
+          contrib := 0;
+          for t := 0 to FStepTapCnt[st] - 1 do
+          begin
+            tap := GetTap(FStepTapOfs[st] + t);
+            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+            contrib := contrib + tap * dF[jj];
+          end;
+          sF[i] := sF[i] + contrib;
+        end;
+    end;
+
+    // --- seed gradient from output error (approx then detail bands) ---
+    for i := 0 to FHalf - 1 do
+    begin
+      gs[i] := FOutputError.FData[i * (2 * FDepth) + c];
+      gd[i] := FOutputError.FData[i * (2 * FDepth) + FDepth + c];
+    end;
+    // adjoint of final scaling
+    for i := 0 to FHalf - 1 do
+    begin
+      gs[i] := gs[i] * FScaleS;
+      gd[i] := gd[i] * FScaleD;
+    end;
+
+    // --- walk steps in reverse, transposing each ---
+    for st := Length(FStepKind) - 1 downto 0 do
+    begin
+      if FStepKind[st] = 0 then
+      begin
+        // forward: d[i] -= sum_t tap*s[refl(i+off)]
+        // wrt taps: dL/dtap += sum_i gd[i]*(-s_pre[refl(i+off)])
+        // wrt s   : gs[refl(i+off)] += gd[i]*(-tap)   (gd unchanged for d row)
+        for i := 0 to FHalf - 1 do
+        begin
+          g := gd[i];
+          for t := 0 to FStepTapCnt[st] - 1 do
+          begin
+            tap := GetTap(FStepTapOfs[st] + t);
+            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+            gs[jj] := gs[jj] - g * tap;
+            if haveTapGrad then
+              WDelta.FData[FStepTapOfs[st] + t] :=
+                WDelta.FData[FStepTapOfs[st] + t] +
+                (-FLearningRate) * (-g * histS[st][jj]);
+          end;
+        end;
+      end
+      else
+      begin
+        // forward: s[i] += sum_t tap*d[refl(i+off)]
+        for i := 0 to FHalf - 1 do
+        begin
+          g := gs[i];
+          for t := 0 to FStepTapCnt[st] - 1 do
+          begin
+            tap := GetTap(FStepTapOfs[st] + t);
+            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+            gd[jj] := gd[jj] + g * tap;
+            if haveTapGrad then
+              WDelta.FData[FStepTapOfs[st] + t] :=
+                WDelta.FData[FStepTapOfs[st] + t] +
+                (-FLearningRate) * (g * histD[st][jj]);
+          end;
+        end;
+      end;
+    end;
+
+    // --- scatter gs (even), gd (odd) back to the input error ---
+    if havePrev then
+    begin
+      for i := 0 to FHalf - 1 do
+      begin
+        LocalPrevError.FData[(2 * i) * FDepth + c] :=
+          LocalPrevError.FData[(2 * i) * FDepth + c] + gs[i];
+        if 2 * i + 1 < FSeqLen then
+          LocalPrevError.FData[(2 * i + 1) * FDepth + c] :=
+            LocalPrevError.FData[(2 * i + 1) * FDepth + c] + gd[i]
+        else
+          // odd padding folded back onto x[FSeqLen-2]
+          LocalPrevError.FData[(FSeqLen - 2) * FDepth + c] :=
+            LocalPrevError.FData[(FSeqLen - 2) * FDepth + c] + gd[i];
+      end;
+    end;
+  end;
+
+  if haveTapGrad and (not FBatchUpdate) then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetSpectralConv2D }
 
 // The forward map is the linear 2-D pipeline
@@ -62788,6 +63374,7 @@ begin
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
+      'TNNetDWT1D' :                Result := TNNetDWT1D.Create(St[0], St[1] <> 0);
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
@@ -63117,6 +63704,7 @@ begin
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
+      if S[0] = 'TNNetDWT1D' then Result := TNNetDWT1D.Create(St[0], St[1] <> 0) else
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
