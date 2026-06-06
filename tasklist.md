@@ -227,7 +227,7 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [ ] Set Transformer family — inducing-point attention (`TNNetInducedSetAttention`)
+- [X] Set Transformer family — inducing-point attention (`TNNetInducedSetAttention`)
       + pooling-by-multihead-attention (`TNNetAttentionPooling`) (Lee et al. 2019,
       "Set Transformer", ICML). Two structurally NEW primitives for permutation-
       invariant set inputs, both DISTINCT from everything already here:
@@ -267,6 +267,16 @@ rather than acted on.
       mean-pool baseline AND that ISAB with `M << N` matches full self-attention
       pooling at a fraction of the score-matrix size. Pairs naturally with the
       open [[Product-Key Memory]] task as the set-structured-input cluster.
+      LANDED 2026-06-06: both classes (self-contained, owning the learnable
+      bank, serialized like `TNNetModernHopfield` — NO source-index injection),
+      both builders (`Heads` accepted for API stability but only `Heads=1`
+      implemented), 12 numerical/serialization tests (ISAB+PMA input/weight
+      gradient checks incl. M=1/k=1 edge cases, PMA permutation invariance,
+      round-trips, builder end-to-end), and `examples/SetTransformer/` all green.
+      DESIGN CHOICE: v1 uses IDENTITY Q/K/V projections (only the inducing/seed
+      bank is learnable) — keeps the two-stage softmax-Jacobian backward exact
+      and gradient-checkable. DEFERRED follow-ups: multi-head MABs, and per-MAB
+      learnable W_Q/W_K/W_V + residual/feed-forward (the full SAB/ISAB block).
 - [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
       landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
       per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load

@@ -279,6 +279,17 @@ type
     procedure TestModernHopfieldWeightGradientCheck;
     procedure TestModernHopfieldSerializationRoundTrip;
     procedure TestAddModernHopfieldRetrievalBuilder;
+    procedure TestInducedSetAttentionInputGradientCheck;
+    procedure TestInducedSetAttentionWeightGradientCheck;
+    procedure TestInducedSetAttentionSingleInducingGradientCheck;
+    procedure TestInducedSetAttentionSerializationRoundTrip;
+    procedure TestAddInducedSetAttentionBuilder;
+    procedure TestAttentionPoolingInputGradientCheck;
+    procedure TestAttentionPoolingWeightGradientCheck;
+    procedure TestAttentionPoolingSingleSeedGradientCheck;
+    procedure TestAttentionPoolingPermutationInvariance;
+    procedure TestAttentionPoolingSerializationRoundTrip;
+    procedure TestAddAttentionPoolingBuilder;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -23812,6 +23823,599 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+// Deterministic, non-trivial inducing/seed bank so the two-stage softmax is far
+// from the degenerate uniform regime where every gradient path is tiny.
+procedure SeedSetBank(LH: TNNetLayer);
+var i: integer;
+begin
+  for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    LH.Neurons[0].Weights.Raw[i] := Sin(i * 0.77 + 0.3) * 0.6;
+end;
+
+procedure TTestNeuralNumerical.TestInducedSetAttentionInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LH: TNNetInducedSetAttention;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // N=4 inputs, M=2 inducing points, d=3 keeps the two-stage central differences
+  // cheap while still exercising the M<N bottleneck and both stacked MABs.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetInducedSetAttention.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    SeedSetBank(LH);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ISAB input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ISAB input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInducedSetAttentionWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetInducedSetAttention;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetInducedSetAttention.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.9 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    SeedSetBank(LH);
+
+    // The inducing bank feeds stage 1 (as queries) and, via H, stage 2 -- the
+    // classic place for a missing accumulation term across the two MABs.
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ISAB weight gradient check I[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ISAB weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInducedSetAttentionSingleInducingGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetInducedSetAttention;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // M=1 edge case: a single inducing point (stage-1 attends over all inputs to
+  // one summary; stage-2 attends back over that single summary).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    LH := TNNetInducedSetAttention.Create(1, 2);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.7) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    SeedSetBank(LH);
+
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ISAB(M=1) weight gradient check I[' + IntToStr(i) + ']',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ISAB(M=1) weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInducedSetAttentionSerializationRoundTrip;
+begin
+  // The learnable inducing bank (M x d) must survive Save/LoadFromString along
+  // with the M/d hyperparameters.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetInducedSetAttention.Create(2, 3), 'InducedSetAttention', 5, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddInducedSetAttentionBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+  LH: TNNetInducedSetAttention;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 3);
+  Desired := TNNetVolume.Create(6, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 3));
+    LH := NN.AddInducedSetAttention(2, 1) as TNNetInducedSetAttention;
+    NN.SetLearningRate(0.1, 0.0);
+
+    AssertTrue('AddInducedSetAttention last layer type',
+      NN.GetLastLayer is TNNetInducedSetAttention);
+    AssertEquals('AddInducedSetAttention InducingPoints', 2, LH.InducingPoints);
+    AssertEquals('AddInducedSetAttention Dim from prev layer', 3, LH.Dim);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.3) * 1.2;
+      Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    end;
+    NN.Compute(Input);
+    AssertEquals('AddInducedSetAttention output SizeX preserved',
+      6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddInducedSetAttention output Depth preserved',
+      3, NN.GetLastLayer.Output.Depth);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('AddInducedSetAttention training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddInducedSetAttention round-trip last layer type',
+        NN2.GetLastLayer is TNNetInducedSetAttention);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddInducedSetAttention SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAttentionPoolingInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LH: TNNetAttentionPooling;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // N=4 inputs pooled to k=2 seeds, d=3.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetAttentionPooling.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    SeedSetBank(LH);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('PMA input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('PMA input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAttentionPoolingWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetAttentionPooling;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetAttentionPooling.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.9 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    SeedSetBank(LH);
+
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('PMA weight gradient check S[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('PMA weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAttentionPoolingSingleSeedGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetAttentionPooling;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // k=1 edge case: a single learned query -> a weighted-sum attention pool.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 2);
+  Desired := TNNetVolume.Create(1, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 2, 1));
+    LH := TNNetAttentionPooling.Create(1, 2);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.7) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    SeedSetBank(LH);
+
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('PMA(k=1) weight gradient check S[' + IntToStr(i) + ']',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('PMA(k=1) weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAttentionPoolingPermutationInvariance;
+var
+  NN: TNNet;
+  Input, Shuffled, OutA, OutB: TNNetVolume;
+  LH: TNNetAttentionPooling;
+  i, d, N, Dim: integer;
+  perm: array[0..3] of integer;
+  maxErr: TNeuralFloat;
+begin
+  // Pooling output must be invariant to any permutation of the input rows.
+  RandSeed := 424242;
+  N := 4; Dim := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(N, 1, Dim);
+  Shuffled := TNNetVolume.Create(N, 1, Dim);
+  OutA := TNNetVolume.Create(2, 1, Dim);
+  OutB := TNNetVolume.Create(2, 1, Dim);
+  try
+    NN.AddLayer(TNNetInput.Create(N, 1, Dim, 1));
+    LH := TNNetAttentionPooling.Create(2, Dim);
+    NN.AddLayer(LH);
+    SeedSetBank(LH);
+
+    for i := 0 to N - 1 do
+      for d := 0 to Dim - 1 do
+        Input[i, 0, d] := Sin(i * 1.7 + d * 0.9) * 1.2 + 0.1;
+    // A fixed non-trivial permutation of the 4 rows.
+    perm[0] := 2; perm[1] := 0; perm[2] := 3; perm[3] := 1;
+    for i := 0 to N - 1 do
+      for d := 0 to Dim - 1 do
+        Shuffled[i, 0, d] := Input[perm[i], 0, d];
+
+    NN.Compute(Input);  OutA.Copy(NN.GetLastLayer.Output);
+    NN.Compute(Shuffled); OutB.Copy(NN.GetLastLayer.Output);
+
+    maxErr := 0;
+    for i := 0 to OutA.Size - 1 do
+      if Abs(OutA.Raw[i] - OutB.Raw[i]) > maxErr then
+        maxErr := Abs(OutA.Raw[i] - OutB.Raw[i]);
+    AssertTrue('PMA permutation invariance maxErr=' + FloatToStr(maxErr),
+      maxErr < 1e-5);
+    WriteLn('PMA permutation invariance max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Shuffled.Free; OutA.Free; OutB.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAttentionPoolingSerializationRoundTrip;
+begin
+  // The learnable seed bank (k x d) must survive Save/LoadFromString along with
+  // the k/d hyperparameters.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetAttentionPooling.Create(2, 3), 'AttentionPooling', 5, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddAttentionPoolingBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+  LH: TNNetAttentionPooling;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 3);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 3));
+    LH := NN.AddAttentionPooling(2, 1) as TNNetAttentionPooling;
+    NN.SetLearningRate(0.1, 0.0);
+
+    AssertTrue('AddAttentionPooling last layer type',
+      NN.GetLastLayer is TNNetAttentionPooling);
+    AssertEquals('AddAttentionPooling NumSeeds', 2, LH.NumSeeds);
+    AssertEquals('AddAttentionPooling Dim from prev layer', 3, LH.Dim);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 1.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    NN.Compute(Input);
+    AssertEquals('AddAttentionPooling output SizeX = NumSeeds',
+      2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddAttentionPooling output Depth preserved',
+      3, NN.GetLastLayer.Output.Depth);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('AddAttentionPooling training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddAttentionPooling round-trip last layer type',
+        NN2.GetLastLayer is TNNetAttentionPooling);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddAttentionPooling SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
   end;
 end;
 

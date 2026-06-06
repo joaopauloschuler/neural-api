@@ -2448,6 +2448,107 @@ type
       property Beta: TNeuralFloat read FBeta;
   end;
 
+  /// Induced Set Attention Block (ISAB; Lee et al. 2019, "Set Transformer",
+  // arXiv:1810.00825). A PERMUTATION-EQUIVARIANT set-to-set layer that replaces
+  // the O(N^2) self-attention of TNNetScaledDotProductAttention with an
+  // O(N*M) two-stage bottleneck through M learnable INDUCING POINTS. Given an
+  // input set X of N rows (each a d-vector) and a small LEARNABLE bank I of M
+  // inducing points (M << N), it computes two stacked single-head cross-
+  // attention blocks (MAB = Multihead Attention Block, here single head):
+  //   H = MAB(I, X)   -- the M inducing points attend over the N inputs -> (M,d)
+  //     s1[m,n] = (I[m] . X[n]) / sqrt(d);  a1[m,:] = softmax_n(s1[m,:]);
+  //     H[m]    = sum_n a1[m,n] * X[n]
+  //   Y = MAB(X, H)   -- the N inputs attend back over the M summaries -> (N,d)
+  //     s2[n,m] = (X[n] . H[m]) / sqrt(d);  a2[n,:] = softmax_m(s2[n,:]);
+  //     Y[n]    = sum_m a2[n,m] * H[m]
+  // Output shape == input shape (N,1,d). Because the inputs route through the M
+  // inducing points, the largest score matrix is N x M (stage 2) rather than
+  // N x N -- the whole point of ISAB.
+  //
+  // PROJECTIONS / LEARNABLE PARAMS: this v1 uses IDENTITY Q/K/V projections (no
+  // per-MAB linear maps); the ONLY trainable parameter is the inducing-point
+  // bank I. This keeps the two-stage softmax-Jacobian backward exact and
+  // numerically gradient-checkable (per-MAB learnable W_Q/W_K/W_V and a residual
+  // + feed-forward are a documented follow-up). The bank is read FROM the layer
+  // (it is NOT a second input source), so unlike TNNetCrossAttention this layer
+  // owns its data and serializes like TNNetModernHopfield (plain struct + neuron
+  // weights, no source-index injection). SINGLE HEAD only for v1: the builder
+  // exposes a Heads parameter for API stability but Heads>1 is not yet
+  // implemented (multi-head ISAB is a follow-up).
+  //
+  // Input layout: a (N,1,d) set laid out along SizeX (SizeY must be 1), exactly
+  // like the attention / Hopfield layers. Storage in Neurons[0].FWeights: the
+  // inducing bank I as (SizeX=M, 1, Depth=d) so each inducing d-vector is
+  // depth-contiguous (AVX dot/MulAdd friendly). FStruct[0]=M, FStruct[1]=d
+  // persist. Forward caches H and both attention maps a1,a2; backward
+  // differentiates the two stacked MABs (the SDPA softmax-Jacobian path applied
+  // stage-2 then stage-1, accumulating dX from BOTH stages and dH from stage 2)
+  // and scatters into both the bank I and the input set X.
+  // Coded by Claude (AI).
+  TNNetInducedSetAttention = class(TNNetLayer)
+    private
+      FM: integer;        // number of inducing points
+      FDim: integer;      // feature width d
+      FInvSqrtDim: TNeuralFloat;
+      FH: TNNetVolume;    // stage-1 summaries H: (M,1,d)
+      FA1: TNNetVolume;   // stage-1 attention: [X=n key, Y=m query, 1] (M rows)
+      FA2: TNNetVolume;   // stage-2 attention: [X=m key, Y=n query, 1] (N rows)
+      FGradI: TNNetVolume;// (M,1,d) bank-gradient accumulator
+      FdH: TNNetVolume;   // (M,1,d) gradient w.r.t. H
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(InducingPoints, d: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property InducingPoints: integer read FM;
+      property Dim: integer read FDim;
+  end;
+
+  /// Pooling by Multihead Attention (PMA; Lee et al. 2019, "Set Transformer",
+  // arXiv:1810.00825). A PERMUTATION-INVARIANT learnable pooler: it collapses a
+  // variable-length set X of N rows (each a d-vector) down to a FIXED k outputs
+  // by letting k LEARNABLE SEED vectors S cross-attend over the N inputs:
+  //   PMA = MAB(S, X)            -- single-head cross-attention, k queries
+  //     s[q,n] = (S[q] . X[n]) / sqrt(d);  a[q,:] = softmax_n(s[q,:]);
+  //     Y[q]   = sum_n a[q,n] * X[n]
+  // Output shape (k,1,d). k=1 collapses to a single learned-query weighted-sum
+  // attention pool. Unlike the parameter-free TNNetAvgChannel / TNNetMaxChannel,
+  // PMA learns WHAT to pool (the seed bank), and its output is invariant to any
+  // permutation of the input rows (the softmax over n is symmetric in n).
+  //
+  // PROJECTIONS / LEARNABLE PARAMS: identity Q/K/V projections (no per-MAB
+  // linear maps); the ONLY trainable parameter is the seed bank S. This keeps
+  // the single softmax-Jacobian backward exact and gradient-checkable. SINGLE
+  // HEAD only for v1 (the builder exposes Heads for API stability; Heads>1 is a
+  // follow-up). The seed bank is read FROM the layer (not a second input), so it
+  // serializes like TNNetModernHopfield (plain struct + neuron weights).
+  //
+  // Input layout: a (N,1,d) set along SizeX (SizeY must be 1). Storage in
+  // Neurons[0].FWeights: the seed bank S as (SizeX=k, 1, Depth=d). FStruct[0]=k,
+  // FStruct[1]=d persist. Forward caches the k x N attention map; backward is
+  // the standard SDPA softmax-Jacobian, scattering into the seed bank S and the
+  // input set X.
+  // Coded by Claude (AI).
+  TNNetAttentionPooling = class(TNNetLayer)
+    private
+      FK: integer;        // number of output seeds
+      FDim: integer;      // feature width d
+      FInvSqrtDim: TNeuralFloat;
+      FA: TNNetVolume;    // attention: [X=n key, Y=q query, 1] (k rows)
+      FGradS: TNNetVolume;// (k,1,d) seed-gradient accumulator
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(NumSeeds, d: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property NumSeeds: integer read FK;
+      property Dim: integer read FDim;
+  end;
+
   /// Cosine-Similarity Attention (single head).
   // A drop-in variant of TNNetScaledDotProductAttention where the raw
   // Q.K^T score is replaced by a cosine-similarity score:
@@ -7311,6 +7412,23 @@ type
       // layer. See TNNetModernHopfield for the math and serialization.
       function AddModernHopfieldRetrieval(NumPatterns, KSteps: integer;
         Beta: TNeuralFloat = 1.0): TNNetLayer;
+      // Wires an Induced Set Attention Block (ISAB; Set Transformer, Lee et al.
+      // 2019) over a (N,1,d) set (GetLastLayer, SizeY=1, Depth=d) using
+      // InducingPoints learnable inducing vectors. Output shape == input
+      // (N,1,d); the inputs route through the M inducing points for O(N*M)
+      // (vs O(N^2)) attention. Heads is reserved for a multi-head follow-up;
+      // only Heads=1 is implemented (other values raise). Returns the
+      // TNNetInducedSetAttention layer. Coded by Claude (AI).
+      function AddInducedSetAttention(InducingPoints: integer;
+        Heads: integer = 1): TNNetLayer;
+      // Wires Pooling by Multihead Attention (PMA; Set Transformer, Lee et al.
+      // 2019) over a (N,1,d) set, collapsing it to a FIXED (NumSeeds,1,d) output
+      // by letting NumSeeds learnable seed vectors cross-attend over the inputs.
+      // Permutation-invariant. Heads reserved for a follow-up (only Heads=1
+      // implemented). Returns the TNNetAttentionPooling layer.
+      // Coded by Claude (AI).
+      function AddAttentionPooling(NumSeeds: integer;
+        Heads: integer = 1): TNNetLayer;
       // One-call HyperNetwork wiring (Ha et al. 2016): a GENERATOR reads the
       // ContextLayer and EMITS the weight matrix (+ optional bias) of a linear
       // map that is then applied to the MAIN data path (GetLastLayer) by a
@@ -15718,6 +15836,437 @@ begin
   for p := 0 to FNumPatterns - 1 do
     for d := 0 to FDim - 1 do
       FNeurons[0].FWeights[p, 0, d] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetInducedSetAttention }
+
+constructor TNNetInducedSetAttention.Create(InducingPoints, d: integer);
+begin
+  inherited Create();
+  FM := InducingPoints;
+  FDim := d;
+  if FM < 1 then
+    FErrorProc('TNNetInducedSetAttention requires InducingPoints >= 1. Got ' +
+      IntToStr(FM));
+  if FDim < 1 then
+    FErrorProc('TNNetInducedSetAttention requires d >= 1. Got ' + IntToStr(FDim));
+  FInvSqrtDim := pcr_rsqrtf(FDim);
+  FStruct[0] := FM;
+  FStruct[1] := FDim;
+  FH := TNNetVolume.Create();
+  FA1 := TNNetVolume.Create();
+  FA2 := TNNetVolume.Create();
+  FGradI := TNNetVolume.Create();
+  FdH := TNNetVolume.Create();
+  AddMissingNeurons(1);
+end;
+
+destructor TNNetInducedSetAttention.Destroy();
+begin
+  FdH.Free;
+  FGradI.Free;
+  FA2.Free;
+  FA1.Free;
+  FH.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetInducedSetAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetInducedSetAttention requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDim then
+    FErrorProc('TNNetInducedSetAttention requires input depth = d. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d=' + IntToStr(FDim));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  FOutput.ReSize(SeqLen, 1, FDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Inducing bank I: (M, 1, d) -- each inducing d-vector is depth-contiguous.
+  FNeurons[0].FWeights.ReSize(FM, 1, FDim);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FH.ReSize(FM, 1, FDim);
+  FA1.ReSize(SeqLen, FM, 1);   // X=n (key over N), Y=m (query over M)
+  FA2.ReSize(FM, SeqLen, 1);   // X=m (key over M), Y=n (query over N)
+  FGradI.ReSize(FM, 1, FDim);
+  FdH.ReSize(FM, 1, FDim);
+  InitDefault();
+end;
+
+procedure TNNetInducedSetAttention.Compute();
+var
+  StartTime: double;
+  X, I: TNNetVolume;
+  SeqLen, m, ni, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  HPtr, OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  I := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  // ---- Stage 1: H = MAB(I, X). For each inducing point m, attend over X. ----
+  for m := 0 to FM - 1 do
+  begin
+    MaxScore := -1e30;
+    for ni := 0 to SeqLen - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(I.GetRawPtr(m, 0, 0), X.GetRawPtr(ni, 0, 0),
+        FDim) * FInvSqrtDim;
+      FA1[ni, m, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    SumExp := 0;
+    for ni := 0 to SeqLen - 1 do
+    begin
+      Score := pcr_expf(FA1[ni, m, 0] - MaxScore);
+      FA1[ni, m, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for ni := 0 to SeqLen - 1 do
+        FA1[ni, m, 0] := FA1[ni, m, 0] / SumExp;
+    HPtr := FH.GetRawPtr(m, 0, 0);
+    for d := 0 to FDim - 1 do HPtr^[d] := 0;
+    for ni := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(HPtr, X.GetRawPtr(ni, 0, 0), FA1[ni, m, 0], FDim);
+  end;
+  // ---- Stage 2: Y = MAB(X, H). For each input ni, attend over H. ----
+  for ni := 0 to SeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for m := 0 to FM - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(X.GetRawPtr(ni, 0, 0), FH.GetRawPtr(m, 0, 0),
+        FDim) * FInvSqrtDim;
+      FA2[m, ni, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    SumExp := 0;
+    for m := 0 to FM - 1 do
+    begin
+      Score := pcr_expf(FA2[m, ni, 0] - MaxScore);
+      FA2[m, ni, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for m := 0 to FM - 1 do
+        FA2[m, ni, 0] := FA2[m, ni, 0] / SumExp;
+    OutPtr := FOutput.GetRawPtr(ni, 0, 0);
+    for d := 0 to FDim - 1 do OutPtr^[d] := 0;
+    for m := 0 to FM - 1 do
+      TNNetVolume.MulAdd(OutPtr, FH.GetRawPtr(m, 0, 0), FA2[m, ni, 0], FDim);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetInducedSetAttention.Backpropagate();
+var
+  StartTime: double;
+  X, I, Xerr: TNNetVolume;
+  SeqLen, m, ni, k, d: integer;
+  hasInputGrad: boolean;
+  dA: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAA, A, dS: TNeuralFloat;
+  dHm, GradIm, Hm, Xni: TNeuralFloatArrPtr;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  I := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  Xerr := nil;
+  if hasInputGrad then Xerr := FPrevLayer.FOutputError;
+  FGradI.Fill(0);
+  FdH.Fill(0);
+  // ============ Stage 2 backward: Y[ni] = sum_m a2[ni,m] * H[m] ============
+  // For each query ni: accumulate dH (value path), dX[ni] via dScore -> H keys,
+  // dH via dScore -> X[ni] queries.
+  SetLength(dA, FM);
+  SetLength(dScore, FM);
+  for ni := 0 to SeqLen - 1 do
+  begin
+    // dH[m] += a2[ni,m] * dOut[ni];  dA[m] = dOut[ni] . H[m]
+    for m := 0 to FM - 1 do
+    begin
+      A := FA2[m, ni, 0];
+      TNNetVolume.MulAdd(FdH.GetRawPtr(m, 0, 0), FOutputError.GetRawPtr(ni, 0, 0),
+        A, FDim);
+      dA[m] := TNNetVolume.DotProduct(FOutputError.GetRawPtr(ni, 0, 0),
+        FH.GetRawPtr(m, 0, 0), FDim);
+    end;
+    SumDAA := 0;
+    for k := 0 to FM - 1 do SumDAA := SumDAA + dA[k] * FA2[k, ni, 0];
+    for m := 0 to FM - 1 do
+      dScore[m] := FA2[m, ni, 0] * (dA[m] - SumDAA);
+    // score2[ni,m] = invSqrtDim * (X[ni] . H[m]):
+    //   dX[ni] += invSqrtDim * dScore[m] * H[m]
+    //   dH[m]  += invSqrtDim * dScore[m] * X[ni]
+    Xni := X.GetRawPtr(ni, 0, 0);
+    for m := 0 to FM - 1 do
+    begin
+      dS := dScore[m] * FInvSqrtDim;
+      if dS <> 0 then
+      begin
+        if hasInputGrad then
+          TNNetVolume.MulAdd(Xerr.GetRawPtr(ni, 0, 0), FH.GetRawPtr(m, 0, 0), dS,
+            FDim);
+        TNNetVolume.MulAdd(FdH.GetRawPtr(m, 0, 0), Xni, dS, FDim);
+      end;
+    end;
+  end;
+  // ============ Stage 1 backward: H[m] = sum_ni a1[m,ni] * X[ni] ============
+  // dH[m] now holds the full gradient w.r.t. H[m]. Propagate into I and X.
+  SetLength(dA, SeqLen);
+  SetLength(dScore, SeqLen);
+  for m := 0 to FM - 1 do
+  begin
+    dHm := FdH.GetRawPtr(m, 0, 0);
+    GradIm := FGradI.GetRawPtr(m, 0, 0);
+    // dX[ni] += a1[m,ni] * dH[m];  dA[ni] = dH[m] . X[ni]
+    for ni := 0 to SeqLen - 1 do
+    begin
+      A := FA1[ni, m, 0];
+      if hasInputGrad then
+        TNNetVolume.MulAdd(Xerr.GetRawPtr(ni, 0, 0), dHm, A, FDim);
+      dA[ni] := TNNetVolume.DotProduct(dHm, X.GetRawPtr(ni, 0, 0), FDim);
+    end;
+    SumDAA := 0;
+    for k := 0 to SeqLen - 1 do SumDAA := SumDAA + dA[k] * FA1[k, m, 0];
+    for ni := 0 to SeqLen - 1 do
+      dScore[ni] := FA1[ni, m, 0] * (dA[ni] - SumDAA);
+    // score1[m,ni] = invSqrtDim * (I[m] . X[ni]):
+    //   dI[m]  += invSqrtDim * dScore[ni] * X[ni]
+    //   dX[ni] += invSqrtDim * dScore[ni] * I[m]
+    Hm := I.GetRawPtr(m, 0, 0);
+    for ni := 0 to SeqLen - 1 do
+    begin
+      dS := dScore[ni] * FInvSqrtDim;
+      if dS <> 0 then
+      begin
+        TNNetVolume.MulAdd(GradIm, X.GetRawPtr(ni, 0, 0), dS, FDim);
+        if hasInputGrad then
+          TNNetVolume.MulAdd(Xerr.GetRawPtr(ni, 0, 0), Hm, dS, FDim);
+      end;
+    end;
+  end;
+  // Flush bank gradient into the neuron delta (-LearningRate scaled).
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradI.GetRawPtr(),
+    -FLearningRate, I.Size);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetInducedSetAttention.InitDefault();
+var
+  m, d, oldSeed: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Small random inducing points (deterministic seed, independent of global RNG
+  // ordering) so the bottleneck starts unbiased; training learns the summaries.
+  oldSeed := RandSeed;
+  RandSeed := 271828;
+  for m := 0 to FM - 1 do
+    for d := 0 to FDim - 1 do
+      FNeurons[0].FWeights[m, 0, d] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetAttentionPooling }
+
+constructor TNNetAttentionPooling.Create(NumSeeds, d: integer);
+begin
+  inherited Create();
+  FK := NumSeeds;
+  FDim := d;
+  if FK < 1 then
+    FErrorProc('TNNetAttentionPooling requires NumSeeds >= 1. Got ' +
+      IntToStr(FK));
+  if FDim < 1 then
+    FErrorProc('TNNetAttentionPooling requires d >= 1. Got ' + IntToStr(FDim));
+  FInvSqrtDim := pcr_rsqrtf(FDim);
+  FStruct[0] := FK;
+  FStruct[1] := FDim;
+  FA := TNNetVolume.Create();
+  FGradS := TNNetVolume.Create();
+  AddMissingNeurons(1);
+end;
+
+destructor TNNetAttentionPooling.Destroy();
+begin
+  FGradS.Free;
+  FA.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetAttentionPooling.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetAttentionPooling requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDim then
+    FErrorProc('TNNetAttentionPooling requires input depth = d. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d=' + IntToStr(FDim));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  // Output is the FIXED k seeds (k,1,d), independent of the input length N.
+  FOutput.ReSize(FK, 1, FDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Seed bank S: (k, 1, d) -- each seed d-vector is depth-contiguous.
+  FNeurons[0].FWeights.ReSize(FK, 1, FDim);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FA.ReSize(SeqLen, FK, 1);   // X=n (key over N), Y=q (query over k)
+  FGradS.ReSize(FK, 1, FDim);
+  InitDefault();
+end;
+
+procedure TNNetAttentionPooling.Compute();
+var
+  StartTime: double;
+  X, S: TNNetVolume;
+  SeqLen, q, ni, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  S := FNeurons[0].FWeights;
+  SeqLen := X.SizeX;
+  // PMA = MAB(S, X): each seed q attends over the SeqLen inputs.
+  for q := 0 to FK - 1 do
+  begin
+    MaxScore := -1e30;
+    for ni := 0 to SeqLen - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(S.GetRawPtr(q, 0, 0), X.GetRawPtr(ni, 0, 0),
+        FDim) * FInvSqrtDim;
+      FA[ni, q, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    SumExp := 0;
+    for ni := 0 to SeqLen - 1 do
+    begin
+      Score := pcr_expf(FA[ni, q, 0] - MaxScore);
+      FA[ni, q, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for ni := 0 to SeqLen - 1 do
+        FA[ni, q, 0] := FA[ni, q, 0] / SumExp;
+    OutPtr := FOutput.GetRawPtr(q, 0, 0);
+    for d := 0 to FDim - 1 do OutPtr^[d] := 0;
+    for ni := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, X.GetRawPtr(ni, 0, 0), FA[ni, q, 0], FDim);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAttentionPooling.Backpropagate();
+var
+  StartTime: double;
+  X, S, Xerr: TNNetVolume;
+  SeqLen, q, ni, k, d: integer;
+  hasInputGrad: boolean;
+  dA: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAA, A, dS: TNeuralFloat;
+  Sq, GradSq: TNeuralFloatArrPtr;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  S := FNeurons[0].FWeights;
+  SeqLen := X.SizeX;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  Xerr := nil;
+  if hasInputGrad then Xerr := FPrevLayer.FOutputError;
+  FGradS.Fill(0);
+  SetLength(dA, SeqLen);
+  SetLength(dScore, SeqLen);
+  for q := 0 to FK - 1 do
+  begin
+    // Y[q] = sum_ni a[q,ni] * X[ni].
+    //   dX[ni] += a[q,ni] * dOut[q];  dA[ni] = dOut[q] . X[ni]
+    for ni := 0 to SeqLen - 1 do
+    begin
+      A := FA[ni, q, 0];
+      if hasInputGrad then
+        TNNetVolume.MulAdd(Xerr.GetRawPtr(ni, 0, 0), FOutputError.GetRawPtr(q, 0, 0),
+          A, FDim);
+      dA[ni] := TNNetVolume.DotProduct(FOutputError.GetRawPtr(q, 0, 0),
+        X.GetRawPtr(ni, 0, 0), FDim);
+    end;
+    SumDAA := 0;
+    for k := 0 to SeqLen - 1 do SumDAA := SumDAA + dA[k] * FA[k, q, 0];
+    for ni := 0 to SeqLen - 1 do
+      dScore[ni] := FA[ni, q, 0] * (dA[ni] - SumDAA);
+    // score[q,ni] = invSqrtDim * (S[q] . X[ni]):
+    //   dS[q]  += invSqrtDim * dScore[ni] * X[ni]
+    //   dX[ni] += invSqrtDim * dScore[ni] * S[q]
+    Sq := S.GetRawPtr(q, 0, 0);
+    GradSq := FGradS.GetRawPtr(q, 0, 0);
+    for ni := 0 to SeqLen - 1 do
+    begin
+      dS := dScore[ni] * FInvSqrtDim;
+      if dS <> 0 then
+      begin
+        TNNetVolume.MulAdd(GradSq, X.GetRawPtr(ni, 0, 0), dS, FDim);
+        if hasInputGrad then
+          TNNetVolume.MulAdd(Xerr.GetRawPtr(ni, 0, 0), Sq, dS, FDim);
+      end;
+    end;
+  end;
+  // Flush seed gradient into the neuron delta (-LearningRate scaled).
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradS.GetRawPtr(),
+    -FLearningRate, S.Size);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetAttentionPooling.InitDefault();
+var
+  q, d, oldSeed: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  oldSeed := RandSeed;
+  RandSeed := 161803;
+  for q := 0 to FK - 1 do
+    for d := 0 to FDim - 1 do
+      FNeurons[0].FWeights[q, 0, d] :=
         FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
   RandSeed := oldSeed;
   AfterWeightUpdate();
@@ -32268,6 +32817,38 @@ begin
       '(SizeY=1). SizeY=' + IntToStr(Query.Output.SizeY));
   Result := AddLayer(
     TNNetModernHopfield.Create(NumPatterns, Query.Output.Depth, KSteps, Beta));
+end;
+
+function TNNet.AddInducedSetAttention(InducingPoints: integer;
+  Heads: integer): TNNetLayer;
+var
+  SetLayer: TNNetLayer;
+begin
+  SetLayer := GetLastLayer();
+  if SetLayer.Output.SizeY <> 1 then
+    FErrorProc('AddInducedSetAttention requires a (N,1,d) set (SizeY=1). SizeY=' +
+      IntToStr(SetLayer.Output.SizeY));
+  if Heads <> 1 then
+    FErrorProc('AddInducedSetAttention: only Heads=1 is implemented (v1). Got ' +
+      IntToStr(Heads));
+  Result := AddLayer(
+    TNNetInducedSetAttention.Create(InducingPoints, SetLayer.Output.Depth));
+end;
+
+function TNNet.AddAttentionPooling(NumSeeds: integer;
+  Heads: integer): TNNetLayer;
+var
+  SetLayer: TNNetLayer;
+begin
+  SetLayer := GetLastLayer();
+  if SetLayer.Output.SizeY <> 1 then
+    FErrorProc('AddAttentionPooling requires a (N,1,d) set (SizeY=1). SizeY=' +
+      IntToStr(SetLayer.Output.SizeY));
+  if Heads <> 1 then
+    FErrorProc('AddAttentionPooling: only Heads=1 is implemented (v1). Got ' +
+      IntToStr(Heads));
+  Result := AddLayer(
+    TNNetAttentionPooling.Create(NumSeeds, SetLayer.Output.Depth));
 end;
 
 function TNNet.AddHyperLinear(Din, Dout: integer; ContextLayer: TNNetLayer;
@@ -58163,6 +58744,8 @@ begin
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
       'TNNetModernHopfield' :       Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]);
+      'TNNetInducedSetAttention' :  Result := TNNetInducedSetAttention.Create(St[0], St[1]);
+      'TNNetAttentionPooling' :     Result := TNNetAttentionPooling.Create(St[0], St[1]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -58476,6 +59059,8 @@ begin
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else
       if S[0] = 'TNNetModernHopfield' then Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]) else
+      if S[0] = 'TNNetInducedSetAttention' then Result := TNNetInducedSetAttention.Create(St[0], St[1]) else
+      if S[0] = 'TNNetAttentionPooling' then Result := TNNetAttentionPooling.Create(St[0], St[1]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
