@@ -104,29 +104,6 @@ rather than acted on.
       morphological dilation/erosion with a learnable structuring element) reusing
       the same arg-select backward — track it as a follow-up, do NOT add a second
       task now.
-- [X] TNNetSpectralConv1D (Fourier Neural Operator layer; Li et al. 2021,
-      arXiv:2010.08895) — LANDED on a2. First learnable-spectral-weight layer:
-      per-channel real radix-2 FFT (reuses FourierMixFFT), low-pass truncation to
-      the lowest Modes, learnable per-(in,out)-channel COMPLEX weight per mode
-      (2x2 complex-multiply block), inverse FFT. Weight layout 2*Modes*InDepth*
-      OutDepth reals; Create(OutDepth, Modes); Modes round-trips via FStruct[5];
-      registered in both dispatch tables + the LoadFromString cascade. Tests:
-      gradient check on BOTH input and complex weights (real+imag), Modes-
-      truncation forward check, save/load round-trip with non-default Modes (all
-      pass in tests/TestNeuralNumerical.pas). Example examples/FourierNeuralOperator/
-      learns the 1-D antiderivative operator on a 32-point grid and generalises
-      to an unseen 64-point grid (rel-L2 ~7.9% on both) while a local CausalConv1D
-      baseline degrades (63% -> 86%) — the resolution-invariance headline. ~90 s.
-      Follow-up: TNNetSpectralConv2D and an FFT-path (O(L log L)) for the Hyena
-      long-conv could reuse the same helper.
-- [X] TNNetOctonionConv: the convolution analogue of TNNetOctonionLinear
-      (which LANDED on a2 — 8D Cayley-Dickson dense layer with the verified
-      octonion multiplication table, norm-multiplicativity + gradient + save/load
-      tests, and the examples/OctonionLinear/ bake-off). Mirror TNNetQuaternionConv:
-      input Depth and feature count multiples of 8, an (OutO x InO) octonion
-      weight grid per kernel tap applied by the SAME 8x8 block as the dense layer,
-      ~1/8 the weights of a real conv of equal width; numerical-gradient +
-      save/load tests and a small examples/OctonionConv/ image bake-off.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
