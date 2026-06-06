@@ -299,6 +299,8 @@ type
     procedure TestProductKeyMemoryTopK1GradientCheck;
     procedure TestProductKeyMemorySerializationRoundTrip;
     procedure TestAddProductKeyMemoryBuilder;
+    procedure TestProductKeyMemoryMultiHeadInputGradientCheck;
+    procedure TestProductKeyMemoryMultiHeadWeightGradientCheck;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -24162,6 +24164,181 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+// Seed ALL 3*Heads banks of a multi-head product-key memory so each head's
+// half-1 / half-2 scores are well separated (no near-ties across the
+// non-differentiable top-k selection boundary). Each head gets a distinct phase
+// offset so the heads are genuinely independent (and their selected key sets do
+// not coincide).
+procedure SeedMultiHeadProductKeyMemory(PKM: TNNetProductKeyMemory);
+var hh, a, b, d, kIdx: integer; ph: TNeuralFloat;
+begin
+  for hh := 0 to PKM.Heads - 1 do
+  begin
+    ph := 0.4 * hh;
+    // K1_h.
+    for a := 0 to PKM.HalfKeys - 1 do
+      for d := 0 to (PKM.HeadQueryDim div 2) - 1 do
+        PKM.Neurons[3 * hh].Weights[a, 0, d] :=
+          Sin((a + 1) * 0.7 + d * 1.13 + ph) * (0.5 + 0.4 * a);
+    // K2_h.
+    for b := 0 to PKM.HalfKeys - 1 do
+      for d := 0 to (PKM.HeadQueryDim div 2) - 1 do
+        PKM.Neurons[3 * hh + 1].Weights[b, 0, d] :=
+          Cos((b + 1) * 0.9 + d * 0.61 + ph) * (0.5 + 0.35 * b);
+    // V_h.
+    for kIdx := 0 to PKM.NumKeys - 1 do
+      for d := 0 to PKM.ValueDim - 1 do
+        PKM.Neurons[3 * hh + 2].Weights[kIdx, 0, d] :=
+          Sin(kIdx * 0.37 + d * 0.83 + ph) * 0.6 + 0.05 * d;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestProductKeyMemoryMultiHeadInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  PKM: TNNetProductKeyMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // MULTI-HEAD (Heads=2): QueryDim=8 -> 2 sub-queries of width 4 (HalfQ=2),
+  // NumKeys=16 (HalfKeys=4), ValueDim=3, TopK=2. Output Depth = Heads*ValueDim=6.
+  // Each head runs an independent product-key lookup against its own banks; the
+  // well-separated seed keeps every head's selected top-2 set unambiguous so the
+  // central differences never cross the non-differentiable top-k boundary.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 8);
+  InputPlus := TNNetVolume.Create(2, 1, 8);
+  Desired := TNNetVolume.Create(2, 1, 6);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 8, 1));
+    PKM := TNNetProductKeyMemory.Create(16, 3, 2, 2, 8);
+    NN.AddLayer(PKM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedMultiHeadProductKeyMemory(PKM);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('PKM multi-head input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('PKM multi-head input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestProductKeyMemoryMultiHeadWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  PKM: TNNetProductKeyMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  nIdx, i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // MULTI-HEAD (Heads=2): checks ALL SIX learnable banks -- per head h the three
+  // neurons K1_h (3h), K2_h (3h+1), V_h (3h+2). The well-separated per-head seed
+  // keeps each head's selected top-k set stable under the +-epsilon perturbation
+  // (no crossing of the non-differentiable top-k boundary).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 8);
+  Desired := TNNetVolume.Create(2, 1, 6);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 8, 1));
+    PKM := TNNetProductKeyMemory.Create(16, 3, 2, 2, 8);
+    NN.AddLayer(PKM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedMultiHeadProductKeyMemory(PKM);
+
+    for nIdx := 0 to 3 * PKM.Heads - 1 do
+      for i := 0 to PKM.Neurons[nIdx].Weights.Size - 1 do
+      begin
+        PKM.Neurons[nIdx].Weights.Raw[i] :=
+          PKM.Neurons[nIdx].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        PKM.Neurons[nIdx].Weights.Raw[i] :=
+          PKM.Neurons[nIdx].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        PKM.Neurons[nIdx].Weights.Raw[i] :=
+          PKM.Neurons[nIdx].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        PKM.Neurons[nIdx].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -PKM.Neurons[nIdx].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('PKM multi-head weight gradient n=' + IntToStr(nIdx) +
+          ' w[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('PKM multi-head weight gradient max abs error: ', maxErr:0:8);
   finally
     NN.Free; Input.Free; Desired.Free;
   end;

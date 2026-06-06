@@ -1506,7 +1506,7 @@ rather than acted on.
       reading how information is distributed across the coordinate axis.
 
 ### Product-Key Memory layer (large sparse key-value memory)
-- [ ] TNNetProductKeyMemory follow-up (multi-head): the landed v1 is
+- [X] TNNetProductKeyMemory follow-up (multi-head): the landed v1 is
       single-head (`Heads=1`; the builder raises for other values). Implement H
       independent product-key lookups — split the `QueryDim` query into H
       sub-queries, run one product-key retrieval per head against its own (or a

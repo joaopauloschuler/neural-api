@@ -2579,28 +2579,42 @@ type
   // touched rows of K1, K2. A given half-key row can appear in several selected
   // combinations; its gradient accumulates over all of them.
   //
-  // LEARNABLE PARAMS (3 neurons): Neurons[0].Weights = K1 (HalfKeys,1,HalfQ),
-  // Neurons[1].Weights = K2 (HalfKeys,1,HalfQ), Neurons[2].Weights = V
-  // (NumKeys,1,ValueDim). All trainable end-to-end; they serialize/deserialize
-  // through the ordinary per-neuron SaveDataToString/LoadDataFromString (no
-  // custom weight serialization). FStruct[0]=NumKeys, FStruct[1]=ValueDim,
-  // FStruct[2]=TopK, FStruct[3]=Heads, FStruct[4]=QueryDim so the layer
-  // round-trips through SaveToString / LoadFromString.
+  // LEARNABLE PARAMS (3*Heads neurons): each head h owns its OWN three banks,
+  // stored as a contiguous triple of neurons:
+  //   Neurons[3*h+0].Weights = K1_h (HalfKeys,1,HalfQ)
+  //   Neurons[3*h+1].Weights = K2_h (HalfKeys,1,HalfQ)
+  //   Neurons[3*h+2].Weights = V_h  (NumKeys,1,ValueDim)
+  // For Heads=1 this is byte-for-byte identical to the v1 single-head layout
+  // (neurons 0,1,2), so old saved models load unchanged. All trainable
+  // end-to-end; they serialize/deserialize through the ordinary per-neuron
+  // SaveDataToString/LoadDataFromString (no custom weight serialization), and
+  // because Heads is FStruct[3] the per-head neuron count is reconstructed on
+  // load. FStruct[0]=NumKeys, FStruct[1]=ValueDim, FStruct[2]=TopK,
+  // FStruct[3]=Heads, FStruct[4]=QueryDim (the FULL query width).
+  //
+  // MULTI-HEAD: with Heads=H, the QueryDim-wide query is split into H contiguous
+  // sub-queries of width HeadQueryDim = QueryDim div Heads (which must itself be
+  // even, so HalfQ = HeadQueryDim div 2). Each head runs an INDEPENDENT
+  // product-key retrieval (its own K1/K2/V banks above) over its sub-query, and
+  // the H ValueDim-wide head outputs are concatenated along Depth -> output
+  // Depth = Heads*ValueDim. There is no head-axis tensor in this repo; the heads
+  // are H separate concatenated paths, exactly mirroring the multi-head
+  // attention wiring. PER-HEAD banks (not a shared bank) were chosen so each
+  // head specialises its own product-key factorization and value table -- this
+  // is the standard PKM-with-heads design (Lample et al. 2019) and maps cleanly
+  // onto the existing one-neuron-per-bank organization so it round-trips through
+  // serialization with no custom code.
   //
   // INPUT layout: a (SeqLen,1,QueryDim) query laid out along SizeX (SizeY=1,
   // Depth=QueryDim), exactly like the attention layers. QueryDim must be even
-  // (split into two equal halves). OUTPUT shape: (SeqLen,1,ValueDim).
+  // and divisible by Heads, with QueryDim div Heads even too. OUTPUT shape:
+  // (SeqLen,1,Heads*ValueDim).
   //
   // NumKeys must be a perfect square; the builder rounds it to the nearest
   // square. TopK is clamped to <= HalfKeys. This is structurally DISTINCT from
   // TNNetModernHopfield (dense softmax over a small fully-retrieved bank),
   // TNNetEmbedding (one-hot lookup) and MoE (routes to expert MLPs): the
   // novelty is the product-key factorization enabling sparse top-k retrieval.
-  //
-  // MULTI-HEAD: only Heads=1 is implemented in v1 (Heads is stored for API
-  // stability; the builder raises on Heads<>1). Multi-head (split the query
-  // into H independent product-key lookups concatenated along Depth, mirroring
-  // the multi-head attention wiring) is a documented follow-up.
   // Coded by Claude (AI).
   TNNetProductKeyMemory = class(TNNetLayer)
     private
@@ -2608,19 +2622,22 @@ type
       FHalfKeys: integer;   // sqrt(NumKeys), rows per half-key bank
       FValueDim: integer;   // output / value-vector width
       FTopK: integer;       // number of product keys retrieved per query
-      FQueryDim: integer;   // input query width (even); HalfQ = QueryDim div 2
-      FHalfQ: integer;      // half query width
-      FHeads: integer;      // reserved; v1 only Heads=1
-      // Forward caches (per token t, per selected slot k):
-      FIdxA: array of integer;   // (SeqLen*TopK) selected K1 row
-      FIdxB: array of integer;   // (SeqLen*TopK) selected K2 row
-      FIdxKey: array of integer; // (SeqLen*TopK) selected value row = a*HalfKeys+b
-      FW: TNNetVolume;           // (SeqLen,1,TopK) softmax weights
-      FS1: TNNetVolume;          // (SeqLen,1,HalfKeys) half-1 scores (scratch)
-      FS2: TNNetVolume;          // (SeqLen,1,HalfKeys) half-2 scores (scratch)
-      FGradK1: TNNetVolume;      // (HalfKeys,1,HalfQ) K1-gradient accumulator
-      FGradK2: TNNetVolume;      // (HalfKeys,1,HalfQ) K2-gradient accumulator
-      FGradV: TNNetVolume;       // (NumKeys,1,ValueDim) V-gradient accumulator
+      FQueryDim: integer;   // FULL input query width (even); per-head = QueryDim div Heads
+      FHeadQueryDim: integer; // per-head query width = QueryDim div Heads (even)
+      FHalfQ: integer;      // per-head half query width = FHeadQueryDim div 2
+      FHeads: integer;      // number of independent product-key heads (>=1)
+      // Forward caches (per head h, per token t, per selected slot k):
+      // Per-head caches are concatenated along the head axis: entry for head h,
+      // token t, slot k lives at index ((h*SeqLen + t)*TopK + k).
+      FIdxA: array of integer;   // (Heads*SeqLen*TopK) selected K1 row
+      FIdxB: array of integer;   // (Heads*SeqLen*TopK) selected K2 row
+      FIdxKey: array of integer; // (Heads*SeqLen*TopK) selected value row = a*HalfKeys+b
+      FW: TNNetVolume;           // (SeqLen,1,Heads*TopK) softmax weights (head-major along Depth)
+      FS1: TNNetVolume;          // (SeqLen,1,HalfKeys) half-1 scores (scratch, reused per head)
+      FS2: TNNetVolume;          // (SeqLen,1,HalfKeys) half-2 scores (scratch, reused per head)
+      FGradK1: TNNetVolume;      // (HalfKeys,1,HalfQ) K1-gradient accumulator (reused per head)
+      FGradK2: TNNetVolume;      // (HalfKeys,1,HalfQ) K2-gradient accumulator (reused per head)
+      FGradV: TNNetVolume;       // (NumKeys,1,ValueDim) V-gradient accumulator (reused per head)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(NumKeys, ValueDim, TopK, Heads, QueryDim: integer); overload;
@@ -2633,6 +2650,7 @@ type
       property ValueDim: integer read FValueDim;
       property TopK: integer read FTopK;
       property QueryDim: integer read FQueryDim;
+      property HeadQueryDim: integer read FHeadQueryDim;
       property Heads: integer read FHeads;
   end;
 
@@ -16298,10 +16316,17 @@ begin
   if (FQueryDim mod 2) <> 0 then
     FErrorProc('TNNetProductKeyMemory requires an even QueryDim. Got ' +
       IntToStr(FQueryDim));
-  if FHeads <> 1 then
-    FErrorProc('TNNetProductKeyMemory: only Heads=1 is implemented (v1). Got ' +
+  if FHeads < 1 then
+    FErrorProc('TNNetProductKeyMemory requires Heads >= 1. Got ' +
       IntToStr(FHeads));
-  FHalfQ := FQueryDim div 2;
+  if (FQueryDim mod FHeads) <> 0 then
+    FErrorProc('TNNetProductKeyMemory requires QueryDim divisible by Heads. ' +
+      'QueryDim=' + IntToStr(FQueryDim) + ', Heads=' + IntToStr(FHeads));
+  FHeadQueryDim := FQueryDim div FHeads;
+  if (FHeadQueryDim mod 2) <> 0 then
+    FErrorProc('TNNetProductKeyMemory requires (QueryDim div Heads) to be even.' +
+      ' QueryDim=' + IntToStr(FQueryDim) + ', Heads=' + IntToStr(FHeads));
+  FHalfQ := FHeadQueryDim div 2;
   if FTopK < 1 then FTopK := 1;
   if FTopK > FHalfKeys then FTopK := FHalfKeys; // can't take more than HalfKeys
   FStruct[0] := FNumKeys;
@@ -16315,7 +16340,7 @@ begin
   FGradK1 := TNNetVolume.Create();
   FGradK2 := TNNetVolume.Create();
   FGradV := TNNetVolume.Create();
-  AddMissingNeurons(3);
+  AddMissingNeurons(3 * FHeads);
 end;
 
 destructor TNNetProductKeyMemory.Destroy();
@@ -16331,7 +16356,7 @@ end;
 
 procedure TNNetProductKeyMemory.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  SeqLen: integer;
+  SeqLen, h, n: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   if pPrevLayer.FOutput.SizeY <> 1 then
@@ -16342,31 +16367,36 @@ begin
       'depth=' + IntToStr(pPrevLayer.FOutput.Depth) + ', QueryDim=' +
       IntToStr(FQueryDim));
   SeqLen := pPrevLayer.FOutput.SizeX;
-  FOutput.ReSize(SeqLen, 1, FValueDim);
+  // Output Depth = Heads*ValueDim (the H head outputs concatenated along Depth).
+  FOutput.ReSize(SeqLen, 1, FHeads * FValueDim);
   FOutputError.ReSize(FOutput);
   FOutputErrorDeriv.ReSize(FOutput);
-  if FNeurons.Count < 3 then AddMissingNeurons(3 - FNeurons.Count);
-  // Neuron 0: K1 half-key bank (HalfKeys,1,HalfQ); each half-key contiguous.
-  FNeurons[0].FWeights.ReSize(FHalfKeys, 1, FHalfQ);
-  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
-  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
-  // Neuron 1: K2 half-key bank (HalfKeys,1,HalfQ).
-  FNeurons[1].FWeights.ReSize(FHalfKeys, 1, FHalfQ);
-  FNeurons[1].FDelta.ReSize(FNeurons[1].FWeights);
-  FNeurons[1].FBackInertia.ReSize(FNeurons[1].FWeights);
-  // Neuron 2: V value table (NumKeys,1,ValueDim); each value contiguous.
-  FNeurons[2].FWeights.ReSize(FNumKeys, 1, FValueDim);
-  FNeurons[2].FDelta.ReSize(FNeurons[2].FWeights);
-  FNeurons[2].FBackInertia.ReSize(FNeurons[2].FWeights);
-  FW.ReSize(SeqLen, 1, FTopK);
+  if FNeurons.Count < 3 * FHeads then
+    AddMissingNeurons(3 * FHeads - FNeurons.Count);
+  // Per head h: neuron 3h = K1_h (HalfKeys,1,HalfQ), neuron 3h+1 = K2_h
+  // (HalfKeys,1,HalfQ), neuron 3h+2 = V_h (NumKeys,1,ValueDim).
+  for h := 0 to FHeads - 1 do
+  begin
+    n := 3 * h;
+    FNeurons[n].FWeights.ReSize(FHalfKeys, 1, FHalfQ);
+    FNeurons[n].FDelta.ReSize(FNeurons[n].FWeights);
+    FNeurons[n].FBackInertia.ReSize(FNeurons[n].FWeights);
+    FNeurons[n + 1].FWeights.ReSize(FHalfKeys, 1, FHalfQ);
+    FNeurons[n + 1].FDelta.ReSize(FNeurons[n + 1].FWeights);
+    FNeurons[n + 1].FBackInertia.ReSize(FNeurons[n + 1].FWeights);
+    FNeurons[n + 2].FWeights.ReSize(FNumKeys, 1, FValueDim);
+    FNeurons[n + 2].FDelta.ReSize(FNeurons[n + 2].FWeights);
+    FNeurons[n + 2].FBackInertia.ReSize(FNeurons[n + 2].FWeights);
+  end;
+  FW.ReSize(SeqLen, 1, FHeads * FTopK);
   FS1.ReSize(SeqLen, 1, FHalfKeys);
   FS2.ReSize(SeqLen, 1, FHalfKeys);
-  FGradK1.ReSize(FNeurons[0].FWeights);
-  FGradK2.ReSize(FNeurons[1].FWeights);
-  FGradV.ReSize(FNeurons[2].FWeights);
-  SetLength(FIdxA, SeqLen * FTopK);
-  SetLength(FIdxB, SeqLen * FTopK);
-  SetLength(FIdxKey, SeqLen * FTopK);
+  FGradK1.ReSize(FHalfKeys, 1, FHalfQ);
+  FGradK2.ReSize(FHalfKeys, 1, FHalfQ);
+  FGradV.ReSize(FNumKeys, 1, FValueDim);
+  SetLength(FIdxA, FHeads * SeqLen * FTopK);
+  SetLength(FIdxB, FHeads * SeqLen * FTopK);
+  SetLength(FIdxKey, FHeads * SeqLen * FTopK);
   InitDefault();
 end;
 
@@ -16405,7 +16435,7 @@ procedure TNNetProductKeyMemory.Compute();
 var
   StartTime: double;
   Prev, K1, K2, V: TNNetVolume;
-  SeqLen, t, a, b, kk, jj, base, keyIdx: integer;
+  SeqLen, t, a, b, kk, jj, base, keyIdx, h, qOff, wOff, outOff: integer;
   q1, q2, OutPtr, Vptr: TNeuralFloatArrPtr;
   SelA, SelB: array of integer;
   CandScore: array of TNeuralFloat;
@@ -16415,75 +16445,81 @@ var
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
-  K1 := FNeurons[0].FWeights;
-  K2 := FNeurons[1].FWeights;
-  V := FNeurons[2].FWeights;
   SeqLen := FOutput.SizeX;
   SetLength(SelA, FTopK);
   SetLength(SelB, FTopK);
   SetLength(CandScore, FTopK * FTopK);
   SetLength(CandA, FTopK * FTopK);
   SetLength(CandB, FTopK * FTopK);
-  for t := 0 to SeqLen - 1 do
+  for h := 0 to FHeads - 1 do
   begin
-    q1 := Prev.GetRawPtr(t, 0, 0);            // q[0..HalfQ-1]
-    q2 := Prev.GetRawPtr(t, 0, FHalfQ);       // q[HalfQ..2HalfQ-1]
-    // Half scores.
-    for a := 0 to FHalfKeys - 1 do
-      FS1[t, 0, a] := TNNetVolume.DotProduct(q1, K1.GetRawPtr(a, 0, 0), FHalfQ);
-    for b := 0 to FHalfKeys - 1 do
-      FS2[t, 0, b] := TNNetVolume.DotProduct(q2, K2.GetRawPtr(b, 0, 0), FHalfQ);
-    // Top-TopK per half.
-    PKMTopKIndices(FS1.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, SelA);
-    PKMTopKIndices(FS2.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, SelB);
-    // TopK x TopK candidate combinations, scored s1[a] + s2[b].
-    nCand := 0;
-    for a := 0 to FTopK - 1 do
-      for b := 0 to FTopK - 1 do
-      begin
-        CandScore[nCand] := FS1[t, 0, SelA[a]] + FS2[t, 0, SelB[b]];
-        CandA[nCand] := SelA[a];
-        CandB[nCand] := SelB[b];
-        Inc(nCand);
-      end;
-    // Pick the global top-TopK of the candidates (partial selection sort).
-    base := t * FTopK;
-    for kk := 0 to FTopK - 1 do
+    K1 := FNeurons[3 * h].FWeights;
+    K2 := FNeurons[3 * h + 1].FWeights;
+    V := FNeurons[3 * h + 2].FWeights;
+    qOff := h * FHeadQueryDim;       // start of this head's sub-query in the input
+    wOff := h * FTopK;               // this head's softmax-weight slots in FW Depth
+    outOff := h * FValueDim;         // this head's output slot in FOutput Depth
+    for t := 0 to SeqLen - 1 do
     begin
-      gbest := -1;
-      for gi := 0 to nCand - 1 do
-        if (CandA[gi] >= 0) and
-           ((gbest = -1) or (CandScore[gi] > CandScore[gbest])) then
-          gbest := gi;
-      FIdxA[base + kk] := CandA[gbest];
-      FIdxB[base + kk] := CandB[gbest];
-      FIdxKey[base + kk] := CandA[gbest] * FHalfKeys + CandB[gbest];
-      FW[t, 0, kk] := CandScore[gbest]; // store raw score; softmax below
-      CandA[gbest] := -1;               // mark consumed
-    end;
-    // Softmax over the TopK selected combination scores.
-    MaxScore := -1e30;
-    for kk := 0 to FTopK - 1 do
-      if FW[t, 0, kk] > MaxScore then MaxScore := FW[t, 0, kk];
-    SumExp := 0;
-    for kk := 0 to FTopK - 1 do
-    begin
-      sc := pcr_expf(FW[t, 0, kk] - MaxScore);
-      FW[t, 0, kk] := sc;
-      SumExp := SumExp + sc;
-    end;
-    if SumExp > 0 then
+      q1 := Prev.GetRawPtr(t, 0, qOff);            // sub-q[0..HalfQ-1]
+      q2 := Prev.GetRawPtr(t, 0, qOff + FHalfQ);   // sub-q[HalfQ..2HalfQ-1]
+      // Half scores.
+      for a := 0 to FHalfKeys - 1 do
+        FS1[t, 0, a] := TNNetVolume.DotProduct(q1, K1.GetRawPtr(a, 0, 0), FHalfQ);
+      for b := 0 to FHalfKeys - 1 do
+        FS2[t, 0, b] := TNNetVolume.DotProduct(q2, K2.GetRawPtr(b, 0, 0), FHalfQ);
+      // Top-TopK per half.
+      PKMTopKIndices(FS1.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, SelA);
+      PKMTopKIndices(FS2.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, SelB);
+      // TopK x TopK candidate combinations, scored s1[a] + s2[b].
+      nCand := 0;
+      for a := 0 to FTopK - 1 do
+        for b := 0 to FTopK - 1 do
+        begin
+          CandScore[nCand] := FS1[t, 0, SelA[a]] + FS2[t, 0, SelB[b]];
+          CandA[nCand] := SelA[a];
+          CandB[nCand] := SelB[b];
+          Inc(nCand);
+        end;
+      // Pick the global top-TopK of the candidates (partial selection sort).
+      base := (h * SeqLen + t) * FTopK;
       for kk := 0 to FTopK - 1 do
-        FW[t, 0, kk] := FW[t, 0, kk] / SumExp;
-    // Weighted sum over the selected value rows -> output.
-    OutPtr := FOutput.GetRawPtr(t, 0, 0);
-    for jj := 0 to FValueDim - 1 do OutPtr^[jj] := 0;
-    for kk := 0 to FTopK - 1 do
-    begin
-      keyIdx := FIdxKey[base + kk];
-      w := FW[t, 0, kk];
-      Vptr := V.GetRawPtr(keyIdx, 0, 0);
-      TNNetVolume.MulAdd(OutPtr, Vptr, w, FValueDim);
+      begin
+        gbest := -1;
+        for gi := 0 to nCand - 1 do
+          if (CandA[gi] >= 0) and
+             ((gbest = -1) or (CandScore[gi] > CandScore[gbest])) then
+            gbest := gi;
+        FIdxA[base + kk] := CandA[gbest];
+        FIdxB[base + kk] := CandB[gbest];
+        FIdxKey[base + kk] := CandA[gbest] * FHalfKeys + CandB[gbest];
+        FW[t, 0, wOff + kk] := CandScore[gbest]; // store raw score; softmax below
+        CandA[gbest] := -1;                      // mark consumed
+      end;
+      // Softmax over the TopK selected combination scores (this head).
+      MaxScore := -1e30;
+      for kk := 0 to FTopK - 1 do
+        if FW[t, 0, wOff + kk] > MaxScore then MaxScore := FW[t, 0, wOff + kk];
+      SumExp := 0;
+      for kk := 0 to FTopK - 1 do
+      begin
+        sc := pcr_expf(FW[t, 0, wOff + kk] - MaxScore);
+        FW[t, 0, wOff + kk] := sc;
+        SumExp := SumExp + sc;
+      end;
+      if SumExp > 0 then
+        for kk := 0 to FTopK - 1 do
+          FW[t, 0, wOff + kk] := FW[t, 0, wOff + kk] / SumExp;
+      // Weighted sum over the selected value rows -> this head's output slice.
+      OutPtr := FOutput.GetRawPtr(t, 0, outOff);
+      for jj := 0 to FValueDim - 1 do OutPtr^[jj] := 0;
+      for kk := 0 to FTopK - 1 do
+      begin
+        keyIdx := FIdxKey[base + kk];
+        w := FW[t, 0, wOff + kk];
+        Vptr := V.GetRawPtr(keyIdx, 0, 0);
+        TNNetVolume.MulAdd(OutPtr, Vptr, w, FValueDim);
+      end;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -16493,7 +16529,7 @@ procedure TNNetProductKeyMemory.Backpropagate();
 var
   StartTime: double;
   Prev, PrevErr, K1, K2, V: TNNetVolume;
-  SeqLen, t, kk, jj, base, keyIdx, a, b: integer;
+  SeqLen, t, kk, jj, base, keyIdx, a, b, h, qOff, wOff, outOff: integer;
   hasInputGrad: boolean;
   q1, q2, dq1, dq2, dOut, Vptr: TNeuralFloatArrPtr;
   G: array of TNeuralFloat;       // g_k = dOut . V[keyIdx_k]
@@ -16505,84 +16541,89 @@ begin
   TestBackPropCallCurrCnt();
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
-  K1 := FNeurons[0].FWeights;
-  K2 := FNeurons[1].FWeights;
-  V := FNeurons[2].FWeights;
   SeqLen := FOutput.SizeX;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  FGradK1.Fill(0);
-  FGradK2.Fill(0);
-  FGradV.Fill(0);
   SetLength(G, FTopK);
   SetLength(dScore, FTopK);
-  for t := 0 to SeqLen - 1 do
+  for h := 0 to FHeads - 1 do
   begin
-    base := t * FTopK;
-    dOut := FOutputError.GetRawPtr(t, 0, 0);
-    q1 := Prev.GetRawPtr(t, 0, 0);
-    q2 := Prev.GetRawPtr(t, 0, FHalfQ);
-    // out = sum_k w_k * V[key_k].
-    //   g_k        = dOut . V[key_k]                 (-> softmax path)
-    //   dV[key_k] += w_k * dOut                      (sparse value gradient)
-    for kk := 0 to FTopK - 1 do
+    K1 := FNeurons[3 * h].FWeights;
+    K2 := FNeurons[3 * h + 1].FWeights;
+    V := FNeurons[3 * h + 2].FWeights;
+    qOff := h * FHeadQueryDim;
+    wOff := h * FTopK;
+    outOff := h * FValueDim;
+    FGradK1.Fill(0);
+    FGradK2.Fill(0);
+    FGradV.Fill(0);
+    for t := 0 to SeqLen - 1 do
     begin
-      keyIdx := FIdxKey[base + kk];
-      w := FW[t, 0, kk];
-      Vptr := V.GetRawPtr(keyIdx, 0, 0);
-      G[kk] := TNNetVolume.DotProduct(dOut, Vptr, FValueDim);
-      TNNetVolume.MulAdd(FGradV.GetRawPtr(keyIdx, 0, 0), dOut, w, FValueDim);
-    end;
-    // Exact softmax Jacobian over the selected TopK:
-    //   dScore_k = w_k * (g_k - sum_j w_j g_j).
-    SumWG := 0;
-    for kk := 0 to FTopK - 1 do
-      SumWG := SumWG + FW[t, 0, kk] * G[kk];
-    for kk := 0 to FTopK - 1 do
-      dScore[kk] := FW[t, 0, kk] * (G[kk] - SumWG);
-    // Combination score s_k = s1[a_k] + s2[b_k], with
-    //   s1[a] = q1 . K1[a],  s2[b] = q2 . K2[b].
-    // So dScore_k flows into BOTH halves:
-    //   dq1     += dScore_k * K1[a_k];   dK1[a_k] += dScore_k * q1
-    //   dq2     += dScore_k * K2[b_k];   dK2[b_k] += dScore_k * q2
-    if hasInputGrad then
-    begin
-      dq1 := PrevErr.GetRawPtr(t, 0, 0);
-      dq2 := PrevErr.GetRawPtr(t, 0, FHalfQ);
-    end
-    else
-    begin
-      dq1 := nil; dq2 := nil;
-    end;
-    for kk := 0 to FTopK - 1 do
-    begin
-      ds := dScore[kk];
-      if ds = 0 then continue;
-      a := FIdxA[base + kk];
-      b := FIdxB[base + kk];
-      TNNetVolume.MulAdd(FGradK1.GetRawPtr(a, 0, 0), q1, ds, FHalfQ);
-      TNNetVolume.MulAdd(FGradK2.GetRawPtr(b, 0, 0), q2, ds, FHalfQ);
+      base := (h * SeqLen + t) * FTopK;
+      dOut := FOutputError.GetRawPtr(t, 0, outOff);
+      q1 := Prev.GetRawPtr(t, 0, qOff);
+      q2 := Prev.GetRawPtr(t, 0, qOff + FHalfQ);
+      // out = sum_k w_k * V[key_k].
+      //   g_k        = dOut . V[key_k]                 (-> softmax path)
+      //   dV[key_k] += w_k * dOut                      (sparse value gradient)
+      for kk := 0 to FTopK - 1 do
+      begin
+        keyIdx := FIdxKey[base + kk];
+        w := FW[t, 0, wOff + kk];
+        Vptr := V.GetRawPtr(keyIdx, 0, 0);
+        G[kk] := TNNetVolume.DotProduct(dOut, Vptr, FValueDim);
+        TNNetVolume.MulAdd(FGradV.GetRawPtr(keyIdx, 0, 0), dOut, w, FValueDim);
+      end;
+      // Exact softmax Jacobian over the selected TopK:
+      //   dScore_k = w_k * (g_k - sum_j w_j g_j).
+      SumWG := 0;
+      for kk := 0 to FTopK - 1 do
+        SumWG := SumWG + FW[t, 0, wOff + kk] * G[kk];
+      for kk := 0 to FTopK - 1 do
+        dScore[kk] := FW[t, 0, wOff + kk] * (G[kk] - SumWG);
+      // Combination score s_k = s1[a_k] + s2[b_k], with
+      //   s1[a] = q1 . K1[a],  s2[b] = q2 . K2[b].
+      // So dScore_k flows into BOTH halves:
+      //   dq1     += dScore_k * K1[a_k];   dK1[a_k] += dScore_k * q1
+      //   dq2     += dScore_k * K2[b_k];   dK2[b_k] += dScore_k * q2
       if hasInputGrad then
       begin
-        TNNetVolume.MulAdd(dq1, K1.GetRawPtr(a, 0, 0), ds, FHalfQ);
-        TNNetVolume.MulAdd(dq2, K2.GetRawPtr(b, 0, 0), ds, FHalfQ);
+        dq1 := PrevErr.GetRawPtr(t, 0, qOff);
+        dq2 := PrevErr.GetRawPtr(t, 0, qOff + FHalfQ);
+      end
+      else
+      begin
+        dq1 := nil; dq2 := nil;
+      end;
+      for kk := 0 to FTopK - 1 do
+      begin
+        ds := dScore[kk];
+        if ds = 0 then continue;
+        a := FIdxA[base + kk];
+        b := FIdxB[base + kk];
+        TNNetVolume.MulAdd(FGradK1.GetRawPtr(a, 0, 0), q1, ds, FHalfQ);
+        TNNetVolume.MulAdd(FGradK2.GetRawPtr(b, 0, 0), q2, ds, FHalfQ);
+        if hasInputGrad then
+        begin
+          TNNetVolume.MulAdd(dq1, K1.GetRawPtr(a, 0, 0), ds, FHalfQ);
+          TNNetVolume.MulAdd(dq2, K2.GetRawPtr(b, 0, 0), ds, FHalfQ);
+        end;
       end;
     end;
+    // Flush this head's bank gradients into its neuron deltas (-LR scaled).
+    TNNetVolume.MulAdd(FNeurons[3 * h].FDelta.GetRawPtr(), FGradK1.GetRawPtr(),
+      -FLearningRate, K1.Size);
+    TNNetVolume.MulAdd(FNeurons[3 * h + 1].FDelta.GetRawPtr(),
+      FGradK2.GetRawPtr(), -FLearningRate, K2.Size);
+    TNNetVolume.MulAdd(FNeurons[3 * h + 2].FDelta.GetRawPtr(),
+      FGradV.GetRawPtr(), -FLearningRate, V.Size);
   end;
-  // Flush bank gradients into neuron deltas (-LearningRate scaled).
-  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradK1.GetRawPtr(),
-    -FLearningRate, K1.Size);
-  TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), FGradK2.GetRawPtr(),
-    -FLearningRate, K2.Size);
-  TNNetVolume.MulAdd(FNeurons[2].FDelta.GetRawPtr(), FGradV.GetRawPtr(),
-    -FLearningRate, V.Size);
   if (not FBatchUpdate) then
   begin
-    FNeurons[0].UpdateWeights(FInertia);
-    FNeurons[1].UpdateWeights(FInertia);
-    FNeurons[2].UpdateWeights(FInertia);
+    for h := 0 to 3 * FHeads - 1 do
+      FNeurons[h].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -16591,25 +16632,32 @@ end;
 
 procedure TNNetProductKeyMemory.InitDefault();
 var
-  a, b, d, oldSeed: integer;
+  a, b, d, h, oldSeed: integer;
 begin
-  if FNeurons.Count < 3 then AddMissingNeurons(3 - FNeurons.Count);
+  if FNeurons.Count < 3 * FHeads then
+    AddMissingNeurons(3 * FHeads - FNeurons.Count);
   // Small random half-keys + values (deterministic seed, independent of global
   // RNG ordering) so retrieval starts unbiased; training learns the memory.
+  // Each head's seed is offset so the H heads start DIFFERENTLY (otherwise
+  // identical heads would stay tied and waste the extra capacity). Head 0 keeps
+  // the v1 seed (161803) so single-head init is byte-for-byte unchanged.
   oldSeed := RandSeed;
-  RandSeed := 161803;
-  for a := 0 to FHalfKeys - 1 do
-    for d := 0 to FHalfQ - 1 do
-      FNeurons[0].FWeights[a, 0, d] :=
-        FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
-  for b := 0 to FHalfKeys - 1 do
-    for d := 0 to FHalfQ - 1 do
-      FNeurons[1].FWeights[b, 0, d] :=
-        FNeurons[1].FWeights.RandomGaussianValue() * 0.1;
-  for a := 0 to FNumKeys - 1 do
-    for d := 0 to FValueDim - 1 do
-      FNeurons[2].FWeights[a, 0, d] :=
-        FNeurons[2].FWeights.RandomGaussianValue() * 0.1;
+  for h := 0 to FHeads - 1 do
+  begin
+    RandSeed := 161803 + h * 101;
+    for a := 0 to FHalfKeys - 1 do
+      for d := 0 to FHalfQ - 1 do
+        FNeurons[3 * h].FWeights[a, 0, d] :=
+          FNeurons[3 * h].FWeights.RandomGaussianValue() * 0.1;
+    for b := 0 to FHalfKeys - 1 do
+      for d := 0 to FHalfQ - 1 do
+        FNeurons[3 * h + 1].FWeights[b, 0, d] :=
+          FNeurons[3 * h + 1].FWeights.RandomGaussianValue() * 0.1;
+    for a := 0 to FNumKeys - 1 do
+      for d := 0 to FValueDim - 1 do
+        FNeurons[3 * h + 2].FWeights[a, 0, d] :=
+          FNeurons[3 * h + 2].FWeights.RandomGaussianValue() * 0.1;
+  end;
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -33395,8 +33443,15 @@ begin
   if (Query.Output.Depth mod 2) <> 0 then
     FErrorProc('AddProductKeyMemory requires an even query depth (QueryDim). ' +
       'Got depth=' + IntToStr(Query.Output.Depth));
-  if Heads <> 1 then
-    FErrorProc('AddProductKeyMemory: only Heads=1 is implemented (v1). Got ' +
+  if Heads < 1 then
+    FErrorProc('AddProductKeyMemory requires Heads >= 1. Got ' +
+      IntToStr(Heads));
+  if (Query.Output.Depth mod Heads) <> 0 then
+    FErrorProc('AddProductKeyMemory requires query depth divisible by Heads. ' +
+      'depth=' + IntToStr(Query.Output.Depth) + ', Heads=' + IntToStr(Heads));
+  if ((Query.Output.Depth div Heads) mod 2) <> 0 then
+    FErrorProc('AddProductKeyMemory requires (query depth div Heads) to be ' +
+      'even. depth=' + IntToStr(Query.Output.Depth) + ', Heads=' +
       IntToStr(Heads));
   // NumKeys is rounded to the nearest perfect square inside the layer.
   Result := AddLayer(
