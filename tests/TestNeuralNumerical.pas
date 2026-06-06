@@ -159,6 +159,10 @@ type
     procedure TestHouseholderLinearGradientCheck;
     procedure TestHouseholderLinearOrthogonality;
     procedure TestHouseholderLinearSerializationRoundTrip;
+    // TNNetHyperbolicLinear Poincare-ball hyperbolic dense layer
+    procedure TestHyperbolicLinearGradientCheck;
+    procedure TestHyperbolicLinearShape;
+    procedure TestHyperbolicLinearSerializationRoundTrip;
     // TNNetQuaternionLinear hypercomplex dense layer
     procedure TestQuaternionLinearGradientCheck;
     procedure TestQuaternionLinearSerializationRoundTrip;
@@ -36220,6 +36224,235 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertTrue('HouseholderLinear reloaded output matches at ' + IntToStr(i),
+          Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  HL: TNNetHyperbolicLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, j, NIn, NOut: integer;
+  c, nrm: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient through the FULL Poincare-ball map
+  // (log_0 -> Mobius matmul -> exp_0 -> Mobius bias add), for the INPUT, the
+  // matrix rows M[j] AND the Mobius bias b. Reseed the shared RNG per the
+  // ordering rule. The input is kept strictly inside the ball (||x|| <= 0.6/sqrt(c))
+  // so FD perturbations never straddle the boundary singularity; weights are
+  // bounded so the exp_0 image stays well inside the ball too. Do NOT loosen tol.
+  RandSeed := 424242;
+  c := 1.3;
+  NIn := 4;
+  NOut := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, NIn);
+  InputPlus := TNNetVolume.Create(1, 1, NIn);
+  Desired := TNNetVolume.Create(1, 1, NOut);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, NIn, 1));
+    HL := TNNetHyperbolicLinear.Create(NOut, c, 0);
+    NN.AddLayer(HL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded input strictly inside the ball.
+    for i := 0 to NIn - 1 do
+      Input.Raw[i] := Sin(i * 0.7 + 0.3) * 0.2 + 0.05;
+    nrm := 0;
+    for i := 0 to NIn - 1 do nrm := nrm + Input.Raw[i] * Input.Raw[i];
+    nrm := Sqrt(nrm);
+    if nrm > 0.6 / Sqrt(c) then
+      for i := 0 to NIn - 1 do Input.Raw[i] := Input.Raw[i] * (0.6 / Sqrt(c)) / nrm;
+
+    for j := 0 to NOut - 1 do
+      Desired.Raw[j] := Cos(j * 0.5) * 0.1;
+
+    // Bounded matrix rows + Mobius bias.
+    for j := 0 to NOut - 1 do
+    begin
+      for i := 0 to NIn - 1 do
+        HL.Neurons[j].Weights.Raw[i] := 0.15 * Sin(i * 1.1 + j * 0.6) + 0.05;
+      HL.Neurons[j].BiasWeight := 0.04 * (j - 1);
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to NIn - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('HyperbolicLinear input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.005);
+    end;
+
+    // ---- Gradient w.r.t. each matrix row M[j] ----
+    for j := 0 to NOut - 1 do
+      for i := 0 to NIn - 1 do
+      begin
+        HL.Neurons[j].Weights.Raw[i] := HL.Neurons[j].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        HL.Neurons[j].Weights.Raw[i] := HL.Neurons[j].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        HL.Neurons[j].Weights.Raw[i] := HL.Neurons[j].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        HL.Neurons[j].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -HL.Neurons[j].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        AssertTrue('HyperbolicLinear M[' + IntToStr(j) + '] gradient at ' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.005);
+      end;
+
+    // ---- Gradient w.r.t. the Mobius bias b ----
+    for j := 0 to NOut - 1 do
+    begin
+      HL.Neurons[j].BiasWeight := HL.Neurons[j].BiasWeight + epsilon;
+      lossPlus := ComputeLoss(Input);
+      HL.Neurons[j].BiasWeight := HL.Neurons[j].BiasWeight - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      HL.Neurons[j].BiasWeight := HL.Neurons[j].BiasWeight + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      HL.Neurons[j].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -HL.Neurons[j].BiasDelta;
+
+      AssertTrue('HyperbolicLinear bias gradient at ' + IntToStr(j) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.005);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicLinearShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  HL: TNNetHyperbolicLinear;
+  i: integer;
+  nrm: TNeuralFloat;
+begin
+  // The layer maps a D_in vector to a D_out vector AND the output stays inside
+  // the Poincare ball of radius 1/sqrt(c): ||y|| < 1/sqrt(c).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 7);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 7, 1));
+    HL := TNNetHyperbolicLinear.Create(5, 2.0, 0); // c = 2.0
+    NN.AddLayer(HL);
+
+    for i := 0 to 6 do Input.Raw[i] := Sin(i * 0.9) * 0.15;
+    NN.Compute(Input);
+
+    // FullConnect-style layout: D_out lives on SizeX (Output is (5,1,1)); only
+    // the total Size (= D_out) is contractually meaningful for this dense map.
+    AssertEquals('HyperbolicLinear output Size', 5, HL.Output.Size);
+    AssertEquals('HyperbolicLinear output SizeY', 1, HL.Output.SizeY);
+    AssertEquals('HyperbolicLinear output Depth', 1, HL.Output.Depth);
+
+    nrm := 0;
+    for i := 0 to HL.Output.Size - 1 do
+      nrm := nrm + HL.Output.Raw[i] * HL.Output.Raw[i];
+    nrm := Sqrt(nrm);
+    AssertTrue('HyperbolicLinear output stays inside ball ||y||=' +
+      FloatToStr(nrm) + ' < 1/sqrt(c)=' + FloatToStr(1.0 / Sqrt(2.0)),
+      nrm < 1.0 / Sqrt(2.0));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHyperbolicLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  HL: TNNetHyperbolicLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, j: integer;
+begin
+  // HyperbolicLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match (proving the
+  // matrix rows, Mobius bias AND the curvature c round-trip via FFloatSt[0]
+  // through both CreateLayer dispatch points).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5, 1));
+    HL := TNNetHyperbolicLinear.Create(4, 1.7, 0);
+    NN.AddLayer(HL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to 4 do Input.Raw[i] := Sin(i * 0.8) * 0.12 - 0.03;
+    for j := 0 to 3 do
+    begin
+      for i := 0 to 4 do
+        HL.Neurons[j].Weights.Raw[i] := 0.13 * (i + 1) - 0.3 + 0.2 * j;
+      HL.Neurons[j].BiasWeight := 0.05 - 0.02 * j;
+    end;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HyperbolicLinear serialization byte-identical', Saved, Saved2);
+
+      AssertTrue('HyperbolicLinear curvature round-trips',
+        Abs((NN2.Layers[1] as TNNetHyperbolicLinear).Curvature - 1.7) < 1e-6);
+
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('HyperbolicLinear reloaded output matches at ' + IntToStr(i),
           Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]) < 1e-5);
     finally
       NN2.Free;
