@@ -72,25 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetDWT1D — learnable lifting-scheme Discrete Wavelet Transform layer
-      (LANDED 2026-06-06 on a2, commits 6e90292 + 1cb19fd). Single-level 1-D DWT
-      along SeqLen via the second-generation lifting scheme (split even/odd ->
-      predict -> update); fixed-filter mode (csDWT1DHaar default / csDWT1DCDF53 /
-      csDWT1DDaub4) AND opt-in learnable predict/update taps (lifting STRUCTURE
-      fixed, tap VALUES trainable -> invertibility guaranteed for any taps).
-      Output (L,1,D) -> (L div 2,1,2*D) = [approx | detail] along Depth; odd L via
-      whole-sample symmetric extension; FStruct[0..2] = filter/learnable/tapcount;
-      public InverseChannel() IDWT oracle. Exact O(L) linear adjoint backward (no
-      FFT). Tests: input + learnable-tap numerical gradients, LoadFromString
-      round-trip, IDWT(DWT(x))==x to 1.1e-7 (even + odd L). Multi-level builder
-      TNNet.AddWaveletPacketTransform(Levels,Filter,Learnable) (full balanced
-      wavelet-PACKET tree, (L,1,D)->(L/2^lv,1,2^lv*D)) + shape smoke test +
-      examples/WaveletDenoise/ (Donoho-Johnstone soft-threshold shrinkage on the
-      "Blocks" signal: 21.20 dB vs 16.60 dB moving-average baseline, +4.60 dB)
-      all landed. Open follow-up: FFT-fast-path is N/A (lifting is already O(L));
-      remaining stretch = a learnable-wavelet SCATTERING-net example that trains
-      the taps end-to-end on a tiny transient-classification task to show the
-      learned basis beats the fixed Haar/Daub4 basis.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
@@ -1489,48 +1470,3 @@ rather than acted on.
       < random-init) is the robust, reproducible signal. Pairs with
       [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
       degeneracy-aware generalization of "effective parameter count").
-
-- [ ] `TNNetGraphConv` — the repo's FIRST graph / relational layer (Kipf &
-      Welling 2017, "Semi-Supervised Classification with Graph Convolutional
-      Networks", arXiv:1609.02907). Every existing layer here operates on
-      Euclidean grids (conv = fixed spatial neighbourhood) or fully-mixed
-      token sets (attention, SDPA) — none consume an arbitrary graph
-      topology, so this opens a genuinely new data domain rather than
-      duplicating any current layer. A GCN layer is two-input, exactly the
-      wiring pattern already proven by [[cfc-and-hyperlinear-layers]]
-      (`TNNetHyperLinear` reads a second tensor) and
-      `TNNetCrossAttention`: input A is the node-feature matrix `X`
-      shaped `(NumNodes, 1, FInput)`, input B is the precomputed normalized
-      adjacency `Â = D̃^(-1/2)·(A+I)·D̃^(-1/2)` shaped `(NumNodes, 1,
-      NumNodes)` (constant per graph, fed as a layer input so the symmetric
-      normalization and self-loops are done once on the caller side — keeps
-      the layer pure linear algebra and avoids baking any graph format into
-      neuralnetwork.pas). Forward is the single GCN propagation rule
-      `H = Â·(X·W) (+ bias)`: project each node's features with a learned
-      `FInput×FOutput` weight `W` (a per-node `PointwiseConvLinear`-style
-      projection — see [[mha-builder-and-seq-projection]] for why per-token
-      projection must NOT flatten the node axis), then mix neighbours by the
-      sparse-ish `Â` matmul. Output shape `(NumNodes, 1, FOutput)`. Backward
-      is the exact transpose chain: `dL/d(XW) = Âᵀ·dL/dH` (Â is symmetric so
-      Âᵀ = Â), `dL/dW = (X)ᵀ·(Âᵀ·dL/dH)` summed over nodes, `dL/dX =
-      (Âᵀ·dL/dH)·Wᵀ`; the adjacency input is constant (no gradient flows to
-      B). Both the weight gradient and the node-feature input gradient must
-      be numerically gradient-checked per the
-      [[loss-layer-pattern]]/layer-authoring recipe (reseed RandSeed per
-      [[numerical-test-rng-ordering]]; bound the weights so the two matmuls
-      don't truncate the central difference). Distinct from EVERY structured
-      layer already landed — `TNNetCirculantLinear`/`TNNetMonarchLinear`/
-      `TNNetKroneckerLinear` impose a FIXED algebraic matrix structure on a
-      single dense map, whereas GraphConv applies a DATA-PROVIDED sparse
-      mixing operator (the graph) around a learned projection. Ship with
-      `examples/GraphNodeClassification/` doing transductive node
-      classification on a tiny built-in graph (Zachary's Karate Club, 34
-      nodes / 2 communities, or a synthetic stochastic-block-model graph so
-      no dataset download is needed): two stacked `TNNetGraphConv` layers
-      (ReLU between) + softmax, train on a handful of labelled nodes per
-      class, report accuracy on the held-out nodes and contrast against an
-      MLP baseline that IGNORES the graph (same features, identity Â) to show
-      the topology is what carries the signal. Natural follow-ups once the
-      leaf layer lands: a `TNNet.AddGraphSAGE`-style mean-aggregator builder
-      and a graph-attention (GAT) variant that learns edge weights instead of
-      using the fixed Â — both genuinely distinct heads, not near-duplicates.
