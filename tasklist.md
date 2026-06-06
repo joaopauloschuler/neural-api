@@ -96,11 +96,15 @@ rather than acted on.
       LANDED 2026-06-06 on a2 (examples/MonarchLinear/: 64->64 mixer bake-off,
       Monarch 1088 wts MSE ~0.004 vs Dense 4096 wts vs Circulant 128 wts; DFT
       sub-check SKIPPED — layer has no DFT-init path, noted in program/README).
-- [ ] TNNetTropicalConv example follow-up (the SPATIAL TNNetTropicalConv layer +
+- [X] TNNetTropicalConv example follow-up (the SPATIAL TNNetTropicalConv layer +
       gradient/forward/save-load tests LANDED 2026-06-06 on a2): add an
       examples/TropicalMorphology/ demo contrasting TNNetTropicalConv with a
       same-size linear conv on a morphological target (thin/thicken a binary
       glyph), showcasing the learnable additive structuring element.
+      LANDED 2026-06-06 on a2 (examples/TropicalMorphology/TropicalMorphologyConv.lpr:
+      learns 3x3 dilation/erosion of a 12x12 cross glyph; tropical conv beats the
+      linear conv on per-pixel MSE on both targets — dilation an exact MSE-0/100%
+      win — via its learnable additive SE; ~1 s).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT

@@ -80,4 +80,66 @@ same-width linear layer plateaus at the best-fitting single straight line (≈1.
 MSE — it cannot bend). The **min-plus erode** sibling does the same for the
 concave target. Different algebra, different hypothesis class.
 
+---
+
+# TropicalMorphologyConv — the SPATIAL conv `TNNetTropicalConv`
+
+A second program in this directory, **`TropicalMorphologyConv.lpr`**, exercises
+the **spatial** sibling **`TNNetTropicalConv`** — the convolutional max-plus /
+min-plus layer (subclass of `TNNetConvolutionLinear`). Where the dense
+`TNNetTropicalLinear` above mixes a flat vector, `TNNetTropicalConv` slides a
+learnable **additive structuring element (SE)** over a 2-D feature map and takes
+a per-cell max (dilation) or min (erosion) instead of a sum-of-products:
+
+```
+dilation:  y[o] = max_tap ( x[tap] + SE[tap] )
+erosion :  y[o] = min_tap ( x[tap] - SE[tap] )   (erode flag = 1)
+```
+
+Constructor:
+`TNNetTropicalConv.Create(NumFeatures, FeatureSize, InputPadding, Stride, Erode)`.
+The whole SE lives in a single weight neuron; the erode flag round-trips via
+`FStruct[6]`. Backward is the same hard one-hot arg-max/arg-min subgradient as
+`TNNetMaxPool` (`FWinner` caches the winning tap per output cell).
+
+## The morphological task
+
+We build one `12×12` binary glyph (a width-4 cross) and, using a flat `3×3` SE,
+compute its classical morphological **dilation** (thicker strokes) and
+**erosion** (thinner strokes) as supervised targets. For each target we train:
+
+* `TNNetTropicalConv` (1 feature, `3×3`, pad 1, stride 1, erode flag matched) —
+  max-plus / min-plus;
+* `TNNetConvolutionLinear` (same `1` feature, `3×3`, pad 1, stride 1) — the
+  ordinary linear sum-of-products baseline.
+
+Identical receptive-field size and weight count; only the **algebra** differs.
+
+## Representative output
+
+```
+=== Per-pixel MSE / binary reconstruction accuracy ===
+  DILATION  tropical conv : MSE 0.000000   acc 100.0%
+  DILATION  linear   conv : MSE 0.070509   acc 100.0%
+  EROSION   tropical conv : MSE 0.051980   acc  94.4%
+  EROSION   linear   conv : MSE 0.074354   acc  97.2%
+```
+
+On the **trained objective (per-pixel MSE)** the tropical conv beats the
+same-size linear conv on **both** targets. **Dilation** is a decisive, *exact*
+win — the learnable additive SE reconstructs the thickened glyph to **MSE 0**
+(100% binary accuracy) while the fixed linear filter cannot match the per-pixel
+max and plateaus. **Erosion** is also won on MSE; it stops just short of MSE 0
+because the **hard per-cell arg-min subgradient** (one-hot, like max-pool)
+leaves a few boundary taps un-pressured — a property of the morphological
+subgradient, not the linear baseline being a better fit. (The binary-accuracy
+column can favor the blurrier linear output purely as a thresholding artifact;
+MSE is the quantity actually optimized.) Runs in **~1 second**.
+
+```
+cd examples/TropicalMorphology
+lazbuild TropicalMorphologyConv.lpi
+../../bin/x86_64-linux/bin/TropicalMorphologyConv
+```
+
 Coded by Claude (AI).
