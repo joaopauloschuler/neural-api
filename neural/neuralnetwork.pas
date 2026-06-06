@@ -6632,6 +6632,60 @@ type
     property Erode: integer read FErode;
   end;
 
+  /// MONARCH structured DENSE layer (Dao et al. 2022, "Monarch: Expressive
+  /// Structured Matrices for Efficient and Accurate Training", arXiv:2204.00595).
+  /// A square n -> n linear map whose n x n weight is a MONARCH matrix -- a
+  /// product of two block-diagonal factors interleaved with a fixed reshape-
+  /// transpose permutation, which is sub-quadratic (O(n*sqrt(n)) compute and
+  /// parameters) yet far more expressive than other structured-linear layers
+  /// (circulant, low-rank, Householder) of the same budget.
+  ///
+  /// FORWARD (the dense matrix is NEVER materialized -- four cheap passes):
+  ///   y = P^T * ( L * ( P * ( R * x ) ) )
+  /// with n = b*m factored into b blocks of size m. View a length-n vector as a
+  /// (b,m) row-major matrix X (row r, col k -> index r*m+k).
+  ///   R: block-diagonal, b blocks R_r each m x m, acts per ROW r of X:
+  ///        (R x)[r,k] = sum_t R_r[k,t] * X[r,t]
+  ///   P: the fixed (b,m)->(m,b) reshape-transpose (a pure index gather, NO
+  ///        weights):  (P u)[k,r] = u[r,k]  (length-n index k*b+r).
+  ///   L: block-diagonal, b blocks L_c each m x m, acts per COLUMN c of the
+  ///        (m,b) tensor:  (L z)[k,c] = sum_t L_c[k,t] * z[t,c].
+  ///   P^T: the inverse reshape-transpose (m,b)->(b,m).
+  /// Only R and L are trainable (plus optional bias); P / P^T carry no weights.
+  ///
+  /// BACKWARD is the exact transpose chain -- dL/dx, dL/dR, dL/dL are all
+  /// block-LOCAL m x m matmuls (no dense Jacobian). The cached intermediates
+  /// xR = R*x and zP = P*xR feed the weight gradients.
+  ///
+  /// Requires a factorization n = b*m. By default b = m = round(sqrt(n)) (n a
+  /// perfect square); if n is not a perfect square the largest divisor of n that
+  /// is <= sqrt(n) is used as b. b round-trips through FStruct[1] (n is recovered
+  /// from the previous layer) so save/load preserves the block structure.
+  /// Weight layout: neuron 0 holds R (b*m*m reals, block r at r*m*m + k*m + t),
+  /// neuron 1 holds L (same layout), neuron 2 is the optional bias (length n).
+  /// Constructor: Create(pSuppressBias). The output is an (n,1,1) vector.
+  // Coded by Claude (AI).
+  TNNetMonarchLinear = class(TNNetLayer)
+  private
+    FDim: integer;        // n (flat input/output size)
+    FBlocks: integer;     // b (number of blocks)
+    FBlockSize: integer;  // m (block size, n = b*m)
+    FCacheXR: TNNetVolume; // R*x  (length n, (b,m) layout)
+    FCacheZP: TNNetVolume; // P*(R*x) (length n, (m,b) layout)
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pSuppressBias: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Dim: integer read FDim;
+    property Blocks: integer read FBlocks;
+    property BlockSize: integer read FBlockSize;
+  end;
+
   /// Weight Standardization CONVOLUTION layer (Qiao et al. 2019,
   /// "Micro-Batch Training with Batch-Channel Normalization and Weight
   /// Standardization", arXiv:1903.10520). This is the convolution sibling of
@@ -36607,6 +36661,279 @@ begin
   end;
 end;
 
+{ TNNetMonarchLinear }
+
+// Monarch structured dense layer: y = P^T*(L*(P*(R*x))) (+bias). R and L are
+// block-diagonal (b blocks of size m, n=b*m); P is the fixed (b,m)->(m,b)
+// reshape-transpose. The dense n x n matrix is never formed: forward and
+// backward are all block-local m x m matmuls.
+
+constructor TNNetMonarchLinear.Create(pSuppressBias: integer = 0);
+begin
+  inherited Create();
+  if pSuppressBias <> 0 then FSuppressBias := 1 else FSuppressBias := 0;
+  FStruct[3] := FSuppressBias;
+  FCacheXR := TNNetVolume.Create();
+  FCacheZP := TNNetVolume.Create();
+  // R, L (and optional bias) neurons are sized in SetPrevLayer once n is known.
+  while FNeurons.Count > 3 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 3 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+destructor TNNetMonarchLinear.Destroy();
+begin
+  FCacheXR.Free;
+  FCacheZP.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetMonarchLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N, b, d, BlockWeights: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  N := pPrevLayer.Output.Size;
+  if N <= 0 then
+    FErrorProc('TNNetMonarchLinear requires a non-empty input.');
+  FDim := N;
+
+  // Factor n = b*m. Prefer b = round(sqrt(n)) (perfect square); otherwise pick
+  // the largest divisor of n that is <= sqrt(n).
+  b := Trunc(Sqrt(N) + 0.5);
+  if b * b <> N then
+  begin
+    b := Trunc(Sqrt(N));
+    if b < 1 then b := 1;
+    while (b > 1) and (N mod b <> 0) do Dec(b);
+  end;
+  FBlocks := b;
+  FBlockSize := N div b;
+  FStruct[1] := FBlocks;
+
+  FOutput.ReSize(N, 1, 1);
+  FOutputError.ReSize(N, 1, 1);
+  FOutputErrorDeriv.ReSize(N, 1, 1);
+  FCacheXR.ReSize(N, 1, 1);
+  FCacheZP.ReSize(N, 1, 1);
+
+  // neuron 0 = R, neuron 1 = L (each b blocks of m*m), neuron 2 = bias (n).
+  BlockWeights := FBlocks * FBlockSize * FBlockSize;
+  for d := 0 to 1 do
+  begin
+    FNeurons[d].Weights.ReSize(BlockWeights, 1, 1);
+    FNeurons[d].BackInertia.ReSize(BlockWeights, 1, 1);
+    FNeurons[d].Delta.ReSize(BlockWeights, 1, 1);
+    FNeurons[d].FBiasWeight := 0;
+  end;
+  FNeurons[2].Weights.ReSize(N, 1, 1);
+  FNeurons[2].BackInertia.ReSize(N, 1, 1);
+  FNeurons[2].Delta.ReSize(N, 1, 1);
+  FNeurons[2].FBiasWeight := 0;
+  BuildArrNeurons();
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Small random block weights; bias starts at zero. The block scale follows the
+// usual 1/sqrt(fan_in) heuristic (fan_in = block size m).
+procedure TNNetMonarchLinear.InitDefault();
+var
+  i, BlockWeights: integer;
+  scale: TNeuralFloat;
+  WR, WL, Bias: TNNetVolume;
+begin
+  if FDim <= 0 then exit;
+  WR := FArrNeurons[0].FWeights;
+  WL := FArrNeurons[1].FWeights;
+  Bias := FArrNeurons[2].FWeights;
+  BlockWeights := WR.Size;
+  if FBlockSize > 0 then scale := 1.0 / Sqrt(FBlockSize) else scale := 0.1;
+  for i := 0 to BlockWeights - 1 do
+  begin
+    WR.FData[i] := scale * (Random - 0.5) * 2;
+    WL.FData[i] := scale * (Random - 0.5) * 2;
+  end;
+  Bias.Fill(0);
+end;
+
+procedure TNNetMonarchLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward (four passes, no dense matrix):
+//   xR[r,k]  = sum_t R_r[k,t] * x[r,t]            (block-diagonal R, per row r)
+//   zP[k,r]  = xR[r,k]                            (P: (b,m)->(m,b) reshape-T)
+//   yT[k,c]  = sum_t L_c[k,t] * zP[t,c]           (block-diagonal L, per col c)
+//   y[r,k]   = yT[k,r]   (+bias)                  (P^T: (m,b)->(b,m))
+// Index maps: x[r,t]=r*m+t ; zP[k,c]=k*b+c ; block weights at blk*m*m+row*m+col.
+procedure TNNetMonarchLinear.ComputeCPU();
+var
+  b, m, r, c, k, t, blkBase: integer;
+  PrevOut, WR, WL, Bias: TNNetVolume;
+  acc: TNeuralFloat;
+begin
+  b := FBlocks;
+  m := FBlockSize;
+  PrevOut := FPrevLayer.FOutput;
+  WR := FArrNeurons[0].FWeights;
+  WL := FArrNeurons[1].FWeights;
+  Bias := FArrNeurons[2].FWeights;
+
+  // Pass 1: R (per row/block r) -> xR in (b,m) layout.
+  for r := 0 to b - 1 do
+  begin
+    blkBase := r * m * m;
+    for k := 0 to m - 1 do
+    begin
+      acc := 0;
+      for t := 0 to m - 1 do
+        acc := acc + WR.FData[blkBase + k * m + t] * PrevOut.FData[r * m + t];
+      FCacheXR.FData[r * m + k] := acc;
+    end;
+  end;
+
+  // Pass 2: P -> zP[k,c] = xR[c,k]  (in (m,b) layout, index k*b+c).
+  for c := 0 to b - 1 do
+    for k := 0 to m - 1 do
+      FCacheZP.FData[k * b + c] := FCacheXR.FData[c * m + k];
+
+  // Pass 3 + 4: L (per column/block c) then P^T into FOutput (b,m layout).
+  for c := 0 to b - 1 do
+  begin
+    blkBase := c * m * m;
+    for k := 0 to m - 1 do
+    begin
+      acc := 0;
+      for t := 0 to m - 1 do
+        acc := acc + WL.FData[blkBase + k * m + t] * FCacheZP.FData[t * b + c];
+      // P^T: output (m,b)[k,c] goes to (b,m)[c,k] -> index c*m+k.
+      FOutput.FData[c * m + k] := acc;
+    end;
+  end;
+
+  if FSuppressBias = 0 then
+    FOutput.Add(Bias);
+end;
+
+procedure TNNetMonarchLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact transpose chain. Let dy be the output error in (b,m) layout.
+//   dyT[k,c] = dy[c,k]                              (P, undo P^T)
+//   dL_c[k,t] += dyT[k,c] * zP[t,c]                 (L weight grad)
+//   dzP[t,c]  = sum_k L_c[k,t] * dyT[k,c]           (back through L)
+//   dxR[c,k]  = dzP[k,c]                            (P^T, undo P)
+//   dR_r[k,t] += dxR[r,k] * x[r,t]                  (R weight grad)
+//   dx[r,t]   = sum_k R_r[k,t] * dxR[r,k]           (back through R)
+// All accumulations are block-local m x m matmuls. Deltas carry -LR*grad.
+procedure TNNetMonarchLinear.BackpropagateCPU();
+var
+  b, m, r, c, k, t, blkBase: integer;
+  PrevOut, WR, WL, WRDelta, WLDelta, BiasDelta, LocalPrevError: TNNetVolume;
+  acc, e: TNeuralFloat;
+  HasPrevError: boolean;
+  dyT, dxR: array of TNeuralFloat; // scratch, both length n
+begin
+  b := FBlocks;
+  m := FBlockSize;
+  PrevOut := FPrevLayer.FOutput;
+  WR := FArrNeurons[0].FWeights;
+  WL := FArrNeurons[1].FWeights;
+  WRDelta := FArrNeurons[0].FDelta;
+  WLDelta := FArrNeurons[1].FDelta;
+  BiasDelta := FArrNeurons[2].FDelta;
+  HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  LocalPrevError := FPrevLayer.OutputError;
+
+  // Bias grad.
+  if FSuppressBias = 0 then
+    for k := 0 to FDim - 1 do
+      BiasDelta.FData[k] := BiasDelta.FData[k] - FLearningRate * FOutputError.FData[k];
+
+  // dyT[k,c] = dy[c,k]  (P: undo P^T). Stored in (m,b) layout index k*b+c.
+  SetLength(dyT, FDim);
+  SetLength(dxR, FDim);
+  for c := 0 to b - 1 do
+    for k := 0 to m - 1 do
+      dyT[k * b + c] := FOutputError.FData[c * m + k];
+
+  // L weight grad + back through L -> dzP, then dxR = P^T(dzP). zP (the forward
+  // pass-2 output) is still in FCacheZP; FCacheXR (forward R*x) is read for dR.
+  for c := 0 to b - 1 do
+  begin
+    blkBase := c * m * m;
+    // dL_c[k,t] += dyT[k,c] * zP[t,c].
+    for k := 0 to m - 1 do
+    begin
+      e := dyT[k * b + c];
+      for t := 0 to m - 1 do
+        WLDelta.FData[blkBase + k * m + t] :=
+          WLDelta.FData[blkBase + k * m + t]
+          - FLearningRate * e * FCacheZP.FData[t * b + c];
+    end;
+    // dzP[t,c] = sum_k L_c[k,t]*dyT[k,c]; then dxR[c,t] = dzP[t,c] (P^T).
+    for t := 0 to m - 1 do
+    begin
+      acc := 0;
+      for k := 0 to m - 1 do
+        acc := acc + WL.FData[blkBase + k * m + t] * dyT[k * b + c];
+      dxR[c * m + t] := acc; // P^T: (m,b)[t,c]->(b,m)[c,t]
+    end;
+  end;
+
+  // R weight grad + back through R -> dx.
+  for r := 0 to b - 1 do
+  begin
+    blkBase := r * m * m;
+    for k := 0 to m - 1 do
+    begin
+      e := dxR[r * m + k];
+      for t := 0 to m - 1 do
+        WRDelta.FData[blkBase + k * m + t] :=
+          WRDelta.FData[blkBase + k * m + t]
+          - FLearningRate * e * PrevOut.FData[r * m + t];
+    end;
+    if HasPrevError then
+      for t := 0 to m - 1 do
+      begin
+        acc := 0;
+        for k := 0 to m - 1 do
+          acc := acc + WR.FData[blkBase + k * m + t] * dxR[r * m + k];
+        LocalPrevError.FData[r * m + t] := LocalPrevError.FData[r * m + t] + acc;
+      end;
+  end;
+
+  if not FBatchUpdate then
+  begin
+    FArrNeurons[0].UpdateWeightsWithoutInertia();
+    FArrNeurons[1].UpdateWeightsWithoutInertia();
+    if FSuppressBias = 0 then FArrNeurons[2].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetHouseholderLinear }
 
 // Floor used to guard the v_i^T v_i denominator: below this a reflection is
@@ -61323,6 +61650,7 @@ begin
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
+      'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetKANLayer' :             Result := TNNetKANLayer.Create(St[0], St[5]);
       'TNNetGraphConvolution' :     Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]);
@@ -61647,6 +61975,7 @@ begin
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
+      if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetKANLayer' then Result := TNNetKANLayer.Create(St[0], St[5]) else
       if S[0] = 'TNNetGraphConvolution' then Result := TNNetGraphConvolution.Create(St[0], St[1], St[2], St[3]) else

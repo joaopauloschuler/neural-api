@@ -181,6 +181,11 @@ type
     procedure TestTropicalLinearGradientCheck;
     procedure TestTropicalLinearForwardKnownValue;
     procedure TestTropicalLinearSerializationRoundTrip;
+    // TNNetMonarchLinear sub-quadratic structured (block-diagonal) dense layer
+    procedure TestMonarchLinearInputGradientCheck;
+    procedure TestMonarchLinearWeightGradientCheck;
+    procedure TestMonarchLinearForwardKnownValue;
+    procedure TestMonarchLinearSerializationRoundTrip;
     // TNNetOctonionConv 8D hypercomplex convolution layer
     procedure TestOctonionConvGradientCheck;
     procedure TestOctonionConvSerializationRoundTrip;
@@ -37145,6 +37150,294 @@ begin
         (NN2.Layers[1] as TNNetTropicalLinear).Erode);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('TropicalLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMonarchLinearInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  ML: TNNetMonarchLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for the Monarch layer. n = 9
+  // (perfect square -> b = m = 3). Block weights are bounded to a small range so
+  // FD truncation never dominates (do NOT loosen tolerance). Reseed shared RNG.
+  RandSeed := 424242;
+  N := 9;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputPlus := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    ML := TNNetMonarchLinear.Create(0);
+    NN.AddLayer(ML);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    // Bounded R, L block weights and a small bias.
+    for i := 0 to ML.Neurons[0].Weights.Size - 1 do
+    begin
+      ML.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+      ML.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    end;
+    for i := 0 to N - 1 do
+      ML.Neurons[2].Weights.Raw[i] := 0.05 * (i - 4);
+
+    for i := 0 to N - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('MonarchLinear input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMonarchLinearWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  ML: TNNetMonarchLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, d, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // FD vs analytic gradient on BOTH block-diagonal factors R (neuron 0) and
+  // L (neuron 1). Weights bounded to a small range to avoid FD truncation error
+  // (do NOT loosen tolerance). Reseed shared RNG.
+  RandSeed := 424242;
+  N := 9; // b = m = 3
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    ML := TNNetMonarchLinear.Create(0);
+    NN.AddLayer(ML);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    for i := 0 to ML.Neurons[0].Weights.Size - 1 do
+    begin
+      ML.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+      ML.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    end;
+    for i := 0 to N - 1 do
+      ML.Neurons[2].Weights.Raw[i] := 0.05 * (i - 4);
+
+    // d = 0 -> R, d = 1 -> L.
+    for d := 0 to 1 do
+      for i := 0 to ML.Neurons[d].Weights.Size - 1 do
+      begin
+        ML.Neurons[d].Weights.Raw[i] := ML.Neurons[d].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        ML.Neurons[d].Weights.Raw[i] := ML.Neurons[d].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        ML.Neurons[d].Weights.Raw[i] := ML.Neurons[d].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        ML.Neurons[0].ClearDelta;
+        ML.Neurons[1].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -ML.Neurons[d].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('MonarchLinear factor ' + IntToStr(d) + ' weight gradient w=' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('  MonarchLinear weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMonarchLinearForwardKnownValue;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ML: TNNetMonarchLinear;
+  i, k, t, c, blkBase, N, m, b: integer;
+  expected: TNeuralFloat;
+begin
+  // (1) Monarch from IDENTITY R and IDENTITY L collapses to P^T*P = identity, so
+  //     y == x exactly. (2) Identity R + a single non-trivial L block reduces to
+  //     the L block-diagonal matmul over the permuted vector, which we compute by
+  //     hand and compare.
+  RandSeed := 424242;
+  N := 9; m := 3; b := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    ML := TNNetMonarchLinear.Create(1); // suppress bias
+    NN.AddLayer(ML);
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 1.1) * 1.7 - 0.3;
+
+    // ---- (1) Identity R and L -> output == input ----
+    ML.Neurons[0].Weights.Fill(0);
+    ML.Neurons[1].Weights.Fill(0);
+    for c := 0 to b - 1 do
+    begin
+      blkBase := c * m * m;
+      for k := 0 to m - 1 do
+      begin
+        ML.Neurons[0].Weights.Raw[blkBase + k * m + k] := 1.0; // R block = I
+        ML.Neurons[1].Weights.Raw[blkBase + k * m + k] := 1.0; // L block = I
+      end;
+    end;
+    NN.Compute(Input);
+    for i := 0 to N - 1 do
+      AssertEquals('MonarchLinear identity (P^T*P=I) y=x at ' + IntToStr(i),
+        Input.Raw[i], ML.Output.Raw[i], 1e-6);
+
+    // ---- (2) Identity R + explicit L blocks -> hand-computed block matmul ----
+    // With R = I, zP[k,c] = x[c*m+k]. With L_c arbitrary, the (m,b) output is
+    //   yT[k,c] = sum_t L_c[k,t] * x[c*m+t], placed at index c*m+k by P^T.
+    for i := 0 to ML.Neurons[1].Weights.Size - 1 do
+      ML.Neurons[1].Weights.Raw[i] := 0.2 * Sin(i * 0.8 + 1.0) + 0.1;
+    NN.Compute(Input);
+    for c := 0 to b - 1 do
+    begin
+      blkBase := c * m * m;
+      for k := 0 to m - 1 do
+      begin
+        expected := 0;
+        for t := 0 to m - 1 do
+          expected := expected +
+            ML.Neurons[1].Weights.Raw[blkBase + k * m + t] * Input.Raw[c * m + t];
+        AssertEquals('MonarchLinear identity-R block matmul at (' +
+          IntToStr(c) + ',' + IntToStr(k) + ')', expected,
+          ML.Output.Raw[c * m + k], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMonarchLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  ML: TNNetMonarchLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, N: integer;
+begin
+  // MonarchLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the
+  // block count round-trips and both factor neurons + bias survive both dispatch
+  // points.
+  RandSeed := 424242;
+  N := 9;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    ML := TNNetMonarchLinear.Create(0);
+    NN.AddLayer(ML);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for i := 0 to ML.Neurons[0].Weights.Size - 1 do
+    begin
+      ML.Neurons[0].Weights.Raw[i] := 0.17 * (i + 1) - 0.4;
+      ML.Neurons[1].Weights.Raw[i] := 0.11 * (i + 1) - 0.3;
+    end;
+    for i := 0 to N - 1 do
+      ML.Neurons[2].Weights.Raw[i] := 0.05 - 0.03 * i;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('MonarchLinear SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('MonarchLinear token present in serialized string',
+        Pos('TNNetMonarchLinear', Saved) > 0);
+      AssertEquals('MonarchLinear block count round-trips', 3,
+        (NN2.Layers[1] as TNNetMonarchLinear).Blocks);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MonarchLinear Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
