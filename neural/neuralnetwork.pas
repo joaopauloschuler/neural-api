@@ -6685,6 +6685,75 @@ type
     property Erode: integer read FErode;
   end;
 
+  /// CONDITIONALLY-PARAMETERIZED ("dynamic") CONVOLUTION layer (CondConv,
+  /// Yang et al. 2019, NeurIPS "CondConv: Conditionally Parameterized
+  /// Convolutions for Efficient Inference", arXiv:1904.04971). The layer owns a
+  /// BANK of K expert convolution kernels W_1..W_K (each a normal
+  /// Features x FeatureSize x FeatureSize x InChannels kernel) plus a tiny
+  /// per-sample ROUTING head (global-average-pool over the spatial map ->
+  /// FullConnect -> sigmoid) that emits K mixing coefficients alpha_1..alpha_K
+  /// PER INPUT SAMPLE. The effective kernel is the per-sample blend
+  ///   W_eff = sum_k alpha_k * W_k
+  /// applied as ONE ordinary convolution, so INFERENCE cost stays that of a
+  /// single conv regardless of K while model capacity grows with the bank.
+  ///
+  /// This is genuinely DISTINCT from its fork siblings: TNNetHyperConv GENERATES
+  /// the whole kernel from a second tensor in one shot; TNNet.AddMixtureOfExperts
+  /// mixes K expert OUTPUTS post-hoc (K forward passes); CondConv mixes K kernels
+  /// BEFORE the conv (one forward pass / one conv).
+  ///
+  /// FORWARD (per sample):
+  ///   1. pooled[ci] = (1/(SX*SY)) * sum_{x,y} x[x,y,ci]    (global avg pool)
+  ///   2. logit_k = rBias[k] + sum_ci rW[k,ci]*pooled[ci]; alpha_k = sigmoid(logit_k)
+  ///   3. W_eff = sum_k alpha_k * W_k
+  ///   4. y = conv(x, W_eff)                                 (identity activation)
+  /// There is NO per-channel conv output bias (the routing head carries its own
+  /// bias, which is what the routing-gradient path needs); the blend provides the
+  /// modeling power. pSuppressBias is accepted for signature symmetry.
+  ///
+  /// BACKWARD (the interesting part -- numerically gradient-checked):
+  ///   dL/dW_k     = alpha_k * dL/dW_eff                       (route to each expert)
+  ///   dL/dalpha_k = <dL/dW_eff, W_k>                          (Frobenius inner product)
+  ///   dlogit_k    = dL/dalpha_k * alpha_k*(1-alpha_k)         (through the sigmoid)
+  ///   dL/drW[k,ci]= dlogit_k * pooled[ci];  dL/drBias[k] = dlogit_k
+  ///   dL/dpooled[ci] = sum_k dlogit_k * rW[k,ci]
+  ///   dL/dx        = conv_input_grad(dL/dy, W_eff)            (standard conv path)
+  ///               +  (1/(SX*SY)) * dL/dpooled[ci]             (broadcast pool path)
+  ///
+  /// Neuron layout (K = NumExperts, KSize = FeatSizeX*FeatSizeY*InDepth*Features):
+  ///   neuron 0..K-1 : expert kernel W_k  (Weights size KSize), laid out as
+  ///                   W[((fy*FeatSizeX+fx)*InDepth+ci)*Features+co]
+  ///   neuron K      : routing weights rW (size K*InDepth, rW[k*InDepth+ci])
+  ///   neuron K+1    : routing biases  rBias (size K)
+  /// Constructor: Create(NumExperts, NumFeatures, FeatureSize, Padding, Stride,
+  /// SuppressBias). FStruct[0..4] carry the usual conv params (features, kernel,
+  /// padding, stride, suppress-bias) and FStruct[5] the expert count K, so the
+  /// layer round-trips through SaveStructureToString / LoadFromString /
+  /// CreateLayer with K/Features/FeatureSize/Padding/Stride preserved.
+  // Coded by Claude (AI).
+  TNNetCondConv = class(TNNetConvolutionLinear)
+  private
+    FInDepth: integer;      // input Depth (ci count)
+    FOutDepth: integer;     // output features (co count)
+    FNumExperts: integer;   // K
+    FKSize: integer;        // per-expert kernel weight count
+    FWeff: TNNetVolume;     // per-sample blended kernel
+    FPooled: TNNetVolume;   // cached global-avg-pool vector (length InDepth)
+    FAlpha: array of TNeuralFloat;  // cached per-sample mixing coefficients
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pNumExperts, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property InDepth: integer read FInDepth;
+    property OutDepth: integer read FOutDepth;
+    property NumExperts: integer read FNumExperts;
+  end;
+
   /// MONARCH structured DENSE layer (Dao et al. 2022, "Monarch: Expressive
   /// Structured Matrices for Efficient and Accurate Training", arXiv:2204.00595).
   /// A square n -> n linear map whose n x n weight is a MONARCH matrix -- a
@@ -36975,6 +37044,293 @@ begin
   end;
 end;
 
+{ TNNetCondConv }
+
+constructor TNNetCondConv.Create(pNumExperts, pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  // Identity activation + conv output sizing come from TNNetConvolutionLinear.
+  // The conv part carries no per-channel bias (the routing head has its own).
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, 1);
+  if pNumExperts < 1 then pNumExperts := 1;
+  FNumExperts := pNumExperts;
+  FStruct[5] := FNumExperts;
+  FWeff := TNNetVolume.Create();
+  FPooled := TNNetVolume.Create();
+  // Expert + routing neurons are sized in SetPrevLayer once InDepth is known.
+end;
+
+destructor TNNetCondConv.Destroy();
+begin
+  FWeff.Free;
+  FPooled.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetCondConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  iK, NeededNeurons: integer;
+begin
+  // Let the convolution machinery size FOutput / FOutputError / FOutputSizeX/Y /
+  // FFeatureSizeX/Y. We then replace its neuron layout with K expert kernels
+  // plus the two routing neurons.
+  inherited SetPrevLayer(pPrevLayer);
+
+  FInDepth := pPrevLayer.Output.Depth;
+  FOutDepth := FStruct[0];
+  if FInDepth <= 0 then
+    FErrorProc('TNNetCondConv requires a non-empty input.');
+
+  FKSize := FFeatureSizeX * FFeatureSizeY * FInDepth * FOutDepth;
+  NeededNeurons := FNumExperts + 2;  // K experts + routing weights + routing bias
+
+  while FNeurons.Count > NeededNeurons do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < NeededNeurons do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  // Expert kernels.
+  for iK := 0 to FNumExperts - 1 do
+  begin
+    FNeurons[iK].Weights.ReSize(FKSize, 1, 1);
+    FNeurons[iK].BackInertia.ReSize(FKSize, 1, 1);
+    FNeurons[iK].Delta.ReSize(FKSize, 1, 1);
+    FNeurons[iK].FBiasWeight := 0;
+  end;
+  // Routing weights: K*InDepth.
+  FNeurons[FNumExperts].Weights.ReSize(FNumExperts * FInDepth, 1, 1);
+  FNeurons[FNumExperts].BackInertia.ReSize(FNumExperts * FInDepth, 1, 1);
+  FNeurons[FNumExperts].Delta.ReSize(FNumExperts * FInDepth, 1, 1);
+  FNeurons[FNumExperts].FBiasWeight := 0;
+  // Routing biases: K.
+  FNeurons[FNumExperts + 1].Weights.ReSize(FNumExperts, 1, 1);
+  FNeurons[FNumExperts + 1].BackInertia.ReSize(FNumExperts, 1, 1);
+  FNeurons[FNumExperts + 1].Delta.ReSize(FNumExperts, 1, 1);
+  FNeurons[FNumExperts + 1].FBiasWeight := 0;
+
+  FVectorSize := FKSize;
+  FShouldConcatWeights := false;
+  FShouldInterleaveWeights := false;
+  BuildArrNeurons();
+
+  FWeff.ReSize(FKSize, 1, 1);
+  FPooled.ReSize(FInDepth, 1, 1);
+  SetLength(FAlpha, FNumExperts);
+
+  InitDefault();
+  RefreshCalculatePrevLayerError();
+  AfterWeightUpdate();
+end;
+
+// Expert kernels get a small He-style random init (bounded, so the finite-
+// difference weight-gradient test does not suffer truncation). Routing weights
+// start near zero so every expert begins with alpha ~ 0.5 (balanced blend).
+procedure TNNetCondConv.InitDefault();
+var
+  iK, i: integer;
+  W: TNNetVolume;
+  Range: TNeuralFloat;
+begin
+  if FInDepth <= 0 then exit;
+  Range := Sqrt(2.0 / (FFeatureSizeX * FFeatureSizeY * FInDepth));
+  if Range > 0.25 then Range := 0.25;  // bound for clean gradient checks
+  for iK := 0 to FNumExperts - 1 do
+  begin
+    W := FArrNeurons[iK].FWeights;
+    for i := 0 to W.Size - 1 do
+      W.FData[i] := Range * (Random - 0.5) * 2;
+  end;
+  W := FArrNeurons[FNumExperts].FWeights;
+  for i := 0 to W.Size - 1 do
+    W.FData[i] := 0.05 * (Random - 0.5) * 2;
+  FArrNeurons[FNumExperts + 1].FWeights.Fill(0);
+end;
+
+procedure TNNetCondConv.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCondConv.ComputeCPU();
+var
+  ox, oy, co, fx, fy, ci, iK, tap: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  PrevOut, rW, rB: TNNetVolume;
+  acc, logit, a, invN: TNeuralFloat;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  rW := FArrNeurons[FNumExperts].FWeights;
+  rB := FArrNeurons[FNumExperts + 1].FWeights;
+
+  // 1. Global average pool over the spatial map.
+  invN := 1.0 / (prevSizeX * prevSizeY);
+  FPooled.Fill(0);
+  for oy := 0 to prevSizeY - 1 do
+  for ox := 0 to prevSizeX - 1 do
+    for ci := 0 to FInDepth - 1 do
+      FPooled.FData[ci] := FPooled.FData[ci] + PrevOut.Get(ox, oy, ci);
+  for ci := 0 to FInDepth - 1 do
+    FPooled.FData[ci] := FPooled.FData[ci] * invN;
+
+  // 2. Routing head: logit -> sigmoid -> alpha_k.
+  for iK := 0 to FNumExperts - 1 do
+  begin
+    logit := rB.FData[iK];
+    for ci := 0 to FInDepth - 1 do
+      logit := logit + rW.FData[iK * FInDepth + ci] * FPooled.FData[ci];
+    a := 1.0 / (1.0 + Exp(-logit));
+    FAlpha[iK] := a;
+  end;
+
+  // 3. Blend the expert kernels: W_eff = sum_k alpha_k * W_k.
+  FWeff.Fill(0);
+  for iK := 0 to FNumExperts - 1 do
+  begin
+    a := FAlpha[iK];
+    if a = 0 then continue;
+    FWeff.MulAdd(a, FArrNeurons[iK].FWeights);
+  end;
+
+  // 4. Ordinary convolution with the blended kernel (identity activation).
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+    for co := 0 to FOutDepth - 1 do
+    begin
+      acc := 0;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ci := 0 to FInDepth - 1 do
+          begin
+            tap := ((fy * FFeatureSizeX + fx) * FInDepth + ci) * FOutDepth + co;
+            acc := acc + FWeff.FData[tap] * PrevOut.Get(prevX, prevY, ci);
+          end;
+        end;
+      end;
+      FOutput.FData[FOutput.GetRawPos(ox, oy, co)] := acc;
+    end;
+end;
+
+procedure TNNetCondConv.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetCondConv.BackpropagateCPU();
+var
+  ox, oy, co, fx, fy, ci, iK, tap: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  PrevOut, PrevErr, rW, rWDelta, rBDelta: TNNetVolume;
+  dWeff: TNNetVolume;
+  dy, dot, dlogit, a, invN, g: TNeuralFloat;
+  dPooled: array of TNeuralFloat;
+  HasPrevError: boolean;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.OutputError;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  HasPrevError := FCalculatePrevLayerError;
+  invN := 1.0 / (prevSizeX * prevSizeY);
+  rW := FArrNeurons[FNumExperts].FWeights;
+  rWDelta := FArrNeurons[FNumExperts].FDelta;
+  rBDelta := FArrNeurons[FNumExperts + 1].FDelta;
+
+  // dL/dW_eff accumulated over the conv, plus the standard conv input gradient.
+  dWeff := TNNetVolume.Create(FKSize, 1, 1);
+  dWeff.Fill(0);
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+    for co := 0 to FOutDepth - 1 do
+    begin
+      dy := FOutputError.Get(ox, oy, co);
+      if dy = 0 then continue;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ci := 0 to FInDepth - 1 do
+          begin
+            tap := ((fy * FFeatureSizeX + fx) * FInDepth + ci) * FOutDepth + co;
+            dWeff.FData[tap] := dWeff.FData[tap] + dy * PrevOut.Get(prevX, prevY, ci);
+            if HasPrevError then
+              PrevErr.Add(prevX, prevY, ci, dy * FWeff.FData[tap]);
+          end;
+        end;
+      end;
+    end;
+
+  // dL/dpooled accumulator (length InDepth), seeded to 0.
+  SetLength(dPooled, FInDepth);
+  for ci := 0 to FInDepth - 1 do dPooled[ci] := 0;
+
+  // Per expert: dL/dW_k = alpha_k*dWeff ; dL/dalpha_k = <dWeff, W_k>.
+  for iK := 0 to FNumExperts - 1 do
+  begin
+    a := FAlpha[iK];
+    // Expert kernel gradient (Delta carries -LearningRate*grad).
+    FArrNeurons[iK].FDelta.MulAdd((-FLearningRate) * a, dWeff);
+    // dL/dalpha_k = Frobenius inner product of dWeff and W_k.
+    dot := dWeff.DotProduct(FArrNeurons[iK].FWeights);
+    // Through the sigmoid: dlogit = dalpha * a*(1-a).
+    dlogit := dot * a * (1.0 - a);
+    // Routing weights / bias gradients (Delta carries -LearningRate*grad).
+    g := (-FLearningRate) * dlogit;
+    rBDelta.FData[iK] := rBDelta.FData[iK] + g;
+    for ci := 0 to FInDepth - 1 do
+    begin
+      rWDelta.FData[iK * FInDepth + ci] :=
+        rWDelta.FData[iK * FInDepth + ci] + g * FPooled.FData[ci];
+      // dL/dpooled accumulates the TRUE gradient (no -LearningRate here).
+      dPooled[ci] := dPooled[ci] + dlogit * rW.FData[iK * FInDepth + ci];
+    end;
+  end;
+
+  // Broadcast the pooled-path gradient back to every input position.
+  if HasPrevError then
+    for oy := 0 to prevSizeY - 1 do
+    for ox := 0 to prevSizeX - 1 do
+      for ci := 0 to FInDepth - 1 do
+        PrevErr.Add(ox, oy, ci, dPooled[ci] * invN);
+
+  dWeff.Free;
+
+  if not FBatchUpdate then
+  begin
+    for iK := 0 to FNumExperts + 1 do
+    begin
+      FArrNeurons[iK].UpdateWeightsWithoutInertia();
+    end;
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetMonarchLinear }
 
 // Monarch structured dense layer: y = P^T*(L*(P*(R*x))) (+bias). R and L are
@@ -62137,6 +62493,7 @@ begin
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
+      'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
@@ -62464,6 +62821,7 @@ begin
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
+      if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else

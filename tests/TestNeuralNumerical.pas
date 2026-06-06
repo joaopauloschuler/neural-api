@@ -186,6 +186,12 @@ type
     procedure TestTropicalConvWeightGradientCheck;
     procedure TestTropicalConvForwardKnownValue;
     procedure TestTropicalConvSerializationRoundTrip;
+    // TNNetCondConv conditionally-parameterized (dynamic) convolution layer
+    procedure TestCondConvInputGradientCheck;
+    procedure TestCondConvExpertWeightGradientCheck;
+    procedure TestCondConvRoutingGradientCheck;
+    procedure TestCondConvShapeInference;
+    procedure TestCondConvSerializationRoundTrip;
     // TNNetMonarchLinear sub-quadratic structured (block-diagonal) dense layer
     procedure TestMonarchLinearInputGradientCheck;
     procedure TestMonarchLinearWeightGradientCheck;
@@ -37448,6 +37454,343 @@ begin
         NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('TropicalConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCondConvInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  CC: TNNetCondConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient w.r.t. the INPUT of CondConv. Note
+  // the input feeds BOTH the conv (through the blended kernel) AND the routing
+  // head (global-avg-pool -> FC -> sigmoid), so the analytic input gradient has
+  // two terms; the check exercises both. Forward is smooth (sigmoid), so a small
+  // epsilon and the default 1e-2 bound apply. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  InputPlus := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1)); // 1 = collect input error
+    CC := TNNetCondConv.Create(3, 2, 3, 1, 1, 0); // 3 experts, 2 feat, 3x3, pad1, stride1
+    NN.AddLayer(CC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    InSize := Input.Size;
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.13 * i - 0.7;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('CondConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  CondConv input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCondConvExpertWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  CC: TNNetCondConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, iK, WCount: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient w.r.t. each EXPERT-BANK kernel weight.
+  // dL/dW_k = alpha_k * dL/dW_eff. Checks every expert's full kernel.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    CC := TNNetCondConv.Create(3, 2, 3, 1, 1, 0);
+    NN.AddLayer(CC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.13 * i - 0.7;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for iK := 0 to CC.NumExperts - 1 do
+    begin
+      WCount := CC.Neurons[iK].Weights.Size;
+      for i := 0 to WCount - 1 do
+      begin
+        CC.Neurons[iK].Weights.Raw[i] := CC.Neurons[iK].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss();
+        CC.Neurons[iK].Weights.Raw[i] := CC.Neurons[iK].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss();
+        CC.Neurons[iK].Weights.Raw[i] := CC.Neurons[iK].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        CC.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -CC.Neurons[iK].Delta.Raw[i];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('CondConv expert weight gradient check expert=' +
+          IntToStr(iK) + ' w=' + IntToStr(i) + ' num=' +
+          FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    end;
+    WriteLn('  CondConv expert weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCondConvRoutingGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  CC: TNNetCondConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, RWIdx, RBIdx: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient w.r.t. the ROUTING head: both the
+  // routing FC weights (neuron K) and the routing biases (neuron K+1). This is
+  // the dL/dalpha = <dWeff, W_k> path chained through sigmoid + FC.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    CC := TNNetCondConv.Create(3, 2, 3, 1, 1, 0);
+    NN.AddLayer(CC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    RWIdx := CC.NumExperts;       // routing-weights neuron
+    RBIdx := CC.NumExperts + 1;   // routing-bias neuron
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.13 * i - 0.7;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+    // Give the routing FC some non-zero weights so the path is exercised.
+    for i := 0 to CC.Neurons[RWIdx].Weights.Size - 1 do
+      CC.Neurons[RWIdx].Weights.Raw[i] := 0.07 * (i + 1) - 0.2;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    // Routing FC weights.
+    for i := 0 to CC.Neurons[RWIdx].Weights.Size - 1 do
+    begin
+      CC.Neurons[RWIdx].Weights.Raw[i] := CC.Neurons[RWIdx].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      CC.Neurons[RWIdx].Weights.Raw[i] := CC.Neurons[RWIdx].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      CC.Neurons[RWIdx].Weights.Raw[i] := CC.Neurons[RWIdx].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      CC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -CC.Neurons[RWIdx].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('CondConv routing-weight gradient check w=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    // Routing biases.
+    for i := 0 to CC.Neurons[RBIdx].Weights.Size - 1 do
+    begin
+      CC.Neurons[RBIdx].Weights.Raw[i] := CC.Neurons[RBIdx].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      CC.Neurons[RBIdx].Weights.Raw[i] := CC.Neurons[RBIdx].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      CC.Neurons[RBIdx].Weights.Raw[i] := CC.Neurons[RBIdx].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      CC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -CC.Neurons[RBIdx].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('CondConv routing-bias gradient check b=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  CondConv routing gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCondConvShapeInference;
+var
+  NN: TNNet;
+  CC: TNNetCondConv;
+begin
+  // Shape-inference smoke check: a non-default conv config should size the output
+  // exactly like an ordinary conv and build the expected neuron bank
+  // (K experts + 2 routing neurons), with InDepth inferred from the prev layer.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    CC := TNNetCondConv.Create(4, 5, 3, 1, 2, 0); // 4 experts, 5 feat, 3x3, pad1, stride2
+    NN.AddLayer(CC);
+    // (8 + 2*1 - 3)/2 + 1 = 4 along each spatial axis.
+    AssertEquals('CondConv output SizeX', 4, CC.Output.SizeX);
+    AssertEquals('CondConv output SizeY', 4, CC.Output.SizeY);
+    AssertEquals('CondConv output Depth = features', 5, CC.Output.Depth);
+    AssertEquals('CondConv inferred InDepth', 3, CC.InDepth);
+    AssertEquals('CondConv NumExperts', 4, CC.NumExperts);
+    AssertEquals('CondConv neuron count = K + 2', 6, CC.Neurons.Count);
+    // Each expert kernel: 3*3*3*5 = 135 weights.
+    AssertEquals('CondConv expert kernel size', 135, CC.Neurons[0].Weights.Size);
+    // Routing weights: K*InDepth = 4*3 = 12 ; routing biases: K = 4.
+    AssertEquals('CondConv routing weight size', 12, CC.Neurons[4].Weights.Size);
+    AssertEquals('CondConv routing bias size', 4, CC.Neurons[5].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCondConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  CC: TNNetCondConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // CondConv in the MIDDLE of a net with NON-DEFAULT K/features/kernel/pad/stride:
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical and
+  // Compute must match, proving K (FStruct[5]) and the conv params (FStruct[0..3])
+  // round-trip through BOTH dispatch points and all expert + routing neurons
+  // survive.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    CC := TNNetCondConv.Create(3, 4, 3, 1, 2, 0); // 3 experts, 4 feat, 3x3, pad1, stride2
+    NN.AddLayer(CC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CondConv SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('CondConv token present in serialized string',
+        Pos('TNNetCondConv', Saved) > 0);
+      AssertEquals('CondConv NumExperts round-trips', 3,
+        (NN2.Layers[1] as TNNetCondConv).NumExperts);
+      AssertEquals('CondConv output SizeX preserved',
+        NN.Layers[1].Output.SizeX, NN2.Layers[1].Output.SizeX);
+      AssertEquals('CondConv output SizeY preserved',
+        NN.Layers[1].Output.SizeY, NN2.Layers[1].Output.SizeY);
+      AssertEquals('CondConv output Depth preserved',
+        NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CondConv Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
