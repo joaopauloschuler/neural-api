@@ -58,7 +58,7 @@ const
   cNoiseAmp    = 0.35;   // uniform background noise amplitude
 
 type
-  TPoolKind = (pkAvg, pkMax, pkLp, pkSoft);
+  TPoolKind = (pkAvg, pkMax, pkLp, pkSoft, pkStoch);
 
   TArm = record
     Name : string;
@@ -67,14 +67,16 @@ type
   end;
 
   TArmResult = record
-    Name        : string;
-    FinalValLoss: TNeuralFloat;
-    FinalValAcc : TNeuralFloat;
-    Trace       : array[1..cEpochs] of TNeuralFloat; // per-epoch train NLL
+    Name         : string;
+    FinalValLoss : TNeuralFloat;
+    FinalValAcc  : TNeuralFloat;
+    FinalTrainAcc: TNeuralFloat;     // train-set accuracy at end (inference mode)
+    Gap          : TNeuralFloat;     // FinalTrainAcc - FinalValAcc
+    Trace        : array[1..cEpochs] of TNeuralFloat; // per-epoch train NLL
   end;
 
 const
-  cArms: array[0..9] of TArm =
+  cArms: array[0..10] of TArm =
   (
     (Name: 'TNNetAvgPool';          Kind: pkAvg;  Param: 0.0),
     (Name: 'TNNetMaxPool';          Kind: pkMax;  Param: 0.0),
@@ -85,7 +87,8 @@ const
     (Name: 'TNNetSoftPool(beta=0.5)'; Kind: pkSoft; Param: 0.5),
     (Name: 'TNNetSoftPool(beta=1)';   Kind: pkSoft; Param: 1.0),
     (Name: 'TNNetSoftPool(beta=2)';   Kind: pkSoft; Param: 2.0),
-    (Name: 'TNNetSoftPool(beta=8)';   Kind: pkSoft; Param: 8.0)
+    (Name: 'TNNetSoftPool(beta=8)';   Kind: pkSoft; Param: 8.0),
+    (Name: 'TNNetStochasticPool';     Kind: pkStoch; Param: 0.0)
   );
 
 // Quadrant origins (x0,y0) for the 6x6 blob region of each class.
@@ -165,6 +168,11 @@ begin
     pkMax : NN.AddLayer(TNNetMaxPool.Create(cImgSize));
     pkLp  : NN.AddLayer(TNNetLpPool.Create(cImgSize, cImgSize, 0, Arm.Param));
     pkSoft: NN.AddLayer(TNNetSoftPool.Create(cImgSize, cImgSize, 0, Arm.Param));
+    // StochasticPool samples a cell ~ p_i (a_i/sum) at TRAIN time and outputs
+    // the deterministic expectation sum_i p_i*a_i at INFERENCE. The train vs
+    // inference gate is the layer's Enabled flag, toggled by
+    // TNNet.EnableDropouts(true/false) around the train loop / eval below.
+    pkStoch: NN.AddLayer(TNNetStochasticPool.Create(cImgSize, cImgSize, 0));
   end;
 
   NN.AddLayer(TNNetFullConnectLinear.Create(cNumClasses)); // 1x1x4
@@ -209,7 +217,7 @@ var
   Epoch, I: integer;
   P: TNNetVolume;
   Sum: Double;
-  ValNLL, ValAcc: TNeuralFloat;
+  ValNLL, ValAcc, TrainNLL, TrainAcc: TNeuralFloat;
 begin
   Result.Name := Arm.Name;
 
@@ -224,6 +232,10 @@ begin
   try
     NN.SetLearningRate(cLearnRate, cInertia);
 
+    // TRAIN mode: enables StochasticPool sampling (no-op for the other arms,
+    // which have no Enabled gate). Dropout-family layers, if any, would also
+    // switch on here.
+    NN.EnableDropouts(true);
     for Epoch := 1 to cEpochs do
     begin
       Sum := 0;
@@ -237,9 +249,16 @@ begin
       Result.Trace[Epoch] := Sum / TrainSet.Count;
     end;
 
+    // INFERENCE mode: StochasticPool now outputs the deterministic expectation.
+    // Both train-acc and val-acc are measured here so the train/val gap is a
+    // clean generalisation gap, not a sampling-noise artefact.
+    NN.EnableDropouts(false);
+    Evaluate(NN, TrainSet, TrainNLL, TrainAcc);
     Evaluate(NN, ValSet, ValNLL, ValAcc);
-    Result.FinalValLoss := ValNLL;
-    Result.FinalValAcc  := ValAcc;
+    Result.FinalValLoss  := ValNLL;
+    Result.FinalValAcc   := ValAcc;
+    Result.FinalTrainAcc := TrainAcc;
+    Result.Gap           := TrainAcc - ValAcc;
   finally
     NN.Free;
     ValSet.Free;
@@ -278,17 +297,21 @@ begin
     Write('Training ', cArms[K].Name, ' ...');
     Results[K] := RunArm(cArms[K]);
     WriteLn(' done.  val_loss=', SafeF(Results[K].FinalValLoss, 4),
-            '  val_acc=', SafeF(Results[K].FinalValAcc, 4));
+            '  train_acc=', SafeF(Results[K].FinalTrainAcc, 4),
+            '  val_acc=', SafeF(Results[K].FinalValAcc, 4),
+            '  gap=', SafeF(Results[K].Gap, 4));
   end;
   EndTime := Now;
 
   WriteLn;
   WriteLn('=== Results (CSV) ===');
-  WriteLn('pooling,final_val_loss,final_val_accuracy');
+  WriteLn('pooling,final_val_loss,final_train_accuracy,final_val_accuracy,train_val_gap');
   for K := 0 to High(cArms) do
     WriteLn(Results[K].Name, ',',
             SafeF(Results[K].FinalValLoss, 4), ',',
-            SafeF(Results[K].FinalValAcc, 4));
+            SafeF(Results[K].FinalTrainAcc, 4), ',',
+            SafeF(Results[K].FinalValAcc, 4), ',',
+            SafeF(Results[K].Gap, 4));
 
   WriteLn;
   WriteLn('=== Train NLL vs epoch (per arm) ===');
@@ -309,6 +332,12 @@ begin
 end;
 
 begin
+  // Mask hardware FP exceptions (matches the other neural-api examples). The
+  // power-mean / softmax pooling arms can transiently produce denormals or
+  // intermediate Inf/NaN that are harmless to the final result but would
+  // otherwise raise EInvalidOp on x86.
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
+                    exOverflow, exUnderflow, exPrecision]);
   RandSeed := cSeed;
   RunBakeoff();
 end.
