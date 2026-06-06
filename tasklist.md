@@ -450,16 +450,12 @@ rather than acted on.
       against an actual plain-softmax head arm side by side — the demo currently
       shows the separation trend WITHIN ArcFace across margins m in {0,0.3,0.5},
       not ArcFace-vs-softmax head to head. Pairs with [[FeatureSeparability]] and
-      the open TNNetCenterLoss SOFTMAX-JOINT follow-up.
+      the landed examples/CenterLossSoftmaxJoint/ (softmax-only vs softmax+center
+      head-to-head).
 - [ ] TNNetKLDivergence distillation follow-up
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
       accuracy/agreement.
-- [ ] TNNetCenterLoss follow-up: a true SOFTMAX-JOINT variant (or an example)
-      that wires the landed penalty head alongside a classification head and
-      shows the headline Wen et al. result — center loss tightens intra-class
-      feature clusters (visualise a 2-D embedding before/after). Pairs with the
-      [[FeatureSeparability]] example.
 - [ ] TNNetCenterLoss follow-up: cross-batch EMA-updated centers — needs a
       batch-aware loss hook (the per-sample FOutputError path is blind to other
       minibatch samples, the same limitation logged for a true cross-batch
