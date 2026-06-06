@@ -243,8 +243,9 @@ rather than acted on.
       sibling demo (or extend it) that runs with `MaxThreadNum := 4` twice
       and prints which weights diverge first — useful starting point for any
       future "make TNeuralFit deterministic under parallelism" work.
-- [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
+- [X] Quick-start example: tiny char-level sequence model (XOR-of-bits or
       counting task) that trains in well under a minute on CPU.
+      (examples/QuickStartSequence — counting task, manual SGD loop, ~1 s CPU)
 
 ### Ideas from JP
 - [ ] Better integrate TBytePredictionViaNNet and TEasyBytePredictionViaNNet with
