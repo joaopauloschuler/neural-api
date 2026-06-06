@@ -290,6 +290,11 @@ type
     procedure TestAttentionPoolingPermutationInvariance;
     procedure TestAttentionPoolingSerializationRoundTrip;
     procedure TestAddAttentionPoolingBuilder;
+    procedure TestProductKeyMemoryInputGradientCheck;
+    procedure TestProductKeyMemoryWeightGradientCheck;
+    procedure TestProductKeyMemoryTopK1GradientCheck;
+    procedure TestProductKeyMemorySerializationRoundTrip;
+    procedure TestAddProductKeyMemoryBuilder;
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
@@ -23823,6 +23828,338 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+// Deterministic, WELL-SEPARATED half-key banks + value table so the top-k
+// selection is UNAMBIGUOUS: the half-scores for the chosen query are spread far
+// enough apart that the +-epsilon central-difference perturbation cannot flip
+// the selected (a,b) product-key set (which is a non-differentiable boundary).
+procedure SeedProductKeyMemory(PKM: TNNetProductKeyMemory);
+var a, b, d, kIdx: integer;
+begin
+  // K1: row a points strongly along feature (a mod HalfQ) with magnitude
+  // increasing in a, so distinct half-1 dot products against a fixed query.
+  for a := 0 to PKM.HalfKeys - 1 do
+    for d := 0 to (PKM.QueryDim div 2) - 1 do
+      PKM.Neurons[0].Weights[a, 0, d] :=
+        Sin((a + 1) * 0.7 + d * 1.13) * (0.5 + 0.4 * a);
+  // K2: distinct pattern, different phase, so half-2 scores are well separated.
+  for b := 0 to PKM.HalfKeys - 1 do
+    for d := 0 to (PKM.QueryDim div 2) - 1 do
+      PKM.Neurons[1].Weights[b, 0, d] :=
+        Cos((b + 1) * 0.9 + d * 0.61) * (0.5 + 0.35 * b);
+  // V: distinct value vector per product-key slot.
+  for kIdx := 0 to PKM.NumKeys - 1 do
+    for d := 0 to PKM.ValueDim - 1 do
+      PKM.Neurons[2].Weights[kIdx, 0, d] :=
+        Sin(kIdx * 0.37 + d * 0.83) * 0.6 + 0.05 * d;
+end;
+
+procedure TTestNeuralNumerical.TestProductKeyMemoryInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  PKM: TNNetProductKeyMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // NumKeys=16 (HalfKeys=4), QueryDim=4 (HalfQ=2), ValueDim=3, TopK=2.
+  // The seeded banks keep the selected top-2 product-key set unambiguous, so the
+  // central differences never cross the non-differentiable top-k boundary.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  InputPlus := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    PKM := TNNetProductKeyMemory.Create(16, 3, 2, 1, 4);
+    NN.AddLayer(PKM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedProductKeyMemory(PKM);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ProductKeyMemory input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ProductKeyMemory input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestProductKeyMemoryWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  PKM: TNNetProductKeyMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  nIdx, i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Checks ALL THREE learnable banks: half-keys K1 (neuron 0), K2 (neuron 1),
+  // and the value table V (neuron 2). The seeded, well-separated banks keep the
+  // selected top-k set stable under the +-epsilon perturbation.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    PKM := TNNetProductKeyMemory.Create(16, 3, 2, 1, 4);
+    NN.AddLayer(PKM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedProductKeyMemory(PKM);
+
+    for nIdx := 0 to 2 do
+      for i := 0 to PKM.Neurons[nIdx].Weights.Size - 1 do
+      begin
+        PKM.Neurons[nIdx].Weights.Raw[i] :=
+          PKM.Neurons[nIdx].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        PKM.Neurons[nIdx].Weights.Raw[i] :=
+          PKM.Neurons[nIdx].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        PKM.Neurons[nIdx].Weights.Raw[i] :=
+          PKM.Neurons[nIdx].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        PKM.Neurons[nIdx].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -PKM.Neurons[nIdx].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('ProductKeyMemory weight gradient n=' + IntToStr(nIdx) +
+          ' w[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('ProductKeyMemory weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestProductKeyMemoryTopK1GradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  PKM: TNNetProductKeyMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // TopK=1 EDGE CASE: a single product key is retrieved, the softmax is a
+  // 1-element (constant 1.0) distribution, so the softmax Jacobian is exactly
+  // zero and the score gradient must vanish -- the gradient flows ONLY through
+  // the one selected value row. Exercises the degenerate-softmax path.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  InputPlus := TNNetVolume.Create(1, 1, 4);
+  Desired := TNNetVolume.Create(1, 1, 3);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    PKM := TNNetProductKeyMemory.Create(16, 3, 1, 1, 4);
+    NN.AddLayer(PKM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 1.1 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.3) * 0.7;
+    SeedProductKeyMemory(PKM);
+
+    // Input gradient must be exactly zero (a hard top-1 selection with a
+    // constant-1 softmax weight -> the output is a CONSTANT value row, no
+    // dependence on the query within the selected region).
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('ProductKeyMemory TopK=1 input gradient ~0 at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        (Abs(numericalGrad) < 1e-4) and (Abs(analyticalGrad) < 1e-4));
+    end;
+
+    // The single touched value row still trains (its gradient is the plain dOut).
+    PKM.Neurons[2].Weights.Raw[0] := PKM.Neurons[2].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    PKM.Neurons[2].Weights.Raw[0] := PKM.Neurons[2].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    PKM.Neurons[2].Weights.Raw[0] := PKM.Neurons[2].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+    NN.Compute(Input);
+    PKM.Neurons[2].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -PKM.Neurons[2].Delta.Raw[0];
+    AssertTrue('ProductKeyMemory TopK=1 value-row gradient (num=' +
+      FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+    WriteLn('ProductKeyMemory TopK=1 gradient check passed.');
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestProductKeyMemorySerializationRoundTrip;
+begin
+  // The three learnable banks (K1, K2, V) plus the NumKeys/ValueDim/TopK/Heads/
+  // QueryDim hyperparameters must survive Save/LoadFromString.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetProductKeyMemory.Create(16, 3, 2, 1, 4), 'ProductKeyMemory',
+    5, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAddProductKeyMemoryBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+  PKM: TNNetProductKeyMemory;
+begin
+  // Exercise TNNet.AddProductKeyMemory end to end:
+  // (1) NumKeys=64 rounds to a perfect square (8x8), output Depth = ValueDim;
+  // (2) one training run reduces the loss (all three banks train);
+  // (3) SaveToString/LoadFromString round-trips bit-for-bit.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 6);
+  Desired := TNNetVolume.Create(4, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 6));
+    PKM := NN.AddProductKeyMemory(64, 5, 3, 1) as TNNetProductKeyMemory;
+    NN.SetLearningRate(0.1, 0.0);
+
+    AssertTrue('AddProductKeyMemory last layer is TNNetProductKeyMemory',
+      NN.GetLastLayer is TNNetProductKeyMemory);
+    AssertEquals('AddProductKeyMemory NumKeys (perfect square)', 64,
+      PKM.NumKeys);
+    AssertEquals('AddProductKeyMemory HalfKeys', 8, PKM.HalfKeys);
+    AssertEquals('AddProductKeyMemory ValueDim', 5, PKM.ValueDim);
+    AssertEquals('AddProductKeyMemory TopK', 3, PKM.TopK);
+    AssertEquals('AddProductKeyMemory QueryDim from prev layer', 6,
+      PKM.QueryDim);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 1.5;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.5;
+    NN.Compute(Input);
+    AssertEquals('AddProductKeyMemory output SizeX preserved', 4,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('AddProductKeyMemory output Depth = ValueDim', 5,
+      NN.GetLastLayer.Output.Depth);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('AddProductKeyMemory training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('AddProductKeyMemory round-trip last layer type',
+        NN2.GetLastLayer is TNNetProductKeyMemory);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AddProductKeyMemory SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
   end;
 end;
 

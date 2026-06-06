@@ -1543,7 +1543,7 @@ rather than acted on.
       reading how information is distributed across the coordinate axis.
 
 ### Product-Key Memory layer (large sparse key-value memory)
-- [ ] `TNNetProductKeyMemory` — a large, sparsely-accessed key-value memory
+- [X] `TNNetProductKeyMemory` — a large, sparsely-accessed key-value memory
       layer (Lample et al., NeurIPS 2019, "Large Memory Layers with Product
       Keys"). The point is a memory bank far too large to address with a flat
       softmax: instead of one set of `|K|` keys, keep TWO small half-key
@@ -1578,3 +1578,11 @@ rather than acted on.
       step, and a short note on the known failure mode (key-usage collapse —
       a handful of slots hog all reads — and the batch-norm-on-query trick
       the paper uses to spread usage).
+      DONE (single-head v1): `TNNetProductKeyMemory` +
+      `TNNet.AddProductKeyMemory(NumKeys, ValueDim, TopK, Heads)` landed with
+      dispatch wiring, 5 numerical/serialization tests, and
+      `examples/ProductKeyMemory/`. MULTI-HEAD is DEFERRED — the builder
+      exposes `Heads` for API stability but only `Heads=1` is implemented
+      (other values raise); a follow-up should split the query into H
+      independent product-key lookups concatenated along Depth, mirroring the
+      multi-head attention wiring.
