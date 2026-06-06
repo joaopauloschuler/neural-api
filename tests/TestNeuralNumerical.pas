@@ -173,6 +173,9 @@ type
     procedure TestSpectralConv1DGradientCheck;
     procedure TestSpectralConv1DModesTruncation;
     procedure TestSpectralConv1DSerializationRoundTrip;
+    // TNNetOctonionConv 8D hypercomplex convolution layer
+    procedure TestOctonionConvGradientCheck;
+    procedure TestOctonionConvSerializationRoundTrip;
     // TNNetKANLayer Kolmogorov-Arnold dense layer
     procedure TestKANLayerGradientCheck;
     procedure TestKANLayerSerializationRoundTrip;
@@ -36863,6 +36866,199 @@ begin
         Pos('TNNetQuaternionConv', Saved) > 0);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('QuaternionConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOctonionConvGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  OC: TNNetOctonionConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, oo, InO, OutO, InDepth, OutDepth, taps, SizeX, SizeY, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT, the eight real weight
+  // components of every octonion tap (across the kernel window AND input octonion
+  // groups), AND the per-output bias, for a strided + padded octonion
+  // convolution. A sign error in any of the eight weight-component gradients of
+  // the 8x8 Cayley-Dickson layout is exactly what this catches. Weights are
+  // BOUNDED (not loosened tolerance) to keep FD truncation small. Reseed the
+  // shared RNG per the numerical-test ordering rule.
+  RandSeed := 424242;
+  SizeX := 3;  SizeY := 3;
+  InO := 2;  OutO := 2;
+  InDepth := InO * 8;  OutDepth := OutO * 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  InputPlus := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+    OC := TNNetOctonionConv.Create(OutDepth, {kernel}2, {padding}1, {stride}2);
+    NN.AddLayer(OC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Sin(i * 0.7) * 0.6 + 0.1) * 0.4;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5 * 0.4;
+
+    taps := OC.Neurons[0].Weights.Size; // FeatureX*FeatureY*InO*8
+    // Deterministic, BOUNDED octonion weights and biases. The octonion block
+    // sums 8 terms per output component (twice the quaternion case), so inputs,
+    // weights and biases are kept small to keep single-precision FD truncation
+    // below the 0.01 gradient tolerance WITHOUT loosening it.
+    for oo := 0 to OutO - 1 do
+      for i := 0 to taps - 1 do
+        OC.Neurons[oo].Weights.Raw[i] := (0.2 + 0.15 * Sin(i * 1.1 + oo) - 0.1 * Cos(i * 0.4 + 2 * oo)) * 0.5;
+    for i := 0 to OutDepth - 1 do
+      OC.Neurons[OutO].Weights.Raw[i] := 0.02 * (i - 7); // bias
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('OctonionConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. each block-row's octonion weight components ----
+    for oo := 0 to OutO - 1 do
+      for i := 0 to taps - 1 do
+      begin
+        OC.Neurons[oo].Weights.Raw[i] := OC.Neurons[oo].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        OC.Neurons[oo].Weights.Raw[i] := OC.Neurons[oo].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        OC.Neurons[oo].Weights.Raw[i] := OC.Neurons[oo].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        OC.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -OC.Neurons[oo].Delta.Raw[i];
+
+        AssertTrue('OctonionConv weight gradient check oo=' + IntToStr(oo) +
+          ' c=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the per-output bias (bias neuron = OutO) ----
+    for i := 0 to OutDepth - 1 do
+    begin
+      OC.Neurons[OutO].Weights.Raw[i] := OC.Neurons[OutO].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      OC.Neurons[OutO].Weights.Raw[i] := OC.Neurons[OutO].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      OC.Neurons[OutO].Weights.Raw[i] := OC.Neurons[OutO].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      OC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -OC.Neurons[OutO].Delta.Raw[i];
+
+      AssertTrue('OctonionConv bias gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOctonionConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  OC: TNNetOctonionConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, oo, InO, OutO, InDepth, OutDepth, taps, SizeX, SizeY: integer;
+begin
+  // OctonionConv in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the
+  // (OutO block-row + bias) neuron storage round-trips through the standard
+  // per-neuron serialization and both dispatch points.
+  RandSeed := 424242;
+  SizeX := 4;  SizeY := 4;
+  InO := 2;  OutO := 3;
+  InDepth := InO * 8;  OutDepth := OutO * 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+    OC := TNNetOctonionConv.Create(OutDepth, {kernel}3, {padding}1, {stride}1);
+    NN.AddLayer(OC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    taps := OC.Neurons[0].Weights.Size;
+    for oo := 0 to OutO - 1 do
+      for i := 0 to taps - 1 do
+        OC.Neurons[oo].Weights.Raw[i] := 0.13 * (i + 1) - 0.3 + 0.1 * oo;
+    for i := 0 to OutDepth - 1 do
+      OC.Neurons[OutO].Weights.Raw[i] := 0.04 - 0.02 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('OctonionConv SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('OctonionConv token present in serialized string',
+        Pos('TNNetOctonionConv', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('OctonionConv Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

@@ -87,7 +87,7 @@ rather than acted on.
       baseline degrades (63% -> 86%) — the resolution-invariance headline. ~90 s.
       Follow-up: TNNetSpectralConv2D and an FFT-path (O(L log L)) for the Hyena
       long-conv could reuse the same helper.
-- [ ] TNNetOctonionConv: the convolution analogue of TNNetOctonionLinear
+- [X] TNNetOctonionConv: the convolution analogue of TNNetOctonionLinear
       (which LANDED on a2 — 8D Cayley-Dickson dense layer with the verified
       octonion multiplication table, norm-multiplicativity + gradient + save/load
       tests, and the examples/OctonionLinear/ bake-off). Mirror TNNetQuaternionConv:
