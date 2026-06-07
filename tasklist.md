@@ -133,6 +133,58 @@ rather than acted on.
       trained sequences" claim needs this); full DNC allocation + temporal-link
       read modes; optional concat[input,read] output mode.
 
+- [ ] TNNetKalmanFilterCell — a differentiable Bayesian filtering recurrent
+      layer (Kalman 1960). FIRST layer in the suite that propagates UNCERTAINTY
+      rather than just a deterministic state: it carries a state mean AND a
+      (diagonal) state covariance over the time axis, and at each step computes
+      a Kalman gain that adaptively trades the model prediction against the new
+      observation. This is genuinely distinct from every existing recurrent /
+      state-space layer — TNNetDiagonalSSM, TNNetSelectiveSSM (Mamba/S6),
+      TNNetClosedFormContinuous (CfC), TNNetSLSTMCell / TNNetMLSTMCell,
+      TNNetNTMMemory — none of which maintain or propagate a covariance or
+      form a gain from it; the Kalman gain g_t = P⁻_t / (P⁻_t + R) is the new
+      mechanism and the whole point. Scope v1 to a tractable DIAGONAL
+      (per-channel independent scalar) filter so there is no matrix inverse:
+      over an (T,1,StateDim) input treated as the per-step observation z_t,
+      sweep the time axis running the two-phase recurrence —
+      PREDICT: x⁻_t = a·x_{t-1} (+b optional control bias),  P⁻_t = a²·P_{t-1} + Q;
+      UPDATE: g_t = P⁻_t/(P⁻_t + R),  x_t = x⁻_t + g_t·(z_t − x⁻_t),
+              P_t = (1 − g_t)·P⁻_t.
+      Per-channel learnable scalars: transition a (bounded to (−1,1) via
+      tanh(raw) for stability, mirroring [[constrained-learnable-scalar-sigmoid]]
+      the TNNetRetention learnable-gamma trick), process-noise Q and
+      measurement-noise R (both kept positive via softplus(raw) so the gain
+      stays in (0,1) by construction). Emit the filtered means x_t as the
+      (T,1,StateDim) output (optionally also expose the per-step covariance P_t
+      as extra depth channels for a downstream uncertainty head — defer to a
+      follow-up). Layout: StateDim = input Depth, FStruct[0]=StateDim,
+      neuron weights pack [a_raw, Q_raw, R_raw] per channel (3·StateDim params,
+      tiny); SizeY=1 contract like the other sequence layers. Full BPTT: the
+      gain g_t depends on P⁻_t which depends on P_{t-1}, so the covariance
+      recurrence carries its own adjoint right-to-left ALONGSIDE the mean
+      adjoint (two coupled backward scans — the interesting part, and the
+      reason this is more than a re-skinned DiagonalSSM; verify the dg_t/dP⁻_t
+      and dP_t/dP⁻_t chain with a numerical grad-check). Initialise x_0=0,
+      P_0=1 (re-init on load, not persisted — cf. TNNetNTMMemory's M). Follow
+      the layer-authoring recipe in [[layer-authoring-extras]] /
+      docs/layer-authoring.md: declaration with the `// Coded by Claude (AI).`
+      attribution line ([[claude-authorship-comment]]), forward, BPTT backward,
+      both serialization dispatch tables, and the test trio in
+      TestNeuralNumerical.pas (input grad-check + per-channel weight grad-check
+      with BOUNDED weights to avoid FD truncation, serialization round-trip,
+      and a tiny noisy-sine smoke-train showing the filter learns to denoise a
+      tracked signal — MSE(filtered, clean) < MSE(noisy, clean)). Reseed
+      RandSeed:=424242 per [[numerical-test-rng-ordering]]. Example
+      examples/KalmanFilter/: track a 1-D constant-velocity signal corrupted by
+      Gaussian noise; show TNNetKalmanFilterCell recovers it and contrast the
+      LEARNED Q,R against a param-matched TNNetDiagonalSSM arm (which cannot
+      adapt its gain to the noise level) at matched parameter count. Open
+      follow-ups (NOT in v1): full (non-diagonal) covariance with a Cholesky/
+      Joseph-form update; INPUT-DEPENDENT (Mamba-style "selective") a,Q,R from
+      a projection of z_t for a learned-Kalman-gain filter; an Extended/
+      Unscented variant for nonlinear transitions; a builder
+      TNNet.AddKalmanFilter; smoothing (RTS backward pass) as a second output.
+
 - [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
       landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
       PHANTOM backward, TNNetDeepEquilibriumSharedConv per-forward weight cache,
