@@ -72,14 +72,11 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [x] TNNetKANConv convolutional Kolmogorov-Arnold layer (LANDED 2026-06-07 on a2,
-      commit fbe7c1a) — conv sibling of the landed dense TNNetKANLayer: replaces the
-      conv linear dot product over each receptive-field patch with a sum of learned
-      univariate Chebyshev edge functions phi_p(t)=sum_k c_{p,k} T_k(tanh(t)), one per
-      (kernel position x input channel); subclasses TNNetConvolutionLinear, no output
-      bias, near-linear init, degree K via FStruct[5]; numerical-gradient (input +
-      coeff) + serialization tests in TestNeuralNumerical.pas; examples/KANConv/ beats
-      a matched linear conv on a per-3x3-window nonlinear task. Open follow-ups:
+- [ ] TNNetKANConv follow-ups (the convolutional Kolmogorov-Arnold layer LANDED
+      2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:
+      sum of learned univariate Chebyshev edge functions per receptive-field patch,
+      subclasses TNNetConvolutionLinear, degree K via FStruct[5], numerical-gradient +
+      serialization tests, examples/KANConv/):
       - [ ] B-spline (fixed-knot) basis variant alongside the Chebyshev basis, behind
             a flag — the paper's original parameterisation; contrast smoothness/extrapolation.
       - [ ] examples/KANConv/ on a real tiny-image task (CIFAR/MNIST stub) vs a plain
@@ -1407,50 +1404,14 @@ rather than acted on.
       today's FGSM).
 
 ### Loss-landscape degeneracy (Singular Learning Theory)
-- [x] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
-      — estimate the *local learning coefficient* (LLC, an empirical
-      RLCT) of a trained network from Singular Learning Theory (Watanabe;
-      Lau, Murfet, Wei et al. 2023, "Quantifying Degeneracy in Singular
-      Models via the LLC"). This measures the volume-scaling /
-      effective-dimensionality of the minimum the optimizer settled into —
-      a fundamentally DIFFERENT quantity from the already-landed
-      `HessianCurvatureReport` / [[EdgeOfStability]] top-eigenvalue (which
-      is purely 2nd-order and blind to flat, degenerate directions that the
-      LLC is precisely designed to count). Estimator is the SGLD-based
-      WBIC/free-energy form: from the trained weights `w*`, run a short
-      tempered SGLD chain that samples the local posterior with a Gaussian
-      anchor `gamma/2 * ||w - w*||^2` pinning it to the basin, then
-      `LLC_hat = n*beta * ( mean_chain[ L(w) ] - L(w*) )` where `L` is the
-      average training NLL, `n` the sample count, and `beta = 1/log(n)` the
-      WBIC inverse-temperature. Pure CPU, tiny MLP. The honest headline (in
-      the "what did NOT fit the budget" style the [[Grokking]] entry uses):
-      report the LLC and contrast it with the raw parameter count to show
-      `LLC_hat << dim(w)` — the network uses far fewer *effective* degrees
-      of freedom than it has weights. A clean built-in sanity check: a
-      deliberately over-parameterised net (duplicate-then-halve a hidden
-      layer so two units are forced redundant) should have a LOWER LLC than
-      a minimal net fitting the same function, because the duplicated
-      directions are flat/degenerate. The SGLD chain reuses the existing
-      backward pass (no new gradient machinery); the only new infrastructure
-      is the anchored-Langevin weight update + chain averaging, which can
-      live entirely inside the report method. NOTE the known pitfall to call
-      out in the README: LLC estimates are sensitive to the SGLD step size
-      `epsilon` and localisation `gamma` — ship a fixed, documented
-      (epsilon, gamma, chain-length) and a one-line caveat that the absolute
-      value is calibration-dependent but the *ordering* (minimal < redundant
-      < random-init) is the robust, reproducible signal. Pairs with
-      [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
-      degeneracy-aware generalization of "effective parameter count").
-      LANDED 2026-06-07 on a2 (commit be56591): function signature
-      `LocalLearningCoefficientReport(NN, Samples; ChainLen=40, Eps=1e-5, Gamma=1.0)`,
-      non-destructive (w* snapshot/restore bit-identical, FP-exception mask during the
-      chain), smoke test in TestNeuralLayersExtra.pas, examples/LocalLearningCoefficient/.
-      HONEST FINDING (the "what did NOT fit the budget" caveat): the robust,
-      reproducible signal at CPU-toy chain length is trained-vs-untrained (both trained
-      nets read small LLC_hat << dim(w); a random-init net reads large/negative LLC_hat
-      = "not a minimum"). The fine minimal-vs-over-parameterised ORDERING does NOT
-      separate reproducibly across seeds at this chain length (estimator noise ≈ the
-      tiny mean_chain−L(w*) gap). Open follow-up:
+- [ ] `TNNet.LocalLearningCoefficientReport` follow-up (the empirical local learning
+      coefficient / RLCT report from Singular Learning Theory — anchored tempered SGLD
+      `LLC_hat = n*beta*(mean_chain[L(w)] - L(w*))` — LANDED 2026-06-07 on a2, commit
+      be56591: signature `LocalLearningCoefficientReport(NN, Samples; ChainLen=40,
+      Eps=1e-5, Gamma=1.0)`, non-destructive w* snapshot/restore, smoke test in
+      TestNeuralLayersExtra.pas, examples/LocalLearningCoefficient/. HONEST FINDING: at
+      CPU-toy chain length the reproducible signal is trained-vs-untrained, not the fine
+      minimal-vs-over-parameterised ordering — see [[local-learning-coefficient-report]]):
       - [ ] longer/multi-chain averaging (or a calibrated eps/gamma sweep) to recover
             the minimal < redundant ordering reproducibly within budget.
 
