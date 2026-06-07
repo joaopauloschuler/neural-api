@@ -253,6 +253,10 @@ end;
 var
   TreeNet, MLPNet: TNNet;
   accTree, accMLP: TNeuralFloat;
+  ProbeBatch: TNNetVolumeList;
+  PV: TNNetVolume;
+  px0, px1: TNeuralFloat;
+  i, pc: integer;
 begin
   Randomize;
   RandSeed := 20260606;   // reproducible
@@ -291,6 +295,22 @@ begin
   WriteLn('=== Interpretable decision path (tree only) ===');
   ExplainPath(TreeNet, 0.8, 0.6);
   ExplainPath(TreeNet, 0.2, -0.2);
+  WriteLn;
+
+  // Batch-level statistical companion to the per-point path above: how the
+  // trained tree ROUTES a whole probe batch (leaf occupancy, gate crispness,
+  // effective leaf count). Forward-only — no training-time changes.
+  WriteLn('=== Batch routing statistics (RoutingEntropyReport) ===');
+  ProbeBatch := TNNetVolumeList.Create(True);
+  for i := 1 to 256 do
+  begin
+    SampleMoon(px0, px1, pc);
+    PV := TNNetVolume.Create(1, 1, 2);
+    PV.FData[0] := px0; PV.FData[1] := px1;
+    ProbeBatch.Add(PV);
+  end;
+  WriteLn(TNNet.RoutingEntropyReport(TreeNet, ProbeBatch));
+  ProbeBatch.Free;
 
   TreeNet.Free;
   MLPNet.Free;

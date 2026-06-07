@@ -1523,7 +1523,7 @@ rather than acted on.
       degeneracy-aware generalization of "effective parameter count").
 
 ### Differentiable hierarchical routing (a genuinely new paradigm)
-- [ ] `TNNet.RoutingEntropyReport` — forward-only introspection diagnostic for a
+- [X] `TNNet.RoutingEntropyReport` — forward-only introspection diagnostic for a
       `TNNetSoftDecisionTree` layer (DEFERRED from the SoftDecisionTree task,
       done 2026-06-06). Over a probe batch, recompute each inner gate
       `p_i = sigmoid(beta*(w_i.x+b_i))` and the per-leaf path probabilities

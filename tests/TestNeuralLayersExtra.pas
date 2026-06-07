@@ -135,6 +135,7 @@ type
     procedure TestShakeShakeRoundTrip;
     procedure TestShakeShakeTrainSmoke;
     procedure TestShakeDropEvalAndRoundTrip;
+    procedure TestRoutingEntropyReportSmoke;
   end;
 
 implementation
@@ -5951,6 +5952,54 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestRoutingEntropyReportSmoke;
+var
+  NN: TNNet;
+  Probe: TNNetVolumeList;
+  V: TNNetVolume;
+  Report: string;
+  I: integer;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.RoutingEntropyReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Probe := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetSoftDecisionTree.Create(2, 3)); // depth 2 -> 4 leaves
+    NN.InitWeights();
+
+    // empty probe handled gracefully.
+    Report := TNNet.RoutingEntropyReport(NN, Probe);
+    AssertTrue('empty probe reported gracefully',
+      Pos('Probe is nil or empty', Report) > 0);
+
+    for I := 0 to 7 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      V.FData[0] := (I mod 2) * 1.0;
+      V.FData[1] := -(I mod 3) * 0.5;
+      V.FData[2] := I * 0.1;
+      V.FData[3] := 1.0 - I * 0.1;
+      Probe.Add(V);
+    end;
+
+    Report := TNNet.RoutingEntropyReport(NN, Probe);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('RoutingEntropyReport', Report) > 0);
+    AssertTrue('Occupancy section present', Pos('OCCUPANCY', Report) > 0);
+    AssertTrue('Gate-entropy section present', Pos('BINARY ENTROPY', Report) > 0);
+    AssertTrue('Effective-leaf-count section present',
+      Pos('EFFECTIVE-LEAF-COUNT', Report) > 0);
+  finally
+    Probe.Free;
+    NN.Free;
   end;
 end;
 

@@ -11153,6 +11153,34 @@ type
         yMax: TNeuralFloat = 0;
         EmitCsv: boolean = False
       ): string;
+      // Forward-only routing-introspection diagnostic for the first
+      // TNNetSoftDecisionTree layer in NN. Recomputes — over the supplied probe
+      // batch — the inner-gate probabilities p_i = sigmoid(beta*(w_i.x+b_i)) and
+      // the per-leaf root->leaf path probabilities P_l (the same heap-layout
+      // product the layer's Compute uses), then reports three views of how the
+      // soft tree actually ROUTES the batch:
+      //   (1) PER-LEAF OCCUPANCY = mean P_l over the batch, as ASCII bars — is
+      //       the tree spreading mass over all 2^D leaves or collapsing onto a
+      //       few? (a near-uniform 1/2^D row = balanced; one tall bar = the tree
+      //       degenerated to a single leaf).
+      //   (2) AVERAGE PER-GATE BINARY ENTROPY
+      //       H(p_i) = -p_i*log2(p_i) - (1-p_i)*log2(1-p_i) in [0,1] bits, per
+      //       gate (ASCII bars) and overall mean — are the splits CRISP (H~0,
+      //       p near 0 or 1) or MUSHY/undecided (H~1, p near 0.5)?
+      //   (3) AVERAGE PER-SAMPLE EFFECTIVE-LEAF-COUNT
+      //       exp(-sum_l P_l*ln P_l) (the perplexity of the per-sample leaf
+      //       distribution), in [1, 2^D]: 1 = decisive routing to a single leaf,
+      //       2^D = maximally diffuse.
+      // Probe is a TNNetVolumeList of inputs (only the inputs are read; any
+      // targets are ignored). Pure forward only: it runs NN.Compute per sample
+      // and reads the tree's gate/leaf weights — no backward pass, no weight
+      // updates, no new layer type. Guards nil NN / empty probe / no
+      // TNNetSoftDecisionTree present gracefully (returns a clear message,
+      // never crashes).
+      class function RoutingEntropyReport(
+        NN: TNNet;
+        Probe: TNNetVolumeList
+      ): string;
       function GetWeightSum(): TNeuralFloat;
       function GetBiasSum(): TNeuralFloat;
       function GetInertiaSum(): TNeuralFloat;
@@ -66489,6 +66517,204 @@ begin
   finally
     if InVol <> nil then InVol.Free;
     if OutVol <> nil then OutVol.Free;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.RoutingEntropyReport(
+  NN: TNNet;
+  Probe: TNNetVolumeList
+): string;
+const
+  cEps = 1e-12;
+  cBarW = 40;
+var
+  Lines: TStringList;
+  LayerIdx, TreeIdx: integer;
+  Tree: TNNetSoftDecisionTree;
+  Layer: TNNetLayer;
+  D, NumInner, NumLeaves, InSize, BatchN: integer;
+  Beta: TNeuralFloat;
+  PrevOut: TNNetVolume;
+  i, l, level, node, bit, s: integer;
+  zi, pp, prob, hh, plv: TNeuralFloat;
+  // Per-gate p_i for the current sample, plus batch accumulators.
+  GateP: array of TNeuralFloat;
+  LeafProb: array of TNeuralFloat;
+  SumLeafProb: array of Double;     // running sum of P_l for occupancy.
+  SumGateEntropy: array of Double;  // running sum of H(p_i) per gate.
+  SumEffLeaves: Double;             // running sum of per-sample eff-leaf-count.
+  MaxOcc, OverallGateH: TNeuralFloat;
+  effLeaves, sampleNegEntropy: TNeuralFloat;
+  BarLen: integer;
+  Bar: string;
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  try
+    if NN = nil then
+    begin
+      Result := 'RoutingEntropyReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Probe = nil) or (Probe.Count = 0) then
+    begin
+      Result := 'RoutingEntropyReport: Probe is nil or empty.' + sLineBreak;
+      Exit;
+    end;
+    if NN.GetLastLayerIdx() < 0 then
+    begin
+      Result := 'RoutingEntropyReport: NN has no layers.' + sLineBreak;
+      Exit;
+    end;
+
+    // Locate the first TNNetSoftDecisionTree layer.
+    Tree := nil;
+    TreeIdx := -1;
+    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerIdx];
+      if Layer is TNNetSoftDecisionTree then
+      begin
+        Tree := TNNetSoftDecisionTree(Layer);
+        TreeIdx := LayerIdx;
+        Break;
+      end;
+    end;
+    if Tree = nil then
+    begin
+      Result := 'RoutingEntropyReport: no TNNetSoftDecisionTree layer found ' +
+        'in NN.' + sLineBreak;
+      Exit;
+    end;
+    if Tree.PrevLayer = nil then
+    begin
+      Result := 'RoutingEntropyReport: the TNNetSoftDecisionTree layer has no ' +
+        'previous layer.' + sLineBreak;
+      Exit;
+    end;
+
+    D := Tree.TreeDepth;
+    NumInner := Tree.InnerCount;    // 2^D - 1
+    NumLeaves := Tree.LeafCount;    // 2^D
+    InSize := Tree.PrevLayer.Output.Size;
+    Beta := Tree.Beta;
+    BatchN := Probe.Count;
+
+    SetLength(GateP, NumInner);
+    SetLength(LeafProb, NumLeaves);
+    SetLength(SumLeafProb, NumLeaves);
+    SetLength(SumGateEntropy, NumInner);
+    for i := 0 to NumInner - 1 do SumGateEntropy[i] := 0;
+    for l := 0 to NumLeaves - 1 do SumLeafProb[l] := 0;
+    SumEffLeaves := 0;
+
+    // ---- Recompute routing over the probe batch (forward only). ----
+    for s := 0 to BatchN - 1 do
+    begin
+      NN.Compute(Probe[s]);
+      PrevOut := Tree.PrevLayer.Output;
+
+      // Inner-gate probabilities p_i = sigmoid(beta*(w_i.x + b_i)).
+      for i := 0 to NumInner - 1 do
+      begin
+        zi := Tree.Neurons[i].Weights.DotProduct(PrevOut) +
+              Tree.Neurons[i].BiasWeight;
+        pp := 1.0 / (1.0 + Exp(-Beta * zi));
+        GateP[i] := pp;
+        // Binary entropy H(p_i) in bits (clamped to avoid log(0)).
+        if (pp <= cEps) or (pp >= 1.0 - cEps) then
+          hh := 0
+        else
+          hh := -pp * Ln(pp) / Ln(2.0) - (1.0 - pp) * Ln(1.0 - pp) / Ln(2.0);
+        SumGateEntropy[i] := SumGateEntropy[i] + hh;
+      end;
+
+      // Per-leaf path probability (same heap layout as Compute: MSB = root,
+      // bit=0 -> left -> factor p_i, bit=1 -> right -> 1-p_i).
+      sampleNegEntropy := 0;
+      for l := 0 to NumLeaves - 1 do
+      begin
+        prob := 1.0;
+        node := 0;
+        for level := D - 1 downto 0 do
+        begin
+          bit := (l shr level) and 1;
+          pp := GateP[node];
+          if bit = 0 then
+          begin
+            prob := prob * pp;
+            node := 2 * node + 1;
+          end
+          else
+          begin
+            prob := prob * (1.0 - pp);
+            node := 2 * node + 2;
+          end;
+        end;
+        LeafProb[l] := prob;
+        SumLeafProb[l] := SumLeafProb[l] + prob;
+        // Accumulate sum_l P_l*ln P_l for this sample's effective-leaf-count.
+        if prob > cEps then
+          sampleNegEntropy := sampleNegEntropy + prob * Ln(prob);
+      end;
+      // Effective leaf count = exp(-sum_l P_l*ln P_l).
+      effLeaves := Exp(-sampleNegEntropy);
+      SumEffLeaves := SumEffLeaves + effLeaves;
+    end;
+
+    // ---- Header. ----
+    Lines.Add(Format(
+      'RoutingEntropyReport: TNNetSoftDecisionTree at layer %d ' +
+      '(depth D=%d, %d inner gate(s), %d leaves, beta=%g, Din=%d).',
+      [TreeIdx, D, NumInner, NumLeaves, Beta, InSize]));
+    Lines.Add(Format('Probe batch: %d sample(s). Forward-only (no weight ' +
+      'updates).', [BatchN]));
+    Lines.Add('');
+
+    // ---- (1) Per-leaf occupancy = mean P_l over the batch. ----
+    MaxOcc := 0;
+    for l := 0 to NumLeaves - 1 do
+      if (SumLeafProb[l] / BatchN) > MaxOcc then MaxOcc := SumLeafProb[l] / BatchN;
+    Lines.Add(Format('(1) Per-leaf OCCUPANCY = mean P_l over the batch ' +
+      '(uniform = %.4f). Are all %d leaves used?', [1.0 / NumLeaves, NumLeaves]));
+    for l := 0 to NumLeaves - 1 do
+    begin
+      plv := SumLeafProb[l] / BatchN;
+      if MaxOcc > cEps then
+        BarLen := Round((plv / MaxOcc) * cBarW)
+      else
+        BarLen := 0;
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  leaf %3d | occ=%.4f | %s', [l, plv, Bar]));
+    end;
+    Lines.Add('');
+
+    // ---- (2) Average per-gate binary entropy. ----
+    OverallGateH := 0;
+    for i := 0 to NumInner - 1 do
+      OverallGateH := OverallGateH + (SumGateEntropy[i] / BatchN);
+    if NumInner > 0 then OverallGateH := OverallGateH / NumInner;
+    Lines.Add(Format('(2) Average per-gate BINARY ENTROPY H(p_i) in bits ' +
+      '[0=crisp split, 1=mushy/undecided]. Overall mean = %.4f.',
+      [OverallGateH]));
+    for i := 0 to NumInner - 1 do
+    begin
+      hh := SumGateEntropy[i] / BatchN;
+      BarLen := Round(hh * cBarW); // H in [0,1] maps directly to the bar.
+      Bar := StringOfChar('#', BarLen);
+      Lines.Add(Format('  gate %3d | H=%.4f | %s', [i, hh, Bar]));
+    end;
+    Lines.Add('');
+
+    // ---- (3) Average per-sample effective-leaf-count. ----
+    effLeaves := SumEffLeaves / BatchN;
+    Lines.Add(Format('(3) Average per-sample EFFECTIVE-LEAF-COUNT ' +
+      'exp(-sum_l P_l*ln P_l) = %.4f (1=decisive single-leaf routing, ' +
+      'up to %d=maximally diffuse).', [effLeaves, NumLeaves]));
+
+    Result := Lines.Text;
+  finally
     Lines.Free;
   end;
 end;

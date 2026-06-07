@@ -67,12 +67,32 @@ Tree parameters: 37   MLP parameters: 37 (matched)
     node 2: p(left)=0.084 -> RIGHT
     node 6: p(left)=0.979 -> LEFT
     => dominant leaf 6, logits [-1.619,  1.475]
+
+=== Batch routing statistics (RoutingEntropyReport) ===
+RoutingEntropyReport: TNNetSoftDecisionTree at layer 1 (depth D=3, 7 inner gate(s), 8 leaves, beta=2, Din=2).
+Probe batch: 256 sample(s). Forward-only (no weight updates).
+
+(1) Per-leaf OCCUPANCY = mean P_l over the batch (uniform = 0.1250). Are all 8 leaves used?
+  leaf   0 | occ=0.3084 | ########################################
+  ...
+(2) Average per-gate BINARY ENTROPY H(p_i) in bits [0=crisp split, 1=mushy/undecided]. Overall mean = 0.5117.
+  gate   0 | H=0.4104 | ################
+  ...
+(3) Average per-sample EFFECTIVE-LEAF-COUNT exp(-sum_l P_l*ln P_l) = 2.3613 (1=decisive single-leaf routing, up to 8=maximally diffuse).
 ```
 
 At matched capacity the soft tree ties or beats the MLP on this toy **and** —
 unlike the MLP — exposes a **human-readable decision path**: which gate sends the
 point left/right, with what confidence, down to the dominant leaf and its class
 logits. (Exact numbers vary slightly with the RNG seed.)
+
+The final block is the batch-level statistical companion to that single-point
+path: `TNNet.RoutingEntropyReport` recomputes the gates and per-leaf path
+probabilities over a whole probe batch and summarises **leaf occupancy** (are all
+`2^D` leaves used or has the tree collapsed onto a few?), **per-gate binary
+entropy** (are splits crisp ≈0 or mushy ≈1?), and the **average effective leaf
+count** `exp(-sum_l P_l ln P_l)` (1 = decisive single-leaf routing, up to `2^D` =
+maximally diffuse). Forward-only — it never touches the weights.
 
 ## Build & run
 
