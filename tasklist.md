@@ -1272,16 +1272,6 @@ rather than acted on.
       end-to-end on a real SimpleImage-style CNN, not just an MLP. Reuse the
       conv Compute's patch-iteration; assert conservation residual stays O(eps)
       on a tiny conv probe in the smoke test.
-- [X] LRPReport follow-up: gamma-rule and alpha-beta (LRP-αβ) variants LANDED
-      2026-06-07 on a2 (commit ae72870). TLRPRule=(lrpEpsilon,lrpGamma,lrpAlphaBeta)
-      enum + new Rule/Gamma/Alpha params on TNNet.LRPReport (epsilon stays the
-      DEFAULT so existing callers unchanged); gamma uses effective weight
-      w+gamma*w+, alpha-beta splits positive/negative contributions with
-      beta=alpha-1. TestLRPReportSmoke extended (asserts default still epsilon +
-      conservation < 0.1 for gamma/alpha-beta on the tiny probe); examples/LRP
-      gained a rule-contrast arm + README note. Full suite 1308 green.
-      STILL OPEN (separate task above): the CONV relevance rule — gamma/alpha-beta
-      here, like epsilon, only back-distribute through the dense+activation stack.
 - [ ] TNNetCosineSimilarityAttention bake-off (now easier — learnable scale
       landed 2026-06-05): plain SDPA vs cosine-attn (fixed scale) vs cosine-attn
       (learnable scale) vs SDPA+TNNetSoftCapping on the PositionEncodingBakeoff
@@ -1415,61 +1405,15 @@ rather than acted on.
 
 
 ### Normalizing flows (exact-likelihood generative density)
-- [X] `TNNetActNorm` — Glow's data-dependent activation normalization LANDED
-      2026-06-07 on a2 (commit 61bd331): per-channel invertible affine y=s*x+b
-      (s=exp(logs)), lazy data-dependent init (logs=-ln std, b=-mean/std) guarded
-      by FStruct[1], public LogDetJacobian=SizeX*SizeY*Σlogs, Inverse path
-      x=(z-b)/s, backward into logs+b+input, 6 numerical-gradient/init/inverse/
-      serialization tests (full suite 1308 green). Completes the canonical Glow
-      trio ActNorm -> Invertible1x1Conv -> AffineCoupling.
-      OPEN follow-up: upgrade examples/NormalizingFlow/ to the FULL Glow step
+- [ ] Glow full-step example follow-up (the three flow primitives ActNorm ->
+      TNNetInvertible1x1Conv -> TNNetAffineCoupling have all landed): upgrade
+      examples/NormalizingFlow/ to the FULL Glow step
       (ActNorm -> Invertible1x1Conv -> AffineCoupling). BLOCKER: that harness
       computes one sample at a time (input (1,1,2), a single spatial position per
       forward), so ActNorm's minibatch data-dependent init sees std~0 and logs
       blows up. Needs a batched/multi-position warm-up forward before training;
-      keep it under the <5-min / numerical-stability budget.
-      Original spec retained below for reference:
-      (Kingma & Dhariwal 2018, arXiv:1807.03039, sec. 3.1), the THIRD and final
-      missing Glow flow primitive that completes the canonical flow step trio
-      already half-landed here: ActNorm -> `TNNetInvertible1x1Conv` ->
-      `TNNetAffineCoupling`. ActNorm is a per-channel invertible affine
-      transform y[.,.,c] = s[c] * x[.,.,c] + b[c] with a learnable scale s and
-      bias b, initialised so that the FIRST forward minibatch is made per-channel
-      zero-mean / unit-variance (data-dependent init), after which s,b are free
-      trainable parameters. Why it is genuinely distinct from every existing
-      layer (NOT a near-duplicate — checked the normalization cheat sheet in
-      docs/normalization.md):
-      - it is INVERTIBLE with a tractable, CHEAP log-det = H*W*sum(log|s[c]|)
-        (one term per channel, summed over spatial positions), which none of the
-        existing normalizers (`TNNetChannelStdNormalization`, `TNNetGroupNorm`,
-        `TNNetInstanceNorm`, `TNNetMovingStdNormalization`, ...) expose — they
-        normalize but have NO inverse path and NO log-det, so they cannot sit
-        inside a flow's exact-likelihood NLL;
-      - unlike batch/instance/group norm it does NOT recompute statistics from the
-        activations on every forward — after the one-shot init the affine params
-        are ordinary weights (so it behaves identically at train and sample time,
-        which is exactly the property a flow needs);
-      - it is the per-position scalar special case that the channel-MIXING
-        `TNNetInvertible1x1Conv` (full C x C) and the SPLIT-conditioned
-        `TNNetAffineCoupling` deliberately leave out; the three compose into the
-        real Glow block.
-      Mechanism + design notes (mirror the two landed flow layers):
-      - store s as log-scale to keep s strictly non-zero (parametrize
-        s = exp(logs)); init logs and b lazily on the first forward pass from the
-        batch per-channel mean/std (guard with an "initialised" flag in FStruct so
-        re-init does not fire on reload), then treat logs,b as trainable;
-      - expose a read-only `LogDetJacobian` = H*W*sum(logs) summed over the batch
-        position count for the current forward, additively composable with
-        `TNNetAffineCoupling.LogDetJacobian` / `TNNetInvertible1x1Conv.LogDetJacobian`;
-      - add an `Inverse` (sampling) forward path z -> x = (z - b)/s reusing the
-        same logs,b (trivial, no solve needed);
-      - gradient-check forward over logs AND b, verify forward o inverse is the
-        identity to tolerance, verify the data-dependent init really yields
-        per-channel ~0 mean / ~1 var on the init batch, and serialization
-        round-trip (FStruct carries C + the initialised flag);
-      - then upgrade `examples/NormalizingFlow/` to the FULL Glow step
-        ActNorm -> Invertible1x1Conv -> AffineCoupling and show the added
-        data-dependent normalization improves training stability / mean
-        log-likelihood over the current two-layer flow (the Invertible1x1Conv
-        note already records "glow training unstable at coupling LR" — ActNorm is
-        precisely the paper's fix for that instability).
+      keep it under the <5-min / numerical-stability budget. Show the added
+      data-dependent normalization improves training stability / mean
+      log-likelihood over the current two-layer flow (the Invertible1x1Conv note
+      records "glow training unstable at coupling LR" — ActNorm is the paper's
+      fix for that instability).
