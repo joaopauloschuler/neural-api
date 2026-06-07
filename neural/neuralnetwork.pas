@@ -5297,6 +5297,67 @@ type
       property LogDetLossWeight: TNeuralFloat read FLogDetLossWeight write FLogDetLossWeight;
   end;
 
+  /// TNNetInvertible1x1Conv: Glow's LEARNABLE invertible 1x1 convolution
+  // (Kingma & Dhariwal 2018 "Glow", arXiv:1807.03039 sec. 3.2). A learnable
+  // C x C matrix W is applied per spatial position across the Depth axis,
+  //   y[x,y,:] = W * x[x,y,:],
+  // a trainable generalization of the FIXED channel permutation that the
+  // companion TNNetAffineCoupling relies on to mix channels. This is the
+  // channel-mixing half of a real Glow step. Distinct from TNNetHouseholderLinear
+  // (exactly ORTHOGONAL, log-det identically 0 -> zero volume change) and from
+  // TNNetPointwiseConvLinear (generic 1x1 conv with no tractable inverse/log-det).
+  //
+  // W is NOT stored directly: it is parametrized by its LU decomposition
+  //   W = P * L * (U + diag(s))
+  // with P a FIXED permutation chosen at init (regenerated deterministically from
+  // a stored seed), L unit-lower-triangular (trainable strictly-below-diagonal
+  // entries), U strictly-upper-triangular (trainable strictly-above-diagonal
+  // entries), and s the log-scale vector (the diagonal, trainable). With this
+  // factorization the per-position log-determinant is the CHEAP sum(log|s|) over
+  // channels (O(C)) instead of a full O(C^3) determinant every step.
+  //
+  // Forward applies W in stages per position: t1 = (U+diag(s))*x ; t2 = L*t1 ;
+  // y = P*t2. The Inverse (sampling) map z -> x reuses the SAME L/U/s by
+  // triangular solves (no explicit matrix inverse): t2 = P^T*z ; solve L*t1 = t2
+  // (forward substitution, unit diagonal) ; solve (U+diag(s))*x = t1 (back
+  // substitution). log|det J| = SizeX*SizeY * sum(log|s|), exposed as the public
+  // read-only LogDetJacobian (sum for the current forward) so a flow's NLL
+  // composes additively with the coupling layers' log-dets.
+  //
+  // Two neurons carry the trainable parameters: neuron 0 = the packed (C,1,C) LU
+  // matrix LUm with LUm[i][j]=U[i][j] for j>i, LUm[i][j]=L[i][j] for j<i (the
+  // diagonal LUm[i][i] is unused -> implicit L_ii=1, U_ii=0); neuron 1 = the
+  // (C,1,1) log-scale vector s. Both round-trip via the standard per-neuron save.
+  // FStruct[0]=C, FStruct[1]=permutation seed, FStruct[2]=inverse flag (0/1).
+  // Coded by Claude (AI).
+  TNNetInvertible1x1Conv = class(TNNetLayer)
+    private
+      FC: integer;            // channel count (== Depth)
+      FPermSeed: integer;     // seed the fixed permutation P is regenerated from
+      FInverse: boolean;      // true: run the sampling map z -> x
+      FLogDet: TNeuralFloat;  // SizeX*SizeY*sum(log|s|) over the last forward
+      FLogDetLossWeight: TNeuralFloat; // coef of d(-logdet)/dparams folded into backward (ML=1)
+      FPerm: array of integer;     // P: y_row = FPerm[t2_row]  (forward permutation)
+      FInvPerm: array of integer;  // P^-1: FInvPerm[FPerm[i]] = i
+      FT1: TNNetVolume;       // cached (U+diag(s))*x per position, (SizeX,SizeY,C)
+      FT2: TNNetVolume;       // cached L*t1 per position, (SizeX,SizeY,C)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure BuildPermutation();
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInverse: boolean; pPermSeed: integer = 0); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property LogDetJacobian: TNeuralFloat read FLogDet;
+      property Inverse: boolean read FInverse;
+      // Weight of the -logdet term folded into backward so a single ML loss
+      // 0.5*||z||^2 trains the matrix end to end. Default 1.0; set 0.0 to
+      // gradient-check the pure transform with no log-det contribution.
+      property LogDetLossWeight: TNeuralFloat read FLogDetLossWeight write FLogDetLossWeight;
+  end;
+
   /// TNNetTestTimeTraining: the Test-Time Training (TTT) sequence-mixing layer
   // (Sun et al. 2024, "Learning to (Learn at Test Time): RNNs with Expressive
   // Hidden States", arXiv:2407.04620). The recurrent hidden STATE is itself a
@@ -33113,6 +33174,287 @@ begin
     FNeurons[r].FBiasDelta := 0;
     FNeurons[r].FBiasInertia := 0;
   end;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetInvertible1x1Conv }
+constructor TNNetInvertible1x1Conv.Create();
+begin
+  Create(false, 0);
+end;
+
+constructor TNNetInvertible1x1Conv.Create(pInverse: boolean; pPermSeed: integer = 0);
+begin
+  inherited Create();
+  FInverse := pInverse;
+  FPermSeed := pPermSeed;
+  FC := 0;
+  FLogDet := 0;
+  FLogDetLossWeight := 1.0;
+  FStruct[0] := 0;
+  FStruct[1] := FPermSeed;
+  FStruct[2] := Ord(FInverse);
+  FT1 := TNNetVolume.Create();
+  FT2 := TNNetVolume.Create();
+end;
+
+destructor TNNetInvertible1x1Conv.Destroy();
+begin
+  FT2.Free;
+  FT1.Free;
+  inherited Destroy();
+end;
+
+// Builds the FIXED permutation P deterministically from FPermSeed via a
+// Fisher-Yates shuffle, so it round-trips through save/load (only the seed and C
+// are persisted, not the permutation array).
+procedure TNNetInvertible1x1Conv.BuildPermutation();
+var
+  i, swapIdx, tmp, oldSeed: integer;
+begin
+  SetLength(FPerm, FC);
+  SetLength(FInvPerm, FC);
+  for i := 0 to FC - 1 do FPerm[i] := i;
+  oldSeed := RandSeed;
+  RandSeed := 271828 + FPermSeed;
+  for i := FC - 1 downto 1 do
+  begin
+    swapIdx := Random(i + 1);
+    tmp := FPerm[i]; FPerm[i] := FPerm[swapIdx]; FPerm[swapIdx] := tmp;
+  end;
+  RandSeed := oldSeed;
+  for i := 0 to FC - 1 do FInvPerm[FPerm[i]] := i;
+end;
+
+procedure TNNetInvertible1x1Conv.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FC := pPrevLayer.FOutput.Depth;
+  if FC < 2 then
+    FErrorProc('TNNetInvertible1x1Conv requires Depth>=2, got Depth=' +
+      IntToStr(FC));
+  FStruct[0] := FC;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, FC);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // Neuron 0 = packed LU matrix (C,1,C); neuron 1 = log-scale vector s (C,1,1).
+  if FNeurons.Count < 2 then AddMissingNeurons(2 - FNeurons.Count);
+  FNeurons[0].FWeights.ReSize(FC, 1, FC);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FNeurons[1].FWeights.ReSize(FC, 1, 1);
+  FNeurons[1].FDelta.ReSize(FNeurons[1].FWeights);
+  FNeurons[1].FBackInertia.ReSize(FNeurons[1].FWeights);
+  FT1.ReSize(FOutput.SizeX, FOutput.SizeY, FC);
+  FT2.ReSize(FOutput.SizeX, FOutput.SizeY, FC);
+  BuildPermutation();
+  InitDefault();
+end;
+
+// LUm[i][j] for i = row (output channel), j = column (input channel), stored as
+// FWeights.Get(j, 0, i) so that the i-th row is contiguous in the C-block.
+// Helpers below index it as Ptr := FWeights.GetRawPtr(0,0,i)^[j].
+procedure TNNetInvertible1x1Conv.Compute();
+var
+  StartTime: double;
+  SizeX, SizeY, x, y, i, j: integer;
+  acc, sumLogS, sval: TNeuralFloat;
+  InPtr, OutPtr, T1Ptr, T2Ptr, SPtr, LURow: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  SPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
+  sumLogS := 0;
+  for i := 0 to FC - 1 do sumLogS := sumLogS + Ln(Abs(SPtr^[i]) + 1e-12);
+  FLogDet := 0;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+    begin
+      InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+      OutPtr := FOutput.GetRawPtr(x, y, 0);
+      T1Ptr := FT1.GetRawPtr(x, y, 0);
+      T2Ptr := FT2.GetRawPtr(x, y, 0);
+      if not FInverse then
+      begin
+        // Forward: y = P * L * (U + diag(s)) * x.
+        // t1 = (U + diag(s)) * x : U strictly upper, diag = s.
+        for i := 0 to FC - 1 do
+        begin
+          LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+          acc := SPtr^[i] * InPtr^[i];
+          for j := i + 1 to FC - 1 do acc := acc + LURow^[j] * InPtr^[j];
+          T1Ptr^[i] := acc;
+        end;
+        // t2 = L * t1 : L unit-lower (diag implicit 1).
+        for i := 0 to FC - 1 do
+        begin
+          LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+          acc := T1Ptr^[i];
+          for j := 0 to i - 1 do acc := acc + LURow^[j] * T1Ptr^[j];
+          T2Ptr^[i] := acc;
+        end;
+        // y = P * t2 : output row FPerm[i] gets t2[i].
+        for i := 0 to FC - 1 do OutPtr^[FPerm[i]] := T2Ptr^[i];
+        FLogDet := FLogDet + sumLogS;
+      end
+      else
+      begin
+        // Inverse (sampling): x = (U+diag(s))^-1 * L^-1 * P^T * z.
+        // t2 = P^T * z : t2[i] = z[FPerm[i]].
+        for i := 0 to FC - 1 do T2Ptr^[i] := InPtr^[FPerm[i]];
+        // Solve L * t1 = t2 (forward substitution, unit diagonal).
+        for i := 0 to FC - 1 do
+        begin
+          LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+          acc := T2Ptr^[i];
+          for j := 0 to i - 1 do acc := acc - LURow^[j] * T1Ptr^[j];
+          T1Ptr^[i] := acc;
+        end;
+        // Solve (U + diag(s)) * x = t1 (back substitution).
+        for i := FC - 1 downto 0 do
+        begin
+          LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+          acc := T1Ptr^[i];
+          for j := i + 1 to FC - 1 do acc := acc - LURow^[j] * OutPtr^[j];
+          sval := SPtr^[i];
+          if Abs(sval) < 1e-12 then
+          begin
+            if sval < 0 then sval := -1e-12 else sval := 1e-12;
+          end;
+          OutPtr^[i] := acc / sval;
+        end;
+      end;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetInvertible1x1Conv.Backpropagate();
+var
+  StartTime: double;
+  SizeX, SizeY, x, y, i, j: integer;
+  hasInputGrad: boolean;
+  gt1, gt2, gx, sval: TNeuralFloat;
+  InPtr, GyPtr, PrevErrPtr, T1Ptr, SPtr, LURow, dLURow, dSPtr: TNeuralFloatArrPtr;
+  gT1Arr, gT2Arr: array of TNeuralFloat;
+  lr: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // Backprop is defined for the FORWARD map only (training a flow runs forward).
+  if FInverse then
+  begin
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+    exit;
+  end;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  lr := FLearningRate;
+  SPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
+  dSPtr := FNeurons[1].FDelta.GetRawPtr(0, 0, 0);
+  SetLength(gT1Arr, FC);
+  SetLength(gT2Arr, FC);
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErrPtr := nil;
+  // -logdet term: d(-SizeX*SizeY*sum(log|s|))/ds_i = -SizeX*SizeY/s_i, folded in
+  // once (it does not depend on the per-position data).
+  if FLogDetLossWeight <> 0 then
+    for i := 0 to FC - 1 do
+    begin
+      sval := SPtr^[i];
+      if Abs(sval) < 1e-12 then
+      begin
+        if sval < 0 then sval := -1e-12 else sval := 1e-12;
+      end;
+      dSPtr^[i] := dSPtr^[i] + (-lr) * (-FLogDetLossWeight * SizeX * SizeY / sval);
+    end;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+    begin
+      InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+      GyPtr := FOutputError.GetRawPtr(x, y, 0);
+      T1Ptr := FT1.GetRawPtr(x, y, 0);
+      if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y, 0);
+      // y = P * t2 -> dL/dt2[i] = dL/dy[FPerm[i]].
+      for i := 0 to FC - 1 do gT2Arr[i] := GyPtr^[FPerm[i]];
+      // t2 = L * t1 ; t2[i] = t1[i] + sum_{j<i} L[i][j]*t1[j].
+      // dL/dt1[j] = gT2[j] + sum_{i>j} gT2[i]*L[i][j] ; dL/dL[i][j] = gT2[i]*t1[j].
+      for j := 0 to FC - 1 do gT1Arr[j] := gT2Arr[j];
+      for i := 0 to FC - 1 do
+      begin
+        LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+        dLURow := FNeurons[0].FDelta.GetRawPtr(0, 0, i);
+        gt2 := gT2Arr[i];
+        for j := 0 to i - 1 do
+        begin
+          gT1Arr[j] := gT1Arr[j] + gt2 * LURow^[j];
+          dLURow^[j] := dLURow^[j] + (-lr) * gt2 * T1Ptr^[j];
+        end;
+      end;
+      // t1 = (U + diag(s)) * x ; t1[i] = s[i]*x[i] + sum_{j>i} U[i][j]*x[j].
+      // dL/dx[j] = gT1[j]*s[j] + sum_{i<j} gT1[i]*U[i][j].
+      // dL/ds[i] = gT1[i]*x[i] ; dL/dU[i][j] = gT1[i]*x[j] (j>i).
+      for i := 0 to FC - 1 do
+      begin
+        LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+        dLURow := FNeurons[0].FDelta.GetRawPtr(0, 0, i);
+        gt1 := gT1Arr[i];
+        dSPtr^[i] := dSPtr^[i] + (-lr) * gt1 * InPtr^[i];
+        if hasInputGrad then
+        begin
+          gx := gt1 * SPtr^[i];
+          PrevErrPtr^[i] := PrevErrPtr^[i] + gx;
+        end;
+        for j := i + 1 to FC - 1 do
+        begin
+          dLURow^[j] := dLURow^[j] + (-lr) * gt1 * InPtr^[j];
+          if hasInputGrad then
+            PrevErrPtr^[j] := PrevErrPtr^[j] + gt1 * LURow^[j];
+        end;
+      end;
+    end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetInvertible1x1Conv.InitDefault();
+var
+  i, j, oldSeed: integer;
+  LURow: TNeuralFloatArrPtr;
+begin
+  if FNeurons.Count < 2 then exit;
+  if FC < 1 then exit;
+  oldSeed := RandSeed;
+  RandSeed := 161803;
+  // Small random L (strictly lower) and U (strictly upper); s = 1 -> near-identity
+  // (W = P at init, log-det = 0).
+  FNeurons[0].FWeights.Fill(0);
+  for i := 0 to FC - 1 do
+  begin
+    LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
+    for j := 0 to FC - 1 do
+      if j <> i then
+        LURow^[j] := FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
+  end;
+  for i := 0 to FC - 1 do FNeurons[1].FWeights.FData[i] := 1.0;
+  FNeurons[0].FDelta.Fill(0);
+  FNeurons[0].FBackInertia.Fill(0);
+  FNeurons[0].FBiasWeight := 0; FNeurons[0].FBiasDelta := 0; FNeurons[0].FBiasInertia := 0;
+  FNeurons[1].FDelta.Fill(0);
+  FNeurons[1].FBackInertia.Fill(0);
+  FNeurons[1].FBiasWeight := 0; FNeurons[1].FBiasDelta := 0; FNeurons[1].FBiasInertia := 0;
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -76282,6 +76624,7 @@ begin
       'TNNetWKV':                   Result := TNNetWKV.Create();
       'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0], St[1] = 1);
       'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
+      'TNNetInvertible1x1Conv':     Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]);
       'TNNetTestTimeTraining':      Result := TNNetTestTimeTraining.Create(St[1], St[2]);
       'TNNetTitansMemory':          Result := TNNetTitansMemory.Create(St[2]);
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
@@ -76644,6 +76987,7 @@ begin
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
       if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0], St[1] = 1) else
       if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
+      if S[0] = 'TNNetInvertible1x1Conv' then Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]) else
       if S[0] = 'TNNetTestTimeTraining' then Result := TNNetTestTimeTraining.Create(St[1], St[2]) else
       if S[0] = 'TNNetTitansMemory' then Result := TNNetTitansMemory.Create(St[2]) else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else

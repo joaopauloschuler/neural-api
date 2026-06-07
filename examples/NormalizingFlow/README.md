@@ -2,7 +2,10 @@
 
 Fits a 2-D **two-moons** density with a small RealNVP/Glow-style
 **normalizing flow** built from stacked `TNNetAffineCoupling` layers — the
-library's first exact-likelihood generative primitive.
+library's first exact-likelihood generative primitive — and shows that
+interleaving the couplings with Glow's **learnable invertible 1x1 convolution**
+(`TNNetInvertible1x1Conv`) reaches a **higher** mean log-likelihood than the
+fixed-permute baseline on the same target.
 
 ## What a flow is
 
@@ -40,14 +43,36 @@ inverse:  x_a = y_a ;  x_b = (y_b - t) * exp(-s)
   flow trains end-to-end under one maximum-likelihood objective by injecting
   only the data-loss gradient `dL/dz = z`.
 
+## The learnable invertible 1x1 convolution (the real Glow step)
+
+The alternating `pTransformSecond` flag is a **fixed** channel permutation — the
+network cannot adapt how channels are mixed. Glow replaces it with a **learnable
+`C x C` matrix `W`** applied per spatial position across the Depth axis,
+`y[x,y,:] = W * x[x,y,:]` (`TNNetInvertible1x1Conv`):
+
+* `W` is parametrized by its LU decomposition `W = P * L * (U + diag(s))` with
+  `P` a **fixed** permutation chosen at init, `L` unit-lower-triangular, `U`
+  strictly-upper-triangular, and `s` the log-scale vector. This makes the
+  per-position log-det the **cheap** `sum(log|s|)` (`O(C)`) instead of a full
+  `O(C^3)` determinant.
+* `LogDetJacobian` returns `SizeX*SizeY*sum(log|s|)` for the current forward, so
+  it composes additively with the couplings' log-dets.
+* The map is exactly invertible via triangular solves (no matrix inverse); pass
+  `pInverse=true` for the sampling direction, reusing the same `L/U/s`.
+
 ## What this example does
 
-1. Builds a forward flow of 6 alternating affine couplings.
-2. Trains by maximum likelihood on two-moons mini-batches (pure SGD, CPU).
-3. Prints the **mean log-likelihood climbing** over training.
-4. Builds the inverse (sampling) flow with the same weights, draws
-   `z ~ N(0, I)`, and pushes them through `z -> x` to **generate** new points on
-   the data manifold.
+1. Builds a **baseline** flow of 6 alternating affine couplings (fixed permute)
+   and a **glow** flow with a learnable `TNNetInvertible1x1Conv` between each
+   consecutive pair of couplings.
+2. Trains both by maximum likelihood on two-moons mini-batches (pure SGD, CPU).
+   The glow flow uses a smaller learning rate plus light weight decay because the
+   unconstrained matrix + the `-1/s` log-det gradient are less forgiving.
+3. Prints the **mean log-likelihood climbing** for each, then reports that the
+   learnable mixing reaches a **higher** final log-likelihood.
+4. Builds the inverse (sampling) flow of the glow model with the same weights,
+   draws `z ~ N(0, I)`, and pushes them through `z -> x` to **generate** new
+   points on the data manifold.
 5. Round-trips real points `x -> z -> x` to confirm exact invertibility.
 
 ## Running
@@ -57,6 +82,7 @@ lazbuild NormalizingFlow.lpi
 ../../bin/x86_64-linux/bin/NormalizingFlow
 ```
 
-Runs in well under a minute on 2 cores. Expected: the mean log-likelihood rises
-from roughly `-2.6` toward `-1.5`, the forward->inverse reconstruction error is
-~0 (exact bijection), and the generated-sample statistics match the data cloud.
+Runs in a few minutes on 2 cores. Expected: both mean log-likelihoods rise from
+roughly `-2.6`, the **glow flow ends higher** than the fixed-permute baseline
+(e.g. `-1.16` vs `-1.56`), the forward->inverse reconstruction error is ~0 (exact
+bijection), and the generated-sample statistics match the data cloud.

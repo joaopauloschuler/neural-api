@@ -441,6 +441,12 @@ type
     procedure TestAffineCouplingInverseIdentity;
     procedure TestAffineCouplingLogDetGradientCheck;
     procedure TestAffineCouplingSerializationRoundTrip;
+    procedure TestInvertible1x1ConvInputGradientCheck;
+    procedure TestInvertible1x1ConvWeightGradientCheck;
+    procedure TestInvertible1x1ConvLogDetGradientCheck;
+    procedure TestInvertible1x1ConvInverseIdentity;
+    procedure TestInvertible1x1ConvLogDetValue;
+    procedure TestInvertible1x1ConvSerializationRoundTrip;
     procedure TestTTTShapeInference;
     procedure TestTTTLinearInputGradientCheck;
     procedure TestTTTLinearWeightGradientCheck;
@@ -24450,6 +24456,296 @@ begin
   // conditioner weights round-trip via the standard per-neuron save.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetAffineCoupling.Create(true, false, 2.0), 'AffineCoupling', 4, 1, 4, 1e-5);
+end;
+
+// --- TNNetInvertible1x1Conv (Glow learnable invertible 1x1 conv) ------------
+
+// Bounded, deterministic L/U/s so exp/log and the inverse triangular solves stay
+// well-conditioned and inside the finite-difference truncation tolerance.
+procedure SeedInvertible1x1Conv(L: TNNetInvertible1x1Conv);
+var i, c, row, col: integer;
+begin
+  c := L.Neurons[1].Weights.Size; // == C
+  // Neuron 0: packed LU matrix stored FWeights.Get(col,0,row).
+  for row := 0 to c - 1 do
+    for col := 0 to c - 1 do
+      if row <> col then
+        L.Neurons[0].Weights.Add(col, 0, row,
+          Sin(row * 0.9 + col * 1.7) * 0.25 - L.Neurons[0].Weights.Get(col, 0, row));
+  // Neuron 1: log-scale vector s, bounded away from 0 in (0.5, 1.5).
+  for i := 0 to c - 1 do
+    L.Neurons[1].Weights.Raw[i] := 1.0 + Sin(i * 1.1) * 0.4;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetInvertible1x1Conv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  InputPlus := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetInvertible1x1Conv.Create(false);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 0; // pure transform check
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedInvertible1x1Conv(L);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Invertible1x1Conv input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('Invertible1x1Conv input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetInvertible1x1Conv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetInvertible1x1Conv.Create(false);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 0; // pure transform check
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedInvertible1x1Conv(L);
+
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('Invertible1x1Conv W gradient n=' + IntToStr(n) + '[' + IntToStr(i) +
+          '] num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('Invertible1x1Conv weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvLogDetGradientCheck;
+// Verifies the -logdet term folded into backward: ML loss = 0.5*||y||^2 - LogDet.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  L: TNNetInvertible1x1Conv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; y: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      y := NN.GetLastLayer.Output.Raw[k];
+      Result := Result + 0.5 * y * y;
+    end;
+    Result := Result - L.LogDetJacobian;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetInvertible1x1Conv.Create(false);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 1.0; // ML objective: -logdet folded into backward
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6 + 0.2;
+    SeedInvertible1x1Conv(L);
+
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Layers[0].OutputError.Fill(0);
+        L.OutputError.Copy(NN.GetLastLayer.Output); // dL/dy = y
+        L.IncDepartingBranchesCnt();
+        L.Backpropagate();
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('Invertible1x1Conv logdet gradient n=' + IntToStr(n) + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('Invertible1x1Conv logdet gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvInverseIdentity;
+// forward then inverse (with identical L/U/s and permutation seed) reconstructs
+// the input to tolerance, proving the map is an exact bijection.
+var
+  NNf, NNi: TNNet;
+  Lf, Li: TNNetInvertible1x1Conv;
+  X, Y: TNNetVolume;
+  i: integer;
+  maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NNf := TNNet.Create();
+  NNi := TNNet.Create();
+  X := TNNetVolume.Create(3, 1, 5);
+  Y := TNNetVolume.Create(3, 1, 5);
+  maxErr := 0;
+  try
+    NNf.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    Lf := TNNetInvertible1x1Conv.Create(false, 7); NNf.AddLayer(Lf);
+    NNi.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    Li := TNNetInvertible1x1Conv.Create(true, 7); NNi.AddLayer(Li); // SAME perm seed
+    SeedInvertible1x1Conv(Lf);
+    // Copy the SAME L/U/s weights into the inverse layer.
+    for i := 0 to Lf.Neurons.Count - 1 do
+      Li.Neurons[i].Weights.Copy(Lf.Neurons[i].Weights);
+    for i := 0 to X.Size - 1 do X.Raw[i] := Sin(i * 0.83) * 1.5 - 0.3;
+    NNf.Compute(X);
+    Y.Copy(NNf.GetLastLayer.Output);
+    NNi.Compute(Y);
+    for i := 0 to X.Size - 1 do
+      if Abs(NNi.GetLastLayer.Output.Raw[i] - X.Raw[i]) > maxErr then
+        maxErr := Abs(NNi.GetLastLayer.Output.Raw[i] - X.Raw[i]);
+    WriteLn('Invertible1x1Conv forward-inverse max reconstruction error: ', maxErr:0:8);
+    AssertTrue('Invertible1x1Conv forward-inverse identity (err=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-4);
+  finally
+    NNf.Free; NNi.Free; X.Free; Y.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvLogDetValue;
+// LogDetJacobian == SizeX*SizeY * sum_i ln|s_i|.
+var
+  NN: TNNet;
+  L: TNNetInvertible1x1Conv;
+  X: TNNetVolume;
+  i, sx, sy: integer;
+  expected, s: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  sx := 3; sy := 2;
+  X := TNNetVolume.Create(sx, sy, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(sx, sy, 4, 1));
+    L := TNNetInvertible1x1Conv.Create(false);
+    NN.AddLayer(L);
+    SeedInvertible1x1Conv(L);
+    for i := 0 to X.Size - 1 do X.Raw[i] := Sin(i * 0.5) * 0.7;
+    NN.Compute(X);
+    expected := 0;
+    for i := 0 to L.Neurons[1].Weights.Size - 1 do
+    begin
+      s := L.Neurons[1].Weights.Raw[i];
+      expected := expected + Ln(Abs(s) + 1e-12);
+    end;
+    expected := expected * sx * sy;
+    WriteLn('Invertible1x1Conv logdet value: got=', L.LogDetJacobian:0:6,
+      ' expected=', expected:0:6);
+    AssertEquals('Invertible1x1Conv LogDetJacobian == SizeX*SizeY*sum(ln|s|)',
+      expected, L.LogDetJacobian, 1e-4);
+  finally
+    NN.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // FStruct[0]=C, FStruct[1]=perm seed, FStruct[2]=inverse flag; L/U/s round-trip
+  // via the standard per-neuron save; the permutation regenerates from the seed.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetInvertible1x1Conv.Create(false, 5), 'Invertible1x1Conv', 4, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestKalmanFilterCellSerializationRoundTrip;
