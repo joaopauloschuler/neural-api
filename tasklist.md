@@ -1017,7 +1017,7 @@ rather than acted on.
 - [ ] "Memorize a sentence" demo: train a 1-layer SDPA+RoPE model to
       perfectly memorize a 32-token sequence, print training loss curve
       and reconstructed sample.
-- [ ] "Learn to reverse" toy: SeqLen=8 input → output the reversed sequence.
+- [X] "Learn to reverse" toy: SeqLen=8 input → output the reversed sequence.
 - [ ] "Smallest net that can learn parity-N" study — sweep N ∈ {2, 4, 6, 8}.
 - [ ] Grokking demo (`examples/Grokking/`) — reproduce delayed generalization
       (Power et al. 2022) on a pure-CPU toy. Train a tiny MLP on modular
