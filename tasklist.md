@@ -131,6 +131,27 @@ rather than acted on.
       contraction constraints so convergence is guaranteed at arbitrary init
       (v1 uses damped Picard + output bounding, not guaranteed).
 
+- [ ] TNNetPonderHalting + TNNet.AddPonderNetBlock (Adaptive Computation Time /
+      PonderNet — a NEW paradigm for the fork: learned PROBABILISTIC halting,
+      distinct from the planned fixed-point DeepEquilibrium and from any fixed-depth
+      block). A weight-tied step function f is applied up to MaxSteps times; at each
+      step a tiny halting head emits lambda_n in (0,1) (sigmoid), giving the
+      geometric halting distribution p_n = lambda_n * prod_{k<n}(1-lambda_k). The
+      block output is the p_n-weighted sum of per-step outputs (so backward stays
+      smooth — no hard argmax). Adds a TNNetPonderCostLoss head: the regularizer is
+      KL(p_n || geometric(prior_lambda)) which pushes the expected number of steps
+      toward a target, plus the usual reconstruction/task loss on the weighted
+      output. Deliverables: leaf halting layer (FStruct holds MaxSteps + prior),
+      the AddPonderNetBlock builder wiring f x MaxSteps with shared weights and the
+      running p_n accumulator, KL ponder-cost loss head, shape/gradient/save-load
+      tests (gradient check on both the weighted output and the KL term), and an
+      examples/PonderNet/ demo on a variable-difficulty toy task (e.g. parity over a
+      variable-length bit string) showing expected-steps RISES with difficulty.
+      Open design Qs to settle in the task: (a) expose halting at INFERENCE as a
+      true early-exit (threshold cumulative p_n) vs always running MaxSteps; (b)
+      whether the per-step output is read from f's hidden state or a separate
+      readout head.
+
 - [ ] TNNetRetention follow-up (layer + TNNet.AddRetention builder +
       examples/RetentionDualForm/ all landed; learnable-gamma variant
       TNNetRetention.Create(d_k, gamma, LearnGamma:=true) — gamma=sigmoid(raw)
