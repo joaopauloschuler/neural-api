@@ -422,6 +422,8 @@ type
     procedure TestGLARecallSmokeTrain;
     procedure TestAddGatedLinearAttentionShape;
     procedure TestAddGatedLinearAttentionInputGradient;
+    procedure TestAddGatedLinearAttentionBlockShape;
+    procedure TestAddGatedLinearAttentionBlockSmokeTrain;
     procedure TestWKVShapeInference;
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
@@ -26276,6 +26278,77 @@ begin
     WriteLn('GLA builder input gradient max abs error: ', maxErr:0:8);
   finally
     NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddGatedLinearAttentionBlockShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i: integer;
+begin
+  // The AddGatedLinearAttentionBlock builder must be shape-preserving over the
+  // (SeqLen,1,d_model) sequence (GLA time-mix residual + SwiGLU FFN residual all
+  // keep the sequence layout) so blocks can be stacked.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6));
+    NN.AddGatedLinearAttentionBlock({d_ff=}12);
+    Out := NN.AddGatedLinearAttentionBlock({d_ff=}12, {PreNorm=}false);
+    AssertEquals('GLA block output SizeX', 5, Out.Output.SizeX);
+    AssertEquals('GLA block output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('GLA block output Depth', 6, Out.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('GLA block computed SizeX', 5, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GLA block computed Depth', 6, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddGatedLinearAttentionBlockSmokeTrain;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end smoke: a tiny sequence regression task on a stacked
+  // AddGatedLinearAttentionBlock tower (GLA time-mix + SwiGLU FFN residuals).
+  // Forward+backward must run and training must reduce the loss.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 6);
+  Desired := TNNetVolume.Create(4, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 6));
+    NN.AddGatedLinearAttentionBlock({d_ff=}12);
+    NN.AddGatedLinearAttentionBlock({d_ff=}12);
+    NN.SetLearningRate(0.01, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+
+    NN.Compute(Input);
+    AssertEquals('GLA block smoke output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GLA block smoke output Depth', 6, NN.GetLastLayer.Output.Depth);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('GLA block training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
   end;
 end;
 

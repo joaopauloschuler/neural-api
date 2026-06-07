@@ -10277,6 +10277,21 @@ type
       // out-projection back to D. Shape-preserving (output == input shape).
       // Returns the out layer.
       function AddGatedLinearAttention(): TNNetLayer;
+      // Composite builder: a full transformer-style BLOCK over a (SeqLen,1,d_model)
+      // sequence (SizeY=1) that wraps the AddGatedLinearAttention time-mixing builder
+      // in a pre/post-norm residual structure plus a token-wise SwiGLU feed-forward
+      // residual, mirroring AddTransformerEncoderBlock but with the self-attention
+      // arm replaced by gated linear attention. Wires two residual sub-blocks:
+      //   1. x := x + GLA(LayerNorm(x))   (time-mixing residual)
+      //   2. x := x + FFN(LayerNorm(x))   token-wise SwiGLU FFN
+      //      (PointwiseConvLinear(2*d_ff) -> TNNetSwiGLU -> PointwiseConvLinear(d_model)).
+      // PreNorm=False places the norm AFTER each residual sum instead. d_model is
+      // inferred from the input depth (GetLastLayer().Output.Depth); the output shape
+      // matches the input so blocks can be stacked. Pointwise (not FullConnect) convs
+      // keep the token axis. NormClass selects the norm class at every norm slot (nil
+      // defaults to TNNetLayerNorm). Returns the last layer. (Coded by Claude (AI).)
+      function AddGatedLinearAttentionBlock(d_ff: integer;
+        PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
       // spiking neural network, over a (T,1,D) spike/feature tensor on the time
       // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
@@ -40904,6 +40919,43 @@ begin
   Gated := AddLayer( TNNetCellMulByCell.Create(RGate, Cell) );
   // (6) Output projection back to D.
   Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Gated );
+end;
+
+function TNNet.AddGatedLinearAttentionBlock(d_ff: integer;
+  PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+  d_model: integer;
+begin
+  if NormClass = nil then NormClass := TNNetLayerNorm;
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddGatedLinearAttentionBlock requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(GetLastLayer().Output.SizeY));
+  // ---- Time-mixing sub-block: residual around gated linear attention. ----
+  // Replicated inline (not via AddPreNormResidual/AddPostNormResidual) because
+  // AddGatedLinearAttention adds MANY layers through GetLastLayer() chaining and
+  // cannot be expressed as a pre-built "array of TNNetLayer".
+  BranchInput := GetLastLayer();
+  d_model := BranchInput.Output.Depth;  // inferred residual-stream width
+  if PreNorm then AddLayer( NormClass.Create() );
+  // Gated linear attention mixer (shape-preserving D->D; owns its q/k/v/forget-gate
+  // projections internally).
+  AddGatedLinearAttention();
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( NormClass.Create() );
+
+  // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( NormClass.Create() );
+  // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
+  // the depth channel-wise, so the inner projection must be 2*d_ff.
+  AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
+  AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( NormClass.Create() );
+
+  Result := GetLastLayer();
 end;
 
 function TNNet.AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;
