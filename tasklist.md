@@ -1260,11 +1260,16 @@ rather than acted on.
       end-to-end on a real SimpleImage-style CNN, not just an MLP. Reuse the
       conv Compute's patch-iteration; assert conservation residual stays O(eps)
       on a tiny conv probe in the smoke test.
-- [ ] LRPReport follow-up: add the gamma-rule and alpha-beta (LRP-αβ) variants
-      alongside the epsilon-rule (selectable via a parameter), which separate
-      positive/negative contributions and are the standard "explanation-quality"
-      upgrade over plain epsilon. Contrast their input-relevance maps vs epsilon
-      on the existing examples/LRP probe.
+- [X] LRPReport follow-up: gamma-rule and alpha-beta (LRP-αβ) variants LANDED
+      2026-06-07 on a2 (commit ae72870). TLRPRule=(lrpEpsilon,lrpGamma,lrpAlphaBeta)
+      enum + new Rule/Gamma/Alpha params on TNNet.LRPReport (epsilon stays the
+      DEFAULT so existing callers unchanged); gamma uses effective weight
+      w+gamma*w+, alpha-beta splits positive/negative contributions with
+      beta=alpha-1. TestLRPReportSmoke extended (asserts default still epsilon +
+      conservation < 0.1 for gamma/alpha-beta on the tiny probe); examples/LRP
+      gained a rule-contrast arm + README note. Full suite 1308 green.
+      STILL OPEN (separate task above): the CONV relevance rule — gamma/alpha-beta
+      here, like epsilon, only back-distribute through the dense+activation stack.
 - [ ] TNNetCosineSimilarityAttention bake-off (now easier — learnable scale
       landed 2026-06-05): plain SDPA vs cosine-attn (fixed scale) vs cosine-attn
       (learnable scale) vs SDPA+TNNetSoftCapping on the PositionEncodingBakeoff
@@ -1398,7 +1403,20 @@ rather than acted on.
 
 
 ### Normalizing flows (exact-likelihood generative density)
-- [ ] `TNNetActNorm` — Glow's data-dependent activation normalization
+- [X] `TNNetActNorm` — Glow's data-dependent activation normalization LANDED
+      2026-06-07 on a2 (commit 61bd331): per-channel invertible affine y=s*x+b
+      (s=exp(logs)), lazy data-dependent init (logs=-ln std, b=-mean/std) guarded
+      by FStruct[1], public LogDetJacobian=SizeX*SizeY*Σlogs, Inverse path
+      x=(z-b)/s, backward into logs+b+input, 6 numerical-gradient/init/inverse/
+      serialization tests (full suite 1308 green). Completes the canonical Glow
+      trio ActNorm -> Invertible1x1Conv -> AffineCoupling.
+      OPEN follow-up: upgrade examples/NormalizingFlow/ to the FULL Glow step
+      (ActNorm -> Invertible1x1Conv -> AffineCoupling). BLOCKER: that harness
+      computes one sample at a time (input (1,1,2), a single spatial position per
+      forward), so ActNorm's minibatch data-dependent init sees std~0 and logs
+      blows up. Needs a batched/multi-position warm-up forward before training;
+      keep it under the <5-min / numerical-stability budget.
+      Original spec retained below for reference:
       (Kingma & Dhariwal 2018, arXiv:1807.03039, sec. 3.1), the THIRD and final
       missing Glow flow primitive that completes the canonical flow step trio
       already half-landed here: ActNorm -> `TNNetInvertible1x1Conv` ->
