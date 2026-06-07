@@ -72,30 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] `TNNetTensorTrain` — a Tensor-Train (Matrix-Product-State) factorized
-      DENSE layer, the next rung of the structured / sub-quadratic weight family
-      after [[kronecker-linear-layer]] (W = A⊗B, a single 2-factor product) and
-      [[monarch-linear-layer]] (two block-diagonal + permutation factors).
-      Factor the (n_in × n_out) weight as a CHAIN of d small 4-D cores
-      G_k ∈ R^{r_{k-1} × m_k × n_k × r_k} with TT-ranks r_0=r_d=1, so the
-      reshaped input tensor is contracted core-by-core left→right
-      (Oseledets 2011, "Tensor-Train Decomposition"; Novikov et al. 2015,
-      "Tensorizing Neural Networks"). Genuinely distinct from Kronecker/Monarch:
-      d>2 cores with a tunable internal rank give a smooth compression↔capacity
-      dial (params ~ d·m·n·r² vs the full m^d·n^d), not a fixed 2-factor shape.
-      Scope to match the existing structured layers: factorization shape
-      (d, the m_k/n_k splits, the TT-rank r) carried in FStruct; never
-      materialize the full W — contract cores directly in forward, and
-      backprop through each contraction (the per-core gradient is the standard
-      "freeze all other cores, contract" rule, validated the usual way against
-      a dense reference). Reuse the base FSuppressBias path. Deliver the layer +
-      numerical-gradient + serialization (round-trip d and the ranks) tests in
-      TestNeuralLayersExtra.pas, the `// Coded by Claude (AI).` attribution, and
-      an examples/TensorTrainLinear/ demo that reports weight count vs a matched
-      dense FullConnect at equal/▽-accuracy (mirroring the Kronecker "85× fewer
-      weights" and Monarch examples). Fills the multi-factor low-rank-tensor gap
-      in the structured-matrix family; an optional TT-rank sweep table is a clean
-      follow-up.
 - [ ] TNNetTensorTrain follow-ups (the layer + numerical-gradient/serialization
       tests in tests/TestNeuralNumerical.pas + examples/TensorTrainLinear/ all
       LANDED 2026-06-07 on a2, commit c78edd0; default d=2 auto-factored cores,
@@ -381,13 +357,6 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [X] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
-      fairly FLAT, so absolute accept rates are high even for a weak draft and
-      the speedup headline is carried by the monotone accept-rate RISE, not the
-      absolute %. Add a PEAKED-target variant (sharper next-token distribution,
-      e.g. a near-deterministic rule + low-temperature target) so the
-      weak-draft accept rate drops well below 1 and the calls-saved gap between
-      a good and bad draft widens — a more discriminating speedup chart.
 - [ ] SpeculativeDecoding follow-up: KV-cache composition — once the open
       KV-cache incremental-decode path lands, remove the per-verification-pass
       prefix recompute (the v1 demo recomputes the whole prefix each pass) so the
@@ -425,11 +394,6 @@ rather than acted on.
       SetBatchUpdate(True) idiom from [[manual-gradient-and-snapshot-gotchas]];
       keep eval deterministic. Add a test that two samples in one batch get
       different effective scales.
-- [X] ShakeShake follow-up (b): examples/ShakeShakeReg/ demo — contrast an
-      AddShakeShakeBlock stack vs a plain two-branch (deterministic 0.5/0.5)
-      residual on a small noisy/over-parameterised task, charting the train/val
-      gap narrowing (the headline regularisation win, à la the Mixup/SAM
-      follow-ups). Pure CPU, <5 min, no binaries committed.
 
 #### Channel attention / conditioning
 - [ ] TNNetCBAM follow-up: the landed AddCBAM uses TWO SEPARATE channel MLPs
