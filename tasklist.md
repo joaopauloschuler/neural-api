@@ -72,7 +72,7 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] `TNNetTensorTrain` — a Tensor-Train (Matrix-Product-State) factorized
+- [X] `TNNetTensorTrain` — a Tensor-Train (Matrix-Product-State) factorized
       DENSE layer, the next rung of the structured / sub-quadratic weight family
       after [[kronecker-linear-layer]] (W = A⊗B, a single 2-factor product) and
       [[monarch-linear-layer]] (two block-diagonal + permutation factors).

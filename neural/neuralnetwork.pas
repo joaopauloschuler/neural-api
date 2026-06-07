@@ -8999,6 +8999,64 @@ type
     property FactorQ: integer read FQ;
   end;
 
+  /// Tensor-Train (Matrix-Product-State / MPO) factorized dense layer. The
+  /// (n x n) square weight map is factorized as a CHAIN of d small cores rather
+  /// than ever being materialized. The flat input/output dimension n is split as
+  /// n = prod_k f_k over d nearly-equal integer factors f_k (the same factor list
+  /// is used for the input legs m_k = f_k and the output legs o_k = f_k, so the
+  /// map is square: n_in = n_out = n). Core k has shape
+  ///   G_k : r_{k-1} x m_k x o_k x r_k
+  /// with the boundary TT-ranks pinned to r_0 = r_d = 1 and every interior rank
+  /// equal to a tunable rank r (FRank). Total params ~ sum_k r_{k-1}*m_k*o_k*r_k
+  /// = O(d * f^2 * r^2) versus n^2 for the dense map -- sub-quadratic for d >= 2.
+  ///
+  /// Forward is the exact MPO-vector contraction, performed as a left-to-right
+  /// sweep that consumes one input leg and emits one output leg per core while
+  /// carrying the TT-rank index, so the dense n x n matrix is NEVER formed:
+  ///   T_{-1}[i_0..i_{d-1}; ; a_{-1}=0] = x[i_0..i_{d-1}]
+  ///   T_k[i_{k+1}..; j_0..j_k; a_k] =
+  ///       sum_{i_k, a_{k-1}} G_k[a_{k-1}, i_k, j_k, a_k]
+  ///                          * T_{k-1}[i_k, i_{k+1}..; j_0..j_{k-1}; a_{k-1}]
+  /// After the last core T has no input legs left and a_{d-1}=0, giving
+  /// y[j_0..j_{d-1}] (+ optional bias). Backward is the standard "freeze the
+  /// other cores, contract" rule applied as the exact reverse sweep: each core's
+  /// gradient dG_k and the back-message dT_{k-1} are read off the cached forward
+  /// messages T_{k-1}, and the leading message yields dx.
+  ///
+  /// Square map: n is inferred from the previous layer's flat size (no N arg),
+  /// mirroring TNNetMonarchLinear. The number of cores d (default 2) and the
+  /// interior rank r (default 2) round-trip through FStruct[1] / FStruct[2];
+  /// FSuppressBias round-trips through FStruct[3] (the base FSuppressBias path is
+  /// reused). Weight layout: neuron k (0..d-1) holds core G_k flattened in
+  /// (a_{k-1}, i_k, j_k, a_k) row-major order; neuron d is the optional bias
+  /// (length n). Constructor: Create(pSuppressBias, pCores, pRank). The output is
+  /// an (n,1,1) vector.
+  // Coded by Claude (AI).
+  TNNetTensorTrain = class(TNNetLayer)
+  private
+    FDim: integer;                 // n (flat input/output size)
+    FCores: integer;               // d (number of TT cores)
+    FRank: integer;                // r (interior TT-rank; boundary ranks are 1)
+    FReqCores: integer;            // requested d (0 = auto); resolved d round-trips via FStruct[1]
+    FFactors: array of integer;    // f_0..f_{d-1}, prod = n (m_k = o_k = f_k)
+    FRanks: array of integer;      // r_0..r_d (r_0 = r_d = 1, interior = FRank)
+    FMsg: array of TNNetVolume;    // cached forward messages T_0..T_{d-1} (T_k after core k)
+    procedure FactorN(N: integer);
+    procedure SizeCores();
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pSuppressBias: integer = 0; pCores: integer = 0; pRank: integer = 0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Dim: integer read FDim;
+    property Cores: integer read FCores;
+    property Rank: integer read FRank;
+  end;
+
   /// Soft (oblique) decision tree layer -- a single differentiable, balanced
   /// binary decision tree of fixed depth D (Kontschieder et al. 2015, "Deep
   /// Neural Decision Forests"; Frosst & Hinton 2017, "Distilling a Neural
@@ -50000,6 +50058,364 @@ begin
   end;
 end;
 
+{ TNNetTensorTrain }
+
+// Tensor-Train (MPO) factorized dense layer. The square n x n map is a chain of
+// d cores; forward is the exact left-to-right MPO-vector contraction and the
+// dense matrix is never materialized. See the class header for the full math.
+
+constructor TNNetTensorTrain.Create(pSuppressBias: integer = 0; pCores: integer = 0; pRank: integer = 0);
+begin
+  inherited Create();
+  if pSuppressBias <> 0 then FSuppressBias := 1 else FSuppressBias := 0;
+  FStruct[3] := FSuppressBias;
+  if pCores < 0 then pCores := 0;
+  if pRank < 1 then pRank := 2;
+  FReqCores := pCores;
+  FRank := pRank;
+  FStruct[2] := FRank;
+  // Core neurons (+ optional bias) are sized in SetPrevLayer once n is known.
+  while FNeurons.Count > 0 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  BuildArrNeurons();
+end;
+
+destructor TNNetTensorTrain.Destroy();
+var
+  i: integer;
+begin
+  for i := 0 to Length(FMsg) - 1 do
+    if Assigned(FMsg[i]) then FMsg[i].Free;
+  SetLength(FMsg, 0);
+  inherited Destroy();
+end;
+
+// Factor n = prod_k f_k into FCores nearly-equal integer factors. Greedy: pick
+// the divisor of the running remainder closest to its ideal geometric root for
+// each remaining core. Boundary ranks r_0 = r_d = 1; interior ranks = FRank.
+procedure TNNetTensorTrain.FactorN(N: integer);
+var
+  d, idx, rem, best, cand, root, prodSoFar: integer;
+begin
+  d := FReqCores;
+  if d < 2 then d := 2;
+  if d > 6 then d := 6;
+  // Cap d so every factor can be >= 2 (need 2^d <= n); otherwise reduce d.
+  while (d > 2) and (1 shl d > N) do Dec(d);
+  if (d > 1) and (1 shl d > N) then d := 1;
+  if d < 1 then d := 1;
+
+  SetLength(FFactors, d);
+  rem := N;
+  for idx := 0 to d - 1 do
+  begin
+    if idx = d - 1 then
+    begin
+      FFactors[idx] := rem; // last core absorbs the remaining cofactor
+      rem := 1;
+    end
+    else
+    begin
+      // Ideal factor = rem^(1/(remaining cores)); search divisors near it.
+      root := Trunc(Exp(Ln(rem) / (d - idx)) + 0.5);
+      if root < 2 then root := 2;
+      best := 0;
+      // Prefer the divisor closest to root, scanning outward.
+      for cand := 2 to rem do
+      begin
+        if rem mod cand = 0 then
+        begin
+          if (best = 0) or (Abs(cand - root) < Abs(best - root)) then best := cand;
+          if cand >= root then break;
+        end;
+      end;
+      if best < 1 then best := rem;
+      FFactors[idx] := best;
+      rem := rem div best;
+    end;
+  end;
+  FCores := d;
+  FStruct[1] := FCores;
+
+  // Verify the product matches; if a degenerate split slipped through, fall back
+  // to a single core (exact dense, still correct).
+  prodSoFar := 1;
+  for idx := 0 to FCores - 1 do prodSoFar := prodSoFar * FFactors[idx];
+  if prodSoFar <> N then
+  begin
+    SetLength(FFactors, 1);
+    FFactors[0] := N;
+    FCores := 1;
+    FStruct[1] := 1;
+  end;
+
+  SetLength(FRanks, FCores + 1);
+  FRanks[0] := 1;
+  FRanks[FCores] := 1;
+  for idx := 1 to FCores - 1 do
+    FRanks[idx] := FRank;
+end;
+
+// Allocate one neuron per core (core k holds r_{k-1}*m_k*o_k*r_k reals) plus a
+// final bias neuron of length n.
+procedure TNNetTensorTrain.SizeCores();
+var
+  k, sz: integer;
+begin
+  while FNeurons.Count > FCores + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FCores + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  for k := 0 to FCores - 1 do
+  begin
+    sz := FRanks[k] * FFactors[k] * FFactors[k] * FRanks[k + 1];
+    FNeurons[k].Weights.ReSize(sz, 1, 1);
+    FNeurons[k].BackInertia.ReSize(sz, 1, 1);
+    FNeurons[k].Delta.ReSize(sz, 1, 1);
+    FNeurons[k].FBiasWeight := 0;
+  end;
+  FNeurons[FCores].Weights.ReSize(FDim, 1, 1);
+  FNeurons[FCores].BackInertia.ReSize(FDim, 1, 1);
+  FNeurons[FCores].Delta.ReSize(FDim, 1, 1);
+  FNeurons[FCores].FBiasWeight := 0;
+  BuildArrNeurons();
+end;
+
+procedure TNNetTensorTrain.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  N, i: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  N := pPrevLayer.Output.Size;
+  if N <= 0 then
+    FErrorProc('TNNetTensorTrain requires a non-empty input.');
+  FDim := N;
+
+  FactorN(N);
+  SizeCores();
+
+  FOutput.ReSize(N, 1, 1);
+  FOutputError.ReSize(N, 1, 1);
+  FOutputErrorDeriv.ReSize(N, 1, 1);
+
+  // Forward messages T_0..T_{d-1} are (re)allocated lazily in ComputeCPU.
+  for i := 0 to Length(FMsg) - 1 do
+    if Assigned(FMsg[i]) then FMsg[i].Free;
+  SetLength(FMsg, FCores);
+  for i := 0 to FCores - 1 do
+    FMsg[i] := TNNetVolume.Create();
+
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// Small random core weights; bias starts at zero. Each core is scaled by
+// 1/sqrt(fan_in) with fan_in = r_{k-1}*m_k so the composed chain is well
+// conditioned at init (the product of d cores stays O(1)).
+procedure TNNetTensorTrain.InitDefault();
+var
+  k, i, fanIn: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FDim <= 0 then exit;
+  for k := 0 to FCores - 1 do
+  begin
+    W := FArrNeurons[k].FWeights;
+    fanIn := FRanks[k] * FFactors[k];
+    if fanIn > 0 then scale := 1.0 / Sqrt(fanIn) else scale := 0.1;
+    for i := 0 to W.Size - 1 do
+      W.FData[i] := scale * (Random - 0.5) * 2;
+  end;
+  FArrNeurons[FCores].FWeights.Fill(0);
+end;
+
+procedure TNNetTensorTrain.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward MPO-vector sweep (left to right). Message T_{k} is indexed
+//   [ inputSuffix (legs k+1..d-1) , outputPrefix (legs 0..k) , rank a_k ]
+// flattened as ((suf*prefSize + pref)*rankDim + a). T_{-1} = x (suffix = n,
+// prefix = 1, rank = 1). Each step consumes input leg i_k and emits output leg
+// j_k against core G_k[a_{k-1}, i_k, j_k, a_k]. The final message (no input legs,
+// a_{d-1} = 0) is y. Every T_k is cached for the backward sweep.
+procedure TNNetTensorTrain.ComputeCPU();
+var
+  k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
+  suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx: integer;
+  PrevOut, Wk, Bias, Prev, Cur: TNNetVolume;
+  acc: TNeuralFloat;
+begin
+  PrevOut := FPrevLayer.FOutput;
+
+  prefCur := 1;
+  for k := 0 to FCores - 1 do
+  begin
+    fk := FFactors[k];
+    rinDim := FRanks[k];
+    routDim := FRanks[k + 1];
+    prefPrev := prefCur;          // output combos through legs 0..k-1
+    prefCur := prefPrev * fk;     // output combos through legs 0..k
+    // suffix size AFTER consuming leg k = prod_{j>k} f_j = FDim div prefCur.
+    sufSize := FDim div prefCur;
+
+    Wk := FArrNeurons[k].FWeights;
+    Cur := FMsg[k];
+    Cur.ReSize(sufSize * prefCur * routDim, 1, 1);
+    if k = 0 then Prev := PrevOut else Prev := FMsg[k - 1];
+
+    for suf := 0 to sufSize - 1 do
+      for prefIdx := 0 to prefPrev - 1 do
+        for jk := 0 to fk - 1 do
+          for aout := 0 to routDim - 1 do
+          begin
+            acc := 0;
+            for ik := 0 to fk - 1 do
+              for ain := 0 to rinDim - 1 do
+              begin
+                // previous suffix index = ik * sufSize + suf.
+                if k = 0 then
+                  // T_{-1} = x : rank dim 1, prefix dim 1 -> index = inputSuffix.
+                  prevIdx := ik * sufSize + suf
+                else
+                  prevIdx := ((ik * sufSize + suf) * prefPrev + prefIdx) * rinDim + ain;
+                gIdx := ((ain * fk + ik) * fk + jk) * routDim + aout;
+                acc := acc + Wk.FData[gIdx] * Prev.FData[prevIdx];
+              end;
+            curIdx := (suf * prefCur + (prefIdx * fk + jk)) * routDim + aout;
+            Cur.FData[curIdx] := acc;
+          end;
+  end;
+
+  // Final message T_{d-1}: sufSize = 1, prefCur = FDim, routDim = 1 -> y.
+  Cur := FMsg[FCores - 1];
+  for k := 0 to FDim - 1 do
+    FOutput.FData[k] := Cur.FData[k];
+
+  Bias := FArrNeurons[FCores].FWeights;
+  if FSuppressBias = 0 then
+    FOutput.Add(Bias);
+end;
+
+procedure TNNetTensorTrain.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact reverse MPO sweep. dT_{d-1} = output error (reshaped, identical layout).
+// For each core k (d-1 down to 0), given the back-message dT_k, accumulate the
+// core gradient against the cached forward message T_{k-1} and produce dT_{k-1}:
+//   dG_k[a_{k-1},i_k,j_k,a_k] += sum_{suf,pref} dT_k[..] * T_{k-1}[i_k.. ; pref; a_{k-1}]
+//   dT_{k-1}[i_k.. ; pref; a_{k-1}] += sum_{j_k,a_k} G_k[..] * dT_k[..]
+// (T_{-1} is x, so dT_{-1} is dx.) Deltas carry -LR*grad.
+procedure TNNetTensorTrain.BackpropagateCPU();
+var
+  k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
+  suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx, ti: integer;
+  PrevOut, Wk, WkDelta, BiasDelta, Prev, LocalPrevError: TNNetVolume;
+  dCur, dPrev: array of TNeuralFloat;
+  dval, gval, tval: TNeuralFloat;
+  HasPrevError: boolean;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  BiasDelta := FArrNeurons[FCores].FDelta;
+  HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+  LocalPrevError := FPrevLayer.OutputError;
+
+  // Bias grad.
+  if FSuppressBias = 0 then
+    for ti := 0 to FDim - 1 do
+      BiasDelta.FData[ti] := BiasDelta.FData[ti] - FLearningRate * FOutputError.FData[ti];
+
+  // dT_{d-1} = output error (same flat layout as y).
+  SetLength(dCur, FDim);
+  for ti := 0 to FDim - 1 do
+    dCur[ti] := FOutputError.FData[ti];
+
+  for k := FCores - 1 downto 0 do
+  begin
+    fk := FFactors[k];
+    rinDim := FRanks[k];
+    routDim := FRanks[k + 1];
+    prefCur := 1;
+    for ti := 0 to k do prefCur := prefCur * FFactors[ti];
+    prefPrev := prefCur div fk;
+    sufSize := FDim div prefCur;
+
+    Wk := FArrNeurons[k].FWeights;
+    WkDelta := FArrNeurons[k].FDelta;
+    if k = 0 then Prev := PrevOut else Prev := FMsg[k - 1];
+
+    // dT_{k-1} buffer: size = (fk*sufSize) * prefPrev * rinDim.
+    SetLength(dPrev, fk * sufSize * prefPrev * rinDim);
+    for ti := 0 to Length(dPrev) - 1 do dPrev[ti] := 0;
+
+    for suf := 0 to sufSize - 1 do
+      for prefIdx := 0 to prefPrev - 1 do
+        for jk := 0 to fk - 1 do
+          for aout := 0 to routDim - 1 do
+          begin
+            curIdx := (suf * prefCur + (prefIdx * fk + jk)) * routDim + aout;
+            dval := dCur[curIdx];
+            if dval = 0 then continue;
+            for ik := 0 to fk - 1 do
+              for ain := 0 to rinDim - 1 do
+              begin
+                if k = 0 then
+                  prevIdx := ik * sufSize + suf
+                else
+                  prevIdx := ((ik * sufSize + suf) * prefPrev + prefIdx) * rinDim + ain;
+                gIdx := ((ain * fk + ik) * fk + jk) * routDim + aout;
+                tval := Prev.FData[prevIdx];
+                gval := Wk.FData[gIdx];
+                // Core gradient.
+                WkDelta.FData[gIdx] := WkDelta.FData[gIdx] - FLearningRate * dval * tval;
+                // Back-message into dT_{k-1}.
+                dPrev[prevIdx] := dPrev[prevIdx] + gval * dval;
+              end;
+          end;
+
+    if k > 0 then
+    begin
+      SetLength(dCur, Length(dPrev));
+      for ti := 0 to Length(dPrev) - 1 do dCur[ti] := dPrev[ti];
+    end
+    else
+    begin
+      // dT_{-1} = dx. Layout of dPrev is exactly x's flat layout (suffix only).
+      if HasPrevError then
+        for ti := 0 to FDim - 1 do
+          LocalPrevError.FData[ti] := LocalPrevError.FData[ti] + dPrev[ti];
+    end;
+  end;
+
+  if not FBatchUpdate then
+  begin
+    for k := 0 to FCores - 1 do
+      FArrNeurons[k].UpdateWeightsWithoutInertia();
+    if FSuppressBias = 0 then FArrNeurons[FCores].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetSoftDecisionTree }
 
 constructor TNNetSoftDecisionTree.Create(TreeDepth, OutputDepth: integer;
@@ -77964,6 +78380,7 @@ begin
       'TNNetGroupPoolP4' :          Result := TNNetGroupPoolP4.Create(St[0]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
+      'TNNetTensorTrain' :          Result := TNNetTensorTrain.Create(St[3], St[1], St[2]);
       'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
       'TNNetHouseholderLinear' :    Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]);
       'TNNetHyperbolicLinear' :     Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3], St[4] = 1);
@@ -78332,6 +78749,7 @@ begin
       if S[0] = 'TNNetGroupPoolP4' then Result := TNNetGroupPoolP4.Create(St[0]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else
+      if S[0] = 'TNNetTensorTrain' then Result := TNNetTensorTrain.Create(St[3], St[1], St[2]) else
       if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
       if S[0] = 'TNNetHouseholderLinear' then Result := TNNetHouseholderLinear.Create(St[0], St[4], 1, St[3]) else
       if S[0] = 'TNNetHyperbolicLinear' then Result := TNNetHyperbolicLinear.Create(St[0], Ft[0], St[3], St[4] = 1) else

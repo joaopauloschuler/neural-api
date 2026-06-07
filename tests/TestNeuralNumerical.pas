@@ -273,6 +273,10 @@ type
     procedure TestKroneckerLinearWeightGradientCheck;
     procedure TestKroneckerLinearForwardKnownValue;
     procedure TestKroneckerLinearSerializationRoundTrip;
+    // TNNetTensorTrain sub-quadratic structured (tensor-train / MPO) dense layer
+    procedure TestTensorTrainInputGradientCheck;
+    procedure TestTensorTrainWeightGradientCheck;
+    procedure TestTensorTrainSerializationRoundTrip;
     // TNNetSoftDecisionTree differentiable soft (oblique) decision tree layer
     procedure TestSoftDecisionTreeInputGradientCheck;
     procedure TestSoftDecisionTreeWeightGradientCheck;
@@ -48373,6 +48377,228 @@ begin
         (NN2.Layers[1] as TNNetKroneckerLinear).FactorQ);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('KroneckerLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTensorTrainInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  TT: TNNetTensorTrain;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    p: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for p := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[p] - Desired.Raw[p];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for the tensor-train layer.
+  // n = 12 -> d = 2 cores (factors 3 x 4), interior rank r = 2. Core weights are
+  // bounded to a small range so FD truncation never dominates (do NOT loosen
+  // tolerance).
+  RandSeed := 424242;
+  N := 12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  InputPlus := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    TT := TNNetTensorTrain.Create(0, 2, 2); // d = 2 cores, rank 2
+    NN.AddLayer(TT);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    // Bounded core weights and a small bias.
+    for i := 0 to TT.Neurons[0].Weights.Size - 1 do
+      TT.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+    for i := 0 to TT.Neurons[1].Weights.Size - 1 do
+      TT.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    for i := 0 to N - 1 do
+      TT.Neurons[2].Weights.Raw[i] := 0.05 * (i - 5);
+
+    for i := 0 to N - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('TensorTrain input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTensorTrainWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  TT: TNNetTensorTrain;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, d, N: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    p: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for p := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[p] - Desired.Raw[p];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // FD vs analytic gradient on BOTH tensor-train cores (neuron 0 and neuron 1) --
+  // this checks the "freeze the other core, contract" backward rule on each core.
+  // n = 12 (d = 2, factors 3 x 4, rank 2). Core weights bounded to a small range
+  // to avoid FD truncation error (do NOT loosen tolerance).
+  RandSeed := 424242;
+  N := 12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  Desired := TNNetVolume.Create(1, 1, N);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    TT := TNNetTensorTrain.Create(0, 2, 2);
+    NN.AddLayer(TT);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to N - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+    for i := 0 to TT.Neurons[0].Weights.Size - 1 do
+      TT.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+    for i := 0 to TT.Neurons[1].Weights.Size - 1 do
+      TT.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    for i := 0 to N - 1 do
+      TT.Neurons[2].Weights.Raw[i] := 0.05 * (i - 5);
+
+    // d = 0 -> core G_0, d = 1 -> core G_1.
+    for d := 0 to 1 do
+      for i := 0 to TT.Neurons[d].Weights.Size - 1 do
+      begin
+        TT.Neurons[d].Weights.Raw[i] := TT.Neurons[d].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        TT.Neurons[d].Weights.Raw[i] := TT.Neurons[d].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        TT.Neurons[d].Weights.Raw[i] := TT.Neurons[d].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        TT.Neurons[0].ClearDelta;
+        TT.Neurons[1].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -TT.Neurons[d].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('TensorTrain core ' + IntToStr(d) + ' weight gradient w=' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('  TensorTrain weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTensorTrainSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  TT: TNNetTensorTrain;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, N: integer;
+begin
+  // TensorTrain in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match, proving the core
+  // count d and interior rank r round-trip and every core neuron + bias survive
+  // both dispatch points.
+  RandSeed := 424242;
+  N := 12;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, N);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
+    TT := TNNetTensorTrain.Create(0, 2, 2);
+    NN.AddLayer(TT);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to N - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for i := 0 to TT.Neurons[0].Weights.Size - 1 do
+      TT.Neurons[0].Weights.Raw[i] := 0.17 * (i + 1) - 0.4;
+    for i := 0 to TT.Neurons[1].Weights.Size - 1 do
+      TT.Neurons[1].Weights.Raw[i] := 0.11 * (i + 1) - 0.3;
+    for i := 0 to N - 1 do
+      TT.Neurons[2].Weights.Raw[i] := 0.05 - 0.03 * i;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('TensorTrain SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('TensorTrain token present in serialized string',
+        Pos('TNNetTensorTrain', Saved) > 0);
+      AssertEquals('TensorTrain core count round-trips', 2,
+        (NN2.Layers[1] as TNNetTensorTrain).Cores);
+      AssertEquals('TensorTrain interior rank round-trips', 2,
+        (NN2.Layers[1] as TNNetTensorTrain).Rank);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('TensorTrain Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
