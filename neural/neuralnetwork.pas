@@ -9281,6 +9281,34 @@ type
       // Requires d_k (= d_model div Heads) even and SizeY=1.
       function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false; UseRoPE: boolean = false): TNNetLayer;
+      // Talking-Heads Attention (Shazeer et al. 2020, arXiv:2003.02436) over a
+      // (SeqLen,1,d_in) sequence tensor. Talking-heads inserts a small learnable
+      // HxH linear mixing ACROSS the attention heads at two points: on the
+      // pre-softmax logits and on the post-softmax weights. This tree has NO
+      // single head-axis tensor (multi-head = H separate concatenated heads, see
+      // AddMultiHeadSelfAttention), so this is implemented as a BUILDER, not a
+      // drop-in layer. The score tensor for head h is materialised as a REAL
+      // graph tensor [X=key, Y=query, 1] (TNNetDotProducts + TransposeYD); the H
+      // per-head score slabs are DeepConcat'd along Depth into a [key,query,H]
+      // tensor and the HxH mix is a TNNetPointwiseConvLinear(H) (1x1 conv over
+      // the head/Depth axis at each (key,query) position) -- exactly the
+      // talking-heads mix. The softmax is taken over the KEY axis per query row
+      // (TransposeXD -> PointwiseSoftMax over Depth=key -> TransposeXD back).
+      //   - PreSoftmaxMix=True  inserts the HxH mix on the logits (before softmax)
+      //   - PostSoftmaxMix=True inserts a SECOND HxH mix on the weights (after)
+      //   - CausalMask=True applies a TNNetMaskedFill (mask where key > query)
+      //     between the pre-mix and the softmax.
+      // Both mixes default on (the full Shazeer variant); set either off for an
+      // ablation. d_model must be divisible by Heads (d_k = d_model div Heads);
+      // requires SizeY=1. Q/K/V are per-token TNNetPointwiseConvLinear(d_model)
+      // projections and the heads are out-projected by a final
+      // TNNetPointwiseConvLinear(d_model). All composed from existing serializable
+      // layers (no new class), so save/load just works. Returns the out-proj.
+      // Coded by Claude (AI).
+      function AddTalkingHeadsAttention(Heads, d_model: integer;
+        CausalMask: boolean = false;
+        PreSoftmaxMix: boolean = true;
+        PostSoftmaxMix: boolean = true): TNNetLayer;
       // Multi-head Graph Attention (Velickovic et al. 2018, GAT) over a
       // (NumNodes,1,FeatureDim) node-feature tensor. There is NO head-axis
       // tensor in this tree, so multi-head GAT is built as Heads INDEPENDENT
@@ -37362,6 +37390,115 @@ begin
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddTalkingHeadsAttention(Heads, d_model: integer;
+  CausalMask: boolean = false;
+  PreSoftmaxMix: boolean = true;
+  PostSoftmaxMix: boolean = true): TNNetLayer;
+var
+  PreviousLayer, QGroup, KGroup, VGroup: TNNetLayer;
+  QHead, KHead, VHead, VTHead, ScoreHead, WHead, OutHead: TNNetLayer;
+  PreviousDepth, PreviousSizeX, PreviousSizeY, d_k, HeadCnt: integer;
+  ScoreSlabs, WeightSlabs, HeadOutputs: array of TNNetLayer;
+  MixedLogits, MixedWeights, ConcatScores, ConcatWeights: TNNetLayer;
+  InvSqrtDk: TNeuralFloat;
+begin
+  if Heads < 1 then
+    FErrorProc('AddTalkingHeadsAttention requires Heads >= 1. Heads=' +
+      IntToStr(Heads));
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddTalkingHeadsAttention requires d_model divisible by Heads. ' +
+      'd_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  PreviousLayer := GetLastLayer();
+  PreviousDepth := PreviousLayer.Output.Depth;
+  PreviousSizeX := PreviousLayer.Output.SizeX;
+  PreviousSizeY := PreviousLayer.Output.SizeY;
+  if PreviousSizeY > 1 then
+    PreviousLayer := AddLayer(
+      TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth));
+  d_k := d_model div Heads;
+  InvSqrtDk := 1.0 / Sqrt(d_k);
+
+  // Per-token Q/K/V projections (PointwiseConvLinear = 1x1 conv; FullConnect
+  // would flatten the sequence axis -- see AddMultiHeadSelfAttention header).
+  QGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
+  KGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
+  VGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
+
+  SetLength(ScoreSlabs, Heads);
+  SetLength(WeightSlabs, Heads);
+  SetLength(HeadOutputs, Heads);
+
+  // 1) Per-head scaled logits as a real [X=key, Y=query, 1] graph tensor.
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    QHead := AddLayerAfter(
+      TNNetSplitChannels.Create(HeadCnt * d_k, d_k), QGroup);
+    KHead := AddLayerAfter(
+      TNNetSplitChannels.Create(HeadCnt * d_k, d_k), KGroup);
+    // DotProducts(Q,K) -> [X=key, Y=1, D=query]; scale by 1/sqrt(d_k).
+    ScoreHead := AddLayer(TNNetDotProducts.Create(QHead, KHead));
+    ScoreHead := AddLayer(TNNetMulByConstant.Create(InvSqrtDk));
+    // TransposeYD: [key,1,query] -> [key,query,1] so heads can stack on Depth.
+    ScoreSlabs[HeadCnt] := AddLayerAfter(TNNetTransposeYD.Create(), ScoreHead);
+  end;
+
+  // 2) Pre-softmax HxH mix: concat heads on Depth -> [key,query,H], mix, split.
+  if PreSoftmaxMix and (Heads > 1) then
+  begin
+    ConcatScores := AddLayer(TNNetDeepConcat.Create(ScoreSlabs));
+    MixedLogits := AddLayer(TNNetPointwiseConvLinear.Create(Heads));
+    for HeadCnt := 0 to Heads - 1 do
+      ScoreSlabs[HeadCnt] := AddLayerAfter(
+        TNNetSplitChannels.Create(HeadCnt, 1), MixedLogits);
+  end;
+
+  // 3) Optional causal mask (mask where key X > query Y), then softmax over the
+  //    KEY axis per query row, per head.
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    WHead := ScoreSlabs[HeadCnt]; // [key, query, 1]
+    if CausalMask then
+      WHead := AddLayerAfter(TNNetMaskedFill.Create(), WHead);
+    // TransposeXD: [key,query,1] -> [1,query,key]; softmax over Depth=key.
+    WHead := AddLayerAfter(TNNetTransposeXD.Create(), WHead);
+    WHead := AddLayerAfter(TNNetPointwiseSoftMax.Create(), WHead);
+    // Back to [key,query,1].
+    WeightSlabs[HeadCnt] := AddLayerAfter(TNNetTransposeXD.Create(), WHead);
+  end;
+
+  // 4) Post-softmax HxH mix on the attention weights.
+  if PostSoftmaxMix and (Heads > 1) then
+  begin
+    ConcatWeights := AddLayer(TNNetDeepConcat.Create(WeightSlabs));
+    MixedWeights := AddLayer(TNNetPointwiseConvLinear.Create(Heads));
+    for HeadCnt := 0 to Heads - 1 do
+      WeightSlabs[HeadCnt] := AddLayerAfter(
+        TNNetSplitChannels.Create(HeadCnt, 1), MixedWeights);
+  end;
+
+  // 5) weights . V per head, then concat heads back to d_model.
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    // Back to [key,1,query] for the DotProducts with V^T (matches CAI path).
+    WHead := AddLayerAfter(TNNetTransposeYD.Create(), WeightSlabs[HeadCnt]);
+    VHead := AddLayerAfter(
+      TNNetSplitChannels.Create(HeadCnt * d_k, d_k), VGroup);
+    VTHead := AddLayerAfter(TNNetTransposeXD.Create(), VHead);
+    OutHead := AddLayer(TNNetDotProducts.Create(VTHead, WHead));
+    HeadOutputs[HeadCnt] := OutHead;
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+
+  // Token-wise out-projection back to d_model.
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  if PreviousSizeY > 1 then
+    Result := AddLayer(
+      TNNetReshape.Create(PreviousSizeX, PreviousSizeY, d_model));
+  SetLength(ScoreSlabs, 0);
+  SetLength(WeightSlabs, 0);
+  SetLength(HeadOutputs, 0);
 end;
 
 function TNNet.AddMultiHeadGraphAttention(Heads, pHeadFeatures: integer;

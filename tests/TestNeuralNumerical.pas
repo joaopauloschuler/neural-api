@@ -669,6 +669,9 @@ type
     procedure TestScaledDotProductAttentionCausalGradientCheck;
     procedure TestScaledDotProductAttentionSeqLenStressGradientCheck;
     procedure TestScaledDotProductAttentionAllMaskedRow;
+    procedure TestTalkingHeadsAttentionShape;
+    procedure TestTalkingHeadsAttentionInputGradientCheck;
+    procedure TestTalkingHeadsAttentionSerializationRoundTrip;
     procedure TestCosineSimilarityAttentionForward;
     procedure TestCosineSimilarityAttentionGradientCheck;
     procedure TestCosineSimilarityAttentionCausalGradientCheck;
@@ -10809,6 +10812,184 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTalkingHeadsAttentionShape;
+// AddTalkingHeadsAttention (Heads=2, d_model=4) over a (SeqLen,1,d_in) tensor
+// must preserve the (SeqLen,1,d_model) shape, materialise the per-head score
+// slabs + the two HxH mix layers, end with the out-projection, and train.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i, SeqLen, dotCnt, smaxCnt: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 4);
+  Desired := TNNetVolume.Create(SeqLen, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 4));
+    NN.AddTalkingHeadsAttention(2, 4); // 2 heads, d_model=4, both mixes on
+    NN.SetLearningRate(0.02, 0.0);
+
+    AssertEquals('TalkingHeads output SizeX preserved',
+      SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('TalkingHeads output Depth preserved (d_model)',
+      4, NN.GetLastLayer.Output.Depth);
+    AssertTrue('TalkingHeads last layer is the out-projection',
+      NN.GetLastLayer is TNNetPointwiseConvLinear);
+
+    dotCnt := 0; smaxCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+    begin
+      if NN.Layers[i] is TNNetDotProducts then Inc(dotCnt);
+      if NN.Layers[i] is TNNetPointwiseSoftMax then Inc(smaxCnt);
+    end;
+    // 2 heads x (1 score dotprod + 1 weights.V dotprod) = 4 DotProducts.
+    AssertEquals('TalkingHeads DotProducts count', 4, dotCnt);
+    // One softmax per head.
+    AssertEquals('TalkingHeads softmax count (one per head)', 2, smaxCnt);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.1) * 1.0;
+      Desired.Raw[i] := Cos(i * 0.6) * 0.4;
+    end;
+    NN.Compute(Input);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 299 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('TalkingHeads training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTalkingHeadsAttentionInputGradientCheck;
+// End-to-end finite-difference input-gradient check on the talking-heads
+// composite (Q/K/V proj -> per-head logits -> pre-softmax HxH mix -> softmax
+// -> post-softmax HxH mix -> weights.V -> concat -> out-proj). Validates that
+// every sublayer's backward (DotProducts, TransposeXD/YD, PointwiseSoftMax,
+// the two PointwiseConvLinear mixes) chains correctly.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // SeqLen=3, d_model=4, Heads=2 (d_k=2). Causal mask on to also exercise the
+  // MaskedFill branch.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddTalkingHeadsAttention(2, 4, {CausalMask=}true, true, true);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('TalkingHeads input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('TalkingHeads input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTalkingHeadsAttentionSerializationRoundTrip;
+// The talking-heads block is composed entirely of existing serializable layers
+// (no new class), so SaveToString -> LoadFromString -> SaveToString must be a
+// byte-for-byte round-trip and the loaded net must reproduce the forward pass.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, SeqLen: integer;
+  maxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 4));
+    NN.AddTalkingHeadsAttention(2, 4, false, true, true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.9) * 0.8;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('TalkingHeads SaveToString round-trip equality',
+        Saved, Saved2);
+
+      // Same weights -> identical forward pass.
+      NN2.Compute(Input);
+      maxDiff := 0;
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        if Abs(NN.GetLastLayer.Output.Raw[i] -
+               NN2.GetLastLayer.Output.Raw[i]) > maxDiff then
+          maxDiff := Abs(NN.GetLastLayer.Output.Raw[i] -
+                         NN2.GetLastLayer.Output.Raw[i]);
+      AssertTrue('TalkingHeads loaded net reproduces forward (maxDiff=' +
+        FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
   end;
 end;
 

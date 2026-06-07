@@ -268,17 +268,19 @@ rather than acted on.
 - [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
       decoder block can opt into sinks per head behind a flag.
-- [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
-      heads (Shazeer et al.). A tiny learnable HxH multiply applied to
-      attention logits along the head axis. NOTE (2026-05-31): this repo has
-      NO single head-axis tensor — multi-head attention is built from H
-      SEPARATE TNNetScaledDotProductAttention layers (each FAttn is
-      [key,query,1]) concatenated along Depth. So a clean standalone HxH-mix
-      layer has nothing to operate on. To do this properly, either (a) add an
-      explicit multi-head SDPA tensor representation first, or (b) scope it as
-      a BUILDER that inserts the HxH mix between the per-head logit slabs
-      inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
-      Re-scope before attempting.
+- [x] Talking-Heads Attention (Shazeer et al. 2020) — DONE 2026-06-07 as the
+      BUILDER TNNet.AddTalkingHeadsAttention(Heads, d_model, CausalMask,
+      PreSoftmaxMix, PostSoftmaxMix) (re-scoped per the 2026-05-31 note: no
+      head-axis tensor, so NOT a drop-in layer). The fused
+      TNNetScaledDotProductAttention hides its logits, so the builder composes
+      attention from finer primitives: per-head logits are materialised as a
+      REAL [X=key,Y=query,1] graph tensor via TNNetDotProducts + TransposeYD,
+      the H slabs are DeepConcat'd to [key,query,H], and BOTH HxH mixes (pre-
+      and post-softmax) are TNNetPointwiseConvLinear(H) over the head/Depth
+      axis. Softmax over key per query row (TransposeXD -> PointwiseSoftMax ->
+      TransposeXD). All existing serializable layers (no new class). Tests:
+      TestTalkingHeadsAttention{Shape,InputGradientCheck,SerializationRoundTrip}
+      in TestNeuralNumerical.pas (FD input-grad max err 3.8e-4).
 
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
