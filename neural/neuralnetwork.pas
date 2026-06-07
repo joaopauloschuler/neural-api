@@ -78,6 +78,15 @@ type
   // (open arrays cannot be multi-dimensional, so a named type is required).
   TSpectralConv2DMatrix = array of array of Double;
 
+  // Relevance-redistribution rule selector for TNNet.LRPReport.
+  //   lrpEpsilon   - z-rule with eps stabiliser (Bach et al. 2015), default.
+  //   lrpGamma     - gamma-rule: w -> w + gamma*w+ (Montavon et al. 2019),
+  //                  emphasising positive contributions.
+  //   lrpAlphaBeta - LRP-alpha-beta: split contributions into positive/negative
+  //                  parts, R_i = sum_j (alpha*z+_ij/z+_j - beta*z-_ij/z-_j) R_j
+  //                  with alpha - beta = 1.
+  TLRPRule = (lrpEpsilon, lrpGamma, lrpAlphaBeta);
+
   // Integrator selector for TNNet.AddNeuralODEBlock.
   //   odeEuler    : explicit Euler step   y := y + h*f(y)            (1 f / step)
   //   odeMidpoint : RK2 / midpoint step   k1:=f(y); k2:=f(y+(h/2)*k1);
@@ -12596,7 +12605,10 @@ type
         Probe: TNNetVolume;
         ForcedClass: integer = -1;
         TopK: integer = 8;
-        Eps: TNeuralFloat = 1e-2
+        Eps: TNeuralFloat = 1e-2;
+        Rule: TLRPRule = lrpEpsilon;
+        Gamma: TNeuralFloat = 0.25;
+        Alpha: TNeuralFloat = 2.0
       ): string;
       // Forward-only CAUSAL mechanistic-interpretability diagnostic
       // (activation patching / causal tracing; Vig et al. 2020, Meng et al.
@@ -74387,11 +74399,17 @@ class function TNNet.LRPReport(
   Probe: TNNetVolume;
   ForcedClass: integer = -1;
   TopK: integer = 8;
-  Eps: TNeuralFloat = 1e-2
+  Eps: TNeuralFloat = 1e-2;
+  Rule: TLRPRule = lrpEpsilon;
+  Gamma: TNeuralFloat = 0.25;
+  Alpha: TNeuralFloat = 2.0
 ): string;
 const
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
+  Beta: TNeuralFloat;
+  zPos, zNeg, cPos, cNeg, wEff: TNeuralFloat;
+  RuleName: string;
   Lines: TStringList;
   Snap: string;
   LastIdx, LIdx, i, j, n: integer;
@@ -74462,6 +74480,15 @@ begin
     end;
     if TopK < 1 then TopK := 1;
     if Eps <= 0 then Eps := 1e-2;
+    if Gamma < 0 then Gamma := 0;
+    // alpha - beta = 1 (standard LRP-alpha-beta constraint).
+    if Alpha < 1 then Alpha := 1;
+    Beta := Alpha - 1;
+    case Rule of
+      lrpGamma:     RuleName := 'gamma';
+      lrpAlphaBeta: RuleName := 'alpha-beta';
+    else            RuleName := 'epsilon';
+    end;
 
     // Save exact state; LRP only forwards (no weight steps), but a final clean
     // recompute is run, so we restore bit-for-bit on exit regardless.
@@ -74494,15 +74521,15 @@ begin
     R[LastIdx][PredClass] := PredLogit;
 
     Lines.Add(Format(
-      'LRPReport (Layer-wise Relevance Propagation, epsilon-rule; ' +
-      'Bach et al. 2015)', []));
+      'LRPReport (Layer-wise Relevance Propagation, %s-rule)', [RuleName]));
     Lines.Add(StringOfChar('=', 72));
     Lines.Add(Format('Probe shape (%d,%d,%d), %d outputs. Explained class c=%d '
       + '(forced=%s).',
       [SizeX, SizeY, Depth, OutSize, PredClass,
        BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
-    Lines.Add(Format('Seed relevance R_c = logit_c = %8.4f   eps = %.4g',
-      [PredLogit, Eps]));
+    Lines.Add(Format('Seed relevance R_c = logit_c = %8.4f   eps = %.4g   '
+      + 'gamma = %.4g   alpha = %.4g   beta = %.4g',
+      [PredLogit, Eps, Gamma, Alpha, Beta]));
     Lines.Add(StringOfChar('-', 72));
     Lines.Add(Format('%-4s %-26s %-9s %12s %12s %12s',
       ['#', 'layer', 'rule', 'sum(R_out)', 'sum(R_in)', 'residual']));
@@ -74523,23 +74550,73 @@ begin
 
       if IsDense then
       begin
-        KindStr := 'epsilon';
-        // For each output neuron j distribute R_out[j] back to inputs i
-        // proportionally to (a_i * w_ij), stabilised by eps*sign(z_j).
+        KindStr := RuleName;
+        // For each output neuron j distribute R_out[j] back to inputs i.
         for j := 0 to Layer.Neurons.Count - 1 do
         begin
           Neuron := Layer.Neurons[j];
-          z := Neuron.Bias;
-          for i := 0 to Length(Rin) - 1 do
-            z := z + PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
-          if z >= 0 then sgn := 1 else sgn := -1;
-          denom := z + Eps * sgn;
-          if denom = 0 then denom := Eps;  // last-resort guard
-          for i := 0 to Length(Rin) - 1 do
-          begin
-            ai := PrevLayer.Output.Raw[i];
-            wij := Neuron.Weights.Raw[i];
-            Rin[i] := Rin[i] + (ai * wij / denom) * R[LIdx][j];
+          case Rule of
+            lrpGamma:
+            begin
+              // gamma-rule: effective weight w -> w + gamma*w+. Bias is mapped
+              // through the SAME gamma transform so conservation holds exactly.
+              zPos := Neuron.Bias + Gamma * Max(Neuron.Bias, 0);
+              for i := 0 to Length(Rin) - 1 do
+              begin
+                ai := PrevLayer.Output.Raw[i];
+                wij := Neuron.Weights.Raw[i];
+                wEff := wij + Gamma * Max(wij, 0);
+                zPos := zPos + ai * wEff;
+              end;
+              if zPos >= 0 then sgn := 1 else sgn := -1;
+              denom := zPos + Eps * sgn;
+              if denom = 0 then denom := Eps;
+              for i := 0 to Length(Rin) - 1 do
+              begin
+                ai := PrevLayer.Output.Raw[i];
+                wij := Neuron.Weights.Raw[i];
+                wEff := wij + Gamma * Max(wij, 0);
+                Rin[i] := Rin[i] + (ai * wEff / denom) * R[LIdx][j];
+              end;
+            end;
+            lrpAlphaBeta:
+            begin
+              // Split each contribution c_ij = a_i*w_ij into positive/negative
+              // parts; redistribute alpha*c+/z+ - beta*c-/z- of R_out[j].
+              // Bias is folded into both z+ and z- by its sign.
+              zPos := Max(Neuron.Bias, 0);
+              zNeg := Max(-Neuron.Bias, 0);
+              for i := 0 to Length(Rin) - 1 do
+              begin
+                cPos := PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
+                if cPos > 0 then zPos := zPos + cPos
+                else zNeg := zNeg - cPos;
+              end;
+              for i := 0 to Length(Rin) - 1 do
+              begin
+                cPos := PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
+                cNeg := 0;
+                if cPos < 0 then begin cNeg := -cPos; cPos := 0; end;
+                wEff := 0;
+                if zPos > 0 then wEff := wEff + Alpha * (cPos / zPos);
+                if zNeg > 0 then wEff := wEff - Beta * (cNeg / zNeg);
+                Rin[i] := Rin[i] + wEff * R[LIdx][j];
+              end;
+            end;
+          else
+            // lrpEpsilon: z-rule stabilised by eps*sign(z_j).
+            z := Neuron.Bias;
+            for i := 0 to Length(Rin) - 1 do
+              z := z + PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
+            if z >= 0 then sgn := 1 else sgn := -1;
+            denom := z + Eps * sgn;
+            if denom = 0 then denom := Eps;  // last-resort guard
+            for i := 0 to Length(Rin) - 1 do
+            begin
+              ai := PrevLayer.Output.Raw[i];
+              wij := Neuron.Weights.Raw[i];
+              Rin[i] := Rin[i] + (ai * wij / denom) * R[LIdx][j];
+            end;
           end;
         end;
       end
@@ -74584,13 +74661,26 @@ begin
 
     Lines.Add(StringOfChar('-', 72));
     Lines.Add(Format('Max conservation residual over HANDLED boundaries = %.6g '
-      + '(eps = %.4g).', [MaxResidual, Eps]));
-    Lines.Add('Conservation check: the epsilon-rule TRADES exact conservation '
-      + 'for numerical stability via eps; the residual is O(eps) and -> 0 as '
-      + 'eps -> 0 (pure z-rule). A residual that stays bounded by the eps '
-      + 'stabiliser is the expected, healthy LRP behaviour; a residual that '
-      + 'BLOWS UP signals a layer whose relevance rule is undefined (and which '
-      + 'should appear as SKIPPED above) rather than a redistribution.');
+      + '(eps = %.4g, rule = %s).', [MaxResidual, Eps, RuleName]));
+    case Rule of
+      lrpGamma:
+        Lines.Add('Conservation check: the gamma-rule (w -> w + gamma*w+) maps '
+          + 'the bias through the SAME transform, so it conserves relevance up '
+          + 'to the eps stabiliser; emphasising positive contributions yields a '
+          + 'sharper, less noisy relevance map than plain epsilon.');
+      lrpAlphaBeta:
+        Lines.Add('Conservation check: LRP-alpha-beta splits each contribution '
+          + 'into positive/negative parts (R_i = sum_j alpha*z+/z+_j - '
+          + 'beta*z-/z-_j R_j) with alpha - beta = 1, conserving total '
+          + 'relevance EXACTLY at non-degenerate boundaries (no eps trade-off).');
+    else
+      Lines.Add('Conservation check: the epsilon-rule TRADES exact conservation '
+        + 'for numerical stability via eps; the residual is O(eps) and -> 0 as '
+        + 'eps -> 0 (pure z-rule). A residual that stays bounded by the eps '
+        + 'stabiliser is the expected, healthy LRP behaviour; a residual that '
+        + 'BLOWS UP signals a layer whose relevance rule is undefined (and which '
+        + 'should appear as SKIPPED above) rather than a redistribution.');
+    end;
     Lines.Add('');
 
     // --- Top-K most-relevant input positions (layer 0). ---

@@ -28,6 +28,24 @@ the report:
    stabiliser whose sign follows `z_j`. ReLU / activation / Input / Identity
    layers pass relevance through 1:1.
 
+### Rule selector (epsilon / gamma / alpha-beta)
+
+`LRPReport` takes an optional `Rule: TLRPRule` parameter (default `lrpEpsilon`,
+so existing callers are unchanged) selecting the dense-layer redistribution:
+
+- **`lrpEpsilon`** — the z-rule above with the `eps` stabiliser.
+- **`lrpGamma`** (`Gamma`, default `0.25`) — replaces the weight with
+  `w + gamma*w+`, emphasising positive contributions for a sharper, less noisy
+  map (Montavon et al. 2019). The bias is mapped through the same transform, so
+  conservation holds up to `eps`.
+- **`lrpAlphaBeta`** (`Alpha`, default `2.0`; `beta = alpha - 1`) — splits each
+  contribution `a_i*w_ij` into positive/negative parts and redistributes
+  `alpha * z+_ij/z+_j - beta * z-_ij/z-_j` of `R_j`. With `alpha - beta = 1`
+  this conserves total relevance exactly at non-degenerate boundaries.
+
+Scope matches the epsilon-rule: dense (`TNNetFullConnect` family) + activation
+stack only; convolution remains a separate task.
+
 It prints:
 
 - **(a) the per-layer-boundary relevance-conservation residual**
@@ -65,6 +83,9 @@ report on:
    positions cluster on the discriminative top-left blob, and the conservation
    residual stays `O(eps)`;
 2. a **noisier** class-1 probe — relevance spreads out a little more.
+3. a **rule-contrast** arm running the epsilon-, gamma- and alpha-beta-rules on
+   the same class-0 probe, so the three relevance maps can be compared
+   side-by-side.
 
 The `SoftMax` head is reported as skipped/pass-through, demonstrating the honest
 handling of layers without an epsilon-rule.

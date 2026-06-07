@@ -20,6 +20,12 @@ For a probe sample and its predicted class c, the report prints:
 The SoftMax layer is SKIPPED honestly (no epsilon rule), and that is stated in
 the report rather than faked.
 
+A final arm contrasts the three relevance-redistribution rules on the SAME
+class-0 probe: the epsilon-rule (default), the gamma-rule (w -> w + gamma*w+,
+emphasising positive contributions), and LRP-alpha-beta (positive/negative
+contribution split, alpha - beta = 1). The latter two conserve relevance more
+tightly than plain epsilon.
+
 No dataset download, pure CPU, well under a minute.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
@@ -182,6 +188,28 @@ begin
     finally
       X1.Free;
       Y1.Free;
+    end;
+
+    WriteLn;
+
+    // ---- Rule contrast: epsilon vs gamma vs alpha-beta on a class-0 probe. ----
+    MakeSample(X0, Y0, 0, 0.05);
+    try
+      NN.Compute(X0);
+      WriteLn(StringOfChar('=', 72));
+      WriteLn('RULE CONTRAST (same class-0 probe): epsilon vs gamma vs alpha-beta');
+      WriteLn(StringOfChar('=', 72));
+      WriteLn('--- epsilon-rule (default, z-rule + eps stabiliser) ---');
+      Write(TNNet.LRPReport(NN, X0, -1, 6, 1e-2, lrpEpsilon));
+      WriteLn;
+      WriteLn('--- gamma-rule (gamma=0.25; emphasises positive contributions) ---');
+      Write(TNNet.LRPReport(NN, X0, -1, 6, 1e-2, lrpGamma, 0.25));
+      WriteLn;
+      WriteLn('--- alpha-beta-rule (alpha=2, beta=1; pos/neg split) ---');
+      Write(TNNet.LRPReport(NN, X0, -1, 6, 1e-2, lrpAlphaBeta, 0.25, 2.0));
+    finally
+      X0.Free;
+      Y0.Free;
     end;
 
     WriteLn;

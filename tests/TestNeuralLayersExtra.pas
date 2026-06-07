@@ -5679,11 +5679,37 @@ begin
   end;
 end;
 
+// Parses the "Max conservation residual ... = <value> (..." line out of an
+// LRPReport string. Returns -1 if the line/value is absent. The gamma- and
+// alpha-beta-rules (alpha-beta=1) conserve relevance up to the eps stabiliser.
+function LRPResidual(const Report: string): Extended;
+var
+  P, Q: integer;
+  NumStr: string;
+  FS: TFormatSettings;
+begin
+  Result := -1;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  P := Pos('Max conservation residual', Report);
+  if P <= 0 then Exit;
+  P := PosEx('=', Report, P);
+  if P <= 0 then Exit;
+  Inc(P);
+  while (P <= Length(Report)) and (Report[P] = ' ') do Inc(P);
+  Q := P;
+  while (Q <= Length(Report)) and (Report[Q] <> ' ') and (Report[Q] <> '(') do
+    Inc(Q);
+  NumStr := Trim(Copy(Report, P, Q - P));
+  Result := StrToFloatDef(NumStr, -1, FS);
+end;
+
 procedure TTestNeuralLayersExtra.TestLRPReportSmoke;
 var
   NN: TNNet;
   vInput: TNNetVolume;
   Report: string;
+  ResVal: Extended;
 begin
   // nil NN handled gracefully.
   Report := TNNet.LRPReport(nil, nil);
@@ -5712,6 +5738,26 @@ begin
       Pos('conservation residual', Report) > 0);
     AssertTrue('top-k positions present',
       Pos('most-relevant input positions', Report) > 0);
+    // Default call selects the epsilon-rule (unchanged behaviour).
+    AssertTrue('default is epsilon-rule', Pos('epsilon-rule', Report) > 0);
+
+    // gamma-rule variant runs end-to-end and conserves relevance tightly.
+    Report := TNNet.LRPReport(NN, vInput, -1, 8, 1e-2, lrpGamma, 0.25);
+    AssertTrue('gamma header present', Pos('gamma-rule', Report) > 0);
+    AssertTrue('gamma top-k positions present',
+      Pos('most-relevant input positions', Report) > 0);
+    ResVal := LRPResidual(Report);
+    AssertTrue('gamma residual parsed', ResVal >= 0);
+    AssertTrue('gamma relevance conserved', ResVal < 0.1);
+
+    // alpha-beta variant (alpha=2, beta=1) runs end-to-end and conserves.
+    Report := TNNet.LRPReport(NN, vInput, -1, 8, 1e-2, lrpAlphaBeta, 0.25, 2.0);
+    AssertTrue('alpha-beta header present', Pos('alpha-beta-rule', Report) > 0);
+    AssertTrue('alpha-beta top-k positions present',
+      Pos('most-relevant input positions', Report) > 0);
+    ResVal := LRPResidual(Report);
+    AssertTrue('alpha-beta residual parsed', ResVal >= 0);
+    AssertTrue('alpha-beta relevance conserved', ResVal < 0.1);
   finally
     if vInput <> nil then vInput.Free;
     NN.Free;
