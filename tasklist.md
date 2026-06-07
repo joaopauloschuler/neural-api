@@ -110,27 +110,6 @@ rather than acted on.
       explicitly OUT of v1: the full p4m group (adds reflections, 8-fold field) and
       steerable/SO(2) continuous-rotation harmonics — note them as follow-ups, do
       not build them in the first landing.
-- [ ] TNNetLIFNeuron follow-ups (the spiking leaky-integrate-and-fire surrogate-
-      gradient leaf layer + examples/SpikingMNIST/ + numerical-gradient/forward/
-      shape/save-load + FFloatSt round-trip tests all LANDED 2026-06-07 on a2):
-      - [X] the adaptive-LIF (ALIF) variant with a second slow threshold-
-            adaptation state — LANDED 2026-06-07 on a2 as TNNetALIFNeuron
-            (TNNetLayer leaf, mirrors TNNetLIFNeuron). LSNN/Bellec et al. 2018
-            dynamics: fast membrane V[t]=beta*V[t-1]*(1-S[t-1])+I[t] PLUS a slow
-            per-neuron adaptation trace a[t]=rho*a[t-1]+S[t-1] raising the
-            effective threshold V_th_eff=V_th+adaptBeta*a[t] (spike-frequency
-            adaptation; adaptBeta=0 reduces EXACTLY to plain LIF). Surrogate-
-            gradient BPTT through BOTH recurrences (carry gVnext AND gAnext;
-            gS gets the adaptation consumer gAnext*1, gA=gS*sgPrime*(-adaptBeta)
-            +gAnext*rho). Opt-in learnable per-channel V_th/leak (same 2-neuron
-            pattern as LIF). FFloatSt[0..4]=beta/V_th/alpha/adaptBeta/rho round-
-            trip; registered at both CreateLayer dispatch sites. Tests in
-            tests/TestNeuralNumerical.pas: input-gradient check, learnable-V_th
-            gradient check, adaptation-suppresses-immediate-respike forward
-            (t=1 fires for adaptBeta=0 but is suppressed for adaptBeta=0.8),
-            shape, save/load round-trip. Full suite green (1188 tests). No
-            example added (LIF's SpikingMNIST covers the paradigm; an ALIF demo
-            was skipped to stay in budget).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
@@ -338,34 +317,6 @@ rather than acted on.
       a BUILDER that inserts the HxH mix between the per-head logit slabs
       inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
       Re-scope before attempting.
-
-- [X] `TNNet.AddPerceiverEncoder(NumLatents, d_latent, Heads, Depth, d_ff,
-      PreNorm, NormClass)` — the Perceiver latent bottleneck (Jaegle et al. 2021,
-      arXiv:2103.03206; Perceiver IO, arXiv:2107.14795). BUILDER (no new leaf
-      class) composing already-landed pieces: (1) an optional token-wise
-      `TNNetPointwiseConvLinear(d_latent)` input width projection; (2)
-      `AddAttentionPooling(NumLatents, Heads)` as the input→latent CROSS-ATTENTION
-      read — its learnable PMA seed bank IS the Perceiver latent array `Z`,
-      collapsing the (possibly huge) `InputSeqLen` rows to a FIXED
-      `(NumLatents,1,d_latent)` summary at a cost linear in the input length; (3)
-      `AddTransformerEncoderBlock` repeated `Depth` times as the latent
-      self-attention tower (`O(NumLatents²)` per block, independent of input
-      length). Output length = `NumLatents` regardless of input — the missing
-      THIRD mode vs the Set-Transformer builders (`InducedSetAttention` projects
-      BACK to `n` input rows; `AttentionPooling` is a single pool with no
-      refinement). NOTE: used `TNNetAttentionPooling` (PMA) rather than the raw
-      `TNNetCrossAttention` for the read — the PMA seed bank already IS the
-      learnable latent array and gives an exact softmax-Jacobian backward.
-      Example `examples/Perceiver/` classifies a deliberately LONG 256-token input
-      (chance 25% → 100% in ≈55 s) and prints IDENTICAL weight counts at SEQLEN
-      and 2*SEQLEN (doubling the input adds ZERO weights). Tests (reseeded
-      `RandSeed := 424242`): shape (output rows = NumLatents AND weight count is
-      input-length-independent), input-gradient FD check (multi-head; epsilon=1e-3
-      — single-precision FD through the softmax+SwiGLU stack LOSES accuracy below
-      that, the analytic gradient is correct), and save/load round-trip. Optional
-      Perceiver-IO output cross-attention (a final `(NumOutputs,1,d)` query array
-      reading the refined latents) remains a natural v2 follow-up. Landed on a2.
-      Pairs with [[set-transformer-isab-pma]] / [[set-attention-block-builder]].
 
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
@@ -840,13 +791,6 @@ rather than acted on.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
 ### Examples I'd enjoy writing
-- [X] EchoStateNetwork follow-up: added `TNNet.EstimateSpectralRadius` (power
-      iteration on W·v only, no W^T step; Rayleigh ratio ρ≈‖Wv‖ at convergence,
-      square-matrix only) so reservoirs target the TRUE spectral RADIUS instead
-      of the conservative spectral-norm upper bound EstimateSpectralNorm gives.
-      EchoStateNetwork now scales W to rho_target<1 directly (cRhoGood=0.9);
-      free-run NRMSE improved 0.21→0.08. Test: TestEstimateSpectralRadiusKnown-
-      Matrix (triangular ρ=max|diag|, ρ≤σ_1 strict, diagonal ρ=σ_1, non-square→0).
 - [ ] EchoStateNetwork follow-up: an optional ridge closed-form readout solve
       (normal equations) as a deterministic alternative to the SGD readout loop,
       showing the classic ESN one-shot linear fit (the SGD loop is LR-sensitive).
