@@ -199,10 +199,15 @@ rather than acted on.
 - [ ] TNNetHamiltonianCell follow-ups (leaf layer + input/weight numerical-gradient
       tests + LoadFromString round-trip + examples/HamiltonianPendulum/ all LANDED
       2026-06-07 on a2, commit 4fd7309):
-      - [ ] builder TNNet.AddHamiltonianBlock (skipped at landing; leaf+tests+example
-            were the priority).
-      - [ ] separable H(q,p)=T(p)+V(q) (kinetic+potential split) variant that makes the
-            leapfrog step exact and cheaper.
+      - [x] builder TNNet.AddHamiltonianBlock — LANDED 2026-06-07 on a2 (commit
+            e2ddb00): `y = x + HamiltonianCell(RMSNorm(x))` via AddRMSNormResidual,
+            even-Depth/SizeY=1 guards; builder smoke test asserts residual TNNetSum +
+            shape preservation.
+      - [x] separable H(q,p)=T(p)+V(q) (kinetic+potential split) variant — LANDED
+            2026-06-07 on a2 (commit e2ddb00): `pSeparable` ctor flag (FStruct[3]),
+            two independent half-width MLPs T(p)+V(q), exact leapfrog (Störmer-Verlet)
+            forward + reverse-leapfrog half-width-HVP backward; input+weight
+            numerical-gradient + serialization round-trip tests, coupled path unchanged.
 - [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
       landed 2026-06-01, sine-regression task distribution, manual inner-loop
       Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
