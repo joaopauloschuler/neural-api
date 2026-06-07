@@ -779,6 +779,8 @@ type
     procedure TestLinearAttentionGradientCheck;
     procedure TestLinearAttentionSeqLen1Degeneracy;
     procedure TestLinearAttentionSerializationRoundTrip;
+    procedure TestPerformerAttentionInputGradientCheck;
+    procedure TestPerformerAttentionSerializationRoundTrip;
     procedure TestCausalLinearAttentionGradientCheck;
     procedure TestCausalLinearAttentionCausality;
     procedure TestCausalLinearAttentionSerializationRoundTrip;
@@ -15725,6 +15727,87 @@ begin
   // d_k = 4. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetCausalLinearAttention.Create(4),
     'CausalLinearAttention', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestPerformerAttentionInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetPerformerAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Self-contained RNG: these gradient tests share one RNG and some checks are
+  // ordering-sensitive, so reseed (do NOT loosen tolerances to compensate).
+  RandSeed := 424242;
+  SeqLen := 3;
+  Dk := 4; // d_v = d_k = 4
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetPerformerAttention.Create(Dk, {m=}8, {seed=}1234);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bound inputs to a modest range so the exp() feature map does not blow the
+    // finite-difference truncation (do NOT loosen tolerance to hide bugs).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.4 + 0.05;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('PerformerAttention input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPerformerAttentionSerializationRoundTrip;
+begin
+  // d_k = 4 (input depth = 3*d_k = 12), m = 8, non-default seed. The frozen
+  // random W is redrawn deterministically from the stored seed on load, so the
+  // reloaded net must produce bit-identical output (1e-5 tolerance).
+  SerializationRoundTrip(Self, TNNetPerformerAttention.Create(4, 8, 777),
+    'PerformerAttention', 3, 1, 12, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestLinformerAttentionInputGradientCheck;

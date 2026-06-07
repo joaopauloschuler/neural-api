@@ -3200,6 +3200,55 @@ type
     property Dk: integer read FDk;
   end;
 
+  /// Performer self-attention (Choromanski et al. 2020, "Rethinking Attention
+  // with Performers", FAVOR+). Unlike TNNetLinearAttention (which uses the
+  // deterministic elu+1 feature map of Katharopoulos 2020) this layer uses
+  // POSITIVE RANDOM FEATURES that give an UNBIASED, low-variance estimate of the
+  // softmax attention kernel exp(q.k) while keeping linear O(SeqLen*m*d_v) cost.
+  // The feature map for an m x d_k FROZEN (non-trainable) random projection W is
+  //   phi(x) = exp(W.x - ||x||^2/2) / sqrt(m)        (m positive features)
+  // so that E[ phi(q).phi(k) ] = exp(q.k) (the softmax numerator kernel). The
+  // rows of W are drawn i.i.d. N(0,1) and, when m >= d_k, ORTHOGONALIZED block by
+  // block (Gram-Schmidt) which further reduces the estimator variance (the
+  // "+ " in FAVOR+). W is frozen: it receives no weight gradient. Attention then
+  // uses the same accumulate-S/Z structure as TNNetLinearAttention but in the
+  // m-dimensional random-feature space:
+  //   q'_t = phi(Q_t), k'_s = phi(K_s)   (each length m)
+  //   S = sum_s k'_s (x) V_s   (m x d_v),   Z = sum_s k'_s   (m,)
+  //   Out_t = (q'_t . S) / (q'_t . Z)
+  // Input contract is identical to the sibling attention layers: SizeY = 1,
+  // input depth = 3*d_k laid out as [Q (d_k) | K (d_k) | V (d_k)] along Depth,
+  // output depth = d_v = d_k. dL/dQ and dL/dK are backpropagated THROUGH phi
+  // (which depends on x via both W.x and the -||x||^2/2 term). d_k is stored in
+  // FStruct[0], m in FStruct[1] and the RNG seed in FStruct[5] so the frozen W
+  // reloads identically through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetPerformerAttention = class(TNNetLayer)
+  private
+    FDk: integer;       // query/key/value feature width d_k (= d_v)
+    FM: integer;        // number of random features m
+    FSeed: integer;     // RandSeed used to draw the frozen projection W
+    FScale: TNeuralFloat; // 1/sqrt(m)
+    // Forward caches reused by Backpropagate().
+    FWProj: TNNetVolume; // frozen random projection W, [d_k,1,m] (X=feature a, Depth=random row r)
+    FQproj: TNNetVolume; // W.Q_t per query, [SeqLen,1,m]
+    FKproj: TNNetVolume; // W.K_s per key,   [SeqLen,1,m]
+    FPhiQ: TNNetVolume;  // phi(Q_t),        [SeqLen,1,m]
+    FPhiK: TNNetVolume;  // phi(K_s),        [SeqLen,1,m]
+    FS: TNNetVolume;     // S = sum_s phi(K_s)(x)V_s, [m,1,d_v] (X=random row r, Depth=value b)
+    FZ: TNNetVolume;     // Z = sum_s phi(K_s),       [m,1,1]
+    FDen: TNNetVolume;   // per-query denominator phi(Q_t).Z, [SeqLen,1,1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; m: integer = 0; pSeed: integer = 424242); overload;
+    destructor Destroy(); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Dk: integer read FDk;
+    property NumFeatures: integer read FM;
+  end;
+
   /// Causal (autoregressive) linear attention. Same feature map phi(x)=elu(x)+1
   // and the same I/O contract as TNNetLinearAttention (input depth = 3*d_k laid
   // out as Q|K|V slabs with SizeY=1, output depth = d_k, no trainable
@@ -22014,6 +22063,301 @@ begin
     finally
       dS.Free;
       dZ.Free;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetPerformerAttention }
+
+constructor TNNetPerformerAttention.Create(d_k: integer; m: integer = 0;
+  pSeed: integer = 424242);
+begin
+  inherited Create();
+  FDk := d_k;
+  if FDk < 1 then
+    FErrorProc('TNNetPerformerAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  // Default m: round up to 2*d_k random features (a common FAVOR+ choice).
+  if m <= 0 then m := 2 * FDk;
+  FM := m;
+  FSeed := pSeed;
+  FScale := 1.0 / Sqrt(FM);
+  FStruct[0] := FDk;
+  FStruct[1] := FM;
+  FStruct[5] := FSeed;
+  FWProj := TNNetVolume.Create();
+  FQproj := TNNetVolume.Create();
+  FKproj := TNNetVolume.Create();
+  FPhiQ := TNNetVolume.Create();
+  FPhiK := TNNetVolume.Create();
+  FS := TNNetVolume.Create();
+  FZ := TNNetVolume.Create();
+  FDen := TNNetVolume.Create();
+end;
+
+destructor TNNetPerformerAttention.Destroy();
+begin
+  FWProj.Free;
+  FQproj.Free;
+  FKproj.Free;
+  FPhiQ.Free;
+  FPhiK.Free;
+  FS.Free;
+  FZ.Free;
+  FDen.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetPerformerAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetPerformerAttention requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> 3 * FDk then
+    FErrorProc('TNNetPerformerAttention requires input depth = 3*d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // W laid out X=feature a (d_k), Depth=random row r (m): W[a,0,r] = W_{r,a}.
+  FWProj.ReSize(FDk, 1, FM);
+  FQproj.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
+  FKproj.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
+  FPhiQ.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
+  FPhiK.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
+  // S: X = random row r (m), Depth = value feature b (d_v = d_k).
+  FS.ReSize(FM, 1, FDk);
+  FZ.ReSize(FM, 1, 1);
+  FDen.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+  InitDefault();
+end;
+
+// Draw the m x d_k random projection W under a deterministic, restorable seed so
+// the SAME frozen map reloads bit-identically. Rows are i.i.d. N(0,1); when
+// m >= d_k we orthogonalize each consecutive block of d_k rows via Gram-Schmidt
+// and rescale each row to a chi-distributed norm (sqrt(d_k)) so the rows keep
+// N(0,1)-row statistics while being mutually orthogonal (FAVOR+ ortho features).
+procedure TNNetPerformerAttention.InitDefault();
+var
+  r, a, j, blockStart, blockEnd: integer;
+  oldSeed: integer;
+  dot, nrm: TNeuralFloat;
+  SavedExMask: TFPUExceptionMask;
+begin
+  if FWProj.Size <= 0 then exit;
+  // Gram-Schmidt can drive a row near zero before re-normalization; mask FP
+  // exceptions (denormals/underflow) for the draw and restore afterwards.
+  SavedExMask := GetExceptionMask();
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow,
+    exUnderflow, exPrecision]);
+  oldSeed := RandSeed;
+  if FSeed <> 0 then RandSeed := FSeed;
+  // Fill rows with N(0,1).
+  for r := 0 to FM - 1 do
+    for a := 0 to FDk - 1 do
+      FWProj[a, 0, r] := FWProj.RandomGaussianValue();
+  // Block-wise Gram-Schmidt orthogonalization (each block of up to FDk rows).
+  r := 0;
+  while r < FM do
+  begin
+    blockStart := r;
+    blockEnd := r + FDk - 1;
+    if blockEnd > FM - 1 then blockEnd := FM - 1;
+    for r := blockStart to blockEnd do
+    begin
+      // Subtract projections onto previously orthogonalized rows in this block.
+      for j := blockStart to r - 1 do
+      begin
+        dot := 0;
+        for a := 0 to FDk - 1 do dot := dot + FWProj[a, 0, r] * FWProj[a, 0, j];
+        for a := 0 to FDk - 1 do
+          FWProj[a, 0, r] := FWProj[a, 0, r] - dot * FWProj[a, 0, j];
+      end;
+      // Normalize to unit length, then rescale to expected Gaussian-row norm.
+      nrm := 0;
+      for a := 0 to FDk - 1 do nrm := nrm + Sqr(FWProj[a, 0, r]);
+      nrm := Sqrt(nrm);
+      if nrm < 1e-12 then nrm := 1e-12;
+      // Each orthonormal direction is scaled by a fresh chi-norm draw so the row
+      // length matches a Gaussian row (preserves the unbiased softmax estimate).
+      dot := 0;
+      for a := 0 to FDk - 1 do dot := dot + Sqr(FWProj.RandomGaussianValue());
+      dot := Sqrt(dot);
+      for a := 0 to FDk - 1 do
+        FWProj[a, 0, r] := FWProj[a, 0, r] * (dot / nrm);
+    end;
+    r := blockEnd + 1;
+  end;
+  if FSeed <> 0 then RandSeed := oldSeed;
+  ClearExceptions(false);
+  SetExceptionMask(SavedExMask);
+end;
+
+procedure TNNetPerformerAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, a, r: integer;
+  Prev: TNNetVolume;
+  Q, K, sqNormQ, sqNormK, proj, PhiVal, Den: TNeuralFloat;
+  SavedExMask: TFPUExceptionMask;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // The positive random feature exp(W.x - ||x||^2/2) can underflow/denormalize
+  // for strongly negative exponents (mathematically a harmless 0); mask the
+  // arithmetic FP exceptions for the duration and restore the mask afterwards so
+  // a sticky flag does not leak into unrelated downstream code.
+  SavedExMask := GetExceptionMask();
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow,
+    exUnderflow, exPrecision]);
+  try
+  // 1) Positive random features phi(x) = exp(W.x - ||x||^2/2) / sqrt(m).
+  for i := 0 to SeqLen - 1 do
+  begin
+    // ||Q||^2 and ||K||^2 over the d_k feature slabs.
+    sqNormQ := 0;
+    sqNormK := 0;
+    for a := 0 to FDk - 1 do
+    begin
+      Q := Prev[i, 0, a];        sqNormQ := sqNormQ + Q * Q;
+      K := Prev[i, 0, FDk + a];  sqNormK := sqNormK + K * K;
+    end;
+    for r := 0 to FM - 1 do
+    begin
+      proj := 0;
+      for a := 0 to FDk - 1 do proj := proj + FWProj[a, 0, r] * Prev[i, 0, a];
+      FQproj[i, 0, r] := proj;
+      FPhiQ[i, 0, r] := FScale * pcr_expf(proj - 0.5 * sqNormQ);
+      proj := 0;
+      for a := 0 to FDk - 1 do proj := proj + FWProj[a, 0, r] * Prev[i, 0, FDk + a];
+      FKproj[i, 0, r] := proj;
+      FPhiK[i, 0, r] := FScale * pcr_expf(proj - 0.5 * sqNormK);
+    end;
+  end;
+  // 2) Accumulate S = sum_s phi(K_s) (x) V_s  and  Z = sum_s phi(K_s).
+  FS.Fill(0);
+  FZ.Fill(0);
+  for i := 0 to SeqLen - 1 do
+    for r := 0 to FM - 1 do
+    begin
+      PhiVal := FPhiK[i, 0, r];
+      FZ.Add(r, 0, 0, PhiVal);
+      TNNetVolume.MulAdd(FS.GetRawPtr(r, 0, 0),
+        Prev.GetRawPtr(i, 0, 2 * FDk), PhiVal, FDk);
+    end;
+  // 3) Out_t = (phi(Q_t) . S) / (phi(Q_t) . Z).
+  for i := 0 to SeqLen - 1 do
+  begin
+    Den := TNNetVolume.DotProduct(
+      FPhiQ.GetRawPtr(i, 0, 0), FZ.GetRawPtr(0, 0, 0), FM);
+    if (Den >= 0) and (Den < 1e-12) then Den := 1e-12;
+    if (Den < 0) and (Den > -1e-12) then Den := -1e-12;
+    FDen[i, 0, 0] := Den;
+    FillChar(FOutput.GetRawPtr(i, 0, 0)^, FDk * SizeOf(TNeuralFloat), 0);
+    for r := 0 to FM - 1 do
+      TNNetVolume.MulAdd(FOutput.GetRawPtr(i, 0, 0),
+        FS.GetRawPtr(r, 0, 0), FPhiQ[i, 0, r], FDk);
+    TNNetVolume.Mul(FOutput.GetRawPtr(i, 0, 0), 1 / Den, FDk);
+  end;
+  finally
+    ClearExceptions(false);
+    SetExceptionMask(SavedExMask);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPerformerAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, a, r: integer;
+  Prev, PrevErr: TNNetVolume;
+  dS: TNNetVolume;
+  dZ: TNNetVolume;
+  Den, PhiQr, dPhiVal, T, dPhiKr, dProjQ, dProjK, dNormQ, dNormK: TNeuralFloat;
+  SavedExMask: TFPUExceptionMask;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := Prev.SizeX;
+    dS := TNNetVolume.Create(FM, 1, FDk);
+    dZ := TNNetVolume.Create(FM, 1, 1);
+    // Cached phi values may be denormal (see Compute); mask FP exceptions.
+    SavedExMask := GetExceptionMask();
+    SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow,
+      exUnderflow, exPrecision]);
+    try
+      dS.Fill(0);
+      dZ.Fill(0);
+      // ---- Per query i: route dOut back to phi(Q_i), S and Z ----
+      // Same algebra as TNNetLinearAttention but over m random features:
+      //   d/dphiQ[i,r] Out[i,b] = (S[r,b] - Out[i,b]*Z[r]) / Den
+      //   d/dS[r,b]    Out[i,b] = phiQ[i,r]/Den
+      //   d/dZ[r]      Out[i,b] = -Out[i,b]*phiQ[i,r]/Den
+      for i := 0 to SeqLen - 1 do
+      begin
+        Den := FDen[i, 0, 0];
+        T := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
+          FOutput.GetRawPtr(i, 0, 0), FDk) / Den;
+        // dProjQ accumulates the gradient w.r.t. W.Q over all random rows so the
+        // shared -||Q||^2/2 term (dNormQ) can be applied once per feature a.
+        dNormQ := 0;
+        for r := 0 to FM - 1 do
+        begin
+          PhiQr := FPhiQ[i, 0, r];
+          dPhiVal := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
+            FS.GetRawPtr(r, 0, 0), FDk) / Den - T * FZ[r, 0, 0];
+          // phi(Q_i,r) = scale*exp(projQ - ||Q||^2/2)  =>  dphi/dprojQ = phi,
+          // dphi/d(||Q||^2) = -phi/2. Chain dPhiVal through phi:
+          dProjQ := dPhiVal * PhiQr;
+          // grad into projQ[r] = W_r . Q  ->  dQ[a] += dProjQ * W[a,r]
+          for a := 0 to FDk - 1 do
+            PrevErr.Add(i, 0, a, dProjQ * FWProj[a, 0, r]);
+          // grad into ||Q||^2 (accumulated, applied below): -dPhiVal*PhiQr/2
+          dNormQ := dNormQ - 0.5 * dProjQ;
+          // gradient into S[r,*] and Z[r]
+          TNNetVolume.MulAdd(dS.GetRawPtr(r, 0, 0),
+            FOutputError.GetRawPtr(i, 0, 0), PhiQr / Den, FDk);
+          dZ.Add(r, 0, 0, -T * PhiQr);
+        end;
+        // ||Q||^2 = sum_a Q_a^2  ->  dQ[a] += dNormQ * 2*Q_a
+        for a := 0 to FDk - 1 do
+          PrevErr.Add(i, 0, a, dNormQ * 2 * Prev[i, 0, a]);
+      end;
+      // ---- Route dS / dZ back through S = sum_s phiK_s (x) V_s, Z = sum_s phiK_s ----
+      for i := 0 to SeqLen - 1 do
+      begin
+        dNormK := 0;
+        for r := 0 to FM - 1 do
+        begin
+          dPhiKr := dZ[r, 0, 0] + TNNetVolume.DotProduct(
+            dS.GetRawPtr(r, 0, 0), Prev.GetRawPtr(i, 0, 2 * FDk), FDk);
+          // phi(K) chain (same exp form as phi(Q)).
+          dProjK := dPhiKr * FPhiK[i, 0, r];
+          for a := 0 to FDk - 1 do
+            PrevErr.Add(i, 0, FDk + a, dProjK * FWProj[a, 0, r]);
+          dNormK := dNormK - 0.5 * dProjK;
+          // dV[s,*] += dS row r * phiK[s,r]
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 2 * FDk),
+            dS.GetRawPtr(r, 0, 0), FPhiK[i, 0, r], FDk);
+        end;
+        for a := 0 to FDk - 1 do
+          PrevErr.Add(i, 0, FDk + a, dNormK * 2 * Prev[i, 0, FDk + a]);
+      end;
+    finally
+      dS.Free;
+      dZ.Free;
+      ClearExceptions(false);
+      SetExceptionMask(SavedExMask);
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -78605,6 +78949,7 @@ begin
       'TNNetAttentionPooling' :     Result := TNNetAttentionPooling.Create(St[0], St[1]);
       'TNNetProductKeyMemory' :     Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
+      'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
@@ -78973,6 +79318,7 @@ begin
       if S[0] = 'TNNetAttentionPooling' then Result := TNNetAttentionPooling.Create(St[0], St[1]) else
       if S[0] = 'TNNetProductKeyMemory' then Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
+      if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
