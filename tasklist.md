@@ -412,7 +412,7 @@ rather than acted on.
       SetBatchUpdate(True) idiom from [[manual-gradient-and-snapshot-gotchas]];
       keep eval deterministic. Add a test that two samples in one batch get
       different effective scales.
-- [ ] ShakeShake follow-up (b): examples/ShakeShakeReg/ demo — contrast an
+- [X] ShakeShake follow-up (b): examples/ShakeShakeReg/ demo — contrast an
       AddShakeShakeBlock stack vs a plain two-branch (deterministic 0.5/0.5)
       residual on a small noisy/over-parameterised task, charting the train/val
       gap narrowing (the headline regularisation win, à la the Mixup/SAM
