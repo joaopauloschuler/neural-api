@@ -280,11 +280,7 @@ rather than acted on.
       AddMultiHeadSDPAConcat landed on a2, commit fcc6ba8): (a) forward the
       variant through TNNetTransformerDecoderBlock / AddTransformerEncoderBlock —
       only the raw MHA breakdown takes it today, so a decoder-block-level flag is
-      the next rung; (b) [X] add avCosineSimilarity to the enum (same drop-in SDPA
-      subclass shape) — LANDED 2026-06-07 on a2 (commit d96ca99): wires the
-      existing TNNetCosineSimilarityAttention as a per-head variant in both
-      AddMultiHeadSelfAttention/AddMultiHeadSDPAConcat, avSDPA default unchanged,
-      shape+save/load test; (c) persist the variant choice in a one-arg rebuild helper
+      the next rung; (b) persist the variant choice in a one-arg rebuild helper
       (the composed layers serialize themselves, so load already works).
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
@@ -1447,42 +1443,3 @@ rather than acted on.
         log-likelihood over the current two-layer flow (the Invertible1x1Conv
         note already records "glow training unstable at coupling LR" — ActNorm is
         precisely the paper's fix for that instability).
-- [X] `TNNetInvertible1x1Conv` — LANDED 2026-06-07 on a2 (commit 4d4d11c):
-      Glow's learnable invertible 1x1 conv via W=P·L·(U+diag(s)) LU param (fixed
-      perm P from a stored seed, trainable L/U/s), cheap per-position log-det
-      sum(log|s|), public LogDetJacobian (summed over positions, mirrors
-      TNNetAffineCoupling), Inverse sampling path via triangular solves, FStruct
-      carries C+perm-seed+inverse-flag, registered in both CreateLayer tables +
-      LoadFromString. 6 tests (input/weight/log-det numerical-grad, forward∘inverse
-      identity, LogDetJacobian value, save/load round-trip). examples/NormalizingFlow
-      upgraded to interleave AffineCoupling<->Invertible1x1Conv (Glow flow reaches
-      mean log-lik -1.16 vs -1.56 fixed-permute baseline). The original idea text:
-      Glow's LEARNABLE invertible 1x1 convolution
-      (Kingma & Dhariwal 2018, arXiv:1807.03039, sec. 3.2), the natural
-      channel-mixing companion to the landed `TNNetAffineCoupling`. The
-      AffineCoupling design note "pair with a FIXED channel permutation so every
-      channel gets updated" leaves mixing non-trainable; Glow replaces that fixed
-      permutation with a learned C x C matrix W applied per spatial position
-      across the Depth axis (y[x,y,:] = W * x[x,y,:]), a generalization of a
-      permutation that the network can adapt. Distinct from every existing layer:
-      `TNNetHouseholderLinear` is exactly ORTHOGONAL (log-det identically 0, so it
-      contributes ZERO volume change and cannot stand in for this), and
-      `TNNetPointwiseConvLinear` is a generic non-invertible 1x1 conv with no
-      tractable inverse or log-det. Mechanism + design notes:
-      - parametrize W via its LU decomposition W = P*L*(U + diag(s)) with P a
-        FIXED permutation chosen at init, L unit-lower-triangular, U strictly
-        upper-triangular, s the log-scale vector — exactly Glow's trick so the
-        per-position log-det is the CHEAP sum(log|s|) (O(C)) instead of a full
-        O(C^3) determinant every step;
-      - expose a read-only `LogDetJacobian` summed over all spatial positions for
-        the current forward (so a flow's NLL composes additively with the
-        coupling layers' log-dets, mirroring `TNNetAffineCoupling.LogDetJacobian`);
-      - add an `Inverse` (sampling) forward path z -> x reusing the same L/U/s by
-        triangular solves (no explicit matrix inverse needed);
-      - gradient-check the forward over L/U/s AND verify forward∘inverse is the
-        identity to tolerance; serialization round-trip (FStruct carries C + the
-        frozen permutation P);
-      - then upgrade `examples/NormalizingFlow/` to interleave
-        AffineCoupling <-> Invertible1x1Conv (the real Glow step) and show the
-        learned mixing reaches a higher mean log-likelihood than the fixed-permute
-        baseline on the same two-moons/spiral target.
