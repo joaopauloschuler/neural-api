@@ -3231,6 +3231,45 @@ type
     property Dk: integer read FDk;
   end;
 
+  /// Linformer self-attention (Wang et al. 2020, "Linformer: Self-Attention
+  // with Linear Complexity"). Single-head self-attention where the Key and
+  // Value sequences are first projected DOWN along the sequence axis from
+  // SeqLen to a small fixed rank k (k << SeqLen) by two LEARNABLE projection
+  // matrices E and F (each k x SeqLen):
+  //   K' = E . K   (k x d_k),   V' = F . V   (k x d_v)
+  //   Attn = softmax( Q . K'^T / sqrt(d_k) )   (SeqLen x k)
+  //   Out  = Attn . V'                         (SeqLen x d_v)
+  // This makes attention O(SeqLen * k) instead of O(SeqLen^2). Because E and F
+  // have a fixed SeqLen dimension the layer requires a FIXED SeqLen (asserted
+  // in SetPrevLayer). Same Q|K|V input contract as TNNetScaledDotProductAttention
+  // / TNNetLinearAttention: SizeY = 1, input depth = 3*d_k laid out as
+  // [Q (d_k) | K (d_k) | V (d_k)] along Depth, output depth = d_v = d_k.
+  // E and F are stored as two trainable neurons (FNeurons[0]=E, FNeurons[1]=F),
+  // each holding a (SeqLen, k, 1) weight volume (E[r,s] = Weights[s, r, 0]); no
+  // bias is used. d_k is stored in FStruct[0], k in FStruct[1] and SeqLen in
+  // FStruct[2] so the layer round-trips through SaveToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetLinformerAttention = class(TNNetLayer)
+  private
+    FDk: integer;        // query/key/value feature width d_k (= d_v)
+    FProjDim: integer;   // projection rank k (k << SeqLen)
+    FSeqLen: integer;    // fixed sequence length (0 until SetPrevLayer)
+    FInvSqrtDk: TNeuralFloat;
+    // Forward caches reused by Backpropagate().
+    FKp: TNNetVolume;    // K' = E.K, [k,1,d_k]   (X=rank r, Depth=feature a)
+    FVp: TNNetVolume;    // V' = F.V, [k,1,d_k]   (X=rank r, Depth=feature b)
+    FAttn: TNNetVolume;  // softmax weights,  X=rank r, Y=query i, [k,SeqLen,1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; k: integer); overload;
+    destructor Destroy(); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Dk: integer read FDk;
+    property ProjDim: integer read FProjDim;
+  end;
+
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
   // consecutive pairs of channels.
@@ -23203,6 +23242,255 @@ begin
   // carries the current value through SaveStructureToString / LoadFromString.
   FFloatSt[0] := localNeuron.FWeights.Raw[0];
   FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetLinformerAttention }
+
+constructor TNNetLinformerAttention.Create(d_k: integer; k: integer);
+begin
+  inherited Create();
+  FDk := d_k;
+  FProjDim := k;
+  FSeqLen := 0;
+  if FDk < 1 then
+    FErrorProc('TNNetLinformerAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  if FProjDim < 1 then
+    FErrorProc('TNNetLinformerAttention requires k >= 1. k=' + IntToStr(FProjDim));
+  FInvSqrtDk := pcr_rsqrtf(FDk);
+  FStruct[0] := FDk;
+  FStruct[1] := FProjDim;
+  FStruct[2] := FSeqLen;
+  FKp := TNNetVolume.Create();
+  FVp := TNNetVolume.Create();
+  FAttn := TNNetVolume.Create();
+  // Two trainable neurons: FNeurons[0] = E, FNeurons[1] = F. Weight volumes are
+  // sized in SetPrevLayer once SeqLen is known.
+  while FNeurons.Count > 2 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 2 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+destructor TNNetLinformerAttention.Destroy();
+begin
+  FKp.Free;
+  FVp.Free;
+  FAttn.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLinformerAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ProjIdx: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetLinformerAttention requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> 3 * FDk then
+    FErrorProc('TNNetLinformerAttention requires input depth = 3*d_k. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
+  FSeqLen := pPrevLayer.FOutput.SizeX;
+  if FProjDim > FSeqLen then
+    FErrorProc('TNNetLinformerAttention requires k <= SeqLen. k=' +
+      IntToStr(FProjDim) + ', SeqLen=' + IntToStr(FSeqLen));
+  FStruct[2] := FSeqLen;
+  FOutput.ReSize(FSeqLen, 1, FDk);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // E and F: (SeqLen, k, 1) each, so weight[s, r, 0] = projection coeff E[r,s].
+  for ProjIdx := 0 to 1 do
+  begin
+    FNeurons[ProjIdx].Weights.ReSize(FSeqLen, FProjDim, 1);
+    FNeurons[ProjIdx].BackInertia.ReSize(FSeqLen, FProjDim, 1);
+    FNeurons[ProjIdx].Delta.ReSize(FSeqLen, FProjDim, 1);
+  end;
+  BuildArrNeurons();
+  // K': X = rank r, Depth = key feature a. V': X = rank r, Depth = value b.
+  FKp.ReSize(FProjDim, 1, FDk);
+  FVp.ReSize(FProjDim, 1, FDk);
+  // Attention weights: X = projected rank r, Y = query i.
+  FAttn.ReSize(FProjDim, FSeqLen, 1);
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+// E and F start as small random sequence-mixing projections. Glorot-style scale
+// keyed to SeqLen keeps the projected K'/V' magnitudes comparable to a single
+// key/value vector at initialization.
+procedure TNNetLinformerAttention.InitDefault();
+var
+  ProjIdx: integer;
+  scale: TNeuralFloat;
+begin
+  if FSeqLen <= 0 then exit;
+  scale := Sqrt(2.0 / (FSeqLen + FProjDim));
+  for ProjIdx := 0 to 1 do
+  begin
+    FArrNeurons[ProjIdx].FWeights.RandomizeGaussian(scale);
+    FArrNeurons[ProjIdx].FBiasWeight := 0;
+  end;
+end;
+
+procedure TNNetLinformerAttention.Compute();
+var
+  StartTime: double;
+  i, r, s, a: integer;
+  Prev, E, F: TNNetVolume;
+  Coef, Score, MaxScore, SumExp: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  E := FArrNeurons[0].FWeights;
+  F := FArrNeurons[1].FWeights;
+  // 1) Project K and V down the sequence axis to rank k:
+  //    K'[r,a] = sum_s E[r,s]*K[s,a], V'[r,b] = sum_s F[r,s]*V[s,b].
+  //    Depth (feature) is contiguous, so each (r) row is an AVX MulAdd over the
+  //    d_k features accumulated across the s key positions. K at depth FDk, V at
+  //    depth 2*FDk.
+  FKp.Fill(0);
+  FVp.Fill(0);
+  for r := 0 to FProjDim - 1 do
+    for s := 0 to FSeqLen - 1 do
+    begin
+      Coef := E[s, r, 0];
+      if Coef <> 0 then
+        TNNetVolume.MulAdd(FKp.GetRawPtr(r, 0, 0),
+          Prev.GetRawPtr(s, 0, FDk), Coef, FDk);
+      Coef := F[s, r, 0];
+      if Coef <> 0 then
+        TNNetVolume.MulAdd(FVp.GetRawPtr(r, 0, 0),
+          Prev.GetRawPtr(s, 0, 2 * FDk), Coef, FDk);
+    end;
+  // 2) For each query i: scaled scores against K', softmax over the k ranks,
+  //    then weighted sum of V'.
+  for i := 0 to FSeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for r := 0 to FProjDim - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(i, 0, 0), FKp.GetRawPtr(r, 0, 0), FDk) * FInvSqrtDk;
+      FAttn[r, i, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    SumExp := 0;
+    for r := 0 to FProjDim - 1 do
+    begin
+      Score := pcr_expf(FAttn[r, i, 0] - MaxScore);
+      FAttn[r, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for r := 0 to FProjDim - 1 do
+        FAttn[r, i, 0] := FAttn[r, i, 0] / SumExp;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for a := 0 to FDk - 1 do
+      OutPtr^[a] := 0;
+    for r := 0 to FProjDim - 1 do
+      TNNetVolume.MulAdd(OutPtr, FVp.GetRawPtr(r, 0, 0), FAttn[r, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLinformerAttention.Backpropagate();
+var
+  StartTime: double;
+  i, r, s: integer;
+  Prev, PrevErr, E, F, dE, dF: TNNetVolume;
+  dKp, dVp: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS, Coef, NegLr: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    E := FArrNeurons[0].FWeights;
+    F := FArrNeurons[1].FWeights;
+    dE := FArrNeurons[0].FDelta;
+    dF := FArrNeurons[1].FDelta;
+    dKp := TNNetVolume.Create(FProjDim, 1, FDk);
+    dVp := TNNetVolume.Create(FProjDim, 1, FDk);
+    SetLength(dAttn, FProjDim);
+    SetLength(dScore, FProjDim);
+    try
+      dKp.Fill(0);
+      dVp.Fill(0);
+      // ---- Per query i: route dOut back to Q[i], K' and V' ----
+      // Out[i,b] = sum_r Attn[r,i]*V'[r,b]
+      //   dV'[r,b] += Attn[r,i]*dOut[i,b]
+      //   dAttn[r]  = sum_b dOut[i,b]*V'[r,b]   (AVX dot over d_k)
+      for i := 0 to FSeqLen - 1 do
+      begin
+        for r := 0 to FProjDim - 1 do
+        begin
+          A := FAttn[r, i, 0];
+          TNNetVolume.MulAdd(dVp.GetRawPtr(r, 0, 0),
+            FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+          dAttn[r] := TNNetVolume.DotProduct(
+            FOutputError.GetRawPtr(i, 0, 0), FVp.GetRawPtr(r, 0, 0), FDk);
+        end;
+        // Softmax Jacobian: dScore[r] = Attn[r]*(dAttn[r] - sum_k dAttn[k]*Attn[k]).
+        SumDAttnAttn := 0;
+        for r := 0 to FProjDim - 1 do
+          SumDAttnAttn := SumDAttnAttn + dAttn[r] * FAttn[r, i, 0];
+        for r := 0 to FProjDim - 1 do
+          dScore[r] := FAttn[r, i, 0] * (dAttn[r] - SumDAttnAttn);
+        // score[i,r] = invSqrtDk * Q[i].K'[r]
+        //   dQ[i,a] += invSqrtDk * sum_r dScore[r]*K'[r,a]
+        //   dK'[r,a] += invSqrtDk * dScore[r]*Q[i,a]
+        for r := 0 to FProjDim - 1 do
+        begin
+          dS := dScore[r] * FInvSqrtDk;
+          if dS <> 0 then
+          begin
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+              FKp.GetRawPtr(r, 0, 0), dS, FDk);
+            TNNetVolume.MulAdd(dKp.GetRawPtr(r, 0, 0),
+              Prev.GetRawPtr(i, 0, 0), dS, FDk);
+          end;
+        end;
+      end;
+      // ---- Route dK'/dV' back to the projections E,F and the inputs K,V ----
+      // K'[r,a] = sum_s E[r,s]*K[s,a]
+      //   dE[r,s] += sum_a dK'[r,a]*K[s,a]   (AVX dot over d_k)
+      //   dK[s,a] += E[r,s]*dK'[r,a]         (AVX MulAdd over d_k)
+      // Same structure for F,V'. Weight deltas follow the library convention
+      // Delta = -lr * dL/dW (UpdateWeights then does W += Delta), so the raw
+      // dL/dW dot products are scaled by NegLr = -FLearningRate.
+      NegLr := -FLearningRate;
+      for r := 0 to FProjDim - 1 do
+        for s := 0 to FSeqLen - 1 do
+        begin
+          dE[s, r, 0] := dE[s, r, 0] + NegLr * TNNetVolume.DotProduct(
+            dKp.GetRawPtr(r, 0, 0), Prev.GetRawPtr(s, 0, FDk), FDk);
+          Coef := E[s, r, 0];
+          if Coef <> 0 then
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(s, 0, FDk),
+              dKp.GetRawPtr(r, 0, 0), Coef, FDk);
+          dF[s, r, 0] := dF[s, r, 0] + NegLr * TNNetVolume.DotProduct(
+            dVp.GetRawPtr(r, 0, 0), Prev.GetRawPtr(s, 0, 2 * FDk), FDk);
+          Coef := F[s, r, 0];
+          if Coef <> 0 then
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(s, 0, 2 * FDk),
+              dVp.GetRawPtr(r, 0, 0), Coef, FDk);
+        end;
+    finally
+      dKp.Free;
+      dVp.Free;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -78318,6 +78606,7 @@ begin
       'TNNetProductKeyMemory' :     Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
+      'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -78685,6 +78974,7 @@ begin
       if S[0] = 'TNNetProductKeyMemory' then Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
+      if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else

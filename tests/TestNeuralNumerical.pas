@@ -782,6 +782,9 @@ type
     procedure TestCausalLinearAttentionGradientCheck;
     procedure TestCausalLinearAttentionCausality;
     procedure TestCausalLinearAttentionSerializationRoundTrip;
+    procedure TestLinformerAttentionInputGradientCheck;
+    procedure TestLinformerAttentionWeightGradientCheck;
+    procedure TestLinformerAttentionSerializationRoundTrip;
     procedure TestFiLMForward;
     procedure TestFiLMIdentity;
     procedure TestFiLMGradientCheck;
@@ -15722,6 +15725,168 @@ begin
   // d_k = 4. Input depth must be 3*d_k = 12.
   SerializationRoundTrip(Self, TNNetCausalLinearAttention.Create(4),
     'CausalLinearAttention', 3, 1, 12, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLinformerAttentionInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetLinformerAttention;
+  SeqLen, Dk, ProjK: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Self-contained RNG: these gradient tests share one RNG and some checks are
+  // ordering-sensitive, so reseed (do NOT loosen tolerances to compensate).
+  RandSeed := 424242;
+  SeqLen := 5;
+  Dk := 4;     // d_v = d_k = 4
+  ProjK := 2;  // low-rank projection k << SeqLen
+  NN := TNNet.Create();
+  // Input MUST be built with pError=1 or reading Layers[0].OutputError beyond
+  // index 0 is an OOB stale-heap read (garbage input gradients).
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetLinformerAttention.Create(Dk, ProjK);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('LinformerAttention input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLinformerAttentionWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetLinformerAttention;
+  SeqLen, Dk, ProjK: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, d: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // FD vs analytic gradient on BOTH projection matrices E (neuron 0) and F
+  // (neuron 1). Weights bounded to a small range to avoid FD truncation error
+  // (do NOT loosen tolerance). Reseed shared RNG.
+  RandSeed := 424242;
+  SeqLen := 5;
+  Dk := 4;
+  ProjK := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetLinformerAttention.Create(Dk, ProjK);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    // Bound the E/F weights to a small range to control FD truncation error.
+    for i := 0 to Attn.Neurons[0].Weights.Size - 1 do
+    begin
+      Attn.Neurons[0].Weights.Raw[i] := 0.3 * Sin(i * 1.3 + 0.2);
+      Attn.Neurons[1].Weights.Raw[i] := 0.3 * Cos(i * 0.9 - 0.1);
+    end;
+
+    // d = 0 -> E, d = 1 -> F.
+    for d := 0 to 1 do
+      for i := 0 to Attn.Neurons[d].Weights.Size - 1 do
+      begin
+        Attn.Neurons[d].Weights.Raw[i] := Attn.Neurons[d].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        Attn.Neurons[d].Weights.Raw[i] := Attn.Neurons[d].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        Attn.Neurons[d].Weights.Raw[i] := Attn.Neurons[d].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        Attn.Neurons[0].ClearDelta;
+        Attn.Neurons[1].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -Attn.Neurons[d].Delta.Raw[i]; // LR=1 => grad = -Delta
+
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('LinformerAttention proj ' + IntToStr(d) + ' weight gradient w=' +
+          IntToStr(i) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('  LinformerAttention weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLinformerAttentionSerializationRoundTrip;
+begin
+  // d_k = 4 -> input depth 3*d_k = 12; k = 2 low-rank projection over SeqLen=6.
+  SerializationRoundTrip(Self, TNNetLinformerAttention.Create(4, 2),
+    'LinformerAttention', 6, 1, 12, 1e-5);
 end;
 
 // ---------------------------------------------------------------------------
