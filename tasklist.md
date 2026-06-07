@@ -72,6 +72,56 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetLIFNeuron — a SPIKING leaky-integrate-and-fire layer trained with a
+      SURROGATE GRADIENT (Neftci, Mostafa & Zenke 2019, "Surrogate Gradient
+      Learning in Spiking Neural Networks"; Zenke & Ganguli 2018, SuperSpike).
+      A genuinely NEW computational paradigm for this repo: every existing layer
+      emits continuous real-valued activations, whereas an LIF layer is an
+      EVENT-DRIVEN, stateful neuron model that integrates its input current into
+      a membrane potential over a TIME axis and emits a binary {0,1} SPIKE when
+      the potential crosses a threshold, then resets. Distinct from everything
+      already in tree: the recurrent/SSM family (TNNetCfC, TNNetSLSTMCell,
+      TNNetSelectiveSSM, TNNetDiagonalSSM) carries continuous hidden state and
+      never produces a hard spike; the STE layer (TNNetStraightThroughEstimator)
+      binarises a SINGLE feed-forward value with no membrane/leak/reset dynamics;
+      the threshold/digital activations (TNNetThreshold, TNNetDigital) are
+      stateless. Forward, per neuron over input shape (T, 1, D) — T = time steps
+      on SizeX, D channels on Depth (same time-on-X convention as the SSM/
+      attention layers): V[t] = beta*V[t-1]*(1 - S[t-1]) + I[t]; S[t] = 1 if
+      V[t] >= V_th else 0 (hard Heaviside; hard reset-by-subtraction is the
+      1 - S[t-1] term). beta = exp(-1/tau) is the membrane leak, V_th the firing
+      threshold (both constructor args, FFloatSt[0..1]); the forward is exactly
+      the non-differentiable spiking dynamics so inference is faithfully binary.
+      The trainable trick is the BACKWARD: replace the zero-almost-everywhere
+      Heaviside derivative dS/dV with a smooth surrogate — the fast-sigmoid /
+      SuperSpike form sigma'(V) = 1/(1 + alpha*|V - V_th|)^2 (alpha = surrogate
+      sharpness, FFloatSt[2]) — and backprop-through-time across the T unrolled
+      steps via the SetBatchUpdate(True) weight-accumulation idiom
+      ([[manual-gradient-and-snapshot-gotchas]]); the membrane recurrence routes
+      dL/dV[t] back into dL/dV[t-1] through beta and through the reset coupling.
+      No trainable weights of its own (it is a pointwise neuron model over an
+      upstream linear/conv layer, like an activation) — keeps the layer focused
+      and the gradient check clean. Done = numerical-gradient test on the INPUT
+      gradient with the surrogate substituted (finite-difference the surrogate-
+      smoothed forward, NOT the hard Heaviside — document this explicitly, it is
+      the STE-style "central difference is provably wrong on the hard forward"
+      pattern), plus forward spike-pattern, shape, and save/load round-trip
+      tests, and FStruct/FFloatSt round-trip of beta/V_th/alpha at non-default
+      values. Example examples/SpikingMNIST/ (or a tiny synthetic rate-coded
+      task to stay inside the <5-min pure-CPU budget): rate-encode a few input
+      classes as Poisson/repeated spike trains over T steps, stack
+      Input -> FullConnectLinear -> TNNetLIFNeuron -> (sum-over-time readout)
+      -> SoftMax, and show the spiking net learns the classification via the
+      surrogate gradient; headline payoff = report mean SPIKE RATE (sparsity)
+      alongside accuracy, the neuromorphic selling point (sparse, event-driven
+      compute) that no other layer in the suite demonstrates. Honest caveat to
+      document in the README in the house style: the hard reset + Heaviside means
+      the surrogate is a biased gradient estimator, so expect it to need a
+      gentler LR / more steps than the equivalent ReLU MLP, and state the
+      surrogate-vs-true forward mismatch up front. Possible follow-ups (do NOT
+      scope into v1): a learnable per-channel threshold/leak; the adaptive-LIF
+      (ALIF) variant with a second slow threshold-adaptation state; a builder
+      AddSpikingBlock wiring the linear+LIF+readout pattern.
 - [X] TNNetSinkhorn — differentiable optimal-transport / doubly-stochastic
       normalization layer LANDED 2026-06-07 on a2 (commit 435a93d). (N,1,N) score
       matrix, log-space Sinkhorn–Knopp (KIter alternating row/col subtract-logsumexp
