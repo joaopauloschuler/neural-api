@@ -72,32 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetGraphAttention — Graph Attention Network layer (Veličković et al. 2018,
-      "Graph Attention Networks", arXiv:1710.10903). Genuinely distinct from the
-      already-landed spectral TNNetGCNLayer (Kipf & Welling): instead of a FIXED
-      caller-supplied symmetrically-normalized adjacency Ahat, GAT learns
-      CONTENT-DEPENDENT per-edge attention coefficients. Input is a graph signal
-      (NumNodes, 1, FeatureDim); transform h'_i = W h_i, then for each edge (i,j)
-      score e_ij = LeakyReLU(aᵀ[W h_i || W h_j]) (the additive attention of the
-      paper, a is a learnable 2*F' vector), MASK e_ij to the graph neighborhood
-      using the SAME 0/1 adjacency-with-self-loops infrastructure as TNNetGCNLayer's
-      SetAdjacency (reuse it — store the boolean neighbor mask once, NOT the
-      normalized Ahat), softmax over each node i's neighbors j to get alpha_ij, and
-      read out h''_i = sum_j alpha_ij (W h_j). Backward: exact gradient through the
-      masked softmax (same masked-softmax-Jacobian care as the attention family,
-      cf. [[mha-builder-and-seq-projection]]) plus dL/dW and dL/da. Scope v1 as
-      SINGLE-HEAD (a multi-head variant is then a natural builder composing H heads
-      + DeepConcat, exactly the head-axis pattern from [[multihead-no-head-axis-tensor]]
-      — track that as a follow-up, not v1). Deliverables: the leaf class with
-      "// Coded by Claude (AI).", LoadFromString/CreateLayer registration + FStruct
-      params (NumNodes, FeatureDim, F', suppress-bias), serialization that persists
-      learned weights but NOT the adjacency (mirror SetAdjacency's "rebuild after
-      load" contract), numerical input+weight gradient tests in
-      TestNeuralNumerical.pas (well-separated node features so the masked-softmax
-      argmax boundary is unambiguous), and a small examples/GraphAttention/ node-
-      classification demo on a tiny synthetic 2-community graph contrasting GAT's
-      learned edge weights vs GCN's fixed normalization. First attention-over-graph-
-      neighborhood layer; completes the GNN family alongside the spectral GCN.
 - [ ] TNNetDeltaNet chunked/parallel forward (the paper's WY-matrix
       reformulation of Yang et al. 2024, arXiv:2406.06484) so training is
       sub-quadratic instead of the current strict per-token left-to-right scan in
@@ -294,20 +268,6 @@ rather than acted on.
 - [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
       decoder block can opt into sinks per head behind a flag.
-- [x] Talking-Heads Attention (Shazeer et al. 2020) — DONE 2026-06-07 as the
-      BUILDER TNNet.AddTalkingHeadsAttention(Heads, d_model, CausalMask,
-      PreSoftmaxMix, PostSoftmaxMix) (re-scoped per the 2026-05-31 note: no
-      head-axis tensor, so NOT a drop-in layer). The fused
-      TNNetScaledDotProductAttention hides its logits, so the builder composes
-      attention from finer primitives: per-head logits are materialised as a
-      REAL [X=key,Y=query,1] graph tensor via TNNetDotProducts + TransposeYD,
-      the H slabs are DeepConcat'd to [key,query,H], and BOTH HxH mixes (pre-
-      and post-softmax) are TNNetPointwiseConvLinear(H) over the head/Depth
-      axis. Softmax over key per query row (TransposeXD -> PointwiseSoftMax ->
-      TransposeXD). All existing serializable layers (no new class). Tests:
-      TestTalkingHeadsAttention{Shape,InputGradientCheck,SerializationRoundTrip}
-      in TestNeuralNumerical.pas (FD input-grad max err 3.8e-4).
-
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
