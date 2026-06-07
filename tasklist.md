@@ -72,6 +72,31 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] Mixture-of-Depths dynamic-compute block (Raposo et al. 2024,
+      "Mixture-of-Depths: Dynamically allocating compute in transformer-based
+      language models", arXiv:2404.02258) — a per-token router that scores each
+      token of a (SeqLen,1,d_model) sequence, keeps only the top-capacity
+      fraction (e.g. 12.5%) to flow through an expensive sub-block (a
+      TransformerEncoderBlock / attention+FFN), and lets the rest bypass via the
+      identity residual, so per-layer FLOPs are a fixed fraction of dense compute
+      and are data-dependent. This is genuinely DISTINCT from the layers we
+      already have: PonderNet (TNNetPonderHalting) halts a weight-tied RECURRENT
+      step probabilistically over depth; Top-K MoE (AddTopKMixtureOfExperts /
+      TNNetTopKGate) routes a token to top-k of N parallel EXPERTS but every
+      token is still processed; Token Merging (TNNetTokenMerging) permanently
+      shortens the sequence by fusing similar tokens. MoD instead SKIPS the block
+      for low-scoring tokens and rejoins them unchanged — capacity-based token
+      DROPPING along the depth axis, not halting, not expert choice, not merging.
+      Deliverable: a new TNNetMixtureOfDepths gate layer (top-capacity selection
+      mask + straight-through / scaled-residual blend of processed vs bypassed
+      tokens, like the TNNetTopKGate top-k boundary subgradient) plus a
+      TNNet.AddMixtureOfDepthsBlock(InputLayer, Capacity, BuildSubBlock) builder
+      that wires router -> gated sub-block -> residual rejoin; numerical +
+      serialization tests and an examples/MixtureOfDepths recall/throughput demo
+      comparing matched-FLOP dense vs MoD on the tiny char corpus. Open design
+      choice to settle in the task: token-choice routing (each token's own score
+      vs a learned/quantile threshold, causal-safe) vs expert-choice routing
+      (block picks its top-C tokens, needs a non-causal or block-local variant).
 - [ ] Dirichlet-evidence CLASSIFICATION variant of evidential learning (Sensoy
       et al. 2018, "Evidential Deep Learning to Quantify Classification
       Uncertainty") — the classification sibling of the now-landed
