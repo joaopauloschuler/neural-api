@@ -1433,3 +1433,32 @@ rather than acted on.
         spiral density with a few stacked couplings + permutations, print the
         mean log-likelihood climbing, and sample new points from the base
         Gaussian back through the inverse to show they match the data manifold.
+- [ ] `TNNetInvertible1x1Conv` — Glow's LEARNABLE invertible 1x1 convolution
+      (Kingma & Dhariwal 2018, arXiv:1807.03039, sec. 3.2), the natural
+      channel-mixing companion to the landed `TNNetAffineCoupling`. The
+      AffineCoupling design note "pair with a FIXED channel permutation so every
+      channel gets updated" leaves mixing non-trainable; Glow replaces that fixed
+      permutation with a learned C x C matrix W applied per spatial position
+      across the Depth axis (y[x,y,:] = W * x[x,y,:]), a generalization of a
+      permutation that the network can adapt. Distinct from every existing layer:
+      `TNNetHouseholderLinear` is exactly ORTHOGONAL (log-det identically 0, so it
+      contributes ZERO volume change and cannot stand in for this), and
+      `TNNetPointwiseConvLinear` is a generic non-invertible 1x1 conv with no
+      tractable inverse or log-det. Mechanism + design notes:
+      - parametrize W via its LU decomposition W = P*L*(U + diag(s)) with P a
+        FIXED permutation chosen at init, L unit-lower-triangular, U strictly
+        upper-triangular, s the log-scale vector — exactly Glow's trick so the
+        per-position log-det is the CHEAP sum(log|s|) (O(C)) instead of a full
+        O(C^3) determinant every step;
+      - expose a read-only `LogDetJacobian` summed over all spatial positions for
+        the current forward (so a flow's NLL composes additively with the
+        coupling layers' log-dets, mirroring `TNNetAffineCoupling.LogDetJacobian`);
+      - add an `Inverse` (sampling) forward path z -> x reusing the same L/U/s by
+        triangular solves (no explicit matrix inverse needed);
+      - gradient-check the forward over L/U/s AND verify forward∘inverse is the
+        identity to tolerance; serialization round-trip (FStruct carries C + the
+        frozen permutation P);
+      - then upgrade `examples/NormalizingFlow/` to interleave
+        AffineCoupling <-> Invertible1x1Conv (the real Glow step) and show the
+        learned mixing reaches a higher mean log-likelihood than the fixed-permute
+        baseline on the same two-moons/spiral target.
