@@ -72,34 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetTokenMerging — a Token Merging (ToMe, Bolya et al. 2023,
-  https://arxiv.org/abs/2210.09461) sequence-shortening layer for the
-  transformer stack. Operates on a `(SeqLen, 1, Depth)` token tensor and
-  reduces it to a fixed shorter `(SeqLen - R, 1, Depth)` by *bipartite soft
-  matching*: split tokens into alternating sets A/B, compute cosine
-  similarity of each A-token to its most-similar B-token, pick the top-R
-  highest-similarity A→B edges, and MERGE each chosen A-token into its B
-  partner by (size-weighted) averaging; unmatched tokens pass through. Carry
-  a per-output-token "size" count so repeated merges average proportionally
-  (the paper's proportional-attention bookkeeping) — store it on an extra
-  Depth slot or an FStruct-backed side buffer. This is DISTINCT from the
-  existing sequence-reducers and must not duplicate them: TNNetAttentionPooling
-  / AddPerceiverEncoder learn a fixed set of *query* slots (cross-attention
-  read), AddMixtureOfDepths *routes/skips* tokens through a block, and the
-  pooling layers collapse the whole axis — ToMe instead *fuses redundant
-  adjacent-in-similarity tokens* with NO learned parameters (it is weightless,
-  like TNNetSinkhorn). Backward: the merge is a plain weighted average, so
-  dL/d(input token) routes the merged-output gradient back to each
-  contributing token scaled by its size weight (top-R edge selection is the
-  non-differentiable boundary, frozen per forward pass like MaxPool's argmax).
-  Serialize R (and the A/B parity) via FStruct; output SeqLen is static given
-  R so downstream shape inference stays simple. Deliverables: the weightless
-  layer + a numerical-gradient test (well-separated token clusters so the
-  top-R edge set is unambiguous, à la the ProductKeyMemory/Tropical recipe) +
-  an `examples/TokenMerging/` demo that shows a small SDPA classifier keeping
-  accuracy while dropping ~half its tokens (wall-clock + token-count report).
-  Follow-up once the leaf lands: an `AddToMeTransformerBlock` builder that
-  interleaves merging between encoder blocks (the paper's per-block schedule).
 - [ ] TNNetKANConv follow-ups (the convolutional Kolmogorov-Arnold layer LANDED
       2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:
       sum of learned univariate Chebyshev edge functions per receptive-field patch,

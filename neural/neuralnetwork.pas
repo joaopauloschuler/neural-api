@@ -7712,6 +7712,61 @@ type
     property Tau: TNeuralFloat read FTau;
   end;
 
+  /// TOKEN MERGING (ToMe, Bolya et al. 2023, "Token Merging: Your ViT But
+  /// Faster", ICLR 2023, https://arxiv.org/abs/2210.09461). A WEIGHTLESS (zero
+  /// trainable parameters, like TNNetSinkhorn) sequence-shortening layer for the
+  /// transformer stack. It operates on a (SeqLen,1,Depth) token tensor and
+  /// reduces it to a STATIC (SeqLen-R,1,Depth) tensor by BIPARTITE SOFT MATCHING:
+  ///   1. Split tokens into alternating sets A (parity p indices) and B (the
+  ///      rest). Default parity p=1 -> A = odd indices, B = even indices.
+  ///   2. For each A-token compute cosine similarity to its most-similar B-token.
+  ///   3. Pick the top-R highest-similarity A->B edges (R = FStruct[0]).
+  ///   4. MERGE each chosen A-token into its B partner by SIZE-WEIGHTED average;
+  ///      unmatched tokens pass through unchanged. Output tokens stay in original
+  ///      index order with the merged A-tokens removed (the B partner carries the
+  ///      fused result), giving a deterministic length-(SeqLen-R) sequence.
+  ///   5. A per-output-token "size" count (FOutSize) records how many input
+  ///      tokens fused into each output token, so a B partner that absorbed m
+  ///      A-tokens averages over (m+1) tokens (the paper's proportional
+  ///      bookkeeping). Within one layer each input token enters with size 1.
+  ///
+  /// DISTINCT from existing sequence reducers: TNNetAttentionPooling /
+  /// AddPerceiverEncoder LEARN fixed query slots (cross-attention read);
+  /// AddMixtureOfDepths ROUTES/SKIPS tokens; pooling layers COLLAPSE the whole
+  /// axis. ToMe instead FUSES redundant tokens with NO learned parameters.
+  ///
+  /// BACKWARD: each merge is a plain weighted average, so the merged output
+  /// gradient routes back to every contributing input token scaled by its size
+  /// weight 1/size_o. The top-R edge selection is the non-differentiable boundary
+  /// and is FROZEN per forward pass (like MaxPool's argmax): the forward records,
+  /// for each input token, its output index (FSrcToOut) and contribution weight
+  /// (FSrcWeight), and backward simply scatters dOutput[o]*FSrcWeight[i] to
+  /// input token i. R and the A/B parity round-trip via FStruct[0]/FStruct[1].
+  /// Constructor: Create(R, parity).
+  // Coded by Claude (AI).
+  TNNetTokenMerging = class(TNNetLayer)
+  private
+    FSeqLen: integer;        // input sequence length (SizeX)
+    FDepth: integer;         // token feature dimension (Depth)
+    FR: integer;             // number of A->B merges (output len = SeqLen - R)
+    FParity: integer;        // 0 or 1; A-set = tokens whose index mod 2 = FParity
+    FSrcToOut: array of integer;     // input token idx -> output token idx
+    FSrcWeight: array of TNeuralFloat; // input token idx -> backward weight 1/size
+    FOutSize: array of integer;      // output token idx -> #input tokens fused in
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pR: integer = 1; pParity: integer = 1); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property R: integer read FR;
+    property Parity: integer read FParity;
+    // OutSize[o] = number of input tokens fused into output token o (>=1).
+    function OutSize(o: integer): integer;
+  end;
+
   /// SPIKING LEAKY-INTEGRATE-AND-FIRE (LIF) neuron layer trained with a
   /// SURROGATE GRADIENT (Neftci, Mostafa & Zenke 2019, "Surrogate Gradient
   /// Learning in Spiking Neural Networks", IEEE Signal Processing Magazine;
@@ -9903,6 +9958,15 @@ type
       function AddTransformerEncoderBlock(Heads, d_ff: integer;
         PreNorm: boolean = true; CausalMask: boolean = false;
         UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // Composite builder: interleaves weightless Token Merging (ToMe) BETWEEN
+      // transformer encoder blocks following the paper's per-block schedule.
+      // Stacks Blocks encoder blocks; after each of the first Blocks-1 blocks it
+      // inserts a TNNetTokenMerging(R) layer, so the sequence shrinks by R tokens
+      // per merge and the deeper (more expensive) blocks attend over an ever
+      // shorter sequence. ToMe adds NO trainable parameters. Returns the last
+      // layer. (Coded by Claude (AI).)
+      function AddToMeTransformerBlock(Blocks, R, Heads, d_ff: integer;
+        PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Composite builder assembling a standard transformer DECODER block by
       // stacking three residual sub-blocks on the current decoder stream:
       //   1. CAUSAL multi-head self-attention (same idiom as the encoder block
@@ -39320,6 +39384,28 @@ begin
   Result := GetLastLayer();
 end;
 
+// ToMe schedule: Blocks encoder blocks with a weightless TNNetTokenMerging(R)
+// inserted after each of the first Blocks-1 blocks, so the sequence shrinks by R
+// tokens per merge and the deeper blocks attend over a shorter sequence.
+function TNNet.AddToMeTransformerBlock(Blocks, R, Heads, d_ff: integer;
+  PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  b: integer;
+begin
+  if Blocks < 1 then Blocks := 1;
+  if R < 1 then R := 1;
+  for b := 0 to Blocks - 1 do
+  begin
+    AddTransformerEncoderBlock(Heads, d_ff, PreNorm, {CausalMask=}false,
+      {UseRoPE=}false, NormClass);
+    // Merge between blocks (not after the last one): the paper's per-block
+    // schedule. Guards against over-shortening the sequence.
+    if (b < Blocks - 1) and (R < GetLastLayer().Output.SizeX) then
+      AddLayer( TNNetTokenMerging.Create(R, 1) );
+  end;
+  Result := GetLastLayer();
+end;
+
 function TNNet.AddTransformerDecoderBlock(Heads, d_ff: integer;
   EncoderOutput: TNNetLayer; PreNorm: boolean = true;
   UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
@@ -42879,6 +42965,224 @@ begin
     for ri := 0 to FN * FN - 1 do
       FPrevLayer.OutputError.FData[ri] :=
         FPrevLayer.OutputError.FData[ri] + g.FData[ri] / FTau;
+end;
+
+{ TNNetTokenMerging }
+
+// Token Merging (ToMe). Forward: bipartite soft matching between alternating
+// token sets A and B, top-R cosine-similarity A->B edges merged by size-weighted
+// average. The matching (the non-differentiable top-R argmax) is frozen per
+// forward pass and recorded as a token-level scatter map (FSrcToOut/FSrcWeight)
+// so backward is a plain weighted-average adjoint. No trainable parameters.
+// Token layout (SizeY=1): token t occupies depth-contiguous FData[t*Depth..].
+
+constructor TNNetTokenMerging.Create(pR: integer; pParity: integer);
+begin
+  inherited Create();
+  if pR < 1 then pR := 1;
+  if (pParity <> 0) and (pParity <> 1) then pParity := 1;
+  FR := pR;
+  FParity := pParity;
+  FSeqLen := 0;
+  FDepth := 0;
+  FStruct[0] := FR;
+  FStruct[1] := FParity;
+  // No weight neurons: ToMe is parameter-free.
+  while FNeurons.Count > 0 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  BuildArrNeurons();
+end;
+
+destructor TNNetTokenMerging.Destroy();
+begin
+  SetLength(FSrcToOut, 0);
+  SetLength(FSrcWeight, 0);
+  SetLength(FOutSize, 0);
+  inherited Destroy();
+end;
+
+function TNNetTokenMerging.OutSize(o: integer): integer;
+begin
+  if (o >= 0) and (o < Length(FOutSize)) then Result := FOutSize[o]
+  else Result := 0;
+end;
+
+procedure TNNetTokenMerging.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  OutLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetTokenMerging requires a (SeqLen,1,Depth) input. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FSeqLen := pPrevLayer.FOutput.SizeX;
+  FDepth := pPrevLayer.FOutput.Depth;
+  if FR >= FSeqLen then
+    FErrorProc('TNNetTokenMerging requires R < SeqLen. R=' + IntToStr(FR) +
+      ' SeqLen=' + IntToStr(FSeqLen));
+  OutLen := FSeqLen - FR;
+
+  FOutput.ReSize(OutLen, 1, FDepth);
+  FOutputError.ReSize(OutLen, 1, FDepth);
+  FOutputErrorDeriv.ReSize(OutLen, 1, FDepth);
+
+  SetLength(FSrcToOut, FSeqLen);
+  SetLength(FSrcWeight, FSeqLen);
+  SetLength(FOutSize, OutLen);
+end;
+
+procedure TNNetTokenMerging.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTokenMerging.ComputeCPU();
+var
+  Inp: TNNetVolume;
+  Norm: array of TNeuralFloat;        // L2 norm per token
+  BestB: array of integer;            // for each A token: best B partner
+  BestSim: array of TNeuralFloat;     // for each A token: best cosine sim
+  Merged: array of boolean;           // A token chosen for merge
+  // input token idx -> output token idx; built after we know which A merge
+  t, a, b, d, i, oIdx, picks, bestA: integer;
+  dot, sim, denom, eps, curBest: TNeuralFloat;
+  isA: boolean;
+begin
+  Inp := FPrevLayer.FOutput;
+  eps := 1e-8;
+
+  SetLength(Norm, FSeqLen);
+  for t := 0 to FSeqLen - 1 do
+    Norm[t] := Sqrt(TNNetVolume.DotProduct(
+      Inp.GetRawPtr(t, 0, 0), Inp.GetRawPtr(t, 0, 0), FDepth)) + eps;
+
+  // ---- For each A token, find its most-similar B token (cosine) ----
+  SetLength(BestB, FSeqLen);
+  SetLength(BestSim, FSeqLen);
+  SetLength(Merged, FSeqLen);
+  for t := 0 to FSeqLen - 1 do
+  begin
+    BestB[t] := -1;
+    BestSim[t] := -1e30;
+    Merged[t] := False;
+  end;
+
+  for a := 0 to FSeqLen - 1 do
+  begin
+    isA := (a mod 2) = FParity;
+    if not isA then continue;
+    for b := 0 to FSeqLen - 1 do
+    begin
+      if (b mod 2) = FParity then continue; // b must be in B set
+      dot := TNNetVolume.DotProduct(
+        Inp.GetRawPtr(a, 0, 0), Inp.GetRawPtr(b, 0, 0), FDepth);
+      sim := dot / (Norm[a] * Norm[b]);
+      if sim > BestSim[a] then
+      begin
+        BestSim[a] := sim;
+        BestB[a] := b;
+      end;
+    end;
+  end;
+
+  // ---- Pick the top-R A->B edges by similarity (frozen selection) ----
+  // Simple repeated arg-max over the A tokens that have a valid B partner.
+  picks := 0;
+  while picks < FR do
+  begin
+    bestA := -1;
+    curBest := -1e30;
+    for a := 0 to FSeqLen - 1 do
+    begin
+      if (a mod 2) <> FParity then continue;
+      if Merged[a] then continue;
+      if BestB[a] < 0 then continue;
+      if BestSim[a] > curBest then
+      begin
+        curBest := BestSim[a];
+        bestA := a;
+      end;
+    end;
+    if bestA < 0 then break; // not enough A tokens with partners (R<SeqLen guards this normally)
+    Merged[bestA] := True;
+    Inc(picks);
+  end;
+
+  // ---- Build the input->output token map in original index order ----
+  // Tokens that are NOT merged-away A tokens keep their own output slot, in
+  // ascending index order. Merged A tokens map to their B partner's slot.
+  for i := 0 to FSeqLen - 1 do FSrcToOut[i] := -1;
+  oIdx := 0;
+  for t := 0 to FSeqLen - 1 do
+  begin
+    if Merged[t] then continue; // merged-away A token: no slot of its own
+    FSrcToOut[t] := oIdx;
+    Inc(oIdx);
+  end;
+  // Map each merged A token to its B partner's output slot.
+  for a := 0 to FSeqLen - 1 do
+    if Merged[a] then
+      FSrcToOut[a] := FSrcToOut[BestB[a]];
+
+  // ---- Count fused tokens per output slot (size) ----
+  for i := 0 to Length(FOutSize) - 1 do FOutSize[i] := 0;
+  for i := 0 to FSeqLen - 1 do
+    Inc(FOutSize[FSrcToOut[i]]);
+
+  // ---- Size-weighted average into the output, record backward weights ----
+  FOutput.Fill(0);
+  for i := 0 to FSeqLen - 1 do
+  begin
+    oIdx := FSrcToOut[i];
+    denom := FOutSize[oIdx];
+    FSrcWeight[i] := 1.0 / denom;
+    for d := 0 to FDepth - 1 do
+      FOutput.FData[oIdx * FDepth + d] :=
+        FOutput.FData[oIdx * FDepth + d] +
+        Inp.FData[i * FDepth + d] * FSrcWeight[i];
+  end;
+end;
+
+procedure TNNetTokenMerging.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Adjoint of the size-weighted average. Each input token i contributed to output
+// token o=FSrcToOut[i] with weight FSrcWeight[i]=1/size_o, so dInput[i,d] +=
+// FSrcWeight[i] * dOutput[o,d]. The top-R matching is frozen (no gradient).
+procedure TNNetTokenMerging.BackpropagateCPU();
+var
+  i, d, oIdx: integer;
+  w: TNeuralFloat;
+  PrevErr: TNNetVolume;
+begin
+  if FPrevLayer.OutputError.Size <> FPrevLayer.Output.Size then exit;
+  PrevErr := FPrevLayer.FOutputError;
+  for i := 0 to FSeqLen - 1 do
+  begin
+    oIdx := FSrcToOut[i];
+    w := FSrcWeight[i];
+    for d := 0 to FDepth - 1 do
+      PrevErr.FData[i * FDepth + d] :=
+        PrevErr.FData[i * FDepth + d] +
+        w * FOutputError.FData[oIdx * FDepth + d];
+  end;
 end;
 
 { TNNetLIFNeuron }
@@ -73123,6 +73427,7 @@ begin
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetSinkhorn' :             Result := TNNetSinkhorn.Create(St[0], Ft[0]);
+      'TNNetTokenMerging' :         Result := TNNetTokenMerging.Create(St[0], St[1]);
       'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1);
       'TNNetALIFNeuron' :           Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
@@ -73478,6 +73783,7 @@ begin
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetSinkhorn' then Result := TNNetSinkhorn.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetTokenMerging' then Result := TNNetTokenMerging.Create(St[0], St[1]) else
       if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
       if S[0] = 'TNNetALIFNeuron' then Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else

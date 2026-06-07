@@ -210,6 +210,12 @@ type
     procedure TestSinkhornDoublyStochastic;
     procedure TestSinkhornShape;
     procedure TestSinkhornSerializationRoundTrip;
+    // TNNetTokenMerging (ToMe) weightless sequence-shortening layer
+    procedure TestTokenMergingShape;
+    procedure TestTokenMergingMergesClusters;
+    procedure TestTokenMergingInputGradientCheck;
+    procedure TestTokenMergingSerializationRoundTrip;
+    procedure TestToMeTransformerBlockSchedule;
     // AddSinkhornAttention builder (doubly-stochastic attention)
     procedure TestSinkhornAttentionShapeAndDoublyStochastic;
     procedure TestSinkhornAttentionTrains;
@@ -40575,6 +40581,255 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenMergingShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  TM: TNNetTokenMerging;
+  SeqLen, Depth, RVal: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 8; Depth := 4; RVal := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    TM := TNNetTokenMerging.Create(RVal, 1);
+    NN.AddLayer(TM);
+    Input.Fill(0.0);
+    NN.Compute(Input);
+    AssertEquals('TokenMerging output SizeX (SeqLen-R)', SeqLen - RVal, TM.Output.SizeX);
+    AssertEquals('TokenMerging output SizeY', 1, TM.Output.SizeY);
+    AssertEquals('TokenMerging output Depth', Depth, TM.Output.Depth);
+    AssertEquals('TokenMerging R property', RVal, TM.R);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenMergingMergesClusters;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  TM: TNNetTokenMerging;
+  SeqLen, Depth, t, d, totalSize: integer;
+begin
+  // Well-separated 2D clusters so the top-R bipartite matching is unambiguous.
+  // 6 tokens, Depth=2. A-set (parity 1) = idx 1,3,5; B-set = idx 0,2,4.
+  // Place near-duplicate A/B pairs so each chosen A token merges into a clear B
+  // partner. R=2 -> output length 4, total fused size must equal SeqLen.
+  RandSeed := 424242;
+  SeqLen := 6; Depth := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    TM := TNNetTokenMerging.Create(2, 1);
+    NN.AddLayer(TM);
+    // B tokens (even): three well-separated directions.
+    Input[0,0,0] := 10;  Input[0,0,1] := 0;    // B0 ~ +x
+    Input[2,0,0] := 0;   Input[2,0,1] := 10;   // B2 ~ +y
+    Input[4,0,0] := -10; Input[4,0,1] := 0;    // B4 ~ -x
+    // A tokens (odd): near-duplicates of two of the B tokens, one orthogonal.
+    Input[1,0,0] := 9;   Input[1,0,1] := 0.5;  // A1 ~ B0 (high cosine)
+    Input[3,0,0] := 0.5; Input[3,0,1] := 9;    // A3 ~ B2 (high cosine)
+    Input[5,0,0] := 1;   Input[5,0,1] := 1;    // A5 weak match (diagonal)
+    NN.Compute(Input);
+
+    // Total size across all output tokens must equal the input length.
+    totalSize := 0;
+    for t := 0 to TM.Output.SizeX - 1 do
+      totalSize := totalSize + TM.OutSize(t);
+    AssertEquals('TokenMerging total fused size = SeqLen', SeqLen, totalSize);
+
+    // Exactly R=2 tokens were absorbed -> two output slots have size 2.
+    d := 0;
+    for t := 0 to TM.Output.SizeX - 1 do
+      if TM.OutSize(t) = 2 then Inc(d);
+    AssertEquals('TokenMerging produced exactly R merged slots', 2, d);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenMergingInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  TM: TNNetTokenMerging;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, SeqLen, Depth, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient through the size-weighted average.
+  // Inputs use WELL-SEPARATED clusters so the frozen top-R edge set never flips
+  // under the +/- epsilon perturbation (the matching is non-differentiable, so a
+  // boundary flip would corrupt the check). Standard 0.01 bound. (Shared RNG.)
+  RandSeed := 424242;
+  SeqLen := 6; Depth := 3;
+  InSize := SeqLen * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Depth);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1)); // 1 = collect input error
+    TM := TNNetTokenMerging.Create(2, 1);
+    NN.AddLayer(TM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    OutSize := (SeqLen - 2) * Depth;
+    Desired := TNNetVolume.Create(SeqLen - 2, 1, Depth);
+
+    // Three well-separated cluster DIRECTIONS, each A/B pair a near-duplicate.
+    // No exact-zero components and large angular gaps between clusters so the
+    // top-R cosine matching is far from any boundary -> a 1e-3 perturbation on
+    // ANY component cannot flip the frozen edge set (keeps the FD check honest).
+    // Cluster c1=(8,1,1), c2=(1,8,1), c3=(1,1,8). A1~B0(c1), A3~B2(c2), A5~B4(c3).
+    Input[0,0,0] := 8.0; Input[0,0,1] := 1.0; Input[0,0,2] := 1.0; // B0 c1
+    Input[1,0,0] := 7.5; Input[1,0,1] := 1.2; Input[1,0,2] := 0.9; // A1 c1
+    Input[2,0,0] := 1.0; Input[2,0,1] := 8.0; Input[2,0,2] := 1.0; // B2 c2
+    Input[3,0,0] := 1.2; Input[3,0,1] := 7.4; Input[3,0,2] := 1.1; // A3 c2
+    Input[4,0,0] := 1.0; Input[4,0,1] := 1.0; Input[4,0,2] := 8.0; // B4 c3
+    // A5 deliberately WEAK match (no B is close to it) so it is never in the
+    // top-2 -> the unmerged token is unambiguously A5, far from the boundary.
+    Input[5,0,0] := 4.0; Input[5,0,1] := 4.0; Input[5,0,2] := 4.0; // A5 diagonal
+
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := 0.2 + 0.1 * Cos(i * 0.5);
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('TokenMerging input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TokenMerging gradient check max-abs-error: ', maxErr:0:8);
+    Desired.Free;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenMergingSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  TM: TNNetTokenMerging;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, SeqLen, Depth, RVal, ParityVal: integer;
+begin
+  // Non-default R (FStruct[0]) and parity (FStruct[1]) must survive
+  // SaveToString -> LoadFromString -> SaveToString (byte identical) through both
+  // CreateLayer dispatch points, and Compute must match.
+  RandSeed := 424242;
+  SeqLen := 8; Depth := 4; RVal := 3; ParityVal := 0; // non-default parity
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    TM := TNNetTokenMerging.Create(RVal, ParityVal);
+    NN.AddLayer(TM);
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('TokenMerging SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('TokenMerging token present in serialized string',
+        Pos('TNNetTokenMerging', Saved) > 0);
+      AssertEquals('TokenMerging R round-trips', RVal,
+        (NN2.Layers[1] as TNNetTokenMerging).R);
+      AssertEquals('TokenMerging parity round-trips', ParityVal,
+        (NN2.Layers[1] as TNNetTokenMerging).Parity);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('TokenMerging Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestToMeTransformerBlockSchedule;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, Blocks, RVal, mergeCount, lay: integer;
+begin
+  // AddToMeTransformerBlock interleaves a weightless TNNetTokenMerging(R) after
+  // each of the first Blocks-1 encoder blocks, so the sequence shrinks by R per
+  // merge and the final output length is SeqLen - (Blocks-1)*R.
+  RandSeed := 424242;
+  SeqLen := 32; Depth := 8; Blocks := 3; RVal := 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    NN.AddToMeTransformerBlock(Blocks, RVal, {Heads=}2, {d_ff=}16);
+    Input.Fill(0.0);
+    NN.Compute(Input);
+    AssertEquals('ToMe schedule final SeqLen',
+      SeqLen - (Blocks - 1) * RVal, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('ToMe schedule preserves Depth', Depth,
+      NN.GetLastLayer.Output.Depth);
+    // Exactly Blocks-1 TNNetTokenMerging layers were inserted.
+    mergeCount := 0;
+    for lay := 0 to NN.CountLayers - 1 do
+      if NN.Layers[lay] is TNNetTokenMerging then Inc(mergeCount);
+    AssertEquals('ToMe schedule inserted Blocks-1 merge layers',
+      Blocks - 1, mergeCount);
   finally
     NN.Free;
     Input.Free;
