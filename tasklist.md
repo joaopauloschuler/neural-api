@@ -1281,6 +1281,32 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
+- [ ] `TNNetLegendreMemoryUnit` — the **HiPPO-LegS Legendre Memory Unit** (Voelker
+      et al. 2019). This fills a real structural gap in the SSM family: every
+      recurrent/state-space layer in tree today uses either a **real diagonal**
+      transition (`TNNetDiagonalSSM`), a **complex diagonal** one (`TNNetLRU`), or a
+      **matrix-memory linear-attention** update (`TNNetGatedLinearAttention`,
+      `TNNetDeltaNet`, `TNNetTitansMemory`, `TNNetWKV`). The LMU is none of these —
+      it carries an order-`N` memory vector `m_t` that holds the coefficients of a
+      shifted-**Legendre-polynomial** projection of a sliding window of the input,
+      driven by the *dense, structured, NON-diagonal* HiPPO-LegS transition matrix
+      `A_ij = (2i+1)*(-1 if i<j else (-1)^(i-j+1))` with input matrix
+      `B_i = (2i+1)*(-1)^i`. Per channel: discretize `(A,B)` once at build time
+      (zero-order-hold or the paper's Euler step with a learnable/​fixed timescale
+      `theta`), run the linear recurrence `m_t = A_bar*m_{t-1} + B_bar*u_t` along the
+      time axis, then read out a learned linear combination of the `N` Legendre
+      coefficients (optionally concatenated with a learned hidden state, the full
+      LMU cell). Memory cost is `N` numbers regardless of window length — the
+      orthogonal-polynomial basis is what makes it a genuinely different compression
+      mechanism from the exponential-decay kernels of the diagonal SSMs. Distinct
+      enough that it is NOT a near-duplicate of anything in tree; the fixed HiPPO
+      matrices also need no gradient (only the readout + optional `theta` train, so
+      backward is a clean adjoint scan plus one `dtheta` term if `theta` is
+      learnable). Ship with a copy/recall example (`examples/LegendreMemoryUnit/`,
+      a delay-line / permuted-sequence-MNIST-style long-range task where the LMU's
+      window memory should beat a matched diagonal SSM) and the usual shape +
+      input-gradient + save/load tests; verify the discretized `A_bar` against a
+      brute-force matrix-exponential reference in the smoke test.
 - [ ] `TNNetTitansMemory` follow-up — a **gated-DeltaNet-style chunked parallel
       scan** forward for `TNNetTitansMemory`, replacing the sequential O(SeqLen)
       inner-gradient scan with a chunked associative/parallel recurrence (the
