@@ -184,7 +184,7 @@ rather than acted on.
 - [ ] Forward-Forward follow-up: deeper FF stack (4+ layers) — does
       accumulated-goodness accuracy keep improving with depth, or does the
       length-normalised signal saturate?
-- [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
+- [X] Reinforcement learning: minimal DQN solving CartPole or a grid world — examples/DeepQLearning: complete DQN on a 5x5 deterministic grid-world (one-hot state, ReLU(64)x2->Linear(4) Q-net, experience-replay ring buffer, target net synced via CopyWeights, epsilon-greedy decay, single-action TD update, SetBatchUpdate(True) minibatch accumulation). Learning curve climbs from ~-1.06/17-steps to ~0.78/optimal-8-steps; final greedy rollout reaches goal along shortest pit-avoiding path; 100% greedy success over all 21 start cells. Pure CPU ~32s. No new layer class.
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [X] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
       DONE. Full BPTT through ALL T=32 unrolled shared steps FIT the budget (~61 s
