@@ -72,7 +72,20 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetGroupConvP4 — a p4 (cyclic 90°-rotation) GROUP-EQUIVARIANT convolution
+- [X] TNNetGroupConvP4 — LANDED 2026-06-07 on a2. p4 (C4 cyclic 90° rotation)
+      GROUP-EQUIVARIANT LIFTING convolution (plane -> C4 field, Depth=4*Features,
+      channel=co*4+r) + companion TNNetGroupPoolP4 (max/mean reduce over the 4
+      orientation channels -> rotation-INVARIANT map). Both subclass-wired with
+      full FStruct serialization (both dispatch points). 5 numerical tests in
+      tests/TestNeuralNumerical.pas (input-grad, shared-kernel weight-grad fold,
+      EXACT equivariance forward = 0.0 error to machine precision, output-shape,
+      save/load round-trip) — all green; full suite 1194 tests pass. Example
+      examples/GroupEquivariantMNIST/. Deferred FOLLOW-UPS (NOT built in v1):
+      (i) the full p4m group (adds reflections, 8-fold field); (ii) steerable /
+      SO(2) continuous-rotation harmonics; (iii) p4 GROUP conv on an existing C4
+      field (field->field, currently only the plane->field lifting rung exists).
+- [-] TNNetGroupConvP4 (original spec, superseded by the line above) — a p4
+      (cyclic 90°-rotation) GROUP-EQUIVARIANT convolution
       (Cohen & Welling 2016, "Group Equivariant Convolutional Networks",
       arXiv:1602.07576). The first layer in the fork that is rotation-equivariant
       BY CONSTRUCTION, not merely measured after the fact by the existing

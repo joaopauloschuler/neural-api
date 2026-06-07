@@ -242,6 +242,12 @@ type
     procedure TestCondConvRoutingGradientCheck;
     procedure TestCondConvShapeInference;
     procedure TestCondConvSerializationRoundTrip;
+    // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
+    procedure TestGroupConvP4InputGradientCheck;
+    procedure TestGroupConvP4WeightGradientCheck;
+    procedure TestGroupConvP4Equivariance;
+    procedure TestGroupConvP4OutputShape;
+    procedure TestGroupConvP4SerializationRoundTrip;
     // TNNetMonarchLinear sub-quadratic structured (block-diagonal) dense layer
     procedure TestMonarchLinearInputGradientCheck;
     procedure TestMonarchLinearWeightGradientCheck;
@@ -41088,6 +41094,374 @@ begin
         NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CondConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupConvP4InputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  GC: TNNetGroupConvP4;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, InDepth, Feat, SizeX, SizeY, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for a strided + padded p4
+  // lifting conv. The input gradient must sum the contributions of all four
+  // rotated filter views through FRotMap.
+  RandSeed := 424242;
+  SizeX := 5;  SizeY := 5;
+  InDepth := 2;  Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  InputPlus := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+    GC := TNNetGroupConvP4.Create(Feat, {kernel}3, {padding}1, {stride}2);
+    NN.AddLayer(GC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    OutSize := NN.GetLastLayer.Output.Size;
+    AssertEquals('GroupConvP4 output Depth = 4*Feat', 4 * Feat,
+      NN.GetLastLayer.Output.Depth);
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+
+    // Inputs and target kept small: the loss is O(Desired^2) and num is a
+    // single-precision central difference, so a large loss would lose digits to
+    // catastrophic cancellation in (lossPlus-lossMinus). Bounding the
+    // magnitudes (not loosening the tolerance) keeps num accurate.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.3 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.2;
+
+    // Deterministic, bounded shared filters + biases.
+    for i := 0 to GC.Neurons[0].Weights.Size - 1 do
+    begin
+      GC.Neurons[0].Weights.Raw[i] := 0.08 * Sin(i * 1.1);
+      GC.Neurons[1].Weights.Raw[i] := 0.06 * Cos(i * 0.7);
+      GC.Neurons[2].Weights.Raw[i] := 0.04 * Sin(i * 0.3 + 1);
+    end;
+    for i := 0 to Feat - 1 do
+      GC.Neurons[Feat].Weights.Raw[i] := 0.02 * (i - 1);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GroupConvP4 input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupConvP4WeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  GC: TNNetGroupConvP4;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, co, InDepth, Feat, SizeX, SizeY, OutSize, taps: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the SINGLE SHARED kernel bank and
+  // the per-feature bias. The shared-kernel check is where a silent
+  // rotation-fold reduction bug hides: a wrong fold would make the analytic
+  // weight gradient disagree with the finite difference taken over the one bank.
+  RandSeed := 424242;
+  SizeX := 5;  SizeY := 5;
+  InDepth := 2;  Feat := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+    GC := TNNetGroupConvP4.Create(Feat, {kernel}3, {padding}1, {stride}1);
+    NN.AddLayer(GC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+
+    // Small inputs + target so the O(loss) single-precision cancellation in the
+    // central-difference num stays negligible (bound magnitudes, not tolerance).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 0.2 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.12;
+
+    taps := GC.Neurons[0].Weights.Size;
+    // Small, bounded shared filters so central-difference truncation stays well
+    // under tolerance (the stride-1 5x5 setup gives each base tap a large
+    // 4-orientation-folded gradient, which amplifies any second-order error).
+    for co := 0 to Feat - 1 do
+      for i := 0 to taps - 1 do
+        GC.Neurons[co].Weights.Raw[i] := 0.07 * Sin(i * 1.3 + co) - 0.04 * Cos(i * 0.5);
+    for i := 0 to Feat - 1 do
+      GC.Neurons[Feat].Weights.Raw[i] := 0.02 * (i - 1);
+
+    // ---- Shared kernel-bank weights ----
+    for co := 0 to Feat - 1 do
+      for i := 0 to taps - 1 do
+      begin
+        GC.Neurons[co].Weights.Raw[i] := GC.Neurons[co].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss();
+        GC.Neurons[co].Weights.Raw[i] := GC.Neurons[co].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss();
+        GC.Neurons[co].Weights.Raw[i] := GC.Neurons[co].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        GC.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -GC.Neurons[co].Delta.Raw[i];
+
+        AssertTrue('GroupConvP4 shared-kernel gradient co=' + IntToStr(co) +
+          ' tap=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Per-feature bias (neuron Feat) ----
+    for i := 0 to Feat - 1 do
+    begin
+      GC.Neurons[Feat].Weights.Raw[i] := GC.Neurons[Feat].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      GC.Neurons[Feat].Weights.Raw[i] := GC.Neurons[Feat].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      GC.Neurons[Feat].Weights.Raw[i] := GC.Neurons[Feat].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      GC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -GC.Neurons[Feat].Delta.Raw[i];
+
+      AssertTrue('GroupConvP4 bias gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupConvP4Equivariance;
+var
+  NN: TNNet;
+  Input, InputRot, OutRef, OutRot: TNNetVolume;
+  GC: TNNetGroupConvP4;
+  i, co, r, x, y, S, InDepth, Feat, ci: integer;
+  maxErr, refVal, rotVal: TNeuralFloat;
+begin
+  // HEADLINE correctness guarantee. With kernel=3, pad=1, stride=1 the output is
+  // spatially aligned with the input. A 90-degree CCW rotation of the input must
+  // produce an output that equals the reference field rot90'd in space AND with
+  // its orientation channels cyclically shifted by one. We verify
+  //   OutRot[x,y, co*4 + r]  ==  OutRef[ rot(x,y), co*4 + ((r-1) mod 4) ]
+  // (with rot(x,y) = (S-1-y, x), the same CCW plane map used on the input) to
+  // < 1e-4. A scrambled (non-cyclic) orientation layout fails this hard.
+  RandSeed := 424242;
+  S := 5;  InDepth := 2;  Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(S, S, InDepth);
+  InputRot := TNNetVolume.Create(S, S, InDepth);
+  OutRef := TNNetVolume.Create();
+  OutRot := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(S, S, InDepth, 1));
+    GC := TNNetGroupConvP4.Create(Feat, {kernel}3, {padding}1, {stride}1);
+    NN.AddLayer(GC);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1 * Cos(i * 1.3);
+    for co := 0 to Feat - 1 do
+      for i := 0 to GC.Neurons[co].Weights.Size - 1 do
+        GC.Neurons[co].Weights.Raw[i] := 0.2 * Sin(i * 1.1 + co) - 0.1 * Cos(i * 0.4);
+    for i := 0 to Feat - 1 do
+      GC.Neurons[Feat].Weights.Raw[i] := 0.05 * (i - 1);
+
+    // rot90 CCW of the input plane: InputRot(x,y) = Input(S-1-y, x).
+    for ci := 0 to InDepth - 1 do
+      for y := 0 to S - 1 do
+        for x := 0 to S - 1 do
+          InputRot.FData[InputRot.GetRawPos(x, y, ci)] :=
+            Input.Get(S - 1 - y, x, ci);
+
+    NN.Compute(Input);
+    OutRef.Copy(NN.GetLastLayer.Output);
+    NN.Compute(InputRot);
+    OutRot.Copy(NN.GetLastLayer.Output);
+
+    maxErr := 0;
+    for co := 0 to Feat - 1 do
+      for r := 0 to 3 do
+        for y := 0 to S - 1 do
+          for x := 0 to S - 1 do
+          begin
+            // rot(x,y) under the same CCW plane map applied to the input is
+            // (S-1-y, x); the orientation channels shift by -1 (= +3 mod 4).
+            refVal := OutRef.Get(S - 1 - y, x, co * 4 + ((r + 3) mod 4));
+            rotVal := OutRot.Get(x, y, co * 4 + r);
+            if Abs(refVal - rotVal) > maxErr then
+              maxErr := Abs(refVal - rotVal);
+          end;
+
+    AssertTrue('GroupConvP4 p4 equivariance error ' + FloatToStr(maxErr) +
+      ' must be < 1e-4', maxErr < 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+    InputRot.Free;
+    OutRef.Free;
+    OutRot.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupConvP4OutputShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  PoolLayer: TNNetGroupPoolP4;
+begin
+  // Output shape of the lifting conv (Depth = 4*Feat, conv-sized spatially) and
+  // of the group-pool head (collapses orientation back to Feat channels).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    NN.AddLayer(TNNetGroupConvP4.Create({feat}5, {kernel}3, {pad}1, {stride}2));
+    AssertEquals('GroupConvP4 output Depth', 20, NN.GetLastLayer.Output.Depth);
+    AssertEquals('GroupConvP4 output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GroupConvP4 output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+
+    PoolLayer := TNNetGroupPoolP4.Create();
+    NN.AddLayer(PoolLayer);
+    AssertEquals('GroupPoolP4 output Depth', 5, NN.GetLastLayer.Output.Depth);
+    AssertEquals('GroupPoolP4 output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GroupPoolP4 output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('GroupPoolP4 FeaturesCount', 5, PoolLayer.FeaturesCount);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGroupConvP4SerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  GC: TNNetGroupConvP4;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, co, taps, Feat: integer;
+begin
+  // GroupConvP4 + GroupPoolP4 in the MIDDLE of a net with non-default
+  // features/kernel/pad/stride and MEAN-reduce pool: SaveToString ->
+  // LoadFromString -> SaveToString byte-identical and Compute matches, proving
+  // FStruct[0..4] (conv params) and the pool's FStruct[0] (reduce mode) round-
+  // trip through BOTH dispatch points and every shared-bank + bias neuron
+  // survives.
+  RandSeed := 424242;
+  Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    GC := TNNetGroupConvP4.Create(Feat, 3, 1, 2, 0);
+    NN.AddLayer(GC);
+    NN.AddLayer(TNNetGroupPoolP4.Create({mean}1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+    taps := GC.Neurons[0].Weights.Size;
+    for co := 0 to Feat - 1 do
+      for i := 0 to taps - 1 do
+        GC.Neurons[co].Weights.Raw[i] := 0.11 * (i + 1) - 0.25 + 0.07 * co;
+    for i := 0 to Feat - 1 do
+      GC.Neurons[Feat].Weights.Raw[i] := 0.03 - 0.02 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GroupConvP4 SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('GroupConvP4 token present',
+        Pos('TNNetGroupConvP4', Saved) > 0);
+      AssertTrue('GroupPoolP4 token present',
+        Pos('TNNetGroupPoolP4', Saved) > 0);
+      AssertEquals('GroupConvP4 output Depth preserved',
+        NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
+      AssertEquals('GroupPoolP4 output Depth preserved',
+        NN.Layers[2].Output.Depth, NN2.Layers[2].Output.Depth);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GroupConvP4 Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

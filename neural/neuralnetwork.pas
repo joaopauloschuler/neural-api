@@ -7347,6 +7347,88 @@ type
     property NumExperts: integer read FNumExperts;
   end;
 
+  /// p4 GROUP-EQUIVARIANT CONVOLUTION -- the LIFTING layer of a Group
+  /// Equivariant Convolutional Network (Cohen & Welling 2016, "Group Equivariant
+  /// Convolutional Networks", arXiv:1602.07576) for the C4 group of 90-degree
+  /// plane rotations. This is the first layer in the fork that is rotation-
+  /// equivariant BY CONSTRUCTION rather than only measured after the fact by
+  /// TNNet.EquivarianceReport.
+  ///
+  /// MECHANISM (v1 = lifting conv only, plane -> C4 feature field):
+  /// One learned KxK kernel bank (FeaturesCount filters over the input Depth) is
+  /// SHARED across the four rotations of C4. For every output feature co the
+  /// layer convolves the input with the four rot-{0,90,180,270} copies of the
+  /// SAME trained filter and stacks the four responses along a new 4-fold
+  /// "orientation" sub-axis of the output Depth. Output Depth = 4*FeaturesCount,
+  /// laid out as channel = co*4 + r (feature co, orientation r in 0..3), so a
+  /// 90-degree rotation of the input rot90's the spatial map AND CYCLICALLY
+  /// PERMUTES the orientation channels (r -> r+1 mod 4) -- it does not scramble
+  /// them. That cyclic permutation is the headline equivariance guarantee
+  /// (verified to < 1e-4 by the numerical equivariance test).
+  ///
+  /// IMPLEMENTATION reuses the ordinary single-kernel convolution math (the same
+  /// trusted im2col-style tap loop as TNNetConvolution); the three extra rotated
+  /// filters are materialised as index VIEWS of the one trained bank at forward
+  /// time via a precomputed spatial rotation map FRotMap (tap (fx,fy) of the
+  /// r-times-rotated filter reads tap (fx',fy') of the base filter). Backward
+  /// FOLDS the four orientation gradients back onto the single shared kernel
+  /// (rotation-tied weight-gradient sum) through the SAME map, so the four tied
+  /// copies always stay byte-identical. Weight layout: neuron co (0..Features-1)
+  /// holds one KxK*InDepth filter (tap ((fy*K+fx)*InDepth+ci)); the last neuron
+  /// holds FeaturesCount biases (one per feature, shared across orientations).
+  /// FStruct[0..4] carry the usual convolution parameters (FeaturesCount, kernel
+  /// size, padding, stride, suppress-bias) so the layer round-trips through
+  /// SaveStructureToString / LoadFromString / CreateLayer. Collapse a C4 field
+  /// back to a rotation-invariant map with the companion TNNetGroupPoolP4.
+  /// Out of v1 scope (see tasklist.md): the full p4m group (reflections, 8-fold
+  /// field) and steerable / SO(2) continuous-rotation harmonics.
+  // Coded by Claude (AI).
+  TNNetGroupConvP4 = class(TNNetConvolutionLinear)
+  private
+    FInDepth: integer;        // input Depth (ci count)
+    FFeaturesCount: integer;  // co count (output Depth = 4*FeaturesCount)
+    FKSize: integer;          // per-filter weight count (K*K*InDepth)
+    FRotMap: array of integer; // FRotMap[r*FKSize + tap] = base tap of rot-r view
+    procedure BuildRotMap();
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+    procedure ComputePreviousLayerErrorCPU();
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    property InDepth: integer read FInDepth;
+    property FeaturesCount: integer read FFeaturesCount;
+  end;
+
+  /// p4 GROUP-POOL head -- collapses a C4 feature field produced by
+  /// TNNetGroupConvP4 (Depth = 4*FeaturesCount, channel = co*4 + r) back to a
+  /// rotation-INVARIANT (SizeX, SizeY, FeaturesCount) map by reducing over the
+  /// four orientation channels of each feature. With max reduction (default) the
+  /// output is exactly invariant to the C4 input rotations the lifting layer is
+  /// equivariant to (a 90-degree rotation only cyclically permutes the four
+  /// orientations, and max over them is permutation-invariant); mean reduction
+  /// is the smooth alternative. Parameter-free; gradient routes only to the
+  /// arg-max orientation (max) or splits 1/4 to each (mean). Feed the result to
+  /// an ordinary classifier tail. FStruct[0] = reduce mode (0 = max, 1 = mean),
+  /// FStruct[1] = FeaturesCount (the number of output channels). Use it right
+  /// after a TNNetGroupConvP4 stack to make the whole net rotation-invariant.
+  // Coded by Claude (AI).
+  TNNetGroupPoolP4 = class(TNNetLayer)
+  private
+    FFeaturesCount: integer;  // co count = output Depth
+    FMeanReduce: boolean;     // false = max (default), true = mean
+    FArgMax: array of integer; // per output element, winning orientation (max mode)
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pMeanReduce: integer = 0); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property FeaturesCount: integer read FFeaturesCount;
+  end;
+
   /// MONARCH structured DENSE layer (Dao et al. 2022, "Monarch: Expressive
   /// Structured Matrices for Efficient and Accurate Training", arXiv:2204.00595).
   /// A square n -> n linear map whose n x n weight is a MONARCH matrix -- a
@@ -40401,6 +40483,395 @@ begin
   end;
 end;
 
+{ TNNetGroupConvP4 }
+
+constructor TNNetGroupConvP4.Create(pNumFeatures, pFeatureSize, pInputPadding,
+  pStride: integer; pSuppressBias: integer = 0);
+begin
+  // Identity activation + the convolution output sizing come from
+  // TNNetConvolutionLinear. pNumFeatures is the FeaturesCount (number of shared
+  // filters); the real output Depth is 4*FeaturesCount, fixed in SetPrevLayer
+  // once the input Depth is known. FStruct[0] keeps FeaturesCount so the layer
+  // round-trips through CreateLayer exactly like the other conv layers.
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+end;
+
+// Spatial rotation map of one KxK*InDepth filter. For r in 0..3 (0/90/180/270
+// CCW) the rot-r view at destination tap (fx,fy) reads base tap (sx,sy):
+//   r=0: (sx,sy)=(fx,fy)
+//   r=1 (90 CCW):  (sx,sy)=(K-1-fy, fx)
+//   r=2 (180):     (sx,sy)=(K-1-fx, K-1-fy)
+//   r=3 (270 CCW): (sx,sy)=(fy, K-1-fx)
+// The input-channel index ci is untouched (rotation acts on the plane only).
+procedure TNNetGroupConvP4.BuildRotMap();
+var
+  r, fx, fy, ci, sx, sy, KX, KY, dstTap, srcTap: integer;
+begin
+  KX := FFeatureSizeX;
+  KY := FFeatureSizeY;
+  SetLength(FRotMap, 4 * FKSize);
+  for r := 0 to 3 do
+    for fy := 0 to KY - 1 do
+      for fx := 0 to KX - 1 do
+      begin
+        case r of
+          0: begin sx := fx;          sy := fy;          end;
+          1: begin sx := KX - 1 - fy; sy := fx;          end;
+          2: begin sx := KX - 1 - fx; sy := KY - 1 - fy; end;
+        else   begin sx := fy;        sy := KY - 1 - fx; end;
+        end;
+        for ci := 0 to FInDepth - 1 do
+        begin
+          dstTap := (fy * KX + fx) * FInDepth + ci;
+          srcTap := (sy * KX + sx) * FInDepth + ci;
+          FRotMap[r * FKSize + dstTap] := srcTap;
+        end;
+      end;
+end;
+
+procedure TNNetGroupConvP4.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  OutDepth, co: integer;
+begin
+  // Let the convolution machinery size FOutputSizeX/Y, FFeatureSizeX/Y and the
+  // padded-error buffer. We then discard its full-feature neuron layout and
+  // install the compact shared-bank layout: one neuron per FEATURE plus a bias
+  // neuron, and we re-size the output buffers to the 4*FeaturesCount field.
+  FFeaturesCount := FStruct[0];
+  inherited SetPrevLayer(pPrevLayer);
+
+  FInDepth := pPrevLayer.Output.Depth;
+  if FInDepth <= 0 then
+    FErrorProc('TNNetGroupConvP4 requires a non-empty input.');
+
+  OutDepth := 4 * FFeaturesCount;
+  FKSize := FFeatureSizeX * FFeatureSizeY * FInDepth;
+
+  // The C4 feature field: Depth = 4*FeaturesCount (channel = co*4 + r).
+  FOutput.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
+  FOutputRaw.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
+  FOutputError.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
+  FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
+
+  while FNeurons.Count > FFeaturesCount + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FFeaturesCount + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  for co := 0 to FFeaturesCount - 1 do
+  begin
+    FNeurons[co].Weights.ReSize(FKSize, 1, 1);
+    FNeurons[co].BackInertia.ReSize(FKSize, 1, 1);
+    FNeurons[co].Delta.ReSize(FKSize, 1, 1);
+    FNeurons[co].FBiasWeight := 0;
+  end;
+  // Bias neuron: one bias per FEATURE (shared across the 4 orientations).
+  FNeurons[FFeaturesCount].Weights.ReSize(FFeaturesCount, 1, 1);
+  FNeurons[FFeaturesCount].BackInertia.ReSize(FFeaturesCount, 1, 1);
+  FNeurons[FFeaturesCount].Delta.ReSize(FFeaturesCount, 1, 1);
+  FNeurons[FFeaturesCount].FBiasWeight := 0;
+
+  FVectorSize := FKSize;
+  FShouldConcatWeights := false;
+  FShouldInterleaveWeights := false;
+  BuildArrNeurons();
+
+  BuildRotMap();
+  InitDefault();
+  FNeurons[FFeaturesCount].Weights.Fill(0); // biases start at 0
+  RefreshCalculatePrevLayerError();
+  AfterWeightUpdate();
+end;
+
+// Bounded He-style random init for each shared filter (kept small so the
+// finite-difference weight-gradient test does not suffer truncation noise).
+procedure TNNetGroupConvP4.InitDefault();
+var
+  co, i: integer;
+  W: TNNetVolume;
+  Range: TNeuralFloat;
+begin
+  if (FInDepth <= 0) or (FFeaturesCount <= 0) then exit;
+  Range := Sqrt(2.0 / FKSize);
+  if Range > 0.25 then Range := 0.25;  // bound for clean gradient checks
+  for co := 0 to FFeaturesCount - 1 do
+  begin
+    W := FArrNeurons[co].FWeights;
+    for i := 0 to W.Size - 1 do
+      W.FData[i] := Range * (Random - 0.5) * 2;
+  end;
+end;
+
+procedure TNNetGroupConvP4.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: for each output feature co and orientation r, convolve the input with
+// the rot-r view of filter co (read through FRotMap) and write the response to
+// output channel co*4 + r. The bias of feature co is shared across r.
+procedure TNNetGroupConvP4.ComputeCPU();
+var
+  ox, oy, co, r, fx, fy, ci, dstTap, oc: integer;
+  prevX, prevY, prevSizeX, prevSizeY, rBase: integer;
+  acc, b: TNeuralFloat;
+  W, PrevOut, Bias: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FFeaturesCount].FWeights;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+    for co := 0 to FFeaturesCount - 1 do
+    begin
+      W := FArrNeurons[co].FWeights;
+      if FSuppressBias = 0 then b := Bias.FData[co] else b := 0;
+      for r := 0 to 3 do
+      begin
+        rBase := r * FKSize;
+        acc := 0;
+        for fy := 0 to FFeatureSizeY - 1 do
+        begin
+          prevY := oy * FStride + fy - FPadding;
+          if (prevY < 0) or (prevY >= prevSizeY) then continue;
+          for fx := 0 to FFeatureSizeX - 1 do
+          begin
+            prevX := ox * FStride + fx - FPadding;
+            if (prevX < 0) or (prevX >= prevSizeX) then continue;
+            for ci := 0 to FInDepth - 1 do
+            begin
+              dstTap := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+              acc := acc + W.FData[FRotMap[rBase + dstTap]] *
+                PrevOut.Get(prevX, prevY, ci);
+            end;
+          end;
+        end;
+        oc := co * 4 + r;
+        FOutput.FData[FOutput.GetRawPos(ox, oy, oc)] := acc + b;
+      end;
+    end;
+end;
+
+procedure TNNetGroupConvP4.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerErrorCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Weight gradient: FOLD the four orientation gradients back onto the single
+// shared filter through FRotMap (rotation-tied sum) so the tied copies stay
+// identical. Bias gradient of feature co sums the error over all 4 orientations
+// and all spatial positions.
+procedure TNNetGroupConvP4.BackpropagateCPU();
+var
+  ox, oy, co, r, fx, fy, ci, dstTap, oc, rBase: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  dy, lr: TNeuralFloat;
+  WDelta, BiasDelta, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  BiasDelta := FArrNeurons[FFeaturesCount].FDelta;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  lr := -FLearningRate;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+    for co := 0 to FFeaturesCount - 1 do
+    begin
+      WDelta := FArrNeurons[co].FDelta;
+      for r := 0 to 3 do
+      begin
+        oc := co * 4 + r;
+        dy := lr * FOutputError.Get(ox, oy, oc);
+        if (FSuppressBias = 0) then
+          BiasDelta.FData[co] := BiasDelta.FData[co] + dy;
+        if dy = 0 then continue;
+        rBase := r * FKSize;
+        for fy := 0 to FFeatureSizeY - 1 do
+        begin
+          prevY := oy * FStride + fy - FPadding;
+          if (prevY < 0) or (prevY >= prevSizeY) then continue;
+          for fx := 0 to FFeatureSizeX - 1 do
+          begin
+            prevX := ox * FStride + fx - FPadding;
+            if (prevX < 0) or (prevX >= prevSizeX) then continue;
+            for ci := 0 to FInDepth - 1 do
+            begin
+              dstTap := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+              // Fold onto the BASE tap this rot-r view came from.
+              WDelta.FData[FRotMap[rBase + dstTap]] :=
+                WDelta.FData[FRotMap[rBase + dstTap]] +
+                dy * PrevOut.Get(prevX, prevY, ci);
+            end;
+          end;
+        end;
+      end;
+    end;
+  if not FBatchUpdate then
+  begin
+    for co := 0 to FFeaturesCount do
+      FArrNeurons[co].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
+// Input gradient: dL/dx += sum_{co,r} (rot-r filter co)^T * dy_{co,r}, read
+// through the SAME FRotMap that built the forward views.
+procedure TNNetGroupConvP4.ComputePreviousLayerErrorCPU();
+var
+  ox, oy, co, r, fx, fy, ci, dstTap, oc, rBase: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  dy: TNeuralFloat;
+  W, LocalPrevError: TNNetVolume;
+begin
+  if not FCalculatePrevLayerError then exit;
+  LocalPrevError := FPrevLayer.OutputError;
+  prevSizeX := FPrevLayer.FOutput.SizeX;
+  prevSizeY := FPrevLayer.FOutput.SizeY;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+    for co := 0 to FFeaturesCount - 1 do
+    begin
+      W := FArrNeurons[co].FWeights;
+      for r := 0 to 3 do
+      begin
+        oc := co * 4 + r;
+        dy := FOutputError.Get(ox, oy, oc);
+        if dy = 0 then continue;
+        rBase := r * FKSize;
+        for fy := 0 to FFeatureSizeY - 1 do
+        begin
+          prevY := oy * FStride + fy - FPadding;
+          if (prevY < 0) or (prevY >= prevSizeY) then continue;
+          for fx := 0 to FFeatureSizeX - 1 do
+          begin
+            prevX := ox * FStride + fx - FPadding;
+            if (prevX < 0) or (prevX >= prevSizeX) then continue;
+            for ci := 0 to FInDepth - 1 do
+            begin
+              dstTap := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+              LocalPrevError.Add(prevX, prevY, ci,
+                dy * W.FData[FRotMap[rBase + dstTap]]);
+            end;
+          end;
+        end;
+      end;
+    end;
+end;
+
+{ TNNetGroupPoolP4 }
+
+constructor TNNetGroupPoolP4.Create(pMeanReduce: integer = 0);
+begin
+  inherited Create();
+  if pMeanReduce <> 0 then FMeanReduce := true else FMeanReduce := false;
+  FStruct[0] := Ord(FMeanReduce);
+end;
+
+procedure TNNetGroupPoolP4.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.Output.Depth mod 4 <> 0 then
+    FErrorProc('TNNetGroupPoolP4 requires the input Depth to be a multiple of 4 '+
+      '(a C4 field of channel = co*4 + r): got Depth '+
+      IntToStr(pPrevLayer.Output.Depth)+'.');
+  FFeaturesCount := pPrevLayer.Output.Depth div 4;
+  FStruct[1] := FFeaturesCount;
+  FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, FFeaturesCount);
+  FOutputError.ReSize(FOutput);
+  SetLength(FArgMax, FOutput.Size);
+end;
+
+// Reduce the 4 orientation channels co*4+r of each feature co to a single
+// rotation-invariant channel co: max (default) or mean.
+procedure TNNetGroupPoolP4.Compute();
+var
+  ox, oy, co, r, sizeX, sizeY, idx, best: integer;
+  v, acc: TNeuralFloat;
+  PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  sizeX := PrevOut.SizeX;
+  sizeY := PrevOut.SizeY;
+  for oy := 0 to sizeY - 1 do
+  for ox := 0 to sizeX - 1 do
+    for co := 0 to FFeaturesCount - 1 do
+    begin
+      idx := FOutput.GetRawPos(ox, oy, co);
+      if FMeanReduce then
+      begin
+        acc := 0;
+        for r := 0 to 3 do
+          acc := acc + PrevOut.Get(ox, oy, co * 4 + r);
+        FOutput.FData[idx] := acc * 0.25;
+      end
+      else
+      begin
+        best := 0;
+        acc := PrevOut.Get(ox, oy, co * 4);
+        for r := 1 to 3 do
+        begin
+          v := PrevOut.Get(ox, oy, co * 4 + r);
+          if v > acc then begin acc := v; best := r; end;
+        end;
+        FArgMax[idx] := best;
+        FOutput.FData[idx] := acc;
+      end;
+    end;
+end;
+
+procedure TNNetGroupPoolP4.Backpropagate();
+var
+  ox, oy, co, r, sizeX, sizeY, idx: integer;
+  dy: TNeuralFloat;
+  PrevErr: TNNetVolume;
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    StartTime := Now();
+    PrevErr := FPrevLayer.OutputError;
+    sizeX := FPrevLayer.FOutput.SizeX;
+    sizeY := FPrevLayer.FOutput.SizeY;
+    for oy := 0 to sizeY - 1 do
+    for ox := 0 to sizeX - 1 do
+      for co := 0 to FFeaturesCount - 1 do
+      begin
+        idx := FOutput.GetRawPos(ox, oy, co);
+        dy := FOutputError.FData[idx];
+        if FMeanReduce then
+        begin
+          for r := 0 to 3 do
+            PrevErr.Add(ox, oy, co * 4 + r, dy * 0.25);
+        end
+        else
+          PrevErr.Add(ox, oy, co * 4 + FArgMax[idx], dy);
+      end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetMonarchLinear }
 
 // Monarch structured dense layer: y = P^T*(L*(P*(R*x))) (+bias). R and L are
@@ -67314,6 +67785,8 @@ begin
       'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1);
       'TNNetALIFNeuron' :           Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
+      'TNNetGroupConvP4' :          Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetGroupPoolP4' :          Result := TNNetGroupPoolP4.Create(St[0]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
       'TNNetRandomFourierFeatures': Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]);
@@ -67654,6 +68127,8 @@ begin
       if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
       if S[0] = 'TNNetALIFNeuron' then Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetGroupConvP4' then Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetGroupPoolP4' then Result := TNNetGroupPoolP4.Create(St[0]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else
       if S[0] = 'TNNetRandomFourierFeatures' then Result := TNNetRandomFourierFeatures.Create(St[0], Ft[0], St[6], St[5]) else
