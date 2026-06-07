@@ -770,20 +770,11 @@ rather than acted on.
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
       a few seeds (mean +/- std) would show whether the bounce is a seed artifact
       or a real saturation/recovery transition.
-- [X] `examples/AnomalyAutoencoder/` — LANDED 2026-06-07 on a2 (commit a30d60f).
-      Undercomplete autoencoder (8→16→2→16→8) trained only on a synthetic NORMAL
-      2-D-manifold distribution; scores anomalies by reconstruction error.
-      mean recon NORMAL=0.948 vs ANOMALY=6.381, rank-AUROC=0.971 (Mann-Whitney-U
-      helper copied locally from MahalanobisOOD, not promoted to the library).
-      Built as synthetic rather than MNIST for reliability/runtime; an MNIST
-      digit-"0" variant with per-digit AUROC is still open as a follow-up.
+- [ ] `examples/AnomalyAutoencoder/` MNIST follow-up: an MNIST digit-"0"
+      variant with per-digit AUROC (the landed synthetic demo is reliable/fast,
+      but a real-image arm is still open).
 - [ ] `examples/SpokenDigitKWS/` — 1D-conv keyword-spotting on FSDD:
       MFCCs → 1D conv stack → classification.
-- [X] `examples/TimeSeriesForecast/` — LANDED 2026-06-07 on a2 (commit 753476e).
-      Causal-conv 1-D stack (TNNetCausalConv1D incl. dilation-2 +
-      TNNetPointwiseConvLinear + FC head) on a synthetic seasonal+trend+noise
-      series; 24-step auto-regressive rollout. Val MSE 1.01→0.013 over 40 epochs,
-      horizon MAE=0.222 / RMSE=0.271 vs naive-persistence MAE 1.004 (~5× better).
 - [ ] `examples/GradientFlowVisualizer/` — train a deep MLP with and
       without LayerNorm/RMSNorm and print per-layer gradient-norm tables
       across steps.
