@@ -72,6 +72,44 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetDeltaNet — delta-rule linear-attention recurrence (Yang et al. 2024,
+      "Parallelizing Linear Transformers with the Delta Rule over Sequence
+      Length", arXiv:2406.06484). This is a genuinely new memory-update paradigm
+      in the fork, distinct from every existing recurrent/linear-attention layer:
+      TNNetRetention decays the state with a fixed/learned exponential gamma,
+      TNNetMLSTMCell accumulates an unbounded outer-product (covariance) memory,
+      and TNNetSLSTMCell is the scalar exp-gated variant — none of them do
+      *error-correcting* writes. DeltaNet instead maintains a matrix state S
+      (d_k x d_v) updated by the classic delta (Widrow-Hoff) rule per timestep:
+      S_t = S_{t-1} + beta_t * k_t ⊗ (v_t - S_{t-1}ᵀ k_t), i.e. it first READS
+      the current value prediction (S_{t-1}ᵀ k_t), measures the error against the
+      target v_t, and writes back only the correction scaled by a per-token write
+      strength beta_t = sigmoid(...) ∈ (0,1). Read-out is y_t = S_tᵀ q_t. This
+      removes-then-adds associations (a true associative memory) rather than just
+      summing or decaying them, which is exactly what lets it beat plain linear
+      attention on hard recall/in-context tasks.
+      Plan: (a) per-token q,k,v projections (reuse PointwiseConvLinear over the
+      Depth axis like the other sequence layers — FullConnect would flatten the
+      sequence; see [[mha-builder-and-seq-projection]]) plus a 1-neuron beta head
+      with a sigmoid gate (cf. [[constrained-learnable-scalar-sigmoid]]);
+      (b) forward = a single left-to-right scan over the time axis carrying S,
+      L2-normalizing k (and optionally q) for stability; (c) backward = the
+      coupled adjoint scan right-to-left, propagating dL/dS_t back through BOTH
+      the rank-1 write (into k, v, beta, and S_{t-1}) and the read-out — the beta
+      and the (v - S_{t-1}ᵀk) error term make this the interesting/error-prone
+      gradient (carry the exact dL/dS like TNNetMLSTMCell does, NOT a
+      stop-gradient on the state; see [[mlstm-cell-layer]] and
+      [[ntm-memory-layer]] for the matrix-state BPTT pattern). Init beta near 0
+      (small write strength) so an untrained layer barely perturbs S and stays
+      numerically tame. Deliverables: leaf layer with `// Coded by Claude (AI).`,
+      LoadFromString/serialization wiring, input+weight numerical-gradient tests
+      (bound the inputs; reseed RandSeed:=424242 per [[numerical-test-rng-ordering]]),
+      shape-inference smoke entry, and an examples/DeltaNet/ associative-recall
+      demo (key→value lookup over a sequence) showing it beats a param-matched
+      TNNetRetention / plain linear-attention baseline on exact recall.
+  - [ ] Optional follow-up: a chunked/parallel forward (the paper's WY-matrix
+        reformulation) so training is sub-quadratic instead of a strict
+        per-token scan; gate it behind an exact-vs-chunked equivalence assert.
 - [X] TNNetDeformableConv — deformable convolution (Dai et al. 2017): a conv
       whose KxK sampling grid is shifted by learnable, per-output-location
       (and per-tap) 2-D offsets, so the receptive field adapts to content
