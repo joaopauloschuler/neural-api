@@ -2152,6 +2152,74 @@ type
     function EpistemicVar(d: integer = 0; X: integer = 0; Y: integer = 0): TNeuralFloat;
   end;
 
+  /// Evidential (Dirichlet) Deep Learning CLASSIFICATION head (Sensoy, Kaplan &
+  // Kandemir, NeurIPS 2018, arXiv:1806.01768) — the classification sibling of
+  // TNNetEvidentialRegression. A single-forward-pass uncertainty head that, over
+  // K classes, treats the network output as EVIDENCE for a Dirichlet over the
+  // class-probability simplex and so reports a calibrated per-sample uncertainty
+  // mass without any sampling or ensembling.
+  //
+  // INPUT/OUTPUT PACKING (over the Depth axis): the previous layer emits K raw
+  // channels (K = NumClasses). Each is mapped, in place, to a Dirichlet
+  // concentration (the only difference from a TNNetIdentity passthrough):
+  //   e_k     (>=0)  = softplus(raw[k])          (non-negative evidence)
+  //   alpha_k (>1)   = e_k + 1.
+  // The output IS the alpha vector. Derived quantities: strength S = sum_k
+  // alpha_k, predicted probability p_k = alpha_k/S, and uncertainty mass
+  // u = K/S in [0,1] (u->1 = no evidence / maximal uncertainty, u->0 = strong
+  // evidence). Softplus mirrors the regression head's positivity discipline.
+  //
+  // LOSS (Eq. 5 expected/Bayes-risk MSE + KL regularizer). With one-hot label y:
+  //   ERR = sum_k (y_k - p_k)^2 + p_k*(1-p_k)/(S+1)
+  //   KL  = lambda * KL[ Dir(alphaTilde) || Dir(1) ]
+  // where the MISLEADING evidence is alphaTilde_k = y_k + (1-y_k)*alpha_k (the
+  // correct class is reset to 1 so only wrong-class evidence is penalised). With
+  // StilDe = sum_k alphaTilde_k and digamma = psi:
+  //   KL = lnGamma(StilDe) - lnGamma(K) - sum_k lnGamma(alphaTilde_k)
+  //        + sum_k (alphaTilde_k-1)*(psi(alphaTilde_k) - psi(StilDe)).
+  // lambda (the annealing coefficient, FFloatSt[0], default 1.0) round-trips via
+  // Save/Load; K via FStruct[0]. Forward is an identity-style passthrough (so
+  // Net.Compute returns the alpha vector); training relies on the framework
+  // seeding FOutputError := output - target. Backpropagate recovers the one-hot
+  // label y_k = alpha_k - FOutputError[k] (so set the target volume to the
+  // one-hot label in the K channels) and OVERWRITES the whole FOutputError with
+  // the EXACT dL/d(raw[k]), chaining the softplus link (softplus' = sigmoid):
+  //   dERR/dalpha_j = (2/S)*[ (p_j-y_j) - sum_k (p_k-y_k)*p_k ]
+  //                 + d/dalpha_j [ (1 - sum_k p_k^2)/(S+1) ]
+  //   dKL/dalpha_j  = lambda*(1-y_j)*[ (alphaTilde_j-1)*psi'(alphaTilde_j)
+  //                       - (sum_k (alphaTilde_k-1))*psi'(StilDe) ]
+  //   dL/draw[j]    = (dERR/dalpha_j + dKL/dalpha_j) * sigmoid(raw[j]).
+  //
+  // INFERENCE HELPERS (read alpha from FOutput; call after Compute):
+  // Alpha(k) = alpha_k; Prediction(k) = alpha_k/S; Uncertainty = K/S. The
+  // uncertainty mass spikes on out-of-distribution / ambiguous inputs (the
+  // paper's OOD-detection use case) without any sampling.
+  // Coded by Claude (AI).
+  TNNetEvidentialClassification = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Local lnGamma / digamma / trigamma so the head needs no extra unit dep.
+    function LnGammaF(x: TNeuralFloat): TNeuralFloat;
+    function DigammaF(x: TNeuralFloat): TNeuralFloat;
+    function TrigammaF(x: TNeuralFloat): TNeuralFloat;
+  public
+    constructor Create(); overload; override;
+    constructor Create(NumClasses: integer; pLambda: TNeuralFloat = 1.0); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Number of classes K and the KL-regularizer weight lambda.
+    function NumClasses(): integer;
+    function Lambda(): TNeuralFloat;
+    // EDL loss (Bayes-risk MSE + lambda*KL) of one-hot target y (K values) under
+    // the alpha params currently in FOutput at cell (X,Y). Used by tests / monitoring.
+    function EvidentialLoss(const yTarget: array of TNeuralFloat; X: integer = 0;
+      Y: integer = 0): TNeuralFloat;
+    // Inference helpers (read alpha params from FOutput at cell (X,Y)).
+    function Alpha(c: integer = 0; X: integer = 0; Y: integer = 0): TNeuralFloat;
+    function Prediction(c: integer = 0; X: integer = 0; Y: integer = 0): TNeuralFloat;
+    function Uncertainty(X: integer = 0; Y: integer = 0): TNeuralFloat;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -17942,6 +18010,299 @@ begin
         FOutputError[X, Y, B + 2] := dAl * SigAl;
         FOutputError[X, Y, B + 3] := dBe * SigBe;
       end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetEvidentialClassification }
+
+constructor TNNetEvidentialClassification.Create();
+begin
+  // Default: K = 2 classes, lambda = 1.0.
+  Create(2, 1.0);
+end;
+
+constructor TNNetEvidentialClassification.Create(NumClasses: integer;
+  pLambda: TNeuralFloat = 1.0);
+begin
+  inherited Create();
+  if NumClasses < 2 then
+    FErrorProc('TNNetEvidentialClassification requires NumClasses >= 2.');
+  if pLambda < 0 then
+    FErrorProc('TNNetEvidentialClassification lambda must be >= 0.');
+  FStruct[0] := NumClasses;
+  FFloatSt[0] := pLambda;
+end;
+
+procedure TNNetEvidentialClassification.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Kc: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Kc := FStruct[0];
+  if Kc < 2 then
+    FErrorProc('TNNetEvidentialClassification requires NumClasses >= 2.');
+  if pPrevLayer.FOutput.Depth <> Kc then
+    FErrorProc('TNNetEvidentialClassification requires input depth = NumClasses = ' +
+      IntToStr(Kc) + ', got ' + IntToStr(pPrevLayer.FOutput.Depth) + '.');
+end;
+
+function TNNetEvidentialClassification.NumClasses(): integer;
+begin
+  Result := FStruct[0];
+end;
+
+function TNNetEvidentialClassification.Lambda(): TNeuralFloat;
+begin
+  Result := FFloatSt[0];
+end;
+
+// Lanczos approximation to ln(Gamma(x)) for x > 0 (g=7, 9 coefficients).
+function TNNetEvidentialClassification.LnGammaF(x: TNeuralFloat): TNeuralFloat;
+const
+  cG: array[0..8] of Double = (
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7);
+  cSqrt2Pi = 2.5066282746310002; // sqrt(2*pi)
+var
+  xd, t, a: Double;
+  i: integer;
+begin
+  xd := x;
+  if xd < 0.5 then
+    Result := Ln(Pi / Sin(Pi * xd)) - LnGammaF(1 - x)
+  else
+  begin
+    xd := xd - 1;
+    a := cG[0];
+    t := xd + 7.5;
+    for i := 1 to 8 do
+      a := a + cG[i] / (xd + i);
+    Result := Ln(cSqrt2Pi * a) + (xd + 0.5) * Ln(t) - t;
+  end;
+end;
+
+// digamma(x) = d/dx ln(Gamma(x)), x > 0, via recurrence up to x>=6 then the
+// asymptotic series.
+function TNNetEvidentialClassification.DigammaF(x: TNeuralFloat): TNeuralFloat;
+var
+  xd, r, f: Double;
+begin
+  xd := x;
+  r := 0;
+  while xd < 6 do
+  begin
+    r := r - 1 / xd;
+    xd := xd + 1;
+  end;
+  f := 1 / (xd * xd);
+  r := r + Ln(xd) + 1 / (2 * xd)
+    - f * (1.0/12.0 - f * (1.0/120.0 - f * (1.0/252.0)));
+  Result := r;
+end;
+
+// trigamma(x) = d/dx digamma(x) = psi'(x), x > 0, via the same recurrence
+// (psi'(x) = psi'(x+1) + 1/x^2) up to x>=6 then the asymptotic series.
+function TNNetEvidentialClassification.TrigammaF(x: TNeuralFloat): TNeuralFloat;
+var
+  xd, r, f: Double;
+begin
+  xd := x;
+  r := 0;
+  while xd < 6 do
+  begin
+    r := r + 1 / (xd * xd);
+    xd := xd + 1;
+  end;
+  f := 1 / (xd * xd);
+  // 1/x + 1/(2x^2) + 1/(6x^3) - 1/(30x^5) + ...  =  (1/x)*(1 + 1/(2x) + ...).
+  r := r + (1 / xd) * (1 + (1 / (2 * xd))
+    + f * (1.0/6.0 - f * (1.0/30.0 - f * (1.0/42.0))));
+  Result := r;
+end;
+
+procedure TNNetEvidentialClassification.Compute();
+var
+  StartTime: double;
+  Kc, X, Y, c, MaxX, MaxY: integer;
+
+  function SoftPlus(s: TNeuralFloat): TNeuralFloat;
+  begin
+    if s > 30 then Result := s
+    else Result := Ln(1 + Exp(s));
+  end;
+
+begin
+  StartTime := Now();
+  // Identity passthrough, then map each raw channel to alpha = 1 + softplus.
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Kc := FStruct[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for c := 0 to Kc - 1 do
+        FOutput[X, Y, c] := 1 + SoftPlus(FOutput[X, Y, c]);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+function TNNetEvidentialClassification.EvidentialLoss(
+  const yTarget: array of TNeuralFloat; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+var
+  Kc, c: integer;
+  Al, Sstr, Pk, Yk, Lam, Err, Kl, AlTil, StilDe, SumAlTilM1: TNeuralFloat;
+begin
+  Kc := FStruct[0];
+  Lam := FFloatSt[0];
+  // Strength S.
+  Sstr := 0;
+  for c := 0 to Kc - 1 do
+    Sstr := Sstr + FOutput[X, Y, c];
+  // Bayes-risk expected MSE.
+  Err := 0;
+  for c := 0 to Kc - 1 do
+  begin
+    Al := FOutput[X, Y, c];
+    Pk := Al / Sstr;
+    if c > High(yTarget) then Yk := 0 else Yk := yTarget[c];
+    Err := Err + (Yk - Pk) * (Yk - Pk) + Pk * (1 - Pk) / (Sstr + 1);
+  end;
+  // KL[ Dir(alphaTilde) || Dir(1) ], alphaTilde_k = y_k + (1-y_k)*alpha_k.
+  StilDe := 0;
+  SumAlTilM1 := 0;
+  for c := 0 to Kc - 1 do
+  begin
+    if c > High(yTarget) then Yk := 0 else Yk := yTarget[c];
+    AlTil := Yk + (1 - Yk) * FOutput[X, Y, c];
+    StilDe := StilDe + AlTil;
+    SumAlTilM1 := SumAlTilM1 + (AlTil - 1);
+  end;
+  Kl := LnGammaF(StilDe) - LnGammaF(Kc);
+  for c := 0 to Kc - 1 do
+  begin
+    if c > High(yTarget) then Yk := 0 else Yk := yTarget[c];
+    AlTil := Yk + (1 - Yk) * FOutput[X, Y, c];
+    Kl := Kl - LnGammaF(AlTil)
+        + (AlTil - 1) * (DigammaF(AlTil) - DigammaF(StilDe));
+  end;
+  Result := Err + Lam * Kl;
+end;
+
+function TNNetEvidentialClassification.Alpha(c: integer = 0; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+begin
+  Result := FOutput[X, Y, c];
+end;
+
+function TNNetEvidentialClassification.Prediction(c: integer = 0; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+var
+  Kc, j: integer;
+  Sstr: TNeuralFloat;
+begin
+  Kc := FStruct[0];
+  Sstr := 0;
+  for j := 0 to Kc - 1 do
+    Sstr := Sstr + FOutput[X, Y, j];
+  Result := FOutput[X, Y, c] / Sstr;
+end;
+
+function TNNetEvidentialClassification.Uncertainty(X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+var
+  Kc, j: integer;
+  Sstr: TNeuralFloat;
+begin
+  Kc := FStruct[0];
+  Sstr := 0;
+  for j := 0 to Kc - 1 do
+    Sstr := Sstr + FOutput[X, Y, j];
+  Result := Kc / Sstr;
+end;
+
+procedure TNNetEvidentialClassification.Backpropagate();
+var
+  StartTime: double;
+  Kc, X, Y, c, MaxX, MaxY: integer;
+  Sstr, Lam, Qsum, PkMinusYkPk, Yj, Aj, Pj: TNeuralFloat;
+  dErr, dKL, dB, SumAlTilM1, StilDe, AlTilj, Raw, Sig: TNeuralFloat;
+  TrigStilDe: TNeuralFloat;
+
+  function SigmoidOf(s: TNeuralFloat): TNeuralFloat;
+  begin
+    if s > 30 then Result := 1
+    else if s < -30 then Result := 0
+    else Result := 1 / (1 + Exp(-s));
+  end;
+
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Kc := FStruct[0];
+  Lam := FFloatSt[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      // Strength S and helper sums shared across the K channels.
+      Sstr := 0;
+      for c := 0 to Kc - 1 do
+        Sstr := Sstr + FOutput[X, Y, c];
+      // Q = sum_k p_k^2 ; PkMinusYkPk = sum_k (p_k - y_k)*p_k. The one-hot
+      // label is recovered from y_k = alpha_k - FOutputError[k].
+      Qsum := 0;
+      PkMinusYkPk := 0;
+      StilDe := 0;
+      SumAlTilM1 := 0;
+      for c := 0 to Kc - 1 do
+      begin
+        Aj := FOutput[X, Y, c];
+        Pj := Aj / Sstr;
+        Yj := Aj - FOutputError[X, Y, c];
+        Qsum := Qsum + Pj * Pj;
+        PkMinusYkPk := PkMinusYkPk + (Pj - Yj) * Pj;
+        AlTilj := Yj + (1 - Yj) * Aj;
+        StilDe := StilDe + AlTilj;
+        SumAlTilM1 := SumAlTilM1 + (AlTilj - 1);
+      end;
+      TrigStilDe := TrigammaF(StilDe);
+
+      for c := 0 to Kc - 1 do
+      begin
+        Aj := FOutput[X, Y, c];
+        Pj := Aj / Sstr;
+        Yj := Aj - FOutputError[X, Y, c];
+
+        // dERR_A/dalpha_j for term A = sum_k (y_k - p_k)^2:
+        //   = (2/S)*[ (p_j - y_j) - sum_k (p_k - y_k)*p_k ].
+        dErr := (2 / Sstr) * ((Pj - Yj) - PkMinusYkPk);
+
+        // dERR_B/dalpha_j for term B = (1 - Q)/(S+1), Q = sum_k p_k^2:
+        //   dQ/dalpha_j = (2/S)*(p_j - Q)
+        //   dB/dalpha_j = [ -(dQ/dalpha_j)*(S+1) - (1-Q) ] / (S+1)^2.
+        dB := ( -((2 / Sstr) * (Pj - Qsum)) * (Sstr + 1) - (1 - Qsum) )
+              / ((Sstr + 1) * (Sstr + 1));
+        dErr := dErr + dB;
+
+        // dKL/dalpha_j (chain through alphaTilde_j = y_j + (1-y_j)*alpha_j):
+        //   dKL/dalphaTilde_j = (alphaTilde_j-1)*psi'(alphaTilde_j)
+        //                       - (sum_k (alphaTilde_k-1))*psi'(StilDe)
+        //   dalphaTilde_j/dalpha_j = (1 - y_j).
+        AlTilj := Yj + (1 - Yj) * Aj;
+        dKL := (1 - Yj) * ( (AlTilj - 1) * TrigammaF(AlTilj)
+               - SumAlTilM1 * TrigStilDe );
+
+        // softplus chain: dalpha_j/draw[j] = sigmoid(raw[j]).
+        Raw := FPrevLayer.FOutput[X, Y, c];
+        Sig := SigmoidOf(Raw);
+        FOutputError[X, Y, c] := (dErr + Lam * dKL) * Sig;
+      end;
+    end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -74776,6 +75137,7 @@ begin
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetMixtureDensity' :       Result := TNNetMixtureDensity.Create(St[0], St[1]);
       'TNNetEvidentialRegression' : Result := TNNetEvidentialRegression.Create(St[0], Ft[0]);
+      'TNNetEvidentialClassification' : Result := TNNetEvidentialClassification.Create(St[0], Ft[0]);
       'TNNetSoftDecisionTree' :     Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
@@ -75133,6 +75495,7 @@ begin
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetMixtureDensity' then Result := TNNetMixtureDensity.Create(St[0], St[1]) else
       if S[0] = 'TNNetEvidentialRegression' then Result := TNNetEvidentialRegression.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetEvidentialClassification' then Result := TNNetEvidentialClassification.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetSoftDecisionTree' then Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else

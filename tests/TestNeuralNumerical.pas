@@ -576,6 +576,8 @@ type
     procedure TestMixtureDensitySampleAndLoadFromString;
     procedure TestEvidentialRegressionGradient;
     procedure TestEvidentialRegressionLoadFromString;
+    procedure TestEvidentialClassificationGradient;
+    procedure TestEvidentialClassificationLoadFromString;
     procedure TestLabelSmoothingLossForwardPassthrough;
     procedure TestLabelSmoothingLossTransform;
     procedure TestLabelSmoothingLossLoadFromString;
@@ -33198,6 +33200,177 @@ begin
     AssertTrue('beta > 0', EV.Output[0,0,3] > 0);
     AssertTrue('aleatoric var > 0', EV.AleatoricVar(0) > 0);
     AssertTrue('epistemic var > 0', EV.EpistemicVar(0) > 0);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEvidentialClassificationGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  EC: TNNetEvidentialClassification;
+  Yt: array[0..2] of TNeuralFloat;
+  AnaGrad, NumGrad, OldP, LossP, LossM, Eps: TNeuralFloat;
+  i, Kc: integer;
+  Lam: TNeuralFloat;
+
+  // EDL loss (Bayes-risk MSE + lambda*KL) as a function of the RAW params (Input
+  // here, since the previous layer is identity). Recomputes the softplus->alpha
+  // transform exactly as Compute does, then the closed-form loss.
+  function EdlLoss(ARaw: TNNetVolume): TNeuralFloat;
+  var
+    c: integer;
+    Al, Sstr, Pk, Yk, Err, Kl, AlTil, StilDe: TNeuralFloat;
+    AlphaArr: array[0..7] of TNeuralFloat;
+
+    function Sp(s: TNeuralFloat): TNeuralFloat;
+    begin
+      if s > 30 then Result := s else Result := Ln(1 + Exp(s));
+    end;
+    // lnGamma via FPC-independent Lanczos (mirrors the layer).
+    function Lg(x: TNeuralFloat): TNeuralFloat;
+    const
+      cG: array[0..8] of Double = (
+        0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+        771.32342877765313, -176.61502916214059, 12.507343278686905,
+        -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7);
+    var
+      xd, t, a: Double; j: integer;
+    begin
+      xd := x - 1; a := cG[0]; t := xd + 7.5;
+      for j := 1 to 8 do a := a + cG[j] / (xd + j);
+      Lg := Ln(2.5066282746310002 * a) + (xd + 0.5) * Ln(t) - t;
+    end;
+    // digamma (mirrors the layer).
+    function Dg(x: TNeuralFloat): TNeuralFloat;
+    var xd, r, f: Double;
+    begin
+      xd := x; r := 0;
+      while xd < 6 do begin r := r - 1 / xd; xd := xd + 1; end;
+      f := 1 / (xd * xd);
+      r := r + Ln(xd) + 1 / (2 * xd)
+        - f * (1.0/12.0 - f * (1.0/120.0 - f * (1.0/252.0)));
+      Dg := r;
+    end;
+  begin
+    Sstr := 0;
+    for c := 0 to Kc - 1 do
+    begin
+      Al := 1 + Sp(ARaw.Raw[c]);
+      AlphaArr[c] := Al;
+      Sstr := Sstr + Al;
+    end;
+    Err := 0;
+    for c := 0 to Kc - 1 do
+    begin
+      Pk := AlphaArr[c] / Sstr;
+      Yk := Yt[c];
+      Err := Err + (Yk - Pk) * (Yk - Pk) + Pk * (1 - Pk) / (Sstr + 1);
+    end;
+    StilDe := 0;
+    for c := 0 to Kc - 1 do
+      StilDe := StilDe + (Yt[c] + (1 - Yt[c]) * AlphaArr[c]);
+    Kl := Lg(StilDe) - Lg(Kc);
+    for c := 0 to Kc - 1 do
+    begin
+      AlTil := Yt[c] + (1 - Yt[c]) * AlphaArr[c];
+      Kl := Kl - Lg(AlTil) + (AlTil - 1) * (Dg(AlTil) - Dg(StilDe));
+    end;
+    Result := Err + Lam * Kl;
+  end;
+
+begin
+  // Reseed so the shared RNG state is deterministic (this file shares one RNG
+  // across tests and is ordering sensitive).
+  RandSeed := 424242;
+  Kc := 3;
+  Yt[0] := 0; Yt[1] := 1; Yt[2] := 0; // one-hot label (class 1).
+  Lam := 0.3;
+  Eps := 1e-4;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, Kc);
+  Target := TNNetVolume.Create(1, 1, Kc);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Kc, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    EC := TNNetEvidentialClassification.Create(Kc, Lam);
+    NN.AddLayer(EC);
+
+    // Bounded raw evidence so alpha stays moderate (well above 1).
+    Input.Raw[0] :=  0.5;  // raw evidence class 0
+    Input.Raw[1] :=  1.2;  // raw evidence class 1 (the true class)
+    Input.Raw[2] := -0.3;  // raw evidence class 2
+
+    NN.Compute(Input);
+    // Framework seeds FOutputError := output - target; the head recovers the
+    // one-hot label from the alpha channels. Target = one-hot label.
+    Target.Raw[0] := Yt[0]; Target.Raw[1] := Yt[1]; Target.Raw[2] := Yt[2];
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + Eps;
+      LossP := EdlLoss(Input);
+      Input.Raw[i] := OldP - Eps;
+      LossM := EdlLoss(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * Eps);
+      AssertEquals('EvidentialClassification grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEvidentialClassificationLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  EC: TNNetEvidentialClassification;
+  Saved: string;
+  Su, Pk: TNeuralFloat;
+begin
+  // Save/Load must preserve K (FStruct[0]) and lambda (FFloatSt[0]).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    NN.AddLayer(TNNetEvidentialClassification.Create(3, 0.42));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetEvidentialClassification',
+      NN2.GetLastLayer is TNNetEvidentialClassification);
+    EC := NN2.GetLastLayer as TNNetEvidentialClassification;
+    AssertEquals('Loaded K', 3, EC.NumClasses());
+    AssertEquals('Loaded lambda', 0.42, EC.Lambda(), 1e-6);
+
+    // Forward transform sanity: alpha > 1, probabilities sum to 1, u in (0,1].
+    Input.Raw[0] := 2.0; Input.Raw[1] := -1.0; Input.Raw[2] := 0.0;
+    NN2.Compute(Input);
+    AssertTrue('alpha_0 > 1', EC.Alpha(0) > 1);
+    AssertTrue('alpha_1 > 1', EC.Alpha(1) > 1);
+    AssertTrue('alpha_2 > 1', EC.Alpha(2) > 1);
+    Pk := EC.Prediction(0) + EC.Prediction(1) + EC.Prediction(2);
+    AssertEquals('predictions sum to 1', 1.0, Pk, 1e-5);
+    Su := EC.Uncertainty();
+    AssertTrue('uncertainty > 0', Su > 0);
+    AssertTrue('uncertainty <= 1', Su <= 1 + 1e-6);
+    // Class 0 has the most evidence -> highest probability.
+    AssertTrue('class 0 most probable', EC.Prediction(0) > EC.Prediction(1));
   finally
     NN.Free;
     NN2.Free;
