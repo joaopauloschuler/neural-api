@@ -769,14 +769,6 @@ rather than acted on.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
 ### Examples I'd enjoy writing
-- [X] `examples/TinyGPT/` — LANDED 2026-06-06 (commit ad0478d): char-level
-      decoder-only GPT (one-hot -> PointwiseConvLinear token proj -> AddPositionalEmbedding
-      -> 2x AddTransformerEncoderBlock with CausalMask=true + SwiGLU FFN -> softmax head),
-      trains on a small embedded corpus and generates autoregressively. ~1.3-2 min pure CPU,
-      val loss 4.49->3.28 / next-char acc ~0.30 at the budget config; honestly documented as
-      "memorizes the tiny corpus, under-trained for the 5-min budget" (a clean idle box reaches
-      loss <1.0 with more epochs). Used AddTransformerEncoderBlock (NOT the encoder-decoder
-      AddTransformerDecoderBlock which needs cross-attention).
 - [ ] EchoStateNetwork follow-up: add a `TNNetSpectralRadius` helper (power
       iteration on W·v only, no W^T step) so reservoirs can target the true
       spectral RADIUS rather than the conservative spectral-norm upper bound
@@ -1500,45 +1492,6 @@ rather than acted on.
       degeneracy-aware generalization of "effective parameter count").
 
 ### Differentiable hierarchical routing (a genuinely new paradigm)
-- [x] (DONE 2026-06-06) `TNNetSoftDecisionTree` — a single differentiable *soft (oblique)
-      decision tree* layer (Kontschieder et al. 2015, "Deep Neural Decision
-      Forests"; Frosst & Hinton 2017, "Distilling a Neural Network Into a
-      Soft Decision Tree"). This is a structurally NEW paradigm for this
-      repo: not a matrix factorization ([[kronecker-linear-layer]],
-      [[monarch-linear-layer]]), not attention, not recurrence, not a kernel
-      method ([[random-fourier-features-layer]]) — it is *hierarchical soft
-      routing*. A balanced binary tree of fixed depth `D` has `2^D - 1`
-      inner nodes and `2^D` leaves. Each inner node `i` is a learnable
-      linear gate producing a routing probability
-      `p_i = sigmoid(beta * (w_i . x + b_i))` (the `beta` inverse-temperature
-      is a fixed hyperparam, optionally trainable per the
-      [[constrained-learnable-scalar-sigmoid]] recipe). A sample reaches a
-      leaf with probability equal to the product of the left/right gate
-      decisions along its root-to-leaf path (`p_i` going left, `1-p_i`
-      going right). Each leaf `l` holds a learnable output vector `phi_l`
-      (Depth-sized, a logit/value vector); the layer output is the
-      path-probability-weighted mixture `y = sum_l P(leaf=l|x) * phi_l`.
-      Forward is one matrix of node gates + a leaf-distribution combine;
-      backward is exact and cheap — the product-of-gates path probabilities
-      give clean analytic derivatives w.r.t. every `w_i, b_i` (a node's
-      gradient is its accumulated subtree responsibility, mirroring the
-      already-proven product-rule backward in the gated-mixture heads like
-      [[mixture-density-head]]). Weight layout: pack the `2^D - 1` gate
-      neurons + `2^D` leaf neurons into the standard `Neurons[]` array, store
-      `D` in `FStruct[0]`, mark with `// Coded by Claude (AI).` per
-      [[claude-authorship-comment]]. Numerical-gradient test trio + reseed
-      `RandSeed := 424242` per [[numerical-test-rng-ordering]]; build/run via
-      [[build-test-runner]]. Ship `examples/SoftDecisionTree/` on a 2-D
-      two-moons / XOR-style toy where the learned axis-and-oblique splits are
-      interpretable, and add a `TNNet.RoutingEntropyReport` companion idea
-      note (per-leaf occupancy + average path entropy → are the splits crisp
-      or mushy?) following [[introspection-report-pattern]]. Honest headline
-      in the [[nlp-experiment-harness]] "what fit the budget" style: contrast
-      a single soft tree against a plain 2-layer MLP with matched parameter
-      count — the tree should win or tie on the toy *and* expose a
-      human-readable decision path, which the MLP cannot. Follow-up (NOT this
-      task): a `TNNet.AddNeuralDecisionForest` builder that averages an
-      ensemble of these trees with bagged feature subsets.
 - [ ] `TNNet.RoutingEntropyReport` — forward-only introspection diagnostic for a
       `TNNetSoftDecisionTree` layer (DEFERRED from the SoftDecisionTree task,
       done 2026-06-06). Over a probe batch, recompute each inner gate
