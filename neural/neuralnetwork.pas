@@ -11017,6 +11017,34 @@ type
       // Returns the last layer. (Coded by Claude (AI).)
       function AddLRU(d_ff: integer;
         PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // CONFORMER block (Gulati et al. 2020, "Conformer: Convolution-augmented
+      // Transformer for Speech Recognition") over a (SeqLen,1,d_model) sequence
+      // (SizeY=1). A "macaron"-style block that sandwiches a multi-head
+      // self-attention module and a convolution module between two HALF-step
+      // feed-forward modules, every sub-module a pre-norm residual, with a final
+      // LayerNorm:
+      //   x := x + 0.5 * FFN(LayerNorm(x))      (first half-step FFN)
+      //   x := x + MHSA(LayerNorm(x))           (multi-head self-attention)
+      //   x := x + Conv(LayerNorm(x))           (convolution module)
+      //   x := x + 0.5 * FFN(LayerNorm(x))      (second half-step FFN)
+      //   x := LayerNorm(x)
+      // FFN module (token-wise, 1x1 convs keep the sequence axis):
+      //   PointwiseConvLinear(d_ff) -> TNNetSwish -> PointwiseConvLinear(d_model),
+      // the residual sum scaled by 0.5 via TNNetMulByConstant (macaron).
+      // Convolution module:
+      //   PointwiseConvLinear(2*d_model) -> TNNetGLU (glu gating, back to d_model)
+      //   -> TNNetCausalConv1D(d_model, ConvKernelSize) (1-D depth-mixing conv over
+      //      the time axis, causal/SAME so length is preserved) -> TNNetSwish
+      //   -> PointwiseConvLinear(d_model) (point-wise projection back).
+      // NOTE on the depthwise conv: the paper uses a per-channel DEPTHWISE 1-D
+      // conv; the library has no per-channel 1-D-over-sequence primitive, so
+      // TNNetCausalConv1D (a full 1-D conv that DOES mix channels across the
+      // kernel window) is used as the closest existing shape-preserving 1-D
+      // sequence conv. d_model is inferred from the input depth. All sub-layers
+      // are already serializable, so the block needs no new class and round-trips
+      // through SaveToString/LoadFromString. Returns the final-LayerNorm layer so
+      // blocks can be stacked. (Coded by Claude (AI).)
+      function AddConformerBlock(Heads, d_ff, ConvKernelSize: integer): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
       // spiking neural network, over a (T,1,D) spike/feature tensor on the time
       // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
@@ -44567,6 +44595,67 @@ begin
   if not PreNorm then AddLayer( NormClass.Create() );
 
   Result := GetLastLayer();
+end;
+
+function TNNet.AddConformerBlock(Heads, d_ff, ConvKernelSize: integer): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+  d_model: integer;
+begin
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddConformerBlock requires a (SeqLen,1,d_model) input (SizeY=1). Got SizeY=' +
+      IntToStr(GetLastLayer().Output.SizeY));
+  if ConvKernelSize < 1 then ConvKernelSize := 1;
+  d_model := GetLastLayer().Output.Depth;  // inferred residual-stream width
+
+  // ---- (1) First HALF-step feed-forward module (macaron). -------------------
+  // Pre-norm residual around a token-wise FFN, the residual branch SCALED by 0.5
+  // (TNNetMulByConstant) before being summed back -- the Conformer "macaron" FFN.
+  // Pointwise (1x1) convs keep the sequence axis; FullConnect would flatten/mix
+  // the tokens and zero the input gradient.
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetLayerNorm.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_ff) );
+  AddLayer( TNNetSwish.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetMulByConstant.Create(0.5) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+
+  // ---- (2) Multi-head self-attention module. --------------------------------
+  // Pre-norm residual; QKV slab projection d_model -> 3*d_model (1x1 conv per
+  // token) feeds AddMultiHeadSelfAttention, which out-projects back to d_model.
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetLayerNorm.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
+  AddMultiHeadSelfAttention(Heads, {CausalMask=}false, {UseRoPE=}false);
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+
+  // ---- (3) Convolution module. ----------------------------------------------
+  // Pre-norm residual: LayerNorm -> pointwise expand to 2*d_model -> GLU gating
+  // (back to d_model) -> 1-D conv over the time axis (causal/SAME, length
+  // preserved) -> Swish -> pointwise projection back to d_model. See the header
+  // note: TNNetCausalConv1D is a full (channel-mixing) 1-D sequence conv used as
+  // the closest available stand-in for the paper's per-channel depthwise conv.
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetLayerNorm.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(2 * d_model) );
+  AddLayer( TNNetGLU.Create() );
+  AddLayer( TNNetCausalConv1D.Create(d_model, ConvKernelSize) );
+  AddLayer( TNNetSwish.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+
+  // ---- (4) Second HALF-step feed-forward module (macaron). ------------------
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetLayerNorm.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_ff) );
+  AddLayer( TNNetSwish.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetMulByConstant.Create(0.5) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+
+  // ---- (5) Final LayerNorm. -------------------------------------------------
+  Result := AddLayer( TNNetLayerNorm.Create() );
 end;
 
 function TNNet.AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;
