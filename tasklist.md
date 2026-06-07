@@ -187,6 +187,38 @@ rather than acted on.
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
+- [ ] TNNetHamiltonianCell — a structure-preserving (symplectic) dynamics layer.
+      Greenberg & co's "Hamiltonian Neural Networks" (Greydanus et al. 2019,
+      arXiv:1906.01563): instead of regressing the time-derivative field directly
+      (which is what the existing TNNet.AddNeuralODEBlock residual field and the
+      CfC / TNNetClosedFormContinuous cells do — neither conserves energy), this
+      layer parameterizes a SCALAR learned Hamiltonian H(q,p) with a small MLP and
+      produces the SYMPLECTIC gradient field dq/dt = +dH/dp, dp/dt = -dH/dq, then
+      integrates one or more leapfrog/Stormer-Verlet steps along the time axis.
+      The conserved quantity falls out of the construction, so a free-swinging
+      pendulum / mass-spring trajectory stays on its energy level set instead of
+      spiralling in or blowing up the way a plain MLP-field NeuralODE does. This
+      is genuinely distinct from every continuous-dynamics layer already in tree
+      (NeuralODE = unconstrained field; CfC = liquid closed-form gate; DiagonalSSM
+      / SelectiveSSM = linear state space; TNNetKalmanFilterCell = uncertainty
+      propagation) — none of them compute the gradient of a learned scalar energy
+      or guarantee a symplectic (volume-preserving) update. Input/output shape
+      (T, 1, 2*D): the depth axis is the (q | p) phase-space pair, D coords each.
+      KEY GRADIENT SUBTLETY: the forward pass already needs dH/dq and dH/dp (a
+      first derivative through the inner MLP via one backward sweep), so the
+      training backward pass differentiates THROUGH that gradient — a Hessian-
+      vector product of H. Implement it as a second tape pass over the same inner
+      MLP rather than materializing the Hessian; gradient-check the composed
+      forward+backward with the standard LayerInputAndWeightGradientCheck against
+      central differences (expect to bound the inner weights, per the FD-truncation
+      gotcha, rather than loosen tolerance). Deliverables per the introspection /
+      layer-authoring recipe: decl + impl + LoadFromString round-trip + numerical
+      gradient test + a `examples/HamiltonianPendulum/` demo that trains on noisy
+      (q,p) samples from an ideal pendulum and shows the learned rollout conserves
+      energy over a long horizon vs an unconstrained-MLP-field baseline that drifts.
+      Follow-up once it lands: a builder `TNNet.AddHamiltonianBlock` and a separable
+      H(q,p)=T(p)+V(q) variant (kinetic + potential split) that makes the leapfrog
+      step exact and even cheaper.
 - [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
       landed 2026-06-01, sine-regression task distribution, manual inner-loop
       Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
