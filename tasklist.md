@@ -285,40 +285,33 @@ rather than acted on.
       inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
       Re-scope before attempting.
 
-- [ ] `TNNet.AddPerceiverEncoder` — the Perceiver / Perceiver-IO latent
-      bottleneck (Jaegle et al. 2021, "Perceiver: General Perception with
-      Iterative Attention", arXiv:2103.03206; and Perceiver IO,
-      arXiv:2107.14795). The defining trick is a SMALL, FIXED-SIZE learnable
-      *latent array* `Z` of shape `(NumLatents, 1, d_latent)` (NumLatents «
-      InputSeqLen) that (a) cross-attends to the (possibly huge) byte/pixel/token
-      input ONCE to absorb it, then (b) is refined by a STACK of `Depth` latent
-      SELF-attention + FFN blocks operating only over the `NumLatents` rows. This
-      decouples the bulk of the compute from the input length: the quadratic cost
-      lives in the cheap `NumLatents²` latent tower, and the input only enters
-      through the linear `NumLatents × InputSeqLen` cross-attention — exactly the
-      "process a 50k-pixel image / long byte stream with an O(1)-in-length deep
-      tower" win. Implementation is a BUILDER composing already-landed pieces: the
-      learnable seed bank pattern from [[set-attention-block-builder]] /
-      `AddAttentionPooling` for `Z`; [[cross-attention-asymmetric-seqlen-bug]]
-      (`TNNetCrossAttention`, rectangular QSeqLen×KVSeqLen) for the input→latent
-      read; and `AddTransformerEncoderBlock` (residual MHA + FFN, see
-      [[mha-builder-and-seq-projection]]) repeated `Depth` times for the latent
-      tower. CRITICAL distinctness — this is NOT a near-duplicate of the existing
-      Set-Transformer builders: `TNNetInducedSetAttention` uses inducing points to
-      reduce cost but PROJECTS BACK to the original `n` input rows (output length =
-      input length); `TNNetAttentionPooling` is a SINGLE pooling step to `k` seeds
-      with no self-attention refinement. Perceiver is the missing third mode — a
-      PERSISTENT latent carrier processed by a multi-block self-attention tower,
-      output length = `NumLatents` regardless of input length. Optional
-      Perceiver-IO output cross-attention (a final query array of shape
-      `(NumOutputs,1,d)` reading the refined latents) is a natural follow-up but
-      not required for v1. Example `examples/Perceiver/`: classify a deliberately
-      LONG input (e.g. a flattened sequence far longer than any transformer
-      example here) with `NumLatents` ≈ 16–32 and show the parameter / time cost
-      is governed by the latent tower, not the input length — i.e. doubling
-      InputSeqLen barely moves the weight count. Reseed the gradient test with
-      `RandSeed := 424242` ([[numerical-test-rng-ordering]]) and add the
-      shape/input-gradient/save-load trio. Pairs with [[set-transformer-isab-pma]].
+- [X] `TNNet.AddPerceiverEncoder(NumLatents, d_latent, Heads, Depth, d_ff,
+      PreNorm, NormClass)` — the Perceiver latent bottleneck (Jaegle et al. 2021,
+      arXiv:2103.03206; Perceiver IO, arXiv:2107.14795). BUILDER (no new leaf
+      class) composing already-landed pieces: (1) an optional token-wise
+      `TNNetPointwiseConvLinear(d_latent)` input width projection; (2)
+      `AddAttentionPooling(NumLatents, Heads)` as the input→latent CROSS-ATTENTION
+      read — its learnable PMA seed bank IS the Perceiver latent array `Z`,
+      collapsing the (possibly huge) `InputSeqLen` rows to a FIXED
+      `(NumLatents,1,d_latent)` summary at a cost linear in the input length; (3)
+      `AddTransformerEncoderBlock` repeated `Depth` times as the latent
+      self-attention tower (`O(NumLatents²)` per block, independent of input
+      length). Output length = `NumLatents` regardless of input — the missing
+      THIRD mode vs the Set-Transformer builders (`InducedSetAttention` projects
+      BACK to `n` input rows; `AttentionPooling` is a single pool with no
+      refinement). NOTE: used `TNNetAttentionPooling` (PMA) rather than the raw
+      `TNNetCrossAttention` for the read — the PMA seed bank already IS the
+      learnable latent array and gives an exact softmax-Jacobian backward.
+      Example `examples/Perceiver/` classifies a deliberately LONG 256-token input
+      (chance 25% → 100% in ≈55 s) and prints IDENTICAL weight counts at SEQLEN
+      and 2*SEQLEN (doubling the input adds ZERO weights). Tests (reseeded
+      `RandSeed := 424242`): shape (output rows = NumLatents AND weight count is
+      input-length-independent), input-gradient FD check (multi-head; epsilon=1e-3
+      — single-precision FD through the softmax+SwiGLU stack LOSES accuracy below
+      that, the analytic gradient is correct), and save/load round-trip. Optional
+      Perceiver-IO output cross-attention (a final `(NumOutputs,1,d)` query array
+      reading the refined latents) remains a natural v2 follow-up. Landed on a2.
+      Pairs with [[set-transformer-isab-pma]] / [[set-attention-block-builder]].
 
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32

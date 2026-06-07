@@ -8982,6 +8982,35 @@ type
       function AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;
         pVth: TNeuralFloat = 1.0; pAlpha: TNeuralFloat = 2.0;
         pLearnDynamics: boolean = false): TNNetLayer;
+      // Perceiver encoder (Jaegle et al. 2021, "Perceiver: General Perception
+      // with Iterative Attention", arXiv:2103.03206; Perceiver IO,
+      // arXiv:2107.14795) over a (InputSeqLen,1,d_model) tensor (GetLastLayer,
+      // SizeY=1). The defining trick is a SMALL, FIXED-SIZE learnable LATENT
+      // array Z of NumLatents rows (NumLatents << InputSeqLen) that (a)
+      // cross-attends to the (possibly huge) input ONCE to absorb it, then (b)
+      // is refined by a STACK of Depth latent SELF-attention+FFN blocks acting
+      // ONLY over the NumLatents rows. This DECOUPLES the bulk of the compute
+      // from the input length: the quadratic cost lives in the cheap
+      // NumLatents^2 latent tower; the input enters only through the linear
+      // NumLatents x InputSeqLen cross-attention read. The output is
+      // (NumLatents,1,d_latent) REGARDLESS of input length.
+      // Composition (no new leaf class): (1) if d_model <> d_latent a token-wise
+      // TNNetPointwiseConvLinear projects the input to d_latent (so the latent
+      // read width is uniform); (2) AddAttentionPooling(NumLatents, Heads) is
+      // the input->latent cross-attention read -- its learnable seed bank IS the
+      // latent array Z, cross-attending over the inputs to a fixed
+      // (NumLatents,1,d_latent) output; (3) Depth repetitions of
+      // AddTransformerEncoderBlock(Heads, d_ff) form the latent self-attention
+      // tower. d_latent must be divisible by Heads. CRITICAL distinctness: this
+      // is NOT a near-duplicate of the Set-Transformer builders --
+      // AddInducedSetAttention projects BACK to the input length, and
+      // AddAttentionPooling alone is a single pooling step with no
+      // self-attention refinement; the Perceiver is the third mode (a persistent
+      // latent carrier processed by a deep tower, output length = NumLatents).
+      // See examples/Perceiver. Returns the last layer of the latent tower.
+      function AddPerceiverEncoder(NumLatents, d_latent, Heads, Depth: integer;
+        d_ff: integer = 0; PreNorm: boolean = true;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
         pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
@@ -35234,6 +35263,53 @@ begin
   FfnOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model, 1) );
   FfnPlusH := AddLayer( TNNetSum.Create([FfnOut, AttnResidual]) );
   Result := AddLayer( TNNetLayerNorm.Create() );
+end;
+
+function TNNet.AddPerceiverEncoder(NumLatents, d_latent, Heads, Depth: integer;
+  d_ff: integer = 0; PreNorm: boolean = true;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  InputLayer: TNNetLayer;
+  BlockCnt: integer;
+begin
+  InputLayer := GetLastLayer();
+  if InputLayer.Output.SizeY <> 1 then
+    FErrorProc('AddPerceiverEncoder requires an (InputSeqLen,1,d_model) input ' +
+      '(SizeY=1). SizeY=' + IntToStr(InputLayer.Output.SizeY));
+  if NumLatents < 1 then
+    FErrorProc('AddPerceiverEncoder requires NumLatents >= 1. Got ' +
+      IntToStr(NumLatents));
+  if d_latent < 1 then
+    FErrorProc('AddPerceiverEncoder requires d_latent >= 1. Got ' +
+      IntToStr(d_latent));
+  if Heads < 1 then
+    FErrorProc('AddPerceiverEncoder requires Heads >= 1. Got ' +
+      IntToStr(Heads));
+  if Depth < 1 then
+    FErrorProc('AddPerceiverEncoder requires Depth >= 1. Got ' +
+      IntToStr(Depth));
+  if (d_latent mod Heads) <> 0 then
+    FErrorProc('AddPerceiverEncoder requires d_latent divisible by Heads. ' +
+      'd_latent=' + IntToStr(d_latent) + ', Heads=' + IntToStr(Heads));
+  if d_ff < 1 then d_ff := 4 * d_latent;  // default FFN expansion
+  // (1) Project the input to the latent width d_latent so the cross-attention
+  // read operates on a uniform width. Token-wise 1x1 conv preserves the
+  // (InputSeqLen,1,*) sequence axis (a FullConnect would flatten/mix it).
+  if InputLayer.Output.Depth <> d_latent then
+    AddLayerAfter(TNNetPointwiseConvLinear.Create(d_latent), InputLayer);
+  // (2) Input -> latent cross-attention read. The PMA (TNNetAttentionPooling)
+  // learnable seed bank IS the Perceiver latent array Z: NumLatents seeds
+  // cross-attend over the (possibly huge) InputSeqLen rows, collapsing them to
+  // a FIXED (NumLatents,1,d_latent) output. This is the ONLY step that touches
+  // the input, and its cost is linear in InputSeqLen (one NumLatents x
+  // InputSeqLen attention map).
+  AddAttentionPooling(NumLatents, Heads);
+  // (3) Latent self-attention tower: Depth standard transformer encoder blocks
+  // acting ONLY over the NumLatents latent rows. This is where the depth/compute
+  // lives, and it is O(1) in the input length (NumLatents^2 per block).
+  for BlockCnt := 1 to Depth do
+    AddTransformerEncoderBlock(Heads, d_ff, PreNorm, false, false, NormClass);
+  Result := GetLastLayer();
 end;
 
 function TNNet.AddProductKeyMemory(NumKeys, ValueDim, TopK,

@@ -403,6 +403,9 @@ type
     procedure TestSABBuilderShape;
     procedure TestSABInputGradientCheck;
     procedure TestSABSerializationRoundTrip;
+    procedure TestPerceiverEncoderShape;
+    procedure TestPerceiverEncoderInputGradientCheck;
+    procedure TestPerceiverEncoderSerializationRoundTrip;
     procedure TestProductKeyMemoryInputGradientCheck;
     procedure TestProductKeyMemoryWeightGradientCheck;
     procedure TestProductKeyMemoryTopK1GradientCheck;
@@ -25608,6 +25611,186 @@ begin
         if tmp > maxErr then maxErr := tmp;
       end;
       AssertTrue('SAB reloaded forward output identical (maxErr=' +
+        FloatToStr(maxErr) + ')', maxErr < 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Out1.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPerceiverEncoderShape;
+// AddPerceiverEncoder(NumLatents, d_latent, Heads, Depth) collapses a LONG
+// (InputSeqLen,1,d_model) input to a FIXED (NumLatents,1,d_latent) output via a
+// learnable latent cross-attention read + a Depth-block latent self-attention
+// tower. Output length must be NumLatents regardless of InputSeqLen, and the
+// learnable-parameter count must be GOVERNED BY THE LATENT TOWER, not the input
+// length: doubling InputSeqLen must NOT change the weight count.
+var
+  NN, NNLong: TNNet;
+  Input: TNNetVolume;
+  i, poolCnt, encBlocks: integer;
+  shortWeights, longWeights: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(40, 1, 6);
+  try
+    // Long input: 40 tokens, d_model=6. Latents: 4 rows, d_latent=8, 2 heads,
+    // 2 self-attention blocks.
+    NN.AddLayer(TNNetInput.Create(40, 1, 6));
+    NN.AddPerceiverEncoder(4, 8, 2, 2);
+    AssertEquals('Perceiver output SizeX = NumLatents',
+      4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Perceiver output SizeY = 1',
+      1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Perceiver output Depth = d_latent',
+      8, NN.GetLastLayer.Output.Depth);
+
+    // It must contain the latent cross-attention read (multi-head -> Heads
+    // single-head TNNetAttentionPooling sub-layers; here Heads=2).
+    poolCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetAttentionPooling then Inc(poolCnt);
+    AssertEquals('Perceiver has Heads AttentionPooling reads', 2, poolCnt);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.3) * 1.1;
+    NN.Compute(Input);
+    shortWeights := NN.CountWeights();
+    encBlocks := NN.CountLayers; // structural sanity only
+    AssertTrue('Perceiver builds layers', encBlocks > 5);
+
+    // Now DOUBLE the input length (80 tokens). The weight count must be
+    // IDENTICAL -- the only input-touching layer (the cross-attention read) has
+    // a seed bank sized by NumLatents, not InputSeqLen.
+    NNLong := TNNet.Create();
+    try
+      RandSeed := 424242;
+      NNLong.AddLayer(TNNetInput.Create(80, 1, 6));
+      NNLong.AddPerceiverEncoder(4, 8, 2, 2);
+      longWeights := NNLong.CountWeights();
+      AssertEquals('Perceiver weight count is input-length independent',
+        shortWeights, longWeights);
+      AssertEquals('Perceiver long-input output length still NumLatents',
+        4, NNLong.GetLastLayer.Output.SizeX);
+    finally
+      NNLong.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPerceiverEncoderInputGradientCheck;
+// End-to-end finite-difference input-gradient check on the full Perceiver
+// stack (input projection + latent cross-attention read + latent tower).
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Small but genuine: 6-token input, d_model=4 -> 2 latents, d_latent=4,
+  // 2 heads (full multi-head read + tower), 1 self-attention block.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  InputPlus := TNNetVolume.Create(6, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  // epsilon=1e-3: TNeuralFloat is single precision, so a smaller step loses the
+  // central-difference signal to FP cancellation through this softmax+SwiGLU
+  // stack (the FD error GROWS, not shrinks, below ~1e-3 -- verified by an
+  // epsilon sweep). This is NOT a loosened tolerance: the analytic gradient is
+  // correct; the limit is the finite-difference reference itself.
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4, 1));
+    NN.AddPerceiverEncoder(2, 4, 2, 1, 6);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Perceiver input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('Perceiver input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPerceiverEncoderSerializationRoundTrip;
+// The full Perceiver stack must SaveToString/LoadFromString bit-for-bit and the
+// reloaded net must reproduce the EXACT same forward output on a random input.
+var
+  NN, NN2: TNNet;
+  Input, Out1: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  maxErr, tmp: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(12, 1, 6);
+  Out1 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(12, 1, 6));
+    NN.AddPerceiverEncoder(3, 6, 3, 2, 12); // NumLatents=3, d_latent=6, 3 heads
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.17) * 1.2 - 0.3;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Perceiver SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      maxErr := 0;
+      for i := 0 to Out1.Size - 1 do
+      begin
+        tmp := Abs(Out1.Raw[i] - NN2.GetLastLayer.Output.Raw[i]);
+        if tmp > maxErr then maxErr := tmp;
+      end;
+      AssertTrue('Perceiver reloaded forward output identical (maxErr=' +
         FloatToStr(maxErr) + ')', maxErr < 1e-6);
     finally
       NN2.Free;
