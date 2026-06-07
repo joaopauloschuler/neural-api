@@ -116,12 +116,6 @@ rather than acted on.
       - [ ] Chunked/parallel hardware-efficient forward (the paper's main systems
             contribution; v1 ships the exact per-token scan only) — gate behind an
             exact-vs-chunked equivalence assert (mirrors open DeltaNet/WKV chunked tasks).
-      - [X] AddGatedLinearAttentionBlock full-block builder — wrap the landed
-            TNNet.AddGatedLinearAttention time-mixing builder in an FFN/LayerNorm
-            residual block. LANDED 2026-06-07 on a2 (commit 2dbf87e): pre/post-norm
-            TNNetSum residual + SwiGLU FFN mirroring AddTransformerEncoderBlock,
-            shape + smoke-train tests, examples/GatedLinearAttentionBlock/ (3-block
-            tower reaches 100% exact recall vs 81% for the bare mixer).
       - [ ] Wire AddGatedLinearAttention into the downstream ../gpt-3-for-pascal
             decoder as a mixer arm (mirrors the open AddRWKVTimeMix gpt-3 wiring task).
       - [ ] Rectangular d_k != d_v state variant (FStruct[0]/[1] already carry both).
