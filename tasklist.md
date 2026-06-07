@@ -109,22 +109,6 @@ rather than acted on.
         norm/phase behaviour the way OctonionLinear checks |W.X|=|W|.|X|.
       - Links the hypercomplex family note in MEMORY.md ([[quaternion-linear-layer]],
         [[octonion-linear-layer]], [[octonion-conv-layer]]).
-- [ ] TNNetSinkhorn follow-ups (the doubly-stochastic OT-normalization leaf layer
-      + examples/SinkhornSort/ + numerical-gradient/forward/shape/save-load tests all
-      LANDED 2026-06-07 on a2, commit 435a93d):
-      - [X] AddSinkhornAttention builder — doubly-stochastic attention as a drop-in
-            contrast to softmax attention (LANDED on a2): single-head builder
-            mirroring AddSingleHeadSelfAttention (PointwiseConvLinear Q/K/V, scaled
-            QK^T scores via TNNetDotProducts -> the square (N,1,N) matrix, then
-            TNNetSinkhorn in place of the softmax, value-weight, out-project);
-            returns the Sinkhorn layer so callers can inspect the doubly-stochastic
-            map. Tests: TestSinkhornAttentionShapeAndDoublyStochastic (shape +
-            rows/cols sum to 1) and TestSinkhornAttentionTrains (loss 4.25 -> 0.37).
-      - [X] Soft bipartite matching / learnable-permutation example (LANDED on a2):
-            examples/SinkhornMatching/ solves a 4x4 LINEAR-ASSIGNMENT problem from
-            a cost matrix via a soft permutation, trained on the OT cost
-            L=sum P[i,j]C[i,j] (dL/dP=C). Exact-match ~0.5% -> ~95%, optimality gap
-            0.32 -> 0.0015 in ~18 s; brute-force optimum scores the gap.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
