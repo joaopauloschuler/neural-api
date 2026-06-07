@@ -4609,6 +4609,65 @@ type
       procedure InitMemory();
   end;
 
+  /// TNNetKalmanFilterCell: a differentiable DIAGONAL Bayesian filtering
+  // recurrent layer (Kalman 1960, "A New Approach to Linear Filtering and
+  // Prediction Problems"). The FIRST layer in the suite that propagates
+  // UNCERTAINTY rather than just a deterministic state: it carries a per-channel
+  // state mean x AND a per-channel (diagonal) state covariance P over the time
+  // axis, and at each step forms a Kalman gain g that adaptively trades the
+  // model prediction against the new observation. Distinct from
+  // TNNetDiagonalSSM / TNNetSelectiveSSM / TNNetClosedFormContinuous /
+  // TNNetSLSTMCell / TNNetMLSTMCell / TNNetNTMMemory: none maintain/propagate a
+  // covariance or form a gain from it.
+  //
+  // Over a (SeqLen,1,StateDim) input treated as a per-step observation z_t
+  // (SizeY must be 1, like the SSM/attention layers), each channel d runs an
+  // independent scalar two-phase recurrence (x_0=0, P_0=1):
+  //   PREDICT: xm_t = a*x_{t-1};            Pm_t = a*a*P_{t-1} + Q
+  //   UPDATE:  g_t  = Pm_t/(Pm_t + R);      x_t  = xm_t + g_t*(z_t - xm_t);
+  //            P_t  = (1 - g_t)*Pm_t
+  // The output is the filtered means x_t, shape == input shape. v1 is diagonal
+  // (per-channel independent scalars), so there is NO matrix inverse and the
+  // gain is a plain scalar ratio. (No control bias b in v1.)
+  //
+  // Per-channel learnable raw scalars are packed one neuron per parameter
+  // (3*StateDim params total), each Depth-long:
+  //   FNeurons[0].Weights = a_raw  ->  a = tanh(a_raw)     in (-1,1), stable
+  //   FNeurons[1].Weights = Q_raw  ->  Q = softplus(Q_raw) > 0
+  //   FNeurons[2].Weights = R_raw  ->  R = softplus(R_raw) > 0
+  // The tanh bound keeps the transition stable (mirrors TNNetRetention's
+  // learnable-gamma trick); softplus keeps Q,R positive so g stays in (0,1) by
+  // construction. Init a_raw=0 (a=0, pure-observation start), Q_raw,R_raw via
+  // softplus^-1 so Q~=1, R~=1. P is re-initialised per sweep, NOT persisted
+  // (like TNNetNTMMemory's M). FStruct[0]=StateDim (resolved in SetPrevLayer).
+  //
+  // Backward is full BPTT with TWO coupled right-to-left adjoint scans: the
+  // mean adjoint dL/dx_t AND the covariance adjoint dL/dP_t, because g_t depends
+  // on Pm_t which depends on P_{t-1}. Each step chains dg/dPm = R/(Pm+R)^2,
+  // dP_t/dPm = (1-g) - Pm*dg/dPm, then folds the raw-param chain rule
+  // (da/da_raw = 1-a^2, dQ/dQ_raw = sigmoid(Q_raw), dR/dR_raw = sigmoid(R_raw)).
+  // Coded by Claude (AI).
+  TNNetKalmanFilterCell = class(TNNetLayer)
+    private
+      FStateDim: integer;
+      FXm: TNNetVolume;     // predicted mean xm_t cache, (SeqLen,1,StateDim)
+      FPm: TNNetVolume;     // predicted covariance Pm_t cache, (SeqLen,1,StateDim)
+      FX: TNNetVolume;      // filtered mean x_t cache, (SeqLen,1,StateDim)
+      FP: TNNetVolume;      // filtered covariance P_t cache, (SeqLen,1,StateDim)
+      FG: TNNetVolume;      // Kalman gain g_t cache, (SeqLen,1,StateDim)
+      FA: TNNetVolume;      // per-channel a=tanh(a_raw), StateDim-long scratch
+      FQ: TNNetVolume;      // per-channel Q=softplus(Q_raw), StateDim-long scratch
+      FR: TNNetVolume;      // per-channel R=softplus(R_raw), StateDim-long scratch
+      FGradA, FGradQ, FGradR: TNNetVolume; // StateDim-long grad accumulators
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetSelectiveSSM: an INPUT-DEPENDENT ("selective", Mamba/S6-style,
   // Gu & Dao 2023, "Mamba: Linear-Time Sequence Modeling with Selective State
   // Spaces", arXiv:2312.00752) diagonal state-space sequence mixer. Unlike the
@@ -29913,6 +29972,274 @@ begin
   FNeurons[1].FWeights.Fill(1);
   FNeurons[2].FWeights.Fill(1);
   FNeurons[3].FWeights.Fill(1);
+  AfterWeightUpdate();
+end;
+
+{ TNNetKalmanFilterCell }
+constructor TNNetKalmanFilterCell.Create();
+begin
+  inherited Create();
+  FStateDim := 0;            // resolved in SetPrevLayer
+  FStruct[0] := 0;
+  FXm := TNNetVolume.Create();
+  FPm := TNNetVolume.Create();
+  FX := TNNetVolume.Create();
+  FP := TNNetVolume.Create();
+  FG := TNNetVolume.Create();
+  FA := TNNetVolume.Create();
+  FQ := TNNetVolume.Create();
+  FR := TNNetVolume.Create();
+  FGradA := TNNetVolume.Create();
+  FGradQ := TNNetVolume.Create();
+  FGradR := TNNetVolume.Create();
+  // [0]=a_raw [1]=Q_raw [2]=R_raw
+  AddMissingNeurons(3);
+end;
+
+destructor TNNetKalmanFilterCell.Destroy();
+begin
+  FGradR.Free;
+  FGradQ.Free;
+  FGradA.Free;
+  FR.Free;
+  FQ.Free;
+  FA.Free;
+  FG.Free;
+  FP.Free;
+  FX.Free;
+  FPm.Free;
+  FXm.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetKalmanFilterCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetKalmanFilterCell requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FStateDim := pPrevLayer.FOutput.Depth;
+  FStruct[0] := FStateDim;
+  // Output is the filtered means, same shape as the observation sequence.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FStateDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  SetNumWeightsForAllNeurons(1, 1, FStateDim);
+  for ii := 0 to 2 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FXm.ReSize(FOutput.SizeX, 1, FStateDim);
+  FPm.ReSize(FOutput.SizeX, 1, FStateDim);
+  FX.ReSize(FOutput.SizeX, 1, FStateDim);
+  FP.ReSize(FOutput.SizeX, 1, FStateDim);
+  FG.ReSize(FOutput.SizeX, 1, FStateDim);
+  FA.ReSize(1, 1, FStateDim);
+  FQ.ReSize(1, 1, FStateDim);
+  FR.ReSize(1, 1, FStateDim);
+  FGradA.ReSize(1, 1, FStateDim);
+  FGradQ.ReSize(1, 1, FStateDim);
+  FGradR.ReSize(1, 1, FStateDim);
+  InitDefault();
+end;
+
+procedure TNNetKalmanFilterCell.Compute();
+var
+  StartTime: double;
+  Wa, Wq, Wr, Prev: TNNetVolume;
+  SeqLen, Depth, t, d: integer;
+  raw, av, qv, rv, xprev, pprev, xm, pm, gv, zv: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wa := FNeurons[0].FWeights;
+  Wq := FNeurons[1].FWeights;
+  Wr := FNeurons[2].FWeights;
+  SeqLen := FOutput.SizeX;
+  Depth := FStateDim;
+  // Map raw params to constrained ones once: a=tanh(a_raw) in (-1,1);
+  // Q,R = softplus(raw) > 0 (numerically stable form via Ln(1+Exp)).
+  for d := 0 to Depth - 1 do
+  begin
+    FA.FData[d] := TanH(Wa.FData[d]);
+    raw := Wq.FData[d];
+    if raw > 30 then FQ.FData[d] := raw else FQ.FData[d] := Ln(1 + Exp(raw));
+    raw := Wr.FData[d];
+    if raw > 30 then FR.FData[d] := raw else FR.FData[d] := Ln(1 + Exp(raw));
+  end;
+  // Per-channel scalar two-phase Kalman recurrence. x_0=0, P_0=1.
+  for d := 0 to Depth - 1 do
+  begin
+    av := FA.FData[d];
+    qv := FQ.FData[d];
+    rv := FR.FData[d];
+    xprev := 0;
+    pprev := 1;
+    for t := 0 to SeqLen - 1 do
+    begin
+      zv := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      // PREDICT
+      xm := av * xprev;
+      pm := av * av * pprev + qv;
+      // UPDATE
+      gv := pm / (pm + rv);
+      FXm.FData[FXm.GetRawPos(t, 0, d)] := xm;
+      FPm.FData[FPm.GetRawPos(t, 0, d)] := pm;
+      FG.FData[FG.GetRawPos(t, 0, d)] := gv;
+      xprev := xm + gv * (zv - xm);
+      pprev := (1 - gv) * pm;
+      FX.FData[FX.GetRawPos(t, 0, d)] := xprev;
+      FP.FData[FP.GetRawPos(t, 0, d)] := pprev;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := xprev;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetKalmanFilterCell.Backpropagate();
+var
+  StartTime: double;
+  Na, Nq, Nr: TNNetNeuron;
+  Wa, Wq, Wr, Prev, PrevErr: TNNetVolume;
+  SeqLen, Depth, t, d: integer;
+  av, qv, rv: TNeuralFloat;
+  gx, gp, xm, pm, gv, zv, xprev, pprev: TNeuralFloat;
+  dxm, dpm, dgFromUpd, dg, dz, denom: TNeuralFloat;
+  gradA, gradQ, gradR, dAraw, dQraw, dRraw: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Na := FNeurons[0];
+  Nq := FNeurons[1];
+  Nr := FNeurons[2];
+  Wa := Na.FWeights;
+  Wq := Nq.FWeights;
+  Wr := Nr.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  Depth := FStateDim;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  // Recompute constrained params (same map as Compute).
+  for d := 0 to Depth - 1 do
+  begin
+    FA.FData[d] := TanH(Wa.FData[d]);
+    if Wq.FData[d] > 30 then FQ.FData[d] := Wq.FData[d]
+    else FQ.FData[d] := Ln(1 + Exp(Wq.FData[d]));
+    if Wr.FData[d] > 30 then FR.FData[d] := Wr.FData[d]
+    else FR.FData[d] := Ln(1 + Exp(Wr.FData[d]));
+  end;
+  FGradA.Fill(0);
+  FGradQ.Fill(0);
+  FGradR.Fill(0);
+  // Two coupled right-to-left adjoint scans per channel: gx = dL/dx_t,
+  // gp = dL/dP_t. Forward relations (per step):
+  //   xm = a*x_{t-1};            pm = a^2*P_{t-1} + Q
+  //   g  = pm/(pm+R)             dg/dpm = R/(pm+R)^2
+  //   x_t = xm + g*(z - xm) = (1-g)*xm + g*z
+  //   P_t = (1-g)*pm
+  // Adjoints into the UPDATE intermediates (dg gets two contributions):
+  //   dxm        = gx*(1-g)
+  //   dg(update) = gx*(z - xm) + gp*(-pm)
+  //   dz         = gx*g                          -> input gradient
+  //   dpm        = gp*(1-g) + dg*(dg/dpm)
+  // Then PREDICT pushes adjoints to the previous step and the params:
+  //   dL/dx_{t-1} = a*dxm            (carried as next gx)
+  //   dL/dP_{t-1} = a^2*dpm          (carried as next gp)
+  //   dL/dQ      += dpm
+  //   dL/da      += dxm*x_{t-1} + dpm*2*a*P_{t-1}
+  //   dL/dR      += dg(update)*(-pm/(pm+R)^2)   [since dg/dR = -pm/(pm+R)^2]
+  for d := 0 to Depth - 1 do
+  begin
+    av := FA.FData[d];
+    qv := FQ.FData[d];
+    rv := FR.FData[d];
+    gx := 0;
+    gp := 0;
+    gradA := 0;
+    gradQ := 0;
+    gradR := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      zv := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      xm := FXm.FData[FXm.GetRawPos(t, 0, d)];
+      pm := FPm.FData[FPm.GetRawPos(t, 0, d)];
+      gv := FG.FData[FG.GetRawPos(t, 0, d)];
+      if t > 0 then
+      begin
+        xprev := FX.FData[FX.GetRawPos(t - 1, 0, d)];
+        pprev := FP.FData[FP.GetRawPos(t - 1, 0, d)];
+      end
+      else
+      begin
+        xprev := 0;
+        pprev := 1;
+      end;
+      // Incoming adjoint on x_t from the output (plus recurrence already in gx).
+      gx := gx + FOutputError.FData[FOutputError.GetRawPos(t, 0, d)];
+      denom := (pm + rv) * (pm + rv);
+      // UPDATE adjoints.
+      dxm := gx * (1 - gv);
+      dgFromUpd := gx * (zv - xm) + gp * (-pm);
+      dz := gx * gv;
+      // dg/dpm = R/(pm+R)^2 ; dpm gets gp's direct (1-g) term plus via g.
+      dpm := gp * (1 - gv) + dgFromUpd * (rv / denom);
+      // dg/dR = -pm/(pm+R)^2.
+      gradR := gradR + dgFromUpd * (-pm / denom);
+      // PREDICT adjoints (xm=a*x_{t-1}, pm=a^2*P_{t-1}+Q).
+      gradQ := gradQ + dpm;
+      gradA := gradA + dxm * xprev + dpm * (2 * av * pprev);
+      if hasInputGrad then
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] + dz;
+      // Carry to previous step.
+      gx := av * dxm;
+      gp := av * av * dpm;
+    end;
+    // Chain the raw-param maps: da/da_raw = 1-a^2;
+    // dQ/dQ_raw = sigmoid(Q_raw); dR/dR_raw = sigmoid(R_raw).
+    dAraw := gradA * (1 - av * av);
+    dQraw := gradQ * Sigmoid(Wq.FData[d]);
+    dRraw := gradR * Sigmoid(Wr.FData[d]);
+    FGradA.FData[d] := dAraw;
+    FGradQ.FData[d] := dQraw;
+    FGradR.FData[d] := dRraw;
+  end;
+  // Flush -FLearningRate-scaled per-channel grads into the neuron deltas.
+  TNNetVolume.MulAdd(Na.FDelta.GetRawPtr(), FGradA.GetRawPtr(), -FLearningRate, Depth);
+  TNNetVolume.MulAdd(Nq.FDelta.GetRawPtr(), FGradQ.GetRawPtr(), -FLearningRate, Depth);
+  TNNetVolume.MulAdd(Nr.FDelta.GetRawPtr(), FGradR.GetRawPtr(), -FLearningRate, Depth);
+  if (not FBatchUpdate) then
+  begin
+    Na.UpdateWeights(FInertia);
+    Nq.UpdateWeights(FInertia);
+    Nr.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetKalmanFilterCell.InitDefault();
+const
+  // softplus^-1(1) = Ln(Exp(1)-1) ~= 0.5413, so Q,R start at ~1.
+  cSoftplusInv1 = 0.541324854612918;
+begin
+  if FNeurons.Count < 3 then AddMissingNeurons(3);
+  // a_raw=0 -> a=tanh(0)=0 (start as a pure-observation tracker, ignoring the
+  // unset transition); Q,R ~= 1 -> a moderate gain g~=0.5 at the first step.
+  FNeurons[0].FWeights.Fill(0);
+  FNeurons[1].FWeights.Fill(cSoftplusInv1);
+  FNeurons[2].FWeights.Fill(cSoftplusInv1);
   AfterWeightUpdate();
 end;
 
@@ -68965,6 +69292,7 @@ begin
       'TNNetSLSTMCell':             Result := TNNetSLSTMCell.Create();
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
+      'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
       'TNNetSelectiveSSM':          Result := TNNetSelectiveSSM.Create();
       'TNNetImplicitLongConv':      Result := TNNetImplicitLongConv.Create(Max(St[0], 1));
       'TNNetSpatialGatingUnit':     Result := TNNetSpatialGatingUnit.Create(St[0]);
@@ -69310,6 +69638,7 @@ begin
       if S[0] = 'TNNetSLSTMCell' then Result := TNNetSLSTMCell.Create() else
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
+      if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
       if S[0] = 'TNNetSelectiveSSM' then Result := TNNetSelectiveSSM.Create() else
       if S[0] = 'TNNetImplicitLongConv' then Result := TNNetImplicitLongConv.Create(Max(St[0], 1)) else
       if S[0] = 'TNNetSpatialGatingUnit' then Result := TNNetSpatialGatingUnit.Create(St[0]) else

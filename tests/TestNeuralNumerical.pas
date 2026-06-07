@@ -394,6 +394,10 @@ type
     procedure TestNTMMemoryWeightGradientCheck;
     procedure TestNTMMemorySerializationRoundTrip;
     procedure TestNTMMemoryWriteReadBack;
+    procedure TestKalmanFilterCellInputGradientCheck;
+    procedure TestKalmanFilterCellWeightGradientCheck;
+    procedure TestKalmanFilterCellSerializationRoundTrip;
+    procedure TestKalmanFilterCellNoisySineSmokeTrain;
     procedure TestAddClosedFormContinuousBuilder;
     procedure TestAddBidirectionalClosedFormContinuousBuilder;
     procedure TestBidirectionalClosedFormContinuousGradientCheck;
@@ -22760,6 +22764,260 @@ begin
   // SizeX=4 as the time axis.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDiagonalSSM.Create(), 'DiagonalSSM', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetKalmanFilterCell (differentiable diagonal Kalman filter) ----------
+
+procedure TTestNeuralNumerical.TestKalmanFilterCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LK: TNNetKalmanFilterCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  // SeqLen=4, StateDim=3.
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LK := TNNetKalmanFilterCell.Create();
+    NN.AddLayer(LK);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+
+    // Non-trivial per-channel raw params so a (tanh), Q, R (softplus) and the
+    // gain-from-covariance recurrence are all exercised away from defaults.
+    LK.Neurons[0].Weights.Raw[0] := -0.7;  // a_raw -> a = tanh(-0.7)
+    LK.Neurons[0].Weights.Raw[1] :=  0.3;
+    LK.Neurons[0].Weights.Raw[2] :=  0.9;
+    LK.Neurons[1].Weights.Raw[0] :=  0.5;  // Q_raw -> Q = softplus
+    LK.Neurons[1].Weights.Raw[1] := -0.2;
+    LK.Neurons[1].Weights.Raw[2] :=  0.8;
+    LK.Neurons[2].Weights.Raw[0] :=  0.4;  // R_raw -> R = softplus
+    LK.Neurons[2].Weights.Raw[1] :=  0.7;
+    LK.Neurons[2].Weights.Raw[2] := -0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('KalmanFilterCell input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('KalmanFilterCell input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKalmanFilterCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LK: TNNetKalmanFilterCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..2] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'a_raw';
+  Names[1] := 'Q_raw';
+  Names[2] := 'R_raw';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LK := TNNetKalmanFilterCell.Create();
+    NN.AddLayer(LK);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+
+    // BOUNDED raw params (all |.| <= 0.9) so the tanh/softplus maps stay well
+    // inside their smooth regions and the central difference does not straddle a
+    // saturating tail (finite-difference truncation control).
+    LK.Neurons[0].Weights.Raw[0] := -0.7;  // a_raw
+    LK.Neurons[0].Weights.Raw[1] :=  0.3;
+    LK.Neurons[0].Weights.Raw[2] :=  0.6;
+    LK.Neurons[1].Weights.Raw[0] :=  0.5;  // Q_raw
+    LK.Neurons[1].Weights.Raw[1] := -0.2;
+    LK.Neurons[1].Weights.Raw[2] :=  0.8;
+    LK.Neurons[2].Weights.Raw[0] :=  0.4;  // R_raw
+    LK.Neurons[2].Weights.Raw[1] :=  0.7;
+    LK.Neurons[2].Weights.Raw[2] := -0.3;
+
+    // Cover all three weight tensors. The covariance adjoint (gp) couples the
+    // Q/R gradients across time, a classic place for a missing chain-rule term.
+    for n := 0 to 2 do
+      for i := 0 to LK.Neurons[n].Weights.Size - 1 do
+      begin
+        LK.Neurons[n].Weights.Raw[i] := LK.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LK.Neurons[n].Weights.Raw[i] := LK.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LK.Neurons[n].Weights.Raw[i] := LK.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LK.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // With LearningRate = 1 and batch update on, analytical = -Delta.
+        analyticalGrad := -LK.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('KalmanFilterCell weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('KalmanFilterCell weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKalmanFilterCellSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // TNNetKalmanFilterCell stores three per-channel raw vectors (a_raw, Q_raw,
+  // R_raw). P is re-initialised per sweep (not persisted); FStruct[0]=StateDim.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetKalmanFilterCell.Create(), 'KalmanFilterCell', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestKalmanFilterCellNoisySineSmokeTrain;
+var
+  NN: TNNet;
+  LK: TNNetKalmanFilterCell;
+  Clean, Noisy, Filtered: TNNetVolume;
+  i, epoch, SeqLen: integer;
+  cleanVal, mseNoisy, mseFiltered, diff: TNeuralFloat;
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  SeqLen := 64;
+  NN := TNNet.Create();
+  Clean := TNNetVolume.Create(SeqLen, 1, 1);
+  Noisy := TNNetVolume.Create(SeqLen, 1, 1);
+  Filtered := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    LK := TNNetKalmanFilterCell.Create();
+    NN.AddLayer(LK);
+    NN.SetLearningRate(0.05, 0.0);
+    NN.SetBatchUpdate(false);
+
+    // Clean smooth sine; noisy = clean + Gaussian noise (the observation).
+    for i := 0 to SeqLen - 1 do
+    begin
+      cleanVal := Sin(i * 0.18) * 1.5;
+      Clean.Raw[i] := cleanVal;
+      // Box-Muller Gaussian noise, std=0.5.
+      Noisy.Raw[i] := cleanVal +
+        Sqrt(-2 * Ln(Random + 1e-12)) * Cos(2 * Pi * Random) * 0.5;
+    end;
+
+    // Train the filter to denoise: target is the clean signal, input is noisy.
+    for epoch := 0 to 400 do
+    begin
+      NN.Compute(Noisy);
+      NN.Backpropagate(Clean);
+    end;
+
+    NN.Compute(Noisy);
+    Filtered.Copy(NN.GetLastLayer.Output);
+
+    mseNoisy := 0;
+    mseFiltered := 0;
+    for i := 0 to SeqLen - 1 do
+    begin
+      diff := Noisy.Raw[i] - Clean.Raw[i];
+      mseNoisy := mseNoisy + diff * diff;
+      diff := Filtered.Raw[i] - Clean.Raw[i];
+      mseFiltered := mseFiltered + diff * diff;
+    end;
+    mseNoisy := mseNoisy / SeqLen;
+    mseFiltered := mseFiltered / SeqLen;
+    WriteLn('KalmanFilterCell smoke-train MSE(noisy,clean)=', mseNoisy:0:5,
+      ' MSE(filtered,clean)=', mseFiltered:0:5);
+    AssertTrue('KalmanFilterCell should denoise: MSE(filtered) < MSE(noisy) (' +
+      FloatToStr(mseFiltered) + ' < ' + FloatToStr(mseNoisy) + ')',
+      mseFiltered < mseNoisy);
+  finally
+    NN.Free;
+    Clean.Free;
+    Noisy.Free;
+    Filtered.Free;
+  end;
 end;
 
 // --- TNNetSelectiveSSM (input-dependent Mamba/S6-style) ---------------------
