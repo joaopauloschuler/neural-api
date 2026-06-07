@@ -72,6 +72,34 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetSinkhorn — differentiable optimal-transport / doubly-stochastic
+      normalization layer (NEW PARADIGM, no sibling in the suite: softmax and all
+      its relatives — sparsemax, entmax, the attention scores — normalize ONE
+      axis; this is the first layer that normalizes a square N×N matrix to be
+      *doubly stochastic*, i.e. every row AND every column sums to 1, by iterating
+      Sinkhorn–Knopp row/column rescaling on exp(score/tau)). Input is an (N,1,N)
+      score matrix (or (N,N,1) — pick one and document); forward runs a fixed K
+      iterations of alternating row-normalize then column-normalize in log-space
+      for stability (log-sum-exp, not raw division) with a temperature tau
+      (FFloatSt[0]) and iteration count K (FStruct[0]). Backward: unroll the K
+      iterations storing intermediate activations and backprop the exact analytic
+      gradient through the alternating normalizations (each step is just a
+      subtract-log-sum-exp along an axis — differentiable; the manual-gradient
+      idiom in [[manual-gradient-and-snapshot-gotchas]] applies, SetBatchUpdate),
+      numerical-gradient test asserting analytic == finite-difference to tol, plus
+      shape and save/load (FStruct[0]+FFloatSt[0] round-trip) tests. As tau→0 the
+      output approaches a hard permutation matrix, so this is the building block
+      for differentiable sorting / learnable permutations / soft bipartite
+      matching — distinct from the Hungarian/auction note at neuralnetwork.pas
+      ~line 10065 (that is a hard non-differentiable solve; this is the soft
+      relaxation that can be trained through). Example examples/SinkhornSort/:
+      learn to SORT a short list of scalars end-to-end — feed pairwise scores into
+      TNNetSinkhorn, multiply the resulting soft-permutation by the input vector,
+      MSE against the sorted vector, and show Kendall-tau / exact-sort accuracy
+      climbing as tau anneals down across training (the headline being that a net
+      learns a discrete operation through a continuous relaxation). Stretch:
+      AddSinkhornAttention builder (doubly-stochastic attention as a drop-in
+      contrast to softmax attention on one of the existing tiny seq tasks).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
