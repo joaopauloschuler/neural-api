@@ -122,19 +122,9 @@ rather than acted on.
       scope into v1): a learnable per-channel threshold/leak; the adaptive-LIF
       (ALIF) variant with a second slow threshold-adaptation state; a builder
       AddSpikingBlock wiring the linear+LIF+readout pattern.
-- [X] TNNetSinkhorn — differentiable optimal-transport / doubly-stochastic
-      normalization layer LANDED 2026-06-07 on a2 (commit 435a93d). (N,1,N) score
-      matrix, log-space Sinkhorn–Knopp (KIter alternating row/col subtract-logsumexp
-      on score/tau, then exp), tau=FFloatSt[0], KIter=FStruct[0]; backward unrolls
-      all 2*KIter steps (FLogTape cache) with the exact softmax-style adjoint. No
-      trainable params. Numerical-gradient (max-abs-err 1.7e-5 < 0.01, inputs bound
-      ±0.7), doubly-stochastic forward, shape, and save/load round-trip tests added;
-      full suite 1160 tests green. examples/SinkhornSort/ learns to sort 5 scalars
-      (yhat=P·x, MSE vs ascending sort, dL/dP set by hand and backprop'd through the
-      unrolled iteration), exact-sort accuracy ~2.5%→62.5% as tau anneals 1.0→0.07
-      (below ~0.07 the internal softmaxes saturate → vanishing grad; schedule stops
-      there, documented).
-      Open follow-ups:
+- [ ] TNNetSinkhorn follow-ups (the doubly-stochastic OT-normalization leaf layer
+      + examples/SinkhornSort/ + numerical-gradient/forward/shape/save-load tests all
+      LANDED 2026-06-07 on a2, commit 435a93d):
       - [ ] AddSinkhornAttention builder — doubly-stochastic attention as a drop-in
             contrast to softmax attention on one of the existing tiny seq tasks.
       - [ ] Soft bipartite matching / learnable-permutation example beyond sorting
