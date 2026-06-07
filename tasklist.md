@@ -1365,7 +1365,7 @@ rather than acted on.
       today's FGSM).
 
 ### Loss-landscape degeneracy (Singular Learning Theory)
-- [ ] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
+- [x] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
       — estimate the *local learning coefficient* (LLC, an empirical
       RLCT) of a trained network from Singular Learning Theory (Watanabe;
       Lau, Murfet, Wei et al. 2023, "Quantifying Degeneracy in Singular

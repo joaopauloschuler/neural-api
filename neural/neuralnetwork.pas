@@ -11137,6 +11137,41 @@ type
         NumProbes: integer = 16;
         Eps: TNeuralFloat = 1e-3
       ): string;
+      // Local Learning Coefficient (LLC) report — an empirical estimate of the
+      // Real Log Canonical Threshold (RLCT) from Singular Learning Theory
+      // (Watanabe; Lau, Murfet, Wei et al. 2023, "Quantifying Degeneracy in
+      // Singular Models via the Local Learning Coefficient"). The LLC measures
+      // the volume-scaling / EFFECTIVE dimensionality of the minimum the
+      // optimizer settled into: it counts the flat, degenerate directions a
+      // 2nd-order Hessian top-eigenvalue (HessianCurvatureReport) cannot see.
+      // A redundant / over-parameterised solution has LLC_hat << dim(w) (far
+      // fewer effective degrees of freedom than raw weights).
+      //   Estimator (SGLD-based WBIC / free-energy form). From the trained
+      // weights w*, run a short tempered, ANCHORED Stochastic Gradient Langevin
+      // Dynamics chain that samples the local posterior pinned to the basin by a
+      // Gaussian anchor (gamma/2)*||w - w*||^2, then
+      //   LLC_hat = n * beta * ( mean_chain[L(w)] - L(w*) )
+      // where L is the average training NLL over Samples, n = Samples.Count and
+      // beta = 1/ln(n) is the WBIC inverse temperature. The per-step anchored-
+      // Langevin update over a minibatch loss gradient g is
+      //   w <- w - (eps/2)*( n*beta*g + gamma*(w - w*) ) + N(0, eps)
+      // (Gaussian noise of variance eps per weight). It REUSES the existing
+      // forward+backward gradient read-out (SetBatchUpdate(true), Delta=-LR*grad
+      // divided back out) — the only new machinery is the anchored update + the
+      // chain average, all inside this method. (Eps, Gamma, ChainLen) are FIXED,
+      // documented and conservative; the absolute LLC_hat is calibration-
+      // dependent but the ORDERING across nets is the robust signal. The report
+      // prints LLC_hat, dim(w) and the ratio LLC_hat/dim(w). NON-DESTRUCTIVE:
+      // w* is snapshotted and restored bit-for-bit on return. Guards nil NN, an
+      // empty batch and a net with no trainable params gracefully.
+      // Coded by Claude (AI).
+      class function LocalLearningCoefficientReport(
+        NN: TNNet;
+        Samples: TNNetVolumePairList;
+        ChainLen: integer = 40;
+        Eps: TNeuralFloat = 1e-5;
+        Gamma: TNeuralFloat = 1.0
+      ): string;
       // Linear-mode-connectivity / loss-barrier diagnostic between TWO trained
       // nets of the SAME architecture (Garipov et al. 2018; Frankle et al. 2020,
       // "Linear Mode Connectivity and the Lottery Ticket Hypothesis"). Answers
@@ -65242,6 +65277,396 @@ begin
     Result := Lines.Text;
   finally
     RandSeed := SavedRandSeed;
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LocalLearningCoefficientReport(
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  ChainLen: integer = 40;
+  Eps: TNeuralFloat = 1e-5;
+  Gamma: TNeuralFloat = 1.0
+): string;
+const
+  cBurnFrac = 0.25;   // fraction of the chain discarded as burn-in.
+  cLossEps  = 1e-12;  // floor for the NLL log to avoid Ln(0).
+  // LLC/dim(w) effective-degeneracy verdict bands.
+  cVeryDegen = 0.10;
+  cDegen     = 0.50;
+var
+  Lines: TStringList;
+  LIdx, NeuronIdx, SampleIdx, P, Step, BurnIn, ChainCnt: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  Pair: TNNetVolumePair;
+  LastLayer: TNNetLayer;
+  OutSize, NetParamCnt, TrainableLayers, NSamples: integer;
+  Target: TNNetVolume;
+  Snapshot: string;
+  SavedRandSeed: longword;
+  SavedExMask: TFPUExceptionMask;
+  LayerHasParams: array of boolean;
+  FlatBase: array of integer;
+  LayerParamCnt: array of integer;
+  WStar, Grad: array of TNeuralFloat;
+  Beta, nBeta, LStar, LCur, ChainSum, ChainMean, LLCHat, Ratio: TNeuralFloat;
+  ParamCntCheck: integer;
+  NonFinite: boolean;
+  Verdict: string;
+
+  // Average training NLL L(w) over Samples on the CURRENT weights (forward
+  // only). Cross-entropy of the target class: L = -mean_s ln(p_{s, class_s}),
+  // with the output read as a (clamped) probability so a softmax head gives the
+  // exact NLL and any head gives a finite, monotone surrogate.
+  function MeanNLL(): TNeuralFloat;
+  var
+    SI, Cls: integer;
+    Out2: TNNetVolume;
+    Pr: TNNetVolumePair;
+    SumL, Pv: TNeuralFloat;
+    Cnt: integer;
+  begin
+    SumL := 0;
+    Cnt := 0;
+    for SI := 0 to Samples.Count - 1 do
+    begin
+      Pr := Samples[SI];
+      if (Pr = nil) or (Pr.I = nil) or (Pr.O = nil) then Continue;
+      NN.Compute(Pr.I);
+      Out2 := NN.GetLastLayer().Output;
+      Cls := Pr.O.GetClass();
+      if (Cls < 0) or (Cls >= Out2.Size) then Continue;
+      Pv := Out2.FData[Cls];
+      if Pv < cLossEps then Pv := cLossEps;
+      if Pv > 1.0 then Pv := 1.0;
+      SumL := SumL - Ln(Pv);
+      Inc(Cnt);
+    end;
+    if Cnt > 0 then Result := SumL / Cnt else Result := 0;
+  end;
+
+  // Whole-batch loss gradient flattened into G (net-flat axis). Mirrors the
+  // FROZEN-net read-out the other reports use: ClearDeltas, forward+backward per
+  // sample (one-hot target), then read Delta = -LR*grad and divide LR back out
+  // (negated to the TRUE +grad). Averaged over the batch so the SGLD step size
+  // is sample-count-stable.
+  procedure ComputeGradient(var G: array of TNeuralFloat);
+  var
+    SI, LL, NN_, KK, PP, Cls, UsedCnt: integer;
+    Lay: TNNetLayer;
+    Neu: TNNetNeuron;
+    Lr2: TNeuralFloat;
+  begin
+    for KK := 0 to NetParamCnt - 1 do G[KK] := 0;
+    UsedCnt := 0;
+    for SI := 0 to Samples.Count - 1 do
+    begin
+      Pair := Samples[SI];
+      if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
+      Cls := Pair.O.GetClass();
+      if (Cls < 0) or (Cls >= OutSize) then Continue;
+      NN.ClearDeltas();
+      NN.Compute(Pair.I);
+      Target.Fill(0);
+      Target.FData[Cls] := 1.0;
+      NN.Backpropagate(Target);
+      for LL := 0 to NN.GetLastLayerIdx() do
+      begin
+        if not LayerHasParams[LL] then Continue;
+        Lay := NN.Layers[LL];
+        Lr2 := Lay.LearningRate;
+        if Lr2 <= 0 then Lr2 := 1.0;
+        PP := FlatBase[LL];
+        for NN_ := 0 to Lay.Neurons.Count - 1 do
+        begin
+          Neu := Lay.Neurons[NN_];
+          for KK := 0 to Neu.Delta.Size - 1 do
+          begin
+            G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
+            Inc(PP);
+          end;
+          G[PP] := G[PP] - Neu.FBiasDelta / Lr2;
+          Inc(PP);
+        end;
+      end;
+      Inc(UsedCnt);
+    end;
+    if UsedCnt > 1 then
+      for KK := 0 to NetParamCnt - 1 do G[KK] := G[KK] / UsedCnt;
+  end;
+
+  // Standard-normal sample via polar Box-Muller on the global RNG.
+  function NextGaussian(): TNeuralFloat;
+  var
+    rr, xx, yy: TNeuralFloat;
+  begin
+    rr := 0;
+    while (rr > 1) or (rr = 0) do
+    begin
+      xx := 2.0 * Random() - 1.0;
+      yy := 2.0 * Random() - 1.0;
+      rr := xx * xx + yy * yy;
+    end;
+    Result := xx * Sqrt(-2.0 * Ln(rr) / rr);
+  end;
+
+  // One anchored-Langevin (SGLD) step IN PLACE on the live weights:
+  //   w <- w - (eps/2)*( n*beta*g + gamma*(w - w*) ) + N(0, eps)
+  procedure LangevinStep();
+  var
+    LL, NN_, KK, PP: integer;
+    Lay: TNNetLayer;
+    Neu: TNNetNeuron;
+    Cur, Drift, Noise: TNeuralFloat;
+    NoiseSd: TNeuralFloat;
+  begin
+    ComputeGradient(Grad);
+    NoiseSd := Sqrt(Eps);
+    PP := 0;
+    for LL := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LL] then Continue;
+      Lay := NN.Layers[LL];
+      for NN_ := 0 to Lay.Neurons.Count - 1 do
+      begin
+        Neu := Lay.Neurons[NN_];
+        for KK := 0 to Neu.Weights.Size - 1 do
+        begin
+          Cur := Neu.Weights.FData[KK];
+          Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
+          Noise := NoiseSd * NextGaussian();
+          Neu.Weights.FData[KK] := Cur - 0.5 * Eps * Drift + Noise;
+          Inc(PP);
+        end;
+        Cur := Neu.FBiasWeight;
+        Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
+        Noise := NoiseSd * NextGaussian();
+        Neu.FBiasWeight := Cur - 0.5 * Eps * Drift + Noise;
+        Inc(PP);
+      end;
+      Lay.AfterWeightUpdate();
+    end;
+  end;
+
+begin
+  Result := '';
+  Lines := TStringList.Create();
+  Snapshot := '';
+  Target := nil;
+  SavedRandSeed := RandSeed;
+  try
+    if NN = nil then
+    begin
+      Result := 'LocalLearningCoefficientReport: NN is nil.' + sLineBreak;
+      Exit;
+    end;
+    if (Samples = nil) or (Samples.Count = 0) then
+    begin
+      Result := 'LocalLearningCoefficientReport: Samples is nil or empty.' +
+        sLineBreak;
+      Exit;
+    end;
+    if NN.CountLayers() < 2 then
+    begin
+      Result := 'LocalLearningCoefficientReport: network needs at least 2 ' +
+        'layers.' + sLineBreak;
+      Exit;
+    end;
+    if ChainLen < 2 then ChainLen := 2;
+    if Eps <= 0 then Eps := 1e-5;
+    if Gamma < 0 then Gamma := 1.0;
+
+    // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    SetLength(LayerHasParams, NN.CountLayers());
+    SetLength(FlatBase, NN.CountLayers());
+    SetLength(LayerParamCnt, NN.CountLayers());
+    NetParamCnt := 0;
+    TrainableLayers := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LIdx];
+      LayerHasParams[LIdx] := false;
+      LayerParamCnt[LIdx] := 0;
+      FlatBase[LIdx] := NetParamCnt;
+      if Layer.Neurons.Count = 0 then Continue;
+      if Layer.Neurons[0].Weights = nil then Continue;
+      if Layer.Neurons[0].Weights.Size = 0 then Continue;
+      ParamCntCheck := 0;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        ParamCntCheck := ParamCntCheck +
+          Layer.Neurons[NeuronIdx].Weights.Size + 1;
+      if ParamCntCheck = 0 then Continue;
+      LayerHasParams[LIdx] := true;
+      LayerParamCnt[LIdx] := ParamCntCheck;
+      FlatBase[LIdx] := NetParamCnt;
+      NetParamCnt := NetParamCnt + ParamCntCheck;
+      Inc(TrainableLayers);
+    end;
+
+    if (TrainableLayers = 0) or (NetParamCnt = 0) then
+    begin
+      Result := 'LocalLearningCoefficientReport: no trainable layers with ' +
+        'parameters.' + sLineBreak;
+      Exit;
+    end;
+
+    // Why batch update: Delta accumulates -LR*gradient only with batch update
+    // on; the live SGLD step is applied by hand here, never by UpdateWeights.
+    NN.SetBatchUpdate(true);
+
+    LastLayer := NN.GetLastLayer();
+    OutSize := LastLayer.Output.Size;
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+
+    NSamples := 0;
+    for SampleIdx := 0 to Samples.Count - 1 do
+    begin
+      Pair := Samples[SampleIdx];
+      if (Pair <> nil) and (Pair.I <> nil) and (Pair.O <> nil) then
+        Inc(NSamples);
+    end;
+    if NSamples = 0 then
+    begin
+      Result := 'LocalLearningCoefficientReport: no valid input/target ' +
+        'pairs in Samples.' + sLineBreak;
+      Exit;
+    end;
+
+    // WBIC inverse temperature beta = 1/ln(n); n=1 would divide by zero.
+    if NSamples > 1 then Beta := 1.0 / Ln(NSamples) else Beta := 1.0;
+    nBeta := NSamples * Beta;
+
+    // Snapshot w* (data only) for exact restore AND as the Langevin anchor.
+    Snapshot := NN.SaveDataToString();
+    SetLength(WStar, NetParamCnt);
+    SetLength(Grad, NetParamCnt);
+    P := 0;
+    for LIdx := 0 to NN.GetLastLayerIdx() do
+    begin
+      if not LayerHasParams[LIdx] then Continue;
+      Layer := NN.Layers[LIdx];
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        for SampleIdx := 0 to Neuron.Weights.Size - 1 do
+        begin
+          WStar[P] := Neuron.Weights.FData[SampleIdx];
+          Inc(P);
+        end;
+        WStar[P] := Neuron.FBiasWeight;
+        Inc(P);
+      end;
+    end;
+
+    // The anchored Langevin sampler can transiently overflow a weight into a
+    // very large value, and the clamped-NLL log can touch tiny probabilities;
+    // mask arithmetic FP exceptions for the duration so a sticky-flag does not
+    // leak into unrelated downstream code, and restore the mask afterwards.
+    SavedExMask := GetExceptionMask();
+    SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow,
+      exUnderflow, exPrecision]);
+    try
+      // Reference loss L(w*) at the trained minimum.
+      LStar := MeanNLL();
+      if IsNan(LStar) or IsInfinite(LStar) then
+      begin
+        Lines.Add('LocalLearningCoefficientReport: the network produced a ' +
+          'non-finite loss at w* - it has likely diverged during training, so ' +
+          'the LLC is undefined. No report generated.');
+        Result := Lines.Text;
+        Exit;
+      end;
+
+      // --- Anchored SGLD chain; average L(w) over the post-burn-in samples. ---
+      RandSeed := 987654;
+      BurnIn := Trunc(ChainLen * cBurnFrac);
+      if BurnIn >= ChainLen then BurnIn := ChainLen - 1;
+      ChainSum := 0;
+      ChainCnt := 0;
+      NonFinite := false;
+      for Step := 1 to ChainLen do
+      begin
+        LangevinStep();
+        LCur := MeanNLL();
+        if IsNan(LCur) or IsInfinite(LCur) then
+        begin
+          NonFinite := true;
+          Break;
+        end;
+        if Step > BurnIn then
+        begin
+          ChainSum := ChainSum + LCur;
+          Inc(ChainCnt);
+        end;
+      end;
+    finally
+      // CRITICAL non-destructiveness: restore w* bit-for-bit.
+      NN.LoadDataFromString(Snapshot);
+      ClearExceptions(false);
+      SetExceptionMask(SavedExMask);
+    end;
+
+    if NonFinite or (ChainCnt = 0) then
+    begin
+      Lines.Add('LocalLearningCoefficientReport: the SGLD chain produced a ' +
+        'non-finite loss (eps too large for this basin). Try a smaller eps. ' +
+        'No estimate produced.');
+      Result := Lines.Text;
+      Exit;
+    end;
+
+    ChainMean := ChainSum / ChainCnt;
+    // LLC_hat = n * beta * ( mean_chain[L(w)] - L(w*) ).
+    LLCHat := nBeta * (ChainMean - LStar);
+    if NetParamCnt > 0 then Ratio := LLCHat / NetParamCnt else Ratio := 0;
+
+    if Ratio < cVeryDegen then
+      Verdict := Format('HIGHLY DEGENERATE basin (LLC/dim = %.3f < %.2f): ' +
+        'the minimum has far fewer EFFECTIVE degrees of freedom than weights ' +
+        '- most directions are flat (redundant / over-parameterised).',
+        [Ratio, cVeryDegen])
+    else if Ratio < cDegen then
+      Verdict := Format('DEGENERATE basin (%.2f <= LLC/dim = %.3f < %.2f): ' +
+        'a sizeable fraction of weight directions are flat.',
+        [cVeryDegen, Ratio, cDegen])
+    else
+      Verdict := Format('NEAR-REGULAR basin (LLC/dim = %.3f >= %.2f): the ' +
+        'effective dimensionality is close to the raw parameter count.',
+        [Ratio, cDegen]);
+
+    Lines.Add(Format('LocalLearningCoefficientReport: %d sample(s), %d ' +
+      'trainable layer(s), %d parameter(s).',
+      [NSamples, TrainableLayers, NetParamCnt]));
+    Lines.Add('Empirical Local Learning Coefficient (RLCT) via anchored SGLD ' +
+      '/ WBIC free-energy.');
+    Lines.Add('');
+    Lines.Add(Format('  SGLD hyperparameters: chain length=%d (burn-in=%d), ' +
+      'eps=%g, gamma=%g.', [ChainLen, BurnIn, Eps, Gamma]));
+    Lines.Add(Format('  WBIC inverse temperature beta = 1/ln(n) = %.6g  ' +
+      '(n*beta = %.6g).', [Beta, nBeta]));
+    Lines.Add('');
+    Lines.Add(Format('  L(w*)            = %.6g   (mean training NLL at the ' +
+      'minimum)', [LStar]));
+    Lines.Add(Format('  mean_chain[L(w)] = %.6g   (over %d post-burn-in ' +
+      'sample(s))', [ChainMean, ChainCnt]));
+    Lines.Add('');
+    Lines.Add(Format('  LLC_hat          = %.6g', [LLCHat]));
+    Lines.Add(Format('  dim(w)           = %d', [NetParamCnt]));
+    Lines.Add(Format('  LLC_hat / dim(w) = %.4f', [Ratio]));
+    Lines.Add('');
+    Lines.Add('Verdict: ' + Verdict);
+    Lines.Add('');
+    Lines.Add('Caveat: the ABSOLUTE LLC_hat is calibration-dependent (it ' +
+      'shifts with eps/gamma/chain-length); the ROBUST signal is the ' +
+      'ORDERING of LLC_hat across nets measured with the SAME fixed ' +
+      'hyperparameters. Weights are restored - this is a measurement, not ' +
+      'training.');
+
+    Result := Lines.Text;
+  finally
+    RandSeed := SavedRandSeed;
+    if Target <> nil then Target.Free;
     Lines.Free;
   end;
 end;

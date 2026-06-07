@@ -136,6 +136,7 @@ type
     procedure TestShakeShakeTrainSmoke;
     procedure TestShakeDropEvalAndRoundTrip;
     procedure TestRoutingEntropyReportSmoke;
+    procedure TestLocalLearningCoefficientReportSmoke;
   end;
 
 implementation
@@ -4563,6 +4564,96 @@ begin
     NN.Free;
     LinNN.Free;
     RandSeed := SavedSeed;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLocalLearningCoefficientReportSmoke;
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  NilReport, EmptyReport, Report, SnapBefore, SnapAfter: string;
+  Ep, I, C: integer;
+  SavedSeed: longword;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+begin
+  SavedSeed := RandSeed;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.LocalLearningCoefficientReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    EmptyReport := TNNet.LocalLearningCoefficientReport(NN, Samples);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', EmptyReport) > 0);
+
+    // Train briefly on a separable 3-cluster problem.
+    RandSeed := 4321;
+    for Ep := 1 to 40 do
+      for I := 1 to 60 do
+      begin
+        C := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        try
+          X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+          X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+          Y.Fill(0);
+          Y.FData[C] := 1.0;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    for C := 0 to 2 do
+      for I := 1 to 8 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+        X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Non-destructiveness: weights must be bit-identical after the report.
+    SnapBefore := NN.SaveDataToString();
+    Report := TNNet.LocalLearningCoefficientReport(NN, Samples, 16);
+    SnapAfter := NN.SaveDataToString();
+
+    AssertTrue('report non-empty', Length(Report) > 0);
+    AssertTrue('header present',
+      Pos('LocalLearningCoefficientReport', Report) > 0);
+    AssertTrue('LLC_hat line present', Pos('LLC_hat', Report) > 0);
+    AssertTrue('dim(w) line present', Pos('dim(w)', Report) > 0);
+    AssertTrue('ratio line present', Pos('LLC_hat / dim(w)', Report) > 0);
+    AssertTrue('verdict present', Pos('Verdict:', Report) > 0);
+    AssertTrue('weights restored bit-for-bit', SnapBefore = SnapAfter);
+  finally
+    Samples.Free;
+    NN.Free;
+    // Restore a FIXED global RNG seed (not just SavedSeed): a later
+    // order-sensitive test (TTestNeuralTraining.TestClipValueDefaultIdentical)
+    // reads the leftover stream, and this smoke test consumes a different
+    // number of Random() draws than the suite was tuned for. See the
+    // numerical-test RNG-ordering note.
+    RandSeed := 424242;
   end;
 end;
 
