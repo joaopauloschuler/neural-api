@@ -5361,6 +5361,56 @@ type
       property LogDetLossWeight: TNeuralFloat read FLogDetLossWeight write FLogDetLossWeight;
   end;
 
+  /// TNNetActNorm: Glow's data-dependent ACTIVATION NORMALIZATION flow primitive
+  // (Kingma & Dhariwal 2018 "Glow", arXiv:1807.03039 sec. 3.1). The THIRD and
+  // final canonical Glow flow-step component, completing the trio already in this
+  // library: ActNorm -> TNNetInvertible1x1Conv -> TNNetAffineCoupling. A per-
+  // channel invertible affine transform
+  //   y[x,y,c] = s[c] * x[x,y,c] + b[c]
+  // with learnable scale s and bias b. To keep s strictly non-zero (so the map is
+  // invertible and the log-det finite) s is parametrized as s = exp(logs).
+  //
+  // DATA-DEPENDENT INIT: on the FIRST forward minibatch the parameters are lazily
+  // set from that batch's per-channel statistics, logs = -ln(std[c]) and
+  // b = -mean[c]/std[c], so the first batch comes out per-channel ~0 mean / ~1
+  // variance; afterwards s,b are free trainable parameters. The init fires exactly
+  // once -- guarded by an "initialised" flag persisted in FStruct so it does NOT
+  // re-fire on reload or on subsequent forwards. Distinct from TNNetChannelStdNorm
+  // (a non-invertible running-stat normalizer) in that the transform is an exact
+  // bijection with a tractable log-determinant, composable into a flow.
+  //
+  // Inverse (sampling) map z -> x = (z - b) / s reuses the same logs,b (no solve).
+  // log|det J| = (SizeX*SizeY) * sum_c(logs[c]), exposed as the public read-only
+  // LogDetJacobian (sum for the current forward) so a flow's NLL composes
+  // additively with the other two flow layers' log-dets. Two neurons carry the
+  // trainable params: neuron 0 = logs (C,1,1), neuron 1 = b (C,1,1), both round-
+  // tripped via the standard per-neuron save. FStruct[0]=C, FStruct[1]=initialised
+  // flag (0/1), FStruct[2]=inverse flag (0/1). Coded by Claude (AI).
+  TNNetActNorm = class(TNNetLayer)
+    private
+      FC: integer;            // channel count (== Depth)
+      FInverse: boolean;      // true: run the sampling map z -> x
+      FInitialised: boolean;  // false until the data-dependent init has fired
+      FLogDet: TNeuralFloat;  // (SizeX*SizeY)*sum(logs) over the last forward
+      FLogDetLossWeight: TNeuralFloat; // coef of d(-logdet)/dparams folded into backward (ML=1)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure DataDependentInit();
+    public
+      constructor Create(); overload; override;
+      constructor Create(pInverse: boolean); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property LogDetJacobian: TNeuralFloat read FLogDet;
+      property Inverse: boolean read FInverse;
+      property Initialised: boolean read FInitialised;
+      // Weight of the -logdet term folded into backward so a single ML loss
+      // 0.5*||z||^2 trains s,b end to end. Default 1.0; set 0.0 to gradient-check
+      // the pure transform with no log-det contribution.
+      property LogDetLossWeight: TNeuralFloat read FLogDetLossWeight write FLogDetLossWeight;
+  end;
+
   /// TNNetTestTimeTraining: the Test-Time Training (TTT) sequence-mixing layer
   // (Sun et al. 2024, "Learning to (Learn at Test Time): RNNs with Expressive
   // Hidden States", arXiv:2407.04620). The recurrent hidden STATE is itself a
@@ -33461,6 +33511,222 @@ begin
   FNeurons[1].FBackInertia.Fill(0);
   FNeurons[1].FBiasWeight := 0; FNeurons[1].FBiasDelta := 0; FNeurons[1].FBiasInertia := 0;
   RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetActNorm }
+constructor TNNetActNorm.Create();
+begin
+  Create(false);
+end;
+
+constructor TNNetActNorm.Create(pInverse: boolean);
+begin
+  inherited Create();
+  FInverse := pInverse;
+  FC := 0;
+  FInitialised := false;
+  FLogDet := 0;
+  FLogDetLossWeight := 1.0;
+  FStruct[0] := 0;
+  FStruct[1] := 0;            // initialised flag
+  FStruct[2] := Ord(FInverse);
+end;
+
+destructor TNNetActNorm.Destroy();
+begin
+  inherited Destroy();
+end;
+
+procedure TNNetActNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FC := pPrevLayer.FOutput.Depth;
+  if FC < 1 then
+    FErrorProc('TNNetActNorm requires Depth>=1, got Depth=' + IntToStr(FC));
+  FStruct[0] := FC;
+  FInitialised := (FStruct[1] = 1);
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, FC);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // Neuron 0 = logs (C,1,1); neuron 1 = b (C,1,1).
+  if FNeurons.Count < 2 then AddMissingNeurons(2 - FNeurons.Count);
+  FNeurons[0].FWeights.ReSize(FC, 1, 1);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FNeurons[1].FWeights.ReSize(FC, 1, 1);
+  FNeurons[1].FDelta.ReSize(FNeurons[1].FWeights);
+  FNeurons[1].FBackInertia.ReSize(FNeurons[1].FWeights);
+  InitDefault();
+end;
+
+// Data-dependent init: set b = -mean[c], logs = -ln(std[c]) from the current
+// minibatch (FPrevLayer.FOutput), so the first forward comes out per-channel ~0
+// mean / ~1 variance. Fires exactly once; the flag is persisted in FStruct.
+procedure TNNetActNorm.DataDependentInit();
+var
+  SizeX, SizeY, x, y, c, cnt: integer;
+  mean, varc, v, std: TNeuralFloat;
+  LogSPtr, BPtr, InPtr: TNeuralFloatArrPtr;
+begin
+  SizeX := FPrevLayer.FOutput.SizeX;
+  SizeY := FPrevLayer.FOutput.SizeY;
+  cnt := SizeX * SizeY;
+  LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  BPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
+  for c := 0 to FC - 1 do
+  begin
+    mean := 0;
+    for y := 0 to SizeY - 1 do
+      for x := 0 to SizeX - 1 do
+      begin
+        InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+        mean := mean + InPtr^[c];
+      end;
+    if cnt > 0 then mean := mean / cnt;
+    varc := 0;
+    for y := 0 to SizeY - 1 do
+      for x := 0 to SizeX - 1 do
+      begin
+        InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+        v := InPtr^[c] - mean;
+        varc := varc + v * v;
+      end;
+    if cnt > 0 then varc := varc / cnt;
+    std := Sqrt(varc + 1e-6);
+    // y = s*x + b with s = 1/std, b = -mean/std => first batch ~0 mean / ~1 var.
+    LogSPtr^[c] := -Ln(std);
+    BPtr^[c] := -mean / std;
+  end;
+  FInitialised := true;
+  FStruct[1] := 1;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetActNorm.Compute();
+var
+  StartTime: double;
+  SizeX, SizeY, x, y, c: integer;
+  sumLogS, sval, bval: TNeuralFloat;
+  LogSPtr, BPtr, InPtr, OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  // Data-dependent init on the first forward (forward map only).
+  if (not FInitialised) and (not FInverse) then DataDependentInit();
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  BPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
+  sumLogS := 0;
+  for c := 0 to FC - 1 do sumLogS := sumLogS + LogSPtr^[c];
+  if not FInverse then FLogDet := SizeX * SizeY * sumLogS
+  else FLogDet := -SizeX * SizeY * sumLogS;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+    begin
+      InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+      OutPtr := FOutput.GetRawPtr(x, y, 0);
+      if not FInverse then
+      begin
+        for c := 0 to FC - 1 do
+        begin
+          sval := Exp(LogSPtr^[c]);
+          OutPtr^[c] := sval * InPtr^[c] + BPtr^[c];
+        end;
+      end
+      else
+      begin
+        // Inverse (sampling): x = (z - b) / s = (z - b) * exp(-logs).
+        for c := 0 to FC - 1 do
+        begin
+          sval := Exp(-LogSPtr^[c]);
+          bval := BPtr^[c];
+          OutPtr^[c] := (InPtr^[c] - bval) * sval;
+        end;
+      end;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetActNorm.Backpropagate();
+var
+  StartTime: double;
+  SizeX, SizeY, x, y, c: integer;
+  hasInputGrad: boolean;
+  sval, gy: TNeuralFloat;
+  LogSPtr, GyPtr, InPtr, PrevErrPtr, dLogSPtr, dBPtr: TNeuralFloatArrPtr;
+  lr: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // Backprop is defined for the FORWARD map only (training a flow runs forward).
+  if FInverse then
+  begin
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+    exit;
+  end;
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  lr := FLearningRate;
+  LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  dLogSPtr := FNeurons[0].FDelta.GetRawPtr(0, 0, 0);
+  dBPtr := FNeurons[1].FDelta.GetRawPtr(0, 0, 0);
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErrPtr := nil;
+  // -logdet term: d(-SizeX*SizeY*sum(logs))/dlogs_c = -SizeX*SizeY, folded in once
+  // (it does not depend on the per-position data).
+  if FLogDetLossWeight <> 0 then
+    for c := 0 to FC - 1 do
+      dLogSPtr^[c] := dLogSPtr^[c] + (-lr) * (-FLogDetLossWeight * SizeX * SizeY);
+  // y = s*x + b, s = exp(logs).
+  // dL/dx[c]    = gy * s
+  // dL/db[c]    = gy
+  // dL/dlogs[c] = gy * s * x = gy * (y - b) ... computed directly as gy*s*x.
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+    begin
+      InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+      GyPtr := FOutputError.GetRawPtr(x, y, 0);
+      if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y, 0);
+      for c := 0 to FC - 1 do
+      begin
+        sval := Exp(LogSPtr^[c]);
+        gy := GyPtr^[c];
+        dBPtr^[c] := dBPtr^[c] + (-lr) * gy;
+        dLogSPtr^[c] := dLogSPtr^[c] + (-lr) * gy * sval * InPtr^[c];
+        if hasInputGrad then
+          PrevErrPtr^[c] := PrevErrPtr^[c] + gy * sval;
+      end;
+    end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetActNorm.InitDefault();
+begin
+  if FNeurons.Count < 2 then exit;
+  if FC < 1 then exit;
+  // Identity at start (logs=0 -> s=1, b=0); the data-dependent init overwrites
+  // these on the first forward unless already initialised (e.g. after reload).
+  FNeurons[0].FWeights.Fill(0);
+  FNeurons[0].FDelta.Fill(0);
+  FNeurons[0].FBackInertia.Fill(0);
+  FNeurons[0].FBiasWeight := 0; FNeurons[0].FBiasDelta := 0; FNeurons[0].FBiasInertia := 0;
+  FNeurons[1].FWeights.Fill(0);
+  FNeurons[1].FDelta.Fill(0);
+  FNeurons[1].FBackInertia.Fill(0);
+  FNeurons[1].FBiasWeight := 0; FNeurons[1].FBiasDelta := 0; FNeurons[1].FBiasInertia := 0;
   AfterWeightUpdate();
 end;
 
@@ -76633,6 +76899,7 @@ begin
       'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0], St[1] = 1);
       'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
       'TNNetInvertible1x1Conv':     Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]);
+      'TNNetActNorm':               Result := TNNetActNorm.Create(St[2] = 1);
       'TNNetTestTimeTraining':      Result := TNNetTestTimeTraining.Create(St[1], St[2]);
       'TNNetTitansMemory':          Result := TNNetTitansMemory.Create(St[2]);
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
@@ -76996,6 +77263,7 @@ begin
       if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0], St[1] = 1) else
       if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetInvertible1x1Conv' then Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]) else
+      if S[0] = 'TNNetActNorm' then Result := TNNetActNorm.Create(St[2] = 1) else
       if S[0] = 'TNNetTestTimeTraining' then Result := TNNetTestTimeTraining.Create(St[1], St[2]) else
       if S[0] = 'TNNetTitansMemory' then Result := TNNetTitansMemory.Create(St[2]) else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else

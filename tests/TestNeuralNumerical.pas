@@ -447,6 +447,12 @@ type
     procedure TestInvertible1x1ConvInverseIdentity;
     procedure TestInvertible1x1ConvLogDetValue;
     procedure TestInvertible1x1ConvSerializationRoundTrip;
+    procedure TestActNormInputGradientCheck;
+    procedure TestActNormWeightGradientCheck;
+    procedure TestActNormLogDetGradientCheck;
+    procedure TestActNormInverseIdentity;
+    procedure TestActNormDataDependentInit;
+    procedure TestActNormSerializationRoundTrip;
     procedure TestTTTShapeInference;
     procedure TestTTTLinearInputGradientCheck;
     procedure TestTTTLinearWeightGradientCheck;
@@ -24803,6 +24809,321 @@ begin
   // via the standard per-neuron save; the permutation regenerates from the seed.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetInvertible1x1Conv.Create(false, 5), 'Invertible1x1Conv', 4, 1, 4, 1e-5);
+end;
+
+// --- TNNetActNorm (Glow data-dependent activation normalization) ------------
+
+// Bounded, deterministic logs (scale) and b so exp stays well-conditioned and
+// inside the finite-difference truncation tolerance. Call AFTER one forward has
+// fired the data-dependent init (so Initialised is already true and these seeds
+// are not overwritten on the next forward).
+procedure SeedActNorm(L: TNNetActNorm);
+var i, c: integer;
+begin
+  c := L.Neurons[0].Weights.Size; // == C
+  for i := 0 to c - 1 do
+  begin
+    L.Neurons[0].Weights.Raw[i] := Sin(i * 1.1) * 0.4;    // logs in (-0.4,0.4)
+    L.Neurons[1].Weights.Raw[i] := Cos(i * 0.7) * 0.5;    // b
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestActNormInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetActNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  InputPlus := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetActNorm.Create(false);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 0; // pure transform check
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    // Fire the data-dependent init once, then overwrite with bounded seeds.
+    NN.Compute(Input);
+    SeedActNorm(L);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ActNorm input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ActNorm input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestActNormWeightGradientCheck;
+// Gradient w.r.t. logs (neuron 0) AND b (neuron 1).
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetActNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetActNorm.Create(false);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 0; // pure transform check
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    NN.Compute(Input); // fire init
+    SeedActNorm(L);
+
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('ActNorm W gradient n=' + IntToStr(n) + '[' + IntToStr(i) +
+          '] num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('ActNorm weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestActNormLogDetGradientCheck;
+// Verifies the -logdet term folded into backward: ML loss = 0.5*||y||^2 - LogDet.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  L: TNNetActNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; y: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      y := NN.GetLastLayer.Output.Raw[k];
+      Result := Result + 0.5 * y * y;
+    end;
+    Result := Result - L.LogDetJacobian;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetActNorm.Create(false);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 1.0; // ML objective: -logdet folded into backward
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6 + 0.2;
+    NN.Compute(Input); // fire init
+    SeedActNorm(L);
+
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Layers[0].OutputError.Fill(0);
+        L.OutputError.Copy(NN.GetLastLayer.Output); // dL/dy = y
+        L.IncDepartingBranchesCnt();
+        L.Backpropagate();
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('ActNorm logdet gradient n=' + IntToStr(n) + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('ActNorm logdet gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestActNormInverseIdentity;
+// forward then inverse (with identical logs,b) reconstructs the input to
+// tolerance, proving the per-channel affine map is an exact bijection.
+var
+  NNf, NNi: TNNet;
+  Lf, Li: TNNetActNorm;
+  X, Y: TNNetVolume;
+  i: integer;
+  maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NNf := TNNet.Create();
+  NNi := TNNet.Create();
+  X := TNNetVolume.Create(3, 1, 5);
+  Y := TNNetVolume.Create(3, 1, 5);
+  maxErr := 0;
+  try
+    NNf.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    Lf := TNNetActNorm.Create(false); NNf.AddLayer(Lf);
+    NNi.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    Li := TNNetActNorm.Create(true); NNi.AddLayer(Li); // inverse map
+    for i := 0 to X.Size - 1 do X.Raw[i] := Sin(i * 0.83) * 1.5 - 0.3;
+    NNf.Compute(X); // fire init
+    SeedActNorm(Lf);
+    // Copy the SAME logs,b weights into the inverse layer.
+    for i := 0 to Lf.Neurons.Count - 1 do
+      Li.Neurons[i].Weights.Copy(Lf.Neurons[i].Weights);
+    NNf.Compute(X);
+    Y.Copy(NNf.GetLastLayer.Output);
+    NNi.Compute(Y);
+    for i := 0 to X.Size - 1 do
+      if Abs(NNi.GetLastLayer.Output.Raw[i] - X.Raw[i]) > maxErr then
+        maxErr := Abs(NNi.GetLastLayer.Output.Raw[i] - X.Raw[i]);
+    WriteLn('ActNorm forward-inverse max reconstruction error: ', maxErr:0:8);
+    AssertTrue('ActNorm forward-inverse identity (err=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-4);
+  finally
+    NNf.Free; NNi.Free; X.Free; Y.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestActNormDataDependentInit;
+// The first forward minibatch comes out per-channel ~0 mean / ~1 variance.
+var
+  NN: TNNet;
+  L: TNNetActNorm;
+  Inp: TNNetVolume;
+  sx, sy, d, x, y, c, cnt: integer;
+  mean, varc, v: TNeuralFloat;
+  maxMeanErr, maxVarErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  sx := 4; sy := 3; d := 5;
+  Inp := TNNetVolume.Create(sx, sy, d);
+  cnt := sx * sy;
+  maxMeanErr := 0; maxVarErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(sx, sy, d, 1));
+    L := TNNetActNorm.Create(false);
+    NN.AddLayer(L);
+    // Per-channel non-trivial mean/variance so the init has work to do.
+    for c := 0 to d - 1 do
+      for y := 0 to sy - 1 do
+        for x := 0 to sx - 1 do
+          Inp.Add(x, y, c, (c + 1) * 2.0 + Sin((x + y * sx) * (c + 1) * 0.37) * (c + 1));
+    AssertFalse('ActNorm not initialised before first forward', L.Initialised);
+    NN.Compute(Inp);
+    AssertTrue('ActNorm initialised after first forward', L.Initialised);
+    // Check output per-channel mean ~0, variance ~1.
+    for c := 0 to d - 1 do
+    begin
+      mean := 0;
+      for y := 0 to sy - 1 do
+        for x := 0 to sx - 1 do
+          mean := mean + L.Output.Get(x, y, c);
+      mean := mean / cnt;
+      varc := 0;
+      for y := 0 to sy - 1 do
+        for x := 0 to sx - 1 do
+        begin
+          v := L.Output.Get(x, y, c) - mean;
+          varc := varc + v * v;
+        end;
+      varc := varc / cnt;
+      if Abs(mean) > maxMeanErr then maxMeanErr := Abs(mean);
+      if Abs(varc - 1.0) > maxVarErr then maxVarErr := Abs(varc - 1.0);
+    end;
+    WriteLn('ActNorm init per-channel max |mean|=', maxMeanErr:0:8,
+      ' max |var-1|=', maxVarErr:0:8);
+    AssertTrue('ActNorm init per-channel mean ~0', maxMeanErr < 1e-4);
+    AssertTrue('ActNorm init per-channel var ~1', maxVarErr < 1e-3);
+  finally
+    NN.Free; Inp.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestActNormSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // FStruct[0]=C, FStruct[1]=initialised flag, FStruct[2]=inverse flag; logs,b
+  // round-trip via the standard per-neuron save. The round-trip helper computes
+  // once (firing+persisting the data-dependent init) before saving.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetActNorm.Create(false), 'ActNorm', 4, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestKalmanFilterCellSerializationRoundTrip;
