@@ -434,6 +434,10 @@ type
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
     procedure TestWKVSerializationRoundTrip;
+    procedure TestLRUShapeInference;
+    procedure TestLRUInputGradientCheck;
+    procedure TestLRUWeightGradientCheck;
+    procedure TestLRUSerializationRoundTrip;
     procedure TestCrossWKVShapeInference;
     procedure TestCrossWKVInputGradientCheck;
     procedure TestCrossWKVWeightGradientCheck;
@@ -23803,6 +23807,220 @@ begin
   // sweep (not persisted); FStruct[0]=C. Input depth must be 2*C=4 -> C=2.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetWKV.Create(), 'WKV', 4, 1, 4, 1e-5);
+end;
+
+// --- TNNetLRU (Linear Recurrent Unit, Orvieto et al. 2023) -------------------
+
+procedure TTestNeuralNumerical.TestLRUShapeInference;
+var
+  NN: TNNet;
+  L: TNNetLRU;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    // Shape-preserving over (SeqLen,1,Depth): SeqLen=5, Depth=3.
+    NN.AddLayer(TNNetInput.Create(5, 1, 3, 1));
+    L := TNNetLRU.Create();
+    NN.AddLayer(L);
+    AssertEquals('LRU output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('LRU output SizeY', 1, L.Output.SizeY);
+    AssertEquals('LRU output Depth = input Depth', 3, L.Output.Depth);
+    AssertEquals('LRU neuron count (nu,theta,B,Cre,Cim,D)', 6, L.Neurons.Count);
+    AssertEquals('LRU nu size = Depth', 3, L.Neurons[0].Weights.Size);
+    AssertEquals('LRU D size = Depth', 3, L.Neurons[5].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLRUInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LL: TNNetLRU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  // SeqLen=4, Depth=2 (shape-preserving output).
+  Input := TNNetVolume.Create(4, 1, 2);
+  InputPlus := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));  // pError=1 for input-grad read
+    LL := TNNetLRU.Create();
+    NN.AddLayer(LL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded inputs/targets (FD-truncation control); the recurrence is linear
+    // so it is well-conditioned, but keep amplitudes off the FP32 round-off floor.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    // Non-trivial per-channel params so |lambda|/angle/gamma/C/D paths are live.
+    LL.Neurons[0].Weights.Raw[0] := -1.5;  // nu
+    LL.Neurons[0].Weights.Raw[1] := -2.0;
+    LL.Neurons[1].Weights.Raw[0] := -1.0;  // theta
+    LL.Neurons[1].Weights.Raw[1] := -1.5;
+    LL.Neurons[2].Weights.Raw[0] :=  0.8;  // B
+    LL.Neurons[2].Weights.Raw[1] :=  1.2;
+    LL.Neurons[3].Weights.Raw[0] :=  0.7;  // Cre
+    LL.Neurons[3].Weights.Raw[1] :=  1.1;
+    LL.Neurons[4].Weights.Raw[0] :=  0.3;  // Cim
+    LL.Neurons[4].Weights.Raw[1] := -0.4;
+    LL.Neurons[5].Weights.Raw[0] :=  0.2;  // D
+    LL.Neurons[5].Weights.Raw[1] := -0.1;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('LRU input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('LRU input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLRUWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LL: TNNetLRU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..5] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'nu'; Names[1] := 'theta'; Names[2] := 'B';
+  Names[3] := 'Cre'; Names[4] := 'Cim'; Names[5] := 'D';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    LL := TNNetLRU.Create();
+    NN.AddLayer(LL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.55) * 0.6 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+
+    // Bounded raw params so exp/sqrt stay in smooth regions (FD-truncation).
+    LL.Neurons[0].Weights.Raw[0] := -1.5;  // nu
+    LL.Neurons[0].Weights.Raw[1] := -2.0;
+    LL.Neurons[1].Weights.Raw[0] := -1.0;  // theta
+    LL.Neurons[1].Weights.Raw[1] := -1.5;
+    LL.Neurons[2].Weights.Raw[0] :=  0.8;  // B
+    LL.Neurons[2].Weights.Raw[1] :=  1.2;
+    LL.Neurons[3].Weights.Raw[0] :=  0.7;  // Cre
+    LL.Neurons[3].Weights.Raw[1] :=  1.1;
+    LL.Neurons[4].Weights.Raw[0] :=  0.3;  // Cim
+    LL.Neurons[4].Weights.Raw[1] := -0.4;
+    LL.Neurons[5].Weights.Raw[0] :=  0.2;  // D
+    LL.Neurons[5].Weights.Raw[1] := -0.1;
+
+    for n := 0 to 5 do
+      for i := 0 to LL.Neurons[n].Weights.Size - 1 do
+      begin
+        LL.Neurons[n].Weights.Raw[i] := LL.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LL.Neurons[n].Weights.Raw[i] := LL.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LL.Neurons[n].Weights.Raw[i] := LL.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LL.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // With LearningRate = 1 and batch update on, analytical = -Delta.
+        analyticalGrad := -LL.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('LRU weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('LRU weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLRUSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // TNNetLRU stores six per-channel raw vectors (nu,theta,B,Cre,Cim,D). The
+  // complex state h re-inits per sweep (not persisted); FStruct[0]=Depth.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLRU.Create(), 'LRU', 4, 1, 3, 1e-5);
 end;
 
 // --- TNNetCrossWKV (two-source RWKV WKV: receptance src + key|value src) -----

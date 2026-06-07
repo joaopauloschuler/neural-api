@@ -5334,6 +5334,67 @@ type
       property Asymmetric: boolean read FAsymmetric;
   end;
 
+  /// TNNetLRU: the Linear Recurrent Unit (Orvieto, Smith, Gu, Fernando,
+  // Gulcehre, Pascanu, De 2023, "Resurrecting Recurrent Neural Networks for
+  // Long Sequences", arXiv:2303.06349). A STABLE, diagonal, COMPLEX-valued
+  // linear recurrence over the time axis. Operates over a (SeqLen,1,Depth)
+  // sequence laid out along SizeX exactly like the attention / TNNetDiagonalSSM /
+  // TNNetWKV layers (SizeY must be 1); output shape == input shape.
+  //
+  // Distinct from the existing real-diagonal TNNetDiagonalSSM (h_t = a*h_{t-1} +
+  // b*x with a=sigmoid(a_raw) a REAL decay in (0,1)): the LRU's defining
+  // features are (1) a COMPLEX diagonal eigenvalue lambda with the paper's STABLE
+  // exponential parameterisation, and (2) a normalisation factor gamma on the
+  // input projection that keeps the hidden-state variance constant regardless of
+  // |lambda|. The complex state lets each channel encode an oscillation
+  // (rotation by exp(i*angle) per step) on top of an exponential decay, which a
+  // real-only diagonal SSM cannot represent.
+  //
+  // Per output channel j the state h_j is COMPLEX (x_j and y_j are real). With
+  // per-channel learnable real scalars nu_j, theta_j, B_j, Cre_j, Cim_j, D_j:
+  //   |lambda_j| = exp(-exp(nu_j))                  (in (0,1): STABLE by constr.)
+  //   angle_j    = exp(theta_j)                     (rotation rate, > 0)
+  //   lambda_j   = |lambda_j| * (cos(angle_j) + i*sin(angle_j))
+  //   gamma_j    = sqrt(1 - |lambda_j|^2)           (input normalisation)
+  //   h_j(t)     = lambda_j * h_j(t-1) + gamma_j * B_j * x_j(t)   (h_j(-1)=0)
+  //   y_j(t)     = Re(C_j * h_j(t)) + D_j * x_j(t)
+  // where C_j = Cre_j + i*Cim_j and the input drive gamma*B*x is REAL (it enters
+  // only the real part of h). Writing lr=|lambda|cos(angle), li=|lambda|sin(angle):
+  //   hre(t) = lr*hre(t-1) - li*him(t-1) + gamma*B*x(t)
+  //   him(t) = lr*him(t-1) + li*hre(t-1)
+  //   y(t)   = Cre*hre(t) - Cim*him(t) + D*x(t)
+  //
+  // Storage in Neurons[] (6 tensors, each Depth-long):
+  //   [0]=nu     -> |lambda| = exp(-exp(nu))   (init so |lambda|~=0.9)
+  //   [1]=theta  -> angle    = exp(theta)      (init so angle is small, ~0.1)
+  //   [2]=B      -> real per-channel input gain (init 1)
+  //   [3]=Cre    -> real part of output mix C  (init 1)
+  //   [4]=Cim    -> imag part of output mix C  (init 0)
+  //   [5]=D      -> real feedthrough/skip      (init 0)
+  // FStruct[0]=Depth (resolved in SetPrevLayer). The complex state h re-inits per
+  // sweep (NOT persisted). FORWARD is a left-to-right scan carrying (hre,him),
+  // caching them for the backward pass. BACKWARD is the EXACT BPTT adjoint scan
+  // (right-to-left, carrying dL/dhre_t, dL/dhim_t), folding the input gradient
+  // and the per-channel gradients for nu, theta, B, Cre, Cim, D - chaining
+  // carefully through |lambda|=exp(-exp(nu)) (d|lambda|/dnu = -|lambda|*exp(nu)),
+  // angle=exp(theta) (dangle/dtheta = angle) and gamma=sqrt(1-|lambda|^2)
+  // (dgamma/d|lambda| = -|lambda|/gamma). Per-channel scalar scan -> scalar is
+  // fine, no AVX. Coded by Claude (AI).
+  TNNetLRU = class(TNNetLayer)
+    private
+      FDepth: integer;          // resolved in SetPrevLayer
+      FHre: TNNetVolume;        // cached real part of h_t, (SeqLen,1,Depth)
+      FHim: TNNetVolume;        // cached imag part of h_t, (SeqLen,1,Depth)
+      FGradNu, FGradTheta, FGradB, FGradCre, FGradCim, FGradD: TNNetVolume;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetAffineCoupling: an invertible RealNVP/Glow-style AFFINE COUPLING layer
   // (Dinh et al. 2016 "Density estimation using Real NVP", arXiv:1605.08803;
   // Kingma & Dhariwal 2018 "Glow", arXiv:1807.03039). This is the library's
@@ -32593,6 +32654,269 @@ begin
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   FNeurons[0].FWeights.Fill(cSoftplusInv1);  // w_raw -> w ~= 1
   FNeurons[1].FWeights.Fill(0);              // bonus u = 0
+  AfterWeightUpdate();
+end;
+
+{ TNNetLRU }
+constructor TNNetLRU.Create();
+begin
+  inherited Create();
+  FDepth := 0;
+  FStruct[0] := 0;
+  FHre := TNNetVolume.Create();
+  FHim := TNNetVolume.Create();
+  FGradNu := TNNetVolume.Create();
+  FGradTheta := TNNetVolume.Create();
+  FGradB := TNNetVolume.Create();
+  FGradCre := TNNetVolume.Create();
+  FGradCim := TNNetVolume.Create();
+  FGradD := TNNetVolume.Create();
+  // [0]=nu [1]=theta [2]=B [3]=Cre [4]=Cim [5]=D
+  AddMissingNeurons(6);
+end;
+
+destructor TNNetLRU.Destroy();
+begin
+  FGradD.Free;
+  FGradCim.Free;
+  FGradCre.Free;
+  FGradB.Free;
+  FGradTheta.Free;
+  FGradNu.Free;
+  FHim.Free;
+  FHre.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLRU.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetLRU requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FDepth := pPrevLayer.FOutput.Depth;
+  FStruct[0] := FDepth;
+  // Shape-preserving.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 6 then AddMissingNeurons(6);
+  SetNumWeightsForAllNeurons(1, 1, FDepth);
+  for ii := 0 to 5 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FHre.ReSize(FOutput.SizeX, 1, FDepth);
+  FHim.ReSize(FOutput.SizeX, 1, FDepth);
+  FGradNu.ReSize(1, 1, FDepth);
+  FGradTheta.ReSize(1, 1, FDepth);
+  FGradB.ReSize(1, 1, FDepth);
+  FGradCre.ReSize(1, 1, FDepth);
+  FGradCim.ReSize(1, 1, FDepth);
+  FGradD.ReSize(1, 1, FDepth);
+  InitDefault();
+end;
+
+procedure TNNetLRU.Compute();
+var
+  StartTime: double;
+  Wnu, Wtheta, Wb, Wcre, Wcim, Wd, Prev: TNNetVolume;
+  SeqLen, Dn, t, d: integer;
+  absLam, angle, lr, li, gamma, gB, cre, cim, dd: TNeuralFloat;
+  hrePrev, himPrev, hreNew, himNew, xt: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wnu := FNeurons[0].FWeights;
+  Wtheta := FNeurons[1].FWeights;
+  Wb := FNeurons[2].FWeights;
+  Wcre := FNeurons[3].FWeights;
+  Wcim := FNeurons[4].FWeights;
+  Wd := FNeurons[5].FWeights;
+  SeqLen := FOutput.SizeX;
+  Dn := FDepth;
+  for d := 0 to Dn - 1 do
+  begin
+    absLam := Exp(-Exp(Wnu.FData[d]));          // |lambda| in (0,1)
+    angle := Exp(Wtheta.FData[d]);              // rotation rate
+    lr := absLam * Cos(angle);
+    li := absLam * Sin(angle);
+    gamma := Sqrt(1 - absLam * absLam);         // input normalisation
+    gB := gamma * Wb.FData[d];
+    cre := Wcre.FData[d];
+    cim := Wcim.FData[d];
+    dd := Wd.FData[d];
+    hrePrev := 0;
+    himPrev := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      xt := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      hreNew := lr * hrePrev - li * himPrev + gB * xt;
+      himNew := lr * himPrev + li * hrePrev;
+      FHre.FData[FHre.GetRawPos(t, 0, d)] := hreNew;
+      FHim.FData[FHim.GetRawPos(t, 0, d)] := himNew;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] :=
+        cre * hreNew - cim * himNew + dd * xt;
+      hrePrev := hreNew;
+      himPrev := himNew;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLRU.Backpropagate();
+var
+  StartTime: double;
+  Wnu, Wtheta, Wb, Wcre, Wcim, Wd, Prev, PrevErr: TNNetVolume;
+  SeqLen, Dn, t, d: integer;
+  absLam, angle, lr, li, gamma, gB, cre, cim, dd: TNeuralFloat;
+  hre, him, hrePrev, himPrev, xt, dyt: TNeuralFloat;
+  phre, phim, phrePrev, phimPrev: TNeuralFloat;
+  dlr, dli, dgB, dxt: TNeuralFloat;
+  gNu, gTheta, gB_, gCre, gCim, gD: TNeuralFloat;
+  dAbs, dAngle, dGamma: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Wnu := FNeurons[0].FWeights;
+  Wtheta := FNeurons[1].FWeights;
+  Wb := FNeurons[2].FWeights;
+  Wcre := FNeurons[3].FWeights;
+  Wcim := FNeurons[4].FWeights;
+  Wd := FNeurons[5].FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  Dn := FDepth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGradNu.Fill(0);
+  FGradTheta.Fill(0);
+  FGradB.Fill(0);
+  FGradCre.Fill(0);
+  FGradCim.Fill(0);
+  FGradD.Fill(0);
+  // Exact BPTT carrying phre=dL/dhre_t, phim=dL/dhim_t right-to-left.
+  // Forward per step:
+  //   hre_t = lr*hre_{t-1} - li*him_{t-1} + gB*x_t
+  //   him_t = lr*him_{t-1} + li*hre_{t-1}
+  //   y_t   = cre*hre_t - cim*him_t + dd*x_t
+  for d := 0 to Dn - 1 do
+  begin
+    absLam := Exp(-Exp(Wnu.FData[d]));
+    angle := Exp(Wtheta.FData[d]);
+    lr := absLam * Cos(angle);
+    li := absLam * Sin(angle);
+    gamma := Sqrt(1 - absLam * absLam);
+    gB := gamma * Wb.FData[d];
+    cre := Wcre.FData[d];
+    cim := Wcim.FData[d];
+    dd := Wd.FData[d];
+    phre := 0;
+    phim := 0;
+    gNu := 0; gTheta := 0; gB_ := 0; gCre := 0; gCim := 0; gD := 0;
+    dlr := 0; dli := 0; dgB := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      xt := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      hre := FHre.FData[FHre.GetRawPos(t, 0, d)];
+      him := FHim.FData[FHim.GetRawPos(t, 0, d)];
+      if t > 0 then
+      begin
+        hrePrev := FHre.FData[FHre.GetRawPos(t - 1, 0, d)];
+        himPrev := FHim.FData[FHim.GetRawPos(t - 1, 0, d)];
+      end
+      else
+      begin
+        hrePrev := 0;
+        himPrev := 0;
+      end;
+      dyt := FOutputError.FData[FOutputError.GetRawPos(t, 0, d)];
+      // ---- Output read-out adjoints ----
+      gCre := gCre + dyt * hre;
+      gCim := gCim - dyt * him;
+      gD := gD + dyt * xt;
+      dxt := dyt * dd;                       // y has +dd*x_t
+      // dL/dhre_t, dL/dhim_t accumulate the carried adjoint + read-out term.
+      phre := phre + dyt * cre;
+      phim := phim - dyt * cim;
+      // ---- State step adjoints ----
+      // hre_t = lr*hre_{t-1} - li*him_{t-1} + gB*x_t
+      // him_t = lr*him_{t-1} + li*hre_{t-1}
+      dlr := dlr + phre * hrePrev + phim * himPrev;
+      dli := dli - phre * himPrev + phim * hrePrev;
+      dgB := dgB + phre * xt;
+      dxt := dxt + phre * gB;
+      // Propagate to previous state (h_{t-1}).
+      phrePrev := lr * phre + li * phim;     // hre_{t-1} feeds lr*hre_t & li*him_t
+      phimPrev := -li * phre + lr * phim;    // him_{t-1} feeds -li*hre_t & lr*him_t
+      if hasInputGrad then
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] + dxt;
+      phre := phrePrev;
+      phim := phimPrev;
+    end;
+    // ---- Chain through the parameterisation ----
+    // lr = absLam*cos(angle); li = absLam*sin(angle).
+    dAbs := dlr * Cos(angle) + dli * Sin(angle);
+    dAngle := -dlr * absLam * Sin(angle) + dli * absLam * Cos(angle);
+    // gB = gamma*B, gamma = sqrt(1-absLam^2) -> dgamma/dabsLam = -absLam/gamma.
+    gB_ := dgB * gamma;                      // dL/dB
+    dGamma := dgB * Wb.FData[d];             // dL/dgamma
+    if gamma > 1e-12 then
+      dAbs := dAbs + dGamma * (-absLam / gamma);
+    // absLam = exp(-exp(nu)) -> dabsLam/dnu = absLam * (-exp(nu)).
+    gNu := dAbs * absLam * (-Exp(Wnu.FData[d]));
+    // angle = exp(theta) -> dangle/dtheta = angle.
+    gTheta := dAngle * angle;
+    FGradNu.FData[d] := gNu;
+    FGradTheta.FData[d] := gTheta;
+    FGradB.FData[d] := gB_;
+    FGradCre.FData[d] := gCre;
+    FGradCim.FData[d] := gCim;
+    FGradD.FData[d] := gD;
+  end;
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradNu.GetRawPtr(), -FLearningRate, Dn);
+  TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), FGradTheta.GetRawPtr(), -FLearningRate, Dn);
+  TNNetVolume.MulAdd(FNeurons[2].FDelta.GetRawPtr(), FGradB.GetRawPtr(), -FLearningRate, Dn);
+  TNNetVolume.MulAdd(FNeurons[3].FDelta.GetRawPtr(), FGradCre.GetRawPtr(), -FLearningRate, Dn);
+  TNNetVolume.MulAdd(FNeurons[4].FDelta.GetRawPtr(), FGradCim.GetRawPtr(), -FLearningRate, Dn);
+  TNNetVolume.MulAdd(FNeurons[5].FDelta.GetRawPtr(), FGradD.GetRawPtr(), -FLearningRate, Dn);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    FNeurons[2].UpdateWeights(FInertia);
+    FNeurons[3].UpdateWeights(FInertia);
+    FNeurons[4].UpdateWeights(FInertia);
+    FNeurons[5].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetLRU.InitDefault();
+const
+  // |lambda| = exp(-exp(nu)) = 0.9 -> exp(nu)=-ln(0.9)=0.10536 -> nu=ln(0.10536).
+  cNuInit = -2.24946162;     // |lambda| ~= 0.9 (long memory)
+  // angle = exp(theta) = 0.1 -> theta = ln(0.1).
+  cThetaInit = -2.30258509;  // small rotation rate ~0.1 rad/step
+begin
+  if FNeurons.Count < 6 then AddMissingNeurons(6);
+  FNeurons[0].FWeights.Fill(cNuInit);    // nu     -> |lambda| ~= 0.9
+  FNeurons[1].FWeights.Fill(cThetaInit); // theta  -> angle ~= 0.1
+  FNeurons[2].FWeights.Fill(1);          // B = 1
+  FNeurons[3].FWeights.Fill(1);          // Cre = 1
+  FNeurons[4].FWeights.Fill(0);          // Cim = 0
+  FNeurons[5].FWeights.Fill(0);          // D = 0
   AfterWeightUpdate();
 end;
 
@@ -77559,6 +77883,7 @@ begin
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
+      'TNNetLRU':                   Result := TNNetLRU.Create();
       'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0], St[1] = 1);
       'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
       'TNNetInvertible1x1Conv':     Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]);
@@ -77925,6 +78250,7 @@ begin
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
+      if S[0] = 'TNNetLRU' then Result := TNNetLRU.Create() else
       if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0], St[1] = 1) else
       if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetInvertible1x1Conv' then Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]) else
