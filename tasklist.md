@@ -481,6 +481,21 @@ rather than acted on.
       mostly POSITIONAL on the test seed rather than a sharp hard-vs-easy content
       split — design a next-token task where the triage provably tracks "hard"
       tokens to make the interpretability headline land.
+- [ ] TNNet.AddExpertChoiceMixtureOfExperts builder — Expert-Choice routing
+      (Zhou et al. 2022, "Mixture-of-Experts with Expert Choice Routing"), the
+      TRANSPOSE of the existing token-choice MoE family. Instead of each token
+      picking its top-k experts (AddMixtureOfExperts dense / AddTopKMixtureOfExperts
+      hard top-k, both LANDED), each EXPERT picks its top-Capacity tokens from the
+      gate score matrix — so load balance is GUARANTEED by construction and no
+      Switch-style aux loss (TNNetLoadBalanceLoss) is required, and a token may be
+      processed by 0, 1, or several experts. Reuse the existing per-expert MLP
+      composition and TNNetTopKGate machinery, but build the mask along the TOKEN
+      axis per expert (capacity factor C = NumTokens * cap / NumExperts) rather
+      than along the expert axis per token. Distinct routing DIRECTION, not a
+      near-duplicate of the landed routers. Ships with examples/ExpertChoiceMoE/
+      contrasting expert-choice vs token-choice top-k load balance (per-expert
+      token counts) at matched capacity, plus a gradient-check confirming the
+      transposed top-k subgradient. Pairs with [[topk-moe-routing]].
 #### Normalization primitives
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
       projection* (renormalize the previous layer's weights after each update,
