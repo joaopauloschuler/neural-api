@@ -72,6 +72,35 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetGatedLinearAttention — Gated Linear Attention (Yang et al. 2023,
+      "Gated Linear Attention Transformers with Hardware-Efficient Training",
+      arXiv:2312.06635). A matrix-valued associative memory state S (d_k x d_v)
+      updated by a DATA-DEPENDENT PER-CHANNEL (vector) diagonal forget gate:
+        alpha_t = sigmoid(W_a x_t)            (d_k forget gates, one per key channel)
+        S_t     = Diag(alpha_t) S_{t-1} + k_t v_t^T
+        o_t     = q_t^T S_t                   (read-out), causal left-to-right scan.
+      Why this is NOT a near-duplicate of the existing linear-attention family
+      (the lucky-day anti-repetition rule): TNNetWKV/RWKV-4 uses a FIXED-LEARNED
+      per-channel decay (not input-dependent); TNNetRetention uses a single
+      (learnable) SCALAR gamma; TNNetMLSTMCell's covariance memory uses SCALAR
+      exp input/forget gates with a running-max normalizer; TNNetDeltaNet has a
+      scalar beta WRITE gate but NO multiplicative forget on the state;
+      TNNetSelectiveSSM (Mamba) gates a DIAGONAL (vector-state) recurrence, not a
+      full outer-product MATRIX memory. GLA is the only member with a
+      data-dependent VECTOR forget gate acting on a 2-D outer-product state — the
+      mechanism modern Gated-DeltaNet / Mamba-2 / RWKV-6 build on. Scope: leaf
+      layer subclassing TNNetLayer (shape-preserving over the time axis like
+      DeltaNet/WKV — output shape == input shape, SizeY=1 sequence), three small
+      random projections q/k/v + the gate projection W_a, optional L2-normalized
+      keys (reuse the DeltaNet idiom), exact dL/dS coupled forward+backward BPTT
+      scans (follow [[mlstm-cell-layer]] which propagates exact dL/dm_t, and
+      [[deltanet-layer]] / [[ntm-memory-layer]] for the editable-state adjoint),
+      FStruct-serialized d_k/d_v, numerical-gradient (input + all four weight
+      sets) + LoadFromString round-trip tests, and an examples/GatedLinearAttention/
+      associative-recall demo contrasting it head-to-head with the landed DeltaNet
+      and RWKV recall demos (same toy, three arms). Mark the chunked/parallel
+      secondary-chunk forward as an explicit follow-up (mirrors the open
+      DeltaNet/WKV chunked-scan tasks) so v1 ships the exact per-token scan first.
 - [ ] TNNetKANConv follow-ups (the convolutional Kolmogorov-Arnold layer LANDED
       2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:
       sum of learned univariate Chebyshev edge functions per receptive-field patch,
