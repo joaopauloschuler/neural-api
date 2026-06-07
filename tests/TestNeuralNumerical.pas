@@ -169,6 +169,11 @@ type
     procedure TestHyperbolicDistanceGradientCheck;
     procedure TestHyperbolicDistanceShape;
     procedure TestHyperbolicDistanceSerializationRoundTrip;
+    // TNNetComplexLinear 2D hypercomplex dense layer
+    procedure TestComplexForwardReference;
+    procedure TestComplexLinearGradientCheck;
+    procedure TestComplexLinearShape;
+    procedure TestComplexLinearSerializationRoundTrip;
     // TNNetQuaternionLinear hypercomplex dense layer
     procedure TestQuaternionLinearGradientCheck;
     procedure TestQuaternionLinearSerializationRoundTrip;
@@ -243,6 +248,11 @@ type
     procedure TestRandomFourierFeaturesWeightGradientCheck;
     procedure TestRandomFourierFeaturesKernelApproximation;
     procedure TestRandomFourierFeaturesSerializationRoundTrip;
+    // TNNetComplexConv 2D hypercomplex convolution layer
+    procedure TestComplexConvForwardReference;
+    procedure TestComplexConvGradientCheck;
+    procedure TestComplexConvShape;
+    procedure TestComplexConvSerializationRoundTrip;
     // TNNetOctonionConv 8D hypercomplex convolution layer
     procedure TestOctonionConvGradientCheck;
     procedure TestOctonionConvSerializationRoundTrip;
@@ -37448,6 +37458,266 @@ begin
   for i := 0 to 3 do y[i+4] := da[i] + bcc[i];              // d a + b c*
 end;
 
+procedure TTestNeuralNumerical.TestComplexForwardReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CL: TNNetComplexLinear;
+  a, b, re, im, refRe, refIm, refNorm, outNorm, maxDiff: TNeuralFloat;
+  trial: integer;
+begin
+  // Proves the hard-coded 2x2 complex multiply block equals the true complex
+  // product w.X (w=a+bi, X=re+im*i): Re'=a*re-b*im, Im'=a*im+b*re, and that the
+  // layer is norm-multiplicative |w.X| = |w|.|X| (true for the complex algebra).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2);
+  maxDiff := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+    CL := TNNetComplexLinear.Create(2, {SuppressBias}1); // InC=OutC=1, no bias
+    NN.AddLayer(CL);
+    for trial := 0 to 19 do
+    begin
+      a  := (Random - 0.5) * 2.0;
+      b  := (Random - 0.5) * 2.0;
+      re := (Random - 0.5) * 2.0;
+      im := (Random - 0.5) * 2.0;
+      CL.Neurons[0].Weights.Raw[0] := a;
+      CL.Neurons[0].Weights.Raw[1] := b;
+      Input.Raw[0] := re;
+      Input.Raw[1] := im;
+      NN.Compute(Input);
+
+      refRe := a * re - b * im;
+      refIm := a * im + b * re;
+      maxDiff := Max(maxDiff, Abs(NN.GetLastLayer.Output.Raw[0] - refRe));
+      maxDiff := Max(maxDiff, Abs(NN.GetLastLayer.Output.Raw[1] - refIm));
+
+      refNorm := Sqrt(a*a + b*b) * Sqrt(re*re + im*im);
+      outNorm := Sqrt(Sqr(NN.GetLastLayer.Output.Raw[0]) +
+                      Sqr(NN.GetLastLayer.Output.Raw[1]));
+      AssertTrue('Complex norm multiplicativity trial ' + IntToStr(trial) +
+        ' (|w.X|=' + FloatToStr(outNorm) + ' |w||X|=' + FloatToStr(refNorm) + ')',
+        Abs(outNorm - refNorm) < 1e-4);
+    end;
+    AssertTrue('ComplexLinear forward matches complex product (maxDiff=' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestComplexLinearShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CL: TNNetComplexLinear;
+begin
+  // OutC*2 block-row weight neurons (each InC*2 weights) + 1 bias neuron, and an
+  // output of length OutSize.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6); // InC = 3
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    CL := TNNetComplexLinear.Create(8); // OutC = 4
+    NN.AddLayer(CL);
+    NN.Compute(Input);
+    AssertEquals('ComplexLinear InComplex', 3, CL.InComplex);
+    AssertEquals('ComplexLinear OutComplex', 4, CL.OutComplex);
+    AssertEquals('ComplexLinear output size', 8, CL.Output.Size);
+    AssertEquals('ComplexLinear neuron count (OutC + bias)', 5, CL.Neurons.Count);
+    AssertEquals('ComplexLinear block-row weight count', 6, CL.Neurons[0].Weights.Size);
+    AssertEquals('ComplexLinear bias neuron length', 8, CL.Neurons[4].Weights.Size);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestComplexLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  CL: TNNetComplexLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, oc, InC, OutC, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    p: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for p := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[p] - Desired.Raw[p];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT, the two real weight
+  // components per complex block, AND the per-output bias. A sign error in the
+  // 2x2 complex layout shows up here. Magnitudes are bounded to keep FD
+  // truncation small -- do NOT loosen the tolerance.
+  RandSeed := 424242;
+  InC := 2;  OutC := 2;
+  InSize := InC * 2;  OutSize := OutC * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  InputPlus := TNNetVolume.Create(1, 1, InSize);
+  Desired := TNNetVolume.Create(1, 1, OutSize);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    CL := TNNetComplexLinear.Create(OutSize);
+    NN.AddLayer(CL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+    for oc := 0 to OutC - 1 do
+      for i := 0 to InSize - 1 do
+        CL.Neurons[oc].Weights.Raw[i] := 0.15 - 0.03 * i + 0.2 * Sin(i * 1.1 + oc);
+    for i := 0 to OutSize - 1 do
+      CL.Neurons[OutC].Weights.Raw[i] := 0.03 * (i - 1); // bias
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('ComplexLinear input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. each block-row's complex weight components ----
+    for oc := 0 to OutC - 1 do
+      for i := 0 to InSize - 1 do
+      begin
+        CL.Neurons[oc].Weights.Raw[i] := CL.Neurons[oc].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        CL.Neurons[oc].Weights.Raw[i] := CL.Neurons[oc].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        CL.Neurons[oc].Weights.Raw[i] := CL.Neurons[oc].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        CL.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -CL.Neurons[oc].Delta.Raw[i];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+        AssertTrue('ComplexLinear weight gradient check oc=' + IntToStr(oc) +
+          ' c=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the per-output bias (bias neuron = OutC) ----
+    for i := 0 to OutSize - 1 do
+    begin
+      CL.Neurons[OutC].Weights.Raw[i] := CL.Neurons[OutC].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      CL.Neurons[OutC].Weights.Raw[i] := CL.Neurons[OutC].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      CL.Neurons[OutC].Weights.Raw[i] := CL.Neurons[OutC].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      CL.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -CL.Neurons[OutC].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('ComplexLinear bias gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ComplexLinear gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestComplexLinearSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  CL: TNNetComplexLinear;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, oc, InC, OutC, InSize, OutSize: integer;
+begin
+  // ComplexLinear in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match.
+  RandSeed := 424242;
+  InC := 3;  OutC := 2;
+  InSize := InC * 2;  OutSize := OutC * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    CL := TNNetComplexLinear.Create(OutSize);
+    NN.AddLayer(CL);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    for oc := 0 to OutC - 1 do
+      for i := 0 to InSize - 1 do
+        CL.Neurons[oc].Weights.Raw[i] := 0.07 * (i + 1) - 0.3 + 0.1 * oc;
+    for i := 0 to OutSize - 1 do
+      CL.Neurons[OutC].Weights.Raw[i] := 0.04 - 0.02 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ComplexLinear SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('ComplexLinear token present in serialized string',
+        Pos('TNNetComplexLinear', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ComplexLinear Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestOctonionNormMultiplicativity;
 var
   NN: TNNet;
@@ -41238,6 +41508,80 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestComplexConvForwardReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CC: TNNetComplexConv;
+  a, b, re, im, refRe, refIm, maxDiff: TNeuralFloat;
+  trial: integer;
+begin
+  // 1x1 complex conv on a 1x1x2 input is just the complex product w.X; verify
+  // the conv forward matches Re'=a*re-b*im, Im'=a*im+b*re.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2);
+  maxDiff := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+    CC := TNNetComplexConv.Create(2, {kernel}1, {padding}0, {stride}1, {SuppressBias}1);
+    NN.AddLayer(CC);
+    for trial := 0 to 19 do
+    begin
+      a  := (Random - 0.5) * 2.0;
+      b  := (Random - 0.5) * 2.0;
+      re := (Random - 0.5) * 2.0;
+      im := (Random - 0.5) * 2.0;
+      CC.Neurons[0].Weights.Raw[0] := a;
+      CC.Neurons[0].Weights.Raw[1] := b;
+      Input.Raw[0] := re;
+      Input.Raw[1] := im;
+      NN.Compute(Input);
+
+      refRe := a * re - b * im;
+      refIm := a * im + b * re;
+      maxDiff := Max(maxDiff, Abs(NN.GetLastLayer.Output.Raw[0] - refRe));
+      maxDiff := Max(maxDiff, Abs(NN.GetLastLayer.Output.Raw[1] - refIm));
+    end;
+    AssertTrue('ComplexConv forward matches complex product (maxDiff=' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestComplexConvShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CC: TNNetComplexConv;
+begin
+  // 8x8x4 (InC=2) input, 6 features (OutC=3), kernel 3, padding 1, stride 1 ->
+  // 8x8x6 output; OutC block-row neurons + 1 bias neuron.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    CC := TNNetComplexConv.Create(6, {kernel}3, {padding}1, {stride}1);
+    NN.AddLayer(CC);
+    NN.Compute(Input);
+    AssertEquals('ComplexConv InComplex', 2, CC.InComplex);
+    AssertEquals('ComplexConv OutComplex', 3, CC.OutComplex);
+    AssertEquals('ComplexConv output SizeX', 8, CC.Output.SizeX);
+    AssertEquals('ComplexConv output SizeY', 8, CC.Output.SizeY);
+    AssertEquals('ComplexConv output Depth', 6, CC.Output.Depth);
+    AssertEquals('ComplexConv neuron count (OutC + bias)', 4, CC.Neurons.Count);
+    // FeatureX*FeatureY*InC*2 = 3*3*2*2 = 36 weights per block-row.
+    AssertEquals('ComplexConv block-row weight count', 36, CC.Neurons[0].Weights.Size);
+    AssertEquals('ComplexConv bias neuron length', 6, CC.Neurons[3].Weights.Size);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestOctonionConvGradientCheck;
 var
   NN: TNNet;
@@ -41420,6 +41764,190 @@ begin
         Pos('TNNetOctonionConv', Saved) > 0);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('OctonionConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestComplexConvGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  CC: TNNetComplexConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, oc, InC, OutC, InDepth, OutDepth, taps, SizeX, SizeY, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    p: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for p := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[p] - Desired.Raw[p];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for the INPUT, the two real weight
+  // components of every complex tap (across the kernel window AND input complex
+  // groups), AND the per-output bias, for a strided + padded complex conv.
+  // Weights are BOUNDED (not loosened tolerance) to keep FD truncation small.
+  RandSeed := 424242;
+  SizeX := 3;  SizeY := 3;
+  InC := 2;  OutC := 2;
+  InDepth := InC * 2;  OutDepth := OutC * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  InputPlus := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+    CC := TNNetComplexConv.Create(OutDepth, {kernel}2, {padding}1, {stride}2);
+    NN.AddLayer(CC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Sin(i * 0.7) * 0.6 + 0.1) * 0.4;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.5 * 0.4;
+
+    taps := CC.Neurons[0].Weights.Size; // FeatureX*FeatureY*InC*2
+    for oc := 0 to OutC - 1 do
+      for i := 0 to taps - 1 do
+        CC.Neurons[oc].Weights.Raw[i] := (0.2 + 0.15 * Sin(i * 1.1 + oc) - 0.1 * Cos(i * 0.4 + 2 * oc)) * 0.5;
+    for i := 0 to OutDepth - 1 do
+      CC.Neurons[OutC].Weights.Raw[i] := 0.02 * (i - 1); // bias
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('ComplexConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. each block-row's complex weight components ----
+    for oc := 0 to OutC - 1 do
+      for i := 0 to taps - 1 do
+      begin
+        CC.Neurons[oc].Weights.Raw[i] := CC.Neurons[oc].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        CC.Neurons[oc].Weights.Raw[i] := CC.Neurons[oc].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        CC.Neurons[oc].Weights.Raw[i] := CC.Neurons[oc].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        CC.ClearDeltas;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -CC.Neurons[oc].Delta.Raw[i];
+
+        AssertTrue('ComplexConv weight gradient check oc=' + IntToStr(oc) +
+          ' c=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Gradient w.r.t. the per-output bias (bias neuron = OutC) ----
+    for i := 0 to OutDepth - 1 do
+    begin
+      CC.Neurons[OutC].Weights.Raw[i] := CC.Neurons[OutC].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      CC.Neurons[OutC].Weights.Raw[i] := CC.Neurons[OutC].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      CC.Neurons[OutC].Weights.Raw[i] := CC.Neurons[OutC].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      CC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -CC.Neurons[OutC].Delta.Raw[i];
+
+      AssertTrue('ComplexConv bias gradient check at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestComplexConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  CC: TNNetComplexConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, oc, InC, OutC, InDepth, OutDepth, taps, SizeX, SizeY: integer;
+begin
+  // ComplexConv in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match.
+  RandSeed := 424242;
+  SizeX := 4;  SizeY := 4;
+  InC := 2;  OutC := 3;
+  InDepth := InC * 2;  OutDepth := OutC * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+    CC := TNNetComplexConv.Create(OutDepth, {kernel}3, {padding}1, {stride}1);
+    NN.AddLayer(CC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    taps := CC.Neurons[0].Weights.Size;
+    for oc := 0 to OutC - 1 do
+      for i := 0 to taps - 1 do
+        CC.Neurons[oc].Weights.Raw[i] := 0.13 * (i + 1) - 0.3 + 0.1 * oc;
+    for i := 0 to OutDepth - 1 do
+      CC.Neurons[OutC].Weights.Raw[i] := 0.04 - 0.02 * i;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ComplexConv SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('ComplexConv token present in serialized string',
+        Pos('TNNetComplexConv', Saved) > 0);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ComplexConv Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

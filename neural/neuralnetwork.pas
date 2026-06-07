@@ -5734,6 +5734,45 @@ type
     property OutQuaternions: integer read FOutQuaternions;
   end;
 
+  /// 2-DIMENSIONAL HYPERCOMPLEX (complex) DENSE layer -- the simplest base rung
+  /// of the same Cayley-Dickson ladder as TNNetQuaternionLinear (4D) and
+  /// TNNetOctonionLinear (8D). It reinterprets the input/output Depth (both
+  /// multiples of 2) as packed COMPLEX numbers (group g holds Re=chan[2g],
+  /// Im=chan[2g+1]) and learns an (OutC x InC) grid of complex-valued weights,
+  /// where each learned complex w = a + b i drives a whole 2x2 real block via the
+  /// complex product w . x = M(w) * x, so ONE complex's 2 reals control 4 matrix
+  /// entries, giving ~1/2 the parameters of a dense layer of the same real width
+  /// while still mixing the real and imaginary parts of every input complex.
+  ///
+  /// The 2x2 block M(w) acting on input complex X = (Re,Im) is
+  ///   Re' = a*Re - b*Im,  Im' = a*Im + b*Re,
+  /// i.e. M(w) = [[a,-b],[b,a]]. Written in the SAME table form used by the
+  /// octonion layer, M(w)[i][j] = CPX_SGN[i][j] * w[CPX_SRC[i][j]] with
+  /// CPX_SRC[i][j] = i XOR j and CPX_SGN = ((1,-1),(1,1)).
+  ///
+  /// Neuron layout mirrors TNNetQuaternionLinear: OutC block-row weight neurons
+  /// (each holding InC*2 shared reals) plus ONE bias neuron (length OutSize).
+  /// Out round-trips via FStruct[0]; SuppressBias via FStruct[3] -- identical
+  /// dispatch shape to TNNetQuaternionLinear, wired through Create(St[0], St[3]).
+  // Coded by Claude (AI).
+  TNNetComplexLinear = class(TNNetFullConnectLinear)
+  private
+    FInComplex: integer;   // InC = input Depth / 2
+    FOutComplex: integer;  // OutC = output Depth / 2
+    procedure ComputePreviousLayerErrorCPU(); override;
+  public
+    constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure ComputeCPU(); override;
+    procedure Backpropagate(); override;
+    procedure BackpropagateCPU(); override;
+    procedure InitDefault(); override;
+    property InComplex: integer read FInComplex;
+    property OutComplex: integer read FOutComplex;
+  end;
+
   // EXACTLY-ORTHOGONAL dense (linear) layer. The n x n weight is parameterized
   // as a product of K Householder reflections
   //     Q = H_1 * H_2 * ... * H_K,   H_i = I - 2 * (v_i v_i^T) / (v_i^T v_i),
@@ -6641,6 +6680,49 @@ type
     procedure InitDefault(); override;
     property InOctonions: integer read FInOctonions;
     property OutOctonions: integer read FOutOctonions;
+  end;
+
+  /// COMPLEX CONVOLUTION layer -- the spatial sibling of the dense
+  /// TNNetComplexLinear and the 2D base rung of the same Cayley-Dickson family as
+  /// TNNetQuaternionConv (4D) and TNNetOctonionConv (8D). The two channel
+  /// components of every 2-channel input patch are treated as a complex number
+  /// Re + Im i, and each filter tap is a LEARNED complex w = a + b i applied by
+  /// the complex product w . X = M(w) * X, accumulated over the kernel window and
+  /// the input complex groups. Because two real channels are coupled by only two
+  /// shared weights (instead of the 2x2=4 of a real conv of equal width), the
+  /// layer carries ~1/2 of the weights of a real convolution of the same
+  /// input/output width while still mixing the real and imaginary parts.
+  ///
+  /// Both the input Depth AND the filter (feature) count must be multiples of 2.
+  /// With InC = inputDepth/2 input complex groups and OutC = features/2 output
+  /// complex groups, output channel block oc is
+  ///   y_oc(ox,oy) = bias_oc + sum_{fx,fy} sum_ic M(w_{oc,fx,fy,ic}) * x_ic(...)
+  /// where the two weights per (oc,fx,fy,ic) tap are stored contiguously (a,b)
+  /// inside block-row neuron oc. A separate bias neuron holds one bias per output
+  /// channel. The forward complex kernel, the input-gradient transpose M(w)^T,
+  /// and the two weight-component gradients reuse the SAME gradient-checked 2x2
+  /// CPX_SGN / CPX_SRC tables as TNNetComplexLinear, evaluated once per spatial
+  /// tap. Padding/stride follow the usual convolution semantics; out-of-range
+  /// (padded) input positions contribute zero. FStruct[0..4] carry the usual
+  /// convolution parameters (features, kernel size, padding, stride,
+  /// suppress-bias) so the layer round-trips through SaveStructureToString /
+  /// LoadFromString / CreateLayer.
+  // Coded by Claude (AI).
+  TNNetComplexConv = class(TNNetConvolutionLinear)
+  private
+    FInComplex: integer;   // InC = input Depth / 2
+    FOutComplex: integer;  // OutC = output Depth / 2
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+    procedure ComputePreviousLayerErrorCPU();
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    property InComplex: integer read FInComplex;
+    property OutComplex: integer read FOutComplex;
   end;
 
   /// 8-DIMENSIONAL HYPERCOMPLEX (octonion / Cayley-Dickson) DENSE layer.
@@ -36954,6 +37036,262 @@ begin
   end;
 end;
 
+{ TNNetComplexLinear }
+
+// Complex multiplication table, the 2-D base rung of the same Cayley-Dickson
+// ladder as the octonion table below. For weight complex w = a + b i and input
+// complex X = (Re,Im), the product w . X = M(w) * X with
+//   M(w)[i][j] = CPX_SGN[i][j] * w[ CPX_SRC[i][j] ],  CPX_SRC[i][j] = i XOR j.
+// SRC index table (= i xor j):     SGN sign table:
+//   (0 1)                            ( 1 -1)
+//   (1 0)                            ( 1  1)
+// giving M(w) = [[a,-b],[b,a]], i.e. Re' = a*Re - b*Im, Im' = a*Im + b*Re.
+// Forward uses M, the input gradient uses M^T (same tables, transposed indexing),
+// and the weight gradient scatters CPX_SGN[i][j]*X[j]*E[i] into component
+// CPX_SRC[i][j].
+const
+  CPX_SRC: array[0..1, 0..1] of integer =
+  (
+    (0, 1),
+    (1, 0)
+  );
+  CPX_SGN: array[0..1, 0..1] of TNeuralFloat =
+  (
+    ( 1, -1),
+    ( 1,  1)
+  );
+
+constructor TNNetComplexLinear.Create(pSizeX, pSizeY, pDepth: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
+  // The base FullConnect constructor added FOutput.Size neurons. The complex
+  // layer keeps OutC block-row neurons plus ONE bias neuron (set up in
+  // SetPrevLayer once OutC is known). Trim to a single neuron for now.
+  while FNeurons.Count > 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+  BuildArrNeurons();
+end;
+
+constructor TNNetComplexLinear.Create(pSize: integer; pSuppressBias: integer = 0);
+begin
+  Self.Create(pSize, 1, 1, pSuppressBias);
+end;
+
+procedure TNNetComplexLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  InSize, OutSize, Cnt: integer;
+begin
+  // Bypass TNNetFullConnect.SetPrevLayer (which resizes EVERY neuron to the
+  // input size for FOutput.Size neurons). We keep OutC block-row neurons (each
+  // InC*2 weights) plus one bias neuron (length OutSize).
+  FPrevLayer := pPrevLayer;
+  InSize := pPrevLayer.Output.Size;
+  OutSize := FOutput.Size;
+  if (InSize mod 2 <> 0) or (OutSize mod 2 <> 0) then
+  begin
+    FErrorProc
+    (
+      'TNNetComplexLinear requires input and output Depth to be multiples '+
+      'of 2: input '+IntToStr(InSize)+', output '+IntToStr(OutSize)+'.'
+    );
+  end;
+  FInComplex := InSize div 2;
+  FOutComplex := OutSize div 2;
+
+  // OutC weight neurons + 1 bias neuron.
+  while FNeurons.Count > FOutComplex + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FOutComplex + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  // Each block-row neuron holds InC*2 weights (2 reals per (oc,ic) complex).
+  for Cnt := 0 to FOutComplex - 1 do
+  begin
+    FNeurons[Cnt].Weights.ReSize(FInComplex * 2, 1, 1);
+    FNeurons[Cnt].BackInertia.ReSize(FInComplex * 2, 1, 1);
+    FNeurons[Cnt].Delta.ReSize(FInComplex * 2, 1, 1);
+  end;
+  // Bias neuron: one bias per output channel.
+  FNeurons[FOutComplex].Weights.ReSize(OutSize, 1, 1);
+  FNeurons[FOutComplex].BackInertia.ReSize(OutSize, 1, 1);
+  FNeurons[FOutComplex].Delta.ReSize(OutSize, 1, 1);
+
+  FVectorSize := FNeurons[0].Weights.Size;
+  BuildArrNeurons();  // FArrNeurons must match the new neuron count before InitDefault
+  InitDefault();
+  FNeurons[FOutComplex].Weights.Fill(0);  // bias starts at 0
+  for Cnt := 0 to FOutComplex do
+    FNeurons[Cnt].FBiasWeight := 0;
+  AfterWeightUpdate();
+end;
+
+// Each block starts near a scaled identity: real part a gets a small random
+// value, the imaginary part b a smaller one, so an untrained block is close to
+// a shrunken scalar multiple of the identity rather than an arbitrary mix.
+procedure TNNetComplexLinear.InitDefault();
+var
+  oc, ic, base: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FOutComplex <= 0 then exit;
+  scale := Sqrt(2.0 / (FInComplex * 2 + 1));
+  for oc := 0 to FOutComplex - 1 do
+  begin
+    W := FArrNeurons[oc].FWeights;
+    for ic := 0 to FInComplex - 1 do
+    begin
+      base := ic * 2;
+      W.FData[base + 0] := scale * (Random - 0.5) * 2;          // real part a
+      W.FData[base + 1] := scale * (Random - 0.5) * 2 * 0.25;   // imaginary part b
+    end;
+  end;
+end;
+
+procedure TNNetComplexLinear.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: y_oc = bias_oc + sum_ic M(w_{oc,ic}) * x_ic, where
+//   y[i] = sum_j CPX_SGN[i][j] * W[CPX_SRC[i][j]] * x[j].
+procedure TNNetComplexLinear.ComputeCPU();
+var
+  oc, ic, wBase, oBase, iBase, i, j: integer;
+  acc: TNeuralFloat;
+  W, PrevOut, Bias: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FOutComplex].FWeights;
+  for oc := 0 to FOutComplex - 1 do
+  begin
+    W := FArrNeurons[oc].FWeights;
+    oBase := oc * 2;
+    for i := 0 to 1 do
+    begin
+      acc := 0;
+      for ic := 0 to FInComplex - 1 do
+      begin
+        wBase := ic * 2;
+        iBase := ic * 2;
+        for j := 0 to 1 do
+          acc := acc + CPX_SGN[i, j] * W.FData[wBase + CPX_SRC[i, j]]
+                       * PrevOut.FData[iBase + j];
+      end;
+      if FSuppressBias = 0 then
+        FOutput.FData[oBase + i] := acc + Bias.FData[oBase + i]
+      else
+        FOutput.FData[oBase + i] := acc;
+    end;
+  end;
+end;
+
+procedure TNNetComplexLinear.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerError();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Input gradient: dL/dx_ic += M(w_{oc,ic})^T * dy_oc, summed over oc, i.e.
+//   dL/dx[j] += sum_i CPX_SGN[i][j] * W[CPX_SRC[i][j]] * e[i].
+procedure TNNetComplexLinear.ComputePreviousLayerErrorCPU();
+var
+  oc, ic, wBase, oBase, iBase, i, j: integer;
+  e: array[0..1] of TNeuralFloat;
+  allZero: boolean;
+  contrib: TNeuralFloat;
+  W, LocalPrevError: TNNetVolume;
+begin
+  LocalPrevError := FPrevLayer.OutputError;
+  for oc := 0 to FOutComplex - 1 do
+  begin
+    W := FArrNeurons[oc].FWeights;
+    oBase := oc * 2;
+    allZero := True;
+    for i := 0 to 1 do
+    begin
+      e[i] := FOutputError.FData[oBase + i];
+      if e[i] <> 0 then allZero := False;
+    end;
+    if allZero then continue;
+    for ic := 0 to FInComplex - 1 do
+    begin
+      wBase := ic * 2;
+      iBase := ic * 2;
+      for j := 0 to 1 do
+      begin
+        contrib := 0;
+        for i := 0 to 1 do
+          contrib := contrib + CPX_SGN[i, j] * W.FData[wBase + CPX_SRC[i, j]] * e[i];
+        LocalPrevError.FData[iBase + j] := LocalPrevError.FData[iBase + j] + contrib;
+      end;
+    end;
+  end;
+end;
+
+// Weight gradient (per block-row neuron) and bias gradient, accumulated into the
+// neurons' Delta scaled by -LearningRate (so the ordinary update applies):
+//   dL/dW[CPX_SRC[i][j]] += CPX_SGN[i][j] * x[j] * e[i].
+procedure TNNetComplexLinear.BackpropagateCPU();
+var
+  oc, ic, wBase, oBase, iBase, i, j: integer;
+  e: array[0..1] of TNeuralFloat;
+  allZero: boolean;
+  WDelta, BiasDelta, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  BiasDelta := FArrNeurons[FOutComplex].FDelta;
+  for oc := 0 to FOutComplex - 1 do
+  begin
+    WDelta := FArrNeurons[oc].FDelta;
+    oBase := oc * 2;
+    allZero := True;
+    for i := 0 to 1 do
+    begin
+      e[i] := -FLearningRate * FOutputError.FData[oBase + i];
+      if e[i] <> 0 then allZero := False;
+    end;
+    if FSuppressBias = 0 then
+      for i := 0 to 1 do
+        BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
+    if allZero then continue;
+    for ic := 0 to FInComplex - 1 do
+    begin
+      wBase := ic * 2;
+      iBase := ic * 2;
+      for i := 0 to 1 do
+        for j := 0 to 1 do
+          WDelta.FData[wBase + CPX_SRC[i, j]] :=
+            WDelta.FData[wBase + CPX_SRC[i, j]]
+            + CPX_SGN[i, j] * PrevOut.FData[iBase + j] * e[i];
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for oc := 0 to FOutComplex do
+      FArrNeurons[oc].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
 { TNNetOctonionLinear }
 
 // Octonion multiplication table, derived from the Cayley-Dickson doubling of
@@ -41757,6 +42095,308 @@ begin
   begin
     for oq := 0 to FOutQuaternions do
       FArrNeurons[oq].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+end;
+
+{ TNNetComplexConv }
+
+// Reuses the CPX_SGN / CPX_SRC tables declared in the TNNetComplexLinear
+// implementation block above. For weight complex w = a + b i and input complex
+// X, w . X = M(w) * X with
+//   y[i] = sum_j CPX_SGN[i][j] * W[CPX_SRC[i][j]] * x[j].
+
+constructor TNNetComplexConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  // Identity activation is already set by TNNetConvolutionLinear. The real
+  // neuron layout (OutC block-row neurons + 1 bias neuron) is fixed in
+  // SetPrevLayer once the input Depth (hence InC) is known.
+end;
+
+procedure TNNetComplexConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  InDepth, OutDepth, oc, taps: integer;
+begin
+  InDepth := pPrevLayer.Output.Depth;
+  OutDepth := FNeurons.Count; // numFeatures requested in Create
+  if (InDepth mod 2 <> 0) or (OutDepth mod 2 <> 0) then
+  begin
+    FErrorProc
+    (
+      'TNNetComplexConv requires input Depth and feature count to be '+
+      'multiples of 2: input Depth '+IntToStr(InDepth)+', features '+
+      IntToStr(OutDepth)+'.'
+    );
+  end;
+  // Let the standard convolution machinery size FOutput / FOutputError /
+  // FOutputSizeX/Y / FFeatureSizeX/Y and the padded-error buffer. We then
+  // discard its full-feature neuron layout and install the compact complex
+  // block-row layout below.
+  inherited SetPrevLayer(pPrevLayer);
+
+  FInComplex := InDepth div 2;
+  FOutComplex := OutDepth div 2;
+  // Each block-row neuron oc holds (FeatureSizeX*FeatureSizeY*InC) complex
+  // taps of 2 reals each, laid out contiguously.
+  taps := FFeatureSizeX * FFeatureSizeY * FInComplex * 2;
+
+  while FNeurons.Count > FOutComplex + 1 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < FOutComplex + 1 do
+    FNeurons.Add(TNNetNeuron.Create());
+
+  for oc := 0 to FOutComplex - 1 do
+  begin
+    FNeurons[oc].Weights.ReSize(taps, 1, 1);
+    FNeurons[oc].BackInertia.ReSize(taps, 1, 1);
+    FNeurons[oc].Delta.ReSize(taps, 1, 1);
+  end;
+  // Bias neuron: one bias per output channel.
+  FNeurons[FOutComplex].Weights.ReSize(OutDepth, 1, 1);
+  FNeurons[FOutComplex].BackInertia.ReSize(OutDepth, 1, 1);
+  FNeurons[FOutComplex].Delta.ReSize(OutDepth, 1, 1);
+
+  FVectorSize := taps;
+  FShouldConcatWeights := false;
+  FShouldInterleaveWeights := false;
+  BuildArrNeurons();
+  InitDefault();
+  FNeurons[FOutComplex].Weights.Fill(0); // bias starts at 0
+  for oc := 0 to FOutComplex do
+    FNeurons[oc].FBiasWeight := 0;
+  RefreshCalculatePrevLayerError();
+  AfterWeightUpdate();
+end;
+
+// Each complex tap starts near a scaled identity: real part a gets a small
+// random value, the imaginary part b a smaller one, so an untrained tap is
+// close to a shrunken scalar multiple of the identity.
+procedure TNNetComplexConv.InitDefault();
+var
+  oc, t, base, numTaps: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FOutComplex <= 0 then exit;
+  numTaps := FFeatureSizeX * FFeatureSizeY * FInComplex;
+  scale := Sqrt(2.0 / (numTaps * 2 + 1));
+  for oc := 0 to FOutComplex - 1 do
+  begin
+    W := FArrNeurons[oc].FWeights;
+    for t := 0 to numTaps - 1 do
+    begin
+      base := t * 2;
+      W.FData[base + 0] := scale * (Random - 0.5) * 2;          // real part a
+      W.FData[base + 1] := scale * (Random - 0.5) * 2 * 0.25;   // imaginary part b
+    end;
+  end;
+end;
+
+procedure TNNetComplexConv.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: for each output position (ox,oy) and output complex block oc,
+//   y_oc = bias_oc + sum_{fx,fy} sum_ic M(w_{oc,fx,fy,ic}) * x_ic(prevX,prevY),
+// with y[i] = sum_j CPX_SGN[i][j] * W[CPX_SRC[i][j]] * x[j].
+// Padded (out-of-range) input positions contribute zero.
+procedure TNNetComplexConv.ComputeCPU();
+var
+  ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j: integer;
+  prevX, prevY: integer;
+  acc: TNeuralFloat;
+  x: array[0..1] of TNeuralFloat;
+  y: array[0..1] of TNeuralFloat;
+  W, PrevOut, Bias: TNNetVolume;
+  prevSizeX, prevSizeY: integer;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FOutComplex].FWeights;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for oc := 0 to FOutComplex - 1 do
+    begin
+      W := FArrNeurons[oc].FWeights;
+      for i := 0 to 1 do y[i] := 0;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ic := 0 to FInComplex - 1 do
+          begin
+            tapBase := ((fy * FFeatureSizeX + fx) * FInComplex + ic) * 2;
+            for j := 0 to 1 do
+              x[j] := PrevOut.Get(prevX, prevY, ic*2 + j);
+            for i := 0 to 1 do
+            begin
+              acc := 0;
+              for j := 0 to 1 do
+                acc := acc + CPX_SGN[i, j] * W.FData[tapBase + CPX_SRC[i, j]] * x[j];
+              y[i] := y[i] + acc;
+            end;
+          end;
+        end;
+      end;
+      oBase := oc * 2;
+      if FSuppressBias = 0 then
+        for i := 0 to 1 do
+          y[i] := y[i] + Bias.FData[oBase + i];
+      for i := 0 to 1 do
+        FOutput.FData[FOutput.GetRawPos(ox, oy, oBase + i)] := y[i];
+    end;
+  end;
+end;
+
+procedure TNNetComplexConv.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerErrorCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Input gradient: dL/dx_ic(prevX,prevY) += M(w_{oc,fx,fy,ic})^T * dy_oc(ox,oy),
+// summed over every output position / tap that reads that input position:
+//   dL/dx[j] += sum_i CPX_SGN[i][j] * W[CPX_SRC[i][j]] * e[i].
+procedure TNNetComplexConv.ComputePreviousLayerErrorCPU();
+var
+  ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j: integer;
+  prevX, prevY: integer;
+  e: array[0..1] of TNeuralFloat;
+  allZero: boolean;
+  contrib: TNeuralFloat;
+  W, LocalPrevError: TNNetVolume;
+  prevSizeX, prevSizeY: integer;
+begin
+  if not FCalculatePrevLayerError then exit;
+  LocalPrevError := FPrevLayer.OutputError;
+  prevSizeX := FPrevLayer.FOutput.SizeX;
+  prevSizeY := FPrevLayer.FOutput.SizeY;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for oc := 0 to FOutComplex - 1 do
+    begin
+      oBase := oc * 2;
+      allZero := True;
+      for i := 0 to 1 do
+      begin
+        e[i] := FOutputError.Get(ox, oy, oBase + i);
+        if e[i] <> 0 then allZero := False;
+      end;
+      if allZero then continue;
+      W := FArrNeurons[oc].FWeights;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ic := 0 to FInComplex - 1 do
+          begin
+            tapBase := ((fy * FFeatureSizeX + fx) * FInComplex + ic) * 2;
+            for j := 0 to 1 do
+            begin
+              contrib := 0;
+              for i := 0 to 1 do
+                contrib := contrib + CPX_SGN[i, j] * W.FData[tapBase + CPX_SRC[i, j]] * e[i];
+              LocalPrevError.Add(prevX, prevY, ic*2 + j, contrib);
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// Weight gradient (per block-row neuron) and bias gradient, accumulated into the
+// neurons' Delta scaled by -LearningRate (so the ordinary update applies):
+//   dL/dW[CPX_SRC[i][j]] += CPX_SGN[i][j] * x[j] * e[i].
+procedure TNNetComplexConv.BackpropagateCPU();
+var
+  ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j: integer;
+  prevX, prevY: integer;
+  x: array[0..1] of TNeuralFloat;
+  e: array[0..1] of TNeuralFloat;
+  allZero: boolean;
+  lr: TNeuralFloat;
+  WDelta, BiasDelta, PrevOut: TNNetVolume;
+  prevSizeX, prevSizeY: integer;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  BiasDelta := FArrNeurons[FOutComplex].FDelta;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  lr := -FLearningRate;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for oc := 0 to FOutComplex - 1 do
+    begin
+      oBase := oc * 2;
+      allZero := True;
+      for i := 0 to 1 do
+      begin
+        e[i] := lr * FOutputError.Get(ox, oy, oBase + i);
+        if e[i] <> 0 then allZero := False;
+      end;
+      if FSuppressBias = 0 then
+        for i := 0 to 1 do
+          BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
+      if allZero then continue;
+      WDelta := FArrNeurons[oc].FDelta;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ic := 0 to FInComplex - 1 do
+          begin
+            tapBase := ((fy * FFeatureSizeX + fx) * FInComplex + ic) * 2;
+            for j := 0 to 1 do
+              x[j] := PrevOut.Get(prevX, prevY, ic*2 + j);
+            for i := 0 to 1 do
+              for j := 0 to 1 do
+                WDelta.FData[tapBase + CPX_SRC[i, j]] :=
+                  WDelta.FData[tapBase + CPX_SRC[i, j]]
+                  + CPX_SGN[i, j] * x[j] * e[i];
+          end;
+        end;
+      end;
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for oc := 0 to FOutComplex do
+      FArrNeurons[oc].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
   end;
 end;
@@ -65913,6 +66553,7 @@ begin
       'TNNetFullConnectLinear' :    Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetComplexLinear' :        Result := TNNetComplexLinear.Create(St[0], St[3]);
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
@@ -65959,6 +66600,7 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetWeightStandardizationConv' : Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]);
@@ -66250,6 +66892,7 @@ begin
       if S[0] = 'TNNetFullConnectLinear' then Result := TNNetFullConnectLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetComplexLinear' then Result := TNNetComplexLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
@@ -66296,6 +66939,7 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetWeightStandardizationConv' then Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]) else
