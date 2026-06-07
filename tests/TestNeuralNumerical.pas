@@ -407,6 +407,10 @@ type
     procedure TestDeltaNetWeightGradientCheck;
     procedure TestDeltaNetSerializationRoundTrip;
     procedure TestDeltaNetRecallSmokeTrain;
+    procedure TestWKVShapeInference;
+    procedure TestWKVInputGradientCheck;
+    procedure TestWKVWeightGradientCheck;
+    procedure TestWKVSerializationRoundTrip;
     procedure TestNTMMemoryInputGradientCheck;
     procedure TestNTMMemoryWeightGradientCheck;
     procedure TestNTMMemorySerializationRoundTrip;
@@ -23154,6 +23158,204 @@ begin
     Input.Free;
     Desired.Free;
   end;
+end;
+
+// --- TNNetWKV (RWKV time-mixing weighted key-value recurrence) --------------
+
+procedure TTestNeuralNumerical.TestWKVShapeInference;
+var
+  NN: TNNet;
+  L: TNNetWKV;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    // Input depth = 2*C (k|v split); SeqLen=5, C=3 -> input depth 6.
+    NN.AddLayer(TNNetInput.Create(5, 1, 6, 1));
+    L := TNNetWKV.Create();
+    NN.AddLayer(L);
+    AssertEquals('WKV output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('WKV output SizeY', 1, L.Output.SizeY);
+    AssertEquals('WKV output Depth = C = InputDepth/2', 3, L.Output.Depth);
+    AssertEquals('WKV neuron count (w_raw,u)', 2, L.Neurons.Count);
+    AssertEquals('WKV w_raw size = C', 3, L.Neurons[0].Weights.Size);
+    AssertEquals('WKV u size = C', 3, L.Neurons[1].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWKVInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LW: TNNetWKV;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  // SeqLen=4, C=2 -> input depth 4 (k|v); output is C=2 channels (wkv).
+  Input := TNNetVolume.Create(4, 1, 4);
+  InputPlus := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    LW := TNNetWKV.Create();
+    NN.AddLayer(LW);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // BOUNDED k/v inputs so e^{k}, e^{u+k} stay well-conditioned and the central
+    // difference does not straddle a near-overflow region (FD truncation control).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    // Non-trivial per-channel w_raw / u so decay + bonus paths are exercised.
+    LW.Neurons[0].Weights.Raw[0] :=  0.4;  // w_raw -> w = softplus
+    LW.Neurons[0].Weights.Raw[1] := -0.3;
+    LW.Neurons[1].Weights.Raw[0] :=  0.5;  // u (bonus)
+    LW.Neurons[1].Weights.Raw[1] := -0.6;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('WKV input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('WKV input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWKVWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LW: TNNetWKV;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..1] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'w_raw';
+  Names[1] := 'u';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4, 1));
+    LW := TNNetWKV.Create();
+    NN.AddLayer(LW);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.55) * 0.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+
+    // BOUNDED raw params so softplus/exp stay in their smooth regions.
+    LW.Neurons[0].Weights.Raw[0] :=  0.4;  // w_raw
+    LW.Neurons[0].Weights.Raw[1] := -0.3;
+    LW.Neurons[1].Weights.Raw[0] :=  0.5;  // u
+    LW.Neurons[1].Weights.Raw[1] := -0.6;
+
+    for n := 0 to 1 do
+      for i := 0 to LW.Neurons[n].Weights.Size - 1 do
+      begin
+        LW.Neurons[n].Weights.Raw[i] := LW.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LW.Neurons[n].Weights.Raw[i] := LW.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LW.Neurons[n].Weights.Raw[i] := LW.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LW.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // With LearningRate = 1 and batch update on, analytical = -Delta.
+        analyticalGrad := -LW.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('WKV weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('WKV weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWKVSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // TNNetWKV stores two per-channel raw vectors (w_raw, u). a,b re-init per
+  // sweep (not persisted); FStruct[0]=C. Input depth must be 2*C=4 -> C=2.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetWKV.Create(), 'WKV', 4, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestKalmanFilterCellSerializationRoundTrip;

@@ -4868,6 +4868,64 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetWKV: the RWKV time-mixing WEIGHTED KEY-VALUE (WKV) recurrence (Peng et
+  // al. 2023, "RWKV: Reinventing RNNs for the Transformer Era",
+  // arXiv:2305.13048) as a first-class leaf layer. This is the softmax-free,
+  // linear-time "attention" core of RWKV: an EMA-style numerator/denominator pair
+  // that gives each past token an exponentially-decaying weight plus a special
+  // BONUS weight for the current token, so it behaves like a normalised
+  // attention over the whole prefix while running as a constant-memory RNN.
+  // Distinct from the other recurrent mixers in the suite: TNNetRetention (fixed
+  // exp decay, NO normalisation), TNNetDeltaNet (matrix delta-rule write),
+  // TNNetSelectiveSSM (Mamba diagonal SSM), TNNetMLSTMCell (covariance memory) -
+  // none carry a SELF-NORMALISING numerator+denominator pair with a per-token
+  // bonus.
+  //
+  // Over a (SeqLen,1,2*C) input (SizeY must be 1, recurrence along SizeX) the
+  // Depth axis is split into the layer's own key/value pair: the first C channels
+  // are k_t (key), the next C are v_t (value). The output has C channels (wkv_t).
+  // Per channel d (a_{-1}=b_{-1}=0):
+  //   wkv_t = ( a_{t-1} + e^{u + k_t} v_t ) / ( b_{t-1} + e^{u + k_t} )
+  //   a_t   = e^{-w} a_{t-1} + e^{k_t} v_t
+  //   b_t   = e^{-w} b_{t-1} + e^{k_t}
+  // with a learnable per-channel POSITIVE decay w = softplus(w_raw) (so e^{-w} in
+  // (0,1) by construction, like TNNetRetention's gamma trick) and a learnable
+  // per-channel BONUS u that up-weights the current token. Receptance gating
+  // r=sigmoid(.) and the output mix live OUTSIDE this leaf so TNNet.AddRWKVTimeMix
+  // can compose it with TNNetTokenShift + pointwise projections.
+  //
+  // FORWARD is the official RWKV-v4 numerically-stabilised kernel: it carries the
+  // running max of the exponents in log-space (Q_t) and evaluates every e^{.} as
+  // e^{.-Qmax}, so e^{k} / e^{u+k} never overflow regardless of the magnitude of
+  // k. The max shift cancels exactly between numerator and denominator (and is
+  // compensated by Q_t in the state), so it is a pure stabiliser and NOT a source
+  // of gradient (the reference CUDA backward also treats Qmax as a constant).
+  //
+  // Storage in Neurons[] (2 tensors, each C-long):
+  //   [0] = w_raw  ->  w = softplus(w_raw) > 0
+  //   [1] = u      ->  bonus (unconstrained)
+  // FStruct[0]=C (channels, resolved in SetPrevLayer). a,b re-init per sweep, NOT
+  // persisted. BACKWARD is exact BPTT with TWO coupled right-to-left adjoint scans
+  // over the running accumulators a_t,b_t (carried as dL/da_t, dL/db_t), folding
+  // dL/d(k_t), dL/d(v_t) into the input split and dL/dw (chain softplus),
+  // dL/du per channel - mirrors the coupled scans in TNNetKalmanFilterCell /
+  // TNNetDeltaNet. Coded by Claude (AI).
+  TNNetWKV = class(TNNetLayer)
+    private
+      FChannels: integer;       // C, resolved in SetPrevLayer
+      FW: TNNetVolume;          // per-channel w=softplus(w_raw), C-long scratch
+      FA: TNNetVolume;          // cached true accumulator a_t, (SeqLen,1,C)
+      FB: TNNetVolume;          // cached true accumulator b_t, (SeqLen,1,C)
+      FGradW, FGradU: TNNetVolume; // C-long grad accumulators
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetSelectiveSSM: an INPUT-DEPENDENT ("selective", Mamba/S6-style,
   // Gu & Dao 2023, "Mamba: Linear-Time Sequence Modeling with Selective State
   // Spaces", arXiv:2312.00752) diagonal state-space sequence mixer. Unlike the
@@ -9790,6 +9848,16 @@ type
       // to TNNetSinkhorn (smaller Tau -> sharper / more permutation-like).
       procedure AddSinkhornAttention(out Attended, W: TNNetLayer;
         KIter: integer = 20; Tau: TNeuralFloat = 1.0);
+      // RWKV TIME-MIXING block (Peng et al. 2023, arXiv:2305.13048): the full
+      // softmax-free linear-attention mixer composed around the TNNetWKV leaf, over
+      // a (SeqLen,1,D) sequence (SizeY=1). Wires: (1) a TNNetTokenShift per-channel
+      // time-shift, (2) three per-token PointwiseConvLinear projections of the
+      // shifted stream to receptance r, key k and value v (each D channels),
+      // (3) k|v concatenated (TNNetDeepConcat) into the 2*D tensor TNNetWKV consumes
+      // -> wkv (D channels), (4) the receptance gate r=sigmoid(.) cell-multiplied
+      // (TNNetCellMulByCell) into wkv, (5) a final PointwiseConvLinear out-projection
+      // back to D. Shape-preserving (output == input shape). Returns the out layer.
+      function AddRWKVTimeMix(): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
       // spiking neural network, over a (T,1,D) spike/feature tensor on the time
       // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
@@ -30819,6 +30887,258 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetWKV }
+constructor TNNetWKV.Create();
+begin
+  inherited Create();
+  FChannels := 0;           // resolved in SetPrevLayer
+  FStruct[0] := 0;
+  FW := TNNetVolume.Create();
+  FA := TNNetVolume.Create();
+  FB := TNNetVolume.Create();
+  FGradW := TNNetVolume.Create();
+  FGradU := TNNetVolume.Create();
+  // [0]=w_raw [1]=u
+  AddMissingNeurons(2);
+end;
+
+destructor TNNetWKV.Destroy();
+begin
+  FGradU.Free;
+  FGradW.Free;
+  FB.Free;
+  FA.Free;
+  FW.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetWKV.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetWKV requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+    FErrorProc('TNNetWKV requires an EVEN input depth (2*C: k|v split). Depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FChannels := pPrevLayer.FOutput.Depth div 2;
+  FStruct[0] := FChannels;
+  // Output = wkv, C channels, same length as the sequence.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FChannels);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  SetNumWeightsForAllNeurons(1, 1, FChannels);
+  for ii := 0 to 1 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FW.ReSize(1, 1, FChannels);
+  FA.ReSize(FOutput.SizeX, 1, FChannels);
+  FB.ReSize(FOutput.SizeX, 1, FChannels);
+  FGradW.ReSize(1, 1, FChannels);
+  FGradU.ReSize(1, 1, FChannels);
+  InitDefault();
+end;
+
+procedure TNNetWKV.Compute();
+var
+  StartTime: double;
+  Ww, Wu, Prev: TNNetVolume;
+  SeqLen, C, t, d: integer;
+  raw, wv, uv, kt, vt, aprev, bprev: TNeuralFloat;
+  qprev, ww1, qmax, e1, e2, num, den, dwexp: TNeuralFloat;
+  ww2, qmax2, e3, e4: TNeuralFloat;
+  anew, bnew: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Ww := FNeurons[0].FWeights;
+  Wu := FNeurons[1].FWeights;
+  SeqLen := FOutput.SizeX;
+  C := FChannels;
+  // Per-channel positive decay w = softplus(w_raw).
+  for d := 0 to C - 1 do
+  begin
+    raw := Ww.FData[d];
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := Ln(1 + Exp(raw));
+  end;
+  // Numerically-stabilised RWKV-v4 WKV recurrence per channel (a_-1=b_-1=0).
+  // Stabilised state (A,B,Q): true a = A*e^Q, b = B*e^Q. We additionally cache
+  // the TRUE a_t,b_t (overflow-safe for bounded inputs) for the backward pass.
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    uv := Wu.FData[d];
+    dwexp := Exp(-wv);             // e^{-w} in (0,1)
+    aprev := 0;                    // stabilised A_{t-1}
+    bprev := 0;                    // stabilised B_{t-1}
+    qprev := -1e30;                // log-space running max, -inf
+    for t := 0 to SeqLen - 1 do
+    begin
+      kt := Prev.FData[Prev.GetRawPos(t, 0, d)];          // key channel d
+      vt := Prev.FData[Prev.GetRawPos(t, 0, C + d)];      // value channel d
+      // OUTPUT step: bonus path weights the current token by e^{u+k}.
+      ww1 := uv + kt;
+      qmax := qprev;
+      if ww1 > qmax then qmax := ww1;
+      e1 := Exp(qprev - qmax);
+      e2 := Exp(ww1 - qmax);
+      num := e1 * aprev + e2 * vt;
+      den := e1 * bprev + e2;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := num / den;
+      // STATE step: decay path. a_t = e^{-w} a_{t-1} + e^{k} v.
+      ww2 := (-wv) + qprev;
+      qmax2 := ww2;
+      if kt > qmax2 then qmax2 := kt;
+      e3 := Exp(ww2 - qmax2);
+      e4 := Exp(kt - qmax2);
+      anew := e3 * aprev + e4 * vt;
+      bnew := e3 * bprev + e4;
+      // Cache TRUE accumulators a_t,b_t (= stabilised * e^{Q_t}).
+      FA.FData[FA.GetRawPos(t, 0, d)] := anew * Exp(qmax2);
+      FB.FData[FB.GetRawPos(t, 0, d)] := bnew * Exp(qmax2);
+      aprev := anew;
+      bprev := bnew;
+      qprev := qmax2;
+      // Keep stabilised state bounded: renormalise so max(|A|,B)~O(1) is implicit
+      // because e3,e4 <= 1 and at least one equals 1 (qmax2 = max), so A,B stay
+      // O(sequence) which is fine; Q absorbs the growth.
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetWKV.Backpropagate();
+var
+  StartTime: double;
+  Nw, Nu: TNNetNeuron;
+  Ww, Wu, Prev, PrevErr: TNNetVolume;
+  SeqLen, C, t, d: integer;
+  wv, uv, dwexp, kt, vt: TNeuralFloat;
+  aprev, bprev, Ek, Eu, dyt, denT, yt, numT: TNeuralFloat;
+  pa, pb, dnum, dden, dEu, dEk, dDk, dDw, dkt, dvt: TNeuralFloat;
+  gradW, gradU, paPrev, pbPrev: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Nw := FNeurons[0];
+  Nu := FNeurons[1];
+  Ww := Nw.FWeights;
+  Wu := Nu.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  C := FChannels;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  // Recompute w = softplus(w_raw) (same map as Compute).
+  for d := 0 to C - 1 do
+  begin
+    if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
+    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+  end;
+  FGradW.Fill(0);
+  FGradU.Fill(0);
+  // Exact BPTT in TRUE-accumulator space (a_t,b_t cached overflow-safely). Carry
+  // pa=dL/da_t, pb=dL/db_t right-to-left. Forward relations per step:
+  //   num = a_{t-1} + Eu*v ; den = b_{t-1} + Eu ; y = num/den   (Eu=e^{u+k})
+  //   a_t = Dw*a_{t-1} + Ek*v ; b_t = Dw*b_{t-1} + Ek   (Dw=e^{-w}, Ek=e^{k})
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    uv := Wu.FData[d];
+    dwexp := Exp(-wv);
+    pa := 0;
+    pb := 0;
+    gradW := 0;
+    gradU := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      kt := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      vt := Prev.FData[Prev.GetRawPos(t, 0, C + d)];
+      Ek := Exp(kt);
+      Eu := Exp(uv + kt);
+      if t > 0 then
+      begin
+        aprev := FA.FData[FA.GetRawPos(t - 1, 0, d)];
+        bprev := FB.FData[FB.GetRawPos(t - 1, 0, d)];
+      end
+      else
+      begin
+        aprev := 0;
+        bprev := 0;
+      end;
+      dyt := FOutputError.FData[FOutputError.GetRawPos(t, 0, d)];
+      numT := aprev + Eu * vt;
+      denT := bprev + Eu;
+      yt := numT / denT;
+      dkt := 0;
+      dvt := 0;
+      // ---- STATE step adjoints (pa,pb currently hold dL/da_t, dL/db_t) ----
+      // a_t = Dw*a_{t-1} + Ek*v ; b_t = Dw*b_{t-1} + Ek.
+      paPrev := dwexp * pa;          // da_t/da_{t-1} = Dw
+      pbPrev := dwexp * pb;          // db_t/db_{t-1} = Dw
+      dvt := dvt + pa * Ek;          // da_t/dv = Ek
+      dDk := pa * vt + pb;           // d./dEk
+      dkt := dkt + dDk * Ek;         // Ek=e^k -> dEk/dk=Ek
+      dDw := pa * aprev + pb * bprev;// d./dDw
+      gradW := gradW + dDw * (-dwexp); // Dw=e^{-w} -> dDw/dw = -Dw
+      // ---- OUTPUT step adjoints (y = num/den) ----
+      dnum := dyt / denT;
+      dden := -dyt * yt / denT;
+      paPrev := paPrev + dnum;       // num has +a_{t-1}
+      pbPrev := pbPrev + dden;       // den has +b_{t-1}
+      dvt := dvt + dnum * Eu;        // num has +Eu*v
+      dEu := dnum * vt + dden;       // d./dEu
+      dkt := dkt + dEu * Eu;         // Eu=e^{u+k} -> dEu/dk=Eu
+      gradU := gradU + dEu * Eu;     // dEu/du=Eu
+      // Scatter input grads (k channel d, v channel C+d).
+      if hasInputGrad then
+      begin
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] + dkt;
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, C + d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, C + d)] + dvt;
+      end;
+      // Carry to previous step.
+      pa := paPrev;
+      pb := pbPrev;
+    end;
+    // Chain softplus for w: dw/dw_raw = sigmoid(w_raw). u is unconstrained.
+    FGradW.FData[d] := gradW * Sigmoid(Ww.FData[d]);
+    FGradU.FData[d] := gradU;
+  end;
+  TNNetVolume.MulAdd(Nw.FDelta.GetRawPtr(), FGradW.GetRawPtr(), -FLearningRate, C);
+  TNNetVolume.MulAdd(Nu.FDelta.GetRawPtr(), FGradU.GetRawPtr(), -FLearningRate, C);
+  if (not FBatchUpdate) then
+  begin
+    Nw.UpdateWeights(FInertia);
+    Nu.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetWKV.InitDefault();
+const
+  // softplus^-1(1) ~= 0.5413 so w starts at ~1 (a moderate decay e^{-1}~=0.37).
+  cSoftplusInv1 = 0.541324854612918;
+begin
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  FNeurons[0].FWeights.Fill(cSoftplusInv1);  // w_raw -> w ~= 1
+  FNeurons[1].FWeights.Fill(0);              // bonus u = 0
+  AfterWeightUpdate();
+end;
+
 { TNNetHamiltonianCell }
 constructor TNNetHamiltonianCell.Create(pSteps: integer = 1; pDt: TNeuralFloat = 0.1;
   pHidden: integer = 0; pSeparable: boolean = false);
@@ -38488,6 +38808,32 @@ begin
   W := AddLayer( TNNetSinkhorn.Create(KIter, Tau) );
   (*Y := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+end;
+
+function TNNet.AddRWKVTimeMix(): TNNetLayer;
+var
+  x, Shifted, RGate, KProj, VProj, KV, Wkv, Gated: TNNetLayer;
+  D: integer;
+begin
+  x := GetLastLayer();
+  if x.Output.SizeY <> 1 then
+    FErrorProc('AddRWKVTimeMix requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(x.Output.SizeY));
+  D := x.Output.Depth;
+  // (1) Per-channel token shift (the RWKV time-shift primitive).
+  Shifted := AddLayerAfter( TNNetTokenShift.Create(), x );
+  // (2) Per-token (PointwiseConvLinear keeps the sequence axis) projections of the
+  // shifted stream to receptance r, key k and value v.
+  RGate := AddLayerAfter( [TNNetPointwiseConvLinear.Create(D, 1), TNNetSigmoid.Create()], Shifted );
+  KProj := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Shifted );
+  VProj := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Shifted );
+  // (3) k|v concatenated on the Depth axis -> the 2*D tensor TNNetWKV splits.
+  KV := AddLayer( TNNetDeepConcat.Create([KProj, VProj]) );
+  Wkv := AddLayerAfter( TNNetWKV.Create(), KV );
+  // (4) Receptance gate: r (*) wkv, cell-wise.
+  Gated := AddLayer( TNNetCellMulByCell.Create(RGate, Wkv) );
+  // (5) Output projection back to D.
+  Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Gated );
 end;
 
 function TNNet.AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;
@@ -72136,6 +72482,7 @@ begin
       'TNNetSLSTMCell':             Result := TNNetSLSTMCell.Create();
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
+      'TNNetWKV':                   Result := TNNetWKV.Create();
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
       'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
       'TNNetHamiltonianCell':       Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0);
@@ -72489,6 +72836,7 @@ begin
       if S[0] = 'TNNetSLSTMCell' then Result := TNNetSLSTMCell.Create() else
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
+      if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
       if S[0] = 'TNNetHamiltonianCell' then Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0) else
