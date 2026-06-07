@@ -72,6 +72,18 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [x] TNNetKANConv convolutional Kolmogorov-Arnold layer (LANDED 2026-06-07 on a2,
+      commit fbe7c1a) — conv sibling of the landed dense TNNetKANLayer: replaces the
+      conv linear dot product over each receptive-field patch with a sum of learned
+      univariate Chebyshev edge functions phi_p(t)=sum_k c_{p,k} T_k(tanh(t)), one per
+      (kernel position x input channel); subclasses TNNetConvolutionLinear, no output
+      bias, near-linear init, degree K via FStruct[5]; numerical-gradient (input +
+      coeff) + serialization tests in TestNeuralNumerical.pas; examples/KANConv/ beats
+      a matched linear conv on a per-3x3-window nonlinear task. Open follow-ups:
+      - [ ] B-spline (fixed-knot) basis variant alongside the Chebyshev basis, behind
+            a flag — the paper's original parameterisation; contrast smoothness/extrapolation.
+      - [ ] examples/KANConv/ on a real tiny-image task (CIFAR/MNIST stub) vs a plain
+            conv at matched weight budget, to show the headline param-efficiency on data.
 - [ ] TNNetDeltaNet chunked/parallel forward (the paper's WY-matrix
       reformulation of Yang et al. 2024, arXiv:2406.06484) so training is
       sub-quadratic instead of the current strict per-token left-to-right scan in
@@ -1399,4 +1411,16 @@ rather than acted on.
       < random-init) is the robust, reproducible signal. Pairs with
       [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
       degeneracy-aware generalization of "effective parameter count").
+      LANDED 2026-06-07 on a2 (commit be56591): function signature
+      `LocalLearningCoefficientReport(NN, Samples; ChainLen=40, Eps=1e-5, Gamma=1.0)`,
+      non-destructive (w* snapshot/restore bit-identical, FP-exception mask during the
+      chain), smoke test in TestNeuralLayersExtra.pas, examples/LocalLearningCoefficient/.
+      HONEST FINDING (the "what did NOT fit the budget" caveat): the robust,
+      reproducible signal at CPU-toy chain length is trained-vs-untrained (both trained
+      nets read small LLC_hat << dim(w); a random-init net reads large/negative LLC_hat
+      = "not a minimum"). The fine minimal-vs-over-parameterised ORDERING does NOT
+      separate reproducibly across seeds at this chain length (estimator noise ≈ the
+      tiny mean_chain−L(w*) gap). Open follow-up:
+      - [ ] longer/multi-chain averaging (or a calibrated eps/gamma sweep) to recover
+            the minimal < redundant ordering reproducibly within budget.
 
