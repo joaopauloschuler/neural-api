@@ -347,6 +347,18 @@ rather than acted on.
 - [ ] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
+- [ ] Multi-Token Prediction head (DeepSeek-V3 / Gloeckle et al. 2024 MTP):
+      a `TNNet.AddMultiTokenPrediction(NumFuture, ...)` builder that taps a
+      shared trunk hidden state and attaches NumFuture sequential, weight-tied
+      prediction modules, each forecasting token t+1, t+2, ... t+NumFuture so the
+      training signal is denser than single-next-token. Distinct from the existing
+      SpeculativeDecoding example (that uses TWO separate nets, draft+verify) and
+      from TNNetTokenHistoryPenalty — MTP is one net with parallel future heads.
+      Build from existing primitives (shared trunk + per-offset PointwiseConvLinear
+      projection + per-offset softmax/cross-entropy), no new leaf class needed;
+      add examples/MultiTokenPrediction/ on a tiny next-token rule showing the
+      auxiliary future-token losses speed convergence of the t+1 head, and note
+      the inference-time self-speculative-decode reuse of the extra heads.
 - [ ] TNNetTokenHistoryPenalty follow-up: wire it into the downstream
       ../gpt-3-for-pascal generation loop (call `Apply` before the sampler
       and `RegisterToken` after each emit, `ResetHistory` per sequence) and
