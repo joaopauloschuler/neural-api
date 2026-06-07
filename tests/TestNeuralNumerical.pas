@@ -390,6 +390,10 @@ type
     procedure TestMLSTMCellWeightGradientCheck;
     procedure TestMLSTMCellSerializationRoundTrip;
     procedure TestAddMLSTMBuilder;
+    procedure TestNTMMemoryInputGradientCheck;
+    procedure TestNTMMemoryWeightGradientCheck;
+    procedure TestNTMMemorySerializationRoundTrip;
+    procedure TestNTMMemoryWriteReadBack;
     procedure TestAddClosedFormContinuousBuilder;
     procedure TestAddBidirectionalClosedFormContinuousBuilder;
     procedure TestBidirectionalClosedFormContinuousGradientCheck;
@@ -23669,6 +23673,223 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure SeedNTMMemory(L: TNNetNTMMemory; SlotWidth, InputDim: integer);
+var c, j: integer;
+begin
+  // Deterministic non-degenerate projections so keys/erase/add vary per cell and
+  // the cosine-addressing path is exercised away from zero-vector singularities.
+  for c := 0 to SlotWidth - 1 do
+  begin
+    for j := 0 to InputDim - 1 do
+    begin
+      L.Neurons[0].Weights[c, 0, j] := Sin(c * 1.1 + j * 0.7) * 0.40; // Wk
+      L.Neurons[4].Weights[c, 0, j] := Cos(c * 0.6 - j * 0.5) * 0.35; // We
+      L.Neurons[6].Weights[c, 0, j] := Sin(c * 0.9 + j * 0.3) * 0.45; // Wa
+    end;
+    L.Neurons[1].Weights.Raw[c] := Cos(c * 0.5) * 0.30;  // bk
+    L.Neurons[5].Weights.Raw[c] := Sin(c * 0.4) * 0.25;  // be
+    L.Neurons[7].Weights.Raw[c] := Cos(c * 0.7) * 0.30;  // ba
+  end;
+  for j := 0 to InputDim - 1 do
+    L.Neurons[2].Weights[0, 0, j] := Sin(j * 0.8 + 0.2) * 0.30;        // Wb (beta)
+  L.Neurons[3].Weights.Raw[0] := 0.4;                                   // bb
+end;
+
+procedure TTestNeuralNumerical.TestNTMMemoryInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetNTMMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // SeqLen=3 keeps the unrolled BPTT through the recurrent M update cheap while
+  // still exercising the cross-step dL/dM chain (the truncation-bug hotspot).
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 2);   // output Depth = SlotWidth = 2
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetNTMMemory.Create(3, 2, 0.2);  // NumSlots=3, SlotWidth=2
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.2 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    SeedNTMMemory(L, 2, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('NTM input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('NTM input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNTMMemoryWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetNTMMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..7] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'Wk'; Names[1] := 'bk'; Names[2] := 'Wb'; Names[3] := 'bb';
+  Names[4] := 'We'; Names[5] := 'be'; Names[6] := 'Wa'; Names[7] := 'ba';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetNTMMemory.Create(3, 2, 0.2);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.1 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    SeedNTMMemory(L, 2, 3);
+
+    // Cover all eight projection tensors. The write projections (We/be, Wa/ba)
+    // and beta (Wb/bb) feed M_t, whose grad must chain back across steps; the
+    // key projection (Wk/bk) feeds the cosine address. A truncated cross-step
+    // dL/dM shows up as an O(1) miss here.
+    for n := 0 to 7 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('NTM weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('NTM weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNTMMemorySerializationRoundTrip;
+begin
+  // NTM stores eight projection tensors (Wk/bk/Wb/bb/We/be/Wa/ba). M is NOT
+  // persisted (re-init to the constant each Compute), so the round-trip output
+  // matches deterministically once the weights round-trip.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetNTMMemory.Create(4, 3, 0.1), 'NTMMemory', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestNTMMemoryWriteReadBack;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetNTMMemory;
+  i, ep: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end sanity: the layer can LEARN to write a pattern early and read it
+  // back later from external memory (training reduces a content-recall loss).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4));
+    L := TNNetNTMMemory.Create(4, 3, 0.01);
+    NN.AddLayer(L);
+    AssertEquals('NTM output SizeX = SeqLen', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('NTM output Depth = SlotWidth', 3, NN.GetLastLayer.Output.Depth);
+    NN.SetLearningRate(0.05, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.9) * 1.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.5) * 0.5;
+
+    NN.Compute(Input);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for ep := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('NTM training reduces recall loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
   finally
     NN.Free; Input.Free; Desired.Free;
   end;
