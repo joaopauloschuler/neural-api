@@ -113,42 +113,25 @@ rather than acted on.
       loss on a small MNIST/Fashion-MNIST subset and report digit accuracy vs a
       param-matched plain CNN as the headline.
 
-- [ ] TNNetNTMMemory — a differentiable, WRITABLE external memory layer in the
-      Neural Turing Machine / Differentiable Neural Computer family (Graves et al.
-      2014, "Neural Turing Machines", arXiv:1410.5401). This is a genuinely NEW
-      paradigm in the fork: the existing associative-memory layers are READ-ONLY
-      retrieval against a learned bank — TNNetModernHopfield (iterated energy
-      softmax recall) and TNNetProductKeyMemory (sparse top-k lookup) — and
-      TNNetSelectiveSSM keeps a per-channel recurrent STATE, not an addressable
-      memory MATRIX. NTM is distinct: a persistent M (NumSlots x SlotWidth) that
-      the layer both READS and WRITES as it sweeps the time axis of an
-      (T,1,InputDim) input. Per step the input drives (a) a content-addressing
-      read — cosine-similarity key against every slow row, softmax over slots
-      (sharpened by a softplus key-strength beta) -> weights w, read vector
-      r = w^T M; and (b) a write — erase/add: M_new[i] = M[i]*(1 - w[i]*e) +
-      w[i]*a, with sigmoid erase vector e and add vector a from the input. The
-      layer emits the per-step read vectors as a (T,1,SlotWidth) tensor (or
-      concat[input,read]). v1 scope to keep it tractable and gradient-checkable:
-      CONTENT addressing only (defer the location-based shift/interpolation
-      addressing and DNC's temporal link matrix to a follow-up), single read+write
-      head, M initialised to a small constant and rolled forward within a sequence.
-      Trainables = the projection neurons producing (key, beta, erase, add) from
-      the input. Backward must BPTT through the recurrent M update (the erase/add
-      makes M_t depend on M_{t-1} and on w_t, so dL/dM and dL/dw both chain
-      backward across steps — the place a silent truncation bug would hide, so
-      gradient-check the read path, the write projections, and the input gradient
-      hard). Round-trip the head dims via FStruct, serialize like the other
-      stateful layers, M is NOT persisted (re-init on load, like SetAdjacency).
-      Headline example examples/NeuralTuringMachine/ (pure CPU): the classic
-      COPY task — present a random binary sequence followed by a delimiter, then
-      require the net to reproduce it from memory — which a same-size plain
-      LSTM/GRU stack cannot generalize to longer-than-trained sequences but the
-      NTM can, because it has learned to WRITE then READ-BACK addresses. Report
-      copy bit-accuracy vs sequence length for the NTM vs a param-matched
-      TNNetSLSTMCell arm to make the "external writable memory beats fixed
-      recurrent state" claim concretely. Follow-ups (NOT in v1): multi-head
-      read/write, location-based addressing with circular shift, and the full DNC
-      allocation + temporal-link read modes.
+- [X] TNNetNTMMemory — a differentiable, WRITABLE external memory layer in the
+      Neural Turing Machine family (Graves et al. 2014, arXiv:1410.5401). LANDED
+      2026-06-07 on a2 (commit 7e94269): persistent M (NumSlots x SlotWidth) the
+      layer both READS and WRITES as it sweeps the time axis of an (T,1,InputDim)
+      input → emits per-step read vectors (T,1,SlotWidth). Content addressing
+      (cosine key vs every slot, softplus-beta-sharpened softmax over slots,
+      r=w^T·M) + erase/add write M[i]:=M[i]·(1−w[i]·e)+w[i]·a; single read+write
+      head, 8 projection neurons [Wk,bk,Wb,bb,We,be,Wa,ba], FStruct[0]=NumSlots
+      FStruct[1]=SlotWidth FFloatSt[0]=InitVal, M re-init on load (not persisted).
+      Full BPTT through the recurrent M update (FGM carries dL/dM right-to-left).
+      Tests in TestNeuralNumerical.pas (input + per-tensor weight grad-check,
+      serialization round-trip, write/read-back training). Example
+      examples/NeuralTuringMachine/ (COPY task, NTM vs param-matched SLSTM arm,
+      ~0.8s, same 87.5% recall at ~2.6× fewer params). Open follow-ups (NOT in
+      v1): multi-head read/write; LOCATION-based addressing with interpolation +
+      circular shift + sharpening (the part that gives length-generalization the
+      content-only v1 lacks — the headline "beats a plain LSTM on longer-than-
+      trained sequences" claim needs this); full DNC allocation + temporal-link
+      read modes; optional concat[input,read] output mode.
 
 - [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
       landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
@@ -469,12 +452,25 @@ rather than acted on.
       entropy range — the current well-separated toy lives in the confident-routing
       regime where even tau=2.0 is already near one-hot (honest caveat in its README).
       Pure CPU, ~2 s.
-- [ ] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
-      soft `TNNet.AddMixtureOfExperts` block) — run only the k highest-gated experts per token (sparse
-      dispatch) plus a load-balancing auxiliary loss so the gate does not collapse
-      onto one expert. Needs a top-k masking/dispatch mechanism on the gate plus
-      an aux-loss head; left out of v1 to avoid shipping an untested router. (The
-      TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
+- [X] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
+      soft `TNNet.AddMixtureOfExperts` block). LANDED 2026-06-07 on a2 (commit
+      88f8413): `TNNet.AddTopKMixtureOfExperts(InputLayer, NumExperts,
+      ExpertHiddenDim, TopCnt, out AuxLossHead, AuxCoeff)` builder + two new
+      classes — `TNNetTopKGate` (keeps TopCnt largest gate weights per cell,
+      zeroes the rest, renormalizes survivors to sum 1, exact fused mask+renorm
+      Jacobian backward) and `TNNetLoadBalanceLoss` (self-contained Switch-
+      Transformer aux loss L_aux = coeff·E·Σ_i f_i·P_i, f_i stop-grad token-load
+      fraction, P_i mean gate prob; gradient flows through P_i only). Both
+      registered in both CreateLayer tables + LoadFromString. 8 tests in
+      TestNeuralNumerical.pas (gate grad-check, aux-loss grad, only-TopCnt-active,
+      collapsed-vs-balanced aux penalty, two round-trips). Example
+      examples/TopKMoE/ (~19s): WITHOUT aux loss the router collapses to one
+      expert (max/mean load 4.00); WITH it the load is near-uniform (1.11).
+      Open follow-ups: (a) Gumbel-noise top-k gate variant (TNNetGumbelSoftmax is
+      the natural differentiable hard-routing gate — v1 uses plain softmax+TopK);
+      (b) true sparse DISPATCH that skips the unselected experts' compute (v1
+      still runs all experts then masks — correct but not compute-sparse); (c)
+      capacity-factor token dropping when an expert overflows its buffer.
 - [ ] AddMixtureOfDepths follow-up (builder + examples/MixtureOfDepths/ landed
       2026-06-01): (a) add a load-balancing / capacity-utilisation auxiliary loss so
       the router spreads its budget instead of fixating on a few positions; (b) a
