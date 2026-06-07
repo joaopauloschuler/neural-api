@@ -113,26 +113,6 @@ rather than acted on.
       loss on a small MNIST/Fashion-MNIST subset and report digit accuracy vs a
       param-matched plain CNN as the headline.
 
-- [X] TNNetNTMMemory — a differentiable, WRITABLE external memory layer in the
-      Neural Turing Machine family (Graves et al. 2014, arXiv:1410.5401). LANDED
-      2026-06-07 on a2 (commit 7e94269): persistent M (NumSlots x SlotWidth) the
-      layer both READS and WRITES as it sweeps the time axis of an (T,1,InputDim)
-      input → emits per-step read vectors (T,1,SlotWidth). Content addressing
-      (cosine key vs every slot, softplus-beta-sharpened softmax over slots,
-      r=w^T·M) + erase/add write M[i]:=M[i]·(1−w[i]·e)+w[i]·a; single read+write
-      head, 8 projection neurons [Wk,bk,Wb,bb,We,be,Wa,ba], FStruct[0]=NumSlots
-      FStruct[1]=SlotWidth FFloatSt[0]=InitVal, M re-init on load (not persisted).
-      Full BPTT through the recurrent M update (FGM carries dL/dM right-to-left).
-      Tests in TestNeuralNumerical.pas (input + per-tensor weight grad-check,
-      serialization round-trip, write/read-back training). Example
-      examples/NeuralTuringMachine/ (COPY task, NTM vs param-matched SLSTM arm,
-      ~0.8s, same 87.5% recall at ~2.6× fewer params). Open follow-ups (NOT in
-      v1): multi-head read/write; LOCATION-based addressing with interpolation +
-      circular shift + sharpening (the part that gives length-generalization the
-      content-only v1 lacks — the headline "beats a plain LSTM on longer-than-
-      trained sequences" claim needs this); full DNC allocation + temporal-link
-      read modes; optional concat[input,read] output mode.
-
 - [ ] TNNetKalmanFilterCell — a differentiable Bayesian filtering recurrent
       layer (Kalman 1960). FIRST layer in the suite that propagates UNCERTAINTY
       rather than just a deterministic state: it carries a state mean AND a
@@ -504,25 +484,6 @@ rather than acted on.
       entropy range — the current well-separated toy lives in the confident-routing
       regime where even tau=2.0 is already near one-hot (honest caveat in its README).
       Pure CPU, ~2 s.
-- [X] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
-      soft `TNNet.AddMixtureOfExperts` block). LANDED 2026-06-07 on a2 (commit
-      88f8413): `TNNet.AddTopKMixtureOfExperts(InputLayer, NumExperts,
-      ExpertHiddenDim, TopCnt, out AuxLossHead, AuxCoeff)` builder + two new
-      classes — `TNNetTopKGate` (keeps TopCnt largest gate weights per cell,
-      zeroes the rest, renormalizes survivors to sum 1, exact fused mask+renorm
-      Jacobian backward) and `TNNetLoadBalanceLoss` (self-contained Switch-
-      Transformer aux loss L_aux = coeff·E·Σ_i f_i·P_i, f_i stop-grad token-load
-      fraction, P_i mean gate prob; gradient flows through P_i only). Both
-      registered in both CreateLayer tables + LoadFromString. 8 tests in
-      TestNeuralNumerical.pas (gate grad-check, aux-loss grad, only-TopCnt-active,
-      collapsed-vs-balanced aux penalty, two round-trips). Example
-      examples/TopKMoE/ (~19s): WITHOUT aux loss the router collapses to one
-      expert (max/mean load 4.00); WITH it the load is near-uniform (1.11).
-      Open follow-ups: (a) Gumbel-noise top-k gate variant (TNNetGumbelSoftmax is
-      the natural differentiable hard-routing gate — v1 uses plain softmax+TopK);
-      (b) true sparse DISPATCH that skips the unselected experts' compute (v1
-      still runs all experts then masks — correct but not compute-sparse); (c)
-      capacity-factor token dropping when an expert overflows its buffer.
 - [ ] AddMixtureOfDepths follow-up (builder + examples/MixtureOfDepths/ landed
       2026-06-01): (a) add a load-balancing / capacity-utilisation auxiliary loss so
       the router spreads its budget instead of fixating on a few positions; (b) a
