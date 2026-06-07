@@ -4934,6 +4934,79 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetTestTimeTraining: the Test-Time Training (TTT) sequence-mixing layer
+  // (Sun et al. 2024, "Learning to (Learn at Test Time): RNNs with Expressive
+  // Hidden States", arXiv:2407.04620). The recurrent hidden STATE is itself a
+  // small model W whose weights are updated by ONE explicit gradient-descent
+  // step on a self-supervised reconstruction loss at every timestep, so the
+  // forward scan literally TRAINS an inner net as it reads the sequence.
+  //
+  // Operates over a (SeqLen,1,Depth) sequence (SizeY must be 1, recurrence along
+  // SizeX); output shape == input shape. Per token t (learnable view
+  // projections theta_K/theta_V/theta_Q, all DepthxDepth stored [out,0,in], and
+  // a learnable inner learning-rate eta = softplus(eta_raw) > 0):
+  //   k_t = theta_K x_t ;  v_t = theta_V x_t ;  q_t = theta_Q x_t
+  //   inner loss  ell_t(W) = 1/2 || W(k_t) - v_t ||^2     (self-supervised)
+  //   W_t = W_{t-1} - eta * grad_W ell_t(W_{t-1})         (the TTT update)
+  //   y_t = W_t(q_t)                                       (read-out)
+  // The inner W is the sequence "hidden state"; it is RESET each forward sweep
+  // (W linear -> 0 ; W MLP -> small fixed init) and carried t->t+1 by the update.
+  //
+  // Two inner-model variants behind ONE flag in FStruct[1] (0=linear, 1=MLP):
+  //  (a) TTT-LINEAR: W is a single DepthxDepth matrix. Its MSE gradient step is
+  //      rank-1, so the scan reduces to a delta-rule-like recurrence. This is
+  //      CLOSELY RELATED TO the landed TNNetDeltaNet but NOT a duplicate:
+  //      DeltaNet writes the Widrow-Hoff correction  S += beta_t k_t (x) err_t
+  //      with a per-token SIGMOID gate beta_t and an L2-normalized key, whereas
+  //      TTT-Linear writes the MSE-gradient step  W -= eta (W k_t - v_t)(x) k_t
+  //      with a single learnable per-LAYER inner LR eta and a raw (un-normalized)
+  //      key. (DeltaNet's gate is data-dependent; TTT-Linear's eta is a global
+  //      trained scalar.)
+  //  (b) TTT-MLP: W is a TWO-layer non-linear net  W(z) = W2 * GeLU(W1 z)
+  //      (hidden width FStruct[2]). Its gradient step is a genuine NON-LINEAR
+  //      fast-weight update that DeltaNet's single matrix CANNOT express -- this
+  //      non-linear inner state is the headline novelty of TTT.
+  //
+  // Storage in Neurons[]: [0]=theta_K [1]=theta_V [2]=theta_Q (all DepthxDepth);
+  // [3]=eta_raw (1x1x1 scalar). MLP arm adds the INITIAL inner fast-weights as
+  // trainable neurons: [4]=W1_0 (HxDepth) [5]=W2_0 (DepthxH). FStruct[0]=Depth,
+  // FStruct[1]=variant, FStruct[2]=hidden width (MLP only).
+  //
+  // FORWARD is the explicit left-to-right scan; each step runs an INNER backward
+  // (to form grad_W ell_t) so the OUTER backward is a SECOND-ORDER pass: it
+  // differentiates y_t w.r.t. x_t, the view projections and eta, propagating the
+  // adjoint of W_t back to W_{t-1} across the scan -- a Hessian-vector product
+  // for the MLP arm. Same 2nd-inner-tape technique proven in
+  // TNNetHamiltonianCell. The inner state gradient is NOT stop-gradiented.
+  // Coded by Claude (AI).
+  TNNetTestTimeTraining = class(TNNetLayer)
+    private
+      FDepth: integer;        // Depth, resolved in SetPrevLayer
+      FHidden: integer;       // inner-MLP hidden width (MLP arm only)
+      FIsMLP: boolean;        // inner-model variant flag
+      FScaleQ: TNeuralFloat;  // 1/sqrt(Depth) read-out query scaling
+      // Forward caches over the scan, sized (SeqLen,...).
+      FK, FVv, FQ: TNNetVolume;   // cached k_t, v_t, q_t, (SeqLen,1,Depth)
+      // TTT-Linear: cached inner matrix state W_t, (SeqLen,Depth,Depth).
+      FWlin: TNNetVolume;
+      FResid: TNNetVolume;        // cached inner residual r_t = W_{t-1}k_t - v_t
+      // TTT-MLP caches: inner states W1_t (SeqLen,H,Depth), W2_t (SeqLen,Depth,H)
+      // plus per-step inner-forward activations needed for the second-order pass.
+      FW1, FW2: TNNetVolume;
+      FA1k, FH1k: TNNetVolume;    // a1=W1_{t-1}k_t, h1=GeLU(a1), (SeqLen,1,H)
+      FRr: TNNetVolume;           // inner residual r_t (SeqLen,1,Depth)
+      FA1q, FH1q: TNNetVolume;    // a1q=W1_t q_t, h1q=GeLU(a1q), (SeqLen,1,H)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      // pVariant: 0 = TTT-Linear (matrix inner state), 1 = TTT-MLP (2-layer
+      // non-linear inner state). pHidden: MLP hidden width (0 => auto max(2*Depth,8)).
+      constructor Create(pVariant: integer = 0; pHidden: integer = 0); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetSelectiveSSM: an INPUT-DEPENDENT ("selective", Mamba/S6-style,
   // Gu & Dao 2023, "Mamba: Linear-Time Sequence Modeling with Selective State
   // Spaces", arXiv:2312.00752) diagonal state-space sequence mixer. Unlike the
@@ -33358,6 +33431,512 @@ begin
   FNeurons[3].FWeights.Fill(0);  // bb
   FNeurons[5].FWeights.Fill(0);  // be
   FNeurons[7].FWeights.Fill(0);  // ba
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetTestTimeTraining }
+
+// tanh-approx GeLU and its first/second derivatives. g2 (second derivative) is
+// only needed for the TTT-MLP outer Hessian-vector product.
+procedure TTTGelu(a: TNeuralFloat; out g, g1, g2: TNeuralFloat);
+const cC = 0.7978845608028654;  // sqrt(2/pi)
+      cA = 0.044715;
+var u, up, upp, s, p: TNeuralFloat;
+begin
+  u   := cC * (a + cA * a * a * a);
+  up  := cC * (1 + 3 * cA * a * a);   // du/da
+  upp := cC * 6 * cA * a;             // d2u/da2
+  s   := TanH(u);
+  p   := 1 - s * s;                   // ds/du
+  g   := 0.5 * a * (1 + s);
+  g1  := 0.5 * (1 + s) + 0.5 * a * p * up;
+  g2  := p * up + 0.5 * a * p * (upp - 2 * s * up * up);
+end;
+
+function TTTSoftPlus(x: TNeuralFloat): TNeuralFloat;
+begin
+  if x > 30 then Result := x else Result := Ln(1 + Exp(x));
+end;
+
+constructor TNNetTestTimeTraining.Create(pVariant: integer = 0; pHidden: integer = 0);
+begin
+  inherited Create();
+  FDepth := 0;
+  FIsMLP := (pVariant <> 0);
+  FHidden := Max(pHidden, 0);
+  FStruct[0] := 0;
+  FStruct[1] := Ord(FIsMLP);
+  FStruct[2] := FHidden;
+  FK := TNNetVolume.Create();   FVv := TNNetVolume.Create();
+  FQ := TNNetVolume.Create();   FWlin := TNNetVolume.Create();
+  FResid := TNNetVolume.Create();
+  FW1 := TNNetVolume.Create();  FW2 := TNNetVolume.Create();
+  FA1k := TNNetVolume.Create(); FH1k := TNNetVolume.Create();
+  FRr := TNNetVolume.Create();
+  FA1q := TNNetVolume.Create(); FH1q := TNNetVolume.Create();
+  if FIsMLP then AddMissingNeurons(6) else AddMissingNeurons(4);
+end;
+
+destructor TNNetTestTimeTraining.Destroy();
+begin
+  FH1q.Free; FA1q.Free; FRr.Free; FH1k.Free; FA1k.Free;
+  FW2.Free; FW1.Free; FResid.Free; FWlin.Free;
+  FQ.Free; FVv.Free; FK.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetTestTimeTraining.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ii, SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetTestTimeTraining requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FDepth := pPrevLayer.FOutput.Depth;
+  FIsMLP := FStruct[1] <> 0;
+  if FStruct[2] > 0 then FHidden := FStruct[2]
+  else FHidden := Max(2 * FDepth, 8);
+  FScaleQ := 1.0 / Sqrt(FDepth);
+  FStruct[0] := FDepth;
+  FStruct[1] := Ord(FIsMLP);
+  FStruct[2] := FHidden;
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  FOutput.ReSize(SeqLen, 1, FDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FIsMLP then
+  begin
+    if FNeurons.Count < 6 then AddMissingNeurons(6);
+  end
+  else if FNeurons.Count < 4 then AddMissingNeurons(4);
+  for ii := 0 to 2 do FNeurons[ii].FWeights.ReSize(FDepth, 1, FDepth);
+  FNeurons[3].FWeights.ReSize(1, 1, 1);
+  if FIsMLP then
+  begin
+    FNeurons[4].FWeights.ReSize(FHidden, 1, FDepth);  // W1_0
+    FNeurons[5].FWeights.ReSize(FDepth, 1, FHidden);  // W2_0
+  end;
+  for ii := 0 to FNeurons.Count - 1 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FK.ReSize(SeqLen, 1, FDepth);
+  FVv.ReSize(SeqLen, 1, FDepth);
+  FQ.ReSize(SeqLen, 1, FDepth);
+  if FIsMLP then
+  begin
+    FW1.ReSize(SeqLen, FHidden, FDepth);
+    FW2.ReSize(SeqLen, FDepth, FHidden);
+    FA1k.ReSize(SeqLen, 1, FHidden);
+    FH1k.ReSize(SeqLen, 1, FHidden);
+    FRr.ReSize(SeqLen, 1, FDepth);
+    FA1q.ReSize(SeqLen, 1, FHidden);
+    FH1q.ReSize(SeqLen, 1, FHidden);
+  end
+  else
+  begin
+    FWlin.ReSize(SeqLen, FDepth, FDepth);
+    FResid.ReSize(SeqLen, 1, FDepth);
+  end;
+  InitDefault();
+end;
+
+procedure TNNetTestTimeTraining.Compute();
+var
+  StartTime: double;
+  ThK, ThV, ThQ: TNNetVolume;
+  W1init, W2init: TNNetVolume;
+  SeqLen, Depth, Hd, t, o, i, j, baseT, baseW, baseW1, baseW2: integer;
+  eta, acc, gg, g1, g2, rj, S: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  ThR: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  ThK := FNeurons[0].FWeights; ThV := FNeurons[1].FWeights;
+  ThQ := FNeurons[2].FWeights;
+  SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
+  eta := TTTSoftPlus(FNeurons[3].FWeights.FData[0]);
+  W1init := nil; W2init := nil;
+  if FIsMLP then begin W1init := FNeurons[4].FWeights; W2init := FNeurons[5].FWeights; end;
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    for o := 0 to Depth - 1 do
+    begin
+      ThR := ThK.GetRawPtr(o, 0, 0); acc := 0;
+      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      FK.FData[baseT + o] := acc;
+      ThR := ThV.GetRawPtr(o, 0, 0); acc := 0;
+      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      FVv.FData[baseT + o] := acc;
+      ThR := ThQ.GetRawPtr(o, 0, 0); acc := 0;
+      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      FQ.FData[baseT + o] := acc * FScaleQ;
+    end;
+    if not FIsMLP then
+    begin
+      baseW := t * Depth * Depth;
+      for o := 0 to Depth - 1 do
+      begin
+        acc := 0;
+        if t > 0 then
+          for i := 0 to Depth - 1 do
+            acc := acc + FWlin.FData[baseW - Depth * Depth + o * Depth + i] * FK.FData[baseT + i];
+        FResid.FData[baseT + o] := acc - FVv.FData[baseT + o];
+      end;
+      for o := 0 to Depth - 1 do
+      begin
+        rj := FResid.FData[baseT + o];
+        for i := 0 to Depth - 1 do
+        begin
+          if t > 0 then acc := FWlin.FData[baseW - Depth * Depth + o * Depth + i]
+          else acc := 0;
+          FWlin.FData[baseW + o * Depth + i] := acc - eta * rj * FK.FData[baseT + i];
+        end;
+      end;
+      for o := 0 to Depth - 1 do
+      begin
+        acc := 0;
+        for i := 0 to Depth - 1 do
+          acc := acc + FWlin.FData[baseW + o * Depth + i] * FQ.FData[baseT + i];
+        OutPtr^[o] := acc;
+      end;
+    end
+    else
+    begin
+      baseW1 := t * Hd * Depth;
+      baseW2 := t * Depth * Hd;
+      // inner forward at k (using W1_{t-1}, W2_{t-1})
+      for j := 0 to Hd - 1 do
+      begin
+        acc := 0;
+        for i := 0 to Depth - 1 do
+          if t > 0 then acc := acc + FW1.FData[baseW1 - Hd * Depth + j * Depth + i] * FK.FData[baseT + i]
+          else acc := acc + W1init.FData[j * Depth + i] * FK.FData[baseT + i];
+        FA1k.FData[t * Hd + j] := acc;
+        TTTGelu(acc, gg, g1, g2);
+        FH1k.FData[t * Hd + j] := gg;
+      end;
+      for o := 0 to Depth - 1 do
+      begin
+        acc := 0;
+        for j := 0 to Hd - 1 do
+          if t > 0 then acc := acc + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FH1k.FData[t * Hd + j]
+          else acc := acc + W2init.FData[o * Hd + j] * FH1k.FData[t * Hd + j];
+        FRr.FData[baseT + o] := acc - FVv.FData[baseT + o];
+      end;
+      // W2 update
+      for o := 0 to Depth - 1 do
+        for j := 0 to Hd - 1 do
+        begin
+          if t > 0 then acc := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
+          else acc := W2init.FData[o * Hd + j];
+          FW2.FData[baseW2 + o * Hd + j] := acc - eta * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j];
+        end;
+      // W1 update via da1[j] = g1(a1)*S, S = (W2_{t-1}^T r)[j]
+      for j := 0 to Hd - 1 do
+      begin
+        TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
+        S := 0;
+        for o := 0 to Depth - 1 do
+          if t > 0 then S := S + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
+          else S := S + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
+        rj := g1 * S; // da1[j]
+        for i := 0 to Depth - 1 do
+        begin
+          if t > 0 then acc := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
+          else acc := W1init.FData[j * Depth + i];
+          FW1.FData[baseW1 + j * Depth + i] := acc - eta * rj * FK.FData[baseT + i];
+        end;
+      end;
+      // read-out using W1_t, W2_t
+      for j := 0 to Hd - 1 do
+      begin
+        acc := 0;
+        for i := 0 to Depth - 1 do
+          acc := acc + FW1.FData[baseW1 + j * Depth + i] * FQ.FData[baseT + i];
+        FA1q.FData[t * Hd + j] := acc;
+        TTTGelu(acc, gg, g1, g2);
+        FH1q.FData[t * Hd + j] := gg;
+      end;
+      for o := 0 to Depth - 1 do
+      begin
+        acc := 0;
+        for j := 0 to Hd - 1 do
+          acc := acc + FW2.FData[baseW2 + o * Hd + j] * FH1q.FData[t * Hd + j];
+        OutPtr^[o] := acc;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTestTimeTraining.Backpropagate();
+var
+  StartTime: double;
+  ThK, ThV, ThQ, W1init, W2init: TNNetVolume;
+  GThK, GThV, GThQ, GW1in, GW2in: TNNetVolume;
+  SeqLen, Depth, Hd, t, o, i, j, baseT, baseW, baseW1, baseW2: integer;
+  eta, dEtaRaw, acc, rj, gk, gv, gqv, gg, g1, g2, S, w2v, w1v: TNeuralFloat;
+  negLR, etaGrad: TNeuralFloat;
+  hasInputGrad: boolean;
+  GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
+  PrevErr: TNNetVolume;
+  gWlin, gWprev: array of TNeuralFloat;                 // linear arm dL/dW_t
+  gW1c, gW2c, gW1prev, gW2prev: array of TNeuralFloat;  // MLP arm carries
+  gkv, gvv, gqq: array of TNeuralFloat;                 // dL/dk, dL/dv, dL/dq
+  dr, dh1, da1, dS: array of TNeuralFloat;              // MLP scratch
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  ThK := FNeurons[0].FWeights; ThV := FNeurons[1].FWeights;
+  ThQ := FNeurons[2].FWeights;
+  GThK := FNeurons[0].FDelta;  GThV := FNeurons[1].FDelta;
+  GThQ := FNeurons[2].FDelta;
+  W1init := nil; W2init := nil; GW1in := nil; GW2in := nil;
+  if FIsMLP then
+  begin
+    W1init := FNeurons[4].FWeights; W2init := FNeurons[5].FWeights;
+    GW1in := FNeurons[4].FDelta;    GW2in := FNeurons[5].FDelta;
+  end;
+  SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
+  negLR := -FLearningRate;
+  eta := TTTSoftPlus(FNeurons[3].FWeights.FData[0]);
+  dEtaRaw := Sigmoid(FNeurons[3].FWeights.FData[0]); // d eta / d eta_raw
+  etaGrad := 0;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  SetLength(gkv, Depth); SetLength(gvv, Depth); SetLength(gqq, Depth);
+  if not FIsMLP then
+  begin
+    SetLength(gWlin, Depth * Depth); SetLength(gWprev, Depth * Depth);
+    for i := 0 to Depth * Depth - 1 do gWlin[i] := 0;
+  end
+  else
+  begin
+    SetLength(gW1c, Hd * Depth); SetLength(gW2c, Depth * Hd);
+    SetLength(gW1prev, Hd * Depth); SetLength(gW2prev, Depth * Hd);
+    SetLength(dr, Depth); SetLength(dh1, Hd); SetLength(da1, Hd); SetLength(dS, Hd);
+    for i := 0 to Hd * Depth - 1 do gW1c[i] := 0;
+    for i := 0 to Depth * Hd - 1 do gW2c[i] := 0;
+  end;
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    for o := 0 to Depth - 1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
+
+    if not FIsMLP then
+    begin
+      baseW := t * Depth * Depth;
+      // read-out y[o] = sum_i W_t[o,i] q[i]
+      for o := 0 to Depth - 1 do
+        for i := 0 to Depth - 1 do
+        begin
+          gWlin[o * Depth + i] := gWlin[o * Depth + i] + GyPtr^[o] * FQ.FData[baseT + i];
+          gqq[i] := gqq[i] + GyPtr^[o] * FWlin.FData[baseW + o * Depth + i];
+        end;
+      // gWlin now = dL/dW_t. Update: W_t[o,i] = W_{t-1}[o,i] - eta*r[o]*k[i].
+      for i := 0 to Depth * Depth - 1 do gWprev[i] := gWlin[i]; // identity carry
+      for o := 0 to Depth - 1 do
+      begin
+        rj := FResid.FData[baseT + o]; // r[o] = W_{t-1}k - v
+        // dL/dr[o] = sum_i (-eta*k[i]) * gWlin[o,i]; also eta-grad and dL/dk via the write.
+        gv := 0; // accumulates dL/dr[o]
+        for i := 0 to Depth - 1 do
+        begin
+          acc := gWlin[o * Depth + i];
+          etaGrad := etaGrad - acc * rj * FK.FData[baseT + i] * dEtaRaw;
+          gkv[i] := gkv[i] - acc * eta * rj;          // dL/dk via the explicit k factor
+          gv := gv - eta * FK.FData[baseT + i] * acc; // dL/dr[o]
+        end;
+        // r = W_{t-1}k - v : dv -= dr ; feed W_{t-1} and k.
+        gvv[o] := gvv[o] - gv;
+        if t > 0 then
+          for i := 0 to Depth - 1 do
+          begin
+            gkv[i] := gkv[i] + gv * FWlin.FData[baseW - Depth * Depth + o * Depth + i];
+            gWprev[o * Depth + i] := gWprev[o * Depth + i] + gv * FK.FData[baseT + i];
+          end;
+      end;
+      for i := 0 to Depth * Depth - 1 do gWlin[i] := gWprev[i];
+    end
+    else
+    begin
+      baseW1 := t * Hd * Depth;
+      baseW2 := t * Depth * Hd;
+      // ---- read-out: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q ----
+      for o := 0 to Depth - 1 do
+        for j := 0 to Hd - 1 do
+          gW2c[o * Hd + j] := gW2c[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
+      for j := 0 to Hd - 1 do
+      begin
+        acc := 0;
+        for o := 0 to Depth - 1 do acc := acc + GyPtr^[o] * FW2.FData[baseW2 + o * Hd + j];
+        TTTGelu(FA1q.FData[t * Hd + j], gg, g1, g2);
+        acc := acc * g1; // dL/da1q[j]
+        for i := 0 to Depth - 1 do
+        begin
+          gW1c[j * Depth + i] := gW1c[j * Depth + i] + acc * FQ.FData[baseT + i];
+          gqq[i] := gqq[i] + acc * FW1.FData[baseW1 + j * Depth + i];
+        end;
+      end;
+      // gW1c/gW2c = dL/dW1_t, dL/dW2_t. Identity carry to t-1.
+      for i := 0 to Hd * Depth - 1 do gW1prev[i] := gW1c[i];
+      for i := 0 to Depth * Hd - 1 do gW2prev[i] := gW2c[i];
+      for o := 0 to Depth - 1 do dr[o] := 0;
+      for j := 0 to Hd - 1 do begin dh1[j] := 0; da1[j] := 0; dS[j] := 0; end;
+      // ---- W2 update: W2_t[o,j] = W2_{t-1}[o,j] - eta*r[o]*h1[j] ----
+      for o := 0 to Depth - 1 do
+        for j := 0 to Hd - 1 do
+        begin
+          acc := gW2c[o * Hd + j];
+          etaGrad := etaGrad - acc * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j] * dEtaRaw;
+          dr[o]  := dr[o]  - eta * acc * FH1k.FData[t * Hd + j];
+          dh1[j] := dh1[j] - eta * acc * FRr.FData[baseT + o];
+        end;
+      // ---- W1 update: W1_t[j,i] = W1_{t-1}[j,i] - eta*da1[j]*k[i] ----
+      for j := 0 to Hd - 1 do
+      begin
+        TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
+        S := 0; // (W2_{t-1}^T r)[j]
+        for o := 0 to Depth - 1 do
+          if t > 0 then S := S + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
+          else S := S + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
+        // da1_fwd[j] = g1 * S ; d(da1[j]) accumulates from the W1 write.
+        rj := 0; // d(da1[j])
+        for i := 0 to Depth - 1 do
+        begin
+          acc := gW1c[j * Depth + i];
+          etaGrad := etaGrad - acc * (g1 * S) * FK.FData[baseT + i] * dEtaRaw;
+          gkv[i] := gkv[i] - eta * acc * (g1 * S);    // dL/dk via explicit k
+          rj := rj - eta * acc * FK.FData[baseT + i]; // dL/d(da1[j])
+        end;
+        // da1 = g1(a1)*S : split into dS and the g2 second-derivative term on a1.
+        dS[j]  := dS[j]  + rj * g1;
+        da1[j] := da1[j] + rj * g2 * S;
+      end;
+      // dS feeds r and W2_{t-1}.
+      for j := 0 to Hd - 1 do
+        for o := 0 to Depth - 1 do
+        begin
+          if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
+          else w2v := W2init.FData[o * Hd + j];
+          dr[o] := dr[o] + dS[j] * w2v;
+          if t > 0 then gW2prev[o * Hd + j] := gW2prev[o * Hd + j] + dS[j] * FRr.FData[baseT + o]
+          else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dS[j] * FRr.FData[baseT + o];
+        end;
+      // r[o] = f[o] - v[o], f[o] = W2_{t-1} h1 : dv -= dr ; feed W2_{t-1}, h1.
+      for o := 0 to Depth - 1 do
+      begin
+        gvv[o] := gvv[o] - dr[o];
+        for j := 0 to Hd - 1 do
+        begin
+          if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
+          else w2v := W2init.FData[o * Hd + j];
+          dh1[j] := dh1[j] + dr[o] * w2v;
+          if t > 0 then gW2prev[o * Hd + j] := gW2prev[o * Hd + j] + dr[o] * FH1k.FData[t * Hd + j]
+          else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dr[o] * FH1k.FData[t * Hd + j];
+        end;
+      end;
+      // h1[j] = GeLU(a1[j]) : da1 += dh1 * g1(a1).
+      for j := 0 to Hd - 1 do
+      begin
+        TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
+        da1[j] := da1[j] + dh1[j] * g1;
+      end;
+      // a1[j] = sum_i W1_{t-1}[j,i] k[i] : feed W1_{t-1}, k.
+      for j := 0 to Hd - 1 do
+        for i := 0 to Depth - 1 do
+        begin
+          if t > 0 then w1v := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
+          else w1v := W1init.FData[j * Depth + i];
+          gkv[i] := gkv[i] + da1[j] * w1v;
+          if t > 0 then gW1prev[j * Depth + i] := gW1prev[j * Depth + i] + da1[j] * FK.FData[baseT + i]
+          else GW1in.FData[j * Depth + i] := GW1in.FData[j * Depth + i] + negLR * da1[j] * FK.FData[baseT + i];
+        end;
+      for i := 0 to Hd * Depth - 1 do gW1c[i] := gW1prev[i];
+      for i := 0 to Depth * Hd - 1 do gW2c[i] := gW2prev[i];
+    end;
+
+    // ---- map dL/dk, dL/dv, dL/dq back to projections + input ----
+    if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+    else PrevErrPtr := nil;
+    for o := 0 to Depth - 1 do
+    begin
+      gqv := gqq[o] * FScaleQ;
+      gk := gkv[o];
+      gv := gvv[o];
+      for i := 0 to Depth - 1 do
+      begin
+        GThQ.FData[o * Depth + i] := GThQ.FData[o * Depth + i] + negLR * gqv * XtPtr^[i];
+        GThK.FData[o * Depth + i] := GThK.FData[o * Depth + i] + negLR * gk * XtPtr^[i];
+        GThV.FData[o * Depth + i] := GThV.FData[o * Depth + i] + negLR * gv * XtPtr^[i];
+        if hasInputGrad then
+          PrevErrPtr^[i] := PrevErrPtr^[i] +
+            gqv * ThQ.FData[o * Depth + i] + gk * ThK.FData[o * Depth + i] +
+            gv * ThV.FData[o * Depth + i];
+      end;
+    end;
+  end;
+  // MLP arm: the identity-carry adjoint left in gW1c/gW2c after t=0 is the
+  // gradient w.r.t. the INITIAL inner fast-weights W1_0/W2_0 (the W_{-1} term of
+  // the t=0 TTT update). Flush it (the a1/dS/df paths already wrote their parts).
+  if FIsMLP then
+  begin
+    for i := 0 to Hd * Depth - 1 do
+      GW1in.FData[i] := GW1in.FData[i] + negLR * gW1c[i];
+    for i := 0 to Depth * Hd - 1 do
+      GW2in.FData[i] := GW2in.FData[i] + negLR * gW2c[i];
+  end;
+  // eta_raw grad.
+  FNeurons[3].FDelta.FData[0] := FNeurons[3].FDelta.FData[0] + negLR * etaGrad;
+  if (not FBatchUpdate) then
+  begin
+    for j := 0 to FNeurons.Count - 1 do FNeurons[j].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetTestTimeTraining.InitDefault();
+var
+  Depth, Hd, oldSeed, a, b: integer;
+  sc1, sc2: TNeuralFloat;
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  Depth := FNeurons[0].FWeights.SizeX;
+  if Depth < 1 then exit;
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  // Small Gaussian view projections so the layer starts as a mild mixer.
+  for a := 0 to 2 do
+    for b := 0 to FNeurons[a].FWeights.Size - 1 do
+      FNeurons[a].FWeights.FData[b] := FNeurons[a].FWeights.RandomGaussianValue() * 0.1;
+  // eta_raw so eta = softplus(eta_raw) ~ 0.5 (a gentle inner step) at init.
+  FNeurons[3].FWeights.FData[0] := -0.43275; // softplus(-0.43275) ~ 0.5
+  if FIsMLP and (FNeurons.Count >= 6) then
+  begin
+    Hd := FHidden;
+    sc1 := 1.0 / Sqrt(Depth);
+    sc2 := 1.0 / Sqrt(Max(Hd, 1));
+    for b := 0 to FNeurons[4].FWeights.Size - 1 do
+      FNeurons[4].FWeights.FData[b] := FNeurons[4].FWeights.RandomGaussianValue() * sc1;
+    for b := 0 to FNeurons[5].FWeights.Size - 1 do
+      FNeurons[5].FWeights.FData[b] := FNeurons[5].FWeights.RandomGaussianValue() * sc2;
+  end;
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -72698,6 +73277,7 @@ begin
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
+      'TNNetTestTimeTraining':      Result := TNNetTestTimeTraining.Create(St[1], St[2]);
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
       'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
       'TNNetHamiltonianCell':       Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0);
@@ -73052,6 +73632,7 @@ begin
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
+      if S[0] = 'TNNetTestTimeTraining' then Result := TNNetTestTimeTraining.Create(St[1], St[2]) else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
       if S[0] = 'TNNetHamiltonianCell' then Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0) else

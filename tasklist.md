@@ -161,47 +161,15 @@ rather than acted on.
             per-token left-to-right scan; gate behind an exact-vs-chunked equivalence assert
             (mirrors the open TNNetDeltaNet chunked-forward task).
 
-- [ ] TNNetTestTimeTraining — a Test-Time Training (TTT) sequence-mixing layer
-      (Sun et al. 2024, "Learning to (Learn at Test Time): RNNs with Expressive
-      Hidden States", arXiv:2407.04620). The defining idea: the recurrent hidden
-      "state" IS a small model W whose weights are updated by one explicit
-      GRADIENT-DESCENT step on a self-supervised reconstruction loss at every
-      timestep, so the sequence scan literally trains an inner net as it reads —
-      a paradigm distinct from the editable-matrix / decay-kernel mixers already
-      in tree. Forward (per token t, learnable view projections theta_K/theta_V/
-      theta_Q and inner LR eta=softplus(eta_raw)):
-        k_t = theta_K x_t ; v_t = theta_V x_t ; q_t = theta_Q x_t
-        inner loss  ell_t(W) = 1/2 || W(k_t) - v_t ||^2     (self-supervised)
-        W_t = W_{t-1} - eta * grad_W ell_t(W_{t-1})          (the TTT update)
-        y_t = W_t(q_t)                                        (read-out)
-      Two inner-model variants behind ONE flag (FStruct):
-        (a) TTT-LINEAR: W is a matrix; the update is rank-1 and the layer reduces
-            to a delta-rule-like scan. State the explicit relationship to the
-            landed [[deltanet-layer]] in the doc comment so the two are not
-            mistaken for duplicates — TTT-Linear ~ DeltaNet with an MSE-gradient
-            (not Widrow-Hoff) write and a learnable per-channel inner LR.
-        (b) TTT-MLP: W is a TWO-layer MLP (W1, GeLU, W2); its gradient step is a
-            genuine non-linear fast-weight update that DeltaNet's single matrix
-            memory CANNOT express — this non-linear inner state is the headline
-            novelty and the reason the layer earns its place (not a re-skin).
-      The hard part / definition of done: exact BPTT THROUGH the inner update.
-      The forward already runs an inner backward (to get grad_W ell_t), so the
-      outer backward is a second-order pass — differentiate y_t w.r.t. x_t, the
-      view-projection weights, and eta, propagating the adjoint of W_t back to
-      W_{t-1} across the scan (a Hessian-vector product for the TTT-MLP arm, the
-      same 2nd-inner-tape pattern proven in [[hamiltonian-cell-layer]]). Land it
-      with: numerical-gradient checks on input + view weights + eta for BOTH inner
-      variants (well-separated inputs near the GeLU kink, bound weights rather
-      than loosen tol per [[octonion-conv-layer]]), LoadFromString round-trip
-      (FStruct-encoded inner-variant flag + inner dims, with NON-default values
-      per the registry-audit discipline), the `// Coded by Claude (AI).`
-      attribution, and an examples/TestTimeTraining/ associative-recall +
-      copy demo contrasting TTT-Linear vs TTT-MLP vs the landed DeltaNet/WKV
-      arms at matched width (the headline: the non-linear inner state lifts
-      recall on a task the linear mixers plateau on). Optional follow-up to log,
-      not build now: mini-batch TTT (one inner step per CHUNK of b tokens instead
-      of per token) for the same sub-quadratic-training motive as the open
-      DeltaNet/WKV chunked-forward tasks.
+- [ ] Mini-batch / chunked Test-Time Training — follow-up to the landed
+      TNNetTestTimeTraining (both TTT-Linear and TTT-MLP arms, with exact
+      second-order BPTT through the inner update, shipped with tests + the
+      examples/TestTimeTraining parity-binding recall demo). Apply ONE inner
+      gradient-descent step per CHUNK of b tokens (mini-batch the inner SGD)
+      instead of per token, for the same sub-quadratic-training motive as the
+      open DeltaNet/WKV chunked-forward tasks. Optional second follow-up: a
+      learnable PER-CHANNEL inner LR eta (currently a single learnable per-layer
+      scalar via softplus(eta_raw)).
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently

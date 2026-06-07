@@ -413,6 +413,13 @@ type
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
     procedure TestWKVSerializationRoundTrip;
+    procedure TestTTTShapeInference;
+    procedure TestTTTLinearInputGradientCheck;
+    procedure TestTTTLinearWeightGradientCheck;
+    procedure TestTTTMLPInputGradientCheck;
+    procedure TestTTTMLPWeightGradientCheck;
+    procedure TestTTTLinearSerializationRoundTrip;
+    procedure TestTTTMLPSerializationRoundTrip;
     procedure TestNTMMemoryInputGradientCheck;
     procedure TestNTMMemoryWeightGradientCheck;
     procedure TestNTMMemorySerializationRoundTrip;
@@ -25191,6 +25198,226 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDeltaNet.Create(), 'DeltaNet', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetTestTimeTraining (TTT-Linear / TTT-MLP) ----------------------------
+
+// Deterministic, BOUNDED seeding so the second-order BPTT (and the inner
+// MSE-gradient update) stays inside the finite-difference truncation tolerance.
+// Bounding the magnitudes is preferred to loosening the gradient tolerance.
+procedure SeedTTT(L: TNNetTestTimeTraining; Depth, Hd: integer; IsMLP: boolean);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.15; // theta_K
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.15; // theta_V
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 + j * 0.3) * 0.15; // theta_Q
+    end;
+  // eta_raw moderate so eta=softplus(eta_raw) is well inside its range (exercises
+  // the eta gradient away from saturation).
+  L.Neurons[3].Weights.Raw[0] := -0.3;
+  if IsMLP then
+  begin
+    for d := 0 to Hd - 1 do
+      for j := 0 to Depth - 1 do
+        L.Neurons[4].Weights[d, 0, j] := Sin(d * 0.43 + j * 0.27) * 0.20; // W1_0
+    for d := 0 to Depth - 1 do
+      for j := 0 to Hd - 1 do
+        L.Neurons[5].Weights[d, 0, j] := Cos(d * 0.31 - j * 0.37) * 0.20; // W2_0
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTTTShapeInference;
+var
+  NN: TNNet;
+  L: TNNetTestTimeTraining;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 4)); // SeqLen=5, Depth=4
+    L := TNNetTestTimeTraining.Create(1, 6);  // MLP, hidden=6
+    NN.AddLayer(L);
+    AssertEquals('TTT output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('TTT output SizeY', 1, L.Output.SizeY);
+    AssertEquals('TTT output Depth preserved', 4, L.Output.Depth);
+    AssertEquals('TTT-MLP neuron count', 6, L.Neurons.Count);
+    AssertEquals('TTT theta_K size', 16, L.Neurons[0].Weights.Size); // 4x4
+    AssertEquals('TTT eta_raw size', 1, L.Neurons[3].Weights.Size);
+    AssertEquals('TTT W1_0 size', 24, L.Neurons[4].Weights.Size); // 6x4
+    AssertEquals('TTT W2_0 size', 24, L.Neurons[5].Weights.Size); // 4x6
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTTInputGradientCheck(ATest: TTestCase; IsMLP: boolean; Hd: integer;
+  const ATag: string);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetTestTimeTraining;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, Depth: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  Depth := 3;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, Depth);
+  InputPlus := TNNetVolume.Create(3, 1, Depth);
+  Desired := TNNetVolume.Create(3, 1, Depth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, Depth, 1));
+    L := TNNetTestTimeTraining.Create(Ord(IsMLP), Hd);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.6 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedTTT(L, Depth, Hd, IsMLP);
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      ATest.AssertTrue(ATag + ' input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn(ATag + ' input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTTWeightGradientCheck(ATest: TTestCase; IsMLP: boolean; Hd: integer;
+  const ATag: string);
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetTestTimeTraining;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n, Depth: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  Depth := 3;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, Depth);
+  Desired := TNNetVolume.Create(3, 1, Depth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, Depth, 1));
+    L := TNNetTestTimeTraining.Create(Ord(IsMLP), Hd);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.5 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedTTT(L, Depth, Hd, IsMLP);
+    // Cover every learnable tensor: the three projections, eta_raw, and (MLP) the
+    // initial inner fast-weights. eta and the inner MSE-gradient/HVP are the
+    // BPTT-error-prone spots.
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        ATest.AssertTrue(ATag + ' weight gradient check n=' + IntToStr(n) +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn(ATag + ' weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTTTLinearInputGradientCheck;
+begin
+  TTTInputGradientCheck(Self, false, 0, 'TTT-Linear');
+end;
+
+procedure TTestNeuralNumerical.TestTTTLinearWeightGradientCheck;
+begin
+  TTTWeightGradientCheck(Self, false, 0, 'TTT-Linear');
+end;
+
+procedure TTestNeuralNumerical.TestTTTMLPInputGradientCheck;
+begin
+  TTTInputGradientCheck(Self, true, 5, 'TTT-MLP');
+end;
+
+procedure TTestNeuralNumerical.TestTTTMLPWeightGradientCheck;
+begin
+  TTTWeightGradientCheck(Self, true, 5, 'TTT-MLP');
+end;
+
+procedure TTestNeuralNumerical.TestTTTLinearSerializationRoundTrip;
+begin
+  // NON-default values: variant flag (0) + perturbed projections/eta_raw.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetTestTimeTraining.Create(0, 0), 'TTT-Linear', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestTTTMLPSerializationRoundTrip;
+begin
+  // NON-default values: variant flag (1) + non-default hidden width (5) + all
+  // perturbed weights including the initial inner fast-weights W1_0/W2_0.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetTestTimeTraining.Create(1, 5), 'TTT-MLP', 4, 1, 3, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestDeltaNetRecallSmokeTrain;
