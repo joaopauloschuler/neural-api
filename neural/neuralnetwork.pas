@@ -10085,6 +10085,20 @@ type
       // (TNNetCellMulByCell) into wkv, (5) a final PointwiseConvLinear out-projection
       // back to D. Shape-preserving (output == input shape). Returns the out layer.
       function AddRWKVTimeMix(): TNNetLayer;
+      // GATED LINEAR ATTENTION time-mixing block (Yang et al. 2023,
+      // arXiv:2312.06635) over a (SeqLen,1,D) sequence (SizeY=1). Wraps the
+      // TNNetGatedLinearAttention leaf (which itself owns the q/k/v/forget-gate
+      // projections internally) with the surrounding RWKV-style time-mix wiring so
+      // it is a drop-in mixer. Wires: (1) a TNNetTokenShift per-channel time-shift,
+      // (2) a per-token PointwiseConvLinear D->D projection of the shifted stream
+      // that becomes the leaf's input x_t (the leaf derives q/k/v/alpha from it),
+      // (3) the TNNetGatedLinearAttention cell (data-dependent per-channel vector
+      // forget gate on a DxD matrix state) -> D channels, (4) a receptance gate
+      // r=sigmoid(PointwiseConvLinear of the shifted stream) cell-multiplied
+      // (TNNetCellMulByCell) into the cell output, (5) a final PointwiseConvLinear
+      // out-projection back to D. Shape-preserving (output == input shape).
+      // Returns the out layer.
+      function AddGatedLinearAttention(): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
       // spiking neural network, over a (T,1,D) spike/feature tensor on the time
       // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
@@ -39877,6 +39891,34 @@ begin
   // (4) Receptance gate: r (*) wkv, cell-wise.
   Gated := AddLayer( TNNetCellMulByCell.Create(RGate, Wkv) );
   // (5) Output projection back to D.
+  Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Gated );
+end;
+
+function TNNet.AddGatedLinearAttention(): TNNetLayer;
+var
+  x, Shifted, XProj, RGate, Cell, Gated: TNNetLayer;
+  D: integer;
+begin
+  x := GetLastLayer();
+  if x.Output.SizeY <> 1 then
+    FErrorProc('AddGatedLinearAttention requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(x.Output.SizeY));
+  D := x.Output.Depth;
+  // (1) Per-channel token shift (the RWKV time-shift primitive).
+  Shifted := AddLayerAfter( TNNetTokenShift.Create(), x );
+  // (2) Per-token (PointwiseConvLinear keeps the sequence axis) D->D projection of
+  // the shifted stream into the GLA cell input x_t. The leaf itself owns the
+  // q/k/v and per-channel forget-gate projections, so we only feed it a
+  // per-token-mixed stream here.
+  XProj := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Shifted );
+  // (3) Receptance gate r = sigmoid(.) projected per-token from the shifted stream.
+  RGate := AddLayerAfter( [TNNetPointwiseConvLinear.Create(D, 1), TNNetSigmoid.Create()], Shifted );
+  // (4) The gated-linear-attention cell (data-dependent per-channel vector forget
+  // gate on a DxD matrix state) -> D channels.
+  Cell := AddLayerAfter( TNNetGatedLinearAttention.Create(), XProj );
+  // (5) Receptance gate: r (*) cell, cell-wise.
+  Gated := AddLayer( TNNetCellMulByCell.Create(RGate, Cell) );
+  // (6) Output projection back to D.
   Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Gated );
 end;
 

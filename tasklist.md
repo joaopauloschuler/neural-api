@@ -82,8 +82,17 @@ rather than acted on.
       - [ ] Chunked/parallel hardware-efficient forward (the paper's main systems
             contribution; v1 ships the exact per-token scan only) — gate behind an
             exact-vs-chunked equivalence assert (mirrors open DeltaNet/WKV chunked tasks).
-      - [ ] TNNet.AddGatedLinearAttention builder: token-shift + projections +
-            receptance/output gating into a drop-in time-mixing block.
+      - [X] TNNet.AddGatedLinearAttention builder: token-shift + projections +
+            receptance/output gating into a drop-in time-mixing block. LANDED on a2:
+            mirrors AddRWKVTimeMix (TNNetTokenShift -> per-token PointwiseConvLinear
+            D->D projection into the GLA leaf -> sigmoid receptance gate
+            cell-multiplied -> PointwiseConvLinear out-projection). The GLA leaf owns
+            q/k/v/forget-gate projections internally, so the builder only feeds it a
+            per-token-mixed stream (unlike RWKV/WKV whose builder supplies k|v).
+            Shape + input-gradient tests in TestNeuralNumerical.pas. Follow-ups:
+            (a) wire into the downstream ../gpt-3-for-pascal decoder as a mixer arm
+            (mirrors the open AddRWKVTimeMix gpt-3 task); (b) optional FFN/LayerNorm
+            residual wrapper builder (AddGatedLinearAttentionBlock) for a full block.
       - [ ] Rectangular d_k != d_v state variant (FStruct[0]/[1] already carry both).
 - [ ] TNNetKANConv follow-ups (the convolutional Kolmogorov-Arnold layer LANDED
       2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:

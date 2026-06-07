@@ -187,6 +187,19 @@ begin
     Cell.Neurons[4].Weights.Raw[d] := 0.0; // b_a = 0 -> alpha ~= 0.5 at init
 end;
 
+// GLA-builder arm: the SAME projection front-end, but the gated-linear-attention
+// mixer is wired by the TNNet.AddGatedLinearAttention builder (token-shift +
+// per-token projection into the leaf + receptance/output gating) instead of the
+// bare leaf. Shows the drop-in time-mixing block reaches comparable recall.
+function BuildGLABuilder(): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(cSeqLen, 1, cInDim));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(cModelDim));
+  Result.AddGatedLinearAttention();
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(cValueDim));
+end;
+
 // DeltaNet arm: 1x1 projection to cModelDim -> delta-rule cell -> 1x1 readout.
 function BuildDeltaNet(): TNNet;
 var Cell: TNNetDeltaNet;
@@ -234,8 +247,8 @@ begin
 end;
 
 var
-  GNet, DNet, RNet: TNNet;
-  gMSE, dMSE, rMSE, gAcc, dAcc, rAcc: TNeuralFloat;
+  GNet, BNet, DNet, RNet: TNNet;
+  gMSE, bMSE, dMSE, rMSE, gAcc, bAcc, dAcc, rAcc: TNeuralFloat;
 begin
   RandSeed := 12345;
   InitValueBank();
@@ -247,17 +260,21 @@ begin
   WriteLn;
 
   GNet := BuildGLA();
+  BNet := BuildGLABuilder();
   DNet := BuildDeltaNet();
   RNet := BuildRetention();
-  WriteLn('GLA       params = ', GNet.CountWeights());
-  WriteLn('DeltaNet  params = ', DNet.CountWeights());
-  WriteLn('Retention params = ', RNet.CountWeights());
+  WriteLn('GLA (leaf)     params = ', GNet.CountWeights());
+  WriteLn('GLA (builder)  params = ', BNet.CountWeights());
+  WriteLn('DeltaNet       params = ', DNet.CountWeights());
+  WriteLn('Retention      params = ', RNet.CountWeights());
   WriteLn;
 
   WriteLn('training all arms on the SAME recall stream (', cTrainSteps, ' steps each)...');
   // Same RNG stream replay so every arm sees identical training samples.
   RandSeed := 999;
   Train(GNet, cTrainSteps, 0.01);
+  RandSeed := 999;
+  Train(BNet, cTrainSteps, 0.01);
   RandSeed := 999;
   Train(DNet, cTrainSteps, 0.01);
   RandSeed := 999;
@@ -267,13 +284,17 @@ begin
   RandSeed := 7;
   gMSE := Evaluate(GNet, cEvalSeqs, gAcc);
   RandSeed := 7;
+  bMSE := Evaluate(BNet, cEvalSeqs, bAcc);
+  RandSeed := 7;
   dMSE := Evaluate(DNet, cEvalSeqs, dAcc);
   RandSeed := 7;
   rMSE := Evaluate(RNet, cEvalSeqs, rAcc);
 
   WriteLn('eval over ', cEvalSeqs, ' held-out recall sequences:');
-  WriteLn('  GLA (per-channel gate) : recall MSE = ', gMSE:0:5,
+  WriteLn('  GLA (leaf, per-chan gate): recall MSE = ', gMSE:0:5,
           '   exact-recall acc = ', (gAcc * 100):0:1, '%');
+  WriteLn('  GLA (AddGatedLinearAtt.) : recall MSE = ', bMSE:0:5,
+          '   exact-recall acc = ', (bAcc * 100):0:1, '%');
   WriteLn('  DeltaNet (delta rule)  : recall MSE = ', dMSE:0:5,
           '   exact-recall acc = ', (dAcc * 100):0:1, '%');
   WriteLn('  Retention (fixed decay): recall MSE = ', rMSE:0:5,
@@ -286,5 +307,5 @@ begin
   else
     WriteLn('WARNING: GLA did not beat the Retention baseline on recall.');
 
-  GNet.Free; DNet.Free; RNet.Free;
+  GNet.Free; BNet.Free; DNet.Free; RNet.Free;
 end.

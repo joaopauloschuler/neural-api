@@ -420,6 +420,8 @@ type
     procedure TestGLAWeightGradientCheck;
     procedure TestGLASerializationRoundTrip;
     procedure TestGLARecallSmokeTrain;
+    procedure TestAddGatedLinearAttentionShape;
+    procedure TestAddGatedLinearAttentionInputGradient;
     procedure TestWKVShapeInference;
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
@@ -25712,6 +25714,102 @@ begin
       LossAfter < LossBefore);
   finally
     NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddGatedLinearAttentionShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i: integer;
+begin
+  // The AddGatedLinearAttention builder must be shape-preserving over the
+  // (SeqLen,1,D) sequence (the GLA leaf + token-shift + gating + out-projection
+  // all keep the sequence layout).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6));
+    Out := NN.AddGatedLinearAttention();
+    AssertEquals('GLA builder output SizeX', 5, Out.Output.SizeX);
+    AssertEquals('GLA builder output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('GLA builder output Depth', 6, Out.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('GLA builder computed SizeX', 5, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GLA builder computed Depth', 6, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddGatedLinearAttentionInputGradient;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var localJ: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for localJ := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[localJ] - Desired.Raw[localJ];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input-gradient finite-difference check for the whole composed builder block
+  // (token-shift -> projection -> GLA leaf -> receptance gate -> out-projection).
+  // Verifies the per-token PointwiseConvLinear wiring keeps a non-degenerate
+  // input gradient (a FullConnect projection here would zero it).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4));
+    NN.AddGatedLinearAttention();
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GLA builder input gradient at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('GLA builder input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
   end;
 end;
 

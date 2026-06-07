@@ -43,18 +43,28 @@ selectively forget the channels carrying the stale value while retaining the
 rest. All three arms share the same I/O contract and a comparable parameter
 budget: a per-token `1×1` projection → memory mixer → `1×1` readout.
 
+A fourth arm wires the GLA mixer with the **`TNNet.AddGatedLinearAttention`
+builder** (token-shift → per-token projection into the leaf → sigmoid receptance
+gate → out-projection) instead of the bare leaf, to demonstrate the drop-in
+time-mixing block.
+
 ## Headline result
 
 ```
 eval over 400 held-out recall sequences:
-  GLA (per-channel gate) : recall MSE = 0.00851   exact-recall acc = 100.0%
-  DeltaNet (delta rule)  : recall MSE = 0.00765   exact-recall acc = 100.0%
-  Retention (fixed decay): recall MSE = 0.01912   exact-recall acc = 96.3%
+  GLA (leaf, per-chan gate): recall MSE = 0.00851   exact-recall acc = 100.0%
+  GLA (AddGatedLinearAtt.) : recall MSE = 0.05332   exact-recall acc = 65.3%
+  DeltaNet (delta rule)  : recall MSE = 0.00615   exact-recall acc = 99.5%
+  Retention (fixed decay): recall MSE = 0.02254   exact-recall acc = 93.0%
 ```
 
-GLA reaches perfect exact recall — competitive with the delta rule and clearly
-ahead of the single-scalar fixed-decay baseline, which blends the stale and fresh
-values and misses a fraction of overwrites.
+The bare-leaf GLA reaches perfect exact recall — competitive with the delta rule
+and clearly ahead of the single-scalar fixed-decay baseline, which blends the
+stale and fresh values and misses a fraction of overwrites. The builder arm
+trails on *this particular* one-shot overwrite-recall toy because its RWKV-style
+token-shift deliberately mixes each token with its predecessor — counter-
+productive when every token must be read independently — but it is the natural
+drop-in mixer for streaming language-model style workloads.
 
 ## Running
 
@@ -69,7 +79,7 @@ Pure CPU, tiny dimensions; finishes in a few seconds.
 
 - Chunked/parallel (sub-quadratic, hardware-efficient) forward — the paper's main
   contribution on the systems side; v1 ships the exact per-token scan.
-- An `AddGatedLinearAttention` builder composing token-shift + projections + the
-  cell into a drop-in time-mixing block.
+- The `AddGatedLinearAttention` builder (token-shift + projections + the cell into
+  a drop-in time-mixing block) **landed** — demonstrated as the fourth arm above.
 - A rectangular state `d_k ≠ d_v` variant (`FStruct[0]`/`FStruct[1]` already carry
   `d_k`/`d_v` for this).
