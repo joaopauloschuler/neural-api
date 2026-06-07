@@ -5062,14 +5062,42 @@ procedure TTestNeuralLayersExtra.TestNeuralTangentKernelReportSmoke;
 var
   NN: TNNet;
   Probes: TNNetVolumeList;
-  V: TNNetVolume;
+  TrainPairs: TNNetVolumePairList;
+  V, TV: TNNetVolume;
   Report, NilReport, TooSmallReport: string;
+  SnapFresh, SnapStepped: string;
+  DriftSame, DriftStep: TNeuralFloat;
   I, J: integer;
   SavedSeed: longword;
 const
   cInDim  = 8;
   cProbeN = 8;
+
+  // Pull the relative-Frobenius-drift scalar off the
+  // "relative Frobenius drift ... = <value>" line. -1 if not found.
+  function ReadDrift(const S: string): TNeuralFloat;
+  var
+    P, E: integer;
+    FSL: TFormatSettings;
+  begin
+    Result := -1;
+    P := Pos('relative Frobenius drift', S);
+    if P <= 0 then Exit;
+    P := Pos('=', Copy(S, P, Length(S))) + P - 1;
+    if P <= 0 then Exit;
+    Inc(P);
+    while (P <= Length(S)) and (S[P] = ' ') do Inc(P);
+    E := P;
+    while (E <= Length(S)) and (S[E] <> ' ') and (S[E] <> #10) and
+          (S[E] <> #13) do Inc(E);
+    FSL := DefaultFormatSettings;
+    FSL.DecimalSeparator := '.';
+    FSL.ThousandSeparator := #0;
+    Result := StrToFloatDef(Trim(Copy(S, P, E - P)), -1, FSL);
+  end;
+
 begin
+  RandSeed := 424242;
   SavedSeed := RandSeed;
 
   // nil NN handled gracefully.
@@ -5110,6 +5138,52 @@ begin
     AssertTrue('Condition number present', Pos('Condition number', Report) > 0);
     // built-in correctness lines must be present (symmetry == 0, diagonal > 0).
     AssertTrue('Correctness check present', Pos('Correctness:', Report) > 0);
+
+    // --- NTK drift: comparing the net against an IDENTICAL copy of its own
+    // weights must give ~0 drift; comparing fresh-init against a one-step
+    // update must give a finite drift > 0. ---
+    SnapFresh := NN.SaveDataToString();
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes, -1, SnapFresh);
+    AssertTrue('Drift section present', Pos('NTK drift vs SnapshotB', Report) > 0);
+    DriftSame := ReadDrift(Report);
+    AssertTrue('drift scalar parsed (identical copy)', DriftSame >= 0);
+    AssertTrue('drift ~0 for identical weights', DriftSame < 1e-4);
+
+    // Take ONE training step so the weights (and hence the empirical NTK) move.
+    TrainPairs := TNNetVolumePairList.Create(True);
+    try
+      for I := 0 to cProbeN - 1 do
+      begin
+        TV := TNNetVolume.Create(3, 1, 1);
+        TV.Fill(0);
+        TV.Raw[I mod 3] := 1.0;
+        V := TNNetVolume.Create(cInDim, 1, 1);
+        V.Copy(Probes[I]);
+        TrainPairs.Add(TNNetVolumePair.Create(V, TV));
+      end;
+      for I := 0 to TrainPairs.Count - 1 do
+      begin
+        NN.Compute(TrainPairs[I].I);
+        NN.Backpropagate(TrainPairs[I].O);
+      end;
+      NN.UpdateWeights();
+    finally
+      TrainPairs.Free;
+    end;
+    SnapStepped := NN.SaveDataToString();
+
+    // Drift between the FRESH snapshot and the now-stepped live net must be
+    // finite and strictly positive (the kernel moved).
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes, -1, SnapFresh);
+    DriftStep := ReadDrift(Report);
+    AssertTrue('drift scalar parsed (post-step)', DriftStep >= 0);
+    AssertTrue('drift is finite', DriftStep < 1e30);
+    AssertTrue('drift > 0 after a training step', DriftStep > 1e-6);
+
+    // Re-snapshotting the stepped net against ITSELF is again ~0 drift.
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes, -1, SnapStepped);
+    DriftSame := ReadDrift(Report);
+    AssertTrue('drift ~0 for identical stepped copy', DriftSame < 1e-4);
   finally
     Probes.Free;
     NN.Free;

@@ -10603,10 +10603,22 @@ type
       // (spectrum of the WEIGHT tensors, no data). Pure forward+backward READ on
       // a frozen net — weights are never stepped. Guards nil NN and an empty /
       // too-small probe batch (< 2 usable samples) gracefully.
+      // SnapshotB (default '' => no drift section) optionally measures NTK
+      // DRIFT between two checkpoints of the SAME architecture: it is a
+      // NN.SaveDataToString snapshot of a SECOND set of weights (e.g. the same
+      // net before vs after a training step). When supplied, the empirical NTK
+      // is recomputed on a TEMP clone loaded with SnapshotB over the SAME probe
+      // batch and index-aligned to the self kernel, and the report adds the
+      // relative Frobenius drift ||K_self - K_other||_F / ||K_self||_F and the
+      // Pearson correlation of the two kernels' off-diagonal entries (1 = the
+      // kernel did not rotate; large drift = the feature geometry moved). The
+      // live net is never modified. Architecture mismatch is reported
+      // gracefully and falls back to the single-net report.
       class function NeuralTangentKernelReport(
         NN: TNNet;
         Samples: TNNetVolumeList;
-        TargetClass: integer = -1
+        TargetClass: integer = -1;
+        const SnapshotB: string = ''
       ): string;
       // Gradient signal-to-noise diagnostic that ANALYTICALLY PREDICTS the
       // batch-size sweep (McCandlish et al. 2018, "An Empirical Model of
@@ -61434,7 +61446,8 @@ end;
 class function TNNet.NeuralTangentKernelReport(
   NN: TNNet;
   Samples: TNNetVolumeList;
-  TargetClass: integer = -1
+  TargetClass: integer = -1;
+  const SnapshotB: string = ''
 ): string;
 const
   cEps = 1e-30;
@@ -61486,6 +61499,82 @@ var
   Bar, RowStr: string;
   Glyph: char;
   CellVal: Double;
+  // --- NTK drift (optional SnapshotB) scratch ---
+  NetB: TNNet;
+  StructStr, DiffStr: string;
+  GramSelf, GramB: TDoubleMatrix;     // index-aligned self vs B kernels
+  GradsB: array of TFloatArray;
+  BUsable: integer;
+  DriftNum, DriftDen, Drift: Double;
+  OffMeanA, OffMeanB, OffCovAB, OffVarA, OffVarB, OffCorr: Double;
+  OffCnt: integer;
+  CanDrift: boolean;
+
+  // Collect index-aligned per-sample gradient vectors from aNet over exactly
+  // the UsableCount original samples in SampleOrigIdx (same flat layout as the
+  // self net — the architecture is identical). Returns the number filled.
+  // Mirrors the self-net collection loop above; aNet is FROZEN (no weight
+  // update). A returned slot is left nil if that probe yields a zero gradient.
+  function CollectGradsAligned(aNet: TNNet;
+    out aGrads: array of TFloatArray): integer;
+  var
+    si, li, ni, kk, pp, cu: integer;
+    sq, lr2, gg: TNeuralFloat;
+    lay: TNNetLayer;
+    neu: TNNetNeuron;
+    tgt: TNNetVolume;
+    filled: integer;
+  begin
+    aNet.SetBatchUpdate(true);
+    tgt := TNNetVolume.Create(aNet.GetLastLayer().Output.Size, 1, 1);
+    filled := 0;
+    try
+      for si := 0 to N - 1 do
+      begin
+        aGrads[si] := nil;
+        Probe := Samples[SampleOrigIdx[si]];
+        if Probe = nil then Continue;
+        aNet.ClearDeltas();
+        aNet.Compute(Probe);
+        // Use the SAME target class the self net backpropagated for this slot
+        // so the two kernels are measured against the same readout direction.
+        cu := SampleClassUsed[si];
+        if (cu < 0) or (cu >= aNet.GetLastLayer().Output.Size) then Continue;
+        tgt.Fill(0);
+        tgt.Raw[cu] := 1.0;
+        aNet.Backpropagate(tgt);
+        SetLength(aGrads[si], NetParamCnt);
+        sq := 0;
+        for li := 0 to aNet.GetLastLayerIdx() do
+        begin
+          if not LayerHasParams[li] then Continue;
+          lay := aNet.Layers[li];
+          lr2 := lay.LearningRate;
+          if lr2 <= 0 then lr2 := 1.0;
+          pp := FlatBase[li];
+          for ni := 0 to lay.Neurons.Count - 1 do
+          begin
+            neu := lay.Neurons[ni];
+            for kk := 0 to neu.Delta.Size - 1 do
+            begin
+              gg := neu.Delta.FData[kk] / lr2;
+              aGrads[si][pp] := gg;
+              sq := sq + gg * gg;
+              Inc(pp);
+            end;
+            gg := neu.FBiasDelta / lr2;
+            aGrads[si][pp] := gg;
+            sq := sq + gg * gg;
+            Inc(pp);
+          end;
+        end;
+        if sq <= cEps then aGrads[si] := nil else Inc(filled);
+      end;
+    finally
+      tgt.Free;
+    end;
+    Result := filled;
+  end;
 
   // In-place symmetric cyclic Jacobi eigensolver (eigenVALUES only). A is
   // (Dim x Dim) symmetric; on return A's diagonal holds the eigenvalues. Same
@@ -61707,6 +61796,18 @@ begin
       for J := 0 to N - 1 do
         if Abs(Gram[I][J] - Gram[J][I]) > SymOK then
           SymOK := Abs(Gram[I][J] - Gram[J][I]);
+    end;
+
+    // Snapshot the self Gram before the in-place Jacobi pass destroys it, so the
+    // optional NTK-drift section can diff it against the SnapshotB kernel.
+    if SnapshotB <> '' then
+    begin
+      SetLength(GramSelf, N);
+      for I := 0 to N - 1 do
+      begin
+        SetLength(GramSelf[I], N);
+        for J := 0 to N - 1 do GramSelf[I][J] := Gram[I][J];
+      end;
     end;
 
     // --- Report header ---
@@ -61939,6 +62040,96 @@ begin
       'Read it as: a high kernel-target alignment with a small condition ' +
       'number means the model is well-conditioned for this class; a tiny ' +
       'effective rank means the probes are coupled through few directions.');
+
+    // ----------------------------- optional NTK DRIFT vs a SnapshotB ---------
+    // Recompute the empirical NTK on a TEMP clone loaded with SnapshotB over the
+    // SAME index-aligned probe set, then report the relative Frobenius drift and
+    // the off-diagonal Pearson correlation of the two kernels. The live net is
+    // never touched (a separate clone carries B's weights).
+    if SnapshotB <> '' then
+    begin
+      NetB := nil;
+      try
+        StructStr := NN.SaveToString();
+        NetB := TNNet.Create();
+        NetB.LoadFromString(StructStr);
+        NetB.LoadDataFromString(SnapshotB);
+        DiffStr := NN.DiffArchitecture(NetB);
+        CanDrift := (DiffStr = '');
+        Lines.Add('');
+        Lines.Add(StringOfChar('-', 60));
+        if not CanDrift then
+          Lines.Add('NTK drift: SnapshotB has a different architecture than ' +
+            'NN — drift skipped.')
+        else
+        begin
+          SetLength(GradsB, N);
+          BUsable := CollectGradsAligned(NetB, GradsB);
+          // Build B's Gram on the same index layout (zero rows for nil slots).
+          SetLength(GramB, N);
+          for I := 0 to N - 1 do SetLength(GramB[I], N);
+          for I := 0 to N - 1 do
+            for J := I to N - 1 do
+            begin
+              Dot := 0;
+              if (GradsB[I] <> nil) and (GradsB[J] <> nil) then
+                for K := 0 to NetParamCnt - 1 do
+                  Dot := Dot + Double(GradsB[I][K]) * Double(GradsB[J][K]);
+              GramB[I][J] := Dot;
+              GramB[J][I] := Dot;
+            end;
+          // Relative Frobenius drift ||K_self - K_B||_F / ||K_self||_F.
+          DriftNum := 0; DriftDen := 0;
+          for I := 0 to N - 1 do
+            for J := 0 to N - 1 do
+            begin
+              DriftNum := DriftNum +
+                (GramSelf[I][J] - GramB[I][J]) * (GramSelf[I][J] - GramB[I][J]);
+              DriftDen := DriftDen + GramSelf[I][J] * GramSelf[I][J];
+            end;
+          if DriftDen > cEps then Drift := Sqrt(DriftNum) / Sqrt(DriftDen)
+          else Drift := 0;
+          // Pearson correlation of the strictly-upper off-diagonal entries.
+          OffMeanA := 0; OffMeanB := 0; OffCnt := 0;
+          for I := 0 to N - 1 do
+            for J := I + 1 to N - 1 do
+            begin
+              OffMeanA := OffMeanA + GramSelf[I][J];
+              OffMeanB := OffMeanB + GramB[I][J];
+              Inc(OffCnt);
+            end;
+          OffCorr := 0;
+          if OffCnt > 0 then
+          begin
+            OffMeanA := OffMeanA / OffCnt;
+            OffMeanB := OffMeanB / OffCnt;
+            OffCovAB := 0; OffVarA := 0; OffVarB := 0;
+            for I := 0 to N - 1 do
+              for J := I + 1 to N - 1 do
+              begin
+                OffCovAB := OffCovAB +
+                  (GramSelf[I][J] - OffMeanA) * (GramB[I][J] - OffMeanB);
+                OffVarA := OffVarA +
+                  (GramSelf[I][J] - OffMeanA) * (GramSelf[I][J] - OffMeanA);
+                OffVarB := OffVarB +
+                  (GramB[I][J] - OffMeanB) * (GramB[I][J] - OffMeanB);
+              end;
+            if (OffVarA > cEps) and (OffVarB > cEps) then
+              OffCorr := OffCovAB / (Sqrt(OffVarA) * Sqrt(OffVarB));
+          end;
+          Lines.Add(Format('NTK drift vs SnapshotB (%d/%d B-gradients usable):',
+            [BUsable, N]));
+          Lines.Add(Format('  relative Frobenius drift ' +
+            '||K_self - K_B||_F / ||K_self||_F = %10.6f', [Drift]));
+          Lines.Add(Format('  off-diagonal Pearson correlation corr(K_self, ' +
+            'K_B) = %8.4f', [OffCorr]));
+          Lines.Add('  (drift ~0 and corr ~1 => the kernel barely moved; a ' +
+            'large drift => the feature geometry rotated between checkpoints.)');
+        end;
+      finally
+        NetB.Free;
+      end;
+    end;
 
     Result := Lines.Text;
   finally
