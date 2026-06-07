@@ -72,6 +72,44 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetGroupConvP4 — a p4 (cyclic 90°-rotation) GROUP-EQUIVARIANT convolution
+      (Cohen & Welling 2016, "Group Equivariant Convolutional Networks",
+      arXiv:1602.07576). The first layer in the fork that is rotation-equivariant
+      BY CONSTRUCTION, not merely measured after the fact by the existing
+      TNNet.EquivarianceReport diagnostic (which today can only score a net's
+      symmetry, never enforce it). Mechanism: one learned KxK kernel bank is
+      shared across the 4 rotations of the C4 group — the LIFTING layer convolves
+      the input with the 4 rot-{0,90,180,270} copies of each filter and stacks the
+      responses along a new 4-fold "orientation" sub-axis of Depth (output Depth =
+      4*FeaturesCount), so a 90° rotation of the input cyclically permutes the
+      orientation channels instead of scrambling them. Distinct from everything in
+      tree: TNNetFlipX/FlipY/TransposeXD are fixed parameter-free involutions (data
+      augmentation primitives, not weight-shared equivariant maps); CondConv /
+      Quaternion / Octonion share weights across a DIFFERENT algebra (experts /
+      Hamilton blocks), none across a spatial symmetry group. Scope for v1:
+      (a) the p4 LIFTING conv (plane -> C4 feature field) subclassing
+      TNNetConvolutionBase and reusing the existing im2col/AddArea path by
+      materialising the 3 extra rotated kernel views from the one trained bank
+      (forward), with the backward FOLDING the 4 orientation gradients back onto
+      the single shared kernel (the rotation-tied weight-gradient sum — the place a
+      silent reduction bug would hide, so gradient-check it hard); (b) a companion
+      group-pool head TNNetGroupPoolP4 that max- (or mean-) reduces over the 4
+      orientation channels to collapse a C4 field back to a rotation-INVARIANT
+      (SizeX,SizeY,FeaturesCount) map for a classifier tail. Tests in
+      tests/TestNeuralNumerical.pas (reseed RandSeed := 424242): input- AND
+      shared-kernel weight-gradient central-difference checks, an EXACT EQUIVARIANCE
+      forward test (rot90 the input, assert the output equals the cyclically
+      orientation-permuted + rot90'd reference field to <1e-4 — the headline
+      correctness guarantee), output-shape, and FStruct save/load round-trip.
+      Example examples/GroupEquivariantMNIST/ (pure CPU, <5 min): a tiny p4-CNN vs a
+      param-MATCHED plain CNN on a rotation-augmented tiny digit/glyph task, charting
+      the equivariant net's better rotated-test accuracy at equal weight count, and
+      printing TNNet.EquivarianceReport on both to show the p4 stack scores ~0
+      equivariance error where the plain CNN does not (closes the loop with the
+      existing diagnostic). Mark the new class // Coded by Claude (AI). Stretch /
+      explicitly OUT of v1: the full p4m group (adds reflections, 8-fold field) and
+      steerable/SO(2) continuous-rotation harmonics — note them as follow-ups, do
+      not build them in the first landing.
 - [ ] TNNetLIFNeuron follow-ups (the spiking leaky-integrate-and-fire surrogate-
       gradient leaf layer + examples/SpikingMNIST/ + numerical-gradient/forward/
       shape/save-load + FFloatSt round-trip tests all LANDED 2026-06-07 on a2):
