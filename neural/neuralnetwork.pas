@@ -7022,6 +7022,73 @@ type
     property Tau: TNeuralFloat read FTau;
   end;
 
+  /// SPIKING LEAKY-INTEGRATE-AND-FIRE (LIF) neuron layer trained with a
+  /// SURROGATE GRADIENT (Neftci, Mostafa & Zenke 2019, "Surrogate Gradient
+  /// Learning in Spiking Neural Networks", IEEE Signal Processing Magazine;
+  /// Zenke & Ganguli 2018, "SuperSpike", Neural Computation). A new
+  /// computational paradigm for this library: an EVENT-DRIVEN, STATEFUL neuron
+  /// model that integrates an input current into a membrane potential over a
+  /// TIME axis and emits a binary {0,1} SPIKE when the potential crosses a
+  /// threshold, then resets. No trainable parameters of its own -- it is a
+  /// pointwise neuron model over an upstream linear/conv layer (like an
+  /// activation), one independent LIF unit per (time, channel) column.
+  ///
+  /// Input/Output shape (T, 1, D): T = time steps on SizeX, D channels on Depth
+  /// (the same time-on-X convention as the SSM / attention / CausalConv1D
+  /// layers; SizeY must be 1). Per neuron (channel d) the recurrence over t is
+  ///   V[t] = beta*V[t-1]*(1 - S[t-1]) + I[t]
+  ///   S[t] = 1 if V[t] >= V_th else 0   (hard Heaviside)
+  /// with hard reset-by-the-(1 - S[t-1]) coupling: a spike at t-1 zeroes the
+  /// carried-over potential. The layer OUTPUT is the binary spike train S
+  /// (faithfully binary inference). beta = exp(-1/tau) is the membrane leak.
+  ///
+  /// BACKWARD: the Heaviside derivative dS/dV is zero almost everywhere, so it is
+  /// replaced by the fast-sigmoid / SuperSpike SURROGATE
+  ///   sigma'(V) = 1 / (1 + alpha*|V - V_th|)^2 .
+  /// Backprop-through-time across the T unrolled steps: dL/dV[t] receives the
+  /// direct spike-path term g_S[t]*sigma'(V[t]) plus the membrane-carry term
+  /// from t+1 through beta*(1 - S[t]); the reset coupling also routes a term into
+  /// dL/dS[t] (the (1 - S[t-1]) factor depends on S[t-1]). Uses the
+  /// SetBatchUpdate(True) accumulation idiom even though there are no weights so
+  /// the membrane state caches stay valid across the batch. Cached forward state:
+  /// FVmem (V[t]) and FSpike (S[t]) per (t,d).
+  /// beta = FFloatSt[0], V_th = FFloatSt[1], alpha = FFloatSt[2] round-trip via
+  /// save/load (tau is recovered as -1/ln(beta)). Constructor: Create(tau, V_th,
+  /// alpha).
+  // Coded by Claude (AI).
+  TNNetLIFNeuron = class(TNNetLayer)
+  private
+    FTau: TNeuralFloat;     // membrane time constant (>0)
+    FBeta: TNeuralFloat;    // leak = exp(-1/tau), in (0,1)
+    FVth: TNeuralFloat;     // firing threshold
+    FAlpha: TNeuralFloat;   // surrogate sharpness (>0)
+    FSeqLen: integer;       // T (SizeX)
+    FDepth: integer;        // D
+    FVmem: TNNetVolume;     // cached membrane potential V[t] per (t,d)
+    FSpike: TNNetVolume;    // cached binary spikes S[t] per (t,d) (== Output)
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pTau: TNeuralFloat = 2.0; pVth: TNeuralFloat = 1.0;
+      pAlpha: TNeuralFloat = 2.0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // The smooth SURROGATE forward: same membrane recurrence but the hard spike
+    // S[t]=Heaviside(V[t]-V_th) is replaced by the smooth fast-sigmoid
+    // surrogate activation sg(V[t]) used both for emission AND for the reset
+    // coupling. This is the differentiable reference the analytic backward is a
+    // gradient of -- finite-differencing the HARD forward is provably wrong
+    // (zero-a.e. derivative). Exposed for gradient checking / debugging; writes
+    // the smooth spike train into ADst (shape (T,1,D)).
+    procedure ComputeSurrogate(ADst: TNNetVolume);
+    property Tau: TNeuralFloat read FTau;
+    property Beta: TNeuralFloat read FBeta;
+    property Vth: TNeuralFloat read FVth;
+    property Alpha: TNeuralFloat read FAlpha;
+  end;
+
   /// CONDITIONALLY-PARAMETERIZED ("dynamic") CONVOLUTION layer (CondConv,
   /// Yang et al. 2019, NeurIPS "CondConv: Conditionally Parameterized
   /// Convolutions for Efficient Inference", arXiv:1904.04971). The layer owns a
@@ -38582,6 +38649,209 @@ begin
         FPrevLayer.OutputError.FData[ri] + g.FData[ri] / FTau;
 end;
 
+{ TNNetLIFNeuron }
+
+// Spiking leaky-integrate-and-fire neuron with a surrogate gradient. Forward is
+// the exact non-differentiable spiking dynamics (binary spike train). Backward
+// replaces the zero-a.e. Heaviside derivative with the fast-sigmoid SuperSpike
+// surrogate and backprops-through-time across the T unrolled steps. No trainable
+// parameters. Per (t,d) state V[t]=FVmem, S[t]=FSpike. See class doc comment.
+
+constructor TNNetLIFNeuron.Create(pTau: TNeuralFloat; pVth: TNeuralFloat;
+  pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  if pTau <= 0 then pTau := 2.0;
+  if pAlpha <= 0 then pAlpha := 2.0;
+  FTau := pTau;
+  FBeta := Exp(-1.0 / pTau);    // membrane leak in (0,1)
+  FVth := pVth;
+  FAlpha := pAlpha;
+  FSeqLen := 0;
+  FDepth := 0;
+  FFloatSt[0] := FBeta;         // beta (leak) round-trips
+  FFloatSt[1] := FVth;          // firing threshold
+  FFloatSt[2] := FAlpha;        // surrogate sharpness
+  FVmem := TNNetVolume.Create();
+  FSpike := TNNetVolume.Create();
+  // LIF is parameter-free: drop any inherited weight neurons.
+  while FNeurons.Count > 0 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  BuildArrNeurons();
+end;
+
+destructor TNNetLIFNeuron.Destroy();
+begin
+  FSpike.Free;
+  FVmem.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLIFNeuron.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetLIFNeuron requires SizeY=1 (shape (T,1,D)). Got SizeY=' +
+      IntToStr(pPrevLayer.Output.SizeY));
+  FSeqLen := pPrevLayer.Output.SizeX;
+  FDepth := pPrevLayer.Output.Depth;
+  FOutput.ReSize(FSeqLen, 1, FDepth);
+  FOutputError.ReSize(FSeqLen, 1, FDepth);
+  FOutputErrorDeriv.ReSize(FSeqLen, 1, FDepth);
+  FVmem.ReSize(FSeqLen, 1, FDepth);
+  FSpike.ReSize(FSeqLen, 1, FDepth);
+end;
+
+procedure TNNetLIFNeuron.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Exact spiking dynamics. Per channel d the membrane integrates the input
+// current I[t] (the previous layer's output) with a leak and a hard
+// reset-by-subtraction encoded through the (1 - S[t-1]) coupling, then emits a
+// binary spike when V[t] crosses the threshold. Caches V[t] and S[t] for BPTT.
+procedure TNNetLIFNeuron.ComputeCPU();
+var
+  t, d, idx: integer;
+  vPrev, sPrev, vt, current: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  Prev := FPrevLayer.FOutput;
+  for d := 0 to FDepth - 1 do
+  begin
+    vPrev := 0;
+    sPrev := 0;
+    for t := 0 to FSeqLen - 1 do
+    begin
+      idx := t * FDepth + d;
+      current := Prev.FData[idx];
+      vt := FBeta * vPrev * (1 - sPrev) + current;
+      FVmem.FData[idx] := vt;
+      if vt >= FVth then
+      begin
+        FSpike.FData[idx] := 1;
+        FOutput.FData[idx] := 1;
+      end
+      else
+      begin
+        FSpike.FData[idx] := 0;
+        FOutput.FData[idx] := 0;
+      end;
+      vPrev := vt;
+      sPrev := FSpike.FData[idx];
+    end;
+  end;
+end;
+
+// Smooth SURROGATE forward: identical membrane recurrence but the hard spike
+// S[t]=H(V[t]-V_th) is replaced by a smooth gate g(V[t]) used BOTH for emission
+// and for the reset coupling, giving a differentiable reference for
+// finite-difference gradient checks (the hard forward has a zero-a.e.
+// derivative, so central-differencing it is provably wrong). The gate is the
+// exact antiderivative of the SuperSpike kernel so that g'(v) equals the
+// backward's sgPrime EXACTLY:
+//   g(v) = 0.5 + sign(u)/alpha * (1 - 1/(1+alpha*|u|)),  u = v - V_th
+//   g'(v) = 1/(1 + alpha*|u|)^2.
+// Hence the analytic BackpropagateCPU is the exact gradient of THIS forward (a
+// gradient check FDs g and compares to the analytic input gradient). The method
+// also writes the smooth state into FVmem/FSpike/FOutput so a Backpropagate()
+// call immediately after differentiates this surrogate forward.
+procedure TNNetLIFNeuron.ComputeSurrogate(ADst: TNNetVolume);
+var
+  t, d, idx: integer;
+  vPrev, sPrev, vt, current, u, denom, gate: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  Prev := FPrevLayer.FOutput;
+  ADst.ReSize(FSeqLen, 1, FDepth);
+  for d := 0 to FDepth - 1 do
+  begin
+    vPrev := 0;
+    sPrev := 0;
+    for t := 0 to FSeqLen - 1 do
+    begin
+      idx := t * FDepth + d;
+      current := Prev.FData[idx];
+      vt := FBeta * vPrev * (1 - sPrev) + current;
+      u := vt - FVth;
+      denom := 1 + FAlpha * Abs(u);
+      // g(v): antiderivative of the SuperSpike kernel, so g'(v)=1/denom^2.
+      if u >= 0
+        then gate := 0.5 + (1 - 1 / denom) / FAlpha
+        else gate := 0.5 - (1 - 1 / denom) / FAlpha;
+      FVmem.FData[idx] := vt;
+      FSpike.FData[idx] := gate;
+      FOutput.FData[idx] := gate;
+      ADst.FData[idx] := gate;
+      vPrev := vt;
+      sPrev := gate;   // smooth reset coupling uses the smooth gate
+    end;
+  end;
+end;
+
+procedure TNNetLIFNeuron.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Surrogate-gradient BPTT. gO[t]=dL/dS[t] arrives in FOutputError. Walking t
+// from T-1 downto 0 with gVnext = dL/dV[t+1] carried back:
+//   sgPrime = 1/(1+alpha*|V[t]-V_th|)^2                 (SuperSpike kernel)
+//   gS  = gO[t] + gVnext*(-beta*V[t])                   (reset coupling dV[t+1]/dS[t])
+//   gV  = gS*sgPrime + gVnext*beta*(1 - S[t])           (spike path + membrane carry)
+//   dL/dI[t] = gV   (since dV[t]/dI[t] = 1)
+// Each channel is independent. No trainable weights, so nothing is flushed to
+// neuron deltas; the SetBatchUpdate(True) idiom is used by callers only to keep
+// the per-sample forward caches (FVmem/FSpike) valid across a mini-batch.
+procedure TNNetLIFNeuron.BackpropagateCPU();
+var
+  t, d, idx: integer;
+  gVnext, gO, gS, gV, sgPrime, vt, st, denom: TNeuralFloat;
+  hasInputGrad: boolean;
+  PrevErr: TNNetVolume;
+begin
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  if not hasInputGrad then exit;
+  PrevErr := FPrevLayer.FOutputError;
+  for d := 0 to FDepth - 1 do
+  begin
+    gVnext := 0;
+    for t := FSeqLen - 1 downto 0 do
+    begin
+      idx := t * FDepth + d;
+      vt := FVmem.FData[idx];
+      st := FSpike.FData[idx];
+      gO := FOutputError.FData[idx];
+      denom := 1 + FAlpha * Abs(vt - FVth);
+      sgPrime := 1 / (denom * denom);
+      // dL/dS[t]: direct grad + reset coupling from V[t+1] = beta*V[t]*(1-S[t])+..
+      gS := gO + gVnext * (-FBeta * vt);
+      // dL/dV[t]: spike emission path + membrane carry into V[t+1].
+      gV := gS * sgPrime + gVnext * FBeta * (1 - st);
+      // dV[t]/dI[t] = 1, so the input-current gradient is gV.
+      PrevErr.FData[idx] := PrevErr.FData[idx] + gV;
+      gVnext := gV;
+    end;
+  end;
+end;
+
 { TNNetTropicalConv }
 
 // Tropical (max-plus / min-plus) morphological convolution: the spatial sibling
@@ -65611,6 +65881,7 @@ begin
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetSinkhorn' :             Result := TNNetSinkhorn.Create(St[0], Ft[0]);
+      'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2]);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
@@ -65947,6 +66218,7 @@ begin
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetSinkhorn' then Result := TNNetSinkhorn.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2]) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else

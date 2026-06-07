@@ -205,6 +205,11 @@ type
     procedure TestSinkhornDoublyStochastic;
     procedure TestSinkhornShape;
     procedure TestSinkhornSerializationRoundTrip;
+    // TNNetLIFNeuron spiking leaky-integrate-and-fire surrogate-gradient layer
+    procedure TestLIFNeuronInputGradientCheck;
+    procedure TestLIFNeuronSpikePattern;
+    procedure TestLIFNeuronShape;
+    procedure TestLIFNeuronSerializationRoundTrip;
     // TNNetTropicalConv max-plus / min-plus morphological convolution layer
     procedure TestTropicalConvInputGradientCheck;
     procedure TestTropicalConvWeightGradientCheck;
@@ -38085,6 +38090,224 @@ begin
         (NN2.Layers[1] as TNNetSinkhorn).Tau, 1e-5);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('Sinkhorn Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired, Smooth: TNNetVolume;
+  LIF: TNNetLIFNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, T, Depth, InSize: integer;
+
+  // Finite-difference reference: the SMOOTH SURROGATE forward, NOT the hard
+  // Heaviside spike. The hard spike has a zero-almost-everywhere derivative, so
+  // central-differencing the hard forward is provably wrong (the STE pattern);
+  // the analytic backward is the exact gradient of the surrogate forward, so we
+  // FD that. ComputeSurrogate writes the smooth gate into Smooth (and the layer
+  // caches) -- loss = 0.5*sum (gate - desired)^2.
+  function ComputeSurrogateLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);                 // refresh prev-layer output
+    LIF.ComputeSurrogate(Smooth);
+    Result := 0;
+    for k := 0 to Smooth.Size - 1 do
+    begin
+      diff := Smooth.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Gradient check of the surrogate-gradient BPTT through the unrolled LIF
+  // recurrence. Inputs are bounded so the single-precision finite difference is
+  // honest; the standard 0.01 bound applies. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  T := 6; Depth := 3;
+  InSize := T * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  InputPlus := TNNetVolume.Create(T, 1, Depth);
+  Desired := TNNetVolume.Create(T, 1, Depth);
+  Smooth := TNNetVolume.Create(T, 1, Depth);
+  epsilon := 0.0008;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth, 1)); // 1 = collect input error
+    LIF := TNNetLIFNeuron.Create(2.0, 1.0, 2.0);    // tau, V_th, alpha
+    NN.AddLayer(LIF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.4;     // straddles the threshold
+    for i := 0 to InSize - 1 do
+      Desired.Raw[i] := 0.3 + 0.1 * Cos(i * 0.4);
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeSurrogateLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeSurrogateLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      // Analytic: run the SAME surrogate forward (so the cached membrane/gate
+      // state matches the FD reference), seed dL/dS = (gate - desired), then
+      // call the layer's surrogate backward directly. IncDepartingBranchesCnt
+      // first (manual last-layer Backpropagate) to avoid a too-many-calls trap.
+      NN.Compute(Input);
+      LIF.ComputeSurrogate(Smooth);
+      NN.Layers[0].OutputError.Fill(0);
+      LIF.OutputError.Copy(Smooth);
+      LIF.OutputError.Sub(Desired);   // dL/dS[t] = gate - desired
+      LIF.IncDepartingBranchesCnt();
+      LIF.Backpropagate();
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('LIF input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  LIFNeuron surrogate gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+    Smooth.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronSpikePattern;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LIF: TNNetLIFNeuron;
+  t, idx: integer;
+begin
+  // Hard forward must emit a binary {0,1} spike train with leaky integration and
+  // a hard reset. Single channel, T=5. A strong sub-threshold current that only
+  // crosses V_th after integrating, then resets. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1));
+    LIF := TNNetLIFNeuron.Create(2.0, 1.0, 2.0); // beta=exp(-0.5)~0.6065, V_th=1
+    NN.AddLayer(LIF);
+    // currents: 0.6, 0.6, 0.6, 0.0, 1.5
+    Input.FData[0] := 0.6; Input.FData[1] := 0.6; Input.FData[2] := 0.6;
+    Input.FData[3] := 0.0; Input.FData[4] := 1.5;
+    NN.Compute(Input);
+
+    // Output is strictly binary.
+    for t := 0 to 4 do
+    begin
+      idx := t;
+      AssertTrue('LIF output binary at t=' + IntToStr(t),
+        (LIF.Output.FData[idx] = 0) or (LIF.Output.FData[idx] = 1));
+    end;
+    // Hand-traced: V0=0.6 (<1, no spike); V1=0.6065*0.6+0.6=0.964 (<1, no spike);
+    // V2=0.6065*0.964+0.6=1.185 (>=1 -> SPIKE); V3=0.6065*1.185*(1-1)+0=0 (reset,
+    // no spike); V4=0.6065*0*1+1.5=1.5 (>=1 -> SPIKE).
+    AssertEquals('LIF no spike at t=0', 0.0, LIF.Output.FData[0], 1e-6);
+    AssertEquals('LIF no spike at t=1', 0.0, LIF.Output.FData[1], 1e-6);
+    AssertEquals('LIF spike at t=2',    1.0, LIF.Output.FData[2], 1e-6);
+    AssertEquals('LIF reset no spike at t=3', 0.0, LIF.Output.FData[3], 1e-6);
+    AssertEquals('LIF spike at t=4',    1.0, LIF.Output.FData[4], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronShape;
+var
+  NN: TNNet;
+  LIF: TNNetLIFNeuron;
+  T, Depth: integer;
+begin
+  RandSeed := 424242;
+  T := 7; Depth := 4;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIF := TNNetLIFNeuron.Create(3.0, 0.8, 1.5);
+    NN.AddLayer(LIF);
+    AssertEquals('LIF output SizeX', T, LIF.Output.SizeX);
+    AssertEquals('LIF output SizeY', 1, LIF.Output.SizeY);
+    AssertEquals('LIF output Depth', Depth, LIF.Output.Depth);
+    AssertEquals('LIF Vth property', 0.8, LIF.Vth, 1e-6);
+    AssertEquals('LIF Alpha property', 1.5, LIF.Alpha, 1e-6);
+    AssertEquals('LIF Beta = exp(-1/tau)', Exp(-1.0/3.0), LIF.Beta, 1e-6);
+    AssertEquals('LIF has no trainable neurons', 0, LIF.Neurons.Count);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  LIF: TNNetLIFNeuron;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, T, Depth: integer;
+  TauVal, VthVal, AlphaVal, BetaExpected: TNeuralFloat;
+begin
+  // Non-default beta (FFloatSt[0]), V_th (FFloatSt[1]) and alpha (FFloatSt[2])
+  // must survive SaveToString -> LoadFromString -> SaveToString (byte identical)
+  // through both CreateLayer dispatch points, and Compute must match.
+  RandSeed := 424242;
+  T := 5; Depth := 3;
+  TauVal := 4.0; VthVal := 0.65; AlphaVal := 3.5;  // non-default
+  BetaExpected := Exp(-1.0 / TauVal);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIF := TNNetLIFNeuron.Create(TauVal, VthVal, AlphaVal);
+    NN.AddLayer(LIF);
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.8) * 0.9 + 0.3;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('LIF SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('LIF token present in serialized string',
+        Pos('TNNetLIFNeuron', Saved) > 0);
+      AssertEquals('LIF beta round-trips', BetaExpected,
+        (NN2.Layers[1] as TNNetLIFNeuron).Beta, 1e-5);
+      AssertEquals('LIF V_th round-trips', VthVal,
+        (NN2.Layers[1] as TNNetLIFNeuron).Vth, 1e-5);
+      AssertEquals('LIF alpha round-trips', AlphaVal,
+        (NN2.Layers[1] as TNNetLIFNeuron).Alpha, 1e-5);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('LIF Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
