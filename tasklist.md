@@ -72,23 +72,13 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [X] TNNetGatedLinearAttention — Gated Linear Attention (Yang et al. 2023,
-      arXiv:2312.06635) LANDED 2026-06-07 on a2 (commit 6009de8). Matrix-state
-      (d x d) linear-attention recurrence with a DATA-DEPENDENT PER-CHANNEL
-      diagonal forget gate alpha_t = sigmoid(W_a x_t):
-        S_t[d,e] = alpha_t[d]*S_{t-1}[d,e] + k_t[d]*v_t[e],  y_t = q_t^T S_t.
-      The only layer with a data-dependent VECTOR forget gate on a 2-D
-      outer-product state (vs WKV fixed per-channel decay, Retention scalar gamma,
-      MLSTMCell scalar exp gates, DeltaNet scalar write gate / no forget). Leaf
-      subclass of TNNetLayer, shape-preserving over the time axis (SizeY=1),
-      five-neuron bank W_q/W_k/W_v/W_a + b_a, L2-normalized keys, 1/sqrt(d) query
-      scale, FStruct[0..1]=d_k/d_v, exact left-to-right forward + exact dL/dS BPTT,
-      registered in both CreateLayer dispatch tables. Tests in TestNeuralNumerical
-      (shape, input grad, weight grad over all four weight sets + gate bias,
-      serialization round-trip, recall smoke train; max FD err ~5e-4); full suite
-      green (1265 tests). examples/GatedLinearAttention: overwrite key->value
-      recall, GLA 100% (MSE 0.009) vs DeltaNet 100% vs Retention 96.3%. Open
-      follow-ups:
+- [ ] TNNetGatedLinearAttention follow-ups (Gated Linear Attention, Yang et al.
+      2023, arXiv:2312.06635 — matrix-state (d x d) linear-attention recurrence
+      with a data-dependent per-channel diagonal forget gate
+      alpha_t = sigmoid(W_a x_t): S_t = diag(alpha_t)*S_{t-1} + k_t v_t^T,
+      y_t = q_t^T S_t; exact per-token forward + dL/dS BPTT, numerical-gradient +
+      serialization tests, examples/GatedLinearAttention/ — LANDED 2026-06-07 on a2,
+      commit 6009de8):
       - [ ] Chunked/parallel hardware-efficient forward (the paper's main systems
             contribution; v1 ships the exact per-token scan only) — gate behind an
             exact-vs-chunked equivalence assert (mirrors open DeltaNet/WKV chunked tasks).
