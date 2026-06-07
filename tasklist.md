@@ -368,7 +368,7 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [ ] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
+- [X] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
       fairly FLAT, so absolute accept rates are high even for a weak draft and
       the speedup headline is carried by the monotone accept-rate RISE, not the
       absolute %. Add a PEAKED-target variant (sharper next-token distribution,

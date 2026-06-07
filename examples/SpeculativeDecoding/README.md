@@ -126,6 +126,25 @@ explicit RNG streams.
    big-model-calls-saved. Accept rate (hence calls saved) **rises monotonically**
    with draft/target agreement.
 
+## Flat vs PEAKED target (two-scenario speedup chart)
+
+Gates 2 and 3 run **twice** — once for a **FLAT** target (the original
+`mod`-sum map, softmax temperature `1.0`) and once for a **PEAKED** target (the
+same trained net, re-softmaxed at temperature `0.10`). A peaked `p_target`
+concentrates mass on the mode, so a **weak** draft (which only approximates the
+flat objective) puts probability on the *wrong* token and its accept ratio
+`min(1, p_target/p_draft)` collapses, while a **strong** draft still tracks the
+peak. This makes the speedup chart far more **discriminating** of draft quality.
+
+Crucially this changes only **what the target distribution is**, never the
+sampler that draws from it: both plain and speculative sampling read the same
+tempered `p_target` (`NextDist(..., IsTarget=True)` applies the temperature), so
+the exactness/faithfulness invariant holds at **any** temperature. Gate 1
+(degenerate exactness) stays at temperature `1.0` because with `draft == target`
+the *untempered* proposal must equal the verification distribution — exactness is
+a property of the algorithm, not of how peaked the target is. The peaked toy was
+tuned only by the temperature constant `cPeakTemp` (no fabricated numbers).
+
 ## Sample output
 
 ```
@@ -147,14 +166,48 @@ GATE 2  Empirical faithfulness  (real draft != target; histogram match)
   GATE 2 : PASS  (histograms match within sampling noise)
 
 ========================================================================
+GATE 2  Empirical faithfulness  (real draft != target; histogram match)
+========================================================================
+  -- FLAT target (temp 1.0) --
+  total-variation distance = 0.0245  (small => same distribution)
+  -- PEAKED target (temp 0.10) --
+  total-variation distance = 0.0130  (small => same distribution)
+  GATE 2 : PASS  (flat TV=0.0245, peaked TV=0.0130 -- both within noise)
+
+========================================================================
 GATE 3  Speedup vs draft/target agreement  (block K=4)
 ========================================================================
+  ----- FLAT target (temp 1.0; original mod-sum map) -----
   draft       acc-tok/pass   accept-rate   big-calls/tok   calls-saved
   ----------  ------------   -----------   -------------   -----------
   untrained         2.342        0.585           0.299        70.1%
   lightly           3.721        0.930           0.212        78.8%
   fully             3.875        0.969           0.205        79.5%
+
+  ----- PEAKED target (temp 0.10) -----
+  draft       acc-tok/pass   accept-rate   big-calls/tok   calls-saved
+  ----------  ------------   -----------   -------------   -----------
+  untrained         1.622        0.406           0.381        61.9%
+  lightly           2.540        0.635           0.282        71.8%
+  fully             2.564        0.641           0.281        71.9%
+
+  flat-vs-peaked contrast (weak=untrained draft, strong=fully trained):
+                     weak-rate   strong-rate   weak-saved   strong-saved   gap(saved)
+    FLAT target        0.585         0.969        70.1%         79.5%          9.4 pts
+    PEAKED target      0.406         0.641        61.9%         71.9%         10.1 pts
 ```
+
+Reading the contrast: under the FLAT target even an **untrained** draft accepts
+`58.5%` of the time (the `mod`-sum map spreads mass, so random proposals land on
+a plausible token often). Under the PEAKED target that weak-draft accept rate
+**collapses to `40.6%`** — well below 1 — because the sharpened `p_target` no
+longer rewards mass on the wrong token, and the strong-minus-weak **calls-saved
+gap widens** (`9.4 -> 10.1` points). The peaked chart therefore separates a good
+draft from a bad one much more sharply. (Note the peaked target also caps the
+*fully*-trained draft at `64.1%`: that draft was trained on the flat objective,
+so its softer distribution can never fully match a temperature-`0.10` peak — an
+honest artefact of reusing the flat-trained net rather than retraining at low
+temperature.)
 
 Note in Gate 1 that the degenerate run made only **3** big-model passes to
 produce the same 12 tokens plain sampling needed **12** calls for — because every
@@ -172,9 +225,17 @@ draft token was accepted and each pass committed `K+1 = 5`.
   but counted as **one** big-model pass per block, reflecting the batched cost a
   real implementation pays. The speculative loop's *correctness* does not depend
   on how the K+1 scores are physically produced.
-- The toy target's next-token distribution is fairly flat (the `mod`-sum map
-  spreads mass across the vocabulary), so the *absolute* accept rates are high
-  even for a weak draft; the load-bearing result is the **monotone rise** in
-  accept rate with draft quality (Gate 3) plus the **exactness** of the committed
-  distribution (Gates 1-2), not the headline percentage.
+- The toy target's `mod`-sum next-token distribution is fairly flat, so under the
+  FLAT scenario the *absolute* accept rates are high even for a weak draft; there
+  the load-bearing result is the **monotone rise** in accept rate with draft
+  quality plus the committed-distribution **exactness** (Gates 1-2). The **PEAKED**
+  scenario (temperature `0.10`) addresses this: it sharpens `p_target` so the
+  weak-draft accept rate collapses below 1 and the good-vs-bad calls-saved gap
+  widens, giving a more discriminating chart — at no change to the sampled
+  distribution.
+- The peaked target reuses the **flat-trained** net re-softmaxed at low
+  temperature rather than retraining a low-temperature target from scratch, so
+  even the fully-trained draft cannot perfectly match the peak (its accept rate
+  caps around `0.64`). Retraining both models on a near-deterministic objective
+  so the strong draft fully tracks the peak is a possible follow-up.
 ```

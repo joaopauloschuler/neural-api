@@ -170,6 +170,26 @@ var
   gAcc: TRng;    // accept-reject (+ residual resample) stream
 
 // ---------------------------------------------------------------------------
+// TARGET-DISTRIBUTION PEAKEDNESS CONTROL.
+//
+// The committed token's law is whatever p_target we hand the accept/reject loop,
+// so we can make the target SHARPER (more peaked) without touching the algorithm:
+//   * gTgtTemp < 1 re-softmaxes the TARGET's next-token distribution at a low
+//     temperature, concentrating mass on the top token(s). The DRAFT is left at
+//     temperature 1 (it stays the weak, flat-objective approximator), so a weak
+//     draft now puts mass on the WRONG token -> p_target/p_draft collapses ->
+//     accept rate falls well below 1. A strong draft tracks the peak -> high
+//     accept rate. This WIDENS the good-vs-bad-draft calls-saved gap.
+// Plain target-only sampling and speculative sampling read the SAME tempered
+// p_target (NextDist applies gTgtTemp whenever IsTarget=True), so Gate 1's
+// bit-for-bit exactness and Gate 2's faithfulness invariant both still hold for
+// any temperature -- we only change WHAT the target distribution is, never the
+// sampler that draws from it.
+// ---------------------------------------------------------------------------
+var
+  gTgtTemp: TNeuralFloat = 1.0;  // 1.0 = flat (original); <1 = peaked target
+
+// ---------------------------------------------------------------------------
 // Toy task. A random string; the next-token target is a structured fixed-offset
 // copy. We make it learnable but imperfectly-so for a tiny draft.
 // ---------------------------------------------------------------------------
@@ -271,9 +291,14 @@ begin
 end;
 
 // Read p(next | prefix of length Len) from NN's softmax output at row Len-1.
+// When IsTarget and gTgtTemp <> 1, re-softmax the target distribution at the
+// given temperature (T<1 sharpens / peaks it) BEFORE returning it. This changes
+// only the target's distribution, not the sampler -- the speculative loop draws
+// from whatever p_target NextDist returns, so exactness/faithfulness hold for
+// any temperature.
 procedure NextDist(NN: TNNet; const S: TSeq; Len: integer;
-  InputV: TNNetVolume; out P: TProbs);
-var d: integer; Row: integer; Sum: TNeuralFloat;
+  InputV: TNNetVolume; out P: TProbs; IsTarget: boolean = False);
+var d: integer; Row: integer; Sum, mx: TNeuralFloat;
 begin
   FillInput(S, Len, InputV);
   NN.Compute(InputV);
@@ -286,9 +311,32 @@ begin
     Sum := Sum + P[d];
   end;
   if Sum <= 0 then
-    for d := 0 to cVocab - 1 do P[d] := 1.0 / cVocab
-  else
+  begin
+    for d := 0 to cVocab - 1 do P[d] := 1.0 / cVocab;
+    Exit;
+  end;
+  for d := 0 to cVocab - 1 do P[d] := P[d] / Sum;
+
+  // PEAKED TARGET: re-softmax at temperature gTgtTemp. p' ~ p^(1/T) (equivalently
+  // logit/T on logits = ln p), renormalised. T<1 concentrates mass on the mode.
+  if IsTarget and (gTgtTemp <> 1.0) then
+  begin
+    mx := 0;
+    for d := 0 to cVocab - 1 do
+    begin
+      // logit = ln p; clamp tiny probs so ln is finite, then scale by 1/T.
+      if P[d] < 1e-12 then P[d] := 1e-12;
+      P[d] := Ln(P[d]) / gTgtTemp;
+      if (d = 0) or (P[d] > mx) then mx := P[d];
+    end;
+    Sum := 0;
+    for d := 0 to cVocab - 1 do
+    begin
+      P[d] := Exp(P[d] - mx);   // shift for numerical stability
+      Sum := Sum + P[d];
+    end;
     for d := 0 to cVocab - 1 do P[d] := P[d] / Sum;
+  end;
 end;
 
 // Inverse-CDF categorical sample from distribution P using uniform u in [0,1).
@@ -320,7 +368,7 @@ begin
   BigCalls := 0;
   for i := 1 to NTokens do
   begin
-    NextDist(Target, OutSeq, OutLen, InputV, P);  // one big-model call
+    NextDist(Target, OutSeq, OutLen, InputV, P, True);  // one big-model call
     Inc(BigCalls);
     tok := SampleCDF(P, RngFloat(gProp));
     OutSeq[OutLen] := tok;
@@ -387,7 +435,7 @@ begin
     while (i < nProposed) do
     begin
       // p_target at the i-th block context (prefix + accepted x_1..x_i).
-      NextDist(Target, OutSeq, OutLen + i, InputV, Pt);
+      NextDist(Target, OutSeq, OutLen + i, InputV, Pt, True);
       Pd := PdAtPos[i];
       tok := DraftToks[i];
 
@@ -442,7 +490,7 @@ begin
       OutLen := OutLen + nProposed;
       if OutLen < cSeqLen then
       begin
-        NextDist(Target, OutSeq, OutLen, InputV, Pt);
+        NextDist(Target, OutSeq, OutLen, InputV, Pt, True);
         tok := SampleCDF(Pt, RngFloat(gProp));
         OutSeq[OutLen] := tok;
         Inc(OutLen);
@@ -483,29 +531,125 @@ begin
   Result := 0.5 * s;
 end;
 
+// ---------------------------------------------------------------------------
+// GATE 2 driver: empirical faithfulness at the CURRENT gTgtTemp. Samples the
+// first continuation token cFaithN times from a fixed prefix, plain vs
+// speculative, and returns the histogram total-variation distance. The accept/
+// reject loop must reproduce p_target (tempered or not) so TV stays within
+// sampling noise for ANY temperature -- that is the invariant being checked.
+// ---------------------------------------------------------------------------
+procedure RunFaithfulness(Target, Draft: TNNet; InputV: TNNetVolume;
+  const Prefix: TSeq; PrefixLen, FaithN: integer; out TV: TNeuralFloat);
+var
+  HistPlain, HistSpec: array[0..cVocab - 1] of integer;
+  NPlain, NSpec, i, run: integer;
+  PlainOut, SpecOut: TSeq;
+  PlainLen, SpecLen, bcP, bcS, dcS, accTok, passes: integer;
+begin
+  for i := 0 to cVocab - 1 do begin HistPlain[i] := 0; HistSpec[i] := 0; end;
+  NPlain := 0; NSpec := 0;
+  for run := 1 to FaithN do
+  begin
+    RngSeed(gProp, QWord(2000000 + run)); RngSeed(gAcc, QWord(3000000 + run));
+    PlainSample(Target, Prefix, PrefixLen, 1, InputV, PlainOut, PlainLen, bcP);
+    Inc(HistPlain[PlainOut[PrefixLen]]); Inc(NPlain);
+
+    RngSeed(gProp, QWord(5000000 + run)); RngSeed(gAcc, QWord(6000000 + run));
+    SpeculativeSample(Target, Draft, Prefix, PrefixLen, 1, InputV,
+      SpecOut, SpecLen, bcS, dcS, accTok, passes);
+    Inc(HistSpec[SpecOut[PrefixLen]]); Inc(NSpec);
+  end;
+  TV := HistTV(HistPlain, HistSpec, NPlain, NSpec);
+  WriteLn('  token |   plain%   spec%   (', FaithN, ' draws each)');
+  for i := 0 to cVocab - 1 do
+    WriteLn(Format('   %3d  |  %6.2f  %6.2f', [i,
+      100.0 * HistPlain[i] / Max(1, NPlain),
+      100.0 * HistSpec[i]  / Max(1, NSpec)]));
+  WriteLn(Format('  total-variation distance = %.4f  (small => same distribution)', [TV]));
+end;
+
+// ---------------------------------------------------------------------------
+// GATE 3 driver: speedup sweep at the CURRENT gTgtTemp. Rebuilds a fresh draft
+// and grows it through {0, 8, 80} epochs, measuring accept rate and big-model
+// calls saved over cSweepRuns fresh prefixes per stage. Returns the WEAK
+// (untrained, stage 0) and STRONG (fully, last stage) accept-rate and
+// calls-saved so the caller can print a flat-vs-peaked side-by-side.
+// ---------------------------------------------------------------------------
+procedure RunSpeedupSweep(Target: TNNet; InputV: TNNetVolume;
+  PrefixLen, Tokens, SweepRuns: integer;
+  out WeakRate, WeakSaved, StrongRate, StrongSaved: TNeuralFloat);
+const
+  DraftStages: array[0..2] of integer = (0, 8, 80);
+  StageName: array[0..2] of string = ('untrained', 'lightly', 'fully');
+var
+  Draft: TNNet;
+  trainedSoFar, want, q, sample: integer;
+  SweepPrefix, SpecOut: TSeq;
+  SpecLen, bcS, dcS, accTok, passes: integer;
+  SumAcc, SumPass, MeanAccPerPass, BaselineCalls, SpecCalls, Saved, Rate: TNeuralFloat;
+begin
+  WeakRate := 0; WeakSaved := 0; StrongRate := 0; StrongSaved := 0;
+  WriteLn('  draft       acc-tok/pass   accept-rate   big-calls/tok   calls-saved');
+  WriteLn('  ----------  ------------   -----------   -------------   -----------');
+  RandSeed := cSeed + 7;
+  Draft := BuildDraft();
+  try
+    trainedSoFar := 0;
+    for q := 0 to High(DraftStages) do
+    begin
+      want := DraftStages[q];
+      if want > trainedSoFar then
+      begin
+        TrainEpochs(Draft, want - trainedSoFar);
+        trainedSoFar := want;
+      end;
+
+      SumAcc := 0; SumPass := 0; SpecCalls := 0; BaselineCalls := 0;
+      RandSeed := cSeed + 555;
+      for sample := 1 to SweepRuns do
+      begin
+        MakeSeq(SweepPrefix);
+        RngSeed(gProp, QWord(11000000 + sample));
+        RngSeed(gAcc,  QWord(12000000 + sample));
+        SpeculativeSample(Target, Draft, SweepPrefix, PrefixLen, Tokens, InputV,
+          SpecOut, SpecLen, bcS, dcS, accTok, passes);
+        SumAcc := SumAcc + accTok;
+        SumPass := SumPass + passes;
+        SpecCalls := SpecCalls + bcS;
+        BaselineCalls := BaselineCalls + (SpecLen - PrefixLen);
+      end;
+      MeanAccPerPass := SumAcc / Max(1, SumPass);
+      Rate := MeanAccPerPass / cK;
+      Saved := 1.0 - SpecCalls / Max(1.0, BaselineCalls);
+      WriteLn(Format('  %-10s   %10.3f   %10.3f    %12.3f   %9.1f%%',
+        [StageName[q], MeanAccPerPass, Rate,
+         SpecCalls / Max(1.0, BaselineCalls), 100.0 * Saved]));
+      if q = 0 then begin WeakRate := Rate; WeakSaved := 100.0 * Saved; end;
+      if q = High(DraftStages) then
+        begin StrongRate := Rate; StrongSaved := 100.0 * Saved; end;
+    end;
+  finally
+    Draft.Free;
+  end;
+end;
+
 var
   Target, Draft: TNNet;
   InputV: TNNetVolume;
   Prefix, PlainOut, SpecOut: TSeq;
   PrefixLen, PlainLen, SpecLen: integer;
   bcP, bcS, dcS, accTok, passes: integer;
-  i, t, run, q: integer;
-  GateExact, GateFaithful: boolean;
-  // Faithfulness histograms.
-  HistPlain, HistSpec: array[0..cVocab - 1] of integer;
-  NPlain, NSpec: integer;
-  TV: TNeuralFloat;
-  // Speedup sweep.
-  DraftStages: array[0..2] of integer = (0, 8, 80);  // cumulative draft epochs
-  StageName: array[0..2] of string = ('untrained', 'lightly', 'fully');
-  SweepPrefix: TSeq;
-  trainedSoFar, want: integer;
-  SumAcc, SumPass, MeanAccPerPass, BaselineCalls, SpecCalls, Saved: TNeuralFloat;
-  SweepN, sample: integer;
+  t: integer;
+  GateExact, GateFaithFlat, GateFaithPeak: boolean;
+  TVFlat, TVPeak: TNeuralFloat;
+  // Side-by-side speedup results (weak = untrained draft, strong = fully trained).
+  fWeakRate, fWeakSaved, fStrongRate, fStrongSaved: TNeuralFloat;
+  pWeakRate, pWeakSaved, pStrongRate, pStrongSaved: TNeuralFloat;
 const
-  cTokens   = 12;   // continuation length for exactness / sample checks
-  cFaithN   = 4000; // sampling runs for the faithfulness histogram
-  cSweepRuns = 200; // runs per draft stage in the speedup sweep
+  cTokens   = 12;     // continuation length for exactness / sample checks
+  cFaithN   = 4000;   // sampling runs for the faithfulness histogram
+  cSweepRuns = 200;   // runs per draft stage in the speedup sweep
+  cPeakTemp = 0.10;   // target softmax temperature for the PEAKED variant (<1)
 begin
   // Mask FPU exceptions so transient early-training underflows don't abort
   // (matches sibling examples).
@@ -524,6 +668,10 @@ begin
   WriteLn('norm(max(0, p_target - p_draft)) and discard the rest of the block.');
   WriteLn('v1 is FORWARD-ONLY and recomputes the prefix each pass; KV-cache is the');
   WriteLn('explicit follow-up (orthogonal open task).');
+  WriteLn('Gates 2-3 run TWICE: a FLAT target (temp 1.0, the mod-sum map) and a PEAKED');
+  WriteLn(Format('target (softmax temperature %.2f) that sharpens p_target so a WEAK draft''s',
+    [cPeakTemp]));
+  WriteLn('accept rate collapses -- a more discriminating speedup chart.');
   WriteLn;
 
   InputV := TNNetVolume.Create(cSeqLen, 1, 1);
@@ -559,6 +707,10 @@ begin
   WriteLn('GATE 1  Degenerate exactness  (draft == target => always-accept)');
   WriteLn(StringOfChar('=', 72));
 
+  // Gate 1 is a property of the ALGORITHM (always-accept when draft==target), so
+  // it runs at the FLAT target (temp 1.0): with draft==target the untempered
+  // proposal distribution must equal the verification distribution.
+  gTgtTemp := 1.0;
   RngSeed(gProp, 1234567); RngSeed(gAcc, 7654321);
   PlainSample(Target, Prefix, PrefixLen, cTokens, InputV, PlainOut, PlainLen, bcP);
 
@@ -586,107 +738,64 @@ begin
 
   // =========================================================================
   // GATE 2: EMPIRICAL FAITHFULNESS with a genuinely DIFFERENT trained draft.
-  // Sample the FIRST continuation token many times from the fixed prefix both
-  // ways and compare the token histograms (total-variation distance).
+  // Run for BOTH the flat and the peaked target -- exactness of the committed
+  // distribution must hold regardless of how peaked p_target is.
   // =========================================================================
   WriteLn(StringOfChar('=', 72));
   WriteLn('GATE 2  Empirical faithfulness  (real draft != target; histogram match)');
   WriteLn(StringOfChar('=', 72));
 
-  for i := 0 to cVocab - 1 do begin HistPlain[i] := 0; HistSpec[i] := 0; end;
-  NPlain := 0; NSpec := 0;
-
-  for run := 1 to cFaithN do
-  begin
-    // Plain: one token from target.
-    RngSeed(gProp, QWord(2000000 + run)); RngSeed(gAcc, QWord(3000000 + run));
-    PlainSample(Target, Prefix, PrefixLen, 1, InputV, PlainOut, PlainLen, bcP);
-    Inc(HistPlain[PlainOut[PrefixLen]]); Inc(NPlain);
-
-    // Speculative: first committed token from the speculative loop.
-    RngSeed(gProp, QWord(5000000 + run)); RngSeed(gAcc, QWord(6000000 + run));
-    SpeculativeSample(Target, Draft, Prefix, PrefixLen, 1, InputV,
-      SpecOut, SpecLen, bcS, dcS, accTok, passes);
-    Inc(HistSpec[SpecOut[PrefixLen]]); Inc(NSpec);
-  end;
-
-  TV := HistTV(HistPlain, HistSpec, NPlain, NSpec);
-  WriteLn('  token |   plain%   spec%   (', cFaithN, ' draws each)');
-  for i := 0 to cVocab - 1 do
-    WriteLn(Format('   %3d  |  %6.2f  %6.2f', [i,
-      100.0 * HistPlain[i] / Max(1, NPlain),
-      100.0 * HistSpec[i]  / Max(1, NSpec)]));
-  WriteLn(Format('  total-variation distance = %.4f  (small => same distribution)', [TV]));
+  WriteLn('  -- FLAT target (temp 1.0) --');
+  gTgtTemp := 1.0;
+  RunFaithfulness(Target, Draft, InputV, Prefix, PrefixLen, cFaithN, TVFlat);
   // With ~4000 draws per arm over 8 tokens, sampling noise in TV is ~0.02-0.04.
-  GateFaithful := (TV < 0.06);
-  if GateFaithful then
-    WriteLn('  GATE 2 : PASS  (histograms match within sampling noise)')
+  GateFaithFlat := (TVFlat < 0.06);
+  WriteLn;
+  WriteLn(Format('  -- PEAKED target (temp %.2f) --', [cPeakTemp]));
+  gTgtTemp := cPeakTemp;
+  RunFaithfulness(Target, Draft, InputV, Prefix, PrefixLen, cFaithN, TVPeak);
+  GateFaithPeak := (TVPeak < 0.06);
+  if GateFaithFlat and GateFaithPeak then
+    WriteLn(Format('  GATE 2 : PASS  (flat TV=%.4f, peaked TV=%.4f -- both within noise)',
+      [TVFlat, TVPeak]))
   else
-    WriteLn('  GATE 2 : WARN  (TV above noise threshold; see README note)');
+    WriteLn(Format('  GATE 2 : WARN  (flat TV=%.4f, peaked TV=%.4f; see README note)',
+      [TVFlat, TVPeak]));
   WriteLn;
 
   // =========================================================================
-  // GATE 3: SPEEDUP STORY. Sweep draft quality (train the same draft to three
-  // increasing epoch counts) and, for each, measure mean accepted-tokens-per-
-  // verification-pass and the fraction of big-model calls saved vs plain
-  // target-only sampling of the same number of tokens.
+  // GATE 3: SPEEDUP STORY, side-by-side FLAT vs PEAKED target. The peaked
+  // target sharpens p_target so a WEAK draft (which approximates the flat
+  // objective) puts mass on the wrong token -> low accept rate, while a STRONG
+  // draft still tracks the mode -> the good-vs-bad calls-saved gap widens.
   // =========================================================================
   WriteLn(StringOfChar('=', 72));
   WriteLn('GATE 3  Speedup vs draft/target agreement  (block K=', cK, ')');
   WriteLn(StringOfChar('=', 72));
-  WriteLn('  draft       acc-tok/pass   accept-rate   big-calls/tok   calls-saved');
-  WriteLn('  ----------  ------------   -----------   -------------   -----------');
 
-  // Rebuild a fresh draft and grow it through the stages, measuring at each.
-  // Stage 0 is the UNTRAINED draft (near-random proposals -> low agreement ->
-  // low accept rate); later stages train it more so agreement rises. Each
-  // sample draws a FRESH random prefix so the accept rate reflects genuine
-  // draft/target agreement over diverse contexts, not one lucky prefix.
-  RandSeed := cSeed + 7;
-  Draft.Free;
-  Draft := BuildDraft();
-  trainedSoFar := 0;
-
-  SweepN := cSweepRuns;
-  for q := 0 to High(DraftStages) do
-  begin
-    want := DraftStages[q];
-    if want > trainedSoFar then
-    begin
-      TrainEpochs(Draft, want - trainedSoFar);
-      trainedSoFar := want;
-    end;
-
-    SumAcc := 0; SumPass := 0; SpecCalls := 0; BaselineCalls := 0;
-    // Fixed RNG per stage so the only thing that changes across stages is the
-    // draft quality (same prefixes, same proposal/accept uniform streams).
-    RandSeed := cSeed + 555;
-    for sample := 1 to SweepN do
-    begin
-      MakeSeq(SweepPrefix);
-      RngSeed(gProp, QWord(11000000 + sample));
-      RngSeed(gAcc,  QWord(12000000 + sample));
-      SpeculativeSample(Target, Draft, SweepPrefix, PrefixLen, cTokens, InputV,
-        SpecOut, SpecLen, bcS, dcS, accTok, passes);
-      SumAcc := SumAcc + accTok;
-      SumPass := SumPass + passes;
-      SpecCalls := SpecCalls + bcS;            // big-model passes used
-      BaselineCalls := BaselineCalls + (SpecLen - PrefixLen); // plain = 1/tok
-    end;
-    MeanAccPerPass := SumAcc / Max(1, SumPass);
-    // Tokens committed per pass = accepted + (resample or bonus) ~ accept-rate.
-    Saved := 1.0 - SpecCalls / Max(1.0, BaselineCalls);
-    WriteLn(Format('  %-10s   %10.3f   %10.3f    %12.3f   %9.1f%%',
-      [StageName[q],
-       MeanAccPerPass,
-       MeanAccPerPass / cK,
-       SpecCalls / Max(1.0, BaselineCalls),
-       100.0 * Saved]));
-  end;
+  WriteLn('  ----- FLAT target (temp 1.0; original mod-sum map) -----');
+  gTgtTemp := 1.0;
+  RunSpeedupSweep(Target, InputV, PrefixLen, cTokens, cSweepRuns,
+    fWeakRate, fWeakSaved, fStrongRate, fStrongSaved);
   WriteLn;
-  WriteLn('  As the draft agrees more with the target, more draft tokens are accepted');
-  WriteLn('  per verification pass, so fewer big-model passes are needed per committed');
-  WriteLn('  token (calls-saved rises). The committed distribution is unchanged (Gate 1/2).');
+  WriteLn(Format('  ----- PEAKED target (temp %.2f) -----', [cPeakTemp]));
+  gTgtTemp := cPeakTemp;
+  RunSpeedupSweep(Target, InputV, PrefixLen, cTokens, cSweepRuns,
+    pWeakRate, pWeakSaved, pStrongRate, pStrongSaved);
+  WriteLn;
+
+  WriteLn('  flat-vs-peaked contrast (weak=untrained draft, strong=fully trained):');
+  WriteLn('                     weak-rate   strong-rate   weak-saved   strong-saved   gap(saved)');
+  WriteLn(Format('    FLAT target      %7.3f       %7.3f     %7.1f%%      %7.1f%%      %7.1f pts',
+    [fWeakRate, fStrongRate, fWeakSaved, fStrongSaved, fStrongSaved - fWeakSaved]));
+  WriteLn(Format('    PEAKED target    %7.3f       %7.3f     %7.1f%%      %7.1f%%      %7.1f pts',
+    [pWeakRate, pStrongRate, pWeakSaved, pStrongSaved, pStrongSaved - pWeakSaved]));
+  WriteLn;
+  WriteLn('  Under the PEAKED target the weak draft''s accept rate drops well below the');
+  WriteLn('  flat case and the strong-minus-weak calls-saved gap widens: a sharper');
+  WriteLn('  target rewards a good draft far more, so the speedup chart discriminates');
+  WriteLn('  draft quality much more strongly. The committed distribution is unchanged');
+  WriteLn('  at either temperature (Gate 1/2).');
   WriteLn;
 
   // ---- Summary / interpretation ------------------------------------------
@@ -697,18 +806,23 @@ begin
     WriteLn('  [PASS] EXACTNESS  : draft==target => speculative is bit-for-bit plain.')
   else
     WriteLn('  [FAIL] EXACTNESS  : degenerate case diverged.');
-  if GateFaithful then
-    WriteLn(Format('  [PASS] FAITHFUL   : real-draft histogram TV=%.4f within noise.', [TV]))
+  if GateFaithFlat and GateFaithPeak then
+    WriteLn(Format('  [PASS] FAITHFUL   : real-draft TV flat=%.4f peaked=%.4f within noise.',
+      [TVFlat, TVPeak]))
   else
-    WriteLn(Format('  [WARN] FAITHFUL   : real-draft histogram TV=%.4f above noise.', [TV]));
-  WriteLn('  [INFO] SPEEDUP    : accept rate (hence big-model calls saved) rises with');
-  WriteLn('                      draft/target agreement (table above).');
+    WriteLn(Format('  [WARN] FAITHFUL   : real-draft TV flat=%.4f peaked=%.4f above noise.',
+      [TVFlat, TVPeak]));
+  WriteLn(Format('  [INFO] SPEEDUP    : weak-draft accept rate flat=%.3f -> peaked=%.3f;',
+    [fWeakRate, pWeakRate]));
+  WriteLn(Format('                      calls-saved gap (strong-weak) flat=%.1fpts -> peaked=%.1fpts.',
+    [fStrongSaved - fWeakSaved, pStrongSaved - pWeakSaved]));
   WriteLn;
   WriteLn('Interpretation: speculative sampling exactly preserves the target''s output');
-  WriteLn('distribution (Gate 1 pins it bit-for-bit; Gate 2 confirms empirically with a');
-  WriteLn('real, imperfect draft) while committing 1..K+1 tokens per big-model pass, so');
-  WriteLn('a better-agreeing draft means fewer big-model calls at NO change in what is');
-  WriteLn('sampled. v1 recomputes the prefix each pass; KV-cache reuse is the follow-up.');
+  WriteLn('distribution at ANY peakedness (Gate 1 pins it bit-for-bit; Gate 2 confirms');
+  WriteLn('empirically for both a flat and a peaked target) while committing 1..K+1 tokens');
+  WriteLn('per big-model pass. A peaked target makes the speedup MORE sensitive to draft');
+  WriteLn('quality at NO change in what is sampled. v1 recomputes the prefix each pass;');
+  WriteLn('KV-cache reuse is the follow-up.');
 
   Target.Free;
   Draft.Free;
