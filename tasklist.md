@@ -164,18 +164,6 @@ rather than acted on.
 - [ ] TNNetWKV follow-ups (the RWKV-4 time-mixing recurrence base layer +
       AddRWKVTimeMix builder + numerical-gradient/serialization tests + examples/RWKV/
       WKV-vs-DeltaNet recall demo landed 2026-06-07 on a2, commits 2d4473b/1523a45). Open:
-      - [X] Asymmetric/full-context cross variant for TNNetCrossWKV (the base
-            two-source k/v RWKV-4 layer landed 2026-06-07 on a2, commit 3bc1c66,
-            with the EQUAL-seqlen position-aligned read-out contract): summarise
-            the kv memory once, query it with a DIFFERENT-length receptance
-            stream (true permuted associative recall, not position-aligned copy).
-            Landed 2026-06-07 on a2: pAsymmetric constructor flag (FStruct[1],
-            serialized in BOTH dispatch tables) on TNNetCrossWKV — rectangular
-            QSeqLen x KVSeqLen like TNNetCrossAttention; one decay scan summarises
-            the kv memory, every query reads wkv=A/B gated by its receptance;
-            exact coupled-BPTT (u unused, only w carries weight grad); numerical
-            gradient (both sources + w_raw) + serialization tests with
-            QSeqLen<>KVSeqLen; equal-seqlen v1 path unchanged.
       - [ ] Wire AddRWKVTimeMix into the downstream ../gpt-3-for-pascal decoder as an
             attention-free block option and contrast its loss / wall-clock vs the attention
             decoder on the existing tiny corpus (mirrors the open AddHyenaOperator wiring task).
@@ -1411,28 +1399,6 @@ rather than acted on.
 
 
 ### Normalizing flows (exact-likelihood generative density)
-- [X] `TNNetAffineCoupling` — an invertible RealNVP/Glow-style affine coupling
-      layer, the library's FIRST exact-likelihood normalizing-flow primitive
-      (distinct from the existing memory-saving `AddReversibleBlock`, which is a
-      RevNet recompute trick with no tractable Jacobian, and distinct from the
-      density-fitting `TNNetMixtureDensity` head, which is not invertible).
-      Mechanism: split the Depth axis into halves (x_a, x_b); pass x_a through a
-      small internal net to produce per-channel log-scale s(x_a) and shift
-      t(x_a); output y_a = x_a unchanged and y_b = x_b * exp(s) + t. The map is
-      analytically invertible (x_b = (y_b - t) * exp(-s)) and its log-det
-      Jacobian is just sum(s), which the layer must expose so a stacked flow can
-      train by maximum likelihood under a unit-Gaussian base
-      (loss = 0.5*||z||^2 - sum of all coupling log-dets). Design notes:
-      - alternate which half is transformed between stacked layers (or pair with
-        a fixed channel permutation) so every channel gets updated;
-      - clamp/tanh-bound s for numerical stability (Glow's standard trick);
-      - add an `Inverse` (sampling) forward path z -> x for generation;
-      - gradient check the forward transform AND verify forward∘inverse is
-        identity to tolerance;
-      - capstone example `examples/NormalizingFlow/`: fit a 2-D two-moons /
-        spiral density with a few stacked couplings + permutations, print the
-        mean log-likelihood climbing, and sample new points from the base
-        Gaussian back through the inverse to show they match the data manifold.
 - [ ] `TNNetInvertible1x1Conv` — Glow's LEARNABLE invertible 1x1 convolution
       (Kingma & Dhariwal 2018, arXiv:1807.03039, sec. 3.2), the natural
       channel-mixing companion to the landed `TNNetAffineCoupling`. The
