@@ -1246,7 +1246,7 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
-- [ ] `TNNetTitansMemory` — a test-time "neural long-term memory" sequence
+- [X] `TNNetTitansMemory` — a test-time "neural long-term memory" sequence
       mixer (Behrouz et al. 2024, "Titans: Learning to Memorize at Test
       Time"). This is a genuinely NEW memory paradigm, distinct from every
       memory/recurrence layer already in tree — confirm with
@@ -1277,6 +1277,29 @@ rather than acted on.
       long range). Follow-ups to record: the gated-DeltaNet-style chunked
       parallel scan, and an `AddTitansMemory` builder wrapping the MAC
       residual.
+      LANDED 2026-06-07 on a2: single-hidden-layer inner MLP `M(z)=W2·GeLU(W1·z)`,
+      MAC leaf variant. Neurons[] = theta_K/V/Q (Depth×Depth), eta_raw/theta_raw/
+      alpha_raw (Depth, per-channel sigmoid gates), W_alpha (Depth×Depth,
+      data-dependent forget gate `alpha_t=sigmoid(alpha_raw+W_alpha·x_t)`), and the
+      trainable initial inner fast-weights W1_0/W2_0. Gates index by output channel
+      (W2 row o ↦ gate[o], W1 row j ↦ gate[j mod Depth]). Exact second-order BPTT
+      (GeLU HVP) carries dL/dW1, dL/dW2 AND dL/dS right-to-left through the coupled
+      momentum/forget adjoint scans, reusing TTT-MLP's inner-tape machinery; both
+      gradient checks ≈5e-4. Test trio + shape + recall-smoke in
+      TestNeuralNumerical.pas; example examples/TitansMemory/ beats a FIXED-decay
+      TNNetRetention baseline at distractor=24 (MSE 0.16/33.3% vs 0.20/19.8%).
+      Stability note: strong momentum (eta) + near-zero forgetting (alpha) can FP-
+      overflow the inner state on harder configs (many pairs); the data-dependent
+      forget gate is what bounds the geometric momentum sum.
+- [ ] `TNNetTitansMemory` follow-up — a **gated-DeltaNet-style chunked parallel
+      scan** forward for `TNNetTitansMemory`, replacing the sequential O(SeqLen)
+      inner-gradient scan with a chunked associative/parallel recurrence (the
+      hardware-efficient training path Titans/Gated-DeltaNet use); must keep the
+      exact second-order BPTT semantics and pass the existing gradient checks.
+- [ ] `TNNet.AddTitansMemory` builder — a **MAC residual builder** wrapping
+      `TNNetTitansMemory` (token-shift + per-token k/v/q projections + the neural
+      memory leaf + residual/out-projection), the drop-in Memory-as-Context block,
+      mirroring `AddGatedLinearAttention` / `AddRWKVTimeMix`.
 - [ ] `examples/TinyDiffusion/` — a 20-step denoising-diffusion model on
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
       TNNetSinusoidalTimeEmbedding (FiLM and the timestep embedding are both

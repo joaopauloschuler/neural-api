@@ -433,6 +433,11 @@ type
     procedure TestTTTMLPWeightGradientCheck;
     procedure TestTTTLinearSerializationRoundTrip;
     procedure TestTTTMLPSerializationRoundTrip;
+    procedure TestTitansMemoryShapeInference;
+    procedure TestTitansMemoryInputGradientCheck;
+    procedure TestTitansMemoryWeightGradientCheck;
+    procedure TestTitansMemorySerializationRoundTrip;
+    procedure TestTitansMemoryRecallSmokeTrain;
     procedure TestNTMMemoryInputGradientCheck;
     procedure TestNTMMemoryWeightGradientCheck;
     procedure TestNTMMemorySerializationRoundTrip;
@@ -25431,6 +25436,237 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetTestTimeTraining.Create(1, 5), 'TTT-MLP', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetTitansMemory (test-time neural long-term memory, MAC leaf) ---------
+
+// Deterministic, BOUNDED seeding so the second-order BPTT (inner gradient step +
+// momentum/forget carry + GeLU HVP) stays inside the finite-difference
+// truncation tolerance. Bounding magnitudes is preferred to loosening tolerance.
+procedure SeedTitans(L: TNNetTitansMemory; Depth, Hd: integer);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.15; // theta_K
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.15; // theta_V
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 + j * 0.3) * 0.15; // theta_Q
+      L.Neurons[6].Weights[d, 0, j] := Cos(d * 0.4 + j * 0.2) * 0.12; // W_alpha
+    end;
+  // per-channel gate raws, moderate so eta/theta/alpha sit well inside (0,1).
+  for d := 0 to Depth - 1 do
+  begin
+    L.Neurons[3].Weights.Raw[d] := Sin(d * 0.5) * 0.3;       // eta_raw
+    L.Neurons[4].Weights.Raw[d] := Cos(d * 0.6) * 0.3;       // theta_raw
+    L.Neurons[5].Weights.Raw[d] := -0.5 + Sin(d * 0.4) * 0.2;// alpha_raw
+  end;
+  for d := 0 to Hd - 1 do
+    for j := 0 to Depth - 1 do
+      L.Neurons[7].Weights[d, 0, j] := Sin(d * 0.43 + j * 0.27) * 0.20; // W1_0
+  for d := 0 to Depth - 1 do
+    for j := 0 to Hd - 1 do
+      L.Neurons[8].Weights[d, 0, j] := Cos(d * 0.31 - j * 0.37) * 0.20; // W2_0
+end;
+
+procedure TTestNeuralNumerical.TestTitansMemoryShapeInference;
+var
+  NN: TNNet;
+  L: TNNetTitansMemory;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 4)); // SeqLen=5, Depth=4
+    L := TNNetTitansMemory.Create(6);        // hidden=6
+    NN.AddLayer(L);
+    AssertEquals('Titans output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('Titans output SizeY', 1, L.Output.SizeY);
+    AssertEquals('Titans output Depth preserved', 4, L.Output.Depth);
+    AssertEquals('Titans neuron count', 9, L.Neurons.Count);
+    AssertEquals('Titans theta_K size', 16, L.Neurons[0].Weights.Size); // 4x4
+    AssertEquals('Titans eta_raw size', 4, L.Neurons[3].Weights.Size);  // Depth
+    AssertEquals('Titans alpha_raw size', 4, L.Neurons[5].Weights.Size);
+    AssertEquals('Titans W_alpha size', 16, L.Neurons[6].Weights.Size); // 4x4
+    AssertEquals('Titans W1_0 size', 24, L.Neurons[7].Weights.Size);    // 6x4
+    AssertEquals('Titans W2_0 size', 24, L.Neurons[8].Weights.Size);    // 4x6
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTitansMemoryInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetTitansMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, Depth, Hd: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  Depth := 3; Hd := 5;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, Depth);
+  InputPlus := TNNetVolume.Create(3, 1, Depth);
+  Desired := TNNetVolume.Create(3, 1, Depth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, Depth, 1));
+    L := TNNetTitansMemory.Create(Hd);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.6 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedTitans(L, Depth, Hd);
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('Titans input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('Titans input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTitansMemoryWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetTitansMemory;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n, Depth, Hd: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  Depth := 3; Hd := 5;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, Depth);
+  Desired := TNNetVolume.Create(3, 1, Depth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, Depth, 1));
+    L := TNNetTitansMemory.Create(Hd);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.5 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedTitans(L, Depth, Hd);
+    // Cover every learnable tensor: projections, the three per-channel gate raws
+    // (eta/theta/alpha), W_alpha and the initial inner fast-weights W1_0/W2_0.
+    // The momentum/forget carry and the inner-gradient HVP are the error-prone spots.
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('Titans weight gradient check n=' + IntToStr(n) +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('Titans weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTitansMemorySerializationRoundTrip;
+begin
+  // NON-default hidden width (5) + all perturbed weights including the per-channel
+  // gate raws, W_alpha and the initial inner fast-weights W1_0/W2_0.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetTitansMemory.Create(5), 'TitansMemory', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestTitansMemoryRecallSmokeTrain;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end smoke: a tiny key->value recall task. Training must reduce the loss.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4));
+    NN.AddLayer(TNNetTitansMemory.Create(8));
+    NN.SetLearningRate(0.02, 0.0);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+    NN.Compute(Input);
+    AssertEquals('Titans smoke output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Titans smoke output Depth', 4, NN.GetLastLayer.Output.Depth);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('Titans training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestDeltaNetRecallSmokeTrain;
