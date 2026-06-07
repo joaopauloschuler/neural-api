@@ -76,13 +76,8 @@ rather than acted on.
       2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:
       sum of learned univariate Chebyshev edge functions per receptive-field patch,
       subclasses TNNetConvolutionLinear, degree K via FStruct[5], numerical-gradient +
-      serialization tests, examples/KANConv/):
-      - [X] B-spline (fixed-knot) basis variant alongside the Chebyshev basis, behind
-            a flag — the paper's original parameterisation; contrast smoothness/extrapolation.
-            LANDED 2026-06-07 on a2 (commit 6dc49f5): csKANBasisBSpline flag in FStruct[6]
-            (default csKANBasisChebyshev unchanged), clamped open-uniform knots over the
-            tanh-squashed [-1,1] support, G+K coeffs/edge via Cox–de Boor + its derivative
-            recurrence, Greville-abscissa near-linear init; numerical-gradient + save/load tests.
+      serialization tests, examples/KANConv/; B-spline fixed-knot basis variant
+      also landed, commit 6dc49f5):
       - [ ] examples/KANConv/ on a real tiny-image task (CIFAR/MNIST stub) vs a plain
             conv at matched weight budget, to show the headline param-efficiency on data.
 - [ ] TNNetDeltaNet chunked/parallel forward (the paper's WY-matrix
@@ -153,17 +148,9 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [X] TNNetWKV — the RWKV time-mixing recurrence as a first-class layer (the
-      defining attention-free operator of RWKV-4, Peng et al. 2023, arXiv:2305.13048).
-      LANDED 2026-06-07 on a2 (commits 2d4473b layer+builder, 1523a45 example): k|v-split
-      (SeqLen,1,2C) input → (SeqLen,1,C) wkv, learnable per-channel w=softplus(w_raw)+u
-      stored as neuron weights, log-space running-max stabilizer, exact BPTT via two
-      coupled right-to-left adjoint scans over cached a_t/b_t; TNNet.AddRWKVTimeMix builder
-      (TokenShift→{r,k,v} pointwise→WKV→receptance gate→out-proj); numerical-gradient
-      (input/w/u) + serialization tests; examples/RWKV/ WKV-vs-DeltaNet associative-recall
-      demo (both 100% exact recall). REMAINING open follow-up below.
-- [ ] TNNetWKV follow-ups (base layer + AddRWKVTimeMix builder + tests + examples/RWKV/
-      landed — see above). Open:
+- [ ] TNNetWKV follow-ups (the RWKV-4 time-mixing recurrence base layer +
+      AddRWKVTimeMix builder + numerical-gradient/serialization tests + examples/RWKV/
+      WKV-vs-DeltaNet recall demo landed 2026-06-07 on a2, commits 2d4473b/1523a45). Open:
       - [ ] Two-SOURCE k/v variant (separate key and value source tensors, like
             TNNetCrossAttention) instead of the current own-channel k|v split, so cross-WKV
             (decode-time external memory) becomes expressible.
