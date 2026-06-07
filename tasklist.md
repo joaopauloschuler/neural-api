@@ -72,42 +72,44 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetSinkhorn — differentiable optimal-transport / doubly-stochastic
-      normalization layer (NEW PARADIGM, no sibling in the suite: softmax and all
-      its relatives — sparsemax, entmax, the attention scores — normalize ONE
-      axis; this is the first layer that normalizes a square N×N matrix to be
-      *doubly stochastic*, i.e. every row AND every column sums to 1, by iterating
-      Sinkhorn–Knopp row/column rescaling on exp(score/tau)). Input is an (N,1,N)
-      score matrix (or (N,N,1) — pick one and document); forward runs a fixed K
-      iterations of alternating row-normalize then column-normalize in log-space
-      for stability (log-sum-exp, not raw division) with a temperature tau
-      (FFloatSt[0]) and iteration count K (FStruct[0]). Backward: unroll the K
-      iterations storing intermediate activations and backprop the exact analytic
-      gradient through the alternating normalizations (each step is just a
-      subtract-log-sum-exp along an axis — differentiable; the manual-gradient
-      idiom in [[manual-gradient-and-snapshot-gotchas]] applies, SetBatchUpdate),
-      numerical-gradient test asserting analytic == finite-difference to tol, plus
-      shape and save/load (FStruct[0]+FFloatSt[0] round-trip) tests. As tau→0 the
-      output approaches a hard permutation matrix, so this is the building block
-      for differentiable sorting / learnable permutations / soft bipartite
-      matching — distinct from the Hungarian/auction note at neuralnetwork.pas
-      ~line 10065 (that is a hard non-differentiable solve; this is the soft
-      relaxation that can be trained through). Example examples/SinkhornSort/:
-      learn to SORT a short list of scalars end-to-end — feed pairwise scores into
-      TNNetSinkhorn, multiply the resulting soft-permutation by the input vector,
-      MSE against the sorted vector, and show Kendall-tau / exact-sort accuracy
-      climbing as tau anneals down across training (the headline being that a net
-      learns a discrete operation through a continuous relaxation). Stretch:
-      AddSinkhornAttention builder (doubly-stochastic attention as a drop-in
-      contrast to softmax attention on one of the existing tiny seq tasks).
+- [X] TNNetSinkhorn — differentiable optimal-transport / doubly-stochastic
+      normalization layer LANDED 2026-06-07 on a2 (commit 435a93d). (N,1,N) score
+      matrix, log-space Sinkhorn–Knopp (KIter alternating row/col subtract-logsumexp
+      on score/tau, then exp), tau=FFloatSt[0], KIter=FStruct[0]; backward unrolls
+      all 2*KIter steps (FLogTape cache) with the exact softmax-style adjoint. No
+      trainable params. Numerical-gradient (max-abs-err 1.7e-5 < 0.01, inputs bound
+      ±0.7), doubly-stochastic forward, shape, and save/load round-trip tests added;
+      full suite 1160 tests green. examples/SinkhornSort/ learns to sort 5 scalars
+      (yhat=P·x, MSE vs ascending sort, dL/dP set by hand and backprop'd through the
+      unrolled iteration), exact-sort accuracy ~2.5%→62.5% as tau anneals 1.0→0.07
+      (below ~0.07 the internal softmaxes saturate → vanishing grad; schedule stops
+      there, documented).
+      Open follow-ups:
+      - [ ] AddSinkhornAttention builder — doubly-stochastic attention as a drop-in
+            contrast to softmax attention on one of the existing tiny seq tasks.
+      - [ ] Soft bipartite matching / learnable-permutation example beyond sorting
+            (e.g. jigsaw-tile reassembly or a tiny assignment problem) to show the
+            OT/matching use case distinct from the sort demo.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
       reusing FourierMixFFT, ModesX*ModesY low-pass truncation, exact complex
-      adjoint backward): wire it into a small PDE-surrogate example (Darcy-flow-like
-      coefficient→solution map on a tiny grid) to show the headline FNO use case
-      beyond the synthetic diffusion-operator demo (using the landed
-      AddFourierNeuralOperator2D builder).
+      adjoint backward): the PDE-surrogate example LANDED 2026-06-07 on a2
+      (commit 47b93ea, examples/DarcyFlowFNO/) — coefficient→solution map for the
+      LINEAR Poisson member of the Darcy family (-Δu = (a-1), a=exp(band-limited
+      field), Jacobi-solved target, h² folded into the source so the same continuous
+      operator holds at any resolution); lift→AddFourierNeuralOperator2D(width=8,
+      6×6 modes)→project trains relL2 ≈0.64→0.025 at 16×16 and the SAME weights
+      (CopyWeights) hold 0.0284 on an unseen 32×32 grid (resolution invariance).
+      Open follow-ups:
+      - [ ] The FULLY NONLINEAR -div(a grad u)=f Darcy operator does NOT converge
+            under plain SGD within the CPU budget (single linear spectral conv can't
+            represent it; deeper/ReLU FNO stacks freeze at ~zero or destabilize).
+            Revisit with a better optimizer / normalization / curriculum, or a
+            deeper FNO stack tuned to actually fit the non-diagonal operator.
+      - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
+            example-side SetExceptionMask workaround — consider masking/guarding the
+            denormals inside the layer's FFT so callers don't have to.
 - [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
       order-2 builder, numerical-gradient + save/load tests, and the
       examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
