@@ -4729,6 +4729,66 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetDeltaNet: the DELTA-RULE linear-attention recurrence (Yang et al.
+  // 2024, "Parallelizing Linear Transformers with the Delta Rule over Sequence
+  // Length", arXiv:2406.06484). A matrix-state recurrent layer that maintains a
+  // (Depth x Depth) associative memory S and updates it per timestep with the
+  // CLASSIC delta (Widrow-Hoff) learning rule: it first READS the current value
+  // prediction for the incoming key, measures the error against the target
+  // value, and writes back ONLY the correction scaled by a per-token write
+  // strength beta_t in (0,1). This REMOVES-THEN-ADDS associations (true
+  // editable associative memory), unlike TNNetRetention (fixed/learned exp
+  // decay), TNNetMLSTMCell (unbounded outer-product accumulation, no read-back)
+  // or TNNetSLSTMCell (scalar exp-gated): it beats plain linear attention on
+  // hard recall / in-context tasks. Operates over a (SeqLen,1,Depth) sequence
+  // (SizeY must be 1), recurrence along SizeX = SeqLen; output shape == input.
+  //
+  // Per timestep t (S_{-1}=0; d=key index, e=value index over 0..Depth-1):
+  //   q_t = W_q x_t                          (query,  Depth-vector)
+  //   k_t = normalize(W_k x_t)               (key,    L2-normalized Depth-vector)
+  //   v_t = W_v x_t                          (value,  Depth-vector)
+  //   beta_t = sigmoid(b_beta + w_beta . x_t)(per-token write strength in (0,1))
+  //   pred_t[e] = sum_d S_{t-1}[d,e] k_t[d]  (read: S_{t-1}^T k_t)
+  //   err_t  = v_t - pred_t                  (delta-rule error, Depth-vector)
+  //   S_t[d,e] = S_{t-1}[d,e] + beta_t k_t[d] err_t[e]   (rank-1 corrective write)
+  //   y_t[e]  = sum_d S_t[d,e] q_t[d]        (read-out: S_t^T q_t)
+  // W_q/W_k/W_v are DepthxDepth (stored [out,0,in]); w_beta is Depth-long;
+  // b_beta is a scalar. Storage in Neurons[] (5 tensors):
+  //   [0]=W_q [1]=W_k [2]=W_v   (projections, DepthxDepth)
+  //   [3]=w_beta (Depth,1,1)    [4]=b_beta (1,1,1)
+  // Init: projections small random; b_beta strongly negative so beta_t starts
+  // near 0 (a near-zero write strength -> an untrained layer barely perturbs S
+  // and stays numerically tame). Forward is the explicit left-to-right scan
+  // (O(SeqLen*Depth^2)); backward is backprop-through-time, a right-to-left
+  // sweep carrying the EXACT dL/dS_t (DepthxDepth) back through BOTH the rank-1
+  // delta write (into k, v, beta and S_{t-1}, including the read-back term
+  // S_{t-1}^T k_t) and the read-out. The state gradient is NOT stop-gradiented
+  // (cf. TNNetMLSTMCell's exact dL/dC carry); the beta gate and the
+  // (v - S_{t-1}^T k) error term are the error-prone part of the gradient.
+  // Coded by Claude (AI).
+  TNNetDeltaNet = class(TNNetLayer)
+    private
+      FScale: TNeuralFloat;          // 1/sqrt(Depth) query scaling
+      FQ, FV: TNNetVolume;           // cached q_t, v_t, (SeqLen,1,Depth)
+      FKey: TNNetVolume;             // cached NORMALIZED k_t, (SeqLen,1,Depth)
+      FKraw: TNNetVolume;            // cached pre-normalization W_k x_t, (SeqLen,1,Depth)
+      FKnorm: TNNetVolume;          // cached ||W_k x_t||, (SeqLen,1,1)
+      FBeta: TNNetVolume;            // cached beta_t (post-sigmoid), (SeqLen,1,1)
+      FErr: TNNetVolume;             // cached err_t = v_t - S_{t-1}^T k_t, (SeqLen,1,Depth)
+      FS: TNNetVolume;               // cached state S_t, (SeqLen,Depth,Depth)
+      // Backward accumulators.
+      FGS: TNNetVolume;              // dL/dS_t carried across steps, (Depth,1,Depth)
+      FGradWq, FGradWk, FGradWv: TNNetVolume; // DepthxDepth grad accumulators
+      FGradWb: TNNetVolume;          // Depth-long grad accumulator (w_beta)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetSelectiveSSM: an INPUT-DEPENDENT ("selective", Mamba/S6-style,
   // Gu & Dao 2023, "Mamba: Linear-Time Sequence Modeling with Selective State
   // Spaces", arXiv:2312.00752) diagonal state-space sequence mixer. Unlike the
@@ -31639,6 +31699,297 @@ begin
   FNeurons[6].FWeights.Fill(0);    // b_o
   FNeurons[7].FWeights.Fill(0);    // b_i
   FNeurons[8].FWeights.Fill(1.0);  // b_f (forget-bias -> near pass-through)
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetDeltaNet }
+constructor TNNetDeltaNet.Create();
+begin
+  inherited Create();
+  FQ := TNNetVolume.Create();    FV := TNNetVolume.Create();
+  FKey := TNNetVolume.Create();  FKraw := TNNetVolume.Create();
+  FKnorm := TNNetVolume.Create();FBeta := TNNetVolume.Create();
+  FErr := TNNetVolume.Create();  FS := TNNetVolume.Create();
+  FGS := TNNetVolume.Create();
+  FGradWq := TNNetVolume.Create(); FGradWk := TNNetVolume.Create();
+  FGradWv := TNNetVolume.Create(); FGradWb := TNNetVolume.Create();
+  // Depth-dependent weight buffers are (re)allocated in SetPrevLayer.
+  AddMissingNeurons(5);
+end;
+
+destructor TNNetDeltaNet.Destroy();
+begin
+  FGradWb.Free; FGradWv.Free; FGradWk.Free; FGradWq.Free;
+  FGS.Free; FS.Free; FErr.Free; FBeta.Free; FKnorm.Free;
+  FKraw.Free; FKey.Free; FV.Free; FQ.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetDeltaNet.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Depth, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetDeltaNet requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  Depth := pPrevLayer.FOutput.Depth;
+  FScale := 1.0 / Sqrt(Depth);
+  // The delta-rule cell preserves the sequence layout.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 5 then AddMissingNeurons(5);
+  // [0..2]=W_q/W_k/W_v are DepthxDepth (stored [out,0,in]); [3]=w_beta is
+  // Depth-long; [4]=b_beta is a scalar.
+  for ii := 0 to 2 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
+  FNeurons[3].FWeights.ReSize(Depth, 1, 1);
+  FNeurons[4].FWeights.ReSize(1, 1, 1);
+  for ii := 0 to 4 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FQ.ReSize(FOutput.SizeX, 1, Depth);    FV.ReSize(FOutput.SizeX, 1, Depth);
+  FKey.ReSize(FOutput.SizeX, 1, Depth);  FKraw.ReSize(FOutput.SizeX, 1, Depth);
+  FErr.ReSize(FOutput.SizeX, 1, Depth);
+  FKnorm.ReSize(FOutput.SizeX, 1, 1);    FBeta.ReSize(FOutput.SizeX, 1, 1);
+  FS.ReSize(FOutput.SizeX, Depth, Depth);
+  FGS.ReSize(Depth, 1, Depth);
+  FGradWq.ReSize(Depth, 1, Depth); FGradWk.ReSize(Depth, 1, Depth);
+  FGradWv.ReSize(Depth, 1, Depth); FGradWb.ReSize(1, 1, Depth);
+  InitDefault();
+end;
+
+procedure TNNetDeltaNet.Compute();
+var
+  StartTime: double;
+  Wq, Wk, Wv, Wb: TNNetVolume;
+  SeqLen, Depth, t, d, e, j, baseT, baseS: integer;
+  accQ, accK, accV, accBeta, xj, betav, knrm, ss, predE: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  WqR, WkR, WvR: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
+  Wv := FNeurons[2].FWeights; Wb := FNeurons[3].FWeights;
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    baseS := t * Depth * Depth;
+    // q_t, raw k_t, v_t projections, and the scalar beta argument.
+    accBeta := FNeurons[4].FWeights.FData[0]; // b_beta
+    for j := 0 to Depth - 1 do
+      accBeta := accBeta + Wb.FData[j] * XtPtr^[j];
+    for d := 0 to Depth - 1 do
+    begin
+      WqR := Wq.GetRawPtr(d, 0, 0); WkR := Wk.GetRawPtr(d, 0, 0);
+      WvR := Wv.GetRawPtr(d, 0, 0);
+      accQ := 0; accK := 0; accV := 0;
+      for j := 0 to Depth - 1 do
+      begin
+        xj := XtPtr^[j];
+        accQ := accQ + WqR^[j] * xj;
+        accK := accK + WkR^[j] * xj;
+        accV := accV + WvR^[j] * xj;
+      end;
+      FQ.FData[baseT + d] := accQ * FScale;
+      FKraw.FData[baseT + d] := accK;
+      FV.FData[baseT + d] := accV;
+    end;
+    // L2-normalize the key (eps-free; raw norm cached for the backward divide).
+    knrm := 0;
+    for d := 0 to Depth - 1 do knrm := knrm + FKraw.FData[baseT + d] * FKraw.FData[baseT + d];
+    knrm := Sqrt(knrm);
+    if knrm < 1e-12 then knrm := 1e-12;
+    FKnorm.FData[t] := knrm;
+    for d := 0 to Depth - 1 do FKey.FData[baseT + d] := FKraw.FData[baseT + d] / knrm;
+    betav := Sigmoid(accBeta);
+    FBeta.FData[t] := betav;
+    // Read prediction pred_t = S_{t-1}^T k_t, error err_t = v_t - pred_t,
+    // then the corrective write S_t = S_{t-1} + beta_t k_t (x) err_t.
+    for e := 0 to Depth - 1 do
+    begin
+      predE := 0;
+      if t > 0 then
+        for d := 0 to Depth - 1 do
+          predE := predE + FS.FData[baseS - Depth * Depth + d * Depth + e] * FKey.FData[baseT + d];
+      FErr.FData[baseT + e] := FV.FData[baseT + e] - predE;
+    end;
+    for d := 0 to Depth - 1 do
+      for e := 0 to Depth - 1 do
+      begin
+        if t > 0 then ss := FS.FData[baseS - Depth * Depth + d * Depth + e]
+        else ss := 0;
+        ss := ss + betav * FKey.FData[baseT + d] * FErr.FData[baseT + e];
+        FS.FData[baseS + d * Depth + e] := ss;
+      end;
+    // Read-out y_t[e] = sum_d S_t[d,e] q_t[d].
+    for e := 0 to Depth - 1 do
+    begin
+      ss := 0;
+      for d := 0 to Depth - 1 do
+        ss := ss + FS.FData[baseS + d * Depth + e] * FQ.FData[baseT + d];
+      OutPtr^[e] := ss;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDeltaNet.Backpropagate();
+var
+  StartTime: double;
+  Wq, Wk, Wv, Wb: TNNetVolume;
+  SeqLen, Depth, t, d, e, j, baseT, baseS: integer;
+  hasInputGrad: boolean;
+  GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
+  WqR, WkR, WvR, GWqR, GWkR, GWvR: TNeuralFloatArrPtr;
+  betav, knrm, gbeta_pre, gbetav, kdotgkn, sPrev: TNeuralFloat;
+  gq, gv, gkn, gkraw: array of TNeuralFloat; // grads wrt q,v,normalized k,raw k
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
+  Wv := FNeurons[2].FWeights; Wb := FNeurons[3].FWeights;
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  SetLength(gq, Depth); SetLength(gv, Depth);
+  SetLength(gkn, Depth); SetLength(gkraw, Depth);
+  FGS.Fill(0);
+  FGradWq.Fill(0); FGradWk.Fill(0); FGradWv.Fill(0); FGradWb.Fill(0);
+  // Right-to-left BPTT. FGS carries dL/dS_t (DepthxDepth) arriving from the
+  // read-out at step t plus the carry from step t+1's S_t-as-S_{t-1} use.
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    baseS := t * Depth * Depth;
+    betav := FBeta.FData[t];
+    knrm := FKnorm.FData[t];
+    if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+    else PrevErrPtr := nil;
+    for d := 0 to Depth - 1 do
+    begin
+      gq[d] := 0; gv[d] := 0; gkn[d] := 0; gkraw[d] := 0;
+    end;
+    // Read-out y_t[e] = sum_d S_t[d,e] q_t[d]: scatter into dL/dS_t (+carry) and dL/dq.
+    for e := 0 to Depth - 1 do
+      for d := 0 to Depth - 1 do
+      begin
+        FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] + GyPtr^[e] * FQ.FData[baseT + d];
+        gq[d] := gq[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
+      end;
+    // Now FGS = dL/dS_t (full). Write: S_t[d,e] = S_{t-1}[d,e] + beta*k[d]*err[e].
+    // dL/dbeta, dL/dk (via write), dL/derr, and the carry dL/dS_{t-1} = FGS
+    // (the S_{t-1} term passes through with coeff 1; mutated below after using it).
+    gbetav := 0;
+    for d := 0 to Depth - 1 do
+      for e := 0 to Depth - 1 do
+      begin
+        gbetav := gbetav + FGS.FData[d * Depth + e] * FKey.FData[baseT + d] * FErr.FData[baseT + e];
+        gkn[d] := gkn[d] + FGS.FData[d * Depth + e] * betav * FErr.FData[baseT + e];
+        gv[e] := gv[e] + FGS.FData[d * Depth + e] * betav * FKey.FData[baseT + d]; // via err=v-pred
+      end;
+    // err_t = v_t - S_{t-1}^T k_t. The -pred term feeds dL/dk and dL/dS_{t-1}.
+    // gerr[e] (= gv[e] here, since d err/d v = +1) propagates: pred[e]=sum_d S_{t-1}[d,e] k[d].
+    if t > 0 then
+    begin
+      for e := 0 to Depth - 1 do
+        for d := 0 to Depth - 1 do
+        begin
+          sPrev := FS.FData[baseS - Depth * Depth + d * Depth + e];
+          // d pred[e]/d k[d] = S_{t-1}[d,e]; err = v - pred -> chain -gv[e].
+          gkn[d] := gkn[d] - gv[e] * sPrev;
+          // d pred[e]/d S_{t-1}[d,e] = k[d]; carry into dL/dS_{t-1}.
+          FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] - gv[e] * FKey.FData[baseT + d];
+        end;
+    end;
+    // (FGS now holds dL/dS_{t-1}: the +S_{t-1} write term contributes identity,
+    //  the -pred term contributed the -gv*k correction just applied.)
+    // beta_t = sigmoid(pre): pre = b_beta + w_beta . x_t.
+    gbeta_pre := gbetav * betav * (1 - betav);
+    FNeurons[4].FDelta.FData[0] := FNeurons[4].FDelta.FData[0] - FLearningRate * gbeta_pre;
+    for j := 0 to Depth - 1 do
+    begin
+      FGradWb.FData[j] := FGradWb.FData[j] + gbeta_pre * XtPtr^[j];
+      if hasInputGrad then PrevErrPtr^[j] := PrevErrPtr^[j] + gbeta_pre * Wb.FData[j];
+    end;
+    // k_t = kraw / ||kraw||: backprop the L2 normalization (gkn -> gkraw).
+    kdotgkn := 0;
+    for d := 0 to Depth - 1 do kdotgkn := kdotgkn + gkn[d] * FKey.FData[baseT + d];
+    for d := 0 to Depth - 1 do
+      gkraw[d] := (gkn[d] - FKey.FData[baseT + d] * kdotgkn) / knrm;
+    // q_t = scale*(W_q x_t); k_raw = W_k x_t; v_t = W_v x_t.
+    for d := 0 to Depth - 1 do
+    begin
+      WqR := Wq.GetRawPtr(d, 0, 0); WkR := Wk.GetRawPtr(d, 0, 0);
+      WvR := Wv.GetRawPtr(d, 0, 0);
+      GWqR := FGradWq.GetRawPtr(d, 0, 0); GWkR := FGradWk.GetRawPtr(d, 0, 0);
+      GWvR := FGradWv.GetRawPtr(d, 0, 0);
+      gq[d] := gq[d] * FScale;
+      for j := 0 to Depth - 1 do
+      begin
+        GWqR^[j] := GWqR^[j] + gq[d] * XtPtr^[j];
+        GWkR^[j] := GWkR^[j] + gkraw[d] * XtPtr^[j];
+        GWvR^[j] := GWvR^[j] + gv[d] * XtPtr^[j];
+        if hasInputGrad then
+          PrevErrPtr^[j] := PrevErrPtr^[j] +
+            gq[d] * WqR^[j] + gkraw[d] * WkR^[j] + gv[d] * WvR^[j];
+      end;
+    end;
+  end;
+  // Flush -FLearningRate-scaled grads into the neuron deltas.
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradWq.GetRawPtr(),
+    -FLearningRate, FNeurons[0].FWeights.Size);
+  TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), FGradWk.GetRawPtr(),
+    -FLearningRate, FNeurons[1].FWeights.Size);
+  TNNetVolume.MulAdd(FNeurons[2].FDelta.GetRawPtr(), FGradWv.GetRawPtr(),
+    -FLearningRate, FNeurons[2].FWeights.Size);
+  TNNetVolume.MulAdd(FNeurons[3].FDelta.GetRawPtr(), FGradWb.GetRawPtr(),
+    -FLearningRate, Depth);
+  if (not FBatchUpdate) then
+  begin
+    for j := 0 to 4 do FNeurons[j].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetDeltaNet.InitDefault();
+var
+  Depth, d, j, oldSeed: integer;
+begin
+  if FNeurons.Count < 5 then AddMissingNeurons(5);
+  Depth := FNeurons[3].FWeights.Size;
+  if Depth < 1 then exit;
+  oldSeed := RandSeed;
+  RandSeed := 271828;
+  for d := 0 to Depth - 1 do
+    for j := 0 to Depth - 1 do
+    begin
+      FNeurons[0].FWeights[d, 0, j] := FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
+      FNeurons[1].FWeights[d, 0, j] := FNeurons[1].FWeights.RandomGaussianValue() * 0.05;
+      FNeurons[2].FWeights[d, 0, j] := FNeurons[2].FWeights.RandomGaussianValue() * 0.05;
+    end;
+  for j := 0 to Depth - 1 do
+    FNeurons[3].FWeights.FData[j] := FNeurons[3].FWeights.RandomGaussianValue() * 0.05; // w_beta
+  // b_beta strongly negative -> beta_t ~= 0 at init (near-zero write strength).
+  FNeurons[4].FWeights.FData[0] := -4.0;
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -70352,6 +70703,7 @@ begin
       'TNNetClosedFormContinuous':  Result := TNNetClosedFormContinuous.Create();
       'TNNetSLSTMCell':             Result := TNNetSLSTMCell.Create();
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
+      'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
       'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
       'TNNetHamiltonianCell':       Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1]);
@@ -70700,6 +71052,7 @@ begin
       if S[0] = 'TNNetClosedFormContinuous' then Result := TNNetClosedFormContinuous.Create() else
       if S[0] = 'TNNetSLSTMCell' then Result := TNNetSLSTMCell.Create() else
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
+      if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
       if S[0] = 'TNNetHamiltonianCell' then Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1]) else

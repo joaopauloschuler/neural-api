@@ -396,6 +396,11 @@ type
     procedure TestMLSTMCellWeightGradientCheck;
     procedure TestMLSTMCellSerializationRoundTrip;
     procedure TestAddMLSTMBuilder;
+    procedure TestDeltaNetShapeInference;
+    procedure TestDeltaNetInputGradientCheck;
+    procedure TestDeltaNetWeightGradientCheck;
+    procedure TestDeltaNetSerializationRoundTrip;
+    procedure TestDeltaNetRecallSmokeTrain;
     procedure TestNTMMemoryInputGradientCheck;
     procedure TestNTMMemoryWeightGradientCheck;
     procedure TestNTMMemorySerializationRoundTrip;
@@ -24125,6 +24130,245 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure SeedDeltaNet(L: TNNetDeltaNet; Depth: integer);
+var d, j: integer;
+begin
+  // Deterministic, BOUNDED projections (small magnitudes so the FD truncation of
+  // the rank-1 delta write / read-back term stays inside the gradient tolerance).
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.18; // W_q
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.18; // W_k
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 + j * 0.3) * 0.18; // W_v
+    end;
+    L.Neurons[3].Weights.Raw[d] := Sin(d * 0.4) * 0.12;  // w_beta
+  end;
+  // Moderate b_beta so beta_t is well inside (0,1) (exercises the gate gradient
+  // away from the saturated init).
+  L.Neurons[4].Weights.Raw[0] := -0.5;
+end;
+
+procedure TTestNeuralNumerical.TestDeltaNetShapeInference;
+var
+  NN: TNNet;
+  L: TNNetDeltaNet;
+begin
+  // Shape-inference smoke check: output sized like the input sequence, with the
+  // expected 5-neuron bank (W_q, W_k, W_v, w_beta, b_beta).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 4)); // SeqLen=5, Depth=4
+    L := TNNetDeltaNet.Create();
+    NN.AddLayer(L);
+    AssertEquals('DeltaNet output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('DeltaNet output SizeY', 1, L.Output.SizeY);
+    AssertEquals('DeltaNet output Depth preserved', 4, L.Output.Depth);
+    AssertEquals('DeltaNet neuron count', 5, L.Neurons.Count);
+    AssertEquals('DeltaNet W_q size', 16, L.Neurons[0].Weights.Size); // 4x4
+    AssertEquals('DeltaNet W_k size', 16, L.Neurons[1].Weights.Size);
+    AssertEquals('DeltaNet W_v size', 16, L.Neurons[2].Weights.Size);
+    AssertEquals('DeltaNet w_beta size', 4, L.Neurons[3].Weights.Size);
+    AssertEquals('DeltaNet b_beta size', 1, L.Neurons[4].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeltaNetInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetDeltaNet;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetDeltaNet.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded inputs keep the L2-normalize divide + rank-1 write well-conditioned.
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedDeltaNet(L, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('DeltaNet input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('DeltaNet input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeltaNetWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetDeltaNet;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..4] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'W_q'; Names[1] := 'W_k'; Names[2] := 'W_v';
+  Names[3] := 'w_beta'; Names[4] := 'b_beta';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetDeltaNet.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedDeltaNet(L, 3);
+
+    // Cover all five weight tensors. The delta-rule error term (v - S^T k), the
+    // L2-normalized key and the beta gate are the BPTT-error-prone spots.
+    for n := 0 to 4 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('DeltaNet weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('DeltaNet weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeltaNetSerializationRoundTrip;
+begin
+  // DeltaNet stores five learnable tensors (three DepthxDepth projections, a
+  // Depth-long w_beta and the scalar b_beta); the perturbed-weights helper pushes
+  // them away from defaults so the round trip exercises a non-trivial set.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetDeltaNet.Create(), 'DeltaNet', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestDeltaNetRecallSmokeTrain;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end smoke: a tiny key->value recall task. Two distinct (key,value)
+  // pairs are written in the first two positions; the third position re-presents
+  // the FIRST key and the target is its value (true associative recall, which a
+  // fixed-decay layer cannot do as cleanly). Training must reduce the loss.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4));
+    NN.AddLayer(TNNetDeltaNet.Create());
+    NN.SetLearningRate(0.05, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+
+    NN.Compute(Input);
+    AssertEquals('DeltaNet smoke output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('DeltaNet smoke output Depth', 4, NN.GetLastLayer.Output.Depth);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('DeltaNet training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
   finally
     NN.Free; Input.Free; Desired.Free;
   end;
