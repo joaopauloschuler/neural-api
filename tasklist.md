@@ -152,6 +152,36 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
+- [ ] TNNetWKV — the RWKV time-mixing recurrence as a first-class layer (the
+      defining attention-free operator of RWKV-4, Peng et al. 2023, arXiv:2305.13048).
+      Today only the per-channel TIME-SHIFT primitive exists (TNNetTokenShift,
+      neuralnetwork.pas:4341); the actual weighted key-value (WKV) operator is
+      missing. Per channel d, over a (SeqLen,1,Depth) sequence (SizeY=1, same layout
+      as TNNetTokenShift / TNNetSelectiveSSM / TNNetDeltaNet), compute the
+      numerically-stabilized recurrence
+          wkv_t = ( a_{t-1} + e^{u + k_t} v_t ) / ( b_{t-1} + e^{u + k_t} ),
+          a_t = e^{-w} a_{t-1} + e^{k_t} v_t,  b_t = e^{-w} b_{t-1} + e^{k_t},
+      with a learnable per-channel positive decay w (FStruct/softplus-parameterised,
+      like TNNetRetention's gamma) and a learnable per-channel "bonus" u that
+      up-weights the current token; carry the running max in log-space exactly as the
+      reference CUDA kernel does so e^{k} never overflows. Inputs k (key) and v
+      (value) are the layer's own channel split (or two source tensors, like
+      TNNetCrossAttention); receptance gating r=sigmoid(...) and the output mix stay
+      OUTSIDE the leaf so AddRWKVTimeMix can compose it with TNNetTokenShift +
+      pointwise projections, mirroring how AddTalkingHeadsAttention / AddSinkhornAttention
+      build on finer primitives. Exact BPTT through both running accumulators a_t, b_t
+      (two coupled adjoint scans, same shape as the TNNetKalmanFilterCell /
+      TNNetDeltaNet / TNNetMLSTMCell backward) — m_t-style stabilizer is NOT
+      stop-gradient. Deliverables: input + per-channel-w + per-channel-u
+      numerical-gradient tests, serialization round-trip, and examples/RWKV/ contrasting
+      the WKV recurrence against TNNetSelectiveSSM and TNNetDeltaNet on the existing
+      associative-recall / copy task. Distinct from every landed linear-attention layer:
+      SelectiveSSM = input-dependent SSM, DeltaNet = error-correcting delta rule,
+      DiagonalSSM = LTI, Retention = fixed-decay outer-product — WKV is the
+      softmax-free exponential-decay KV average with a current-token bonus. See
+      [[deltanet-layer]] / [[kalman-filter-cell-layer]] / [[constrained-learnable-scalar-sigmoid]]
+      for the BPTT-scan and learnable-positive-scalar patterns.
+
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
