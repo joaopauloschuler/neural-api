@@ -8851,6 +8851,21 @@ type
         EncoderOutput: TNNetLayer; PreNorm: boolean = true;
         UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
+      // Single-head SINKHORN attention: a drop-in, DOUBLY-STOCHASTIC contrast to
+      // softmax self-attention. Standard attention row-normalizes the scaled QK^T
+      // scores with softmax (each query's weights sum to 1 -- ONE-sided stochastic);
+      // this builder normalizes the WHOLE score matrix to be DOUBLY stochastic
+      // (rows AND columns sum to 1) by feeding the scaled scores through the
+      // existing TNNetSinkhorn layer (log-space Sinkhorn-Knopp) in place of the
+      // softmax, then weights V exactly as the softmax path does. Mirrors
+      // AddSingleHeadSelfAttention's layer wiring (PointwiseConvLinear Q/K/V
+      // projections, TNNetDotProducts scores of shape (SeqLen,1,SeqLen) which is
+      // the square (N,1,N) Sinkhorn input, TNNetDotProducts value weighting,
+      // PointwiseConvLinear out-projection). The Sinkhorn layer is returned in W
+      // so callers can inspect its doubly-stochastic output. KIter / Tau forward
+      // to TNNetSinkhorn (smaller Tau -> sharper / more permutation-like).
+      procedure AddSinkhornAttention(out Attended, W: TNNetLayer;
+        KIter: integer = 20; Tau: TNeuralFloat = 1.0);
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
         pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
@@ -35487,6 +35502,31 @@ begin
   (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
   (*W := *)AddLayer( TNNetReLUL.Create(-500,+500,0) );
   W := AddLayer( TNNetPointwiseSoftMax.Create(0, BoolToByte[NoForward]) );
+  (*Y := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
+  Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
+end;
+
+procedure TNNet.AddSinkhornAttention(out Attended, W: TNNetLayer;
+  KIter: integer = 20; Tau: TNeuralFloat = 1.0);
+var
+  x, Query, Key, ValueT: TNNetLayer;
+  EmbeddingDim: integer;
+begin
+  x := GetLastLayer();
+  EmbeddingDim := x.Output.Depth;
+  // Per-token Q/K/V projections (PointwiseConvLinear keeps the (SeqLen,1,D)
+  // sequence axis; FullConnect would flatten/mix the tokens).
+  Query := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
+  Key   := AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
+  (*Value:=*)AddLayerAfter( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1), x);
+  ValueT := AddLayer( TNNetTransposeXD.Create() );
+  // Scaled scores QK^T / sqrt(d): shape (SeqLen,1,SeqLen) -- the square (N,1,N)
+  // matrix TNNetSinkhorn consumes.
+  (*W := *)AddLayer( TNNetDotProducts.Create(Query, Key) );
+  (*W := *)AddLayer( TNNetMulByConstant.Create(1/Sqrt(EmbeddingDim)) );
+  // DOUBLY-STOCHASTIC normalization in place of the softmax: rows AND columns of
+  // the attention map sum to 1 (optimal-transport / soft-permutation weights).
+  W := AddLayer( TNNetSinkhorn.Create(KIter, Tau) );
   (*Y := *)AddLayer( TNNetDotProducts.Create(ValueT, W) );
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;

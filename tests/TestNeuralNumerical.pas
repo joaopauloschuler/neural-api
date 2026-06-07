@@ -205,6 +205,9 @@ type
     procedure TestSinkhornDoublyStochastic;
     procedure TestSinkhornShape;
     procedure TestSinkhornSerializationRoundTrip;
+    // AddSinkhornAttention builder (doubly-stochastic attention)
+    procedure TestSinkhornAttentionShapeAndDoublyStochastic;
+    procedure TestSinkhornAttentionTrains;
     // TNNetLIFNeuron spiking leaky-integrate-and-fire surrogate-gradient layer
     procedure TestLIFNeuronInputGradientCheck;
     procedure TestLIFNeuronSpikePattern;
@@ -38098,6 +38101,113 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkhornAttentionShapeAndDoublyStochastic;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Attended, W: TNNetLayer;
+  SeqLen, d_model, ri, cj, i: integer;
+  rowSum, colSum: TNeuralFloat;
+begin
+  // The builder must wire up to a (SeqLen,1,d_model) output, and the internal
+  // attention map (the returned Sinkhorn layer W) must be DOUBLY stochastic:
+  // every row AND every column sums to ~1.
+  RandSeed := 424242;
+  SeqLen := 5; d_model := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model));
+    NN.AddSinkhornAttention(Attended, W, {KIter=}40, {Tau=}1.0);
+    AssertTrue('AddSinkhornAttention returns a Sinkhorn layer in W',
+      W is TNNetSinkhorn);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 1.3) * 1.5;
+    NN.Compute(Input);
+
+    AssertEquals('SinkhornAttention output SizeX', SeqLen, Attended.Output.SizeX);
+    AssertEquals('SinkhornAttention output SizeY', 1, Attended.Output.SizeY);
+    AssertEquals('SinkhornAttention output Depth', d_model, Attended.Output.Depth);
+
+    // The score/attention matrix is (SeqLen,1,SeqLen) and doubly stochastic.
+    AssertEquals('attn map SizeX', SeqLen, W.Output.SizeX);
+    AssertEquals('attn map Depth', SeqLen, W.Output.Depth);
+    for ri := 0 to SeqLen - 1 do
+    begin
+      rowSum := 0;
+      colSum := 0;
+      for cj := 0 to SeqLen - 1 do
+      begin
+        rowSum := rowSum + W.Output[ri, 0, cj];
+        colSum := colSum + W.Output[cj, 0, ri];
+      end;
+      AssertEquals('attn row ' + IntToStr(ri) + ' sums to 1', 1.0, rowSum, 1e-3);
+      AssertEquals('attn col ' + IntToStr(ri) + ' sums to 1', 1.0, colSum, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkhornAttentionTrains;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attended, W: TNNetLayer;
+  SeqLen, d_model, i, epoch: integer;
+  loss, firstLoss, lastLoss: TNeuralFloat;
+begin
+  // End-to-end smoke test: a Sinkhorn-attention block wired ahead of a linear
+  // head must reduce a fixed-target MSE loss over a handful of full-batch steps,
+  // proving the whole backward path (out-proj -> value-weight DotProducts ->
+  // Sinkhorn -> score DotProducts -> Q/K/V projections) carries a useful
+  // gradient.
+  RandSeed := 424242;
+  SeqLen := 4; d_model := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model));
+    NN.AddSinkhornAttention(Attended, W, {KIter=}15, {Tau=}1.0);
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+    NN.SetLearningRate(0.02, 0.0);
+    // Per-sample update (default): Backpropagate applies the weight delta each
+    // call, so a single-example loop trains without an explicit UpdateWeights.
+    NN.SetBatchUpdate(false);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 1.2;
+      Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    end;
+
+    firstLoss := 0;
+    lastLoss := 0;
+    for epoch := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      loss := 0;
+      for i := 0 to Desired.Size - 1 do
+        loss := loss + Sqr(NN.GetLastLayer.Output.Raw[i] - Desired.Raw[i]);
+      if epoch = 0 then firstLoss := loss;
+      lastLoss := loss;
+      NN.Backpropagate(Desired);
+    end;
+
+    WriteLn('  SinkhornAttention train loss: first=', firstLoss:0:6,
+      ' last=', lastLoss:0:6);
+    AssertTrue('SinkhornAttention training reduces loss (first=' +
+      FloatToStr(firstLoss) + ' last=' + FloatToStr(lastLoss) + ')',
+      lastLoss < firstLoss * 0.5);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 
