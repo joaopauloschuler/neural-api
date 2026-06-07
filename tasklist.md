@@ -1443,3 +1443,27 @@ rather than acted on.
       - [ ] longer/multi-chain averaging (or a calibrated eps/gamma sweep) to recover
             the minimal < redundant ordering reproducibly within budget.
 
+
+### Normalizing flows (exact-likelihood generative density)
+- [ ] `TNNetAffineCoupling` — an invertible RealNVP/Glow-style affine coupling
+      layer, the library's FIRST exact-likelihood normalizing-flow primitive
+      (distinct from the existing memory-saving `AddReversibleBlock`, which is a
+      RevNet recompute trick with no tractable Jacobian, and distinct from the
+      density-fitting `TNNetMixtureDensity` head, which is not invertible).
+      Mechanism: split the Depth axis into halves (x_a, x_b); pass x_a through a
+      small internal net to produce per-channel log-scale s(x_a) and shift
+      t(x_a); output y_a = x_a unchanged and y_b = x_b * exp(s) + t. The map is
+      analytically invertible (x_b = (y_b - t) * exp(-s)) and its log-det
+      Jacobian is just sum(s), which the layer must expose so a stacked flow can
+      train by maximum likelihood under a unit-Gaussian base
+      (loss = 0.5*||z||^2 - sum of all coupling log-dets). Design notes:
+      - alternate which half is transformed between stacked layers (or pair with
+        a fixed channel permutation) so every channel gets updated;
+      - clamp/tanh-bound s for numerical stability (Glow's standard trick);
+      - add an `Inverse` (sampling) forward path z -> x for generation;
+      - gradient check the forward transform AND verify forward∘inverse is
+        identity to tolerance;
+      - capstone example `examples/NormalizingFlow/`: fit a 2-D two-moons /
+        spiral density with a few stacked couplings + permutations, print the
+        mean log-likelihood climbing, and sample new points from the base
+        Gaussian back through the inverse to show they match the data manifold.
