@@ -10581,6 +10581,31 @@ type
       function AddTransformerDecoderBlock(Heads, d_ff: integer;
         EncoderOutput: TNNetLayer; PreNorm: boolean = true;
         UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // MULTI-TOKEN PREDICTION (MTP) head (Gloeckle et al. 2024; DeepSeek-V3)
+      // over a (SeqLen,1,d_model) shared-trunk hidden state (SizeY=1). Instead of
+      // predicting only the next token (t+1), it attaches NumFuture PARALLEL
+      // prediction heads off the SAME trunk, head h forecasting token t+1+h
+      // (h=0..NumFuture-1) at every position t. This densifies the training signal
+      // (each position supervises NumFuture future tokens), which helps the primary
+      // t+1 head converge faster and yields extra heads reusable at inference for
+      // self-speculative decoding. Distinct from the SpeculativeDecoding example
+      // (two SEPARATE draft+verify nets) and from TNNetTokenHistoryPenalty.
+      // Wiring per head (all token-wise 1x1 convs so the sequence axis is kept --
+      // a FullConnect would flatten/mix tokens, see AddMultiHeadSelfAttention):
+      //   trunk -> [optional PointwiseConvLinear(d_model)+activation] ->
+      //            PointwiseConvLinear(VocabSize) -> TNNetPointwiseSoftMax
+      // The NumFuture per-head softmax distributions are TNNetDeepConcat'd along
+      // depth into one (SeqLen,1,NumFuture*VocabSize) output: head h occupies depth
+      // slab [h*VocabSize .. (h+1)*VocabSize-1]. Train with a matching Desired
+      // tensor whose slab h at position t is the one-hot of the token at t+1+h
+      // (positions past the sequence end are left zero / masked). Because the
+      // output is per-token softmax, the framework's default (output-target) seed
+      // gives the standard per-head cross-entropy gradient. ProjHidden=True inserts
+      // the optional per-head hidden transform (pActFn, nil->TNNetReLU); False makes
+      // each head a single linear vocabulary projection. d_model is inferred from
+      // the trunk depth. Returns the concatenated output layer. (Coded by Claude (AI).)
+      function AddMultiTokenPrediction(NumFuture, VocabSize: integer;
+        ProjHidden: boolean = false; pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       // Single-head SINKHORN attention: a drop-in, DOUBLY-STOCHASTIC contrast to
       // softmax self-attention. Standard attention row-normalizes the scaled QK^T
@@ -42715,6 +42740,47 @@ begin
   if not PreNorm then AddLayer( NormClass.Create() );
 
   Result := GetLastLayer();
+end;
+
+function TNNet.AddMultiTokenPrediction(NumFuture, VocabSize: integer;
+  ProjHidden: boolean = false;
+  pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+var
+  Trunk: TNNetLayer;
+  d_model, h: integer;
+  HeadOutputs: array of TNNetLayer;
+begin
+  if NumFuture < 1 then
+    FErrorProc('AddMultiTokenPrediction requires NumFuture >= 1. NumFuture=' +
+      IntToStr(NumFuture));
+  if VocabSize < 1 then
+    FErrorProc('AddMultiTokenPrediction requires VocabSize >= 1. VocabSize=' +
+      IntToStr(VocabSize));
+  if pActFn = nil then pActFn := TNNetReLU;
+  Trunk := GetLastLayer();           // shared (SeqLen,1,d_model) hidden state
+  d_model := Trunk.Output.Depth;     // inferred residual-stream width
+  SetLength(HeadOutputs, NumFuture);
+  for h := 0 to NumFuture - 1 do
+  begin
+    // Each head taps the SAME trunk (parallel heads). Token-wise 1x1 convs keep
+    // the sequence axis (FullConnect would flatten/mix tokens).
+    if ProjHidden then
+    begin
+      AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), Trunk);
+      AddLayer(pActFn.Create());
+      AddLayer(TNNetPointwiseConvLinear.Create(VocabSize));
+    end
+    else
+      AddLayerAfter(TNNetPointwiseConvLinear.Create(VocabSize), Trunk);
+    // Per-token softmax over the VocabSize depth axis -> a probability
+    // distribution per position (the framework seeds output-target as the
+    // cross-entropy gradient at the last layer).
+    HeadOutputs[h] := AddLayer(TNNetPointwiseSoftMax.Create());
+  end;
+  // Concatenate the NumFuture per-head distributions along depth: head h occupies
+  // slab [h*VocabSize .. (h+1)*VocabSize-1]. Output (SeqLen,1,NumFuture*VocabSize).
+  Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  SetLength(HeadOutputs, 0);
 end;
 
 // Ported code from:

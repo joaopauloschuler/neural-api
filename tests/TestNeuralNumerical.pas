@@ -814,6 +814,8 @@ type
     procedure TestMultiHeadLatentAttentionLoadFromString;
     procedure TestTransformerEncoderBlockGradientCheck;
     procedure TestTransformerEncoderBlockCustomNorm;
+    procedure TestMultiTokenPredictionShapes;
+    procedure TestMultiTokenPredictionGradientCheck;
     procedure TestTransformerDecoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
     procedure TestHardConcreteGradientCheck;
@@ -13347,6 +13349,107 @@ begin
   d_ff := 16;
   RunOne(true);
   RunOne(false);
+end;
+
+procedure TTestNeuralNumerical.TestMultiTokenPredictionShapes;
+// AddMultiTokenPrediction must concatenate NumFuture per-token softmax heads into
+// one (SeqLen,1,NumFuture*VocabSize) output, with each per-position slab summing
+// to ~1 (a probability distribution). Checks both the plain (single linear
+// projection) and ProjHidden variants.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SeqLen, d_model, NumFuture, Vocab, t, h, v, i: integer;
+  slabSum: TNeuralFloat;
+begin
+  SeqLen := 4; d_model := 6; NumFuture := 3; Vocab := 5;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddMultiTokenPrediction(NumFuture, Vocab, {ProjHidden=}true);
+    AssertTrue('MTP output SizeX', NN.GetLastLayer.Output.SizeX = SeqLen);
+    AssertTrue('MTP output SizeY', NN.GetLastLayer.Output.SizeY = 1);
+    AssertTrue('MTP output Depth',
+      NN.GetLastLayer.Output.Depth = NumFuture * Vocab);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 0.7;
+    NN.Compute(Input);
+    // Each head's per-position slab is a softmax -> sums to ~1 and is finite.
+    for t := 0 to SeqLen - 1 do
+      for h := 0 to NumFuture - 1 do
+      begin
+        slabSum := 0;
+        for v := 0 to Vocab - 1 do
+          slabSum := slabSum + NN.GetLastLayer.Output[t, 0, h * Vocab + v];
+        AssertTrue('MTP slab sums to 1 at t=' + IntToStr(t) + ' h=' + IntToStr(h),
+          Abs(slabSum - 1.0) < 1e-4);
+      end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiTokenPredictionGradientCheck;
+// Numerical input-gradient check through the AddMultiTokenPrediction builder
+// (NumFuture parallel pointwise-softmax heads off a shared trunk, DeepConcat'd).
+// Tiny shape: d_model=5, seq=3, NumFuture=2, vocab=4.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 5);
+  InputPlus := TNNetVolume.Create(3, 1, 5);
+  Desired := TNNetVolume.Create(3, 1, 2 * 4);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    NN.AddMultiTokenPrediction({NumFuture=}2, {Vocab=}4, {ProjHidden=}false);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.3 + 0.4;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('MTP input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestTransformerEncoderBlockCustomNorm;
