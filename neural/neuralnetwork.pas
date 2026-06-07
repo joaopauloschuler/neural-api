@@ -1851,6 +1851,40 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Load-balancing auxiliary loss for sparse top-k Mixture-of-Experts routing
+  /// (Switch Transformer, Fedus et al. 2021, eq. 4). Keeps the router from
+  /// collapsing onto a few experts by penalizing an uneven token-to-expert
+  /// distribution. SELF-CONTAINED head: there is NO external target tensor; the
+  /// supervision is implicit in the gate weights themselves, so Backpropagate
+  /// ignores the framework-seeded residual and reads FOutput directly.
+  ///
+  /// The input is the per-token gate WEIGHT distribution g_t (a (SeqLen,1,E)
+  /// tensor whose Depth = E = NumExperts; typically a SoftMax output that sums
+  /// to 1 along Depth). The SeqLen*SizeY spatial cells are the "tokens" (T of
+  /// them). With the per-block capacity TopCnt (stored in FStruct[0]) the loss is
+  ///     P_i = (1/T) * sum_t g_t[i]                 (mean gate prob for expert i)
+  ///     f_i = (1/T) * sum_t 1[i in top-TopCnt(g_t)] (fraction of tokens whose
+  ///                                                  top-k routing touches i)
+  ///     L_aux = coeff * E * sum_i ( f_i * P_i )
+  /// where coeff is stored in FFloatSt[0] (default 0.01). L_aux is minimized when
+  /// the load is uniform; it equals coeff at perfect balance and rises toward
+  /// coeff*E as load collapses onto one expert.
+  ///
+  /// GRADIENT: f_i depends on the (non-differentiable) hard top-k assignment, so
+  /// it is treated as a STOP-GRADIENT constant (standard Switch convention); only
+  /// P_i is differentiated. Hence
+  ///     dL_aux/dg_t[i] = coeff * E * f_i / T
+  /// written into FOutputError at every token t and expert channel i (identical
+  /// across tokens for a given i). Forward is an identity passthrough. No
+  /// trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetLoadBalanceLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(TopCnt: integer; Coeff: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// VQ-VAE codebook bottleneck (van den Oord et al. 2017, "Neural Discrete
   // Representation Learning"). Replaces each input feature VECTOR (the
   // Depth-vector z_e at every spatial position (X,Y)) with its nearest entry
@@ -6466,6 +6500,29 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Hard top-k gate renormalizer for sparse Mixture-of-Experts routing.
+  /// Input is a (.,.,NumExperts) tensor of per-expert gate WEIGHTS (typically a
+  /// SoftMax output that sums to 1 along the Depth axis). Per spatial cell the
+  /// layer keeps the TopCnt largest gate weights and zeroes the rest, then
+  /// RENORMALIZES the surviving weights so they sum to 1 again:
+  ///   let S = the set of TopCnt argmax indices, s = sum_{j in S} g_j
+  ///   y_i = g_i / s   for i in S,   y_i = 0   otherwise.
+  /// This is the hard-dispatch mask (TNNetTopK) PLUS the survivor renorm fused
+  /// into one layer so the renorm participates in backprop with an exact
+  /// Jacobian. Backward (only survivors j in S carry gradient):
+  ///   dL/dg_j = (1/s) * ( dL/dy_j - sum_{i in S} dL/dy_i * y_i ).
+  /// Non-survivors receive zero gradient (the hard top-k boundary is treated as
+  /// locally constant, like TNNetTopK / MaxPool argmax routing). TopCnt is
+  /// stored in FStruct[0]; if TopCnt >= NumExperts the layer is the identity.
+  /// No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetTopKGate = class(TNNetIdentity)
+    public
+      constructor Create(TopCnt: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -8503,6 +8560,49 @@ type
       // implemented here.
       function AddMixtureOfExperts(InputLayer: TNNetLayer;
         NumExperts, ExpertHiddenDim: integer): TNNetLayer;
+      // SPARSE hard top-k Mixture-of-Experts feed-forward block (Shazeer et al.
+      // 2017 / Switch Transformer, Fedus et al. 2021). The sparse-dispatch
+      // follow-up to the soft/dense AddMixtureOfExperts above: instead of
+      // blending ALL NumExperts on every token, only the TopCnt highest-gated
+      // experts contribute per token, and a load-balancing auxiliary loss keeps
+      // the router from collapsing onto a few experts.
+      //
+      // Returns the combined block output (shape == InputLayer output, d_model =
+      // InputLayer.Output.Depth), so it is a drop-in FFN replacement wrappable in
+      // AddPreNormResidual([...]). Everything is token-wise (pointwise/1x1 convs
+      // over Depth) so a (SeqLen,1,d_model) sequence keeps its sequence axis.
+      //
+      // Wiring:
+      //   gate logits := PointwiseConvLinear(NumExperts)(InputLayer)
+      //   gSoft       := SoftMax(gate logits)         -- dense per-expert weights
+      //   gTopK       := TNNetTopKGate(TopCnt)(gSoft)  -- keep TopCnt largest,
+      //                  zero rest, RENORMALIZE survivors to sum to 1
+      //   expert_e    := PointwiseConvLinear(d_model)(PointwiseConvReLU(H)(Input))
+      //   y           := Sum_e  gTopK[e] * expert_e   -- sparse weighted combine
+      // The per-expert scalar gTopK[e] is sliced (TNNetSplitChannels(e,1)),
+      // broadcast across d_model (TNNetDeepConcat.Replicate) and cell-multiplied
+      // into expert_e (TNNetCellMulByCell) -- the same broadcast-multiply as
+      // AddMixtureOfExperts; only the gate path differs (hard TopKGate vs raw
+      // SoftMax). Experts whose gate weight was zeroed contribute exactly 0 (and,
+      // in batch mode, get no gradient), giving the sparse dispatch.
+      //
+      // LOAD BALANCING: a TNNetLoadBalanceLoss(TopCnt, AuxCoeff) head is attached
+      // to the gSoft distribution as a SECOND output branch (the network becomes
+      // multi-output: [block output, aux-loss head]). The aux head's gradient
+      // (coeff*E*f_i/T per token, see its doc) flows back into the gate logits
+      // and spreads the load across experts. AuxCoeff=0 disables it (then the
+      // router can collapse -- see examples/TopKMoE). The aux head is an identity
+      // passthrough so it does not alter the gSoft tensor used for routing.
+      //
+      // InputLayer defaults to GetLastLayer() when nil. NumExperts/ExpertHiddenDim
+      // are clamped to >= 1; TopCnt is clamped to 1..NumExperts. Returns the block
+      // output (NOT the aux head). The aux-loss head is exposed via the out
+      // parameter AuxLossHead for callers that want to read it or set its branch
+      // weight. AuxCoeff defaults to 0.01.
+      function AddTopKMixtureOfExperts(InputLayer: TNNetLayer;
+        NumExperts, ExpertHiddenDim, TopCnt: integer;
+        out AuxLossHead: TNNetLayer;
+        AuxCoeff: TNeuralFloat = 0.01): TNNetLayer;
       // Pre-norm residual block:  y = x + Sublayer(Norm(x)).
       // pSublayers is the caller-provided sublayer stack; its output shape MUST
       // match the block input shape so the residual sum is valid. Returns the
@@ -15448,6 +15548,98 @@ begin
         end;
       end;
     end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetLoadBalanceLoss }
+
+constructor TNNetLoadBalanceLoss.Create();
+begin
+  Create(1, 0.01);
+end;
+
+constructor TNNetLoadBalanceLoss.Create(TopCnt: integer; Coeff: TNeuralFloat);
+begin
+  inherited Create();
+  if TopCnt < 1 then TopCnt := 1;
+  if Coeff < 0 then
+    FErrorProc('TNNetLoadBalanceLoss coeff must be >= 0.');
+  FStruct[0] := TopCnt;
+  FFloatSt[0] := Coeff;
+end;
+
+procedure TNNetLoadBalanceLoss.Backpropagate();
+var
+  StartTime: double;
+  Coeff, Val, BestVal, InvT, GradScale: TNeuralFloat;
+  E, T, TopCnt, MaxX, MaxY, X, Y, D, CntK, BestIdx: integer;
+  P, F: array of TNeuralFloat;
+  Kept: array of boolean;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  E := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  T := FOutput.SizeX * FOutput.SizeY;       // number of tokens (cells)
+  TopCnt := FStruct[0];
+  if TopCnt > E then TopCnt := E;
+  Coeff := FFloatSt[0];
+  if T < 1 then T := 1;
+  InvT := 1.0 / T;
+  SetLength(P, E);
+  SetLength(F, E);
+  SetLength(Kept, E);
+  for D := 0 to E - 1 do begin P[D] := 0; F[D] := 0; end;
+  // Aggregate P_i (mean gate prob) and f_i (mean top-k touch fraction) over
+  // all tokens (cells).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      for D := 0 to E - 1 do
+      begin
+        P[D] := P[D] + FOutput[X, Y, D];
+        Kept[D] := False;
+      end;
+      // Hard top-TopCnt assignment for this token.
+      for CntK := 1 to TopCnt do
+      begin
+        BestIdx := -1;
+        BestVal := 0;
+        for D := 0 to E - 1 do
+        begin
+          if Kept[D] then continue;
+          Val := FOutput[X, Y, D];
+          if (BestIdx = -1) or (Val > BestVal) then
+          begin
+            BestIdx := D;
+            BestVal := Val;
+          end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      for D := 0 to E - 1 do
+        if Kept[D] then F[D] := F[D] + 1;
+    end;
+  for D := 0 to E - 1 do
+  begin
+    P[D] := P[D] * InvT;
+    F[D] := F[D] * InvT;
+  end;
+  // dL_aux/dg_t[i] = coeff * E * f_i / T  (f_i is stop-gradient).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to E - 1 do
+      begin
+        GradScale := Coeff * E * F[D] * InvT;
+        FOutputError[X, Y, D] := GradScale;
+      end;
+  SetLength(P, 0);
+  SetLength(F, 0);
+  SetLength(Kept, 0);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -50368,6 +50560,133 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetTopKGate }
+
+constructor TNNetTopKGate.Create(TopCnt: integer);
+begin
+  inherited Create();
+  if TopCnt < 1 then TopCnt := 1;
+  FStruct[0] := TopCnt;
+end;
+
+procedure TNNetTopKGate.Compute;
+var
+  StartTime: double;
+  CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, StartPos, TopCnt, BestIdx: integer;
+  BestVal, Val, SurvSum: TNeuralFloat;
+  Kept: array of boolean;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  TopCnt := FStruct[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  if TopCnt >= FOutput.Depth then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  SetLength(Kept, FOutput.Depth);
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+    begin
+      StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do Kept[CntD] := False;
+      // Keep the TopCnt largest gate weights (first occurrence wins on ties).
+      for CntK := 1 to TopCnt do
+      begin
+        BestIdx := -1;
+        BestVal := 0;
+        for CntD := 0 to MaxD do
+        begin
+          if Kept[CntD] then continue;
+          Val := FOutput.FData[StartPos + CntD];
+          if (BestIdx = -1) or (Val > BestVal) then
+          begin
+            BestIdx := CntD;
+            BestVal := Val;
+          end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      // Renormalize survivors so they sum to 1; zero the rest.
+      SurvSum := 0;
+      for CntD := 0 to MaxD do
+        if Kept[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
+      if SurvSum = 0 then SurvSum := 1;
+      for CntD := 0 to MaxD do
+        if Kept[CntD]
+          then FOutput.FData[StartPos + CntD] := FOutput.FData[StartPos + CntD] / SurvSum
+          else FOutput.FData[StartPos + CntD] := 0;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTopKGate.Backpropagate;
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos, TopCnt: integer;
+  SurvSum, Dot, gy, ErrY: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
+    (FOutput.Size = FOutputError.Size) then
+  begin
+    TopCnt := FStruct[0];
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    if TopCnt >= FOutput.Depth then
+    begin
+      // Identity path: pass the gradient straight through.
+      for CntD := 0 to FOutput.Size - 1 do
+        FPrevLayer.OutputError.FData[CntD] :=
+          FPrevLayer.OutputError.FData[CntD] + FOutputError.FData[CntD];
+      FBackwardTime := FBackwardTime + (Now() - StartTime);
+      FPrevLayer.Backpropagate();
+      exit;
+    end;
+    for CntX := 0 to MaxX do
+      for CntY := 0 to MaxY do
+      begin
+        StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+        // Recover s = sum of surviving INPUT weights from the cached outputs:
+        // each survivor obeys y_i = g_i / s, so the survivor whose stored output
+        // is largest still has the largest g_i; we recover s via the dot term.
+        // Surviving positions are exactly those with FOutput<>0.
+        // dL/dg_j = (1/s)*( gy_j - sum_i gy_i*y_i ),  s = g_j/y_j for any survivor.
+        SurvSum := 0;
+        for CntD := 0 to MaxD do
+          if FOutput.FData[StartPos + CntD] <> 0 then
+            SurvSum := SurvSum +
+              FPrevLayer.FOutput.FData[StartPos + CntD];
+        if SurvSum = 0 then SurvSum := 1;
+        // Dot = sum_i (dL/dy_i) * y_i over survivors.
+        Dot := 0;
+        for CntD := 0 to MaxD do
+          if FOutput.FData[StartPos + CntD] <> 0 then
+            Dot := Dot + FOutputError.FData[StartPos + CntD] *
+                         FOutput.FData[StartPos + CntD];
+        for CntD := 0 to MaxD do
+          if FOutput.FData[StartPos + CntD] <> 0 then
+          begin
+            ErrY := FOutputError.FData[StartPos + CntD];
+            gy := (ErrY - Dot) / SurvSum;
+            FPrevLayer.OutputError.FData[StartPos + CntD] :=
+              FPrevLayer.OutputError.FData[StartPos + CntD] + gy;
+          end;
+      end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetConvolutionReLU }
 constructor TNNetConvolutionReLU.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -68413,6 +68732,7 @@ begin
       'TNNetCosineEmbeddingLoss' :  Result := TNNetCosineEmbeddingLoss.Create(Ft[0]);
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
+      'TNNetLoadBalanceLoss' :      Result := TNNetLoadBalanceLoss.Create(St[0], Ft[0]);
       'TNNetVectorQuantizer' :      Result := TNNetVectorQuantizer.Create(St[0], Ft[0]);
       'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]);
@@ -68532,6 +68852,7 @@ begin
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
       'TNNetTopK' :                 Result := TNNetTopK.Create(St[0]);
+      'TNNetTopKGate' :             Result := TNNetTopKGate.Create(St[0]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -68754,6 +69075,7 @@ begin
       if S[0] = 'TNNetCosineEmbeddingLoss' then Result := TNNetCosineEmbeddingLoss.Create(Ft[0]) else
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
+      if S[0] = 'TNNetLoadBalanceLoss' then Result := TNNetLoadBalanceLoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetVectorQuantizer' then Result := TNNetVectorQuantizer.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]) else
@@ -68875,6 +69197,7 @@ begin
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
       if S[0] = 'TNNetTopK' then Result := TNNetTopK.Create(St[0]) else
+      if S[0] = 'TNNetTopKGate' then Result := TNNetTopKGate.Create(St[0]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
@@ -69588,6 +69911,61 @@ begin
   end;
 
   // Sum the gate-weighted expert outputs: y = Sum_e g[e] * E_e(x).
+  if NumExperts = 1
+    then Result := WeightedExperts[0]
+    else Result := AddLayer( TNNetSum.Create(WeightedExperts) );
+  SetLength(WeightedExperts, 0);
+end;
+
+function TNNet.AddTopKMixtureOfExperts(InputLayer: TNNetLayer;
+  NumExperts, ExpertHiddenDim, TopCnt: integer;
+  out AuxLossHead: TNNetLayer;
+  AuxCoeff: TNeuralFloat = 0.01): TNNetLayer;
+var
+  d_model, e: integer;
+  GateSoft, GateTopK: TNNetLayer;
+  ExpertOut, GateE, GateEBroadcast, WeightedExpert: TNNetLayer;
+  WeightedExperts: array of TNNetLayer;
+begin
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if NumExperts < 1 then NumExperts := 1;
+  if ExpertHiddenDim < 1 then ExpertHiddenDim := 1;
+  if TopCnt < 1 then TopCnt := 1;
+  if TopCnt > NumExperts then TopCnt := NumExperts;
+  d_model := InputLayer.Output.Depth;
+
+  // --- GATING NETWORK ------------------------------------------------------
+  // Token-wise linear projection InputLayer -> NumExperts logits, SoftMax to a
+  // dense per-expert weight distribution gSoft (sums to 1 over Depth).
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(NumExperts), InputLayer );
+  GateSoft := AddLayer( TNNetSoftMax.Create() );
+
+  // Load-balancing auxiliary loss head reads the DENSE gSoft distribution (a
+  // second output branch; identity passthrough so routing is unaffected).
+  AuxLossHead := AddLayerAfter(
+    TNNetLoadBalanceLoss.Create(TopCnt, AuxCoeff), GateSoft );
+
+  // Hard top-k mask + survivor renorm on the gate (the sparse-dispatch step).
+  GateTopK := AddLayerAfter( TNNetTopKGate.Create(TopCnt), GateSoft );
+
+  // --- EXPERTS + GATE-WEIGHTED COMBINE -------------------------------------
+  SetLength(WeightedExperts, NumExperts);
+  for e := 0 to NumExperts - 1 do
+  begin
+    // Shape-preserving 2-layer expert MLP over Depth (1x1 convs keep the
+    // sequence axis; FullConnect would flatten it and break per-token blocks).
+    AddLayerAfter( TNNetPointwiseConvReLU.Create(ExpertHiddenDim), InputLayer );
+    ExpertOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+    // Slice this expert's renormalized top-k gate weight g[e] (a (.,.,1)
+    // channel; zero for experts not in this token's top-TopCnt set)...
+    GateE := AddLayerAfter( TNNetSplitChannels.Create(e, 1), GateTopK );
+    // ...broadcast across the d_model channels, then cell-multiply it in.
+    GateEBroadcast := AddLayer( TNNetDeepConcat.Replicate(d_model, GateE) );
+    WeightedExpert := AddLayer( TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+    WeightedExperts[e] := WeightedExpert;
+  end;
+
+  // Sum the sparse gate-weighted expert outputs: y = Sum_e gTopK[e] * E_e(x).
   if NumExperts = 1
     then Result := WeightedExperts[0]
     else Result := AddLayer( TNNetSum.Create(WeightedExperts) );

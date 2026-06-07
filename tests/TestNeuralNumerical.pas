@@ -530,6 +530,14 @@ type
     procedure TestVectorQuantizerCodebookGradient;
     procedure TestVectorQuantizerCodebookUsage;
     procedure TestMixtureOfDepthsRouterGradient;
+    procedure TestTopKGateForward;
+    procedure TestTopKGateGradientCheck;
+    procedure TestTopKGateLoadFromString;
+    procedure TestLoadBalanceLossForwardPassthrough;
+    procedure TestLoadBalanceLossGradient;
+    procedure TestLoadBalanceLossCollapsedVsBalanced;
+    procedure TestLoadBalanceLossLoadFromString;
+    procedure TestTopKMoEOnlyKExpertsActive;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
     procedure TestArcFaceDegenerateIsCosineSoftmax;
@@ -44549,6 +44557,430 @@ begin
       Hi := HiperbolicTangent(HW.Neurons[i].Weights.Raw[i] * Input.Raw[i]);
       AssertEquals('Highway open-gate bare-transform pos ' + IntToStr(i),
         Hi, NN.GetLastLayer.Output.Raw[i], 1e-4);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// ===========================================================================
+//  Hard top-k Mixture-of-Experts: TNNetTopKGate + TNNetLoadBalanceLoss
+// ===========================================================================
+
+procedure TTestNeuralNumerical.TestTopKGateForward;
+const
+  cE = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Sum, V0, V2: TNeuralFloat;
+  i, NumNonZero: integer;
+begin
+  // TopCnt=2 over 4 well-separated gate weights: keep the two largest, zero the
+  // rest, renormalize survivors to sum to 1.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cE, 1));
+    NN.AddLayer(TNNetTopKGate.Create(2));
+    Input[0, 0, 0] := 0.5;   // survivor (largest)
+    Input[0, 0, 1] := 0.1;   // dropped
+    Input[0, 0, 2] := 0.3;   // survivor (2nd largest)
+    Input[0, 0, 3] := 0.1;   // dropped
+    NN.Compute(Input);
+
+    NumNonZero := 0;
+    Sum := 0;
+    for i := 0 to cE - 1 do
+    begin
+      Sum := Sum + NN.GetLastLayer.Output[0, 0, i];
+      if NN.GetLastLayer.Output[0, 0, i] <> 0 then Inc(NumNonZero);
+    end;
+    AssertEquals('TopKGate keeps exactly TopCnt survivors', 2, NumNonZero);
+    AssertEquals('TopKGate dropped channel 1 is zero', 0.0,
+      NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('TopKGate dropped channel 3 is zero', 0.0,
+      NN.GetLastLayer.Output[0, 0, 3], 1e-6);
+    AssertEquals('TopKGate survivors renormalize to sum 1', 1.0, Sum, 1e-5);
+    // 0.5/(0.5+0.3)=0.625 ; 0.3/0.8=0.375
+    V0 := NN.GetLastLayer.Output[0, 0, 0];
+    V2 := NN.GetLastLayer.Output[0, 0, 2];
+    AssertEquals('TopKGate renorm value chan0', 0.625, V0, 1e-5);
+    AssertEquals('TopKGate renorm value chan2', 0.375, V2, 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTopKGateGradientCheck;
+const
+  cEps = 1e-4;
+  cE = 4;
+  cTopCnt = 2;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  // Scalar loss = sum_i w_i * y_i with a fixed weight vector, computed by
+  // running the SAME forward (top-k mask + renorm) by hand so the numerical
+  // probe and the analytic backprop see an identical active set.
+  function GateLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    j, kk, BestIdx: integer;
+    BestVal, SurvSum: TNeuralFloat;
+    Kept: array of boolean;
+    Y: array of TNeuralFloat;
+    W: array[0..cE - 1] of TNeuralFloat;
+  begin
+    W[0] := 1.0; W[1] := -0.5; W[2] := 0.7; W[3] := 0.2;
+    SetLength(Kept, cE);
+    SetLength(Y, cE);
+    for j := 0 to cE - 1 do Kept[j] := False;
+    for kk := 1 to cTopCnt do
+    begin
+      BestIdx := -1; BestVal := 0;
+      for j := 0 to cE - 1 do
+      begin
+        if Kept[j] then continue;
+        if (BestIdx = -1) or (AInput[0, 0, j] > BestVal) then
+        begin BestIdx := j; BestVal := AInput[0, 0, j]; end;
+      end;
+      if BestIdx >= 0 then Kept[BestIdx] := True;
+    end;
+    SurvSum := 0;
+    for j := 0 to cE - 1 do if Kept[j] then SurvSum := SurvSum + AInput[0, 0, j];
+    if SurvSum = 0 then SurvSum := 1;
+    Result := 0;
+    for j := 0 to cE - 1 do
+    begin
+      if Kept[j] then Y[j] := AInput[0, 0, j] / SurvSum else Y[j] := 0;
+      Result := Result + W[j] * Y[j];
+    end;
+  end;
+
+begin
+  // Well-separated gate weights so the top-2 set is unambiguous under +/-eps
+  // (the top-k boundary is non-differentiable at ties; keep margins large).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cE);
+  Target := TNNetVolume.Create(1, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cE, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetTopKGate.Create(cTopCnt));
+
+    Input[0, 0, 0] := 0.60;  // survivor
+    Input[0, 0, 1] := 0.05;  // dropped (far below)
+    Input[0, 0, 2] := 0.30;  // survivor
+    Input[0, 0, 3] := 0.05;  // dropped (far below)
+    Target.Fill(0);
+
+    NN.Compute(Input);
+    // Seed the gate output error with the fixed weight vector W (dL/dy_i = W_i)
+    // so the analytic input gradient at LMid is the layer's Jacobian^T * W.
+    NN.GetLastLayer.OutputError.Fill(0);
+    NN.GetLastLayer.OutputError[0, 0, 0] := 1.0;
+    NN.GetLastLayer.OutputError[0, 0, 1] := -0.5;
+    NN.GetLastLayer.OutputError[0, 0, 2] := 0.7;
+    NN.GetLastLayer.OutputError[0, 0, 3] := 0.2;
+    NN.GetLastLayer.Backpropagate();
+
+    for i := 0 to cE - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps; LossP := GateLossAt(Input);
+      Input.Raw[i] := OldV - cEps; LossM := GateLossAt(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('TopKGate grad at ' + IntToStr(i), NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTopKGateLoadFromString;
+const
+  cTopCnt = 3;
+  cE = 5;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cE, 1));
+    NN.AddLayer(TNNetTopKGate.Create(cTopCnt));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+    AssertTrue('Loaded last layer is TNNetTopKGate',
+      NN2.GetLastLayer is TNNetTopKGate);
+    AssertEquals('TopKGate round-trip structure preserves TopCnt',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+    for i := 0 to cE - 1 do Input[0, 0, i] := 0.05 + 0.2 * i;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to cE - 1 do
+      AssertEquals('TopKGate round-trip output ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLoadBalanceLossForwardPassthrough;
+const
+  cE = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, cE);   // 3 tokens
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, cE, 1));
+    NN.AddLayer(TNNetLoadBalanceLoss.Create(1, 0.01));
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Random();
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('LoadBalanceLoss forward passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLoadBalanceLossGradient;
+const
+  cE = 3;          // experts
+  cT = 4;          // tokens
+  cTopCnt = 1;
+  cCoeff = 0.5;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  X, D, kk, BestIdx: integer;
+  BestVal: TNeuralFloat;
+  F: array[0..cE - 1] of TNeuralFloat;
+  Kept: array[0..cE - 1] of boolean;
+  Expected, InvT: TNeuralFloat;
+begin
+  // The aux-loss gradient is analytic: dL/dg_t[i] = coeff*E*f_i/T with f_i a
+  // stop-gradient constant. Verify the analytic FOutputError against that
+  // formula directly (the f_i term is non-differentiable, so a finite-diff
+  // through the hard assignment is not the right reference -- pin the formula).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cT, 1, cE);
+  Target := TNNetVolume.Create(cT, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(cT, 1, cE, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetLoadBalanceLoss.Create(cTopCnt, cCoeff));
+    // Well-separated per-token distributions (unambiguous top-1).
+    // token 0 -> expert 0, token 1 -> expert 0, token 2 -> expert 1, t3 -> 2
+    Input.Fill(0.1);
+    Input[0, 0, 0] := 0.8; Input[1, 0, 0] := 0.8;
+    Input[2, 0, 1] := 0.8; Input[3, 0, 2] := 0.8;
+    Target.Fill(0);
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // Recompute f_i (fraction of tokens whose top-1 touches expert i).
+    for D := 0 to cE - 1 do F[D] := 0;
+    for X := 0 to cT - 1 do
+    begin
+      for D := 0 to cE - 1 do Kept[D] := False;
+      for kk := 1 to cTopCnt do
+      begin
+        BestIdx := -1; BestVal := 0;
+        for D := 0 to cE - 1 do
+        begin
+          if Kept[D] then continue;
+          if (BestIdx = -1) or (Input[X, 0, D] > BestVal) then
+          begin BestIdx := D; BestVal := Input[X, 0, D]; end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      for D := 0 to cE - 1 do if Kept[D] then F[D] := F[D] + 1;
+    end;
+    InvT := 1.0 / cT;
+    for D := 0 to cE - 1 do F[D] := F[D] * InvT;
+
+    for X := 0 to cT - 1 do
+      for D := 0 to cE - 1 do
+      begin
+        Expected := cCoeff * cE * F[D] * InvT;
+        AssertEquals('LoadBalanceLoss grad token ' + IntToStr(X) + ' expert ' +
+          IntToStr(D), Expected, LMid.OutputError[X, 0, D], 1e-6);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLoadBalanceLossCollapsedVsBalanced;
+const
+  cE = 4;
+  cT = 4;
+  cTopCnt = 1;
+  cCoeff = 1.0;
+
+  // L_aux = coeff*E*sum_i f_i*P_i. Compute it directly from a gate tensor.
+  function AuxLoss(G: TNNetVolume): TNeuralFloat;
+  var
+    X, D, kk, BestIdx: integer;
+    BestVal, InvT: TNeuralFloat;
+    P, F: array[0..cE - 1] of TNeuralFloat;
+    Kept: array[0..cE - 1] of boolean;
+  begin
+    for D := 0 to cE - 1 do begin P[D] := 0; F[D] := 0; end;
+    for X := 0 to cT - 1 do
+    begin
+      for D := 0 to cE - 1 do begin P[D] := P[D] + G[X, 0, D]; Kept[D] := False; end;
+      for kk := 1 to cTopCnt do
+      begin
+        BestIdx := -1; BestVal := 0;
+        for D := 0 to cE - 1 do
+        begin
+          if Kept[D] then continue;
+          if (BestIdx = -1) or (G[X, 0, D] > BestVal) then
+          begin BestIdx := D; BestVal := G[X, 0, D]; end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      for D := 0 to cE - 1 do if Kept[D] then F[D] := F[D] + 1;
+    end;
+    InvT := 1.0 / cT;
+    Result := 0;
+    for D := 0 to cE - 1 do
+      Result := Result + (F[D] * InvT) * (P[D] * InvT);
+    Result := cCoeff * cE * Result;
+  end;
+
+var
+  Balanced, Collapsed: TNNetVolume;
+  X, D: integer;
+  LBal, LCol: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Balanced := TNNetVolume.Create(cT, 1, cE);
+  Collapsed := TNNetVolume.Create(cT, 1, cE);
+  try
+    // Balanced: each token routes to a different expert (uniform load).
+    Balanced.Fill(0.05);
+    for X := 0 to cT - 1 do Balanced[X, 0, X] := 0.85;
+    // Collapsed: every token routes to expert 0.
+    Collapsed.Fill(0.05);
+    for X := 0 to cT - 1 do Collapsed[X, 0, 0] := 0.85;
+
+    LBal := AuxLoss(Balanced);
+    LCol := AuxLoss(Collapsed);
+    AssertTrue('Aux loss penalizes collapsed router MORE than balanced ('
+      + FloatToStr(LCol) + ' > ' + FloatToStr(LBal) + ')', LCol > LBal);
+    // Perfect balance gives L = coeff (=1.0 here); collapse approaches coeff*E.
+    AssertTrue('Balanced aux loss is near coeff', Abs(LBal - cCoeff) < 0.5);
+    AssertTrue('Collapsed aux loss is well above balanced',
+      LCol > LBal + 1.0);
+  finally
+    Balanced.Free;
+    Collapsed.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLoadBalanceLossLoadFromString;
+const
+  cTopCnt = 2;
+  cCoeff = 0.03;
+  cE = 4;
+var
+  NN, NN2: TNNet;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, cE, 1));
+    NN.AddLayer(TNNetLoadBalanceLoss.Create(cTopCnt, cCoeff));
+    NN2.LoadFromString(NN.SaveToString());
+    AssertTrue('Loaded last layer is TNNetLoadBalanceLoss',
+      NN2.GetLastLayer is TNNetLoadBalanceLoss);
+    AssertEquals('LoadBalanceLoss round-trip preserves TopCnt+Coeff',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTopKMoEOnlyKExpertsActive;
+const
+  cTokens = 3;
+  cD = 4;          // d_model
+  cExperts = 4;
+  cHidden = 3;
+  cTopCnt = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Block, AuxHead, GateTopK: TNNetLayer;
+  X, e, NumActive: integer;
+begin
+  // Assert that after the hard top-k gate, exactly cTopCnt experts have a
+  // nonzero gate weight per token (the sparse-dispatch property).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTokens, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cTokens, 1, cD, 1));
+    Block := NN.AddTopKMixtureOfExperts(nil, cExperts, cHidden, cTopCnt,
+      AuxHead, 0.01);
+    AssertTrue('AddTopKMixtureOfExperts returns a layer', Block <> nil);
+    AssertTrue('Aux head is a TNNetLoadBalanceLoss',
+      AuxHead is TNNetLoadBalanceLoss);
+    // Locate the TNNetTopKGate layer (the hard gate).
+    GateTopK := nil;
+    for e := 0 to NN.CountLayers - 1 do
+      if NN.Layers[e] is TNNetTopKGate then GateTopK := NN.Layers[e];
+    AssertTrue('TopKGate layer present in block', GateTopK <> nil);
+
+    for X := 0 to Input.Size - 1 do Input.Raw[X] := Random() - 0.5;
+    NN.Compute(Input);
+
+    for X := 0 to cTokens - 1 do
+    begin
+      NumActive := 0;
+      for e := 0 to cExperts - 1 do
+        if GateTopK.Output[X, 0, e] <> 0 then Inc(NumActive);
+      AssertEquals('Exactly TopCnt experts active for token ' + IntToStr(X),
+        cTopCnt, NumActive);
     end;
   finally
     NN.Free;
