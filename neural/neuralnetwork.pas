@@ -5158,14 +5158,33 @@ type
   //
   // TWO sources (wired exactly like TNNetCrossAttention -> PrevLayer plus an
   // explicit serialized second source):
-  //   PrevLayer       (receptance r): SizeY=1, SizeX=SeqLen, Depth=C
-  //   KeyValueSource  (k then v):     SizeY=1, SizeX=SeqLen, Depth=2*C
-  // SEQLEN CONTRACT (v1): EQUAL sequence length on both sources. The read-out
-  // at time t uses the WKV state accumulated over the KEY|VALUE source up to t
-  // (the current-token bonus from the kv source's k_t), then gates it by the
-  // receptance from the QUERY source at the SAME index t. (Asymmetric/full-
-  // context cross -- summarise kv once, query with a different-length r stream
-  // -- is a documented follow-up, not implemented here.)
+  //   PrevLayer       (receptance r): SizeY=1, SizeX=QSeqLen,  Depth=C
+  //   KeyValueSource  (k then v):     SizeY=1, SizeX=KVSeqLen, Depth=2*C
+  //
+  // TWO SEQLEN CONTRACTS, selected by the constructor flag pAsymmetric
+  // (FStruct[1]; output length is always QSeqLen = receptance length):
+  //
+  //  (a) pAsymmetric=false (DEFAULT, the original v1 contract): EQUAL sequence
+  //      length on both sources (QSeqLen=KVSeqLen). The read-out at time t uses
+  //      the WKV state accumulated over the KEY|VALUE source up to t (the
+  //      current-token bonus from the kv source's k_t), then gates it by the
+  //      receptance from the QUERY source at the SAME index t. This path is
+  //      bit-for-bit unchanged from commit 3bc1c66.
+  //
+  //  (b) pAsymmetric=true (full-context cross / true associative recall):
+  //      RECTANGULAR QSeqLen x KVSeqLen, exactly like TNNetCrossAttention's
+  //      two-source asymmetric shape. The kv memory is SUMMARISED ONCE by a
+  //      single left-to-right WKV decay scan over ALL KVSeqLen key|value
+  //      positions, producing the full-context final state (A,B) per channel.
+  //      EVERY query position i then reads that SAME summarised memory and is
+  //      gated by its own receptance:
+  //        wkv_i = A / B                     (full-context summary, no per-query k)
+  //        y_i   = sigmoid(r_i) * wkv_i
+  //      QSeqLen may DIFFER from KVSeqLen -- the query stream carries no key, so
+  //      the read-out is purely against the accumulated memory (permuted recall,
+  //      NOT a position-aligned copy). When QSeqLen=KVSeqLen this is still a
+  //      DIFFERENT computation from (a): (a) reads a causal prefix state at each
+  //      t, (b) reads the full-context final state at every i.
   //
   // Per channel d, per timestep t (a_{-1}=b_{-1}=0; k_t,v_t from kv source,
   // r_t from receptance source):
@@ -5183,7 +5202,8 @@ type
   // Storage in Neurons[] (2 tensors, each C-long), identical to TNNetWKV:
   //   [0] = w_raw  ->  w = softplus(w_raw) > 0
   //   [1] = u      ->  bonus (unconstrained)
-  // FStruct[0]=C (resolved in SetPrevLayer). a,b re-init per sweep, NOT
+  // FStruct[0]=C (resolved in SetPrevLayer), FStruct[1]=Ord(pAsymmetric).
+  // a,b re-init per sweep, NOT
   // persisted. The KeyValueSource layer index is serialized (like TNNetConcat /
   // TNNetCrossAttention) so the layer round-trips through SaveToString /
   // LoadFromString. BACKWARD is the exact coupled-BPTT of TNNetWKV (two
@@ -5199,16 +5219,23 @@ type
       FA: TNNetVolume;          // cached true accumulator a_t, (SeqLen,1,C)
       FB: TNNetVolume;          // cached true accumulator b_t, (SeqLen,1,C)
       FGradW, FGradU: TNNetVolume; // C-long grad accumulators
+      FAsymmetric: boolean;     // full-context cross (rectangular QxKV) when true
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure ComputeSym();   // equal-seqlen, position-aligned v1 read-out
+      procedure ComputeAsym();  // summarise kv once, query with QSeqLen<>KVSeqLen
+      procedure BackpropagateSym();
+      procedure BackpropagateAsym();
     public
       constructor Create(); overload; override;
       constructor Create(KeyValueSource: TNNetLayer); overload;
+      constructor Create(KeyValueSource: TNNetLayer; pAsymmetric: boolean); overload;
       destructor Destroy(); override;
       function SaveStructureToString(): string; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       property KeyValueSource: TNNetLayer read FKVLayer;
+      property Asymmetric: boolean read FAsymmetric;
   end;
 
   /// TNNetAffineCoupling: an invertible RealNVP/Glow-style AFFINE COUPLING layer
@@ -32343,9 +32370,17 @@ end;
 
 constructor TNNetCrossWKV.Create(KeyValueSource: TNNetLayer);
 begin
+  Create(KeyValueSource, false);
+end;
+
+constructor TNNetCrossWKV.Create(KeyValueSource: TNNetLayer;
+  pAsymmetric: boolean);
+begin
   inherited Create();
   FChannels := 0;           // resolved in SetPrevLayer
+  FAsymmetric := pAsymmetric;
   FStruct[0] := 0;
+  FStruct[1] := Ord(FAsymmetric);
   FKVLayer := KeyValueSource;
   FW := TNNetVolume.Create();
   FWKV := TNNetVolume.Create();
@@ -32405,14 +32440,20 @@ begin
     FErrorProc('TNNetCrossWKV requires receptance depth = C = KVDepth/2. Got ' +
       'receptance depth=' + IntToStr(pPrevLayer.FOutput.Depth) + ', C=' +
       IntToStr(FChannels));
-  // v1 EQUAL-seqlen contract: read-out grid = receptance grid, which must match
-  // the kv accumulation grid.
-  if pPrevLayer.FOutput.SizeX <> FKVLayer.FOutput.SizeX then
-    FErrorProc('TNNetCrossWKV (v1) requires EQUAL seqlen on both sources. ' +
-      'Receptance SeqLen=' + IntToStr(pPrevLayer.FOutput.SizeX) +
-      ', Key|Value SeqLen=' + IntToStr(FKVLayer.FOutput.SizeX));
+  // Symmetric (v1) contract: read-out grid = receptance grid, which must match
+  // the kv accumulation grid. Asymmetric (full-context cross) contract: the two
+  // sources may have DIFFERENT lengths (rectangular QSeqLen x KVSeqLen, like
+  // TNNetCrossAttention) -- the kv memory is summarised once and queried by the
+  // receptance stream of arbitrary length.
+  if (not FAsymmetric) and
+     (pPrevLayer.FOutput.SizeX <> FKVLayer.FOutput.SizeX) then
+    FErrorProc('TNNetCrossWKV (symmetric v1) requires EQUAL seqlen on both ' +
+      'sources. Receptance SeqLen=' + IntToStr(pPrevLayer.FOutput.SizeX) +
+      ', Key|Value SeqLen=' + IntToStr(FKVLayer.FOutput.SizeX) +
+      '. Use Create(KV, pAsymmetric=true) for the rectangular cross variant.');
   FStruct[0] := FChannels;
-  // Output = gated wkv, C channels, same length as the sequence.
+  FStruct[1] := Ord(FAsymmetric);
+  // Output = gated wkv, C channels, length = receptance (query) length.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FChannels);
   FOutputError.ReSize(FOutput);
   FOutputErrorDeriv.ReSize(FOutput);
@@ -32424,15 +32465,23 @@ begin
     FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
   end;
   FW.ReSize(1, 1, FChannels);
-  FWKV.ReSize(FOutput.SizeX, 1, FChannels);
-  FA.ReSize(FOutput.SizeX, 1, FChannels);
-  FB.ReSize(FOutput.SizeX, 1, FChannels);
+  // The cached state grids a_t/b_t and the pre-gate wkv cache index the KEY|VALUE
+  // accumulation grid (length KVSeqLen), which is the receptance grid only in
+  // the symmetric case.
+  FWKV.ReSize(FKVLayer.FOutput.SizeX, 1, FChannels);
+  FA.ReSize(FKVLayer.FOutput.SizeX, 1, FChannels);
+  FB.ReSize(FKVLayer.FOutput.SizeX, 1, FChannels);
   FGradW.ReSize(1, 1, FChannels);
   FGradU.ReSize(1, 1, FChannels);
   InitDefault();
 end;
 
 procedure TNNetCrossWKV.Compute();
+begin
+  if FAsymmetric then ComputeAsym() else ComputeSym();
+end;
+
+procedure TNNetCrossWKV.ComputeSym();
 var
   StartTime: double;
   Ww, Wu, Rcp, KVv: TNNetVolume;
@@ -32497,7 +32546,80 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetCrossWKV.ComputeAsym();
+// Full-context cross / true associative recall (rectangular QSeqLen x KVSeqLen).
+// PHASE 1: one left-to-right WKV decay scan over ALL KVSeqLen key|value
+// positions, caching the true accumulators a_t,b_t (FA,FB) and the final
+// full-context state (A,B) = (a_{KV-1}, b_{KV-1}) per channel. PHASE 2: every
+// query position i reads the SAME summarised state wkv = A/B and is gated by its
+// own receptance: y_i = sigmoid(r_i) * (A/B). The query stream carries no key,
+// so the readout has NO per-query bonus term -- it is the full-context summary,
+// not a causal-prefix copy.
+var
+  StartTime: double;
+  Ww, Rcp, KVv: TNNetVolume;
+  QLen, KVLen, C, t, i, d: integer;
+  raw, wv, kt, vt, aprev, bprev: TNeuralFloat;
+  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, rt: TNeuralFloat;
+begin
+  StartTime := Now();
+  Rcp := FPrevLayer.FOutput;        // receptance source A (depth C), len QLen
+  KVv := FKVLayer.FOutput;          // key|value source B (depth 2C), len KVLen
+  Ww := FNeurons[0].FWeights;
+  QLen := FOutput.SizeX;
+  KVLen := KVv.SizeX;
+  C := FChannels;
+  // u (FNeurons[1]) is unused in the asymmetric read-out: there is no per-query
+  // current-token bonus, so only the decay weight w drives the summary.
+  for d := 0 to C - 1 do
+  begin
+    raw := Ww.FData[d];
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := Ln(1 + Exp(raw));
+  end;
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    // PHASE 1: summarise the whole kv memory by the stable decay scan.
+    aprev := 0;
+    bprev := 0;
+    qprev := -1e30;
+    for t := 0 to KVLen - 1 do
+    begin
+      kt := KVv.FData[KVv.GetRawPos(t, 0, d)];
+      vt := KVv.FData[KVv.GetRawPos(t, 0, C + d)];
+      ww2 := (-wv) + qprev;
+      qmax2 := ww2;
+      if kt > qmax2 then qmax2 := kt;
+      e3 := Exp(ww2 - qmax2);
+      e4 := Exp(kt - qmax2);
+      anew := e3 * aprev + e4 * vt;
+      bnew := e3 * bprev + e4;
+      FA.FData[FA.GetRawPos(t, 0, d)] := anew * Exp(qmax2);
+      FB.FData[FB.GetRawPos(t, 0, d)] := bnew * Exp(qmax2);
+      aprev := anew;
+      bprev := bnew;
+      qprev := qmax2;
+    end;
+    // Full-context summary state (true accumulators). b>0 always (>= e4 term).
+    summaryWkv := FA.FData[FA.GetRawPos(KVLen - 1, 0, d)] /
+                  FB.FData[FB.GetRawPos(KVLen - 1, 0, d)];
+    FWKV.FData[FWKV.GetRawPos(0, 0, d)] := summaryWkv; // cache for backward
+    // PHASE 2: every query position reads the SAME summary, receptance-gated.
+    for i := 0 to QLen - 1 do
+    begin
+      rt := Rcp.FData[Rcp.GetRawPos(i, 0, d)];
+      FOutput.FData[FOutput.GetRawPos(i, 0, d)] := Sigmoid(rt) * summaryWkv;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 procedure TNNetCrossWKV.Backpropagate();
+begin
+  if FAsymmetric then BackpropagateAsym() else BackpropagateSym();
+end;
+
+procedure TNNetCrossWKV.BackpropagateSym();
 var
   StartTime: double;
   Nw, Nu: TNNetNeuron;
@@ -32620,6 +32742,125 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   // Propagate into BOTH sources (the K|V branch then the receptance chain).
+  if hasKVGrad then FKVLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetCrossWKV.BackpropagateAsym();
+// Exact BPTT for the full-context cross read-out. The forward is
+//   summary = A/B,  A=a_{KV-1}, B=b_{KV-1};  y_i = sigmoid(r_i)*summary.
+// Each query position i contributes:
+//   dr_i      = summary * sigmoid'(r_i) * dy_i             -> receptance source
+//   dSummary += sigmoid(r_i) * dy_i
+// Then dSummary seeds the single decay-scan adjoint over the kv grid:
+//   dA = dSummary/B,  dB = -dSummary*summary/B,  (pa,pb) := (dA,dB) at t=KV-1
+// and the EXACT TNNetWKV state-step adjoint folds (pa,pb) right-to-left into
+// k,v (source B) and w. There is NO output/bonus path here, so u gets no
+// gradient (it is unused in the asymmetric read-out).
+var
+  StartTime: double;
+  Nw, Nu: TNNetNeuron;
+  Ww, Rcp, KVv, RcpErr, KVErr: TNNetVolume;
+  QLen, KVLen, C, t, i, d: integer;
+  wv, dwexp, kt, vt, rt, sg, Ek: TNeuralFloat;
+  aprev, bprev, dyt, summary, dSummary, dA, dB: TNeuralFloat;
+  pa, pb, paPrev, pbPrev, dDk, dDw, dkt, dvt, gradW, Bfin: TNeuralFloat;
+  hasRcpGrad, hasKVGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Nw := FNeurons[0];
+  Nu := FNeurons[1];
+  Ww := Nw.FWeights;
+  Rcp := FPrevLayer.FOutput;
+  KVv := FKVLayer.FOutput;
+  QLen := FOutput.SizeX;
+  KVLen := KVv.SizeX;
+  C := FChannels;
+  hasRcpGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  hasKVGrad := Assigned(FKVLayer) and
+    (FKVLayer.FOutputError.Size = FKVLayer.FOutput.Size);
+  RcpErr := nil; KVErr := nil;
+  if hasRcpGrad then RcpErr := FPrevLayer.FOutputError;
+  if hasKVGrad then KVErr := FKVLayer.FOutputError;
+  for d := 0 to C - 1 do
+  begin
+    if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
+    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+  end;
+  FGradW.Fill(0);
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    dwexp := Exp(-wv);
+    Bfin := FB.FData[FB.GetRawPos(KVLen - 1, 0, d)];
+    summary := FWKV.FData[FWKV.GetRawPos(0, 0, d)];   // = A/B from forward
+    // ---- Receptance gate over the QUERY grid, accumulate dSummary ----
+    dSummary := 0;
+    for i := 0 to QLen - 1 do
+    begin
+      rt := Rcp.FData[Rcp.GetRawPos(i, 0, d)];
+      dyt := FOutputError.FData[FOutputError.GetRawPos(i, 0, d)];
+      sg := Sigmoid(rt);
+      dSummary := dSummary + sg * dyt;
+      if hasRcpGrad then
+        RcpErr.FData[RcpErr.GetRawPos(i, 0, d)] :=
+          RcpErr.FData[RcpErr.GetRawPos(i, 0, d)] +
+          summary * sg * (1 - sg) * dyt;
+    end;
+    // ---- Seed the state adjoint from the summary read-out (summary=A/B) ----
+    dA := dSummary / Bfin;
+    dB := -dSummary * summary / Bfin;
+    pa := dA;
+    pb := dB;
+    gradW := 0;
+    // ---- Single decay-scan adjoint over the kv grid (no bonus path) ----
+    for t := KVLen - 1 downto 0 do
+    begin
+      kt := KVv.FData[KVv.GetRawPos(t, 0, d)];
+      vt := KVv.FData[KVv.GetRawPos(t, 0, C + d)];
+      Ek := Exp(kt);
+      if t > 0 then
+      begin
+        aprev := FA.FData[FA.GetRawPos(t - 1, 0, d)];
+        bprev := FB.FData[FB.GetRawPos(t - 1, 0, d)];
+      end
+      else
+      begin
+        aprev := 0;
+        bprev := 0;
+      end;
+      paPrev := dwexp * pa;
+      pbPrev := dwexp * pb;
+      dvt := pa * Ek;
+      dDk := pa * vt + pb;
+      dkt := dDk * Ek;
+      dDw := pa * aprev + pb * bprev;
+      gradW := gradW + dDw * (-dwexp);
+      if hasKVGrad then
+      begin
+        KVErr.FData[KVErr.GetRawPos(t, 0, d)] :=
+          KVErr.FData[KVErr.GetRawPos(t, 0, d)] + dkt;
+        KVErr.FData[KVErr.GetRawPos(t, 0, C + d)] :=
+          KVErr.FData[KVErr.GetRawPos(t, 0, C + d)] + dvt;
+      end;
+      pa := paPrev;
+      pb := pbPrev;
+    end;
+    FGradW.FData[d] := gradW * Sigmoid(Ww.FData[d]);
+  end;
+  TNNetVolume.MulAdd(Nw.FDelta.GetRawPtr(), FGradW.GetRawPtr(), -FLearningRate, C);
+  // u carries no gradient in the asymmetric read-out (no bonus term).
+  if (not FBatchUpdate) then
+  begin
+    Nw.UpdateWeights(FInertia);
+    Nu.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   if hasKVGrad then FKVLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
@@ -76039,7 +76280,7 @@ begin
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
-      'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0]);
+      'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0], St[1] = 1);
       'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
       'TNNetTestTimeTraining':      Result := TNNetTestTimeTraining.Create(St[1], St[2]);
       'TNNetTitansMemory':          Result := TNNetTitansMemory.Create(St[2]);
@@ -76401,7 +76642,7 @@ begin
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
-      if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0]) else
+      if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0], St[1] = 1) else
       if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetTestTimeTraining' then Result := TNNetTestTimeTraining.Create(St[1], St[2]) else
       if S[0] = 'TNNetTitansMemory' then Result := TNNetTitansMemory.Create(St[2]) else

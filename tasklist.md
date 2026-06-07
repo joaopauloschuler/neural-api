@@ -164,11 +164,18 @@ rather than acted on.
 - [ ] TNNetWKV follow-ups (the RWKV-4 time-mixing recurrence base layer +
       AddRWKVTimeMix builder + numerical-gradient/serialization tests + examples/RWKV/
       WKV-vs-DeltaNet recall demo landed 2026-06-07 on a2, commits 2d4473b/1523a45). Open:
-      - [ ] Asymmetric/full-context cross variant for TNNetCrossWKV (the base
+      - [X] Asymmetric/full-context cross variant for TNNetCrossWKV (the base
             two-source k/v RWKV-4 layer landed 2026-06-07 on a2, commit 3bc1c66,
             with the EQUAL-seqlen position-aligned read-out contract): summarise
             the kv memory once, query it with a DIFFERENT-length receptance
             stream (true permuted associative recall, not position-aligned copy).
+            Landed 2026-06-07 on a2: pAsymmetric constructor flag (FStruct[1],
+            serialized in BOTH dispatch tables) on TNNetCrossWKV — rectangular
+            QSeqLen x KVSeqLen like TNNetCrossAttention; one decay scan summarises
+            the kv memory, every query reads wkv=A/B gated by its receptance;
+            exact coupled-BPTT (u unused, only w carries weight grad); numerical
+            gradient (both sources + w_raw) + serialization tests with
+            QSeqLen<>KVSeqLen; equal-seqlen v1 path unchanged.
       - [ ] Wire AddRWKVTimeMix into the downstream ../gpt-3-for-pascal decoder as an
             attention-free block option and contrast its loss / wall-clock vs the attention
             decoder on the existing tiny corpus (mirrors the open AddHyenaOperator wiring task).

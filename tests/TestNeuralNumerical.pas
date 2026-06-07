@@ -432,6 +432,10 @@ type
     procedure TestCrossWKVInputGradientCheck;
     procedure TestCrossWKVWeightGradientCheck;
     procedure TestCrossWKVSerializationRoundTrip;
+    procedure TestCrossWKVAsymShapeInference;
+    procedure TestCrossWKVAsymInputGradientCheck;
+    procedure TestCrossWKVAsymWeightGradientCheck;
+    procedure TestCrossWKVAsymSerializationRoundTrip;
     procedure TestAffineCouplingInputGradientCheck;
     procedure TestAffineCouplingWeightGradientCheck;
     procedure TestAffineCouplingInverseIdentity;
@@ -23890,6 +23894,292 @@ begin
       NN2.Compute(NN2.Layers[0].Output);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CrossWKV round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    RcpData.Free;
+    KVData.Free;
+  end;
+end;
+
+// --- TNNetCrossWKV ASYMMETRIC (full-context cross, rectangular QSeqLen x KVSeqLen)
+
+procedure TTestNeuralNumerical.TestCrossWKVAsymShapeInference;
+// Output length must follow the QUERY (receptance) stream, NOT the kv memory:
+// QSeqLen=3 query against a KVSeqLen=7 memory -> 3 output positions.
+var
+  NN: TNNet;
+  RcpIn, KVIn: TNNetLayer;
+  L: TNNetCrossWKV;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    // Receptance (query): QSeqLen=3, C=4. Key|Value memory: KVSeqLen=7, depth 2*C=8.
+    RcpIn := NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(7, 1, 8, 1), 0);
+    L := TNNetCrossWKV.Create(KVIn, true);
+    NN.AddLayerAfter(L, RcpIn);
+    AssertTrue('CrossWKV asym flag set', L.Asymmetric);
+    AssertEquals('CrossWKV asym output SizeX = QSeqLen', 3, L.Output.SizeX);
+    AssertEquals('CrossWKV asym output SizeY', 1, L.Output.SizeY);
+    AssertEquals('CrossWKV asym output Depth = C', 4, L.Output.Depth);
+    AssertEquals('CrossWKV asym neuron count', 2, L.Neurons.Count);
+    AssertTrue('CrossWKV asym KeyValueSource wired', L.KeyValueSource = KVIn);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossWKVAsymInputGradientCheck;
+// Central-difference gradient into BOTH sources with QSeqLen <> KVSeqLen.
+// Query QSeqLen=3, C=2; memory KVSeqLen=5, depth 4.
+var
+  NN: TNNet;
+  RcpIn, KVIn, LW: TNNetLayer;
+  RcpData, KVData, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr, saved: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    RcpIn.Output.Copy(RcpData);
+    KVIn.Output.Copy(KVData);
+    NN.Compute(RcpIn.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  RcpData := TNNetVolume.Create(3, 1, 2);   // QSeqLen=3
+  KVData := TNNetVolume.Create(5, 1, 4);    // KVSeqLen=5
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    RcpIn := NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(5, 1, 4, 1), 0);
+    LW := NN.AddLayerAfter(TNNetCrossWKV.Create(KVIn, true), RcpIn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to RcpData.Size - 1 do RcpData.Raw[i] := Sin(i * 0.6) * 0.5 - 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[0] :=  0.4;  // w_raw
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[1] := -0.3;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[0] :=  0.5;  // u (unused in asym)
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[1] := -0.6;
+
+    // ---- Receptance (query) source A grads ----
+    for i := 0 to RcpData.Size - 1 do
+    begin
+      saved := RcpData.Raw[i];
+      RcpData.Raw[i] := saved + epsilon; lossPlus := ComputeLoss;
+      RcpData.Raw[i] := saved - epsilon; lossMinus := ComputeLoss;
+      RcpData.Raw[i] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ComputeLoss;
+      RcpIn.OutputError.Fill(0);
+      KVIn.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := RcpIn.OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('CrossWKV asym receptance gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Key|Value memory source B grads ----
+    for i := 0 to KVData.Size - 1 do
+    begin
+      saved := KVData.Raw[i];
+      KVData.Raw[i] := saved + epsilon; lossPlus := ComputeLoss;
+      KVData.Raw[i] := saved - epsilon; lossMinus := ComputeLoss;
+      KVData.Raw[i] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ComputeLoss;
+      RcpIn.OutputError.Fill(0);
+      KVIn.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := KVIn.OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('CrossWKV asym key|value gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('CrossWKV asym input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    RcpData.Free;
+    KVData.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossWKVAsymWeightGradientCheck;
+// Only w_raw carries gradient in the asymmetric read-out (u is unused, no
+// per-query bonus term). Verify w_raw against central differences with
+// QSeqLen=3 <> KVSeqLen=5, and confirm u's analytical gradient is exactly 0.
+var
+  NN: TNNet;
+  RcpIn, KVIn, LW: TNNetLayer;
+  RcpData, KVData, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    RcpIn.Output.Copy(RcpData);
+    KVIn.Output.Copy(KVData);
+    NN.Compute(RcpIn.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  RcpData := TNNetVolume.Create(3, 1, 2);
+  KVData := TNNetVolume.Create(5, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    RcpIn := NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(5, 1, 4, 1), 0);
+    LW := NN.AddLayerAfter(TNNetCrossWKV.Create(KVIn, true), RcpIn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to RcpData.Size - 1 do RcpData.Raw[i] := Sin(i * 0.5) * 0.5 + 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Sin(i * 0.55) * 0.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[0] :=  0.4;  // w_raw
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[1] := -0.3;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[0] :=  0.5;  // u (unused)
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[1] := -0.6;
+
+    // w_raw (neuron 0) against central differences.
+    for i := 0 to TNNetCrossWKV(LW).Neurons[0].Weights.Size - 1 do
+    begin
+      TNNetCrossWKV(LW).Neurons[0].Weights.Raw[i] :=
+        TNNetCrossWKV(LW).Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      TNNetCrossWKV(LW).Neurons[0].Weights.Raw[i] :=
+        TNNetCrossWKV(LW).Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      TNNetCrossWKV(LW).Neurons[0].Weights.Raw[i] :=
+        TNNetCrossWKV(LW).Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ComputeLoss;
+      TNNetCrossWKV(LW).Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -TNNetCrossWKV(LW).Neurons[0].Delta.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('CrossWKV asym weight gradient w_raw[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // u (neuron 1) must receive exactly zero gradient (unused in asym path).
+    ComputeLoss;
+    TNNetCrossWKV(LW).Neurons[1].ClearDelta;
+    NN.Backpropagate(Desired);
+    for i := 0 to TNNetCrossWKV(LW).Neurons[1].Weights.Size - 1 do
+      AssertEquals('CrossWKV asym u gradient is zero [' + IntToStr(i) + ']',
+        0.0, TNNetCrossWKV(LW).Neurons[1].Delta.Raw[i], 1e-9);
+
+    WriteLn('CrossWKV asym weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    RcpData.Free;
+    KVData.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossWKVAsymSerializationRoundTrip;
+// The asymmetric flag (FStruct[1]) AND the rectangular shapes must survive
+// SaveToString -> LoadFromString, reproducing the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  RcpIn, KVIn, LW: TNNetLayer;
+  RcpData, KVData: TNNetVolume;
+  QLen, KVLen, C, i: integer;
+  Saved, Saved2: string;
+  FoundAsym: boolean;
+begin
+  RandSeed := 424242;
+  QLen := 3; KVLen := 6; C := 2;
+  NN := TNNet.Create();
+  RcpData := TNNetVolume.Create(QLen, 1, C);
+  KVData := TNNetVolume.Create(KVLen, 1, 2 * C);
+  try
+    RcpIn := NN.AddLayer(TNNetInput.Create(QLen, 1, C, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(KVLen, 1, 2 * C, 1), 0);
+    LW := NN.AddLayerAfter(TNNetCrossWKV.Create(KVIn, true), RcpIn);
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[0] :=  0.4;
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[1] := -0.3;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[0] :=  0.5;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[1] := -0.6;
+
+    for i := 0 to RcpData.Size - 1 do RcpData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Cos(i * 0.37) * 0.8 - 0.2;
+    RcpIn.Output.Copy(RcpData);
+    KVIn.Output.Copy(KVData);
+    NN.Compute(RcpIn.Output);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CrossWKV asym SaveToString round-trip equality', Saved, Saved2);
+
+      FoundAsym := false;
+      for i := 0 to NN2.GetLastLayerIdx do
+        if (NN2.Layers[i] is TNNetCrossWKV) and
+           TNNetCrossWKV(NN2.Layers[i]).Asymmetric then FoundAsym := true;
+      AssertTrue('CrossWKV asym flag restored on load', FoundAsym);
+
+      NN2.Layers[0].Output.Copy(RcpData);
+      NN2.Layers[1].Output.Copy(KVData);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CrossWKV asym round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;
