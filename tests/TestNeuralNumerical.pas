@@ -248,6 +248,9 @@ type
     procedure TestDeformableConvOffsetGradientCheck;
     procedure TestDeformableConvShapeInference;
     procedure TestDeformableConvSerializationRoundTrip;
+    procedure TestModulatedDeformableConvInputGradientCheck;
+    procedure TestModulatedDeformableConvWeightGradientCheck;
+    procedure TestModulatedDeformableConvSerializationRoundTrip;
     // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
     procedure TestGroupConvP4InputGradientCheck;
     procedure TestGroupConvP4WeightGradientCheck;
@@ -42361,6 +42364,227 @@ begin
         NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('DeformableConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// --- TNNetDeformableConv DCNv2 modulated variant ---------------------------
+// Same kink-avoidance discipline as the v1 tests: seed the offset head so the
+// 2*KK offset channels produce small fractional offsets (sampling strictly
+// between integer pixels) AND the KK modulation logits are non-zero (so m is
+// away from 0.5 and the sigmoid backward path is exercised). The modulation
+// gradient flows through the SAME offset head, so the input/weight gradient
+// checks below cover the new mask path end-to-end.
+
+procedure TTestNeuralNumerical.TestModulatedDeformableConvInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  DC: TNNetDeformableConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  InputPlus := TNNetVolume.Create(5, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2, 1)); // 1 = collect input error
+    // Modulated = 1 (DCNv2): offset head emits 3*KK channels.
+    DC := TNNetDeformableConv.Create(2, 3, 1, 1, 0, 1);
+    NN.AddLayer(DC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    InSize := Input.Size;
+
+    // Seed offset-head bias (3*KK = 27 channels: first 18 offsets, last 9 mod
+    // logits) and a few small weights so offsets AND mask are content-driven.
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.02 * i;
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.7);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedDeformableConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ModulatedDeformableConv input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedDeformableConvWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  DC: TNNetDeformableConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for each MAIN conv weight, with the
+  // modulation mask active (so dL/dW = dy_out * modM * sampled).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2));
+    DC := TNNetDeformableConv.Create(2, 3, 1, 1, 0, 1); // modulated
+    NN.AddLayer(DC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.02 * i;
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for i := 0 to DC.Neurons[0].Weights.Size - 1 do
+    begin
+      DC.Neurons[0].Weights.Raw[i] := DC.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      DC.Neurons[0].Weights.Raw[i] := DC.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      DC.Neurons[0].Weights.Raw[i] := DC.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      DC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -DC.Neurons[0].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedDeformableConv main-weight gradient check w=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ModulatedDeformableConv main-weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedDeformableConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  DC: TNNetDeformableConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Modulated (DCNv2) deformable conv with the NON-DEFAULT flag set: the
+  // FStruct[5] modulation flag must round-trip through BOTH dispatch points so
+  // the reloaded layer rebuilds the widened 3*KK offset head and Compute matches.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    DC := TNNetDeformableConv.Create(4, 3, 1, 2, 0, 1); // modulated = 1
+    NN.AddLayer(DC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+
+    AssertEquals('ModulatedDeformableConv flag set before save', 1, DC.Modulated);
+    // Offset head now has 3*KK = 27 channels; give it non-trivial weights.
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.3);
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.25 - 0.01 * i;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ModulatedDeformableConv SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertEquals('ModulatedDeformableConv flag preserved after reload', 1,
+        (NN2.Layers[1] as TNNetDeformableConv).Modulated);
+      AssertEquals('ModulatedDeformableConv offset-head width preserved (3*KK)',
+        DC.Neurons[2].Weights.Size,
+        (NN2.Layers[1] as TNNetDeformableConv).Neurons[2].Weights.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ModulatedDeformableConv Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

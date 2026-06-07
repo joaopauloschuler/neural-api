@@ -85,8 +85,11 @@ rather than acted on.
       layer with predicted bilinear sampling offsets, weight+offset
       numerical-gradient tests, serialization, shape smoke, and
       examples/DeformableConv/ all landed 2026-06-07 on a2, commit 0f6be5c):
-  - [ ] Optional v2: modulated deformable conv (DCNv2) adding a learnable
-        per-tap sigmoid amplitude (modulation mask).
+  - [x] Optional v2: modulated deformable conv (DCNv2) adding a learnable
+        per-tap sigmoid amplitude (modulation mask). LANDED 2026-06-07 on a2 as
+        a Modulated flag (FStruct[5]) on TNNetDeformableConv widening the offset
+        head to 3*KK; input/weight numerical-gradient + serialization round-trip
+        tests added; non-modulated path unchanged.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT

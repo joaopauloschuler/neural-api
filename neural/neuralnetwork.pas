@@ -7692,11 +7692,22 @@ type
   ///   neuron 2 : offset-head weights (size KK*In*(2*KK)),
   ///              O[((fy*FeatSizeX+fx)*In+ci)*(2*KK)+oc]
   ///   neuron 3 : offset-head biases  (size 2*KK)
-  /// Constructor: Create(NumFeatures, FeatureSize, Padding, Stride, SuppressBias).
-  /// FStruct[0..4] carry the usual conv params (features, kernel, padding,
-  /// stride, suppress-bias) so the layer round-trips through
-  /// SaveStructureToString / LoadFromString / CreateLayer. Out of v1 scope (see
-  /// tasklist.md): the DCNv2 modulated variant (a learned per-tap [0,1] mask).
+  /// DCNv2 MODULATED VARIANT (Zhu et al. 2019, "Deformable ConvNets v2",
+  /// arXiv:1811.11168): set Modulated=1 (FStruct[5]) to widen the offset head
+  /// from 2*KK to 3*KK channels. The extra KK channels are per-tap MODULATION
+  /// LOGITS; a sigmoid maps each to a scalar m in (0,1) that scales the
+  /// bilinearly-sampled tap value (sampled *= m) before the conv sum. Backward
+  /// flows gradient into the modulation logits (d(out)/d(m) = sampled*weight,
+  /// dm/dlogit = m*(1-m)) in addition to offsets, input and weights. The
+  /// modulation channels are zero-initialised, so m starts at 0.5 (a constant
+  /// scale); the non-modulated path (Modulated=0, the default) is bit-for-bit
+  /// unchanged.
+  ///
+  /// Constructor: Create(NumFeatures, FeatureSize, Padding, Stride, SuppressBias,
+  /// Modulated). FStruct[0..4] carry the usual conv params (features, kernel,
+  /// padding, stride, suppress-bias) and FStruct[5] the modulation flag, so the
+  /// layer round-trips through SaveStructureToString / LoadFromString /
+  /// CreateLayer with the modulation flag preserved.
   // Coded by Claude (AI).
   TNNetDeformableConv = class(TNNetConvolutionLinear)
   private
@@ -7704,15 +7715,17 @@ type
     FOutDepth: integer;    // output features (co count)
     FNumTaps: integer;     // KK = FFeatureSizeX*FFeatureSizeY
     FMainSize: integer;    // KK*InDepth*OutDepth
-    FOffSize: integer;     // KK*InDepth*(2*KK)
-    FOffOut: integer;      // 2*KK (offset-head output channels)
-    FOffMap: TNNetVolume;  // cached offset maps (FOutputSizeX,Y, 2*KK)
+    FOffSize: integer;     // KK*InDepth*FOffOut
+    FOffOut: integer;      // offset-head output channels: 2*KK, or 3*KK if modulated
+    FModulated: integer;   // 0 = plain deformable conv (v1), 1 = DCNv2 modulated
+    FOffMap: TNNetVolume;  // cached offset maps (FOutputSizeX,Y, FOffOut)
     function SampleBilinear(PrevOut: TNNetVolume; px, py: TNeuralFloat;
       ci: integer): TNeuralFloat;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; override;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias, pModulated: integer); reintroduce; overload;
     destructor Destroy(); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
@@ -7720,6 +7733,7 @@ type
     procedure Backpropagate(); override;
     property InDepth: integer read FInDepth;
     property OutDepth: integer read FOutDepth;
+    property Modulated: integer read FModulated;
   end;
 
   /// p4 GROUP-EQUIVARIANT CONVOLUTION -- the LIFTING layer of a Group
@@ -42331,12 +42345,21 @@ end;
 constructor TNNetDeformableConv.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
 begin
+  // Plain (v1) deformable conv: modulation off.
+  Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias, 0);
+end;
+
+constructor TNNetDeformableConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride, pSuppressBias, pModulated: integer);
+begin
   // Identity activation + conv output sizing come from TNNetConvolutionLinear.
   // We fully override Compute/Backpropagate and replace the neuron layout, so
   // pass suppress-bias=1 to the base (its per-feature bias machinery is unused;
   // our own bias lives in neuron 1, governed by FStruct[4]).
   inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, 1);
   FStruct[4] := pSuppressBias;  // remember the requested suppress-bias
+  if pModulated <> 0 then FModulated := 1 else FModulated := 0;
+  FStruct[5] := FModulated;     // DCNv2 modulation flag (round-trips)
   FOffMap := TNNetVolume.Create();
   // Neurons are sized in SetPrevLayer once InDepth is known.
 end;
@@ -42360,8 +42383,12 @@ begin
   if FInDepth <= 0 then
     FErrorProc('TNNetDeformableConv requires a non-empty input.');
 
+  FModulated := FStruct[5];                            // 0 (v1) or 1 (DCNv2)
   FNumTaps := FFeatureSizeX * FFeatureSizeY;          // KK
-  FOffOut := 2 * FNumTaps;                             // 2*KK offset channels
+  if FModulated <> 0 then
+    FOffOut := 3 * FNumTaps                            // 2*KK offsets + KK mod logits
+  else
+    FOffOut := 2 * FNumTaps;                           // 2*KK offset channels
   FMainSize := FNumTaps * FInDepth * FOutDepth;        // main conv weights
   FOffSize := FNumTaps * FInDepth * FOffOut;           // offset-head weights
 
@@ -42479,7 +42506,7 @@ var
   ox, oy, co, fx, fy, ci, tap, oc: integer;
   prevX0, prevY0: integer;
   PrevOut, mW, mB, oW, oB: TNNetVolume;
-  acc, dx, dy, px, py, sampled, offv: TNeuralFloat;
+  acc, dx, dy, px, py, sampled, offv, modM: TNeuralFloat;
 begin
   PrevOut := FPrevLayer.FOutput;
   mW := FArrNeurons[0].FWeights;
@@ -42526,9 +42553,14 @@ begin
         dy := FOffMap.Get(ox, oy, 2 * tap + 1);
         px := ox * FStride + fx - FPadding + dx;
         py := oy * FStride + fy - FPadding + dy;
+        // DCNv2: per-tap modulation m = sigmoid(logit) scales the sampled value.
+        if FModulated <> 0 then
+          modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
+        else
+          modM := 1.0;
         for ci := 0 to FInDepth - 1 do
         begin
-          sampled := SampleBilinear(PrevOut, px, py, ci);
+          sampled := SampleBilinear(PrevOut, px, py, ci) * modM;
           acc := acc + mW.FData[(tap * FInDepth + ci) * FOutDepth + co] * sampled;
         end;
       end;
@@ -42560,6 +42592,7 @@ var
   mWDelta, mBDelta, oWDelta, oBDelta: TNNetVolume;
   dy_out, dx, dyo, px, py, fxr, fyr, wgt, sampled, dval: TNeuralFloat;
   w00, w01, w10, w11, dSdpx, dSdpy, ddx, ddy, dOff, lr: TNeuralFloat;
+  modM, dModAcc: TNeuralFloat;
   HasPrevError: boolean;
   // dL/d(offset map) accumulator (FOutputSizeX,Y, 2*KK).
   dOffMap: TNNetVolume;
@@ -42609,6 +42642,11 @@ begin
         dyo := FOffMap.Get(ox, oy, 2 * tap + 1);
         px := ox * FStride + fx - FPadding + dx;
         py := oy * FStride + fy - FPadding + dyo;
+        // DCNv2: per-tap modulation m = sigmoid(logit).
+        if FModulated <> 0 then
+          modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
+        else
+          modM := 1.0;
         x0 := Floor(px); y0 := Floor(py);
         x1 := x0 + 1;    y1 := y0 + 1;
         fxr := px - x0;  fyr := py - y0;
@@ -42616,10 +42654,11 @@ begin
         w01 := fxr * (1 - fyr);
         w10 := (1 - fxr) * fyr;
         w11 := fxr * fyr;
+        dModAcc := 0;  // dL/dm for this tap, summed over input channels
         for ci := 0 to FInDepth - 1 do
         begin
           wgt := mW.FData[(tap * FInDepth + ci) * FOutDepth + co];
-          // recompute the sampled value (for the main-weight gradient).
+          // recompute the RAW sampled value (before modulation).
           sampled := 0;
           if (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy) then
             sampled := sampled + w00 * PrevOut.Get(x0, y0, ci);
@@ -42629,12 +42668,14 @@ begin
             sampled := sampled + w10 * PrevOut.Get(x0, y1, ci);
           if (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy) then
             sampled := sampled + w11 * PrevOut.Get(x1, y1, ci);
-          // main-weight gradient: dL/dW = dy_out * sampled
+          // main-weight gradient: dL/dW = dy_out * (modM * sampled)
           mWDelta.FData[(tap * FInDepth + ci) * FOutDepth + co] :=
             mWDelta.FData[(tap * FInDepth + ci) * FOutDepth + co] +
-            lr * dy_out * sampled;
-          // dval = dL/dsampled = dy_out * wgt
-          dval := dy_out * wgt;
+            lr * dy_out * modM * sampled;
+          // dL/dm contribution: dy_out * wgt * raw_sampled
+          dModAcc := dModAcc + dy_out * wgt * sampled;
+          // dval = dL/d(raw sampled) = dy_out * wgt * modM
+          dval := dy_out * wgt * modM;
           // input gradient via bilinear corners (zero-padding: skip OOB)
           ScatterCorner(x0, y0, dval * w00, ci);
           ScatterCorner(x1, y0, dval * w01, ci);
@@ -42674,6 +42715,10 @@ begin
           dOffMap.Add(ox, oy, 2 * tap,     ddx);
           dOffMap.Add(ox, oy, 2 * tap + 1, ddy);
         end;
+        // DCNv2: modulation-logit gradient = dL/dm * dm/dlogit, with
+        // dm/dlogit = m*(1-m). Routed through the offset head's mod channel.
+        if FModulated <> 0 then
+          dOffMap.Add(ox, oy, 2 * FNumTaps + tap, dModAcc * modM * (1 - modM));
       end;
     end;
 
@@ -70556,7 +70601,7 @@ begin
       'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1);
       'TNNetALIFNeuron' :           Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
-      'TNNetDeformableConv' :       Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetDeformableConv' :       Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetGroupConvP4' :          Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupPoolP4' :          Result := TNNetGroupPoolP4.Create(St[0]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
@@ -70905,7 +70950,7 @@ begin
       if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
       if S[0] = 'TNNetALIFNeuron' then Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetDeformableConv' then Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetDeformableConv' then Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetGroupConvP4' then Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupPoolP4' then Result := TNNetGroupPoolP4.Create(St[0]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
