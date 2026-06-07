@@ -1,75 +1,81 @@
 # EffectiveReceptiveField
 
-Demonstrates `TNNet.EffectiveReceptiveFieldReport`: the **empirical**
-(gradient-measured) counterpart of the analytical
-[`TNNet.ReceptiveFieldReport`](../ReceptiveFieldReport). The analytical report
-asks *"what input region COULD a deep output unit see?"*; this one asks *"what
-input region does that unit ACTUALLY WEIGHT?"*. Luo et al. 2016 show the
-**effective** receptive field is typically far smaller — and more Gaussian —
-than the theoretical one: a deep stem often only really uses the middle of its
-theoretical window.
+Sweeps a conv stem over several **kernel-size / stack-depth** configurations
+and charts how the **empirical** (gradient-measured) effective receptive field
+grows against the **theoretical** receptive field, using
+`TNNet.EffectiveReceptiveFieldReport` — the empirical counterpart of the
+analytical [`TNNet.ReceptiveFieldReport`](../ReceptiveFieldReport). The
+analytical report asks *"what input region COULD a deep output unit see?"*;
+this one asks *"what input region does that unit ACTUALLY WEIGHT?"*.
+
+**Headline (Luo et al. 2016, "Understanding the Effective Receptive Field in
+Deep Convolutional Neural Networks"):** the effective RF grows only
+**sub-linearly** in the theoretical RF. Composing many small kernels
+concentrates the centre-unit gradient into a tight, roughly Gaussian blob, so a
+deep unit COULD see its whole theoretical window but only really WEIGHTS the
+middle of it — and that gap **widens** as the stack gets deeper.
 
 ## What it does
 
-It picks the **centre output unit** of the final spatial layer, enables
-input-gradient flow with `TNNet.EnableInputGradient` (the same helper the
-saliency and adversarial reports use), and for every probe input runs one
-`NN.Compute`, injects a one-hot output error `e_centre`, back-propagates, and
-reads `d out_centre / d input` off the input layer. It accumulates `|gradient|`
-(summed over input depth) into a per-`(x,y)` input-plane heatmap. The net is
-**frozen** — `ClearDeltas` before each pass, never `UpdateWeights`.
+For each stem configuration the program:
 
-The example builds two **untrained** nets on the same 15x15x1 input, both with
-a **theoretical RF of 9x9**:
+1. builds an **untrained**, single-channel conv stem on a small 21x21x1 grid;
+2. runs `TNNet.EffectiveReceptiveFieldReport` over a deterministic 16-sample
+   synthetic probe batch. The report picks the **centre output unit** of the
+   final spatial layer, enables input-gradient flow with
+   `TNNet.EnableInputGradient`, back-propagates a one-hot `e_centre` error per
+   probe, and accumulates `|d out_centre / d input|` into a per-`(x,y)`
+   input-plane heatmap (the net is **frozen** — `ClearDeltas` before each pass,
+   never `UpdateWeights`);
+3. writes the **`(radius, cumulative-mass-fraction)` CSV side-output** (the
+   optional `CsvFile` argument) to `<tmp>/erf_sweep_<i>.csv` so the growth
+   curve can be plotted outside the terminal;
+4. extracts the effective-RF diameter and the theoretical RF from the report.
 
-1. A **stack of four 3x3 stride-1 convs** (RF grows by 2 per conv: `1 + 4*2 =
-   9`). Many composed 3x3 kernels make the effective RF concentrate sharply
-   near the centre, so the effective/theoretical ratio is **well below 1**.
-2. A **single 9x9 conv** (RF = 9 directly). One flat kernel weights its whole
-   window much more evenly, so the effective RF **fills** the theoretical
-   window (ratio ≈ 1).
+It then prints a compact table of `(config, theoretical_RF, effective_RF_diam,
+eff/theo ratio)`.
 
-No training and no dataset download: a small deterministic synthetic probe
-batch drives the centre-unit gradient. Runs in well under a second.
+The configs are sized so the **theoretical RF roughly doubles** down the table
+(`theo_RF = 1 + N*(K-1)` for `N` stacked stride-1 convs of side `K`) while the
+**effective diameter grows much more slowly** — the sub-linear story.
 
-## What it reports
+No training, no dataset download, tiny tensors: runs in well under a second on
+2 CPU cores.
 
-- a **2-D ASCII heatmap** of the input-plane sensitivity (per-`(x,y)`, summed
-  over depth, shaded `' .:-=+*#%@'` by its own max);
-- the **effective RF**: the smallest centred square holding 90% of the
-  gradient mass (per-axis half-widths and diameters), the mass centroid, and
-  the mass-weighted spatial std `sigma_x`, `sigma_y`;
-- the **theoretical RF side-by-side**: it calls `TNNet.ReceptiveFieldReport`
-  internally for the analytical final-RF number and prints the
-  effective/theoretical ratio per axis.
-
-## Output (abridged)
+## Output
 
 ```
-=== (i) Stack of four 3x3 stride-1 convs (15x15x1 input) ===
-...
-       ......
-     ...:.:::.
-     ..:--=-:.
-     .:-==+=-.
-     .:=-@+=-.
-     .:-+=+=:.
-     .:---*=-.
-     ...::::.
-...
-Mass-weighted spatial std: sigma_x= 2.001  sigma_y= 2.012.
-EFFECTIVE RF (90% of gradient mass): ... per-axis half-width x=3 y=3 ...
-Theoretical RF (analytical, ReceptiveFieldReport): 9 x 9 on 15x15 input.
-Effective / theoretical RF: x =   7.0 / 9 =  0.78   y =   7.0 / 9 =  0.78.
+=== Effective receptive-field growth sweep (Luo et al. 2016) ===
+Input grid 21x21x1, 16 synthetic probes, untrained frozen stems.
 
-=== (ii) Single 9x9 conv (15x15x1 input) ===
-...
-Effective / theoretical RF: x =   9.0 / 9 =  1.00   y =   9.0 / 9 =  1.00.
+config          theo_RF    eff_RF_diam   eff/theo
+--------------------------------------------------
+1x 3x3                3              3       1.00
+2x 3x3                5              5       1.00
+4x 3x3                9              7       0.78
+1x 9x9                9              9       1.00
+4x 5x5               17             13       0.76
+--------------------------------------------------
 ```
 
-The 3x3 stack's effective RF is a tight central blob (ratio ≈ 0.78), while the
-single large kernel weights its full window (ratio ≈ 1.0) — the
-effective-vs-theoretical gap made visible in one run.
+As the theoretical RF climbs from 3 to 17, the effective diameter lags further
+and further behind: a **single** large kernel weights its whole window
+(`eff/theo ≈ 1.0`), but **stacked** small kernels concentrate the gradient and
+the ratio drops below 1 and keeps shrinking (`0.78` at 4×3×3, `0.76` at 4×5×5).
+That is the effective RF growing **sub-linearly** in the theoretical receptive
+field.
+
+The per-config CSV (e.g. `erf_sweep_2.csv` for the 4×3×3 stem) holds the
+cumulative gradient-mass curve, monotonically rising to 1.0:
+
+```
+radius,mass_fraction
+0,0.02585155
+1,0.21686888
+2,0.46353251
+3,0.78151649
+4,1.00000000
+```
 
 ## How it differs from the siblings
 
