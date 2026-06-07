@@ -1247,6 +1247,37 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
+- [ ] `TNNetTitansMemory` — a test-time "neural long-term memory" sequence
+      mixer (Behrouz et al. 2024, "Titans: Learning to Memorize at Test
+      Time"). This is a genuinely NEW memory paradigm, distinct from every
+      memory/recurrence layer already in tree — confirm with
+      [[ntm-memory-layer]] (NTM = attention-addressed read/write of an
+      external matrix M), [[deltanet-layer]] (Widrow-Hoff error-correcting
+      write to a 2-D matrix S), [[test-time-training-layer]] (TTT = inner
+      model updated by a *reconstruction* loss step), and `TNNetSelectiveSSM`
+      (Mamba S6, a diagonal scan). Titans is none of these: the memory is a
+      small MLP `M_t` whose weights are updated *at inference* by the
+      gradient of an associative loss `||M_t(k_t) - v_t||^2`, but the update
+      uses (a) a **momentum / "surprise" term** `S_t = eta*S_{t-1} -
+      theta*grad` so a single surprising token keeps writing for several
+      steps, and (b) a **data-dependent forgetting / weight-decay gate**
+      `M_t = (1 - alpha_t) * M_{t-1} + S_t` (adaptive `alpha_t` = how much of
+      the old memory to erase). Scope for the first landing: the "Memory as
+      Context" (MAC) leaf-layer variant with a single-hidden-layer memory MLP,
+      k/v/q produced by learnable per-token pointwise projections, the three
+      gates (`eta` momentum, `theta` learning-rate, `alpha` forget) as
+      learnable per-channel scalars passed through sigmoid, and full BPTT
+      through the coupled `S_t`/`M_t` adjoint scans (the second-order inner
+      tape like [[test-time-training-layer]]'s TTT-MLP path is the hard part
+      — reuse that machinery). Mark the class `// Coded by Claude (AI).`,
+      gradient-check in TestNeuralNumerical.pas (well-separated k/v so the
+      argmax-free path is unambiguous), and ship `examples/TitansMemory/` as
+      a long-context associative-recall demo (store N key->value pairs early
+      in the sequence, query them after a long distractor span — the
+      surprise+forget gates should beat a plain linear-attention baseline at
+      long range). Follow-ups to record: the gated-DeltaNet-style chunked
+      parallel scan, and an `AddTitansMemory` builder wrapping the MAC
+      residual.
 - [ ] `examples/TinyDiffusion/` — a 20-step denoising-diffusion model on
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
       TNNetSinusoidalTimeEmbedding (FiLM and the timestep embedding are both
