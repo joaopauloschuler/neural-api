@@ -929,6 +929,9 @@ type
     procedure TestBlurPoolShiftInvariance;
     procedure TestPointwiseByteProcessingSerializationRoundTrip;
     procedure TestPointwiseByteProcessingTrainedRoundTrip;
+    procedure TestBitProcessingShapeAndRoundTrip;
+    procedure TestBitProcessingClippingGradient;
+    procedure TestBitProcessingSerializationRoundTrip;
   end;
 
 implementation
@@ -35598,6 +35601,158 @@ begin
       NN.Free;
       Input.Free;
     end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBitProcessingShapeAndRoundTrip;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Bit: TNNetLayer;
+  i: integer;
+  vals: array[0..5] of TNeuralFloat;
+begin
+  // Shape: one byte per input scalar -> output size == input size (no x8
+  // expansion). Round-trip: an UNTRAINED engine copies its current state
+  // through (TStatePredictionClass.Prediction's ABCopy default), so the layer
+  // reduces to decode o encode, which is ~identity within the ~0.2 affine step.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6);
+  try
+    NN.AddLayer(TNNetInput.Create(6));
+    Bit := NN.AddLayer(TNNetBitProcessing.Create(0, 8, 40, 0));
+
+    AssertEquals('BitProcessing output size == input size (1 byte per scalar)',
+      Input.Size, Bit.Output.Size);
+
+    // Known inputs inside [-25.6, +25.6].
+    vals[0] := 0.0;   vals[1] := 1.0;    vals[2] := -2.5;
+    vals[3] := 10.0;  vals[4] := -25.0;  vals[5] := 17.3;
+    for i := 0 to 5 do Input.FData[i] := vals[i];
+
+    NN.Compute(Input);
+
+    // decode o encode round-trip within one quantization step (~0.2).
+    for i := 0 to 5 do
+      AssertEquals('BitProcessing untrained round-trip at ' + IntToStr(i),
+        vals[i], Bit.Output.FData[i], 0.2);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBitProcessingClippingGradient;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Bit, Prev: TNNetLayer;
+  i: integer;
+begin
+  // Straight-through estimator with saturation: a gradient passes to the
+  // previous layer where the input is inside [lo,hi] and is killed where the
+  // quantizer clips (input far outside the affine range).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3);
+  try
+    NN.AddLayer(TNNetInput.Create(3));
+    Bit := NN.AddLayer(TNNetBitProcessing.Create(0, 8, 40, 0));
+    Prev := NN.Layers[0];
+    NN.SetBatchUpdate(True);
+
+    Input.FData[0] := 1.0;     // inside  -> gradient passes
+    Input.FData[1] := 100.0;   // outside -> gradient killed (clipped)
+    Input.FData[2] := -2.0;    // inside  -> gradient passes
+    NN.Compute(Input);
+
+    // Inject a known output gradient and read what lands on the previous layer.
+    Prev.OutputError.Resize(Prev.Output);
+    Prev.OutputError.Fill(0);
+    NN.ClearDeltas();
+    for i := 0 to 2 do Bit.OutputError.FData[i] := 1.0;
+    Bit.IncDepartingBranchesCnt();   // hoist above any reset (STE-test pattern)
+    Bit.Backpropagate();
+
+    AssertEquals('BitProcessing STE passes gradient for in-range input 0',
+      1.0, Prev.OutputError.FData[0], 1e-6);
+    AssertEquals('BitProcessing STE kills gradient for clipped input 1',
+      0.0, Prev.OutputError.FData[1], 1e-6);
+    AssertEquals('BitProcessing STE passes gradient for in-range input 2',
+      1.0, Prev.OutputError.FData[2], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBitProcessingSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Desired: TNNetVolume;
+  Saved, Saved2: string;
+  Struct, Struct2: string;
+  i, ep: integer;
+begin
+  // Round-trip the affine endpoints (custom non-default range) AND the engine's
+  // learned rules after training a small mapping. SaveToString -> LoadFromString
+  // -> SaveToString must be byte-identical, the affine params must be preserved,
+  // and the reloaded net must recompute the same output.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8);
+  Desired := TNNetVolume.Create(8);
+  try
+    NN.AddLayer(TNNetInput.Create(8));
+    // Non-default affine range to prove FFloatSt[0..1] actually round-trip.
+    NN.AddLayer(TNNetBitProcessing.Create(1, 32, 200, 0, -12.8, 12.8));
+
+    for i := 0 to Input.Size - 1 do Input.FData[i] := Sin(i * 0.5) * 5.0;
+    for i := 0 to Desired.Size - 1 do Desired.FData[i] := Cos(i * 0.5) * 5.0;
+
+    // Train the online byte engine so it accumulates serialized rules.
+    for ep := 0 to 9 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('BitProcessing round-trip class identity',
+        NN2.GetLastLayer is TNNetBitProcessing);
+
+      // The affine endpoints live in FFloatSt[0..1] -> the structure string. The
+      // non-default value must appear in it (proving it is carried, not
+      // defaulted), and the reloaded layer's structure must match exactly.
+      Struct := NN.Layers[1].SaveStructureToString();
+      Struct2 := NN2.Layers[1].SaveStructureToString();
+      AssertTrue('BitProcessing struct encodes non-default affine range',
+        Pos('12.8', Struct) > 0);
+      AssertEquals('BitProcessing affine params (FFloatSt) round-trip via struct',
+        Struct, Struct2);
+
+      Saved2 := NN2.SaveToString();
+      AssertEquals('BitProcessing SaveToString round-trip equality (struct+engine)',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('BitProcessing round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.FData[i], NN2.GetLastLayer.Output.FData[i],
+          1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

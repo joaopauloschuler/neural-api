@@ -11111,6 +11111,40 @@ type
       procedure Backpropagate(); override;
   end;
 
+  // Sibling of TNNetByteProcessing that drives the SAME symbolic byte engine
+  // but with a 1:1 AFFINE scalar quantization instead of the parent's
+  // 8-unrelated-floats-into-1-bit-pattern packing. Each input float is
+  // quantized to ONE whole byte over a symmetric affine range
+  // [FAffineLo, FAffineHi] (default -25.6 .. +25.6 -> 51.2/256 ~= 0.2 step);
+  // the engine maps N bytes -> N bytes; each output byte is decoded back to one
+  // float. Input dim == output dim == N (no x8 expansion, no padding).
+  //   encode(x) = RoundAsByte((x-lo)/(hi-lo)*255)
+  //   decode(b) = lo + (b/255)*(hi-lo)
+  // decode o encode ~= identity within the quantization step, so an untrained
+  // engine (which passes its current state through) reproduces the input. The
+  // affine endpoints round-trip via FFloatSt[0..1]. The backward pass is a
+  // straight-through estimator: the gradient flows to the previous layer where
+  // the input is inside [lo,hi] and is killed where it saturates (clipped). The
+  // optional skip connection adds the decoded output (~0 mid-range) to the
+  // input as a residual nudge and carries dL/dOutput through wholesale.
+  // Experimental, like TNNetByteProcessing.
+  // Coded by Claude (AI).
+  TNNetBitProcessing = class(TNNetByteProcessing)
+    private
+      FAffineLo: TNeuralFloat;
+      FAffineHi: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Affine quantize V's scalars into whole bytes (and back). Shared by
+      // Compute/Backpropagate so the affine math lives in one place.
+      procedure EncodeToBytes(V: TNNetVolume; var Bytes: array of byte);
+      procedure DecodeToOutput(var Bytes: array of byte; V: TNNetVolume);
+    public
+      constructor Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection: integer;
+        AffineLo: TNeuralFloat = -25.6; AffineHi: TNeuralFloat = 25.6); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   // This class is very experimental - do not use it.
   TNNetForByteProcessing = class(TNNet)
     private
@@ -24295,6 +24329,130 @@ begin
       FPosOutput.ReadAsBits(FByteOutputFound, 0.0);
       FByteLearning.newStateFound(FByteOutputFound);
     end;
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetBitProcessing }
+
+procedure TNNetBitProcessing.EncodeToBytes(V: TNNetVolume;
+  var Bytes: array of byte);
+var
+  J: integer;
+  Scale: TNeuralFloat;
+begin
+  Scale := FAffineHi - FAffineLo;
+  for J := 0 to High(Bytes) do
+    Bytes[J] := RoundAsByte( (V.FData[J] - FAffineLo) / Scale * 255 );
+end;
+
+procedure TNNetBitProcessing.DecodeToOutput(var Bytes: array of byte;
+  V: TNNetVolume);
+var
+  J: integer;
+  Scale: TNeuralFloat;
+begin
+  Scale := FAffineHi - FAffineLo;
+  for J := 0 to High(Bytes) do
+    V.FData[J] := FAffineLo + (Bytes[J] / 255) * Scale;
+end;
+
+procedure TNNetBitProcessing.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ByteLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // One byte per input scalar (NOT div 8): input dim == output dim == N.
+  ByteLen := pPrevLayer.Output.Size;
+  FByteLearning.Initiate(ByteLen, ByteLen, False{pFullEqual},
+    FStruct[1]{relationTableSize}, FStruct[2]{pNumberOfSearches},
+    (FStruct[0]>0){pUseCache}, FStruct[0]{CacheSize});
+  FOutput.Resize(1, 1, ByteLen);
+  FOutputError.Resize(FOutput);
+  SetLength(FByteInput, ByteLen);
+  SetLength(FByteOutput, ByteLen);
+  SetLength(FByteOutputFound, ByteLen);
+  FByteLearning.BytePred.FUseBelief := True;
+  FByteLearning.BytePred.FGeneralize := True;
+end;
+
+constructor TNNetBitProcessing.Create(CacheSize, NeuronCount,
+  SearchBudget, AddSkipConnection: integer;
+  AffineLo: TNeuralFloat = -25.6; AffineHi: TNeuralFloat = 25.6);
+begin
+  inherited Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection);
+  FAffineLo := AffineLo;
+  FAffineHi := AffineHi;
+  // Persist the affine endpoints alongside the integer FStruct[0..3] the parent
+  // already set, so they round-trip through SaveStructureToString / CreateLayer.
+  FFloatSt[0] := FAffineLo;
+  FFloatSt[1] := FAffineHi;
+end;
+
+procedure TNNetBitProcessing.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  // Affine-encode each input scalar to a whole byte, run the symbolic engine,
+  // then affine-decode each output byte back to a scalar.
+  EncodeToBytes(FPrevLayer.Output, FByteInput);
+  FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
+  DecodeToOutput(FByteOutput, FOutput);
+  // Symmetric range -> decoded mid-range byte ~= 0, so the skip is a residual
+  // nudge on top of the input (mirrors the parent's skip intent).
+  if FAddSkipConnection then FOutput.Add(FPrevLayer.Output);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBitProcessing.Backpropagate();
+var
+  StartTime: double;
+  J, vMax: integer;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+
+  // Straight-through estimator. decode o encode ~= identity so the local slope
+  // is ~1; pass dL/dOutput to the previous layer where the input is inside the
+  // representable affine range [FAffineLo, FAffineHi] and kill it where the
+  // quantizer clips (replacing the parent's Abs(x)<=1 sign-saturation test).
+  // The discrete byte engine in between is treated as the identity on the
+  // backward pass. Capture this before the lines below repurpose FOutputError.
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    if (FAddSkipConnection) then
+    begin
+      // Skip adds the input directly to the output, so the residual path is the
+      // identity (encoding-agnostic): carry dL/dOutput through wholesale.
+      FPrevLayer.FOutputError.Add(FOutputError);
+    end
+    else
+    begin
+      vMax := FPrevLayer.Output.Size - 1;
+      if vMax > FOutputError.Size - 1 then vMax := FOutputError.Size - 1;
+      for J := 0 to vMax do
+      begin
+        x := FPrevLayer.Output.FData[J];
+        if (x >= FAffineLo) and (x <= FAffineHi) then
+          FPrevLayer.FOutputError.FData[J] :=
+            FPrevLayer.FOutputError.FData[J] + FOutputError.FData[J];
+      end;
+    end;
+  end;
+
+  // Online training of the discrete engine: target = FOutput - dL/dOutput,
+  // affine-encoded back to bytes to recover the "found" next state to learn.
+  FOutputError.Mul(-1);
+  FOutputError.Add(FOutput);
+  EncodeToBytes(FOutputError, FByteOutputFound);
+  FByteLearning.newStateFound(FByteOutputFound);
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -65088,6 +65246,7 @@ begin
       'TNNetVectorQuantizer' :      Result := TNNetVectorQuantizer.Create(St[0], Ft[0]);
       'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]);
+      'TNNetBitProcessing' :        Result := TNNetBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetMixtureDensity' :       Result := TNNetMixtureDensity.Create(St[0], St[1]);
       'TNNetSoftDecisionTree' :     Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]);
@@ -65420,6 +65579,7 @@ begin
       if S[0] = 'TNNetVectorQuantizer' then Result := TNNetVectorQuantizer.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetBitProcessing' then Result := TNNetBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetMixtureDensity' then Result := TNNetMixtureDensity.Create(St[0], St[1]) else
       if S[0] = 'TNNetSoftDecisionTree' then Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]) else
