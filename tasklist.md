@@ -539,25 +539,32 @@ rather than acted on.
       the natural precursor to gradient-surgery / PCGrad — add an experiment that
       reweights or projects out the most-conflicting class pair's gradient and
       charts the batch-loss delta.
-- [ ] EffectiveReceptiveFieldReport follow-up: add the optional `(radius, mass-
+- [X] EffectiveReceptiveFieldReport follow-up: add the optional `(radius, mass-
       fraction)` CSV side-output so the cumulative-mass curve can be plotted
       outside the terminal (~10 lines, mirrors the CSV side-output in
       DecisionBoundaryReport / the AdversarialRobustnessReport CSV follow-up).
-- [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
+      LANDED 2026-06-07 on a2 (commit f25bfa7): optional `CsvFile` param writes
+      `radius,mass_fraction` rows; smoke test asserts monotonic non-decreasing mass.
+- [X] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
       the stem and chart effective-RF growth vs theoretical-RF growth — the
-      headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
-- [ ] NeuralTangentKernelReport follow-up: the fresh-init-vs-trained NTK-DRIFT
+      headline Luo et al. 2016 "effective RF grows sub-linearly" curve. LANDED
+      2026-06-07 on a2 (commit 82ebecb, examples/EffectiveReceptiveField/). NOTE:
+      2-D TNNetConvolution has NO dilation param (only TNNetCausalConv1D does), so
+      the sweep varies KERNEL SIZE and STACK DEPTH instead — stacked 3x3 stems give
+      eff/theo ≈0.76-0.78 (sub-linear) vs 1.0 for a single wide kernel.
+- [X] NeuralTangentKernelReport follow-up: the fresh-init-vs-trained NTK-DRIFT
       contrast deliberately left out of the first landing (commit 857f679). Add an
       optional second-net / snapshot argument (mirror `ModeConnectivityReport`'s
       `SnapshotB` or `RepresentationSimilarityReport`'s `OtherNet`) so the report
-      quantifies how far the empirical NTK moved between two checkpoints — e.g. the
-      relative Frobenius drift `||K_trained - K_init||_F / ||K_init||_F` and the
-      change in kernel-target alignment. Headline payoff: ≈0 drift = the
-      infinite-width "lazy / kernel" regime, large drift = "rich" feature learning
-      (the lazy-vs-rich question made visible). Then extend the existing
-      `examples/NeuralTangentKernelReport/` to contrast a WIDE vs NARROW hidden
-      layer and show the wide net's NTK drifts less. Reuse the snapshot machinery
-      already proven in ModeConnectivity/PermutationAlign.
+      quantifies how far the empirical NTK moved between two checkpoints — the
+      relative Frobenius drift `||K_self - K_B||_F / ||K_self||_F` and the off-
+      diagonal Pearson correlation. LANDED 2026-06-07 on a2 (commit 59d3bfd):
+      optional `SnapshotB` arg + drift section; test asserts ~0 drift vs an
+      identical copy and finite >0 drift after one training step. Open sub-follow-up:
+      - [ ] extend the existing `examples/NeuralTangentKernelReport/` to contrast a
+            WIDE vs NARROW hidden layer and show the wide net's NTK drifts less
+            (lazy vs rich regime made visible) — the report machinery is now in
+            place, only the example arm remains.
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
