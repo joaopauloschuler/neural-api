@@ -415,6 +415,11 @@ type
     procedure TestDeltaNetWeightGradientCheck;
     procedure TestDeltaNetSerializationRoundTrip;
     procedure TestDeltaNetRecallSmokeTrain;
+    procedure TestGLAShapeInference;
+    procedure TestGLAInputGradientCheck;
+    procedure TestGLAWeightGradientCheck;
+    procedure TestGLASerializationRoundTrip;
+    procedure TestGLARecallSmokeTrain;
     procedure TestWKVShapeInference;
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
@@ -25461,6 +25466,248 @@ begin
     NN.Compute(Input);
     LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
     AssertTrue('DeltaNet training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+// --- TNNetGatedLinearAttention (GLA) -----------------------------------------
+
+procedure SeedGLA(L: TNNetGatedLinearAttention; Depth: integer);
+var d, j: integer;
+begin
+  // Deterministic, BOUNDED projections (small magnitudes so the FD truncation of
+  // the gated rank-1 write / per-row alpha carry stays inside the gradient
+  // tolerance). Bounding the weights is preferred to loosening the tolerance.
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.18; // W_q
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.18; // W_k
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 + j * 0.3) * 0.18; // W_v
+      L.Neurons[3].Weights[d, 0, j] := Cos(d * 0.3 + j * 0.5) * 0.18; // W_a
+    end;
+    // Moderate b_a so alpha_t is well inside (0,1) (exercises the gate gradient
+    // away from the saturated init where alpha ~ 1).
+    L.Neurons[4].Weights.Raw[d] := Sin(d * 0.4) * 0.3 + 0.2;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGLAShapeInference;
+var
+  NN: TNNet;
+  L: TNNetGatedLinearAttention;
+begin
+  // Output sized like the input sequence, with the expected 5-neuron bank
+  // (W_q, W_k, W_v, W_a, b_a) and FStruct carrying d_k/d_v.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 4)); // SeqLen=5, Depth=4
+    L := TNNetGatedLinearAttention.Create();
+    NN.AddLayer(L);
+    AssertEquals('GLA output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('GLA output SizeY', 1, L.Output.SizeY);
+    AssertEquals('GLA output Depth preserved', 4, L.Output.Depth);
+    AssertEquals('GLA neuron count', 5, L.Neurons.Count);
+    AssertEquals('GLA W_q size', 16, L.Neurons[0].Weights.Size); // 4x4
+    AssertEquals('GLA W_k size', 16, L.Neurons[1].Weights.Size);
+    AssertEquals('GLA W_v size', 16, L.Neurons[2].Weights.Size);
+    AssertEquals('GLA W_a size', 16, L.Neurons[3].Weights.Size);
+    AssertEquals('GLA b_a size', 4, L.Neurons[4].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGLAInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetGatedLinearAttention;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var localK: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for localK := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[localK] - Desired.Raw[localK];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetGatedLinearAttention.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded inputs keep the L2-normalize divide + gated write well-conditioned.
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedGLA(L, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GLA input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('GLA input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGLAWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetGatedLinearAttention;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..4] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var localK: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for localK := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[localK] - Desired.Raw[localK];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'W_q'; Names[1] := 'W_k'; Names[2] := 'W_v';
+  Names[3] := 'W_a'; Names[4] := 'b_a';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetGatedLinearAttention.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedGLA(L, 3);
+
+    // Cover all five weight tensors. The data-dependent vector forget gate alpha
+    // (the per-row scaling of the dL/dS carry), the L2-normalized key and the
+    // outer-product write are the BPTT-error-prone spots.
+    for n := 0 to 4 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('GLA weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('GLA weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGLASerializationRoundTrip;
+begin
+  // GLA stores five learnable tensors (four DepthxDepth projections W_q/W_k/W_v/W_a
+  // and a Depth-long gate bias b_a); the perturbed-weights helper pushes them away
+  // from defaults so the round trip exercises a non-trivial set.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetGatedLinearAttention.Create(), 'GatedLinearAttention', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestGLARecallSmokeTrain;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end smoke: a tiny key->value recall task. The data-dependent vector
+  // forget gate lets GLA selectively retain/forget per key channel. Training must
+  // reduce the loss.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4));
+    NN.AddLayer(TNNetGatedLinearAttention.Create());
+    NN.SetLearningRate(0.05, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+
+    NN.Compute(Input);
+    AssertEquals('GLA smoke output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GLA smoke output Depth', 4, NN.GetLastLayer.Output.Depth);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('GLA training reduces loss (' +
       FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
       LossAfter < LossBefore);
   finally
