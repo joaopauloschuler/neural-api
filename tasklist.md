@@ -187,7 +187,21 @@ rather than acted on.
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
-- [ ] TNNetHamiltonianCell — a structure-preserving (symplectic) dynamics layer.
+- [X] TNNetHamiltonianCell — a structure-preserving (symplectic) dynamics layer.
+      LANDED 2026-06-07 on a2 (commit 4fd7309): leaf layer (scalar tanh-MLP
+      Hamiltonian H(q,p) integrated with sequential symplectic-Euler sub-steps
+      over the (T,1,2*D) phase axis; forward computes the field dH/dz via one inner
+      backward sweep; training backward is the Hessian-vector product via a SECOND
+      tape pass over the same MLP, no Hessian materialized), input+weight
+      numerical-gradient tests (bounded inner weights, RandSeed:=424242) + LoadFromString
+      round-trip, examples/HamiltonianPendulum/ (HNN conserves energy ~4x better than
+      an unconstrained residual-MLP NeuralODE field over an 800-step rollout at
+      matched one-step fit, ~30s). OPEN FOLLOW-UPS:
+      - [ ] builder TNNet.AddHamiltonianBlock (skipped at landing; leaf+tests+example
+            were the priority).
+      - [ ] separable H(q,p)=T(p)+V(q) (kinetic+potential split) variant that makes the
+            leapfrog step exact and cheaper.
+      ORIGINAL SPEC (kept for the follow-ups):
       Greenberg & co's "Hamiltonian Neural Networks" (Greydanus et al. 2019,
       arXiv:1906.01563): instead of regressing the time-derivative field directly
       (which is what the existing TNNet.AddNeuralODEBlock residual field and the
@@ -864,7 +878,21 @@ rather than acted on.
       agree with their textbook formula.
 
 ### Experiments I'm curious about (additional)
-- [ ] `examples/InformationPlane/` (optionally backed by a
+- [X] `examples/InformationPlane/` — LANDED 2026-06-07 on a2 (commit dd5e983).
+      Tiny 3-hidden-layer (width 4) tanh FC classifier on a synthetic 12-bit
+      binary task (label = sign of a 5-bit subset, 7 nuisance bits, 2048 samples).
+      Binning MI estimator B=30 in bits: deterministic net + unique inputs =>
+      I(X;T)=H(T), I(T;Y)=H(T)-H(T|Y) via per-class code histograms (sorted
+      TStringList code counter). Per-epoch table + ASCII information-plane scatter,
+      TWO arms. tanh arm REPRODUCES the compression bend (deepest layer I(X;T)
+      5.61->3.59 bits while I(T;Y) holds at 1.0, bend strengthens with depth);
+      ReLU arm I(X;T) stays flat (~5.2, ill-defined fixed-width bins) — the Saxe
+      et al. 2018 contrast. ~42s pure CPU. OPEN FOLLOW-UP: the optional
+      `TNNet.InformationPlaneReport` introspection method ([[introspection-report-pattern]])
+      was NOT added (the example computes MI inline) — promote the binning-MI
+      collector to a report method if a second consumer appears.
+      ORIGINAL SPEC (kept for the report follow-up):
+      (optionally backed by a
       `TNNet.InformationPlaneReport` introspection method, [[introspection-report-pattern]])
       — reproduce the **information-plane trajectory** of the Information
       Bottleneck story (Tishby & Zaslavsky 2015; Shwartz-Ziv & Tishby 2017,
@@ -1441,11 +1469,22 @@ rather than acted on.
       today's FGSM).
 
 ### Parameter importance (continual learning / pruning)
-- [ ] EWC two-task experiment building on the landed
+- [X] EWC two-task experiment building on the landed
       TNNet.FisherImportanceReport: train on task A, snapshot the diagonal
       Fisher, then train on task B with an L2 penalty pulling high-Fisher
       params back toward their task-A values; chart task-A retention with and
       without the penalty.
+      LANDED 2026-06-07 on a2 (commit 686c564): examples/EWCContinualLearning/.
+      Tiny MLP, Task A = 4 overlapping 2-D Gaussian clusters, Task B = same
+      labels with inputs rotated ~52deg. Diagonal empirical Fisher snapshotted the
+      FisherImportanceReport way (squared per-param grads on a frozen net,
+      SetBatchUpdate(true), read Neuron.Delta/BiasDelta / LR). Decoupled CLAMPED
+      EWC pull w <- w - clamp(LR*lambda*F,0,1)*(w-w_A). Result: PLAIN forgets A
+      (1.000->0.285), EWC retains A 0.535 for a 0.016 Task-B cost; ~3s.
+      Findings for future continual-learning examples: pair list has no Shuffle
+      (use L.Exchange, naive L[I]:=L[J] double-frees), FBiasDelta is private (read
+      via BiasDelta, write via BiasWeight), empirical Fisher of a confident model
+      is tiny (~1e-6) so lambda~1e8 and an unclamped step diverges.
 
 ### Loss-landscape degeneracy (Singular Learning Theory)
 - [ ] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
