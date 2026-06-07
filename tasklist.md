@@ -72,6 +72,45 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [X] Multi-Token Prediction (MTP) head builder — TNNet.AddMultiTokenPrediction
+      (DeepSeek-V3 / Gloeckle et al. 2024). LANDED 2026-06-07 on a2 (commit
+      be16117): builder-only (no new leaf class), taps a shared trunk and attaches
+      NumFuture weight-distinct per-token PointwiseConvLinear→PointwiseSoftMax
+      heads (head h forecasts t+1+h), DeepConcat'd into one (SeqLen,1,NumFuture*Vocab)
+      output; shape + input-gradient tests + examples/MultiTokenPrediction/ (auxiliary
+      future losses speed t+1-head convergence, +5pt at a fixed short budget, 7/8 seeds).
+      Open follow-up:
+      - [ ] Inference-time self-speculative decode: reuse the extra future heads as a
+            built-in draft (drop the SpeculativeDecoding example's second net); show
+            accept-rate / wall-clock on a tiny corpus.
+- [X] TNNetMinGRU + TNNetMinLSTM — minimal parallelizable recurrent cells
+      (Feng et al. 2024, "Were RNNs all we needed?", arXiv:2410.01201). LANDED
+      2026-06-07 on a2 (commit 69f8d53): gates depend on x_t ONLY (no h_{t-1}
+      feedback) so the recurrence is a parallelizable linear scan; minLSTM
+      normalizes f/(f+i) gates (coupling differentiated exactly). Exact BPTT,
+      input+weight numerical-gradient tests + serialization round-trips +
+      examples/MinimalRNN/ selective-copy demo (minGRU 100% / minLSTM 99% vs a
+      memoryless MLP at the 1/6 chance floor; recurrent arms need momentum=0).
+      Open follow-up:
+      - [ ] Parallel-prefix-scan forward (the paper's main systems win) so
+            training is not a strict per-token left-to-right loop; gate behind an
+            exact-vs-parallel equivalence assert (mirrors the open DeltaNet/WKV
+            chunked-forward tasks).
+- [X] TNNetLRU — Linear Recurrent Unit (Orvieto et al. 2023,
+      "Resurrecting Recurrent Neural Networks for Long Sequences",
+      arXiv:2303.06349). LANDED 2026-06-07 on a2 (commit 444e813): stable
+      complex-diagonal linear recurrence, |lambda|=exp(-exp(nu)) stable
+      eigenvalue param, angle=exp(theta), gamma=sqrt(1-|lambda|^2) input
+      normalization, complex state (Re/Im h tracked), y=Re(C*h)+D*x. Distinct
+      from the real LTI TNNetDiagonalSSM. Six per-channel real weight groups,
+      exact BPTT (input+weights numerically gradient-checked, max FD err <2e-3),
+      serialization round-trip, examples/LinearRecurrentUnit/ prefix-sum demo
+      (MSE 3e-5 vs 0.665 memoryless). Open follow-ups:
+      - [ ] Parallel/associative-scan forward (LTI recurrence → parallelizable)
+            gated behind an exact-vs-scan equivalence assert.
+      - [ ] Full LRU block: input/output dense mixing + GLU + residual wrapper
+            (TNNet.AddLRU builder) so it drops into a transformer-style stack like
+            AddRetention / AddGatedLinearAttentionBlock.
 - [ ] TNNetGatedLinearAttention follow-ups (Gated Linear Attention, Yang et al.
       2023, arXiv:2312.06635 — matrix-state (d x d) linear-attention recurrence
       with a data-dependent per-channel diagonal forget gate
