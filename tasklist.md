@@ -75,25 +75,8 @@ rather than acted on.
 - [ ] TNNetLIFNeuron follow-ups (the spiking leaky-integrate-and-fire surrogate-
       gradient leaf layer + examples/SpikingMNIST/ + numerical-gradient/forward/
       shape/save-load + FFloatSt round-trip tests all LANDED 2026-06-07 on a2):
-      - [X] a learnable per-channel threshold / leak (trainable V_th, beta) —
-            LANDED 2026-06-07 on a2: opt-in TNNetLIFNeuron.Create(...,LearnDynamics)
-            4th flag, two width-Depth weight neurons (V_th[d]=raw, beta[d]=sigmoid),
-            exact surrogate backward + grad-checked, FStruct[0] round-trip.
       - [ ] the adaptive-LIF (ALIF) variant with a second slow threshold-
             adaptation state.
-      - [X] a builder AddSpikingBlock wiring the linear+LIF+rate-readout pattern —
-            LANDED 2026-06-07 on a2 (PointwiseConvLinear->TNNetLIFNeuron->AvgChannel).
-- [X] TNNetComplexLinear (+ TNNetComplexConv) — the 2-D base rung of the
-      Cayley-Dickson hypercomplex ladder. LANDED 2026-06-07 on a2 (commit 3140d95):
-      both layers pack adjacent (Re,Im) channel pairs and apply the 2x2 complex
-      multiply block (Re'=a*Re-b*Im, Im'=a*Im+b*Re) via a CPX_SRC/CPX_SGN table in
-      the same idiom as OCT_SRC/OCT_SGN; ~1/2 the weights of an equal real dense
-      layer, optional complex bias, exact real-adjoint backward (input + weight),
-      registered in all 4 dispatch points. Tests: forward/grad-check/shape/save-load
-      for both (max-err 5.5e-5, RandSeed:=424242, bounded weights). Example
-      examples/ComplexLinear/ recovers a 50-deg phase rotation exactly while matched
-      real baselines plateau ~0.4; |w.x|=|w||x| holds to ~1e-7. See MEMORY note
-      [[complex-linear-conv-layer]].
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
