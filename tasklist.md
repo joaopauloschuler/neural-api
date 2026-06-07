@@ -83,9 +83,6 @@ rather than acted on.
 - [ ] TNNetLRU follow-ups (landed 2026-06-07, commit 444e813):
       - [ ] Parallel/associative-scan forward (LTI recurrence → parallelizable)
             gated behind an exact-vs-scan equivalence assert.
-      - [ ] Full LRU block: input/output dense mixing + GLU + residual wrapper
-            (TNNet.AddLRU builder) so it drops into a transformer-style stack like
-            AddRetention / AddGatedLinearAttentionBlock.
 - [ ] TNNetGatedLinearAttention follow-ups (Gated Linear Attention, Yang et al.
       2023, arXiv:2312.06635 — matrix-state (d x d) linear-attention recurrence
       with a data-dependent per-channel diagonal forget gate

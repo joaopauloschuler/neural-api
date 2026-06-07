@@ -430,6 +430,9 @@ type
     procedure TestAddGatedLinearAttentionInputGradient;
     procedure TestAddGatedLinearAttentionBlockShape;
     procedure TestAddGatedLinearAttentionBlockSmokeTrain;
+    procedure TestAddLRUBlockShape;
+    procedure TestAddLRUBlockSerializationRoundTrip;
+    procedure TestAddLRUBlockSmokeTrain;
     procedure TestWKVShapeInference;
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
@@ -28521,6 +28524,121 @@ begin
     NN.Compute(Input);
     LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
     AssertTrue('GLA block training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddLRUBlockShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i: integer;
+begin
+  // The AddLRU block builder must be shape-preserving over the (SeqLen,1,d_model)
+  // sequence (LRU time-mix residual + SwiGLU FFN residual all keep the sequence
+  // layout) so blocks can be stacked into a deep LRU tower.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6));
+    NN.AddLRU({d_ff=}12);
+    Out := NN.AddLRU({d_ff=}12, {PreNorm=}false);
+    AssertEquals('LRU block output SizeX', 5, Out.Output.SizeX);
+    AssertEquals('LRU block output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('LRU block output Depth', 6, Out.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('LRU block computed SizeX', 5, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('LRU block computed Depth', 6, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddLRUBlockSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing an AddLRU block (proving the composed block - input/GLU/output
+  // projections, the TNNetLRU cell, norms and SwiGLU FFN - all serialize).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4));
+    NN.AddLRU({d_ff=}8);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('LRU block round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      AssertEquals('LRU block round-trip output Depth',
+        NN.GetLastLayer.Output.Depth, NN2.GetLastLayer.Output.Depth);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('LRU block SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('LRU block round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddLRUBlockSmokeTrain;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end smoke: a tiny sequence regression task on a stacked AddLRU tower
+  // (LRU time-mix + SwiGLU FFN residuals). Forward+backward must run, loss must
+  // stay finite and training must reduce it.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 6);
+  Desired := TNNetVolume.Create(4, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 6));
+    NN.AddLRU({d_ff=}12);
+    NN.AddLRU({d_ff=}12);
+    NN.SetLearningRate(0.01, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+
+    NN.Compute(Input);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('LRU block initial loss finite', not IsNan(LossBefore) and not IsInfinite(LossBefore));
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('LRU block final loss finite', not IsNan(LossAfter) and not IsInfinite(LossAfter));
+    AssertTrue('LRU block training reduces loss (' +
       FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
       LossAfter < LossBefore);
   finally

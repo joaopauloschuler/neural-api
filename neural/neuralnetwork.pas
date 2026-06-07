@@ -10843,6 +10843,34 @@ type
       // defaults to TNNetLayerNorm). Returns the last layer. (Coded by Claude (AI).)
       function AddGatedLinearAttentionBlock(d_ff: integer;
         PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // Composite builder: the LRU time-mixing ARM over a (SeqLen,1,D) sequence
+      // (SizeY=1), the block analogue of AddGatedLinearAttention but wrapping the
+      // stable complex-diagonal Linear Recurrent Unit (TNNetLRU, Orvieto et al.
+      // 2023 "Resurrecting RNNs for Long Sequences"). Wires (1) a per-token
+      // PointwiseConvLinear D->D input projection into the LRU's per-channel
+      // input, (2) the TNNetLRU recurrence cell (shape-preserving D->D, exact
+      // BPTT), (3) a GLU non-linearity (PointwiseConvLinear(2*D) -> TNNetSwiGLU
+      // gives (W x) (*) SiLU(V x) back down to D channels), (4) a final
+      // PointwiseConvLinear D->D output projection. No TokenShift: the LRU is
+      // already a temporal mixer, so the arm only mixes channels around it.
+      // Shape-preserving (output == input shape). Returns the out layer. Pointwise
+      // (not FullConnect) convs keep the token axis. (Coded by Claude (AI).)
+      function AddLRUMixer(): TNNetLayer;
+      // Composite builder: a full transformer-style BLOCK over a (SeqLen,1,d_model)
+      // sequence (SizeY=1) that wraps the AddLRUMixer time-mixing builder in a
+      // pre/post-norm residual structure plus a token-wise SwiGLU feed-forward
+      // residual, mirroring AddGatedLinearAttentionBlock but with the time-mixing
+      // arm replaced by the LRU. Wires two residual sub-blocks:
+      //   1. x := x + LRU(LayerNorm(x))   (time-mixing residual)
+      //   2. x := x + FFN(LayerNorm(x))   token-wise SwiGLU FFN
+      //      (PointwiseConvLinear(2*d_ff) -> TNNetSwiGLU -> PointwiseConvLinear(d_model)).
+      // PreNorm=False places the norm AFTER each residual sum instead. d_model is
+      // inferred from the input depth (GetLastLayer().Output.Depth); the output shape
+      // matches the input so blocks can be stacked into a deep LRU tower. NormClass
+      // selects the norm class at every norm slot (nil defaults to TNNetLayerNorm).
+      // Returns the last layer. (Coded by Claude (AI).)
+      function AddLRU(d_ff: integer;
+        PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
       // spiking neural network, over a (T,1,D) spike/feature tensor on the time
       // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
@@ -43771,6 +43799,69 @@ begin
   // Gated linear attention mixer (shape-preserving D->D; owns its q/k/v/forget-gate
   // projections internally).
   AddGatedLinearAttention();
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( NormClass.Create() );
+
+  // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( NormClass.Create() );
+  // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
+  // the depth channel-wise, so the inner projection must be 2*d_ff.
+  AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
+  AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( NormClass.Create() );
+
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddLRUMixer(): TNNetLayer;
+var
+  x, XProj, Cell: TNNetLayer;
+  D: integer;
+begin
+  x := GetLastLayer();
+  if x.Output.SizeY <> 1 then
+    FErrorProc('AddLRUMixer requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(x.Output.SizeY));
+  D := x.Output.Depth;
+  // (1) Per-token (PointwiseConvLinear keeps the sequence axis) D->D projection of
+  // the stream into the LRU's per-channel input x_t. No TokenShift here: the LRU
+  // is itself a temporal mixer (a stable complex-diagonal recurrence over time),
+  // so the arm only mixes channels around it.
+  XProj := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), x );
+  // (2) The stable complex-diagonal Linear Recurrent Unit (shape-preserving D->D,
+  // exact BPTT over the time axis).
+  Cell := AddLayerAfter( TNNetLRU.Create(), XProj );
+  // (3) GLU non-linearity. TNNetSwiGLU halves the depth channel-wise, so projecting
+  // the cell output to 2*D then applying SwiGLU yields (W x) (*) SiLU(V x) back
+  // down to D channels (the LRU paper's gated non-linearity).
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(2 * D, 1), Cell );
+  AddLayer( TNNetSwiGLU.Create() );
+  // (4) Output projection back to D (shape-preserving end-to-end).
+  Result := AddLayer( TNNetPointwiseConvLinear.Create(D, 1) );
+end;
+
+function TNNet.AddLRU(d_ff: integer;
+  PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+  d_model: integer;
+begin
+  if NormClass = nil then NormClass := TNNetLayerNorm;
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddLRU requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(GetLastLayer().Output.SizeY));
+  // ---- Time-mixing sub-block: residual around the LRU mixer. ----
+  // Replicated inline (not via AddPreNormResidual/AddPostNormResidual) because
+  // AddLRUMixer adds MANY layers through GetLastLayer() chaining and cannot be
+  // expressed as a pre-built "array of TNNetLayer".
+  BranchInput := GetLastLayer();
+  d_model := BranchInput.Output.Depth;  // inferred residual-stream width
+  if PreNorm then AddLayer( NormClass.Create() );
+  // LRU mixer (shape-preserving D->D; owns its input/GLU/output projections).
+  AddLRUMixer();
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( NormClass.Create() );
 
