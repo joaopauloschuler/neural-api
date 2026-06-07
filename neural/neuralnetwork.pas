@@ -4668,6 +4668,67 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetHamiltonianCell: a STRUCTURE-PRESERVING (symplectic) learned-dynamics
+  // recurrent layer (Hamiltonian Neural Networks, Greydanus, Dzamba & Yosinski
+  // 2019, "Hamiltonian Neural Networks", arXiv:1906.01563). Where the existing
+  // continuous-dynamics layers regress the time-derivative field DIRECTLY and so
+  // conserve nothing (TNNet.AddNeuralODEBlock = unconstrained residual field;
+  // TNNetClosedFormContinuous = liquid closed-form gate; TNNetDiagonalSSM /
+  // TNNetSelectiveSSM = linear state space; TNNetKalmanFilterCell = uncertainty
+  // propagation), this layer instead parameterizes a SCALAR learned Hamiltonian
+  // H(q,p) with a small inner MLP and produces the SYMPLECTIC gradient field
+  //   dq/dt = +dH/dp,   dp/dt = -dH/dq
+  // then integrates one or more steps along the time axis. Because the field is
+  // the gradient of a scalar energy, a free trajectory stays on its energy level
+  // set instead of spiralling in / blowing up the way a plain MLP-field NeuralODE
+  // does.
+  //
+  // Over a (T,1,2*D) input (SizeY must be 1, like the SSM/attention cells) the
+  // Depth axis is the (q | p) phase-space pair: the first D channels are q, the
+  // last D are p. Each time-step's phase vector z=(q,p) is mapped forward by
+  // integrating `Steps` symplectic-Euler steps of size dt:
+  //   q <- q + dt*(dH/dp)(q,p);   p <- p - dt*(dH/dq)(q,p)
+  // (field evaluated once per step). Output shape == input shape.
+  //
+  // The scalar Hamiltonian is a 2*D -> Hidden -> 1 MLP with a SMOOTH (tanh)
+  // hidden activation so the field (a first derivative of H) is itself
+  // differentiable:
+  //   a = W1*z + b1;  hHid = tanh(a);  H = W2.hHid + b2
+  //   dH/dz = W1^T * (W2 (*) (1 - hHid^2))           (the symplectic field)
+  // Storage in Neurons[]:
+  //   [0]=W1 (Hidden,1,2*D)  [1]=b1 (Hidden,1,1)
+  //   [2]=W2 (1,1,Hidden)    [3]=b2 (1,1,1)
+  // FStruct[0]=2*D, FStruct[1]=Hidden, FStruct[2]=Steps; FFloatSt[0]=dt.
+  //
+  // KEY GRADIENT SUBTLETY: the FORWARD pass already needs dH/dz (one backward
+  // sweep through the inner MLP), so the training BACKWARD pass differentiates
+  // THROUGH that gradient -- a Hessian-vector product of H. It is implemented as
+  // a SECOND tape pass over the same inner MLP (propagating the adjoint of the
+  // field back into the MLP weights and the input z) rather than materializing
+  // the Hessian, then a third ordinary first-order pass for the H-value path is
+  // unnecessary because H itself is never read (only its gradient is used).
+  // Gradient-checked against central differences with the inner weights bounded.
+  // Coded by Claude (AI).
+  TNNetHamiltonianCell = class(TNNetLayer)
+    private
+      FPhaseDim: integer;   // 2*D, the (q|p) Depth axis
+      FHidden: integer;     // inner-MLP hidden width
+      FSteps: integer;      // integration steps per time-step
+      Fdt: TNeuralFloat;    // integration step size
+      // Per (time-step, integ-step) caches needed for the backward HVP, sized
+      // (T*Steps, 1, .). Index it = t*Steps + s.
+      FZin: TNNetVolume;    // phase vector z fed to the field at each (t,s)
+      FAct: TNNetVolume;    // pre-activation a = W1*z+b1 cache, (T*Steps,1,Hidden)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pSteps: integer = 1; pDt: TNeuralFloat = 0.1;
+        pHidden: integer = 0); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetSelectiveSSM: an INPUT-DEPENDENT ("selective", Mamba/S6-style,
   // Gu & Dao 2023, "Mamba: Linear-Time Sequence Modeling with Selective State
   // Spaces", arXiv:2312.00752) diagonal state-space sequence mixer. Unlike the
@@ -30259,6 +30320,314 @@ begin
   FNeurons[0].FWeights.Fill(0);
   FNeurons[1].FWeights.Fill(cSoftplusInv1);
   FNeurons[2].FWeights.Fill(cSoftplusInv1);
+  AfterWeightUpdate();
+end;
+
+{ TNNetHamiltonianCell }
+constructor TNNetHamiltonianCell.Create(pSteps: integer = 1; pDt: TNeuralFloat = 0.1;
+  pHidden: integer = 0);
+begin
+  inherited Create();
+  FPhaseDim := 0;        // 2*D, resolved in SetPrevLayer
+  FHidden := Max(pHidden, 0);  // 0 => auto (max(4*D,16)) in SetPrevLayer
+  FSteps := Max(pSteps, 1);
+  Fdt := pDt;
+  FStruct[0] := 0;
+  FStruct[1] := FHidden;
+  FStruct[2] := FSteps;
+  FFloatSt[0] := Fdt;
+  FZin := TNNetVolume.Create();
+  FAct := TNNetVolume.Create();
+  // [0]=W1 [1]=b1 [2]=W2 [3]=b2
+  AddMissingNeurons(4);
+end;
+
+destructor TNNetHamiltonianCell.Destroy();
+begin
+  FAct.Free;
+  FZin.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetHamiltonianCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetHamiltonianCell requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FPhaseDim := pPrevLayer.FOutput.Depth;
+  if Odd(FPhaseDim) then
+    FErrorProc('TNNetHamiltonianCell requires an EVEN Depth (2*D phase pair), got ' +
+      IntToStr(FPhaseDim));
+  // Hidden width: re-use the persisted/requested value, otherwise pick 4*D
+  // (>=16) so the learned scalar Hamiltonian has enough capacity.
+  if FStruct[1] > 0 then FHidden := FStruct[1]
+  else FHidden := Max(2 * FPhaseDim, 16);
+  FSteps := Max(FStruct[2], 1);
+  Fdt := FFloatSt[0];
+  FStruct[0] := FPhaseDim;
+  FStruct[1] := FHidden;
+  FStruct[2] := FSteps;
+  FFloatSt[0] := Fdt;
+  // Output is the integrated phase sequence, same shape as the input.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FPhaseDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  FNeurons[0].FWeights.ReSize(FHidden, 1, FPhaseDim);   // W1
+  FNeurons[1].FWeights.ReSize(FHidden, 1, 1);           // b1
+  FNeurons[2].FWeights.ReSize(1, 1, FHidden);           // W2
+  FNeurons[3].FWeights.ReSize(1, 1, 1);                 // b2
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FNeurons[1].FDelta.ReSize(FNeurons[1].FWeights);
+  FNeurons[1].FBackInertia.ReSize(FNeurons[1].FWeights);
+  FNeurons[2].FDelta.ReSize(FNeurons[2].FWeights);
+  FNeurons[2].FBackInertia.ReSize(FNeurons[2].FWeights);
+  FNeurons[3].FDelta.ReSize(FNeurons[3].FWeights);
+  FNeurons[3].FBackInertia.ReSize(FNeurons[3].FWeights);
+  // Two field evaluations per integration step (sequential symplectic Euler):
+  // sub 0 = at (q,p) for dH/dq, sub 1 = at (q,p_mid) for dH/dp.
+  FZin.ReSize(FOutput.SizeX * FSteps * 2, 1, FPhaseDim);
+  FAct.ReSize(FOutput.SizeX * FSteps * 2, 1, FHidden);
+  InitDefault();
+end;
+
+procedure TNNetHamiltonianCell.Compute();
+var
+  StartTime: double;
+  W1, b1, W2: TNNetVolume;
+  Prev: TNNetVolume;
+  SeqLen, P, Hd, Dhalf, t, s, kk, it2: integer;
+  zv: array of TNeuralFloat;
+  gv: array of TNeuralFloat;
+
+  // Evaluate the symplectic field g = dH/dz at the current zv, caching the input
+  // and pre-activations at sub-index it2 for the backward HVP. Result into gv.
+  procedure FieldAt(it2idx: integer);
+  var jj, k2, zb, bp: integer; a2, h2, t2, s2: TNeuralFloat;
+  begin
+    zb := FZin.GetRawPos(it2idx, 0, 0);
+    bp := FAct.GetRawPos(it2idx, 0, 0);
+    for k2 := 0 to P - 1 do FZin.FData[zb + k2] := zv[k2];
+    for k2 := 0 to P - 1 do gv[k2] := 0;
+    for jj := 0 to Hd - 1 do
+    begin
+      a2 := b1.FData[jj];
+      for k2 := 0 to P - 1 do
+        a2 := a2 + W1.FData[W1.GetRawPos(jj, 0, k2)] * zv[k2];
+      FAct.FData[bp + jj] := a2;
+      h2 := TanH(a2);
+      t2 := 1 - h2 * h2;
+      s2 := W2.FData[jj] * t2;
+      for k2 := 0 to P - 1 do
+        gv[k2] := gv[k2] + W1.FData[W1.GetRawPos(jj, 0, k2)] * s2;
+    end;
+  end;
+
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  W1 := FNeurons[0].FWeights;
+  b1 := FNeurons[1].FWeights;
+  W2 := FNeurons[2].FWeights;
+  SeqLen := FOutput.SizeX;
+  P := FPhaseDim;
+  Hd := FHidden;
+  Dhalf := P div 2;
+  SetLength(zv, P);
+  SetLength(gv, P);
+  for t := 0 to SeqLen - 1 do
+  begin
+    // Load this time-step's phase vector z=(q|p).
+    for kk := 0 to P - 1 do
+      zv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
+    for s := 0 to FSteps - 1 do
+    begin
+      it2 := (t * FSteps + s) * 2;
+      // Sequential symplectic Euler (exact-symplectic for separable H):
+      //   p_mid = p - dt*dH/dq(q, p)     (sub 0, field at (q,p))
+      //   q_new = q + dt*dH/dp(q, p_mid) (sub 1, field at (q,p_mid))
+      // Sub 0: field at the current (q,p); use its q-part for the p update.
+      FieldAt(it2);
+      for kk := 0 to Dhalf - 1 do
+        zv[kk + Dhalf] := zv[kk + Dhalf] - Fdt * gv[kk];   // p_mid
+      // Sub 1: field at (q, p_mid); use its p-part for the q update.
+      FieldAt(it2 + 1);
+      for kk := 0 to Dhalf - 1 do
+        zv[kk] := zv[kk] + Fdt * gv[kk + Dhalf];           // q_new
+    end;
+    // Emit the integrated phase vector.
+    for kk := 0 to P - 1 do
+      FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := zv[kk];
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetHamiltonianCell.Backpropagate();
+var
+  StartTime: double;
+  N1, Nb1, N2: TNNetNeuron;
+  W1, b1, W2: TNNetVolume;
+  GW1, Gb1, GW2: TNNetVolume;
+  Prev, PrevErr: TNNetVolume;
+  SeqLen, P, Hd, Dhalf, t, s, kk, it2: integer;
+  negLR: TNeuralFloat;
+  hasInputGrad: boolean;
+  gzp: array of TNeuralFloat;   // adjoint dL/dz' on this step's output
+  uu: array of TNeuralFloat;    // adjoint on the field g for one sub-eval
+  dz: array of TNeuralFloat;    // dL/d(field input) returned by one HVP
+  gz: array of TNeuralFloat;    // accumulated dL/dz0 for this step's input
+  gpmid: array of TNeuralFloat; // adjoint on the p_mid intermediate
+
+  // Hessian-vector product through ONE inner-MLP field eval cached at it2idx:
+  // contract the field g (= dH/dz = W1^T*(W2 (*) (1-tanh^2(W1*z+b1)))) against
+  // adjoint u, accumulating the (W1,b1,W2) grads and returning dL/d(field input)
+  // in dz. Implemented as a second tape pass over the same MLP (no Hessian).
+  procedure HVP(it2idx: integer);
+  var jj, k2, bp, zb: integer; a2, h2, t2, cj, dLda, dLdc, w1jk: TNeuralFloat;
+  begin
+    bp := FAct.GetRawPos(it2idx, 0, 0);
+    zb := FZin.GetRawPos(it2idx, 0, 0);
+    for k2 := 0 to P - 1 do dz[k2] := 0;
+    for jj := 0 to Hd - 1 do
+    begin
+      a2 := FAct.FData[bp + jj];
+      h2 := TanH(a2);
+      t2 := 1 - h2 * h2;
+      cj := 0;
+      for k2 := 0 to P - 1 do
+        cj := cj + W1.FData[W1.GetRawPos(jj, 0, k2)] * uu[k2];
+      // dL/dW2_j = t_j*c_j ; dL/da_j = W2_j*c_j*(-2 h_j t_j) ; dL/dc_j = W2_j*t_j
+      dLda := W2.FData[jj] * cj * (-2 * h2 * t2);
+      dLdc := W2.FData[jj] * t2;
+      GW2.FData[jj] := GW2.FData[jj] + negLR * (t2 * cj);
+      Gb1.FData[jj] := Gb1.FData[jj] + negLR * dLda;
+      for k2 := 0 to P - 1 do
+      begin
+        w1jk := W1.FData[W1.GetRawPos(jj, 0, k2)];
+        // dL/dW1[j,k] = dL/da_j*z_k + dL/dc_j*u_k ; dL/dz_k += dL/da_j*W1[j,k]
+        GW1.FData[W1.GetRawPos(jj, 0, k2)] :=
+          GW1.FData[W1.GetRawPos(jj, 0, k2)]
+          + negLR * (dLda * FZin.FData[zb + k2] + dLdc * uu[k2]);
+        dz[k2] := dz[k2] + dLda * w1jk;
+      end;
+    end;
+  end;
+
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  N1 := FNeurons[0];
+  Nb1 := FNeurons[1];
+  N2 := FNeurons[2];
+  W1 := N1.FWeights;
+  b1 := Nb1.FWeights;
+  W2 := N2.FWeights;
+  GW1 := N1.FDelta;
+  Gb1 := Nb1.FDelta;
+  GW2 := N2.FDelta;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  P := FPhaseDim;
+  Hd := FHidden;
+  Dhalf := P div 2;
+  negLR := -FLearningRate;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  SetLength(gzp, P);
+  SetLength(uu, P);
+  SetLength(dz, P);
+  SetLength(gz, P);
+  SetLength(gpmid, Dhalf);
+  for t := 0 to SeqLen - 1 do
+  begin
+    // Seed the per-time-step adjoint with the output error on z'_last.
+    for kk := 0 to P - 1 do
+      gzp[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
+    // Walk the integration steps right-to-left.
+    for s := FSteps - 1 downto 0 do
+    begin
+      it2 := (t * FSteps + s) * 2;
+      // Forward of this step (sequential symplectic Euler), z0=(q,p):
+      //   sub0: g_a=field(q,p);     p_mid = p - dt*g_a[q-part]
+      //   sub1: g_b=field(q,p_mid); q_new = q + dt*g_b[p-part]
+      //   output z' = (q_new, p_mid)
+      // Adjoints in (gq_new, gp_mid_out) = gzp; build dL/dz0 in gz.
+      for kk := 0 to P - 1 do gz[kk] := 0;
+      // ----- reverse sub1 (q_new = q + dt*g_b[p-part]) -----
+      // direct: dL/dq += gq_new ; adjoint on g_b only on its p-part.
+      for kk := 0 to P - 1 do uu[kk] := 0;
+      for kk := 0 to Dhalf - 1 do
+      begin
+        gz[kk] := gz[kk] + gzp[kk];              // q_new -> q direct
+        uu[kk + Dhalf] := Fdt * gzp[kk];         // u_b on g_b p-part
+      end;
+      HVP(it2 + 1);                               // field at (q, p_mid)
+      // dz = dL/dz_b where z_b=(q, p_mid): q-part -> dL/dq, p-part -> dL/dp_mid.
+      for kk := 0 to Dhalf - 1 do
+      begin
+        gz[kk] := gz[kk] + dz[kk];                // q contribution from z_b
+        gpmid[kk] := gzp[kk + Dhalf] + dz[kk + Dhalf]; // total adjoint on p_mid
+      end;
+      // ----- reverse sub0 (p_mid = p - dt*g_a[q-part]) -----
+      // direct: dL/dp += gpmid ; adjoint on g_a only on its q-part.
+      for kk := 0 to P - 1 do uu[kk] := 0;
+      for kk := 0 to Dhalf - 1 do
+      begin
+        gz[kk + Dhalf] := gz[kk + Dhalf] + gpmid[kk]; // p_mid -> p direct
+        uu[kk] := -Fdt * gpmid[kk];                   // u_a on g_a q-part
+      end;
+      HVP(it2);                                   // field at (q, p)
+      for kk := 0 to P - 1 do gz[kk] := gz[kk] + dz[kk]; // z0 contribution
+      // Carry dL/dz0 to the previous integration step.
+      for kk := 0 to P - 1 do gzp[kk] := gz[kk];
+    end;
+    // After s=0, gzp holds dL/d(input phase vector for this time-step).
+    if hasInputGrad then
+      for kk := 0 to P - 1 do
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + gzp[kk];
+  end;
+  if (not FBatchUpdate) then
+  begin
+    N1.UpdateWeights(FInertia);
+    Nb1.UpdateWeights(FInertia);
+    N2.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetHamiltonianCell.InitDefault();
+var
+  oldSeed, j, kk: integer;
+  scale: TNeuralFloat;
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  if (FHidden <= 0) or (FPhaseDim <= 0) then exit;  // pre-SetPrevLayer
+  // Small Gaussian inner weights so H starts as a gentle, smooth scalar field
+  // (the symplectic update begins near-identity for small dt). Deterministic
+  // seed keeps the layer reproducible regardless of the shared RNG state.
+  oldSeed := RandSeed;
+  RandSeed := 271828;
+  scale := 1.0 / Sqrt(FPhaseDim);
+  for j := 0 to FHidden - 1 do
+  begin
+    for kk := 0 to FPhaseDim - 1 do
+      FNeurons[0].FWeights.FData[FNeurons[0].FWeights.GetRawPos(j, 0, kk)] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * scale;
+    FNeurons[2].FWeights.FData[j] :=
+      FNeurons[2].FWeights.RandomGaussianValue() * scale;
+  end;
+  FNeurons[1].FWeights.Fill(0);   // b1
+  FNeurons[3].FWeights.Fill(0);   // b2 (never used in the field)
+  RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
 
@@ -69521,6 +69890,7 @@ begin
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
       'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
+      'TNNetHamiltonianCell':       Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1]);
       'TNNetSelectiveSSM':          Result := TNNetSelectiveSSM.Create();
       'TNNetImplicitLongConv':      Result := TNNetImplicitLongConv.Create(Max(St[0], 1));
       'TNNetSpatialGatingUnit':     Result := TNNetSpatialGatingUnit.Create(St[0]);
@@ -69867,6 +70237,7 @@ begin
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
+      if S[0] = 'TNNetHamiltonianCell' then Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1]) else
       if S[0] = 'TNNetSelectiveSSM' then Result := TNNetSelectiveSSM.Create() else
       if S[0] = 'TNNetImplicitLongConv' then Result := TNNetImplicitLongConv.Create(Max(St[0], 1)) else
       if S[0] = 'TNNetSpatialGatingUnit' then Result := TNNetSpatialGatingUnit.Create(St[0]) else

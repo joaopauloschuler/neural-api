@@ -398,6 +398,9 @@ type
     procedure TestKalmanFilterCellWeightGradientCheck;
     procedure TestKalmanFilterCellSerializationRoundTrip;
     procedure TestKalmanFilterCellNoisySineSmokeTrain;
+    procedure TestHamiltonianCellInputGradientCheck;
+    procedure TestHamiltonianCellWeightGradientCheck;
+    procedure TestHamiltonianCellSerializationRoundTrip;
     procedure TestAddClosedFormContinuousBuilder;
     procedure TestAddBidirectionalClosedFormContinuousBuilder;
     procedure TestBidirectionalClosedFormContinuousGradientCheck;
@@ -23018,6 +23021,183 @@ begin
     Noisy.Free;
     Filtered.Free;
   end;
+end;
+
+// --- TNNetHamiltonianCell (symplectic learned-dynamics cell) ----------------
+
+// Fill the inner-MLP weight sets of a HamiltonianCell with deterministic,
+// BOUNDED values so the field (a first derivative of H) and its HVP backward
+// are exercised away from any tanh-saturating tail (FD-truncation control).
+procedure SeedHamiltonianCell(LH: TNNetHamiltonianCell);
+var j, kk: integer;
+begin
+  for j := 0 to LH.Neurons[0].Weights.SizeX - 1 do  // W1 (Hidden,1,Phase)
+  begin
+    for kk := 0 to LH.Neurons[0].Weights.Depth - 1 do
+      LH.Neurons[0].Weights[j, 0, kk] := Sin(j * 1.1 + kk * 0.7) * 0.3;
+    LH.Neurons[1].Weights.Raw[j] := Cos(j * 0.5) * 0.2;     // b1
+    LH.Neurons[2].Weights.Raw[j] := Sin(j * 0.8 + 0.3) * 0.3; // W2
+  end;
+  LH.Neurons[3].Weights.Raw[0] := 0.0;                       // b2 (unused)
+end;
+
+procedure TTestNeuralNumerical.TestHamiltonianCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LH: TNNetHamiltonianCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  // SeqLen=3, phase Depth=4 (D=2 coords), 2 integration steps.
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    LH := TNNetHamiltonianCell.Create(2, 0.1);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    SeedHamiltonianCell(LH);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 0.8 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('HamiltonianCell input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('HamiltonianCell input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHamiltonianCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetHamiltonianCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..3] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'W1'; Names[1] := 'b1'; Names[2] := 'W2'; Names[3] := 'b2';
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    LH := TNNetHamiltonianCell.Create(2, 0.1);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    // BOUNDED inner weights so the second derivative (HVP) is checked away from
+    // the tanh tails (finite-difference truncation control); see SeedHamiltonianCell.
+    SeedHamiltonianCell(LH);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+
+    // Cover W1, b1, W2 (b2 has size 1 and zero gradient, included for safety).
+    for n := 0 to 3 do
+      for i := 0 to LH.Neurons[n].Weights.Size - 1 do
+      begin
+        LH.Neurons[n].Weights.Raw[i] := LH.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LH.Neurons[n].Weights.Raw[i] := LH.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LH.Neurons[n].Weights.Raw[i] := LH.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LH.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // LearningRate=1, batch update on => analytical = -Delta.
+        analyticalGrad := -LH.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('HamiltonianCell weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('HamiltonianCell weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHamiltonianCellSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // TNNetHamiltonianCell stores the inner MLP (W1,b1,W2,b2); FStruct holds
+  // PhaseDim/Hidden/Steps and FFloatSt[0]=dt. Phase Depth=4, 2 steps via Create.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetHamiltonianCell.Create(2, 0.1), 'HamiltonianCell', 5, 1, 4, 1e-5);
 end;
 
 // --- TNNetSelectiveSSM (input-dependent Mamba/S6-style) ---------------------
