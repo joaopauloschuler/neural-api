@@ -1404,7 +1404,7 @@ rather than acted on.
 
 
 ### Normalizing flows (exact-likelihood generative density)
-- [ ] `TNNetAffineCoupling` — an invertible RealNVP/Glow-style affine coupling
+- [X] `TNNetAffineCoupling` — an invertible RealNVP/Glow-style affine coupling
       layer, the library's FIRST exact-likelihood normalizing-flow primitive
       (distinct from the existing memory-saving `AddReversibleBlock`, which is a
       RevNet recompute trick with no tractable Jacobian, and distinct from the

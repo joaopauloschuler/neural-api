@@ -432,6 +432,11 @@ type
     procedure TestCrossWKVInputGradientCheck;
     procedure TestCrossWKVWeightGradientCheck;
     procedure TestCrossWKVSerializationRoundTrip;
+    procedure TestAffineCouplingInputGradientCheck;
+    procedure TestAffineCouplingWeightGradientCheck;
+    procedure TestAffineCouplingInverseIdentity;
+    procedure TestAffineCouplingLogDetGradientCheck;
+    procedure TestAffineCouplingSerializationRoundTrip;
     procedure TestTTTShapeInference;
     procedure TestTTTLinearInputGradientCheck;
     procedure TestTTTLinearWeightGradientCheck;
@@ -23894,6 +23899,267 @@ begin
     RcpData.Free;
     KVData.Free;
   end;
+end;
+
+// --- TNNetAffineCoupling (normalizing-flow primitive) -----------------------
+
+// Bounded, deterministic conditioner so the exp(s) factor stays well inside the
+// finite-difference truncation tolerance (preferred over loosening the bound).
+procedure SeedAffineCoupling(L: TNNetAffineCoupling);
+var n, i: integer;
+begin
+  for n := 0 to L.Neurons.Count - 1 do
+  begin
+    for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      L.Neurons[n].Weights.Raw[i] := Sin(n * 0.7 + i * 1.3) * 0.2;
+    L.Neurons[n].BiasWeight := Cos(n * 0.5) * 0.15;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineCouplingInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetAffineCoupling;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  InputPlus := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetAffineCoupling.Create(true);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 0; // pure transform check
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedAffineCoupling(L);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AffineCoupling input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('AffineCoupling input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineCouplingWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetAffineCoupling;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetAffineCoupling.Create(true);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 0; // pure transform check
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedAffineCoupling(L);
+
+    for n := 0 to L.Neurons.Count - 1 do
+    begin
+      // Conditioner weights.
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('AffineCoupling W gradient n=' + IntToStr(n) + '[' + IntToStr(i) +
+          '] num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    end;
+    WriteLn('AffineCoupling weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineCouplingLogDetGradientCheck;
+// Verifies the -sum(s) (negative log-det) term folded into backward: the full
+// normalizing-flow loss is 0.5*||y||^2 - LogDetJacobian.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  L: TNNetAffineCoupling;
+  Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; y: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      y := NN.GetLastLayer.Output.Raw[k];
+      Result := Result + 0.5 * y * y;
+    end;
+    Result := Result - L.LogDetJacobian;
+  end;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 4);
+  Desired := TNNetVolume.Create(2, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    L := TNNetAffineCoupling.Create(true);
+    NN.AddLayer(L);
+    L.LogDetLossWeight := 1.0; // ML objective: -sum(s) folded into backward
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6 + 0.2;
+    SeedAffineCoupling(L);
+
+    for n := 0 to L.Neurons.Count - 1 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        // Desired = output so that OutputError = output - Desired = 0; the data
+        // loss gradient (= y for 0.5||y||^2) we inject manually below instead.
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Layers[0].OutputError.Fill(0);
+        L.OutputError.Copy(NN.GetLastLayer.Output); // dL/dy = y
+        L.IncDepartingBranchesCnt();
+        L.Backpropagate();
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('AffineCoupling logdet gradient n=' + IntToStr(n) + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('AffineCoupling logdet gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineCouplingInverseIdentity;
+// forward then inverse (with identical conditioner weights) reconstructs the
+// input to tolerance, proving the map is an exact bijection.
+var
+  NNf, NNi: TNNet;
+  Lf, Li: TNNetAffineCoupling;
+  X, Y: TNNetVolume;
+  i: integer;
+  maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NNf := TNNet.Create();
+  NNi := TNNet.Create();
+  X := TNNetVolume.Create(3, 1, 5);  // odd depth -> exercises the uneven split
+  Y := TNNetVolume.Create(3, 1, 5);
+  maxErr := 0;
+  try
+    NNf.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    Lf := TNNetAffineCoupling.Create(true, false); NNf.AddLayer(Lf);
+    NNi.AddLayer(TNNetInput.Create(3, 1, 5, 1));
+    Li := TNNetAffineCoupling.Create(true, true); NNi.AddLayer(Li);
+    SeedAffineCoupling(Lf);
+    // Copy the SAME conditioner weights into the inverse layer.
+    for i := 0 to Lf.Neurons.Count - 1 do
+    begin
+      Li.Neurons[i].Weights.Copy(Lf.Neurons[i].Weights);
+      Li.Neurons[i].BiasWeight := Lf.Neurons[i].BiasWeight;
+    end;
+    for i := 0 to X.Size - 1 do X.Raw[i] := Sin(i * 0.83) * 1.5 - 0.3;
+    NNf.Compute(X);
+    Y.Copy(NNf.GetLastLayer.Output);
+    NNi.Compute(Y);
+    for i := 0 to X.Size - 1 do
+      if Abs(NNi.GetLastLayer.Output.Raw[i] - X.Raw[i]) > maxErr then
+        maxErr := Abs(NNi.GetLastLayer.Output.Raw[i] - X.Raw[i]);
+    WriteLn('AffineCoupling forward-inverse max reconstruction error: ', maxErr:0:8);
+    AssertTrue('AffineCoupling forward-inverse identity (err=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-4);
+  finally
+    NNf.Free; NNi.Free; X.Free; Y.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAffineCouplingSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // FStruct[0]=transform-second flag, FStruct[1]=inverse flag, FFloatSt[0]=clamp;
+  // conditioner weights round-trip via the standard per-neuron save.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetAffineCoupling.Create(true, false, 2.0), 'AffineCoupling', 4, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestKalmanFilterCellSerializationRoundTrip;

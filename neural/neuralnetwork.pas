@@ -5211,6 +5211,65 @@ type
       property KeyValueSource: TNNetLayer read FKVLayer;
   end;
 
+  /// TNNetAffineCoupling: an invertible RealNVP/Glow-style AFFINE COUPLING layer
+  // (Dinh et al. 2016 "Density estimation using Real NVP", arXiv:1605.08803;
+  // Kingma & Dhariwal 2018 "Glow", arXiv:1807.03039). This is the library's
+  // FIRST exact-likelihood NORMALIZING-FLOW primitive: a bijection whose
+  // Jacobian log-determinant is available in closed form, so a stack of these
+  // (interleaved with fixed channel permutations) trains by exact maximum
+  // likelihood under a unit-Gaussian base. Distinct from the memory-saving
+  // AddReversibleBlock (a RevNet recompute trick with NO tractable Jacobian) and
+  // from TNNetMixtureDensity (a density head that is not invertible).
+  //
+  // Operates over a (SizeX,SizeY,Depth) tensor; the Depth axis is split into two
+  // contiguous halves a (first HalfA channels) and b (remaining HalfB channels).
+  // One half is passed through UNCHANGED and conditions an affine transform of
+  // the other:
+  //   forward (pInverse=false):  y_a = x_a; y_b = x_b * exp(s) + t
+  //   inverse (pInverse=true) :  x_a = y_a; x_b = (y_b - t) * exp(-s)
+  // where [s_pre; t] = W * x_a + b (a single per-position linear conditioner over
+  // the unchanged half), and s = FClamp * tanh(s_pre / FClamp) is the Glow log-
+  // scale clamp for numerical stability. Which half is transformed is chosen by
+  // the constructor flag pTransformSecond so that stacked couplings update every
+  // channel; the conditioner is applied independently at every (X,Y) position.
+  //
+  // log|det J| = sum over all transformed positions of s, exposed as the public
+  // read-only LogDetJacobian (sum for the current forward) so a flow's NLL is
+  // loss = 0.5*||z||^2 - sum_couplings(LogDetJacobian). FStruct[0]=transform-
+  // second flag (0/1), FStruct[1]=inverse flag (0/1); FFloatSt[0]=s clamp. The
+  // conditioner is one neuron per conditioner output row: 2*HalfB neurons, each
+  // FWeights (HalfA,1,1) + scalar bias; rows [0..HalfB-1] = s_pre, rows
+  // [HalfB..2*HalfB-1] = t. Allocated in SetPrevLayer and round-tripped via the
+  // standard per-neuron save plus FStruct/FFloatSt. Coded by Claude (AI).
+  TNNetAffineCoupling = class(TNNetLayer)
+    private
+      FTransformSecond: boolean; // true: b is the transformed half (a is identity)
+      FInverse: boolean;         // true: run the sampling map z -> x
+      FClamp: TNeuralFloat;      // Glow tanh clamp on the log-scale
+      FHalfA, FHalfB: integer;   // channel-split widths (a=identity cond, b=transformed)
+      FLogDet: TNeuralFloat;     // sum(s) over the last forward
+      FLogDetLossWeight: TNeuralFloat; // coef of d(-sum s)/dparams folded into backward (ML=1)
+      FS: TNNetVolume;           // cached s = clamp*tanh(s_pre/clamp), (SizeX,SizeY,HalfB)
+      FT: TNNetVolume;           // cached shift t, (SizeX,SizeY,HalfB)
+      FSPre: TNNetVolume;        // cached pre-clamp s_pre, (SizeX,SizeY,HalfB)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pTransformSecond: boolean; pInverse: boolean = false;
+        pClamp: TNeuralFloat = 2.0); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property LogDetJacobian: TNeuralFloat read FLogDet;
+      property Inverse: boolean read FInverse;
+      // Weight of the -sum(s) (negative log-det) term folded into backward so a
+      // single ML loss = 0.5*||z||^2 trains every coupling end to end. Default
+      // 1.0 (the standard normalizing-flow objective); set 0.0 to gradient-check
+      // the pure transform with no log-det contribution.
+      property LogDetLossWeight: TNeuralFloat read FLogDetLossWeight write FLogDetLossWeight;
+  end;
+
   /// TNNetTestTimeTraining: the Test-Time Training (TTT) sequence-mixing layer
   // (Sun et al. 2024, "Learning to (Learn at Test Time): RNNs with Expressive
   // Hidden States", arXiv:2407.04620). The recurrent hidden STATE is itself a
@@ -32572,6 +32631,248 @@ begin
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   FNeurons[0].FWeights.Fill(cSoftplusInv1);  // w_raw -> w ~= 1
   FNeurons[1].FWeights.Fill(0);              // bonus u = 0
+  AfterWeightUpdate();
+end;
+
+{ TNNetAffineCoupling }
+constructor TNNetAffineCoupling.Create();
+begin
+  Create(false, false, 2.0);
+end;
+
+constructor TNNetAffineCoupling.Create(pTransformSecond: boolean;
+  pInverse: boolean = false; pClamp: TNeuralFloat = 2.0);
+begin
+  inherited Create();
+  FTransformSecond := pTransformSecond;
+  FInverse := pInverse;
+  if pClamp <= 0 then pClamp := 2.0;
+  FClamp := pClamp;
+  FLogDet := 0;
+  FLogDetLossWeight := 1.0;
+  FStruct[0] := Ord(FTransformSecond);
+  FStruct[1] := Ord(FInverse);
+  FFloatSt[0] := FClamp;
+  FS := TNNetVolume.Create();
+  FT := TNNetVolume.Create();
+  FSPre := TNNetVolume.Create();
+end;
+
+destructor TNNetAffineCoupling.Destroy();
+begin
+  FSPre.Free;
+  FT.Free;
+  FS.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetAffineCoupling.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Depth, r: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Depth := pPrevLayer.FOutput.Depth;
+  if Depth < 2 then
+    FErrorProc('TNNetAffineCoupling requires Depth>=2, got Depth=' +
+      IntToStr(Depth));
+  // a = conditioning (identity) half, b = transformed half.
+  FHalfA := Depth div 2;
+  FHalfB := Depth - FHalfA;
+  // Output preserves the full input shape.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  // One neuron per conditioner output row: rows [0..HalfB-1]=s_pre, [HalfB..]=t.
+  if FNeurons.Count < 2 * FHalfB then AddMissingNeurons(2 * FHalfB - FNeurons.Count);
+  for r := 0 to 2 * FHalfB - 1 do
+  begin
+    FNeurons[r].FWeights.ReSize(FHalfA, 1, 1);
+    FNeurons[r].FDelta.ReSize(FNeurons[r].FWeights);
+    FNeurons[r].FBackInertia.ReSize(FNeurons[r].FWeights);
+  end;
+  FS.ReSize(FOutput.SizeX, FOutput.SizeY, FHalfB);
+  FT.ReSize(FOutput.SizeX, FOutput.SizeY, FHalfB);
+  FSPre.ReSize(FOutput.SizeX, FOutput.SizeY, FHalfB);
+  InitDefault();
+end;
+
+procedure TNNetAffineCoupling.Compute();
+var
+  StartTime: double;
+  SizeX, SizeY, Depth, x, y, r, j, aOfs, bOfs: integer;
+  spre, sval, tval, xa_j, xb, accS, accT: TNeuralFloat;
+  InPtr, OutPtr, SPtr, TPtr, SPrePtr, Wr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  Depth := FOutput.Depth;
+  // a-half starts at channel aOfs, b-half (transformed) at bOfs.
+  if FTransformSecond then begin aOfs := 0; bOfs := FHalfA; end
+  else begin aOfs := FHalfB; bOfs := 0; end;
+  FLogDet := 0;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+    begin
+      InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+      OutPtr := FOutput.GetRawPtr(x, y, 0);
+      SPtr := FS.GetRawPtr(x, y, 0);
+      TPtr := FT.GetRawPtr(x, y, 0);
+      SPrePtr := FSPre.GetRawPtr(x, y, 0);
+      // Identity (conditioning) half passes through unchanged.
+      for j := 0 to FHalfA - 1 do OutPtr^[aOfs + j] := InPtr^[aOfs + j];
+      // Conditioner: per-row s_pre, t from the linear map over x_a.
+      for r := 0 to FHalfB - 1 do
+      begin
+        Wr := FNeurons[r].FWeights.GetRawPtr(0, 0, 0);
+        accS := FNeurons[r].FBiasWeight;
+        for j := 0 to FHalfA - 1 do
+          accS := accS + Wr^[j] * InPtr^[aOfs + j];
+        Wr := FNeurons[FHalfB + r].FWeights.GetRawPtr(0, 0, 0);
+        accT := FNeurons[FHalfB + r].FBiasWeight;
+        for j := 0 to FHalfA - 1 do
+          accT := accT + Wr^[j] * InPtr^[aOfs + j];
+        spre := accS;
+        // Glow tanh clamp: s = clamp * tanh(s_pre / clamp).
+        sval := FClamp * Tanh(spre / FClamp);
+        tval := accT;
+        SPrePtr^[r] := spre;
+        SPtr^[r] := sval;
+        TPtr^[r] := tval;
+        xb := InPtr^[bOfs + r];
+        if FInverse then
+          // Sampling map: x_b = (y_b - t) * exp(-s).
+          OutPtr^[bOfs + r] := (xb - tval) * Exp(-sval)
+        else
+        begin
+          // Forward map: y_b = x_b * exp(s) + t.
+          OutPtr^[bOfs + r] := xb * Exp(sval) + tval;
+          FLogDet := FLogDet + sval;
+        end;
+      end;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAffineCoupling.Backpropagate();
+var
+  StartTime: double;
+  SizeX, SizeY, x, y, r, j, aOfs, bOfs: integer;
+  hasInputGrad: boolean;
+  sval, tval, spre, es, xb, gyb, gs, gt, gspre, dtanh, gAfromB: TNeuralFloat;
+  InPtr, GyPtr, PrevErrPtr, SPtr, TPtr, SPrePtr, WsR, WtR: TNeuralFloatArrPtr;
+  lr: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  SizeX := FOutput.SizeX;
+  SizeY := FOutput.SizeY;
+  lr := FLearningRate;
+  if FTransformSecond then begin aOfs := 0; bOfs := FHalfA; end
+  else begin aOfs := FHalfB; bOfs := 0; end;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErrPtr := nil;
+  for y := 0 to SizeY - 1 do
+    for x := 0 to SizeX - 1 do
+    begin
+      InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
+      GyPtr := FOutputError.GetRawPtr(x, y, 0);
+      SPtr := FS.GetRawPtr(x, y, 0);
+      TPtr := FT.GetRawPtr(x, y, 0);
+      SPrePtr := FSPre.GetRawPtr(x, y, 0);
+      if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y, 0);
+      // Identity half: gradient passes straight through to x_a (plus the
+      // conditioner contribution accumulated below).
+      if hasInputGrad then
+        for j := 0 to FHalfA - 1 do
+          PrevErrPtr^[aOfs + j] := PrevErrPtr^[aOfs + j] + GyPtr^[aOfs + j];
+      for r := 0 to FHalfB - 1 do
+      begin
+        sval := SPtr^[r];
+        tval := TPtr^[r];
+        spre := SPrePtr^[r];
+        gyb := GyPtr^[bOfs + r];
+        if FInverse then
+        begin
+          // x_b = (y_b - t)*exp(-s); here "input" plays the role of y_b.
+          es := Exp(-sval);
+          xb := InPtr^[bOfs + r];
+          // d/d(y_b): es ; routes to input b-half.
+          if hasInputGrad then
+            PrevErrPtr^[bOfs + r] := PrevErrPtr^[bOfs + r] + gyb * es;
+          // d/dt = -es ; d/ds = -(y_b - t)*es = -x_b_out.
+          gt := -gyb * es;
+          gs := -gyb * (xb - tval) * es;
+        end
+        else
+        begin
+          // y_b = x_b*exp(s)+t.
+          es := Exp(sval);
+          xb := InPtr^[bOfs + r];
+          if hasInputGrad then
+            PrevErrPtr^[bOfs + r] := PrevErrPtr^[bOfs + r] + gyb * es;
+          gt := gyb;
+          gs := gyb * xb * es;
+          // Negative log-det (-sum s) term of the ML loss folds straight into ds.
+          gs := gs - FLogDetLossWeight;
+        end;
+        // s = clamp*tanh(s_pre/clamp) -> ds/ds_pre = 1 - tanh^2 = 1-(s/clamp)^2.
+        dtanh := 1 - (sval / FClamp) * (sval / FClamp);
+        gspre := gs * dtanh;
+        // Accumulate conditioner grads and route into x_a (the conditioning half).
+        WsR := FNeurons[r].FWeights.GetRawPtr(0, 0, 0);          // s-row weights
+        WtR := FNeurons[FHalfB + r].FWeights.GetRawPtr(0, 0, 0); // t-row weights
+        FNeurons[r].FBiasDelta := FNeurons[r].FBiasDelta + (-lr) * gspre;
+        FNeurons[FHalfB + r].FBiasDelta := FNeurons[FHalfB + r].FBiasDelta + (-lr) * gt;
+        for j := 0 to FHalfA - 1 do
+        begin
+          xb := InPtr^[aOfs + j]; // x_a[j] (reuse xb scratch)
+          FNeurons[r].FDelta.FData[j] := FNeurons[r].FDelta.FData[j] + (-lr) * gspre * xb;
+          FNeurons[FHalfB + r].FDelta.FData[j] :=
+            FNeurons[FHalfB + r].FDelta.FData[j] + (-lr) * gt * xb;
+          // Conditioner depends on x_a -> route gspre and gt back into x_a.
+          if hasInputGrad then
+          begin
+            gAfromB := gspre * WsR^[j] + gt * WtR^[j];
+            PrevErrPtr^[aOfs + j] := PrevErrPtr^[aOfs + j] + gAfromB;
+          end;
+        end;
+      end;
+    end;
+  if (not FBatchUpdate) then
+  begin
+    for r := 0 to 2 * FHalfB - 1 do FNeurons[r].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetAffineCoupling.InitDefault();
+var
+  r, j: integer;
+  oldSeed: integer;
+begin
+  if FNeurons.Count < 2 * FHalfB then exit;
+  if FHalfA < 1 then exit;
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  // Small random conditioner; biases zero -> s~0, t~0 -> near-identity at init.
+  for r := 0 to 2 * FHalfB - 1 do
+  begin
+    for j := 0 to FHalfA - 1 do
+      FNeurons[r].FWeights.FData[j] := FNeurons[r].FWeights.RandomGaussianValue() * 0.05;
+    FNeurons[r].FBiasWeight := 0;
+    FNeurons[r].FDelta.Fill(0);
+    FNeurons[r].FBackInertia.Fill(0);
+    FNeurons[r].FBiasDelta := 0;
+    FNeurons[r].FBiasInertia := 0;
+  end;
+  RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
 
@@ -75739,6 +76040,7 @@ begin
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
       'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0]);
+      'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
       'TNNetTestTimeTraining':      Result := TNNetTestTimeTraining.Create(St[1], St[2]);
       'TNNetTitansMemory':          Result := TNNetTitansMemory.Create(St[2]);
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
@@ -76100,6 +76402,7 @@ begin
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
       if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0]) else
+      if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetTestTimeTraining' then Result := TNNetTestTimeTraining.Create(St[1], St[2]) else
       if S[0] = 'TNNetTitansMemory' then Result := TNNetTitansMemory.Create(St[2]) else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
