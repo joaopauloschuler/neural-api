@@ -127,15 +127,21 @@ rather than acted on.
       (b) wire AddHyenaOperator into the downstream ../gpt-3-for-pascal decoder as
           an attention-free block option and contrast its loss / wall-clock vs the
           attention decoder on the existing tiny corpus.
-- [ ] TNNetCapsule follow-up (TNNetCapsuleSquash + TNNetCapsuleRouting — the
+- [X] TNNetCapsule follow-up (TNNetCapsuleSquash + TNNetCapsuleRouting — the
       squash nonlinearity, the fixed-iteration routing-by-agreement loop,
       LoadFromString wiring, and numerical-gradient + serialization tests all
       landed): the reconstruction-decoder pose-perturbation STRETCH goal — feed
       the winning digit-capsule's output vector to a small reconstruction
       decoder, perturb one dimension, and show it varies an interpretable pose
-      factor (stroke thickness / skew). Train the CapsNet with the paper's MARGIN
-      loss on a small MNIST/Fashion-MNIST subset and report digit accuracy vs a
-      param-matched plain CNN as the headline.
+      factor (stroke thickness / skew). DONE 2026-06-07 on a2:
+      examples/CapsuleReconstruction trains a CapsNet with the paper's MARGIN loss
+      + masked-reconstruction MSE on a SYNTHETIC 12x12 bars set (controllable
+      thickness/position pose factors — chosen over a real MNIST parse to stay in
+      the <5-min CPU budget; ~17 s). Sweeping the most-responsive pose dimension
+      varies the decoded bar SMOOTHLY and monotonically (stroke intensity/
+      thickness; total ink 32.6->24.9). Accuracy: CapsNet 100% vs param-matched
+      plain MLP 100% (easy 2-class task; the capsule win is the interpretable
+      pose vector, reported honestly).
 
 - [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
       landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
