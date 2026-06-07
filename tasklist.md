@@ -186,7 +186,18 @@ rather than acted on.
       length-normalised signal saturate?
 - [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
-- [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
+- [X] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
+      DONE. Full BPTT through ALL T=32 unrolled shared steps FIT the budget (~61 s
+      for 600 iters on 2 cores, no truncation needed); 16x16 grid, Ch=12 (4 RGBA +
+      8 hidden), ~4.3k tied params via TNNetConvolutionSharedWeights, grows a clean
+      letter-"A" glyph from one seed pixel (L2 0.9 -> ~0.002), ASCII-rendered. Three
+      stability guards needed (zero-init update head + bounded leaky TNNetReLUL(-10,10)
+      state clamp + NormalizeMaxAbsoluteDelta grad clip) — without them the 32-deep
+      residual recurrence NaNs in one update. TRUNCATED from the paper to stay in
+      budget/deterministic: stochastic per-cell update mask and sample-replacement
+      pool dropped (single seed->target sample; alpha>0.1 "alive" used only at render);
+      regeneration-after-damage stretch goal SKIPPED (needs the pool + many more iters)
+      and documented honestly in the README.
       reproduce Mordvintsev et al. 2020 "Growing Neural CA" on a TINY pure-CPU
       target (e.g. a 16x16 RGBA emoji-like glyph, channels = 4 visible RGBA +
       ~8 hidden state = 12-deep grid). One CA "rule" step is a shared-weight
