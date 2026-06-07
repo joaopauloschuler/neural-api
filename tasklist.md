@@ -72,41 +72,6 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] Mixture-of-Depths dynamic-compute block (Raposo et al. 2024,
-      "Mixture-of-Depths: Dynamically allocating compute in transformer-based
-      language models", arXiv:2404.02258) — a per-token router that scores each
-      token of a (SeqLen,1,d_model) sequence, keeps only the top-capacity
-      fraction (e.g. 12.5%) to flow through an expensive sub-block (a
-      TransformerEncoderBlock / attention+FFN), and lets the rest bypass via the
-      identity residual, so per-layer FLOPs are a fixed fraction of dense compute
-      and are data-dependent. This is genuinely DISTINCT from the layers we
-      already have: PonderNet (TNNetPonderHalting) halts a weight-tied RECURRENT
-      step probabilistically over depth; Top-K MoE (AddTopKMixtureOfExperts /
-      TNNetTopKGate) routes a token to top-k of N parallel EXPERTS but every
-      token is still processed; Token Merging (TNNetTokenMerging) permanently
-      shortens the sequence by fusing similar tokens. MoD instead SKIPS the block
-      for low-scoring tokens and rejoins them unchanged — capacity-based token
-      DROPPING along the depth axis, not halting, not expert choice, not merging.
-      Deliverable: a new TNNetMixtureOfDepths gate layer (top-capacity selection
-      mask + straight-through / scaled-residual blend of processed vs bypassed
-      tokens, like the TNNetTopKGate top-k boundary subgradient) plus a
-      TNNet.AddMixtureOfDepthsBlock(InputLayer, Capacity, BuildSubBlock) builder
-      that wires router -> gated sub-block -> residual rejoin; numerical +
-      serialization tests and an examples/MixtureOfDepths recall/throughput demo
-      comparing matched-FLOP dense vs MoD on the tiny char corpus. Open design
-      choice to settle in the task: token-choice routing (each token's own score
-      vs a learned/quantile threshold, causal-safe) vs expert-choice routing
-      (block picks its top-C tokens, needs a non-causal or block-local variant).
-- [X] Dirichlet-evidence CLASSIFICATION variant of evidential learning (Sensoy
-      et al. 2018, "Evidential Deep Learning to Quantify Classification
-      Uncertainty") — LANDED 2026-06-07 on a2 (commit 3b15090) as
-      `TNNetEvidentialClassification` (subclass of TNNetIdentity): alpha_k =
-      1 + softplus(raw_k), Bayes-risk expected-MSE loss (Eq. 5) + lambda·KL-to-
-      uniform on the misclassified-evidence Dirichlet, exact analytic backward
-      through softplus (local Ln/Di/Trigamma helpers), Alpha/Prediction/
-      Uncertainty(u=K/S) accessors, both serialization tables, numerical-gradient
-      + save/load tests, examples/EvidentialClassification (in-dist u=0.151 vs
-      OOD u=0.853, u→1.0 below the blobs — side-by-side blobs, NOT antipodal).
 - [ ] TNNetGatedLinearAttention follow-ups (Gated Linear Attention, Yang et al.
       2023, arXiv:2312.06635 — matrix-state (d x d) linear-attention recurrence
       with a data-dependent per-channel diagonal forget gate
@@ -199,17 +164,11 @@ rather than acted on.
 - [ ] TNNetWKV follow-ups (the RWKV-4 time-mixing recurrence base layer +
       AddRWKVTimeMix builder + numerical-gradient/serialization tests + examples/RWKV/
       WKV-vs-DeltaNet recall demo landed 2026-06-07 on a2, commits 2d4473b/1523a45). Open:
-      - [X] Two-SOURCE k/v variant (separate key and value source tensors, like
-            TNNetCrossAttention) — LANDED 2026-06-07 on a2 (commit 3bc1c66) as
-            `TNNetCrossWKV`: receptance/query from PrevLayer (depth C), k|v from a
-            separate KeyValueSource (depth 2C), reuses the exact log-space-stable
-            RWKV-4 kernel + coupled-BPTT scans, two-source wiring/serialization
-            like TNNetCrossAttention. v1 ships the EQUAL-seqlen position-aligned
-            read-out contract (state through kv-source up to t); examples/CrossWKV
-            cross-copy hits 100% exact recall vs 17% (chance) for memory-blind WKV.
-            - [ ] Asymmetric/full-context cross variant: summarise the kv memory
-                  once, query it with a DIFFERENT-length receptance stream (true
-                  permuted associative recall, not position-aligned copy).
+      - [ ] Asymmetric/full-context cross variant for TNNetCrossWKV (the base
+            two-source k/v RWKV-4 layer landed 2026-06-07 on a2, commit 3bc1c66,
+            with the EQUAL-seqlen position-aligned read-out contract): summarise
+            the kv memory once, query it with a DIFFERENT-length receptance
+            stream (true permuted associative recall, not position-aligned copy).
       - [ ] Wire AddRWKVTimeMix into the downstream ../gpt-3-for-pascal decoder as an
             attention-free block option and contrast its loss / wall-clock vs the attention
             decoder on the existing tiny corpus (mirrors the open AddHyenaOperator wiring task).
