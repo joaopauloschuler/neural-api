@@ -113,17 +113,11 @@ rather than acted on.
       - [ ] Chunked/parallel hardware-efficient forward (the paper's main systems
             contribution; v1 ships the exact per-token scan only) — gate behind an
             exact-vs-chunked equivalence assert (mirrors open DeltaNet/WKV chunked tasks).
-      - [X] TNNet.AddGatedLinearAttention builder: token-shift + projections +
-            receptance/output gating into a drop-in time-mixing block. LANDED on a2:
-            mirrors AddRWKVTimeMix (TNNetTokenShift -> per-token PointwiseConvLinear
-            D->D projection into the GLA leaf -> sigmoid receptance gate
-            cell-multiplied -> PointwiseConvLinear out-projection). The GLA leaf owns
-            q/k/v/forget-gate projections internally, so the builder only feeds it a
-            per-token-mixed stream (unlike RWKV/WKV whose builder supplies k|v).
-            Shape + input-gradient tests in TestNeuralNumerical.pas. Follow-ups:
-            (a) wire into the downstream ../gpt-3-for-pascal decoder as a mixer arm
-            (mirrors the open AddRWKVTimeMix gpt-3 task); (b) optional FFN/LayerNorm
-            residual wrapper builder (AddGatedLinearAttentionBlock) for a full block.
+      - [ ] AddGatedLinearAttentionBlock full-block builder — wrap the landed
+            TNNet.AddGatedLinearAttention time-mixing builder in an FFN/LayerNorm
+            residual block; and wire AddGatedLinearAttention into the downstream
+            ../gpt-3-for-pascal decoder as a mixer arm (mirrors the open
+            AddRWKVTimeMix gpt-3 wiring task).
       - [ ] Rectangular d_k != d_v state variant (FStruct[0]/[1] already carry both).
 - [ ] TNNetKANConv follow-ups (the convolutional Kolmogorov-Arnold layer LANDED
       2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:
@@ -318,30 +312,14 @@ rather than acted on.
       incremental-decode]] task — the KV footprint shrinks by QueryHeads/KVHeads,
       exactly the bottleneck that task fights.
 
-- [X] TNNetDifferentialAttention follow-up: fold differential heads into the
-      MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
-      TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
-      into differential attention per head — a natural drop-in for the
-      downstream ../gpt-3-for-pascal long-context retrieval.
-      DONE on a2: new TNNetAttentionVariant enum (avSDPA/avDifferential/avSink)
-      + optional Variant/NumSinks params on AddMultiHeadSelfAttention &
-      AddMultiHeadSDPAConcat (default avSDPA = bit-for-bit unchanged); per-head
-      drop-in via an inner AddHeadAttention helper; avDifferential guards even
-      d_k. Shape + input-gradient tests (max abs err ~9.3e-4).
-- [X] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
-      ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
-      decoder block can opt into sinks per head behind a flag.
-      DONE on a2 (same enum/params as above): avSink wires per-head
-      TNNetSinkAttention(d_k, CausalMask, NumSinks); NumSinks builder arg
-      (default 1) sets sink-slot count per head. Shape (NumSinks round-trips) +
-      input-gradient tests (max abs err ~8.5e-4).
-      Follow-ups discovered: (a) TNNetTransformerDecoderBlock /
-      AddTransformerEncoderBlock don't yet forward the variant — only the raw
-      MHA breakdown does; a decoder-block-level flag is the next rung.
-      (b) avCosineSimilarity could join the enum (same drop-in SDPA subclass
-      shape). (c) variant choice is NOT persisted by the builder itself (the
-      composed layers serialize themselves, so load is fine, but a one-arg
-      rebuild helper would need it).
+- [ ] Per-head attention-variant follow-ups (the avSDPA/avDifferential/avSink
+      enum + optional Variant/NumSinks params on AddMultiHeadSelfAttention &
+      AddMultiHeadSDPAConcat landed on a2, commit fcc6ba8): (a) forward the
+      variant through TNNetTransformerDecoderBlock / AddTransformerEncoderBlock —
+      only the raw MHA breakdown takes it today, so a decoder-block-level flag is
+      the next rung; (b) add avCosineSimilarity to the enum (same drop-in SDPA
+      subclass shape); (c) persist the variant choice in a one-arg rebuild helper
+      (the composed layers serialize themselves, so load already works).
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
@@ -1293,51 +1271,6 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
-- [X] `TNNetTitansMemory` — a test-time "neural long-term memory" sequence
-      mixer (Behrouz et al. 2024, "Titans: Learning to Memorize at Test
-      Time"). This is a genuinely NEW memory paradigm, distinct from every
-      memory/recurrence layer already in tree — confirm with
-      [[ntm-memory-layer]] (NTM = attention-addressed read/write of an
-      external matrix M), [[deltanet-layer]] (Widrow-Hoff error-correcting
-      write to a 2-D matrix S), [[test-time-training-layer]] (TTT = inner
-      model updated by a *reconstruction* loss step), and `TNNetSelectiveSSM`
-      (Mamba S6, a diagonal scan). Titans is none of these: the memory is a
-      small MLP `M_t` whose weights are updated *at inference* by the
-      gradient of an associative loss `||M_t(k_t) - v_t||^2`, but the update
-      uses (a) a **momentum / "surprise" term** `S_t = eta*S_{t-1} -
-      theta*grad` so a single surprising token keeps writing for several
-      steps, and (b) a **data-dependent forgetting / weight-decay gate**
-      `M_t = (1 - alpha_t) * M_{t-1} + S_t` (adaptive `alpha_t` = how much of
-      the old memory to erase). Scope for the first landing: the "Memory as
-      Context" (MAC) leaf-layer variant with a single-hidden-layer memory MLP,
-      k/v/q produced by learnable per-token pointwise projections, the three
-      gates (`eta` momentum, `theta` learning-rate, `alpha` forget) as
-      learnable per-channel scalars passed through sigmoid, and full BPTT
-      through the coupled `S_t`/`M_t` adjoint scans (the second-order inner
-      tape like [[test-time-training-layer]]'s TTT-MLP path is the hard part
-      — reuse that machinery). Mark the class `// Coded by Claude (AI).`,
-      gradient-check in TestNeuralNumerical.pas (well-separated k/v so the
-      argmax-free path is unambiguous), and ship `examples/TitansMemory/` as
-      a long-context associative-recall demo (store N key->value pairs early
-      in the sequence, query them after a long distractor span — the
-      surprise+forget gates should beat a plain linear-attention baseline at
-      long range). Follow-ups to record: the gated-DeltaNet-style chunked
-      parallel scan, and an `AddTitansMemory` builder wrapping the MAC
-      residual.
-      LANDED 2026-06-07 on a2: single-hidden-layer inner MLP `M(z)=W2·GeLU(W1·z)`,
-      MAC leaf variant. Neurons[] = theta_K/V/Q (Depth×Depth), eta_raw/theta_raw/
-      alpha_raw (Depth, per-channel sigmoid gates), W_alpha (Depth×Depth,
-      data-dependent forget gate `alpha_t=sigmoid(alpha_raw+W_alpha·x_t)`), and the
-      trainable initial inner fast-weights W1_0/W2_0. Gates index by output channel
-      (W2 row o ↦ gate[o], W1 row j ↦ gate[j mod Depth]). Exact second-order BPTT
-      (GeLU HVP) carries dL/dW1, dL/dW2 AND dL/dS right-to-left through the coupled
-      momentum/forget adjoint scans, reusing TTT-MLP's inner-tape machinery; both
-      gradient checks ≈5e-4. Test trio + shape + recall-smoke in
-      TestNeuralNumerical.pas; example examples/TitansMemory/ beats a FIXED-decay
-      TNNetRetention baseline at distractor=24 (MSE 0.16/33.3% vs 0.20/19.8%).
-      Stability note: strong momentum (eta) + near-zero forgetting (alpha) can FP-
-      overflow the inner state on harder configs (many pairs); the data-dependent
-      forget gate is what bounds the geometric momentum sum.
 - [ ] `TNNetTitansMemory` follow-up — a **gated-DeltaNet-style chunked parallel
       scan** forward for `TNNetTitansMemory`, replacing the sequential O(SeqLen)
       inner-gradient scan with a chunked associative/parallel recurrence (the
