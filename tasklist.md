@@ -77,8 +77,12 @@ rather than acted on.
       sum of learned univariate Chebyshev edge functions per receptive-field patch,
       subclasses TNNetConvolutionLinear, degree K via FStruct[5], numerical-gradient +
       serialization tests, examples/KANConv/):
-      - [ ] B-spline (fixed-knot) basis variant alongside the Chebyshev basis, behind
+      - [X] B-spline (fixed-knot) basis variant alongside the Chebyshev basis, behind
             a flag — the paper's original parameterisation; contrast smoothness/extrapolation.
+            LANDED 2026-06-07 on a2 (commit 6dc49f5): csKANBasisBSpline flag in FStruct[6]
+            (default csKANBasisChebyshev unchanged), clamped open-uniform knots over the
+            tanh-squashed [-1,1] support, G+K coeffs/edge via Cox–de Boor + its derivative
+            recurrence, Greville-abscissa near-linear init; numerical-gradient + save/load tests.
       - [ ] examples/KANConv/ on a real tiny-image task (CIFAR/MNIST stub) vs a plain
             conv at matched weight budget, to show the headline param-efficiency on data.
 - [ ] TNNetDeltaNet chunked/parallel forward (the paper's WY-matrix
@@ -149,35 +153,26 @@ rather than acted on.
       generates the whole Din*Dout matrix in one shot, which caps main-layer
       size; document the memory/param trade-off.
 
-- [ ] TNNetWKV — the RWKV time-mixing recurrence as a first-class layer (the
+- [X] TNNetWKV — the RWKV time-mixing recurrence as a first-class layer (the
       defining attention-free operator of RWKV-4, Peng et al. 2023, arXiv:2305.13048).
-      Today only the per-channel TIME-SHIFT primitive exists (TNNetTokenShift,
-      neuralnetwork.pas:4341); the actual weighted key-value (WKV) operator is
-      missing. Per channel d, over a (SeqLen,1,Depth) sequence (SizeY=1, same layout
-      as TNNetTokenShift / TNNetSelectiveSSM / TNNetDeltaNet), compute the
-      numerically-stabilized recurrence
-          wkv_t = ( a_{t-1} + e^{u + k_t} v_t ) / ( b_{t-1} + e^{u + k_t} ),
-          a_t = e^{-w} a_{t-1} + e^{k_t} v_t,  b_t = e^{-w} b_{t-1} + e^{k_t},
-      with a learnable per-channel positive decay w (FStruct/softplus-parameterised,
-      like TNNetRetention's gamma) and a learnable per-channel "bonus" u that
-      up-weights the current token; carry the running max in log-space exactly as the
-      reference CUDA kernel does so e^{k} never overflows. Inputs k (key) and v
-      (value) are the layer's own channel split (or two source tensors, like
-      TNNetCrossAttention); receptance gating r=sigmoid(...) and the output mix stay
-      OUTSIDE the leaf so AddRWKVTimeMix can compose it with TNNetTokenShift +
-      pointwise projections, mirroring how AddTalkingHeadsAttention / AddSinkhornAttention
-      build on finer primitives. Exact BPTT through both running accumulators a_t, b_t
-      (two coupled adjoint scans, same shape as the TNNetKalmanFilterCell /
-      TNNetDeltaNet / TNNetMLSTMCell backward) — m_t-style stabilizer is NOT
-      stop-gradient. Deliverables: input + per-channel-w + per-channel-u
-      numerical-gradient tests, serialization round-trip, and examples/RWKV/ contrasting
-      the WKV recurrence against TNNetSelectiveSSM and TNNetDeltaNet on the existing
-      associative-recall / copy task. Distinct from every landed linear-attention layer:
-      SelectiveSSM = input-dependent SSM, DeltaNet = error-correcting delta rule,
-      DiagonalSSM = LTI, Retention = fixed-decay outer-product — WKV is the
-      softmax-free exponential-decay KV average with a current-token bonus. See
-      [[deltanet-layer]] / [[kalman-filter-cell-layer]] / [[constrained-learnable-scalar-sigmoid]]
-      for the BPTT-scan and learnable-positive-scalar patterns.
+      LANDED 2026-06-07 on a2 (commits 2d4473b layer+builder, 1523a45 example): k|v-split
+      (SeqLen,1,2C) input → (SeqLen,1,C) wkv, learnable per-channel w=softplus(w_raw)+u
+      stored as neuron weights, log-space running-max stabilizer, exact BPTT via two
+      coupled right-to-left adjoint scans over cached a_t/b_t; TNNet.AddRWKVTimeMix builder
+      (TokenShift→{r,k,v} pointwise→WKV→receptance gate→out-proj); numerical-gradient
+      (input/w/u) + serialization tests; examples/RWKV/ WKV-vs-DeltaNet associative-recall
+      demo (both 100% exact recall). REMAINING open follow-up below.
+- [ ] TNNetWKV follow-ups (base layer + AddRWKVTimeMix builder + tests + examples/RWKV/
+      landed — see above). Open:
+      - [ ] Two-SOURCE k/v variant (separate key and value source tensors, like
+            TNNetCrossAttention) instead of the current own-channel k|v split, so cross-WKV
+            (decode-time external memory) becomes expressible.
+      - [ ] Wire AddRWKVTimeMix into the downstream ../gpt-3-for-pascal decoder as an
+            attention-free block option and contrast its loss / wall-clock vs the attention
+            decoder on the existing tiny corpus (mirrors the open AddHyenaOperator wiring task).
+      - [ ] Chunked/parallel forward (RWKV-5/6 style) so training is not a strict
+            per-token left-to-right scan; gate behind an exact-vs-chunked equivalence assert
+            (mirrors the open TNNetDeltaNet chunked-forward task).
 
 ## Interesting applications / examples
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
