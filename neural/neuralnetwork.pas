@@ -6966,6 +6966,62 @@ type
     property Erode: integer read FErode;
   end;
 
+  /// SINKHORN doubly-stochastic normalization layer -- a differentiable optimal-
+  /// transport relaxation. Where softmax/sparsemax/entmax normalize ONE axis,
+  /// this normalizes a square N x N score matrix to be DOUBLY STOCHASTIC (every
+  /// row AND every column sums to 1) by iterating the Sinkhorn-Knopp algorithm.
+  /// As the temperature tau -> 0 the output approaches a hard PERMUTATION matrix,
+  /// so the layer is the continuous relaxation used to learn discrete matchings /
+  /// sortings / assignments end-to-end (Adams & Zemel 2011; Mena et al. 2018,
+  /// "Learning Latent Permutations with Gumbel-Sinkhorn Networks", arXiv:1802.08665).
+  ///
+  /// LAYOUT: the input is an (N, 1, N) tensor read as a square matrix
+  ///   M[i,j] = Input[ SizeX=i, SizeY=0, Depth=j ]   (row i = SizeX, col j = Depth)
+  /// SizeX = N, Depth = N, SizeY = 1. The output has the same (N,1,N) shape.
+  ///
+  /// FORWARD (in log-space for stability):
+  ///   L := score / tau
+  ///   repeat KIter times:
+  ///     row-normalize:  L[i,j] -= logsumexp_j L[i,:]   (each ROW -> log-simplex)
+  ///     col-normalize:  L[i,j] -= logsumexp_i L[:,j]   (each COL -> log-simplex)
+  ///   Output := exp(L)
+  /// After the final COLUMN step every column sums to exactly 1; rows sum to ~1
+  /// (they converge to 1 as KIter grows). Each normalization is a per-group
+  /// subtract-logsumexp == fully differentiable.
+  ///
+  /// BACKWARD: the KIter*2 alternating log-sum-exp steps are unrolled and each
+  /// step's input log-matrix is cached (FLogTape). Backprop walks the tape in
+  /// reverse. One normalization step  y = x - logsumexp_group(x)  has Jacobian
+  ///   dy_k/dx_l = delta_kl - softmax(x)_l   (within the group),
+  /// so its vector-Jacobian product is the softmax-style reduction
+  ///   dL/dx_l = dL/dy_l - softmax(x)_l * sum_{k in group} dL/dy_k.
+  /// The trailing exp contributes dL/dL_final = gradOut * Output. No trainable
+  /// parameters; tau = FFloatSt[0], KIter = FStruct[0] round-trip via save/load.
+  /// Constructor: Create(KIter, tau).
+  // Coded by Claude (AI).
+  TNNetSinkhorn = class(TNNetLayer)
+  private
+    FN: integer;           // matrix side length (SizeX = Depth = N)
+    FKIter: integer;       // number of Sinkhorn-Knopp iterations
+    FTau: TNeuralFloat;    // temperature (>0); smaller -> sharper / more permutation-like
+    FLogTape: array of TNNetVolume; // cached input log-matrix per normalization step
+    FTapeLen: integer;     // = 2*FKIter (row+col per iteration)
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+  public
+    constructor Create(pKIter: integer = 20; pTau: TNeuralFloat = 1.0); overload;
+    destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Temperature annealing: setting a smaller tau sharpens the output towards a
+    // hard permutation. Updates FFloatSt[0] so the change still round-trips.
+    procedure SetTau(pTau: TNeuralFloat);
+    property N: integer read FN;
+    property KIter: integer read FKIter;
+    property Tau: TNeuralFloat read FTau;
+  end;
+
   /// CONDITIONALLY-PARAMETERIZED ("dynamic") CONVOLUTION layer (CondConv,
   /// Yang et al. 2019, NeurIPS "CondConv: Conditionally Parameterized
   /// Convolutions for Efficient Inference", arXiv:1904.04971). The layer owns a
@@ -38295,6 +38351,237 @@ begin
   end;
 end;
 
+{ TNNetSinkhorn }
+
+// Sinkhorn doubly-stochastic normalization. Forward runs KIter alternating
+// row/column log-sum-exp normalizations on L = score/tau in log-space and
+// outputs exp(L). The input log-matrix of every normalization step is cached in
+// FLogTape so the backward pass can replay the exact softmax-style adjoint of
+// each subtract-logsumexp step (see the class doc comment). No trainable params.
+// Matrix layout (SizeY = 1): M[i,j] == FData[i*N + j], row i = SizeX, col j = Depth.
+
+constructor TNNetSinkhorn.Create(pKIter: integer; pTau: TNeuralFloat);
+begin
+  inherited Create();
+  if pKIter < 1 then pKIter := 1;
+  if pTau <= 0 then pTau := 1.0;
+  FKIter := pKIter;
+  FTau := pTau;
+  FN := 0;
+  FTapeLen := 0;
+  FStruct[0] := FKIter;
+  FFloatSt[0] := FTau;
+  // No weight neurons: Sinkhorn is parameter-free.
+  while FNeurons.Count > 0 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  BuildArrNeurons();
+end;
+
+destructor TNNetSinkhorn.Destroy();
+var
+  iStep: integer;
+begin
+  for iStep := 0 to Length(FLogTape) - 1 do
+    if Assigned(FLogTape[iStep]) then FLogTape[iStep].Free;
+  SetLength(FLogTape, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetSinkhorn.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  iStep: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.Output.SizeX <> pPrevLayer.Output.Depth then
+    FErrorProc('TNNetSinkhorn requires a square (N,1,N) input. Got SizeX=' +
+      IntToStr(pPrevLayer.Output.SizeX) + ' Depth=' +
+      IntToStr(pPrevLayer.Output.Depth));
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetSinkhorn requires SizeY=1. Got SizeY=' +
+      IntToStr(pPrevLayer.Output.SizeY));
+  FN := pPrevLayer.Output.SizeX;
+
+  FOutput.ReSize(FN, 1, FN);
+  FOutputError.ReSize(FN, 1, FN);
+  FOutputErrorDeriv.ReSize(FN, 1, FN);
+
+  // (Re)allocate the unroll tape: one cached log-matrix per normalization step.
+  for iStep := 0 to Length(FLogTape) - 1 do
+    if Assigned(FLogTape[iStep]) then FLogTape[iStep].Free;
+  FTapeLen := 2 * FKIter;
+  SetLength(FLogTape, FTapeLen);
+  for iStep := 0 to FTapeLen - 1 do
+    FLogTape[iStep] := TNNetVolume.Create(FN, 1, FN);
+end;
+
+procedure TNNetSinkhorn.SetTau(pTau: TNeuralFloat);
+begin
+  if pTau <= 0 then pTau := 1.0;
+  FTau := pTau;
+  FFloatSt[0] := pTau;
+end;
+
+procedure TNNetSinkhorn.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSinkhorn.ComputeCPU();
+var
+  ri, cj, iter, step: integer;
+  L: TNNetVolume;
+  maxVal, sumExp, lse: TNeuralFloat;
+begin
+  L := FOutput;
+  // L := score / tau
+  for ri := 0 to FN * FN - 1 do
+    L.FData[ri] := FPrevLayer.FOutput.FData[ri] / FTau;
+
+  step := 0;
+  for iter := 0 to FKIter - 1 do
+  begin
+    // ---- ROW normalize: each row i is a log-simplex over columns j ----
+    FLogTape[step].Copy(L);  // cache input of this step
+    for ri := 0 to FN - 1 do
+    begin
+      maxVal := L.FData[ri * FN];
+      for cj := 1 to FN - 1 do
+        if L.FData[ri * FN + cj] > maxVal then maxVal := L.FData[ri * FN + cj];
+      sumExp := 0;
+      for cj := 0 to FN - 1 do
+        sumExp := sumExp + Exp(L.FData[ri * FN + cj] - maxVal);
+      lse := maxVal + Ln(sumExp);
+      for cj := 0 to FN - 1 do
+        L.FData[ri * FN + cj] := L.FData[ri * FN + cj] - lse;
+    end;
+    Inc(step);
+
+    // ---- COLUMN normalize: each column j is a log-simplex over rows i ----
+    FLogTape[step].Copy(L);
+    for cj := 0 to FN - 1 do
+    begin
+      maxVal := L.FData[cj];
+      for ri := 1 to FN - 1 do
+        if L.FData[ri * FN + cj] > maxVal then maxVal := L.FData[ri * FN + cj];
+      sumExp := 0;
+      for ri := 0 to FN - 1 do
+        sumExp := sumExp + Exp(L.FData[ri * FN + cj] - maxVal);
+      lse := maxVal + Ln(sumExp);
+      for ri := 0 to FN - 1 do
+        L.FData[ri * FN + cj] := L.FData[ri * FN + cj] - lse;
+    end;
+    Inc(step);
+  end;
+
+  // Output := exp(L)
+  for ri := 0 to FN * FN - 1 do
+    L.FData[ri] := Exp(L.FData[ri]);
+end;
+
+procedure TNNetSinkhorn.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    BackpropagateCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Reverse-mode adjoint. g holds dL/d(current activation), walked from the output
+// back to the raw scores. The trailing exp gives dL/dL_final = gradOut * Output.
+// Each normalization step y = x - logsumexp_group(x) has VJP
+//   dL/dx_l = dL/dy_l - softmax(x)_l * sum_{k in group} dL/dy_k,
+// with softmax(x) recomputed from the cached step input FLogTape[step]. Column
+// steps reduce down each column, row steps across each row. Finally the score/tau
+// scaling contributes a 1/tau factor into the previous layer's error.
+procedure TNNetSinkhorn.BackpropagateCPU();
+var
+  ri, cj, iter, step: integer;
+  g, Lin: TNNetVolume;
+  maxVal, sumExp, dotG, sm: TNeuralFloat;
+  softrow, softcol: array of TNeuralFloat;
+begin
+  g := FOutputErrorDeriv;
+  // dL/dL_final = gradOut * Output  (exp derivative; Output still holds exp(L)).
+  for ri := 0 to FN * FN - 1 do
+    g.FData[ri] := FOutputError.FData[ri] * FOutput.FData[ri];
+
+  SetLength(softrow, FN);
+  SetLength(softcol, FN);
+
+  // Walk the tape in reverse: order was row(step) then col(step+1) per iter.
+  for iter := FKIter - 1 downto 0 do
+  begin
+    // ---- adjoint of the COLUMN normalize (the later step) ----
+    step := 2 * iter + 1;
+    Lin := FLogTape[step];
+    for cj := 0 to FN - 1 do
+    begin
+      maxVal := Lin.FData[cj];
+      for ri := 1 to FN - 1 do
+        if Lin.FData[ri * FN + cj] > maxVal then maxVal := Lin.FData[ri * FN + cj];
+      sumExp := 0;
+      for ri := 0 to FN - 1 do
+      begin
+        softcol[ri] := Exp(Lin.FData[ri * FN + cj] - maxVal);
+        sumExp := sumExp + softcol[ri];
+      end;
+      dotG := 0;
+      for ri := 0 to FN - 1 do
+      begin
+        softcol[ri] := softcol[ri] / sumExp;
+        dotG := dotG + g.FData[ri * FN + cj];
+      end;
+      for ri := 0 to FN - 1 do
+        g.FData[ri * FN + cj] := g.FData[ri * FN + cj] - softcol[ri] * dotG;
+    end;
+
+    // ---- adjoint of the ROW normalize (the earlier step) ----
+    step := 2 * iter;
+    Lin := FLogTape[step];
+    for ri := 0 to FN - 1 do
+    begin
+      maxVal := Lin.FData[ri * FN];
+      for cj := 1 to FN - 1 do
+        if Lin.FData[ri * FN + cj] > maxVal then maxVal := Lin.FData[ri * FN + cj];
+      sumExp := 0;
+      for cj := 0 to FN - 1 do
+      begin
+        softrow[cj] := Exp(Lin.FData[ri * FN + cj] - maxVal);
+        sumExp := sumExp + softrow[cj];
+      end;
+      dotG := 0;
+      for cj := 0 to FN - 1 do
+      begin
+        softrow[cj] := softrow[cj] / sumExp;
+        dotG := dotG + g.FData[ri * FN + cj];
+      end;
+      for cj := 0 to FN - 1 do
+      begin
+        sm := softrow[cj];
+        g.FData[ri * FN + cj] := g.FData[ri * FN + cj] - sm * dotG;
+      end;
+    end;
+  end;
+
+  // dL/dscore = (1/tau) * g, routed into the previous layer's error tensor.
+  if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+    for ri := 0 to FN * FN - 1 do
+      FPrevLayer.OutputError.FData[ri] :=
+        FPrevLayer.OutputError.FData[ri] + g.FData[ri] / FTau;
+end;
+
 { TNNetTropicalConv }
 
 // Tropical (max-plus / min-plus) morphological convolution: the spatial sibling
@@ -65323,6 +65610,7 @@ begin
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
+      'TNNetSinkhorn' :             Result := TNNetSinkhorn.Create(St[0], Ft[0]);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
@@ -65658,6 +65946,7 @@ begin
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
+      if S[0] = 'TNNetSinkhorn' then Result := TNNetSinkhorn.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else

@@ -200,6 +200,11 @@ type
     procedure TestTropicalLinearGradientCheck;
     procedure TestTropicalLinearForwardKnownValue;
     procedure TestTropicalLinearSerializationRoundTrip;
+    // TNNetSinkhorn doubly-stochastic optimal-transport normalization layer
+    procedure TestSinkhornInputGradientCheck;
+    procedure TestSinkhornDoublyStochastic;
+    procedure TestSinkhornShape;
+    procedure TestSinkhornSerializationRoundTrip;
     // TNNetTropicalConv max-plus / min-plus morphological convolution layer
     procedure TestTropicalConvInputGradientCheck;
     procedure TestTropicalConvWeightGradientCheck;
@@ -37882,6 +37887,204 @@ begin
         (NN2.Layers[1] as TNNetSpectralConv1D).Modes);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('SpectralConv1D Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkhornInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  SK: TNNetSinkhorn;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, Nside, MatSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient through the full unrolled Sinkhorn
+  // iteration (KIter alternating row/col log-sum-exp normalizations). Every step
+  // is a clean differentiable subtract-logsumexp, so a moderate epsilon and the
+  // standard 0.01 bound apply; inputs are bounded (tanh-ish range) to keep the
+  // single-precision finite difference honest. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  Nside := 4;
+  MatSize := Nside * Nside;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Nside, 1, Nside);
+  InputPlus := TNNetVolume.Create(Nside, 1, Nside);
+  Desired := TNNetVolume.Create(Nside, 1, Nside);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(Nside, 1, Nside, 1)); // 1 = collect input error
+    SK := TNNetSinkhorn.Create(8, 1.0);
+    NN.AddLayer(SK);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to MatSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1; // bounded scores
+    for i := 0 to MatSize - 1 do
+      Desired.Raw[i] := 0.2 + 0.1 * Cos(i * 0.5);
+
+    for i := 0 to MatSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('Sinkhorn input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  Sinkhorn gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkhornDoublyStochastic;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SK: TNNetSinkhorn;
+  Nside, ri, cj: integer;
+  rowSum, colSum: TNeuralFloat;
+begin
+  // After the forward pass every ROW and every COLUMN of the output must sum to
+  // ~1 (doubly stochastic), the defining property of the Sinkhorn projection.
+  RandSeed := 424242;
+  Nside := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Nside, 1, Nside);
+  try
+    NN.AddLayer(TNNetInput.Create(Nside, 1, Nside));
+    SK := TNNetSinkhorn.Create(40, 1.0);
+    NN.AddLayer(SK);
+    for ri := 0 to Nside * Nside - 1 do
+      Input.Raw[ri] := Sin(ri * 1.7) * 2.0; // arbitrary scores
+    NN.Compute(Input);
+
+    for ri := 0 to Nside - 1 do
+    begin
+      rowSum := 0;
+      colSum := 0;
+      for cj := 0 to Nside - 1 do
+      begin
+        rowSum := rowSum + SK.Output[ri, 0, cj];
+        colSum := colSum + SK.Output[cj, 0, ri];
+      end;
+      AssertEquals('Sinkhorn row ' + IntToStr(ri) + ' sums to 1', 1.0, rowSum, 1e-3);
+      AssertEquals('Sinkhorn col ' + IntToStr(ri) + ' sums to 1', 1.0, colSum, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkhornShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  SK: TNNetSinkhorn;
+  Nside: integer;
+begin
+  RandSeed := 424242;
+  Nside := 6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Nside, 1, Nside);
+  try
+    NN.AddLayer(TNNetInput.Create(Nside, 1, Nside));
+    SK := TNNetSinkhorn.Create(10, 0.5);
+    NN.AddLayer(SK);
+    Input.Fill(0.0);
+    NN.Compute(Input);
+    AssertEquals('Sinkhorn output SizeX', Nside, SK.Output.SizeX);
+    AssertEquals('Sinkhorn output SizeY', 1, SK.Output.SizeY);
+    AssertEquals('Sinkhorn output Depth', Nside, SK.Output.Depth);
+    AssertEquals('Sinkhorn N property', Nside, SK.N);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkhornSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  SK: TNNetSinkhorn;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, Nside, KIterVal: integer;
+  TauVal: TNeuralFloat;
+begin
+  // Non-default KIter (FStruct[0]) and tau (FFloatSt[0]) must survive
+  // SaveToString -> LoadFromString -> SaveToString (byte identical) through both
+  // CreateLayer dispatch points, and Compute must match.
+  RandSeed := 424242;
+  Nside := 4; KIterVal := 13; TauVal := 0.37; // non-default
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Nside, 1, Nside);
+  try
+    NN.AddLayer(TNNetInput.Create(Nside, 1, Nside));
+    SK := TNNetSinkhorn.Create(KIterVal, TauVal);
+    NN.AddLayer(SK);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Sinkhorn SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('Sinkhorn token present in serialized string',
+        Pos('TNNetSinkhorn', Saved) > 0);
+      AssertEquals('Sinkhorn KIter round-trips', KIterVal,
+        (NN2.Layers[1] as TNNetSinkhorn).KIter);
+      AssertEquals('Sinkhorn tau round-trips', TauVal,
+        (NN2.Layers[1] as TNNetSinkhorn).Tau, 1e-5);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Sinkhorn Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
