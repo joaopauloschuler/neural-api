@@ -784,6 +784,7 @@ type
     procedure TestMultiHeadSelfAttentionDifferentialGradientCheck;
     procedure TestMultiHeadSelfAttentionSinkShapes;
     procedure TestMultiHeadSelfAttentionSinkGradientCheck;
+    procedure TestMultiHeadSelfAttentionCosineSimilarityShapes;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
     procedure TestAffineGridSampleIdentity;
@@ -14124,6 +14125,62 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionCosineSimilarityShapes;
+// AddMultiHeadSelfAttention with Variant=avCosineSimilarity swaps each head's
+// plain SDPA for a TNNetCosineSimilarityAttention (cosine-normalised logits).
+// Asserts: the expected output shape is preserved, Heads cosine-attention heads
+// were built, the forward pass is finite, and a SaveToString/LoadFromString
+// round-trip reproduces Compute bit-for-bit.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  NetStr: string;
+  d_model, Heads, SeqLen, i, cosCnt: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false, false,
+      avCosineSimilarity);
+    NN.SetLearningRate(1.0, 0.0);
+
+    AssertEquals('MHSA-cos out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-cos out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MHSA-cos out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    cosCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetCosineSimilarityAttention then Inc(cosCnt);
+    AssertEquals('MHSA-cos has Heads cosine-attention heads', Heads, cosCnt);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHSA-cos finite output at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+
+    // Save/load round-trip: Compute must match bit-for-bit.
+    NetStr := NN.SaveToString();
+    NN2.LoadFromString(NetStr);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('MHSA-cos save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i]);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
   end;
 end;
 

@@ -99,7 +99,10 @@ type
   //   avSink         : TNNetSinkAttention (prepends learnable (key,value) sink
   //                    slots every query attends to; stabilises causal/streaming
   //                    attention). Sink-slot count is the builder's NumSinks arg.
-  TNNetAttentionVariant = (avSDPA, avDifferential, avSink);
+  //   avCosineSimilarity : TNNetCosineSimilarityAttention (cosine-normalised
+  //                    Q.K logits with a fixed scale; decouples attention weights
+  //                    from the magnitude of the query/key vectors).
+  TNNetAttentionVariant = (avSDPA, avDifferential, avSink, avCosineSimilarity);
 
   { TNNetNeuron }
   TNNetNeuron = class(TMObject)
@@ -10039,9 +10042,10 @@ type
       // on AddMultiHeadSelfAttention.
       // Variant (default avSDPA = plain SDPA) swaps the per-head attention
       // layer for a drop-in SDPA subclass: avDifferential
-      // (TNNetDifferentialAttention, requires even d_k) or avSink
-      // (TNNetSinkAttention, NumSinks learnable sink slots/head). See
-      // TNNetAttentionVariant. NumSinks is only consulted for avSink.
+      // (TNNetDifferentialAttention, requires even d_k), avSink
+      // (TNNetSinkAttention, NumSinks learnable sink slots/head) or
+      // avCosineSimilarity (TNNetCosineSimilarityAttention, cosine-normalised
+      // logits). See TNNetAttentionVariant. NumSinks is only consulted for avSink.
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
         UseRoPE: boolean = false;
@@ -10067,8 +10071,9 @@ type
       // Requires d_k (= d_model div Heads) even and SizeY=1.
       // Variant (default avSDPA) lets every head opt into a drop-in SDPA
       // subclass instead of plain SDPA: avDifferential
-      // (TNNetDifferentialAttention) or avSink (TNNetSinkAttention with
-      // NumSinks learnable sink slots per head). See TNNetAttentionVariant.
+      // (TNNetDifferentialAttention), avSink (TNNetSinkAttention with
+      // NumSinks learnable sink slots per head) or avCosineSimilarity
+      // (TNNetCosineSimilarityAttention). See TNNetAttentionVariant.
       // avDifferential additionally requires an EVEN per-head dim d_k. NumSinks
       // is only consulted for avSink. The out-projection is identical for all
       // variants (each head still emits depth d_k).
@@ -41377,6 +41382,9 @@ var
       avSink:
         Result := AddLayerAfter(
           TNNetSinkAttention.Create(d_k, CausalMask, NumSinks), AfterLayer);
+      avCosineSimilarity:
+        Result := AddLayerAfter(
+          TNNetCosineSimilarityAttention.Create(d_k, CausalMask), AfterLayer);
     else
       Result := AddLayerAfter(
         TNNetScaledDotProductAttention.Create(d_k, CausalMask), AfterLayer);
