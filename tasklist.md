@@ -212,44 +212,7 @@ rather than acted on.
 - [ ] Forward-Forward follow-up: deeper FF stack (4+ layers) — does
       accumulated-goodness accuracy keep improving with depth, or does the
       length-normalised signal saturate?
-- [X] Reinforcement learning: minimal DQN solving CartPole or a grid world — examples/DeepQLearning: complete DQN on a 5x5 deterministic grid-world (one-hot state, ReLU(64)x2->Linear(4) Q-net, experience-replay ring buffer, target net synced via CopyWeights, epsilon-greedy decay, single-action TD update, SetBatchUpdate(True) minibatch accumulation). Learning curve climbs from ~-1.06/17-steps to ~0.78/optimal-8-steps; final greedy rollout reaches goal along shortest pit-avoiding path; 100% greedy success over all 21 start cells. Pure CPU ~32s. No new layer class.
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
-- [X] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
-      DONE. Full BPTT through ALL T=32 unrolled shared steps FIT the budget (~61 s
-      for 600 iters on 2 cores, no truncation needed); 16x16 grid, Ch=12 (4 RGBA +
-      8 hidden), ~4.3k tied params via TNNetConvolutionSharedWeights, grows a clean
-      letter-"A" glyph from one seed pixel (L2 0.9 -> ~0.002), ASCII-rendered. Three
-      stability guards needed (zero-init update head + bounded leaky TNNetReLUL(-10,10)
-      state clamp + NormalizeMaxAbsoluteDelta grad clip) — without them the 32-deep
-      residual recurrence NaNs in one update. TRUNCATED from the paper to stay in
-      budget/deterministic: stochastic per-cell update mask and sample-replacement
-      pool dropped (single seed->target sample; alpha>0.1 "alive" used only at render);
-      regeneration-after-damage stretch goal SKIPPED (needs the pool + many more iters)
-      and documented honestly in the README.
-      reproduce Mordvintsev et al. 2020 "Growing Neural CA" on a TINY pure-CPU
-      target (e.g. a 16x16 RGBA emoji-like glyph, channels = 4 visible RGBA +
-      ~8 hidden state = 12-deep grid). One CA "rule" step is a shared-weight
-      conv stack applied in place: per-cell perceive (fixed 3x3 Sobel-x/Sobel-y/
-      identity depthwise filters, or a small learned 3x3 conv) -> 1x1
-      TNNetPointwiseConvReLU -> 1x1 TNNetPointwiseConvLinear update added
-      residually to the grid, with a stochastic per-cell update mask and an
-      alpha>0.1 "alive" mask. Train by UNROLLING T in {48..64} steps sharing one
-      rule via TNNetConvolutionSharedWeights (the SharedWeights layer is the key
-      enabler — without it each step would learn separate weights), L2 loss to the
-      target RGBA at the final step, pool-based sample replacement for
-      persistence. Headline payoff: a net that GROWS the target from a single
-      seed pixel and (stretch) REGENERATES after the grid is damaged — visually
-      striking and conceptually unlike anything in the suite (it is recurrent-in-
-      space self-organisation, not a feed-forward classifier or a diagnostic
-      report). Render frames as ASCII/ppm so it stays dependency-free. Feasibility
-      risk to settle in the first version: confirm the unrolled shared-weight
-      gradient flows correctly under the SetBatchUpdate(True) idiom across T steps
-      (the manual-gradient gotcha noted in [[manual-gradient-and-snapshot-gotchas]]);
-      if full backprop-through-time over 48+ steps blows the CPU budget, fall back
-      to a shorter T or truncated BPTT and document it (the same "what did NOT fit
-      the budget" honesty the Grokking entry uses). Distinct from VisualGAN
-      (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
-      DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
 - [ ] Neural ODE follow-ups (builder `TNNet.AddNeuralODEBlock` + `examples/NeuralODE/`
       landed 2026-05-31, Euler-only, trains via stored-activation backprop through the
       unrolled steps). Deferred:
