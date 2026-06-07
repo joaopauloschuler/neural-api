@@ -110,28 +110,10 @@ rather than acted on.
   - [ ] Optional follow-up: a chunked/parallel forward (the paper's WY-matrix
         reformulation) so training is sub-quadratic instead of a strict
         per-token scan; gate it behind an exact-vs-chunked equivalence assert.
-- [X] TNNetDeformableConv — deformable convolution (Dai et al. 2017): a conv
-      whose KxK sampling grid is shifted by learnable, per-output-location
-      (and per-tap) 2-D offsets, so the receptive field adapts to content
-      instead of being a rigid axis-aligned window. This is a genuinely new
-      paradigm in the fork — distinct from regular/dilated conv (fixed grid),
-      TNNetInvolution (location-specific *kernels*, fixed grid), and
-      TNNetGroupConvP4 (rotation copies of a fixed grid): here the *sampling
-      positions themselves* are predicted and bilinearly interpolated.
-      Plan: (a) a small "offset head" sub-conv producing 2*K*K offset maps
-      from the same input; (b) forward = gather each tap via bilinear
-      interpolation at (base + offset), then the usual weighted sum;
-      (c) backward must propagate gradients into BOTH the conv weights AND the
-      offsets through the bilinear-interpolation weights (the offset gradient
-      is the interesting part — dOut/d(offset) flows through the 4 corner
-      pixels' interpolation coefficients). Zero-init the offset head so the
-      layer starts identical to a plain conv. Deliverables: leaf layer with
-      `// Coded by Claude (AI).`, LoadFromString/serialization wiring,
-      numerical-gradient tests for weights AND offsets (bound inputs so the
-      bilinear kinks at integer positions don't trip finite differences),
-      shape-inference smoke entry, and an examples/DeformableConv/ demo on a
-      geometrically-warped tiny dataset (rotated/scaled MNIST digits) showing
-      it beats a param-matched rigid conv.
+- [ ] TNNetDeformableConv follow-up (the content-adaptive deformable-conv leaf
+      layer with predicted bilinear sampling offsets, weight+offset
+      numerical-gradient tests, serialization, shape smoke, and
+      examples/DeformableConv/ all landed 2026-06-07 on a2, commit 0f6be5c):
   - [ ] Optional v2: modulated deformable conv (DCNv2) adding a learnable
         per-tap sigmoid amplitude (modulation mask).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
@@ -165,21 +147,6 @@ rather than acted on.
       (b) wire AddHyenaOperator into the downstream ../gpt-3-for-pascal decoder as
           an attention-free block option and contrast its loss / wall-clock vs the
           attention decoder on the existing tiny corpus.
-- [X] TNNetCapsule follow-up (TNNetCapsuleSquash + TNNetCapsuleRouting — the
-      squash nonlinearity, the fixed-iteration routing-by-agreement loop,
-      LoadFromString wiring, and numerical-gradient + serialization tests all
-      landed): the reconstruction-decoder pose-perturbation STRETCH goal — feed
-      the winning digit-capsule's output vector to a small reconstruction
-      decoder, perturb one dimension, and show it varies an interpretable pose
-      factor (stroke thickness / skew). DONE 2026-06-07 on a2:
-      examples/CapsuleReconstruction trains a CapsNet with the paper's MARGIN loss
-      + masked-reconstruction MSE on a SYNTHETIC 12x12 bars set (controllable
-      thickness/position pose factors — chosen over a real MNIST parse to stay in
-      the <5-min CPU budget; ~17 s). Sweeping the most-responsive pose dimension
-      varies the decoded bar SMOOTHLY and monotonically (stroke intensity/
-      thickness; total ink 32.6->24.9). Accuracy: CapsNet 100% vs param-matched
-      plain MLP 100% (easy 2-class task; the capsule win is the interpretable
-      pose vector, reported honestly).
 
 - [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
       landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
@@ -1055,7 +1022,6 @@ rather than acted on.
 - [ ] "Memorize a sentence" demo: train a 1-layer SDPA+RoPE model to
       perfectly memorize a 32-token sequence, print training loss curve
       and reconstructed sample.
-- [X] "Learn to reverse" toy: SeqLen=8 input → output the reversed sequence.
 - [ ] "Smallest net that can learn parity-N" study — sweep N ∈ {2, 4, 6, 8}.
 - [ ] Grokking demo (`examples/Grokking/`) — reproduce delayed generalization
       (Power et al. 2022) on a pure-CPU toy. Train a tiny MLP on modular
