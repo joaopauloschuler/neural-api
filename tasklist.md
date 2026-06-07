@@ -72,6 +72,29 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] TNNetDeformableConv — deformable convolution (Dai et al. 2017): a conv
+      whose KxK sampling grid is shifted by learnable, per-output-location
+      (and per-tap) 2-D offsets, so the receptive field adapts to content
+      instead of being a rigid axis-aligned window. This is a genuinely new
+      paradigm in the fork — distinct from regular/dilated conv (fixed grid),
+      TNNetInvolution (location-specific *kernels*, fixed grid), and
+      TNNetGroupConvP4 (rotation copies of a fixed grid): here the *sampling
+      positions themselves* are predicted and bilinearly interpolated.
+      Plan: (a) a small "offset head" sub-conv producing 2*K*K offset maps
+      from the same input; (b) forward = gather each tap via bilinear
+      interpolation at (base + offset), then the usual weighted sum;
+      (c) backward must propagate gradients into BOTH the conv weights AND the
+      offsets through the bilinear-interpolation weights (the offset gradient
+      is the interesting part — dOut/d(offset) flows through the 4 corner
+      pixels' interpolation coefficients). Zero-init the offset head so the
+      layer starts identical to a plain conv. Deliverables: leaf layer with
+      `// Coded by Claude (AI).`, LoadFromString/serialization wiring,
+      numerical-gradient tests for weights AND offsets (bound inputs so the
+      bilinear kinks at integer positions don't trip finite differences),
+      shape-inference smoke entry, and an examples/DeformableConv/ demo on a
+      geometrically-warped tiny dataset (rotated/scaled MNIST digits) showing
+      it beats a param-matched rigid conv. Optional v2: modulated deformable
+      conv (DCNv2) adding a learnable per-tap sigmoid amplitude.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
