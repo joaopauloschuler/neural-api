@@ -72,6 +72,30 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] `TNNetTensorTrain` — a Tensor-Train (Matrix-Product-State) factorized
+      DENSE layer, the next rung of the structured / sub-quadratic weight family
+      after [[kronecker-linear-layer]] (W = A⊗B, a single 2-factor product) and
+      [[monarch-linear-layer]] (two block-diagonal + permutation factors).
+      Factor the (n_in × n_out) weight as a CHAIN of d small 4-D cores
+      G_k ∈ R^{r_{k-1} × m_k × n_k × r_k} with TT-ranks r_0=r_d=1, so the
+      reshaped input tensor is contracted core-by-core left→right
+      (Oseledets 2011, "Tensor-Train Decomposition"; Novikov et al. 2015,
+      "Tensorizing Neural Networks"). Genuinely distinct from Kronecker/Monarch:
+      d>2 cores with a tunable internal rank give a smooth compression↔capacity
+      dial (params ~ d·m·n·r² vs the full m^d·n^d), not a fixed 2-factor shape.
+      Scope to match the existing structured layers: factorization shape
+      (d, the m_k/n_k splits, the TT-rank r) carried in FStruct; never
+      materialize the full W — contract cores directly in forward, and
+      backprop through each contraction (the per-core gradient is the standard
+      "freeze all other cores, contract" rule, validated the usual way against
+      a dense reference). Reuse the base FSuppressBias path. Deliver the layer +
+      numerical-gradient + serialization (round-trip d and the ranks) tests in
+      TestNeuralLayersExtra.pas, the `// Coded by Claude (AI).` attribution, and
+      an examples/TensorTrainLinear/ demo that reports weight count vs a matched
+      dense FullConnect at equal/▽-accuracy (mirroring the Kronecker "85× fewer
+      weights" and Monarch examples). Fills the multi-factor low-rank-tensor gap
+      in the structured-matrix family; an optional TT-rank sweep table is a clean
+      follow-up.
 - [ ] Multi-Token Prediction follow-up (TNNet.AddMultiTokenPrediction landed
       2026-06-07, commit be16117): Inference-time self-speculative decode — reuse
       the extra future heads as a built-in draft (drop the SpeculativeDecoding
