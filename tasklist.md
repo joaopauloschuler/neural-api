@@ -75,8 +75,24 @@ rather than acted on.
 - [ ] TNNetLIFNeuron follow-ups (the spiking leaky-integrate-and-fire surrogate-
       gradient leaf layer + examples/SpikingMNIST/ + numerical-gradient/forward/
       shape/save-load + FFloatSt round-trip tests all LANDED 2026-06-07 on a2):
-      - [ ] the adaptive-LIF (ALIF) variant with a second slow threshold-
-            adaptation state.
+      - [X] the adaptive-LIF (ALIF) variant with a second slow threshold-
+            adaptation state — LANDED 2026-06-07 on a2 as TNNetALIFNeuron
+            (TNNetLayer leaf, mirrors TNNetLIFNeuron). LSNN/Bellec et al. 2018
+            dynamics: fast membrane V[t]=beta*V[t-1]*(1-S[t-1])+I[t] PLUS a slow
+            per-neuron adaptation trace a[t]=rho*a[t-1]+S[t-1] raising the
+            effective threshold V_th_eff=V_th+adaptBeta*a[t] (spike-frequency
+            adaptation; adaptBeta=0 reduces EXACTLY to plain LIF). Surrogate-
+            gradient BPTT through BOTH recurrences (carry gVnext AND gAnext;
+            gS gets the adaptation consumer gAnext*1, gA=gS*sgPrime*(-adaptBeta)
+            +gAnext*rho). Opt-in learnable per-channel V_th/leak (same 2-neuron
+            pattern as LIF). FFloatSt[0..4]=beta/V_th/alpha/adaptBeta/rho round-
+            trip; registered at both CreateLayer dispatch sites. Tests in
+            tests/TestNeuralNumerical.pas: input-gradient check, learnable-V_th
+            gradient check, adaptation-suppresses-immediate-respike forward
+            (t=1 fires for adaptBeta=0 but is suppressed for adaptBeta=0.8),
+            shape, save/load round-trip. Full suite green (1188 tests). No
+            example added (LIF's SpikingMNIST covers the paradigm; an ALIF demo
+            was skipped to stay in budget).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT

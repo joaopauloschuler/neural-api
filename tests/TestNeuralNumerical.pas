@@ -225,6 +225,12 @@ type
     procedure TestLIFNeuronLearnableInputGradientCheck;
     procedure TestLIFNeuronLearnableSerializationRoundTrip;
     procedure TestSpikingBlockBuilder;
+    // TNNetALIFNeuron adaptive-LIF (LSNN) spiking layer with a slow adaptation state
+    procedure TestALIFNeuronInputGradientCheck;
+    procedure TestALIFNeuronAdaptationSuppressesSpike;
+    procedure TestALIFNeuronShape;
+    procedure TestALIFNeuronSerializationRoundTrip;
+    procedure TestALIFNeuronLearnableVthGradientCheck;
     // TNNetTropicalConv max-plus / min-plus morphological convolution layer
     procedure TestTropicalConvInputGradientCheck;
     procedure TestTropicalConvWeightGradientCheck;
@@ -39280,6 +39286,316 @@ begin
       NN.GetLastLayer.Output.Raw[0] = NN.GetLastLayer.Output.Raw[0]);
   finally
     NN.Free; Input.Free; Tgt.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALIFNeuronInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired, Smooth: TNNetVolume;
+  ALIF: TNNetALIFNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, T, Depth, InSize: integer;
+
+  // FD reference is the SMOOTH SURROGATE forward (the hard spike is zero-a.e.).
+  // ComputeSurrogate runs BOTH recurrences (membrane + adaptation) with the
+  // smooth gate; loss = 0.5*sum (gate - desired)^2. The analytic BPTT must be the
+  // exact gradient of THIS forward, including the adaptation-trace path.
+  function ComputeSurrogateLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    ALIF.ComputeSurrogate(Smooth);
+    Result := 0;
+    for k := 0 to Smooth.Size - 1 do
+    begin
+      diff := Smooth.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Gradient check of surrogate-gradient BPTT through the adaptive-LIF recurrence
+  // (membrane AND adaptation). adaptBeta>0 so the adaptation path is exercised.
+  RandSeed := 424242;
+  T := 6; Depth := 3;
+  InSize := T * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  InputPlus := TNNetVolume.Create(T, 1, Depth);
+  Desired := TNNetVolume.Create(T, 1, Depth);
+  Smooth := TNNetVolume.Create(T, 1, Depth);
+  epsilon := 0.0008;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth, 1)); // 1 = collect input error
+    ALIF := TNNetALIFNeuron.Create(2.0, 1.0, 2.0, 0.8, 0.9); // tau,Vth,alpha,adaptBeta,rho
+    NN.AddLayer(ALIF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.4;     // straddles the threshold
+    for i := 0 to InSize - 1 do
+      Desired.Raw[i] := 0.3 + 0.1 * Cos(i * 0.4);
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeSurrogateLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeSurrogateLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      ALIF.ComputeSurrogate(Smooth);
+      NN.Layers[0].OutputError.Fill(0);
+      ALIF.OutputError.Copy(Smooth);
+      ALIF.OutputError.Sub(Desired);   // dL/dS[t] = gate - desired
+      ALIF.IncDepartingBranchesCnt();
+      ALIF.Backpropagate();
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('ALIF input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ALIFNeuron surrogate gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+    Smooth.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALIFNeuronAdaptationSuppressesSpike;
+var
+  NN, NNLif: TNNet;
+  Input, InputL: TNNetVolume;
+  ALIF, LifEquiv: TNNetALIFNeuron;
+  t: integer;
+begin
+  // Hand-traced single-channel case showing the ADAPTIVE threshold rises after a
+  // spike and suppresses an immediate second spike. beta=exp(-0.5)~0.6065,
+  // V_th=1, adaptBeta=0.8, rho=0.9. Currents: 1.2,1.0,1.2,0,0.
+  //   t=0: V=1.2 >= Vth_eff=1.0          -> SPIKE; a stays 0 this step.
+  //   t=1: a=1.0 -> Vth_eff=1.8; V=1.0   -> NO spike (would spike for plain LIF!)
+  //   t=2: a=0.9 -> Vth_eff=1.72; V=1.8065 >= 1.72 -> SPIKE
+  //   t=3,4: reset + high threshold      -> NO spike
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NNLif := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  InputL := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 1));
+    ALIF := TNNetALIFNeuron.Create(2.0, 1.0, 2.0, 0.8, 0.9);
+    NN.AddLayer(ALIF);
+
+    // Same dynamics but adaptBeta=0 reduces EXACTLY to plain LIF -> spikes at t=1.
+    NNLif.AddLayer(TNNetInput.Create(5, 1, 1));
+    LifEquiv := TNNetALIFNeuron.Create(2.0, 1.0, 2.0, 0.0, 0.9);
+    NNLif.AddLayer(LifEquiv);
+
+    Input.FData[0] := 1.2; Input.FData[1] := 1.0; Input.FData[2] := 1.2;
+    Input.FData[3] := 0.0; Input.FData[4] := 0.0;
+    InputL.Copy(Input);
+    NN.Compute(Input);
+    NNLif.Compute(InputL);
+
+    for t := 0 to 4 do
+      AssertTrue('ALIF output binary at t=' + IntToStr(t),
+        (ALIF.Output.FData[t] = 0) or (ALIF.Output.FData[t] = 1));
+
+    AssertEquals('ALIF spike at t=0', 1.0, ALIF.Output.FData[0], 1e-6);
+    AssertEquals('ALIF adaptation suppresses spike at t=1', 0.0,
+      ALIF.Output.FData[1], 1e-6);
+    AssertEquals('ALIF spike at t=2', 1.0, ALIF.Output.FData[2], 1e-6);
+    AssertEquals('ALIF no spike at t=3', 0.0, ALIF.Output.FData[3], 1e-6);
+    AssertEquals('ALIF no spike at t=4', 0.0, ALIF.Output.FData[4], 1e-6);
+
+    // Contrast: with adaptBeta=0 (plain-LIF behaviour) t=1 DOES spike, proving the
+    // suppression at t=1 above is caused by the adaptation state.
+    AssertEquals('adaptBeta=0 spikes at t=1 (plain LIF)', 1.0,
+      LifEquiv.Output.FData[1], 1e-6);
+  finally
+    NN.Free; NNLif.Free; Input.Free; InputL.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALIFNeuronShape;
+var
+  NN: TNNet;
+  ALIF: TNNetALIFNeuron;
+  T, Depth: integer;
+begin
+  RandSeed := 424242;
+  T := 7; Depth := 4;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    ALIF := TNNetALIFNeuron.Create(3.0, 0.8, 1.5, 0.7, 0.92);
+    NN.AddLayer(ALIF);
+    AssertEquals('ALIF output SizeX', T, ALIF.Output.SizeX);
+    AssertEquals('ALIF output SizeY', 1, ALIF.Output.SizeY);
+    AssertEquals('ALIF output Depth', Depth, ALIF.Output.Depth);
+    AssertEquals('ALIF Vth property', 0.8, ALIF.Vth, 1e-6);
+    AssertEquals('ALIF Alpha property', 1.5, ALIF.Alpha, 1e-6);
+    AssertEquals('ALIF AdaptBeta property', 0.7, ALIF.AdaptBeta, 1e-6);
+    AssertEquals('ALIF Rho property', 0.92, ALIF.Rho, 1e-6);
+    AssertEquals('ALIF Beta = exp(-1/tau)', Exp(-1.0/3.0), ALIF.Beta, 1e-6);
+    AssertEquals('ALIF has no trainable neurons', 0, ALIF.Neurons.Count);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALIFNeuronSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  ALIF: TNNetALIFNeuron;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, T, Depth: integer;
+  TauVal, VthVal, AlphaVal, AdaptVal, RhoVal, BetaExpected: TNeuralFloat;
+begin
+  // beta(FFloatSt[0]),V_th(1),alpha(2),adaptBeta(3),rho(4) must survive
+  // SaveToString -> LoadFromString -> SaveToString (byte identical) through both
+  // CreateLayer dispatch points, and Compute must match.
+  RandSeed := 424242;
+  T := 5; Depth := 3;
+  TauVal := 4.0; VthVal := 0.65; AlphaVal := 3.5; AdaptVal := 0.6; RhoVal := 0.93;
+  BetaExpected := Exp(-1.0 / TauVal);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    ALIF := TNNetALIFNeuron.Create(TauVal, VthVal, AlphaVal, AdaptVal, RhoVal);
+    NN.AddLayer(ALIF);
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.8) * 0.9 + 0.3;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ALIF SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('ALIF token present in serialized string',
+        Pos('TNNetALIFNeuron', Saved) > 0);
+      AssertEquals('ALIF beta round-trips', BetaExpected,
+        (NN2.Layers[1] as TNNetALIFNeuron).Beta, 1e-5);
+      AssertEquals('ALIF V_th round-trips', VthVal,
+        (NN2.Layers[1] as TNNetALIFNeuron).Vth, 1e-5);
+      AssertEquals('ALIF alpha round-trips', AlphaVal,
+        (NN2.Layers[1] as TNNetALIFNeuron).Alpha, 1e-5);
+      AssertEquals('ALIF adaptBeta round-trips', AdaptVal,
+        (NN2.Layers[1] as TNNetALIFNeuron).AdaptBeta, 1e-5);
+      AssertEquals('ALIF rho round-trips', RhoVal,
+        (NN2.Layers[1] as TNNetALIFNeuron).Rho, 1e-5);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ALIF Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALIFNeuronLearnableVthGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired, Smooth: TNNetVolume;
+  ALIF: TNNetALIFNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr,
+    saved: TNeuralFloat;
+  d, i, T, Depth: integer;
+
+  function SurrogateLoss(): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    ALIF.ComputeSurrogate(Smooth);
+    Result := 0;
+    for k := 0 to Smooth.Size - 1 do
+    begin
+      diff := Smooth.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Learnable per-channel V_th gradient (opt-in dynamics). FD the raw threshold
+  // weight; analytic backward accumulates dL/dV_th into FNeurons[0].Delta as
+  // (-lr)*grad with lr=1, so grad = -Delta.
+  RandSeed := 424242;
+  T := 6; Depth := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  Desired := TNNetVolume.Create(T, 1, Depth);
+  Smooth := TNNetVolume.Create(T, 1, Depth);
+  epsilon := 0.0008;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth, 1));
+    ALIF := TNNetALIFNeuron.Create(2.0, 1.0, 2.0, 0.8, 0.9, {LearnDynamics=}true);
+    NN.AddLayer(ALIF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.4;
+    for i := 0 to Input.Size - 1 do
+      Desired.Raw[i] := 0.3 + 0.1 * Cos(i * 0.4);
+
+    for d := 0 to Depth - 1 do
+    begin
+      saved := ALIF.Neurons[0].Weights.FData[d];
+      ALIF.Neurons[0].Weights.FData[d] := saved + epsilon;
+      lossPlus := SurrogateLoss();
+      ALIF.Neurons[0].Weights.FData[d] := saved - epsilon;
+      lossMinus := SurrogateLoss();
+      ALIF.Neurons[0].Weights.FData[d] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      ALIF.ComputeSurrogate(Smooth);
+      NN.ClearDeltas();
+      ALIF.OutputError.Copy(Smooth);
+      ALIF.OutputError.Sub(Desired);
+      ALIF.IncDepartingBranchesCnt();
+      ALIF.Backpropagate();
+      analyticalGrad := -ALIF.Neurons[0].Delta.FData[d];   // lr=1
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ALIF learnable V_th grad at d=' + IntToStr(d) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ALIFNeuron learnable V_th grad max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+    Smooth.Free;
   end;
 end;
 
