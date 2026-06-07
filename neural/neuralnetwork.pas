@@ -7109,6 +7109,67 @@ type
     property OutComplex: integer read FOutComplex;
   end;
 
+  /// CONVOLUTIONAL Kolmogorov-Arnold layer -- the spatial sibling of the dense
+  /// TNNetKANLayer (Liu et al. 2024, "KAN: Kolmogorov-Arnold Networks",
+  /// arXiv:2404.19756) and the KAN analogue of TNNetConvolutionLinear.
+  ///
+  /// An ordinary convolution maps each (FeatureSize x FeatureSize x InputDepth)
+  /// receptive-field patch to one output value per filter via a linear dot
+  /// product (sum of weight*input). TNNetKANConv replaces that linear dot
+  /// product with a sum of LEARNED univariate edge functions, exactly like
+  /// TNNetKANLayer does for the dense case:
+  ///   y_oo(ox,oy) = sum_{fx,fy} sum_i phi_{oo,fx,fy,i}( x_i(prevX,prevY) ),
+  /// where each edge function phi is a Chebyshev expansion of degree K over the
+  /// squashed input u = tanh(x) (so the argument lives in the (-1,1) Chebyshev
+  /// domain):
+  ///   phi(x) = sum_{k=0..K} c_k * T_k(u),  u = tanh(x),
+  /// with the first-kind recurrence T_0=1, T_1=u, T_k = 2u*T_{k-1} - T_{k-2}.
+  /// Only the (FeatureSize*FeatureSize*InputDepth)*(K+1) coefficients per output
+  /// filter train; the basis is FIXED and orthogonal. There is NO output bias
+  /// activation (the c_0 constant term plays that role), like the Quaternion /
+  /// Octonion conv siblings.
+  ///
+  /// STORAGE / SERIALIZATION: exactly ONE neuron per output filter (NumFeatures
+  /// neurons), each holding (FeatureSize*FeatureSize*InputDepth)*(K+1)
+  /// coefficients laid out as index tap*(K+1)+k where tap sweeps
+  /// (fy,fx,inputChannel). This reuses the ordinary per-neuron Delta / inertia /
+  /// UpdateWeights path and per-neuron SaveDataToString / LoadDataFromString, so
+  /// no custom weight serialization is needed. FStruct[0..4] carry the usual
+  /// convolution parameters (features, kernel size, padding, stride,
+  /// suppress-bias) and the polynomial degree K rides in FStruct[5]; CreateLayer
+  /// / LoadFromString wire K back via Create(St[0],St[1],St[2],St[3],St[5]).
+  ///
+  /// INIT: near-linear start. The degree-1 (T_1=u) coefficient of each edge gets
+  /// a small random value, the constant and higher-order coefficients stay 0, so
+  /// an untrained TNNetKANConv behaves like a tanh-squashed linear convolution
+  /// with near-zero higher-order curvature.
+  ///
+  /// BACKWARD reuses the exact KANLayer Chebyshev math: dL/dc_k = gy * T_k(u),
+  /// and dL/dx = (1 - u^2) * sum_k c_k * T_k'(u) with T_k'(u) = k * U_{k-1}(u)
+  /// (second-kind recurrence U_0=1, U_1=2u, U_k = 2u*U_{k-1} - U_{k-2}).
+  /// Padding/stride follow the usual convolution semantics; out-of-range
+  /// (padded) input positions contribute zero.
+  // Coded by Claude (AI).
+  TNNetKANConv = class(TNNetConvolutionLinear)
+  private
+    FDegree: integer;            // K (polynomial degree -> K+1 coeffs per edge)
+    FInDepth: integer;           // input Depth, learned in SetPrevLayer
+    FTapsPerFilter: integer;     // FeatureSizeX*FeatureSizeY*InDepth
+    FT: array of TNeuralFloat;   // scratch T_k(u) buffer (length K+1)
+    FU2: array of TNeuralFloat;  // scratch U_k(u) buffer (length K+1)
+    procedure ComputeCPU();
+    procedure BackpropagateCPU();
+    procedure ComputePreviousLayerErrorCPU();
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pDegree, pSuppressBias: integer); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    property Degree: integer read FDegree;
+  end;
+
   /// 8-DIMENSIONAL HYPERCOMPLEX (octonion / Cayley-Dickson) DENSE layer.
   /// This is the octonion sibling of TNNetQuaternionLinear: it reinterprets the
   /// input/output Depth (both multiples of 8) as packed OCTONIONS and learns an
@@ -46951,6 +47012,291 @@ begin
   end;
 end;
 
+{ TNNetKANConv }
+
+constructor TNNetKANConv.Create(pNumFeatures, pFeatureSize, pInputPadding,
+  pStride: integer; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  // Identity activation is already set by TNNetConvolutionLinear. FStruct[5]
+  // carries the polynomial degree K; the base ctor leaves it 0, so default to 3
+  // here so a 5-arg / from-string construction still gets a sane degree. The
+  // (NumFeatures,...,K) ctor overrides it AFTER this runs.
+  if FStruct[5] < 1 then FStruct[5] := 3;
+  FDegree := FStruct[5];
+  FInDepth := 0;
+  FTapsPerFilter := 0;
+  // KAN edges carry their OWN constant term (c_0); the conv bias is not used.
+  FSuppressBias := 1;
+  FStruct[4] := 1;
+  SetLength(FT, FDegree + 1);
+  SetLength(FU2, FDegree + 1);
+end;
+
+constructor TNNetKANConv.Create(pNumFeatures, pFeatureSize, pInputPadding,
+  pStride, pDegree, pSuppressBias: integer);
+begin
+  if pDegree < 1 then
+    raise Exception.Create('TNNetKANConv requires degree K >= 1.');
+  Self.Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, 1);
+  FStruct[5] := pDegree;
+  FDegree := pDegree;
+  SetLength(FT, FDegree + 1);
+  SetLength(FU2, FDegree + 1);
+end;
+
+procedure TNNetKANConv.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  oo, OutDepth, coeffs: integer;
+begin
+  OutDepth := FNeurons.Count; // numFeatures requested in Create
+  // Let the standard convolution machinery size FOutput / FOutputError /
+  // FOutputSizeX/Y / FFeatureSizeX/Y and the padded-error buffer. We then
+  // discard its full-feature linear neuron layout and install the compact
+  // per-filter Chebyshev-coefficient layout below.
+  inherited SetPrevLayer(pPrevLayer);
+
+  FInDepth := pPrevLayer.Output.Depth;
+  FTapsPerFilter := FFeatureSizeX * FFeatureSizeY * FInDepth;
+  // Each output filter neuron holds FTapsPerFilter*(K+1) coefficients laid out
+  // as tap*(K+1)+k where tap sweeps (fy,fx,inputChannel).
+  coeffs := FTapsPerFilter * (FDegree + 1);
+
+  while FNeurons.Count > OutDepth do FNeurons.Delete(FNeurons.Count - 1);
+  while FNeurons.Count < OutDepth do FNeurons.Add(TNNetNeuron.Create());
+
+  for oo := 0 to OutDepth - 1 do
+  begin
+    FNeurons[oo].Weights.ReSize(coeffs, 1, 1);
+    FNeurons[oo].BackInertia.ReSize(coeffs, 1, 1);
+    FNeurons[oo].Delta.ReSize(coeffs, 1, 1);
+  end;
+
+  FVectorSize := coeffs;
+  FShouldConcatWeights := false;
+  FShouldInterleaveWeights := false;
+  SetLength(FT, FDegree + 1);
+  SetLength(FU2, FDegree + 1);
+  BuildArrNeurons();
+  InitDefault();
+  for oo := 0 to OutDepth - 1 do
+    FNeurons[oo].FBiasWeight := 0;
+  RefreshCalculatePrevLayerError();
+  AfterWeightUpdate();
+end;
+
+// Near-linear init: the degree-1 (T_1=u) coefficient of each edge gets a small
+// random value, c_0 and c_{k>=2} stay 0.
+procedure TNNetKANConv.InitDefault();
+var
+  oo, t, base, OutDepth: integer;
+  scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FTapsPerFilter <= 0 then exit;
+  OutDepth := FNeurons.Count;
+  scale := Sqrt(2.0 / Max(1, FTapsPerFilter));
+  for oo := 0 to OutDepth - 1 do
+  begin
+    W := FArrNeurons[oo].FWeights;
+    W.Fill(0);
+    FArrNeurons[oo].FBiasWeight := 0;
+    for t := 0 to FTapsPerFilter - 1 do
+    begin
+      base := t * (FDegree + 1);
+      // index +1 is the degree-1 (T_1 = u) coefficient.
+      W.FData[base + 1] := scale * (Random - 0.5) * 2.0;
+    end;
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetKANConv.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward: y_oo(ox,oy) = sum_{fx,fy} sum_i sum_k c_{oo,tap,k} * T_k(tanh(x_i)).
+procedure TNNetKANConv.ComputeCPU();
+var
+  ox, oy, oo, fx, fy, ic, kk, tap, base, OutDepth: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  u, acc, xv: TNeuralFloat;
+  W, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  OutDepth := FNeurons.Count;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for oo := 0 to OutDepth - 1 do
+    begin
+      W := FArrNeurons[oo].FWeights;
+      acc := 0;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ic := 0 to FInDepth - 1 do
+          begin
+            xv := PrevOut.Get(prevX, prevY, ic);
+            u := Tanh(xv);
+            FT[0] := 1;
+            if FDegree >= 1 then FT[1] := u;
+            for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
+            tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
+            base := tap * (FDegree + 1);
+            for kk := 0 to FDegree do
+              acc := acc + W.FData[base + kk] * FT[kk];
+          end;
+        end;
+      end;
+      FOutput.FData[FOutput.GetRawPos(ox, oy, oo)] := acc;
+    end;
+  end;
+end;
+
+procedure TNNetKANConv.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    if FLearningRate <> 0.0 then BackpropagateCPU();
+    ComputePreviousLayerErrorCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Per-coefficient gradient: dL/dc_{oo,tap,k} = gy_oo(ox,oy) * T_k(u),
+// accumulated into the neuron Delta scaled by -LearningRate.
+procedure TNNetKANConv.BackpropagateCPU();
+var
+  ox, oy, oo, fx, fy, ic, kk, tap, base, OutDepth: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  u, gy, localErr, xv: TNeuralFloat;
+  WDelta, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  OutDepth := FNeurons.Count;
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for oo := 0 to OutDepth - 1 do
+    begin
+      gy := FOutputError.Get(ox, oy, oo);
+      localErr := -FLearningRate * gy;
+      if localErr = 0.0 then continue;
+      WDelta := FArrNeurons[oo].FDelta;
+      for fy := 0 to FFeatureSizeY - 1 do
+      begin
+        prevY := oy * FStride + fy - FPadding;
+        if (prevY < 0) or (prevY >= prevSizeY) then continue;
+        for fx := 0 to FFeatureSizeX - 1 do
+        begin
+          prevX := ox * FStride + fx - FPadding;
+          if (prevX < 0) or (prevX >= prevSizeX) then continue;
+          for ic := 0 to FInDepth - 1 do
+          begin
+            xv := PrevOut.Get(prevX, prevY, ic);
+            u := Tanh(xv);
+            FT[0] := 1;
+            if FDegree >= 1 then FT[1] := u;
+            for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
+            tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
+            base := tap * (FDegree + 1);
+            for kk := 0 to FDegree do
+              WDelta.FData[base + kk] := WDelta.FData[base + kk] + localErr * FT[kk];
+          end;
+        end;
+      end;
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    for oo := 0 to OutDepth - 1 do
+      FArrNeurons[oo].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+end;
+
+// Input gradient: dL/dx_i += (1 - u^2) * sum_oo gy_oo * sum_k c_{oo,tap,k} T_k'(u),
+// with T_k'(u) = k*U_{k-1}(u), u = tanh(x_i), summed over every output position
+// / tap that reads input position (prevX,prevY,ic).
+procedure TNNetKANConv.ComputePreviousLayerErrorCPU();
+var
+  ox, oy, oo, fx, fy, ic, kk, tap, base, OutDepth: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  u, dudx, gy, edgeDeriv, gradAcc, xv: TNeuralFloat;
+  W, PrevOut, LocalPrevError: TNNetVolume;
+  Tderiv: array of TNeuralFloat;
+begin
+  if not FCalculatePrevLayerError then exit;
+  PrevOut := FPrevLayer.FOutput;
+  LocalPrevError := FPrevLayer.OutputError;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  OutDepth := FNeurons.Count;
+  SetLength(Tderiv, FDegree + 1);
+  for oy := 0 to FOutputSizeY - 1 do
+  for ox := 0 to FOutputSizeX - 1 do
+  begin
+    for fy := 0 to FFeatureSizeY - 1 do
+    begin
+      prevY := oy * FStride + fy - FPadding;
+      if (prevY < 0) or (prevY >= prevSizeY) then continue;
+      for fx := 0 to FFeatureSizeX - 1 do
+      begin
+        prevX := ox * FStride + fx - FPadding;
+        if (prevX < 0) or (prevX >= prevSizeX) then continue;
+        for ic := 0 to FInDepth - 1 do
+        begin
+          xv := PrevOut.Get(prevX, prevY, ic);
+          u := Tanh(xv);
+          dudx := 1 - u * u;
+          // T_k'(u) = k * U_{k-1}(u). FU2 holds U_0..U_{K-1}; U_{-1}=0 so T_0'=0.
+          FU2[0] := 1;
+          if FDegree >= 1 then FU2[1] := 2 * u;
+          for kk := 2 to FDegree do FU2[kk] := 2 * u * FU2[kk - 1] - FU2[kk - 2];
+          Tderiv[0] := 0;
+          for kk := 1 to FDegree do Tderiv[kk] := kk * FU2[kk - 1];
+          tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
+          base := tap * (FDegree + 1);
+          gradAcc := 0;
+          for oo := 0 to OutDepth - 1 do
+          begin
+            gy := FOutputError.Get(ox, oy, oo);
+            if gy = 0.0 then continue;
+            W := FArrNeurons[oo].FWeights;
+            edgeDeriv := 0;
+            for kk := 1 to FDegree do
+              edgeDeriv := edgeDeriv + W.FData[base + kk] * Tderiv[kk];
+            gradAcc := gradAcc + gy * edgeDeriv;
+          end;
+          LocalPrevError.Add(prevX, prevY, ic, dudx * gradAcc);
+        end;
+      end;
+    end;
+  end;
+end;
+
 { TNNetGraphConvolution }
 
 constructor TNNetGraphConvolution.Create(pSizeX, pSizeY, pDepth: integer;
@@ -71259,6 +71605,7 @@ begin
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetKANConv' :              Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetWeightStandardizationConv' : Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]);
       'TNNetSpectralNormConv' :     Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -71611,6 +71958,7 @@ begin
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetKANConv' then Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetWeightStandardizationConv' then Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]) else
       if S[0] = 'TNNetSpectralNormConv' then Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else

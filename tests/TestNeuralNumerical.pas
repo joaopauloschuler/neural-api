@@ -287,6 +287,9 @@ type
     // TNNetKANLayer Kolmogorov-Arnold dense layer
     procedure TestKANLayerGradientCheck;
     procedure TestKANLayerSerializationRoundTrip;
+    // TNNetKANConv Kolmogorov-Arnold convolutional layer
+    procedure TestKANConvGradientCheck;
+    procedure TestKANConvSerializationRoundTrip;
     // TNNetGraphConvolution spectral GCN layer
     procedure TestGraphConvolutionGradientCheck;
     procedure TestGraphConvolutionSerializationRoundTrip;
@@ -45613,6 +45616,190 @@ begin
             KAN2.Neurons[j].Weights.Raw[w], 1e-5);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('KAN Compute matches after round-trip pos ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKANConvGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  KAN: TNNetKANConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, w, idx, coeffs, Deg: integer;
+  SizeXY, InD, NumF, FeatSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for both the INPUT and EVERY edge
+  // coefficient of a small KAN convolution. Weights kept BOUNDED so the
+  // Chebyshev finite-difference truncation does not falsely fail. Reseed the
+  // shared RNG per the numerical-test rule.
+  RandSeed := 424242;
+  SizeXY := 4;
+  InD := 2;
+  NumF := 2;
+  FeatSize := 2;
+  Deg := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeXY, SizeXY, InD);
+  InputPlus := TNNetVolume.Create(SizeXY, SizeXY, InD);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InD, 1));
+    // FeatureSize=2, padding=0, stride=2 -> output 2x2.
+    KAN := TNNetKANConv.Create(NumF, FeatSize, 0, 2, Deg, 1);
+    NN.AddLayer(KAN);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+
+    coeffs := FeatSize * FeatSize * InD * (Deg + 1);
+    AssertEquals('KANConv neuron count = NumFeatures', NumF, KAN.Neurons.Count);
+    AssertEquals('KANConv coeffs per filter = FS*FS*InD*(K+1)', coeffs,
+      KAN.Neurons[0].Weights.Size);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.6;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+    // Non-trivial BOUNDED coefficients (incl. higher orders) so the test
+    // exercises the full Chebyshev derivative path, not just near-linear init.
+    for idx := 0 to NumF - 1 do
+      for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+        KAN.Neurons[idx].Weights.Raw[w] := Sin((idx * 7 + w) * 0.3) * 0.2;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('KANConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. every coefficient ----
+    for idx := 0 to NumF - 1 do
+      for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+      begin
+        KAN.Neurons[idx].Weights.Raw[w] := KAN.Neurons[idx].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        KAN.Neurons[idx].Weights.Raw[w] := KAN.Neurons[idx].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        KAN.Neurons[idx].Weights.Raw[w] := KAN.Neurons[idx].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        for i := 0 to NumF - 1 do KAN.Neurons[i].ClearDelta;
+        NN.Backpropagate(Desired);
+        // Delta := Delta - LearningRate*gradient with LR=1 => grad = -Delta.
+        analyticalGrad := -KAN.Neurons[idx].Delta.Raw[w];
+
+        AssertTrue('KANConv coeff gradient check neuron[' + IntToStr(idx) +
+          '] w=' + IntToStr(w) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKANConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  KAN, KAN2: TNNetKANConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, w, idx, coeffs, Deg: integer;
+  SizeXY, InD, NumF, FeatSize: integer;
+begin
+  // KANConv in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match (proving the
+  // per-filter coefficient storage and both CreateLayer dispatch points
+  // round-trip the conv params (FStruct[0..4]) and the degree K (FStruct[5])).
+  RandSeed := 424242;
+  SizeXY := 5;
+  InD := 2;
+  NumF := 3;
+  FeatSize := 3;
+  Deg := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeXY, SizeXY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InD, 1));
+    KAN := TNNetKANConv.Create(NumF, FeatSize, 1, 1, Deg, 1);
+    NN.AddLayer(KAN);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    coeffs := FeatSize * FeatSize * InD * (Deg + 1);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 - 0.1;
+    for idx := 0 to NumF - 1 do
+      for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+        KAN.Neurons[idx].Weights.Raw[w] := 0.05 * (idx + 1) - 0.011 * w + 0.13;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('KANConv SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('KANConv token present in serialized string',
+        Pos('TNNetKANConv', Saved) > 0);
+      KAN2 := NN2.Layers[1] as TNNetKANConv;
+      AssertEquals('KANConv round-trip neuron count', NumF, KAN2.Neurons.Count);
+      AssertEquals('KANConv round-trip degree', Deg, KAN2.Degree);
+      AssertEquals('KANConv round-trip coeff count', coeffs,
+        KAN2.Neurons[0].Weights.Size);
+      for idx := 0 to NumF - 1 do
+        for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+          AssertEquals('KANConv round-trip coeff neuron[' + IntToStr(idx) + '] w=' +
+            IntToStr(w), KAN.Neurons[idx].Weights.Raw[w],
+            KAN2.Neurons[idx].Weights.Raw[w], 1e-5);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('KANConv Compute matches after round-trip pos ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
