@@ -280,8 +280,11 @@ rather than acted on.
       AddMultiHeadSDPAConcat landed on a2, commit fcc6ba8): (a) forward the
       variant through TNNetTransformerDecoderBlock / AddTransformerEncoderBlock —
       only the raw MHA breakdown takes it today, so a decoder-block-level flag is
-      the next rung; (b) add avCosineSimilarity to the enum (same drop-in SDPA
-      subclass shape); (c) persist the variant choice in a one-arg rebuild helper
+      the next rung; (b) [X] add avCosineSimilarity to the enum (same drop-in SDPA
+      subclass shape) — LANDED 2026-06-07 on a2 (commit d96ca99): wires the
+      existing TNNetCosineSimilarityAttention as a per-head variant in both
+      AddMultiHeadSelfAttention/AddMultiHeadSDPAConcat, avSDPA default unchanged,
+      shape+save/load test; (c) persist the variant choice in a one-arg rebuild helper
       (the composed layers serialize themselves, so load already works).
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
@@ -1399,7 +1402,17 @@ rather than acted on.
 
 
 ### Normalizing flows (exact-likelihood generative density)
-- [ ] `TNNetInvertible1x1Conv` — Glow's LEARNABLE invertible 1x1 convolution
+- [X] `TNNetInvertible1x1Conv` — LANDED 2026-06-07 on a2 (commit 4d4d11c):
+      Glow's learnable invertible 1x1 conv via W=P·L·(U+diag(s)) LU param (fixed
+      perm P from a stored seed, trainable L/U/s), cheap per-position log-det
+      sum(log|s|), public LogDetJacobian (summed over positions, mirrors
+      TNNetAffineCoupling), Inverse sampling path via triangular solves, FStruct
+      carries C+perm-seed+inverse-flag, registered in both CreateLayer tables +
+      LoadFromString. 6 tests (input/weight/log-det numerical-grad, forward∘inverse
+      identity, LogDetJacobian value, save/load round-trip). examples/NormalizingFlow
+      upgraded to interleave AffineCoupling<->Invertible1x1Conv (Glow flow reaches
+      mean log-lik -1.16 vs -1.56 fixed-permute baseline). The original idea text:
+      Glow's LEARNABLE invertible 1x1 convolution
       (Kingma & Dhariwal 2018, arXiv:1807.03039, sec. 3.2), the natural
       channel-mixing companion to the landed `TNNetAffineCoupling`. The
       AffineCoupling design note "pair with a FIXED channel permutation so every
