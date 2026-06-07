@@ -419,6 +419,11 @@ type
     procedure TestSeparableHamiltonianCellWeightGradientCheck;
     procedure TestSeparableHamiltonianCellSerializationRoundTrip;
     procedure TestAddHamiltonianBlockBuilder;
+    procedure TestPonderNetBlockShape;
+    procedure TestPonderNetBlockGradientCheck;
+    procedure TestPonderCostLossGradient;
+    procedure TestPonderCostLossLoadFromString;
+    procedure TestPonderHaltingLoadFromString;
     procedure TestAddClosedFormContinuousBuilder;
     procedure TestAddBidirectionalClosedFormContinuousBuilder;
     procedure TestBidirectionalClosedFormContinuousGradientCheck;
@@ -23435,6 +23440,242 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// --- TNNetPonderHalting / AddPonderNetBlock / TNNetPonderCostLoss -----------
+
+procedure TTestNeuralNumerical.TestPonderNetBlockShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Halting, BlockOut: TNNetLayer;
+  i, MaxSteps: integer;
+  PSum: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  MaxSteps := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 5));
+    BlockOut := NN.AddPonderNetBlock(nil, MaxSteps, Halting, 8, 0.2);
+    NN.AddLayer(TNNetIdentity.Create()); // task head placeholder
+    NN.InitWeights();
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.7) * 0.5;
+    NN.Compute(Input);
+
+    // Block output preserves the (1,1,d_model) shape.
+    AssertEquals('PonderNet block output Depth', 5, BlockOut.Output.Depth);
+    AssertEquals('PonderNet block output SizeX', 1, BlockOut.Output.SizeX);
+    // Halting distribution is (1,1,MaxSteps) and sums to 1 (geometric construction).
+    AssertEquals('PonderNet halting Depth', MaxSteps, Halting.Output.Depth);
+    PSum := 0;
+    for i := 0 to Halting.Output.Depth - 1 do
+    begin
+      AssertTrue('PonderNet p_n >= 0 at ' + IntToStr(i), Halting.Output.Raw[i] >= -1e-6);
+      PSum := PSum + Halting.Output.Raw[i];
+    end;
+    AssertEquals('PonderNet halting distribution sums to 1', 1.0, PSum, 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPonderNetBlockGradientCheck;
+const
+  cEps = 1e-3;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Halting, BlockOut: TNNetLayer;
+  i: integer;
+  OldV, LossP, LossM, NumGrad, AnaGrad, MaxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference check the gradient flowing back into the input through the
+  // WHOLE smooth p_n-weighted PonderNet block (no hard argmax anywhere). The
+  // final output DeepConcats the weighted block output with the halting branch so
+  // both block outputs are consumed (a dangling halting branch would inflate the
+  // residual-Sum departing-branch counts and freeze the backward pass).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  Desired := TNNetVolume.Create(1, 1, 3 + 3); // d_model + MaxSteps
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    BlockOut := NN.AddPonderNetBlock(nil, 3, Halting, 4, 0.3);
+    NN.AddLayer(TNNetDeepConcat.Create([BlockOut, Halting]));
+    NN.InitWeights();
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1) * 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.9) * 0.3;
+
+    MaxErr := 0;
+    for i := 0 to Input.Size - 1 do
+    begin
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps; LossP := ComputeLoss(Input);
+      Input.Raw[i] := OldV - cEps; LossM := ComputeLoss(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      AnaGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(NumGrad - AnaGrad) > MaxErr then MaxErr := Abs(NumGrad - AnaGrad);
+    end;
+    AssertTrue('PonderNet block input gradient (maxErr=' +
+      FloatToStr(MaxErr) + ')', MaxErr < 1e-2);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPonderCostLossGradient;
+const
+  cEps = 1e-4;
+  cN = 4;
+  cPrior = 0.25;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  i: integer;
+  AnaGrad, NumGrad, OldV, LossP, LossM, GeoSum, Gn: TNeuralFloat;
+
+  function KLAt(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; p, prior_n: TNeuralFloat;
+  begin
+    Result := 0;
+    Gn := cPrior;
+    for k := 0 to AInput.Size - 1 do
+    begin
+      p := AInput.Raw[k];
+      if p < 1e-7 then p := 1e-7;
+      prior_n := (Gn / GeoSum);
+      if prior_n < 1e-7 then prior_n := 1e-7;
+      Result := Result + p * (Ln(p) - Ln(prior_n));
+      Gn := Gn * (1.0 - cPrior);
+    end;
+  end;
+
+begin
+  // KL(p || truncated-geometric(prior)) gradient check at the cost-head input.
+  RandSeed := 424242;
+  // Truncated-geometric normaliser used by both the layer and the reference.
+  GeoSum := 0; Gn := cPrior;
+  for i := 0 to cN - 1 do begin GeoSum := GeoSum + Gn; Gn := Gn * (1.0 - cPrior); end;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cN);
+  Target := TNNetVolume.Create(1, 1, cN);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cN, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetPonderCostLoss.Create(cPrior));
+
+    // A valid (well inside (0,1), summing to 1) halting distribution.
+    Input[0, 0, 0] := 0.4; Input[0, 0, 1] := 0.3;
+    Input[0, 0, 2] := 0.2; Input[0, 0, 3] := 0.1;
+    Target.Fill(0); // ignored by the penalty head.
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps; LossP := KLAt(Input);
+      Input.Raw[i] := OldV - cEps; LossM := KLAt(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('PonderCostLoss grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPonderCostLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+begin
+  // Round-trip a net ending in TNNetPonderCostLoss with NON-default prior 0.37:
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical, proving
+  // prior_lambda (FFloatSt[0]) survives the dispatch tables.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4));
+    NN.AddLayer(TNNetPonderCostLoss.Create(0.37));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('PonderCostLoss round-trip class identity',
+        NN2.GetLastLayer is TNNetPonderCostLoss);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('PonderCostLoss SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPonderHaltingLoadFromString;
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+begin
+  // Round-trip TNNetPonderHalting with NON-default MaxSteps=7 / prior=0.15,
+  // proving FStruct[0] (MaxSteps) and FFloatSt[0] (prior) survive the dispatch.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 1));
+    NN.AddLayer(TNNetPonderHalting.Create(7, 0.15));
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('PonderHalting round-trip class identity',
+        NN2.GetLastLayer is TNNetPonderHalting);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('PonderHalting SaveToString round-trip equality',
+        Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
   end;
 end;
 

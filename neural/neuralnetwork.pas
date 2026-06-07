@@ -1677,6 +1677,33 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// PonderNet ponder-cost regularizer head (Banino, Balaguer & Blundell 2021).
+  // The input is the per-step halting distribution p = (p_0..p_{N-1}) emitted by
+  // an AddPonderNetBlock (one probability per ponder step, on the Depth axis;
+  // p sums to 1 by construction). This head penalises the KL divergence between
+  // that learned distribution and a fixed GEOMETRIC prior
+  //   g_n = prior_lambda * (1 - prior_lambda)^n   (n = 0 .. N-1),
+  // i.e. the halting distribution of a process that halts with constant
+  // probability prior_lambda at every step. Minimising KL(p || g) pulls the
+  // EXPECTED number of ponder steps toward the prior's mean 1/prior_lambda, so a
+  // small prior_lambda asks the model to think longer and a large one to halt
+  // early. This is a self-contained PENALTY head: it has NO external target, so
+  // (like TNNetTripletLoss / TNNetCenterLoss) it IGNORES the framework-seeded
+  // residual and reads p straight from FOutput. The forward pass is an identity
+  // passthrough. Backpropagate overwrites each residual with the analytic
+  //   dL/dp_n = log(p_n) - log(g_n) + 1
+  // (the +gradient, so the optimizer descends the KL). p_n is clamped to
+  // [eps, 1] before the log; the prior is renormalised over the N steps so the
+  // geometric tail mass beyond step N-1 does not bias the target. prior_lambda
+  // is stored in FFloatSt[0] (default 0.2) and round-trips via Save/Load.
+  // Coded by Claude (AI).
+  TNNetPonderCostLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pPriorLambda: TNeuralFloat); overload;
+    procedure Backpropagate(); override;
+  end;
+
   /// Tversky loss output layer for image segmentation / class-imbalanced
   // dense prediction. Operates on probability-space inputs p (typically after
   // a sigmoid or softmax) with binary/one-hot targets g, reduced over the
@@ -3151,6 +3178,27 @@ type
       constructor Create(); override;
   end;
 
+  /// PonderNet HALTING HEAD (Banino, Balaguer & Blundell 2021). A tiny leaf layer
+  /// that maps its input logit to a per-step halting probability
+  ///   lambda_n = sigmoid(input)  in (0,1)
+  /// (forward and backward are exactly TNNetSigmoid's). It is the per-step head
+  /// applied inside TNNet.AddPonderNetBlock: at step n the weight-tied step
+  /// function f produces a hidden state, a shared scalar projection reduces it to
+  /// one logit, and this layer turns that logit into lambda_n. The geometric
+  /// halting distribution p_n = lambda_n * prod_{k<n}(1 - lambda_k) is then
+  /// assembled by the builder from the lambda_n of every step. The layer carries
+  /// no trainable weights of its own; it stores the block hyperparameters so they
+  /// survive serialization and can be read back by the cost-loss head:
+  /// MaxSteps in FStruct[0] and the geometric prior_lambda in FFloatSt[0]
+  /// (defaults 1 and 0.2). Distinct from a bare TNNetSigmoid only by carrying that
+  /// PonderNet metadata.
+  // Coded by Claude (AI).
+  TNNetPonderHalting = class(TNNetSigmoid)
+    public
+      constructor Create(); overload; override;
+      constructor Create(pMaxSteps: integer; pPriorLambda: TNeuralFloat); overload;
+  end;
+
   /// This layer multiplies the learning in previous layers. It can speed up
   // learning but can also provoke overflows.
   TNNetMulLearning = class(TNNetIdentity)
@@ -3170,6 +3218,20 @@ type
   TNNetNegate = class(TNNetMulByConstant)
     public
       constructor Create(); override;
+  end;
+
+  /// This layer adds a fixed constant to every output element
+  /// (y = x + c). The forward shifts each element by c; the backward is an exact
+  /// identity (d y / d x = 1), so the gradient passes straight through. The
+  /// additive constant c is stored in FFloatSt[0] so the layer round-trips through
+  /// Save/Load. Companion of TNNetMulByConstant (which scales); useful for building
+  /// complements such as 1 - sigmoid(x) = AddConstant(1)(Negate(sigmoid)).
+  // Coded by Claude (AI).
+  TNNetAddConstant = class(TNNetIdentity)
+    public
+      constructor Create(); overload; override;
+      constructor Create(pAdd: TNeuralFloat); overload;
+      procedure Compute(); override;
   end;
 
   /// Gradient Reversal Layer (Ganin et al. 2015, https://arxiv.org/abs/1505.07818).
@@ -9030,6 +9092,49 @@ type
       // MaxIters is clamped to >= 1, HiddenDim to >= 1. Returns the final iterate
       // layer (shape identical to InputLayer.Output).
       function AddDeepEquilibriumBlock(InputLayer: TNNetLayer; HiddenDim, MaxIters: integer): TNNetLayer;
+      // PonderNet adaptive-computation-time block (Banino, Balaguer & Blundell
+      // 2021, "PonderNet: Learning to Ponder", https://arxiv.org/abs/2107.05407).
+      //
+      // A weight-tied step function f is applied up to MaxSteps times. f is a
+      // shape-preserving pointwise 2-layer function over Depth (d_model =
+      // InputLayer.Output.Depth, hidden = HiddenDim or 2*d_model when <1), applied
+      // residually as h_n := h_{n-1} + f(h_{n-1}) from h_0 = x; 1x1/pointwise convs
+      // keep the sequence axis intact. WEIGHT SHARING follows AddDeepEquilibriumBlock:
+      // step 1 creates the real conv layers, later steps reuse their weights via
+      // TNNetDeepEquilibriumSharedConv, so the parameter count is INDEPENDENT of
+      // MaxSteps. A SHARED scalar projection + TNNetPonderHalting head reads each
+      // h_n and emits a halting probability lambda_n in (0,1).
+      //
+      // The geometric halting distribution is assembled WITHOUT any hard argmax:
+      //   p_n = lambda_n * prod_{k<n}(1 - lambda_k),   p_{MaxSteps-1} gets the
+      // whole remaining mass (lambda forced to 1 at the last step) so the p_n sum
+      // to 1. The running product prod_{k<n}(1-lambda_k) is accumulated step by
+      // step with TNNetMul layers; the block output is the SMOOTH p_n-weighted sum
+      // of the per-step outputs y_n (a shape-preserving readout of h_n), so the
+      // whole block is differentiable end-to-end. Each p_n is broadcast over the
+      // output Depth before weighting.
+      //
+      // INFERENCE: this builder always unrolls MaxSteps applications (static shapes
+      // for the framework's tensor graph) and returns the p_n-weighted expectation.
+      // A true threshold-on-cumulative-p_n early-exit would need dynamic shapes the
+      // unrolled-graph API does not support, so it is deliberately NOT done here;
+      // the expected output is identical, only the compute is not saved. The per-
+      // step lambda_n / p_n layers are left on the graph so a caller can read them.
+      //
+      // OutHalting returns the (1,1,MaxSteps) concatenated halting distribution p
+      // (feed it to a TNNetPonderCostLoss head for the KL ponder-cost regularizer).
+      // The RETURNED weighted block output is left as the network's last layer so a
+      // task head can be appended directly. NOTE: for TRAINING the ponder cost the
+      // OutHalting branch must be CONSUMED (e.g. DeepConcat the task-head output and
+      // the cost-head output into one final tensor) -- a dangling OutHalting branch
+      // inflates the residual-Sum departing-branch counts and freezes the backward
+      // pass. See examples/PonderNet for the two-loss wiring. For task-only use
+      // (no ponder cost) just append a task head to the return value.
+      // InputLayer defaults to GetLastLayer(); MaxSteps is clamped to >= 1. Returns
+      // the p_n-weighted block output (shape identical to InputLayer.Output).
+      function AddPonderNetBlock(InputLayer: TNNetLayer; MaxSteps: integer;
+        out OutHalting: TNNetLayer; HiddenDim: integer = 0;
+        PriorLambda: TNeuralFloat = 0.2): TNNetLayer;
       // Mixture-of-Depths conditional-compute block (Raposo et al. 2024,
       // "Mixture-of-Depths: Dynamically Allocating Compute in Transformer-Based
       // Language Models", https://arxiv.org/abs/2404.02258).
@@ -15699,6 +15804,65 @@ begin
       // dL/dq_i = -p_i / q_i.
       FOutputError.FData[Idx] := -Target / Q;
     end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetPonderCostLoss }
+
+constructor TNNetPonderCostLoss.Create();
+begin
+  Create(0.2);
+end;
+
+constructor TNNetPonderCostLoss.Create(pPriorLambda: TNeuralFloat);
+begin
+  inherited Create();
+  if (pPriorLambda <= 0) or (pPriorLambda >= 1) then
+    FErrorProc('TNNetPonderCostLoss prior_lambda must be in (0,1).');
+  FFloatSt[0] := pPriorLambda;
+end;
+
+procedure TNNetPonderCostLoss.Backpropagate();
+const
+  cEps = 1e-7;
+var
+  StartTime: double;
+  Idx, SizeM1: integer;
+  Prior, PNorm, GeoSum, Gn: TNeuralFloat;
+  P: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  SizeM1 := FOutputError.Size - 1;
+  Prior := FFloatSt[0];
+  // Geometric prior over the SizeM1+1 steps: g_n = prior*(1-prior)^n, renormalised
+  // over the finite horizon so the tail mass beyond the last step does not bias the
+  // target (sum of the truncated geometric series).
+  GeoSum := 0;
+  Gn := Prior;
+  for Idx := 0 to SizeM1 do
+  begin
+    GeoSum := GeoSum + Gn;
+    Gn := Gn * (1.0 - Prior);
+  end;
+  if GeoSum < cEps then GeoSum := cEps;
+  // This is a self-contained penalty head with NO external target: read p straight
+  // from FOutput and overwrite the seeded residual with the analytic KL gradient.
+  // dL/dp_n = log(p_n) - log(g_n) + 1  (the +gradient, so the optimizer descends).
+  Gn := Prior;
+  for Idx := 0 to SizeM1 do
+  begin
+    P := FOutput.FData[Idx];
+    if P < cEps then P := cEps
+    else if P > 1.0 then P := 1.0;
+    PNorm := Gn / GeoSum;            // renormalised geometric prior at step Idx
+    if PNorm < cEps then PNorm := cEps;
+    FOutputError.FData[Idx] := Ln(P) - Ln(PNorm) + 1.0;
+    Gn := Gn * (1.0 - Prior);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -24926,6 +25090,25 @@ begin
   FOutput.Mul(FFloatSt[0]);
 end;
 
+{ TNNetAddConstant }
+constructor TNNetAddConstant.Create();
+begin
+  inherited Create();
+  FFloatSt[0] := 0;
+end;
+
+constructor TNNetAddConstant.Create(pAdd: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pAdd;
+end;
+
+procedure TNNetAddConstant.Compute();
+begin
+  inherited Compute();
+  FOutput.Add(FFloatSt[0]);
+end;
+
 { TNNetGradientReversal }
 constructor TNNetGradientReversal.Create(Lambda: TNeuralFloat);
 begin
@@ -26337,6 +26520,24 @@ begin
   inherited Create();
   FActivationFn := @HiperbolicTangent;
   FActivationFnDerivative := @HiperbolicTangentDerivative;
+end;
+
+{ TNNetPonderHalting }
+constructor TNNetPonderHalting.Create();
+begin
+  inherited Create();
+  // PonderNet metadata (carried for serialization / cost-head lookup; forward and
+  // backward are plain sigmoid). Defaults: 1 step, geometric prior 0.2.
+  FStruct[0] := 1;
+  FFloatSt[0] := 0.2;
+end;
+
+constructor TNNetPonderHalting.Create(pMaxSteps: integer; pPriorLambda: TNeuralFloat);
+begin
+  Self.Create();
+  if pMaxSteps < 1 then pMaxSteps := 1;
+  FStruct[0] := pMaxSteps;
+  FFloatSt[0] := pPriorLambda;
 end;
 
 { TNNetNeuronList }
@@ -70783,6 +70984,7 @@ begin
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
+      'TNNetPonderCostLoss' :       Result := TNNetPonderCostLoss.Create(Ft[0]);
       'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
       'TNNetDiceLoss' :             Result := TNNetDiceLoss.Create();
       'TNNetTripletLoss' :          Result := TNNetTripletLoss.Create(Ft[0]);
@@ -70836,6 +71038,7 @@ begin
       'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
+      'TNNetPonderHalting' :        Result := TNNetPonderHalting.Create(St[0], Ft[0]);
       'TNNetHyperbolicTangent' :    Result := TNNetHyperbolicTangent.Create();
       'TNNetLeCunTanh' :            Result := TNNetLeCunTanh.Create();
       'TNNetLogCoshActivation' :    Result := TNNetLogCoshActivation.Create();
@@ -70897,6 +71100,7 @@ begin
       'TNNetLocalConnectReLU' :     Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(Ft[0]);
       'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(Ft[0]);
+      'TNNetAddConstant'  :         Result := TNNetAddConstant.Create(Ft[0]);
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetGradientReversal' :     Result := TNNetGradientReversal.Create(Ft[0]);
       'TNNetLayerSoftMax' :         Result := TNNetSoftMax.Create();
@@ -71130,6 +71334,7 @@ begin
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
+      if S[0] = 'TNNetPonderCostLoss' then Result := TNNetPonderCostLoss.Create(Ft[0]) else
       if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else
       if S[0] = 'TNNetDiceLoss' then Result := TNNetDiceLoss.Create() else
       if S[0] = 'TNNetTripletLoss' then Result := TNNetTripletLoss.Create(Ft[0]) else
@@ -71183,6 +71388,7 @@ begin
       if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
+      if S[0] = 'TNNetPonderHalting' then Result := TNNetPonderHalting.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetHyperbolicTangent' then Result := TNNetHyperbolicTangent.Create() else
       if S[0] = 'TNNetLeCunTanh' then Result := TNNetLeCunTanh.Create() else
       if S[0] = 'TNNetLogCoshActivation' then Result := TNNetLogCoshActivation.Create() else
@@ -71246,6 +71452,7 @@ begin
       if S[0] = 'TNNetLocalConnectReLU' then Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(Ft[0]) else
       if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(Ft[0]) else
+      if S[0] = 'TNNetAddConstant' then Result := TNNetAddConstant.Create(Ft[0]) else
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetGradientReversal' then Result := TNNetGradientReversal.Create(Ft[0]) else
       if S[0] = 'TNNetLayerSoftMax' then Result := TNNetSoftMax.Create() else
@@ -72323,6 +72530,127 @@ begin
   end;
 
   Result := Z;
+end;
+
+function TNNet.AddPonderNetBlock(InputLayer: TNNetLayer; MaxSteps: integer;
+  out OutHalting: TNNetLayer; HiddenDim: integer;
+  PriorLambda: TNeuralFloat): TNNetLayer;
+var
+  d_model, step: integer;
+  H, FHidden, FOut, HaltLogit, Lambda, OneMinus: TNNetLayer;
+  Pn, PnBroadcast, WeightedY, RemProd, NewRemProd: TNNetLayer;
+  Iter1ReLUConv, Iter1LinConv, Iter1HaltConv: TNNetLayer;
+  WeightedTerms, HaltTerms: array of TNNetLayer;
+begin
+  // See the declaration doc-comment for the full PonderNet mechanics: a weight-tied
+  // residual step function f is applied up to MaxSteps times; a shared halting head
+  // emits lambda_n in (0,1) at each step; the geometric halting distribution
+  // p_n = lambda_n * prod_{k<n}(1-lambda_k) weights the per-step outputs into a
+  // single SMOOTH expectation (no hard argmax). Weight sharing mirrors
+  // AddDeepEquilibriumBlock (step 1 builds the real convs, later steps reuse them
+  // via TNNetDeepEquilibriumSharedConv).
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if MaxSteps < 1 then MaxSteps := 1;
+  d_model := InputLayer.Output.Depth;
+  if HiddenDim < 1 then HiddenDim := 2 * d_model;
+
+  Iter1ReLUConv := nil; Iter1LinConv := nil; Iter1HaltConv := nil;
+  SetLength(WeightedTerms, MaxSteps);
+  SetLength(HaltTerms, MaxSteps);
+  RemProd := nil;   // running product prod_{k<n}(1-lambda_k); 1 before step 1.
+  H := InputLayer;  // h_0 = x.
+
+  for step := 1 to MaxSteps do
+  begin
+    // --- weight-tied residual step  h_n := h_{n-1} + f(h_{n-1}) ---------------
+    if step = 1 then
+    begin
+      Iter1ReLUConv := AddLayerAfter( TNNetPointwiseConvReLU.Create(HiddenDim), H );
+      Iter1LinConv  := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+      FOut := Iter1LinConv;
+    end
+    else
+    begin
+      AddLayerAfter( TNNetDeepEquilibriumSharedConv.Create(Iter1ReLUConv), H );
+      FOut := AddLayer( TNNetDeepEquilibriumSharedConv.Create(Iter1LinConv) );
+    end;
+    H := AddLayer( TNNetSum.Create([H, FOut]) );  // residual hidden state h_n
+    FHidden := H; // per-step output y_n is read directly from h_n
+    // Per-step output y_n is read directly from the hidden state h_n.
+
+    // The shared halting head lambda_n = sigmoid(W_h . h_n) is needed only at the
+    // NON-last steps (the last step's lambda is forced to 1); building it on the
+    // last step would leave an unconsumed (dangling) layer that inflates the
+    // residual-Sum's departing-branch count and freezes the backward pass.
+    if step < MaxSteps then
+    begin
+      if step = 1 then
+      begin
+        Iter1HaltConv := AddLayerAfter( TNNetPointwiseConvLinear.Create(1), H );
+        HaltLogit := Iter1HaltConv;
+      end
+      else
+        HaltLogit := AddLayerAfter( TNNetDeepEquilibriumSharedConv.Create(Iter1HaltConv), H );
+
+      Lambda := AddLayerAfter( TNNetPonderHalting.Create(MaxSteps, PriorLambda), HaltLogit );
+      // --- p_n = lambda_n * RemProd  (RemProd = 1 before the first step) ------
+      if RemProd = nil then
+        Pn := Lambda
+      else
+        Pn := AddLayer( TNNetCellMulByCell.Create(Lambda, RemProd) );
+    end
+    else
+    begin
+      // Last step: lambda forced to 1, so ALL the remaining halting mass is
+      // assigned here and the p_n sum exactly to 1: p_last = RemProd.
+      if RemProd <> nil then
+        Pn := RemProd
+      else
+      begin
+        // Single-step block (MaxSteps=1): p_0 = 1. Build an exact constant-1
+        // (1,1,1) layer as lambda + (1 - lambda) from a real halting head, so the
+        // value is 1 and its net gradient through lambda cancels to zero.
+        Iter1HaltConv := AddLayerAfter( TNNetPointwiseConvLinear.Create(1), H );
+        Lambda := AddLayer( TNNetPonderHalting.Create(MaxSteps, PriorLambda) );
+        OneMinus := AddLayerAfter( TNNetNegate.Create(), Lambda );
+        OneMinus := AddLayer( TNNetAddConstant.Create(1.0) );
+        Pn := AddLayer( TNNetSum.Create([Lambda, OneMinus]) );
+      end;
+    end;
+    HaltTerms[step - 1] := Pn;
+
+    // --- p_n-weighted output term  p_n * y_n  (broadcast p_n over d_model) ----
+    PnBroadcast := AddLayer( TNNetDeepConcat.Replicate(d_model, Pn) );
+    WeightedY := AddLayer( TNNetCellMulByCell.Create(H, PnBroadcast) );
+    WeightedTerms[step - 1] := WeightedY;
+
+    // --- update running product RemProd := RemProd * (1 - lambda_n) -----------
+    if step < MaxSteps then
+    begin
+      OneMinus := AddLayerAfter( TNNetNegate.Create(), Lambda );      // -lambda
+      OneMinus := AddLayer( TNNetAddConstant.Create(1.0) );           // 1 - lambda
+      if RemProd = nil then
+        NewRemProd := OneMinus
+      else
+        NewRemProd := AddLayer( TNNetCellMulByCell.Create(RemProd, OneMinus) );
+      RemProd := NewRemProd;
+    end;
+  end;
+
+  // Halting distribution p = (p_0..p_{N-1}) on the Depth axis, (1,1,MaxSteps),
+  // ready for a TNNetPonderCostLoss head. Built BEFORE the weighted output so the
+  // p_n-weighted block output remains the network's last layer (GetLastLayer): the
+  // caller attaches a task head to the RETURN value; OutHalting is a side output.
+  if MaxSteps = 1 then
+    OutHalting := AddLayerAfter( TNNetIdentity.Create(), HaltTerms[0] )
+  else
+    OutHalting := AddLayer( TNNetDeepConcat.Create(HaltTerms) );
+
+  // Block output = sum_n p_n * y_n  (smooth expectation over halting steps).
+  if MaxSteps = 1 then
+    Result := AddLayerAfter( TNNetIdentity.Create(), WeightedTerms[0] )
+  else
+    Result := AddLayer( TNNetSum.Create(WeightedTerms) );
 end;
 
 function TNNet.AddMixtureOfDepths(InputLayer: TNNetLayer;
