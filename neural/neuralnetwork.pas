@@ -86,6 +86,21 @@ type
   // independent of Steps AND of Method.
   TNNetODEMethod = (odeEuler, odeMidpoint);
 
+  // Per-head attention variant selector for TNNet.AddMultiHeadSelfAttention /
+  // AddMultiHeadSDPAConcat. Each head is an independent SDPA-family layer with
+  // the SAME (SeqLen,1,3*d_k) Q|K|V input and (SeqLen,1,d_k) output, so the
+  // variants are drop-in per head.
+  //   avSDPA         : plain TNNetScaledDotProductAttention (default; existing
+  //                    behaviour, bit-for-bit unchanged).
+  //   avDifferential : TNNetDifferentialAttention (two softmax maps, learnable
+  //                    lambda; subtracts a noise map to sharpen attention).
+  //                    Requires an EVEN per-head dim d_k (each head is split in
+  //                    half down the channel axis).
+  //   avSink         : TNNetSinkAttention (prepends learnable (key,value) sink
+  //                    slots every query attends to; stabilises causal/streaming
+  //                    attention). Sink-slot count is the builder's NumSinks arg.
+  TNNetAttentionVariant = (avSDPA, avDifferential, avSink);
+
   { TNNetNeuron }
   TNNetNeuron = class(TMObject)
     protected
@@ -9671,9 +9686,16 @@ type
       // left unrotated. This injects RELATIVE position into the attention scores
       // and is meant to REPLACE absolute positional embedding -- see the caveat
       // on AddMultiHeadSelfAttention.
+      // Variant (default avSDPA = plain SDPA) swaps the per-head attention
+      // layer for a drop-in SDPA subclass: avDifferential
+      // (TNNetDifferentialAttention, requires even d_k) or avSink
+      // (TNNetSinkAttention, NumSinks learnable sink slots/head). See
+      // TNNetAttentionVariant. NumSinks is only consulted for avSink.
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
-        UseRoPE: boolean = false): TNNetLayer;
+        UseRoPE: boolean = false;
+        Variant: TNNetAttentionVariant = avSDPA;
+        NumSinks: integer = 1): TNNetLayer;
       // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
       // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
       // out-projection to depth d_model. Returns the out-projection layer.
@@ -9692,8 +9714,17 @@ type
       // (TNNetEmbedding), NOT TNNetTokenAndPositionalEmbedding -- otherwise
       // absolute and rotary positions are both present (a hybrid, not RoPE).
       // Requires d_k (= d_model div Heads) even and SizeY=1.
+      // Variant (default avSDPA) lets every head opt into a drop-in SDPA
+      // subclass instead of plain SDPA: avDifferential
+      // (TNNetDifferentialAttention) or avSink (TNNetSinkAttention with
+      // NumSinks learnable sink slots per head). See TNNetAttentionVariant.
+      // avDifferential additionally requires an EVEN per-head dim d_k. NumSinks
+      // is only consulted for avSink. The out-projection is identical for all
+      // variants (each head still emits depth d_k).
       function AddMultiHeadSelfAttention(Heads: integer;
-        CausalMask: boolean = false; UseRoPE: boolean = false): TNNetLayer;
+        CausalMask: boolean = false; UseRoPE: boolean = false;
+        Variant: TNNetAttentionVariant = avSDPA;
+        NumSinks: integer = 1): TNNetLayer;
       // Talking-Heads Attention (Shazeer et al. 2020, arXiv:2003.02436) over a
       // (SeqLen,1,d_in) sequence tensor. Talking-heads inserts a small learnable
       // HxH linear mixing ACROSS the attention heads at two points: on the
@@ -39353,12 +39384,33 @@ end;
 
 function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
-  UseRoPE: boolean = false): TNNetLayer;
+  UseRoPE: boolean = false;
+  Variant: TNNetAttentionVariant = avSDPA;
+  NumSinks: integer = 1): TNNetLayer;
 var
   d_model, d_k, HeadCnt, d: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
   QSlice, KSlice, VSlice, AttnInput: TNNetLayer;
   QChannels, KChannels, VChannels: array of integer;
+
+  // Builds one per-head attention layer (the selected SDPA-family variant)
+  // after AfterLayer. All variants share the (SeqLen,1,3*d_k) Q|K|V input and
+  // (SeqLen,1,d_k) output contract, so they are drop-in per head.
+  function AddHeadAttention(AfterLayer: TNNetLayer): TNNetLayer;
+  begin
+    case Variant of
+      avDifferential:
+        Result := AddLayerAfter(
+          TNNetDifferentialAttention.Create(d_k, CausalMask), AfterLayer);
+      avSink:
+        Result := AddLayerAfter(
+          TNNetSinkAttention.Create(d_k, CausalMask, NumSinks), AfterLayer);
+    else
+      Result := AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(d_k, CausalMask), AfterLayer);
+    end;
+  end;
+
 begin
   if SourceLayer = nil then SourceLayer := GetLastLayer();
   // Source is the Q|K|V slab, so its depth is 3*d_model.
@@ -39368,6 +39420,13 @@ begin
     FErrorProc('AddMultiHeadSDPAConcat with UseRoPE requires an even per-head ' +
       'dim d_k (= d_model div Heads). d_model=' + IntToStr(d_model) +
       ', Heads=' + IntToStr(Heads) + ', d_k=' + IntToStr(d_k));
+  if (Variant = avDifferential) and (Odd(d_k)) then
+    FErrorProc('AddMultiHeadSDPAConcat with avDifferential requires an even ' +
+      'per-head dim d_k (= d_model div Heads). d_model=' + IntToStr(d_model) +
+      ', Heads=' + IntToStr(Heads) + ', d_k=' + IntToStr(d_k));
+  if (Variant = avSink) and (NumSinks < 1) then
+    FErrorProc('AddMultiHeadSDPAConcat with avSink requires NumSinks >= 1. ' +
+      'NumSinks=' + IntToStr(NumSinks));
   SetLength(SliceLayers, Heads);
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
   SetLength(HeadOutputs, Heads);
@@ -39392,9 +39451,7 @@ begin
       KSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), KSlice);
       VSlice := AddLayerAfter(TNNetSplitChannels.Create(VChannels), SliceLayers[HeadCnt]);
       AttnInput := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
-      HeadOutputs[HeadCnt] :=
-        AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
-          AttnInput);
+      HeadOutputs[HeadCnt] := AddHeadAttention(AttnInput);
     end;
     SetLength(QChannels, 0);
     SetLength(KChannels, 0);
@@ -39403,9 +39460,7 @@ begin
   else
   begin
     for HeadCnt := 0 to Heads - 1 do
-      HeadOutputs[HeadCnt] :=
-        AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
-          SliceLayers[HeadCnt]);
+      HeadOutputs[HeadCnt] := AddHeadAttention(SliceLayers[HeadCnt]);
   end;
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(SliceLayers, 0);
@@ -39413,13 +39468,16 @@ begin
 end;
 
 function TNNet.AddMultiHeadSelfAttention(Heads: integer;
-  CausalMask: boolean = false; UseRoPE: boolean = false): TNNetLayer;
+  CausalMask: boolean = false; UseRoPE: boolean = false;
+  Variant: TNNetAttentionVariant = avSDPA;
+  NumSinks: integer = 1): TNNetLayer;
 var
   d_model: integer;
 begin
   // Input is the Q|K|V slab, so its depth is 3*d_model.
   d_model := GetLastLayer().Output.Depth div 3;
-  AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer(), UseRoPE);
+  AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer(), UseRoPE,
+    Variant, NumSinks);
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));

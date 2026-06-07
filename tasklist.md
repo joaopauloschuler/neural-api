@@ -287,14 +287,30 @@ rather than acted on.
       incremental-decode]] task — the KV footprint shrinks by QueryHeads/KVHeads,
       exactly the bottleneck that task fights.
 
-- [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
+- [X] TNNetDifferentialAttention follow-up: fold differential heads into the
       MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
       TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
       into differential attention per head — a natural drop-in for the
       downstream ../gpt-3-for-pascal long-context retrieval.
-- [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
+      DONE on a2: new TNNetAttentionVariant enum (avSDPA/avDifferential/avSink)
+      + optional Variant/NumSinks params on AddMultiHeadSelfAttention &
+      AddMultiHeadSDPAConcat (default avSDPA = bit-for-bit unchanged); per-head
+      drop-in via an inner AddHeadAttention helper; avDifferential guards even
+      d_k. Shape + input-gradient tests (max abs err ~9.3e-4).
+- [X] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
       decoder block can opt into sinks per head behind a flag.
+      DONE on a2 (same enum/params as above): avSink wires per-head
+      TNNetSinkAttention(d_k, CausalMask, NumSinks); NumSinks builder arg
+      (default 1) sets sink-slot count per head. Shape (NumSinks round-trips) +
+      input-gradient tests (max abs err ~8.5e-4).
+      Follow-ups discovered: (a) TNNetTransformerDecoderBlock /
+      AddTransformerEncoderBlock don't yet forward the variant — only the raw
+      MHA breakdown does; a decoder-block-level flag is the next rung.
+      (b) avCosineSimilarity could join the enum (same drop-in SDPA subclass
+      shape). (c) variant choice is NOT persisted by the builder itself (the
+      composed layers serialize themselves, so load is fine, but a one-arg
+      rebuild helper would need it).
 ### Bake-off / experiment follow-ups
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa

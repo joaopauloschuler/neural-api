@@ -755,6 +755,10 @@ type
     procedure TestMultiHeadSelfAttentionGradientCheck;
     procedure TestHyenaOperatorShapeAndGradientCheck;
     procedure TestMultiHeadSelfAttentionRoPEGradientCheck;
+    procedure TestMultiHeadSelfAttentionDifferentialShapes;
+    procedure TestMultiHeadSelfAttentionDifferentialGradientCheck;
+    procedure TestMultiHeadSelfAttentionSinkShapes;
+    procedure TestMultiHeadSelfAttentionSinkGradientCheck;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
     procedure TestAffineGridSampleIdentity;
@@ -13876,6 +13880,220 @@ begin
         ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionDifferentialShapes;
+// AddMultiHeadSelfAttention with Variant=avDifferential swaps each head's plain
+// SDPA for a TNNetDifferentialAttention. Asserts the (SeqLen,1,d_model) output
+// shape is preserved AND that Heads TNNetDifferentialAttention layers were
+// actually built (one per head), proving the variant flag wired through.
+var
+  NN: TNNet;
+  d_model, Heads, SeqLen, i, diffCnt: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, false, false, avDifferential);
+    NN.SetLearningRate(1.0, 0.0);
+
+    AssertEquals('MHSA-diff out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-diff out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MHSA-diff out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    diffCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetDifferentialAttention then Inc(diffCnt);
+    AssertEquals('MHSA-diff has Heads differential-attention heads', Heads, diffCnt);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionDifferentialGradientCheck;
+// Numerical input-gradient check through the full AddMultiHeadSelfAttention
+// builder with Variant=avDifferential (per-head TNNetDifferentialAttention,
+// even d_k=4). Same protocol as TestMultiHeadSelfAttentionGradientCheck.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  d_model, Heads, SeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, false, false, avDifferential);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MHSA-diff input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('MHSA-differential input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionSinkShapes;
+// AddMultiHeadSelfAttention with Variant=avSink swaps each head's plain SDPA for
+// a TNNetSinkAttention (NumSinks=2 learnable sink slots/head). Asserts output
+// shape preserved AND that Heads TNNetSinkAttention layers were built with the
+// requested sink count.
+var
+  NN: TNNet;
+  d_model, Heads, SeqLen, i, sinkCnt: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}true, false, avSink, {NumSinks=}2);
+    NN.SetLearningRate(1.0, 0.0);
+
+    AssertEquals('MHSA-sink out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-sink out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MHSA-sink out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    sinkCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetSinkAttention then
+      begin
+        Inc(sinkCnt);
+        AssertEquals('MHSA-sink head NumSinks',
+          2, TNNetSinkAttention(NN.Layers[i]).NumSinks);
+      end;
+    AssertEquals('MHSA-sink has Heads sink-attention heads', Heads, sinkCnt);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionSinkGradientCheck;
+// Numerical input-gradient check through the full AddMultiHeadSelfAttention
+// builder with Variant=avSink (per-head TNNetSinkAttention, NumSinks=2, causal).
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  d_model, Heads, SeqLen, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}true, false, avSink, {NumSinks=}2);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MHSA-sink input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('MHSA-sink input gradient max abs error: ', maxErr:0:8);
   finally
     NN.Free;
     Input.Free;
