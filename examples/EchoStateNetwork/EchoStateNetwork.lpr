@@ -21,14 +21,15 @@ fixed random recurrence usable as a feature generator.
 Pipeline:
   1. Build W_in and a sparse W with hand-rolled arrays.
   2. RESCALE W to the target spectral radius. We reuse the library's
-     power-iteration helper TNNet.EstimateSpectralNorm to MEASURE the current
-     scale instead of running a full eigensolve. NOTE: that helper returns the
-     largest SINGULAR value (spectral NORM), not the largest eigenvalue
-     MAGNITUDE (spectral RADIUS). For a general non-symmetric W they differ,
-     but the singular value is always an UPPER BOUND on |lambda|_max, so
-     rescaling W := W * (rho_target / sigma_1) leaves the true spectral radius
-     <= rho_target. That is exactly the safe side for the echo-state property,
-     so it is an acceptable - and conservative - proxy here.
+     power-iteration helper TNNet.EstimateSpectralRadius to MEASURE the current
+     largest eigenvalue MAGNITUDE rho = |lambda|_max directly (W*v iteration,
+     no transpose step) instead of running a full eigensolve. The echo-state
+     property is governed by rho, so rescaling W := W * (rho_target / rho)
+     targets the TRUE spectral radius exactly: with rho_target < 1 the reservoir
+     forgets its initial state (rich, well-tuned memory) without the conservative
+     under-scaling that EstimateSpectralNorm's singular-value upper bound (rho <=
+     sigma_1) would give. For comparison we also print the spectral NORM sigma_1
+     via EstimateSpectralNorm to show rho <= sigma_1 on this non-symmetric W.
   3. Run the reservoir FORWARD (no gradient) over a training sequence, collect
      each state h_t into a TNNetVolumePair (input = h_t, target = x_{t+1}).
   4. Train ONLY a TNNetFullConnectLinear(1) readout on those collected pairs
@@ -80,14 +81,12 @@ const
   cN         = 100;    // reservoir size (units). Tiny: 50-150 is plenty.
   cLeak      = 0.3;    // leak rate `a` in the state update.
   cSparsity  = 0.1;    // fraction of W entries that are non-zero.
-  // NOTE on the two rho settings: EstimateSpectralNorm returns the spectral
-  // NORM (largest singular value sigma_1), an UPPER bound on the spectral
-  // RADIUS |lambda|_max. So rescaling W to "rho" via sigma_1 leaves the true
-  // radius <= rho - conservatively short memory. We therefore set the working
-  // target near 1.25 (true radius still < 1, rich memory) and the ablation
-  // target well above it so even the looser true radius exceeds 1.
-  cRhoGood   = 1.5;    // echo-state working case (true radius stays < 1).
-  cRhoBad    = 3.0;    // ablation case (true radius driven > 1, ESP broken).
+  // NOTE on the two rho settings: EstimateSpectralRadius returns the TRUE
+  // spectral RADIUS rho = |lambda|_max, so we can target it directly. The
+  // echo-state property holds iff rho < 1, so the working case sets rho just
+  // below 1 (rich memory, still contractive) and the ablation drives rho > 1.
+  cRhoGood   = 0.9;    // echo-state working case (true radius < 1, ESP holds).
+  cRhoBad    = 1.8;    // ablation case (true radius > 1, ESP broken).
   cInScale   = 1.0;    // input weight scale.
   cWarmup    = 100;    // washout steps (reservoir forgets its zero init).
   cTrainLen  = 600;    // teacher-forced training steps after washout.
@@ -96,7 +95,7 @@ const
   cReadoutEpochs = 600;
   cReadoutLR     = 0.02;
   cReadoutL2     = 1e-5; // ridge-style regularisation on the readout.
-  cPowerIters    = 50;   // power-iteration steps for EstimateSpectralNorm.
+  cPowerIters    = 200;  // power-iteration steps for the spectral helpers.
 
 type
   // The fixed random reservoir. W_in and W are plain arrays - the recurrence
@@ -105,7 +104,8 @@ type
     Win: array of TNeuralFloat;            // [N]   input weights
     W:   array of array of TNeuralFloat;   // [N,N] sparse recurrent matrix
     H:   array of TNeuralFloat;            // [N]   current state h_t
-    Sigma: TNeuralFloat;                   // measured spectral norm after init
+    Rho:   TNeuralFloat;                  // measured spectral RADIUS of raw W
+    Sigma: TNeuralFloat;                  // measured spectral NORM of raw W
   end;
 
 // The deterministic target series x_t = sin(0.2 t) + 0.3 sin(0.31 t).
@@ -116,7 +116,7 @@ end;
 
 // Build W_in (uniform in [-cInScale, cInScale]) and a sparse W (uniform in
 // [-1,1] on a cSparsity fraction of entries), then rescale W to TargetRho
-// using the library power-iteration spectral-norm helper (see file header).
+// using the library power-iteration spectral-RADIUS helper (see file header).
 procedure BuildReservoir(var R: TReservoir; TargetRho: TNeuralFloat);
 var
   i, j: integer;
@@ -141,11 +141,12 @@ begin
     end;
   end;
 
-  // Measure the current spectral norm of W by stuffing its rows into a
+  // Measure the current spectral RADIUS of W by stuffing its rows into a
   // throwaway Input(N)->FullConnectLinear(N) network (building the net sizes
   // each neuron's Weights to fan-in N, so Neurons[i].Weights = row i of W) and
   // calling the reusable power-iteration helper. No training, no gradients -
-  // we only read sigma_1 back out.
+  // we read both rho (the echo-state-relevant radius) and, for comparison,
+  // sigma_1 (the conservative spectral-norm upper bound) back out.
   ProbeNN := TNNet.Create();
   try
     ProbeNN.AddLayer([
@@ -156,14 +157,17 @@ begin
     for i := 0 to cN - 1 do
       for j := 0 to cN - 1 do
         ProbeLayer.Neurons[i].Weights.FData[j] := R.W[i][j];
+    R.Rho   := TNNet.EstimateSpectralRadius(ProbeLayer, cPowerIters);
     R.Sigma := TNNet.EstimateSpectralNorm(ProbeLayer, cPowerIters);
   finally
     ProbeNN.Free;
   end;
 
-  if R.Sigma > 1e-12 then
+  // Rescale to the TRUE target spectral radius (rho_target). Because rho is the
+  // exact echo-state quantity, TargetRho < 1 directly guarantees ESP.
+  if R.Rho > 1e-12 then
   begin
-    Scale := TargetRho / R.Sigma;
+    Scale := TargetRho / R.Rho;
     for i := 0 to cN - 1 do
       for j := 0 to cN - 1 do
         R.W[i][j] := R.W[i][j] * Scale;
@@ -430,8 +434,9 @@ begin
   WriteLn;
   WriteLn('[1] Building reservoir at rho=', cRhoGood:0:2, ' ...');
   BuildReservoir(R, cRhoGood);
-  WriteLn('    measured spectral norm sigma_1 of raw W = ', R.Sigma:0:4,
-    '  -> W rescaled so rho <= ', cRhoGood:0:2);
+  WriteLn('    measured raw W: spectral RADIUS rho = ', R.Rho:0:4,
+    '   spectral NORM sigma_1 = ', R.Sigma:0:4, '  (rho <= sigma_1)');
+  WriteLn('    -> W rescaled so its true spectral radius = ', cRhoGood:0:2);
 
   WriteLn('    training the linear readout (', cReadoutEpochs, ' epochs)...');
   NN := TrainReadout(R);
@@ -454,7 +459,8 @@ begin
   WriteLn('[2] ABLATION - rebuilding reservoir at rho=', cRhoBad:0:2,
     ' (> 1, echo-state property BROKEN)');
   BuildReservoir(R, cRhoBad);
-  WriteLn('    measured spectral norm sigma_1 of raw W = ', R.Sigma:0:4);
+  WriteLn('    measured raw W: spectral RADIUS rho = ', R.Rho:0:4,
+    '   spectral NORM sigma_1 = ', R.Sigma:0:4);
   NN := TrainReadout(R);
   SetLength(PredB, cFreeRun);
   SetLength(TruthB, cFreeRun);

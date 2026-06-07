@@ -802,10 +802,13 @@ rather than acted on.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
 ### Examples I'd enjoy writing
-- [ ] EchoStateNetwork follow-up: add a `TNNetSpectralRadius` helper (power
-      iteration on W·v only, no W^T step) so reservoirs can target the true
-      spectral RADIUS rather than the conservative spectral-norm upper bound
-      EstimateSpectralNorm gives — would let rho_target be set directly <1.
+- [X] EchoStateNetwork follow-up: added `TNNet.EstimateSpectralRadius` (power
+      iteration on W·v only, no W^T step; Rayleigh ratio ρ≈‖Wv‖ at convergence,
+      square-matrix only) so reservoirs target the TRUE spectral RADIUS instead
+      of the conservative spectral-norm upper bound EstimateSpectralNorm gives.
+      EchoStateNetwork now scales W to rho_target<1 directly (cRhoGood=0.9);
+      free-run NRMSE improved 0.21→0.08. Test: TestEstimateSpectralRadiusKnown-
+      Matrix (triangular ρ=max|diag|, ρ≤σ_1 strict, diagonal ρ=σ_1, non-square→0).
 - [ ] EchoStateNetwork follow-up: an optional ridge closed-form readout solve
       (normal equations) as a deterministic alternative to the SGD readout loop,
       showing the classic ESN one-shot linear fit (the SGD loop is LR-sensitive).

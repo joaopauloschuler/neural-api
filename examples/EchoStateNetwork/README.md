@@ -26,21 +26,25 @@ h_t = (1 - a) * h_{t-1} + a * tanh(W_in * x_t + W * h_{t-1})
 ### Spectral-radius rescaling
 
 We reuse the library's power-iteration helper
-[`TNNet.EstimateSpectralNorm`](../../neural/neuralnetwork.pas) to **measure**
-the scale of `W` instead of running a full eigensolver. Note that helper
-returns the spectral **norm** (largest singular value `sigma_1`), not the
-spectral **radius** (`|lambda|_max`). For a general non-symmetric `W` these
-differ, but `sigma_1` is always an *upper bound* on `|lambda|_max`, so
-rescaling `W := W * (rho_target / sigma_1)` leaves the *true* radius
-`<= rho_target` — conservatively on the safe side of the echo-state property.
-This is why the working `rho_target` in the source is set above 1.0 (the true
-radius still lands below 1). See the comments in `EchoStateNetwork.lpr`.
+[`TNNet.EstimateSpectralRadius`](../../neural/neuralnetwork.pas) to **measure**
+the scale of `W` instead of running a full eigensolver. Unlike its sibling
+`TNNet.EstimateSpectralNorm` — which estimates the spectral **norm** (largest
+singular value `sigma_1`) by alternating `W*v` and `W^T*u` steps —
+`EstimateSpectralRadius` iterates **only** `v := W*v / ‖W*v‖` (no transpose
+step) and returns the Rayleigh-flavoured ratio `rho ≈ ‖W*v‖` at convergence,
+i.e. the true spectral **radius** `|lambda|_max` that actually governs the
+echo-state property. Because `rho <= sigma_1` for a non-symmetric `W`, scaling
+`W := W * (rho_target / rho)` targets the radius **directly and exactly** — so
+`rho_target < 1` can be set straight (here `0.9`), with none of the
+under-scaling the conservative `sigma_1` upper bound would impose. The example
+also prints `sigma_1` alongside `rho` to show `rho <= sigma_1` on the raw `W`.
+See the comments in `EchoStateNetwork.lpr`.
 
 ### Pipeline
 
 1. Build `W_in` and a sparse `W` as plain Pascal arrays (hand-rolled
    recurrence — never touched by a gradient).
-2. Rescale `W` to the target spectral radius using `EstimateSpectralNorm`.
+2. Rescale `W` to the target spectral radius using `EstimateSpectralRadius`.
 3. Run the reservoir **forward** (no gradient) over a training sequence and
    collect each state `h_t` into a `TNNetVolumePair` (input = `h_t`,
    target = `x_{t+1}`).
@@ -96,16 +100,17 @@ are covered by `examples/.gitignore` and the root `.gitignore`.
 
 ```
 Echo State Network (Reservoir Computing, Jaeger 2001)
-Reservoir N=100  leak=0.30  sparsity=0.10  target rho=1.50
+Reservoir N=100  leak=0.30  sparsity=0.10  target rho=0.90
 Task: one-step prediction of sin(0.2 t) + 0.3 sin(0.31 t).
 ================================================================
 
-[1] Building reservoir at rho=1.50 ...
-    measured spectral norm sigma_1 of raw W = 3.6656  -> W rescaled so rho <= 1.50
+[1] Building reservoir at rho=0.90 ...
+    measured raw W: spectral RADIUS rho = 1.7471   spectral NORM sigma_1 = 3.6757  (rho <= sigma_1)
+    -> W rescaled so its true spectral radius = 0.90
     training the linear readout (600 epochs)...
-    teacher-forced one-step NRMSE = 0.0161
+    teacher-forced one-step NRMSE = 0.0214
     persistence baseline   NRMSE = 0.2136
-    free-run (autonomous)  NRMSE = 0.2061
+    free-run (autonomous)  NRMSE = 0.0793
 
 Free-run waveform   ( . = true   o = predicted   * = overlap ):
   step |---------------------------------------------------|
@@ -115,15 +120,15 @@ Free-run waveform   ( . = true   o = predicted   * = overlap ):
     ...
 
 ================================================================
-[2] ABLATION - rebuilding reservoir at rho=3.00 (> 1, echo-state property BROKEN)
-    measured spectral norm sigma_1 of raw W = 3.9123
+[2] ABLATION - rebuilding reservoir at rho=1.80 (> 1, echo-state property BROKEN)
+    measured raw W: spectral RADIUS rho = 1.9087   spectral NORM sigma_1 = 3.9124
     free-run (autonomous)  NRMSE = Nan  (expected to explode)
 
 ================================================================
 Correctness checks:
-  PASS  teacher-forced NRMSE 0.0161 < 0.5 x persistence 0.2136
-  PASS  rho<1 free-run NRMSE 0.2061 < 0.5
-  PASS  rho>1 free-run NRMSE Nan explodes vs rho<1 0.2061
+  PASS  teacher-forced NRMSE 0.0214 < 0.5 x persistence 0.2136
+  PASS  rho<1 free-run NRMSE 0.0793 < 0.5
+  PASS  rho>1 free-run NRMSE Nan explodes vs rho<1 0.0793
 ================================================================
 ALL CHECKS PASSED
 ```

@@ -10066,6 +10066,40 @@ type
         Iters: integer = 10;
         Seed: longword = 1234567
       ): TNeuralFloat;
+      // Power-iteration estimate of the SPECTRAL RADIUS rho = |lambda|_max
+      // (the largest-MAGNITUDE eigenvalue) of a layer's SQUARE weight matrix W
+      // (rows = neurons, cols = weights-per-neuron). Unlike EstimateSpectralNorm
+      // — which estimates the largest SINGULAR value sigma_1 (the spectral NORM)
+      // by alternating W*v and W^T*u steps — this iterates ONLY the eigenvector
+      // recurrence v <- W*v / ||W*v|| (no transpose step) and returns the
+      // Rayleigh-flavoured ratio estimate rho ~= ||W*v|| / ||v|| at convergence.
+      //
+      // When to use which:
+      //   * EstimateSpectralNorm (sigma_1): Lipschitz constant / 2-norm gain of
+      //     the linear map — relevant to weight clipping, gradient-norm control,
+      //     spectral normalisation. Always >= rho for a general matrix.
+      //   * EstimateSpectralRadius (rho): the long-run growth rate of repeated
+      //     application W^k — the quantity that governs the echo-state property
+      //     of a recurrent reservoir (h_{t} depends on W*h_{t-1}); a reservoir
+      //     must have rho < 1 to forget its initial state. Because rho <= sigma_1
+      //     for non-symmetric W, scaling a reservoir to a target rho directly is
+      //     the TIGHTER (correct) target — using sigma_1 only guarantees the true
+      //     radius stays below the target, i.e. a conservative under-estimate of
+      //     usable memory.
+      //
+      // Requires a SQUARE matrix (fan-out = fan-in); returns 0 for non-square or
+      // empty/biases-only layers. Power iteration converges to the
+      // dominant-EIGENVALUE magnitude provided that eigenvalue is real and
+      // strictly largest in magnitude with a non-orthogonal start vector (the
+      // generic case for a random reservoir); a dominant complex-conjugate pair
+      // is tracked in magnitude by the ||W*v|| ratio. Deterministic (fixed
+      // internal LCG seed, independent of the global RandSeed). Pure CPU,
+      // forward-only on the weight tensor — no gradients, no probe batch.
+      class function EstimateSpectralRadius(
+        Layer: TNNetLayer;
+        Iters: integer = 100;
+        Seed: longword = 1234567
+      ): TNeuralFloat;
       // Purely weight-tensor (forward-only, no probe batch) spectral diagnostic.
       // For every trainable layer (Neurons.Count > 0 and Weights.Size > 0) it
       // treats the weights as a matrix W of shape [num_neurons (fan-out) x
@@ -58501,6 +58535,81 @@ begin
   end;
 
   Result := Sigma;
+end;
+
+class function TNNet.EstimateSpectralRadius(
+  Layer: TNNetLayer;
+  Iters: integer = 100;
+  Seed: longword = 1234567
+): TNeuralFloat;
+var
+  FanOut, FanIn, N, Col, Iter: integer;
+  V, U: array of TNeuralFloat;
+  Acc, NormV, NormU, Rho: TNeuralFloat;
+  RngState: longword;
+  Neuron: TNNetNeuron;
+begin
+  Result := 0;
+  if Layer = nil then Exit;
+  if Layer.Neurons.Count = 0 then Exit;
+  if Layer.Neurons[0].Weights.Size = 0 then Exit;
+
+  FanOut := Layer.Neurons.Count;          // rows of W (one per neuron)
+  FanIn  := Layer.Neurons[0].Weights.Size; // cols of W (weights per neuron)
+  if (FanOut = 0) or (FanIn = 0) then Exit;
+  // Eigenvalues are only defined for a SQUARE matrix. A reservoir matrix W is
+  // N x N; anything else has no spectral radius — bail out (return 0).
+  if FanOut <> FanIn then Exit;
+  if Iters < 1 then Iters := 1;
+
+  SetLength(V, FanIn);
+  SetLength(U, FanOut);
+
+  // Deterministic LCG-seeded random unit start vector (independent of the
+  // global RandSeed so the estimate is fully reproducible).
+  RngState := Seed;
+  NormV := 0;
+  for Col := 0 to FanIn - 1 do
+  begin
+    RngState := (RngState * 1664525 + 1013904223) and $FFFFFFFF;
+    // Map to (-1, 1).
+    V[Col] := (RngState / 2147483648.0) - 1.0;
+    NormV := NormV + V[Col] * V[Col];
+  end;
+  NormV := Sqrt(NormV);
+  if NormV <= 1e-30 then
+  begin
+    // Degenerate start; fall back to a flat vector.
+    for Col := 0 to FanIn - 1 do V[Col] := 1.0;
+    NormV := Sqrt(FanIn);
+  end;
+  for Col := 0 to FanIn - 1 do V[Col] := V[Col] / NormV;
+
+  Rho := 0;
+  for Iter := 1 to Iters do
+  begin
+    // u = W v   (row n = Neurons[n].Weights). NO transpose step — this is the
+    // eigenvector recurrence, not the singular-vector one.
+    NormU := 0;
+    for N := 0 to FanOut - 1 do
+    begin
+      Neuron := Layer.Neurons[N];
+      Acc := 0;
+      for Col := 0 to FanIn - 1 do
+        Acc := Acc + Neuron.Weights.FData[Col] * V[Col];
+      U[N] := Acc;
+      NormU := NormU + Acc * Acc;
+    end;
+    NormU := Sqrt(NormU);
+
+    // Rayleigh-flavoured ratio estimate: with ||v|| = 1, rho ~= ||W v||.
+    Rho := NormU;
+    if NormU <= 1e-30 then Break; // nilpotent / all-zero direction => rho = 0
+    // v := u / ||u||  (re-normalise the new dominant-eigenvector estimate).
+    for Col := 0 to FanIn - 1 do V[Col] := U[Col] / NormU;
+  end;
+
+  Result := Rho;
 end;
 
 class function TNNet.WeightSpectrumReport(

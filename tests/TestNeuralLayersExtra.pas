@@ -94,6 +94,7 @@ type
     procedure TestWeightSpectrumReportRank1Matrix;
     procedure TestWeightSpectrumReportStructureAndFlags;
     procedure TestWeightSpectralTailReportSmoke;
+    procedure TestEstimateSpectralRadiusKnownMatrix;
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
@@ -1922,6 +1923,94 @@ begin
       Report = TNNet.WeightSpectralTailReport(NN));
   finally
     Lines.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestEstimateSpectralRadiusKnownMatrix;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  N, K, Dim: integer;
+  Rho, Sigma, Expected: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Dim := 5;
+
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(Dim, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(Dim));
+    NN.InitWeights();
+    Layer := NN.Layers[1];
+    AssertTrue('square layer neuron count', Layer.Neurons.Count = Dim);
+    AssertTrue('square layer fan-in', Layer.Neurons[0].Weights.Size = Dim);
+
+    // (1) Lower-TRIANGULAR matrix: eigenvalues are exactly the diagonal, so the
+    // spectral radius = max |diagonal|. Strictly-lower entries don't change the
+    // spectrum but do make W non-symmetric (so radius < norm below).
+    // Diagonal = (0.2, -0.9, 0.5, 0.7, -0.4)  => rho = 0.9.
+    for N := 0 to Dim - 1 do
+      for K := 0 to Dim - 1 do
+      begin
+        if K < N then
+          Layer.Neurons[N].Weights.FData[K] := 0.6 + 0.1 * (N - K) // sub-diag
+        else if K = N then
+          Layer.Neurons[N].Weights.FData[K] := 0.0
+        else
+          Layer.Neurons[N].Weights.FData[K] := 0.0;
+      end;
+    Layer.Neurons[0].Weights.FData[0] :=  0.2;
+    Layer.Neurons[1].Weights.FData[1] := -0.9;
+    Layer.Neurons[2].Weights.FData[2] :=  0.5;
+    Layer.Neurons[3].Weights.FData[3] :=  0.7;
+    Layer.Neurons[4].Weights.FData[4] := -0.4;
+    Expected := 0.9; // max |diagonal|
+
+    Rho := TNNet.EstimateSpectralRadius(Layer, 300);
+    AssertTrue(Format(
+      'EstimateSpectralRadius of triangular matrix should be ~%.4f, got %.4f',
+      [Expected, Rho]), Abs(Rho - Expected) < 1e-2);
+
+    // (2) Radius is the TIGHTER bound: rho <= sigma_1 for this non-symmetric
+    // (strictly-triangular off-diagonal) matrix, and strictly less here.
+    Sigma := TNNet.EstimateSpectralNorm(Layer, 300);
+    AssertTrue(Format('radius %.4f must be <= norm %.4f', [Rho, Sigma]),
+      Rho <= Sigma + 1e-4);
+    AssertTrue(Format('radius %.4f should be strictly < norm %.4f here',
+      [Rho, Sigma]), Rho < Sigma - 1e-3);
+
+    // (3) Symmetric diagonal matrix: radius == norm == max |diagonal|.
+    for N := 0 to Dim - 1 do
+      for K := 0 to Dim - 1 do
+        Layer.Neurons[N].Weights.FData[K] := 0.0;
+    Layer.Neurons[0].Weights.FData[0] :=  0.3;
+    Layer.Neurons[1].Weights.FData[1] := -1.4; // dominant
+    Layer.Neurons[2].Weights.FData[2] :=  0.8;
+    Layer.Neurons[3].Weights.FData[3] :=  0.1;
+    Layer.Neurons[4].Weights.FData[4] := -0.6;
+    Rho := TNNet.EstimateSpectralRadius(Layer, 300);
+    Sigma := TNNet.EstimateSpectralNorm(Layer, 300);
+    AssertTrue(Format('diagonal radius should be ~1.4, got %.4f', [Rho]),
+      Abs(Rho - 1.4) < 1e-3);
+    AssertTrue(Format('diagonal radius %.4f == norm %.4f', [Rho, Sigma]),
+      Abs(Rho - Sigma) < 1e-3);
+
+    // (4) Edge cases mirror EstimateSpectralNorm: nil layer => 0.
+    AssertTrue('nil layer => 0', TNNet.EstimateSpectralRadius(nil) = 0);
+  finally
+    NN.Free;
+  end;
+
+  // (5) Non-square layer has no eigenvalues => returns 0.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(6));
+    NN.InitWeights();
+    AssertTrue('non-square layer => 0',
+      TNNet.EstimateSpectralRadius(NN.Layers[1]) = 0);
+  finally
     NN.Free;
   end;
 end;
