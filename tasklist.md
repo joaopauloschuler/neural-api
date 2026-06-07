@@ -164,6 +164,43 @@ rather than acted on.
       loss on a small MNIST/Fashion-MNIST subset and report digit accuracy vs a
       param-matched plain CNN as the headline.
 
+- [ ] TNNetNTMMemory — a differentiable, WRITABLE external memory layer in the
+      Neural Turing Machine / Differentiable Neural Computer family (Graves et al.
+      2014, "Neural Turing Machines", arXiv:1410.5401). This is a genuinely NEW
+      paradigm in the fork: the existing associative-memory layers are READ-ONLY
+      retrieval against a learned bank — TNNetModernHopfield (iterated energy
+      softmax recall) and TNNetProductKeyMemory (sparse top-k lookup) — and
+      TNNetSelectiveSSM keeps a per-channel recurrent STATE, not an addressable
+      memory MATRIX. NTM is distinct: a persistent M (NumSlots x SlotWidth) that
+      the layer both READS and WRITES as it sweeps the time axis of an
+      (T,1,InputDim) input. Per step the input drives (a) a content-addressing
+      read — cosine-similarity key against every slow row, softmax over slots
+      (sharpened by a softplus key-strength beta) -> weights w, read vector
+      r = w^T M; and (b) a write — erase/add: M_new[i] = M[i]*(1 - w[i]*e) +
+      w[i]*a, with sigmoid erase vector e and add vector a from the input. The
+      layer emits the per-step read vectors as a (T,1,SlotWidth) tensor (or
+      concat[input,read]). v1 scope to keep it tractable and gradient-checkable:
+      CONTENT addressing only (defer the location-based shift/interpolation
+      addressing and DNC's temporal link matrix to a follow-up), single read+write
+      head, M initialised to a small constant and rolled forward within a sequence.
+      Trainables = the projection neurons producing (key, beta, erase, add) from
+      the input. Backward must BPTT through the recurrent M update (the erase/add
+      makes M_t depend on M_{t-1} and on w_t, so dL/dM and dL/dw both chain
+      backward across steps — the place a silent truncation bug would hide, so
+      gradient-check the read path, the write projections, and the input gradient
+      hard). Round-trip the head dims via FStruct, serialize like the other
+      stateful layers, M is NOT persisted (re-init on load, like SetAdjacency).
+      Headline example examples/NeuralTuringMachine/ (pure CPU): the classic
+      COPY task — present a random binary sequence followed by a delimiter, then
+      require the net to reproduce it from memory — which a same-size plain
+      LSTM/GRU stack cannot generalize to longer-than-trained sequences but the
+      NTM can, because it has learned to WRITE then READ-BACK addresses. Report
+      copy bit-accuracy vs sequence length for the NTM vs a param-matched
+      TNNetSLSTMCell arm to make the "external writable memory beats fixed
+      recurrent state" claim concretely. Follow-ups (NOT in v1): multi-head
+      read/write, location-based addressing with circular shift, and the full DNC
+      allocation + temporal-link read modes.
+
 - [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
       landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
       PHANTOM backward, TNNetDeepEquilibriumSharedConv per-forward weight cache,
