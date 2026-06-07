@@ -72,7 +72,7 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetDeformableConv — deformable convolution (Dai et al. 2017): a conv
+- [X] TNNetDeformableConv — deformable convolution (Dai et al. 2017): a conv
       whose KxK sampling grid is shifted by learnable, per-output-location
       (and per-tap) 2-D offsets, so the receptive field adapts to content
       instead of being a rigid axis-aligned window. This is a genuinely new
@@ -93,8 +93,9 @@ rather than acted on.
       bilinear kinks at integer positions don't trip finite differences),
       shape-inference smoke entry, and an examples/DeformableConv/ demo on a
       geometrically-warped tiny dataset (rotated/scaled MNIST digits) showing
-      it beats a param-matched rigid conv. Optional v2: modulated deformable
-      conv (DCNv2) adding a learnable per-tap sigmoid amplitude.
+      it beats a param-matched rigid conv.
+  - [ ] Optional v2: modulated deformable conv (DCNv2) adding a learnable
+        per-tap sigmoid amplitude (modulation mask).
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT

@@ -242,6 +242,12 @@ type
     procedure TestCondConvRoutingGradientCheck;
     procedure TestCondConvShapeInference;
     procedure TestCondConvSerializationRoundTrip;
+    // TNNetDeformableConv deformable convolution (learnable per-tap offsets)
+    procedure TestDeformableConvInputGradientCheck;
+    procedure TestDeformableConvWeightGradientCheck;
+    procedure TestDeformableConvOffsetGradientCheck;
+    procedure TestDeformableConvShapeInference;
+    procedure TestDeformableConvSerializationRoundTrip;
     // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
     procedure TestGroupConvP4InputGradientCheck;
     procedure TestGroupConvP4WeightGradientCheck;
@@ -41761,6 +41767,356 @@ begin
         NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CondConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// --- TNNetDeformableConv ---------------------------------------------------
+// The offset head is ZERO-init, so by default every tap samples exactly ON the
+// integer grid (the bilinear kink). To exercise the bilinear path and keep the
+// finite difference away from kinks, these tests SEED the offset bias with small
+// fractional values (~0.3) so all sampling positions sit strictly between
+// integer pixels, and keep input/weight magnitudes small.
+
+procedure TTestNeuralNumerical.TestDeformableConvInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  DC: TNNetDeformableConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input feeds BOTH the deformable conv (through the bilinear corners) AND the
+  // offset head (which moves the sampling positions), so the input gradient has
+  // two terms; this exercises both.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  InputPlus := TNNetVolume.Create(5, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2, 1)); // 1 = collect input error
+    DC := TNNetDeformableConv.Create(2, 3, 1, 1, 0); // 2 feat, 3x3, pad1, stride1
+    NN.AddLayer(DC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    InSize := Input.Size;
+
+    // Seed offset-head bias with small fractional offsets (avoid integer-grid
+    // kinks) and a few small offset-head weights so offsets are content-driven.
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.02 * i;
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.7);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('DeformableConv input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  DeformableConv input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  DC: TNNetDeformableConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic gradient for each MAIN conv weight.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2));
+    DC := TNNetDeformableConv.Create(2, 3, 1, 1, 0);
+    NN.AddLayer(DC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.02 * i;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for i := 0 to DC.Neurons[0].Weights.Size - 1 do
+    begin
+      DC.Neurons[0].Weights.Raw[i] := DC.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      DC.Neurons[0].Weights.Raw[i] := DC.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      DC.Neurons[0].Weights.Raw[i] := DC.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      DC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -DC.Neurons[0].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('DeformableConv main-weight gradient check w=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  DeformableConv main-weight gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvOffsetGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  DC: TNNetDeformableConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // The HARD path: gradient w.r.t. the OFFSET-head weights AND biases. The
+  // offset moves the bilinear sampling position, so this flows through
+  // dSample/dpx, dSample/dpy. We seed off-grid offsets (~0.3) so the finite
+  // difference never straddles an integer pixel boundary.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2));
+    DC := TNNetDeformableConv.Create(2, 3, 1, 1, 0);
+    NN.AddLayer(DC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Off-grid base offsets + small content-driven offset weights.
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.02 * i;
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.7);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    // Offset-head weights (neuron 2).
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+    begin
+      DC.Neurons[2].Weights.Raw[i] := DC.Neurons[2].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      DC.Neurons[2].Weights.Raw[i] := DC.Neurons[2].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      DC.Neurons[2].Weights.Raw[i] := DC.Neurons[2].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      DC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -DC.Neurons[2].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('DeformableConv offset-weight gradient check w=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    // Offset-head biases (neuron 3).
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+    begin
+      DC.Neurons[3].Weights.Raw[i] := DC.Neurons[3].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss();
+      DC.Neurons[3].Weights.Raw[i] := DC.Neurons[3].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      DC.Neurons[3].Weights.Raw[i] := DC.Neurons[3].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      DC.ClearDeltas;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -DC.Neurons[3].Delta.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('DeformableConv offset-bias gradient check b=' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  DeformableConv offset gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvShapeInference;
+var
+  NN: TNNet;
+  DC: TNNetDeformableConv;
+begin
+  // Shape-inference smoke check: output sized like an ordinary conv, with the
+  // expected 4-neuron bank (main W, main bias, offset W, offset bias).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    DC := TNNetDeformableConv.Create(5, 3, 1, 2, 0); // 5 feat, 3x3, pad1, stride2
+    NN.AddLayer(DC);
+    // (8 + 2*1 - 3)/2 + 1 = 4 along each spatial axis.
+    AssertEquals('DeformableConv output SizeX', 4, DC.Output.SizeX);
+    AssertEquals('DeformableConv output SizeY', 4, DC.Output.SizeY);
+    AssertEquals('DeformableConv output Depth = features', 5, DC.Output.Depth);
+    AssertEquals('DeformableConv inferred InDepth', 3, DC.InDepth);
+    AssertEquals('DeformableConv neuron count', 4, DC.Neurons.Count);
+    // Main kernel: 3*3*3*5 = 135.
+    AssertEquals('DeformableConv main kernel size', 135, DC.Neurons[0].Weights.Size);
+    // Main bias: features = 5.
+    AssertEquals('DeformableConv main bias size', 5, DC.Neurons[1].Weights.Size);
+    // Offset weights: 3*3*3*(2*9) = 27*18 = 486.
+    AssertEquals('DeformableConv offset weight size', 486, DC.Neurons[2].Weights.Size);
+    // Offset bias: 2*K*K = 18.
+    AssertEquals('DeformableConv offset bias size', 18, DC.Neurons[3].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  DC: TNNetDeformableConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // DeformableConv in the MIDDLE of a net with non-default features/kernel/pad/
+  // stride: SaveToString -> LoadFromString -> SaveToString must be byte-identical
+  // and Compute must match, proving the conv params (FStruct[0..4]) round-trip
+  // through BOTH dispatch points and all four neurons survive.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    DC := TNNetDeformableConv.Create(4, 3, 1, 2, 0); // 4 feat, 3x3, pad1, stride2
+    NN.AddLayer(DC);
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+
+    // Give the offset head non-trivial weights so the deformable path is active.
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.3);
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.25 - 0.01 * i;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('DeformableConv SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('DeformableConv token present in serialized string',
+        Pos('TNNetDeformableConv', Saved) > 0);
+      AssertEquals('DeformableConv output SizeX preserved',
+        NN.Layers[1].Output.SizeX, NN2.Layers[1].Output.SizeX);
+      AssertEquals('DeformableConv output Depth preserved',
+        NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('DeformableConv Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
