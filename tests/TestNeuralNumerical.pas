@@ -26229,16 +26229,26 @@ begin
   Input := TNNetVolume.Create(3, 1, 4);
   InputPlus := TNNetVolume.Create(3, 1, 4);
   Desired := TNNetVolume.Create(3, 1, 4);
-  epsilon := 0.0001;
+  // Coarser epsilon: the per-token init weights are small so the input gradient
+  // is tiny; a larger step keeps the FP32 central difference above the loss
+  // round-off floor (the loss is ~O(1) here, so lossPlus-lossMinus stays resolvable).
+  epsilon := 0.001;
   maxErr := 0;
   try
-    NN.AddLayer(TNNetInput.Create(3, 1, 4));
+    // The 4th arg (pError=1) enables the input layer's error buffer so the
+    // analytical input gradient is actually written back to Layers[0].OutputError;
+    // without it that buffer stays size-1 and reading Raw[i>0] is an out-of-bounds
+    // (stale-heap) read that intermittently produced garbage gradients.
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
     NN.AddGatedLinearAttention();
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
 
-    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
-    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    // Larger input/target amplitudes lift the input gradient to O(1e-2) so the
+    // analytical vs finite-difference comparison is a meaningful check rather than
+    // two values both buried in FP32 noise.
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 2.5 + 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 2.0;
 
     for i := 0 to Input.Size - 1 do
     begin
