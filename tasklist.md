@@ -96,6 +96,19 @@ rather than acted on.
       weights" and Monarch examples). Fills the multi-factor low-rank-tensor gap
       in the structured-matrix family; an optional TT-rank sweep table is a clean
       follow-up.
+- [ ] TNNetTensorTrain follow-ups (the layer + numerical-gradient/serialization
+      tests in tests/TestNeuralNumerical.pas + examples/TensorTrainLinear/ all
+      LANDED 2026-06-07 on a2, commit c78edd0; default d=2 auto-factored cores,
+      interior rank r, exact left→right MPO-vector contraction, square map infers
+      n from the previous layer, d/r/suppress-bias round-trip via FStruct[1..3]):
+      - [ ] examples/TensorTrainLinear/ TT-RANK SWEEP table — sweep the interior
+            rank r ∈ {1,2,4,8} (and/or d ∈ {2,3}) on the same teacher and chart
+            weight-count vs accuracy, making the "smooth compression↔capacity dial"
+            claim land on data (the v1 example reports a single d=2 point).
+      - [ ] Validate / harden the GENERAL d>2 core path: the landed forward/backward
+            handle d cores but the example and tests exercise d=2 (with auto-factoring
+            capped at 6). Add an explicit d=3 gradient-check arm and a d=3 example
+            point so the multi-core chain is covered by a test, not just constructible.
 - [ ] Multi-Token Prediction follow-up (TNNet.AddMultiTokenPrediction landed
       2026-06-07, commit be16117): Inference-time self-speculative decode — reuse
       the extra future heads as a built-in draft (drop the SpeculativeDecoding
