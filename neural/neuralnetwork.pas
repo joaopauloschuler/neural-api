@@ -2081,6 +2081,77 @@ type
       X: integer = 0; Y: integer = 0);
   end;
 
+  /// Deep Evidential Regression head (Amini et al., NeurIPS 2020,
+  // arXiv:1910.02600). A single-forward-pass uncertainty head that, per scalar
+  // regression target, emits the 4 parameters of a Normal-Inverse-Gamma (NIG)
+  // higher-order distribution and so reports BOTH aleatoric (data) and
+  // epistemic (model) uncertainty without any sampling or ensembling.
+  //
+  // INPUT/OUTPUT PACKING (over the Depth axis): the previous layer must emit
+  // 4*D raw channels, where D = TargetDimension. For target dimension d the
+  // four consecutive raw channels at base 4*d are mapped, in place, to the NIG
+  // parameters (this is the only difference from a TNNetIdentity passthrough):
+  //   gamma_d (mean)  = raw[4d+0]                      (left LINEAR)
+  //   nu_d    (>0)    = softplus(raw[4d+1])
+  //   alpha_d (>1)    = 1 + softplus(raw[4d+2])
+  //   beta_d  (>0)    = softplus(raw[4d+3]).
+  // The positivity links mirror TNNetMixtureDensity's softplus discipline.
+  //
+  // LOSS (per target d, summed): the NIG negative log-likelihood (the Student-t
+  // marginal of y, in closed form via lgamma) plus the paper's evidence
+  // regularizer that penalises misleading evidence on errors. With
+  //   Delta = y - gamma,  Omega = 2*beta*(1+nu),  S = Delta^2*nu + Omega:
+  //   NLL = 0.5*ln(pi/nu) - alpha*ln(Omega) + (alpha+0.5)*ln(S)
+  //         + lnGamma(alpha) - lnGamma(alpha+0.5)
+  //   REG = lambda * |Delta| * (2*nu + alpha)
+  // and the total head loss is L = NLL + REG (lambda in FFloatSt[0], default
+  // 0.01). Forward is an identity-style passthrough (so Net.Compute returns the
+  // transformed NIG params); training relies on the framework seeding
+  // FOutputError := output - target. Backpropagate recovers the scalar target
+  // y_d = output[4d] - FOutputError[4d] (only the gamma channel matters; fill
+  // the other target channels equal to the output so their seeded residual is
+  // 0) and OVERWRITES the whole FOutputError with the EXACT dL/d(raw param),
+  // chaining the softplus link (softplus' = sigmoid(raw)):
+  //   dL/dgamma = -2*nu*(alpha+0.5)*Delta/S - lambda*sign(Delta)*(2*nu+alpha)
+  //   dL/dnu    = -0.5/nu - alpha*2*beta/Omega + (alpha+0.5)*(Delta^2+2*beta)/S
+  //               + 2*lambda*|Delta|                          [* sigmoid(raw_nu)]
+  //   dL/dalpha = -ln(Omega) + ln(S) + digamma(alpha) - digamma(alpha+0.5)
+  //               + lambda*|Delta|                          [* sigmoid(raw_alpha)]
+  //   dL/dbeta  = -alpha*2*(1+nu)/Omega + (alpha+0.5)*2*(1+nu)/S
+  //                                                         [* sigmoid(raw_beta)].
+  //
+  // INFERENCE HELPERS (read the transformed params from FOutput; call after
+  // Compute): Prediction = gamma; AleatoricVar = beta/(alpha-1); EpistemicVar =
+  // beta/(nu*(alpha-1)). The epistemic estimate spikes on out-of-distribution
+  // inputs (the paper's OOD-detection use case) without any sampling.
+  //
+  // lambda round-trips via Save/Load (FFloatSt[0]); D via FStruct[0].
+  // Coded by Claude (AI).
+  TNNetEvidentialRegression = class(TNNetIdentity)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Local lnGamma / digamma so the head has no extra unit dependency.
+    function LnGammaF(x: TNeuralFloat): TNeuralFloat;
+    function DigammaF(x: TNeuralFloat): TNeuralFloat;
+  public
+    constructor Create(); overload; override;
+    constructor Create(TargetDim: integer; pLambda: TNeuralFloat = 0.01); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Target dimension D and the evidence-regularizer weight lambda.
+    function TargetDimension(): integer;
+    function Lambda(): TNeuralFloat;
+    // NIG negative-log-likelihood + evidence regularizer of target y (D values)
+    // under the params currently in FOutput at cell (X,Y). Reads the already
+    // transformed (gamma,nu,alpha,beta) params; used by tests / monitoring.
+    function EvidentialLoss(const yTarget: array of TNeuralFloat; X: integer = 0;
+      Y: integer = 0): TNeuralFloat;
+    // Inference helpers (read transformed params from FOutput at cell (X,Y)).
+    function Prediction(d: integer = 0; X: integer = 0; Y: integer = 0): TNeuralFloat;
+    function AleatoricVar(d: integer = 0; X: integer = 0; Y: integer = 0): TNeuralFloat;
+    function EpistemicVar(d: integer = 0; X: integer = 0; Y: integer = 0): TNeuralFloat;
+  end;
+
   /// Wing loss output layer (facial-landmark regression loss; per-element,
   // like Huber). Given the seeded residual r = output - target per element and
   // hyperparameters w (width, default 10.0) and eps (curvature, default 2.0):
@@ -17582,6 +17653,280 @@ begin
         end;
       end;
     end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetEvidentialRegression }
+
+constructor TNNetEvidentialRegression.Create();
+begin
+  // Default: D = 1 scalar target, lambda = 0.01.
+  Create(1, 0.01);
+end;
+
+constructor TNNetEvidentialRegression.Create(TargetDim: integer;
+  pLambda: TNeuralFloat = 0.01);
+begin
+  inherited Create();
+  if TargetDim < 1 then
+    FErrorProc('TNNetEvidentialRegression target dimension must be >= 1.');
+  if pLambda < 0 then
+    FErrorProc('TNNetEvidentialRegression lambda must be >= 0.');
+  FStruct[0] := TargetDim;
+  FFloatSt[0] := pLambda;
+end;
+
+procedure TNNetEvidentialRegression.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Dim, Expected: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Dim := FStruct[0];
+  if Dim < 1 then
+    FErrorProc('TNNetEvidentialRegression target dimension must be >= 1.');
+  Expected := 4 * Dim;
+  if pPrevLayer.FOutput.Depth <> Expected then
+    FErrorProc('TNNetEvidentialRegression requires input depth = 4*D = ' +
+      IntToStr(Expected) + ' (D=' + IntToStr(Dim) + '), got ' +
+      IntToStr(pPrevLayer.FOutput.Depth) + '.');
+end;
+
+function TNNetEvidentialRegression.TargetDimension(): integer;
+begin
+  Result := FStruct[0];
+end;
+
+function TNNetEvidentialRegression.Lambda(): TNeuralFloat;
+begin
+  Result := FFloatSt[0];
+end;
+
+// Lanczos approximation to ln(Gamma(x)) for x > 0 (g=7, 9 coefficients);
+// accurate to ~1e-13 on the well-conditioned x>=1 range the head uses.
+function TNNetEvidentialRegression.LnGammaF(x: TNeuralFloat): TNeuralFloat;
+const
+  cG: array[0..8] of Double = (
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7);
+  cSqrt2Pi = 2.5066282746310002; // sqrt(2*pi)
+var
+  xd, t, a: Double;
+  i: integer;
+begin
+  xd := x;
+  if xd < 0.5 then
+    // Reflection (not used by the head's bounded params, kept for safety).
+    Result := Ln(Pi / Sin(Pi * xd)) - LnGammaF(1 - x)
+  else
+  begin
+    xd := xd - 1;
+    a := cG[0];
+    t := xd + 7.5;
+    for i := 1 to 8 do
+      a := a + cG[i] / (xd + i);
+    // ln( sqrt(2*pi) * a * t^(xd+0.5) * e^-t )
+    Result := Ln(cSqrt2Pi * a) + (xd + 0.5) * Ln(t) - t;
+  end;
+end;
+
+// digamma(x) = d/dx ln(Gamma(x)), x > 0, via recurrence up to x>=6 then the
+// asymptotic series. Well conditioned for the head's alpha (>1) range.
+function TNNetEvidentialRegression.DigammaF(x: TNeuralFloat): TNeuralFloat;
+var
+  xd, r, f: Double;
+begin
+  xd := x;
+  r := 0;
+  while xd < 6 do
+  begin
+    r := r - 1 / xd;
+    xd := xd + 1;
+  end;
+  f := 1 / (xd * xd);
+  r := r + Ln(xd) + 1 / (2 * xd)
+    - f * (1.0/12.0 - f * (1.0/120.0 - f * (1.0/252.0)));
+  Result := r;
+end;
+
+procedure TNNetEvidentialRegression.Compute();
+var
+  StartTime: double;
+  Dim, X, Y, dd, MaxX, MaxY, B: integer;
+  RawNu, RawAl, RawBe: TNeuralFloat;
+
+  function SoftPlus(s: TNeuralFloat): TNeuralFloat;
+  begin
+    if s > 30 then Result := s
+    else Result := Ln(1 + Exp(s));
+  end;
+
+begin
+  StartTime := Now();
+  // Identity passthrough, then transform nu/alpha/beta channels in place;
+  // gamma channel is left linear.
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Dim := FStruct[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for dd := 0 to Dim - 1 do
+      begin
+        B := 4 * dd;
+        // gamma = FOutput[B] left as-is.
+        RawNu := FOutput[X, Y, B + 1];
+        RawAl := FOutput[X, Y, B + 2];
+        RawBe := FOutput[X, Y, B + 3];
+        FOutput[X, Y, B + 1] := SoftPlus(RawNu);
+        FOutput[X, Y, B + 2] := 1 + SoftPlus(RawAl);
+        FOutput[X, Y, B + 3] := SoftPlus(RawBe);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+function TNNetEvidentialRegression.EvidentialLoss(
+  const yTarget: array of TNeuralFloat; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+var
+  Dim, dd, B: integer;
+  Gam, Nu, Al, Be, Delta, Omega, S, Lam, Total: TNeuralFloat;
+const
+  cMinNu = 1e-6;
+  cMinBe = 1e-6;
+begin
+  Dim := FStruct[0];
+  Lam := FFloatSt[0];
+  Total := 0;
+  for dd := 0 to Dim - 1 do
+  begin
+    if dd > High(yTarget) then break;
+    B := 4 * dd;
+    Gam := FOutput[X, Y, B];
+    Nu  := FOutput[X, Y, B + 1]; if Nu < cMinNu then Nu := cMinNu;
+    Al  := FOutput[X, Y, B + 2];
+    Be  := FOutput[X, Y, B + 3]; if Be < cMinBe then Be := cMinBe;
+    Delta := yTarget[dd] - Gam;
+    Omega := 2 * Be * (1 + Nu);
+    S := Delta * Delta * Nu + Omega;
+    Total := Total
+      + 0.5 * Ln(Pi / Nu)
+      - Al * Ln(Omega)
+      + (Al + 0.5) * Ln(S)
+      + LnGammaF(Al) - LnGammaF(Al + 0.5)
+      + Lam * Abs(Delta) * (2 * Nu + Al);
+  end;
+  Result := Total;
+end;
+
+function TNNetEvidentialRegression.Prediction(d: integer = 0; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+begin
+  Result := FOutput[X, Y, 4 * d];
+end;
+
+function TNNetEvidentialRegression.AleatoricVar(d: integer = 0; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+var
+  Al, Be: TNeuralFloat;
+begin
+  Be := FOutput[X, Y, 4 * d + 3];
+  Al := FOutput[X, Y, 4 * d + 2];
+  if Al <= 1 + 1e-6 then Al := 1 + 1e-6;
+  Result := Be / (Al - 1);
+end;
+
+function TNNetEvidentialRegression.EpistemicVar(d: integer = 0; X: integer = 0;
+  Y: integer = 0): TNeuralFloat;
+var
+  Al, Be, Nu: TNeuralFloat;
+begin
+  Be := FOutput[X, Y, 4 * d + 3];
+  Al := FOutput[X, Y, 4 * d + 2];
+  Nu := FOutput[X, Y, 4 * d + 1];
+  if Al <= 1 + 1e-6 then Al := 1 + 1e-6;
+  if Nu < 1e-6 then Nu := 1e-6;
+  Result := Be / (Nu * (Al - 1));
+end;
+
+procedure TNNetEvidentialRegression.Backpropagate();
+var
+  StartTime: double;
+  Dim, X, Y, dd, MaxX, MaxY, B: integer;
+  Yd, Gam, Nu, Al, Be, Delta, Omega, S, Lam, SgnD, AbsD: TNeuralFloat;
+  dGam, dNu, dAl, dBe: TNeuralFloat;
+  RawNu, RawAl, RawBe, SigNu, SigAl, SigBe: TNeuralFloat;
+const
+  cMinNu = 1e-6;
+  cMinBe = 1e-6;
+
+  function SigmoidOf(s: TNeuralFloat): TNeuralFloat;
+  begin
+    if s > 30 then Result := 1
+    else if s < -30 then Result := 0
+    else Result := 1 / (1 + Exp(-s));
+  end;
+
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  Dim := FStruct[0];
+  Lam := FFloatSt[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for dd := 0 to Dim - 1 do
+      begin
+        B := 4 * dd;
+        // Recover the scalar target from the gamma channel: framework seeded
+        // FOutputError := output - target, and gamma is an identity passthrough.
+        Yd := FOutput[X, Y, B] - FOutputError[X, Y, B];
+        Gam := FOutput[X, Y, B];
+        Nu  := FOutput[X, Y, B + 1]; if Nu < cMinNu then Nu := cMinNu;
+        Al  := FOutput[X, Y, B + 2];
+        Be  := FOutput[X, Y, B + 3]; if Be < cMinBe then Be := cMinBe;
+        Delta := Yd - Gam;
+        AbsD := Abs(Delta);
+        if Delta > 0 then SgnD := 1
+        else if Delta < 0 then SgnD := -1
+        else SgnD := 0;
+        Omega := 2 * Be * (1 + Nu);
+        S := Delta * Delta * Nu + Omega;
+
+        // dL/dgamma (gamma is linear -> no softplus chain).
+        dGam := -2 * Nu * (Al + 0.5) * Delta / S
+                - Lam * SgnD * (2 * Nu + Al);
+        // dL/dnu (before softplus chain).
+        dNu := -0.5 / Nu
+               - Al * (2 * Be) / Omega
+               + (Al + 0.5) * (Delta * Delta + 2 * Be) / S
+               + 2 * Lam * AbsD;
+        // dL/dalpha (before softplus chain).
+        dAl := -Ln(Omega) + Ln(S)
+               + DigammaF(Al) - DigammaF(Al + 0.5)
+               + Lam * AbsD;
+        // dL/dbeta (before softplus chain).
+        dBe := -Al * 2 * (1 + Nu) / Omega
+               + (Al + 0.5) * 2 * (1 + Nu) / S;
+
+        // softplus chain (softplus' = sigmoid(raw)); alpha = 1+softplus, so the
+        // chain factor is identical to nu/beta. Recover raws from prev layer.
+        RawNu := FPrevLayer.FOutput[X, Y, B + 1];
+        RawAl := FPrevLayer.FOutput[X, Y, B + 2];
+        RawBe := FPrevLayer.FOutput[X, Y, B + 3];
+        SigNu := SigmoidOf(RawNu);
+        SigAl := SigmoidOf(RawAl);
+        SigBe := SigmoidOf(RawBe);
+
+        FOutputError[X, Y, B]     := dGam;
+        FOutputError[X, Y, B + 1] := dNu * SigNu;
+        FOutputError[X, Y, B + 2] := dAl * SigAl;
+        FOutputError[X, Y, B + 3] := dBe * SigBe;
+      end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -74378,6 +74723,7 @@ begin
       'TNNetBitProcessing' :        Result := TNNetBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetMixtureDensity' :       Result := TNNetMixtureDensity.Create(St[0], St[1]);
+      'TNNetEvidentialRegression' : Result := TNNetEvidentialRegression.Create(St[0], Ft[0]);
       'TNNetSoftDecisionTree' :     Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]);
       'TNNetWingLoss' :             Result := TNNetWingLoss.Create(Ft[0], Ft[1]);
       'TNNetLabelSmoothingLoss' :   Result := TNNetLabelSmoothingLoss.Create(Ft[0]);
@@ -74734,6 +75080,7 @@ begin
       if S[0] = 'TNNetBitProcessing' then Result := TNNetBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetMixtureDensity' then Result := TNNetMixtureDensity.Create(St[0], St[1]) else
+      if S[0] = 'TNNetEvidentialRegression' then Result := TNNetEvidentialRegression.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetSoftDecisionTree' then Result := TNNetSoftDecisionTree.Create(St[0], St[1], Ft[0]) else
       if S[0] = 'TNNetWingLoss' then Result := TNNetWingLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetLabelSmoothingLoss' then Result := TNNetLabelSmoothingLoss.Create(Ft[0]) else

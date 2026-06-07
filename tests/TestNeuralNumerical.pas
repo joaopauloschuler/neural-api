@@ -572,6 +572,8 @@ type
     procedure TestMixtureDensityForwardTransform;
     procedure TestMixtureDensityGradient;
     procedure TestMixtureDensitySampleAndLoadFromString;
+    procedure TestEvidentialRegressionGradient;
+    procedure TestEvidentialRegressionLoadFromString;
     procedure TestLabelSmoothingLossForwardPassthrough;
     procedure TestLabelSmoothingLossTransform;
     procedure TestLabelSmoothingLossLoadFromString;
@@ -32961,6 +32963,168 @@ begin
     AssertTrue('most samples near dominant component mean (hits=' +
       IntToStr(hits) + ')', hits > 180);
     AssertEquals('sample mean ~ mu_1,0', 5.0, Mean, 0.5);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEvidentialRegressionGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  EV: TNNetEvidentialRegression;
+  Yt: array[0..1] of TNeuralFloat;
+  AnaGrad, NumGrad, OldP, LossP, LossM, Eps: TNeuralFloat;
+  i, Dim, Depth: integer;
+  Lam: TNeuralFloat;
+
+  // NIG NLL + evidence regularizer as a function of the RAW params (Input here,
+  // since the previous layer is identity). Recomputes the softplus transforms
+  // exactly as Compute does, then the closed-form loss for both targets.
+  function EvNLL(ARaw: TNNetVolume): TNeuralFloat;
+  var
+    dd, B: integer;
+    Gam, Nu, Al, Be, Delta, Omega, S, Total: TNeuralFloat;
+
+    function Sp(s: TNeuralFloat): TNeuralFloat;
+    begin
+      if s > 30 then Result := s else Result := Ln(1 + Exp(s));
+    end;
+    // lnGamma via FPC-independent Lanczos (mirrors the layer).
+    function Lg(x: TNeuralFloat): TNeuralFloat;
+    const
+      cG: array[0..8] of Double = (
+        0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+        771.32342877765313, -176.61502916214059, 12.507343278686905,
+        -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7);
+    var
+      xd, t, a: Double; j: integer;
+    begin
+      xd := x - 1; a := cG[0]; t := xd + 7.5;
+      for j := 1 to 8 do a := a + cG[j] / (xd + j);
+      Lg := Ln(2.5066282746310002 * a) + (xd + 0.5) * Ln(t) - t;
+    end;
+  begin
+    Total := 0;
+    for dd := 0 to Dim - 1 do
+    begin
+      B := 4 * dd;
+      Gam := ARaw.Raw[B];
+      Nu  := Sp(ARaw.Raw[B + 1]);
+      Al  := 1 + Sp(ARaw.Raw[B + 2]);
+      Be  := Sp(ARaw.Raw[B + 3]);
+      Delta := Yt[dd] - Gam;
+      Omega := 2 * Be * (1 + Nu);
+      S := Delta * Delta * Nu + Omega;
+      Total := Total
+        + 0.5 * Ln(Pi / Nu)
+        - Al * Ln(Omega)
+        + (Al + 0.5) * Ln(S)
+        + Lg(Al) - Lg(Al + 0.5)
+        + Lam * Abs(Delta) * (2 * Nu + Al);
+    end;
+    Result := Total;
+  end;
+
+begin
+  // Reseed so the shared RNG state is deterministic (this file shares one RNG
+  // across tests and is ordering sensitive).
+  RandSeed := 424242;
+  Dim := 2;
+  Depth := 4 * Dim; // 8
+  Yt[0] := 0.4;
+  Yt[1] := -0.7;
+  Lam := 0.05;
+  Eps := 1e-4;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, Depth);
+  Target := TNNetVolume.Create(1, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Depth, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    EV := TNNetEvidentialRegression.Create(Dim, Lam);
+    NN.AddLayer(EV);
+
+    // Bounded raw params so the softplus->(nu,alpha-1,beta) stay moderate and
+    // lgamma/digamma are well conditioned (alpha well above 1).
+    Input.Raw[0] :=  0.3;  // gamma_0
+    Input.Raw[1] :=  0.6;  // raw nu_0  -> softplus ~ 1.04
+    Input.Raw[2] :=  1.0;  // raw alpha_0 -> alpha ~ 2.31
+    Input.Raw[3] :=  0.5;  // raw beta_0  -> ~0.97
+    Input.Raw[4] := -0.5;  // gamma_1
+    Input.Raw[5] :=  0.2;  // raw nu_1
+    Input.Raw[6] :=  0.8;  // raw alpha_1
+    Input.Raw[7] :=  0.4;  // raw beta_1
+
+    NN.Compute(Input);
+    // Framework seeds FOutputError := output - target; the head recovers the
+    // scalar target from the gamma channel only. Set the other target channels
+    // equal to the output (seeded residual 0).
+    Target.Copy(NN.GetLastLayer.Output);
+    Target.Raw[0] := Yt[0];
+    Target.Raw[4] := Yt[1];
+    NN.Backpropagate(Target);
+
+    for i := 0 to LMid.OutputError.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldP := Input.Raw[i];
+      Input.Raw[i] := OldP + Eps;
+      LossP := EvNLL(Input);
+      Input.Raw[i] := OldP - Eps;
+      LossM := EvNLL(Input);
+      Input.Raw[i] := OldP;
+      NumGrad := (LossP - LossM) / (2 * Eps);
+      AssertEquals('EvidentialRegression grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEvidentialRegressionLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  EV: TNNetEvidentialRegression;
+  Saved: string;
+begin
+  // Save/Load must preserve D (FStruct[0]) and lambda (FFloatSt[0]).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 8, 1));
+    NN.AddLayer(TNNetEvidentialRegression.Create(2, 0.07));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetEvidentialRegression',
+      NN2.GetLastLayer is TNNetEvidentialRegression);
+    EV := NN2.GetLastLayer as TNNetEvidentialRegression;
+    AssertEquals('Loaded D', 2, EV.TargetDimension());
+    AssertEquals('Loaded lambda', 0.07, EV.Lambda(), 1e-6);
+
+    // Forward transform sanity: nu,beta > 0 and alpha > 1, gamma linear.
+    Input.Raw[0] := 1.5; Input.Raw[1] := 0.0; Input.Raw[2] := 0.0; Input.Raw[3] := 0.0;
+    Input.Raw[4] := -2.0; Input.Raw[5] := 0.0; Input.Raw[6] := 0.0; Input.Raw[7] := 0.0;
+    NN2.Compute(Input);
+    AssertEquals('gamma_0 linear passthrough', 1.5, EV.Prediction(0), 1e-5);
+    AssertEquals('gamma_1 linear passthrough', -2.0, EV.Prediction(1), 1e-5);
+    AssertTrue('alpha > 1', EV.Output[0,0,2] > 1);
+    AssertTrue('nu > 0', EV.Output[0,0,1] > 0);
+    AssertTrue('beta > 0', EV.Output[0,0,3] > 0);
+    AssertTrue('aleatoric var > 0', EV.AleatoricVar(0) > 0);
+    AssertTrue('epistemic var > 0', EV.EpistemicVar(0) > 0);
   finally
     NN.Free;
     NN2.Free;
